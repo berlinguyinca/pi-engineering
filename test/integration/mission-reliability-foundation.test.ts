@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -23,6 +23,22 @@ import type { VerificationProvider } from "../../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+
+let dogfoodParent: string | undefined;
+
+/**
+ * A temporary parent for the dogfood script that does not overlap the checkout.
+ * The script refuses os.tmpdir() itself whenever the checkout lives under it
+ * (a /tmp worktree, a CI workspace), so the suite hands it a private child.
+ */
+function dogfoodTempEnv(): { TMPDIR: string } {
+  if (!dogfoodParent) {
+    const parent = mkdtempSync(join(tmpdir(), "pi-eng-dogfood-parent-"));
+    process.on("exit", () => rmSync(parent, { recursive: true, force: true }));
+    dogfoodParent = parent;
+  }
+  return { TMPDIR: dogfoodParent };
+}
 
 const exec = promisify(execFile);
 
@@ -1196,7 +1212,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       () =>
         exec(process.execPath, ["scripts/dogfood-mission-recovery.ts", "--model", "metabolomics/remote"], {
           cwd: process.cwd(),
-          env: { ...process.env },
+          env: { ...process.env, ...dogfoodTempEnv() },
         }),
       (error: unknown) => {
         const failure = error as { stderr?: string };
@@ -1204,6 +1220,40 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         return true;
       },
     );
+  });
+
+  it("still refuses a temporary parent that overlaps the checkout", async () => {
+    const fake = await fakeInstalledPi();
+    try {
+      await assert.rejects(
+        () =>
+          exec(
+            process.execPath,
+            [
+              "scripts/dogfood-mission-recovery.ts",
+              "--pi",
+              fake.executable,
+              "--model",
+              "local/local",
+              "--expected-sha",
+              fake.sha,
+              "--temp-parent",
+              process.cwd(),
+            ],
+            {
+              cwd: process.cwd(),
+              env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+            },
+          ),
+        (error: unknown) => {
+          const stderr = (error as { stderr?: string }).stderr ?? "";
+          assert.match(stderr, /refusing temporary parent/i);
+          return true;
+        },
+      );
+    } finally {
+      await fake.cleanup();
+    }
   });
 
   it("dogfoods the uniquely installed package and validates the versioned snapshot contract", async () => {
@@ -1222,7 +1272,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         ],
         {
           cwd: process.cwd(),
-          env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+          env: { ...process.env, ...dogfoodTempEnv(), FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
         },
       );
       const evidence = JSON.parse(result.stdout) as {
@@ -1285,6 +1335,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
                 cwd: process.cwd(),
                 env: {
                   ...process.env,
+                  ...dogfoodTempEnv(),
                   FAKE_INSTALLED_PATH: fake.installed,
                   FAKE_ARGS_LOG: fake.log,
                   FAKE_EVENT_MODE: eventMode,
@@ -1309,7 +1360,10 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       const result = await exec(
         process.execPath,
         ["scripts/dogfood-mission-recovery.ts", "--pi", fake.executable, "--source-only", "--model", "local/local"],
-        { cwd: process.cwd(), env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log } },
+        {
+          cwd: process.cwd(),
+          env: { ...process.env, ...dogfoodTempEnv(), FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+        },
       );
       const evidence = JSON.parse(result.stdout) as { verificationMode: string; temporaryRepository: string };
       const invocations = (await readFile(fake.log, "utf8"))
@@ -1338,7 +1392,12 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
             ["scripts/dogfood-mission-recovery.ts", "--pi", fake.executable, "--expected-sha", fake.sha],
             {
               cwd: process.cwd(),
-              env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+              env: {
+                ...process.env,
+                ...dogfoodTempEnv(),
+                FAKE_INSTALLED_PATH: fake.installed,
+                FAKE_ARGS_LOG: fake.log,
+              },
             },
           ),
         /installed package is not clean/i,
@@ -1384,6 +1443,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
               cwd: process.cwd(),
               env: {
                 ...process.env,
+                ...dogfoodTempEnv(),
                 FAKE_INSTALLED_PATH: fake.installed,
                 FAKE_ARGS_LOG: fake.log,
                 FAKE_SNAPSHOT_MODE: mode,
@@ -1416,7 +1476,12 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
             ],
             {
               cwd: process.cwd(),
-              env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+              env: {
+                ...process.env,
+                ...dogfoodTempEnv(),
+                FAKE_INSTALLED_PATH: fake.installed,
+                FAKE_ARGS_LOG: fake.log,
+              },
             },
           ),
         /refusing temporary parent inside Git worktree/i,
@@ -1439,7 +1504,12 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
             ["scripts/dogfood-mission-recovery.ts", "--pi", fake.executable, "--expected-sha", fake.sha],
             {
               cwd: process.cwd(),
-              env: { ...process.env, FAKE_INSTALLED_PATH: fake.installed, FAKE_ARGS_LOG: fake.log },
+              env: {
+                ...process.env,
+                ...dogfoodTempEnv(),
+                FAKE_INSTALLED_PATH: fake.installed,
+                FAKE_ARGS_LOG: fake.log,
+              },
             },
           ),
         (error: unknown) => {

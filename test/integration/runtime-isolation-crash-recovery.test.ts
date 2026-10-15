@@ -32,9 +32,12 @@ describe("crash recovery across real processes", () => {
 
     // While the holder lives, another session must not take its mission.
     const blocked = startChild("adopt", repo, stateDir, { env: { PI_TEST_ADOPT_MISSION: held.missionId! } });
+    // Contention queues (up to custodyWaitMs, fd5fcf1/#126) instead of failing
+    // fast, and the wait's timer is unref'd, so with nothing else in the child's
+    // event loop the contender exits without ever reporting an adoption.
     const blockedReport = await blocked.report.catch((error: Error) => ({ ok: false, error: error.message }) as const);
     assert.equal(blockedReport.ok, false, "a live custodian's mission is not adopted");
-    assert.match(String(blockedReport.error), /custody of another live session/);
+    await blocked.exited;
 
     holder.child.kill("SIGKILL");
     await holder.exited;
