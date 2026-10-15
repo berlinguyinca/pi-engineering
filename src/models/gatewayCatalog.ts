@@ -31,6 +31,8 @@ export interface GatewayModelEntry {
   state?: string;
   /** Concurrent requests this model can serve. Zero is why a 503 happens. */
   slots?: number;
+  /** Concurrent requests the gateway admits for this model (`active_limit` / `x_active_limit`). */
+  activeLimit?: number;
   /** Largest request body the gateway accepts for this model, when advertised. */
   maxRequestBytes?: number;
   /** True when `id` is a logical route (`x_alias`) rather than a concrete model. */
@@ -94,6 +96,7 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
     const contextTotal = num(row.ctx_total);
     const state = str(row.x_state) ?? str(row.state);
     const slots = typeof row.slots === "number" && Number.isFinite(row.slots) ? row.slots : undefined;
+    const activeLimit = num(row.x_active_limit) ?? num(row.active_limit);
     const maxRequestBytes = num(row.x_max_request_bytes) ?? num(row.max_request_bytes);
     out.push({
       id,
@@ -101,6 +104,7 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
       ...(contextTotal !== undefined ? { contextTotal } : {}),
       ...(state ? { state } : {}),
       ...(slots !== undefined ? { slots } : {}),
+      ...(activeLimit !== undefined ? { activeLimit } : {}),
       ...(maxRequestBytes !== undefined ? { maxRequestBytes } : {}),
       ...(alias ? { alias } : {}),
       ...(backingModel ? { backingModel } : {}),
@@ -108,6 +112,37 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
     });
   }
   return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/**
+ * Concurrency the gateway will serve: the largest per-model `active_limit`
+ * (falling back to its slot count). Undefined when the catalogue says nothing.
+ */
+export function gatewayCapacity(entries: readonly GatewayModelEntry[]): number | undefined {
+  let best: number | undefined;
+  for (const entry of entries) {
+    const n = entry.activeLimit ?? entry.slots;
+    if (n !== undefined && n > 0 && (best === undefined || n > best)) best = n;
+  }
+  return best;
+}
+
+let observedCapacity: number | undefined;
+let observedByModel = new Map<string, number>();
+
+/**
+ * Capacity from the most recent catalogue this process fetched (scheduler
+ * default): the routed model's own limit when known, else the catalogue maximum.
+ */
+export function observedGatewayCapacity(modelId?: string): number | undefined {
+  return (modelId ? observedByModel.get(modelId) : undefined) ?? observedCapacity;
+}
+
+/** Total concurrency across the catalogue's concrete (non-alias) models. */
+export function gatewayCapacityTotal(entries: readonly GatewayModelEntry[]): number | undefined {
+  let total = 0;
+  for (const entry of entries) if (!entry.alias) total += entry.activeLimit ?? entry.slots ?? 0;
+  return total > 0 ? total : undefined;
 }
 
 export interface FetchCatalogOptions {
@@ -171,6 +206,13 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
     if (models.length === 0) {
       throw new CatalogFetchError(`gateway returned no usable models from ${base}/models`, res.status);
     }
+    observedCapacity = gatewayCapacity(models);
+    observedByModel = new Map(
+      models.flatMap((m) => {
+        const n = m.activeLimit ?? m.slots;
+        return n !== undefined && n > 0 ? [[m.id, n] as [string, number]] : [];
+      }),
+    );
     return models;
   } catch (err) {
     opts.signal?.throwIfAborted();

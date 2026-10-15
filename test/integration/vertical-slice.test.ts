@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { ROLE_BUDGETS } from "../../src/core/types.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 
 const execFileAsync = promisify(execFile);
@@ -239,12 +240,13 @@ test("worker requests carry the role's hard context-token budget (spec §10.6)",
     } as never;
     const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker: wrapped, verifier: new CommandVerifier() });
     await rt.engineer("Implement add(a, b) to return a + b");
-    assert.equal(captured.get("scout"), 24000);
-    assert.equal(captured.get("implementer"), 40000);
-    // Review/prose roles carry a larger hard budget (64k) so an independent
-    // review is never cut off at the context cap (fix(worker) PR #34; spec 10.6
-    // values are targets, not fixed caps).
-    assert.equal(captured.get("reviewer"), 64000);
+    // The hard caps are ROLE_BUDGETS (spec 10.6 values are targets, not fixed
+    // caps); what this pins is that each worker request carries its role's cap
+    // and that a review is never budgeted below the work it reviews (#34).
+    assert.equal(captured.get("scout"), ROLE_BUDGETS.scout.hardMaxTokens);
+    assert.equal(captured.get("implementer"), ROLE_BUDGETS.implementer.hardMaxTokens);
+    assert.equal(captured.get("reviewer"), ROLE_BUDGETS.reviewer.hardMaxTokens);
+    assert.ok(ROLE_BUDGETS.reviewer.hardMaxTokens >= ROLE_BUDGETS.implementer.hardMaxTokens);
   } finally {
     await fixture.cleanup();
   }

@@ -15,6 +15,12 @@ export interface GatewayAdmissionConfig {
   enabled: boolean;
   /** Allow model-scoped gateway outages to change the active session model. */
   modelFallbackEnabled: boolean;
+  /**
+   * Act on the gateway's own "retry on an alternate deployment" guidance
+   * (IW-ACT-RETRY-ALTERNATE) by switching the session to a stand-in and
+   * continuing the turn, instead of waiting and printing the advice.
+   */
+  advisedModelSwitch: boolean;
   /** Concurrent model sessions allowed before a gateway says otherwise. */
   maxConcurrency: number;
   /** Slots held back for the operator's own interactive turn. */
@@ -46,6 +52,8 @@ export interface GatewayAdmissionConfig {
    * watchdog.
    */
   modelStreamStallMs: number;
+  /** Window before the first token of a model turn (default 15m, longer than the between-token window). */
+  firstTokenStallMs: number;
   /** Emit one structured telemetry line per admission event. */
   telemetry: boolean;
 }
@@ -53,13 +61,15 @@ export interface GatewayAdmissionConfig {
 export const DEFAULT_GATEWAY_CONFIG: GatewayAdmissionConfig = {
   enabled: true,
   modelFallbackEnabled: false,
+  advisedModelSwitch: true,
   maxConcurrency: 4,
   reservedSlots: 1,
   maxWaitMs: 300_000,
   jitterMs: 250,
   maxRetries: 8,
   maxElapsedMs: 12 * 3_600_000,
-  modelStreamStallMs: 10 * 60_000,
+  modelStreamStallMs: 5 * 60_000,
+  firstTokenStallMs: 15 * 60_000,
   telemetry: true,
 };
 
@@ -97,6 +107,8 @@ export function parseGatewayElapsedMs(value: string | undefined): number | null 
  *   PI_GATEWAY_ADMISSION_ENABLED — "true"/"false" (default true)
  *   PI_GATEWAY_MODEL_FALLBACK_ENABLED — on only for 1/true/yes/on (any case); anything else,
  *                                  including unset or a typo, is off (default false)
+ *   PI_GATEWAY_ADVISED_MODEL_SWITCH — "true"/"false": follow the gateway's IW-ACT-RETRY-ALTERNATE
+ *                                  advice by switching to a stand-in model (default true)
  *   PI_GATEWAY_MAX_CONCURRENCY   — int, concurrent model sessions (default 4)
  *   PI_GATEWAY_RESERVED_SLOTS    — int, slots kept for the interactive turn (default 1)
  *   PI_GATEWAY_MAX_WAIT_MS       — int, cap on one honoured wait (default: none)
@@ -105,8 +117,10 @@ export function parseGatewayElapsedMs(value: string | undefined): number | null 
  *                                  mission scheduler takes over the wait (default: 8)
  *   PI_GATEWAY_MAX_ELAPSED_MS    — ms or duration ("12h"), how long one interactive turn waits
  *                                  out transient infrastructure (default: 12h)
- *   PI_GATEWAY_STREAM_STALL_MS   — ms or duration ("10m"), no-data window before an in-flight
- *                                  model request is aborted as stalled; "0" disables (default: 10m)
+ *   PI_GATEWAY_STREAM_STALL_MS   — ms or duration ("5m"), no-data window before an in-flight
+ *                                  model request is aborted as stalled; "0" disables (default: 5m)
+ *   PI_GATEWAY_FIRST_TOKEN_STALL_MS — ms or duration, window before the first token of a turn
+ *                                  (default: 15m; the between-token window stays PI_GATEWAY_STREAM_STALL_MS)
  *   PI_GATEWAY_TELEMETRY         — "true"/"false" (default true)
  */
 export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>): GatewayAdmissionConfig {
@@ -117,6 +131,10 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   // Deliberately not `bool(env, cfg.x)`: a safety-sensitive switch has no
   // fallback to inherit — only an explicit affirmative turns it on.
   cfg.modelFallbackEnabled = optIn(env.PI_GATEWAY_MODEL_FALLBACK_ENABLED);
+  // Not an inference of ours but the gateway's explicit instruction, and the
+  // chooser still refuses any stand-in the session would not fit in — so this
+  // one defaults on, with an ordinary off switch.
+  cfg.advisedModelSwitch = bool(env.PI_GATEWAY_ADVISED_MODEL_SWITCH, cfg.advisedModelSwitch);
   cfg.maxConcurrency = Math.max(1, int(env.PI_GATEWAY_MAX_CONCURRENCY, cfg.maxConcurrency));
   cfg.reservedSlots = Math.max(0, int(env.PI_GATEWAY_RESERVED_SLOTS, cfg.reservedSlots));
   cfg.maxWaitMs = Math.max(0, int(env.PI_GATEWAY_MAX_WAIT_MS, cfg.maxWaitMs));
@@ -126,6 +144,8 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   if (elapsed !== null) cfg.maxElapsedMs = elapsed;
   const stall = parseGatewayElapsedMs(env.PI_GATEWAY_STREAM_STALL_MS);
   if (stall !== null) cfg.modelStreamStallMs = stall;
+  const firstToken = parseGatewayElapsedMs(env.PI_GATEWAY_FIRST_TOKEN_STALL_MS);
+  if (firstToken !== null) cfg.firstTokenStallMs = firstToken;
   cfg.telemetry = bool(env.PI_GATEWAY_TELEMETRY, cfg.telemetry);
 
   if (overrides) Object.assign(cfg, overrides);
@@ -137,6 +157,8 @@ export function resolveGatewayConfig(overrides?: Partial<GatewayAdmissionConfig>
   cfg.maxRetries = Math.max(0, Math.floor(cfg.maxRetries));
   cfg.maxElapsedMs = Math.max(0, cfg.maxElapsedMs);
   cfg.modelStreamStallMs = Math.max(0, Math.floor(cfg.modelStreamStallMs));
+  if (!Number.isFinite(cfg.firstTokenStallMs)) cfg.firstTokenStallMs = DEFAULT_GATEWAY_CONFIG.firstTokenStallMs;
+  cfg.firstTokenStallMs = Math.max(0, Math.floor(cfg.firstTokenStallMs));
   return cfg;
 }
 
@@ -163,6 +185,7 @@ export function sharedAdmissionController(): AdmissionController {
     shared = new AdmissionController({
       maxConcurrency: cfg.maxConcurrency,
       reservedSlots: cfg.reservedSlots,
+      fixedConcurrency: Boolean(process.env.PI_GATEWAY_MAX_CONCURRENCY),
       maxWaitMs: cfg.maxWaitMs,
       jitterMs: cfg.jitterMs,
       ...(cfg.telemetry ? { onEvent: emitAdmissionTelemetry } : {}),

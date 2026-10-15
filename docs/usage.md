@@ -221,6 +221,20 @@ A released mission uses role pins and the router until you switch models again.
 Automatic fallback of the interactive model (`PI_GATEWAY_MODEL_FALLBACK_ENABLED`)
 is still off by default, and a switch it makes is not an operator pin.
 
+Following the gateway's own advice is on by default: when a request is refused
+with `IW-ACT-RETRY-ALTERNATE` ("try another eligible deployment", scope
+`model`), the runtime switches the session to a stand-in that fits its context
+and modality and continues the turn on it, with a notice naming both models.
+The envelope names no model, so the choice is the runtime's (the same chooser
+as the fallback above; it refuses any model the session would not fit in). If
+no stand-in fits, the request waits as before and ends with the advice (a
+stand-in that stopped fitting mid-turn is handled by taking the declared delay
+and retrying the same model, at most three times). A model left this way is not
+chosen again for ten minutes, so two models short of capacity cannot trade the
+session back and forth. Set
+`PI_GATEWAY_ADVISED_MODEL_SWITCH=false` to only print the advice. A switch made
+this way is not an operator pin either; `/model` changes back.
+
 ### Provider failures before any tool call
 
 An implementer execution that fails on the provider (connection error, timeout,
@@ -261,6 +275,31 @@ that the review moves to the next eligible model, and a provider whose connectio
 was refused is skipped for five minutes. An operator-pinned reviewer is exempt
 from the cap and keeps waiting, unless its host refuses connections or does not
 resolve; then it moves to another model with a notice.
+
+### Updating and hot reload (`/pie`)
+
+`/pie` is the short alias for everything pi-engineering registers: `/pie
+update`, `/pie reload`, `/pie version`, `/pie rollback`, `/pie status`, `/pie
+cancel`, and any pi-engineering command by name (`/pie mission status` is
+`/mission status`; `/pie` alone lists them).
+
+When Pi loads pi-engineering from a git checkout, a commit landing on that
+checkout hot-reloads every running session by itself within about 15 seconds:
+the Host hands over to a new generation at the next safe point and the same
+conversation continues. Nothing has to be restarted. Uncommitted edits are
+never loaded: while a tracked file has uncommitted changes, a new commit is
+not reloaded either (the handover would copy the half-edit); you are told
+once, and the reload happens as soon as the tree is clean, or at once with
+`/pie reload`. Summary and compaction calls, which have no turn to continue,
+wait out a gateway hold instead of switching models. `/pie update` does the same immediately (and, when the checkout
+has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
+turns the automatic reload off.
+
+A session on another host, loading pi-engineering from a clone that tracks
+GitHub, follows it too: every 5 minutes the checkout is fetched and
+fast-forwarded (only when clean and strictly behind its upstream; a diverged
+or dirty checkout is never touched), and the new commit hot-reloads the
+session the same way. `PI_ENGINEERING_FOLLOW_REMOTE=0` turns the fetch off.
 
 ### Interrupting and cancelling a mission
 
@@ -319,6 +358,13 @@ is left as it was.
 ### Mission planning for non-trivial goals
 
 A mission whose goal implies more than one deliverable, names several paths, or runs past 30 words makes ONE planner call (role `planner`, strongest routed model, the planner/worker `PLANNER_PROMPT`) and gets a bounded task DAG: per-task `write_domains`, `relevant_files` and `verification` (handed to each worker as its context). Tasks run in parallel only when their write domains are disjoint; overlapping ones are serialized. Trivial goals keep the single task. A malformed or empty plan falls back to the single task and records a minor `mission_planner` finding. `PI_MISSION_PLANNER=on|off|auto` (default `auto`) forces or disables it. Task domains are pre-validated: absolute, `..`, `.git`, forbidden, read-only and out-of-manifest domains are dropped, and a task left with none falls back to the single task (the finding names the rejected domains). The call is bounded by `PI_MISSION_PLANNER_TIMEOUT_MS` (default 600000); a transient failure is retried once, then falls back with a finding saying transient.
+
+## Concurrency caps, cooldown scope and stall detection
+
+- Caps follow the gateway: when the `/models` catalogue advertises `active_limit` (or `x_active_limit`, else `slots`), the scheduler's per-role and agent caps and the admission controller's concurrency (less `PI_GATEWAY_RESERVED_SLOTS`) use that capacity. The fixed defaults (2 per role, 4 minus 1 reserved) apply only when the catalogue says nothing. `PI_ENGINEERING_MAX_PER_ROLE`, `PI_ENGINEERING_MAX_AGENTS` and `PI_GATEWAY_MAX_CONCURRENCY` always override.
+- A 429 cools down only the model (or route) it named. It parks the whole process only when the gateway says `scope: "global"` or `"caller"`, or when the refusal names no model.
+- A model turn that streams no first token for `PI_GATEWAY_FIRST_TOKEN_STALL_MS` (default 15 minutes), or then goes `PI_GATEWAY_STREAM_STALL_MS` (default 5 minutes; `0` disables) between tokens, ends as a transient stream failure, so resume and retry accounting apply. A slow turn that keeps streaming never stalls. The 60 minute worker-inactivity watchdog remains for long-running tool commands.
+- The scheduler pass loop is event-driven: it wakes when a task settles and otherwise ticks once a second.
 
 ## Worker transcripts and runtime log caps
 

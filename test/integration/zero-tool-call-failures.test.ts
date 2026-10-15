@@ -205,6 +205,25 @@ describe("zero-tool-call provider failures are not task attempts", () => {
     assert.ok(!h.statuses.includes("BLOCKED"));
   });
 
+  it("a model-scoped 429 with no tool call is counted by the zero-tool cap like any other", async () => {
+    const controller = new AbortController();
+    const h = harness({
+      agent: () => ({
+        ...connectionError(0),
+        summary: '429: {"scope":"model","type":"inference_admission","retry_after_ms":1000}',
+        error: "transient:rate_limit",
+      }),
+      probe: () => ({ healthy: true, authoritative: false }),
+      resilience: { ...DEFAULT_GATEWAY_RESILIENCE, max_zero_tool_retries: 2 },
+      onSleep: (_ms, sleeps) => {
+        if (sleeps === 10) controller.abort();
+      },
+    });
+    await h.start(controller.signal);
+    assert.equal(h.agentCalls(), 3);
+    assert.equal(h.implementer().attempt, 0);
+  });
+
   it("the supervisor snapshot names the zero-tool-call wait, its count, cap, class and next probe", async () => {
     const controller = new AbortController();
     let snapshot: Promise<Awaited<ReturnType<MissionSupervisor["tick"]>>> | undefined;

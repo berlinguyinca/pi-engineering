@@ -258,6 +258,7 @@ and a link cut do not switch models.
 | -------- | ------- | ------- |
 | `PI_GATEWAY_ADMISSION_ENABLED` | `true` | Disable admission control entirely |
 | `PI_GATEWAY_MODEL_FALLBACK_ENABLED` | `false` | Allow a model-scoped outage to switch the active session model automatically |
+| `PI_GATEWAY_ADVISED_MODEL_SWITCH` | `true` | When the gateway itself advises an alternate deployment (`IW-ACT-RETRY-ALTERNATE`), switch to a stand-in that fits the session and continue the turn on it instead of waiting and printing "switch with /model" |
 | `PI_GATEWAY_MAX_CONCURRENCY` | `4` | Total concurrent model requests this runtime aims at |
 | `PI_GATEWAY_RESERVED_SLOTS` | `1` | Of that total, slots kept free for your interactive turn (so 3 worker sessions by default, held from the start) |
 | `PI_GATEWAY_MAX_WAIT_MS` | `300000` | Retained for compatibility; a server-advertised wait is never shortened |

@@ -87,6 +87,7 @@ import {
   resolveStreamResumeMax,
 } from "../inference/streamResume.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
+import { missionDepthSpawnHook } from "../orchestration/missionMode.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
@@ -592,8 +593,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
     const customTools = [
       ...this.customTools,
       ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
-      ...(req.wallClock && req.tools.includes("bash")
-        ? [budgetNotice(createBashToolDefinition(req.cwd) as unknown as ToolDefinition)]
+      // Every worker bash command runs one mission-depth deeper (recursion
+      // guard). The built-in tool is replaced by one with the same name; the
+      // budget notice wraps it only for budgeted runs.
+      ...(req.tools.includes("bash")
+        ? [
+            budgetNotice(
+              createBashToolDefinition(req.cwd, { spawnHook: missionDepthSpawnHook }) as unknown as ToolDefinition,
+            ),
+          ]
         : []),
       ...(offersClaimDeliverable(req)
         ? [budgetNotice(createClaimDeliverableTool(req.deliverables ?? []) as unknown as ToolDefinition)]
@@ -1406,6 +1414,7 @@ ${recovery.recoveryPrompt}`;
       stallMs > 0
         ? new StreamStallWatchdog({
             stallMs,
+            firstTokenMs: this.gatewayConfig.firstTokenStallMs,
             onStall: () => {
               stalled = true;
               assistantError ??= `model stream stalled: no data for ${stallMs}ms`;
@@ -1492,7 +1501,7 @@ ${recovery.recoveryPrompt}`;
       // completion re-arms it for the next model turn; an assistant
       // message_end without a tool ends the turn.
       if (event.type === "message_update" && (event.message as { role?: unknown } | undefined)?.role === "assistant")
-        armStall();
+        stallWatchdog?.token();
       else if (event.type === "tool_execution_start") disarmStall();
       else if (event.type === "tool_execution_end") armStall();
       else if (event.type === "message_end" && (event.message as { role?: unknown } | undefined)?.role === "assistant")

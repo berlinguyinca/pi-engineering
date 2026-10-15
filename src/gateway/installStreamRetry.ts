@@ -116,6 +116,12 @@ export interface InstallDeps<M, O, C = unknown> {
    */
   hold(signal: GatewayWaitSignal, attempt: number, abort: AbortSignal | undefined, model: M): Promise<void>;
   onHold?: (info: Parameters<NonNullable<GatewayStreamRetryOptions["onHold"]>>[0], model: M) => void;
+  /** See `GatewayStreamRetryOptions.abandonForAlternate`; receives the model too. */
+  abandonForAlternate?: (
+    info: Parameters<NonNullable<GatewayStreamRetryOptions["abandonForAlternate"]>>[0],
+    model: M,
+    context: C,
+  ) => boolean;
   /**
    * Called when a stream first produces output. Exposed so a caller keeping its
    * own consecutive-hold count resets it on the same evidence this module does.
@@ -305,6 +311,9 @@ export function installGatewayStreamRetry<M, C, O>(
             deps.onProgress?.(model);
           },
           ...(deps.onHold ? { onHold: (info) => deps.onHold?.(info, model) } : {}),
+          ...(deps.abandonForAlternate
+            ? { abandonForAlternate: (info) => deps.abandonForAlternate?.(info, model, context) === true }
+            : {}),
           ...(signal ? { signal } : {}),
           ...(deps.maxEscalatedWaitMs != null ? { maxEscalatedWaitMs: deps.maxEscalatedWaitMs } : {}),
           ...(deps.maxAttempts != null ? { maxAttempts: deps.maxAttempts } : {}),

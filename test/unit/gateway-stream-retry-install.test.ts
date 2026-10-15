@@ -466,3 +466,32 @@ test("install: a run of holds ends when a call settles in failure", async () => 
   assert.deepEqual(waits, [5_000, 5_000], "the failed call's run does not escalate the next call");
   assert.notEqual(since[1], undefined, "the new run carries its own 'waiting since'");
 });
+
+test("install: abandonForAlternate sees the request context, so a summary call can be told from a turn", async () => {
+  resetGatewayStreamRetry();
+  const advised =
+    '429: {"message":"Try another eligible deployment after the declared delay.","type":"inferweave_backpressure","code":"capacity_unavailable","retryable":true,"replay_safe":true,"request_state":"not_started","action":"retry_alternate","action_code":"IW-ACT-RETRY-ALTERNATE","retry_after_ms":20000,"scope":"model"}';
+  const fail = { type: "error", error: { stopReason: "error", errorMessage: advised } } as Ev;
+  const ok = { type: "done", message: { stopReason: "stop" } } as Ev;
+  const h = makeHost([[fail], [ok]]);
+  const stream = fakeStream();
+  const seen: Array<{ model: string; context: unknown }> = [];
+  installGatewayStreamRetry(
+    h.host,
+    { provider: "acme", api: "a" },
+    deps(stream, {
+      abandonForAlternate: (_info: unknown, model: { id: string }, context: unknown) => {
+        seen.push({ model: model.id, context });
+        return false;
+      },
+    }),
+  );
+  const handler = h.registered[0]?.config.streamSimple as (model: { id: string }, context: unknown) => unknown;
+  const context = { systemPrompt: "summarize", messages: [] };
+  handler({ id: "model-a" }, context);
+  await stream.settled;
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]?.model, "model-a");
+  assert.equal(seen[0]?.context, context, "the very context Pi sent, for isSummarizationRequest");
+  assert.equal(h.baseCalls, 2, "declined: the hold was waited out and the call retried");
+});

@@ -317,7 +317,8 @@ export class PiBridge {
     return run(target);
   }
 
-  private async runCommand(name: string, args: string, ctx: unknown): Promise<void> {
+  /** Run a command of the dispatch generation, gated and tracked (the forwarders and `/pie` use this). */
+  async runCommand(name: string, args: string, ctx: unknown): Promise<void> {
     await this.target.whenOpen();
     const generation = await this.target.dispatchGeneration();
     const command = generation === undefined ? undefined : this.tables.get(generation)?.commands.get(name);
