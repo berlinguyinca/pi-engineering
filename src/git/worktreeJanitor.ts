@@ -37,6 +37,13 @@ const exec = promisify(execFile);
 export const WORKTREE_IDLE_HOURS_ENV = "PI_WORKTREE_IDLE_HOURS";
 export const DEFAULT_WORKTREE_IDLE_HOURS = 24;
 
+/**
+ * Hours before which nothing is reclaimed, whatever its owner's state. Must be
+ * at least the longest mission inactivity window (1 h, docs/usage.md).
+ */
+export const WORKTREE_MIN_AGE_HOURS_ENV = "PI_WORKTREE_MIN_AGE_HOURS";
+export const DEFAULT_WORKTREE_MIN_AGE_HOURS = 1;
+
 /** Who a runtime worktree belongs to, parsed from its branch name. */
 export interface WorktreeOwner {
   missionId?: string;
@@ -54,6 +61,8 @@ export interface JanitorOptions {
    */
   ownerLiveness?: (owner: WorktreeOwner) => OwnerLiveness | Promise<OwnerLiveness>;
   maxIdleMs?: number;
+  /** Nothing younger than this is reclaimed. Default 1 h, env-raisable; never lower in production. */
+  minAgeMs?: number;
   /** Report what would happen without touching anything. */
   dryRun?: boolean;
   now?: () => number;
@@ -84,6 +93,12 @@ export function parseWorktreeOwner(branch: string | null): WorktreeOwner {
   const orch = /^pi-eng-orch-([A-Za-z]+-[A-Za-z0-9]+)/.exec(branch);
   if (orch?.[1]) return { taskId: orch[1] };
   return {};
+}
+
+export function worktreeMinAgeMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = Number(env[WORKTREE_MIN_AGE_HOURS_ENV]);
+  const hours = Number.isFinite(raw) && raw >= DEFAULT_WORKTREE_MIN_AGE_HOURS ? raw : DEFAULT_WORKTREE_MIN_AGE_HOURS;
+  return hours * 60 * 60 * 1000;
 }
 
 export function worktreeIdleMs(env: Record<string, string | undefined> = process.env): number {
@@ -132,6 +147,7 @@ async function directoryBytes(path: string): Promise<number | null> {
 
 /** Refuse anything that is not a namespace sibling of the repo root. */
 async function assertNamespacePath(repo: GitRepo, path: string): Promise<void> {
+  repo.assertSafeWorktreePath(path);
   const parent = dirname(repo.root);
   const prefix = repo.worktreeNamespacePrefix();
   if (dirname(path) !== parent || !basename(path).startsWith(prefix) || path === repo.root) {
@@ -185,7 +201,8 @@ async function preserveUncommittedWork(path: string, branch: string | null): Pro
 export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorReport> {
   const { repo } = opts;
   const now = opts.now?.() ?? Date.now();
-  const maxIdle = opts.maxIdleMs ?? worktreeIdleMs();
+  const minAge = opts.minAgeMs ?? worktreeMinAgeMs();
+  const maxIdle = Math.max(opts.maxIdleMs ?? worktreeIdleMs(), minAge);
   const report: JanitorReport = { reclaimed: [], kept: [], failed: [], dryRun: Boolean(opts.dryRun) };
   const prefix = repo.worktreeNamespacePrefix();
   const parent = dirname(repo.root);
@@ -218,7 +235,15 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
     registered.set(path, after ?? { path, branch: null, head: null });
   }
 
+  const referenced = await repo.durablyReferencedWorktreePaths([...registered.keys()]);
+
   for (const wt of registered.values()) {
+    // A durable candidate/cleanup record still names this checkout: the
+    // mission's recovery path owns its removal, never the janitor.
+    if (referenced.has(wt.path)) {
+      report.kept.push({ path: wt.path, branch: wt.branch, reason: "a durable mission record still references it" });
+      continue;
+    }
     const owner = parseWorktreeOwner(wt.branch);
     let liveness: OwnerLiveness = "unknown";
     if (opts.ownerLiveness && (owner.missionId || owner.taskId)) {
@@ -233,6 +258,15 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         path: wt.path,
         branch: wt.branch,
         reason: `owner ${owner.missionId ?? owner.taskId} is live`,
+      });
+      continue;
+    }
+    const ageMs = now - (await worktreeLastActivity(wt.path));
+    if (ageMs < minAge) {
+      report.kept.push({
+        path: wt.path,
+        branch: wt.branch,
+        reason: `active ${Math.round(ageMs / 60_000)} min ago (< ${Math.round(minAge / 60_000)} min minimum age)`,
       });
       continue;
     }

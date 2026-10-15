@@ -12,6 +12,7 @@ import {
   sweepWorktrees,
   worktreeIdleMs,
   worktreeLastActivity,
+  worktreeMinAgeMs,
 } from "../../src/git/worktreeJanitor.ts";
 import { describeHousekeeping, missionOwnerLiveness, runHousekeeping } from "../../src/runtime/janitor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -86,6 +87,7 @@ test("terminal owner: worktree reclaimed, uncommitted work preserved on its bran
       repo,
       ownerLiveness: () => "terminal",
       maxIdleMs: 24 * HOUR,
+      minAgeMs: 0,
     });
     assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
     assert.equal(report.failed.length, 0);
@@ -186,7 +188,12 @@ test("a namespace directory git lost track of is kept while fresh and removed on
     await rm(link, { recursive: true, force: true });
     assert.equal((await repo.listLinkedWorktrees()).length, 0, "git no longer lists it");
 
-    const fresh = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 24 * HOUR });
+    const fresh = await sweepWorktrees({
+      repo,
+      ownerLiveness: () => "terminal",
+      maxIdleMs: 24 * HOUR,
+      minAgeMs: 0,
+    });
     assert.equal(fresh.reclaimed.length, 0);
     assert.equal(fresh.failed.length, 0, JSON.stringify(fresh.failed));
     assert.equal(fresh.kept.length, 1);
@@ -214,6 +221,8 @@ test("runHousekeeping binds the mission store and reports only when something ha
     const head = await repo.headCommit();
     const done = await repo.createWorktree(head, "pi-eng-candidate-MSN-hk0001-repo-1-0-EXC-a");
     const live = await repo.createWorktree(head, "pi-eng-candidate-MSN-hk0002-repo-1-0-EXC-a");
+    await ageWorktree(done.path, 2 * HOUR);
+    await ageWorktree(live.path, 2 * HOUR);
     const missions = {
       getMission: (id: string) =>
         id === "MSN-hk0001"
@@ -249,6 +258,52 @@ test("worktreeLastActivity reads the newest probe", async () => {
     await writeFile(join(wt.path, "touch.txt"), "x");
     await exec("git", ["-C", wt.path, "status", "--porcelain"]); // refreshes the index
     assert.ok(Date.now() - (await worktreeLastActivity(wt.path)) < HOUR);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("nothing younger than the minimum age is reclaimed, even for a terminal owner", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), "pi-eng-candidate-MSN-young1-repo-1-0-EXC-a");
+    const young = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 0 });
+    assert.equal(young.reclaimed.length, 0);
+    assert.match(young.kept[0]!.reason, /minimum age/);
+    assert.equal(await exists(wt.path), true);
+    await ageWorktree(wt.path, 2 * HOUR);
+    const old = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 0 });
+    assert.equal(old.reclaimed.length, 1);
+    assert.equal(worktreeMinAgeMs({ PI_WORKTREE_MIN_AGE_HOURS: "0" }), HOUR, "cannot be lowered below the default");
+    assert.equal(worktreeMinAgeMs({ PI_WORKTREE_MIN_AGE_HOURS: "6" }), 6 * HOUR);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a worktree a durable candidate or cleanup record still references is never reclaimed", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), "pi-eng-candidate-MSN-rec001-repo-1-0-EXC-a");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const common = (
+      await exec("git", ["-C", fixture.root, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    ).stdout.trim();
+    const dir = join(common, "pi-engineering-candidates");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      join(dir, "cleanup.record.json"),
+      JSON.stringify({ missionId: "MSN-rec001", path: wt.path, branch: "x", state: "intent" }),
+    );
+    const kept = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 0 });
+    assert.equal(kept.reclaimed.length, 0);
+    assert.match(kept.kept[0]!.reason, /durable mission record/);
+    assert.equal(await exists(wt.path), true);
+    await rm(join(dir, "cleanup.record.json"));
+    const gone = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 0 });
+    assert.equal(gone.reclaimed.length, 1);
   } finally {
     await fixture.cleanup();
   }

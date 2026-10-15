@@ -24,6 +24,13 @@ import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
 
+/** Make a fixture repo a Rust project: a committed minimal Cargo.toml at its root. */
+async function makeRust(root: string): Promise<void> {
+  await writeFile(join(root, "Cargo.toml"), '[package]\nname = "fx"\nversion = "0.0.0"\nedition = "2021"\n');
+  await exec("git", ["-C", root, "add", "Cargo.toml"]);
+  await exec("git", ["-C", root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "cargo"]);
+}
+
 /** An env with no operator overrides and an empty PATH (no sccache). */
 function bareEnv(extra: Record<string, string> = {}): Record<string, string | undefined> {
   return { HOME: "/home/example", PATH: "", ...extra };
@@ -49,6 +56,8 @@ test("each worktree gets its own CARGO_TARGET_DIR under one per-repository dir",
   resetRustTargetKeys();
   const a = await makeFixtureRepo();
   const b = await makeFixtureRepo();
+  await makeRust(a.root);
+  await makeRust(b.root);
   const worktree = join(a.root, "..", `wt-${Date.now().toString(36)}`);
   try {
     await exec("git", ["-C", a.root, "worktree", "add", "-q", worktree, "-b", "candidate"]);
@@ -93,6 +102,7 @@ test("each worktree gets its own CARGO_TARGET_DIR under one per-repository dir",
 test("a cwd outside any repository maps to the unscoped key", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-rust-cache-"));
   try {
+    await writeFile(join(dir, "Cargo.toml"), '[package]\nname = "fx"\n');
     assert.equal(await rustTargetKey(dir), UNSCOPED_TARGET_KEY);
     const env = await rustBuildEnv(dir, bareEnv({ PI_RUST_CACHE_DIR: "/cache" }));
     assert.equal(env.CARGO_TARGET_DIR, join("/cache", "target", UNSCOPED_TARGET_KEY));
@@ -104,6 +114,8 @@ test("a cwd outside any repository maps to the unscoped key", async () => {
 test("operator-set CARGO_TARGET_DIR, RUSTC_WRAPPER and SCCACHE_DIR are never overridden", async () => {
   resetSccacheLookup();
   const bin = await mkdtemp(join(tmpdir(), "pi-sccache-bin-"));
+  const crate = await mkdtemp(join(tmpdir(), "pi-rust-crate-"));
+  await writeFile(join(crate, "Cargo.toml"), '[package]\nname = "fx"\n');
   try {
     await writeFile(join(bin, "sccache"), "#!/bin/sh\nexit 0\n");
     await chmod(join(bin, "sccache"), 0o755);
@@ -111,11 +123,11 @@ test("operator-set CARGO_TARGET_DIR, RUSTC_WRAPPER and SCCACHE_DIR are never ove
     assert.equal(found, join(bin, "sccache"));
 
     const env = bareEnv({ PATH: bin, PI_RUST_CACHE_DIR: "/cache" });
-    const auto = await rustBuildEnv(process.cwd(), env);
+    const auto = await rustBuildEnv(crate, env);
     assert.equal(auto.RUSTC_WRAPPER, join(bin, "sccache"));
     assert.equal(auto.SCCACHE_DIR, join("/cache", "sccache"));
 
-    const pinned = await rustBuildEnv(process.cwd(), {
+    const pinned = await rustBuildEnv(crate, {
       ...env,
       CARGO_TARGET_DIR: "/custom/target",
       RUSTC_WRAPPER: "/usr/bin/my-wrapper",
@@ -123,13 +135,14 @@ test("operator-set CARGO_TARGET_DIR, RUSTC_WRAPPER and SCCACHE_DIR are never ove
     });
     assert.deepEqual(pinned, {}, "explicit operator values win");
 
-    const wrapperOnly = await rustBuildEnv(process.cwd(), { ...env, RUSTC_WRAPPER: "/usr/bin/my-wrapper" });
+    const wrapperOnly = await rustBuildEnv(crate, { ...env, RUSTC_WRAPPER: "/usr/bin/my-wrapper" });
     assert.ok(wrapperOnly.CARGO_TARGET_DIR, "target dir still shared");
     assert.equal(wrapperOnly.RUSTC_WRAPPER, undefined);
     assert.equal(wrapperOnly.SCCACHE_DIR, undefined, "SCCACHE_DIR only accompanies a wrapper we installed");
   } finally {
     resetSccacheLookup();
     await rm(bin, { recursive: true, force: true });
+    await rm(crate, { recursive: true, force: true });
   }
 });
 
@@ -137,6 +150,7 @@ test("withRustBuildEnv merges in place and touches nothing on disk", async () =>
   const root = await mkdtemp(join(tmpdir(), "pi-rust-root-"));
   const dir = await mkdtemp(join(tmpdir(), "pi-rust-cwd-"));
   try {
+    await writeFile(join(dir, "Cargo.toml"), '[package]\nname = "fx"\n');
     const env = bareEnv({ PI_RUST_CACHE_DIR: root });
     const same = await withRustBuildEnv(env, dir);
     assert.equal(same, env);
@@ -162,11 +176,25 @@ test("applyRustBuildEnvToProcess exports the cache to process.env for inherited 
     delete process.env.RUSTC_WRAPPER;
     delete process.env.SCCACHE_DIR;
     process.env.PI_RUST_CACHE_DIR = root;
-    const added = await applyRustBuildEnvToProcess(root);
-    assert.ok(added.CARGO_TARGET_DIR?.startsWith(join(root, "target")));
-    assert.equal(process.env.CARGO_TARGET_DIR, added.CARGO_TARGET_DIR);
-    const { stdout } = await exec("sh", ["-c", 'printf %s "$CARGO_TARGET_DIR"']);
-    assert.equal(stdout, added.CARGO_TARGET_DIR, "a child inherits it");
+    await writeFile(join(root, "Cargo.toml"), '[package]\nname = "fx"\n');
+    const fakeBin = join(root, "bin");
+    await mkdir(fakeBin);
+    await writeFile(join(fakeBin, "sccache"), "#!/bin/sh\nexit 0\n");
+    await chmod(join(fakeBin, "sccache"), 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}:${savedPath ?? ""}`;
+    resetSccacheLookup();
+    try {
+      const added = await applyRustBuildEnvToProcess(root);
+      assert.equal(added.CARGO_TARGET_DIR, undefined, "target dir is per worktree, never exported process-wide");
+      assert.equal(process.env.CARGO_TARGET_DIR, undefined);
+      assert.equal(process.env.SCCACHE_DIR, join(root, "sccache"));
+      const { stdout } = await exec("sh", ["-c", 'printf %s "$SCCACHE_DIR"']);
+      assert.equal(stdout, join(root, "sccache"), "a child inherits the shared dependency cache");
+    } finally {
+      process.env.PATH = savedPath;
+      resetSccacheLookup();
+    }
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
@@ -183,6 +211,7 @@ test("verification stages run with the shared Rust cache in their environment", 
   const savedTarget = process.env.CARGO_TARGET_DIR;
   const expected = join(root, "target", UNSCOPED_TARGET_KEY);
   try {
+    await writeFile(join(dir, "Cargo.toml"), '[package]\nname = "fx"\n');
     process.env.PI_RUST_CACHE_DIR = root;
     process.env.PI_TEST_EXPECTED_TARGET = expected;
     delete process.env.CARGO_TARGET_DIR;
@@ -253,5 +282,57 @@ test("sweepRustCache removes target dirs idle past the threshold and keeps activ
     });
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("two worktrees of one Rust repo share one cache root but get distinct target dirs; a Node repo gets no Rust env", async () => {
+  resetRustTargetKeys();
+  const rust = await makeFixtureRepo();
+  const node = await makeFixtureRepo();
+  const wt1 = join(rust.root, "..", `wt1-${Date.now().toString(36)}`);
+  const wt2 = join(rust.root, "..", `wt2-${Date.now().toString(36)}`);
+  const nodeWt = join(node.root, "..", `nwt-${Date.now().toString(36)}`);
+  try {
+    await makeRust(rust.root);
+    await writeFile(join(node.root, "package.json"), "{}\n");
+    await exec("git", ["-C", rust.root, "worktree", "add", "-q", wt1, "-b", "cand-1"]);
+    await exec("git", ["-C", rust.root, "worktree", "add", "-q", wt2, "-b", "cand-2"]);
+    await exec("git", ["-C", node.root, "worktree", "add", "-q", nodeWt, "-b", "cand-n"]);
+
+    const env = bareEnv({ PI_RUST_CACHE_DIR: "/cache" });
+    const one = await rustBuildEnv(wt1, env);
+    const two = await rustBuildEnv(wt2, env);
+    assert.ok(one.CARGO_TARGET_DIR && two.CARGO_TARGET_DIR);
+    assert.notEqual(one.CARGO_TARGET_DIR, two.CARGO_TARGET_DIR, "distinct target dirs");
+    assert.equal(dirname(one.CARGO_TARGET_DIR), dirname(two.CARGO_TARGET_DIR), "one per-repository cache location");
+
+    // The shared dependency cache is the same for both when sccache exists.
+    const bin = await mkdtemp(join(tmpdir(), "pi-sccache-two-"));
+    try {
+      await writeFile(join(bin, "sccache"), "#!/bin/sh\nexit 0\n");
+      await chmod(join(bin, "sccache"), 0o755);
+      resetSccacheLookup();
+      const withCache = bareEnv({ PI_RUST_CACHE_DIR: "/cache", PATH: bin });
+      const a = await rustBuildEnv(wt1, withCache);
+      const b = await rustBuildEnv(wt2, withCache);
+      assert.equal(a.SCCACHE_DIR, b.SCCACHE_DIR);
+      assert.equal(a.SCCACHE_DIR, join("/cache", "sccache"));
+      assert.deepEqual(await rustBuildEnv(nodeWt, withCache), {}, "Node repo worktree: no Rust env, even with sccache");
+    } finally {
+      resetSccacheLookup();
+      await rm(bin, { recursive: true, force: true });
+    }
+    assert.deepEqual(await rustBuildEnv(node.root, env), {}, "Node repo: no Rust env vars");
+  } finally {
+    for (const [repo, wt] of [
+      [rust.root, wt1],
+      [rust.root, wt2],
+      [node.root, nodeWt],
+    ] as const) {
+      await exec("git", ["-C", repo, "worktree", "remove", "--force", wt]).catch(() => {});
+      await rm(wt, { recursive: true, force: true });
+    }
+    await rust.cleanup();
+    await node.cleanup();
   }
 });

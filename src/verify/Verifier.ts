@@ -3,6 +3,7 @@ import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
+import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 import {
   type BaselineVerdict,
   type FailureBaseline,
@@ -10,7 +11,6 @@ import {
   hashProfile,
   parseFailingTests,
 } from "./failureBaseline.ts";
-import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 
 /**
  * Default hang guard for a verification command: killed only after this long

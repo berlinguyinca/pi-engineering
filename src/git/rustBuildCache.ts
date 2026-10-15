@@ -35,7 +35,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { constants, accessSync } from "node:fs";
+import { constants, accessSync, existsSync } from "node:fs";
 import { readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
@@ -160,6 +160,21 @@ export function resetSccacheLookup(): void {
   sccacheLookup = null;
 }
 
+/**
+ * True when `cwd` (or the root of the git checkout containing it) has a
+ * `Cargo.toml`. Node, Python and other repositories get no Rust variables.
+ */
+export async function isRustProject(cwd: string): Promise<boolean> {
+  if (existsSync(join(cwd, "Cargo.toml"))) return true;
+  try {
+    const r = await exec("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 10_000 });
+    const top = r.stdout.trim();
+    return top !== "" && existsSync(join(top, "Cargo.toml"));
+  } catch {
+    return false;
+  }
+}
+
 const keyCache = new Map<string, Promise<string>>();
 
 /** Test seam: forget memoised per-cwd target keys. */
@@ -173,7 +188,7 @@ export function resetRustTargetKeys(): void {
  * variable the operator already set.
  */
 export async function rustBuildEnv(cwd: string, env: Env = process.env): Promise<RustBuildEnv> {
-  if (!rustCacheEnabled(env)) return {};
+  if (!rustCacheEnabled(env) || !(await isRustProject(cwd))) return {};
   const root = rustCacheRoot(env);
   const out: RustBuildEnv = {};
   if (!env.CARGO_TARGET_DIR?.trim()) {
@@ -211,6 +226,10 @@ export async function withRustBuildEnv<T extends Env>(env: T, cwd: string): Prom
  */
 export async function applyRustBuildEnvToProcess(cwd: string): Promise<RustBuildEnv> {
   const additions = await rustBuildEnv(cwd, process.env);
+  // CARGO_TARGET_DIR is per worktree. Exporting the session checkout's value
+  // here would read as an operator override in every candidate worktree and
+  // make them all share one target dir, so only the dependency cache is global.
+  delete additions.CARGO_TARGET_DIR;
   applyAdditions(process.env, additions);
   return additions;
 }
