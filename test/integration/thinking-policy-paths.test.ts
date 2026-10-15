@@ -34,9 +34,11 @@ function model(provider: string, baseUrl: string) {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 262_144,
     maxTokens: 32_768,
+    compat: { supportsReasoningEffort: true },
   };
 }
 const METABOLOMICS = model("metabolomics", "https://llm.example.com/v1");
+const NODE_ONLY = { ...METABOLOMICS, compat: { supportsReasoningEffort: false } };
 const ELSEWHERE = model("elsewhere", "https://api.example.invalid/v1");
 
 /** A native provider backed by pi-ai's real openai-completions transport. */
@@ -163,6 +165,15 @@ test("interactive: Pi's compaction request to the metabolomics gateway carries r
     assert.equal(payload.reasoning_effort, "none");
     const ordinary = await ordinaryPayload(runtime, METABOLOMICS);
     assert.equal(ordinary.reasoning_effort, undefined, "an ordinary turn with room to spare is untouched");
+  });
+});
+
+test("interactive: a route without compat.supportsReasoningEffort gets only the chat-template switch", async () => {
+  await withDir(async (dir) => {
+    const runtime = await interactiveRuntime(dir, NODE_ONLY);
+    const payload = await summarizationPayload(runtime, NODE_ONLY);
+    assert.equal(payload.reasoning_effort, undefined);
+    assert.deepEqual(payload.chat_template_kwargs, { enable_thinking: false });
   });
 });
 

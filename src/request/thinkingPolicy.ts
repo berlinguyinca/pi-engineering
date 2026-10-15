@@ -40,10 +40,12 @@
  *    the one-shot planner): thinking off unconditionally, whatever the output
  *    allowance. A long-running worker makes ~46 model turns, and 8-13k hidden
  *    reasoning tokens per turn is minutes of decode that also eats the cap.
- *    The wire field is always `chat_template_kwargs.enable_thinking: false`
- *    (the InferWeave node allowlists exactly that and rejects unknown top-level
- *    fields with "unsupported request field"); `reasoning_effort: "none"` is
- *    added only for models whose `compat.supportsReasoningEffort` is true.
+ *
+ *    For EVERY reason the wire field is always
+ *    `chat_template_kwargs.enable_thinking: false` (the InferWeave node
+ *    allowlists exactly that and rejects unknown top-level fields with
+ *    "unsupported request field"); `reasoning_effort: "none"` is added only for
+ *    models whose `compat.supportsReasoningEffort` is true.
  * 4. A reply cut at "length" with almost no visible text becomes a clear error
  *    instead of a one-word answer — but ONLY when it spent the model's whole
  *    `maxTokens`. A shorter (window-clamped) length stop is exactly what Pi's
@@ -205,6 +207,9 @@ export function thinkingOffReason(
   allowance?: number,
 ): ThinkingOffReason | undefined {
   if (!acceptsThinkingOff(model, config)) return undefined;
+  const invocation = currentInferenceInvocation();
+  // The one-shot planner keeps thinking whatever the allowance or prompt.
+  if (invocation && !invocation.interactive && THINKING_ROLES.has(invocation.role)) return undefined;
   if (isMissionRoleInvocation()) return "mission-role";
   if (config.summaries && isSummarizationRequest(context)) return "summarization";
   if (config.lowOutputBudget) {
@@ -327,12 +332,10 @@ export function streamWithThinkingPolicy<
       onPayload: async (payload: unknown, m: unknown) => {
         const reason = thinkingOffReason(model, context, config, payloadAllowance(payload));
         const edited = reason
-          ? reason === "mission-role"
-            ? applyThinkingOff(payload, {
-                forceTemplate: true,
-                reasoningEffort: model.compat?.supportsReasoningEffort === true,
-              })
-            : applyThinkingOff(payload)
+          ? applyThinkingOff(payload, {
+              forceTemplate: true,
+              reasoningEffort: model.compat?.supportsReasoningEffort === true,
+            })
           : payload;
         if (reason === "mission-role") {
           emitTelemetry({
