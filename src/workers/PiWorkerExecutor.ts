@@ -662,7 +662,12 @@ ${TOOL_TRANSITION_RULE}`;
               attempt,
               guardConfig,
             ),
-          config: this.transientConfig,
+          config: GATE_ROLES.has(req.role)
+            ? {
+                ...this.transientConfig,
+                maxAttempts: Math.min(this.transientConfig.maxAttempts, GATE_ROLE_MAX_TRANSIENT_RETRIES),
+              }
+            : this.transientConfig,
           sleep: this.transientSleep,
           rand: this.transientRand,
         });
@@ -1537,6 +1542,21 @@ const PROSE_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
   "scout",
   "summarizer",
 ]);
+
+/**
+ * Gate roles judge work and have no side effects, so a dead route must not be
+ * waited on in-session: after this many transient retries the failure goes to
+ * the backend, which moves the role to another route. Implementers keep the
+ * full transient policy.
+ */
+const GATE_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
+  "reviewer",
+  "architecture-reviewer",
+  "security-review",
+  "performance-review",
+  "clean-room-challenger",
+]);
+const GATE_ROLE_MAX_TRANSIENT_RETRIES = 2;
 
 /**
  * A review must inspect evidence and write concrete findings. It should never

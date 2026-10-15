@@ -140,6 +140,12 @@ const PROVIDER_REQUEST_REFUSAL = /failed to parse grammar|failed to initialize s
  */
 const REQUEST_SPECIFIC_REFUSAL = /invalid model name/i;
 
+/** Stands in for the session default of a run that names no model. */
+const UNNAMED_MODEL: ModelRef = { provider: "session", id: "default" };
+
+/** How long a provider that refused connections is skipped when choosing a reviewer. */
+const UNREACHABLE_PROVIDER_COOLDOWN_MS = 5 * 60_000;
+
 const sameModel = (a: ModelRef, b: ModelRef): boolean => modelKey(a) === modelKey(b);
 
 /**
@@ -292,7 +298,8 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
     usage: {
       input: result.usage?.input ?? 0,
       output: result.usage?.output ?? 0,
-      model: result.usage?.model ?? "unknown",
+      // A failed run has no usage; it still names the model it attempted.
+      model: result.usage?.model ?? (ranOn(result) ? modelKey(ranOn(result) as ModelRef) : "unknown"),
     },
   };
   // Surface the worker's machine-readable failure marker (e.g.
@@ -305,6 +312,8 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
 }
 
 export function realBackends(opts: RealBackendsOptions) {
+  /** Providers that refused connections, with the time their cooldown ends. */
+  const unreachableProviders = new Map<string, number>();
   const repository = async (repoId?: string): Promise<{ git: GitRepo | null; cwd: string }> =>
     (await opts.repository?.(repoId)) ?? { git: opts.git, cwd: opts.cwd };
   const runWorker = async (
@@ -423,6 +432,8 @@ export function realBackends(opts: RealBackendsOptions) {
        * server cannot compile) instead of failing the task on that route.
        */
       failoverOnProviderError?: boolean;
+      /** Told when a model's provider refused the connection with no output, so routing can avoid it for a while. */
+      onProviderUnreachable?: (model: ModelRef) => void;
       /**
        * Implementer work: an attempt that failed on the provider before any
        * tool call ran has no side effects, so it moves to another eligible
@@ -479,7 +490,9 @@ export function realBackends(opts: RealBackendsOptions) {
         model = route ?? ranOn(run) ?? opts.reviewFallbackModel;
         continue;
       }
-      if (!model) break;
+      // An unrouted run that names no model still failed on the provider: the
+      // takeover hands it to the first eligible route rather than giving up.
+      if (!model && !(plan.failoverOnProviderError === true && PROVIDER_FAULT_MARKERS.has(error))) break;
       const gone = MODEL_GONE_MARKERS.has(error);
       const noToolCalls = plan.failoverWhenNoToolCalls === true && run.toolCalls === 0;
       const pinnedWait = noToolCalls && req.operatorPinned === true;
@@ -492,7 +505,10 @@ export function realBackends(opts: RealBackendsOptions) {
           (PROVIDER_FAULT_MARKERS.has(error) || PROVIDER_REQUEST_REFUSAL.test(run.result.summary))) ||
           (noToolCalls && PROVIDER_FAULT_MARKERS.has(error)));
       if (!gone && !capacity && !providerFault) break;
-      const failed: ModelRef = model;
+      const failed: ModelRef = model ?? UNNAMED_MODEL;
+      if (providerFault && model && error === "transient:network" && run.toolCalls === 0) {
+        plan.onProviderUnreachable?.(model);
+      }
       const reason = run.result.summary;
       // A gone model is gateway-confirmed and leaves routing for a TTL; a
       // capacity-exhausted one is transient, so it stays eligible everywhere
@@ -720,28 +736,41 @@ export function realBackends(opts: RealBackendsOptions) {
         const fallback = opts.reviewFallbackModel;
         const independentOfProducers = (model: ModelRef): boolean =>
           modelFamily(model.id) !== undefined && !producers.some((m) => sameFamily(m, model));
+        const cooling = (provider: string): boolean => (unreachableProviders.get(provider) ?? 0) > Date.now();
         const pickReviewer = async (tried: ModelRef[]): Promise<ModelRoute | undefined> => {
-          // Prefer a model of a different family; remember the first sibling of a
-          // producer's family (or unknown family) in case nothing better exists.
+          // Prefer a model of a different family on a reachable provider; remember
+          // the first sibling of a producer's family (or unknown family), and the
+          // first model of a provider that recently refused connections, in case
+          // nothing better exists.
           const passedOver: ModelRef[] = [];
           let sibling: ModelRoute | undefined;
+          let unreachable: ModelRoute | undefined;
           for (let probe = 0; probe < MAX_FAMILY_PROBES; probe++) {
             const candidate = await opts.routeModel?.(req.role, {
               exclude: [...producers, ...tried, ...passedOver],
               missionId: input.missionId,
             });
             if (!candidate) break;
-            if (independentOfProducers(candidate)) return candidate;
-            sibling ??= candidate;
+            if (cooling(candidate.provider)) unreachable ??= candidate;
+            else if (independentOfProducers(candidate)) return candidate;
+            else sibling ??= candidate;
             passedOver.push({ provider: candidate.provider, id: candidate.id });
           }
           if (sibling) return sibling;
-          if (fallback && !tried.some((m) => sameModel(m, fallback)) && !opts.isModelUnavailable?.(fallback)) {
+          if (
+            fallback &&
+            !tried.some((m) => sameModel(m, fallback)) &&
+            !opts.isModelUnavailable?.(fallback) &&
+            !cooling(fallback.provider)
+          ) {
             return { ...fallback, warning: reducedIndependence(fallback, "no distinct reviewer model is available") };
           }
-          return producers.length > 0
-            ? opts.routeModel?.(req.role, { exclude: tried, missionId: input.missionId })
-            : undefined;
+          if (producers.length > 0) {
+            const producer = await opts.routeModel?.(req.role, { exclude: tried, missionId: input.missionId });
+            if (producer && !cooling(producer.provider)) return producer;
+            return unreachable ?? producer;
+          }
+          return unreachable;
         };
         const reviewWarning = (route: ModelRoute): string | undefined => {
           if (route.warning) return route.warning;
@@ -777,6 +806,8 @@ export function realBackends(opts: RealBackendsOptions) {
           repick: pickReviewer,
           freshSessionId: () => id("RVS"),
           failoverOnProviderError: true,
+          onProviderUnreachable: (model) =>
+            unreachableProviders.set(model.provider, Date.now() + UNREACHABLE_PROVIDER_COOLDOWN_MS),
           context: { missionId: input.missionId, taskId: input.taskId },
           onSwitch: (_from, to) =>
             notify(
