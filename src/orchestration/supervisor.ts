@@ -255,13 +255,10 @@ export class MissionSupervisor {
     const diagnosis = this.diagnose(mission);
     if (!diagnosis) {
       this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
-      return this.status(
-        mission,
-        "HEALTHY",
-        "Mission has current ownership or a named future wait",
-        undefined,
-        this.currentWait(mission.mission_id),
-      );
+      const wait = this.currentWait(mission.mission_id);
+      const healthy = this.status(mission, "HEALTHY", "Mission has current ownership or a named future wait");
+      // The open wait is shown to the operator, never handed to the runtime as a decision to act on.
+      return wait ? { ...healthy, nextAction: wait.expectedMaterialChange, nextActionAt: wait.nextActionAt } : healthy;
     }
 
     this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
