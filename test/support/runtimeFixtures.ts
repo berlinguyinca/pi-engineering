@@ -160,6 +160,11 @@ export async function createRuntime(ctx: any) {
           b.values.push("cmd:" + VALUE);
         },
       });
+      ctx.pi.registerCommand("aprobe", {
+        description: "fixture async probe",
+        getArgumentCompletions: async (p) => ["alpha", "alpine"].filter((n) => n.startsWith(p)),
+        handler: async () => {},
+      });
       ctx.resources.setInterval(() => b.ticks++, 60_000);
       // A late timer: after a handover it must not run, or must be fenced.
       ctx.resources.setTimeout(() => {

@@ -75,11 +75,25 @@ test("a generation command's string[] completions are forwarded as items", async
   const completer = await setup();
   const probe = completer("probe");
   assert.ok(probe, "the forwarder exposes completions");
-  const items = probe("ver") as Array<{ value: string; label: string }>;
+  const items = (await probe("ver")) as Array<{ value: string; label: string }>;
   assert.deepEqual(items, [
     { value: "verbose", label: "verbose" },
     { value: "version", label: "version" },
   ]);
   assert.equal(pisMatcher(items, "ver").length, 2);
-  assert.equal(probe("q"), null);
+  assert.equal(await probe("q"), null);
+});
+
+test("an async completion provider's Promise is awaited and normalised to items", async () => {
+  const completer = await setup();
+  const aprobe = completer("aprobe");
+  assert.ok(aprobe);
+  const result = aprobe("al");
+  assert.ok(result instanceof Promise, "Pi awaits the forwarder");
+  const items = (await result) as Array<{ value: string; label: string }>;
+  assert.deepEqual(items, [
+    { value: "alpha", label: "alpha" },
+    { value: "alpine", label: "alpine" },
+  ]);
+  assert.equal(await aprobe("zz"), null);
 });

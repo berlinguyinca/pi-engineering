@@ -9,13 +9,16 @@ test("bare strings become items with a string value and label (issue #254)", () 
   ]);
 });
 
-test("item objects pass through unchanged", () => {
+test("item objects pass through unchanged, and a missing label is filled from value", () => {
   const item = { value: "status", label: "status", description: "show status" };
   const out = toAutocompleteItems([item]);
   assert.equal(out?.[0], item);
+  assert.deepEqual(toAutocompleteItems([{ value: "x", description: "d" }]), [
+    { value: "x", label: "x", description: "d" },
+  ]);
 });
 
-test("null, empty, non-array and value-less entries yield null or are dropped", () => {
+test("null, empty and non-array input yield null; entries without a string value are dropped", () => {
   assert.equal(toAutocompleteItems(null), null);
   assert.equal(toAutocompleteItems(undefined), null);
   assert.equal(toAutocompleteItems([]), null);
