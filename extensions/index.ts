@@ -640,13 +640,29 @@ export default function (pi: ExtensionAPI) {
   // processes is not proven in production yet. `/gc` always acts.
   const hkMode = housekeepingMode(process.env);
   const housekeepingEnabled = hkMode !== "off";
+  // First sweep waits this long so a session that reloads or exits at once
+  // never starts git children; cancellable together with the interval.
+  const housekeepingFirstRunMs = Number(process.env.PI_HOUSEKEEPING_FIRST_RUN_MS ?? 30_000);
   let housekeepingTimer: NodeJS.Timeout | null = null;
+  let housekeepingFirstTimer: NodeJS.Timeout | null = null;
+  let housekeepingAbort: AbortController | null = null;
+  const stopHousekeeping = () => {
+    if (housekeepingTimer) clearInterval(housekeepingTimer);
+    if (housekeepingFirstTimer) clearTimeout(housekeepingFirstTimer);
+    housekeepingTimer = null;
+    housekeepingFirstTimer = null;
+    housekeepingAbort?.abort();
+    housekeepingAbort = null;
+  };
   const housekeep = async (cwd: string, notify: (text: string, level: "info" | "warning") => void) => {
+    const signal = housekeepingAbort?.signal;
     const runtime = await getRuntimeByCwd(cwd).catch(() => null);
+    signal?.throwIfAborted();
     const result = await runHousekeeping({
       cwd,
       missions: runtime?.missionStore,
       dryRun: hkMode !== "on",
+      signal,
     });
     const lines = describeHousekeeping(result);
     if (lines.length > 0)
@@ -655,17 +671,19 @@ export default function (pi: ExtensionAPI) {
   if (housekeepingEnabled && typeof pi.on === "function") {
     pi.on("session_start", (_event, ctx) => {
       const notify = ctx.hasUI ? (text: string, level: "info" | "warning") => ctx.ui.notify(text, level) : () => {};
-      void housekeep(ctx.cwd, notify).catch(() => {});
-      if (housekeepingTimer) clearInterval(housekeepingTimer);
+      stopHousekeeping();
+      housekeepingAbort = new AbortController();
+      housekeepingFirstTimer = setTimeout(
+        () => void housekeep(ctx.cwd, notify).catch(() => {}),
+        housekeepingFirstRunMs,
+      );
+      housekeepingFirstTimer.unref();
       if (housekeepingIntervalMs > 0) {
         housekeepingTimer = setInterval(() => void housekeep(ctx.cwd, notify).catch(() => {}), housekeepingIntervalMs);
         housekeepingTimer.unref();
       }
     });
-    pi.on("session_shutdown", () => {
-      if (housekeepingTimer) clearInterval(housekeepingTimer);
-      housekeepingTimer = null;
-    });
+    pi.on("session_shutdown", stopHousekeeping);
   }
   pi.registerCommand("gc", {
     description: "Reclaim abandoned candidate worktrees and expired Rust build caches (--dry-run to preview).",

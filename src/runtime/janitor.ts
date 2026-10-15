@@ -68,10 +68,15 @@ export async function runHousekeeping(opts: {
   cwd: string;
   missions?: MissionLookup | null;
   dryRun?: boolean;
+  /** Aborting kills in-flight git children and rejects with the abort reason. */
+  signal?: AbortSignal;
 }): Promise<HousekeepingResult> {
-  const repo = await GitRepo.open(opts.cwd);
+  const { signal } = opts;
+  const repo = await GitRepo.open(opts.cwd, signal);
+  signal?.throwIfAborted();
   // Durable facts include missions run by other pi processes on this worktree.
   const durable = await discoverMissionHandover(opts.cwd).catch(() => null);
+  signal?.throwIfAborted();
   const worktrees = repo
     ? await sweepWorktrees({
         repo,
@@ -79,6 +84,7 @@ export async function runHousekeeping(opts: {
         dryRun: opts.dryRun,
       })
     : null;
+  signal?.throwIfAborted();
   const rustCache = await sweepRustCache({ dryRun: opts.dryRun });
   return { worktrees, rustCache };
 }
