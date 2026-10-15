@@ -13,6 +13,7 @@
  * normal-language intent by the orchestrator / extension hook.
  */
 
+import { type ExecutionMode, type FlagEnv, chooseMode, readAutospecFlags } from "./missionMode.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles, workflowRank } from "./policies.ts";
 import type { Intent, IntentResult, RequiredGate, RiskProfile, WorkflowClass } from "./types.ts";
 
@@ -174,6 +175,15 @@ export interface RouteInput {
   changedFiles?: string[];
   /** True when the request is a mutation request regardless of semantic guess. */
   mutationRequested?: boolean;
+  /** Env record the autospec flags are read from. Absent means every flag is off. */
+  env?: FlagEnv;
+  /** Explicit mode request (`--mode`). Honored only when `PI_AUTOSPEC_ENABLED` is set. */
+  requestedMode?: ExecutionMode;
+}
+
+/** The routing result plus the execution mode (R-MODE). `local` unless flags allow otherwise. */
+export interface RoutedIntent extends IntentResult {
+  mode: ExecutionMode;
 }
 
 export class IntentRouter {
@@ -184,7 +194,7 @@ export class IntentRouter {
   }
 
   /** Full routing: Stage A semantic + Stage B deterministic policy. */
-  route(input: RouteInput): IntentResult {
+  route(input: RouteInput): RoutedIntent {
     const { intent, confidence } = classifyIntent(input.request);
     const semanticWorkflow = workflowForIntent(intent);
     const riskHints = RISK_HINTS.filter((h) => h.pattern.test(input.request)).map((h) => h.hint);
@@ -228,6 +238,7 @@ export class IntentRouter {
       needs_scout: needsScout,
       escalated,
       reasons,
+      mode: chooseMode(input.request, readAutospecFlags(input.env ?? {}), input.requestedMode),
     };
   }
 
