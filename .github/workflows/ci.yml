@@ -2,17 +2,23 @@
 #
 # Spec (docs/specs/pi-engineering-verifiable-roadmap-completion-spec.md §20):
 # CI SHOULD run npm test, npm run typecheck, and npm run roadmap:check.
-# On a release candidate, roadmap:check MUST pass (all required milestones
-# VERIFIED, evidence fresh, no unresolved critical/high findings, dogfood
-# evidence present). `roadmap check` regenerates the deterministic evidence
-# store (gitignored) at the checked-out commit and reads the committed manual
-# index (docs/roadmap/evidence.yaml), so a complete commit passes here.
+# Policy: the `verify` job (every push to main and every PR) runs the
+# deterministic gates once plus `roadmap:structural`, which only validates the
+# roadmap definition and manual evidence index (no tests rerun, no fresh_review
+# or dogfood freshness). The full `roadmap:check` release gate (all required
+# milestones VERIFIED, evidence fresh, no unresolved critical/high findings,
+# dogfood evidence present) is the MUST of §20 for a release candidate, so it
+# runs in the `release-gate` job only on release/* tag pushes and manual
+# dispatch. `roadmap check` regenerates the deterministic evidence store
+# (gitignored) at the checked-out commit and reads the committed manual index
+# (docs/roadmap/evidence.yaml).
 
 name: CI
 
 on:
   push:
     branches: [main]
+    tags: ["release/*"]
   pull_request:
   workflow_dispatch:
 
@@ -51,5 +57,24 @@ jobs:
         run: npm test
       - name: Package-load + command smoke
         run: npm run test:e2e
+      - name: Roadmap structural check (definition + evidence index only)
+        run: npm run roadmap:structural
+
+  release-gate:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/release/'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: Install verifier test toolchain
+        run: python3 -m pip install --quiet pytest
       - name: Verifiable roadmap check (exit 0 = complete)
         run: npm run roadmap:check
