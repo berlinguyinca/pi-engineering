@@ -207,6 +207,9 @@ export function thinkingOffReason(
   allowance?: number,
 ): ThinkingOffReason | undefined {
   if (!acceptsThinkingOff(model, config)) return undefined;
+  const invocation = currentInferenceInvocation();
+  // The one-shot planner keeps thinking whatever the allowance or prompt.
+  if (invocation && !invocation.interactive && THINKING_ROLES.has(invocation.role)) return undefined;
   if (isMissionRoleInvocation()) return "mission-role";
   if (config.summaries && isSummarizationRequest(context)) return "summarization";
   if (config.lowOutputBudget) {

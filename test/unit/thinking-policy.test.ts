@@ -27,6 +27,7 @@ import {
   streamWithThinkingPolicy,
   thinkingOffReason,
 } from "../../src/request/thinkingPolicy.ts";
+import { runWithInferenceInvocation } from "../../src/inference/inferenceContext.ts";
 import { setTelemetrySink } from "../../src/telemetry/sink.ts";
 
 const METABOLOMICS = {
@@ -254,4 +255,27 @@ test("interactive summarization and low-budget turns: no reasoning_effort unless
     assert.deepEqual(granted.chat_template_kwargs, { enable_thinking: false });
     assert.equal(granted.reasoning_effort, "none");
   }
+});
+
+test("planner role keeps thinking on even with a low allowance or a summarization prompt", async () => {
+  const config = resolveThinkingOffConfig({});
+  const summary = await piSummarizationContext();
+  const ordinary = { systemPrompt: "You are Pi.", messages: [user("hi")] };
+  await runWithInferenceInvocation({ role: "planner" }, async () => {
+    assert.equal(thinkingOffReason(METABOLOMICS, ordinary, config, 4_000), undefined);
+    assert.equal(thinkingOffReason(METABOLOMICS, summary, config, 4_000), undefined);
+    let sent: Record<string, unknown> | undefined;
+    const base = (_m: unknown, _c: unknown, options?: { onPayload?: (p: unknown, m: unknown) => unknown }) => ({
+      async *[Symbol.asyncIterator]() {},
+      result: async () => {
+        sent = (await options?.onPayload?.({ max_tokens: 4_000 }, METABOLOMICS)) as never;
+        return { stopReason: "stop" };
+      },
+    });
+    await streamWithThinkingPolicy(base as never, config)(METABOLOMICS, ordinary as never, {} as never).result();
+    assert.deepEqual(sent, { max_tokens: 4_000 });
+  });
+  await runWithInferenceInvocation({ role: "implementer" }, async () => {
+    assert.equal(thinkingOffReason(METABOLOMICS, ordinary, config, 4_000), "mission-role");
+  });
 });
