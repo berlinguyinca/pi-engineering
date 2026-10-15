@@ -46,7 +46,17 @@ export interface PendingFallback {
    * ping-pong a session between them for hours.
    */
   excludeIds?: string[];
+  /** The gateway's declared delay on the hold that armed an advised switch. */
+  retryAfterMs?: number;
 }
+
+/**
+ * How long a model left on the gateway's advice stays excluded as a stand-in.
+ * Not cleared by the next output: with capacity alternating between two
+ * models, clearing on progress bounced a session A→B→A on every turn, each
+ * bounce moving the operator off the model they chose. Cleared by `/model`.
+ */
+export const SWITCHED_FROM_TTL_MS = 10 * 60_000;
 
 /**
  * The plain-data state machine.
@@ -81,13 +91,26 @@ export class FallbackCoordinator {
   private sourceProvider: string | undefined;
   /** Last lifecycle-time preview: is there a model this session could move to? */
   private standInAvailable = false;
-  /** Models already left during this outage episode (plain ids). */
-  private readonly switchedFrom = new Set<string>();
+  /** Models already left during this outage episode: id → excluded until (epoch ms). */
+  private readonly switchedFrom = new Map<string, number>();
+  private advisedRetryAfterMs: number | undefined;
+  private readonly now: () => number;
+  private readonly switchedFromTtlMs: number;
 
-  constructor(opts: { enabled?: boolean; advisedSwitch?: boolean; afterHolds?: number } = {}) {
+  constructor(
+    opts: {
+      enabled?: boolean;
+      advisedSwitch?: boolean;
+      afterHolds?: number;
+      now?: () => number;
+      switchedFromTtlMs?: number;
+    } = {},
+  ) {
     this.enabled = opts.enabled ?? false;
     this.advisedSwitch = opts.advisedSwitch ?? false;
     this.afterHolds = opts.afterHolds ?? FALLBACK_AFTER_HOLDS;
+    this.now = opts.now ?? Date.now;
+    this.switchedFromTtlMs = opts.switchedFromTtlMs ?? SWITCHED_FROM_TTL_MS;
   }
 
   /**
@@ -105,6 +128,8 @@ export class FallbackCoordinator {
       accountWide?: boolean;
       /** The gateway's own IW-ACT-RETRY-ALTERNATE guidance on this hold. */
       advisesAlternate?: boolean;
+      /** The declared delay on this hold, kept for a switch that cannot be made. */
+      retryAfterMs?: number;
     } = {},
   ): void {
     if (!this.enabled && !(this.advisedSwitch && info.advisesAlternate === true)) return;
@@ -118,21 +143,26 @@ export class FallbackCoordinator {
     // Only a model-scoped outage — capacity_unavailable, a reload, a GPU move —
     // makes a switch worth it, and that can last hours.
     if (info.accountWide === true) return;
-    if (this.enabled) this.consecutiveHolds++;
+    const advised = info.advisesAlternate === true && this.willSwitchOnAdvice;
+    // A hold the pump is about to abandon (no wait taken) is not evidence of
+    // a saturated model the way a waited-out hold is; it must not inflate the
+    // opt-in ledger, least of all across Pi's own retries of the same turn.
+    if (this.enabled && !advised) this.consecutiveHolds++;
     if (this.fallbackPending) return;
-    if (this.advisedSwitch && info.advisesAlternate === true && this.standInAvailable) {
+    if (advised) {
       this.arm("gateway-advised-alternate", info);
       return;
     }
     if (this.enabled && this.consecutiveHolds >= this.afterHolds) this.arm("gateway-admission-hold", info);
   }
 
-  private arm(reason: FallbackReason, info: { modelId?: string; provider?: string }): void {
+  private arm(reason: FallbackReason, info: { modelId?: string; provider?: string; retryAfterMs?: number }): void {
     this.fallbackPending = true;
-    this.requestedAt = Date.now();
+    this.requestedAt = this.now();
     this.reason = reason;
     this.sourceModelId = info.modelId;
     this.sourceProvider = info.provider;
+    this.advisedRetryAfterMs = info.retryAfterMs;
   }
 
   /**
@@ -152,17 +182,23 @@ export class FallbackCoordinator {
   /** A stream produced output: the consecutive-hold run is over. */
   onProgress(): void {
     this.consecutiveHolds = 0;
-    this.switchedFrom.clear();
   }
 
   /**
    * The session moved to a stand-in. The new model starts with a clean hold
-   * ledger, and the model just left stays excluded until real progress shows
-   * the outage is over.
+   * ledger, and the model just left stays excluded for SWITCHED_FROM_TTL_MS
+   * (or until the operator picks a model), so two models short of capacity
+   * cannot trade the session back and forth.
    */
   onSwitched(fromId: string | undefined): void {
     this.consecutiveHolds = 0;
-    if (fromId) this.switchedFrom.add(fromId);
+    if (fromId) this.switchedFrom.set(fromId, this.now() + this.switchedFromTtlMs);
+  }
+
+  private liveExclusions(): string[] {
+    const now = this.now();
+    for (const [id, until] of this.switchedFrom) if (until <= now) this.switchedFrom.delete(id);
+    return [...this.switchedFrom.keys()];
   }
 
   /** The operator explicitly selected a model: a stale fallback intent is void. */
@@ -182,6 +218,7 @@ export class FallbackCoordinator {
     this.reason = undefined;
     this.sourceModelId = undefined;
     this.sourceProvider = undefined;
+    this.advisedRetryAfterMs = undefined;
     this.switchedFrom.clear();
   }
 
@@ -195,6 +232,7 @@ export class FallbackCoordinator {
 
   /** A read-only copy of the current state. */
   snapshot(): PendingFallback {
+    const excludeIds = this.liveExclusions();
     return {
       consecutiveHolds: this.consecutiveHolds,
       ...(this.fallbackPending
@@ -203,7 +241,8 @@ export class FallbackCoordinator {
             reason: this.reason,
             sourceModelId: this.sourceModelId,
             sourceProvider: this.sourceProvider,
-            ...(this.switchedFrom.size > 0 ? { excludeIds: [...this.switchedFrom] } : {}),
+            ...(excludeIds.length > 0 ? { excludeIds } : {}),
+            ...(this.advisedRetryAfterMs !== undefined ? { retryAfterMs: this.advisedRetryAfterMs } : {}),
           }
         : {}),
     };
@@ -211,7 +250,7 @@ export class FallbackCoordinator {
 
   /** Models left during this outage episode, for a lifecycle-time preview. */
   get excludedModelIds(): string[] {
-    return [...this.switchedFrom];
+    return this.liveExclusions();
   }
 
   /**
@@ -230,6 +269,7 @@ export class FallbackCoordinator {
     this.reason = undefined;
     this.sourceModelId = undefined;
     this.sourceProvider = undefined;
+    this.advisedRetryAfterMs = undefined;
     return pending;
   }
 }

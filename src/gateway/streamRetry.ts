@@ -52,6 +52,7 @@ import { monotonicNow } from "../core/clock.ts";
 import { augmentInferenceErrorMessage, isAssistantOutputEvent } from "../inference/admissionContract.ts";
 import {
   ALTERNATE_MODEL_ADVICE,
+  ALTERNATE_MODEL_SWITCHING,
   type GatewayWaitInput,
   type GatewayWaitSignal,
   advisesAlternateModel,
@@ -453,13 +454,21 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     const retryable =
       held?.retryable === true && attempt < attemptCap && chainRemainingMs > 0 && held.retryAfterMs <= chainRemainingMs;
 
+    let abandoned = false;
     if (retryable && held) {
       opts.onHold?.({ attempt, signal: held, errorText: failure });
       // A wait not worth taking: the gateway advised an alternate and the
       // caller has a stand-in armed (by the `onHold` just above), so settle
       // with the advice on the error and let the settle boundary switch models
-      // and continue the turn there.
-      const abandoned = advisesAlternateModel(held) && opts.abandonForAlternate?.({ attempt, signal: held }) === true;
+      // and continue the turn there. Only when the advice will actually reach
+      // the final message: a thrown failure is rethrown as is (no guidance is
+      // attached to it), so abandoning it would leave the boundary nothing to
+      // recognise and the turn would simply fail faster.
+      abandoned =
+        thrown === undefined &&
+        guidance !== null &&
+        advisesAlternateModel(held) &&
+        opts.abandonForAlternate?.({ attempt, signal: held }) === true;
       if (!abandoned) {
         holds++;
         await opts.hold(held, attempt);
@@ -487,8 +496,12 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     // the gateway serving us, so it bypasses `emit` and never counts as progress.
     for (const event of leading) sink.push(event);
     if (thrown !== undefined) throw thrown;
-    const finalResult = guidance ? withGuidance(result, guidance) : result;
-    if (withheld) sink.push(guidance ? withEventGuidance(withheld, guidance) : withheld);
+    const finalResult = abandoned ? withSwitchPending(result) : guidance ? withGuidance(result, guidance) : result;
+    if (withheld) {
+      sink.push(
+        abandoned ? withEventSwitchPending(withheld) : guidance ? withEventGuidance(withheld, guidance) : withheld,
+      );
+    }
     const settled = isAbort ? "aborted" : result?.stopReason === "error" ? "error" : "ok";
     opts.onSettle?.(settled);
     sink.end(finalResult);
@@ -503,6 +516,23 @@ function withGuidance<R extends RetryableResult>(result: R | undefined, guidance
     ...result,
     errorMessage: advisesAlternateModel(guidance) ? `${message} — ${ALTERNATE_MODEL_ADVICE}` : message,
   };
+}
+
+/**
+ * The message of an abandoned attempt: the switching marker ALONE. The raw
+ * envelope ("429 … capacity_unavailable …") is dropped on purpose — see
+ * ALTERNATE_MODEL_SWITCHING for why Pi must not see it.
+ */
+function withSwitchPending<R extends RetryableResult>(result: R | undefined): R | undefined {
+  if (!result) return result;
+  return { ...result, errorMessage: ALTERNATE_MODEL_SWITCHING };
+}
+
+function withEventSwitchPending<E extends RetryableEvent>(event: E): E {
+  const field = event.type === "done" ? "message" : "error";
+  const terminal = event[field];
+  if (!terminal) return event;
+  return { ...event, [field]: withSwitchPending(terminal) } as E;
 }
 
 function withEventGuidance<E extends RetryableEvent>(event: E, guidance: GatewayWaitSignal): E {

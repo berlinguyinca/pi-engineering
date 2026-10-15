@@ -227,7 +227,11 @@ with `IW-ACT-RETRY-ALTERNATE` ("try another eligible deployment", scope
 and modality and continues the turn on it, with a notice naming both models.
 The envelope names no model, so the choice is the runtime's (the same chooser
 as the fallback above; it refuses any model the session would not fit in). If
-no stand-in fits, the request waits as before and ends with the advice. Set
+no stand-in fits, the request waits as before and ends with the advice (a
+stand-in that stopped fitting mid-turn is handled by taking the declared delay
+and retrying the same model, at most three times). A model left this way is not
+chosen again for ten minutes, so two models short of capacity cannot trade the
+session back and forth. Set
 `PI_GATEWAY_ADVISED_MODEL_SWITCH=false` to only print the advice. A switch made
 this way is not an operator pin either; `/model` changes back.
 

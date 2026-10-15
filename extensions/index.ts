@@ -1405,13 +1405,22 @@ ${RECOVERY_PROMPT}`;
               source: info.signal.source,
               accountWide: isAccountWideRefusal(info.signal),
               advisesAlternate: advisesAlternateModel(info.signal),
+              retryAfterMs: info.signal.retryAfterMs,
             });
           },
           // An advised hold with a switch armed is not waited out: the pump
           // settles with the advice and the settle boundary switches models and
           // continues the turn on the stand-in (AdvisedModelSwitch below).
+          // The cooldown is still recorded (without sleeping): the model being
+          // left is out of capacity, and workers or parallel sessions on it
+          // must not walk straight back into the refusal this turn is leaving.
           // Plain data only, for the same lifecycle reason as `onHold`.
-          abandonForAlternate: () => fallbackCoordinator.willSwitchOnAdvice && fallbackCoordinator.hasPending,
+          abandonForAlternate: (info, actualModel) => {
+            if (!(fallbackCoordinator.willSwitchOnAdvice && fallbackCoordinator.hasPending)) return false;
+            const callModel = actualModel as Model<any>;
+            admission.noteWait({ ...info.signal, provider: callModel.provider, model: callModel.id });
+            return true;
+          },
           maxElapsedMs: gatewayConfig.maxElapsedMs,
           // Fit every request body to the gateway's cap (advertised, else
           // 10 MiB) before it is sent; a 413 is permanent and ends the turn.
@@ -1492,10 +1501,11 @@ ${RECOVERY_PROMPT}`;
       // until real progress. A "stay" keeps the count so the next hold re-arms
       // the pending flag and the choice is reconsidered. The preview is redone
       // for the new model so a second advised hold knows where it could go.
-      if (result.switched) {
-        fallbackCoordinator.onSwitched(result.currentId);
-        await refreshStandIn(ctx);
-      }
+      // A stay re-previews too: the record that armed this switch was wrong,
+      // and the next advised hold must be waited out rather than abandoned on
+      // the same stale answer.
+      if (result.switched) fallbackCoordinator.onSwitched(result.currentId);
+      await refreshStandIn(ctx);
       return result;
     };
 
@@ -1507,11 +1517,29 @@ ${RECOVERY_PROMPT}`;
 
     // The mid-turn half of the advised switch: at the settle boundary of a
     // turn the pump abandoned on IW-ACT-RETRY-ALTERNATE, switch models against
-    // that callback's fresh ctx and continue the turn on the stand-in.
-    new AdvisedModelSwitch({
-      claimPending: () => fallbackCoordinator.claimPending(),
-      apply: applyClaimedFallback,
-    }).register(pi as never);
+    // that callback's fresh ctx and continue the turn on the stand-in. Only
+    // registered when the feature is on: with it off, a pending fallback from
+    // the opt-in hold-count path must wait for before_agent_start as before,
+    // not switch mid-turn through this door.
+    if (gatewayConfig.advisedModelSwitch) {
+      new AdvisedModelSwitch({
+        claimPending: () => fallbackCoordinator.claimPending(),
+        apply: applyClaimedFallback,
+        // The wait the pump skipped, taken by the gateway wrapper before the
+        // continued request (the same seam AfterOutputRetry uses).
+        oweWait: (ctx, delayMs, attempt) => {
+          const m = ctx.model;
+          if (!m) return;
+          afterOutputRetry.owe(
+            { provider: m.provider, id: m.id },
+            delayMs,
+            attempt,
+            "gateway capacity",
+            `${m.id} is out of capacity and no other model fits this session`,
+          );
+        },
+      }).register(pi as never);
+    }
 
     // Per (provider, api): `composeModelProvider` only dispatches to our
     // handler when the model's api matches the one registered, so a switch to a
@@ -1552,8 +1580,11 @@ ${RECOVERY_PROMPT}`;
       // ledger; otherwise one model's outage would switch away from the model
       // the operator just chose. Our own switch has already been accounted for
       // (`onSwitched`), and must keep the model it left excluded.
-      if (!automaticModelSwitch) fallbackCoordinator.onModelSelect();
       installStreamRetry(ctx, event.model);
+      // Our own switch previews again itself, after recording the model it
+      // left; previewing here too would run without that exclusion.
+      if (automaticModelSwitch) return;
+      fallbackCoordinator.onModelSelect();
       await refreshStandIn(ctx as FallbackContext);
     });
 

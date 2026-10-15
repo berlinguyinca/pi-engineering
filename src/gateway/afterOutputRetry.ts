@@ -238,7 +238,7 @@ export class AfterOutputRetry {
   private attempt = 0;
   private firstFailureAt: number | undefined;
   /** The wait owed before the continued request for a model is sent. */
-  private readonly pending = new Map<string, { delayMs: number; attempt: number; kind: string }>();
+  private readonly pending = new Map<string, { delayMs: number; attempt: number; kind: string; label?: string }>();
   /** Models whose calls pass the gateway wrapper (so a wait can be taken). */
   private readonly paced = new Set<string>();
   private ui: SettleContext["ui"];
@@ -274,9 +274,13 @@ export class AfterOutputRetry {
     this.paced.add(keyOf(model));
   }
 
-  /** Owe a wait before `model`'s next (non-summary) call. */
-  owe(model: ModelKey, delayMs: number, attempt: number, kind: string): void {
-    this.pending.set(keyOf(model), { delayMs, attempt, kind });
+  /**
+   * Owe a wait before `model`'s next (non-summary) call. `label` replaces the
+   * "Answer cut off (kind)" status text for a wait owed for another reason
+   * (a gateway hold the pump gave up, AdvisedModelSwitch).
+   */
+  owe(model: ModelKey, delayMs: number, attempt: number, kind: string, label?: string): void {
+    this.pending.set(keyOf(model), { delayMs, attempt, kind, ...(label ? { label } : {}) });
   }
 
   private onBeforeSettle(event: BeforeSettleEvent, ctx: SettleContext) {
@@ -358,7 +362,7 @@ export class AfterOutputRetry {
     const status = () =>
       this.ui?.setStatus?.(
         STATUS_KEY,
-        `Answer cut off (${pending.kind}) — retrying in ${formatWait(Math.max(0, until - this.now()))} (attempt ${pending.attempt}; Esc to stop)`,
+        `${pending.label ?? `Answer cut off (${pending.kind})`} — retrying in ${formatWait(Math.max(0, until - this.now()))} (attempt ${pending.attempt}; Esc to stop)`,
       );
     const tick = setInterval(() => {
       try {
