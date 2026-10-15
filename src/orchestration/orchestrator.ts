@@ -462,19 +462,37 @@ export class Orchestrator {
       const repositoryDiagnostics = await this.broker.durableRepositoryDiagnostics(missionId);
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       if (repositoryDiagnostics.length > 0) {
+        const openFindings = this.store.listFindings(missionId).filter((finding) => finding.status !== "resolved");
         for (const diagnostic of repositoryDiagnostics) {
+          const summary = `Corrupt durable ${diagnostic.recordKind} record for ${diagnostic.repoId}`;
+          const evidence = diagnostic.quarantinedTo
+            ? `${diagnostic.reason} (quarantined to ${diagnostic.quarantinedTo})`
+            : diagnostic.reason;
+          if (
+            openFindings.some(
+              (finding) =>
+                finding.summary === summary &&
+                finding.file === (diagnostic.file || null) &&
+                finding.evidence === evidence,
+            )
+          )
+            continue;
           this.store.addFinding({
             mission_id: missionId,
             task_id: null,
-            severity: "blocking",
+            severity: diagnostic.blocking ? "blocking" : "minor",
             category: "persistence",
             file: diagnostic.file || null,
             line: null,
-            summary: `Corrupt durable ${diagnostic.recordKind} record for ${diagnostic.repoId}`,
-            evidence: diagnostic.reason,
-            recommended_action: "Repair or quarantine the named durable record before mission recovery.",
+            summary,
+            evidence,
+            recommended_action: diagnostic.quarantinedTo
+              ? "None required; the record was quarantined and the mission continues."
+              : "Inspect the named durable record; it does not block this mission.",
           });
         }
+      }
+      if (repositoryDiagnostics.some((diagnostic) => diagnostic.blocking)) {
         this.store.stopMission(missionId, {
           reason: "durable repository recovery records failed canonical identity validation",
           preservedWork: this.store
