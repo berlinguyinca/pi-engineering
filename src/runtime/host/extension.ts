@@ -423,7 +423,8 @@ export class EngineeringHostExtension {
     const followEvery = this.config.followRemoteIntervalMs ?? DEFAULT_FOLLOW_REMOTE_INTERVAL_MS;
     let lastFollowAt = Number.NEGATIVE_INFINITY;
     const fingerprint = async (): Promise<string | null> => {
-      if (this.config.followRemote === true && Date.now() - lastFollowAt >= followEvery) {
+      // Not while a handover runs: its snapshot must not see the tree move.
+      if (this.config.followRemote === true && !host.pendingTask() && Date.now() - lastFollowAt >= followEvery) {
         lastFollowAt = Date.now();
         const result = await followRemote(root);
         if (result.applied) {
@@ -441,8 +442,9 @@ export class EngineeringHostExtension {
       baseline: host.activeGeneration()?.source.commit ?? source.commit ?? null,
       fingerprint,
       onChange: async (next, previous) => {
-        // Another handover is in flight: leave the baseline and look again.
-        if (host.pendingTask()) return false;
+        // Another handover is in flight, or the session is on its way out:
+        // leave the baseline and look again (never, once disposed).
+        if (host.pendingTask() || !this.sourceWatcher?.active) return false;
         const latest = (host.latestContext() as Ctx | undefined) ?? ctx;
         // Quiet: a mutation lock held by another process (an update or
         // retention elsewhere) is not worth a warning every poll. The
@@ -731,7 +733,10 @@ export class EngineeringHostExtension {
   pieNames(): string[] {
     const generation = this.host?.activeGeneration()?.generation;
     const runtime = generation === undefined ? [] : (this.host?.bridge.generationCommandNames(generation) ?? []);
-    return [...HOST_SUBCOMMANDS, ...runtime.filter((n) => !HOST_SUBCOMMANDS.has(n) && n !== "pie")];
+    return [
+      ...HOST_SUBCOMMANDS,
+      ...runtime.filter((n) => !HOST_SUBCOMMANDS.has(n) && n !== "pie" && n !== "engineering"),
+    ];
   }
 
   private pieCompletions(prefix: string): string[] | null {
@@ -765,6 +770,9 @@ export class EngineeringHostExtension {
       );
     }
     if (HOST_SUBCOMMANDS.has(sub)) return this.command(trimmed, ctx);
+    // `/pie engineering <x>` is `/engineering <x>` — the Host's own, which
+    // forwards the runtime's subcommands itself.
+    if (sub === "engineering") return this.command(rest.join(" "), ctx);
     const generation = host.activeGeneration()?.generation;
     if (generation !== undefined && host.bridge.generationCommand(generation, sub)) {
       // Through the bridge, exactly like `/<sub>` itself: held while a
@@ -887,17 +895,20 @@ export class EngineeringHostExtension {
     // from. That IS the update; hand over to it (the watcher would within
     // one poll, this does it now) instead of asking the remote.
     const moved = this.checkoutMoved();
+    const movedLine = moved ? `Checkout moved ${short(moved.from)} → ${short(moved.to)}` : null;
+    if (parsed.check) {
+      // --check still asks the remote; a local move is reported alongside.
+      const check = await this.updates.check(parsed.request);
+      const lines = [...(movedLine ? [`${movedLine}; /pie update reloads it (remote not consulted then).`] : [])];
+      return notify(ctx, [...lines, formatCheck(check)].join("\n"), check.failure ? "warning" : "info");
+    }
     if (moved && !parsed.request.commit && !parsed.request.channel) {
-      if (parsed.check) {
-        return notify(ctx, `Checkout moved ${short(moved.from)} → ${short(moved.to)}; /pie update reloads it.`);
-      }
-      notify(ctx, `Checkout moved ${short(moved.from)} → ${short(moved.to)} — hot-reloading.`);
+      notify(
+        ctx,
+        `${movedLine} — hot-reloading the local checkout (remote not consulted; --channel/--commit for that).`,
+      );
       await this.reload(ctx);
       return;
-    }
-    if (parsed.check) {
-      const check = await this.updates.check(parsed.request);
-      return notify(ctx, formatCheck(check), check.failure ? "warning" : "info");
     }
     const progress: string[] = [];
     const outcome = await this.updates.update(parsed.request, (line) => progress.push(line));

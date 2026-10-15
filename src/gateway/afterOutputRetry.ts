@@ -290,6 +290,11 @@ export class AfterOutputRetry {
       return undefined;
     }
     const failed = this.lastFailed(event.context.contextEntries);
+    // A failure before any visible output is the gateway pump's (or
+    // AdvisedModelSwitch's), never this layer's: it may have just owed a wait
+    // through `owe()` for its own continue, and a reset here would erase it.
+    // Leaving the counters alone is harmless — `agent_settled` clears them.
+    if (failed && !hasVisibleOutput(failed.message)) return undefined;
     if (!failed || !isRetryableTransportFailure(failed.message, ctx.model?.contextWindow ?? 0)) {
       this.reset();
       return undefined;

@@ -17,6 +17,8 @@
  */
 
 import { execFile } from "node:child_process";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { type GitRunner, type SelfUpdateResult, checkForUpdate } from "../../update/selfUpdate.ts";
 
 export const DEFAULT_AUTO_RELOAD_INTERVAL_MS = 15_000;
@@ -44,6 +46,7 @@ export class SourceWatcher {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private baseline: string | null;
   private disposed = false;
+  private started = false;
   private polling: Promise<void> | undefined;
 
   constructor(opts: SourceWatchOptions) {
@@ -56,12 +59,14 @@ export class SourceWatcher {
     return this.baseline;
   }
 
+  /** Started and not disposed. True during a poll too (the timer is re-armed after it). */
   get active(): boolean {
-    return !this.disposed && this.timer !== undefined;
+    return !this.disposed && this.started;
   }
 
   start(): void {
     if (this.disposed || this.timer) return;
+    this.started = true;
     this.schedule();
   }
 
@@ -107,6 +112,65 @@ export class SourceWatcher {
   }
 }
 
+/**
+ * The environment for git run from a timer, where nobody can answer a
+ * prompt. `git_terminal_prompt` opens /dev/tty directly, whatever stdio is,
+ * so it is switched off; askpass is pointed at `true` (empty answer, fast
+ * failure); ssh runs in batch mode so a passphrase or an unknown host key
+ * fails at once. The operator's own GIT_SSH_COMMAND, when set, is kept.
+ */
+export function unattendedGitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...base,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_ASKPASS: "true",
+    SSH_ASKPASS: "",
+    ...(base.GIT_SSH_COMMAND ? {} : { GIT_SSH_COMMAND: "ssh -oBatchMode=yes" }),
+  };
+}
+
+/**
+ * Is a git operation that moves HEAD on its own underway — a rebase, a merge
+ * with conflicts, a bisect — or is HEAD detached? Each intermediate HEAD of
+ * those is not code anyone meant to run, and a snapshot would copy the
+ * half-resolved working tree with it. The watcher skips its poll until they
+ * are done; a `git checkout` of another branch still counts as a move.
+ */
+export function gitOperationInProgress(root: string): boolean {
+  const gitDir = resolveGitDir(root);
+  if (!gitDir) return false;
+  for (const marker of [
+    "rebase-merge",
+    "rebase-apply",
+    "MERGE_HEAD",
+    "BISECT_LOG",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+  ]) {
+    if (existsSync(join(gitDir, marker))) return true;
+  }
+  try {
+    // A detached HEAD is a bare commit id rather than "ref: refs/heads/…".
+    return !readFileSync(join(gitDir, "HEAD"), "utf8").startsWith("ref: ");
+  } catch {
+    return false;
+  }
+}
+
+/** `.git` of `root`, following the `gitdir:` file a worktree keeps there. */
+function resolveGitDir(root: string): string | null {
+  const dotGit = join(root, ".git");
+  try {
+    if (statSync(dotGit).isDirectory()) return dotGit;
+    const pointer = readFileSync(dotGit, "utf8").trim();
+    if (!pointer.startsWith("gitdir: ")) return null;
+    const target = pointer.slice("gitdir: ".length);
+    return resolve(root, target);
+  } catch {
+    return null;
+  }
+}
+
 /** A GitRunner (src/update/selfUpdate.ts) over `root`, for the follow-remote step. */
 export function gitRunner(root: string, timeoutMs = 30_000): GitRunner {
   return (args) =>
@@ -118,8 +182,7 @@ export function gitRunner(root: string, timeoutMs = 30_000): GitRunner {
           timeout: timeoutMs,
           windowsHide: true,
           maxBuffer: 4 * 1024 * 1024,
-          // Never a credential prompt from a timer: fail fast and try next time.
-          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          env: unattendedGitEnv(),
         },
         (error, stdout, stderr) => {
           const code = error ? ((error as { code?: unknown }).code as number | undefined) : 0;
@@ -147,6 +210,9 @@ export function followRemote(root: string): Promise<SelfUpdateResult> {
 /** `git rev-parse HEAD` of `root`, or null when it is not a readable checkout. */
 export function gitHead(root: string, timeoutMs = 5_000): Promise<string | null> {
   return new Promise((resolve) => {
+    // A rebase, merge or bisect in flight (or a detached HEAD): no fingerprint,
+    // so the poll is skipped rather than loading an intermediate state.
+    if (gitOperationInProgress(root)) return resolve(null);
     execFile("git", ["-C", root, "rev-parse", "HEAD"], { timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
       if (error) return resolve(null);
       const sha = stdout.trim();

@@ -578,7 +578,8 @@ export const ALTERNATE_MODEL_ADVICE = "gateway advises an alternate model — sw
  * of a request the gateway just refused would be exactly the wasted calls the
  * switch exists to avoid. The settle handler recognises this marker.
  */
-export const ALTERNATE_MODEL_SWITCHING = "gateway advises an alternate model — automatic switch pending";
+export const ALTERNATE_MODEL_SWITCHING =
+  "no capacity on this deployment; gateway advises an alternate model — switching automatically if one fits, else switch with /model";
 
 /** One-line human summary for notices and logs. */
 export function describeGatewayWait(signal: GatewayWaitSignal): string {

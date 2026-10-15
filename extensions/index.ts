@@ -100,6 +100,7 @@ import { renderStatus } from "../src/status/layout.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
+import { unattendedGitEnv } from "../src/runtime/host/sourceWatch.ts";
 import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
@@ -1011,13 +1012,14 @@ ${RECOVERY_PROMPT}`;
   let lastUpdateCheckAt: number | undefined;
 
   const runGit = async (args: string[]) => {
-    const r = await execFileAsync("git", ["-C", extensionRoot, ...args], { timeout: 30_000 }).catch(
-      (err: { code?: number; stdout?: string; stderr?: string; message?: string }) => ({
-        code: typeof err.code === "number" ? err.code : 1,
-        stdout: err.stdout ?? "",
-        stderr: err.stderr ?? err.message ?? "",
-      }),
-    );
+    const r = await execFileAsync("git", ["-C", extensionRoot, ...args], {
+      timeout: 30_000,
+      env: unattendedGitEnv(),
+    }).catch((err: { code?: number; stdout?: string; stderr?: string; message?: string }) => ({
+      code: typeof err.code === "number" ? err.code : 1,
+      stdout: err.stdout ?? "",
+      stderr: err.stderr ?? err.message ?? "",
+    }));
     return { code: (r as { code?: number }).code ?? 0, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
   };
 
@@ -1498,7 +1500,7 @@ ${RECOVERY_PROMPT}`;
       // A successful switch means the new model gets a clean ledger; the
       // stand-in's own outage must start its own count, not inherit the one
       // that triggered this switch — while the model just left stays excluded
-      // until real progress. A "stay" keeps the count so the next hold re-arms
+      // for SWITCHED_FROM_TTL_MS. A "stay" keeps the count so the next hold re-arms
       // the pending flag and the choice is reconsidered. The preview is redone
       // for the new model so a second advised hold knows where it could go.
       // A stay re-previews too: the record that armed this switch was wrong,

@@ -5,11 +5,16 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { SourceWatcher, gitHead } from "../../src/runtime/host/sourceWatch.ts";
+import {
+  SourceWatcher,
+  gitHead,
+  gitOperationInProgress,
+  unattendedGitEnv,
+} from "../../src/runtime/host/sourceWatch.ts";
 
 function watcher(opts: {
   values: Array<string | null>;
@@ -131,4 +136,42 @@ test("gitHead: the checkout's HEAD, and null for a directory that is not one", a
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("gitOperationInProgress: a rebase marker or a detached HEAD suspends polling; a normal branch does not", async () => {
+  const root = mkdtempSync(join(tmpdir(), "rt-gitop-"));
+  try {
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-C", root, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { stdio: "pipe" })
+        .toString()
+        .trim();
+    git("init", "-q", "-b", "main");
+    writeFileSync(join(root, "a.txt"), "1\n");
+    git("add", "-A");
+    git("commit", "-qm", "one");
+    assert.equal(gitOperationInProgress(root), false);
+    const head = await gitHead(root);
+    assert.match(head ?? "", /^[0-9a-f]{40}$/);
+
+    mkdirSync(join(root, ".git", "rebase-merge"));
+    assert.equal(gitOperationInProgress(root), true);
+    assert.equal(await gitHead(root), null, "no fingerprint mid-rebase: the poll is skipped");
+    rmSync(join(root, ".git", "rebase-merge"), { recursive: true });
+
+    git("checkout", "-q", "--detach");
+    assert.equal(gitOperationInProgress(root), true);
+    git("checkout", "-q", "main");
+    assert.equal(gitOperationInProgress(root), false);
+    assert.equal(await gitHead(root), head);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unattendedGitEnv: no terminal, askpass or ssh prompt can block a timer; a custom ssh command is kept", () => {
+  const env = unattendedGitEnv({ PATH: "/bin" });
+  assert.equal(env.GIT_TERMINAL_PROMPT, "0");
+  assert.equal(env.GIT_ASKPASS, "true");
+  assert.equal(env.GIT_SSH_COMMAND, "ssh -oBatchMode=yes");
+  assert.equal(unattendedGitEnv({ GIT_SSH_COMMAND: "ssh -i key" }).GIT_SSH_COMMAND, "ssh -i key");
 });
