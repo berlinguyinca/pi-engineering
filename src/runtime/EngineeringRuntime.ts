@@ -44,6 +44,7 @@ import {
   FailureClassifier,
   RecoveryPlanner,
   type RecoveryPlannerOptions,
+  describeRecoveryOutcome,
 } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
@@ -1367,9 +1368,14 @@ export class EngineeringRuntime {
     }
     mission = this.missionStore.getMission(missionId)!;
     if ((mission.status === "BLOCKED" || mission.status === "REPAIRING") && !this.currentMissionStop(missionId)) {
+      const generation = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+      const ran = this.missionStore
+        .listRecoveryDecisions(missionId)
+        .filter((decision) => (decision.resumptionGeneration ?? 0) === generation)
+        .at(-1);
       await this.persistRecoveryStop(
         missionId,
-        `Recovery did not produce material progress: ${recoverySource.resumeCondition}`,
+        `Recovery did not produce material progress: ${describeRecoveryOutcome(ran, this.orchestrator.gate.evaluate(mission))}`,
         recoverySource,
       );
     }

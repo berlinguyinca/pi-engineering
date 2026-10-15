@@ -481,7 +481,7 @@ export class GitRepo {
     return `pi-eng-candidate-${suffix}`;
   }
 
-  private worktreePath(branch: string): string {
+  worktreePath(branch: string): string {
     return join(this.repoRoot, "..", `pi-eng-${shortHash(this.repoRoot)}-${branch}`);
   }
 

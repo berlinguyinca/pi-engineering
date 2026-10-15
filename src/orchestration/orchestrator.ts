@@ -15,6 +15,7 @@
  * No slash command is required: call `orchestrate(request)`.
  */
 
+import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
 import { GitRepo } from "../git/GitRepo.ts";
@@ -248,6 +249,12 @@ export interface OrchestrateOptions {
 /** Executions whose build activity is remembered for the budget-exhausted hint. */
 const MAX_TRACKED_BUILD_EXECUTIONS = 256;
 
+/** Finding category for committed worker work that integration refused to merge. */
+const STRANDED_WORKER_WORK = "stranded_worker_work";
+
+/** Content hash of an empty diff: a candidate identical to its base. */
+const EMPTY_DIFF_HASH = `sha256:${createHash("sha256").update("").digest("hex")}`;
+
 export class Orchestrator {
   readonly store: MissionStore;
   readonly broker: ExecutionBroker;
@@ -459,6 +466,8 @@ export class Orchestrator {
     try {
       await this.broker.cancelStaleResumptionExecutions(missionId, expectedResumptionGeneration);
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      await this.broker.rehydrateMission(missionId);
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const repositoryDiagnostics = await this.broker.durableRepositoryDiagnostics(missionId);
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       if (repositoryDiagnostics.length > 0) {
@@ -519,12 +528,27 @@ export class Orchestrator {
       const verifiedRecoveryStart = recoveryStartRecord ? await this.broker.verifiedCandidateContent(missionId) : null;
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const recoveryStartCandidate = recoveryStartRecord?.identityHash ?? null;
+      // A recorded no-change candidate (sha == the manifest-bound base, empty
+      // diff) is its own proof: its baseline needs no worktree, so it stays
+      // usable when Git verification of a mounted candidate is unavailable.
+      const recordedBinding = recoveryStartRecord
+        ? this.store
+            .getWorkspaceManifest(missionId)
+            ?.repositories.find((entry) => entry.repoId === recoveryStartRecord.identity.repoId)
+        : undefined;
+      const recordedEmptyBaseline =
+        recoveryStartRecord &&
+        recordedBinding &&
+        recoveryStartRecord.identity.candidateSha === recordedBinding.baseSha &&
+        recoveryStartRecord.identity.diffHash === EMPTY_DIFF_HASH
+          ? { candidateSha: recordedBinding.baseSha, diffHash: EMPTY_DIFF_HASH }
+          : null;
       const recoveryStartContent = verifiedRecoveryStart
         ? {
             candidateSha: verifiedRecoveryStart.candidateSha,
             diffHash: verifiedRecoveryStart.diffHash,
           }
-        : null;
+        : recordedEmptyBaseline;
       for (const stale of this.store
         .listRecoveryDecisions(missionId)
         .filter((entry) => entry.status === "started" && (entry.resumptionGeneration ?? 0) !== resumptionGeneration)) {
@@ -612,7 +636,9 @@ export class Orchestrator {
             category: "recovery_candidate_baseline",
             file: null,
             line: null,
-            summary: "Gate repair requires an independently Git-verified current candidate.",
+            summary: recoveryStartRecord
+              ? "Gate repair requires a current candidate Git can verify: the recorded candidate no longer matches the repository."
+              : "Gate repair requires an independently Git-verified current candidate: none is recorded for this mission.",
             evidence: repairDecision.recoveryId,
             recommended_action: "Reconstruct the current candidate from Git before dispatching repair work.",
           });
@@ -620,7 +646,9 @@ export class Orchestrator {
         const preservedWork = await this.preservedMissionWork(missionId);
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         this.store.stopMission(missionId, {
-          reason: "gate repair refused: no independently Git-verified current candidate exists for this mission",
+          reason: recoveryStartRecord
+            ? `gate repair refused: the recorded candidate ${recoveryStartRecord.identity.candidateSha} could not be Git-verified against the repository (its recorded diff no longer matches)`
+            : "gate repair refused: no candidate was ever recorded for this mission, so there is nothing to verify",
           preservedWork,
           attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
           resumeCondition: `a successful integration must publish Git-verified candidate evidence before gate repair can run; otherwise cancel the mission with /mission cancel ${missionId}`,
@@ -742,12 +770,31 @@ export class Orchestrator {
             !this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === task.task_id),
         );
       const actionTaskId = classification.taskId;
+      // A fence classification that names no live failed task (none recorded, or
+      // already superseded) falls back to the mission's failed leaf tasks: those
+      // that no later task of their kind replaced and whose own dependencies
+      // did not fail.
+      const missionTasksNow = this.store.listTasks(missionId);
+      const namedFence = unresolvedFailedTasks.find((task) => task.task_id === actionTaskId);
+      const fenceTaskIds = new Set(
+        namedFence
+          ? [namedFence.task_id]
+          : unresolvedFailedTasks
+              .filter(
+                (task) =>
+                  !unresolvedFailedTasks.some((other) => task.depends_on.includes(other.task_id)) &&
+                  !missionTasksNow
+                    .slice(missionTasksNow.findIndex((entry) => entry.task_id === task.task_id) + 1)
+                    .some((later) => later.kind === task.kind && later.status === "SUCCEEDED"),
+              )
+              .map((task) => task.task_id),
+      );
       const failedTasks = unresolvedFailedTasks.filter((task) => {
         switch (repairDecision.action) {
           case "CHECKPOINT_SPLIT_AND_REPLACE":
           case "REPAIR_WORKER_OUTPUT":
           case "FENCE_RECONCILE_AND_RESUME":
-            return actionTaskId ? task.task_id === actionTaskId : false;
+            return fenceTaskIds.has(task.task_id);
           case "REBUILD_INTEGRATION_CANDIDATE":
             return task.kind === "integration" && (!actionTaskId || task.task_id === actionTaskId);
           case "CREATE_REPAIR_TASKS":
@@ -763,6 +810,30 @@ export class Orchestrator {
             return false;
         }
       });
+      if (repairDecision.action === "FENCE_RECONCILE_AND_RESUME" && failedTasks.length === 0 && recoveryStartContent) {
+        // Nothing failed is left to replace: only the gates are outstanding, so
+        // re-run them against the existing candidate (the #194 gate path)
+        // instead of recording "no material progress".
+        if (this.store.getMission(missionId)!.status === "BLOCKED" && repairDecision.status === "planned") {
+          this.store.transitionMission(missionId, "REPAIRING", "system", {
+            recoveryDecisionId: repairDecision.recoveryId,
+          });
+        } else if (repairDecision.status === "planned") {
+          this.store.transitionRecovery(repairDecision.recoveryId, "started");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const reran = await this.finalizeMission(missionId, expectedResumptionGeneration, signal, undefined, {
+          gateOnly: true,
+        });
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        if (this.store.getRecoveryDecision(repairDecision.recoveryId)?.status === "started") {
+          this.store.transitionRecovery(repairDecision.recoveryId, reran.completed ? "succeeded" : "failed");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return reran.mission;
+      }
       const importsCheckpoint = [
         "CHECKPOINT_SPLIT_AND_REPLACE",
         "REPAIR_WORKER_OUTPUT",
@@ -2208,7 +2279,13 @@ export class Orchestrator {
           ...unclassified,
           ...(gateDiedOnProvider
             ? {}
-            : { category: blockerTask?.kind === "validation" ? "VALIDATION_FAILED" : "REVIEW_FAILED" }),
+            : {
+                category: openBlocking.some((finding) => finding.category === STRANDED_WORKER_WORK)
+                  ? "IMPLEMENTATION_DEFECT"
+                  : blockerTask?.kind === "validation"
+                    ? "VALIDATION_FAILED"
+                    : "REVIEW_FAILED",
+              }),
         });
         this.store.classifyFailure(classification);
       }
@@ -2351,13 +2428,17 @@ export class Orchestrator {
         this.store.transitionMission(missionId, "REPAIRING");
       }
       this.phase(this.store.getMission(missionId)!, "repairing");
-      const objectives: Array<{ objective: string; findingId?: string }> = openBlocking.map((f) => {
-        const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
-        return {
-          objective: `Repair review finding (${f.category})${where}: ${f.summary} — recommended: ${f.recommended_action || "n/a"}`,
-          findingId: f.finding_id,
-        };
-      });
+      const objectives: Array<{ objective: string; findingId?: string; baseSha?: string; adoptedTaskId?: string }> =
+        openBlocking.map((f) => {
+          const where = f.file ? ` [${f.file}${f.line ? `:${f.line}` : ""}]` : "";
+          return {
+            objective: `Repair review finding (${f.category})${where}: ${f.summary} — recommended: ${f.recommended_action || "n/a"}`,
+            findingId: f.finding_id,
+            ...(f.category === STRANDED_WORKER_WORK && f.evidence
+              ? { baseSha: f.evidence, adoptedTaskId: f.task_id ?? undefined }
+              : {}),
+          };
+        });
       if (objectives.length === 0) {
         for (const t of failedGates) {
           objectives.push({
@@ -2387,6 +2468,7 @@ export class Orchestrator {
           write_domains: this.writableDomainsForMission(missionId),
           isolation: repairIsolation,
           repo_id: this.repoIdForMission(missionId),
+          repair_base_candidate_sha: obj.baseSha,
           ...this.boundedTaskFields(missionId, ["repair"], []),
         });
         this.store.transitionTask(repair.task_id, "READY");
@@ -2395,6 +2477,26 @@ export class Orchestrator {
         });
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         if (repaired && obj.findingId) this.store.resolveFinding(obj.findingId);
+        // The replacement started from the dead worker's committed branch, so it
+        // carries that task's work: the dead task no longer blocks completion.
+        const adopted = obj.adoptedTaskId ? this.store.getTask(obj.adoptedTaskId) : undefined;
+        if (
+          repaired &&
+          adopted?.status === "FAILED" &&
+          !this.store.listTaskSupersessions(missionId).some((entry) => entry.failedTaskId === adopted.task_id)
+        ) {
+          this.store.supersedeTask({
+            supersessionId: `${repair.task_id}-SUP-${adopted.task_id}`,
+            missionId,
+            failedTaskId: adopted.task_id,
+            replacementTaskIds: [repair.task_id],
+            repoId: adopted.repo_id ?? "",
+            acceptanceIds: [...(adopted.acceptance_ids ?? [])],
+            coverageFingerprint: taskCoverageFingerprint(adopted),
+            reason: `re-adopted preserved branch of ${adopted.task_id} at ${obj.baseSha}`,
+            createdAt: new Date(this.scheduler.now()).toISOString(),
+          });
+        }
       }
       post = await this.postExecution(this.store.getMission(missionId)!, signal);
       if (signal?.aborted) return this.canceledFinalization(missionId, signal);
@@ -2714,6 +2816,37 @@ export class Orchestrator {
       const cur = this.store.getMission(mission.mission_id)!.status;
       if (cur !== "INTEGRATING" && canTransitionMission(cur, "INTEGRATING")) {
         this.store.transitionMission(mission.mission_id, "INTEGRATING");
+      }
+      // Every worker branch is integration-ineligible but some carry commits:
+      // integrating would publish a no-change candidate as gate evidence over
+      // the preserved work. Record the branches and let the repair round
+      // re-adopt them instead.
+      const { eligible, stranded } = await this.broker.strandedWorkerWork(mission.mission_id);
+      if (eligible === 0 && stranded.length > 0) {
+        for (const branch of stranded) {
+          const recorded = this.store
+            .listFindings(mission.mission_id)
+            .some(
+              (finding) =>
+                finding.category === STRANDED_WORKER_WORK &&
+                finding.status === "open" &&
+                finding.evidence === branch.tip,
+            );
+          if (recorded) continue;
+          this.store.addFinding({
+            mission_id: mission.mission_id,
+            task_id: branch.taskId,
+            severity: "blocking",
+            category: STRANDED_WORKER_WORK,
+            file: null,
+            line: null,
+            summary: `Preserved worker branch ${branch.branch} holds committed work but was ineligible for integration (${branch.marker}); no candidate was published over it`,
+            evidence: branch.tip,
+            recommended_action:
+              "Re-adopt the preserved branch: a replacement worker starts from its tip and completes the remaining work.",
+          });
+        }
+        return { validationAttempted, validationOk, reviewAttempted, reviewOk, integrationOk: false };
       }
       const integ = this.store.createTask({
         mission_id: mission.mission_id,
