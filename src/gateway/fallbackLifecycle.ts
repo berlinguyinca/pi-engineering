@@ -48,7 +48,20 @@ export interface PendingFallback {
   excludeIds?: string[];
   /** The gateway's declared delay on the hold that armed an advised switch. */
   retryAfterMs?: number;
+  /** Models left during this episode and when each becomes eligible again (hysteresis). */
+  cooldownUntil?: Record<string, number>;
+  /** A tool call has started and has no recorded outcome yet, so a stand-in might issue it again. */
+  toolExecutionStarted?: boolean;
+  /** Every unfinished tool call is read-only, so running it again repeats no side effect. */
+  replaySafe?: boolean;
 }
+
+/**
+ * Tools whose re-execution cannot repeat a side effect. Anything else (bash,
+ * edit, write, a mission tool, an unknown name) is treated as side-effecting:
+ * replaying a request after one of those started could run it twice.
+ */
+export const REPLAY_SAFE_TOOLS: ReadonlySet<string> = new Set(["read", "grep", "find", "ls"]);
 
 /**
  * How long a model left on the gateway's advice stays excluded as a stand-in.
@@ -94,6 +107,8 @@ export class FallbackCoordinator {
   /** Models already left during this outage episode: id → excluded until (epoch ms). */
   private readonly switchedFrom = new Map<string, number>();
   private advisedRetryAfterMs: number | undefined;
+  /** Tool calls started and not yet ended, by call id; cleared by {@link onTurnStart}. */
+  private readonly unfinishedTools = new Map<string, string>();
   private readonly now: () => number;
   private readonly switchedFromTtlMs: number;
 
@@ -179,6 +194,26 @@ export class FallbackCoordinator {
     return this.advisedSwitch && this.standInAvailable;
   }
 
+  /**
+   * A tool call started. Until {@link noteToolEnded} records its outcome, a
+   * stand-in model could issue the same call again, so while a side-effecting
+   * tool is unfinished a switch is refused. A finished call has its result in
+   * the session context and is not re-executed by a new model.
+   */
+  noteToolStarted(toolName: string, callId: string): void {
+    this.unfinishedTools.set(callId, toolName);
+  }
+
+  /** The tool call finished (its result is recorded in the context). */
+  noteToolEnded(callId: string): void {
+    this.unfinishedTools.delete(callId);
+  }
+
+  /** A new user turn begins: nothing unfinished can be replayed into it. */
+  onTurnStart(): void {
+    this.unfinishedTools.clear();
+  }
+
   /** A stream produced output: the consecutive-hold run is over. */
   onProgress(): void {
     this.consecutiveHolds = 0;
@@ -212,6 +247,7 @@ export class FallbackCoordinator {
   }
 
   private reset(): void {
+    this.unfinishedTools.clear();
     this.consecutiveHolds = 0;
     this.fallbackPending = false;
     this.requestedAt = undefined;
@@ -241,11 +277,24 @@ export class FallbackCoordinator {
             reason: this.reason,
             sourceModelId: this.sourceModelId,
             sourceProvider: this.sourceProvider,
-            ...(excludeIds.length > 0 ? { excludeIds } : {}),
+            ...(excludeIds.length > 0 ? { excludeIds, cooldownUntil: this.liveCooldowns() } : {}),
             ...(this.advisedRetryAfterMs !== undefined ? { retryAfterMs: this.advisedRetryAfterMs } : {}),
+            ...(this.unfinishedTools.size > 0
+              ? {
+                  toolExecutionStarted: true,
+                  replaySafe: [...this.unfinishedTools.values()].every((name) => REPLAY_SAFE_TOOLS.has(name)),
+                }
+              : {}),
           }
         : {}),
     };
+  }
+
+  private liveCooldowns(): Record<string, number> {
+    const now = this.now();
+    const out: Record<string, number> = {};
+    for (const [id, until] of this.switchedFrom) if (until > now) out[id] = until;
+    return out;
   }
 
   /** Models left during this outage episode, for a lifecycle-time preview. */
@@ -295,6 +344,10 @@ export interface FallbackApplyDeps {
   healthFor?(ctx: FallbackContext): Promise<ModelHealthProvider | undefined> | ModelHealthProvider | undefined;
   /** Debug logging; must never be a substitute for a session operation. */
   log?: (message: string) => void;
+  /** Clock for the cool-down check; defaults to `Date.now`. */
+  now?: () => number;
+  /** Jitter source for Retry-After, in [0, 1]; defaults to `Math.random`. */
+  random?: () => number;
 }
 
 export interface FallbackApplyResult {
@@ -305,6 +358,8 @@ export interface FallbackApplyResult {
   reason?: string;
   /** Why no switch was made. Diagnostic only — never a reason to throw. */
   skipped?: string;
+  /** Set (with `skipped: "blocked"`) when no qualified model exists: the bounded wait to take instead. */
+  blocked?: { maxWaitMs: number; retryAfterMs: number; reason: string };
 }
 
 function toCandidate(m: Model<any>, health?: ModelHealthProvider): FallbackCandidate {
@@ -319,12 +374,16 @@ function toCandidate(m: Model<any>, health?: ModelHealthProvider): FallbackCandi
     input: m.input ?? ["text"],
     ...(reading.state !== undefined ? { state: reading.state } : {}),
     ...(reading.slots !== undefined ? { slots: reading.slots } : {}),
+    ...(reading.capabilities !== undefined ? { capabilities: reading.capabilities } : {}),
+    ...(reading.tools !== undefined ? { tools: reading.tools } : {}),
+    ...(reading.alias === true ? { alias: true } : {}),
   };
 }
 
 type FallbackChoice =
   | { action: "switch"; current: Model<any>; target: Model<any>; reason: string }
-  | { action: "stay"; skipped: string; reason?: string };
+  | { action: "stay"; skipped: string; reason?: string }
+  | { action: "blocked"; reason: string; maxWaitMs: number; retryAfterMs: number };
 
 /**
  * The switch decision against a FRESH context: the catalogue, the measured
@@ -332,9 +391,9 @@ type FallbackChoice =
  * Pure apart from the health probe; touches nothing on the session.
  */
 async function chooseFallback(
-  deps: Pick<FallbackApplyDeps, "healthFor" | "log">,
+  deps: Pick<FallbackApplyDeps, "healthFor" | "log" | "now" | "random">,
   ctx: FallbackContext,
-  pending: Pick<PendingFallback, "sourceModelId" | "excludeIds">,
+  pending: Pick<PendingFallback, "sourceModelId" | "excludeIds" | "cooldownUntil" | "retryAfterMs">,
 ): Promise<FallbackChoice> {
   const current = ctx.model;
   if (!current) return { action: "stay", skipped: "no-current-model" };
@@ -364,7 +423,20 @@ async function chooseFallback(
     current: toCandidate(current, health),
     available: available.map((m) => toCandidate(m, health)),
     usedTokens: usage?.tokens ?? null,
+    nowMs: (deps.now ?? Date.now)(),
+    ...(pending.cooldownUntil ? { cooldownUntil: pending.cooldownUntil } : {}),
+    ...(pending.retryAfterMs !== undefined ? { retryAfterMs: pending.retryAfterMs } : {}),
+    ...(deps.random ? { random: deps.random } : {}),
   });
+  if (decision.action === "blocked") {
+    deps.log?.(`[gateway-fallback] blocked current=${current.id} (${decision.reason})`);
+    return {
+      action: "blocked",
+      reason: decision.reason,
+      maxWaitMs: decision.maxWaitMs,
+      retryAfterMs: decision.retryAfterMs,
+    };
+  }
   if (decision.action !== "switch") {
     deps.log?.(`[gateway-fallback] stay current=${current.id} (${decision.reason})`);
     return { action: "stay", skipped: "stay", reason: decision.reason };
@@ -406,7 +478,29 @@ export async function applyPendingFallback(
   ctx: FallbackContext,
   pending: PendingFallback,
 ): Promise<FallbackApplyResult> {
+  // No blind replay: once a side-effecting tool call has started in the turn,
+  // moving the request to another model could run it a second time.
+  if (pending.toolExecutionStarted === true && pending.replaySafe !== true) {
+    ctx.ui?.notify(
+      "Model switch skipped: a tool call already started this turn and is not replay-safe. Waiting on the current model.",
+      "warning",
+    );
+    deps.log?.("[gateway-fallback] stay (tool call started, not replay-safe)");
+    return { switched: false, skipped: "tool-started-not-replay-safe" };
+  }
   const choice = await chooseFallback(deps, ctx, pending);
+  if (choice.action === "blocked") {
+    ctx.ui?.notify(
+      `${ctx.model?.id ?? "The current model"} has no capacity and ${choice.reason}. Retrying in ${choice.retryAfterMs} ms.`,
+      "warning",
+    );
+    return {
+      switched: false,
+      skipped: "blocked",
+      reason: choice.reason,
+      blocked: { maxWaitMs: choice.maxWaitMs, retryAfterMs: choice.retryAfterMs, reason: choice.reason },
+    };
+  }
   if (choice.action === "stay") {
     return { switched: false, skipped: choice.skipped, ...(choice.reason ? { reason: choice.reason } : {}) };
   }

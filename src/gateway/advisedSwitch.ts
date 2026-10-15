@@ -162,7 +162,8 @@ export class AdvisedModelSwitch {
         });
         return undefined;
       }
-      const delayMs = pending.retryAfterMs ?? DEFAULT_STAY_WAIT_MS;
+      // A BLOCKED result carries its own bounded, jittered delay (autospec #158).
+      const delayMs = result.blocked?.retryAfterMs ?? pending.retryAfterMs ?? DEFAULT_STAY_WAIT_MS;
       this.deps.oweWait(ctx, delayMs, this.stays);
       emitTelemetry({
         level: "info",

@@ -1339,6 +1339,10 @@ ${RECOVERY_PROMPT}`;
       enabled: gatewayConfig.modelFallbackEnabled,
       advisedSwitch: gatewayConfig.advisedModelSwitch,
     });
+    // Which tool calls have no recorded outcome yet: a switch must not hand one
+    // to a stand-in that could issue it a second time (autospec #158).
+    pi.on("tool_execution_start", (event) => fallbackCoordinator.noteToolStarted(event.toolName, event.toolCallId));
+    pi.on("tool_execution_end", (event) => fallbackCoordinator.noteToolEnded(event.toolCallId));
 
     // Retry a turn whose stream was cut AFTER partial output (link cut,
     // "terminated"): omit the partial answer and continue, with long-wait
@@ -1557,6 +1561,7 @@ ${RECOVERY_PROMPT}`;
       await refreshStandIn(ctx as FallbackContext);
     });
     pi.on("before_agent_start", async (_event, ctx) => {
+      fallbackCoordinator.onTurnStart();
       installStreamRetry(ctx, ctx.model);
       // The fallback (if any) runs against THIS callback's live ctx — never a
       // stale one captured from an earlier session. It is awaited so a switch
