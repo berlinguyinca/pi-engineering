@@ -234,7 +234,7 @@ const INCOMPLETE_STREAM_PATTERNS = [
 const AUTH_STRING_PATTERNS =
   /\b(401|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed|invalid[_ -]?credentials|api[_ -]?key[_ -]?invalid)\b/i;
 const CONTEXT_STRING_PATTERNS =
-  /\b(context[_ -]?(length|window|limit|exceeded|overflow)|maximum[_ -]?context|too[_ -]?many[_ -]?tokens|prompt[_ -]?is[_ -]?too[_ -]?long|input[_ -]?too[_ -]?long|413)\b/i;
+  /\b(context[_ -]?(length|window|limit|exceeded|overflow)|maximum[_ -]?context|exceeds?[_ -]the[_ -](available[_ -])?context|too[_ -]?many[_ -]?tokens|prompt[_ -]?is[_ -]?too[_ -]?long|input[_ -]?too[_ -]?long|413)\b/i;
 const NO_WORKER_STRING_PATTERNS = /\b(no[_ -]?workers?|no available worker|no worker for model)\b/i;
 const ACTIVATING_STRING_PATTERNS = /\b(model[_ -]?activating|model[_ -]?loading|loading model|cold[_ -]?start)\b/i;
 const STALE_ROUTE_STRING_PATTERNS = /\b(routing[_ -]?snapshot[_ -]?expired|stale[_ -]?route|route[_ -]?expired)\b/i;
@@ -313,7 +313,10 @@ function finish(
     cls === "authentication" ||
     cls === "authorization" ||
     cls === "billing" ||
-    cls === "invalid_request"
+    cls === "invalid_request" ||
+    // Replaying a prompt the model cannot hold fails identically every time:
+    // the worker compacts once itself and then fails with context_overflow.
+    cls === "context_overflow"
   );
   let action: InferenceFailureAction;
   switch (cls) {
@@ -359,7 +362,7 @@ function finish(
       action = "refresh_then_fallback";
       break;
     case "context_overflow":
-      action = "compact_and_retry";
+      action = "fail";
       break;
     case "quota":
       action = "fallback";
@@ -483,6 +486,12 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
           source: "http_status",
           reason: `HTTP 400 (unknown-model wording)`,
         });
+      }
+      // A 400 saying the prompt does not fit the window (OpenAI "maximum
+      // context length", llama.cpp "exceeds the available context size") is a
+      // context overflow, not a malformed request: the worker compacts once.
+      if (CONTEXT_STRING_PATTERNS.test(text) && !/\b413\b|too large/i.test(text)) {
+        return finish(input, "context_overflow", { source: "http_status", reason: "HTTP 400 (context phrasing)" });
       }
       return finish(input, "invalid_request", { source: "http_status", reason: "HTTP 400" });
     }

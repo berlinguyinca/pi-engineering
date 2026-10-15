@@ -95,6 +95,10 @@ function infraCategoryFromWorkerMarker(marker?: string): InfraErrorCategory | nu
       return "RATE_LIMITED";
     case "compaction":
       return "CONTEXT_RECOVERABLE";
+    // The worker already compacted once and the prompt still overflowed: the
+    // task needs splitting (recovery), not an infrastructure retry window.
+    case "context_overflow":
+      return null;
     // An unknown model already had its one catalog-resync retry in the worker;
     // the gateway is healthy, so the infra window would only hide a
     // configuration error behind hours of waiting and a paused mission.

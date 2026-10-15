@@ -276,6 +276,35 @@ and are listed with the gateway's own error text. Only an authentication or
 account-wide refusal stops a provider's refresh. In that case its configuration
 is left as it was.
 
+## Context budget for mission workers
+
+A worker's context budget is the smaller of its role's budget (`ROLE_BUDGETS`,
+`hardMaxTokens`) and 70% of the context window of the model it was routed to, so
+a role is never planned for more context than its model holds: an implementer or
+reviewer on a 32k-slot model gets 22,937 tokens, not 40k/64k. The window comes
+from the model record (`contextWindow` in `models.json`, kept in step with the
+gateway catalogue). If it is unknown, only the role budget applies and a warning
+is shown. The budget is passed to the session as `maxContextTokens` and recorded
+as `details.context_budget` (`tokens`, `roleTokens`, `contextWindow`,
+`limitedBy`) on the worker result.
+
+Mission worker sessions compact at 60% of that budget, keeping the recent window
+the per-model compaction tuning computes (bounded to half the trigger on small
+windows); the summary request is sent thinking-off like every worker request.
+Operator (interactive) sessions are unchanged.
+
+- `PI_WORKER_COMPACT_AT` (default `0.6`): fraction of the budget at which a worker
+  session compacts. Accepts 0.1 to 0.95; anything else falls back to 0.6.
+
+A provider error that says the prompt does not fit the context (HTTP 400
+"context length exceeded", "maximum context length", llama.cpp "exceeds the
+available context size", `context_length_exceeded`) is **not retryable**. The
+worker compacts its prompt once and retries the turn once in a fresh session; if
+that overflows too, the run fails with the structured error `context_overflow`.
+Recovery classifies it as `TASK_BUDGET_EXHAUSTED` and plans
+`CHECKPOINT_SPLIT_AND_REPLACE` (split the task into smaller ones) instead of
+replaying it.
+
 ## Thinking off for mission roles
 
 Mission implementers, reviewers and repair workers send thinking off on every

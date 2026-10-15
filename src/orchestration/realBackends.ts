@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
 import { id } from "../core/ids.ts";
+import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
@@ -608,6 +609,9 @@ export function realBackends(opts: RealBackendsOptions) {
           tools: [...IMPLEMENTER_TOOLS],
           tolerantFileTools: true,
           cwd: input.worktree ?? bound.cwd,
+          // Role budget; the executor clamps it to 70% of the routed model's
+          // window and compacts at 60% of the result (issue #180).
+          maxContextTokens: ROLE_BUDGETS[(input.role as WorkerRequest["role"]) ?? "implementer"]?.hardMaxTokens,
           // No duration cap: the broker owns liveness (activity-based) and any
           // opt-in limit. This only carries an explicit operator override.
           timeoutMs: workerTimeoutMs(),
@@ -773,7 +777,10 @@ export function realBackends(opts: RealBackendsOptions) {
           context: input.contextRef,
           tools: ["ledger_read", "artifact_read", "repo_search", "symbol"],
           cwd: input.worktree ?? bound.cwd,
-          maxContextTokens: 64_000,
+          // The role's table budget; the executor clamps it to 70% of the
+          // routed model's context window (issue #180), so a 32k-slot model is
+          // never handed a fixed 64k.
+          maxContextTokens: ROLE_BUDGETS.reviewer.hardMaxTokens,
           // Same as implementation workers: no duration cap (the broker owns
           // liveness), and inference waiting is unbounded. The executor's old
           // 5-minute default aborted reviewers mid-analysis.

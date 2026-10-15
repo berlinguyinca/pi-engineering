@@ -133,15 +133,27 @@ test("classify: timeout is retryable", () => {
   assert.equal(cls.retryable, true);
 });
 
-test("classify: compaction / context-overflow / summarization failure is retryable", () => {
+test("classify: compaction / summarization failure is retryable", () => {
   for (const msg of [
     "Summarization failed: generation hit the token cap and the summary is incomplete",
     "Auto-compaction failed",
-    "context overflow",
   ]) {
     const cls = classifyError(new Error(msg));
     assert.equal(cls.category, "compaction");
     assert.equal(cls.retryable, true);
+  }
+});
+
+test("classify: a prompt that exceeds the context window is NOT retryable (issue #180)", () => {
+  for (const msg of [
+    "context overflow",
+    "400 This model's maximum context length is 32768 tokens",
+    "the request exceeds the available context size (32768 tokens)",
+    '400 {"error":{"code":"context_length_exceeded"}}',
+  ]) {
+    const cls = classifyError(new Error(msg));
+    assert.equal(cls.category, "context_overflow", msg);
+    assert.equal(cls.retryable, false, msg);
   }
 });
 
@@ -344,7 +356,7 @@ test("classify: agrees with the unified classifier and preserves scheduler bucke
     [Object.assign(new Error("invalid model name"), { status: 400 }), "model_unavailable"],
     [new Error("fetch failed: ECONNRESET"), "network"],
     [new Error("Request timed out after 30000ms"), "timeout"],
-    [new Error("context overflow: too many tokens"), "compaction"],
+    [new Error("context overflow: too many tokens"), "context_overflow"],
     [{ status: 401, message: "Invalid API key" }, "permanent"],
     [{ status: 400, message: "messages must not be empty" }, "permanent"],
   ];

@@ -29,6 +29,7 @@ import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/ty
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
 import type { ModelCapabilityRegistry } from "../capability/registry.ts";
 import type { RoleRouter } from "../capability/router.ts";
+import { tunedCompactionTokens } from "../compaction/autoTune.ts";
 import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
@@ -92,6 +93,12 @@ import {
 import { BuildCommandTimer } from "./buildActivity.ts";
 import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "./checkpointProgressTool.ts";
 import { CLAIM_DELIVERABLE_TOOL_NAME, createClaimDeliverableTool } from "./claimDeliverableTool.ts";
+import {
+  type ContextBudget,
+  resolveCompactAt,
+  resolveContextBudget,
+  workerCompactionSettings,
+} from "./contextBudget.ts";
 import { registerLocalProviders } from "./localProviders.ts";
 import { WORKER_KICKOFF, buildSystemPrompt, wantsCommitDiscipline } from "./prompts.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
@@ -468,8 +475,27 @@ export class PiWorkerExecutor implements WorkerExecutor {
 
 ${TOOL_TRANSITION_RULE}`;
 
+    // The budget is the role's, clamped to what the routed model can hold
+    // (issue #180); the run's request carries it and the result records it.
+    const budget = resolveContextBudget(req.role, req.maxContextTokens, model.contextWindow);
+    if (budget.warning) {
+      emitTelemetry({
+        level: "warning",
+        text: budget.warning,
+        key: `context-budget-unknown:${model.provider}/${model.id}`,
+      });
+    }
     // Run the worker with the generation guard and recovery ladder.
-    return this.runWithGuard(req, model, baseSystemPrompt, modelRuntime);
+    const run = await this.runWithGuard(
+      { ...req, maxContextTokens: budget.tokens, contextBudget: budget },
+      model,
+      baseSystemPrompt,
+      modelRuntime,
+    );
+    return {
+      ...run,
+      result: { ...run.result, details: { ...run.result.details, context_budget: budget } },
+    };
   }
 
   /**
@@ -621,6 +647,39 @@ ${TOOL_TRANSITION_RULE}`;
     // strict loop-mitigation defaults.
     const guardConfig = guardConfigForRole(req.role, this.guardConfig);
 
+    // A prompt the model's window cannot hold fails identically on every
+    // replay (issue #180). The first overflow compacts the prompt and retries
+    // the turn once in a fresh session; the second fails with a structured
+    // `context_overflow`, which recovery answers by splitting the task.
+    let overflowCompacted = false;
+    const onContextOverflow = (detail: string, toolCalls: number): WorkerRun | undefined => {
+      if (!overflowCompacted) {
+        overflowCompacted = true;
+        systemPrompt = buildCompactedWorkerPrompt(
+          req,
+          "The previous attempt's prompt exceeded the model's context window. Work in small steps and read only what you need.",
+        );
+        attempt += 1;
+        return undefined;
+      }
+      const summary = `context_overflow: the prompt still exceeds the context window of ${model.provider}/${model.id} after one compaction (budget ${req.maxContextTokens ?? "unset"} tokens): ${detail}`;
+      return {
+        result: {
+          status: "failed",
+          summary,
+          claims: [],
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+          details: { context_overflow: true, model: { provider: model.provider, id: model.id } },
+          error: "context_overflow",
+        },
+        usage: null,
+        error: "context_overflow",
+        toolCalls: Math.max(toolCalls, this.executedActionCount(req)),
+      };
+    };
+
     while (true) {
       // Every pass of this loop starts a new inference request: the boundary
       // at which an operator's model switch takes over (never mid-stream).
@@ -716,6 +775,12 @@ ${TOOL_TRANSITION_RULE}`;
             await holdForGateway(handover.signal);
             continue;
           }
+        }
+
+        if (transientOutcome.category === "context_overflow") {
+          const overflow = onContextOverflow(detail, 0);
+          if (overflow) return overflow;
+          continue;
         }
 
         // Transient retries were exhausted (or a non-retryable transport error).
@@ -925,6 +990,21 @@ ${TOOL_TRANSITION_RULE}`;
         };
       }
 
+      if (
+        !guardAborted &&
+        !budgetExhausted &&
+        !timedOut &&
+        lastAssistantError !== undefined &&
+        classifyError(lastAssistantError).category === "context_overflow"
+      ) {
+        const overflow = onContextOverflow(lastAssistantError, toolCalls);
+        if (!overflow) {
+          lastAssistantError = undefined;
+          continue;
+        }
+        return { ...overflow, usage: this.collectUsage(this.asMessages(session.messages)) };
+      }
+
       if (!guardAborted || !this.guardConfig.enabled) {
         // Non-guard failure (timeout, budget, gateway, no-result) — no recovery ladder.
         const gateway = lastAssistantError ? parseGatewayWait({ text: lastAssistantError }) : null;
@@ -1098,8 +1178,19 @@ ${recovery.recoveryPrompt}`;
   }> {
     const resourceLoader = roleResourceLoader(systemPrompt);
     const sessionManager = SessionManager.inMemory(req.cwd);
+    // Mission workers compact at a share of their context budget (default 60%,
+    // PI_WORKER_COMPACT_AT), keeping the autotuned recent window; the summary
+    // call goes through the same thinking-off request policy as every worker
+    // request. Without a known window there is nothing to size against.
+    const compaction = req.contextBudget
+      ? workerCompactionSettings(
+          req.contextBudget,
+          resolveCompactAt(),
+          tunedCompactionTokens(model as { contextWindow?: number; maxTokens?: number })?.keepRecentTokens,
+        )
+      : undefined;
     const settingsManager = SettingsManager.inMemory({
-      compaction: { enabled: false },
+      compaction: compaction ?? { enabled: false },
       retry: { enabled: false }, // We handle retries ourselves via the recovery ladder.
     });
 
