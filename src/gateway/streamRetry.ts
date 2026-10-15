@@ -174,6 +174,16 @@ export interface GatewayStreamRetryOptions {
   /** Observe each hold (status bar, telemetry). */
   onHold?(info: { attempt: number; signal: GatewayWaitSignal; errorText: string }): void;
   /**
+   * A hold the gateway says another model should serve
+   * (IW-ACT-RETRY-ALTERNATE): return true to settle the attempt NOW, with the
+   * guidance on the error, instead of waiting it out. Called after `onHold`,
+   * so a coordinator that arms a model switch on the hold is consulted with
+   * that switch armed. The owed wait belongs to the model this turn is about
+   * to leave; the switch itself happens at the settle boundary, against a
+   * fresh session context, and the turn is continued on the stand-in.
+   */
+  abandonForAlternate?(info: { attempt: number; signal: GatewayWaitSignal }): boolean;
+  /**
    * Called synchronously the first time anything reaches the sink — the gateway
    * served us, so an escalation ladder can reset.
    *
@@ -445,22 +455,29 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
 
     if (retryable && held) {
       opts.onHold?.({ attempt, signal: held, errorText: failure });
-      holds++;
-      await opts.hold(held, attempt);
-      // Escape during the hold ends the turn. Normalising to an aborted
-      // message matches what Pi's own retry does when its backoff is
-      // interrupted, so callers never have to care when cancellation landed.
-      if (opts.signal?.aborted) {
-        opts.onSettle?.("aborted");
-        sink.end(abortedFrom(result));
-        return { attempts: attempt, holds, settled: "aborted" };
-      }
-      // Timer jitter or a busy event loop can make the hold resolve after its
-      // budget. Recheck after the await and at the replay boundary.
-      const elapsedAfterHold = now() - startedAt;
-      if (elapsedAfterHold < maxElapsedMs) {
-        const elapsedAtReplay = now() - startedAt;
-        if (elapsedAtReplay < maxElapsedMs) continue;
+      // A wait not worth taking: the gateway advised an alternate and the
+      // caller has a stand-in armed (by the `onHold` just above), so settle
+      // with the advice on the error and let the settle boundary switch models
+      // and continue the turn there.
+      const abandoned = advisesAlternateModel(held) && opts.abandonForAlternate?.({ attempt, signal: held }) === true;
+      if (!abandoned) {
+        holds++;
+        await opts.hold(held, attempt);
+        // Escape during the hold ends the turn. Normalising to an aborted
+        // message matches what Pi's own retry does when its backoff is
+        // interrupted, so callers never have to care when cancellation landed.
+        if (opts.signal?.aborted) {
+          opts.onSettle?.("aborted");
+          sink.end(abortedFrom(result));
+          return { attempts: attempt, holds, settled: "aborted" };
+        }
+        // Timer jitter or a busy event loop can make the hold resolve after its
+        // budget. Recheck after the await and at the replay boundary.
+        const elapsedAfterHold = now() - startedAt;
+        if (elapsedAfterHold < maxElapsedMs) {
+          const elapsedAtReplay = now() - startedAt;
+          if (elapsedAtReplay < maxElapsedMs) continue;
+        }
       }
     }
 

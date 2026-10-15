@@ -14,13 +14,16 @@ import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
 import { contextReading, planModelSwitch } from "../src/context/usage.ts";
+import { AdvisedModelSwitch } from "../src/gateway/advisedSwitch.ts";
 import { AfterOutputRetry } from "../src/gateway/afterOutputRetry.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
 import {
   type FallbackApplyDeps,
   type FallbackContext,
   FallbackCoordinator,
+  type PendingFallback,
   applyPendingFallback,
+  previewFallback,
 } from "../src/gateway/fallbackLifecycle.ts";
 import {
   installGatewayStreamRetry,
@@ -28,6 +31,7 @@ import {
   isGatewayStreamRetryLive,
 } from "../src/gateway/installStreamRetry.ts";
 import {
+  advisesAlternateModel,
   describeGatewayWait,
   gatewayHoldScope,
   isAccountWideRefusal,
@@ -1332,7 +1336,13 @@ ${RECOVERY_PROMPT}`;
     // never a Pi context — so an async gateway callback can update it safely
     // even after the session that raised the hold has been replaced or reloaded.
     // Its own default is also off, keeping the safety boundary fail-closed.
-    const fallbackCoordinator = new FallbackCoordinator({ enabled: gatewayConfig.modelFallbackEnabled });
+    // The gateway's explicit IW-ACT-RETRY-ALTERNATE advice is a separate,
+    // default-on trigger (src/gateway/advisedSwitch.ts): an instruction from
+    // the gateway, not an inference of ours.
+    const fallbackCoordinator = new FallbackCoordinator({
+      enabled: gatewayConfig.modelFallbackEnabled,
+      advisedSwitch: gatewayConfig.advisedModelSwitch,
+    });
 
     // Retry a turn whose stream was cut AFTER partial output (link cut,
     // "terminated"): omit the partial answer and continue, with long-wait
@@ -1394,8 +1404,14 @@ ${RECOVERY_PROMPT}`;
               provider: callModel.provider,
               source: info.signal.source,
               accountWide: isAccountWideRefusal(info.signal),
+              advisesAlternate: advisesAlternateModel(info.signal),
             });
           },
+          // An advised hold with a switch armed is not waited out: the pump
+          // settles with the advice and the settle boundary switches models and
+          // continues the turn on the stand-in (AdvisedModelSwitch below).
+          // Plain data only, for the same lifecycle reason as `onHold`.
+          abandonForAlternate: () => fallbackCoordinator.willSwitchOnAdvice && fallbackCoordinator.hasPending,
           maxElapsedMs: gatewayConfig.maxElapsedMs,
           // Fit every request body to the gateway's cap (advertised, else
           // 10 MiB) before it is sent; a 413 is permanent and ends the turn.
@@ -1437,9 +1453,21 @@ ${RECOVERY_PROMPT}`;
     // `pi.setModel` — all against a currently-valid context. A failure here is
     // caught and logged (by the caller), so a fallback problem degrades the
     // feature rather than terminating Pi.
-    const applyPendingFallbackWithFreshCtx = async (ctx: FallbackContext): Promise<void> => {
-      const pending = fallbackCoordinator.claimPending();
-      if (!pending) return;
+    // Preview, against a FRESH ctx, whether a stand-in exists for the current
+    // model, and record the answer as a plain boolean the hold path may read.
+    // Without a stand-in on record an advised hold is waited out as before —
+    // abandoning it would turn a slow turn into a failed one.
+    const refreshStandIn = async (ctx: FallbackContext): Promise<void> => {
+      let available = false;
+      try {
+        available = await previewFallback(ctx, { excludeIds: fallbackCoordinator.excludedModelIds });
+      } catch {
+        // Treated as "no stand-in": the hold is then waited out, never abandoned.
+      }
+      fallbackCoordinator.noteStandIn(available);
+    };
+
+    const applyClaimedFallback = async (ctx: FallbackContext, pending: PendingFallback) => {
       const result = await applyPendingFallback(
         {
           // Our own fallback switch is not an operator choice: missions must
@@ -1460,10 +1488,30 @@ ${RECOVERY_PROMPT}`;
       );
       // A successful switch means the new model gets a clean ledger; the
       // stand-in's own outage must start its own count, not inherit the one
-      // that triggered this switch. A "stay" keeps the count so the next hold
-      // re-arms the pending flag and the choice is reconsidered.
-      if (result.switched) fallbackCoordinator.onProgress();
+      // that triggered this switch — while the model just left stays excluded
+      // until real progress. A "stay" keeps the count so the next hold re-arms
+      // the pending flag and the choice is reconsidered. The preview is redone
+      // for the new model so a second advised hold knows where it could go.
+      if (result.switched) {
+        fallbackCoordinator.onSwitched(result.currentId);
+        await refreshStandIn(ctx);
+      }
+      return result;
     };
+
+    const applyPendingFallbackWithFreshCtx = async (ctx: FallbackContext): Promise<void> => {
+      const pending = fallbackCoordinator.claimPending();
+      if (!pending) return;
+      await applyClaimedFallback(ctx, pending);
+    };
+
+    // The mid-turn half of the advised switch: at the settle boundary of a
+    // turn the pump abandoned on IW-ACT-RETRY-ALTERNATE, switch models against
+    // that callback's fresh ctx and continue the turn on the stand-in.
+    new AdvisedModelSwitch({
+      claimPending: () => fallbackCoordinator.claimPending(),
+      apply: applyClaimedFallback,
+    }).register(pi as never);
 
     // Per (provider, api): `composeModelProvider` only dispatches to our
     // handler when the model's api matches the one registered, so a switch to a
@@ -1476,8 +1524,9 @@ ${RECOVERY_PROMPT}`;
     // land before the first provider call — `before_provider_request` fires
     // from inside the provider's own stream call, which is already too late for
     // that request.
-    pi.on("session_start", (_event, ctx) => {
+    pi.on("session_start", async (_event, ctx) => {
       installStreamRetry(ctx, ctx.model);
+      await refreshStandIn(ctx as FallbackContext);
     });
     pi.on("before_agent_start", async (_event, ctx) => {
       installStreamRetry(ctx, ctx.model);
@@ -1493,13 +1542,19 @@ ${RECOVERY_PROMPT}`;
       } catch (error) {
         console.error("[pi-engineering] fallback application failed", error);
       }
+      // Cheap and local (no readiness probe): the catalogue and the measured
+      // context size, so the hold path knows whether an advised hold is worth
+      // abandoning for a switch.
+      await refreshStandIn(ctx as FallbackContext);
     });
-    pi.on("model_select", (event, ctx) => {
-      // A switch — ours or the operator's — supersedes any stale fallback
-      // intent and the hold ledger; otherwise one model's outage would switch
-      // away from the model the operator just chose.
-      fallbackCoordinator.onModelSelect();
+    pi.on("model_select", async (event, ctx) => {
+      // An operator's switch supersedes any stale fallback intent and the hold
+      // ledger; otherwise one model's outage would switch away from the model
+      // the operator just chose. Our own switch has already been accounted for
+      // (`onSwitched`), and must keep the model it left excluded.
+      if (!automaticModelSwitch) fallbackCoordinator.onModelSelect();
       installStreamRetry(ctx, event.model);
+      await refreshStandIn(ctx as FallbackContext);
     });
 
     // ─── Model fallback when one model has no workers ──────────────────────

@@ -158,9 +158,26 @@ export function failureKind(text: string): string {
 
 // ─── The retry controller ──────────────────────────────────────────────────
 
-interface ProjectedEntry {
+export interface ProjectedEntry {
   sourceEntry: { id: string };
   messages: AssistantLike[];
+}
+
+/**
+ * The turn's last assistant message, when it failed: the one a settle-boundary
+ * handler may omit from context and replay. A last assistant message that did
+ * not fail means there is nothing to replay.
+ */
+export function lastFailedAssistant(
+  entries: ProjectedEntry[],
+): { entryId: string; message: AssistantLike } | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    const assistants = (entry?.messages ?? []).filter((m) => m.role === "assistant");
+    const message = assistants[assistants.length - 1];
+    if (message) return isFailedAssistantMessage(message) ? { entryId: entry!.sourceEntry.id, message } : undefined;
+  }
+  return undefined;
 }
 
 interface BeforeSettleEvent {
@@ -317,13 +334,7 @@ export class AfterOutputRetry {
   }
 
   private lastFailed(entries: ProjectedEntry[]): { entryId: string; message: AssistantLike } | undefined {
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const entry = entries[i];
-      const assistants = (entry?.messages ?? []).filter((m) => m.role === "assistant");
-      const message = assistants[assistants.length - 1];
-      if (message) return isFailedAssistantMessage(message) ? { entryId: entry!.sourceEntry.id, message } : undefined;
-    }
-    return undefined;
+    return lastFailedAssistant(entries);
   }
 
   /**

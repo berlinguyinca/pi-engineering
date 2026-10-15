@@ -221,6 +221,16 @@ A released mission uses role pins and the router until you switch models again.
 Automatic fallback of the interactive model (`PI_GATEWAY_MODEL_FALLBACK_ENABLED`)
 is still off by default, and a switch it makes is not an operator pin.
 
+Following the gateway's own advice is on by default: when a request is refused
+with `IW-ACT-RETRY-ALTERNATE` ("try another eligible deployment", scope
+`model`), the runtime switches the session to a stand-in that fits its context
+and modality and continues the turn on it, with a notice naming both models.
+The envelope names no model, so the choice is the runtime's (the same chooser
+as the fallback above; it refuses any model the session would not fit in). If
+no stand-in fits, the request waits as before and ends with the advice. Set
+`PI_GATEWAY_ADVISED_MODEL_SWITCH=false` to only print the advice. A switch made
+this way is not an operator pin either; `/model` changes back.
+
 ### Provider failures before any tool call
 
 An implementer execution that fails on the provider (connection error, timeout,
