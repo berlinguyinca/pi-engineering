@@ -102,6 +102,7 @@ async function withServer(
   contextWindow: number,
   script: (seen: Seen, index: number) => Reply,
   body: (executor: PiWorkerExecutor, cwd: string, seen: Seen[]) => Promise<void>,
+  opts: { maxTokens?: number; omitWindow?: boolean } = {},
 ): Promise<Seen[]> {
   const seen: Seen[] = [];
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -129,7 +130,7 @@ async function withServer(
           baseUrl: `http://127.0.0.1:${port}/v1`,
           api: "openai-completions",
           apiKey: "k",
-          models: [{ id: "m", maxTokens: 4096, contextWindow }],
+          models: [{ id: "m", maxTokens: opts.maxTokens ?? 4096, ...(opts.omitWindow ? {} : { contextWindow }) }],
         },
       },
     }),
@@ -313,9 +314,49 @@ test("unknown window: only the role budget applies, with a warning", async () =>
         const run = await bare.run({ role: "implementer", task: "t", tools: [], cwd });
         assert.equal(run.result.status, "completed", run.result.summary);
         const budget = budgetOf(run);
-        assert.equal(budget?.tokens, ROLE_BUDGETS.implementer.hardMaxTokens);
+        assert.equal(budget?.tokens, 24_000);
         assert.equal(budget?.limitedBy, "role");
       },
+    );
+  } finally {
+    uninstall();
+  }
+  assert.ok(
+    notices.some((t) => /context window .*unknown/.test(t)),
+    JSON.stringify(notices),
+  );
+});
+
+test("output reserve: on a 32k slot with maxTokens 32768, prompt budget plus max_tokens fits the window", async () => {
+  const seen = await withServer(
+    32_768,
+    () => toolCall("worker_result", WORKER_RESULT),
+    async (executor, cwd) => {
+      const run = await executor.run({ role: "implementer", task: "t", tools: [], cwd, modelOverride: route });
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.ok((budgetOf(run)?.tokens ?? 0) > 0);
+    },
+    { maxTokens: 32_768 },
+  );
+  const body = seen[0]?.body ?? {};
+  const maxOut = Number(body.max_tokens ?? body.max_completion_tokens);
+  assert.ok(Number.isFinite(maxOut), "request carries an output cap");
+  assert.ok(22_937 + maxOut <= 32_768, `budget 22937 + max_tokens ${maxOut} exceeds the 32768 slot`);
+});
+
+test("unknown window: a models.json entry without contextWindow (Pi fills 128000) gets the capped role budget and a warning", async () => {
+  const notices: string[] = [];
+  const uninstall = setTelemetrySink((n) => notices.push(n.text));
+  try {
+    await withServer(
+      32_768,
+      () => toolCall("worker_result", WORKER_RESULT),
+      async (executor, cwd) => {
+        const run = await executor.run({ role: "implementer", task: "t", tools: [], cwd, modelOverride: route });
+        assert.equal(run.result.status, "completed", run.result.summary);
+        assert.equal(budgetOf(run)?.tokens, 24_000);
+      },
+      { omitWindow: true },
     );
   } finally {
     uninstall();

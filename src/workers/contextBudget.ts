@@ -7,6 +7,8 @@
  * fraction of that budget, well before the window is full.
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ROLE_BUDGETS, type WorkerRole } from "../core/types.ts";
 
 /** Share of the routed model's context window a worker may plan to use. */
@@ -27,25 +29,64 @@ export interface ContextBudget {
   warning?: string;
 }
 
-/** Role budget (`requested` if the caller set one) clamped to the routed model's window. */
+/** Conservative prompt cap when the routed model's window is not declared anywhere. */
+export const UNKNOWN_WINDOW_BUDGET_CAP = 24_000;
+/** Largest share of the window held back for the model's output. */
+export const OUTPUT_RESERVE_SHARE = 0.25;
+
+/** Output allowance kept out of the prompt budget: the model's maxTokens, at most a quarter of the window. */
+export function outputReserve(contextWindow: number, maxTokens: unknown): number {
+  const cap = Math.floor(contextWindow * OUTPUT_RESERVE_SHARE);
+  return typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0 ? Math.min(maxTokens, cap) : cap;
+}
+
+/**
+ * Role budget (`requested` if the caller set one) clamped to the routed
+ * model's window: 70% of it, and never so much that prompt plus output
+ * allowance overflows the slot. `declared: false` means the window came from a
+ * default rather than the model record, so it is not trusted.
+ */
 export function resolveContextBudget(
   role: WorkerRole,
   requested: number | undefined,
   contextWindow: unknown,
+  maxTokens?: unknown,
+  declared = true,
 ): ContextBudget {
   const roleTokens = requested ?? ROLE_BUDGETS[role]?.hardMaxTokens ?? 32_768;
-  if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+  if (!declared || typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+    const tokens = Math.min(roleTokens, UNKNOWN_WINDOW_BUDGET_CAP);
     return {
-      tokens: roleTokens,
+      tokens,
       roleTokens,
       limitedBy: "role",
-      warning: `context window of the routed model is unknown; ${role} budget is the role budget (${roleTokens} tokens) only`,
+      warning: `context window of the routed model is unknown; ${role} budget is the role budget capped at ${tokens} tokens`,
     };
   }
-  const windowTokens = Math.floor(CONTEXT_WINDOW_SHARE * contextWindow);
+  const windowTokens = Math.min(
+    Math.floor(CONTEXT_WINDOW_SHARE * contextWindow),
+    contextWindow - outputReserve(contextWindow, maxTokens),
+  );
   return windowTokens < roleTokens
     ? { tokens: windowTokens, roleTokens, contextWindow, limitedBy: "model" }
     : { tokens: roleTokens, roleTokens, contextWindow, limitedBy: "role" };
+}
+
+/**
+ * False when models.json lists the model WITHOUT a contextWindow (Pi then
+ * fills 128000, which says nothing about the real slot). True when declared or
+ * when the model is not in models.json (registered at runtime with its own).
+ */
+export function windowDeclared(agentDir: string, provider: string, id: string): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(join(agentDir, "models.json"), "utf8")) as {
+      providers?: Record<string, { models?: Array<{ id?: string; contextWindow?: unknown }> }>;
+    };
+    const entry = raw.providers?.[provider]?.models?.find((m) => m.id === id);
+    return entry === undefined || typeof entry.contextWindow === "number";
+  } catch {
+    return true;
+  }
 }
 
 /** PI_WORKER_COMPACT_AT: fraction (0.1..0.95) of the budget at which a worker session compacts. */

@@ -97,6 +97,7 @@ import {
   type ContextBudget,
   resolveCompactAt,
   resolveContextBudget,
+  windowDeclared,
   workerCompactionSettings,
 } from "./contextBudget.ts";
 import { registerLocalProviders } from "./localProviders.ts";
@@ -477,7 +478,8 @@ ${TOOL_TRANSITION_RULE}`;
 
     // The budget is the role's, clamped to what the routed model can hold
     // (issue #180); the run's request carries it and the result records it.
-    const budget = resolveContextBudget(req.role, req.maxContextTokens, model.contextWindow);
+    const declared = windowDeclared(this.agentDir, model.provider, model.id);
+    const budget = resolveContextBudget(req.role, req.maxContextTokens, model.contextWindow, model.maxTokens, declared);
     if (budget.warning) {
       emitTelemetry({
         level: "warning",
@@ -486,12 +488,15 @@ ${TOOL_TRANSITION_RULE}`;
       });
     }
     // Run the worker with the generation guard and recovery ladder.
-    const run = await this.runWithGuard(
-      { ...req, maxContextTokens: budget.tokens, contextBudget: budget },
-      model,
-      baseSystemPrompt,
-      modelRuntime,
-    );
+    // max_tokens on the wire must leave the prompt budget its room in the slot.
+    const maxOutputTokens = budget.contextWindow !== undefined ? budget.contextWindow - budget.tokens : undefined;
+    const sized = { ...req, maxContextTokens: budget.tokens, contextBudget: budget };
+    const invocation = currentInferenceInvocation();
+    const run = await (invocation && maxOutputTokens !== undefined
+      ? runWithInferenceInvocation({ ...invocation, maxOutputTokens }, () =>
+          this.runWithGuard(sized, model, baseSystemPrompt, modelRuntime),
+        )
+      : this.runWithGuard(sized, model, baseSystemPrompt, modelRuntime));
     return {
       ...run,
       result: { ...run.result, details: { ...run.result.details, context_budget: budget } },

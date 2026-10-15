@@ -33,6 +33,8 @@ export interface InferenceInvocation {
    * the edits/commits of the generation that was cut.
    */
   actions?: ExecutedActionTracker;
+  /** Output cap that keeps prompt budget + max_tokens inside the model's slot (issue #180). */
+  maxOutputTokens?: number;
   /**
    * True when this invocation is being driven by the unified resilient
    * runtime layer (spec: one canonical retry authority). Admission observes

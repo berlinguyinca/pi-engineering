@@ -327,8 +327,13 @@ export function classifyError(error: unknown): ErrorClass {
     return { category: "timeout", retryable: true, retryAfterMs, reason: "timeout" };
   }
 
-  // A prompt that does not fit the context window: replaying cannot help.
+  // A prompt that does not fit the context window: replaying cannot help. Only
+  // prompt-side wording, only on a 400/413 or a status-less error, and never a
+  // max_tokens complaint (that is configuration) or a 429/503 that merely
+  // mentions context.
   if (
+    [status, textStatus].every((s) => s == null || s === 400 || s === 413) &&
+    !has("max_tokens", "max_completion_tokens") &&
     has(
       "context overflow",
       "context limit",
@@ -336,6 +341,7 @@ export function classifyError(error: unknown): ErrorClass {
       "context_length",
       "maximum context",
       "exceeds the available context",
+      "prompt is too long",
     )
   ) {
     return { category: "context_overflow", retryable: false, reason: "context overflow" };

@@ -235,6 +235,9 @@ const AUTH_STRING_PATTERNS =
   /\b(401|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed|invalid[_ -]?credentials|api[_ -]?key[_ -]?invalid)\b/i;
 const CONTEXT_STRING_PATTERNS =
   /\b(context[_ -]?(length|window|limit|exceeded|overflow)|maximum[_ -]?context|exceeds?[_ -]the[_ -](available[_ -])?context|too[_ -]?many[_ -]?tokens|prompt[_ -]?is[_ -]?too[_ -]?long|input[_ -]?too[_ -]?long|413)\b/i;
+/** Prompt-side wording only: a 400 about max_tokens vs the window is a config error, not an overflow. */
+const PROMPT_OVERFLOW_PATTERNS =
+  /\b(maximum[_ -]?context[_ -]?length|exceeds?[_ -]the[_ -](available[_ -])?context|context[_ -]?length[_ -]?exceeded|prompt[_ -]?is[_ -]?too[_ -]?long|context[_ -]?overflow)\b/i;
 const NO_WORKER_STRING_PATTERNS = /\b(no[_ -]?workers?|no available worker|no worker for model)\b/i;
 const ACTIVATING_STRING_PATTERNS = /\b(model[_ -]?activating|model[_ -]?loading|loading model|cold[_ -]?start)\b/i;
 const STALE_ROUTE_STRING_PATTERNS = /\b(routing[_ -]?snapshot[_ -]?expired|stale[_ -]?route|route[_ -]?expired)\b/i;
@@ -490,7 +493,7 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
       // A 400 saying the prompt does not fit the window (OpenAI "maximum
       // context length", llama.cpp "exceeds the available context size") is a
       // context overflow, not a malformed request: the worker compacts once.
-      if (CONTEXT_STRING_PATTERNS.test(text) && !/\b413\b|too large/i.test(text)) {
+      if (PROMPT_OVERFLOW_PATTERNS.test(text) && !/max_?(completion_)?tokens|too large/i.test(text)) {
         return finish(input, "context_overflow", { source: "http_status", reason: "HTTP 400 (context phrasing)" });
       }
       return finish(input, "invalid_request", { source: "http_status", reason: "HTTP 400" });
@@ -545,7 +548,8 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
       return finish(input, "no_workers", { source: "string_fallback", reason: "no-workers phrasing" });
     if (ACTIVATING_STRING_PATTERNS.test(text))
       return finish(input, "model_activating", { source: "string_fallback", reason: "activation phrasing" });
-    if (CONTEXT_STRING_PATTERNS.test(text)) {
+    // A leading non-400/413 status (429, 503, ...) that merely mentions context is not an overflow.
+    if (CONTEXT_STRING_PATTERNS.test(text) && !/^\s*(?:error:\s*)?(?:4(?!00|13)\d\d|5\d\d)\b/i.test(text)) {
       if (/\b413\b|too large/i.test(text))
         return finish(input, "request_too_large", { source: "string_fallback", reason: "body-size phrasing" });
       return finish(input, "context_overflow", { source: "string_fallback", reason: "context phrasing" });
