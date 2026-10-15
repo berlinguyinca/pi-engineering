@@ -21,7 +21,13 @@ import { type GatewayResilienceConfig, resolveGatewayResilienceConfig } from "..
 import { type ProbeResult, type RecoveryProbe, healthyProbe } from "../resilience/probe.ts";
 import { type RetryWindowState, recordProbe, startRetryWindow, windowOpen } from "../resilience/retryWindow.ts";
 import { type SchedulableTask, Scheduler } from "../sched/Scheduler.ts";
-import { type ExecutionBroker, type ExecutionHandle, type ExecutionRequestInput, INACTIVITY_MARKER } from "./broker.ts";
+import {
+  type ExecutionBroker,
+  type ExecutionHandle,
+  type ExecutionOutcome,
+  type ExecutionRequestInput,
+  INACTIVITY_MARKER,
+} from "./broker.ts";
 import { isPauseAbort } from "./interrupt.ts";
 import {
   INTEGRATION_DOMAIN,
@@ -36,7 +42,13 @@ import {
 } from "./lanes.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { DispatchAuthority } from "./ownership.ts";
-import { FailureClassifier, type FailureEvidence, RecoveryPlanner, type RecoveryPlannerOptions } from "./recovery.ts";
+import {
+  FailureClassifier,
+  type FailureEvidence,
+  RecoveryPlanner,
+  type RecoveryPlannerOptions,
+  classifyGateFailure,
+} from "./recovery.ts";
 import type { MissionStatus, OrchestrationTask, TaskKind, TaskStatus } from "./types.ts";
 
 /**
@@ -771,7 +783,7 @@ export class MissionScheduler {
             authority?.assertAuthoritative();
             if (this.taskAlreadyTerminal(task.task_id)) return;
             this.settleTaskRecoveries(task, "failed");
-            this.recordTerminalFailure(task, ceiling, handle.executionId, outcome.error);
+            this.recordTerminalFailure(task, ceiling, handle.executionId, outcome.error, outcome);
             this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: ceiling });
             return;
           }
@@ -792,7 +804,7 @@ export class MissionScheduler {
                 authority?.assertAuthoritative();
                 if (this.taskAlreadyTerminal(task.task_id)) return;
                 this.settleTaskRecoveries(task, "failed");
-                this.recordTerminalFailure(task, recoveryStop, handle.executionId, outcome.error);
+                this.recordTerminalFailure(task, recoveryStop, handle.executionId, outcome.error, outcome);
                 this.store.transitionTask(task.task_id, "FAILED", "system", { failure_reason: recoveryStop });
                 return;
               }
@@ -850,6 +862,7 @@ export class MissionScheduler {
             `backend reported ${outcome.exitStatus}${detail}`,
             handle.executionId,
             outcome.error,
+            outcome,
           );
           this.store.transitionTask(task.task_id, "FAILED", "system", {
             failure_reason: `backend reported ${outcome.exitStatus}${detail}`,
@@ -989,6 +1002,7 @@ export class MissionScheduler {
     summary: string,
     executionId: string | null,
     structuredError?: string,
+    outcome?: ExecutionOutcome,
   ): void {
     const evidence = {
       missionId: task.mission_id,
@@ -1009,17 +1023,13 @@ export class MissionScheduler {
         "PERSISTENCE_FAILURE",
         "WORKSPACE_SCOPE_MISMATCH",
       ].includes(inferred.category);
-    const gateCategory =
-      task.kind === "validation"
-        ? "VALIDATION_FAILED"
-        : task.kind === "review"
-          ? "REVIEW_FAILED"
-          : task.kind === "integration"
-            ? "MERGE_CONFLICT"
-            : undefined;
+    // A gate category is only true when the gate ran and reported a verdict. A
+    // reviewer or validator that died on a provider error, a malformed output,
+    // a capacity hold, a cut stream or a model restart says nothing about the
+    // candidate, so it keeps the category inferred from what actually happened.
     const classification = structuredCategory
       ? inferred
-      : this.failureClassifier.classify({ ...evidence, ...(gateCategory ? { category: gateCategory } : {}) });
+      : classifyGateFailure(this.failureClassifier, task.kind, evidence, outcome);
     if (this.store.getFailureClassification(classification.classificationId)) return;
     this.store.classifyFailure({
       ...classification,
@@ -1380,6 +1390,20 @@ export class MissionScheduler {
   private forgetOutage(task: OrchestrationTask): void {
     this.outageStartedAt.delete(task.task_id);
     this.relaunches.delete(task.task_id);
+  }
+
+  /**
+   * Pace a gate re-run after a provider failure. The recovery planner's
+   * nextActionAt is "now", so the pacing comes from the scheduler's retry
+   * window: exponential from probe_interval_ms up to max_backoff_ms.
+   */
+  async gateBackoff(attempt: number, signal?: AbortSignal): Promise<void> {
+    const cfg = this.resilience;
+    const wait = Math.min(
+      cfg.max_backoff_ms ?? cfg.probe_interval_ms,
+      cfg.probe_interval_ms * 2 ** Math.min(attempt, 30),
+    );
+    await this.abortable(this.sleepFn(wait), signal);
   }
 
   /** The resolved mission resilience config. */

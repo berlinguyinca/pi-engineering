@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { ExecutionOutcome } from "./broker.ts";
 import type {
   Execution,
   FailureCategory,
@@ -253,6 +254,92 @@ export function failureFingerprint(
   })}`;
 }
 
+/** Categories that say the gate's infrastructure failed, not that the candidate did. */
+const GATE_INFRASTRUCTURE_CATEGORIES: ReadonlySet<FailureCategory> = new Set([
+  "PROVIDER_TRANSIENT",
+  "PROVIDER_PERMANENT",
+  "INVALID_WORKER_OUTPUT",
+  "ORPHANED_EXECUTION",
+  "EVIDENCE_UNAVAILABLE",
+]);
+
+/**
+ * Whether a failed gate task actually ran and reported a verdict about the
+ * candidate: a review verdict with request_changes or blocking findings, a
+ * validation run whose checks exited non-zero, or a real merge conflict.
+ * Verdict evidence decides when the backend supplied it; otherwise only text
+ * matching a known provider/infrastructure signature (or no text at all) is
+ * treated as a gate that never reported. Only these cases may carry the gate
+ * category (REVIEW_FAILED / VALIDATION_FAILED / MERGE_CONFLICT).
+ */
+export function gateReportedVerdict(
+  classifier: FailureClassifier,
+  kind: OrchestrationTask["kind"],
+  evidence: FailureEvidence,
+  outcome?: ExecutionOutcome,
+): boolean {
+  if (kind === "review") {
+    const review = outcome?.reviewEvidence;
+    if (review) {
+      return (
+        review.outputValid &&
+        review.accessible &&
+        (review.verdict === "request_changes" || review.findings.some((finding) => finding.severity === "blocking"))
+      );
+    }
+    if (outcome?.findings?.some((finding) => finding.severity === "blocking")) return true;
+  } else if (kind === "validation") {
+    const validation = outcome?.validationEvidence;
+    if (validation) return validation.accessible && !validation.noTargets && validation.exitCode !== 0;
+  } else if (kind === "integration") {
+    if (outcome?.exitStatus === "conflict" || /conflict/i.test(evidence.summary)) return true;
+  }
+  // Judge the backend's own words, not a "backend reported ..." wrapper.
+  const reported = outcome ? [outcome.error, outcome.summary].filter(Boolean).join(": ") : evidence.summary;
+  if (!reported.trim()) return false;
+  // A missing repository-scoped git provider is a wiring fault of the gate, not a provider outage.
+  if (/git provider/i.test(reported)) return true;
+  const recognized = classifier.inferRecognizedCategory({ ...evidence, summary: reported });
+  return recognized === undefined || !GATE_INFRASTRUCTURE_CATEGORIES.has(recognized);
+}
+
+/**
+ * The transport-level failure texts a legacy gate failure must carry before it
+ * is re-read as a provider failure: connection loss, a cut stream, a model
+ * restart, a gateway capacity hold, or a grammar refusal. Loose words such as
+ * "timeout" or "network" can come from a real review or test output.
+ */
+export const GATE_TRANSPORT_SIGNATURE =
+  /connection error|connection closed|stream ended without (?:a )?finish_reason|model[_ ]superseded|gateway capacity hold|capacity hold:|http 400.*grammar|failed to parse grammar|failed to initialize samplers/i;
+
+const GATE_FAILURE_CATEGORY: Partial<Record<OrchestrationTask["kind"], FailureCategory>> = {
+  validation: "VALIDATION_FAILED",
+  review: "REVIEW_FAILED",
+  integration: "MERGE_CONFLICT",
+};
+
+/**
+ * Classify a failed validation/review/integration task. The gate category is
+ * applied only when the gate reported a verdict; any other failure keeps the
+ * category inferred from what actually happened, and a gate whose output was
+ * malformed is a provider-side failure, not a defect in the candidate.
+ */
+export function classifyGateFailure(
+  classifier: FailureClassifier,
+  kind: OrchestrationTask["kind"],
+  evidence: FailureEvidence,
+  outcome?: ExecutionOutcome,
+): FailureClassification {
+  const gateCategory = GATE_FAILURE_CATEGORY[kind];
+  if (gateCategory && gateReportedVerdict(classifier, kind, evidence, outcome)) {
+    return classifier.classify({ ...evidence, category: gateCategory });
+  }
+  const inferred = classifier.classify(evidence);
+  return gateCategory && inferred.category === "INVALID_WORKER_OUTPUT"
+    ? classifier.classify({ ...evidence, category: "PROVIDER_TRANSIENT" })
+    : inferred;
+}
+
 /** A lost execution lease: the work is ownerless, whatever the caller believes. */
 const LOST_OWNERSHIP = /no longer authoritative/;
 
@@ -281,6 +368,15 @@ export class FailureClassifier {
   }
 
   private inferCategory(evidence: FailureEvidence): FailureCategory {
+    return this.inferRecognizedCategory(evidence) ?? "PROVIDER_TRANSIENT";
+  }
+
+  /**
+   * The category a known failure signature maps to, or undefined when the text
+   * matches no signature. Gate tasks use this to tell "the provider died" from
+   * "the gate ran and reported a defect" when no verdict evidence exists.
+   */
+  inferRecognizedCategory(evidence: FailureEvidence): FailureCategory | undefined {
     const summary = normalizedSummary(evidence.summary);
     const providerCode = evidence.providerCode?.trim().toUpperCase();
     if (evidence.providerStatus !== undefined) {
@@ -297,6 +393,14 @@ export class FailureClassifier {
       }
       return "PROVIDER_PERMANENT";
     }
+    // A restarted model switch, a gateway capacity hold and a grammar rejection
+    // are the serving side failing, whatever role's task they interrupted.
+    if (
+      /model[_ ]superseded|gateway capacity hold|capacity hold:|http 400.*grammar|failed to parse grammar|failed to initialize samplers/.test(
+        summary,
+      )
+    )
+      return "PROVIDER_TRANSIENT";
     if (/workspace|scope mismatch|role-access|repository mismatch/.test(summary)) return "WORKSPACE_SCOPE_MISMATCH";
     if (/evidence.*(unavailable|missing|inaccessible)|candidate evidence unavailable/.test(summary)) {
       return "EVIDENCE_UNAVAILABLE";
@@ -348,9 +452,7 @@ export class FailureClassifier {
     ) {
       return "PROVIDER_TRANSIENT";
     }
-    // Anything unrecognized is assumed recoverable: stopping a mission on an
-    // unknown signature is how capacity blinks killed 259 missions.
-    return "PROVIDER_TRANSIENT";
+    return undefined;
   }
 }
 

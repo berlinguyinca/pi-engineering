@@ -865,9 +865,14 @@ export class MissionStore {
       if (!repairDecision) {
         throw new Error("BLOCKED -> REPAIRING requires a durable repair recovery decision ID");
       }
+      // A probe normally only waits, but re-running a gate that died on a
+      // provider failure is active work on the existing candidate.
+      const probedTaskId = this.getFailureClassification(repairDecision.classificationId)?.taskId;
+      const probesGate = ["validation", "review", "integration"].includes(this.getTask(probedTaskId ?? "")?.kind ?? "");
       if (
         repairDecision.missionId !== missionId ||
-        ["STOP", "WAIT_FOR_REQUIREMENT", "PAUSE_FOR_PERSISTENCE", "PROBE_AND_BACKOFF"].includes(repairDecision.action)
+        ["STOP", "WAIT_FOR_REQUIREMENT", "PAUSE_FOR_PERSISTENCE"].includes(repairDecision.action) ||
+        (repairDecision.action === "PROBE_AND_BACKOFF" && !probesGate)
       ) {
         throw new Error(`recovery ${repairRecoveryId} cannot enter active repair for mission ${missionId}`);
       }

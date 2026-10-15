@@ -25,7 +25,7 @@ import type { RecoveryProbe } from "../resilience/probe.ts";
 import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
-import { type BrokerBackends, ExecutionBroker } from "./broker.ts";
+import { type BrokerBackends, ExecutionBroker, type ExecutionOutcome } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
@@ -46,8 +46,10 @@ import type { DispatchAuthority, MissionOwnership } from "./ownership.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import {
   FailureClassifier,
+  GATE_TRANSPORT_SIGNATURE,
   RecoveryPlanner,
   type RecoveryPlannerOptions,
+  classifyGateFailure,
   replacementRecoveryFingerprint,
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
@@ -60,6 +62,7 @@ import { noTargetsTestRequirement } from "./testRequirement.ts";
 import type {
   AcceptanceCriterion,
   CompletionVerdict,
+  FailureClassification,
   Mission,
   OrchestrationTask,
   RequiredGate,
@@ -489,8 +492,9 @@ export class Orchestrator {
       await this.store.flush();
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const classifications = this.store.listFailureClassifications(missionId);
-      const classification = classifications.at(-1);
+      let classification = classifications.at(-1);
       if (!classification) throw new Error(`blocked mission ${missionId} has no durable failure classification`);
+      classification = this.rederiveLegacyGateClassification(classification);
       const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const recoveryStartRecord = this.store.getCandidate(missionId);
@@ -606,6 +610,30 @@ export class Orchestrator {
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
+      }
+      const resumableGate = this.failedGateWithoutVerdict(classification);
+      if (repairDecision.action === "PROBE_AND_BACKOFF" && resumableGate && recoveryStartContent) {
+        // The gate died on a provider failure: re-run only that gate against
+        // the existing candidate instead of parking again.
+        if (this.store.getMission(missionId)!.status === "BLOCKED" && repairDecision.status === "planned") {
+          this.store.transitionMission(missionId, "REPAIRING", "system", {
+            recoveryDecisionId: repairDecision.recoveryId,
+          });
+        } else if (repairDecision.status === "planned") {
+          this.store.transitionRecovery(repairDecision.recoveryId, "started");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const reran = await this.finalizeMission(missionId, expectedResumptionGeneration, signal, undefined, {
+          gateOnly: true,
+        });
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        if (this.store.getRecoveryDecision(repairDecision.recoveryId)?.status === "started") {
+          this.store.transitionRecovery(repairDecision.recoveryId, reran.completed ? "succeeded" : "failed");
+        }
+        await this.store.flush();
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        return reran.mission;
       }
       if (repairDecision.action === "PAUSE_FOR_PERSISTENCE" || repairDecision.action === "PROBE_AND_BACKOFF") {
         if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "started");
@@ -2067,6 +2095,7 @@ export class Orchestrator {
     expectedResumptionGeneration: number,
     signal?: AbortSignal,
     requiredCandidateChangeFrom?: string | null,
+    opts: { gateOnly?: boolean } = {},
   ): Promise<FinalizationResult> {
     if (signal?.aborted) return this.canceledFinalization(missionId, signal);
     await this.reconcileCommittedPromotions(missionId);
@@ -2074,7 +2103,11 @@ export class Orchestrator {
     // Post-execution: integrate, validate + review if the mission mutated or
     // requires gates. If integration did not land the change, the mission must
     // not complete — otherwise it reports success over an unchanged repository.
-    let post = await this.postExecution(this.store.getMission(missionId)!, signal);
+    // gateOnly: the candidate is already integrated and only a gate that died on
+    // a provider failure is outstanding; the probe loop below re-runs just that.
+    let post = opts.gateOnly
+      ? { validationAttempted: false, validationOk: true, reviewAttempted: false, reviewOk: true, integrationOk: true }
+      : await this.postExecution(this.store.getMission(missionId)!, signal);
     if (signal?.aborted) return this.canceledFinalization(missionId, signal);
     let integrated = post.integrationOk;
     if (
@@ -2115,14 +2148,18 @@ export class Orchestrator {
       const openBlocking = this.store
         .listFindings(missionId)
         .filter((f) => f.severity === "blocking" && f.status === "open");
-      const failedGates = this.store
-        .listTasks(missionId)
-        .filter(
-          (t) =>
-            (t.kind === "validation" || t.kind === "integration" || t.kind === "review") &&
-            t.status === "FAILED" &&
-            this.broker.hasBackend(t.kind as "validation" | "integration" | "review"),
-        );
+      // A FAILED gate task counts only until a later task of the same kind
+      // succeeded: a stale failure must not trigger another probe or repair.
+      const missionTasks = this.store.listTasks(missionId);
+      const failedGates = missionTasks.filter(
+        (t, index) =>
+          (t.kind === "validation" || t.kind === "integration" || t.kind === "review") &&
+          t.status === "FAILED" &&
+          this.broker.hasBackend(t.kind as "validation" | "integration" | "review") &&
+          !missionTasks.some(
+            (later, laterIndex) => laterIndex > index && later.kind === t.kind && later.status === "SUCCEEDED",
+          ),
+      );
       if (openBlocking.length === 0 && failedGates.length === 0) break;
       repairRounds++;
 
@@ -2131,15 +2168,29 @@ export class Orchestrator {
         .listFailureClassifications(missionId)
         .reverse()
         .find((entry) => entry.taskId === blockerTask?.task_id);
+      if (classification) classification = this.rederiveLegacyGateClassification(classification);
       if (!classification) {
-        classification = this.failureClassifier.classify({
+        const unclassified = {
           missionId,
           taskId: blockerTask?.task_id ?? openBlocking.at(-1)?.task_id ?? null,
           executionId: blockerTask?.assigned_execution_id ?? null,
           summary: blockerTask?.failure_reason ?? openBlocking.at(-1)?.summary ?? "review repair required",
           evidenceRefs: openBlocking.map((finding) => finding.finding_id),
-          category: blockerTask?.kind === "validation" ? "VALIDATION_FAILED" : "REVIEW_FAILED",
           observedAt: new Date(this.scheduler.now()).toISOString(),
+        };
+        // A gate that died on a provider failure and reported no finding says
+        // nothing about the candidate: keep the inferred provider category.
+        const gateDiedOnProvider =
+          openBlocking.length === 0 &&
+          !!blockerTask &&
+          ["PROVIDER_TRANSIENT", "PROVIDER_PERMANENT"].includes(
+            this.failureClassifier.inferRecognizedCategory(unclassified) ?? "",
+          );
+        classification = this.failureClassifier.classify({
+          ...unclassified,
+          ...(gateDiedOnProvider
+            ? {}
+            : { category: blockerTask?.kind === "validation" ? "VALIDATION_FAILED" : "REVIEW_FAILED" }),
         });
         this.store.classifyFailure(classification);
       }
@@ -2161,6 +2212,79 @@ export class Orchestrator {
         });
         await this.store.flush();
         break;
+      }
+      // A gate that died on a provider failure never reported a verdict about
+      // the candidate: re-run only that gate against the same candidate. This
+      // is not repair work, so it neither creates tasks nor spends a repair round.
+      if (
+        recoveryChoice.action === "PROBE_AND_BACKOFF" &&
+        blockerTask &&
+        openBlocking.length === 0 &&
+        (blockerTask.kind === "validation" || blockerTask.kind === "review" || blockerTask.kind === "integration")
+      ) {
+        repairRounds--;
+        // Count only this resumption's gate probes, so a mission parked at the
+        // cap becomes resumable and unrelated provider waits are not charged.
+        const generation = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+        const priorProbes = this.store.listRecoveryDecisions(missionId).filter((decision) => {
+          if (decision.action !== "PROBE_AND_BACKOFF" || (decision.resumptionGeneration ?? 0) !== generation) {
+            return false;
+          }
+          const probedTask = this.store.getTask(
+            this.store.getFailureClassification(decision.classificationId)?.taskId ?? "",
+          );
+          return (
+            probedTask?.kind === "validation" || probedTask?.kind === "review" || probedTask?.kind === "integration"
+          );
+        }).length;
+        if (priorProbes >= recoveryChoice.maxAttempts) {
+          const parked =
+            this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
+          if (parked.status === "planned") this.store.transitionRecovery(parked.recoveryId, "started");
+          this.store.stopMission(missionId, {
+            reason: `${blockerTask.kind} gate could not run: ${blockerTask.failure_reason ?? classification.summary}`,
+            preservedWork: await this.preservedMissionWork(missionId),
+            attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
+            resumeCondition: `resume the mission with /mission resume ${missionId} once the provider answers; the candidate is unchanged and only the failed ${blockerTask.kind} gate will re-run`,
+          });
+          await this.store.flush();
+          break;
+        }
+        const probe =
+          this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
+        if (probe.status === "planned") this.store.transitionRecovery(probe.recoveryId, "started");
+        await this.store.flush();
+        if (this.store.getMission(missionId)!.status !== "REPAIRING") {
+          this.store.transitionMission(missionId, "REPAIRING");
+        }
+        await this.scheduler.gateBackoff(priorProbes, signal);
+        if (signal?.aborted) return this.canceledFinalization(missionId, signal);
+        if (blockerTask.kind === "integration") {
+          post = await this.postExecution(this.store.getMission(missionId)!, signal);
+          integrated = post.integrationOk;
+        } else if (blockerTask.kind === "validation") {
+          const revalidated = await this.runValidationGate(this.store.getMission(missionId)!, signal);
+          // Review evidence is bound to the validation it followed; once the
+          // validation is green again the existing review must be refreshed.
+          if (
+            revalidated &&
+            !signal?.aborted &&
+            this.gate.evaluate(this.store.getMission(missionId)!).missing_gates.includes("independent_review")
+          ) {
+            await this.runReviewGate(this.store.getMission(missionId)!, signal);
+          }
+          if (!signal?.aborted) this.store.transitionMission(missionId, "FINAL_VALIDATION");
+        } else {
+          await this.runReviewGate(this.store.getMission(missionId)!, signal);
+          if (!signal?.aborted) this.store.transitionMission(missionId, "FINAL_VALIDATION");
+        }
+        if (signal?.aborted) return this.canceledFinalization(missionId, signal);
+        verdict = this.gate.evaluate(this.store.getMission(missionId)!);
+        if (this.store.getRecoveryDecision(probe.recoveryId)?.status === "started") {
+          this.store.transitionRecovery(probe.recoveryId, verdict.can_complete && integrated ? "succeeded" : "failed");
+          await this.store.flush();
+        }
+        continue;
       }
       const gateRecovery =
         this.store.getRecoveryDecision(recoveryChoice.recoveryId) ??
@@ -2380,6 +2504,139 @@ export class Orchestrator {
     };
   }
 
+  /** The failed gate task behind a classification, when it left no blocking finding. */
+  private failedGateWithoutVerdict(classification: FailureClassification): OrchestrationTask | undefined {
+    const task = classification.taskId ? this.store.getTask(classification.taskId) : undefined;
+    if (!task || task.status !== "FAILED") return undefined;
+    if (task.kind !== "validation" && task.kind !== "review" && task.kind !== "integration") return undefined;
+    const openBlocking = this.store
+      .listFindings(classification.missionId)
+      .some((finding) => finding.severity === "blocking" && finding.status === "open");
+    return openBlocking ? undefined : task;
+  }
+
+  /**
+   * Missions blocked before gate verdicts were distinguished carry a hard-coded
+   * REVIEW_FAILED/VALIDATION_FAILED/MERGE_CONFLICT classification even when the
+   * gate died on a provider error. Re-derive the category from the failed
+   * task's own failure reason so a resume re-runs the gate, not a repair.
+   */
+  private rederiveLegacyGateClassification(classification: FailureClassification): FailureClassification {
+    if (!["REVIEW_FAILED", "VALIDATION_FAILED", "MERGE_CONFLICT"].includes(classification.category)) {
+      return classification;
+    }
+    const task = this.failedGateWithoutVerdict(classification);
+    if (!task || (task.kind !== "validation" && task.kind !== "review" && task.kind !== "integration")) {
+      return classification;
+    }
+    const reason = task.failure_reason ?? classification.summary;
+    const reportedVerdict =
+      this.store.listReviewEvidence(classification.missionId).some((evidence) => evidence.taskId === task.task_id) ||
+      this.store.listValidationEvidence(classification.missionId).some((evidence) => evidence.taskId === task.task_id);
+    if (reportedVerdict || !GATE_TRANSPORT_SIGNATURE.test(reason)) return classification;
+    const rederived = this.failureClassifier.classify({
+      missionId: classification.missionId,
+      taskId: task.task_id,
+      executionId: classification.executionId,
+      summary: reason,
+      evidenceRefs: [],
+      category: "PROVIDER_TRANSIENT",
+      observedAt: new Date(this.scheduler.now()).toISOString(),
+    });
+    if (rederived.category === classification.category) return classification;
+    if (!this.store.getFailureClassification(rederived.classificationId)) {
+      this.store.classifyFailure({
+        ...rederived,
+        blockerEpisodeId: this.store.getMission(classification.missionId)?.blocked_episode_id,
+      });
+    }
+    return rederived;
+  }
+
+  /**
+   * Record why a validation/review/integration task failed, so recovery plans
+   * from the real cause: only a gate that reported a verdict is a gate failure.
+   */
+  private classifyFailedGate(
+    task: OrchestrationTask,
+    summary: string,
+    executionId: string | null,
+    outcome?: ExecutionOutcome,
+  ): void {
+    if (task.kind !== "validation" && task.kind !== "review" && task.kind !== "integration") return;
+    const classification = classifyGateFailure(
+      this.failureClassifier,
+      task.kind,
+      {
+        missionId: task.mission_id,
+        taskId: task.task_id,
+        executionId,
+        summary,
+        evidenceRefs: [],
+        observedAt: new Date(this.scheduler.now()).toISOString(),
+      },
+      outcome,
+    );
+    if (!this.store.getFailureClassification(classification.classificationId)) {
+      this.store.classifyFailure({
+        ...classification,
+        blockerEpisodeId: this.store.getMission(task.mission_id)?.blocked_episode_id,
+      });
+    }
+  }
+
+  /** Create and run one validation task over the integrated result. */
+  private async runValidationGate(mission: Mission, signal?: AbortSignal): Promise<boolean> {
+    this.store.transitionMission(mission.mission_id, "VALIDATING");
+    const task = this.store.createTask({
+      mission_id: mission.mission_id,
+      kind: "validation",
+      role: "validator",
+      objective: "Run deterministic validation (typecheck/tests/lint) over the integrated result.",
+      mutates_repo: false,
+      isolation: "none",
+      repo_id: this.repoIdForMission(mission.mission_id),
+      ...this.boundedTaskFields(mission.mission_id, ["validation"], []),
+    });
+    this.store.transitionTask(task.task_id, "READY");
+    return this.runSingleTask(mission.mission_id, task.task_id, { signal });
+  }
+
+  /** Create and run one fresh independent review task over the integrated result. */
+  private async runReviewGate(mission: Mission, signal?: AbortSignal): Promise<boolean> {
+    this.store.transitionMission(mission.mission_id, "REVIEWING");
+    const gates = new Set<RequiredGate>(mission.required_gates);
+    const role = gates.has("security_review") ? "security-review" : "reviewer";
+    // Work recovered from a timed-out worker was committed before the worker
+    // finished: a green build and a generic review can both miss that only
+    // part of its objective was done. Name each recovered task and its
+    // objective in the review request; the completion gate counts only a
+    // review that carried this note (see CompletionGate.gather).
+    const recovered = this.recoveredTasks(mission.mission_id);
+    const recoveryNote = recovered
+      .map(
+        (t) =>
+          `\n\nRecovered work — verify task ${t.task_id} objective is fully met (its commits were recovered after a wall-clock timeout, so it may be incomplete; report a blocking finding for anything missing). Objective: ${t.objective}`,
+      )
+      .join("");
+    const task = this.store.createTask({
+      mission_id: mission.mission_id,
+      kind: "review",
+      role,
+      objective: `Fresh independent review of the integrated change. Mission: ${mission.goal}${recoveryNote}`,
+      mutates_repo: false,
+      isolation: "none",
+      depends_on: this.lastValidationTaskId(mission.mission_id),
+      repo_id: this.repoIdForMission(mission.mission_id),
+      ...this.boundedTaskFields(mission.mission_id, ["independent-review"], []),
+    });
+    this.store.transitionTask(task.task_id, "READY");
+    return this.runSingleTask(mission.mission_id, task.task_id, {
+      reviewedRecovered: recovered.map((t) => t.task_id),
+      signal,
+    });
+  }
+
   /**
    * Post-execution validation + review, respecting required gates. Reports
    * whether each stage was attempted and whether it succeeded, so the caller
@@ -2500,20 +2757,8 @@ export class Orchestrator {
     }
 
     if (gates.has("validation") || anyMutation) {
-      this.store.transitionMission(mission.mission_id, "VALIDATING");
-      const task = this.store.createTask({
-        mission_id: mission.mission_id,
-        kind: "validation",
-        role: "validator",
-        objective: "Run deterministic validation (typecheck/tests/lint) over the integrated result.",
-        mutates_repo: false,
-        isolation: "none",
-        repo_id: this.repoIdForMission(mission.mission_id),
-        ...this.boundedTaskFields(mission.mission_id, ["validation"], []),
-      });
-      this.store.transitionTask(task.task_id, "READY");
       validationAttempted = true;
-      validationOk = await this.runSingleTask(mission.mission_id, task.task_id, { signal });
+      validationOk = await this.runValidationGate(mission, signal);
       if (signal?.aborted) {
         return {
           validationAttempted,
@@ -2540,37 +2785,8 @@ export class Orchestrator {
       gates.has("compatibility_review") ||
       anyMutation
     ) {
-      this.store.transitionMission(mission.mission_id, "REVIEWING");
-      const role = gates.has("security_review") ? "security-review" : "reviewer";
-      // Work recovered from a timed-out worker was committed before the worker
-      // finished: a green build and a generic review can both miss that only
-      // part of its objective was done. Name each recovered task and its
-      // objective in the review request; the completion gate counts only a
-      // review that carried this note (see CompletionGate.gather).
-      const recovered = this.recoveredTasks(mission.mission_id);
-      const recoveryNote = recovered
-        .map(
-          (t) =>
-            `\n\nRecovered work — verify task ${t.task_id} objective is fully met (its commits were recovered after a wall-clock timeout, so it may be incomplete; report a blocking finding for anything missing). Objective: ${t.objective}`,
-        )
-        .join("");
-      const task = this.store.createTask({
-        mission_id: mission.mission_id,
-        kind: "review",
-        role,
-        objective: `Fresh independent review of the integrated change. Mission: ${mission.goal}${recoveryNote}`,
-        mutates_repo: false,
-        isolation: "none",
-        depends_on: this.lastValidationTaskId(mission.mission_id),
-        repo_id: this.repoIdForMission(mission.mission_id),
-        ...this.boundedTaskFields(mission.mission_id, ["independent-review"], []),
-      });
-      this.store.transitionTask(task.task_id, "READY");
       reviewAttempted = true;
-      reviewOk = await this.runSingleTask(mission.mission_id, task.task_id, {
-        reviewedRecovered: recovered.map((t) => t.task_id),
-        signal,
-      });
+      reviewOk = await this.runReviewGate(mission, signal);
       if (signal?.aborted) {
         return {
           validationAttempted,
@@ -2738,6 +2954,7 @@ export class Orchestrator {
         // Include the worker's own result summary so failures are diagnosable
         // from the event log (guard aborts, budgets, timeouts otherwise vanish).
         const detail = outcome.summary ? `: ${outcome.summary}` : "";
+        this.classifyFailedGate(task, `${outcome.exitStatus}${detail}`, outcome.executionId, outcome);
         this.store.transitionTask(taskId, "FAILED", "system", {
           failure_reason: `${outcome.exitStatus}${detail}`,
         });
@@ -2786,6 +3003,7 @@ export class Orchestrator {
         currentTask?.assigned_execution_id != null &&
         currentTask.assigned_execution_id !== handle.executionId;
       if (currentTask?.status === "RUNNING" && !superseded) {
+        this.classifyFailedGate(task, errorDetail, handle?.executionId ?? null);
         this.store.transitionTask(taskId, "FAILED", "system", { failure_reason: errorDetail });
       }
       this.report(missionId, `[mission ${missionId}] ${task.kind}:${task.role} errored: ${errorDetail}`);
