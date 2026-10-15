@@ -208,6 +208,33 @@ describe("RecoveryPlanner", () => {
     assert.match(exhausted.expectedMaterialChange, /identical failure fingerprint exhausted/i);
   });
 
+  it("surfaces concrete operator guidance when a non-capacity failure exhausts its budget", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 10, strategyMaxAttempts: 2 });
+    const conflict = new FailureClassifier().classify(baseEvidence("merge conflict in candidate"));
+    assert.equal(conflict.category, "MERGE_CONFLICT");
+    const history = [decision(conflict.fingerprint, 1), decision(conflict.fingerprint, 2)];
+    const exhausted = planner.decide({
+      classification: conflict,
+      history,
+      now: Date.parse("2026-09-27T00:00:10.000Z"),
+    });
+    // Budget reason is preserved for downstream consumers, while the operator
+    // gets actionable, conflict-specific guidance (incl. rebase-onto-current-head).
+    assert.equal(exhausted.action, "STOP");
+    assert.match(exhausted.expectedMaterialChange, /identical failure fingerprint exhausted/i);
+    assert.ok(exhausted.operatorGuidance, "expected operator guidance on a budget-exhausted merge conflict");
+    assert.match(exhausted.operatorGuidance!, /rebase the preserved branch onto the current main head/i);
+  });
+
+  it("does not attach operator guidance when a capacity wait parks instead of stopping", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 10, strategyMaxAttempts: 2 });
+    const transient = new FailureClassifier().classify(baseEvidence("gateway returned 503"));
+    const history = [decision(transient.fingerprint, 1), decision(transient.fingerprint, 2)];
+    const parked = planner.decide({ classification: transient, history, now: Date.parse("2026-09-27T00:00:10.000Z") });
+    assert.equal(parked.action, "PROBE_AND_BACKOFF");
+    assert.equal(parked.operatorGuidance, undefined);
+  });
+
   it("allows the next strategy when material evidence changes", () => {
     const planner = new RecoveryPlanner({ missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 });
     const history = [decision(classification.fingerprint, 1), decision(classification.fingerprint, 2)];

@@ -704,17 +704,33 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
         assert.deepEqual(checkpoint.remainingDeliverables, ["three"]);
         assert.ok(modelProbe.requests() >= 3, "the real Pi executor reached checkpoint_progress before timing out");
         releaseLate();
-        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-        assert.ok(runtime.missionStore!.getExecution(checkpoint.executionId)?.status !== "SUCCEEDED");
-        assert.throws(
-          () => runtime!.missionStore!.assertExecutionAuthoritative(checkpoint.executionId),
-          /no longer authoritative|stale execution identity/i,
-        );
+        // Poll (not a fixed sleep) for the durable late-result-rejection event so
+        // a slow CI runner does not flake on a 100ms race: keep sampling the event
+        // store until the rejection is durably recorded or a bounded deadline.
+        const rejectionDeadline = Date.now() + 3_000;
+        let sawLateRejected = false;
+        while (Date.now() < rejectionDeadline) {
+          const evts = runtime
+            .orchestrationEvents()
+            .map((stored) => JSON.stringify(stored))
+            .join("\n");
+          if (evts.includes('"type":"execution.late_result_rejected"')) {
+            sawLateRejected = true;
+            break;
+          }
+          await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+        }
+        assert.ok(sawLateRejected, "execution.late_result_rejected was not durably recorded within 3s");
         const durableEvents = runtime
           .orchestrationEvents()
           .map((stored) => JSON.stringify(stored))
           .join("\n");
         assert.match(durableEvents, /"type":"execution\.late_result_rejected"/);
+        assert.ok(runtime.missionStore!.getExecution(checkpoint.executionId)?.status !== "SUCCEEDED");
+        assert.throws(
+          () => runtime!.missionStore!.assertExecutionAuthoritative(checkpoint.executionId),
+          /no longer authoritative|stale execution identity/i,
+        );
         const repaired = await runtime.orchestrator!.repairBlockedMission(started.mission.mission_id);
         const replacements = runtime
           .missionStore!.listTasks(started.mission.mission_id)

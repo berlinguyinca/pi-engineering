@@ -2222,11 +2222,34 @@ export class Orchestrator {
         const stopped =
           this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
         if (stopped.status === "planned") this.store.transitionRecovery(stopped.recoveryId, "exhausted");
+        const preserved = await this.preservedMissionWork(missionId);
+        // Instead of a silent block, surface concrete operator guidance so a
+        // budget-exhausted mission is actionable (esp. stale-base conflicts that
+        // cannot be auto-resolved without masking the real conflict).
+        const operatorGuidance = recoveryChoice.operatorGuidance;
+        if (operatorGuidance) {
+          this.store.addFinding({
+            mission_id: missionId,
+            task_id: null,
+            severity: "blocking",
+            category: classification.category === "MERGE_CONFLICT" ? "integration" : "recovery",
+            file: null,
+            line: null,
+            summary: `Recovery budget exhausted (${stopped.maxAttempts} attempts): ${recoveryChoice.expectedMaterialChange}. ${operatorGuidance}`,
+            evidence: null,
+            recommended_action:
+              classification.category === "MERGE_CONFLICT"
+                ? "Rebase the preserved branch(es) onto the current main head and re-integrate, or explicitly discard them."
+                : "Follow the listed options or raise the recovery budget; see the preserved work for the current state.",
+          });
+        }
         this.store.stopMission(missionId, {
           reason: recoveryChoice.expectedMaterialChange,
-          preservedWork: await this.preservedMissionWork(missionId),
+          preservedWork: preserved,
           attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
-          resumeCondition: "new candidate evidence or an explicitly increased recovery budget is required",
+          resumeCondition: operatorGuidance
+            ? `Operator decision required: ${operatorGuidance}`
+            : "new candidate evidence or an explicitly increased recovery budget is required",
         });
         await this.store.flush();
         break;
