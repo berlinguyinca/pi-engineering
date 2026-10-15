@@ -330,6 +330,14 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
   // failure and route a transient infrastructure failure into the time-based
   // resilience window instead of immediately failing the task.
   if (!completed) outcome.error = result.result.error ?? result.result.summary;
+  // A deliberate `partial` report keeps its done list so the broker can
+  // checkpoint it instead of treating the run as a plain failure.
+  const details = result.result.details as { partial?: unknown; done?: unknown } | undefined;
+  if (!completed && result.result.status === "blocked" && details?.partial === true) {
+    outcome.partial = {
+      done: Array.isArray(details.done) ? details.done.filter((d): d is string => typeof d === "string") : [],
+    };
+  }
   if (result.toolCalls !== undefined) outcome.toolCalls = result.toolCalls;
   return outcome;
 }

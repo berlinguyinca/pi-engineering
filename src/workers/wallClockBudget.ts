@@ -9,6 +9,29 @@ export const DEFAULT_BUDGET_NOTICE_EVERY = 20;
 export const WRAP_UP_MESSAGE =
   "You are near the time budget. Commit what is coherent now, then call worker_result with status partial (or completed) listing done/remaining deliverables.";
 
+/** Wrap-up for a standalone run that has gone quiet for most of its inactivity window. */
+export const SILENCE_WRAP_UP_MESSAGE =
+  "You have been quiet for most of the inactivity limit and this run will be stopped soon. Commit what is coherent now, then call worker_result with status partial (or completed) listing done/remaining deliverables.";
+
+export const REVIEW_NUDGE_MESSAGE = "Call review_result now with your verdict, summary and findings.";
+
+/** Timer seam so wrap-up timing can be driven without real sleeps. */
+export interface WorkerClock {
+  now(): number;
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+export const realClock: WorkerClock = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => {
+    const handle = setTimeout(fn, ms);
+    handle.unref?.();
+    return handle;
+  },
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
 export const NUDGE_MESSAGE = "Call worker_result now with your status, summary and committed changes.";
 
 const minutes = (ms: number): string => {

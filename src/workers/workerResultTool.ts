@@ -18,7 +18,7 @@ export async function hasNoChangesVsBase(cwd: string, baseRef: string): Promise<
   try {
     const ahead = await exec("git", ["rev-list", "--count", `${baseRef}..HEAD`], { cwd });
     if (Number.parseInt(ahead.stdout.trim(), 10) > 0) return false;
-    const status = await exec("git", ["status", "--porcelain"], { cwd });
+    const status = await exec("git", ["status", "--porcelain", "--untracked-files=no"], { cwd });
     return status.stdout.trim().length === 0;
   } catch {
     return false;

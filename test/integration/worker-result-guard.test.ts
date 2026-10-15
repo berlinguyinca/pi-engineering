@@ -18,6 +18,32 @@ import type { WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
 
 type Reply = (res: ServerResponse) => void;
 
+/** A clock the test drives by hand: timers fire only when it advances. */
+class ManualClock {
+  t = 0;
+  timers: Array<{ at: number; fn: () => void; live: boolean }> = [];
+  now(): number {
+    return this.t;
+  }
+  setTimeout(fn: () => void, ms: number): unknown {
+    const timer = { at: this.t + ms, fn, live: true };
+    this.timers.push(timer);
+    return timer;
+  }
+  clearTimeout(handle: unknown): void {
+    (handle as { live: boolean }).live = false;
+  }
+  advance(ms: number): void {
+    this.t += ms;
+    for (const timer of this.timers) {
+      if (timer.live && timer.at <= this.t) {
+        timer.live = false;
+        timer.fn();
+      }
+    }
+  }
+}
+
 function chunk(delta: Record<string, unknown>, finishReason: string | null = null): string {
   return `data: ${JSON.stringify({
     id: "chatcmpl-probe",
@@ -74,6 +100,7 @@ async function withProbe(
   replies: Reply[],
   body: (ctx: {
     executor: PiWorkerExecutor;
+    clock: ManualClock;
     cwd: string;
     base: string;
     bodies: string[];
@@ -115,7 +142,9 @@ async function withProbe(
   git(repo, "add", "note.txt");
   git(repo, "commit", "-qm", "base");
   const base = git(repo, "rev-parse", "HEAD");
+  const clock = new ManualClock();
   const executor = new PiWorkerExecutor({
+    clock,
     agentDir: dir,
     aps: false,
     gatewayConfig: resolveGatewayConfig({ enabled: false }),
@@ -125,6 +154,7 @@ async function withProbe(
   try {
     await body({
       executor,
+      clock,
       cwd: repo,
       base,
       bodies,
@@ -220,9 +250,13 @@ test("an ignored nudge settles as the existing no-result failure after exactly o
 });
 
 test("a wall-clock budget injects one wrap-up turn at ~75% and a partial result is recorded", async () => {
+  let clockRef: ManualClock | undefined;
   await withProbe(
     [
-      toolCalls([{ name: "bash", args: { command: "sleep 1.2" } }]),
+      (res) => {
+        clockRef!.advance(800); // 80% of the 1000ms budget passes during this turn
+        toolCalls([{ name: "bash", args: { command: "true" } }])(res);
+      },
       toolCalls([
         {
           name: "worker_result",
@@ -230,32 +264,80 @@ test("a wall-clock budget injects one wrap-up turn at ~75% and a partial result 
         },
       ]),
     ],
-    async ({ executor, req, bodies }) => {
+    async ({ executor, clock, req, bodies }) => {
+      clockRef = clock;
       const run = await executor.run(
-        req({ role: "scout", isolatedWorktree: false, wallClock: { startedAt: Date.now(), budgetMs: 1500 } }),
+        req({ role: "scout", isolatedWorktree: false, wallClock: { startedAt: clock.now(), budgetMs: 1000 } }),
       );
       assert.equal(run.result.status, "blocked");
       assert.deepEqual(run.result.details, { done: ["a"], remaining: ["b"], partial: true });
       assert.equal(bodies.length, 2);
       assert.match(bodies[1]!, /You are near the time budget\. Commit what is coherent now, then call worker_result/);
-      assert.equal(bodies.filter((b) => b.includes("You are near the time budget.")).length, 1, "injected once");
+      assert.equal(bodies.filter((b) => b.includes("You are near the time budget.")).length, 1);
     },
   );
 });
 
-test("without a wall-clock budget nothing is injected", async () => {
+test("before 75% of the budget nothing is injected", async () => {
+  let clockRef: ManualClock | undefined;
   await withProbe(
     [
-      toolCalls([{ name: "bash", args: { command: "sleep 1.2" } }]),
+      (res) => {
+        clockRef!.advance(700);
+        toolCalls([{ name: "bash", args: { command: "true" } }])(res);
+      },
       toolCalls([{ name: "worker_result", args: result() }]),
     ],
-    async ({ executor, req, bodies }) => {
-      const run = await executor.run(req({ role: "scout", isolatedWorktree: false }));
-      assert.equal(run.result.status, "completed");
+    async ({ executor, clock, req, bodies }) => {
+      clockRef = clock;
+      await executor.run(
+        req({ role: "scout", isolatedWorktree: false, wallClock: { startedAt: clock.now(), budgetMs: 1000 } }),
+      );
       assert.equal(
         bodies.some((b) => b.includes("time budget")),
         false,
       );
+    },
+  );
+});
+
+test("without a budget and without an explicit timeoutMs nothing is ever injected", async () => {
+  let clockRef: ManualClock | undefined;
+  await withProbe(
+    [
+      (res) => {
+        clockRef!.advance(10 * 3_600_000);
+        toolCalls([{ name: "bash", args: { command: "true" } }])(res);
+      },
+      toolCalls([{ name: "worker_result", args: result() }]),
+    ],
+    async ({ executor, clock, req, bodies }) => {
+      clockRef = clock;
+      assert.equal((await executor.run(req({ role: "scout", isolatedWorktree: false }))).result.status, "completed");
+      assert.equal(clock.timers.length, 0, "no wrap-up timer was even armed");
+      assert.equal(
+        bodies.some((b) => /time budget|quiet/.test(b)),
+        false,
+      );
+    },
+  );
+});
+
+test("an explicit standalone timeoutMs injects the silence wrap-up at 75% of it", async () => {
+  let clockRef: ManualClock | undefined;
+  await withProbe(
+    [
+      (res) => {
+        clockRef!.advance(800);
+        toolCalls([{ name: "bash", args: { command: "true" } }])(res);
+      },
+      toolCalls([{ name: "worker_result", args: result({ status: "partial", summary: "quiet" }) }]),
+    ],
+    async ({ executor, clock, req, bodies }) => {
+      clockRef = clock;
+      const run = await executor.run(req({ role: "scout", isolatedWorktree: false, timeoutMs: 1000 }));
+      assert.equal(run.result.status, "blocked");
+      assert.match(bodies[1]!, /quiet for most of the inactivity limit/);
     },
   );
 });
@@ -272,7 +354,7 @@ test("a budgeted worker sees elapsed and remaining time in bash results every N 
         req({
           role: "scout",
           isolatedWorktree: false,
-          wallClock: { startedAt: Date.now(), budgetMs: 3_600_000 },
+          wallClock: { startedAt: 0, budgetMs: 3_600_000 },
           budgetNoticeEveryToolCalls: 2,
         }),
       );
@@ -281,4 +363,99 @@ test("a budgeted worker sees elapsed and remaining time in bash results every N 
       assert.match(bodies[2]!, /Time budget: .* elapsed, .* remaining/);
     },
   );
+});
+
+test("guard: a tracked modification with no commit counts as a change", async () => {
+  await withProbe(
+    [
+      toolCalls([{ name: "bash", args: { command: "echo more >> note.txt" } }]),
+      toolCalls([{ name: "worker_result", args: result({ summary: "dirty ok" }) }]),
+    ],
+    async ({ executor, req }) => {
+      const run = await executor.run(req());
+      assert.equal(run.result.status, "completed");
+      assert.equal(run.result.summary, "dirty ok");
+    },
+  );
+});
+
+test("guard: untracked files alone are not changes", async () => {
+  await withProbe(
+    [
+      toolCalls([{ name: "bash", args: { command: "echo junk > scratch.txt" } }]),
+      toolCalls([{ name: "worker_result", args: result() }]),
+      toolCalls([{ name: "worker_result", args: result({ status: "blocked", summary: "nothing to commit" }) }]),
+    ],
+    async ({ executor, req, bodies }) => {
+      const run = await executor.run(req());
+      assert.equal(run.result.status, "blocked");
+      assert.match(bodies[2]!, /no changes vs base/);
+    },
+  );
+});
+
+test("guard: an unreadable base lets the report through", async () => {
+  await withProbe([toolCalls([{ name: "worker_result", args: result() }])], async ({ executor, req }) => {
+    const run = await executor.run(req({ baseRef: "0000000000000000000000000000000000000000" }));
+    assert.equal(run.result.status, "completed");
+  });
+});
+
+test("repair worker: no change on a seeded tip is caught; a commit is not", async () => {
+  const seedAndRun = async (workerReplies: Reply[], status: string) => {
+    await withProbe(workerReplies, async ({ executor, cwd, req, bodies }) => {
+      // The worker forked from a seeded tip that is already ahead of the mission base.
+      git(cwd, "commit", "--allow-empty", "-qm", "seeded tip");
+      const seeded = git(cwd, "rev-parse", "HEAD");
+      const run = await executor.run(req({ baseRef: seeded }));
+      assert.equal(bodies.length, 2);
+      assert.equal(run.result.status, status);
+    });
+  };
+  await seedAndRun(
+    [
+      toolCalls([{ name: "worker_result", args: result() }]),
+      toolCalls([{ name: "worker_result", args: result({ status: "blocked", summary: "no change needed" }) }]),
+    ],
+    "blocked",
+  );
+  await seedAndRun(
+    [toolCalls([{ name: "bash", args: { command: COMMIT } }]), toolCalls([{ name: "worker_result", args: result() }])],
+    "completed",
+  );
+});
+
+test("reviewer: a session that ends without review_result gets one review nudge", async () => {
+  const review = {
+    verdict: "approve",
+    summary: "ok",
+    findings: [],
+    missing_tests: [],
+    spec_gaps: [],
+    acceptance_results: [],
+  };
+  await withProbe(
+    [text("looks fine"), toolCalls([{ name: "review_result", args: review }])],
+    async ({ executor, req, bodies }) => {
+      const run = await executor.run(
+        req({ role: "reviewer", isolatedWorktree: false, resultTool: "review_result", tools: [] }),
+      );
+      assert.equal(run.error, undefined, run.result.summary);
+      assert.equal(bodies.length, 2);
+      assert.match(bodies[1]!, /Call review_result now with your verdict, summary and findings\./);
+    },
+  );
+});
+
+test("no nudge after an owner abort or a timeout", async () => {
+  for (const reason of [undefined, new DOMException("late", "TimeoutError")]) {
+    await withProbe([text("never asked")], async ({ executor, req, bodies }) => {
+      const ac = new AbortController();
+      ac.abort(reason);
+      const run = await executor.run(req({ role: "scout", isolatedWorktree: false, signal: ac.signal }));
+      assert.equal(run.result.status, "failed");
+      assert.equal(bodies.length, 0, "no request, so no nudge");
+      assert.equal(run.error, reason ? "timeout" : "no-result");
+    });
+  }
 });

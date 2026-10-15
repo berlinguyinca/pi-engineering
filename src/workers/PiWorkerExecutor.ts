@@ -101,9 +101,13 @@ import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTo
 import {
   DEFAULT_BUDGET_NOTICE_EVERY,
   NUDGE_MESSAGE,
+  REVIEW_NUDGE_MESSAGE,
+  SILENCE_WRAP_UP_MESSAGE,
   WRAP_UP_FRACTION,
   WRAP_UP_MESSAGE,
+  type WorkerClock,
   budgetLine,
+  realClock,
   withBudgetNotice,
 } from "./wallClockBudget.ts";
 import { createWorkerResultTool } from "./workerResultTool.ts";
@@ -160,6 +164,8 @@ export interface PiWorkerExecutorOptions {
   transientSleep?: (ms: number) => Promise<void>;
   /** Injectable RNG for backoff jitter (deterministic in tests). */
   transientRand?: () => number;
+  /** Timer seam for the wrap-up and silence timers (tests drive it without real sleeps). */
+  clock?: WorkerClock;
   /**
    * APS loop-detection for worker sessions (Phase 2, detect-only): tool-call
    * activity is turned into AgentAction records and fed to an
@@ -235,6 +241,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly transientConfig: BackoffConfig;
   private readonly transientSleep: (ms: number) => Promise<void>;
   private readonly transientRand: () => number;
+  private readonly clock: WorkerClock;
   /** APS loop-detection options for worker sessions (`false` disables). */
   private readonly aps: AgentProgressSupervisorOptions | false | undefined;
   /** APS loop-prevention options (`false` disables enforcement). */
@@ -278,6 +285,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.transientConfig = opts.transientConfig ?? resolveTransientRetryConfig();
     this.transientSleep = opts.transientSleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
     this.transientRand = opts.transientRand ?? Math.random;
+    this.clock = opts.clock ?? realClock;
     this.aps = opts.aps;
     this.loopPrevention = opts.loopPrevention;
     this.escalation = opts.escalation;
@@ -514,7 +522,7 @@ ${TOOL_TRANSITION_RULE}`;
     const budgetNotice = (tool: ToolDefinition): ToolDefinition =>
       req.wallClock
         ? withBudgetNotice(tool, () =>
-            ++noticeCalls % noticeEvery === 0 ? budgetLine(req.wallClock!, Date.now()) : undefined,
+            ++noticeCalls % noticeEvery === 0 ? budgetLine(req.wallClock!, this.clock.now()) : undefined,
           )
         : tool;
     const customTools = [
@@ -1220,25 +1228,30 @@ ${recovery.recoveryPrompt}`;
     // Wrap-up: one user turn near the end of an opt-in wall-clock budget, or
     // when a standalone run has been silent for 75% of its inactivity window,
     // so a timeout yields a resumable partial result. No budget, no injection.
-    let wrapUpTimer: ReturnType<typeof setTimeout> | undefined;
+    let wrapUpTimer: unknown;
     let wrappedUp = false;
-    const injectWrapUp = (): void => {
+    const injectWrapUp = (message: string): void => {
       if (wrappedUp || captured) return;
       wrappedUp = true;
-      session.steer(WRAP_UP_MESSAGE).catch(() => {});
+      session.steer(message).catch(() => {});
     };
     if (req.wallClock) {
       const at = req.wallClock.startedAt + req.wallClock.budgetMs * WRAP_UP_FRACTION;
-      wrapUpTimer = setTimeout(injectWrapUp, Math.max(0, at - Date.now()));
-      wrapUpTimer.unref?.();
+      wrapUpTimer = this.clock.setTimeout(() => injectWrapUp(WRAP_UP_MESSAGE), Math.max(0, at - this.clock.now()));
     }
-    let silenceTimer: ReturnType<typeof setTimeout> | undefined;
+    let silenceTimer: unknown;
     const armInactivity = (): void => {
       if (req.signal) return;
       if (timer) clearTimeout(timer);
-      if (silenceTimer) clearTimeout(silenceTimer);
-      silenceTimer = setTimeout(injectWrapUp, inactivityMs * WRAP_UP_FRACTION);
-      silenceTimer.unref?.();
+      if (silenceTimer) this.clock.clearTimeout(silenceTimer);
+      // Only an explicitly configured inactivity window earns a silence
+      // wrap-up; the 300s fallback never injects anything.
+      if (req.timeoutMs !== undefined) {
+        silenceTimer = this.clock.setTimeout(
+          () => injectWrapUp(SILENCE_WRAP_UP_MESSAGE),
+          req.timeoutMs * WRAP_UP_FRACTION,
+        );
+      }
       timer = setTimeout(() => {
         timedOut = true;
         void session.abort();
@@ -1399,7 +1412,7 @@ ${recovery.recoveryPrompt}`;
       // the same attempt. Ignored, it settles as the usual no-result failure.
       if (
         captured === undefined &&
-        terminatingName === "worker_result" &&
+        structured === undefined &&
         !guardAborted &&
         !budgetExhausted &&
         !timedOut &&
@@ -1409,7 +1422,9 @@ ${recovery.recoveryPrompt}`;
         assistantError === undefined &&
         !req.signal?.aborted
       ) {
-        await session.prompt(NUDGE_MESSAGE, { expandPromptTemplates: false });
+        await session.prompt(terminatingName === "worker_result" ? NUDGE_MESSAGE : REVIEW_NUDGE_MESSAGE, {
+          expandPromptTemplates: false,
+        });
       }
     } catch (err) {
       // Capture the error. An abort triggered by the guard/budget/timeout is
@@ -1421,8 +1436,8 @@ ${recovery.recoveryPrompt}`;
       }
     } finally {
       if (timer) clearTimeout(timer);
-      if (silenceTimer) clearTimeout(silenceTimer);
-      if (wrapUpTimer) clearTimeout(wrapUpTimer);
+      if (silenceTimer) this.clock.clearTimeout(silenceTimer);
+      if (wrapUpTimer) this.clock.clearTimeout(wrapUpTimer);
       disarmStall();
       req.signal?.removeEventListener("abort", abortFromOwner);
       unsubscribe();
