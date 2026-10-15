@@ -207,6 +207,22 @@ export class ResourceRegistry {
   }
 
   /**
+   * Keeps a resource whose release failed: the record stays registered as
+   * `retained` with the reason, never silently dropped. A later
+   * {@link beginRelease} may retry it. Idempotent for an already retained
+   * record (the reason is updated); a released or unknown record is an error.
+   */
+  async markRetained(id: string, reason: string): Promise<void> {
+    nonEmpty(reason, "retained reason");
+    await this.locked(async () => {
+      const record = await this.read(id);
+      if (!record) throw new Error(`resource ${id} is not registered`);
+      if (record.state === "released") throw new Error(`resource ${id} is already released`);
+      await this.replace({ ...record, state: "retained", retainedReason: reason });
+    });
+  }
+
+  /**
    * Finishes or rolls back records this host left in `releasing`: the resource
    * is gone from disk (finish), or still there (roll back to active so the
    * ownership is not lost). Non-path kinds cannot be probed and roll back.
