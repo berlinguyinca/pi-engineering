@@ -256,10 +256,14 @@ export class GitRepo {
     }
   }
 
-  private async git(args: string[], opts: { timeout?: number; preserveStdout?: boolean } = {}): Promise<GitResult> {
+  private async git(
+    args: string[],
+    opts: { timeout?: number; preserveStdout?: boolean; env?: Record<string, string> } = {},
+  ): Promise<GitResult> {
     const timeoutMs = opts.timeout ?? 120_000;
     try {
       const { stdout, stderr } = await exec("git", [...this.gitArgs, ...args], {
+        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
         timeout: timeoutMs,
         maxBuffer: 64 * 1024 * 1024,
         signal: this.signal,
@@ -521,7 +525,11 @@ export class GitRepo {
 
   /** Every linked worktree git knows about, primary checkout excluded. */
   async listLinkedWorktrees(): Promise<Array<{ path: string; branch: string | null; head: string | null }>> {
-    const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+    // Only the janitor sweep lists this way; the tag lets observers (tests) tell it from other git use.
+    const listed = await this.git(["worktree", "list", "--porcelain"], {
+      preserveStdout: true,
+      env: { PI_HOUSEKEEPING_SWEEP: "1" },
+    });
     if (listed.code !== 0) throw new Error(`git worktree list failed: ${listed.stderr}`);
     const out: Array<{ path: string; branch: string | null; head: string | null }> = [];
     for (const entry of listed.stdout.split(/\n\n+/)) {
