@@ -19,6 +19,7 @@ import { test } from "node:test";
 import { isRecoverableLength } from "@earendil-works/pi-ai/utils/overflow";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { generateSummary } from "@earendil-works/pi-coding-agent";
+import { runWithInferenceInvocation } from "../../src/inference/inferenceContext.ts";
 import {
   applyThinkingOff,
   describeHiddenReasoningTruncation,
@@ -27,7 +28,6 @@ import {
   streamWithThinkingPolicy,
   thinkingOffReason,
 } from "../../src/request/thinkingPolicy.ts";
-import { runWithInferenceInvocation } from "../../src/inference/inferenceContext.ts";
 import { setTelemetrySink } from "../../src/telemetry/sink.ts";
 
 const METABOLOMICS = {
