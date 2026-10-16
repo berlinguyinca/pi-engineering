@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
-import { externalMissionId, SUBMISSION_RECEIPT_LEASE_MS } from "../../src/orchestration/externalEntry.ts";
+import { SUBMISSION_RECEIPT_LEASE_MS, externalMissionId } from "../../src/orchestration/externalEntry.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionOwnership } from "../../src/orchestration/ownership.ts";
@@ -104,11 +104,7 @@ function harness() {
 }
 
 /** Seed an external mission exactly as externalEntry does. */
-function seedExternalMission(
-  store: MissionStore,
-  key: string,
-  constraints: string[] = [],
-): string {
+function seedExternalMission(store: MissionStore, key: string, constraints: string[] = []): string {
   const id = externalMissionId(key);
   store.createMission({
     mission_id: id,
