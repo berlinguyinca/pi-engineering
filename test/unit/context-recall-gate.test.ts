@@ -163,3 +163,99 @@ test("context-recall-gate: sourceRefs are redacted", () => {
   assert.equal(result.kept.length, 1);
   assert.ok(!result.kept[0]!.sourceRefs.join(" ").includes("sk-abcdef"), "redacted ref must not leak secret");
 });
+
+test("context-recall-gate: text undefined drops as redacted_empty, does not throw", () => {
+  const input = makeInput({ candidates: [candidate({ text: undefined })] });
+  const result = selectRecallForPackage(input);
+  assert.deepEqual(result.dropped, [{ id: "rec-1", reason: "redacted_empty" }]);
+  assert.deepEqual(result.kept, []);
+});
+
+test("context-recall-gate: non-string text (42) drops as redacted_empty", () => {
+  const input = makeInput({
+    candidates: [{ id: "rec-1", text: 42, promotedAt: iso(2) } as unknown as RecallCandidate],
+  });
+  const result = selectRecallForPackage(input);
+  assert.deepEqual(result.dropped, [{ id: "rec-1", reason: "redacted_empty" }]);
+  assert.deepEqual(result.kept, []);
+});
+
+test("context-recall-gate: missing sourceRefs/evidenceIds default to [] and are kept", () => {
+  const input = makeInput({
+    candidates: [candidate({ sourceRefs: undefined, evidenceIds: undefined })],
+  });
+  const result = selectRecallForPackage(input);
+  assert.equal(result.kept.length, 1);
+  assert.deepEqual(result.kept[0]!.sourceRefs, []);
+  assert.deepEqual(result.kept[0]!.evidenceIds, []);
+  assert.deepEqual(result.dropped, []);
+});
+
+test("context-recall-gate: null entry in candidates is ignored, others still processed", () => {
+  const input = makeInput({
+    candidates: [null as unknown as RecallCandidate, candidate({ id: "good", text: "kept fact" })],
+  });
+  const result = selectRecallForPackage(input);
+  assert.equal(result.kept.length, 1);
+  assert.equal(result.kept[0]!.id, "good");
+  assert.deepEqual(result.dropped, []);
+});
+
+test("context-recall-gate: garbage lastVerifiedAt with fresh promotedAt stays fresh", () => {
+  const input = makeInput({
+    candidates: [candidate({ lastVerifiedAt: "garbage" })],
+  });
+  const result = selectRecallForPackage(input);
+  assert.equal(result.kept.length, 1);
+  assert.equal(result.kept[0]!.provenance.freshness, "fresh");
+  assert.equal(result.kept[0]!.provenance.confidence, 1);
+});
+
+test("context-recall-gate: garbage lastVerifiedAt with stale promotedAt drops as stale", () => {
+  const input = makeInput({
+    candidates: [candidate({ promotedAt: iso(40), lastVerifiedAt: "garbage" })],
+  });
+  const result = selectRecallForPackage(input);
+  assert.deepEqual(result.dropped, [{ id: "rec-1", reason: "stale" }]);
+  assert.deepEqual(result.kept, []);
+});
+
+test("context-recall-gate: maxItems 1.5 caps at 0, every item over_limit", () => {
+  const input = makeInput({
+    candidates: [candidate({ id: "a", text: "first fact" }), candidate({ id: "b", text: "second fact" })],
+    maxItems: 1.5,
+  });
+  const result = selectRecallForPackage(input);
+  assert.equal(result.kept.length, 0);
+  assert.deepEqual(result.dropped, [
+    { id: "a", reason: "over_limit" },
+    { id: "b", reason: "over_limit" },
+  ]);
+});
+
+test("context-recall-gate: never throws for a mix of all malformed shapes", () => {
+  const candidates = [
+    null,
+    undefined,
+    42,
+    "plain string",
+    candidate({ text: undefined }),
+    { id: "rec-1", text: 42, promotedAt: iso(2) } as unknown as RecallCandidate,
+    candidate({ sourceRefs: undefined, evidenceIds: undefined }),
+    candidate({ lastVerifiedAt: "garbage" }),
+    candidate({ promotedAt: iso(40), lastVerifiedAt: "garbage" }),
+    candidate({ id: "", text: "empty id" }),
+    candidate({ promotedAt: "not-a-date" }),
+    candidate({ id: "final", text: "final fact" }),
+  ] as unknown as RecallCandidate[];
+  const input = makeInput({ candidates, maxItems: 1.5 });
+  let result: ReturnType<typeof selectRecallForPackage>;
+  assert.doesNotThrow(() => {
+    result = selectRecallForPackage(input);
+  });
+  // Skipped candidates (null/undefined/42/string/empty-id) appear nowhere.
+  // The good 'final' candidate still runs through the pipeline (capped as
+  // over_limit since maxItems 1.5 => 0), proving nothing threw along the way.
+  assert.equal(result!.kept.length, 0);
+  assert.ok(result!.dropped.some((d) => d.id === "final" && d.reason === "over_limit"));
+});

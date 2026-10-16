@@ -75,7 +75,8 @@ function dedupeKey(text: string): string {
  * Score one candidate's freshness/confidence from its promotedAt timestamp.
  *
  * An unparseable `promotedAt` is treated as stale (age unbounded), so a
- * malformed record is never silently kept as "fresh".
+ * malformed record is never silently kept as "fresh". A `lastVerifiedAt` that
+ * is present but unparseable is ignored (age is measured from `promotedAt`).
  */
 function scoreCandidate(c: RecallCandidate, now: Date, currentSha?: string) {
   // An unparseable promotedAt must be treated as stale (never kept as fresh).
@@ -89,10 +90,35 @@ function scoreCandidate(c: RecallCandidate, now: Date, currentSha?: string) {
   }
   const mem: FreshnessMemory = {
     createdAt: c.promotedAt,
-    ...(c.lastVerifiedAt !== undefined ? { lastVerifiedAt: c.lastVerifiedAt } : {}),
+    // Ignore a present-but-unparseable lastVerifiedAt (score from promotedAt).
+    ...(c.lastVerifiedAt !== undefined && !Number.isNaN(Date.parse(c.lastVerifiedAt))
+      ? { lastVerifiedAt: c.lastVerifiedAt }
+      : {}),
     ...(c.sourceSha !== undefined ? { sourceSha: c.sourceSha } : {}),
   };
   return scoreMemory(mem, now, currentSha);
+}
+
+/**
+ * Normalise a candidate so downstream scoring and output never touch
+ * undefined / non-array fields, then return it (or null when the candidate is
+ * too malformed to process — no id to report).
+ */
+function normaliseCandidate(c: RecallCandidate): RecallCandidate | null {
+  // A null / non-object / missing-id or non-string-id candidate cannot be
+  // reported, so skip it entirely (neither kept nor dropped).
+  if (c === null || typeof c !== "object" || typeof c.id !== "string" || c.id.length === 0) {
+    return null;
+  }
+  return {
+    ...c,
+    // id is a non-empty string here; a non-string text is treated as "" so the
+    // item lands in 'redacted_empty' rather than throwing inside the redactor.
+    text: typeof c.text === "string" ? c.text : "",
+    // Missing / non-array sourceRefs and evidenceIds behave as empty lists.
+    sourceRefs: Array.isArray(c.sourceRefs) ? c.sourceRefs : [],
+    evidenceIds: Array.isArray(c.evidenceIds) ? c.evidenceIds : [],
+  };
 }
 
 /**
@@ -106,20 +132,42 @@ function scoreCandidate(c: RecallCandidate, now: Date, currentSha?: string) {
  *  5. redacted-then-trimmed text collapses to nothing → drop `'redacted_empty'`.
  *  6. deterministic ordering (confidence desc, ageDays asc, id asc) then
  *     case/whitespace-insensitive dedupe → later copies drop `'duplicate'`.
- *  7. beyond `maxItems` → drop `'over_limit'` (`maxItems` not finite/< 0 ⇒ 0).
+ *  7. beyond `maxItems` → drop `'over_limit'` (`maxItems` honoured only when
+ *     it is an integer >= 0; otherwise the cap is 0).
  *
- * Never mutates the input; never throws on a malformed candidate.
+ * Never mutates the input; never throws on a malformed candidate. A candidate
+ * that is null / non-object or lacks a non-empty string `id` is skipped
+ * entirely (it appears in neither `kept` nor `dropped`).
  */
 export function selectRecallForPackage(input: RecallGateInput): RecallGateResult {
   const kept: GatedRecall[] = [];
   const dropped: Array<{ id: string; reason: RecallDropReason }> = [];
 
-  const finiteItems = Number.isFinite(input.maxItems) ? input.maxItems : 0;
-  const maxItems = Math.max(0, Math.floor(finiteItems));
+  // maxItems is honoured only when it is an integer >= 0; anything else
+  // (e.g. 1.5, NaN, negative) caps at 0 so nothing is kept.
+  const maxItems = Number.isInteger(input.maxItems) && input.maxItems >= 0 ? input.maxItems : 0;
   const required = input.requiredRefPrefixes ?? [];
 
-  // Score every candidate up front so ordering can use the deterministic rank.
-  const scored = input.candidates.map((c) => ({ c, score: scoreCandidate(c, input.now, input.currentSha) }));
+  // Normalise / skip malformed candidates, then score up front so ordering can
+  // use the deterministic rank. ageDays is guaranteed finite here, so the sort
+  // comparator below never sees NaN.
+  const scored: Array<{ c: RecallCandidate; score: FreshnessScore }> = [];
+  for (const raw of input.candidates) {
+    const c = normaliseCandidate(raw);
+    if (c === null) continue;
+    let score = scoreCandidate(c, input.now, input.currentSha);
+    if (!Number.isFinite(score.ageDays)) {
+      // A non-finite age (malformed timestamps) is never kept as fresh and must
+      // not leak NaN into the comparator — treat as stale with unbounded age.
+      score = {
+        ageDays: Number.POSITIVE_INFINITY,
+        freshness: "stale",
+        confidence: 0.8,
+        reasons: ["non-finite age => stale"],
+      } as FreshnessScore;
+    }
+    scored.push({ c, score });
+  }
 
   // Deterministic order: confidence desc, ageDays asc, id asc.
   scored.sort((a, b) => {
@@ -130,6 +178,9 @@ export function selectRecallForPackage(input: RecallGateInput): RecallGateResult
 
   const seen = new Set<string>();
 
+  // Dedupe happens BEFORE the maxItems cap: a text that was already kept is
+  // reported as 'duplicate' even when it would otherwise have been capped as
+  // 'over_limit'. This keeps the rule ordering (dedupe then limit) stable.
   for (const { c, score } of scored) {
     if (score.freshness === "stale" && input.dropStale !== false) {
       dropped.push({ id: c.id, reason: "stale" });
