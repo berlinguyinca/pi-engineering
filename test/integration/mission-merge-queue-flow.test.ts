@@ -262,6 +262,38 @@ describe("mission promotion through the merge queue (issue #153)", () => {
     }
   });
 
+  it("a repair round that clears the rejection promotes from REPAIRING and completes", async () => {
+    const root = await greenFixture();
+    let calls = 0;
+    const rt = await openRuntime(root, {
+      // Pending once (a check still running), then passing.
+      requiredChecks: async () => (calls++ === 0 ? "pending" : "pass"),
+    });
+    try {
+      const result = await orchestrate(rt);
+      const missionId = result.mission.mission_id;
+      assert.equal(result.completed, true, describeRun(rt, missionId));
+      assert.equal(rt.missionStore!.getMission(missionId)?.status, "COMPLETE");
+      const rejections = rt.missionStore!.listFindings(missionId).filter((f) => f.category === "merge_queue");
+      assert.deepEqual(
+        rejections.map((f) => f.severity),
+        ["minor"],
+      );
+      assert.deepEqual(rt.orchestrator!.broker.mergeQueueStates(missionId), [
+        "MERGE_QUEUED",
+        "MERGE_QUEUED",
+        "MERGING",
+        "MERGED",
+      ]);
+      assert.equal(
+        await git(root, "rev-parse", "HEAD"),
+        rt.missionStore!.getCandidate(missionId)?.identity.candidateSha,
+      );
+    } finally {
+      await rt.close();
+    }
+  });
+
   it("reopening the runtime while MERGING finishes the promotion with exactly 1 merge commit", async () => {
     const root = await greenFixture();
     const base = await git(root, "rev-parse", "HEAD");
