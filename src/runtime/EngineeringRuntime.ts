@@ -7,6 +7,7 @@ import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { BlackholeManager, type BlackholeManagerOptions } from "../blackhole/BlackholeManager.ts";
 import type { RoleRouterAdapter } from "../capability/adapter.ts";
+import { sameFamily } from "../capability/modelRecord.ts";
 import { ContextBroker } from "../context/ContextBroker.ts";
 import { newRunId } from "../core/ids.ts";
 import type {
@@ -26,6 +27,7 @@ import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
+import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
@@ -449,6 +451,13 @@ export interface EngineeringRuntimeOptions {
    * review fallback model from its runtime.
    */
   roleRouter?: Pick<RoleRouterAdapter, "route">;
+  /**
+   * Merge-queue policy and hooks for mission promotion (issue #153), layered
+   * over the runtime defaults: independence required only when
+   * PI_ENGINEERING_REQUIRE_INDEPENDENT_REVIEW is set, and a different-family
+   * reviewer counted as available when the session registry serves one.
+   */
+  mergeQueue?: MissionMergeQueueOptions;
   /**
    * Concise operator-facing inference status lines (fault-tolerance spec
    * §26): "model X penalized · falling back to Y", "waiting for inference
@@ -1345,6 +1354,25 @@ export class EngineeringRuntime {
         recovery: recoveryBudget,
         store: rt.missionStore,
         backends,
+        mergeQueue: {
+          requireIndependentReview: /^(1|true|yes)$/i.test(process.env.PI_ENGINEERING_REQUIRE_INDEPENDENT_REVIEW ?? ""),
+          // A live session model whose family differs from the reviewer's could
+          // have reviewed independently. An unknown family never counts.
+          differentFamilyReviewerAvailable: async ({ reviewer }) => {
+            if (!(rt.worker instanceof PiWorkerExecutor)) return false;
+            try {
+              const models = await (await rt.worker.getModelRuntime()).getAvailable();
+              return models.some(
+                (model) =>
+                  !rt.unavailableModels.has({ provider: model.provider, id: model.id }) &&
+                  !sameFamily(model.id, reviewer.model),
+              );
+            } catch {
+              return false;
+            }
+          },
+          ...opts.mergeQueue,
+        },
         worksetPolicy: { maxTaskBudgetMs: limits.max_task_wall_clock_ms },
         // Re-read `limits` before every mission/resume so an operator edit to
         // engineering.yaml applies without restarting pi (the caps above are the
