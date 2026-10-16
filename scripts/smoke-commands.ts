@@ -36,7 +36,6 @@ const EXPECTED_COMMANDS = [
   "blackhole",
   "remember",
   "memory",
-  "panel",
   "engineering-mode",
   "engineering-status",
   "engineering-plan",
