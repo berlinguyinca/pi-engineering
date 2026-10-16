@@ -580,6 +580,53 @@ describe("leftover background processes after verification (PR #106 re-review)",
   }
 });
 
+test("verifier stage child env drops PI_ENGINEERING_* state vars and sets the verifier marker (CI-004/RESOURCE-003)", async () => {
+  const dir = await makeProject({
+    "package.json": JSON.stringify({ scripts: { test: 'node -e "process.exit(0)"' } }),
+  });
+  const prevState = process.env.PI_ENGINEERING_STATE_DIR;
+  const prevControl = process.env.PI_ENGINEERING_CONTROL_DIR;
+  process.env.PI_ENGINEERING_STATE_DIR = "/tmp/leak-state";
+  process.env.PI_ENGINEERING_CONTROL_DIR = "/tmp/leak-ctl";
+  const envFile = join(dir, "env.json");
+  try {
+    const store = await ArtifactStore.create(join(dir, "artifacts"));
+    const v = new CommandVerifier();
+    const profile = {
+      name: "child-env",
+      stages: [
+        {
+          name: "test",
+          command: process.execPath,
+          args: ["-e", "require('fs').writeFileSync(process.argv[1], JSON.stringify(process.env))", envFile],
+          required: true,
+        },
+      ],
+    };
+    const outcome = await v.run(dir, profile, store);
+    assert.equal(outcome.passed, true, "the env-dump stage must pass");
+    const childEnv = JSON.parse(await readFile(envFile, "utf-8")) as Record<string, string | undefined>;
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(childEnv, "PI_ENGINEERING_STATE_DIR"),
+      "PI_ENGINEERING_STATE_DIR must be stripped from the verifier child",
+    );
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(childEnv, "PI_ENGINEERING_CONTROL_DIR"),
+      "PI_ENGINEERING_CONTROL_DIR must be stripped from the verifier child",
+    );
+    assert.equal(childEnv.PI_ENGINEERING_VERIFIER_CHILD, "1", "verifier child marker must be set");
+    assert.equal(typeof childEnv.PATH, "string");
+    assert.ok(childEnv.PATH!.length > 0, "child PATH must be a non-empty string");
+    if (process.env.HOME) assert.equal(childEnv.HOME, process.env.HOME, "child HOME must match the parent HOME");
+  } finally {
+    if (prevState === undefined) delete process.env.PI_ENGINEERING_STATE_DIR;
+    else process.env.PI_ENGINEERING_STATE_DIR = prevState;
+    if (prevControl === undefined) delete process.env.PI_ENGINEERING_CONTROL_DIR;
+    else process.env.PI_ENGINEERING_CONTROL_DIR = prevControl;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("verifier stage results carry a measured durationMs", async () => {
   const dir = await makeProject({
     "package.json": JSON.stringify({ scripts: { test: 'node -e "setTimeout(() => process.exit(0), 150)"' } }),
