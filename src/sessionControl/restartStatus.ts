@@ -18,10 +18,31 @@ export interface RestartStatusResult {
   blockers: string[];
   staleSessions: string[];
   inFlightMissions: string[];
+  warnings: string[];
   summary: string;
 }
 
 export const DEFAULT_STALE_AFTER_MS = 45000;
+
+const ROLES = new Set(["supervisor", "worker"]);
+const STATES = new Set(["idle", "running", "paused", "terminated"]);
+
+function invalidInput(reason: string): RestartStatusResult {
+  return {
+    safeToRestartSupervisor: false,
+    blockers: [`invalid input: ${reason}`],
+    staleSessions: [],
+    inFlightMissions: [],
+    warnings: [],
+    summary: "safe=false;invalid-input",
+  };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object") return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
 
 /**
  * Compute whether it is safe to restart the supervisor session given the current
@@ -32,29 +53,57 @@ export function computeRestartStatus(
   now: Date,
   opts?: RestartStatusOptions,
 ): RestartStatusResult {
+  if (!Array.isArray(sessions)) {
+    return invalidInput("sessions is not an array");
+  }
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+    return invalidInput("now is not a Date with a finite time");
+  }
   const staleAfterMs = opts?.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  if (!Number.isFinite(staleAfterMs) || staleAfterMs <= 0) {
+    return invalidInput("staleAfterMs is not a finite number > 0");
+  }
+
+  for (const session of sessions) {
+    if (!isPlainObject(session)) {
+      return invalidInput("a session is not a plain object");
+    }
+    if (typeof session.sessionId !== "string") {
+      return invalidInput("a session sessionId is not a string");
+    }
+    if (typeof session.role !== "string" || !ROLES.has(session.role)) {
+      return invalidInput(`a session role is invalid: ${String(session.role)}`);
+    }
+    if (typeof session.state !== "string" || !STATES.has(session.state)) {
+      return invalidInput(`a session state is invalid: ${String(session.state)}`);
+    }
+  }
+
   const nowMs = now.getTime();
   const staleCutoffMs = nowMs - staleAfterMs;
 
   const blockers: string[] = [];
   const staleSessions: string[] = [];
   const inFlightMissions: string[] = [];
+  const warnings: string[] = [];
   const seenMissions = new Set<string>();
 
-  let anyWorkerRunning = false;
-  let supervisorState: RestartStatusSession["state"] | undefined;
-
   for (const session of sessions) {
+    // Terminated sessions are ignored for every purpose.
+    if (session.state === "terminated") {
+      continue;
+    }
+
     const isSupervisor = session.role === "supervisor";
 
-    // Stale detection: a session that is not terminated with a heartbeat strictly
-    // older than the cutoff is considered stale. A heartbeat exactly at the cutoff
-    // is NOT stale. A missing or unparseable heartbeat is not stale.
-    if (session.state !== "terminated" && session.lastHeartbeatAt !== undefined) {
-      const heartbeatMs = Date.parse(session.lastHeartbeatAt);
-      if (!Number.isNaN(heartbeatMs) && heartbeatMs < staleCutoffMs) {
-        staleSessions.push(session.sessionId);
-      }
+    // Stale detection: a missing or unparseable heartbeat is stale (fail
+    // closed); a heartbeat strictly older than the cutoff is stale. A
+    // heartbeat exactly at the cutoff is NOT stale.
+    const heartbeatMs = session.lastHeartbeatAt !== undefined ? Date.parse(session.lastHeartbeatAt) : Number.NaN;
+    if (Number.isNaN(heartbeatMs)) {
+      staleSessions.push(session.sessionId);
+    } else if (heartbeatMs < staleCutoffMs) {
+      staleSessions.push(session.sessionId);
     }
 
     // In-flight missions from workers that are running or paused with a mission.
@@ -65,28 +114,22 @@ export function computeRestartStatus(
       }
     }
 
-    // Blockers.
+    // Blockers. A worker blocks ONLY when running with a non-empty missionId.
+    // A running worker without a missionId is a warning, not a blocker.
     if (session.role === "worker" && session.state === "running") {
-      anyWorkerRunning = true;
-      blockers.push(
-        session.missionId
-          ? `worker ${session.sessionId} (mission ${session.missionId}) is running`
-          : `worker ${session.sessionId} is running`,
-      );
+      if (typeof session.missionId === "string" && session.missionId.length > 0) {
+        blockers.push(`worker ${session.sessionId} (mission ${session.missionId}) is running`);
+      } else {
+        warnings.push(`worker ${session.sessionId} is running without a mission`);
+      }
     } else if (isSupervisor && session.state === "running") {
       blockers.push(`supervisor ${session.sessionId} is running`);
     }
-
-    if (isSupervisor) {
-      supervisorState = session.state;
-    }
   }
 
-  const supervisorBlocking =
-    supervisorState !== undefined && supervisorState !== "idle" && supervisorState !== "paused";
-  const safeToRestartSupervisor = !anyWorkerRunning && !supervisorBlocking;
+  const safeToRestartSupervisor = blockers.length === 0;
 
-  const summary = `safe=${safeToRestartSupervisor};blockers=${blockers.length};stale=${staleSessions.length};inFlight=${inFlightMissions.length}`;
+  const summary = `safe=${safeToRestartSupervisor};blockers=${blockers.length};stale=${staleSessions.length};inFlight=${inFlightMissions.length};warnings=${warnings.length}`;
 
-  return { safeToRestartSupervisor, blockers, staleSessions, inFlightMissions, summary };
+  return { safeToRestartSupervisor, blockers, staleSessions, inFlightMissions, warnings, summary };
 }
