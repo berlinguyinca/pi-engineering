@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { compareRouting, type LiveChoice } from "../../src/cav/routingShadow.ts";
+import { type LiveChoice, compareRouting } from "../../src/cav/routingShadow.ts";
 import type { GatewayModelEntry } from "../../src/models/gatewayCatalog.ts";
 
 /**

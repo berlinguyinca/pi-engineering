@@ -1,3 +1,4 @@
+import type { GatewayModelEntry } from "../models/gatewayCatalog.ts";
 /**
  * Live-path shadow comparison for CAV model routing (MODEL-001/002/004, #274).
  *
@@ -8,8 +9,7 @@
  * log-only comparison — it never changes behaviour — so the runtime can emit the
  * verdict later without risking a route change.
  */
-import { type CavRoute, type CavBlocked, isBlocked, routeRole, type RouteOptions } from "./routing.ts";
-import type { GatewayModelEntry } from "../models/gatewayCatalog.ts";
+import { type CavBlocked, type CavRoute, type RouteOptions, isBlocked, routeRole } from "./routing.ts";
 
 /** The live model a runtime actually used, as the shadow compares against it. */
 export interface LiveChoice {
