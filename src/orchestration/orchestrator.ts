@@ -581,6 +581,11 @@ export class Orchestrator {
         return this.store.getMission(missionId)!;
       }
       const reconciledOrphans = this.store.reconcileOrphanedExecutions(missionId);
+      // A controller-disconnect cancel now leaves its task RETRYING (resumable).
+      // Re-queue those back to READY so recovery re-dispatches the SAME task
+      // instead of treating it as a no-op and advancing the phase. Counted as a
+      // material delta for FENCE_RECONCILE_AND_RESUME.
+      const requeuedResumable = this.store.requeueResumableTasks(missionId);
       await this.store.flush();
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const classifications = this.store.listFailureClassifications(missionId);
@@ -1199,7 +1204,7 @@ export class Orchestrator {
           case "RECONSTRUCT_EVIDENCE":
             return this.store.listEvidenceInvalidations(missionId).length > invalidationsBefore;
           case "FENCE_RECONCILE_AND_RESUME":
-            return reconciledOrphans.length > 0 || failedTasks.length > 0;
+            return reconciledOrphans.length > 0 || failedTasks.length > 0 || requeuedResumable > 0;
           case "CHECKPOINT_SPLIT_AND_REPLACE":
           case "REPAIR_WORKER_OUTPUT":
           case "REBUILD_INTEGRATION_CANDIDATE":
@@ -3614,7 +3619,11 @@ export class Orchestrator {
       });
       const executionHandle = handle;
       authority?.onInvalidated(() => {
-        void executionHandle.cancel();
+        // A controller-disconnect invalidation must NOT terminally cancel the
+        // in-flight task: leave it RETRYING so orphan-recovery re-runs the SAME
+        // task instead of advancing the phase (e.g. dispatching the integrator
+        // against an empty candidate).
+        void executionHandle.cancel({ resumable: true });
       });
       const onAbort = (): void => {
         void executionHandle.cancel();

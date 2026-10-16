@@ -31,6 +31,14 @@ export interface MissionOwnershipOptions {
   custodyPollMs?: number;
   /** Injectable sleep so tests do not wait in real time. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * How many CONSECUTIVE lease-renewal failures a live dispatch authority
+   * tolerates before invalidating itself (default 3). A single transient renew
+   * blip (custody contention, a slow write) must not lapse a healthy controller
+   * lease and orphan a running mission; only sustained failure does. The counter
+   * resets on the next successful renewal.
+   */
+  maxConsecutiveRenewFailures?: number;
 }
 
 export const missionCustodyKey = (missionId: string): string => `mission:${missionId}`;
@@ -42,6 +50,13 @@ export interface DispatchAuthority {
   readonly missionIdentity: MissionLease;
   readonly repositoryIdentity?: RepositoryLease;
   readonly resumptionGeneration?: number;
+  /**
+   * The underlying error from the most recent failed renewal. Retained for
+   * observability (not cleared on a subsequent successful renewal); a live
+   * authority tolerates up to `maxConsecutiveRenewFailures` CONSECUTIVE of
+   * these before invalidating itself.
+   */
+  readonly lastPulseError?: Error;
   assertAuthoritative(): void;
   onInvalidated(listener: (error: Error) => void): void;
   /** Stops renewal and releases repository authority. Release failures are returned, never thrown. */
@@ -74,6 +89,7 @@ export class MissionOwnership {
   private readonly ownerId: string;
   private readonly leaseMs: number;
   private readonly heartbeatMs: number;
+  private readonly maxConsecutiveRenewFailures: number;
   private readonly now: () => number;
   private readonly custody: MissionCustody | undefined;
   private readonly isOwnerGone: ((ownerId: string) => boolean) | undefined;
@@ -94,6 +110,10 @@ export class MissionOwnership {
     this.heartbeatMs = options.heartbeatMs ?? Math.max(1, Math.floor(this.leaseMs / 3));
     if (!Number.isFinite(this.heartbeatMs) || this.heartbeatMs <= 0 || this.heartbeatMs >= this.leaseMs) {
       throw new Error("MissionOwnership heartbeatMs must be positive and shorter than leaseMs");
+    }
+    this.maxConsecutiveRenewFailures = options.maxConsecutiveRenewFailures ?? 3;
+    if (!Number.isInteger(this.maxConsecutiveRenewFailures) || this.maxConsecutiveRenewFailures < 1) {
+      throw new Error("MissionOwnership maxConsecutiveRenewFailures must be a positive integer");
     }
     this.now = options.now ?? Date.now;
     this.custody = options.custody;
@@ -169,7 +189,7 @@ export class MissionOwnership {
   async maintain(identity: MissionLease, repoId?: string): Promise<DispatchAuthority> {
     const mission = await this.renew(identity);
     const repository = repoId ? await this.acquireRepository(mission, repoId) : undefined;
-    return new RenewableDispatchAuthority(this, mission, repository, this.heartbeatMs);
+    return new RenewableDispatchAuthority(this, mission, repository, this.heartbeatMs, this.maxConsecutiveRenewFailures);
   }
 
   async acquire(missionId: string, options: { resumptionGeneration?: number } = {}): Promise<MissionLease> {
@@ -414,7 +434,11 @@ class RenewableDispatchAuthority implements DispatchAuthority {
   private readonly timer: ReturnType<typeof setInterval>;
   private pulseChain: Promise<void> = Promise.resolve();
   private failure: Error | undefined;
+  /** Most recent renewal error. Retained for observability (the failure COUNTER is reset on the next successful pulse, not this). */
+  private lastError: Error | undefined;
   private stopped = false;
+  private consecutiveRenewFailures = 0;
+  private readonly maxConsecutiveRenewFailures: number;
   private readonly invalidationListeners = new Set<(error: Error) => void>();
 
   constructor(
@@ -422,7 +446,9 @@ class RenewableDispatchAuthority implements DispatchAuthority {
     mission: MissionLease,
     repository: RepositoryLease | undefined,
     heartbeatMs: number,
+    maxConsecutiveRenewFailures: number = 3,
   ) {
+    this.maxConsecutiveRenewFailures = maxConsecutiveRenewFailures;
     this.ownership = ownership;
     this.mission = mission;
     this.repository = repository;
@@ -430,8 +456,17 @@ class RenewableDispatchAuthority implements DispatchAuthority {
       this.pulseChain = this.pulseChain
         .then(() => this.pulse())
         .catch((error) => {
-          this.failure = error instanceof Error ? error : new Error(String(error));
-          for (const listener of this.invalidationListeners) listener(this.failure);
+          // A single transient renewal failure does NOT invalidate the authority:
+          // custody contention and slow writes are expected between live sessions.
+          // Only SUSTAINED failure (>= threshold consecutive) lapses the lease.
+          this.lastError = error instanceof Error ? error : new Error(String(error));
+          this.consecutiveRenewFailures += 1;
+          if (this.consecutiveRenewFailures >= this.maxConsecutiveRenewFailures && !this.failure) {
+            this.failure = new Error(
+              `lease renewal failed ${this.consecutiveRenewFailures} times in a row: ${this.lastError.message}`,
+            );
+            for (const listener of this.invalidationListeners) listener(this.failure);
+          }
         });
     }, heartbeatMs);
     this.timer.unref?.();
@@ -447,6 +482,10 @@ class RenewableDispatchAuthority implements DispatchAuthority {
 
   get resumptionGeneration(): number {
     return this.mission.resumptionGeneration ?? 0;
+  }
+
+  get lastPulseError(): Error | undefined {
+    return this.lastError;
   }
 
   assertAuthoritative(): void {
@@ -478,5 +517,8 @@ class RenewableDispatchAuthority implements DispatchAuthority {
     if (this.stopped || this.failure) return;
     this.mission = await this.ownership.renew(this.mission);
     if (this.repository) this.repository = await this.ownership.renewRepository(this.repository);
+    // A successful renewal clears any prior transient-failure streak (the
+    // counter, not the last-observed error, which is retained for observability).
+    this.consecutiveRenewFailures = 0;
   }
 }
