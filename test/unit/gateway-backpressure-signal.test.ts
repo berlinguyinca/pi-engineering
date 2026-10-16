@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyBackpressure, MAX_WAIT_MS } from "../../src/gateway/backpressureSignal.ts";
+import { MAX_WAIT_MS, classifyBackpressure } from "../../src/gateway/backpressureSignal.ts";
 
 test("429 caller_concurrency is quota and waits on the same endpoint", () => {
   const signal = classifyBackpressure({
@@ -197,7 +197,10 @@ test("Retry-After header HTTP date one minute in the past yields waitMs 0", () =
 });
 
 test("retry_after_ms 99999999999 is capped at MAX_WAIT_MS", () => {
-  const signal = classifyBackpressure({ status: 429, body: { code: "caller_concurrency", retry_after_ms: 99999999999 } });
+  const signal = classifyBackpressure({
+    status: 429,
+    body: { code: "caller_concurrency", retry_after_ms: 99999999999 },
+  });
   assert.equal(signal.kind, "quota");
   assert.equal(signal.waitMs, 600000);
 });
