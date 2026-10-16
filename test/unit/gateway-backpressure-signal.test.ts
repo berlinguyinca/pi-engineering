@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyBackpressure } from "../../src/gateway/backpressureSignal.ts";
+import { classifyBackpressure, MAX_WAIT_MS } from "../../src/gateway/backpressureSignal.ts";
 
 test("429 caller_concurrency is quota and waits on the same endpoint", () => {
   const signal = classifyBackpressure({
@@ -157,6 +157,49 @@ test("Retry-After header lookup works on a Headers instance", () => {
   });
   assert.equal(signal.kind, "quota");
   assert.equal(signal.waitMs, 5000);
+});
+
+test("MAX_WAIT_MS is exported as 600000", () => {
+  assert.equal(MAX_WAIT_MS, 600000);
+});
+
+test("body retry_after_ms '' yields waitMs null, not 0", () => {
+  const signal = classifyBackpressure({ status: 429, body: { code: "caller_concurrency", retry_after_ms: "" } });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.waitMs, null);
+});
+
+test("body retry_after_ms -5 yields waitMs null", () => {
+  const signal = classifyBackpressure({ status: 429, body: { code: "caller_concurrency", retry_after_ms: -5 } });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.waitMs, null);
+});
+
+test("Retry-After header 'abc' yields waitMs null", () => {
+  const signal = classifyBackpressure({
+    status: 429,
+    headers: { "Retry-After": "abc" },
+    body: { code: "caller_queue_full" },
+  });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.waitMs, null);
+});
+
+test("Retry-After header HTTP date one minute in the past yields waitMs 0", () => {
+  const past = new Date(Date.now() - 60_000).toUTCString();
+  const signal = classifyBackpressure({
+    status: 429,
+    headers: { "Retry-After": past },
+    body: { code: "caller_queue_full" },
+  });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.waitMs, 0);
+});
+
+test("retry_after_ms 99999999999 is capped at MAX_WAIT_MS", () => {
+  const signal = classifyBackpressure({ status: 429, body: { code: "caller_concurrency", retry_after_ms: 99999999999 } });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.waitMs, 600000);
 });
 
 test("real observed sample: 429 capacity_unavailable with retry_alternate", () => {

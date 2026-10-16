@@ -51,6 +51,9 @@ export interface ClassifyBackpressureInput {
 }
 
 const CAPACITY_CODES = new Set(["capacity_unavailable", "backend_saturated"]);
+
+/** Ceiling for any computed wait hint, in milliseconds. */
+export const MAX_WAIT_MS = 600000;
 const QUOTA_CODES = new Set(["caller_concurrency", "caller_queue_full"]);
 const CONTEXT_CODES = new Set(["context_capacity", "model_context_exceeded", "no_context_capable_backend"]);
 
@@ -92,18 +95,31 @@ function retryAfterFrom(headers?: Record<string, string> | Headers): string | un
   return undefined;
 }
 
-/** Wait hint: body field, else Retry-After header seconds, else null. */
+/**
+ * Wait hint: body field, else Retry-After header seconds, else null.
+ *
+ * The result is always a finite non-negative integer capped at MAX_WAIT_MS,
+ * or null when no valid hint is present (blank or non-numeric body fields,
+ * negative values, and unparseable headers all yield null).
+ */
 function waitMsOf(body: unknown, headers?: Record<string, string> | Headers): number | null {
   const record = asRecord(body);
   if (record) {
     const raw = record.retry_after_ms ?? record.retryAfterMs;
     const value = typeof raw === "string" ? Number(raw) : raw;
-    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+    // Number("") is 0, which is not a valid hint here; only accept non-blank
+    // numeric strings (and numeric values).
+    const blankString = typeof raw === "string" && raw.trim() === "";
+    if (!blankString && typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return Math.min(Math.floor(value), MAX_WAIT_MS);
+    }
   }
   const retryAfter = retryAfterFrom(headers);
   if (retryAfter !== undefined) {
     const ms = parseRetryAfterHeader(retryAfter);
-    if (ms !== undefined) return ms;
+    if (ms !== undefined) {
+      return Math.min(Math.floor(ms), MAX_WAIT_MS);
+    }
   }
   return null;
 }
