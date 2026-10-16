@@ -26,8 +26,10 @@ import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
+import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
+import { readAutospecFlags } from "../orchestration/missionMode.ts";
 import {
   PlannerTransientError,
   missionPlannerMode,
@@ -59,8 +61,6 @@ import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
 import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
-import { readAutospecFlags } from "../orchestration/missionMode.ts";
-import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { type Mission, type MissionStop, PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
@@ -1670,7 +1670,10 @@ export class EngineeringRuntime {
           }
         })
         .catch((error) => {
-          emitTelemetry({ level: "warning", text: `external mission ${missionId} start failed: ${redactSecrets(String(error))}` });
+          emitTelemetry({
+            level: "warning",
+            text: `external mission ${missionId} start failed: ${redactSecrets(String(error))}`,
+          });
         })
         .finally(() => {
           this.runningExternal.delete(missionId);

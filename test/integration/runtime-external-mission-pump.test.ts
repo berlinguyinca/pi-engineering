@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
-import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 
