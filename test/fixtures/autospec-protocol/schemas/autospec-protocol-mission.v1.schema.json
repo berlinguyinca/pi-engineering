@@ -78,12 +78,7 @@
     "last_transition": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "to",
-        "reason",
-        "at",
-        "owner"
-      ],
+      "required": ["to", "reason", "at", "owner"],
       "properties": {
         "from": {
           "$ref": "#/$defs/mission_state",

@@ -73,10 +73,7 @@
     },
     "executor": {
       "type": "string",
-      "enum": [
-        "pi-local",
-        "autospec-managed"
-      ],
+      "enum": ["pi-local", "autospec-managed"],
       "description": "Exactly one executor per task. Switching executor needs quiescence, durable reconciliation and a higher fencing generation."
     },
     "affected_surfaces": {
@@ -84,9 +81,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "path"
-        ],
+        "required": ["path"],
         "properties": {
           "path": {
             "type": "string",

@@ -49,23 +49,13 @@
     },
     "kind": {
       "type": "string",
-      "enum": [
-        "worktree",
-        "process",
-        "build_dir",
-        "cache",
-        "container",
-        "temp_file"
-      ],
+      "enum": ["worktree", "process", "build_dir", "cache", "container", "temp_file"],
       "description": "What kind of resource this is."
     },
     "owner": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "mission_id",
-        "execution_id"
-      ],
+      "required": ["mission_id", "execution_id"],
       "properties": {
         "mission_id": {
           "type": "string",
@@ -88,12 +78,7 @@
     },
     "state": {
       "type": "string",
-      "enum": [
-        "active",
-        "releasable",
-        "released",
-        "retained_for_diagnostics"
-      ],
+      "enum": ["active", "releasable", "released", "retained_for_diagnostics"],
       "description": "Resource lifecycle state."
     },
     "path": {

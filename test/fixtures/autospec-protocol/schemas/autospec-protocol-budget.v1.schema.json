@@ -43,10 +43,7 @@
     },
     "scope": {
       "type": "string",
-      "enum": [
-        "mission",
-        "host"
-      ],
+      "enum": ["mission", "host"],
       "description": "What the budget applies to."
     },
     "disk_bytes_limit": {

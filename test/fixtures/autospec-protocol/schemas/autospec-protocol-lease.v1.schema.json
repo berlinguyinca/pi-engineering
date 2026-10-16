@@ -51,17 +51,11 @@
     "subject": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "id"
-      ],
+      "required": ["kind", "id"],
       "properties": {
         "kind": {
           "type": "string",
-          "enum": [
-            "task",
-            "resource"
-          ],
+          "enum": ["task", "resource"],
           "description": "What the lease guards."
         },
         "id": {
@@ -74,10 +68,7 @@
     "holder": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "authority",
-        "session_id"
-      ],
+      "required": ["authority", "session_id"],
       "properties": {
         "authority": {
           "type": "string",
