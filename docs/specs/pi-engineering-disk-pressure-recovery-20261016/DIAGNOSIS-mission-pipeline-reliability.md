@@ -262,3 +262,40 @@ No existing call sites or state-machine transitions were changed.
   working memory”) is **flaky under parallel resource contention** (fails in the full
   parallel run, passes 3/3 when run alone). It is unrelated to these changes (session
   isolation for tournament candidates) and pre-exists this branch.
+
+## Live-run verification (2026-10-16, mission `MSN-wh5rvu`)
+
+The fixes were validated in a **live run** against the current-`main` codebase. The runtime was
+re-pointed from the stale `pi-engineering-runtime` checkout (commit `1ea5201`) to the live
+`pi-engineering` checkout on `fix/orchestration-lease-and-orphan-v2` (`17d1a27`), and the
+disk-pressure mission was launched from a persistent TTY (tmux) session using the sanitized
+request (no absolute-path literals to existing directories).
+
+Observed behavior — **both fixes confirmed in the live pipeline**:
+
+- **Self-recovery worked.** The mission hit a lease lapse during PLANNING (a long model request
+  starved the 10 s heartbeat against the 30 s lease). It was classified `ORPHANED_EXECUTION`,
+  fenced, reconciled, and **resumed the same implementer task** (generation 1 → 3) — **without**
+  advancing to the integrator and **without** the heartbeat latching dead.
+- **No restart loop.** Exactly 1 task / 1 execution was created; worker activity is continuous
+  (no >45 s gaps); the lease has been stable at generation 3 (fence token 3) since recovery.
+- **The lapse was one-time, not repeating.** All 3 mission-scope `lease.expired` records are
+  gen=1 at the same `renewBy` (21:57:23) — a single transient heartbeat starvation during the
+  planning model request, not the old latch/misfire failure mode.
+
+This is exactly the behavior the fixes were designed to produce: a transient renewal blip no
+longer kills the heartbeat (Bug 1), and orphaned-execution recovery resumes the in-flight
+implementer rather than misfiring at the integrator (Bug 2).
+
+### Outstanding follow-ups
+
+1. Let `MSN-wh5rvu` complete (it is actively implementing the disk-pressure spec in worktree
+   `pi-eng-bj8w57-pi-eng-orch-TSK-q9i9er`); verify it reaches `SUCCEEDED` and produces the
+   expected `StoragePressureIncident` / `WAITING_FOR_DISK_SPACE` / coalesced-warning /
+   auto-resume artifacts.
+2. Merge `fix/orchestration-lease-and-orphan-v2` (PR #336) into `main`; rebuild the runtime
+   `dist/`; re-point the runtime back to `pi-engineering-runtime` once `main` has the fixes.
+3. **Optional hardening:** widen the lease margin (e.g., `heartbeatMs` well under `leaseMs/2`,
+   or a longer `leaseMs`) so a long model request cannot starve the heartbeat into a lapse. The
+   self-recovery now handles the lapse, but a wider margin avoids the unnecessary
+   fence/reconcile cycle.
