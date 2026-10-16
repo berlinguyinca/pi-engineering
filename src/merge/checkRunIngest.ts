@@ -1,3 +1,4 @@
+import type { FailureBaseline } from "../verify/failureBaseline.ts";
 /**
  * Check-run ingestion (merge gate spec §31, issue #306).
  *
@@ -12,7 +13,6 @@
  * gh) and the result is sorted by name via `localeCompare`.
  */
 import type { CheckRun, FailureClass } from "./mergeGate.ts";
-import type { FailureBaseline } from "../verify/failureBaseline.ts";
 
 /**
  * A GitHub PR check summary entry as surfaced by the PR checks bucket. The
@@ -138,13 +138,21 @@ export function normalizeCheckRuns(input: NormalizeCheckRunsInput): CheckRun[] {
 
   for (const gh of input.ghChecks ?? []) {
     if (typeof gh.name !== "string" || gh.name === "") continue;
-    upsert(gh.name, { name: gh.name, status: ghStatus(gh.bucket), sha: input.headSha }, dateKey(gh.completedAt, gh.startedAt));
+    upsert(
+      gh.name,
+      { name: gh.name, status: ghStatus(gh.bucket), sha: input.headSha },
+      dateKey(gh.completedAt, gh.startedAt),
+    );
   }
 
   for (const rest of input.restCheckRuns ?? []) {
     if (typeof rest.name !== "string" || rest.name === "") continue;
     const sha = typeof rest.head_sha === "string" && rest.head_sha !== "" ? rest.head_sha : input.headSha;
-    upsert(rest.name, { name: rest.name, status: restStatus(rest.status, rest.conclusion), sha }, dateKey(rest.completed_at, rest.started_at));
+    upsert(
+      rest.name,
+      { name: rest.name, status: restStatus(rest.status, rest.conclusion), sha },
+      dateKey(rest.completed_at, rest.started_at),
+    );
   }
 
   const result = [...byName.values()];

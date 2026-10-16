@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { CheckRun, MergeDecisionInput } from "../../src/merge/mergeGate.ts";
-import { decideMerge } from "../../src/merge/mergeGate.ts";
 import {
-  classifyCheckFailures,
-  normalizeCheckRuns,
   type GhPrCheck,
   type RestCheckRun,
+  classifyCheckFailures,
+  normalizeCheckRuns,
 } from "../../src/merge/checkRunIngest.ts";
+import type { CheckRun, MergeDecisionInput } from "../../src/merge/mergeGate.ts";
+import { decideMerge } from "../../src/merge/mergeGate.ts";
 
 const HEAD = "abc123";
 const BASE = "base000";
@@ -47,7 +47,9 @@ for (const [bucket, expected] of ghBucketCases) {
   });
 }
 
-const restConclusionCases: Array<[status: string, conclusion: string | null | undefined, expected: CheckRun["status"]]> = [
+const restConclusionCases: Array<
+  [status: string, conclusion: string | null | undefined, expected: CheckRun["status"]]
+> = [
   ["completed", "success", "pass"],
   ["completed", "failure", "fail"],
   ["completed", "timed_out", "fail"],
@@ -86,10 +88,7 @@ test("rest checks use head_sha when non-empty, else fall back to headSha", () =>
 test("dedupe keeps the latest completedAt/startedAt date", () => {
   const out = normalizeCheckRuns({
     headSha: HEAD,
-    ghChecks: [
-      gh("ci", { completedAt: "2024-01-01T00:00:00Z" }),
-      gh("ci", { completedAt: "2024-01-02T00:00:00Z" }),
-    ],
+    ghChecks: [gh("ci", { completedAt: "2024-01-01T00:00:00Z" }), gh("ci", { completedAt: "2024-01-02T00:00:00Z" })],
   });
   // Later date wins; both gh use HEAD sha and 'pass'.
   assert.deepEqual(out, [run("ci", "pass", HEAD)]);
@@ -98,10 +97,7 @@ test("dedupe keeps the latest completedAt/startedAt date", () => {
 test("dedupe prefers completedAt over startedAt", () => {
   const out = normalizeCheckRuns({
     headSha: HEAD,
-    ghChecks: [
-      gh("ci", { startedAt: "2024-01-05T00:00:00Z" }),
-      gh("ci", { completedAt: "2024-01-02T00:00:00Z" }),
-    ],
+    ghChecks: [gh("ci", { startedAt: "2024-01-05T00:00:00Z" }), gh("ci", { completedAt: "2024-01-02T00:00:00Z" })],
   });
   // completedAt 01-02 is still the effective date (completedAt ?? startedAt),
   // so it wins over the later startedAt of the other entry.
@@ -158,8 +154,17 @@ test("output is sorted by name via localeCompare", () => {
 test("entries with missing or non-string names are dropped", () => {
   const out = normalizeCheckRuns({
     headSha: HEAD,
-    ghChecks: [gh("ci"), { bucket: "pass" } as unknown as GhPrCheck, { name: 42 } as unknown as GhPrCheck, { name: "" } as GhPrCheck],
-    restCheckRuns: [rest("lint"), { status: "completed" } as unknown as RestCheckRun, { name: 7 } as unknown as RestCheckRun],
+    ghChecks: [
+      gh("ci"),
+      { bucket: "pass" } as unknown as GhPrCheck,
+      { name: 42 } as unknown as GhPrCheck,
+      { name: "" } as GhPrCheck,
+    ],
+    restCheckRuns: [
+      rest("lint"),
+      { status: "completed" } as unknown as RestCheckRun,
+      { name: 7 } as unknown as RestCheckRun,
+    ],
   });
   assert.deepEqual(out, [run("ci", "pass", HEAD), run("lint", "pass", HEAD)]);
 });
