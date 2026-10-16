@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { capContextPackage, estimateTokensDefault, type PackageFile } from "../../src/context/packageBudget.ts";
+import { type PackageFile, capContextPackage, estimateTokensDefault } from "../../src/context/packageBudget.ts";
 
 function file(path: string, content: string, required?: boolean): PackageFile {
   return { path, content, ...(required === undefined ? {} : { required }) };
