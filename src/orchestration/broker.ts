@@ -32,15 +32,25 @@ import type {
   PromotionResult,
   WorktreeInfo,
 } from "../git/GitRepo.ts";
+import {
+  type ChecksResult,
+  type GitPrimitives,
+  MergeQueue,
+  type PromoteResult,
+  type QueueEntry,
+  type QueueState,
+} from "../merge/MergeQueue.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { TURN_SUMMARY, WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
-import { EvidenceUnavailableError, buildCandidateEvidenceIdentity } from "./evidence.ts";
+import { EvidenceUnavailableError, buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
 import type { GateEvidencePublication, LateExecutionEvidence, MissionStore } from "./missionStore.ts";
 import { isNestedPublicationAcceptable } from "./nestedPublicationGate.ts";
 import type { DispatchAuthority } from "./ownership.ts";
 import { replacementRecoveryFingerprint, replacementTaskFingerprintSpec } from "./recovery.ts";
+import { canTransitionMission } from "./state.ts";
+import { noTargetsTestRequirement } from "./testRequirement.ts";
 import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
 
@@ -497,6 +507,66 @@ export function workerInactivityMs(): number {
   return DEFAULT_WORKER_INACTIVITY_MS;
 }
 
+/** What a mission promotion hands the merge queue's hooks. */
+export interface MissionMergeContext {
+  missionId: string;
+  repoId?: string;
+  git: GitRepo;
+  entry: QueueEntry;
+}
+
+/**
+ * Production merge-queue wiring for mission promotion (autospec R-MERGEQ,
+ * issue #153). Every field is optional: without any, promotion still goes
+ * through the SHA-fenced queue with required checks "none" (core never
+ * requires GitHub) and single-model review promotes with a recorded warning.
+ */
+export interface MissionMergeQueueOptions {
+  /** Status of the target's required checks for exactly `sha`. Absent: "none". */
+  requiredChecks?: (sha: string, context: MissionMergeContext) => Promise<ChecksResult>;
+  /** Wrap the queue's git primitives, e.g. a test-result cache in front of the gate. */
+  decoratePrimitives?: (primitives: GitPrimitives) => GitPrimitives;
+  /** Observe each entry's canonical queue state. */
+  onState?: (missionId: string, entry: QueueEntry, state: QueueState) => void;
+  /** Runs after MERGED and before candidate cleanup (post-merge smoke, revert); a throw is a failed promotion. */
+  afterMerged?: (context: MissionMergeContext & { result: PromoteResult }) => Promise<void>;
+  /** Refuse `same_model_reduced` review evidence even when no other reviewer family exists. */
+  requireIndependentReview?: boolean;
+  /** Whether a reviewer of a family other than the one that reviewed was available. Absent: false. */
+  differentFamilyReviewerAvailable?: (input: {
+    missionId: string;
+    reviewer: { provider: string; model: string };
+  }) => boolean | Promise<boolean>;
+  /** Queue rejections that re-enter REPAIRING before the mission is BLOCKED. Default 2. */
+  maxRepairRounds?: number;
+}
+
+/** A queue rejection: `next` is the state the mission was moved to. */
+export class MergeQueueRejectedError extends Error {
+  readonly next: "REPAIRING" | "BLOCKED";
+  readonly round: number;
+  constructor(reason: string, next: "REPAIRING" | "BLOCKED", round: number) {
+    super(`merge queue rejected the candidate (rejection ${round}): ${reason}`);
+    this.name = "MergeQueueRejectedError";
+    this.next = next;
+    this.round = round;
+  }
+}
+
+/** Finding categories the promotion path records; counted durably, never in memory. */
+const MERGE_QUEUE_REJECTION = "merge_queue";
+const REVIEW_INDEPENDENCE_WARNING = "review_independence";
+
+/** A candidate being promoted, keyed by its branch while it is in the queue. */
+interface QueuedPromotion {
+  missionId: string;
+  repoId?: string;
+  lifecycle: CandidateLifecycle;
+  authority?: DispatchAuthority;
+  git: GitRepo;
+  entry: QueueEntry;
+}
+
 export interface BrokerOptions {
   store: MissionStore;
   backends: BrokerBackends;
@@ -540,6 +610,8 @@ export interface BrokerOptions {
   artifacts?: Pick<ArtifactStore, "readContentByUri" | "putImmutable" | "verifyAndDispatch">;
   /** Maximum cancellation delay while waiting for the backend writer to acknowledge abort. */
   cancellationAckTimeoutMs?: number;
+  /** Merge-queue policy and hooks for mission promotion; see {@link MissionMergeQueueOptions}. */
+  mergeQueue?: MissionMergeQueueOptions;
 }
 
 export class ExecutionBroker {
@@ -556,6 +628,13 @@ export class ExecutionBroker {
   private readonly checkpoints?: CheckpointManager;
   private readonly artifacts?: BrokerOptions["artifacts"];
   private readonly cancellationAckTimeoutMs: number;
+  private readonly mergeQueueOptions: MissionMergeQueueOptions;
+  /** One queue per repository and target branch, so promotions to one branch serialize. */
+  private readonly mergeQueues = new Map<string, { queue: MergeQueue; primitives: GitPrimitives }>();
+  /** Candidates currently in a queue, by branch: the primitives resolve their fence through this. */
+  private readonly queuedPromotions = new Map<string, QueuedPromotion>();
+  /** Queue states each mission's promotions reported in this process (observability only; git holds the durable intent). */
+  private readonly mergeStates = new Map<string, QueueState[]>();
   /** In-flight execution state for cancellation + allocated worktrees. */
   /** Executions canceled by an operator interrupt (pause): their tasks stay resumable. */
   private readonly resumableCancels = new Set<string>();
@@ -661,6 +740,7 @@ export class ExecutionBroker {
     this.checkpoints = opts.checkpoints;
     this.artifacts = opts.artifacts;
     this.cancellationAckTimeoutMs = opts.cancellationAckTimeoutMs ?? 5_000;
+    this.mergeQueueOptions = opts.mergeQueue ?? {};
   }
 
   private durableRecoveryContext(input: ExecutionRequestInput): CheckpointRecoveryContext | undefined {
@@ -2399,12 +2479,7 @@ export class ExecutionBroker {
       path: candidate.lifecycle.path,
       branch: candidate.lifecycle.branch,
     };
-    const result = await candidate.git.promoteCandidate(
-      worktree,
-      candidate.lifecycle.baseSha,
-      authority,
-      candidate.lifecycle,
-    );
+    const result = await this.promoteThroughQueue(missionId, candidate, authority);
     if (!result.promoted) throw new Error(result.reason ?? "candidate promotion failed");
     try {
       await candidate.git.removeWorktree(worktree, { keepBranch: true }, authority);
@@ -2425,6 +2500,291 @@ export class ExecutionBroker {
       });
     }
     return true;
+  }
+
+  /**
+   * Promote through the SHA-fenced merge queue (issue #153). A restart that
+   * finds HEAD already at the candidate resumes the durable promotion intent
+   * instead: the queue would see a moved tip and reject a committed promotion.
+   */
+  private async promoteThroughQueue(
+    missionId: string,
+    candidate: { lifecycle: CandidateLifecycle; git: GitRepo },
+    authority?: DispatchAuthority,
+  ): Promise<PromotionResult> {
+    const { lifecycle, git } = candidate;
+    const worktree = { path: lifecycle.path, branch: lifecycle.branch };
+    const reconcile = async (): Promise<PromotionResult> => {
+      const recovered = await git.promoteCandidate(worktree, lifecycle.baseSha, authority, lifecycle);
+      if (recovered.promoted) this.recordMergeState(missionId, "MERGED");
+      return recovered;
+    };
+    if ((await git.headCommit()) === (await git.resolveCommit(lifecycle.branch))) return reconcile();
+    const entry = await this.assertPromotable(missionId, candidate);
+    const landed = await this.landedPromotion(missionId, candidate, entry.reviewedHeadSha);
+    if (landed) {
+      this.recordMergeState(missionId, "MERGED");
+      return { promoted: true, alreadyPromoted: true, reason: null, candidateSha: landed };
+    }
+    const { queue } = await this.missionMergeQueue(git, entry.target);
+    this.queuedPromotions.set(entry.branch, { missionId, repoId: lifecycle.repoId, lifecycle, authority, git, entry });
+    let result: PromoteResult;
+    try {
+      result = await queue.enqueue(entry);
+    } finally {
+      this.queuedPromotions.delete(entry.branch);
+    }
+    if (result.ok) {
+      await this.mergeQueueOptions.afterMerged?.({ missionId, repoId: lifecycle.repoId, git, entry, result });
+      return { promoted: true, reason: null, candidateSha: entry.reviewedHeadSha };
+    }
+    // HEAD at the candidate means the compare-and-swap committed and only its
+    // follow-up failed: that is reconciled, never charged as a repair round.
+    if ((await git.headCommit()) === entry.reviewedHeadSha) return reconcile();
+    throw await this.onQueueRejected(missionId, entry, result.reason ?? "merge queue rejected the candidate");
+  }
+
+  /**
+   * A restart during MERGING re-runs the mission under a new generation, which
+   * rebuilds a candidate with the same tree as the one this mission already
+   * promoted. That work has landed: merging it again would be a second merge of
+   * the same change onto itself, so the completed durable promotion at HEAD
+   * answers for it. Returns the landed SHA, or undefined.
+   */
+  private async landedPromotion(
+    missionId: string,
+    candidate: { lifecycle: CandidateLifecycle; git: GitRepo },
+    reviewedHeadSha: string,
+  ): Promise<string | undefined> {
+    const { lifecycle, git } = candidate;
+    const head = await git.headCommit();
+    const promotions = await git.loadPromotionLifecycles(missionId, lifecycle.repoId);
+    const prior = promotions.find(
+      (record) => record.state === "completed" && record.candidateSha === head && record.baseSha === lifecycle.baseSha,
+    );
+    if (!prior) return undefined;
+    return (await git.changedFiles(head, reviewedHeadSha)).length === 0 ? head : undefined;
+  }
+
+  /**
+   * Refuse promotion unless the exact candidate SHA has passing validation (a
+   * failure-baseline verdict: introduced failures make the exit code non-zero)
+   * and an approving review. Same-model review blocks only when independence was
+   * required or another reviewer family was available; otherwise it promotes with
+   * one recorded warning, so single-model Pi keeps working.
+   */
+  private async assertPromotable(
+    missionId: string,
+    candidate: { lifecycle: CandidateLifecycle; git: GitRepo },
+  ): Promise<QueueEntry> {
+    const { lifecycle, git } = candidate;
+    const refuse = (why: string): Error => new Error(`PROMOTION_REFUSED: ${why}`);
+    const revision = this.store.getCandidate(missionId, lifecycle.repoId);
+    if (!revision || revision.identity.baseSha !== lifecycle.baseSha) {
+      throw refuse("no candidate evidence is recorded for the promoted candidate and its bound base");
+    }
+    const invalidations = this.store.listEvidenceInvalidations(missionId);
+    const current = <T extends { identityHash: string; recordedAt: string }>(
+      entries: T[],
+      kind: "validation" | "review",
+    ): T | undefined =>
+      entries
+        .filter((entry) => entry.identityHash === revision.identityHash)
+        .filter(
+          (entry) =>
+            !invalidations.some(
+              (invalidation) =>
+                hashCandidateEvidenceIdentity(invalidation.identity) === entry.identityHash &&
+                (invalidation.scope === undefined || invalidation.scope === "all" || invalidation.scope === kind) &&
+                Date.parse(invalidation.invalidatedAt) >= Date.parse(entry.recordedAt),
+            ),
+        )
+        .at(-1);
+    const sha = revision.identity.candidateSha;
+    const validation = current(this.store.listValidationEvidence(missionId), "validation");
+    const criteria = this.store.getMission(missionId)?.acceptance_criteria;
+    const baselineClean =
+      !!validation &&
+      validation.accessible &&
+      (validation.noTargets ? !noTargetsTestRequirement(criteria) : validation.exitCode === 0);
+    if (!baselineClean) throw refuse(`no passing failure-baseline verdict exists for candidate ${sha}`);
+    const review = current(this.store.listReviewEvidence(missionId), "review");
+    if (!review || !review.accessible || !review.outputValid || review.verdict !== "approve") {
+      throw refuse(`no approving review exists for candidate ${sha}`);
+    }
+    if (review.independenceMode === "same_model_reduced") {
+      const policy = this.mergeQueueOptions;
+      const available =
+        !policy.requireIndependentReview &&
+        ((await policy.differentFamilyReviewerAvailable?.({
+          missionId,
+          reviewer: { provider: review.provider, model: review.model },
+        })) ??
+          false);
+      if (policy.requireIndependentReview || available) {
+        throw refuse(
+          `review of ${sha} has reduced independence (${review.provider}/${review.model}) while ${
+            policy.requireIndependentReview
+              ? "independent review is required"
+              : "a different-family reviewer was available"
+          }`,
+        );
+      }
+      const recorded = this.store
+        .listFindings(missionId)
+        .some((finding) => finding.category === REVIEW_INDEPENDENCE_WARNING && finding.evidence === sha);
+      if (!recorded) {
+        this.store.addFinding({
+          mission_id: missionId,
+          task_id: review.taskId,
+          severity: "minor",
+          category: REVIEW_INDEPENDENCE_WARNING,
+          file: null,
+          line: null,
+          summary: `Promoted on same-model review with reduced independence (${review.provider}/${review.model}): no different-family reviewer was available`,
+          evidence: sha,
+          recommended_action: "Configure a reviewer model of another family to get independent review.",
+        });
+        await this.store.flush();
+      }
+    }
+    return {
+      branch: lifecycle.branch,
+      target: (await git.currentBranch()) ?? "HEAD",
+      reviewedHeadSha: sha,
+      boundBaseSha: lifecycle.baseSha,
+    };
+  }
+
+  /**
+   * Record a queue rejection durably and move the mission: REPAIRING for the
+   * first `maxRepairRounds` rejections of this resumption, BLOCKED after that.
+   * Counting store records (never memory) keeps the bound across a restart.
+   */
+  private async onQueueRejected(
+    missionId: string,
+    entry: QueueEntry,
+    reason: string,
+  ): Promise<MergeQueueRejectedError> {
+    const generation = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    const scope = `resumption:${generation};`;
+    const round =
+      this.store
+        .listFindings(missionId)
+        .filter((finding) => finding.category === MERGE_QUEUE_REJECTION && finding.evidence?.startsWith(scope)).length +
+      1;
+    const maxRounds = this.mergeQueueOptions.maxRepairRounds ?? 2;
+    const next = round > maxRounds ? "BLOCKED" : "REPAIRING";
+    this.store.addFinding({
+      mission_id: missionId,
+      task_id: null,
+      severity: next === "BLOCKED" ? "blocking" : "minor",
+      category: MERGE_QUEUE_REJECTION,
+      file: null,
+      line: null,
+      summary: `Merge queue rejected ${entry.branch} at ${entry.reviewedHeadSha.slice(0, 12)} (rejection ${round}; ${maxRounds} repair round(s) allowed): ${reason}`,
+      evidence: `${scope}head:${entry.reviewedHeadSha};base:${entry.boundBaseSha}`,
+      recommended_action:
+        next === "BLOCKED"
+          ? "Rebase the preserved candidate onto the current target, re-run validation and review, then resume the mission."
+          : "The promotion is retried through the merge queue.",
+    });
+    const status = this.store.getMission(missionId)?.status;
+    if (status && status !== next && canTransitionMission(status, next)) this.store.transitionMission(missionId, next);
+    await this.store.flush();
+    return new MergeQueueRejectedError(reason, next, round);
+  }
+
+  /**
+   * The production merge queue for one repository and target branch (built
+   * once, so every promotion to that branch serializes through it). Extension
+   * point: `BrokerOptions.mergeQueue` decorates its primitives and observes or
+   * follows its merges.
+   */
+  async missionMergeQueue(git: GitRepo, target: string): Promise<{ queue: MergeQueue; primitives: GitPrimitives }> {
+    const key = `${await git.commonDir()}\0${target}`;
+    let built = this.mergeQueues.get(key);
+    if (!built) {
+      const base = this.missionMergePrimitives(git, target);
+      const primitives = this.mergeQueueOptions.decoratePrimitives?.(base) ?? base;
+      const queue = new MergeQueue({
+        git: primitives,
+        mainBranch: target,
+        rebaseRetries: 0,
+        onState: (entry, state) => {
+          const promotion = this.queuedPromotions.get(entry.branch);
+          if (!promotion) return;
+          this.recordMergeState(promotion.missionId, state);
+          this.mergeQueueOptions.onState?.(promotion.missionId, entry, state);
+        },
+      });
+      built = { queue, primitives };
+      this.mergeQueues.set(key, built);
+    }
+    return built;
+  }
+
+  /** Queue states this process saw for a mission's promotions, oldest first. */
+  mergeQueueStates(missionId: string): readonly QueueState[] {
+    return [...(this.mergeStates.get(missionId) ?? [])];
+  }
+
+  private recordMergeState(missionId: string, state: QueueState): void {
+    this.mergeStates.set(missionId, [...(this.mergeStates.get(missionId) ?? []), state]);
+  }
+
+  /**
+   * Git primitives over the incumbent checkout. The target is the incumbent
+   * HEAD the promotion compare-and-swap checks; the merge is the durable,
+   * intent-journaled `GitRepo.promoteCandidate` of the queued candidate.
+   */
+  private missionMergePrimitives(git: GitRepo, target: string): GitPrimitives {
+    const promotionFor = (branch: string): QueuedPromotion => {
+      const promotion = this.queuedPromotions.get(branch);
+      if (!promotion) throw new Error(`no queued promotion for ${branch}`);
+      return promotion;
+    };
+    return {
+      currentBranch: async () => (await git.currentBranch()) ?? target,
+      branchExists: async (name) => (await git.resolveCommit(name)) !== null,
+      headCommit: () => git.headCommit(),
+      resolveRef: async (ref) => {
+        if (ref === target) return git.headCommit();
+        const sha = await git.resolveCommit(ref);
+        if (!sha) throw new Error(`ref ${ref} does not resolve to a commit`);
+        return sha;
+      },
+      // Never rebase in place: the rebased commit is one no validation or review
+      // covers, and the durable promotion intent is bound to the reviewed base.
+      rebaseOnto: async (branch, onto) => ({
+        ok: false,
+        conflict: `stale base: ${onto} moved after ${branch} was reviewed; a repair round must rebase and revalidate`,
+      }),
+      requiredChecks: async (sha) => {
+        const promotion = [...this.queuedPromotions.values()].find((queued) => queued.entry.reviewedHeadSha === sha);
+        const provider = this.mergeQueueOptions.requiredChecks;
+        if (!provider || !promotion) return "none";
+        return provider(sha, {
+          missionId: promotion.missionId,
+          repoId: promotion.repoId,
+          git: promotion.git,
+          entry: promotion.entry,
+        });
+      },
+      mergeBranch: async (branch, _target, expectedHeadSha) => {
+        const promotion = promotionFor(branch);
+        if (expectedHeadSha && (await promotion.git.resolveCommit(branch)) !== expectedHeadSha) {
+          return { merged: false, conflict: false, reason: `${branch} moved off the reviewed head ${expectedHeadSha}` };
+        }
+        const promoted = await promotion.git.promoteCandidate(
+          { path: promotion.lifecycle.path, branch },
+          promotion.lifecycle.baseSha,
+          promotion.authority,
+          promotion.lifecycle,
+        );
+        return { merged: promoted.promoted, conflict: false, reason: promoted.reason };
+      },
+    };
   }
 
   async reconcileCommittedPromotions(
