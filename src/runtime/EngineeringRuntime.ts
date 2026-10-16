@@ -26,8 +26,10 @@ import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
+import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
+import { readAutospecFlags } from "../orchestration/missionMode.ts";
 import {
   PlannerTransientError,
   missionPlannerMode,
@@ -158,6 +160,12 @@ const SNAPSHOT_PUBLISH_BACKOFF_MS = 100;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+/** Max external missions this runtime starts per supervisor pump (env override, default 1). */
+function maxExternalMissions(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number.parseInt(env.PI_ENGINEERING_MAX_EXTERNAL_MISSIONS ?? "", 10);
+  return Number.isInteger(raw) && raw > 0 ? raw : 1;
 }
 
 /** Read-only tool allowlist (scout/reviewer/challenger). */
@@ -667,6 +675,9 @@ export class EngineeringRuntime {
   private readonly supervisorSettlementFlights = new Map<string, Promise<void>>();
   /** Spaces out supervisor repairs that keep reporting the same unchanged decision. */
   private readonly supervisorRepairBackoff = new SupervisorRepairBackoff();
+  /** External missions currently being started by this runtime's pump (dedupes in-flight starts). */
+  private readonly runningExternal = new Set<string>();
+  private externalPumpStopped = false;
 
   /**
    * Serializes git mutations that touch the shared main repo (worktree create,
@@ -1412,6 +1423,7 @@ export class EngineeringRuntime {
       rt.missionSupervisor.start();
       return rt;
     } catch (error) {
+      rt.externalPumpStopped = true;
       await rt.missionSupervisor?.shutdown();
       if (rt.ownershipId) liveOwnerIds().delete(rt.ownershipId);
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
@@ -1436,6 +1448,7 @@ export class EngineeringRuntime {
   /** Release this runtime's share of its orchestration namespace. Idempotent. */
   async close(): Promise<void> {
     if (this.closed) return;
+    this.externalPumpStopped = true;
     if (this.openReferences > 1) {
       this.openReferences--;
       if (this.orchestrationPath) EngineeringRuntime.releaseOrchestrationReference(this.orchestrationPath);
@@ -1613,6 +1626,61 @@ export class EngineeringRuntime {
     if (!this.missionStore || !this.orchestrator) return;
     for (const status of statuses) {
       await this.consumeSupervisorStatus(status);
+    }
+    try {
+      this.pumpExternalMissions();
+    } catch (error) {
+      emitTelemetry({ level: "warning", text: `external mission pump: ${redactSecrets(String(error))}` });
+    }
+  }
+
+  /**
+   * Start eligible external missions (`MSN-ext-*` in NEW with no live foreign
+   * lease), up to `PI_ENGINEERING_MAX_EXTERNAL_MISSIONS` concurrent, on each
+   * supervisor tick. Pure side effects live behind the supervisor-driven pump;
+   * the scheduler never dispatches external missions itself.
+   */
+  private pumpExternalMissions(now = new Date()): void {
+    if (this.externalPumpStopped) return;
+    if (!this.missionStore || !this.orchestrator) return;
+    if (!this.ownershipId) return;
+    if (!readAutospecFlags(process.env).enabled) return;
+    const candidates = this.missionStore
+      .listMissions((mission) => mission.status === "NEW")
+      .map((mission) => ({
+        mission,
+        lease: this.missionStore!.getMissionLease(mission.mission_id) ?? undefined,
+      }));
+    const toStart = selectExternalMissionsToStart(
+      candidates,
+      this.ownershipId,
+      now,
+      maxExternalMissions(),
+      this.runningExternal.size,
+    );
+    for (const missionId of toStart) {
+      if (this.runningExternal.has(missionId)) continue;
+      this.runningExternal.add(missionId);
+      void this.orchestrator
+        .runSubmittedMission(missionId, {})
+        .then((outcome) => {
+          if (!outcome.started) {
+            emitTelemetry({
+              level: "warning",
+              text: `external mission ${missionId} not started: ${redactSecrets(outcome.reason)}`,
+            });
+          }
+        })
+        .catch((error) => {
+          emitTelemetry({
+            level: "warning",
+            text: `external mission ${missionId} start failed: ${redactSecrets(String(error))}`,
+          });
+        })
+        .finally(() => {
+          this.runningExternal.delete(missionId);
+          void this.publishMissionSnapshot();
+        });
     }
   }
 
