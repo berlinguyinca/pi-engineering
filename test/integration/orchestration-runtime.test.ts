@@ -864,7 +864,13 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     assert.ok(
       rt
         .missionStore!.listFindings(result.mission.mission_id)
-        .some((finding) => /promotion rejected.*diverged/i.test(finding.summary)),
+        // Promotion is fenced on evidence bound to the candidate's own base (#153):
+        // evidence for another base is refused before the incumbent is touched.
+        .some((finding) =>
+          /promotion rejected.*(diverged|no candidate evidence is recorded for the promoted candidate and its bound base)/i.test(
+            finding.summary,
+          ),
+        ),
       "incumbent divergence must reject promotion",
     );
     assert.equal(result.completed, false, "a conflicted integration must never complete the mission");
