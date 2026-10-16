@@ -71,6 +71,7 @@ import {
   resolveCatalogProbeTarget,
 } from "../resilience/probe.ts";
 import { ResourceRegistry } from "../resources/ResourceRegistry.ts";
+import type { StatfsReader } from "../resources/buildBudget.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
@@ -242,6 +243,9 @@ export function challengerMayDisplace(lead: TournamentEntry, runner: TournamentE
 }
 
 /** Registry id of the worktree + branch pair a candidate owns. */
+/** Mission statuses after which a mission no longer uses its build caches. */
+const FINISHED_MISSION_STATUSES: ReadonlySet<string> = new Set(["COMPLETE", "FAILED", "CANCELED"]);
+
 /** State directories whose ResourceRegistry this process already reconciled. */
 const reconciledStateDirs = new Set<string>();
 
@@ -445,6 +449,8 @@ export interface EngineeringRuntimeOptions {
   inferenceStatus?: (line: string) => void;
   /** Override the durable state directory (default: <repoRoot>/.pi-eng). */
   workDir?: string;
+  /** Test seam: the filesystem reader behind mission build disk admission (default: real statfs). */
+  buildStatfs?: StatfsReader;
   /**
    * Autonomous-stop gate (spec §14.5, roadmap spec §13). When the roadmap is
    * complete, `engineer()` refuses to invent new work. Returns true when the
@@ -1141,6 +1147,19 @@ export class EngineeringRuntime {
         artifacts: rt.artifacts,
         git: rt.git,
         cwd: repoRoot,
+        // Mission verification builds into a per-mission target dir under the
+        // runtime state dir, is refused on a full disk, and frees idle caches
+        // of finished missions under pressure (R-BUILD, issue #259). A mission
+        // this store does not know is treated as active, never collected.
+        build: {
+          stateDir: workDir,
+          registry: rt.resourceRegistry,
+          ...(opts.buildStatfs ? { statfs: opts.buildStatfs } : {}),
+          isMissionActive: (missionId) => {
+            const status = rt.missionStore?.getMission(missionId)?.status;
+            return status === undefined || !FINISHED_MISSION_STATUSES.has(status);
+          },
+        },
         routeModel,
         // A takeover mark is gateway-confirmed (404 model_not_found or a model
         // pruned from the runtime); an attempt that succeeds clears it.

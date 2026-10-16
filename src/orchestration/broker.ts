@@ -306,6 +306,8 @@ function validateRecoveryPaths(values: string[], field: string): string[] {
 
 export interface ProcessRunner {
   runProcess(input: {
+    /** Owning mission: its verification gets a per-mission build dir and disk admission. */
+    missionId?: string;
     repoId?: string;
     objective: string;
     worktree?: string | null;
@@ -353,6 +355,8 @@ export interface IntegrationRunner {
   /** Declares that the runner merges and verifies exclusively in `candidate`. */
   candidateScoped?: boolean;
   runIntegration(input: {
+    /** Owning mission: its verification gets a per-mission build dir and disk admission. */
+    missionId?: string;
     repoId?: string;
     objective: string;
     handoffs: IntegrationHandoff[];
@@ -372,6 +376,8 @@ export const VERIFY_CACHE_NOTICE = "verify.cache:";
 export interface ValidationRunner {
   candidateScoped?: boolean;
   runValidation(input: {
+    /** Owning mission: its verification gets a per-mission build dir and disk admission. */
+    missionId?: string;
     repoId?: string;
     objective: string;
     worktree?: string | null;
@@ -3456,6 +3462,7 @@ export class ExecutionBroker {
         if (!runner) throw new Error("no process backend registered");
         return this.dispatchWithVerifiedRecovery(input, () =>
           runner.runProcess({
+            missionId: input.missionId,
             repoId: input.repoId,
             objective: input.objective,
             worktree: base.worktree,
@@ -3630,6 +3637,7 @@ export class ExecutionBroker {
         const git = repository?.git ?? null;
         let outcome = await this.dispatchWithVerifiedRecovery(input, () =>
           runner.runIntegration({
+            missionId: input.missionId,
             repoId: input.repoId,
             objective: input.objective,
             handoffs,
@@ -3722,6 +3730,7 @@ export class ExecutionBroker {
         }
         return this.dispatchWithVerifiedRecovery(input, () =>
           runner.runValidation({
+            missionId: input.missionId,
             repoId: input.repoId,
             objective: input.objective,
             worktree: candidatePath ?? base.worktree,

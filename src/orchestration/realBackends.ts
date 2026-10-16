@@ -21,7 +21,13 @@ import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
-import { NO_TARGETS_WARNING, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
+import type { MissionBuildOptions } from "../resources/buildBudget.ts";
+import {
+  NO_TARGETS_WARNING,
+  type VerificationProvider,
+  type VerifyOutcome,
+  type VerifyRunOptions,
+} from "../verify/Verifier.ts";
 import { subtractBaselineFailures } from "../verify/baselineSubtraction.ts";
 import { hasCachedVerification, verifyOnce } from "../verify/resultCache.ts";
 import { MODEL_SUPERSEDED } from "../workers/WorkerExecutor.ts";
@@ -46,6 +52,12 @@ interface JudgedVerification {
 }
 
 export interface RealBackendsOptions {
+  /**
+   * Per-mission build directories and disk admission for mission verification
+   * (src/resources/buildBudget.ts). Every mission verify stage run through
+   * these backends gets the mission id plus these options.
+   */
+  build?: Omit<MissionBuildOptions, "executionId">;
   worker: WorkerExecutor;
   verifier: VerificationProvider;
   artifacts: ArtifactStore;
@@ -406,6 +418,9 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
 }
 
 export function realBackends(opts: RealBackendsOptions) {
+  /** The mission id and build options every mission verify stage run is given (R-BUILD wiring). */
+  const missionBuild = (missionId: string | undefined): Pick<VerifyRunOptions, "missionId" | "build"> =>
+    missionId ? { missionId, ...(opts.build ? { build: opts.build } : {}) } : {};
   /** Providers that refused connections, with the time their cooldown ends. */
   const unreachableProviders = new Map<string, number>();
   const cooling = (provider: string): boolean => {
@@ -812,6 +827,7 @@ export function realBackends(opts: RealBackendsOptions) {
     validation: {
       candidateScoped: true,
       async runValidation(input: {
+        missionId?: string;
         repoId?: string;
         objective: string;
         worktree?: string | null;
@@ -828,7 +844,10 @@ export function realBackends(opts: RealBackendsOptions) {
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
         const run = async (): Promise<{ value: JudgedVerification; passed: boolean }> => {
-          const firstOutcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
+          const firstOutcome = await opts.verifier.run(cwd, profile, opts.artifacts, {
+            signal: input.signal,
+            ...missionBuild(input.missionId),
+          });
           const judged = repo.git
             ? await subtractBaselineFailures({
                 git: repo.git,
@@ -839,6 +858,7 @@ export function realBackends(opts: RealBackendsOptions) {
                 profile,
                 outcome: firstOutcome,
                 signal: input.signal,
+                runOptions: missionBuild(input.missionId),
               })
             : undefined;
           // The judged outcome: the candidate's re-run when it had stopped at an inherited failure.
@@ -1186,6 +1206,7 @@ export function realBackends(opts: RealBackendsOptions) {
     },
     process: {
       async runProcess(input: {
+        missionId?: string;
         repoId?: string;
         objective: string;
         worktree?: string | null;
@@ -1197,7 +1218,10 @@ export function realBackends(opts: RealBackendsOptions) {
         const cwd = input.worktree ?? (await repository(input.repoId)).cwd;
         const profile = await opts.verifier.detect(cwd);
         input.signal.throwIfAborted();
-        const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, { signal: input.signal });
+        const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, {
+          signal: input.signal,
+          ...missionBuild(input.missionId),
+        });
         return {
           executionId: "process",
           exitStatus: outcome.passed ? "succeeded" : "failed",
@@ -1210,6 +1234,7 @@ export function realBackends(opts: RealBackendsOptions) {
     integration: {
       candidateScoped: true,
       async runIntegration(input: {
+        missionId?: string;
         repoId?: string;
         objective: string;
         handoffs: IntegrationHandoff[];
@@ -1320,6 +1345,7 @@ export function realBackends(opts: RealBackendsOptions) {
             async () => {
               const firstResult = await opts.verifier.run(candidateCwd, checks, opts.artifacts, {
                 signal: input.signal,
+                ...missionBuild(input.missionId),
               });
               // Failures already red on the base commit are inherited, not introduced.
               const judged = await subtractBaselineFailures({
@@ -1331,6 +1357,7 @@ export function realBackends(opts: RealBackendsOptions) {
                 profile: checks,
                 outcome: firstResult,
                 signal: input.signal,
+                runOptions: missionBuild(input.missionId),
               });
               return {
                 passed: judged.passed,
