@@ -3,14 +3,17 @@
  * environment (CI-001, FLEET-001).
  *
  * The emitter is OFF by default: unless HERDR_INGEST_URL is a valid http(s)
- * URL, createIngestFromEnv returns null and the runtime stays silent. When
- * configured, the returned client is wired with:
- *   - host id from HERDR_HOST_ID ?? os.hostname()
- *   - api key from HERDR_INGEST_API_KEY (sent as an `x-api-key` header)
+ * URL without credentials, query or hash, createIngestFromEnv returns null and
+ * the runtime stays silent. When configured, the returned client is wired with:
+ *   - host id from trimmed HERDR_HOST_ID (falls back to os.hostname())
+ *   - api key from trimmed HERDR_INGEST_API_KEY (sent as an `x-api-key`
+ *     header; omitted entirely when empty; the factory returns null when the
+ *     key contains control characters since such a client could never send)
  *   - source "pi" (injected into every ingest payload)
  *
  * ControlPlaneIngest exposes no api-key/source fields, so those are carried by
  * wrapping its injectable fetch rather than by modifying ControlPlaneIngest.
+ * The api key is never included in errors or logs.
  */
 
 import os from "node:os";
@@ -34,24 +37,41 @@ function stampedFetch(apiKey: string | undefined): typeof globalThis.fetch {
   }) as typeof globalThis.fetch;
 }
 
+/** True when `value` contains a control character (C0 range or DEL). */
+function hasControlChar(value: string): boolean {
+  for (const ch of value) {
+    const code = ch.charCodeAt(0);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
 /**
  * Build a ControlPlaneIngest from the environment, or null when HERDR_INGEST_URL
- * is unset or not a valid http(s) URL.
+ * is unset, blank, not a valid http(s) URL, or carries credentials, a query or a
+ * hash component. An api key containing control characters also yields null
+ * (such a client could never send). The key itself is never surfaced in errors
+ * or logs.
  */
 export function createIngestFromEnv(env: NodeJS.ProcessEnv): ControlPlaneIngest | null {
-  const rawUrl = env.HERDR_INGEST_URL;
-  if (!rawUrl) return null;
+  const trimmedUrl = env.HERDR_INGEST_URL?.trim() ?? "";
+  if (trimmedUrl === "") return null;
 
   let parsed: URL;
   try {
-    parsed = new URL(rawUrl);
+    parsed = new URL(trimmedUrl);
   } catch {
     return null;
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username !== "" || parsed.password !== "") return null;
+  if (parsed.search !== "" || parsed.hash !== "") return null;
 
-  const hostId = env.HERDR_HOST_ID ?? os.hostname();
-  const apiKey = env.HERDR_INGEST_API_KEY;
+  const hostId = env.HERDR_HOST_ID?.trim() || os.hostname();
+
+  const trimmedKey = env.HERDR_INGEST_API_KEY?.trim() ?? "";
+  if (hasControlChar(trimmedKey)) return null;
+  const apiKey = trimmedKey === "" ? undefined : trimmedKey;
 
   return new ControlPlaneIngest({
     url: parsed.toString(),

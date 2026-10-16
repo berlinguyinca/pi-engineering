@@ -103,3 +103,86 @@ test("createIngestFromEnv omits the api key header when HERDR_INGEST_API_KEY is 
     globalThis.fetch = originalFetch;
   }
 });
+
+test("createIngestFromEnv trims HERDR_INGEST_URL before parsing", () => {
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "   " }), null);
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "\t" }), null);
+  const ingest = createIngestFromEnv({ HERDR_INGEST_URL: "  http://dev.lan  " });
+  assert.ok(ingest);
+  assert.equal(ingest.url, "http://dev.lan");
+});
+
+test("createIngestFromEnv returns null for a URL with credentials", () => {
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "http://u:p@dev.lan" }), null);
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "http://u@dev.lan" }), null);
+});
+
+test("createIngestFromEnv returns null for a URL with a query", () => {
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "http://dev.lan?x=1" }), null);
+});
+
+test("createIngestFromEnv returns null for a URL with a hash", () => {
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "http://dev.lan#frag" }), null);
+});
+
+test("createIngestFromEnv falls back to os.hostname() when HERDR_HOST_ID is blank or whitespace", () => {
+  assert.equal(
+    createIngestFromEnv({ HERDR_INGEST_URL: "http://dev.lan", HERDR_HOST_ID: "" })?.host.hostId,
+    os.hostname(),
+  );
+  assert.equal(
+    createIngestFromEnv({ HERDR_INGEST_URL: "http://dev.lan", HERDR_HOST_ID: "   " })?.host.hostId,
+    os.hostname(),
+  );
+});
+
+test("createIngestFromEnv trims HERDR_HOST_ID before use", () => {
+  const ingest = createIngestFromEnv({ HERDR_INGEST_URL: "http://dev.lan", HERDR_HOST_ID: "  bender  " });
+  assert.ok(ingest);
+  assert.equal(ingest.host.hostId, "bender");
+});
+
+test("createIngestFromEnv omits the x-api-key header for a whitespace-only api key", async () => {
+  const calls: CapturedCall[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = recordingFetch(calls);
+  try {
+    const ingest = createIngestFromEnv({
+      HERDR_INGEST_URL: "https://dev.lan",
+      HERDR_HOST_ID: "bender",
+      HERDR_INGEST_API_KEY: "   ",
+    });
+    assert.ok(ingest);
+    await ingest.hostRegistered();
+    const call = calls[0]!;
+    assert.equal(call.headers["x-api-key"], undefined);
+    assert.equal(call.body.source, "pi");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("createIngestFromEnv trims the api key before use", async () => {
+  const calls: CapturedCall[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = recordingFetch(calls);
+  try {
+    const ingest = createIngestFromEnv({
+      HERDR_INGEST_URL: "https://dev.lan",
+      HERDR_HOST_ID: "bender",
+      HERDR_INGEST_API_KEY: "  secret-key  ",
+    });
+    assert.ok(ingest);
+    await ingest.hostRegistered();
+    const call = calls[0]!;
+    assert.equal(call.headers["x-api-key"], "secret-key");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("createIngestFromEnv returns null when the api key contains a control character", () => {
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "http://dev.lan", HERDR_INGEST_API_KEY: "bad\nkey" }), null);
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "http://dev.lan", HERDR_INGEST_API_KEY: "bad\tkey" }), null);
+  assert.equal(createIngestFromEnv({ HERDR_INGEST_URL: "http://dev.lan", HERDR_INGEST_API_KEY: "bad\x00key" }), null);
+});
