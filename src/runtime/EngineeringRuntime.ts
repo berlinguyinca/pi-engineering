@@ -46,6 +46,7 @@ import { buildVerifierStages } from "../orchestration/missionWhy.ts";
 import { MissionObservability } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
+import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
@@ -1414,6 +1415,12 @@ export class EngineeringRuntime {
           supervisedStore.syncExternal();
         },
         admit: async (mission) => {
+          // Externally submitted missions in NEW belong to the external pump, not the
+          // supervisor lifecycle: the pump adopts them via runSubmittedMission, which
+          // acquires the lease and moves them past NEW. Supervising them while their
+          // submission receipt lease is live misreads "no tasks yet" as
+          // REQUIREMENT_AMBIGUITY and blocks them before the pump can start them.
+          if (!supervisorAdmitsMission(mission)) return false;
           const claim = await custody.claim(missionCustodyKey(mission.mission_id));
           if (claim.ok) supervisedStore.syncExternal();
           return claim.ok;
