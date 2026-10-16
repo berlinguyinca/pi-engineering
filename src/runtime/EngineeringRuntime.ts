@@ -242,6 +242,9 @@ export function challengerMayDisplace(lead: TournamentEntry, runner: TournamentE
 }
 
 /** Registry id of the worktree + branch pair a candidate owns. */
+/** State directories whose ResourceRegistry this process already reconciled. */
+const reconciledStateDirs = new Set<string>();
+
 function candidateResourceId(branch: string): string {
   return `candidate-worktree:${branch}`;
 }
@@ -978,6 +981,9 @@ export class EngineeringRuntime {
     const rt = new EngineeringRuntime(opts);
     rt.ledger = ledger;
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
+    // Records this host left in `releasing` (a crash between beginRelease and
+    // completeRelease) are finished or rolled back before any mission work.
+    await rt.reconcileResources(workDir);
     rt.artifacts = artifacts;
     rt.broker = broker;
     rt.git = git;
@@ -2010,6 +2016,46 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
       waveOf.set(t.id, wave);
     }
     return waves;
+  }
+
+  /**
+   * Startup recovery for the ResourceRegistry (issue #258). Runs once per state
+   * directory per process: a second runtime opened in this process cannot have
+   * crashed, and re-running would roll back a release a live sibling runtime is
+   * in the middle of. Every diagnostic becomes a ledger entry carrying the
+   * resource id, action and reason. A failure to reconcile is a visible ledger
+   * finding, never a failed open, and leaves the directory eligible for retry.
+   */
+  private async reconcileResources(workDir: string): Promise<void> {
+    const key = resolve(workDir);
+    if (reconciledStateDirs.has(key)) return;
+    try {
+      const diagnostics = await this.resourceRegistry.reconcile();
+      reconciledStateDirs.add(key);
+      for (const d of diagnostics) {
+        await this.ledger
+          .recordEntity(
+            "finding",
+            `resource ${d.id} ${d.action} at startup: ${d.reason}`,
+            d.action === "quarantined" ? "open" : "resolved",
+            this.actor(newRunId(), "reviewer"),
+            null,
+            { severity: d.action === "quarantined" ? "medium" : "low" },
+          )
+          .catch(() => {});
+      }
+    } catch (error) {
+      await this.ledger
+        .recordEntity(
+          "finding",
+          `resource registry reconcile failed at startup: ${error instanceof Error ? error.message : String(error)}`,
+          "open",
+          this.actor(newRunId(), "reviewer"),
+          null,
+          { severity: "medium" },
+        )
+        .catch(() => {});
+    }
   }
 
   /**
