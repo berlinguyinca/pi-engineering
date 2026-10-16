@@ -16,8 +16,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 const CLI = resolve(fileURLToPath(new URL("../../scripts/pi-engineering.ts", import.meta.url)));
 const SUBMISSION_RECEIPT_LEASE_MS = 5 * 60 * 1000;
