@@ -76,6 +76,29 @@ export function externalMissionId(idempotencyKey: string): string {
 }
 
 /**
+ * Mission identifiers carried by an autospec-protocol envelope: an optional
+ * single-letter prefix followed by letters, digits, dots, underscores and
+ * dashes, at most 64 characters long. Anything else is rejected as
+ * INVALID_FIELD before the store is touched.
+ */
+const ENVELOPE_MISSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** Sentinel embedded in a protocol-created mission's constraints to persist the envelope idempotency_key. */
+const IDEMPOTENCY_SENTINEL_PREFIX = "__pi_idempotency_key:";
+
+function idempotencySentinel(key: string): string {
+  return `${IDEMPOTENCY_SENTINEL_PREFIX}${key}`;
+}
+
+/** The stored envelope idempotency_key embedded in constraints, or undefined if none. */
+function storedIdempotencyKey(constraints: string[]): string | undefined {
+  for (const c of constraints) {
+    if (c.startsWith(IDEMPOTENCY_SENTINEL_PREFIX)) return c.slice(IDEMPOTENCY_SENTINEL_PREFIX.length);
+  }
+  return undefined;
+}
+
+/**
  * The Pi submit fields a protocol-mode submit carries under `extensions.pi`.
  * The mission id and idempotency key come from the envelope itself.
  */
@@ -182,6 +205,14 @@ export async function runExternalEntry(
         reply({ result: "protocol_error", code: result.code, message: result.message });
         return 2;
       }
+      if (!ENVELOPE_MISSION_ID_RE.test(String(result.envelope.mission_id))) {
+        reply({
+          result: "protocol_error",
+          code: "INVALID_FIELD",
+          message: `mission_id must match /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/, got ${JSON.stringify(result.envelope.mission_id)}`,
+        });
+        return 2;
+      }
       protocolSubmit = parseProtocolSubmit(result.envelope);
       ownerId = protocolSubmit.ownerId;
       idempotencyKey = protocolSubmit.idempotencyKey;
@@ -246,7 +277,7 @@ export async function runExternalEntry(
           repository: protocolSubmit ? protocolSubmit.repository : str(body, "repository", true)!,
           base_ref: protocolSubmit ? protocolSubmit.baseRef : str(body, "baseRef", true)!,
           constraints: protocolSubmit
-            ? protocolSubmit.constraints
+            ? [...protocolSubmit.constraints, idempotencySentinel(protocolSubmit.idempotencyKey)]
             : Array.isArray(body.constraints)
               ? body.constraints.filter((c): c is string => typeof c === "string")
               : [],
@@ -258,11 +289,37 @@ export async function runExternalEntry(
             : ((str(body, "workflowClass", false) as WorkflowClass | undefined) ?? "engineering"),
         });
         created = true;
+      } else if (protocolSubmit) {
+        // A protocol resubmit must present the same idempotency_key the mission
+        // was created with; a different key is an idempotency conflict and must
+        // not touch the existing mission or its lease.
+        const storedKey = storedIdempotencyKey(mission.constraints);
+        if (storedKey !== undefined && storedKey !== protocolSubmit.idempotencyKey) {
+          reply({
+            result: "protocol_error",
+            code: "IDEMPOTENCY_CONFLICT",
+            message: "idempotency_key does not match the existing mission",
+          });
+          return 2;
+        }
       }
       let lease = store.getLatestMissionLease(id);
       if (lease && lease.ownerId !== ownerId) {
         reply({ result: "conflict", missionId: id, reason: "the idempotencyKey belongs to another owner" });
         return 1;
+      }
+      if (protocolSubmit) {
+        // Only acquire (or re-confirm) the lease when this submission created
+        // the mission or its idempotency_key matches the envelope's key.
+        const storedKey = storedIdempotencyKey(mission.constraints);
+        if (!created && storedKey !== protocolSubmit.idempotencyKey) {
+          reply({
+            result: "protocol_error",
+            code: "IDEMPOTENCY_CONFLICT",
+            message: "idempotency_key does not match the existing mission",
+          });
+          return 2;
+        }
       }
       // A crash between createMission and acquire leaves a mission with no lease.
       if (!lease) lease = await ownership.acquire(id);

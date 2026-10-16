@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
@@ -146,5 +146,79 @@ describe("pi-engineering mission (autospec-protocol envelope submit)", () => {
     assert.equal(result.code, 2);
     assert.equal(result.json.result, "protocol_error");
     assert.equal(result.json.code, "MISSING_FIELD");
+  });
+
+  it("a mission_id outside the envelope format is a protocol_error INVALID_FIELD (exit 2) and no mission is created", async () => {
+    const dir = await store();
+    const result = run("submit", dir, envelopeSubmit({ envelope: { mission_id: "../../x y:z\n" } }));
+    assert.equal(result.code, 2);
+    assert.equal(result.json.result, "protocol_error");
+    assert.equal(result.json.code, "INVALID_FIELD");
+    assert.match(result.json.message, /mission_id/);
+    // the invalid mission_id was rejected before the store was touched: no store
+    // file was created, so no mission exists.
+    await assert.rejects(
+      stat(join(dir, "orchestration.jsonl")),
+      (e: unknown) => (e as NodeJS.ErrnoException).code === "ENOENT",
+    );
+  });
+
+  it("resubmitting the same mission_id with the same idempotency_key is an existing (exit 0) with exactly one mission", async () => {
+    const dir = await store();
+    const first = run("submit", dir, envelopeSubmit());
+    assert.equal(first.code, 0, first.stderr);
+    assert.equal(first.json.result, "created");
+    const second = run("submit", dir, envelopeSubmit());
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(second.json.result, "existing");
+    assert.equal(second.json.missionId, "MSN-ext-envelope-1");
+    // exactly one mission with that mission_id: observe still returns the same title
+    const seen = run("observe", dir, {
+      missionId: "MSN-ext-envelope-1",
+      ownerId: "autospec-1",
+      fencingToken: first.json.fencingToken,
+    });
+    assert.equal(seen.code, 0, seen.stderr);
+    assert.equal(seen.json.mission.title, "Add isEven");
+  });
+
+  it("resubmitting the same mission_id with a different idempotency_key is a protocol_error IDEMPOTENCY_CONFLICT (exit 2) and the original mission is unchanged", async () => {
+    const dir = await store();
+    const first = run("submit", dir, envelopeSubmit());
+    assert.equal(first.code, 0, first.stderr);
+    const second = run(
+      "submit",
+      dir,
+      envelopeSubmit({ envelope: { idempotency_key: "env-key-other" }, pi: { title: "Changed Title" } }),
+    );
+    assert.equal(second.code, 2);
+    assert.equal(second.json.result, "protocol_error");
+    assert.equal(second.json.code, "IDEMPOTENCY_CONFLICT");
+    const seen = run("observe", dir, {
+      missionId: "MSN-ext-envelope-1",
+      ownerId: "autospec-1",
+      fencingToken: first.json.fencingToken,
+    });
+    assert.equal(seen.code, 0, seen.stderr);
+    assert.equal(seen.json.mission.title, "Add isEven");
+  });
+
+  it("a protocol submit without extensions.pi exits 2 with a message mentioning extensions.pi", async () => {
+    const dir = await store();
+    const body = envelopeSubmit();
+    delete (body.extensions as Record<string, unknown>).pi;
+    const result = run("submit", dir, body);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /extensions\.pi/);
+  });
+
+  it("a protocol submit missing title or ownerId inside extensions.pi exits 2", async () => {
+    const dir = await store();
+    const noTitle = run("submit", dir, envelopeSubmit({ pi: { title: undefined as unknown as string } }));
+    assert.equal(noTitle.code, 2);
+    assert.match(noTitle.stderr, /title/);
+    const noOwner = run("submit", dir, envelopeSubmit({ pi: { ownerId: undefined as unknown as string } }));
+    assert.equal(noOwner.code, 2);
+    assert.match(noOwner.stderr, /ownerId/);
   });
 });
