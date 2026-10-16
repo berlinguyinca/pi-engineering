@@ -34,6 +34,8 @@ export interface ControlPlaneIngestOptions {
   fetch?: typeof globalThis.fetch;
   /** Per-request timeout in ms (default 1500). */
   timeoutMs?: number;
+  /** Optional control-plane API key (sent as X-API-Key; use an `ingest`-role key). */
+  apiKey?: string;
 }
 
 export class ControlPlaneIngest {
@@ -44,6 +46,7 @@ export class ControlPlaneIngest {
 
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
+  private readonly apiKey?: string;
   private readonly seenMissions = new Set<string>();
 
   constructor(opts: ControlPlaneIngestOptions) {
@@ -57,6 +60,7 @@ export class ControlPlaneIngest {
     this.defaultMissionId = opts.defaultMissionId;
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.timeoutMs = opts.timeoutMs ?? 1500;
+    this.apiKey = opts.apiKey?.trim() || undefined;
   }
 
   /**
@@ -78,7 +82,7 @@ export class ControlPlaneIngest {
       try {
         res = await this.fetchImpl(`${this.url}/api/v1/ingest`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", ...(this.apiKey ? { "x-api-key": this.apiKey } : {}) },
           body: JSON.stringify({ entity_type: entityType, entity_id: entityId, event_type: eventType, payload }),
           signal: controller.signal,
         });
@@ -89,6 +93,16 @@ export class ControlPlaneIngest {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Agent-inspector telemetry (docs/contracts/agent-inspector-event.md in herdr-engineering):
+   * one `inspector.batch` ingest for entity `inspector` keyed by the session id. Same
+   * best-effort / non-blocking / timeout behaviour as {@link emit}. The caller bounds the
+   * batch (<= 100 events); see InspectorFeed.
+   */
+  emitBatch(sessionId: string, events: ReadonlyArray<Record<string, unknown>>): Promise<boolean> {
+    return this.emit("inspector", sessionId, "inspector.batch", { events });
   }
 
   /** Report the host once (host.registered). Idempotent on the control plane. */

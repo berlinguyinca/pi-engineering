@@ -77,6 +77,7 @@ import {
 } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
+import { type InspectorFeedHandle, attachInspectorFeedFromEnv } from "../src/runtime/herdr/InspectorFeed.ts";
 import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
@@ -644,6 +645,16 @@ export default function (pi: ExtensionAPI) {
   registerInteractiveMemory(pi);
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
+  // Agent-inspector feed to Herdr: OFF unless HERDR_CP_URL is set AND PI_INSPECTOR_FEED=1.
+  // Best-effort and bounded; see docs/split-view-and-inspector.md.
+  let inspector: InspectorFeedHandle | null = null;
+  try {
+    inspector = attachInspectorFeedFromEnv(pi, process.env, {
+      modelReason: () => (automaticModelSwitch ? "fallback" : undefined),
+    });
+  } catch {
+    inspector = null;
+  }
   // Housekeeping: reclaim worktrees abandoned by crashed or killed runs and
   // expire unused Rust target caches. Live missions keep their worktrees, and
   // uncommitted work is committed to its branch before a checkout goes away,
@@ -2200,6 +2211,7 @@ ${RECOVERY_PROMPT}`;
           await rt.resumeBlockedMission(missionId, ctx.signal);
           const mission = rt.missionStore?.getMission(missionId);
           if (!mission) throw new Error(`unknown mission ${missionId}`);
+          inspector?.associate({ mission_id: mission.mission_id });
           ctx.ui.notify(`Recovery ${mission.mission_id} — ${mission.title} [${mission.status}]`, "info");
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -2232,6 +2244,7 @@ ${RECOVERY_PROMPT}`;
         },
       });
       const m = result.mission;
+      inspector?.associate({ mission_id: m.mission_id });
       const completion =
         result.pausedBy === "operator" && result.mission.status !== "PAUSED_INFRASTRUCTURE"
           ? `interrupt noted — mission left ${result.mission.status} (not canceled); /mission resume ${result.mission.mission_id} continues it`

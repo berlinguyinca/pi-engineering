@@ -53,7 +53,7 @@
     "typescript": "^5.6.0"
   },
   "pi": {
-    "extensions": ["./src/runtime/host/entry.ts"]
+    "extensions": ["./src/runtime/host/entry.ts", "./extensions/split-view/split-view.ts"]
   },
   "piEngineering": {
     "runtimeApi": 1,

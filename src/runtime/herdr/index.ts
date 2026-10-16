@@ -7,3 +7,21 @@ export type { ControlPlaneIngestOptions } from "./ControlPlaneIngest.ts";
 export type { HerdrCli, HerdrAgent, HerdrStatus, RealHerdrCliOptions } from "./HerdrCli.ts";
 export { herdrEnsureLocal, detectHerdr } from "./ensureHerdr.ts";
 export type { HerdrEnsureLocalOptions, HerdrEnsureResult, HerdrDetection } from "./ensureHerdr.ts";
+export {
+  InspectorFeed,
+  INSPECTOR_LIMITS,
+  attachInspectorFeed,
+  attachInspectorFeedFromEnv,
+  inspectorConfigFromEnv,
+  isSensitivePath,
+  isTestCommand,
+  parseTestOutput,
+} from "./InspectorFeed.ts";
+export type {
+  InspectorAssociation,
+  InspectorEvent,
+  InspectorFeedHandle,
+  InspectorFeedOptions,
+  InspectorSink,
+  ReasoningMode,
+} from "./InspectorFeed.ts";
