@@ -16,5 +16,7 @@
     "noUncheckedIndexedAccess": true,
     "resolveJsonModule": true
   },
-  "include": ["src", "extensions", "test"]
+  "include": ["src", "extensions", "test"],
+  // extensions/split-view is vendored third-party code (see its VENDORED.md): not rewritten to our compiler flags.
+  "exclude": ["node_modules", "extensions/split-view"]
 }

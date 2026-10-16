@@ -91,6 +91,16 @@ export class ControlPlaneIngest {
     }
   }
 
+  /**
+   * Agent-inspector telemetry (docs/contracts/agent-inspector-event.md in herdr-engineering):
+   * one `inspector.batch` ingest for entity `inspector` keyed by the session id. Same
+   * best-effort / non-blocking / timeout behaviour as {@link emit}. The caller bounds the
+   * batch (<= 100 events); see InspectorFeed.
+   */
+  emitBatch(sessionId: string, events: ReadonlyArray<Record<string, unknown>>): Promise<boolean> {
+    return this.emit("inspector", sessionId, "inspector.batch", { events });
+  }
+
   /** Report the host once (host.registered). Idempotent on the control plane. */
   hostRegistered(): Promise<boolean> {
     return this.emit("host", this.host.hostId, "host.registered", {
