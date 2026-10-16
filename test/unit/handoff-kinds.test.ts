@@ -144,3 +144,138 @@ test("malformed fields are rejected", () => {
     assert.ok(result.ok === false && result.errors.length > 0);
   }
 });
+
+test("strict timestamp and field validation rejects garbage input", () => {
+  const committed = (patch: Record<string, unknown>) => ({
+    ...validRecord(),
+    state: "committed",
+    successor: { sessionId: "sess-b", generation: 1 },
+    ackAt: "2025-01-01T00:00:01.000Z",
+    ...patch,
+  });
+
+  const cases: Array<{ label: string; record: unknown; message: string }> = [
+    {
+      label: "unknown state 'bogus'",
+      record: { ...baseRecord(), state: "bogus" },
+      message: "state must be one of",
+    },
+    {
+      label: "non-string state 42",
+      record: { ...baseRecord(), state: 42 },
+      message: "state must be a non-empty string",
+    },
+    {
+      label: "generation 1.5",
+      record: { ...baseRecord(), predecessor: { sessionId: "s", generation: 1.5 } },
+      message: "predecessor must be { sessionId: string, generation: number }",
+    },
+    {
+      label: "generation NaN",
+      record: { ...baseRecord(), predecessor: { sessionId: "s", generation: Number.NaN } },
+      message: "predecessor must be { sessionId: string, generation: number }",
+    },
+    {
+      label: "generation -1",
+      record: { ...baseRecord(), predecessor: { sessionId: "s", generation: -1 } },
+      message: "predecessor must be { sessionId: string, generation: number }",
+    },
+    {
+      label: "state committed without successor",
+      record: { ...validRecord(), successor: undefined },
+      message: "successor is required for state committed",
+    },
+    {
+      label: "state committed with ackAt ''",
+      record: committed({ ackAt: "" }),
+      message: "ackAt must be an ISO-8601 timestamp when present",
+    },
+    {
+      label: "state committed with ackAt 'not-a-date'",
+      record: committed({ ackAt: "not-a-date" }),
+      message: "ackAt must be an ISO-8601 timestamp when present",
+    },
+    {
+      label: "createdAt 'garbage'",
+      record: { ...baseRecord(), createdAt: "garbage" },
+      message: "createdAt must be an ISO-8601 timestamp",
+    },
+    {
+      label: "createdAt ''",
+      record: { ...baseRecord(), createdAt: "" },
+      message: "createdAt must be an ISO-8601 timestamp",
+    },
+    {
+      label: "checkpointSha 123",
+      record: { ...validRecord(), checkpointSha: 123 },
+      message: "checkpointSha must match /^[0-9a-f]{7,64}$/ when present",
+    },
+    {
+      label: "checkpointSha 'xyz'",
+      record: { ...validRecord(), checkpointSha: "xyz" },
+      message: "checkpointSha must match /^[0-9a-f]{7,64}$/ when present",
+    },
+    {
+      label: "successor { sessionId: 1 }",
+      record: { ...validRecord(), successor: { sessionId: 1 } },
+      message: "successor must be { sessionId: string, generation: number }",
+    },
+    {
+      label: "input [] (array)",
+      record: [],
+      message: "",
+    },
+  ];
+
+  for (const { label, record, message } of cases) {
+    const result = validateHandoffRecord(record);
+    assert.equal(result.ok, false, `expected ${label} to be rejected`);
+    if (result.ok === false && message !== "") {
+      assert.ok(
+        result.errors.some((e) => e.includes(message)),
+        `${label} errors should include ${message}`,
+      );
+    }
+  }
+});
+
+test("nextStates returns [] for unknown or non-handoff values", () => {
+  assert.deepEqual(nextStates("bogus" as never), []);
+  assert.deepEqual(nextStates("committed"), []);
+  assert.deepEqual(nextStates("aborted"), []);
+});
+
+test("a valid committed record with a future ackAt passes", () => {
+  const result = validateHandoffRecord({
+    ...validRecord(),
+    state: "committed",
+    ackAt: "2026-10-16T00:00:00Z",
+  });
+  assert.equal(result.ok, true);
+});
+
+test("returned record is a fresh copy with no extra fields and isolated from the input", () => {
+  const input = { ...validRecord(), junk: "should-be-dropped" };
+  const result = validateHandoffRecord(input);
+  assert.equal(result.ok, true);
+  assert.ok(result.ok);
+  assert.notStrictEqual(result.record, input);
+  assert.ok(!("junk" in result.record), "extra field should be dropped");
+
+  // Mutating the input after validation must not change the returned record.
+  input.state = "aborted";
+  input.junk = "changed";
+  assert.equal(result.record.state, "committed");
+  assert.ok(!("junk" in result.record));
+});
+
+test("illegal transitions are rejected by the transition helper", () => {
+  // prepared has only [validated, aborted] as successors.
+  assert.ok(!nextStates("prepared").includes("acknowledged"), "prepared -> acknowledged illegal");
+  assert.ok(!nextStates("prepared").includes("committed"), "prepared -> committed illegal");
+  // validated has only [acknowledged, aborted] as successors.
+  assert.ok(!nextStates("validated").includes("prepared"), "validated -> prepared illegal");
+  // committed and aborted are sinks.
+  assert.deepEqual(nextStates("committed"), [], "committed has no successors");
+  assert.deepEqual(nextStates("aborted"), [], "aborted has no successors");
+});

@@ -66,6 +66,8 @@ export function nextStates(state: HandoffState): HandoffState[] {
       return [];
     case "aborted":
       return [];
+    default:
+      return [];
   }
 }
 
@@ -75,6 +77,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return isNonEmptyString(value) && Number.isFinite(Date.parse(value));
 }
 
 function isEndpoint(value: unknown): value is HandoffEndpoint {
@@ -127,11 +133,11 @@ export function validateHandoffRecord(
     }
   }
 
-  if (obj.ackAt !== undefined && typeof obj.ackAt !== "string") {
-    errors.push("ackAt must be a string when present");
+  if (obj.ackAt !== undefined && !isIsoTimestamp(obj.ackAt)) {
+    errors.push("ackAt must be an ISO-8601 timestamp when present");
   }
 
-  if (!isNonEmptyString(obj.createdAt)) errors.push("createdAt must be a non-empty string");
+  if (!isIsoTimestamp(obj.createdAt)) errors.push("createdAt must be an ISO-8601 timestamp");
 
   if (typeof state === "string" && REQUIRED_ACK_STATES.has(state as HandoffState)) {
     if (obj.successor === undefined) errors.push(`successor is required for state ${state}`);
@@ -139,5 +145,20 @@ export function validateHandoffRecord(
   }
 
   if (errors.length > 0) return { ok: false, errors };
-  return { ok: true, record: obj as unknown as HandoffRecord };
+
+  // Build a fresh copy containing only the declared HandoffRecord fields so that
+  // unknown extra fields are dropped and later mutation of the input cannot
+  // affect the returned record.
+  const record: HandoffRecord = {
+    id: obj.id as string,
+    kind: obj.kind as HandoffKind,
+    state: obj.state as HandoffState,
+    missionId: obj.missionId as string,
+    predecessor: obj.predecessor as HandoffEndpoint,
+    createdAt: obj.createdAt as string,
+  };
+  if (obj.successor !== undefined) record.successor = obj.successor as HandoffEndpoint;
+  if (obj.checkpointSha !== undefined) record.checkpointSha = obj.checkpointSha as string;
+  if (obj.ackAt !== undefined) record.ackAt = obj.ackAt as string;
+  return { ok: true, record };
 }
