@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { GitRepo } from "../git/GitRepo.ts";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
-import type { VerificationProfile, VerificationProvider, VerifyOutcome } from "./Verifier.ts";
+import type { VerificationProfile, VerificationProvider, VerifyOutcome, VerifyRunOptions } from "./Verifier.ts";
 import {
   type FailureBaseline,
   captureBaseline,
@@ -64,6 +64,8 @@ export interface SubtractionInput {
   profile: VerificationProfile;
   outcome: VerifyOutcome;
   signal?: AbortSignal;
+  /** Mission build options applied to every verification run made here, base runs included. */
+  runOptions?: Pick<VerifyRunOptions, "missionId" | "build">;
 }
 
 const DEFAULT_BASELINE_TIMEOUT_MS = 20 * 60_000;
@@ -104,6 +106,7 @@ async function computeBaseline(
     // base run should reuse it here instead of building from cold.
     const baseline = await captureBaseline(wt.path, baseSha, input.verifier, baseProfile, input.artifacts, {
       signal,
+      ...(input.runOptions ? { runOptions: input.runOptions } : {}),
       runs: positiveInt(process.env.PI_ENGINEERING_BASELINE_RUNS, DEFAULT_BASELINE_RUNS),
     }).catch((error: unknown) => {
       if (timeout.aborted && !input.signal?.aborted) {
@@ -216,6 +219,7 @@ export async function subtractBaselineFailures(input: SubtractionInput): Promise
       outcome = await input.verifier.run(input.cwd, input.profile, input.artifacts, {
         ...(input.signal ? { signal: input.signal } : {}),
         continueThrough: inheritedStages,
+        ...(input.runOptions ?? {}),
       });
       verdict = compareToBaseline(baseline, outcome, sha);
       if (verdict.stale) return unavailable(verdict.reason);

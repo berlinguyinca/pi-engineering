@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdir, statfs } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { isRustProject } from "../git/rustBuildCache.ts";
-import type { ResourceRegistry } from "./ResourceRegistry.ts";
+import type { MissionActivity, ResourceRegistry } from "./ResourceRegistry.ts";
+import { type GcResult, pressureGc } from "./buildGc.ts";
 
 /**
  * Build budgets (autospec R-BUILD, issue #144).
@@ -13,9 +14,10 @@ import type { ResourceRegistry } from "./ResourceRegistry.ts";
  * separate from the cache budget, and quotas count bytes AND inodes (a disk can
  * be out of inodes with plenty of free bytes).
  *
- * This module only measures and decides. It deletes nothing: reclaiming
- * unreferenced owned caches is the pressure GC's job (issue #145), and the
- * shared sccache evicts by its own LRU.
+ * This module measures and decides. It deletes nothing itself: reclaiming
+ * unreferenced owned caches is the pressure GC's job (issue #145), which
+ * {@link admitMissionBuild} invokes under disk pressure; the shared sccache
+ * evicts by its own LRU.
  */
 
 const GiB = 1024 ** 3;
@@ -172,6 +174,17 @@ export interface MissionBuildOptions {
   /** Execution that owns the directory; defaults to the mission id. */
   executionId?: string;
   budget?: BuildBudgetConfig;
+  /**
+   * Whether a mission is still using its build caches. Under disk pressure the
+   * admission frees idle caches of finished missions through
+   * {@link pressureGc}; that GC runs only when this predicate is supplied (it
+   * must never guess which missions are alive) and a `registry` is present.
+   */
+  isMissionActive?: MissionActivity;
+  /** Idle time below which the pressure GC never removes a cache. */
+  gcMinIdleMs?: number;
+  /** Clock for the pressure GC's idle check. */
+  now?: () => number;
   /** Test seam for the filesystem reader. */
   statfs?: StatfsReader;
 }
@@ -183,6 +196,8 @@ export interface BuildAdmission {
   pressure?: DiskPressure;
   /** Set when the stage must not run; the text says why. */
   refused?: string;
+  /** What the pressure GC did, when disk pressure made admission run it. */
+  gc?: GcResult;
 }
 
 /**
@@ -198,11 +213,34 @@ export async function admitMissionBuild(
 ): Promise<BuildAdmission> {
   if (operatorEnv.CARGO_TARGET_DIR?.trim() || !(await isRustProject(cwd))) return { env: {} };
   const dir = missionTargetDir(build.stateDir, missionId);
-  const pressure = await diskPressure(dir, build.budget ?? DEFAULT_BUILD_BUDGET, build.statfs);
+  let pressure = await diskPressure(dir, build.budget ?? DEFAULT_BUILD_BUDGET, build.statfs);
+  // Production caller of the pressure GC (issue #259): at warn or stop, free
+  // idle caches of finished missions before deciding. A failing GC never blocks
+  // admission by itself; the pressure measured before it then stands.
+  let gc: GcResult | undefined;
+  if (pressure.level !== "ok" && build.registry && build.isMissionActive) {
+    try {
+      gc = await pressureGc(
+        build.registry,
+        {
+          root: join(build.stateDir, "build"),
+          ...(build.budget ? { budget: build.budget } : {}),
+          ...(build.gcMinIdleMs !== undefined ? { minIdleMs: build.gcMinIdleMs } : {}),
+          ...(build.statfs ? { statfs: build.statfs } : {}),
+        },
+        build.isMissionActive,
+        (build.now ?? Date.now)(),
+      );
+      pressure = gc.after;
+    } catch {
+      gc = undefined;
+    }
+  }
   if (pressure.level === "stop") {
     return {
       env: {},
       pressure,
+      ...(gc ? { gc } : {}),
       refused: `build refused for mission ${missionId}: ${pressure.reason ?? "disk pressure"}`,
     };
   }
@@ -217,5 +255,5 @@ export async function admitMissionBuild(
     });
   }
   await mkdir(dir, { recursive: true });
-  return { env: { CARGO_TARGET_DIR: dir }, pressure };
+  return { env: { CARGO_TARGET_DIR: dir }, pressure, ...(gc ? { gc } : {}) };
 }

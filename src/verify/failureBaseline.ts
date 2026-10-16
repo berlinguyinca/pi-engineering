@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
-import type { VerificationProfile, VerificationProvider, VerifyOutcome } from "./Verifier.ts";
+import type { VerificationProfile, VerificationProvider, VerifyOutcome, VerifyRunOptions } from "./Verifier.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -52,6 +52,12 @@ export interface BaselineVerdict {
 
 export interface CaptureBaselineOptions {
   signal?: AbortSignal;
+  /**
+   * Mission build options for the base runs: a baseline build is still a build,
+   * so it gets the requesting mission's target dir and disk admission rather
+   * than bypassing them (issue #259).
+   */
+  runOptions?: Pick<VerifyRunOptions, "missionId" | "build">;
   /**
    * Confirming runs of the profile at the base. A failure counts as
    * pre-existing only if it fails in every run; one that fails in only some is
@@ -166,6 +172,7 @@ export async function captureBaseline(
     const outcome = await provider.run(cwd, profile, store, {
       exhaustive: true,
       ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.runOptions ?? {}),
     });
     // A run that died of the environment describes the machine, not the commit.
     if (outcome.stages.some((run) => run.summary.infrastructureFailure === true)) {
