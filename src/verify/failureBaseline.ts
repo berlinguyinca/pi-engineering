@@ -213,6 +213,18 @@ export function compareToBaseline(
   boundBaseSha: string | undefined,
 ): BaselineVerdict {
   const current = failureIds(outcome);
+  // A blocked outcome depends on a quarantined test: no baseline can forgive it,
+  // and it blocks even when no failing id is listed (stages may all have passed).
+  if (outcome.status === "blocked") {
+    return {
+      introduced: current,
+      preExisting: [],
+      fixed: [],
+      stale: false,
+      blocking: true,
+      reason: `blocked by quarantined test(s): ${(outcome.quarantined ?? []).join(", ") || "unknown"}`,
+    };
+  }
   const stale = (reason: string): BaselineVerdict => ({
     introduced: current,
     preExisting: [],

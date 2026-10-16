@@ -76,6 +76,7 @@ import { Scheduler } from "../sched/Scheduler.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
+import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
@@ -599,6 +600,8 @@ export class EngineeringRuntime {
    * Rooted in the runtime state dir; assigned by open().
    */
   resourceRegistry: ResourceRegistry;
+  /** Stall quarantine for this runtime's verification, persisted under the state dir (issue #260). */
+  testQuarantine: TestQuarantine;
   artifacts: ArtifactStore;
   broker: ContextBroker | null;
   git: GitRepo | null;
@@ -928,6 +931,7 @@ export class EngineeringRuntime {
     // Assigned by open().
     this.ledger = undefined as unknown as Ledger;
     this.resourceRegistry = undefined as unknown as ResourceRegistry;
+    this.testQuarantine = undefined as unknown as TestQuarantine;
     this.artifacts = undefined as unknown as ArtifactStore;
     this.broker = null;
     this.git = null;
@@ -987,6 +991,7 @@ export class EngineeringRuntime {
     const rt = new EngineeringRuntime(opts);
     rt.ledger = ledger;
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
+    rt.testQuarantine = new TestQuarantine(workDir);
     // Records this host left in `releasing` (a crash between beginRelease and
     // completeRelease) are finished or rolled back before any mission work.
     await rt.reconcileResources(workDir);
@@ -1147,6 +1152,7 @@ export class EngineeringRuntime {
         artifacts: rt.artifacts,
         git: rt.git,
         cwd: repoRoot,
+        quarantine: rt.testQuarantine,
         // Mission verification builds into a per-mission target dir under the
         // runtime state dir, is refused on a full disk, and frees idle caches
         // of finished missions under pressure (R-BUILD, issue #259). A mission
@@ -2231,7 +2237,7 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     // certify it (INV-003/005 integrity). Stages still RUN in the candidate
     // worktree so they exercise the candidate's actual code.
     const profile = await this.verifier.detect(this.cwd);
-    const outcome = await this.verifier.run(runCwd, profile, this.artifacts);
+    const outcome = await this.verifier.run(runCwd, profile, this.artifacts, { quarantine: this.testQuarantine });
     const actor = this.actor(newRunId(), "reviewer");
     this.telemetry.verifyStages += outcome.stages.length;
     const evidenceIds: string[] = [];

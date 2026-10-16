@@ -62,6 +62,25 @@ export interface QueueEntry {
   boundBaseSha: string;
 }
 
+/** A gate result that can be `blocked` (a quarantined test): blocked is never a pass. */
+export interface GateVerdict {
+  passed: boolean;
+  status?: "blocked";
+  /** The quarantined test ids a blocked verdict depends on. */
+  quarantined?: string[];
+}
+
+const blockedReason = (ids: readonly string[] | undefined): string =>
+  `integration gate blocked by quarantined test(s): ${ids?.join(", ") || "unknown"}`;
+
+/** Why a gate result refuses the merge, or undefined when it passes. A blocked verdict never passes. */
+function gateRefusal(result: boolean | GateVerdict): string | undefined {
+  if (result === true) return undefined;
+  if (result === false) return "integration gate failed";
+  if (result.status === "blocked") return blockedReason(result.quarantined);
+  return result.passed === true ? undefined : "integration gate failed";
+}
+
 export interface GitPrimitives {
   currentBranch(): Promise<string>;
   branchExists(name: string): Promise<boolean>;
@@ -79,8 +98,12 @@ export interface GitPrimitives {
   ): Promise<{ merged: boolean; conflict: boolean; reason: string | null }>;
   /** The commit at `ref` (HEAD when omitted). */
   headCommit(ref?: string): Promise<string>;
-  /** Run an integration gate (e.g. verify) before promoting to main. */
-  runIntegrationGate?(branch: string, ctx?: { target: string; baseSha: string }): Promise<boolean>;
+  /**
+   * Run an integration gate (e.g. verify) before promoting to main. A gate that
+   * can say more than pass/fail returns a {@link GateVerdict}; only `true`, or a
+   * verdict that passed and is not `blocked`, lets the merge proceed.
+   */
+  runIntegrationGate?(branch: string, ctx?: { target: string; baseSha: string }): Promise<boolean | GateVerdict>;
   /** SHA a ref currently points at. Required by `enqueue`: a fence needs real SHAs. */
   resolveRef?(ref: string): Promise<string>;
   /** Status of the target's required checks for exactly this SHA. */
@@ -235,14 +258,18 @@ export class MergeQueue {
     if (this.git.baselineAt && this.git.verifyBranch) {
       const baseline = await this.git.baselineAt(entry.target, tip);
       const outcome = await this.git.verifyBranch(entry.branch, tip);
+      if (outcome.status === "blocked") {
+        return { level: "integration", ok: false, reason: blockedReason(outcome.quarantined) };
+      }
       const verdict = compareToBaseline(baseline, outcome, tip);
       if (verdict.blocking) {
         return { level: "integration", ok: false, reason: `integration gate failed: ${verdict.reason}` };
       }
     } else if (this.git.runIntegrationGate) {
-      if (!(await this.git.runIntegrationGate(entry.branch, { target: entry.target, baseSha: tip }))) {
-        return { level: "integration", ok: false, reason: "integration gate failed" };
-      }
+      const refusal = gateRefusal(
+        await this.git.runIntegrationGate(entry.branch, { target: entry.target, baseSha: tip }),
+      );
+      if (refusal) return { level: "integration", ok: false, reason: refusal };
     }
     return undefined;
   }
@@ -262,10 +289,8 @@ export class MergeQueue {
     }
     // Level 2: integration gate (deterministic verification) before merge.
     if (this.requireGate && this.git.runIntegrationGate) {
-      const gate = await this.git.runIntegrationGate(branch);
-      if (!gate) {
-        return { level: "integration", ok: false, reason: "integration gate failed" };
-      }
+      const refusal = gateRefusal(await this.git.runIntegrationGate(branch));
+      if (refusal) return { level: "integration", ok: false, reason: refusal };
     }
     // Level 3: controlled merge into main (spec §31.3).
     const merge = await this.git.mergeBranch(branch);

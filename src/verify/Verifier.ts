@@ -12,9 +12,11 @@ import {
   hashProfile,
   parseFailingTests,
 } from "./failureBaseline.ts";
+import type { TestQuarantine } from "./testQuarantine.ts";
 import {
   DEFAULT_SAMPLE_MS,
   DEFAULT_TEST_WATCHDOG,
+  type ProgressKind,
   type StallEvidence,
   type TestWatchdogConfig,
   type WatchdogLevel,
@@ -135,6 +137,8 @@ export interface StageStall {
   silentMs: number;
   /** Process tree and output tail captured BEFORE the signal. */
   evidence: StallEvidence;
+  /** What the watchdog last counted as progress before the stall (part of the quarantine signature). */
+  lastProgressKind: ProgressKind | null;
 }
 
 const WATCHDOG_RECENT_BYTES = 32 * 1024;
@@ -254,7 +258,7 @@ export function runWithInactivityGuard(
         // Evidence first, then the signal: the tree must still be alive to be captured.
         const evidence = captureEvidenceSync(groupPid, recent);
         const silentMs = now - state.lastProgressAtMs;
-        stalled = { level, silentMs, evidence };
+        stalled = { level, silentMs, evidence, lastProgressKind: state.lastProgressKind };
         hung = true;
         stderr += `\n[pi-engineering] killed: test stage stalled, no progress for ${silentMs}ms (last progress: ${state.lastProgressKind ?? "none"})\n${JSON.stringify(evidence)}\n`;
         killTree();
@@ -386,6 +390,13 @@ export interface VerifyOutcome {
   warnings?: string[];
   /** Hash of the profile this outcome ran (see failureBaseline.hashProfile). */
   profileHash?: string;
+  /**
+   * `blocked` when the outcome depends on a quarantined test (see
+   * testQuarantine.ts): never passed, whatever the stages reported.
+   */
+  status?: "blocked";
+  /** The quarantined test ids a blocked outcome depends on. */
+  quarantined?: string[];
   /** Present only when the run was given a failure baseline: introduced failures block, pre-existing ones do not. */
   baselineVerdict?: BaselineVerdict;
 }
@@ -401,6 +412,12 @@ export interface VerifyRunOptions {
   missionId?: string;
   /** Build directory and disk admission for the mission (see src/resources/buildBudget.ts). */
   build?: MissionBuildOptions;
+  /**
+   * Stall quarantine for this run (overrides the verifier's own): a stalled
+   * stage is recorded, and an outcome depending on a quarantined test is
+   * returned `blocked`.
+   */
+  quarantine?: TestQuarantine;
   /** Run every stage even after a required stage fails (a baseline must see the whole profile). */
   exhaustive?: boolean;
   /** Keep going after a required failure in these stages (their failure is inherited from the base). */
@@ -742,6 +759,8 @@ export function probeNextest(cwd: string): Promise<boolean> {
 export interface CommandVerifierOptions {
   /** Whether cargo-nextest is installed; injectable for tests. */
   probeNextest?: (cwd: string) => Promise<boolean>;
+  /** Records stalled stages and blocks outcomes that depend on a quarantined test. */
+  quarantine?: TestQuarantine;
 }
 
 /** Deterministic verifier that runs detected shell commands. */
@@ -754,9 +773,11 @@ export class CommandVerifier implements VerificationProvider {
    */
   private readonly profileCache = new Map<string, VerificationProfile>();
   private readonly probeNextest: (cwd: string) => Promise<boolean>;
+  private readonly quarantine: TestQuarantine | undefined;
 
   constructor(opts: CommandVerifierOptions = {}) {
     this.probeNextest = opts.probeNextest ?? probeNextest;
+    this.quarantine = opts.quarantine;
   }
 
   private async cacheKey(
@@ -855,6 +876,7 @@ export class CommandVerifier implements VerificationProvider {
     const stageRuns: StageRun[] = [];
     const evidence: Evidence[] = [];
     let failedStage: string | null = null;
+    const quarantine = opts?.quarantine ?? this.quarantine;
 
     for (const stage of profile.stages) {
       opts?.signal?.throwIfAborted();
@@ -896,9 +918,24 @@ export class CommandVerifier implements VerificationProvider {
         )
       ).uri;
 
+      // A stage is the unit a stall is attributed to: with a quarantine, the
+      // stage lists its id under `tests` so an outcome depending on a
+      // quarantined stage is blocked even if this run happened to pass.
+      const stageTestId = `stage:${stage.name}`;
+      const stalledTestId = res.stalled && quarantine ? stageTestId : undefined;
+      const quarantinedNow =
+        stalledTestId && res.stalled && quarantine
+          ? await quarantine.recordStall(
+              stalledTestId,
+              { ...res.stalled.evidence, lastProgressKind: res.stalled.lastProgressKind },
+              artifactUri,
+            )
+          : undefined;
       const summary: Record<string, unknown> = {
         stage: stage.name,
         passed,
+        ...(quarantine ? { tests: [stageTestId] } : {}),
+        ...(stalledTestId ? { stalledTest: stalledTestId, quarantined: quarantinedNow === true } : {}),
         exitCode: code,
         stdoutBytes: Buffer.byteLength(stdout),
         stderrBytes: Buffer.byteLength(stderr),
@@ -970,7 +1007,10 @@ export class CommandVerifier implements VerificationProvider {
       warnings: noTargets ? [NO_TARGETS_WARNING] : [],
       profileHash: hashProfile(profile),
     };
-    if (opts?.baseline) outcome.baselineVerdict = compareToBaseline(opts.baseline, outcome, opts.boundBaseSha);
-    return outcome;
+    // Quarantine judges last: an outcome that depends on a quarantined test is
+    // blocked (never passed), and the baseline verdict sees that.
+    const judged: VerifyOutcome = quarantine ? await quarantine.applyToOutcome(outcome) : outcome;
+    if (opts?.baseline) judged.baselineVerdict = compareToBaseline(opts.baseline, judged, opts.boundBaseSha);
+    return judged;
   }
 }
