@@ -2,7 +2,7 @@
  * Hand-written validation of an autospec shared-protocol envelope
  * (`autospec.protocol.<entity>.v<N>`). Mirrors the envelope schema in
  * test/fixtures/autospec-protocol/schemas/autospec-protocol-envelope.v1.schema.json
- * using the keyword subset documented in docs/contracts/autospec-protocol-v1.md,
+ * using the keyword subset documented in test/fixtures/autospec-protocol/schemas/,
  * so a Rust reader and a TypeScript reader behave identically.
  *
  * This module validates only the envelope fields (schema, protocol_version,
@@ -53,7 +53,7 @@ const ENVELOPE_FIELDS = [
 ] as const;
 
 /** Structural form of an entity schema identifier, e.g. autospec.protocol.event.v1. */
-const SCHEMA_FORM = /^autospec\.protocol\.[A-Za-z0-9_-]+\.v\d+$/;
+const SCHEMA_FORM = /^autospec\.protocol\.[a-z-]+\.v1$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -75,8 +75,24 @@ export function validateEnvelope(obj: unknown): EnvelopeValidationResult {
 
   const { protocol_version, schema, idempotency_key, mission_id, sequence, required_extensions } = obj;
 
-  // Version negotiation fails closed before any other envelope check.
-  if (protocol_version !== undefined && protocol_version !== SUPPORTED_PROTOCOL_VERSION) {
+  // Version negotiation fails closed before any other envelope check. A missing
+  // protocol_version is a MISSING_FIELD; a present but non-integer value is an
+  // INVALID_FIELD; an integer other than 1 is PROTOCOL_VERSION_UNSUPPORTED.
+  if (protocol_version === undefined) {
+    return {
+      ok: false,
+      code: "MISSING_FIELD",
+      message: 'required envelope field "protocol_version" is missing',
+    };
+  }
+  if (typeof protocol_version !== "number" || !Number.isInteger(protocol_version)) {
+    return {
+      ok: false,
+      code: "INVALID_FIELD",
+      message: `protocol_version must be an integer, got ${String(protocol_version)}`,
+    };
+  }
+  if (protocol_version !== SUPPORTED_PROTOCOL_VERSION) {
     return {
       ok: false,
       code: "PROTOCOL_VERSION_UNSUPPORTED",

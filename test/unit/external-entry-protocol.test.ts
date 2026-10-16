@@ -117,4 +117,97 @@ describe("validateEnvelope", () => {
       assert.equal(result.code, "INVALID_FIELD");
     }
   });
+
+  it("rejects a non-integer protocol_version with INVALID_FIELD", () => {
+    for (const bad of [1.5, "1", true, null]) {
+      const result = validateEnvelope({
+        schema: "autospec.protocol.event.v1",
+        protocol_version: bad as never,
+        idempotency_key: "idem-1",
+        mission_id: "m-1",
+        sequence: 1,
+        required_extensions: [],
+      });
+      assert.equal(result.ok, false, `expected protocol_version ${String(bad)} to be rejected`);
+      if (!result.ok) {
+        assert.equal(result.code, "INVALID_FIELD");
+      }
+    }
+  });
+
+  it("rejects integer protocol_version other than 1 with PROTOCOL_VERSION_UNSUPPORTED", () => {
+    for (const bad of [2, 0]) {
+      const result = validateEnvelope({
+        schema: "autospec.protocol.event.v1",
+        protocol_version: bad,
+        idempotency_key: "idem-1",
+        mission_id: "m-1",
+        sequence: 1,
+        required_extensions: [],
+      });
+      assert.equal(result.ok, false, `expected protocol_version ${String(bad)} to be rejected`);
+      if (!result.ok) {
+        assert.equal(result.code, "PROTOCOL_VERSION_UNSUPPORTED");
+      }
+    }
+  });
+
+  it("rejects a missing protocol_version with MISSING_FIELD", () => {
+    const result = validateEnvelope({
+      schema: "autospec.protocol.event.v1",
+      idempotency_key: "idem-1",
+      mission_id: "m-1",
+      sequence: 1,
+      required_extensions: [],
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.code, "MISSING_FIELD");
+    }
+  });
+
+  it("rejects schema versions other than v1 with SCHEMA_VIOLATION", () => {
+    const result = validateEnvelope({
+      schema: "autospec.protocol.event.v2",
+      protocol_version: 1,
+      idempotency_key: "idem-1",
+      mission_id: "m-1",
+      sequence: 1,
+      required_extensions: [],
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.code, "SCHEMA_VIOLATION");
+    }
+  });
+
+  it("rejects schema identifiers with uppercase letters or underscores with SCHEMA_VIOLATION", () => {
+    const result = validateEnvelope({
+      schema: "autospec.protocol.Event_1.v1",
+      protocol_version: 1,
+      idempotency_key: "idem-1",
+      mission_id: "m-1",
+      sequence: 1,
+      required_extensions: [],
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.code, "SCHEMA_VIOLATION");
+    }
+  });
+
+  it("accepts a schema identifier with a hyphen in the entity name", () => {
+    const result = validateEnvelope({
+      schema: "autospec.protocol.resource-record.v1",
+      protocol_version: 1,
+      idempotency_key: "idem-1",
+      mission_id: "m-1",
+      sequence: 1,
+      required_extensions: [],
+    });
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.envelope.schema, "autospec.protocol.resource-record.v1");
+    }
+  });
 });
