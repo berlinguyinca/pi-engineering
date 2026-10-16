@@ -93,7 +93,6 @@ describe("mission verification is wired to the build budget (issue #259)", () =>
 
   before(async () => {
     savedTarget = process.env.CARGO_TARGET_DIR;
-    // biome-ignore lint/performance/noDelete: unsetting an env var requires delete
     delete process.env.CARGO_TARGET_DIR;
     scratch = await mkdtemp(join(tmpdir(), "pi-eng-budget-wiring-"));
     stageLog = join(scratch, "stage.log");
@@ -116,7 +115,6 @@ describe("mission verification is wired to the build budget (issue #259)", () =>
 
   after(async () => {
     if (savedTarget === undefined) {
-      // biome-ignore lint/performance/noDelete: unsetting an env var requires delete
       delete process.env.CARGO_TARGET_DIR;
     } else process.env.CARGO_TARGET_DIR = savedTarget;
     await fixture.cleanup();
