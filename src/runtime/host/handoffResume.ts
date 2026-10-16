@@ -36,37 +36,77 @@ export interface HandoffResumeInput {
   maxAgeMs: number;
 }
 
+/** True when a value is a non-null object (records, leases, side-effect entries). */
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 /**
  * Decide whether a handoff may be resumed. Collects EVERY applicable reason in a
  * fixed order and picks the strongest outcome (refuse > restart_fresh > resume).
- * Never throws on malformed input: missing fields simply fail the relevant check.
+ * Never throws on malformed input: missing fields simply fail the relevant check
+ * and fail closed.
  */
 export function decideHandoffResume(input: HandoffResumeInput): { decision: HandoffResumeDecision; reasons: string[] } {
   const reasons: string[] = [];
   let refuse = false;
   let restartFresh = false;
 
-  const { record, currentLease, observedCheckpointSha, expectedSourceSha, observedSourceSha } = input;
+  // Defensively treat the top-level inputs as possibly missing/non-object.
+  const record = isObject(input.record) ? input.record : null;
+  const currentLease = isObject(input.currentLease) ? input.currentLease : null;
+  const observedCheckpointSha = input.observedCheckpointSha;
+  const expectedSourceSha = input.expectedSourceSha;
+  const observedSourceSha = input.observedSourceSha;
+  const nowMs = input.nowMs;
+  const maxAgeMs = input.maxAgeMs;
 
   // --- REFUSE reasons (in order) ---
 
-  if (record.state === "aborted") {
+  if (record === null) {
+    refuse = true;
+    reasons.push("handoff record missing");
+  }
+
+  const leaseGeneration = currentLease === null ? Number.NaN : Number(currentLease.generation);
+  if (!Number.isFinite(leaseGeneration)) {
+    refuse = true;
+    reasons.push("lease generation unknown");
+  }
+
+  if (record !== null && record.state === "aborted") {
     refuse = true;
     reasons.push("handoff aborted");
   }
 
-  if (record.state !== "acknowledged" && record.state !== "committed") {
+  if (
+    record !== null &&
+    record.state !== "aborted" &&
+    record.state !== "acknowledged" &&
+    record.state !== "committed"
+  ) {
     refuse = true;
     reasons.push(`handoff not acknowledged (state ${record.state})`);
   }
 
-  const generation = (record.successor ?? record.predecessor).generation;
-  if (generation < currentLease.generation) {
-    refuse = true;
-    reasons.push(`stale generation ${generation} < ${currentLease.generation}`);
+  if (record !== null) {
+    const successor = isObject(record.successor) ? record.successor : null;
+    const predecessor = isObject(record.predecessor) ? record.predecessor : null;
+    const endpoint = successor ?? predecessor;
+    const g = endpoint === null ? Number.NaN : Number(endpoint.generation);
+    if (!Number.isInteger(g)) {
+      if (Number.isFinite(leaseGeneration)) {
+        refuse = true;
+        reasons.push(`stale generation unknown < ${leaseGeneration}`);
+      }
+    } else if (g < leaseGeneration) {
+      refuse = true;
+      reasons.push(`stale generation ${g} < ${leaseGeneration}`);
+    }
   }
 
   if (
+    record !== null &&
     record.checkpointSha !== undefined &&
     observedCheckpointSha !== null &&
     record.checkpointSha !== observedCheckpointSha
@@ -80,24 +120,40 @@ export function decideHandoffResume(input: HandoffResumeInput): { decision: Hand
     reasons.push("source sha mismatch");
   }
 
-  for (const effect of input.sideEffects) {
-    if (effect.committed === false) {
+  // Treat sideEffects defensively: non-arrays are treated as empty, but any
+  // null/non-object entry is itself a refusal, and any entry whose `committed`
+  // is not exactly true counts as uncommitted.
+  const sideEffects = Array.isArray(input.sideEffects) ? input.sideEffects : [];
+  for (const effect of sideEffects) {
+    if (!isObject(effect)) {
       refuse = true;
-      reasons.push(`uncommitted side effect ${effect.id}`);
+      reasons.push("malformed side effect");
+      continue;
+    }
+    if (effect.committed !== true) {
+      refuse = true;
+      const id = typeof effect.id === "string" ? effect.id : "?";
+      reasons.push(`uncommitted side effect ${id}`);
     }
   }
 
   // --- RESTART_FRESH reasons (in order) ---
 
-  if (record.checkpointSha === undefined || observedCheckpointSha === null) {
+  if (record !== null && (record.checkpointSha === undefined || observedCheckpointSha === null)) {
     restartFresh = true;
     reasons.push("no checkpoint");
   }
 
-  const created = Date.parse(record.createdAt);
-  if (!Number.isFinite(created) || input.nowMs - created > input.maxAgeMs) {
+  // nowMs / maxAgeMs must be finite for the age check to be meaningful.
+  if (!Number.isFinite(nowMs) || !Number.isFinite(maxAgeMs)) {
     restartFresh = true;
-    reasons.push("handoff older than maxAgeMs");
+    reasons.push("handoff age unknown");
+  } else if (record !== null) {
+    const created = typeof record.createdAt === "string" ? Date.parse(record.createdAt) : Number.NaN;
+    if (!Number.isFinite(created) || nowMs - created > maxAgeMs) {
+      restartFresh = true;
+      reasons.push("handoff older than maxAgeMs");
+    }
   }
 
   // --- outcome ---

@@ -133,6 +133,92 @@ test("refuse beats restart_fresh when both apply, reasons contain both", () => {
   assert.ok(result.reasons.includes("no checkpoint"));
 });
 
+test("record undefined refuses without throwing (handoff record missing)", () => {
+  const result = decideHandoffResume(input({ record: undefined as unknown as HandoffRecord }));
+  assert.equal(result.decision, "refuse");
+  assert.deepEqual(result.reasons, ["handoff record missing"]);
+});
+
+test("currentLease undefined refuses without throwing (lease generation unknown)", () => {
+  const result = decideHandoffResume(
+    input({ currentLease: undefined as unknown as HandoffResumeInput["currentLease"] }),
+  );
+  assert.equal(result.decision, "refuse");
+  assert.deepEqual(result.reasons, ["lease generation unknown"]);
+});
+
+test("successor and predecessor both missing refuses (stale generation unknown)", () => {
+  const malformed = { ...validRecord(), successor: undefined, predecessor: undefined };
+  const result = decideHandoffResume(input({ record: malformed as unknown as HandoffRecord }));
+  assert.equal(result.decision, "refuse");
+  assert.deepEqual(result.reasons, ["stale generation unknown < 1"]);
+});
+
+test("successor.generation NaN with lease 5 refuses (stale generation unknown < 5)", () => {
+  const result = decideHandoffResume(
+    input({
+      record: { ...validRecord(), successor: { sessionId: "sess-b", generation: Number.NaN } },
+      currentLease: { generation: 5 },
+    }),
+  );
+  assert.equal(result.decision, "refuse");
+  assert.deepEqual(result.reasons, ["stale generation unknown < 5"]);
+});
+
+test("sideEffects null is treated as empty", () => {
+  const result = decideHandoffResume(input({ sideEffects: null as unknown as HandoffResumeInput["sideEffects"] }));
+  assert.equal(result.decision, "resume");
+  assert.deepEqual(result.reasons, []);
+});
+
+test("a null side-effect entry refuses with 'malformed side effect'", () => {
+  const result = decideHandoffResume(input({ sideEffects: [null] as unknown as HandoffResumeInput["sideEffects"] }));
+  assert.equal(result.decision, "refuse");
+  assert.ok(result.reasons.includes("malformed side effect"));
+});
+
+test("a side-effect entry without committed refuses as uncommitted", () => {
+  const result = decideHandoffResume(
+    input({ sideEffects: [{ id: "push-1", kind: "push" }] as unknown as HandoffResumeInput["sideEffects"] }),
+  );
+  assert.equal(result.decision, "refuse");
+  assert.deepEqual(result.reasons, ["uncommitted side effect push-1"]);
+});
+
+test("nowMs NaN on an otherwise valid record restarts fresh (handoff age unknown)", () => {
+  const result = decideHandoffResume(input({ nowMs: Number.NaN }));
+  assert.equal(result.decision, "restart_fresh");
+  assert.deepEqual(result.reasons, ["handoff age unknown"]);
+});
+
+test("aborted handoff emits exactly ['handoff aborted']", () => {
+  const result = decideHandoffResume(input({ record: { ...validRecord(), state: "aborted" } }));
+  assert.equal(result.decision, "refuse");
+  assert.deepEqual(result.reasons, ["handoff aborted"]);
+});
+
+test("exact reason order for prepared + stale + checkpoint mismatch + uncommitted effect", () => {
+  const result = decideHandoffResume(
+    input({
+      record: {
+        ...validRecord(),
+        state: "prepared",
+        successor: { sessionId: "sess-b", generation: 1 },
+      },
+      currentLease: { generation: 5 },
+      observedCheckpointSha: "ffffffffffffffff",
+      sideEffects: [{ id: "push-1", kind: "push" }] as unknown as HandoffResumeInput["sideEffects"],
+    }),
+  );
+  assert.equal(result.decision, "refuse");
+  assert.deepEqual(result.reasons, [
+    "handoff not acknowledged (state prepared)",
+    "stale generation 1 < 5",
+    "checkpoint sha mismatch",
+    "uncommitted side effect push-1",
+  ]);
+});
+
 test("input is not mutated", () => {
   const before = input({
     sideEffects: [{ id: "push-1", kind: "push", committed: false }],
