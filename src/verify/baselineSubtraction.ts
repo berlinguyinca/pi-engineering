@@ -66,6 +66,8 @@ export interface SubtractionInput {
   signal?: AbortSignal;
   /** Mission build options applied to every verification run made here, base runs included. */
   runOptions?: Pick<VerifyRunOptions, "missionId" | "build">;
+  /** Quarantine judging the candidate's own re-run (never the base runs, which describe the base commit). */
+  quarantine?: VerifyRunOptions["quarantine"];
 }
 
 const DEFAULT_BASELINE_TIMEOUT_MS = 20 * 60_000;
@@ -220,6 +222,7 @@ export async function subtractBaselineFailures(input: SubtractionInput): Promise
         ...(input.signal ? { signal: input.signal } : {}),
         continueThrough: inheritedStages,
         ...(input.runOptions ?? {}),
+        ...(input.quarantine ? { quarantine: input.quarantine } : {}),
       });
       verdict = compareToBaseline(baseline, outcome, sha);
       if (verdict.stale) return unavailable(verdict.reason);

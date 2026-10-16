@@ -30,6 +30,7 @@ import {
 } from "../verify/Verifier.ts";
 import { subtractBaselineFailures } from "../verify/baselineSubtraction.ts";
 import { hasCachedVerification, verifyOnce } from "../verify/resultCache.ts";
+import type { TestQuarantine } from "../verify/testQuarantine.ts";
 import { MODEL_SUPERSEDED } from "../workers/WorkerExecutor.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import {
@@ -58,6 +59,12 @@ export interface RealBackendsOptions {
    * these backends gets the mission id plus these options.
    */
   build?: Omit<MissionBuildOptions, "executionId">;
+  /**
+   * Stall quarantine for mission verification: a stage that stalls twice with
+   * the same signature is quarantined and later outcomes that depend on it are
+   * `blocked` (src/verify/testQuarantine.ts, issue #260).
+   */
+  quarantine?: TestQuarantine;
   worker: WorkerExecutor;
   verifier: VerificationProvider;
   artifacts: ArtifactStore;
@@ -421,6 +428,8 @@ export function realBackends(opts: RealBackendsOptions) {
   /** The mission id and build options every mission verify stage run is given (R-BUILD wiring). */
   const missionBuild = (missionId: string | undefined): Pick<VerifyRunOptions, "missionId" | "build"> =>
     missionId ? { missionId, ...(opts.build ? { build: opts.build } : {}) } : {};
+  /** The quarantine every mission verify run is judged by. Base (baseline) runs are not: they describe the base commit. */
+  const quarantined: Pick<VerifyRunOptions, "quarantine"> = opts.quarantine ? { quarantine: opts.quarantine } : {};
   /** Providers that refused connections, with the time their cooldown ends. */
   const unreachableProviders = new Map<string, number>();
   const cooling = (provider: string): boolean => {
@@ -847,6 +856,7 @@ export function realBackends(opts: RealBackendsOptions) {
           const firstOutcome = await opts.verifier.run(cwd, profile, opts.artifacts, {
             signal: input.signal,
             ...missionBuild(input.missionId),
+            ...quarantined,
           });
           const judged = repo.git
             ? await subtractBaselineFailures({
@@ -859,6 +869,7 @@ export function realBackends(opts: RealBackendsOptions) {
                 outcome: firstOutcome,
                 signal: input.signal,
                 runOptions: missionBuild(input.missionId),
+                ...quarantined,
               })
             : undefined;
           // The judged outcome: the candidate's re-run when it had stopped at an inherited failure.
@@ -1221,6 +1232,7 @@ export function realBackends(opts: RealBackendsOptions) {
         const outcome = await opts.verifier.run(cwd, profile, opts.artifacts, {
           signal: input.signal,
           ...missionBuild(input.missionId),
+          ...quarantined,
         });
         return {
           executionId: "process",
@@ -1346,6 +1358,7 @@ export function realBackends(opts: RealBackendsOptions) {
               const firstResult = await opts.verifier.run(candidateCwd, checks, opts.artifacts, {
                 signal: input.signal,
                 ...missionBuild(input.missionId),
+                ...quarantined,
               });
               // Failures already red on the base commit are inherited, not introduced.
               const judged = await subtractBaselineFailures({
@@ -1358,6 +1371,7 @@ export function realBackends(opts: RealBackendsOptions) {
                 outcome: firstResult,
                 signal: input.signal,
                 runOptions: missionBuild(input.missionId),
+                ...quarantined,
               });
               return {
                 passed: judged.passed,
