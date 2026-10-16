@@ -24,7 +24,7 @@ import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import type { WorkerExecutor, WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
-const exec = promisify(execFile);
+const execFileAsync = promisify(execFile);
 const GOAL = "Add a health endpoint";
 
 /** One fake model for every role: its family is unknown, so review is same_model_reduced. */
@@ -99,7 +99,7 @@ async function greenFixture(): Promise<string> {
 }
 
 async function git(root: string, ...args: string[]): Promise<string> {
-  return (await exec("git", ["-C", root, ...args])).stdout.trim();
+  return (await execFileAsync("git", ["-C", root, ...args])).stdout.trim();
 }
 
 function openRuntime(root: string, mergeQueue?: MissionMergeQueueOptions, beforeReview?: () => Promise<void>) {
