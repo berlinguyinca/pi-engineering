@@ -5,6 +5,7 @@ import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { Evidence, EvidenceTrust } from "../core/types.ts";
 import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 import { type MissionBuildOptions, admitMissionBuild } from "../resources/buildBudget.ts";
+import { sanitizeVerifierEnv } from "./childEnv.ts";
 import {
   type BaselineVerdict,
   type FailureBaseline,
@@ -673,7 +674,7 @@ async function resolveJsEntry(
  * their own `target/`.
  */
 async function cleanEnv(cwd: string, extra: Record<string, string> = {}): Promise<NodeJS.ProcessEnv> {
-  const env = { ...process.env };
+  const env = sanitizeVerifierEnv(process.env);
   delete env.NODE_TEST_CONTEXT;
   await withRustBuildEnv(env, cwd);
   // The mission's own target dir (issue #144) replaces the shared per-worktree one.

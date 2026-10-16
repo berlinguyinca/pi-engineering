@@ -29,6 +29,7 @@ import { GitRepo, type WorktreeInfo } from "../git/GitRepo.ts";
 import { workerInactivityMs, workerTimeoutMs } from "../orchestration/broker.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { DEFAULT_STAGE_INACTIVITY_MS, runWithInactivityGuard } from "../verify/Verifier.ts";
+import { sanitizeVerifierEnv } from "../verify/childEnv.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import { WAITING_FOR_INFERENCE_SUMMARY } from "../workers/activity.ts";
 import { planTransition } from "./compatibility.ts";
@@ -1444,7 +1445,7 @@ function verificationEnv(): NodeJS.ProcessEnv {
     if (k === "NODE_TEST_CONTEXT" || /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i.test(k)) continue;
     env[k] = v;
   }
-  return env;
+  return sanitizeVerifierEnv(env);
 }
 
 /** What `resume` reads back from state.json. */
