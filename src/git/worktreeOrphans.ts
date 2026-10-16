@@ -20,13 +20,15 @@ export interface ListedWorktree {
   path: string;
   /** The branch checked out in the worktree, or null when detached. */
   branch: string | null;
+  /** The commit the worktree points at (HEAD), or null when unknown. */
+  head: string | null;
 }
 
 /** What the cleanup pipeline should do with a classified worktree. */
 export type OrphanDecision = "keep" | "adopt" | "quarantine";
 
 /** The reason a worktree received a decision. */
-export type OrphanReason =
+type OrphanReason =
   | "durable_reference"
   | "lease_live"
   | "mission_live"
@@ -37,13 +39,14 @@ export type OrphanReason =
 
 /** A single classified worktree. */
 export interface OrphanClassification {
-  worktree: ListedWorktree;
-  decision: OrphanDecision;
-  /** 1-based index of the matched rule in the first-match-wins set. */
-  rule: number;
+  /** The worktree's path. */
+  path: string;
+  /** The worktree's branch, or null when detached. */
+  branch: string | null;
   /** The mission the worktree resolved to, when any. */
   missionId: string | null;
-  reason: OrphanReason;
+  decision: OrphanDecision;
+  reason: string;
 }
 
 /** Mission statuses after which a mission never touches its worktrees again. */
@@ -76,9 +79,12 @@ function resolveMissionId(worktree: ListedWorktree, registry: readonly ResourceR
 }
 
 function hasLiveLease(missionId: string, leases: readonly LeaseRecord[], nowMs: number): boolean {
+  // A mission lease is recorded as `mission:<id>` or as `<ns>#mission:<id>`;
+  // strip anything up to and including the first '#' so both forms match.
   const resourceId = `mission:${missionId}`;
   for (const lease of leases) {
-    if (lease.resourceId === resourceId && nowMs <= lease.expiresAtMs) return true;
+    const leaseId = lease.resourceId.includes("#") ? lease.resourceId.slice(lease.resourceId.indexOf("#") + 1) : lease.resourceId;
+    if (leaseId === resourceId && nowMs <= lease.expiresAtMs) return true;
   }
   return false;
 }
@@ -98,39 +104,40 @@ export function classifyWorktrees(input: ClassifyWorktreesInput): OrphanClassifi
 
   return worktrees.map((worktree) => {
     const missionId = resolveMissionId(worktree, registry);
+    const { path, branch } = worktree;
 
     // Rule 1: durably referenced path is always kept.
     if (durable.has(worktree.path)) {
-      return { worktree, decision: "keep", rule: 1, missionId, reason: "durable_reference" as const };
+      return { path, branch, decision: "keep", missionId, reason: "durable_reference" };
     }
 
-    // Rule 2: a live lease on `mission:<id>` keeps it.
+    // Rule 2: a live lease on `mission:<id>` (either lease form) keeps it.
     if (missionId && hasLiveLease(missionId, leases, nowMs)) {
-      return { worktree, decision: "keep", rule: 2, missionId, reason: "lease_live" as const };
+      return { path, branch, decision: "keep", missionId, reason: "lease_live" };
     }
 
     // Rule 3: a known mission that is still live keeps it.
     if (missionId && missionStatuses[missionId] !== undefined && !statusTerminal(missionStatuses[missionId])) {
-      return { worktree, decision: "keep", rule: 3, missionId, reason: "mission_live" as const };
+      return { path, branch, decision: "keep", missionId, reason: "mission_live" };
     }
 
     // Rule 4: an active registry record whose owner is not terminal keeps it.
     const record = registry.find((r) => r.kind === "worktree" && r.locator === worktree.path);
     if (record && record.state === "active" && !statusTerminal(missionStatuses[record.ownerMissionId])) {
-      return { worktree, decision: "keep", rule: 4, missionId, reason: "registry_active" as const };
+      return { path, branch, decision: "keep", missionId, reason: "registry_active" };
     }
 
     // Rule 5: a known mission with no recorded status is kept pending.
     if (missionId && missionStatuses[missionId] === undefined) {
-      return { worktree, decision: "keep", rule: 5, missionId, reason: "owner_unknown" as const };
+      return { path, branch, decision: "keep", missionId, reason: "owner_unknown" };
     }
 
     // Rule 6: a known, terminal mission with no live lease is handed to cleanup.
     if (missionId && statusTerminal(missionStatuses[missionId]) && !hasLiveLease(missionId, leases, nowMs)) {
-      return { worktree, decision: "adopt", rule: 6, missionId, reason: "owner_terminal" as const };
+      return { path, branch, decision: "adopt", missionId, reason: "owner_terminal" };
     }
 
     // Rule 7: no mission and no registry record is quarantined.
-    return { worktree, decision: "quarantine", rule: 7, missionId: null, reason: "unowned" as const };
+    return { path, branch, decision: "quarantine", missionId: null, reason: "unowned" };
   });
 }

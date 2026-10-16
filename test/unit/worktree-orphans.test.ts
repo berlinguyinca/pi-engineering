@@ -18,8 +18,8 @@ const PATH_CANDIDATE = "/worktrees/candidate-a";
 const PATH_ORCH = "/worktrees/orch-b";
 const PATH_UNRELATED = "/worktrees/unrelated";
 
-function worktree(path: string, branch: string | null): ListedWorktree {
-  return { path, branch };
+function worktree(path: string, branch: string | null, head: string | null = null): ListedWorktree {
+  return { path, branch, head };
 }
 
 function registryRecord(overrides: Partial<ResourceRecord> = {}): ResourceRecord {
@@ -91,8 +91,9 @@ test("rule 1: a durably referenced path is kept as durable_reference", () => {
     }),
   );
   assert.equal(result.decision, "keep");
-  assert.equal(result.rule, 1);
   assert.equal(result.reason, "durable_reference");
+  assert.equal(result.path, PATH_CANDIDATE);
+  assert.equal(result.branch, CANDIDATE_BRANCH);
 });
 
 test("rule 2: a live lease on mission:<id> is kept as lease_live", () => {
@@ -104,7 +105,6 @@ test("rule 2: a live lease on mission:<id> is kept as lease_live", () => {
     }),
   );
   assert.equal(result.decision, "keep");
-  assert.equal(result.rule, 2);
   assert.equal(result.reason, "lease_live");
 });
 
@@ -116,7 +116,6 @@ test("rule 3: a known non-terminal mission is kept as mission_live", () => {
     }),
   );
   assert.equal(result.decision, "keep");
-  assert.equal(result.rule, 3);
   assert.equal(result.reason, "mission_live");
 });
 
@@ -131,7 +130,6 @@ test("rule 4: an active registry record whose owner is non-terminal is kept as r
     }),
   );
   assert.equal(result.decision, "keep");
-  assert.equal(result.rule, 4);
   assert.equal(result.reason, "registry_active");
 });
 
@@ -150,7 +148,6 @@ test("rule 4: an active registry record whose owner is unknown counts as not ter
     }),
   );
   assert.equal(result.decision, "keep");
-  assert.equal(result.rule, 4);
   assert.equal(result.reason, "registry_active");
 });
 
@@ -162,7 +159,6 @@ test("rule 5: a known mission with no recorded status is kept as owner_unknown",
     }),
   );
   assert.equal(result.decision, "keep");
-  assert.equal(result.rule, 5);
   assert.equal(result.reason, "owner_unknown");
 });
 
@@ -174,7 +170,6 @@ test("rule 6: a known terminal mission with no live lease is adopted as owner_te
     }),
   );
   assert.equal(result.decision, "adopt");
-  assert.equal(result.rule, 6);
   assert.equal(result.reason, "owner_terminal");
 });
 
@@ -182,7 +177,6 @@ test("rule 7: no mission and no registry record is quarantined as unowned", () =
   const wt = worktree(PATH_UNRELATED, "feature/unrelated");
   const result = single(classification([wt]));
   assert.equal(result.decision, "quarantine");
-  assert.equal(result.rule, 7);
   assert.equal(result.reason, "unowned");
   assert.equal(result.missionId, null);
 });
@@ -197,7 +191,7 @@ test("output order equals input order", () => {
     missionStatuses: { "MSN-Z52ywV": "COMPLETE" },
   });
   assert.deepEqual(
-    result.map((c) => c.worktree.path),
+    result.map((c) => c.path),
     [PATH_UNRELATED, PATH_CANDIDATE, PATH_ORCH],
   );
 });
@@ -215,7 +209,6 @@ test("an expired lease (nowMs > expiresAtMs) falls through to rule 6", () => {
     }),
   );
   assert.equal(result.decision, "adopt");
-  assert.equal(result.rule, 6);
   assert.equal(result.reason, "owner_terminal");
 });
 
@@ -257,8 +250,42 @@ test("missionId is resolved from a registry record when the branch has none", ()
   );
   assert.equal(result.missionId, "MSN-reg");
   assert.equal(result.decision, "keep");
-  assert.equal(result.rule, 3);
   assert.equal(result.reason, "mission_live");
+});
+
+test("a COMPLETE mission holding a live ns#mission:MSN-1 lease is kept as lease_live", () => {
+  const wt = worktree("/worktrees/ns-lease", "pi-eng-candidate-MSN-1-repo-x-0-EXC-x");
+  const result = single(
+    classification([wt], {
+      leases: [leaseRecord({ resourceId: "ns#mission:MSN-1" })],
+      missionStatuses: { "MSN-1": "COMPLETE" },
+    }),
+  );
+  assert.equal(result.decision, "keep");
+  assert.equal(result.reason, "lease_live");
+  assert.equal(result.missionId, "MSN-1");
+});
+
+test("a detached worktree (branch null) with no registry record is quarantined as unowned", () => {
+  const wt = worktree(PATH_UNRELATED, null, "abc123def");
+  const result = single(classification([wt]));
+  assert.equal(result.decision, "quarantine");
+  assert.equal(result.reason, "unowned");
+  assert.equal(result.missionId, null);
+  assert.equal(result.branch, null);
+});
+
+test("ListedWorktree literals including head compile", () => {
+  const literals: ListedWorktree[] = [
+    { path: "/worktrees/a", branch: "main", head: "abc123" },
+    { path: "/worktrees/b", branch: null, head: null },
+  ];
+  const result = classification(literals, {});
+  assert.equal(result.length, 2);
+  assert.equal(result[0]!.path, "/worktrees/a");
+  assert.equal(result[1]!.path, "/worktrees/b");
+  assert.equal(result[0]!.branch, "main");
+  assert.equal(result[1]!.branch, null);
 });
 
 test("TERMINAL_MISSION_STATUSES is the documented set", () => {
