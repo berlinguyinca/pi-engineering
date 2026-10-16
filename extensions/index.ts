@@ -57,15 +57,9 @@ import {
   formatMissionWhy,
   formatModelErrors,
 } from "../src/orchestration/missionWhy.ts";
-import { PanelController } from "../src/panel/PanelController.ts";
 import { PanelState } from "../src/panel/PanelState.ts";
-import { readCommitContent, readDiffContent, readFileContent } from "../src/panel/content.ts";
 import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
-import { MemoryFeeder } from "../src/panel/feeders/MemoryFeeder.ts";
 import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
-import { type PanelLayout, type PanelLayoutPatch, PanelLayoutStore } from "../src/panel/layout.ts";
-import { Narrator } from "../src/panel/narrator/Narrator.ts";
-import { createSummarize } from "../src/panel/narrator/summarize.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { registerPlannerWorker } from "../src/plannerWorker/extension.ts";
 import { redactSecrets } from "../src/platform/redact.ts";
@@ -146,7 +140,6 @@ interface PanelPlumbing {
   state: PanelState;
   ledger: LedgerFeeder;
   workspace: WorkspaceFeeder;
-  memory: MemoryFeeder;
 }
 const panels = new Map<string, PanelPlumbing>();
 
@@ -164,15 +157,13 @@ const panels = new Map<string, PanelPlumbing>();
  * worse than none.
  */
 let ambientPanel: { key: string; state: PanelState } | undefined;
-let activePanel: PanelController | null = null;
 
 /** Removes this session's telemetry sink. */
 let telemetryUninstall: (() => void) | undefined;
-/** Layout is an operator preference, so one store for the whole process. */
-const panelLayoutStore = new PanelLayoutStore();
 
 /**
- * Periodic refresh while the panel is visible.
+ * Periodic refresh of the data the footer's ambient row summarises, for the
+ * life of the session.
  *
  * Paced at the workspace feeder's own TTL: faster would re-run git only to get
  * the cached answer back, slower would leave the TTL unreachable. The loop
@@ -191,9 +182,6 @@ function startPanelRefresh(plumbing: PanelPlumbing): void {
       plumbing.workspace.invalidate();
       void plumbing.workspace.refresh();
       plumbing.ledger.refresh();
-      // Memory counters went stale for as long as the panel stayed open, which
-      // is now the whole session.
-      plumbing.memory.refresh();
     },
   });
   panelRefresh.start();
@@ -203,13 +191,6 @@ function stopPanelRefresh(): void {
   panelRefresh?.stop();
   panelRefresh = null;
 }
-/**
- * Panel input subscriptions, kept separate from `sessionUnsubscribes` on
- * purpose: the footer's `session_start` drains its own array, and a shared
- * array would make "does the hotkey still work?" depend on the order two
- * independent handlers happen to be registered in.
- */
-const panelUnsubscribes: Array<() => void> = [];
 
 /** Panel plumbing for a repo, created on first use. */
 function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
@@ -223,7 +204,6 @@ function panelFor(key: string, rt: EngineeringRuntime): PanelPlumbing {
     state,
     ledger: new LedgerFeeder({ ledger: rt.ledger, state }),
     workspace: new WorkspaceFeeder({ state, repo: rt.git }),
-    memory: new MemoryFeeder({ state, blackhole: rt.blackhole }),
   };
   panels.set(key, created);
   ambientPanel = { key, state };
@@ -1765,130 +1745,6 @@ ${RECOVERY_PROMPT}`;
     },
   });
 
-  // ─── Engineering panel ───────────────────────────────────────────────────
-  // `/panel` (or the configured chord) toggles a right-anchored overlay over
-  // the ledger's record of the run, falling back to the working tree when idle.
-  // Pi registers commands but not keybindings, so the chord is a raw input
-  // handler that consumes only its own key.
-  // Two chords: `ctrl+p` steps the keyboard into and out of the panel for
-  // navigation; `ctrl+b` collapses and uncollapses the whole panel (the same
-  // thing `/panel` does). Both are raw input handlers that consume only their
-  // own key. `ctrl+b` is deliberately not one of pi's default keybindings.
-  const panelChord = process.env.PI_PANEL_CHORD ?? "ctrl+p";
-  const panelToggleChord = process.env.PI_PANEL_TOGGLE_CHORD ?? "ctrl+b";
-
-  /** The slice of Pi's session UI the panel needs. */
-  interface PanelSessionUi {
-    custom?: unknown;
-    onTerminalInput?: (handler: (data: string) => { consume: true } | undefined) => () => void;
-    notify: (message: string, kind?: "info" | "warning" | "error") => void;
-  }
-
-  async function openPanel(ctx: {
-    cwd: string;
-    ui: { notify: (m: string, t?: "info" | "warning" | "error") => void };
-  }) {
-    const key = await repoCacheKey(ctx.cwd);
-    const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
-    if (!rt) {
-      ctx.ui.notify("Panel unavailable: no engineering runtime for this directory.", "error");
-      return null;
-    }
-    // No refresh here: opening the overlay invalidates the cache and refreshes,
-    // so a second read would only race the first.
-    return { plumbing: panelFor(key, rt), rt };
-  }
-
-  /**
-   * Start the session narrator for a repo, at most once.
-   *
-   * On by default now that the panel gives the summary a permanent home;
-   * `PI_PANEL_NARRATOR=0` turns it off. It is the only part of the panel that
-   * spends money, and it is the operator's money, so the gate stays and the
-   * cost is bounded rather than hidden: one call at most every two minutes,
-   * only when the observed state has actually changed, never while a gateway
-   * cooldown is standing, and nothing at all in a session that never opens the
-   * panel. It observes the panel's own state —
-   * the run view the ledger feeder already publishes — rather than reaching
-   * into the runtime for a second source of truth, and it is gated on the SAME
-   * admission controller as every other model call in this process.
-   */
-  const narrators = new Map<string, Narrator>();
-  function startNarrator(plumbing: PanelPlumbing, _rt: EngineeringRuntime): void {
-    const mode = (process.env.PI_PANEL_NARRATOR ?? "1").toLowerCase();
-    if (mode === "0" || mode === "false" || mode === "off") return;
-    const key = [...panels.entries()].find(([, value]) => value === plumbing)?.[0];
-    if (!key || narrators.has(key)) return;
-
-    const admission = sharedAdmissionController();
-    const narrator = new Narrator({
-      state: plumbing.state,
-      summarize: createSummarize(),
-      cooldownRemainingMs: () => admission.cooldownRemainingMs(),
-      acquire: () => admission.acquire(),
-    });
-    narrators.set(key, narrator);
-
-    // Deltas come from panel state, which the ledger feeder already keeps
-    // current. No transcript, no second pipeline.
-    //
-    // The whole session is narrated, run and idle alike: while a run is
-    // underway the run's files drive the arc; when idle (no run, or one that
-    // has settled) the working tree's changed files do. The run view is kept
-    // after settle (see LedgerFeeder), so we switch on phase rather than the
-    // mere presence of a run.
-    const unsubscribe = plumbing.state.subscribe((snapshot) => {
-      // Narrate the WHOLE session, not just engineering runs: while a run is
-      // underway we summarise the run; when idle (no run, or one that has
-      // settled) we summarise the working tree's changed files, so edits and
-      // commands outside /engineer are part of the arc too.
-      const run = snapshot.run;
-      const activeRun = run && run.phase !== "settled" ? run : undefined;
-      const files = activeRun
-        ? activeRun.files.map((file) => file.path)
-        : (snapshot.workspace?.files ?? []).map((file) => file.path);
-      // Nothing happening: no deltas to summarise, no model call to spend.
-      if (!activeRun && files.length === 0) return;
-      void narrator.observe({
-        ...(activeRun?.workItemId ? { workItemId: activeRun.workItemId } : {}),
-        ...(activeRun?.goal ? { goal: activeRun.goal } : {}),
-        ...(activeRun?.phase ? { phase: activeRun.phase } : {}),
-        files,
-      });
-    });
-    // The panel cache is process-wide and outlives a session, so without this
-    // a narrator opted into once would keep observing — and spending — in every
-    // later session, with no way to stop it.
-    panelUnsubscribes.push(() => {
-      unsubscribe();
-      narrator.dispose();
-      narrators.delete(key);
-    });
-  }
-
-  /** Resolve a selected row into a bounded content view. */
-  function openRowFor(rt: EngineeringRuntime, state: PanelState) {
-    return async (payload: { kind: string; path?: string; source?: string; sha?: string; subject?: string }) => {
-      if (payload.kind === "commit" && payload.sha) {
-        // No repository means no history to read; the rows that produce this
-        // payload only exist when there is one, so this is belt and braces.
-        if (!rt.git) return { title: payload.sha, lines: [], truncated: false, error: "not a git checkout" };
-        return readCommitContent(rt.git, payload.sha, payload.subject);
-      }
-      if (payload.kind !== "file" || !payload.path) return undefined;
-      // A run's file is shown as the candidate diff when one was captured;
-      // the artifact URI travels, the body is fetched only to display it.
-      const candidateId = state.snapshot.run?.candidateId;
-      if (payload.source === "run" && candidateId) {
-        const candidate = rt.ledger.getCandidate(candidateId);
-        if (candidate?.diff_artifact_uri) {
-          return readDiffContent(rt.artifacts, candidate.diff_artifact_uri, payload.path);
-        }
-      }
-      return readFileContent(resolve(rt.cwd, payload.path), payload.path);
-    };
-  }
-
   /**
    * Route diagnostics through Pi's own notifications.
    *
@@ -1925,145 +1781,40 @@ ${RECOVERY_PROMPT}`;
     });
   }
 
-  /**
-   * Build the session's controller and bind the chord.
-   *
-   * Called from `session_start` so the hotkey works without `/panel` first, and
-   * from `/panel` itself so a session whose `session_start` found no runtime
-   * (or has not finished its async lookup) still opens rather than reporting a
-   * UI problem that is not the real cause.
-   */
-  function createPanelController(
-    ctx: { ui: PanelSessionUi },
-    plumbing: PanelPlumbing,
-    rt: EngineeringRuntime,
-  ): PanelController {
-    const controller = new PanelController({
-      state: plumbing.state,
-      ui: ctx.ui as never,
-      chord: panelChord,
-      toggleChord: panelToggleChord,
-      layout: panelLayoutStore.load(),
-      // The patch carries width/tab/expansion; open/closed is the controller's,
-      // and is persisted separately when the panel is opened or closed.
-      onLayoutChange: (patch: PanelLayoutPatch) =>
-        panelLayoutStore.save({ ...patch, open: panelLayoutStore.load().open }),
-      onVisibilityChange: (open: boolean) => panelLayoutStore.save({ ...panelLayoutStore.load(), open }),
-      onOpen: () => {
-        plumbing.workspace.invalidate();
-        void plumbing.workspace.refresh();
-        plumbing.ledger.refresh();
-        plumbing.memory.refresh();
-        // Keep refreshing while it is on screen. `onOpen` alone was enough when
-        // the panel was a toggle you opened to look at something; now that it
-        // stays open for the whole session, a view refreshed once at start-up
-        // is a working tree from hours ago presented as current — worse than no
-        // panel, because it looks authoritative. Found by a fresh-context
-        // review, and made materially worse by the auto-open change.
-        startPanelRefresh(plumbing);
-        // The narrator costs money, so it does not start until the panel has
-        // been opened at least once: a session that never opens /panel must
-        // not pay for summaries nobody reads.
-        startNarrator(plumbing, rt);
-      },
-      // Releasing what the panel was driving. A fresh-context review found this
-      // missing: `stopPanelRefresh` existed and was never called, so the timer
-      // outlived every panel that started it — and because `startPanelRefresh`
-      // returns early when a timer is already set, the first session's timer
-      // permanently blocked every later one while still running git against the
-      // first session's repository.
-      onHidden: () => stopPanelRefresh(),
-      openRow: openRowFor(rt, plumbing.state),
-    });
-    if (typeof ctx.ui.onTerminalInput === "function") {
-      panelUnsubscribes.push(ctx.ui.onTerminalInput((data) => controller.handleTerminalInput(data)));
-    }
-    return controller;
-  }
-
-  // The overlay and the chord need a live session UI, which only exists in a
-  // real Pi run (the smoke-test stub has no pi.on).
+  // Session lifecycle: diagnostics sink, and the data behind the footer's
+  // ambient row (files, findings, tokens). Needs a live Pi run (the smoke-test
+  // stub has no pi.on).
   if (typeof pi.on === "function") {
     pi.on("session_start", async (_event, ctx) => {
       // First, before anything can report: until a sink is installed every
       // diagnostic goes to raw stderr, which is what tears the frame.
       //
       // The previous session's sink is removed rather than left stacked
-      // beneath this one. A review flagged that as a hazard for overlapping
-      // sessions, and it would be — but this extension already treats sessions
-      // as serial: the line below disposes `activePanel`, and the panel's
-      // refresh timer is stopped the same way. One live session per process is
-      // the assumption throughout, and a sink left behind by a session that
-      // will never shut down is a slow leak pointed at a dead UI.
+      // beneath this one: this extension treats sessions as serial.
       telemetryUninstall?.();
       telemetryUninstall = installTelemetrySink(ctx.ui as { notify(text: string, level: string): void });
-      for (const un of panelUnsubscribes.splice(0)) un();
-      activePanel?.dispose();
-      activePanel = null;
       // A new session inherits no timer from the last one.
       stopPanelRefresh();
       const key = await repoCacheKey(ctx.cwd);
       const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
-      // Not fatal: `/panel` retries the lookup and builds the controller then.
       if (!rt) return;
-      activePanel = createPanelController(ctx as { ui: PanelSessionUi }, panelFor(key, rt), rt);
-
-      // ── The panel is shown by default, and does not take the keyboard ────
-      // It is registered `nonCapturing` (pi-tui OverlayOptions), so it is on
-      // screen without owning input. `ctrl+p` steps into it and back out;
-      // `ctrl+b` (or `/panel`) collapses and uncollapses it.
-      //
-      // The first attempt at this shipped without `nonCapturing` and made pi
-      // accept no typing at all, because `ui.custom()`'s own doc comment says
-      // "with keyboard focus" and never mentions the option that turns that
-      // off. The flag remains as an escape hatch for anyone who wants no panel
-      // at all without hiding it every session.
-      //
-      // `restore()` rather than `toggle()`: restoring a remembered choice is
-      // not the operator making a new one, and recording it as one would write
-      // the preference back every session whether they touched it or not.
-      const autoOpen = (process.env.PI_PANEL_AUTO_OPEN ?? "1").toLowerCase();
-      const autoOpenEnabled = autoOpen !== "0" && autoOpen !== "false" && autoOpen !== "off";
-      if (autoOpenEnabled && panelLayoutStore.load().open) {
-        const ui = ctx.ui as PanelSessionUi;
-        // An overlay needs somewhere to draw. A session without interactive UI
-        // gets nothing rather than an error it cannot act on.
-        if (typeof ui.custom === "function") activePanel.restore();
-      }
+      const plumbing = panelFor(key, rt);
+      plumbing.workspace.invalidate();
+      void plumbing.workspace.refresh();
+      plumbing.ledger.refresh();
+      startPanelRefresh(plumbing);
     });
 
     pi.on("session_shutdown", async () => {
       // A sink pointing at a torn-down session's UI is worse than none.
       telemetryUninstall?.();
       telemetryUninstall = undefined;
-      for (const un of panelUnsubscribes.splice(0)) un();
-      activePanel?.dispose();
-      activePanel = null;
-      // Belt and braces alongside `onHidden`: a timer that survives a session
-      // both wastes git on a repository nobody is looking at and, because
-      // `startPanelRefresh` returns early when one is already set, stops the
-      // NEXT session from ever refreshing.
+      // A timer that survives a session runs git against a repository nobody
+      // is looking at and blocks the next session's refresh.
       stopPanelRefresh();
       await shutdownCachedRuntimes();
     });
   }
-
-  pi.registerCommand("panel", {
-    description: "Toggle the engineering panel: changed files, reviews, models, and token spend.",
-    handler: async (_args, ctx) => {
-      const opened = await openPanel(ctx);
-      if (!opened) return;
-      if (!activePanel) {
-        const ui = ctx.ui as PanelSessionUi;
-        if (typeof ui.custom !== "function") {
-          ctx.ui.notify("Panel unavailable: this session has no interactive UI.", "error");
-          return;
-        }
-        activePanel = createPanelController({ ui }, opened.plumbing, opened.rt);
-      }
-      activePanel.toggle();
-    },
-  });
 
   // ─── Mission orchestration (spec pi-engineering-orchestration) ─────────
   // Normal-language intent auto-invokes the engineering workflow through the

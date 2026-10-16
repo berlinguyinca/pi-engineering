@@ -303,117 +303,6 @@ limits:
 full inventory of time limits and their classification is in
 [`docs/mission-time-limits.md`](docs/mission-time-limits.md).
 
-## Engineering panel
-
-A right-anchored overlay shows what the runtime is doing — and what it did.
-It is **on by default** and does not take the keyboard: `ctrl+p` steps the
-keyboard into and out of the panel for navigation, while `ctrl+b` (or `/panel`)
-collapses and uncollapses the whole overlay:
-
-```
-┌─ ENGINEERING ───────────┐
-│[Files] Reviews  Tokens  │
-│ ● WI-12 · review · high │
-│ ▾ Changed files (2)     │
-│   A src/gateway/sig…    │
-│   M extensions/index.ts │
-│ ▾ Working tree · main   │
-│   M README.md           │
-└─────────────────────────┘
-```
-
-Five tabs, cycled with `tab`/`shift+tab`:
-
-| Tab | Content |
-| --- | ------- |
-| Files | changed files (candidate or working tree), opening into a bounded view |
-| Reviews | findings with severity, the reviewing role, and the model that produced them |
-| Tokens | spend grouped by model, plus your session's context usage |
-| Session | a running narrative of what this session has worked on |
-| Memory | what this session put into memory |
-
-During an engineering run the panel reads the ledger: the work item and phase,
-the candidate's changed files, review findings with the **role and model that
-produced them**, and token spend grouped by model. With no run active it shows
-the git working tree and your session's context usage, so it is never empty.
-
-Keys (with the panel focused, via `ctrl+p`): `↑`/`↓` move, `→`/`enter` expands
-a section or opens a file, `←` collapses a section, `<`/`>` resize, `/`
-searches, `n`/`N` step matches, `y` copies the selected row and `Y` the visible
-body, `esc` releases the keyboard back to the prompt (the panel stays visible).
-Outside the panel, `ctrl+p` steps the keyboard into it and `ctrl+b` collapses
-or uncollapses the whole overlay. Opening a file shows a **bounded** view — a
-candidate diff is read lazily by artifact URI, a working-tree file from disk,
-both capped rather than loaded whole, and neither is inlined into model
-context.
-
-Search is smartcase (a lowercase query is case-insensitive; any uppercase makes
-it exact) and matches literally, so `config.ts` means what you typed.
-
-The active tab, the width, and which sections are expanded are remembered in
-your **agent profile** (`~/.pi/agent/engineering-panel/layout.json`, written
-owner-only) — not in the repository, so a panel width never lands in a
-project's git history.
-
-Copy goes out over OSC 52, which works over SSH and needs no dependency, but is
-**write-only**: the terminal never answers, so the panel says *"sent to
-terminal clipboard"* rather than claiming a copy it cannot confirm. Some
-terminals (and tmux without clipboard passthrough) discard it silently. In
-fullscreen mode Pi's own selection copy remains available alongside it.
-
-### Session narrative
-
-The Session tab answers "what have we actually been doing?" — a short prose arc
-such as *"started on a status-bar update, moved to gateway error handling, now
-working on the panel"*. It is the only generated content in the panel, and it
-carries three constraints:
-
-* it is fed **deltas** — new work items, phase transitions, newly changed files
-  — never a transcript, so its cost does not grow with the session, and it is
-  debounced;
-* it runs behind the **same admission gate** as every other model call, and is
-  **skipped entirely** while a gateway cooldown is active: a narrative is never
-  worth delaying a run, still less waiting out an unbounded backoff;
-* it is **labeled as generated and never becomes evidence** — it is not written
-  to the ledger, and nothing reads it back as input to a decision (INV-006).
-
-It tracks the **whole session**, not just engineering runs: while a run is
-underway it summarises the run, and when idle it summarises the working tree's
-changed files, so edits and commands outside `/engineer` are part of the arc.
-It is **on by default** (the panel's only spend; `PI_PANEL_NARRATOR=0` turns it
-off), and it does not start until you have opened the panel at least once.
-
-Failure is silent: no model, a refused gateway, or a failed summary leaves the
-previous narrative in place with its own timestamp, and the tab says when it was
-last updated rather than pretending to be current.
-
-### Memory tab
-
-Reports what this session put into memory: entries recorded, promotion
-candidates, promotions to durable memory, compactions, and memory-worker runs,
-all read from Blackhole telemetry. Blackhole is off by default; when it is off
-the tab says so rather than showing zeros that look like a failure.
-
-The panel is a read surface: it never writes to the ledger and never touches a
-worktree. The session narrative is the single exception to "never starts model
-work", and is gated as described above. A failing git or unreadable artifact
-marks its own section and leaves the rest of the panel working.
-
-| Variable | Default | Meaning |
-| -------- | ------- | ------- |
-| `PI_PANEL_CHORD` | `ctrl+p` | Hotkey to step the keyboard into/out of the panel; `none` disables it |
-| `PI_PANEL_TOGGLE_CHORD` | `ctrl+b` | Hotkey to collapse/uncollapse the whole panel; `none` disables it |
-| `PI_PANEL_NARRATOR` | `1` | Generated session narrative (a short prose arc of what the session has worked on, idle work included); `0` disables it |
-
-Two caveats worth knowing. Pi registers commands but not keybindings, so each
-chord is a raw input handler that consumes only its own key. The toggle chord
-is active even while you type, so it shadows pi's own `ctrl+b` (move cursor
-left); if you use that, set `PI_PANEL_TOGGLE_CHORD=none` (or to another chord)
-and rely on `/panel`. And **clicking rows needs fullscreen TUI mode**
-(`--tui-mode fullscreen`): in regular mode the terminal owns its scrollback and
-pointer input is never delivered, so the keyboard is the contract and the mouse
-is a bonus.
-
 ## Live status bar
 
 The footer answers "what is it doing, and why is nothing happening":
@@ -440,6 +329,14 @@ session. The render path never runs git or network work, and redraws are
 coalesced rather than issued per token.
 
 `/harness-status` prints the fully resolved state.
+
+The footer also carries an ambient row summarising the run (changed files,
+findings, token spend). The right-hand **Engineering panel** (`/panel`,
+`ctrl+p` / `ctrl+b`, `PI_PANEL_*`) was removed: its keys collided with Pi's own
+bindings (`ctrl+p` cycles models, `ctrl+b` moves the cursor) and no unused
+`ctrl+letter` exists. For a full per-agent view of conversation, tools, files and
+diffs, tokens and tests, use the Herdr agent inspector
+([`docs/split-view-and-inspector.md`](docs/split-view-and-inspector.md)).
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
