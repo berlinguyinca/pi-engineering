@@ -953,6 +953,7 @@ export function attachInspectorFeedFromEnv(
   const cfg = inspectorConfigFromEnv(env);
   if (!cfg.enabled || !cfg.url) return null;
   const { fetch, ...rest } = extra;
-  const ingest = new ControlPlaneIngest({ url: cfg.url, ...(fetch ? { fetch } : {}) });
+  const apiKey = env.HERDR_CP_API_KEY?.trim() || undefined;
+  const ingest = new ControlPlaneIngest({ url: cfg.url, ...(apiKey ? { apiKey } : {}), ...(fetch ? { fetch } : {}) });
   return attachInspectorFeed(pi, { env, reasoning: cfg.reasoning, ingest, ...rest });
 }

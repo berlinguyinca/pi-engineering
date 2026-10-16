@@ -585,3 +585,17 @@ test("micro-benchmark: 10k tool updates are processed well under a second", () =
   assert.ok(ms < 1000, `10k updates took ${ms.toFixed(1)}ms`);
   handle.dispose();
 });
+
+test("HERDR_CP_API_KEY is sent as X-API-Key and never otherwise", async () => {
+  const seen: Array<Record<string, string>> = [];
+  const fetchStub = (async (_url: unknown, init: { headers: Record<string, string> }) => {
+    seen.push(init.headers);
+    return { ok: true } as Response;
+  }) as unknown as typeof globalThis.fetch;
+  const withKey = new ControlPlaneIngest({ url: "http://cp", apiKey: " k1 ", fetch: fetchStub });
+  const without = new ControlPlaneIngest({ url: "http://cp", fetch: fetchStub });
+  await withKey.emitBatch("s", []);
+  await without.emitBatch("s", []);
+  assert.equal(seen[0]?.["x-api-key"], "k1");
+  assert.equal(seen[1]?.["x-api-key"], undefined);
+});

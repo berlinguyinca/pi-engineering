@@ -34,6 +34,8 @@ export interface ControlPlaneIngestOptions {
   fetch?: typeof globalThis.fetch;
   /** Per-request timeout in ms (default 1500). */
   timeoutMs?: number;
+  /** Optional control-plane API key (sent as X-API-Key; use an `ingest`-role key). */
+  apiKey?: string;
 }
 
 export class ControlPlaneIngest {
@@ -44,6 +46,7 @@ export class ControlPlaneIngest {
 
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
+  private readonly apiKey?: string;
   private readonly seenMissions = new Set<string>();
 
   constructor(opts: ControlPlaneIngestOptions) {
@@ -57,6 +60,7 @@ export class ControlPlaneIngest {
     this.defaultMissionId = opts.defaultMissionId;
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.timeoutMs = opts.timeoutMs ?? 1500;
+    this.apiKey = opts.apiKey?.trim() || undefined;
   }
 
   /**
@@ -78,7 +82,7 @@ export class ControlPlaneIngest {
       try {
         res = await this.fetchImpl(`${this.url}/api/v1/ingest`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: { "content-type": "application/json", ...(this.apiKey ? { "x-api-key": this.apiKey } : {}) },
           body: JSON.stringify({ entity_type: entityType, entity_id: entityId, event_type: eventType, payload }),
           signal: controller.signal,
         });
