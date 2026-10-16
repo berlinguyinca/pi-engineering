@@ -21,12 +21,13 @@ import type { CheckRun, FailureClass } from "./mergeGate.ts";
  */
 export interface GhPrCheck {
   name: string;
-  /** PR head SHA the check ran against, when known. */
-  head_sha?: string;
+  state?: string;
   /** Coarse status bucket. Lower-cased before mapping. */
   bucket?: string;
+  link?: string;
   startedAt?: string;
   completedAt?: string;
+  workflow?: string;
 }
 
 /**
@@ -41,8 +42,9 @@ export interface RestCheckRun {
   head_sha?: string;
   status?: string;
   conclusion?: string | null;
-  started_at?: string;
-  completed_at?: string;
+  html_url?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
 }
 
 /** Baseline slice used for classification (same shape mergeGate accepts). */
@@ -95,28 +97,34 @@ function restStatus(status: string | undefined, conclusion: string | null | unde
 }
 
 /** Treat empty and the zero-time `0001-…` dates as "no date" (empty string). */
-function normalizeDate(value: string | undefined): string {
+function normalizeDate(value: string | null | undefined): string {
   if (!value) return "";
   if (value.startsWith("0001-")) return "";
   return value;
 }
 
-/** Latest-wins date key for a candidate (completedAt ?? startedAt). */
-function dateKey(completedAt: string | undefined, startedAt: string | undefined): string {
-  return normalizeDate(completedAt) || normalizeDate(startedAt) || "";
+/**
+ * Latest-wins date key for a candidate. The key is `normalize(completedAt ??
+ * startedAt)`: `startedAt` is used only when `completedAt` is null/undefined.
+ * An empty or `0001-`-prefixed `completedAt` normalises to `""` and does NOT
+ * fall back to `startedAt`. Same for `completed_at ?? started_at` on REST rows.
+ */
+function dateKey(completedAt: string | null | undefined, startedAt: string | null | undefined): string {
+  return normalizeDate(completedAt ?? startedAt) || "";
 }
 
 /**
  * Convert raw GitHub check data into normalized {@link CheckRun}s.
  *
- * gh entries always use the input `headSha` (their own `head_sha` is not
- * authoritative), while REST entries use their `head_sha` when it is a
- * non-empty string and fall back to `input.headSha` otherwise. Entries with a
- * missing or non-string name are dropped. Entries are de-duplicated by name
- * keeping the entry with the latest `(completedAt ?? startedAt)` date, treating
- * empty or `0001-`-prefixed dates as absent; ties keep the later input, with
- * REST entries considered after gh entries. The result is sorted by name via
- * `localeCompare` and the input is never mutated.
+ * gh entries always use the input `headSha` (they carry no authoritative own
+ * SHA), while REST entries use their `head_sha` when it is a non-empty string
+ * and fall back to `input.headSha` otherwise. Entries with a missing or
+ * non-string name are dropped. Entries are de-duplicated by name keeping the
+ * entry with the latest `(completedAt ?? startedAt)` date (empty or
+ * `0001-`-prefixed dates count as absent but do not fall back to `startedAt`);
+ * ties keep the later input, with REST entries considered after gh entries.
+ * The result is sorted by name via `localeCompare` and the input is never
+ * mutated.
  */
 export function normalizeCheckRuns(input: NormalizeCheckRunsInput): CheckRun[] {
   const byName = new Map<string, CheckRun>();
