@@ -84,7 +84,7 @@ function actionOf(body: unknown): string | undefined {
  * or a `Headers` instance.
  */
 function retryAfterFrom(headers?: Record<string, string> | Headers): string | undefined {
-  if (headers === undefined) return undefined;
+  if (headers == null || typeof headers !== 'object') return undefined;
   if (typeof (headers as Headers).get === "function") {
     return (headers as Headers).get("retry-after") ?? undefined;
   }
