@@ -1645,10 +1645,12 @@ export class EngineeringRuntime {
     if (!this.missionStore || !this.orchestrator) return;
     if (!this.ownershipId) return;
     if (!readAutospecFlags(process.env).enabled) return;
-    const candidates = this.missionStore.listMissions().map((mission) => {
-      const lease = this.missionStore!.getMissionLease(mission.mission_id);
-      return { mission, lease: lease ? { ownerId: lease.ownerId, renewBy: lease.renewBy } : undefined };
-    });
+    const candidates = this.missionStore
+      .listMissions((mission) => mission.status === "NEW")
+      .map((mission) => ({
+        mission,
+        lease: this.missionStore!.getMissionLease(mission.mission_id) ?? undefined,
+      }));
     const toStart = selectExternalMissionsToStart(
       candidates,
       this.ownershipId,
@@ -1659,13 +1661,13 @@ export class EngineeringRuntime {
     for (const missionId of toStart) {
       if (this.runningExternal.has(missionId)) continue;
       this.runningExternal.add(missionId);
-      this.orchestrator
+      void this.orchestrator
         .runSubmittedMission(missionId, {})
         .then((outcome) => {
           if (!outcome.started) {
             emitTelemetry({
               level: "warning",
-              text: `external mission ${missionId} not started: ${outcome.reason}`,
+              text: `external mission ${missionId} not started: ${redactSecrets(outcome.reason)}`,
             });
           }
         })
