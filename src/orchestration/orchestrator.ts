@@ -4019,7 +4019,6 @@ export class Orchestrator {
     });
   }
 
-  /** Reconcile a previously committed CAS before any new validation or review gates run. */
   /**
    * Promote through the broker's merge queue. A rejection the broker answered
    * with REPAIRING is retried through the queue (each retry is a durably
@@ -4037,6 +4036,7 @@ export class Orchestrator {
     }
   }
 
+  /** Reconcile a previously committed CAS before any new validation or review gates run. */
   private async reconcileCommittedPromotions(missionId: string): Promise<void> {
     if (!this.ownership) return;
     const taskByRepo = new Map(
