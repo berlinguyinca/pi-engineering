@@ -64,6 +64,9 @@ const restConclusionCases: Array<
   ["queued", undefined, "pending"],
   ["in_progress", undefined, "pending"],
   ["queued", "success", "pending"],
+  ["waiting", undefined, "pending"],
+  ["requested", undefined, "pending"],
+  ["pending", undefined, "pending"],
 ];
 
 for (const [status, conclusion, expected] of restConclusionCases) {
@@ -73,9 +76,9 @@ for (const [status, conclusion, expected] of restConclusionCases) {
   });
 }
 
-test("gh checks always use the input headSha (own head_sha ignored)", () => {
-  const out = normalizeCheckRuns({ headSha: HEAD, ghChecks: [gh("ci", { head_sha: "other" })] });
-  assert.deepEqual(out, [run("ci", "pass", HEAD)]);
+test("gh checks always use the input headSha", () => {
+  const out = normalizeCheckRuns({ headSha: HEAD, ghChecks: [gh("ci", { bucket: "fail" })] });
+  assert.deepEqual(out, [run("ci", "fail", HEAD)]);
 });
 
 test("rest checks use head_sha when non-empty, else fall back to headSha", () => {
@@ -85,39 +88,66 @@ test("rest checks use head_sha when non-empty, else fall back to headSha", () =>
   assert.deepEqual(withoutSha, [run("ci", "pass", HEAD)]);
 });
 
-test("dedupe keeps the latest completedAt/startedAt date", () => {
+test("dedupe keeps the latest completedAt date", () => {
   const out = normalizeCheckRuns({
     headSha: HEAD,
-    ghChecks: [gh("ci", { completedAt: "2024-01-01T00:00:00Z" }), gh("ci", { completedAt: "2024-01-02T00:00:00Z" })],
+    ghChecks: [
+      gh("ci", { bucket: "pending", completedAt: "2024-01-01T00:00:00Z" }),
+      gh("ci", { bucket: "pass", completedAt: "2024-01-02T00:00:00Z" }),
+    ],
   });
-  // Later date wins; both gh use HEAD sha and 'pass'.
+  // The later completedAt (01-02) wins, so the kept entry reports 'pass'.
   assert.deepEqual(out, [run("ci", "pass", HEAD)]);
 });
 
-test("dedupe prefers completedAt over startedAt", () => {
+test("dedupe prefers completedAt over startedAt when both are present", () => {
   const out = normalizeCheckRuns({
     headSha: HEAD,
-    ghChecks: [gh("ci", { startedAt: "2024-01-05T00:00:00Z" }), gh("ci", { completedAt: "2024-01-02T00:00:00Z" })],
+    ghChecks: [
+      gh("ci", { bucket: "pending", completedAt: "2024-01-05T00:00:00Z", startedAt: "2024-01-01T00:00:00Z" }),
+      gh("ci", { bucket: "pass", completedAt: "2024-01-02T00:00:00Z", startedAt: "2024-01-10T00:00:00Z" }),
+    ],
   });
-  // completedAt 01-02 is still the effective date (completedAt ?? startedAt),
-  // so it wins over the later startedAt of the other entry.
-  assert.deepEqual(out, [run("ci", "pass", HEAD)]);
+  // Each entry's date is completedAt ?? startedAt; the second entry's later
+  // startedAt (01-10) is ignored because it has a completedAt, so the first
+  // entry (01-05) wins and the kept status is 'pending'.
+  assert.deepEqual(out, [run("ci", "pending", HEAD)]);
 });
 
 test("dedupe treats empty and 0001- dates as absent (empty string)", () => {
   const out = normalizeCheckRuns({
     headSha: HEAD,
-    ghChecks: [gh("ci", { completedAt: "" }), gh("ci", { completedAt: "0001-01-01T00:00:00Z" })],
+    ghChecks: [
+      gh("ci", { bucket: "pending", completedAt: "" }),
+      gh("ci", { bucket: "pass", completedAt: "0001-01-01T00:00:00Z" }),
+    ],
   });
-  // Both normalize to ''; tie keeps the later input (the second one).
+  // Both normalize to ''; the tie keeps the later input (the 'pass' one).
   assert.deepEqual(out, [run("ci", "pass", HEAD)]);
 });
 
 test("dedupe: a real date beats an empty date even when it comes first", () => {
   const out = normalizeCheckRuns({
     headSha: HEAD,
-    ghChecks: [gh("ci", { completedAt: "" }), gh("ci", { completedAt: "2024-01-02T00:00:00Z" })],
+    ghChecks: [
+      gh("ci", { bucket: "pending", completedAt: "" }),
+      gh("ci", { bucket: "pass", completedAt: "2024-01-02T00:00:00Z" }),
+    ],
   });
+  // The real completedAt (01-02) beats the empty date; kept status is 'pass'.
+  assert.deepEqual(out, [run("ci", "pass", HEAD)]);
+});
+
+test("dedupe: a 0001- completedAt does NOT fall back to startedAt (regression)", () => {
+  const out = normalizeCheckRuns({
+    headSha: HEAD,
+    ghChecks: [
+      gh("ci", { bucket: "pending", completedAt: "0001-01-01T00:00:00Z", startedAt: "2024-01-05T00:00:00Z" }),
+      gh("ci", { bucket: "pass", completedAt: "2024-01-02T00:00:00Z" }),
+    ],
+  });
+  // The 0001- completedAt normalises to '' and must NOT fall back to startedAt
+  // (01-05), so entry B's real completedAt (01-02) wins. Kept entry is B ('pass').
   assert.deepEqual(out, [run("ci", "pass", HEAD)]);
 });
 
@@ -138,6 +168,33 @@ test("dedupe: gh with a later date wins over an earlier REST entry", () => {
     restCheckRuns: [rest("ci", { conclusion: "failure", completed_at: "2024-01-01T00:00:00Z" })],
   });
   assert.deepEqual(out, [run("ci", "pending", HEAD)]);
+});
+
+test("dedupe: REST completed_at ?? started_at (0001- completed_at does not fall back)", () => {
+  const out = normalizeCheckRuns({
+    headSha: HEAD,
+    restCheckRuns: [
+      rest("ci", {
+        head_sha: "sha-a",
+        status: "in_progress",
+        completed_at: "0001-01-01T00:00:00Z",
+        started_at: "2024-01-05T00:00:00Z",
+      }),
+      rest("ci", { head_sha: "sha-b", conclusion: "success", completed_at: "2024-01-02T00:00:00Z" }),
+    ],
+  });
+  // Entry A's 0001- completed_at normalises to '' and must NOT fall back to its
+  // started_at (01-05), so B's real completed_at (01-02) wins. Kept sha is B's.
+  assert.deepEqual(out, [run("ci", "pass", "sha-b")]);
+});
+
+test("status/conclusion comparison is case-sensitive (SUCCESS on completed -> fail)", () => {
+  const out = normalizeCheckRuns({
+    headSha: HEAD,
+    restCheckRuns: [rest("ci", { status: "completed", conclusion: "SUCCESS" })],
+  });
+  // Only lowercase 'success' maps to 'pass'; 'SUCCESS' falls through to 'fail'.
+  assert.deepEqual(out, [run("ci", "fail", HEAD)]);
 });
 
 test("output is sorted by name via localeCompare", () => {
@@ -171,7 +228,7 @@ test("entries with missing or non-string names are dropped", () => {
 
 test("normalizeCheckRuns does not mutate its inputs", () => {
   const ghChecks: GhPrCheck[] = [
-    gh("ci", { bucket: "pending", completedAt: "2024-01-02T00:00:00Z", head_sha: "gh-sha" }),
+    gh("ci", { bucket: "pending", completedAt: "2024-01-02T00:00:00Z" }),
     gh("zeta", { bucket: "fail" }),
   ];
   const restCheckRuns: RestCheckRun[] = [rest("lint", { conclusion: "failure", head_sha: "rest-sha" })];
