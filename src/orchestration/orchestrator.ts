@@ -1644,6 +1644,34 @@ export class Orchestrator {
       parent_session_id: this.parentSessionId,
     });
     if (opts.executionMode) this.store.updateMission(mission.mission_id, { execution_mode: opts.executionMode });
+    if (this.ownership) {
+      this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
+    }
+    return this.runMissionPipeline(mission, {
+      request,
+      intent,
+      risk,
+      workspace,
+      workspaceError,
+      opts,
+    });
+  }
+
+  private async runMissionPipeline(
+    mission: Mission,
+    ctx: {
+      request: string;
+      intent: ReturnType<IntentRouter["route"]>;
+      risk: RiskProfile;
+      workspace?: Awaited<ReturnType<WorkspaceManifestResolver["resolve"]>> | undefined;
+      workspaceError?: WorkspaceScopeError | undefined;
+      opts: Pick<
+        OrchestrateOptions,
+        "signal" | "onProgress" | "acceptanceCriteria" | "mutationRequested" | "changedFiles"
+      >;
+    },
+  ): Promise<OrchestrateResult> {
+    const { request, intent, risk, workspace, workspaceError, opts } = ctx;
     const expectedResumptionGeneration = this.store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
     const liveRun = opts.signal ? this.runControllers.get(opts.signal) : undefined;
     if (liveRun) {
@@ -1651,9 +1679,6 @@ export class Orchestrator {
       // An operator interrupt is recorded on the mission before anything
       // else reacts to it, so no automatic recovery can resume it meanwhile.
       this.pauseHooks.get(liveRun)?.(() => this.store.markOperatorPause(mission.mission_id));
-    }
-    if (this.ownership) {
-      this.ownershipByMission.set(mission.mission_id, await this.ownership.acquire(mission.mission_id));
     }
     // A live controller keeps its mission lease alive for the whole mission,
     // not only while a worker holds a dispatch authority: a mission waiting
@@ -2219,6 +2244,111 @@ export class Orchestrator {
         }
         this.ownershipByMission.delete(mission.mission_id);
       }
+    }
+  }
+
+  /**
+   * Run an externally submitted mission that is still in status NEW.
+   *
+   * A mission submitted through the AutoSpec entry point (externalEntry) is
+   * created in status NEW and its submitter holds only a short submission-receipt
+   * lease. Once that receipt lease has expired, the runtime controller (this
+   * orchestrator) may acquire ownership and run the mission. The mission must be
+   * externally submitted (an `MSN-ext-` id or an idempotency sentinel constraint)
+   * and still NEW, and this orchestrator must be configured with a MissionOwnership.
+   *
+   * Returns `{ started: true, result }` when the pipeline ran, or
+   * `{ started: false, reason }` when it could not be started.
+   */
+  public async runSubmittedMission(
+    missionId: string,
+    opts: { signal?: AbortSignal; onProgress?: OrchestrateOptions["onProgress"] } = {},
+  ): Promise<{ started: true; result: OrchestrateResult } | { started: false; reason: string }> {
+    await this.refreshMissionLimits();
+    const run = interruptibleRun(opts.signal);
+    this.runControllers.set(run.signal, run.controller);
+    this.pauseHooks.set(run.controller, run.onPause);
+    try {
+      const mission = this.store.getMission(missionId);
+      if (!mission) return { started: false, reason: "not_found" };
+      const external =
+        mission.mission_id.startsWith("MSN-ext-") ||
+        mission.constraints.some((constraint) => constraint.startsWith("__pi_idempotency_key:"));
+      if (!external) return { started: false, reason: "not_external" };
+      if (mission.status !== "NEW") return { started: false, reason: `status_${mission.status}` };
+      if (!this.ownership) return { started: false, reason: "no_ownership" };
+      try {
+        this.ownershipByMission.set(missionId, await this.ownership.acquire(missionId));
+      } catch (error) {
+        const match = /is owned by (\S+) until (\S+)$/.exec(String((error as Error).message ?? error));
+        if (match) return { started: false, reason: `leased_until ${match[2]}` };
+        throw error;
+      }
+      try {
+        const request = mission.user_request;
+        const mutationRequested = workflowMutatesRepo(mission.workflow_class);
+        const intent = {
+          ...this.router.route({ request, mutationRequested }),
+          suggested_workflow: mission.workflow_class,
+        };
+        const risk = mission.risk_profile;
+        let workspace: Awaited<ReturnType<WorkspaceManifestResolver["resolve"]>> | undefined;
+        let workspaceError: WorkspaceScopeError | undefined;
+        if (this.workspaceResolver) {
+          try {
+            workspace = await this.workspaceResolver.resolveRepository(mission.repository);
+          } catch (error) {
+            workspaceError =
+              error instanceof WorkspaceScopeError
+                ? error
+                : new WorkspaceScopeError(error instanceof Error ? error.message : String(error));
+          }
+          // When a repository registry is configured, verify the mission's base
+          // ref belongs to its selected repository, exactly as orchestrateMission
+          // does — but never rewrite the base ref on the record.
+          if (workspace && !workspaceError && this.repositoryRegistry) {
+            const primaryBinding = workspace.repositories.find(
+              (repository) => repository.repoId === workspace?.primaryRepoId,
+            );
+            if (primaryBinding && mission.base_ref) {
+              const targetGit = await GitRepo.open(primaryBinding.canonicalRoot);
+              const targetCommit = await targetGit?.resolveCommit(mission.base_ref);
+              if (!targetCommit) {
+                workspaceError = new WorkspaceScopeError(
+                  `Requested base ${mission.base_ref} does not belong to selected repository ${primaryBinding.canonicalRoot}`,
+                );
+              }
+            }
+          }
+        }
+        // The idempotency sentinel is an internal bookkeeping constraint; it must
+        // never reach spec approval, so it is stripped from the copy the pipeline
+        // sees.
+        const missionCopy = {
+          ...mission,
+          constraints: mission.constraints.filter((constraint) => !constraint.startsWith("__pi_idempotency_key:")),
+        };
+        return {
+          started: true as const,
+          result: await this.runMissionPipeline(missionCopy, {
+            request,
+            intent,
+            risk,
+            workspace,
+            workspaceError,
+            opts: { signal: run.signal, onProgress: opts.onProgress },
+          }),
+        };
+      } catch (error) {
+        const identity = this.ownershipByMission.get(missionId);
+        if (identity && this.ownership) {
+          await this.ownership.release(identity).catch(() => undefined);
+          this.ownershipByMission.delete(missionId);
+        }
+        throw error;
+      }
+    } finally {
+      run.dispose();
     }
   }
 
