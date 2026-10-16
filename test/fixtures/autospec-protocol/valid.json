@@ -46,9 +46,7 @@
       "sequence": 2,
       "required_extensions": [],
       "task_id": "t-2",
-      "depends_on": [
-        "t-1"
-      ],
+      "depends_on": ["t-1"],
       "state": "BLOCKED",
       "executor": "autospec-managed",
       "affected_surfaces": [

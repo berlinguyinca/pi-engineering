@@ -5,10 +5,7 @@
   "description": "The envelope every autospec shared-protocol message carries (autospec.protocol.<entity>.v<N>). It fixes version negotiation, idempotency, per-mission sequence and fail-closed required fields. Only the keyword subset listed in docs/contracts/autospec-protocol-v1.md section Schema subset is used, so a Rust reader and a TypeScript reader can implement it identically. Entity schemas reuse these field definitions.",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "schema", "protocol_version", "idempotency_key", "mission_id",
-    "sequence", "required_extensions"
-  ],
+  "required": ["schema", "protocol_version", "idempotency_key", "mission_id", "sequence", "required_extensions"],
   "properties": {
     "schema": { "$ref": "#/$defs/schema" },
     "protocol_version": { "$ref": "#/$defs/protocol_version" },

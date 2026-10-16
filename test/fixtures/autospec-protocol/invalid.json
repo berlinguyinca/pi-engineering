@@ -173,9 +173,7 @@
       "idempotency_key": "idem-event-1",
       "mission_id": "m-fixture-1",
       "sequence": 1,
-      "required_extensions": [
-        "x-future"
-      ],
+      "required_extensions": ["x-future"],
       "event_id": "ev-1",
       "trace_id": "tr-1",
       "event_type": "task.progress",
@@ -198,9 +196,7 @@
       "idempotency_key": "idem-event-1",
       "mission_id": "m-fixture-1",
       "sequence": 1,
-      "required_extensions": [
-        "x-known"
-      ],
+      "required_extensions": ["x-known"],
       "event_id": "ev-1",
       "trace_id": "tr-1",
       "event_type": "task.progress",

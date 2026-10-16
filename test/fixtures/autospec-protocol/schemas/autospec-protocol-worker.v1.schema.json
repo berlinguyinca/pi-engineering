@@ -64,10 +64,7 @@
     },
     "executor": {
       "type": "string",
-      "enum": [
-        "pi-local",
-        "autospec-managed"
-      ],
+      "enum": ["pi-local", "autospec-managed"],
       "description": "Executor backend the worker serves."
     },
     "model_slots": {

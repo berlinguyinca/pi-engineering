@@ -63,19 +63,13 @@
     },
     "executor": {
       "type": "string",
-      "enum": [
-        "pi-local",
-        "autospec-managed"
-      ],
+      "enum": ["pi-local", "autospec-managed"],
       "description": "The task's single executor."
     },
     "model_policy": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "model",
-        "provider"
-      ],
+      "required": ["model", "provider"],
       "properties": {
         "model": {
           "type": "string",
@@ -110,14 +104,7 @@
     },
     "status": {
       "type": "string",
-      "enum": [
-        "OK",
-        "NO-OUTPUT",
-        "INFRA-FAIL",
-        "LAUNCH-FAIL",
-        "AGENT-NEVER-STARTED",
-        "SIGNALLED"
-      ],
+      "enum": ["OK", "NO-OUTPUT", "INFRA-FAIL", "LAUNCH-FAIL", "AGENT-NEVER-STARTED", "SIGNALLED"],
       "description": "Terminal status as the fleet records it (RunStatus) plus SIGNALLED."
     }
   },
