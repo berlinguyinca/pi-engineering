@@ -40,7 +40,16 @@ export interface ExternalEntryIo {
 }
 
 const USAGE = "usage: pi-engineering mission submit|observe|cancel --store <dir>   (JSON request on stdin)\n";
-/** Long enough that an external owner's lease outlives the gaps between its calls. */
+/**
+ * Submit-time lease: a short receipt lease covering only the handshake that
+ * created the mission and returned its fencing token. An external owner that
+ * keeps working must renew this lease (observe/cancel do not renew it); the
+ * 24h DEFAULT_LEASE_MS below remains for runtime-held controller leases, not
+ * for the submit receipt. Any leaseMs a submit carries is clamped to at most
+ * this value so no submit can grant a long-lived ownership receipt.
+ */
+export const SUBMISSION_RECEIPT_LEASE_MS = 5 * 60 * 1000;
+/** Long enough that a runtime-held controller lease outlives the gaps between its calls. */
 const DEFAULT_LEASE_MS = 24 * 60 * 60_000;
 const RISK: readonly RiskProfile[] = ["low", "medium", "high", "critical"];
 
@@ -256,14 +265,15 @@ export async function runExternalEntry(
     const store = MissionStore.open(backend);
     if (sub === "submit") {
       const id = protocolSubmit ? protocolSubmit.missionId : externalMissionId(idempotencyKey);
-      const ownership = new MissionOwnership(store, {
-        ownerId,
-        leaseMs: protocolSubmit
-          ? (protocolSubmit.leaseMs ?? DEFAULT_LEASE_MS)
+      const leaseMs = Math.min(
+        SUBMISSION_RECEIPT_LEASE_MS,
+        protocolSubmit
+          ? (protocolSubmit.leaseMs ?? SUBMISSION_RECEIPT_LEASE_MS)
           : typeof body.leaseMs === "number" && body.leaseMs > 0
             ? body.leaseMs
-            : DEFAULT_LEASE_MS,
-      });
+            : SUBMISSION_RECEIPT_LEASE_MS,
+      );
+      const ownership = new MissionOwnership(store, { ownerId, leaseMs });
       let mission = store.getMission(id);
       let created = false;
       if (!mission) {
