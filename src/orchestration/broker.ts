@@ -104,7 +104,14 @@ export interface ExecutionHandle {
   taskId: string;
   missionId: string;
   backend: ExecutionBackend;
-  cancel(): Promise<void>;
+  /**
+   * Cancel the execution. When `opts.resumable` is true the owning task is left
+   * resumable (RETRYING) instead of CANCELED — used when the dispatch authority
+   * is invalidated (controller disconnect / orphan) so recovery can re-run the
+   * same task rather than treating it as terminally canceled and advancing the
+   * mission to its next phase.
+   */
+  cancel(opts?: { resumable?: boolean }): Promise<void>;
   steer(request: string): Promise<void>;
   /** Resolves when the execution settles; throws on failure/cancel. */
   result(): Promise<ExecutionOutcome>;
@@ -2320,8 +2327,8 @@ export class ExecutionBroker {
         this.active.get(execution.execution_id)?.status ??
         this.store.getExecution(execution.execution_id)?.status ??
         "PENDING",
-      cancel: async () => {
-        await this.cancelExecution(execution.execution_id, input.taskId);
+      cancel: async (opts?: { resumable?: boolean }) => {
+        await this.cancelExecution(execution.execution_id, input.taskId, opts);
       },
       steer: async (request) => {
         this.store.steerTask(input.taskId, request);

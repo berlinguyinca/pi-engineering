@@ -14,6 +14,7 @@ import { RuntimeSession } from "../../src/runtime/isolation/RuntimeSession.ts";
 import { SessionEventStore } from "../../src/runtime/isolation/SessionEventStore.ts";
 import { resolveWorktreeIdentity } from "../../src/runtime/isolation/WorktreeIdentity.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
+import type { MissionLease } from "../../src/orchestration/types.ts";
 
 /** Probe: does this process still hold the runtime's session event writer? */
 function sessionWriter(runtime: EngineeringRuntime): () => boolean {
@@ -34,6 +35,25 @@ function mission(store: MissionStore, missionId: string) {
     risk_profile: "medium",
     workflow_class: "engineering",
   });
+}
+
+/**
+ * MissionOwnership that fails its next N `renew` calls before delegating to the
+ * real implementation. Proves the lease heartbeat tolerates transient renewal
+ * failures instead of latching dead on the first one.
+ */
+class FlakyRenewOwnership extends MissionOwnership {
+  private failuresRemaining = 0;
+  setFailures(n: number): void {
+    this.failuresRemaining = n;
+  }
+  override async renew(identity: MissionLease): Promise<MissionLease> {
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1;
+      throw new Error("injected transient renewal failure");
+    }
+    return super.renew(identity);
+  }
 }
 
 describe("MissionOwnership", () => {
@@ -254,6 +274,79 @@ describe("MissionOwnership", () => {
 
     await authority.close();
     assert.equal(store.getRepositoryLeaseByRepoId("repo-long"), undefined);
+  });
+
+  it("recovers a transient lease renewal failure instead of latching the heartbeat dead", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-transient");
+    const owner = new FlakyRenewOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+    });
+    const identity = await owner.acquire("M-lease-transient");
+    const authority = await owner.maintain(identity, "repo-transient");
+    try {
+      // Inject a single transient failure on the next heartbeat tick, then let
+      // subsequent ticks run. The old code latched `failure` on the first error
+      // and every later pulse became a no-op, so one blip lapsed a live
+      // controller lease and orphaned a running mission. The fix retries.
+      owner.setFailures(1);
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      // Still authoritative: the transient failure was retried and recovered.
+      authority.assertAuthoritative();
+      assert.match(authority.lastPulseError?.message ?? "", /injected transient renewal failure/);
+    } finally {
+      await authority.close();
+    }
+  });
+
+  it("invalidates a dispatch authority only after sustained renewal failures", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-sustained");
+    const owner = new FlakyRenewOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+      maxConsecutiveRenewFailures: 2,
+    });
+    const identity = await owner.acquire("M-lease-sustained");
+    const authority = await owner.maintain(identity, "repo-sustained");
+    try {
+      // A failure that never recovers must still invalidate the authority, but
+      // only once consecutive failures reach the configured threshold.
+      owner.setFailures(Number.MAX_SAFE_INTEGER);
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      assert.throws(
+        () => authority.assertAuthoritative(),
+        /lease renewal failed 2 times in a row/,
+      );
+      assert.ok(authority.lastPulseError);
+    } finally {
+      await authority.close();
+    }
+  });
+
+  it("survives a sub-threshold run of renewal failures", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-subthreshold");
+    const owner = new FlakyRenewOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+      maxConsecutiveRenewFailures: 3,
+    });
+    const identity = await owner.acquire("M-lease-subthreshold");
+    const authority = await owner.maintain(identity, "repo-subthreshold");
+    try {
+      // Two consecutive failures, then recovery: below the threshold of 3, so
+      // the authority must survive.
+      owner.setFailures(2);
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      authority.assertAuthoritative();
+    } finally {
+      await authority.close();
+    }
   });
 
   it("rejects an old fencing token after takeover and process restart", async () => {

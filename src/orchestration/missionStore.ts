@@ -1619,6 +1619,28 @@ export class MissionStore {
     return reconciled;
   }
 
+  /**
+   * Re-queue resumable (RETRYING) tasks back to READY so the scheduler
+   * re-dispatches them. Called during mission recovery so a task left resumable
+   * by a controller-disconnect cancel (or an interrupted execution) is resumed
+   * instead of being dropped while the mission advances to its next phase.
+   * Returns the task IDs that were re-queued.
+   */
+  requeueResumableTasks(missionId: string): string[] {
+    const requeued: string[] = [];
+    for (const task of this.listTasks(missionId)) {
+      if (task.status === "RETRYING") {
+        try {
+          this.transitionTask(task.task_id, "READY");
+          requeued.push(task.task_id);
+        } catch {
+          // Already re-queued or an invalid transition; skip.
+        }
+      }
+    }
+    return requeued;
+  }
+
   /** Append inert late evidence and keep append failures visible in persistenceDiagnostics(). */
   async recordLateExecution(executionId: string, reason: string, evidence: LateExecutionEvidence): Promise<boolean> {
     this.rejectLateExecution(executionId, reason, evidence);

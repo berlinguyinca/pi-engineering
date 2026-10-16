@@ -473,6 +473,11 @@ export class Orchestrator {
         return this.store.getMission(missionId)!;
       }
       const reconciledOrphans = this.store.reconcileOrphanedExecutions(missionId);
+      // A controller-disconnect cancel leaves the orphaned task resumable
+      // (RETRYING) rather than CANCELED. Re-queue it to READY so recovery re-runs
+      // the SAME task instead of dropping it while the mission advances to its
+      // next phase (e.g. dispatching an integrator against an empty candidate).
+      const requeuedOrphanedTaskIds = this.store.requeueResumableTasks(missionId);
       await this.store.flush();
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const classifications = this.store.listFailureClassifications(missionId);
@@ -979,7 +984,11 @@ export class Orchestrator {
           case "RECONSTRUCT_EVIDENCE":
             return this.store.listEvidenceInvalidations(missionId).length > invalidationsBefore;
           case "FENCE_RECONCILE_AND_RESUME":
-            return reconciledOrphans.length > 0 || failedTasks.length > 0;
+            return (
+              reconciledOrphans.length > 0 ||
+              requeuedOrphanedTaskIds.length > 0 ||
+              failedTasks.length > 0
+            );
           case "CHECKPOINT_SPLIT_AND_REPLACE":
           case "REPAIR_WORKER_OUTPUT":
           case "REBUILD_INTEGRATION_CANDIDATE":
@@ -2649,7 +2658,12 @@ export class Orchestrator {
       });
       const executionHandle = handle;
       authority?.onInvalidated(() => {
-        void executionHandle.cancel();
+        // The dispatch authority was invalidated (controller disconnect / lease
+        // lapse). Leave the owning task resumable (RETRYING) rather than
+        // CANCELED so mission recovery re-runs the SAME task instead of treating
+        // it as terminally canceled and advancing the mission to its next phase
+        // (e.g. dispatching an integrator against an empty candidate).
+        void executionHandle.cancel({ resumable: true });
       });
       const onAbort = (): void => {
         void executionHandle.cancel();

@@ -19,6 +19,14 @@ export interface MissionOwnershipOptions {
    * instead of waiting for the dead owner's lease to expire.
    */
   isOwnerGone?: (ownerId: string) => boolean;
+  /**
+   * How many consecutive heartbeat renewal failures a live dispatch authority
+   * tolerates before it invalidates itself. A single transient renewal failure
+   * must not permanently stop the lease heartbeat (that lapsed live controller
+   * leases and orphaned running missions); only sustained failure is treated as
+   * loss of authority. Must be >= 1.
+   */
+  maxConsecutiveRenewFailures?: number;
 }
 
 export const missionCustodyKey = (missionId: string): string => `mission:${missionId}`;
@@ -34,6 +42,8 @@ export interface DispatchAuthority {
   onInvalidated(listener: (error: Error) => void): void;
   /** Stops renewal and releases repository authority. Release failures are returned, never thrown. */
   close(): Promise<Error | undefined>;
+  /** The most recent renewal error, if any, even when the authority has not yet been invalidated. */
+  readonly lastPulseError?: Error;
 }
 
 function isRepositoryIdentity(identity: OwnershipIdentity): identity is RepositoryLease {
@@ -49,6 +59,7 @@ export class MissionOwnership {
   private readonly now: () => number;
   private readonly custody: MissionCustody | undefined;
   private readonly isOwnerGone: ((ownerId: string) => boolean) | undefined;
+  private readonly maxConsecutiveRenewFailures: number;
   private readonly missionHolders = new Map<string, number>();
   private readonly repositoryHolders = new Map<string, number>();
 
@@ -67,6 +78,10 @@ export class MissionOwnership {
     this.now = options.now ?? Date.now;
     this.custody = options.custody;
     this.isOwnerGone = options.isOwnerGone;
+    this.maxConsecutiveRenewFailures = options.maxConsecutiveRenewFailures ?? 3;
+    if (!Number.isInteger(this.maxConsecutiveRenewFailures) || this.maxConsecutiveRenewFailures < 1) {
+      throw new Error("maxConsecutiveRenewFailures must be a positive integer");
+    }
   }
 
   /** A lease held by another runtime that is provably gone counts as expired. */
@@ -101,7 +116,7 @@ export class MissionOwnership {
   async maintain(identity: MissionLease, repoId?: string): Promise<DispatchAuthority> {
     const mission = await this.renew(identity);
     const repository = repoId ? await this.acquireRepository(mission, repoId) : undefined;
-    return new RenewableDispatchAuthority(this, mission, repository, this.heartbeatMs);
+    return new RenewableDispatchAuthority(this, mission, repository, this.heartbeatMs, this.maxConsecutiveRenewFailures);
   }
 
   async acquire(missionId: string, options: { resumptionGeneration?: number } = {}): Promise<MissionLease> {
@@ -347,6 +362,9 @@ class RenewableDispatchAuthority implements DispatchAuthority {
   private pulseChain: Promise<void> = Promise.resolve();
   private failure: Error | undefined;
   private stopped = false;
+  private consecutiveRenewFailures = 0;
+  private lastError: Error | undefined;
+  private readonly maxConsecutiveRenewFailures: number;
   private readonly invalidationListeners = new Set<(error: Error) => void>();
 
   constructor(
@@ -354,16 +372,29 @@ class RenewableDispatchAuthority implements DispatchAuthority {
     mission: MissionLease,
     repository: RepositoryLease | undefined,
     heartbeatMs: number,
+    maxConsecutiveRenewFailures = 3,
   ) {
     this.ownership = ownership;
     this.mission = mission;
     this.repository = repository;
+    this.maxConsecutiveRenewFailures = maxConsecutiveRenewFailures;
     this.timer = setInterval(() => {
       this.pulseChain = this.pulseChain
         .then(() => this.pulse())
         .catch((error) => {
-          this.failure = error instanceof Error ? error : new Error(String(error));
-          for (const listener of this.invalidationListeners) listener(this.failure);
+          // A single transient renewal failure must not permanently stop the
+          // heartbeat: the old code latched `failure` on the first error and
+          // every later pulse became a no-op, so one blip lapsed a live
+          // controller lease and orphaned a running mission. Retry on the next
+          // ticks and only invalidate once failures are sustained.
+          this.consecutiveRenewFailures += 1;
+          this.lastError = error instanceof Error ? error : new Error(String(error));
+          if (this.consecutiveRenewFailures >= this.maxConsecutiveRenewFailures && !this.failure) {
+            this.failure = new Error(
+              `lease renewal failed ${this.consecutiveRenewFailures} times in a row: ${this.lastError.message}`,
+            );
+            for (const listener of this.invalidationListeners) listener(this.failure);
+          }
         });
     }, heartbeatMs);
     this.timer.unref?.();
@@ -379,6 +410,11 @@ class RenewableDispatchAuthority implements DispatchAuthority {
 
   get resumptionGeneration(): number {
     return this.mission.resumptionGeneration ?? 0;
+  }
+
+  /** The most recent renewal error, if any, even when the authority has not yet been invalidated. */
+  get lastPulseError(): Error | undefined {
+    return this.lastError;
   }
 
   assertAuthoritative(): void {
@@ -410,5 +446,6 @@ class RenewableDispatchAuthority implements DispatchAuthority {
     if (this.stopped || this.failure) return;
     this.mission = await this.ownership.renew(this.mission);
     if (this.repository) this.repository = await this.ownership.renewRepository(this.repository);
+    this.consecutiveRenewFailures = 0;
   }
 }
