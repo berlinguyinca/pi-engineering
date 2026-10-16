@@ -94,7 +94,7 @@ export function buildBootstrapPackage(input: BootstrapPackageInput): BootstrapPa
 
   // PACK: stable sort of survivors.
   const sorted = [...survivors].sort((a, b) => {
-    if (a.required !== b.required) {
+    if (Boolean(a.required) !== Boolean(b.required)) {
       return a.required ? -1 : 1;
     }
     const kindDiff = KIND_PRIORITY[a.kind] - KIND_PRIORITY[b.kind];
@@ -118,6 +118,7 @@ export function buildBootstrapPackage(input: BootstrapPackageInput): BootstrapPa
   const deferred: BootstrapReasonEntry[] = [];
   let count = 0;
   let total = 0;
+  const reasons: string[] = [];
 
   for (const item of sorted) {
     if (item.required) {
@@ -126,7 +127,7 @@ export function buildBootstrapPackage(input: BootstrapPackageInput): BootstrapPa
       count += 1;
       total += item.tokens;
       if (total > maxTokens || count > maxItems) {
-        deferred.push({ id: item.id, reason: `required item exceeds budget: ${item.id}` });
+        reasons.push(`required item exceeds budget: ${item.id}`);
       }
       continue;
     }
@@ -144,7 +145,6 @@ export function buildBootstrapPackage(input: BootstrapPackageInput): BootstrapPa
     total += item.tokens;
   }
 
-  const reasons: string[] = [];
   if (deferred.length > 0) {
     reasons.push(`deferred ${deferred.length} items for lazy retrieval`);
   }
