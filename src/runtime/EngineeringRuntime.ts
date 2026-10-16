@@ -27,6 +27,7 @@ import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.
 import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
+import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
 import { readAutospecFlags } from "../orchestration/missionMode.ts";
@@ -1414,6 +1415,12 @@ export class EngineeringRuntime {
           supervisedStore.syncExternal();
         },
         admit: async (mission) => {
+          // Externally submitted missions in NEW belong to the external pump, not the
+          // supervisor lifecycle: the pump adopts them via runSubmittedMission, which
+          // acquires the lease and moves them past NEW. Supervising them while their
+          // submission receipt lease is live misreads "no tasks yet" as
+          // REQUIREMENT_AMBIGUITY and blocks them before the pump can start them.
+          if (!supervisorAdmitsMission(mission)) return false;
           const claim = await custody.claim(missionCustodyKey(mission.mission_id));
           if (claim.ok) supervisedStore.syncExternal();
           return claim.ok;
