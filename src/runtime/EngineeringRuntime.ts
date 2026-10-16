@@ -7,7 +7,7 @@ import { SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { BlackholeManager, type BlackholeManagerOptions } from "../blackhole/BlackholeManager.ts";
 import type { RoleRouterAdapter } from "../capability/adapter.ts";
-import { sameFamily } from "../capability/modelRecord.ts";
+import { differentFamilyReviewerAvailable } from "../capability/registryCandidates.ts";
 import { ContextBroker } from "../context/ContextBroker.ts";
 import { newRunId } from "../core/ids.ts";
 import type {
@@ -1356,17 +1356,25 @@ export class EngineeringRuntime {
         backends,
         mergeQueue: {
           requireIndependentReview: /^(1|true|yes)$/i.test(process.env.PI_ENGINEERING_REQUIRE_INDEPENDENT_REVIEW ?? ""),
-          // A live session model whose family differs from the reviewer's could
-          // have reviewed independently. An unknown family never counts.
+          // A live session model in the operator's enabled scope whose family
+          // differs from the reviewer's could have reviewed independently.
           differentFamilyReviewerAvailable: async ({ reviewer }) => {
             if (!(rt.worker instanceof PiWorkerExecutor)) return false;
             try {
-              const models = await (await rt.worker.getModelRuntime()).getAvailable();
-              return models.some(
-                (model) =>
-                  !rt.unavailableModels.has({ provider: model.provider, id: model.id }) &&
-                  !sameFamily(model.id, reviewer.model),
-              );
+              const models = (await (await rt.worker.getModelRuntime()).getAvailable()).map((model) => ({
+                provider: model.provider,
+                id: model.id,
+              }));
+              let enabledPatterns: string[] | undefined;
+              try {
+                enabledPatterns = SettingsManager.create(repoRoot, opts.agentDir ?? getAgentDir()).getEnabledModels();
+              } catch {
+                enabledPatterns = undefined;
+              }
+              return differentFamilyReviewerAvailable(models, reviewer.model, {
+                enabledPatterns,
+                isUnavailable: (model) => rt.unavailableModels.has(model),
+              });
             } catch {
               return false;
             }
