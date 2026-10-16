@@ -108,6 +108,57 @@ test("replaySafe from requestState not_started, defaults false otherwise", () =>
   assert.equal(classifyBackpressure({ status: 429, body: { code: "caller_concurrency" } }).replaySafe, false);
 });
 
+test("classifyBackpressure(null) is unknown and does not throw", () => {
+  const signal = classifyBackpressure(null);
+  assert.equal(signal.kind, "unknown");
+  assert.equal(signal.action, "none");
+  assert.equal(signal.waitMs, null);
+});
+
+test("classifyBackpressure(undefined) is unknown", () => {
+  const signal = classifyBackpressure(undefined);
+  assert.equal(signal.kind, "unknown");
+  assert.equal(signal.waitMs, null);
+});
+
+test("classifyBackpressure('x') is unknown", () => {
+  const signal = classifyBackpressure("x");
+  assert.equal(signal.kind, "unknown");
+  assert.equal(signal.action, "none");
+});
+
+test("numeric string status '429' behaves like 429", () => {
+  const signal = classifyBackpressure({ status: "429", body: { code: "caller_concurrency" } });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.action, "wait_same");
+});
+
+test("NaN status is treated as absent and classified unknown", () => {
+  const signal = classifyBackpressure({ status: Number.NaN, body: { code: "capacity_unavailable" } });
+  assert.equal(signal.kind, "unknown");
+  assert.equal(signal.action, "none");
+});
+
+test("Retry-After header lookup is case-insensitive on a plain object", () => {
+  const signal = classifyBackpressure({
+    status: 429,
+    headers: { "RETRY-AFTER": "5" },
+    body: { code: "caller_queue_full" },
+  });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.waitMs, 5000);
+});
+
+test("Retry-After header lookup works on a Headers instance", () => {
+  const signal = classifyBackpressure({
+    status: 429,
+    headers: new Headers({ "Retry-After": "5" }),
+    body: { code: "caller_queue_full" },
+  });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.waitMs, 5000);
+});
+
 test("real observed sample: 429 capacity_unavailable with retry_alternate", () => {
   const signal = classifyBackpressure({
     status: 429,

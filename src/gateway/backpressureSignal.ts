@@ -45,8 +45,8 @@ export interface BackpressureSignal {
 }
 
 export interface ClassifyBackpressureInput {
-  status: number;
-  headers?: Record<string, string>;
+  status: number | string;
+  headers?: Record<string, string> | Headers;
   body?: unknown;
 }
 
@@ -76,20 +76,46 @@ function actionOf(body: unknown): string | undefined {
   return record ? nonEmptyString(record.action) : undefined;
 }
 
+/**
+ * Read the `Retry-After` header case-insensitively from either a plain object
+ * or a `Headers` instance.
+ */
+function retryAfterFrom(headers?: Record<string, string> | Headers): string | undefined {
+  if (headers === undefined) return undefined;
+  if (typeof (headers as Headers).get === "function") {
+    return (headers as Headers).get("retry-after") ?? undefined;
+  }
+  const record = headers as Record<string, string>;
+  for (const [key, value] of Object.entries(record)) {
+    if (key.toLowerCase() === "retry-after") return value;
+  }
+  return undefined;
+}
+
 /** Wait hint: body field, else Retry-After header seconds, else null. */
-function waitMsOf(body: unknown, headers?: Record<string, string>): number | null {
+function waitMsOf(body: unknown, headers?: Record<string, string> | Headers): number | null {
   const record = asRecord(body);
   if (record) {
     const raw = record.retry_after_ms ?? record.retryAfterMs;
     const value = typeof raw === "string" ? Number(raw) : raw;
     if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
   }
-  const retryAfter = headers?.["retry-after"] ?? headers?.["Retry-After"];
+  const retryAfter = retryAfterFrom(headers);
   if (retryAfter !== undefined) {
     const ms = parseRetryAfterHeader(retryAfter);
     if (ms !== undefined) return ms;
   }
   return null;
+}
+
+/**
+ * Normalise the status: accept a numeric string, and treat NaN, negative or
+ * non-finite values as absent (so the signal is classified as unknown).
+ */
+function normalizedStatus(status: number | string): number | undefined {
+  const value = typeof status === "string" ? Number(status) : status;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+  return value;
 }
 
 /**
@@ -105,10 +131,15 @@ function replaySafeOf(body: unknown): boolean {
 }
 
 /** Classify a backpressure response into a recovery signal. */
-export function classifyBackpressure(input: ClassifyBackpressureInput): BackpressureSignal {
-  const { status } = input;
-  const code = codeOf(input.body);
-  const action = actionOf(input.body);
+export function classifyBackpressure(input: unknown): BackpressureSignal {
+  // Non-object inputs (null, undefined, primitives) are unrecognised signals.
+  if (typeof input !== "object" || input === null) {
+    return { kind: "unknown", action: "none", waitMs: null, replaySafe: false, reason: "unknown" };
+  }
+  const { status: statusInput, body, headers } = input as ClassifyBackpressureInput;
+  const status = normalizedStatus(statusInput);
+  const code = codeOf(body);
+  const action = actionOf(body);
   const reason = code ?? "unknown";
 
   // Context problems are terminal for the current context: only shrinking it
@@ -117,8 +148,8 @@ export function classifyBackpressure(input: ClassifyBackpressureInput): Backpres
     return {
       kind: "context",
       action: "shrink_context",
-      waitMs: waitMsOf(input.body, input.headers),
-      replaySafe: replaySafeOf(input.body),
+      waitMs: waitMsOf(body, headers),
+      replaySafe: replaySafeOf(body),
       reason,
     };
   }
@@ -131,8 +162,8 @@ export function classifyBackpressure(input: ClassifyBackpressureInput): Backpres
     return {
       kind: "capacity",
       action: "retry_alternate",
-      waitMs: waitMsOf(input.body, input.headers),
-      replaySafe: replaySafeOf(input.body),
+      waitMs: waitMsOf(body, headers),
+      replaySafe: replaySafeOf(body),
       reason,
     };
   }
@@ -142,8 +173,8 @@ export function classifyBackpressure(input: ClassifyBackpressureInput): Backpres
     return {
       kind: "quota",
       action: "wait_same",
-      waitMs: waitMsOf(input.body, input.headers),
-      replaySafe: replaySafeOf(input.body),
+      waitMs: waitMsOf(body, headers),
+      replaySafe: replaySafeOf(body),
       reason,
     };
   }
@@ -151,8 +182,8 @@ export function classifyBackpressure(input: ClassifyBackpressureInput): Backpres
   return {
     kind: "unknown",
     action: "none",
-    waitMs: waitMsOf(input.body, input.headers),
-    replaySafe: replaySafeOf(input.body),
+    waitMs: waitMsOf(body, headers),
+    replaySafe: replaySafeOf(body),
     reason,
   };
 }
