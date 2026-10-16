@@ -63,9 +63,11 @@ test("Pi loads the Host entry; the real extension reloads 5x with no duplicated 
   const pi: PiTestSession = await startPiSession({ extensionPaths: [hostEntry] });
   try {
     const commands = pi.piCommands();
-    for (const name of ["engineering", "engineer", "mission", "update", "panel"]) {
+    for (const name of ["engineering", "engineer", "mission", "update"]) {
       assert.ok(commands.includes(name), `/${name} registered`);
     }
+    // The Engineering panel was removed; its command must not come back by accident.
+    assert.ok(!commands.includes("panel"), "/panel is gone");
     const watched = ["agent_settled", "before_agent_start", "message_update", "tool_execution_start", "model_select"];
     const handlerCounts = Object.fromEntries(watched.map((e) => [e, pi.piHandlerCount(e)]));
     assert.ok((handlerCounts.before_agent_start ?? 0) > 0);

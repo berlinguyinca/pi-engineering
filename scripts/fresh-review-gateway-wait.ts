@@ -154,16 +154,14 @@ const AREAS: Record<string, { files: string; requirements: string; inspect: stri
   },
   surface: {
     files:
-      "src/status/ and src/panel/, plus their tests. Pay particular attention to the newest work: src/panel/rowPaint.ts (colour), src/panel/gutter.ts, src/panel/highlight.ts, and the render pipeline in src/panel/PanelComponent.ts and src/panel/PanelController.ts.",
+      "src/status/ (the footer and ambient row) and src/panel/PanelState.ts plus the ledger and workspace feeders it reads, together with their tests.",
     requirements: [
       "The status bar shows the active model, the current task, and why the runtime is waiting, including a spinner and queue position during gateway backpressure.",
       "Rendering must never run git or network calls.",
-      "The panel is a read model: it must never invent facts about the session.",
-      "Generated narrative text must never be recorded as machine evidence.",
+      "The ambient row is a read model: it must never invent facts about the session.",
       "Every line returned by render(width) is at most `width` VISIBLE columns. Colour must never change the text: escape sequences cost no columns, and a painter that inserted or dropped a visible character corrupts the frame.",
       "Text is truncated BEFORE it is painted. Truncating painted text cuts an escape sequence in half and stains the rest of the frame with whatever colour happened to be open.",
       "Colours come from the operator's theme by semantic name. A hardcoded colour is wrong the moment they switch to a light theme.",
-      "The panel is registered nonCapturing and must never take the keyboard: an always-on panel that captures input makes pi accept no typing at all.",
     ].join("\n"),
     inspect: [
       "render-path work that blocks or does IO",

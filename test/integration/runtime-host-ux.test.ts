@@ -10,7 +10,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { PanelState } from "../../src/panel/PanelState.ts";
-import { buildRows } from "../../src/panel/tree.ts";
 import { EngineeringHostExtension } from "../../src/runtime/host/extension.ts";
 import { runtimeStatusLines } from "../../src/runtime/host/runtimeStatus.ts";
 import { readStateSchema, writeStateSchema } from "../../src/runtime/migrations/schema.ts";
@@ -77,7 +76,7 @@ async function world(opts: { autoUpdateCheck?: boolean; beforeStart?: (w: { inst
   return { key, b, root, repo, ext, pi, host, settle, run, state };
 }
 
-test("/engineering version and the panel show version, generation, schema, compatibility, previous, last update (§38, §44)", async () => {
+test("/engineering version and the runtime status show version, generation, schema, compatibility, previous, last update (§38, §44)", async () => {
   const w = await world();
   w.repo.publish({ version: "0.2.1", value: "B", stateSchema: { minReadable: 7, maxReadable: 7, writes: 7 } });
   await w.run("/engineering update");
@@ -108,13 +107,11 @@ test("/engineering version and the panel show version, generation, schema, compa
     "Channel       main",
     "Health        healthy",
   ]) {
-    assert.ok(lines.includes(want), `panel shows ${want}: ${lines.join(" | ")}`);
+    assert.ok(lines.includes(want), `runtime status shows ${want}: ${lines.join(" | ")}`);
   }
   assert.ok(lines.includes("0.2.1         retained"));
-  const rows = buildRows(new PanelState().snapshot, new Set(), "session").map((r) => r.label);
-  assert.ok(rows.includes("Runtime") && rows.includes("Version       0.2.2"), "Engineering panel Session tab");
 
-  // During a handover the panel shows what it waits for.
+  // During a handover the status shows what it waits for.
   const op = w.host.operations.begin(3, "inference", "assistant message");
   await w.pi.run("/engineering reload");
   const waiting = runtimeStatusLines();
