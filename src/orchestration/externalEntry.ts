@@ -26,6 +26,7 @@ import { createHash } from "node:crypto";
 import { mkdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
+import { type Envelope, validateEnvelope } from "./externalEntryProtocol.ts";
 import { cancelStaleMission, transitionMissionToCanceled } from "./missionCancel.ts";
 import { assertRootMissionAllowed, readAutospecFlags } from "./missionMode.ts";
 import { buildMissionSnapshot } from "./missionSnapshot.ts";
@@ -72,6 +73,55 @@ function parseBody(stdin: string): Record<string, unknown> {
 /** The same key always names the same mission, across processes and restarts. */
 export function externalMissionId(idempotencyKey: string): string {
   return `MSN-ext-${createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 20)}`;
+}
+
+/**
+ * The Pi submit fields a protocol-mode submit carries under `extensions.pi`.
+ * The mission id and idempotency key come from the envelope itself.
+ */
+interface ProtocolSubmitParams {
+  ownerId: string;
+  idempotencyKey: string;
+  missionId: string;
+  title: string;
+  goal: string;
+  userRequest?: string;
+  repository: string;
+  baseRef: string;
+  constraints: string[];
+  riskProfile?: RiskProfile;
+  workflowClass?: WorkflowClass;
+  leaseMs?: number;
+}
+
+/**
+ * Read the Pi submit fields out of an already-validated autospec-protocol
+ * envelope. The mission id and idempotency key are taken from the envelope;
+ * the rest live under `extensions.pi`. Invalid field values raise RequestError.
+ */
+function parseProtocolSubmit(envelope: Envelope): ProtocolSubmitParams {
+  const pi = envelope.extensions?.pi;
+  if (!pi || typeof pi !== "object" || Array.isArray(pi))
+    throw new RequestError("extensions.pi must be an object for a protocol submit");
+  const fields = pi as Record<string, unknown>;
+  const risk = str(fields, "riskProfile", false);
+  if (risk !== undefined && !RISK.includes(risk as RiskProfile)) throw new RequestError("riskProfile is not valid");
+  return {
+    ownerId: str(fields, "ownerId", true)!,
+    idempotencyKey: envelope.idempotency_key,
+    missionId: envelope.mission_id,
+    title: str(fields, "title", true)!,
+    goal: str(fields, "goal", true)!,
+    userRequest: str(fields, "userRequest", false),
+    repository: str(fields, "repository", true)!,
+    baseRef: str(fields, "baseRef", true)!,
+    constraints: Array.isArray(fields.constraints)
+      ? fields.constraints.filter((c): c is string => typeof c === "string")
+      : [],
+    riskProfile: risk as RiskProfile | undefined,
+    workflowClass: str(fields, "workflowClass", false) as WorkflowClass | undefined,
+    leaseMs: typeof fields.leaseMs === "number" && fields.leaseMs > 0 ? fields.leaseMs : undefined,
+  };
 }
 
 function storeFlag(args: string[]): string {
@@ -122,23 +172,39 @@ export async function runExternalEntry(
   let idempotencyKey = "";
   let missionId = "";
   let fencingToken = 0;
+  let protocolSubmit: ProtocolSubmitParams | undefined;
   try {
-    ownerId = str(body, "ownerId", true)!;
-    if (sub === "submit") {
-      idempotencyKey = str(body, "idempotencyKey", true)!;
-      str(body, "title", true);
-      str(body, "goal", true);
-      str(body, "repository", true);
-      str(body, "baseRef", true);
-      const risk = str(body, "riskProfile", false);
-      if (risk !== undefined && !RISK.includes(risk as RiskProfile)) throw new RequestError("riskProfile is not valid");
-    } else {
-      missionId = str(body, "missionId", true)!;
-      const token = body.fencingToken;
-      if (typeof token !== "number" || !Number.isInteger(token) || token < 0) {
-        throw new RequestError("fencingToken must be a non-negative integer");
+    const isProtocolSubmit =
+      sub === "submit" && typeof body.schema === "string" && body.schema.startsWith("autospec.protocol.");
+    if (isProtocolSubmit) {
+      const result = validateEnvelope(body);
+      if (!result.ok) {
+        reply({ result: "protocol_error", code: result.code, message: result.message });
+        return 2;
       }
-      fencingToken = token;
+      protocolSubmit = parseProtocolSubmit(result.envelope);
+      ownerId = protocolSubmit.ownerId;
+      idempotencyKey = protocolSubmit.idempotencyKey;
+      missionId = protocolSubmit.missionId;
+    } else {
+      ownerId = str(body, "ownerId", true)!;
+      if (sub === "submit") {
+        idempotencyKey = str(body, "idempotencyKey", true)!;
+        str(body, "title", true);
+        str(body, "goal", true);
+        str(body, "repository", true);
+        str(body, "baseRef", true);
+        const risk = str(body, "riskProfile", false);
+        if (risk !== undefined && !RISK.includes(risk as RiskProfile))
+          throw new RequestError("riskProfile is not valid");
+      } else {
+        missionId = str(body, "missionId", true)!;
+        const token = body.fencingToken;
+        if (typeof token !== "number" || !Number.isInteger(token) || token < 0) {
+          throw new RequestError("fencingToken must be a non-negative integer");
+        }
+        fencingToken = token;
+      }
     }
   } catch (error) {
     err(`${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
@@ -158,26 +224,38 @@ export async function runExternalEntry(
   try {
     const store = MissionStore.open(backend);
     if (sub === "submit") {
-      const id = externalMissionId(idempotencyKey);
+      const id = protocolSubmit ? protocolSubmit.missionId : externalMissionId(idempotencyKey);
       const ownership = new MissionOwnership(store, {
         ownerId,
-        leaseMs: typeof body.leaseMs === "number" && body.leaseMs > 0 ? body.leaseMs : DEFAULT_LEASE_MS,
+        leaseMs: protocolSubmit
+          ? (protocolSubmit.leaseMs ?? DEFAULT_LEASE_MS)
+          : typeof body.leaseMs === "number" && body.leaseMs > 0
+            ? body.leaseMs
+            : DEFAULT_LEASE_MS,
       });
       let mission = store.getMission(id);
       let created = false;
       if (!mission) {
         mission = store.createMission({
           mission_id: id,
-          title: str(body, "title", true)!,
-          goal: str(body, "goal", true)!,
-          user_request: str(body, "userRequest", false) ?? str(body, "goal", true)!,
-          repository: str(body, "repository", true)!,
-          base_ref: str(body, "baseRef", true)!,
-          constraints: Array.isArray(body.constraints)
-            ? body.constraints.filter((c): c is string => typeof c === "string")
-            : [],
-          risk_profile: (str(body, "riskProfile", false) as RiskProfile | undefined) ?? "medium",
-          workflow_class: (str(body, "workflowClass", false) as WorkflowClass | undefined) ?? "engineering",
+          title: protocolSubmit ? protocolSubmit.title : str(body, "title", true)!,
+          goal: protocolSubmit ? protocolSubmit.goal : str(body, "goal", true)!,
+          user_request: protocolSubmit
+            ? (protocolSubmit.userRequest ?? protocolSubmit.goal)
+            : (str(body, "userRequest", false) ?? str(body, "goal", true)!),
+          repository: protocolSubmit ? protocolSubmit.repository : str(body, "repository", true)!,
+          base_ref: protocolSubmit ? protocolSubmit.baseRef : str(body, "baseRef", true)!,
+          constraints: protocolSubmit
+            ? protocolSubmit.constraints
+            : Array.isArray(body.constraints)
+              ? body.constraints.filter((c): c is string => typeof c === "string")
+              : [],
+          risk_profile: protocolSubmit
+            ? (protocolSubmit.riskProfile ?? "medium")
+            : ((str(body, "riskProfile", false) as RiskProfile | undefined) ?? "medium"),
+          workflow_class: protocolSubmit
+            ? (protocolSubmit.workflowClass ?? "engineering")
+            : ((str(body, "workflowClass", false) as WorkflowClass | undefined) ?? "engineering"),
         });
         created = true;
       }
