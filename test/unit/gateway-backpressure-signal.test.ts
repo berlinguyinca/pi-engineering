@@ -222,3 +222,11 @@ test("real observed sample: 429 capacity_unavailable with retry_alternate", () =
   assert.equal(signal.waitMs, 20000);
   assert.equal(signal.replaySafe, true);
 });
+
+test("429 with null headers does not throw and classifies like a bare 429", () => {
+  const signal = classifyBackpressure({ status: 429, headers: null });
+  assert.equal(signal.kind, "quota");
+  assert.equal(signal.action, "wait_same");
+  assert.equal(signal.reason, "unknown");
+  assert.equal(signal.waitMs, null);
+});
