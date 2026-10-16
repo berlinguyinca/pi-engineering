@@ -158,12 +158,10 @@ test("bootstrap package: a required item over budget is included with a reason a
     result.included.map((i) => i.id),
     ["big"],
   );
-  assert.deepEqual(result.deferred, [
-    { id: "big", reason: "required item exceeds budget: big" },
-    { id: "small", reason: "over token budget" },
-  ]);
+  assert.deepEqual(result.deferred, [{ id: "small", reason: "over token budget" }]);
   assert.deepEqual(result.dropped, []);
   assert.equal(result.totalTokens, 200);
+  assert.deepEqual(result.reasons, ["required item exceeds budget: big", "deferred 1 items for lazy retrieval"]);
 });
 
 test("bootstrap package: required items beyond maxItems are all included with one reason each", () => {
@@ -178,8 +176,24 @@ test("bootstrap package: required items beyond maxItems are all included with on
     ["r1", "r2", "r3"],
   );
   assert.equal(result.totalTokens, 30);
-  assert.deepEqual(result.deferred, [{ id: "r3", reason: "required item exceeds budget: r3" }]);
+  assert.deepEqual(result.deferred, []);
   assert.deepEqual(result.dropped, []);
+  assert.deepEqual(result.reasons, ["required item exceeds budget: r3"]);
+});
+
+test("bootstrap package: undefined and false required sort as equal", () => {
+  const a = item("a", { required: false });
+  const b = item("b", { required: undefined });
+  const first = buildBootstrapPackage(input({ items: [a, b] }));
+  const second = buildBootstrapPackage(input({ items: [b, a] }));
+  assert.deepEqual(
+    first.included.map((i) => i.id),
+    ["a", "b"],
+  );
+  assert.deepEqual(
+    second.included.map((i) => i.id),
+    ["a", "b"],
+  );
 });
 
 test("bootstrap package: mixed sensitive, unverified, stale and survivors pack correctly", () => {
