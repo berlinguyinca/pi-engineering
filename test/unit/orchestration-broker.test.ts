@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { type BrokerBackends, ExecutionBroker, workerTimeoutMs } from "../../src/orchestration/broker.ts";
 import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
+import { buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "../../src/orchestration/evidence.ts";
 import { Integrator } from "../../src/orchestration/integrator.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionOwnership } from "../../src/orchestration/ownership.ts";
@@ -2035,6 +2036,15 @@ describe("ExecutionBroker (spec 03)", () => {
       await git.commitAll(candidate.path, "reauthorized candidate");
       candidate.candidateSha = await git.headCommitIn(candidate.path);
       await git.persistCandidateLifecycle(candidate);
+      // Promotion is fenced on the exact candidate's current gate evidence (#153).
+      recordPassingGates(store, {
+        missionId: mission.mission_id,
+        repoId: "repo-reauthorize-promotion",
+        manifestHash: "manifest-reauthorize-promotion",
+        baseSha: base,
+        candidateSha: candidate.candidateSha,
+        integration: { taskId: integrationTask.task_id, executionId: execution.execution_id },
+      });
       let stale = false;
       await assert.rejects(
         git.promoteCandidate(
@@ -4060,3 +4070,87 @@ describe("worktree allocation diagnostics", () => {
     );
   });
 });
+
+/** Record the current candidate plus passing validation and approving review evidence for it. */
+function recordPassingGates(
+  store: MissionStore,
+  input: {
+    missionId: string;
+    repoId: string;
+    manifestHash: string;
+    baseSha: string;
+    candidateSha: string;
+    integration: { taskId: string; executionId: string };
+  },
+): void {
+  const identity = buildCandidateEvidenceIdentity({
+    workspaceManifestHash: input.manifestHash,
+    missionGeneration: 0,
+    repoId: input.repoId,
+    baseSha: input.baseSha,
+    candidateSha: input.candidateSha,
+    diffHash: `sha256:${"0".repeat(64)}`,
+    acceptanceIds: [],
+    artifactHashes: [],
+  });
+  store.recordCandidate(input.missionId, identity, "candidate under promotion", input.integration);
+  const identityHash = hashCandidateEvidenceIdentity(identity);
+  for (const kind of ["validation", "review"] as const) {
+    const task = store.createTask({
+      mission_id: input.missionId,
+      kind,
+      role: kind === "validation" ? "validator" : "reviewer",
+      objective: `${kind} gate`,
+      repo_id: input.repoId,
+      mission_generation: 0,
+      candidate_generation: 0,
+    });
+    store.transitionTask(task.task_id, "READY");
+    store.transitionTask(task.task_id, "RUNNING");
+    const execution = store.createExecution({
+      task_id: task.task_id,
+      mission_id: input.missionId,
+      backend: kind,
+      repo_id: input.repoId,
+      base_sha: input.baseSha,
+      mission_generation: 0,
+      candidate_generation: 0,
+    });
+    store.assignTaskExecution(task.task_id, execution.execution_id);
+    store.setExecutionStatus(execution.execution_id, "RUNNING");
+    store.setExecutionStatus(execution.execution_id, "SUCCEEDED");
+    store.transitionTask(task.task_id, "SUCCEEDED");
+    const common = {
+      evidenceId: `EV-${kind}-${input.candidateSha.slice(0, 8)}`,
+      missionId: input.missionId,
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      identity,
+      identityHash,
+      accessible: true,
+      acceptanceResults: [],
+      recordedAt: new Date().toISOString(),
+    };
+    if (kind === "validation") {
+      store.recordValidationEvidence({
+        ...common,
+        command: "npm test",
+        profile: "node",
+        exitCode: 0,
+        testSummary: {},
+        noTargets: false,
+      });
+    } else {
+      store.recordReviewEvidence({
+        ...common,
+        reviewerSessionId: "review-session",
+        model: "reviewer",
+        provider: "test",
+        verdict: "approve",
+        independenceMode: "independent",
+        findings: [],
+        outputValid: true,
+      });
+    }
+  }
+}
