@@ -83,7 +83,9 @@ function hasLiveLease(missionId: string, leases: readonly LeaseRecord[], nowMs: 
   // strip anything up to and including the first '#' so both forms match.
   const resourceId = `mission:${missionId}`;
   for (const lease of leases) {
-    const leaseId = lease.resourceId.includes("#") ? lease.resourceId.slice(lease.resourceId.indexOf("#") + 1) : lease.resourceId;
+    const leaseId = lease.resourceId.includes("#")
+      ? lease.resourceId.slice(lease.resourceId.indexOf("#") + 1)
+      : lease.resourceId;
     if (leaseId === resourceId && nowMs <= lease.expiresAtMs) return true;
   }
   return false;
