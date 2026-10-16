@@ -27,6 +27,7 @@ import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.
 import { Ledger } from "../ledger/Ledger.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
+import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
 import { readAutospecFlags } from "../orchestration/missionMode.ts";
@@ -46,7 +47,6 @@ import { buildVerifierStages } from "../orchestration/missionWhy.ts";
 import { MissionObservability } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
-import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
