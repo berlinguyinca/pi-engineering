@@ -13,7 +13,7 @@
 
 import { canonicalJson } from "./fingerprint.ts";
 import type { AgentAction, LoopVerdict, ProgressThresholds, ProgressVector } from "./types.ts";
-import { DEFAULT_PROGRESS_THRESHOLDS } from "./types.ts";
+import { DEFAULT_PROGRESS_THRESHOLDS, isArtifactRole, isMutatingTool } from "./types.ts";
 
 export interface ProgressEvaluatorOptions {
   /** Maximum number of actions kept in the window. Default 50. */
@@ -126,11 +126,28 @@ export class ProgressEvaluator {
       if (count >= 2) repeatedCalls[fingerprint] = count;
     }
 
+    // No-mutation stall: trailing run of non-mutating actions by an
+    // artifact-producing role. Catches "thrashing" (many distinct reads/bash,
+    // no write/edit) that the identical-fingerprint signal misses. Only for the
+    // last-observed role, and only for artifact roles.
+    let noMutationStall = 0;
+    const lastRole = this.history[n - 1]?.role;
+    if (lastRole !== undefined && isArtifactRole(lastRole)) {
+      for (let i = n - 1; i >= 0; i--) {
+        const action = this.history[i];
+        if (action === undefined) break;
+        if (!isArtifactRole(action.role)) break; // role boundary: stop counting
+        if (isMutatingTool(action.tool)) break; // progress: stop counting
+        noMutationStall += 1;
+      }
+    }
+
     return {
       totalActions: n,
       noProgressTurns,
       repeatedCalls,
       staleToolResults,
+      noMutationStall,
       lastFingerprint: n > 0 ? (this.history[n - 1]?.contentFingerprint ?? null) : null,
     };
   }

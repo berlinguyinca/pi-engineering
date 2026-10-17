@@ -32,7 +32,7 @@ function loopEvent(
     contextUtilization,
     family,
     target,
-    metrics: { noProgressTurns, repeatedCalls: noProgressTurns, staleToolResults: 0 },
+    metrics: { noProgressTurns, repeatedCalls: noProgressTurns, staleToolResults: 0, noMutationStall: 0 },
   };
 }
 
