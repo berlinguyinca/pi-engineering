@@ -50,6 +50,7 @@ function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Pro
 interface Harness {
   orchestrator: Orchestrator;
   store: MissionStore;
+  obs: MissionObservability;
   calls: {
     agent: string[];
     review: string[];
@@ -79,10 +80,13 @@ interface HarnessOpts {
   noGitEvidenceTarget?: boolean;
   /** Emit a distinct candidate identity after a repair worker runs. */
   materialRepairEvidence?: boolean;
+  /** P4: the model the planner requires for the implementer task. */
+  taskModel?: string;
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
   const store = MissionStore.open(JsonlEventStore.inMemory());
+  const obs = MissionObservability.open({ store, backend: JsonlEventStore.inMemory() });
   const calls = {
     agent: [] as string[],
     review: [] as string[],
@@ -253,7 +257,7 @@ function harness(opts: HarnessOpts = {}): Harness {
         isolation: "none" as const,
         depends_on: [],
         priority: 0,
-        execution_requirements: {},
+        execution_requirements: { ...(opts.taskModel ? { model: opts.taskModel } : {}) },
         acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
           criterion.acceptance_id ? [criterion.acceptance_id] : [],
         ),
@@ -261,8 +265,9 @@ function harness(opts: HarnessOpts = {}): Harness {
         failure_policy: "retry" as const,
       },
     ],
+    observability: obs,
   });
-  return { orchestrator, store, calls };
+  return { orchestrator, store, obs, calls };
 }
 
 describe("acceptance scenario A — simple feature auto-invokes engineering+validation+review", () => {
@@ -854,6 +859,23 @@ describe("mission progress visibility — onProgress streams while the mission r
       ),
       `the mode decision must reach the operator; got: ${JSON.stringify(lines)}`,
     );
+  });
+
+  it("surfaces the task's required model in the mission summary (P4 routing provenance)", async () => {
+    const h = harness({ taskModel: "gw/special-model", emitActivity: true });
+    const result = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, true);
+    const summary = h.obs.summary(result.mission.mission_id)!;
+    const detail = summary.workersDetail?.find((w) => w.model === "gw/special-model");
+    assert.ok(
+      detail,
+      `the mission summary must carry per-task routing provenance; got: ${JSON.stringify(summary.workersDetail)}`,
+    );
+    assert.equal(detail!.taskId, h.store.listTasks(result.mission.mission_id)[0]?.task_id);
   });
 
   it("releases execution bookkeeping after settlement when observability is disabled", async () => {

@@ -121,6 +121,17 @@ export interface WorkerObservability {
   noProgressSince?: string;
 }
 
+/**
+ * Per-worker routing provenance surfaced to operators (P4): which model
+ * serves (or was required for) each execution, attributed to its task.
+ */
+export interface WorkerModelInfo {
+  workerId: string;
+  taskId?: string;
+  /** The model the task runs on (required model from its execution requirements). */
+  model?: string;
+}
+
 /** Weighted task progress (spec 01). */
 export type MissionTaskProgressState = "pending" | "ready" | "running" | "waiting" | "blocked" | "failed" | "completed";
 
@@ -231,6 +242,8 @@ export interface MissionObservabilitySummary {
   currentObjective?: string;
   currentActivity?: CurrentActivity;
   workers: { active: number; waiting: number; failed: number };
+  /** Per-worker routing provenance (P4): model per task, for operators. */
+  workersDetail?: WorkerModelInfo[];
   lastHeartbeatAt?: string;
   lastMeaningfulProgressAt: string | null;
   waitingReason?: WaitingReason;

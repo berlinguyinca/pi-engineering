@@ -1346,9 +1346,13 @@ export class Orchestrator {
       this.observedExecutions.add(event.executionId);
       this.taskExecutions.set(`${event.missionId}:${event.taskId}`, event.executionId);
       const task = this.store.getTask(event.taskId);
+      // P4: surface routing provenance — the model the task's execution
+      // requirements asked for (the broker records it on the execution).
+      const executionModel = this.store.getExecution(event.executionId)?.model ?? undefined;
       obs?.workerStarted(event.missionId, event.executionId, {
         taskId: event.taskId,
         runtime: "pi",
+        ...(executionModel ? { model: executionModel } : {}),
       });
       if (task) {
         obs?.taskStarted(event.missionId, event.taskId, task.objective);
@@ -1702,7 +1706,11 @@ export class Orchestrator {
       // reason is what the operator needs to act on (e.g. "configure logical
       // routes on the edge"), so it is reported, never swallowed (P6).
       const mode = this.store.getMission(mission.mission_id)?.execution_mode;
-      if (mode) this.report(mission.mission_id, `[mission ${mission.mission_id}] execution mode: ${mode.mode} — ${mode.reason}`);
+      if (mode)
+        this.report(
+          mission.mission_id,
+          `[mission ${mission.mission_id}] execution mode: ${mode.mode} — ${mode.reason}`,
+        );
       this.observability?.missionCreated(mission.mission_id, mission.title);
       this.store.transitionMission(mission.mission_id, "CLASSIFYING");
 

@@ -1153,6 +1153,14 @@ export class MissionObservability {
       currentObjective: s.currentObjective,
       currentActivity: s.currentActivity,
       workers: workerCounts,
+      // P4: per-worker routing provenance (model per task) for operators.
+      workersDetail: [...s.workers.values()]
+        .map((w) => ({
+          workerId: w.workerId,
+          ...(w.taskId ? { taskId: w.taskId } : {}),
+          ...(w.model ? { model: w.model } : {}),
+        }))
+        .sort((a, b) => a.workerId.localeCompare(b.workerId)),
       lastHeartbeatAt: s.lastHeartbeatAt,
       lastMeaningfulProgressAt: s.lastMeaningfulProgressAt ?? null,
       waitingReason: health.waitingReason ?? s.waitingReason,

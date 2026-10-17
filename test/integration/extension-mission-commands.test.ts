@@ -551,6 +551,44 @@ test("/mission-status reports the execution mode decision and its reason (P6)", 
   }
 });
 
+test("/mission-status shows per-task routing provenance (P4)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-model-status-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "model provenance",
+      goal: "model provenance",
+      user_request: "model provenance",
+      repository: root,
+      base_ref: await runtime.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    // A live worker-start on the shared observability instance is enough for
+    // the handler: no store task is created, so the mission supervisor stays
+    // idle. (The event->summary plumbing is covered by the observability tests.)
+    runtime.missionObservability!.workerStarted(mission.mission_id, "wk-model", {
+      taskId: "TSK-abc123",
+      model: "gw/special-model",
+    });
+    const { commands, handlers } = loadHarness();
+    const { ctx, notices } = commandContext(root);
+    await commands.get("mission-status")!.handler("", ctx);
+    const text = notices.at(-1)?.text ?? "";
+    assert.match(text, /models:.*gw\/special-model/i, `the operator must see the task model; got: ${text}`);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    await runtime.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("/mission completion notification includes the execution mode decision (P6)", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-mode-complete-"));
   const originalOrchestrate = Orchestrator.prototype.orchestrate;
