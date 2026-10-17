@@ -13,7 +13,7 @@
 
 import { canonicalJson } from "./fingerprint.ts";
 import type { AgentAction, LoopVerdict, ProgressThresholds, ProgressVector } from "./types.ts";
-import { DEFAULT_PROGRESS_THRESHOLDS } from "./types.ts";
+import { DEFAULT_PROGRESS_THRESHOLDS, isArtifactRole, isMutatingTool } from "./types.ts";
 
 export interface ProgressEvaluatorOptions {
   /** Maximum number of actions kept in the window. Default 50. */
@@ -126,11 +126,28 @@ export class ProgressEvaluator {
       if (count >= 2) repeatedCalls[fingerprint] = count;
     }
 
+    // Trailing run of NON-MUTATING actions, but only for artifact-producing
+    // roles. An implementer/debugger/integrator that has made many reads/greps
+    // with no write/edit/worker_result is thrashing (stalled), not progressing.
+    // Analysis roles never write, so the signal is 0 for them (never a stall).
+    let noMutationStall = 0;
+    const lastRole = this.history[n - 1]?.role;
+    if (lastRole !== undefined && isArtifactRole(lastRole)) {
+      for (let i = n - 1; i >= 0; i--) {
+        const action = this.history[i];
+        if (action === undefined) break;
+        if (!isArtifactRole(action.role)) break; // role boundary: stop counting
+        if (isMutatingTool(action.tool)) break; // progress: stop counting
+        noMutationStall += 1;
+      }
+    }
+
     return {
       totalActions: n,
       noProgressTurns,
       repeatedCalls,
       staleToolResults,
+      noMutationStall,
       lastFingerprint: n > 0 ? (this.history[n - 1]?.contentFingerprint ?? null) : null,
     };
   }

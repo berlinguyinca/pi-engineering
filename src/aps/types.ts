@@ -133,6 +133,14 @@ export interface ProgressVector {
    * invocation — i.e. the result did not advance, it is stale.
    */
   staleToolResults: number;
+  /**
+   * Length of the trailing run of NON-MUTATING actions for an artifact-producing
+   * role (no write/edit/worker_result). Catches a "thrashing" stall — many
+   * different reads/greps with zero convergence — that the identical-fingerprint
+   * `noProgressTurns` metric misses. Always 0 for non-artifact roles (analysis
+   * roles never write, so the signal does not apply to them).
+   */
+  noMutationStall: number;
   /** Fingerprint of the most recent action, or null for an empty history. */
   lastFingerprint: string | null;
 }
@@ -177,6 +185,33 @@ export const DEFAULT_PROGRESS_THRESHOLDS: ProgressThresholds = {
 };
 
 /**
+ * Roles whose job is to PRODUCE artifacts (write/modify code or tests). For
+ * these roles, a long trailing run of read-only activity with no mutation is
+ * a "stall": the agent is thrashing (reading, grepping, re-reading) without
+ * converging. Analysis-only roles (planner, scout, reviewer, summarizer, …)
+ * legitimately never write, so the stall signal is not applied to them.
+ */
+export const ARTIFACT_ROLES: ReadonlySet<string> = new Set(["implementer", "debugger", "integrator"]);
+
+/**
+ * Tools that count as CONCRETE PROGRESS for an artifact-producing role: a
+ * mutation (write/edit) or the terminal completion call (worker_result).
+ * Anything else (read, bash, symbol, repo_search, ledger_*, …) is non-mutating
+ * for the purposes of stall detection.
+ */
+export const MUTATING_TOOLS: ReadonlySet<string> = new Set(["write", "edit", "worker_result"]);
+
+/** True when the role is expected to produce artifacts (code/tests). */
+export function isArtifactRole(role: string): boolean {
+  return ARTIFACT_ROLES.has(role);
+}
+
+/** True when the tool mutates state or completes the run. */
+export function isMutatingTool(tool: string): boolean {
+  return MUTATING_TOOLS.has(tool);
+}
+
+/**
  * The structured event the supervisor emits when a loop is detected.
  * Detect-only: emitting this event changes nothing about the agent's run.
  */
@@ -210,6 +245,7 @@ export interface AgentLoopCandidateEvent {
     noProgressTurns: number;
     repeatedCalls: number;
     staleToolResults: number;
+    noMutationStall: number;
   };
 }
 
@@ -231,12 +267,22 @@ export interface LoopPreventionOptions {
    * consecutive identical actions).
    */
   noProgressTurns?: number;
+  /**
+   * Trailing run of non-mutating actions (no write/edit/worker_result) by an
+   * artifact-producing role that prevents the current run attempt. Catches a
+   * "thrashing" stall that the identical-fingerprint signal misses. Default: 40
+   * (a normal implementer writes within ~30 actions, so 40 non-mutating actions
+   * with no write is a genuine stall; 20 keeps legitimate exploration clear).
+   * 0 disables the stall signal (identical-fingerprint prevention only).
+   */
+  noMutationStall?: number;
 }
 
 /** Default loop-prevention configuration (enforcement ON, conservative). */
 export const DEFAULT_LOOP_PREVENTION: Required<LoopPreventionOptions> = {
   enabled: true,
   noProgressTurns: 4,
+  noMutationStall: 40,
 };
 
 /**

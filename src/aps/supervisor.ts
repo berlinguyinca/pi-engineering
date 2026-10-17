@@ -135,15 +135,32 @@ export class AgentProgressSupervisor {
   async observe(action: AgentAction): Promise<ObserveResult> {
     const verdict = this.evaluator.classify(action);
     const vector = this.evaluator.vector();
-    // Phase 3 enforcement (independent of the detection gate): a SUSTAINED run
-    // of identical no-progress actions (noProgressTurns at/above the PREVENTION
-    // threshold) is prevented — the enforcement hook fires once and the caller
-    // aborts the run. Conservative: only identical-fingerprint no-progress
-    // triggers it; changed inputs/results change the fingerprint and keep
-    // noProgressTurns low, so legitimate repeats are never prevented.
-    if (this.prevention.enabled && !this.preventionFired && vector.noProgressTurns >= this.prevention.noProgressTurns) {
+    // Phase 3 enforcement (independent of the detection gate). Two independent
+    // signals prevent the run (the hook fires once; the caller aborts it):
+    //   1. no_progress_turns  — a SUSTAINED run of identical-fingerprint
+    //      no-progress actions (the classic tight loop).
+    //   2. no_mutation_stall  — an artifact-producing role's trailing run of
+    //      non-mutating actions (read/bash/… with no write/edit/worker_result)
+    //      reached the stall threshold. Catches a "thrashing" stall — many
+    //      DIFFERENT reads/greps with zero convergence — that signal 1 misses
+    //      (each different call changes the fingerprint, keeping noProgressTurns
+    //      low). Conservative: only artifact roles (implementer/debugger/
+    //      integrator) are subject to the stall signal; analysis roles never
+    //      write and are never prevented on it.
+    let preventionReason: string | undefined;
+    let preventionCount = 0;
+    if (this.prevention.enabled && !this.preventionFired) {
+      if (vector.noProgressTurns >= this.prevention.noProgressTurns) {
+        preventionReason = "no_progress_turns";
+        preventionCount = vector.noProgressTurns;
+      } else if (this.prevention.noMutationStall > 0 && vector.noMutationStall >= this.prevention.noMutationStall) {
+        preventionReason = "no_mutation_stall";
+        preventionCount = vector.noMutationStall;
+      }
+    }
+    if (preventionReason !== undefined) {
       this.preventionFired = true;
-      const event = this.buildPreventedEvent(action, vector.noProgressTurns);
+      const event = this.buildPreventedEvent(action, preventionCount, preventionReason);
       this.events.push(event);
       try {
         this.onPrevented?.(event);
@@ -162,7 +179,7 @@ export class AgentProgressSupervisor {
           /* Persistence is best-effort. */
         }
       }
-      return { ...verdict, emitted: true, prevented: true, preventionReason: "no_progress_turns" };
+      return { ...verdict, emitted: true, prevented: true, preventionReason };
     }
     if (!verdict.loop_candidate) {
       // Progress (or a non-loop action) resets the reported-loop marker.
@@ -198,14 +215,14 @@ export class AgentProgressSupervisor {
     return { ...verdict, emitted: true };
   }
 
-  private buildPreventedEvent(action: AgentAction, noProgressTurns: number): AgentLoopPreventedEvent {
-    const candidate = this.buildEvent(action, "no_progress_turns");
+  private buildPreventedEvent(action: AgentAction, count: number, reason: string): AgentLoopPreventedEvent {
+    const candidate = this.buildEvent(action, reason);
     const { type: _type, ...rest } = candidate;
     return {
       ...rest,
       type: "agent.loop_prevented",
       prevented: true,
-      metrics: { ...candidate.metrics, noProgressTurns },
+      metrics: { ...candidate.metrics, ...(reason === "no_progress_turns" ? { noProgressTurns: count } : { noMutationStall: count }) },
     };
   }
 
@@ -236,6 +253,7 @@ export class AgentProgressSupervisor {
         noProgressTurns: vector.noProgressTurns,
         repeatedCalls: vector.repeatedCalls[action.contentFingerprint] ?? 0,
         staleToolResults: vector.staleToolResults,
+        noMutationStall: vector.noMutationStall,
       },
     };
   }
