@@ -287,6 +287,59 @@ This is exactly the behavior the fixes were designed to produce: a transient ren
 longer kills the heartbeat (Bug 1), and orphaned-execution recovery resumes the in-flight
 implementer rather than misfiring at the integrator (Bug 2).
 
+## Bug 3 — Re-fenced repository lease makes the live authority's renewal a permanent mismatch
+
+**Discovered during the live run of `MSN-wh5rvu` (2026-10-16).** The mission self-recovered
+from the initial lease lapse (Bug 1 + Bug 2 fixed) and resumed the implementer. It then
+**stopped** at 23:03:21 with the lease renewal failing 3 times in a row:
+
+```
+lease renewal failed 3 times in a row: stale repository fencing identity for MSN-wh5rvu:
+generation=4 fencingToken=4
+```
+
+### Root cause (traced)
+
+`RenewableDispatchAuthority` caches the repository lease identity it was created with
+(`maintain()` → `acquireRepository()`). When a `FENCE_RECONCILE_AND_RESUME` recovery fences the
+prior owner and **re-fences the repository lease to a new generation**, the authority's cached
+identity is now stale. Each subsequent `pulse()` → `renewRepository()` calls
+`assertSameEpoch(cached, current, "repository")`, which throws
+`stale repository fencing identity` — a **permanent** mismatch (the cached epoch will never
+match the current lease), **not** a transient blip. The Bug 1 retry counter (correctly) counts
+these as consecutive failures and, after `maxConsecutiveRenewFailures` (3) of them, invalidates
+the authority → the lease lapses → the mission stops. The worktree had 0 changes.
+
+### Fix (implemented — commit `1688959`)
+
+`ownership.ts`:
+
+- New `isStaleFencingIdentity(error, resource)` helper: detects the
+  `stale <mission|repository> fencing identity` error (a permanent epoch mismatch, distinct from
+  a transient renewal failure).
+- `RenewableDispatchAuthority.pulse()`: on a **stale repository fencing identity**, the authority
+  **re-acquires** the repository lease against the just-renewed mission identity
+  (`acquireRepository(this.mission, this.repository.repoId)`) instead of counting it toward the
+  failure threshold. This makes the authority track the new generation and keep renewing. The
+  error is retained on `lastPulseError` for observability.
+- Real renewal failures (custody contention, expiry, a different owner) still count toward the
+  failure threshold and still invalidate after sustained failure — the retry semantics from Bug 1
+  are unchanged.
+
+### Test (added)
+
+`test/unit/mission-ownership.test.ts` — `StaleRepositoryOwnership` simulates the recovery
+re-fence: the next repository renewal is rejected as a stale fencing identity, and the
+authority's re-acquisition returns a lease one generation ahead. The test asserts the authority
+**re-acquires** (generation +1) and **stays authoritative** instead of lapping out. The
+mission-ownership suite passes 19/19.
+
+### Status
+
+- [x] Root cause traced and fixed (commit `1688959`)
+- [x] Test added and passing
+- [ ] Re-run `MSN-wh5rvu` to confirm the live pipeline survives a recovery re-fence
+
 ### Outstanding follow-ups
 
 1. Let `MSN-wh5rvu` complete (it is actively implementing the disk-pressure spec in worktree
