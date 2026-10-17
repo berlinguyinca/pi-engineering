@@ -12,6 +12,7 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
+import { type HandoffRecord, validateHandoffRecord } from "../runtime/host/handoffKinds.ts";
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import {
   buildCandidateEvidenceIdentity,
@@ -68,6 +69,7 @@ export type OrchestrationEventType =
   | "execution.canceled"
   | "finding.created"
   | "finding.resolved"
+  | "handoff.created"
   | "workspace.authorized"
   | "workspace.rebound"
   | "workspace.rebind_failed"
@@ -136,6 +138,7 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "execution.canceled",
   "finding.created",
   "finding.resolved",
+  "handoff.created",
   "workspace.authorized",
   "workspace.rebound",
   "workspace.rebind_failed",
@@ -351,6 +354,16 @@ interface CanonicalLifecycleRecord extends CanonicalLifecycle {
   status: MissionStatus;
 }
 
+/** Thrown by `MissionStore.addHandoffRecord` when a handoff record fails validation. */
+export class HandoffRecordError extends Error {
+  readonly errors: readonly string[];
+  constructor(errors: readonly string[]) {
+    super(`invalid handoff record: ${errors.join("; ")}`);
+    this.name = "HandoffRecordError";
+    this.errors = errors;
+  }
+}
+
 export class MissionStore {
   private readonly backend: EventStoreBackend;
   private readonly missions = new Map<string, Mission>();
@@ -366,6 +379,7 @@ export class MissionStore {
   private readonly repositoryWaits = new Map<string, RepositoryWait>();
   private readonly executions = new Map<string, Execution>();
   private readonly findings = new Map<string, ReviewFinding>();
+  private readonly handoffRecords = new Map<string, HandoffRecord>();
   private readonly workspaceManifests = new Map<string, WorkspaceManifest>();
   private readonly taskCheckpoints = new Map<string, TaskCheckpoint>();
   /** Replay-stable position of the most recent durable event for each checkpoint lineage. */
@@ -1840,6 +1854,37 @@ export class MissionStore {
     return [...this.findings.values()]
       .filter((f) => (missionId ? f.mission_id === missionId : true))
       .map((f) => ({ ...f }));
+  }
+
+  /**
+   * Persist a typed, validated handoff record. The input is validated with
+   * `validateHandoffRecord`; invalid input throws a `HandoffRecordError` carrying
+   * the field-level errors. Records are stored by their stable id and are the
+   * durable substrate for phase-boundary handoffs and resume (spec: typed
+   * handoffs).
+   */
+  addHandoffRecord(record: unknown): HandoffRecord {
+    const result = validateHandoffRecord(record);
+    if (!result.ok) {
+      throw new HandoffRecordError(result.errors);
+    }
+    this.handoffRecords.set(result.record.id, { ...result.record });
+    this.emit("handoff.created", result.record.missionId, {
+      actor: "system",
+      handoff: { ...result.record },
+    });
+    return { ...result.record };
+  }
+
+  getHandoffRecord(id: string): HandoffRecord | undefined {
+    const record = this.handoffRecords.get(id);
+    return record ? { ...record } : undefined;
+  }
+
+  listHandoffRecords(missionId?: string): HandoffRecord[] {
+    return [...this.handoffRecords.values()]
+      .filter((r) => (missionId ? r.missionId === missionId : true))
+      .map((r) => ({ ...r }));
   }
 
   /** Preserve a settled outcome while making failed lease cleanup durable and visible. */
