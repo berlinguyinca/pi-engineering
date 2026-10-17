@@ -14,7 +14,7 @@ import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { newArtifactId, newEvidenceId } from "../core/ids.ts";
 import { withRustBuildEnv } from "../git/rustBuildCache.ts";
-import { tokenizeCommand } from "../verify/Verifier.ts";
+import { scriptCommand } from "../verify/Verifier.ts";
 import type { EngineeringPolicy } from "./policy.ts";
 import type { CheckKind, CheckOutcome, CheckSpec, GateStatus, VerificationReport } from "./types.ts";
 
@@ -277,7 +277,11 @@ async function runOne(
     };
   }
   const started = Date.now();
-  const { command, args } = tokenizeCommand(spec.command);
+  // Shell-wrap chained commands (&&, ||, pipes, redirection) like npm itself
+  // does (`sh -c`); a naive whitespace split passes `&&` to the child as a
+  // literal argument, so e.g. `npm run typecheck:core && npm run
+  // typecheck:scripts` fails the gate with TS6231 every time.
+  const { command, args } = scriptCommand(spec.command);
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
   await withRustBuildEnv(env, cwd);
