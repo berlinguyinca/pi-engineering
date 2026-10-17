@@ -220,9 +220,11 @@ tick will not double-start it) and calls the orchestrator's
    workspace resolution, planning, worker dispatch, validation, review, and the
    completion gate.
 
-The pump awaits the outcome: on `{ started: false, reason }` or a thrown error
-it emits a warning and removes the id from `runningExternal`; on success it also
-publishes a fresh mission snapshot.
+The pump does not await the outcome: `runSubmittedMission` is dispatched
+fire-and-forget (the call is `void`-prefixed), so `pumpExternalMissions` returns
+as soon as the starts are dispatched. Whatever the outcome — started, not
+started, or a thrown error — the `.finally` handler removes the id from
+`runningExternal` and publishes a fresh mission snapshot.
 
 ### Observability
 
