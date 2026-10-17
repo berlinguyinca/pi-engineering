@@ -1698,6 +1698,11 @@ export class Orchestrator {
     leaseKeepAlive?.unref?.();
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
     try {
+      // The mode decision is persisted on the mission (orchestrateMission); the
+      // reason is what the operator needs to act on (e.g. "configure logical
+      // routes on the edge"), so it is reported, never swallowed (P6).
+      const mode = this.store.getMission(mission.mission_id)?.execution_mode;
+      if (mode) this.report(mission.mission_id, `[mission ${mission.mission_id}] execution mode: ${mode.mode} — ${mode.reason}`);
       this.observability?.missionCreated(mission.mission_id, mission.title);
       this.store.transitionMission(mission.mission_id, "CLASSIFYING");
 

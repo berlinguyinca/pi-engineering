@@ -828,6 +828,34 @@ describe("mission progress visibility — onProgress streams while the mission r
     assert.equal(callbacks.size, 0, "failed orchestration must release the captured caller callback");
   });
 
+  it("reports the execution mode decision and its reason as a progress line (P6)", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const orchestrator = new Orchestrator({
+      store,
+      backends: {},
+      planner: async () => {
+        throw new Error("planner unavailable");
+      },
+    });
+    const lines: string[] = [];
+    await assert.rejects(
+      orchestrator.orchestrate("Add a health endpoint", {
+        repository: ".",
+        baseRef: "abc",
+        mutationRequested: true,
+        executionMode: { mode: "single", reason: "auto: the gateway does not advertise role capabilities" },
+        onProgress: (line) => lines.push(line),
+      }),
+      /planner unavailable/,
+    );
+    assert.ok(
+      lines.some((line) =>
+        /execution mode: single — auto: the gateway does not advertise role capabilities/i.test(line),
+      ),
+      `the mode decision must reach the operator; got: ${JSON.stringify(lines)}`,
+    );
+  });
+
   it("releases execution bookkeeping after settlement when observability is disabled", async () => {
     const h = harness({ emitActivity: true });
     const result = await h.orchestrator.orchestrate("Add a health endpoint", {
