@@ -121,6 +121,16 @@ human summary. See `docs/roadmap/roadmap.yaml` and
 `docs/specs/pi-engineering-verifiable-roadmap-completion-spec.md`. The roadmap
 engine is also exported as a public API from `src/index.ts`.
 
+## External mission entry (AutoSpec adapter)
+
+`pi-engineering mission submit|observe|cancel` is a JSON entry point for an
+external system (AutoSpec) to hand Pi a mission and watch or stop it: `submit`
+creates (or re-confirms) a mission and returns its fencing token, `observe`
+reads a mission snapshot, `cancel` stops it. Pi stays the mission's owner.
+The entry is off unless `PI_AUTOSPEC_ENABLED` is set (`1` or `true`) and never
+runs inside a mission worker. See the [External mission entry](docs/usage.md#external-mission-entry-autospec-adapter)
+section in `docs/usage.md` for the request/response contract and exit codes.
+
 ## Automatic engineering lifecycle & capability-aware model router
 
 The runtime ships an **automatic engineering harness** that owns the lifecycle
