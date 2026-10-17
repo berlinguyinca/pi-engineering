@@ -56,6 +56,46 @@ class FlakyRenewOwnership extends MissionOwnership {
   }
 }
 
+/**
+ * Simulates a FENCE_RECONCILE_AND_RESUME recovery re-fencing the repository lease while a live
+ * dispatch authority still holds the old identity: the next repository renewal is rejected as a
+ * stale fencing identity, and the authority's re-acquisition returns a lease one generation ahead.
+ */
+class StaleRepositoryOwnership extends MissionOwnership {
+  private staleRenew = false;
+  private reFenceOnAcquire = false;
+  armStaleRepository(): void {
+    this.staleRenew = true;
+    this.reFenceOnAcquire = true;
+  }
+  override async renewRepository(identity: RepositoryLease): Promise<RepositoryLease> {
+    if (this.staleRenew) {
+      this.staleRenew = false;
+      throw new Error(
+        `stale repository fencing identity for ${identity.missionId}: generation=${identity.generation} fencingToken=${identity.fencingToken}`,
+      );
+    }
+    return super.renewRepository(identity);
+  }
+  override async acquireRepository(identity: MissionLease, repoId: string): Promise<RepositoryLease> {
+    if (this.reFenceOnAcquire) {
+      this.reFenceOnAcquire = false;
+      const current = this.store.getRepositoryLeaseByRepoId(repoId);
+      if (current) {
+        const reFenced: RepositoryLease = {
+          ...current,
+          generation: current.generation + 1,
+          fencingToken: current.fencingToken + 1,
+        };
+        this.store.transitionRepositoryLease("acquired", reFenced);
+        await this.store.flush();
+        return reFenced;
+      }
+    }
+    return super.acquireRepository(identity, repoId);
+  }
+}
+
 describe("MissionOwnership", () => {
   it("fails closed when a backend does not explicitly prove writer authority", async () => {
     const { MissionOwnership } = await import("../../src/orchestration/ownership.ts");
@@ -344,6 +384,38 @@ describe("MissionOwnership", () => {
       owner.setFailures(2);
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
       authority.assertAuthoritative();
+    } finally {
+      await authority.close();
+    }
+  });
+
+  it("re-acquires a re-fenced repository lease instead of lapping out on a stale epoch", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-stale-repo");
+    const owner = new StaleRepositoryOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+      // The stale epoch is a PERMANENT mismatch, so even the default threshold of 3
+      // consecutive failures would have lapsed a healthy controller lease and stopped
+      // the mission (the observed Bug 3: "stale repository fencing identity ... "
+      // failing 3 times in a row). The fix re-acquires instead of counting it.
+      maxConsecutiveRenewFailures: 3,
+    });
+    const identity = await owner.acquire("M-lease-stale-repo");
+    const authority = await owner.maintain(identity, "repo-stale");
+    const originalGeneration = authority.repositoryIdentity?.generation ?? 0;
+    try {
+      // A recovery re-fenced the repository lease to a new generation while the
+      // authority still held the old identity. Inject the stale epoch on the next
+      // renewal and have the re-acquisition return the re-fenced lease.
+      owner.armStaleRepository();
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      // Still authoritative: the stale epoch was re-acquired, not latched dead.
+      authority.assertAuthoritative();
+      assert.match(authority.lastPulseError?.message ?? "", /stale repository fencing identity/);
+      // The authority now tracks the re-fenced lease (one generation ahead).
+      assert.equal(authority.repositoryIdentity?.generation, originalGeneration + 1);
     } finally {
       await authority.close();
     }

@@ -84,6 +84,17 @@ export class RepositoryLeasedError extends Error {
   }
 }
 
+/**
+ * True when a lease renewal failed because the cached fencing identity is stale for the named
+ * resource ("stale mission fencing identity ..." / "stale repository fencing identity ...").
+ * A stale identity is a PERMANENT mismatch (the lease was re-fenced to a new generation), not a
+ * transient blip; callers must re-acquire the lease against the current identity instead of
+ * counting it toward the failure threshold.
+ */
+function isStaleFencingIdentity(error: unknown, resource: "mission" | "repository"): boolean {
+  return error instanceof Error && error.message.includes(`stale ${resource} fencing identity`);
+}
+
 export class MissionOwnership {
   private readonly store: MissionStore;
   private readonly ownerId: string;
@@ -516,7 +527,25 @@ class RenewableDispatchAuthority implements DispatchAuthority {
   private async pulse(): Promise<void> {
     if (this.stopped || this.failure) return;
     this.mission = await this.ownership.renew(this.mission);
-    if (this.repository) this.repository = await this.ownership.renewRepository(this.repository);
+    if (this.repository) {
+      try {
+        this.repository = await this.ownership.renewRepository(this.repository);
+      } catch (error) {
+        // A stale repository fencing identity means the repository lease was re-fenced to a new
+        // generation while this authority still held the old one (a FENCE_RECONCILE_AND_RESUME
+        // recovery fences the prior owner and re-acquires the lease). Renewing against the cached
+        // old identity is a permanent mismatch, not a transient blip: it would otherwise count
+        // toward the failure threshold and lap the lease dead. Re-acquire the repository lease
+        // against the just-renewed mission identity so the authority tracks the new generation.
+        if (isStaleFencingIdentity(error, "repository")) {
+          // Retain the error for observability (lastPulseError) even though it is recovered from.
+          this.lastError = error instanceof Error ? error : new Error(String(error));
+          this.repository = await this.ownership.acquireRepository(this.mission, this.repository.repoId);
+        } else {
+          throw error;
+        }
+      }
+    }
     // A successful renewal clears any prior transient-failure streak (the
     // counter, not the last-observed error, which is retained for observability).
     this.consecutiveRenewFailures = 0;
