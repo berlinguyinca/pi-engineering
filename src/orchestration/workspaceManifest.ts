@@ -43,6 +43,46 @@ function requestRepoReferenceNames(request: string): string[] {
   return [...names];
 }
 
+/**
+ * Immediate child directories of a workspace parent that are git checkouts
+ * rooted exactly there — the only names a request can bind (see
+ * resolveChildRepoCandidates). Used purely for the refusal message.
+ */
+async function childGitCheckoutNames(parent: string): Promise<string[]> {
+  let entries;
+  try {
+    entries = await readdir(parent, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const path = resolve(parent, entry.name);
+    const git = await GitRepo.open(path).catch(() => null);
+    if (git && resolve(git.root) === path) names.push(entry.name);
+  }
+  return names.sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * A launch cwd that is not itself a git checkout is a workspace parent (a
+ * projects root holding many checkouts); the parent is never authorized.
+ * Refuse with what actually exists and the two ways to name a child, instead
+ * of a generic refusal.
+ */
+async function workspaceParentScopeError(launchCwd: string): Promise<string> {
+  const children = await childGitCheckoutNames(launchCwd);
+  const listed = children.slice(0, 8);
+  const more = children.length - listed.length;
+  const found =
+    listed.length > 0
+      ? `Immediate child git checkouts found: ${listed.join(", ")}${more > 0 ? ` (and ${more} more)` : ""}.`
+      : "No immediate child git checkouts found.";
+  const example = listed[0] ? `${launchCwd}/${listed[0]}` : "<child-checkout>";
+  return `Launch directory is not a git checkout, so it cannot be the workspace itself (a workspace parent is never authorized): ${launchCwd}. ${found} Name the repository to work in — as "owner/repo" or its bare directory name, matching an immediate child git checkout — or state scope explicitly with a writable directive pointing at a checkout, e.g. "writable: ${example}" (docs/usage.md, "Workspace scope").`;
+}
+
 function isWithin(parent: string, child: string): boolean {
   const canonicalParent = resolve(parent);
   const canonicalChild = resolve(child);
@@ -431,7 +471,11 @@ export class WorkspaceManifestResolver {
     for (const candidate of candidates) {
       const canonical = await canonicalExistingDirectory(candidate.path, candidate.source);
       const git = await GitRepo.open(canonical);
-      if (!git) throw new WorkspaceScopeError(`Authorized workspace is not inside a Git repository: ${canonical}`);
+      if (!git) {
+        if (candidate.source === "launch_cwd")
+          throw new WorkspaceScopeError(await workspaceParentScopeError(canonical));
+        throw new WorkspaceScopeError(`Authorized workspace is not inside a Git repository: ${canonical}`);
+      }
       const repoRoot = await realpath(git.root);
       const repoProtected = protectedReason(repoRoot);
       if (repoProtected) throw new WorkspaceScopeError(`Refusing protected ${repoProtected}: ${repoRoot}`);
