@@ -511,6 +511,115 @@ restart.
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository. |
 | `/engineering admission` | Show a live InferWeave admission-retry summary (retries, waited time, reasons, saturation). |
 
+## External mission entry (AutoSpec adapter)
+
+The `pi-engineering mission` subcommand is a JSON entry point for an external
+system (AutoSpec) to hand Pi a mission and watch or stop it. It reads exactly
+**one JSON object on stdin** and replies with exactly **one JSON object on
+stdout**; errors are also JSON objects (see exit codes below). Pi stays the
+mission's owner: submit creates the mission in `CREATED` (status `NEW`) and
+acquires its lease for `ownerId`, returning the lease's fencing token.
+
+```
+pi-engineering mission submit  --store <dir>   < input.json   # create or re-confirm a mission
+pi-engineering mission observe --store <dir>   < input.json   # read a mission snapshot
+pi-engineering mission cancel  --store <dir>   < input.json   # cancel a mission
+```
+
+### Master switch and guard
+
+The entry is **off unless `PI_AUTOSPEC_ENABLED` is set** (`1` or `true`). Without
+it the command exits **2** and prints to stderr:
+
+```
+pi-engineering mission is off: set PI_AUTOSPEC_ENABLED=1 to use the external entry point
+```
+
+It never runs inside a mission worker: `assertRootMissionAllowed` refuses when
+`PI_MISSION_DEPTH` is non-zero, so nested missions are not allowed.
+
+### Submit
+
+Reads a plain-JSON request object:
+
+- **Required:** `ownerId`, `idempotencyKey`, `title`, `goal`, `repository`,
+  `baseRef`.
+- **Optional:** `userRequest` (defaults to `goal`), `workflowClass` (default
+  `"engineering"`), `riskProfile` (one of `low`/`medium`/`high`/`critical`,
+  default `"medium"`), `leaseMs` (clamped, see below), `constraints` (an
+  optional array of strings).
+
+`submit` is idempotent: the same `idempotencyKey` always names the same mission
+(`MSN-ext-<sha256>`), across processes and restarts. Re-submitting an existing
+mission under the same owner confirms its lease and returns `result:"existing"`;
+a `leaseMs` it carries is clamped to at most the submission-receipt cap. A
+`submit` whose idempotency key already belongs to another owner is rejected
+with `{result:"conflict", missionId, reason:"the idempotencyKey belongs to
+another owner"}` and exits **1**, writing nothing.
+
+**Submission-receipt lease cap.** `SUBMISSION_RECEIPT_LEASE_MS` is **5 minutes**
+(300 000 ms). Any `submit` `leaseMs` is clamped to at most this value so no
+submit can grant a long-lived ownership receipt; `observe` and `cancel` do
+**not** renew the lease. A runtime-held controller lease (24 h default) is a
+separate concern, not granted by this entry point.
+
+**Response** (exactly these fields):
+
+```json
+{ "result": "created" | "existing", "missionId": "MSN-ext-…", "ownerId": "…", "fencingToken": <int>, "status": "NEW", "canonicalState": "…" }
+```
+
+### Fencing tokens
+
+Every later call must present the same `ownerId` and the fencing token returned
+by submit. The token must match the store's **latest lease epoch exactly**: a
+lower token is a superseded owner, a higher token was never issued, and either
+is rejected as **`stale` with exit 1 and nothing written** (no read, no write).
+
+### Observe
+
+Request: `{ "missionId": "…", "ownerId": "…", "fencingToken": <int> }`.
+
+Response: `{ "result": "ok", "mission": <snapshot> }` where `<snapshot>` is
+the mission snapshot (tasks, findings, executions, classifications, lifecycle).
+If the mission does not exist the reply is `{ "result": "not_found",
+"missionId": "…" }` (exit **1**); if the owner or token is stale the reply is
+`{ "result": "stale", "missionId": "…" }` (exit **1**).
+
+```bash
+# observe: read the mission snapshot
+pi-engineering mission observe --store <dir> < observe.json # {result:"ok", mission:<snapshot>}
+```
+
+### Cancel
+
+Request: `{ "missionId": "…", "ownerId": "…", "fencingToken": <int>, "reason": "…"? }`
+(the `reason` is optional). Response: `{ "result": "cancelled", "missionId":
+"…", "status": "CANCELED", "reason": "…" | null }`. Same `not_found`/`stale`
+handling as observe (exit **1**).
+
+### Exit codes
+
+- **0** — ok.
+- **1** — stale / conflict / not found (a valid request that could not be served).
+- **2** — disabled (no `PI_AUTOSPEC_ENABLED`) or invalid request (bad JSON, missing
+  field, bad subcommand, missing `--store`, invalid `riskProfile`, malformed
+  `fencingToken`).
+- **3** — the store could not be opened (missing/unreadable `orchestration.jsonl`,
+  or the store refuses to run beside a live writer).
+
+### Complete examples
+
+```bash
+# submit: create a mission and receive its fencing token
+pi-engineering mission submit --store <dir> < submit.json # {result:"created", missionId, ownerId, fencingToken, status, canonicalState}
+```
+
+```bash
+# observe: fetch the mission snapshot with the token from submit
+pi-engineering mission observe --store <dir> < observe.json # {result:"ok", mission:<snapshot>}
+```
+
 ## Mission worker tools
 
 Mission implementer and repair workers get `read`, `edit`, `write`, `bash`,
