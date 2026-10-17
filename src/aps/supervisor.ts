@@ -153,10 +153,7 @@ export class AgentProgressSupervisor {
       (vector.noProgressTurns >= this.prevention.noProgressTurns || stallExceeded)
     ) {
       this.preventionFired = true;
-      const event = this.buildPreventedEvent(
-        action,
-        stallExceeded ? "no_mutation_stall" : "no_progress_turns",
-      );
+      const event = this.buildPreventedEvent(action, stallExceeded ? "no_mutation_stall" : "no_progress_turns");
       this.events.push(event);
       try {
         this.onPrevented?.(event);

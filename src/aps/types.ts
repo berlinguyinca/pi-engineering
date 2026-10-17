@@ -188,18 +188,10 @@ export const DEFAULT_PROGRESS_THRESHOLDS: ProgressThresholds = {
  * non-mutating run by one of these roles is a "thrashing" stall. Analysis roles
  * (reviewer/critic) never mutate and are excluded.
  */
-export const ARTIFACT_ROLES: ReadonlySet<string> = new Set([
-  "implementer",
-  "debugger",
-  "integrator",
-]);
+export const ARTIFACT_ROLES: ReadonlySet<string> = new Set(["implementer", "debugger", "integrator"]);
 
 /** Tools that constitute progress toward an artifact (a mutation). */
-export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
-  "write",
-  "edit",
-  "worker_result",
-]);
+export const MUTATING_TOOLS: ReadonlySet<string> = new Set(["write", "edit", "worker_result"]);
 
 /** Is a role one that is expected to produce a mutating artifact? */
 export function isArtifactRole(role: string): boolean {
