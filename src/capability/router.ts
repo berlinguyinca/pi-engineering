@@ -288,7 +288,28 @@ export class RoleRouter {
         rationale.push(
           `Override ${override.ref} requested by ${override.source} is not eligible${why ? `: ${why.reason}` : ": not discovered"}.`,
         );
-        if (this.policy.routing.mode === "manual") {
+        // P2: a policy pin may name a gateway-owned route that is not (yet)
+        // discovered; the role's fallback_model stands in for the missing
+        // route so the role keeps its placement until the edge serves it.
+        // Only the policy's own pin carries a fallback — an explicit operator
+        // pin (session/task) degrades to scoring, never to a silent swap.
+        const fallbackRef =
+          override.source === "policy.routing.roles" ? this.roleConfig(query.role).fallback_model : undefined;
+        if (fallbackRef) {
+          const fref = parseRef(fallbackRef);
+          const inFallbackPool = dutyPool.find((rec) => rec.provider === fref.provider && rec.id === fref.id);
+          if (inFallbackPool) {
+            selected = fref;
+            overrideApplied = { override: fallbackRef, source: "policy.routing.roles.fallback_model" };
+            rationale.push(`Fallback override ${fallbackRef} applied (pinned route ${override.ref} not eligible).`);
+          } else {
+            const fwhy = rejected.find((r) => modelKey(r.model) === modelKey(fref));
+            rationale.push(
+              `Fallback override ${fallbackRef} requested by policy.routing.roles.fallback_model is not eligible${fwhy ? `: ${fwhy.reason}` : ": not discovered"}.`,
+            );
+          }
+        }
+        if (!selected && this.policy.routing.mode === "manual") {
           return {
             role: query.role,
             candidates: scored,
