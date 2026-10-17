@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionOwnership } from "../../src/orchestration/ownership.ts";
+import type { MissionLease, RepositoryLease } from "../../src/orchestration/types.ts";
 import type { EventStoreBackend, StoredEvent } from "../../src/platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
@@ -34,6 +35,115 @@ function mission(store: MissionStore, missionId: string) {
     risk_profile: "medium",
     workflow_class: "engineering",
   });
+}
+
+/**
+ * A MissionOwnership that fails its next N renew calls (to simulate a transient
+ * lease-renewal blip), then recovers. Used to prove a live dispatch authority
+ * survives transient failures instead of latching its heartbeat dead.
+ */
+class FlakyRenewOwnership extends MissionOwnership {
+  private failuresRemaining = 0;
+  setFailures(n: number): void {
+    this.failuresRemaining = n;
+  }
+  override async renew(identity: MissionLease): Promise<MissionLease> {
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1;
+      throw new Error("injected transient renewal failure");
+    }
+    return super.renew(identity);
+  }
+}
+
+/**
+ * Simulates a FENCE_RECONCILE_AND_RESUME recovery re-fencing the repository lease while a live
+ * dispatch authority still holds the old identity: the next repository renewal is rejected as a
+ * stale fencing identity, and the authority's re-acquisition returns a lease one generation ahead.
+ */
+class StaleRepositoryOwnership extends MissionOwnership {
+  private staleRenew = false;
+  private reFenceOnAcquire = false;
+  private readonly storeRef: MissionStore;
+  constructor(store: MissionStore, options: ConstructorParameters<typeof MissionOwnership>[1]) {
+    super(store, options);
+    this.storeRef = store;
+  }
+  armStaleRepository(): void {
+    this.staleRenew = true;
+    this.reFenceOnAcquire = true;
+  }
+  override async renewRepository(identity: RepositoryLease): Promise<RepositoryLease> {
+    if (this.staleRenew) {
+      this.staleRenew = false;
+      throw new Error(
+        `stale repository fencing identity for ${identity.missionId}: generation=${identity.generation} fencingToken=${identity.fencingToken}`,
+      );
+    }
+    return super.renewRepository(identity);
+  }
+  override async acquireRepository(identity: MissionLease, repoId: string): Promise<RepositoryLease> {
+    if (this.reFenceOnAcquire) {
+      this.reFenceOnAcquire = false;
+      const current = this.storeRef.getRepositoryLeaseByRepoId(repoId);
+      if (current) {
+        const reFenced: RepositoryLease = {
+          ...current,
+          generation: current.generation + 1,
+          fencingToken: current.fencingToken + 1,
+        };
+        this.storeRef.transitionRepositoryLease("acquired", reFenced);
+        await this.storeRef.flush();
+        return reFenced;
+      }
+    }
+    return super.acquireRepository(identity, repoId);
+  }
+}
+
+/**
+ * Simulates a FENCE_RECONCILE_AND_RESUME recovery re-fencing the MISSION lease while a live
+ * dispatch authority still holds the old identity: the next mission renewal is rejected as a
+ * stale fencing identity, and the authority's re-acquisition returns a lease one generation ahead.
+ */
+class StaleMissionOwnership extends MissionOwnership {
+  private staleRenew = false;
+  private reFenceOnAcquire = false;
+  private readonly storeRef: MissionStore;
+  constructor(store: MissionStore, options: ConstructorParameters<typeof MissionOwnership>[1]) {
+    super(store, options);
+    this.storeRef = store;
+  }
+  armStaleMission(): void {
+    this.staleRenew = true;
+    this.reFenceOnAcquire = true;
+  }
+  override async renew(identity: MissionLease): Promise<MissionLease> {
+    if (this.staleRenew) {
+      this.staleRenew = false;
+      throw new Error(
+        `stale mission fencing identity for ${identity.missionId}: generation=${identity.generation} fencingToken=${identity.fencingToken}`,
+      );
+    }
+    return super.renew(identity);
+  }
+  override async acquire(missionId: string, options: { resumptionGeneration?: number } = {}): Promise<MissionLease> {
+    if (this.reFenceOnAcquire) {
+      this.reFenceOnAcquire = false;
+      const current = this.storeRef.getMissionLease(missionId);
+      if (current) {
+        const reFenced: MissionLease = {
+          ...current,
+          generation: current.generation + 1,
+          fencingToken: current.fencingToken + 1,
+        };
+        this.storeRef.transitionMissionLease("acquired", reFenced);
+        await this.storeRef.flush();
+        return { ...reFenced };
+      }
+    }
+    return super.acquire(missionId, options);
+  }
 }
 
 describe("MissionOwnership", () => {
@@ -254,6 +364,140 @@ describe("MissionOwnership", () => {
 
     await authority.close();
     assert.equal(store.getRepositoryLeaseByRepoId("repo-long"), undefined);
+  });
+
+  it("recovers a transient lease renewal failure instead of latching the heartbeat dead", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-transient");
+    const owner = new FlakyRenewOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+    });
+    const identity = await owner.acquire("M-lease-transient");
+    const authority = await owner.maintain(identity, "repo-transient");
+    try {
+      // Inject a single transient failure on the next heartbeat tick, then let
+      // subsequent ticks run. The old code latched `failure` on the first error
+      // and every later pulse became a no-op, so one blip lapsed a live
+      // controller lease and orphaned a running mission. The fix retries.
+      owner.setFailures(1);
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      // Still authoritative: the transient failure was retried and recovered.
+      authority.assertAuthoritative();
+      assert.match(authority.lastPulseError?.message ?? "", /injected transient renewal failure/);
+    } finally {
+      await authority.close();
+    }
+  });
+
+  it("invalidates a dispatch authority only after sustained renewal failures", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-sustained");
+    const owner = new FlakyRenewOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+      maxConsecutiveRenewFailures: 2,
+    });
+    const identity = await owner.acquire("M-lease-sustained");
+    const authority = await owner.maintain(identity, "repo-sustained");
+    try {
+      // A failure that never recovers must still invalidate the authority, but
+      // only once consecutive failures reach the configured threshold.
+      owner.setFailures(Number.MAX_SAFE_INTEGER);
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      assert.throws(() => authority.assertAuthoritative(), /lease renewal failed 2 times in a row/);
+      assert.ok(authority.lastPulseError);
+    } finally {
+      await authority.close();
+    }
+  });
+
+  it("survives a sub-threshold run of renewal failures", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-subthreshold");
+    const owner = new FlakyRenewOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+      maxConsecutiveRenewFailures: 3,
+    });
+    const identity = await owner.acquire("M-lease-subthreshold");
+    const authority = await owner.maintain(identity, "repo-subthreshold");
+    try {
+      // Two consecutive failures, then recovery: below the threshold of 3, so
+      // the authority must survive.
+      owner.setFailures(2);
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      authority.assertAuthoritative();
+    } finally {
+      await authority.close();
+    }
+  });
+
+  it("re-acquires a re-fenced repository lease instead of lapping out on a stale epoch", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-stale-repo");
+    const owner = new StaleRepositoryOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+      // The stale epoch is a PERMANENT mismatch, so even the default threshold of 3
+      // consecutive failures would have lapsed a healthy controller lease and stopped
+      // the mission (the observed Bug 3: "stale repository fencing identity ... "
+      // failing 3 times in a row). The fix re-acquires instead of counting it.
+      maxConsecutiveRenewFailures: 3,
+    });
+    const identity = await owner.acquire("M-lease-stale-repo");
+    const authority = await owner.maintain(identity, "repo-stale");
+    const originalGeneration = authority.repositoryIdentity?.generation ?? 0;
+    try {
+      // A recovery re-fenced the repository lease to a new generation while the
+      // authority still held the old identity. Inject the stale epoch on the next
+      // renewal and have the re-acquisition return the re-fenced lease.
+      owner.armStaleRepository();
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      // Still authoritative: the stale epoch was re-acquired, not latched dead.
+      authority.assertAuthoritative();
+      assert.match(authority.lastPulseError?.message ?? "", /stale repository fencing identity/);
+      // The authority now tracks the re-fenced lease (one generation ahead).
+      assert.equal(authority.repositoryIdentity?.generation, originalGeneration + 1);
+    } finally {
+      await authority.close();
+    }
+  });
+
+  it("re-acquires a re-fenced MISSION lease instead of lapping out on a stale epoch", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    mission(store, "M-lease-stale-mission");
+    const owner = new StaleMissionOwnership(store, {
+      ownerId: "controller",
+      leaseMs: 5_000,
+      heartbeatMs: 15,
+      // The stale epoch is a PERMANENT mismatch, so even the default threshold of 3
+      // consecutive failures would have lapsed a healthy controller lease and stopped
+      // the mission (the observed Bug 4: "stale mission fencing identity ... "
+      // failing 3 times in a row). The fix re-acquires instead of counting it.
+      maxConsecutiveRenewFailures: 3,
+    });
+    const identity = await owner.acquire("M-lease-stale-mission");
+    const authority = await owner.maintain(identity);
+    const originalGeneration = authority.missionIdentity?.generation ?? 0;
+    try {
+      // A recovery re-fenced the MISSION lease to a new generation while the
+      // authority still held the old identity. Inject the stale epoch on the next
+      // renewal and have the re-acquisition return the re-fenced lease.
+      owner.armStaleMission();
+      for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
+      // Still authoritative: the stale epoch was re-acquired, not latched dead.
+      authority.assertAuthoritative();
+      assert.match(authority.lastPulseError?.message ?? "", /stale mission fencing identity/);
+      // The authority now tracks the re-fenced lease (one generation ahead).
+      assert.equal(authority.missionIdentity?.generation, originalGeneration + 1);
+    } finally {
+      await authority.close();
+    }
   });
 
   it("rejects an old fencing token after takeover and process restart", async () => {
