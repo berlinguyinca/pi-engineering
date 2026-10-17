@@ -141,6 +141,7 @@ Pi Engineering remains the orchestration authority.
 - **`/mission-status`** — list missions and task progress.
 - `EngineeringRuntime.orchestrator` + `EngineeringRuntime.missionStore` are the
   programmatic entry points.
+- **External mission entry (AutoSpec adapter)** — see the [`External mission entry (AutoSpec adapter)`](usage.md#external-mission-entry-autospec-adapter) section in the usage docs.
 
 ## Worktree isolation, harvest, and integration
 
