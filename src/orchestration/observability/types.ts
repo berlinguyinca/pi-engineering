@@ -107,6 +107,14 @@ export interface WorkerObservability {
   model?: string;
   runtime?: string;
   host?: string;
+  /** Routing provenance (P4): logical route name used, if any. */
+  route?: string;
+  /** Serving node (from InferWeave x-inferweave-node), if known. */
+  node?: string;
+  /** Number of route fallbacks that occurred before a model served. */
+  fallbacks?: number;
+  /** Milliseconds the request waited for inference capacity. */
+  inferenceWaitMs?: number;
   startedAt?: string;
   endedAt?: string;
   lastHeartbeatAt?: string;
@@ -119,6 +127,17 @@ export interface WorkerObservability {
   repeatedErrors: number;
   repeatedCycles: number;
   noProgressSince?: string;
+}
+
+/** Per-worker routing provenance surfaced to operators (P4). */
+export interface WorkerModelInfo {
+  workerId: string;
+  taskId?: string;
+  model?: string;
+  route?: string;
+  node?: string;
+  fallbacks?: number;
+  inferenceWaitMs?: number;
 }
 
 /** Weighted task progress (spec 01). */
@@ -231,6 +250,8 @@ export interface MissionObservabilitySummary {
   currentObjective?: string;
   currentActivity?: CurrentActivity;
   workers: { active: number; waiting: number; failed: number };
+  /** Per-worker routing provenance (P4): served model, route, node, fallbacks. */
+  workersDetail: WorkerModelInfo[];
   lastHeartbeatAt?: string;
   lastMeaningfulProgressAt: string | null;
   waitingReason?: WaitingReason;

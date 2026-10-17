@@ -351,6 +351,10 @@ export class MissionObservability {
           model: meta.model as string | undefined,
           runtime: meta.runtime as string | undefined,
           host: meta.host as string | undefined,
+          route: meta.route as string | undefined,
+          node: meta.node as string | undefined,
+          fallbacks: meta.fallbacks as number | undefined,
+          inferenceWaitMs: meta.inferenceWaitMs as number | undefined,
           startedAt: ev.timestamp,
           lastHeartbeatAt: ev.timestamp,
           lastMeaningfulProgressAt: ev.meaningfulProgress ? ev.timestamp : undefined,
@@ -822,6 +826,10 @@ export class MissionObservability {
       model?: string;
       runtime?: string;
       host?: string;
+      route?: string;
+      node?: string;
+      fallbacks?: number;
+      inferenceWaitMs?: number;
     } = {},
   ): void {
     this.record({
@@ -834,6 +842,10 @@ export class MissionObservability {
         model: opts.model,
         runtime: opts.runtime,
         host: opts.host,
+        route: opts.route,
+        node: opts.node,
+        fallbacks: opts.fallbacks,
+        inferenceWaitMs: opts.inferenceWaitMs,
         label: "worker started",
       },
       meaningfulProgress: true,
@@ -1153,6 +1165,15 @@ export class MissionObservability {
       currentObjective: s.currentObjective,
       currentActivity: s.currentActivity,
       workers: workerCounts,
+      workersDetail: [...s.workers.values()].map((w) => ({
+        workerId: w.workerId,
+        taskId: w.taskId,
+        model: w.model,
+        route: w.route,
+        node: w.node,
+        fallbacks: w.fallbacks,
+        inferenceWaitMs: w.inferenceWaitMs,
+      })),
       lastHeartbeatAt: s.lastHeartbeatAt,
       lastMeaningfulProgressAt: s.lastMeaningfulProgressAt ?? null,
       waitingReason: health.waitingReason ?? s.waitingReason,

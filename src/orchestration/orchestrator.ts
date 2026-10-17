@@ -1346,9 +1346,25 @@ export class Orchestrator {
       this.observedExecutions.add(event.executionId);
       this.taskExecutions.set(`${event.missionId}:${event.taskId}`, event.executionId);
       const task = this.store.getTask(event.taskId);
+      // P4: surface routing provenance per worker. The broker records the served
+      // model from task.execution_requirements.model (scheduler passes it through
+      // as modelRequirements), so read the same field here and pass it along with
+      // any route/fallback metadata the planner attached.
+      const execReq = (task?.execution_requirements ?? {}) as {
+        model?: string;
+        route?: string;
+        node?: string;
+        fallbacks?: number;
+        inferenceWaitMs?: number;
+      };
       obs?.workerStarted(event.missionId, event.executionId, {
         taskId: event.taskId,
         runtime: "pi",
+        model: execReq.model,
+        route: execReq.route,
+        node: execReq.node,
+        fallbacks: execReq.fallbacks,
+        inferenceWaitMs: execReq.inferenceWaitMs,
       });
       if (task) {
         obs?.taskStarted(event.missionId, event.taskId, task.objective);
