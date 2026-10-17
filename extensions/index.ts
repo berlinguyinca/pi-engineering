@@ -2009,6 +2009,7 @@ ${RECOVERY_PROMPT}`;
       const lines = [
         `Mission ${m.mission_id} [${m.status}] workflow=${m.workflow_class} risk=${m.risk_profile}`,
         `Intent: ${result.intent.intent.join(", ")} (confidence ${result.intent.confidence.toFixed(2)})`,
+        ...(m.execution_mode ? [`Execution mode: ${m.execution_mode.mode} — ${m.execution_mode.reason}`] : []),
         `Required gates: ${m.required_gates.join(", ") || "none"}`,
         `Tasks: ${rt.missionStore?.listTasks(m.mission_id).length ?? 0}`,
         `Completion: ${completion}`,
@@ -2060,8 +2061,17 @@ ${RECOVERY_PROMPT}`;
         const preserved = stop?.preservedWork ?? summary?.preservedWork ?? [];
         return [
           `- ${m.mission_id} [${m.status}] rev ${m.revision} ${m.workflow_class} — ${m.title}`,
+          ...(m.execution_mode ? [`  execution mode: ${m.execution_mode.mode} — ${m.execution_mode.reason}`] : []),
           `  ${acceptanceText} · workflow ${workflow.completed}/${workflow.total} (${workflow.approximatePercent}%) · health ${summary?.health ?? "unknown"}`,
           `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
+          // P4: routing provenance — which model serves which task.
+          ...(summary?.workersDetail?.some((w) => w.model)
+            ? [
+                `  models: ${summary.workersDetail
+                  .map((w) => `${(w.taskId ?? w.workerId).replace(/^TSK-/, "")} → ${w.model ?? "default"}`)
+                  .join(" · ")}`,
+              ]
+            : []),
           `  recovery ${recovery.attempt}/${recovery.maxAttempts}; attempted ${stop?.attemptedRecoveries.length ?? 0} · next: ${stop?.resumeCondition ?? summary?.nextAction ?? "No further action is scheduled"}${summary?.nextActionAt ? ` at ${summary.nextActionAt}` : ""}`,
           `  ${stop ? `stop: ${stop.reason}` : `action: ${summary?.action ?? m.status} — ${summary?.reason ?? "No additional reason recorded"}`} · preserved: ${preserved.join(", ") || "none"}`,
           ...describeMissionControl(m).map((line) => `  ${line}`),

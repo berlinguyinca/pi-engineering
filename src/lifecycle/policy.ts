@@ -20,6 +20,12 @@ import { LIFECYCLE_RISKS } from "./types.ts";
 export interface RoutingRoleConfig {
   /** Pinned model ref `provider/id`. Empty means route automatically. */
   model?: string;
+  /**
+   * P2: fallback pin, applied when `model` (typically a gateway-owned route
+   * name) is not discovered or is ineligible. Keeps the role's placement
+   * stable until the edge serves the route.
+   */
+  fallback_model?: string;
   /** Preferred provider for this role. */
   provider?: string;
   /** Minimum declared context window. */
@@ -493,6 +499,13 @@ export function validatePolicy(policy: EngineeringPolicy): PolicyIssue[] {
   for (const [role, cfg] of Object.entries(policy.routing.roles)) {
     if (cfg?.model !== undefined && typeof cfg.model !== "string") {
       issues.push({ path: `routing.roles.${role}.model`, message: "expected a provider/id string", severity: "error" });
+    }
+    if (cfg?.fallback_model !== undefined && typeof cfg.fallback_model !== "string") {
+      issues.push({
+        path: `routing.roles.${role}.fallback_model`,
+        message: "expected a provider/id string",
+        severity: "error",
+      });
     }
   }
   if (policy.vision.enabled && policy.vision.force_handoff && policy.policies.review.independent_reviewer) {

@@ -1346,10 +1346,11 @@ export class Orchestrator {
       this.observedExecutions.add(event.executionId);
       this.taskExecutions.set(`${event.missionId}:${event.taskId}`, event.executionId);
       const task = this.store.getTask(event.taskId);
-      // P4: surface routing provenance per worker. The broker records the served
-      // model from task.execution_requirements.model (scheduler passes it through
-      // as modelRequirements), so read the same field here and pass it along with
-      // any route/fallback metadata the planner attached.
+      // P4: surface routing provenance per worker. The execution record
+      // carries the model the broker resolved for this execution (what
+      // actually served); execution_requirements carries the route/fallback
+      // metadata the planner attached. The recorded model wins over the
+      // requested one when both exist.
       const execReq = (task?.execution_requirements ?? {}) as {
         model?: string;
         route?: string;
@@ -1357,10 +1358,11 @@ export class Orchestrator {
         fallbacks?: number;
         inferenceWaitMs?: number;
       };
+      const executionModel = this.store.getExecution(event.executionId)?.model ?? undefined;
       obs?.workerStarted(event.missionId, event.executionId, {
         taskId: event.taskId,
         runtime: "pi",
-        model: execReq.model,
+        model: executionModel ?? execReq.model,
         route: execReq.route,
         node: execReq.node,
         fallbacks: execReq.fallbacks,
@@ -1714,6 +1716,15 @@ export class Orchestrator {
     leaseKeepAlive?.unref?.();
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
     try {
+      // The mode decision is persisted on the mission (orchestrateMission); the
+      // reason is what the operator needs to act on (e.g. "configure logical
+      // routes on the edge"), so it is reported, never swallowed (P6).
+      const mode = this.store.getMission(mission.mission_id)?.execution_mode;
+      if (mode)
+        this.report(
+          mission.mission_id,
+          `[mission ${mission.mission_id}] execution mode: ${mode.mode} — ${mode.reason}`,
+        );
       this.observability?.missionCreated(mission.mission_id, mission.title);
       this.store.transitionMission(mission.mission_id, "CLASSIFYING");
 

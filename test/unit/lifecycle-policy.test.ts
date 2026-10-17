@@ -287,3 +287,16 @@ test("mission limits: no duration caps by default, a generous hung-worker window
     await rm(agentDir, { recursive: true, force: true });
   }
 });
+
+test("routing role fallback_model must be a provider/id string", () => {
+  const p = structuredClone(DEFAULT_POLICY);
+  (p.routing.roles as Record<string, { fallback_model?: unknown }>).planner = {
+    ...(p.routing.roles.planner ?? {}),
+    fallback_model: 42,
+  };
+  const issues = validatePolicy(p).filter((i) => i.severity === "error");
+  assert.ok(
+    issues.some((i) => i.path === "routing.roles.planner.fallback_model"),
+    "non-string fallback_model is a validation error",
+  );
+});

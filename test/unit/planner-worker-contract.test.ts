@@ -182,3 +182,26 @@ test("task state machine allows the documented lifecycle and rejects illegal mov
   assert.ok(isTerminal("failed"));
   assert.equal(isTerminal("escalated"), false);
 });
+
+test("parseTaskContract accepts an optional per-task execution requirement (P3)", () => {
+  const r = parseTaskContract({
+    ...raw("t1"),
+    execution: { model: "gw/qwen3.8-27b", capabilities: ["long_context"] },
+  });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  if (!r.ok) return;
+  assert.deepEqual(r.contract.execution, { model: "gw/qwen3.8-27b", capabilities: ["long_context"] });
+});
+
+test("parseTaskContract rejects malformed execution requirements (P3)", () => {
+  assert.equal(parseTaskContract({ ...raw("t1"), execution: "fast" }).ok, false, "execution must be an object");
+  assert.equal(parseTaskContract({ ...raw("t1"), execution: { model: 42 } }).ok, false, "model must be a string");
+  assert.equal(parseTaskContract({ ...raw("t1"), execution: { capabilities: { a: 1 } } }).ok, false, "capability entries must be strings");
+});
+
+test("parseTaskContract omits execution when absent (P3)", () => {
+  const r = parseTaskContract(raw("t1"));
+  assert.equal(r.ok, true);
+  if (!r.ok) return;
+  assert.equal("execution" in r.contract, false);
+});

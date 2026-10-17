@@ -272,3 +272,54 @@ test("parseRef splits provider and id, tolerating ids containing slashes", () =>
   assert.deepEqual(parseRef("openai/gpt-4o"), { provider: "openai", id: "gpt-4o" });
   assert.deepEqual(parseRef("ollama"), { provider: "ollama", id: "ollama" });
 });
+
+test("role fallback_model applies when the pinned route is not discovered (P2)", async () => {
+  const p = policy((cfg) => {
+    cfg.routing.roles.implementer = {
+      model: "alpha/coding-implementation",
+      fallback_model: "alpha/stable-concrete",
+    };
+  });
+  const router = await routerFor([record({ provider: "alpha", id: "stable-concrete" })], p);
+  const decision = await router.select({ role: "implementer" });
+  assert.ok(decision.selected);
+  assert.equal(modelKey(decision.selected), "alpha/stable-concrete");
+  assert.equal(decision.overrideApplied?.override, "alpha/stable-concrete");
+  assert.match(decision.overrideApplied?.source ?? "", /fallback/);
+  assert.ok(
+    decision.rationale.some((r) => /coding-implementation[\s\S]*not eligible/.test(r)),
+    "the missing route is explained in the rationale",
+  );
+});
+
+test("a discovered pinned route wins over fallback_model (P2)", async () => {
+  const p = policy((cfg) => {
+    cfg.routing.roles.implementer = {
+      model: "alpha/coding-implementation",
+      fallback_model: "alpha/stable-concrete",
+    };
+  });
+  const router = await routerFor(
+    [record({ provider: "alpha", id: "coding-implementation" }), record({ provider: "alpha", id: "stable-concrete" })],
+    p,
+  );
+  const decision = await router.select({ role: "implementer" });
+  assert.ok(decision.selected);
+  assert.equal(modelKey(decision.selected), "alpha/coding-implementation");
+  assert.equal(decision.overrideApplied?.source, "policy.routing.roles");
+});
+
+test("a fallback_model that is itself ineligible degrades to scoring (P2)", async () => {
+  const p = policy((cfg) => {
+    cfg.routing.roles.implementer = {
+      model: "alpha/coding-implementation",
+      fallback_model: "alpha/also-missing",
+    };
+  });
+  const router = await routerFor([record({ provider: "alpha", id: "other" })], p);
+  const decision = await router.select({ role: "implementer" });
+  assert.ok(decision.selected);
+  assert.equal(modelKey(decision.selected), "alpha/other");
+  assert.equal(decision.overrideApplied, undefined);
+  assert.ok(decision.rationale.some((r) => /also-missing[\s\S]*not eligible/.test(r)));
+});

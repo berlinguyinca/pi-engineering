@@ -516,3 +516,121 @@ test("an orchestrator that failed to initialize says why, in the mission tool an
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("/mission-status reports the execution mode decision and its reason (P6)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-mode-status-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "mode decision",
+      goal: "mode decision",
+      user_request: "mode decision",
+      repository: root,
+      base_ref: await runtime.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    runtime.missionStore!.updateMission(mission.mission_id, {
+      execution_mode: { mode: "single", reason: "auto: the gateway does not advertise role capabilities" },
+    });
+    const { commands, handlers } = loadHarness();
+    const { ctx, notices } = commandContext(root);
+    await commands.get("mission-status")!.handler("", ctx);
+    const text = notices.at(-1)?.text ?? "";
+    assert.match(text, /execution mode: single — auto: the gateway does not advertise role capabilities/i);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    await runtime.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("/mission-status shows per-task routing provenance (P4)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-model-status-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "model provenance",
+      goal: "model provenance",
+      user_request: "model provenance",
+      repository: root,
+      base_ref: await runtime.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    // A live worker-start on the shared observability instance is enough for
+    // the handler: no store task is created, so the mission supervisor stays
+    // idle. (The event->summary plumbing is covered by the observability tests.)
+    runtime.missionObservability!.workerStarted(mission.mission_id, "wk-model", {
+      taskId: "TSK-abc123",
+      model: "gw/special-model",
+    });
+    const { commands, handlers } = loadHarness();
+    const { ctx, notices } = commandContext(root);
+    await commands.get("mission-status")!.handler("", ctx);
+    const text = notices.at(-1)?.text ?? "";
+    assert.match(text, /models:.*gw\/special-model/i, `the operator must see the task model; got: ${text}`);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    await runtime.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("/mission completion notification includes the execution mode decision (P6)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-mode-complete-"));
+  const originalOrchestrate = Orchestrator.prototype.orchestrate;
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "mode completion",
+      goal: "mode completion",
+      user_request: "mode completion",
+      repository: root,
+      base_ref: await runtime.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    for (const status of ["CLASSIFYING", "READY", "EXECUTING", "FINAL_VALIDATION", "COMPLETE"] as const) {
+      runtime.missionStore!.transitionMission(mission.mission_id, status);
+    }
+    runtime.missionStore!.updateMission(mission.mission_id, {
+      execution_mode: { mode: "single", reason: "auto: the gateway does not advertise role capabilities" },
+    });
+    Orchestrator.prototype.orchestrate = (async () => ({
+      mission: runtime.missionStore!.getMission(mission.mission_id)!,
+      intent: { intent: ["implement"], confidence: 0.9, suggested_workflow: "engineering" },
+      verdict: { completed: true },
+      completed: true,
+      failureReason: null,
+    })) as unknown as typeof Orchestrator.prototype.orchestrate;
+    const { commands, handlers } = loadHarness();
+    const { ctx, notices } = commandContext(root);
+    await commands.get("mission")!.handler("Add a health endpoint", ctx);
+    const text = notices.at(-1)?.text ?? "";
+    assert.match(text, /execution mode: single — auto: the gateway does not advertise role capabilities/i);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    await runtime.close();
+  } finally {
+    Orchestrator.prototype.orchestrate = originalOrchestrate;
+    await rm(root, { recursive: true, force: true });
+  }
+});

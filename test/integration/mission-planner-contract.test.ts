@@ -279,6 +279,53 @@ describe("mission planner contract", () => {
     assert.deepEqual(planned.tasks[0]?.write_domains, ["src/calc.js", "test/calc.test.js"]);
   });
 
+  it("planMission carries the planner's per-task execution requirement onto the task (P3)", async () => {
+    const planned = await planMission({
+      goal: BIG_GOAL,
+      mutates: true,
+      mode: "on",
+      acceptanceIds: [],
+      single: () => {
+        throw new Error("must not fall back");
+      },
+      runPlanner: async () => ({
+        summary: "plan",
+        details: {},
+        contracts: [
+          {
+            task_id: "calc",
+            objective: "Implement divide in src/calc.js",
+            scope: { allowed: ["src/calc.js", "test/calc.test.js"] },
+            acceptance: ["divide works"],
+            verification: ["npm test"],
+            execution: { model: "gw/qwen3.8-27b", capabilities: ["long_context"] },
+          },
+        ],
+      }),
+    });
+    assert.equal(planned.tasks.length, 1);
+    assert.deepEqual(planned.tasks[0]?.execution_requirements, {
+      model: "gw/qwen3.8-27b",
+      capabilities: ["long_context"],
+    });
+  });
+
+  it("planMission leaves execution_requirements empty when the planner assigns none (P3)", async () => {
+    const live = await liveWorkerResult();
+    const contracts = (live.details as { contracts: unknown[] }).contracts;
+    const planned = await planMission({
+      goal: BIG_GOAL,
+      mutates: true,
+      mode: "on",
+      acceptanceIds: [],
+      single: () => {
+        throw new Error("must not fall back");
+      },
+      runPlanner: async () => ({ summary: "plan", details: {}, ...{ contracts } }),
+    });
+    assert.deepEqual(planned.tasks[0]?.execution_requirements, {});
+  });
+
   const blockedArgs = (summary: string, details: Record<string, unknown> = {}) => ({
     status: "blocked",
     summary,

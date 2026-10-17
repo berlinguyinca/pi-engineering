@@ -75,6 +75,14 @@ export interface TaskContract {
   relevant_files: string[];
   /** Planner decisions the implementer must follow (bounded). */
   decisions: string[];
+  /**
+   * Per-task execution requirement the planner assigns (P3): a model the task
+   * must run on (`"provider/id"`) and/or hard capability requirements. The
+   * mission planner carries it onto the task's `execution_requirements`, the
+   * broker records it on the execution, and the capability router honours it
+   * (task override / extra requirements). Omitted when the planner is agnostic.
+   */
+  execution?: { model?: string; capabilities?: string[] };
 }
 
 /** Bounded mission summary handed to the planner and every worker. */

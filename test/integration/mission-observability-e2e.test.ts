@@ -19,8 +19,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
+import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 const NOW = Date.parse("2024-01-01T00:00:00.000Z");
@@ -329,10 +329,7 @@ test("live progress bar reflects workflow progress, not acceptance coverage (P1)
 
   const summary = obs.summary(id)!;
   assert.equal(summary.progress.approximatePercent, 0, "precondition: acceptance coverage is 0");
-  assert.ok(
-    summary.workflowProgress.approximatePercent > 0,
-    "precondition: workflow progress is positive",
-  );
+  assert.ok(summary.workflowProgress.approximatePercent > 0, "precondition: workflow progress is positive");
 
   const orchestrator = new Orchestrator({ store, backends: {}, observability: obs, planner: async () => [] });
   const progressBar = (
@@ -345,6 +342,50 @@ test("live progress bar reflects workflow progress, not acceptance coverage (P1)
   const workflowPct = Math.round(summary.workflowProgress.approximatePercent);
   // Bar must contain the workflow percentage and be non-zero (not pinned to 0%).
   assert.match(bar, /\[#/, "bar has at least one filled cell");
-  assert.match(bar, new RegExp(String(workflowPct) + "%$"), "bar label is the workflow percentage");
+  assert.match(bar, new RegExp(`${workflowPct}%$`), "bar label is the workflow percentage");
   assert.doesNotMatch(bar, /0%$/, "bar must not render the 0% acceptance coverage");
+});
+
+test("mission summary carries per-worker routing provenance (P4)", () => {
+  T = NOW;
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store, now: nowFn });
+
+  const id = store.createMission({
+    title: "Model provenance",
+    goal: "Prove which model serves each task",
+    user_request: "Show me the routing",
+    repository: "repo",
+    base_ref: "main",
+    risk_profile: "medium",
+    workflow_class: "engineering",
+  }).mission_id;
+  obs.missionCreated(id, "Model provenance");
+
+  const taskA = store.createTask({
+    mission_id: id,
+    kind: "agent",
+    role: "implementer",
+    objective: "Implement the thing",
+  });
+  const taskB = store.createTask({
+    mission_id: id,
+    kind: "agent",
+    role: "implementer",
+    objective: "Wire the other thing",
+  });
+  walkMission(store, id, "EXECUTING");
+  obs.phaseChanged(id, "EXECUTING");
+  obs.workerStarted(id, "wk-a", { taskId: taskA.task_id, model: "gw/glm5.3-flash" });
+  obs.workerStarted(id, "wk-b", { taskId: taskB.task_id });
+
+  const detail = obs.summary(id)!.workersDetail ?? [];
+  const a = detail.find((w) => w.workerId === "wk-a");
+  const b = detail.find((w) => w.workerId === "wk-b");
+  assert.ok(a, "wk-a appears in workersDetail");
+  assert.equal(a!.model, "gw/glm5.3-flash", "the required/served model is surfaced");
+  assert.equal(a!.taskId, taskA.task_id, "the model is attributed to its task");
+  assert.ok(b, "wk-b appears in workersDetail even without a model");
+  assert.equal(b!.model, undefined, "an unrouted worker has no model");
 });

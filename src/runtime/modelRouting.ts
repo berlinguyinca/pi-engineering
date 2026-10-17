@@ -120,13 +120,20 @@ export function createRouteModel(opts: {
       provider: model.provider,
       id: model.id,
     }));
+    // The task's own requirement (P3): a model override and/or hard capability
+    // requirements. The operator's live pin still wins over both; when the pin
+    // cannot serve the role, the fallback honours the task requirement.
+    const taskQuery = {
+      ...(routeOpts?.taskOverride ? { taskOverride: routeOpts.taskOverride } : {}),
+      ...(routeOpts?.extraRequires?.length ? { extraRequires: routeOpts.extraRequires } : {}),
+    };
     const pin = routeOpts?.missionId ? opts.operatorPin?.(routeOpts.missionId) : undefined;
-    if (!pin) return routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude);
+    if (!pin) return routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude, taskQuery);
     // A pin already tried, gone, or reserved by separation of duties (the
     // reviewer of work the pin produced) is not forced back; the placement
     // records it so an operator-switch check does not restart the attempt.
     if (exclude.some((model) => modelKey(model) === modelKey(pin))) {
-      const routed = await routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude);
+      const routed = await routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude, taskQuery);
       return routed && { ...routed, pinRefused: modelKey(pin) };
     }
     const refusal = await pinRefusal(opts.router, routerRoleFor(role) ?? "implementer", pin, {
@@ -134,7 +141,7 @@ export function createRouteModel(opts: {
       ...(exclude.length > 0 ? { exclude } : {}),
     });
     if (!refusal) return { provider: pin.provider, id: pin.id, operatorPin: true } satisfies ModelRoute;
-    const routed = await routeRole(opts.router, role, true, requester, exclude);
+    const routed = await routeRole(opts.router, role, true, requester, exclude, taskQuery);
     if (!routed) return undefined;
     return {
       ...routed,
@@ -170,6 +177,7 @@ async function routeRole(
   replacement: boolean,
   requester: ModelRef | undefined,
   exclude: ModelRef[],
+  taskQuery?: { taskOverride?: string; extraRequires?: string[] },
 ): Promise<ModelRoute | undefined> {
   // Native roles are routed as always. Any other worker role keeps running on
   // the executor default and is mapped onto a router role only to choose a
@@ -180,6 +188,11 @@ async function routeRole(
     const routed = await router.route(routerRole, {
       ...(requester ? { requester } : {}),
       ...(exclude.length > 0 ? { exclude } : {}),
+      // Per-task execution requirements (P3): the task's required model
+      // (highest router precedence below the operator pin) and its hard
+      // capability requirements.
+      ...(taskQuery?.taskOverride ? { taskOverride: taskQuery.taskOverride } : {}),
+      ...(taskQuery?.extraRequires?.length ? { extraRequires: taskQuery.extraRequires } : {}),
     });
     if (ROLE_REQUIREMENTS[routerRole].independent && routed && requester && modelKey(routed) === modelKey(requester)) {
       return {

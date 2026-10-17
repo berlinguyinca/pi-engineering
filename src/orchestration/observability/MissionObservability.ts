@@ -1165,15 +1165,18 @@ export class MissionObservability {
       currentObjective: s.currentObjective,
       currentActivity: s.currentActivity,
       workers: workerCounts,
-      workersDetail: [...s.workers.values()].map((w) => ({
-        workerId: w.workerId,
-        taskId: w.taskId,
-        model: w.model,
-        route: w.route,
-        node: w.node,
-        fallbacks: w.fallbacks,
-        inferenceWaitMs: w.inferenceWaitMs,
-      })),
+      // P4: per-worker routing provenance for operators, sorted for stable output.
+      workersDetail: [...s.workers.values()]
+        .map((w) => ({
+          workerId: w.workerId,
+          taskId: w.taskId,
+          model: w.model,
+          route: w.route,
+          node: w.node,
+          fallbacks: w.fallbacks,
+          inferenceWaitMs: w.inferenceWaitMs,
+        }))
+        .sort((a, b) => a.workerId.localeCompare(b.workerId)),
       lastHeartbeatAt: s.lastHeartbeatAt,
       lastMeaningfulProgressAt: s.lastMeaningfulProgressAt ?? null,
       waitingReason: health.waitingReason ?? s.waitingReason,

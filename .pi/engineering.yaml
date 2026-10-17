@@ -33,27 +33,36 @@ routing:
     # DISTINCT qwen models (separation-of-duties), implementer on text 262k,
     # reviewer on vision (≠ implementer, ≠ session), verifier on vision q4
     # (≠ implementer, ≠ reviewer).
-    #   planner       -> metabolomics qwen3.8-flash_next text (fast, distinct)
-    #   implementer   -> metabolomics qwen3.8-27b text ctx-c262k q8 (capable)
-    #   reviewer      -> metabolomics qwen3.8-27b vision q8 (vision; ≠ implementer, ≠ session)
+    # NOTE (rev 5, P2 — gateway-owned route names): the text/vision roles now
+    # pin LOGICAL route IDs owned by the inferweave edge instead of concrete
+    # model IDs. A route name never flaps: endpoint churn is absorbed by the
+    # gateway's own fallback machinery (route-generation bump + MODEL_FALLBACK)
+    # instead of the client discovering "model not served" 30 minutes into a
+    # task. Until the edge serves the routes (gateway change G1, not yet
+    # deployed), each pin carries fallback_model — the concrete model the role
+    # ran on before rev 5 — so today's placement is unchanged and the route
+    # takes over the moment it is discovered. An explicit operator pin never
+    # falls back (it degrades to scoring instead).
+    #   planner       -> route coding-planning        (fallback: qwen3.8-flash_next text q4)
+    #   implementer   -> route coding-implementation  (fallback: qwen3.8-flash_next text q4 —
+    #                     see the rev 4 note: the 27b text q8 endpoint flaps)
+    #   reviewer      -> route coding-review          (fallback: qwen3.8-27b vision q8)
     #   verifier      -> metabolomics qwen3.8-27b vision q4 (≠ implementer, ≠ reviewer)
     #   spec_verifier -> metabolomics qwen3.8-27b vision q4 (≠ reviewer)
     #   test_reviewer -> metabolomics qwen3.8-27b vision q4
     planner:
-      model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
+      model: "metabolomics/coding-planning"
+      fallback_model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
       timeout_ms: 3600000
       max_context_tokens: 128000
-    # NOTE (rev 4, 2026-10-06): implementer moved from qwen3.8-27b text q8 to
-    # qwen3.8-flash_next text q4 — the 27b text q8 endpoint flaps (repeatedly
-    # unlisted from /models mid-execution, "model is not served"), which burns
-    # the 30-min recovery deadline on long tasks. flash_next has been consistently
-    # served and is the model the planner role already runs successfully on.
     implementer:
-      model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
+      model: "metabolomics/coding-implementation"
+      fallback_model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
       timeout_ms: 3600000
       max_context_tokens: 128000
     reviewer:
-      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
+      model: "metabolomics/coding-review"
+      fallback_model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
       timeout_ms: 1800000
       max_context_tokens: 128000
     verifier:
