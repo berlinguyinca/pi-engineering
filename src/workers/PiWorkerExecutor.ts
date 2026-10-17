@@ -976,6 +976,12 @@ export class PiWorkerExecutor implements WorkerExecutor {
         }
         if (gatewayConfig.enabled) admission.noteSuccess();
         const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
+        // Name the model that actually served this attempt (P4 provenance):
+        // the resolved route when routed, else the executor's default. Failure
+        // paths already attach `details.model`; the success path must too, so the
+        // orchestrator's ranOn(run) resolves and /mission-status shows the serving
+        // model instead of null (FINDING-cRh1qh).
+        result.details = { ...result.details, model: { provider: model.provider, id: model.id } };
         return { result, usage, toolCalls, structured };
       }
 
