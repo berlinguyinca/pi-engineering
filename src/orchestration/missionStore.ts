@@ -12,6 +12,12 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
+import {
+  type CheckpointRefsInput,
+  attachCheckpointRefs,
+  buildCheckpointRefs,
+} from "../runtime/host/handoffCheckpointRefs.ts";
+import { type HandoffRecord, validateHandoffRecord } from "../runtime/host/handoffKinds.ts";
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import {
   buildCandidateEvidenceIdentity,
@@ -68,6 +74,7 @@ export type OrchestrationEventType =
   | "execution.canceled"
   | "finding.created"
   | "finding.resolved"
+  | "handoff.created"
   | "workspace.authorized"
   | "workspace.rebound"
   | "workspace.rebind_failed"
@@ -136,6 +143,7 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "execution.canceled",
   "finding.created",
   "finding.resolved",
+  "handoff.created",
   "workspace.authorized",
   "workspace.rebound",
   "workspace.rebind_failed",
@@ -351,6 +359,16 @@ interface CanonicalLifecycleRecord extends CanonicalLifecycle {
   status: MissionStatus;
 }
 
+/** Thrown by `MissionStore.addHandoffRecord` when a handoff record fails validation. */
+export class HandoffRecordError extends Error {
+  readonly errors: readonly string[];
+  constructor(errors: readonly string[]) {
+    super(`invalid handoff record: ${errors.join("; ")}`);
+    this.name = "HandoffRecordError";
+    this.errors = errors;
+  }
+}
+
 export class MissionStore {
   private readonly backend: EventStoreBackend;
   private readonly missions = new Map<string, Mission>();
@@ -366,6 +384,7 @@ export class MissionStore {
   private readonly repositoryWaits = new Map<string, RepositoryWait>();
   private readonly executions = new Map<string, Execution>();
   private readonly findings = new Map<string, ReviewFinding>();
+  private readonly handoffRecords = new Map<string, HandoffRecord>();
   private readonly workspaceManifests = new Map<string, WorkspaceManifest>();
   private readonly taskCheckpoints = new Map<string, TaskCheckpoint>();
   /** Replay-stable position of the most recent durable event for each checkpoint lineage. */
@@ -1840,6 +1859,59 @@ export class MissionStore {
     return [...this.findings.values()]
       .filter((f) => (missionId ? f.mission_id === missionId : true))
       .map((f) => ({ ...f }));
+  }
+
+  /**
+   * Persist a typed, validated handoff record. The input is validated with
+   * `validateHandoffRecord`; invalid input throws a `HandoffRecordError` carrying
+   * the field-level errors. Records are stored by their stable id and are the
+   * durable substrate for phase-boundary handoffs and resume (spec: typed
+   * handoffs).
+   */
+  addHandoffRecord(record: unknown): HandoffRecord {
+    const result = validateHandoffRecord(record);
+    if (!result.ok) {
+      throw new HandoffRecordError(result.errors);
+    }
+    this.handoffRecords.set(result.record.id, { ...result.record });
+    this.emit("handoff.created", result.record.missionId, {
+      actor: "system",
+      handoff: { ...result.record },
+    });
+    return { ...result.record };
+  }
+
+  /**
+   * Create and persist a HandoffRecord carrying an immutable checkpoint reference
+   * set. Builds the refs from the raw inputs (full 40-hex checkpoint + source
+   * SHAs and artifact ref/hash pairs) via `buildCheckpointRefs`, attaches them to
+   * the record (setting `checkpointSha`) via `attachCheckpointRefs`, and stores
+   * it. Throws a `HandoffRecordError` when either the refs or the base record are
+   * invalid. This is the foundation for phase-boundary handoffs that resume from
+   * a checkpoint (spec: handoff checkpoints).
+   */
+  addHandoffRecordWithCheckpointRefs(record: unknown, refsInput: CheckpointRefsInput): HandoffRecord {
+    const refsResult = buildCheckpointRefs(refsInput);
+    if (!refsResult.ok) {
+      throw new HandoffRecordError(refsResult.errors);
+    }
+    const base = validateHandoffRecord(record);
+    if (!base.ok) {
+      throw new HandoffRecordError(base.errors);
+    }
+    const withRefs = attachCheckpointRefs(base.record, refsResult.refs);
+    return this.addHandoffRecord(withRefs);
+  }
+
+  getHandoffRecord(id: string): HandoffRecord | undefined {
+    const record = this.handoffRecords.get(id);
+    return record ? { ...record } : undefined;
+  }
+
+  listHandoffRecords(missionId?: string): HandoffRecord[] {
+    return [...this.handoffRecords.values()]
+      .filter((r) => (missionId ? r.missionId === missionId : true))
+      .map((r) => ({ ...r }));
   }
 
   /** Preserve a settled outcome while making failed lease cleanup durable and visible. */
