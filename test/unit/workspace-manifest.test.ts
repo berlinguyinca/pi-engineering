@@ -465,6 +465,84 @@ describe("WorkspaceManifestResolver path policy", () => {
     );
   });
 
+  it("explains the workspace-parent refusal by listing child git checkouts and the writable directive", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-parent-"));
+    const repoA = await makeFixtureRepo();
+    const repoB = await makeFixtureRepo();
+    const dirA = join(launchCwd, "alpha");
+    const dirB = join(launchCwd, "beta-gateway");
+    await rename(repoA.root, dirA);
+    await rename(repoB.root, dirB);
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }));
+
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve("Implement the feature", launchCwd),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkspaceScopeError, `expected WorkspaceScopeError, got ${String(error)}`);
+        const message = error.message;
+        assert.match(message, /workspace parent is never authorized/);
+        assert.match(message, /alpha, beta-gateway/);
+        assert.match(message, /writable: .*alpha/);
+        assert.match(message, /docs\/usage\.md, "Workspace scope"/);
+        return true;
+      },
+    );
+  });
+
+  it("lists the real child checkouts when a named repository does not match any of them", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-parent-"));
+    const repoA = await makeFixtureRepo();
+    const dirA = join(launchCwd, "alpha");
+    await rename(repoA.root, dirA);
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }));
+
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve("Implement the feature in some-org/does-not-exist", launchCwd),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkspaceScopeError, `expected WorkspaceScopeError, got ${String(error)}`);
+        assert.match(error.message, /alpha/);
+        assert.match(error.message, /workspace parent is never authorized/);
+        return true;
+      },
+    );
+  });
+
+  it("says there are no child checkouts when the workspace parent holds none", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-parent-"));
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }));
+
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve("Implement the feature", launchCwd),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkspaceScopeError, `expected WorkspaceScopeError, got ${String(error)}`);
+        assert.match(error.message, /No immediate child git checkouts found/);
+        assert.match(error.message, /writable: /);
+        return true;
+      },
+    );
+  });
+
+  it("bounds the child-checkout listing in the workspace-parent refusal", async () => {
+    const launchCwd = await mkdtemp(join(tmpdir(), "pi-eng-parent-"));
+    for (let index = 0; index < 10; index += 1) {
+      const repo = await makeFixtureRepo();
+      cleanup.push(repo.cleanup);
+      await rename(repo.root, join(launchCwd, `repo-${String(index).padStart(2, "0")}`));
+    }
+    cleanup.push(() => rm(launchCwd, { recursive: true, force: true }));
+
+    await assert.rejects(
+      new WorkspaceManifestResolver().resolve("Implement the feature", launchCwd),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkspaceScopeError, `expected WorkspaceScopeError, got ${String(error)}`);
+        assert.match(error.message, /repo-00, repo-01/);
+        assert.match(error.message, /\(and 2 more\)/);
+        assert.doesNotMatch(error.message, /repo-09/);
+        return true;
+      },
+    );
+  });
+
   it("does not treat a repository path found in repository content as user authorization", async () => {
     const launchRepo = await makeFixtureRepo();
     const otherRepo = await makeFixtureRepo();
