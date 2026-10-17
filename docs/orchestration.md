@@ -143,6 +143,117 @@ Pi Engineering remains the orchestration authority.
   programmatic entry points.
 - **External mission entry (AutoSpec adapter)** — see the [`External mission entry (AutoSpec adapter)`](usage.md#external-mission-entry-autospec-adapter) section in the usage docs.
 
+## External mission start selection
+
+Externally submitted missions (created by `src/orchestration/externalEntry.ts`
+with ids `MSN-ext-*` in status `NEW`) are **never** dispatched by the normal
+scheduler. Instead they are adopted by a runtime-side **pump** that runs as a
+side effect of the supervisor lifecycle.
+
+### When the pump runs
+
+`EngineeringRuntime.pumpExternalMissions` is invoked from
+`consumeSupervisorStatuses`, which is the `onStatuses` callback of the runtime's
+`MissionSupervisor`. Because `onStatuses` is called on **every supervisor tick**
+(startup reconcile and each periodic/explicit tick — even when there are no
+statuses to consume), the pump effectively runs once per supervisor tick.
+
+The pump is a no-op unless **all** of the following hold:
+
+- the runtime has not stopped its external pump (`externalPumpStopped` is false);
+- a mission store and orchestrator are initialized;
+- the runtime has an `ownershipId`;
+- `PI_AUTOSPEC_ENABLED` is on (`readAutospecFlags(process.env).enabled`), the
+  master switch for autospec and mission modes.
+
+It never dispatches external missions itself through the scheduler — pure side
+effects live behind the supervisor-driven pump.
+
+### Selection rules
+
+`pumpExternalMissions` gathers every mission still in status `NEW`, reads each
+one's lease, and asks the pure function `selectExternalMissionsToStart`
+(`src/orchestration/externalStartSelection.ts`) for the ids to start, passing
+the runtime's `ownershipId`, the current time, `maxExternalMissions()` (the
+concurrency budget), and the count of currently running external missions.
+
+Selection is deterministic and mirrors the external-admission contract:
+
+- **`MSN-ext-` prefix required** — only ids starting with `MSN-ext-` are
+  candidates; all others are ignored.
+- **Only `NEW` status** — a mission may start only while it is still `NEW`;
+  everything else (including `QUEUED`) is skipped (fail closed).
+- **Live foreign lease skipped** — a mission with a lease held by another owner
+  is never started while that lease is live. A lease is live when its `renewBy`
+  is a present, parseable timestamp that is not earlier than now; an unparseable
+  `renewBy` is treated as live (we cannot prove it has lapsed).
+- **Absent, expired, or self-owned lease is eligible** — a mission with no
+  lease, an expired lease, or a lease owned by the runtime itself may start.
+- **Oldest first, id tiebreak** — eligible ids are returned oldest `created_at`
+  first (missing/invalid dates last), with ties broken by `mission_id`
+  ascending.
+- **Concurrency cap** — at most `max(0, maxConcurrent - runningExternalCount)`
+  ids are returned. `maxConcurrent` defaults to **1** and can be overridden via
+  `PI_ENGINEERING_MAX_EXTERNAL_MISSIONS` (the runtime's `maxExternalMissions`
+  reads that env var and falls back to 1 when unset, non-integer, or ≤ 0).
+
+### Starting a selected mission
+
+For each selected id, the pump adds it to its `runningExternal` set (so a later
+tick will not double-start it) and calls the orchestrator's
+`runSubmittedMission(missionId, {})`. That method:
+
+1. **External-mission check** — the mission must be externally submitted: an
+   `MSN-ext-` id **or** a constraint starting with `__pi_idempotency_key:`.
+   Otherwise it returns `{ started: false, reason: "not_external" }`.
+2. **Status check** — it must still be `NEW`, else `{ started: false, reason:
+   "status_<status>" }`.
+3. **Ownership acquire** — the runtime must be configured with a
+   `MissionOwnership`; it acquires the mission lease. If the lease is held by
+   another owner, acquisition fails and the method returns `{ started: false,
+   reason: "leased_until <date>" }`.
+4. **Idempotency sentinel stripped** — before the pipeline runs, the mission
+   copy has every `__pi_idempotency_key:` constraint filtered out (the sentinel
+   is internal bookkeeping and must never reach spec approval).
+5. **Normal mission pipeline** — the stripped `missionCopy` then goes through
+   `runMissionPipeline`, exactly as any orchestrated mission: intent routing,
+   workspace resolution, planning, worker dispatch, validation, review, and the
+   completion gate.
+
+The pump does not await the outcome: `runSubmittedMission` is dispatched
+fire-and-forget (the call is `void`-prefixed), so `pumpExternalMissions` returns
+as soon as the starts are dispatched. Whatever the outcome — started, not
+started, or a thrown error — the `.finally` handler removes the id from
+`runningExternal` and publishes a fresh mission snapshot.
+
+### Observability
+
+- A **redacted start reason** is reported: when `runSubmittedMission` returns
+  `{ started: false, reason }`, the pump emits a warning telemetry event
+  `external mission <id> not started: <redactSecrets(reason)>`.
+- **Skipped external missions are logged**: any mission that could not be
+  started (not external, wrong status, leased by another owner, or an error
+  during the start) surfaces as a warning telemetry event with the reason
+  passed through `redactSecrets` (and start failures redact the thrown error
+  text too).
+- A pump-level error (thrown outside the per-mission loop) is logged as
+  `external mission pump: <redactSecrets(error)>`.
+
+### Worked example: expired receipt lease
+
+An externally submitted mission `MSN-ext-abc123` is created in status `NEW`.
+Its submitter holds only a short **submission-receipt lease** of
+`SUBMISSION_RECEIPT_LEASE_MS = 5 * 60 * 1000` (5 minutes); the submitter is not
+actively renewing it. While that 5-minute lease is live, `selectExternalMissionsToStart`
+sees a live lease owned by the external submitter (not the runtime) and skips
+the mission. Once the lease expires (its `renewBy` is earlier than now), the
+mission is eligible. On the **next supervisor tick**, `pumpExternalMissions`
+picks it up, adds it to `runningExternal`, and calls
+`runSubmittedMission("MSN-ext-abc123", {})`. The orchestrator acquires
+ownership (no live foreign lease blocks it), strips the `__pi_idempotency_key:`
+sentinel (if present), and runs the normal mission pipeline — moving the mission
+past `NEW`.
+
 ## Worktree isolation, harvest, and integration
 
 For a task with `isolation=worktree` and `mutates_repo`, the broker allocates a
