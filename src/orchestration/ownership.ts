@@ -200,7 +200,13 @@ export class MissionOwnership {
   async maintain(identity: MissionLease, repoId?: string): Promise<DispatchAuthority> {
     const mission = await this.renew(identity);
     const repository = repoId ? await this.acquireRepository(mission, repoId) : undefined;
-    return new RenewableDispatchAuthority(this, mission, repository, this.heartbeatMs, this.maxConsecutiveRenewFailures);
+    return new RenewableDispatchAuthority(
+      this,
+      mission,
+      repository,
+      this.heartbeatMs,
+      this.maxConsecutiveRenewFailures,
+    );
   }
 
   async acquire(missionId: string, options: { resumptionGeneration?: number } = {}): Promise<MissionLease> {
@@ -457,7 +463,7 @@ class RenewableDispatchAuthority implements DispatchAuthority {
     mission: MissionLease,
     repository: RepositoryLease | undefined,
     heartbeatMs: number,
-    maxConsecutiveRenewFailures: number = 3,
+    maxConsecutiveRenewFailures = 3,
   ) {
     this.maxConsecutiveRenewFailures = maxConsecutiveRenewFailures;
     this.ownership = ownership;

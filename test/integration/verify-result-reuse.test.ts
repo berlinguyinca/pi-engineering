@@ -228,7 +228,6 @@ describe("verification result reuse (#185)", () => {
       assert.equal(fx.verifier.runs, 2);
     } finally {
       if (saved === undefined) {
-        // biome-ignore lint/performance/noDelete: unsetting an env var requires delete
         delete process.env.NODE_ENV;
       } else process.env.NODE_ENV = saved;
       await fx.cleanup();

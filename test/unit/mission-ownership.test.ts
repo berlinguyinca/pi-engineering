@@ -407,10 +407,7 @@ describe("MissionOwnership", () => {
       // only once consecutive failures reach the configured threshold.
       owner.setFailures(Number.MAX_SAFE_INTEGER);
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
-      assert.throws(
-        () => authority.assertAuthoritative(),
-        /lease renewal failed 2 times in a row/,
-      );
+      assert.throws(() => authority.assertAuthoritative(), /lease renewal failed 2 times in a row/);
       assert.ok(authority.lastPulseError);
     } finally {
       await authority.close();
