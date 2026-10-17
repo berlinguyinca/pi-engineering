@@ -526,7 +526,23 @@ class RenewableDispatchAuthority implements DispatchAuthority {
 
   private async pulse(): Promise<void> {
     if (this.stopped || this.failure) return;
-    this.mission = await this.ownership.renew(this.mission);
+    try {
+      this.mission = await this.ownership.renew(this.mission);
+    } catch (error) {
+      // A stale MISSION fencing identity means the mission lease was re-fenced to a new
+      // generation while this authority still held the old one (a FENCE_RECONCILE_AND_RESUME
+      // recovery fences the prior owner and re-acquires the lease). Renewing against the cached
+      // old identity is a permanent mismatch, not a transient blip: it would otherwise count
+      // toward the failure threshold and lap the lease dead. Re-acquire the mission lease so the
+      // authority tracks the new generation. (Symmetric with the repository guard below.)
+      if (isStaleFencingIdentity(error, "mission")) {
+        // Retain the error for observability (lastPulseError) even though it is recovered from.
+        this.lastError = error instanceof Error ? error : new Error(String(error));
+        this.mission = await this.ownership.acquire(this.mission.missionId);
+      } else {
+        throw error;
+      }
+    }
     if (this.repository) {
       try {
         this.repository = await this.ownership.renewRepository(this.repository);
