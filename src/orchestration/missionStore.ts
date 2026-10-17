@@ -1735,6 +1735,27 @@ export class MissionStore {
     return reconciled;
   }
 
+  /**
+   * Re-queue tasks left in RETRYING back to READY so mission recovery re-runs
+   * the SAME task instead of advancing the phase. This is the companion to a
+   * resumable controller-disconnect cancel, which leaves the task RETRYING (not
+   * terminally CANCELED). Idempotent: tasks not in RETRYING are untouched, and a
+   * terminally CANCELED task is never resurrected.
+   * @returns the number of tasks re-queued.
+   */
+  requeueResumableTasks(missionId: string): number {
+    let requeued = 0;
+    for (const task of this.listTasks(missionId)) {
+      if (task.status === "RETRYING") {
+        this.transitionTask(task.task_id, "READY", "system", {
+          failure_reason: "resumable task re-queued after controller-disconnect recovery",
+        });
+        requeued += 1;
+      }
+    }
+    return requeued;
+  }
+
   /** Append inert late evidence and keep append failures visible in persistenceDiagnostics(). */
   async recordLateExecution(executionId: string, reason: string, evidence: LateExecutionEvidence): Promise<boolean> {
     this.rejectLateExecution(executionId, reason, evidence);
