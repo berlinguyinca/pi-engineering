@@ -33,7 +33,7 @@ function prevented(
     contextUtilization: utilization,
     family,
     target: "x.ts",
-    metrics: { noProgressTurns: turns, repeatedCalls: turns, staleToolResults: 0 },
+    metrics: { noProgressTurns: turns, repeatedCalls: turns, staleToolResults: 0, noMutationStall: 0 },
   };
 }
 

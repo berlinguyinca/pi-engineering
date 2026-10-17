@@ -133,6 +133,13 @@ export interface ProgressVector {
    * invocation — i.e. the result did not advance, it is stale.
    */
   staleToolResults: number;
+  /**
+   * Trailing run of non-mutating actions (no write/edit/worker_result) by the
+   * last-observed role. For artifact-producing roles a long non-mutating run is
+   * a "thrashing" stall; analysis roles (reviewer/critic) never mutate, so this
+   * is 0 for them.
+   */
+  noMutationStall: number;
   /** Fingerprint of the most recent action, or null for an empty history. */
   lastFingerprint: string | null;
 }
@@ -177,6 +184,26 @@ export const DEFAULT_PROGRESS_THRESHOLDS: ProgressThresholds = {
 };
 
 /**
+ * Worker roles that are expected to PRODUCE a mutating artifact. A long
+ * non-mutating run by one of these roles is a "thrashing" stall. Analysis roles
+ * (reviewer/critic) never mutate and are excluded.
+ */
+export const ARTIFACT_ROLES: ReadonlySet<string> = new Set(["implementer", "debugger", "integrator"]);
+
+/** Tools that constitute progress toward an artifact (a mutation). */
+export const MUTATING_TOOLS: ReadonlySet<string> = new Set(["write", "edit", "worker_result"]);
+
+/** Is a role one that is expected to produce a mutating artifact? */
+export function isArtifactRole(role: string): boolean {
+  return ARTIFACT_ROLES.has(role);
+}
+
+/** Is a tool one that mutates (writes/edits the artifact, or completes it)? */
+export function isMutatingTool(tool: string): boolean {
+  return MUTATING_TOOLS.has(tool);
+}
+
+/**
  * The structured event the supervisor emits when a loop is detected.
  * Detect-only: emitting this event changes nothing about the agent's run.
  */
@@ -210,6 +237,7 @@ export interface AgentLoopCandidateEvent {
     noProgressTurns: number;
     repeatedCalls: number;
     staleToolResults: number;
+    noMutationStall: number;
   };
 }
 
@@ -231,12 +259,20 @@ export interface LoopPreventionOptions {
    * consecutive identical actions).
    */
   noProgressTurns?: number;
+  /**
+   * Trailing run of non-mutating actions (no write/edit/worker_result) by an
+   * artifact-producing role that prevents the current run attempt. Catches a
+   * "thrashing" stall the identical-fingerprint signal misses. Default: 40.
+   * 0 disables the stall signal.
+   */
+  noMutationStall?: number;
 }
 
 /** Default loop-prevention configuration (enforcement ON, conservative). */
 export const DEFAULT_LOOP_PREVENTION: Required<LoopPreventionOptions> = {
   enabled: true,
   noProgressTurns: 4,
+  noMutationStall: 40,
 };
 
 /**

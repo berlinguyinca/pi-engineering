@@ -141,9 +141,19 @@ export class AgentProgressSupervisor {
     // aborts the run. Conservative: only identical-fingerprint no-progress
     // triggers it; changed inputs/results change the fingerprint and keep
     // noProgressTurns low, so legitimate repeats are never prevented.
-    if (this.prevention.enabled && !this.preventionFired && vector.noProgressTurns >= this.prevention.noProgressTurns) {
+    // Phase 3 enforcement: two independent signals fire the same once-per-run
+    // prevention. (a) noProgressTurns - a tight loop (identical fingerprint);
+    // (b) noMutationStall - an artifact role thrashing on non-mutating actions
+    // (many distinct reads/bash, no write/edit) for a long run.
+    const stallThreshold = this.prevention.noMutationStall ?? 0;
+    const stallExceeded = stallThreshold > 0 && vector.noMutationStall >= stallThreshold;
+    if (
+      this.prevention.enabled &&
+      !this.preventionFired &&
+      (vector.noProgressTurns >= this.prevention.noProgressTurns || stallExceeded)
+    ) {
       this.preventionFired = true;
-      const event = this.buildPreventedEvent(action, vector.noProgressTurns);
+      const event = this.buildPreventedEvent(action, stallExceeded ? "no_mutation_stall" : "no_progress_turns");
       this.events.push(event);
       try {
         this.onPrevented?.(event);
@@ -162,7 +172,12 @@ export class AgentProgressSupervisor {
           /* Persistence is best-effort. */
         }
       }
-      return { ...verdict, emitted: true, prevented: true, preventionReason: "no_progress_turns" };
+      return {
+        ...verdict,
+        emitted: true,
+        prevented: true,
+        preventionReason: stallExceeded ? "no_mutation_stall" : "no_progress_turns",
+      };
     }
     if (!verdict.loop_candidate) {
       // Progress (or a non-loop action) resets the reported-loop marker.
@@ -198,14 +213,17 @@ export class AgentProgressSupervisor {
     return { ...verdict, emitted: true };
   }
 
-  private buildPreventedEvent(action: AgentAction, noProgressTurns: number): AgentLoopPreventedEvent {
-    const candidate = this.buildEvent(action, "no_progress_turns");
+  private buildPreventedEvent(
+    action: AgentAction,
+    reason: "no_progress_turns" | "no_mutation_stall",
+  ): AgentLoopPreventedEvent {
+    const candidate = this.buildEvent(action, reason);
     const { type: _type, ...rest } = candidate;
     return {
       ...rest,
       type: "agent.loop_prevented",
       prevented: true,
-      metrics: { ...candidate.metrics, noProgressTurns },
+      reason,
     };
   }
 
@@ -236,6 +254,7 @@ export class AgentProgressSupervisor {
         noProgressTurns: vector.noProgressTurns,
         repeatedCalls: vector.repeatedCalls[action.contentFingerprint] ?? 0,
         staleToolResults: vector.staleToolResults,
+        noMutationStall: vector.noMutationStall,
       },
     };
   }
