@@ -1477,7 +1477,10 @@ export class Orchestrator {
     const projection = this.observability?.projection(missionId);
     const mission = this.store.getMission(missionId);
     const pct =
-      projection?.summary.progress.approximatePercent ??
+      // Live bar shows weighted-DAG workflow progress (basis "weighted_dag" per
+      // 00-master-spec). Verified-acceptance coverage is a separate audit metric
+      // that stays 0 until the CompletionGate, so it must not drive the live bar.
+      projection?.summary.workflowProgress.approximatePercent ??
       computeProgress({
         missionId,
         tasks: this.store.listTasks(missionId),

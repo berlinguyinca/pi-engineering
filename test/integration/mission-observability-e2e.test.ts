@@ -19,6 +19,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
@@ -283,4 +284,67 @@ test("synthetic mission observability E2E scenario", async () => {
   assert.equal(replayed.workflowProgress.approximatePercent, 100);
   assert.equal(replayed.progress.verifiedComplete, true);
   assert.equal(replayed.health, "complete");
+});
+
+// P1: the LIVE progress bar must reflect weighted-DAG workflow progress, not the
+// verified-acceptance percentage. Acceptance coverage is 0 for essentially the
+// whole mission (it only becomes non-zero after the CompletionGate), so a bar
+// pinned to acceptance would sit at 0% the entire time. This drives the
+// orchestrator's private progressBar() over a deterministic store where the
+// workflow has completed (workflowProgress 100%) but acceptance is still 0%.
+test("live progress bar reflects workflow progress, not acceptance coverage (P1)", () => {
+  T = NOW;
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store, now: nowFn });
+
+  const id = store.createMission({
+    title: "Bar source",
+    goal: "Verify the live bar source",
+    user_request: "Verify the live bar source",
+    repository: "repo",
+    base_ref: "main",
+    risk_profile: "low",
+    workflow_class: "engineering",
+  }).mission_id;
+  obs.missionCreated(id, "Bar source");
+
+  // One implementation task runs to completion. Weighted-DAG workflow progress
+  // rises above 0 while verified-acceptance coverage stays 0 (no gate passed).
+  const task = store.createTask({
+    mission_id: id,
+    kind: "agent",
+    role: "implementer",
+    objective: "Implement the feature",
+  });
+  walkMission(store, id, "EXECUTING");
+  obs.phaseChanged(id, "EXECUTING");
+  store.transitionTask(task.task_id, "READY");
+  store.transitionTask(task.task_id, "RUNNING");
+  obs.workerStarted(id, "wk-impl", { taskId: task.task_id });
+  obs.taskProgress(id, task.task_id, 10, 10);
+  store.transitionTask(task.task_id, "SUCCEEDED");
+  obs.workerCompleted(id, "wk-impl");
+  obs.taskCompleted(id, task.task_id, "implemented");
+
+  const summary = obs.summary(id)!;
+  assert.equal(summary.progress.approximatePercent, 0, "precondition: acceptance coverage is 0");
+  assert.ok(
+    summary.workflowProgress.approximatePercent > 0,
+    "precondition: workflow progress is positive",
+  );
+
+  const orchestrator = new Orchestrator({ store, backends: {}, observability: obs, planner: async () => [] });
+  const progressBar = (
+    orchestrator as unknown as {
+      progressBar: (missionId: string) => string;
+    }
+  ).progressBar.bind(orchestrator);
+  const bar = progressBar(id);
+  // The bar must reflect the workflow percentage, not the 0% acceptance.
+  const workflowPct = Math.round(summary.workflowProgress.approximatePercent);
+  // Bar must contain the workflow percentage and be non-zero (not pinned to 0%).
+  assert.match(bar, /\[#/, "bar has at least one filled cell");
+  assert.match(bar, new RegExp(String(workflowPct) + "%$"), "bar label is the workflow percentage");
+  assert.doesNotMatch(bar, /0%$/, "bar must not render the 0% acceptance coverage");
 });

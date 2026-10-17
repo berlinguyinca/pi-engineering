@@ -211,7 +211,11 @@ The feature is accepted only when:
 - progress survives reconnect/restart;
 - 100% appears only after CompletionGate pass;
 - existing mission/review/autospec behavior remains functional.
-- primary percentage reflects verified acceptance coverage,
+- the live progress bar percentage reflects weighted-DAG workflow progress
+  (`progress.basis = "weighted_dag"`, per 00-master-spec) — never the acceptance
+  coverage, which stays 0 until the CompletionGate;
+- verified acceptance coverage is a separate summary metric (shown alongside
+  the bar, e.g. `acceptance 12%`), distinct from the live progress bar,
 - workflow progress remains separately visible,
 - workerless missions are never generically ACTIVE,
 - every wait and recovery has a next action/deadline,
