@@ -118,6 +118,27 @@ export function parseTaskContract(raw: unknown): ContractParse {
   const constraints = stringList(raw.constraints, `${id}.constraints`, errors);
   const relevant_files = stringList(raw.relevant_files, `${id}.relevant_files`, errors);
   const decisions = stringList(raw.decisions, `${id}.decisions`, errors);
+  // Per-task execution requirement (P3): an optional object with a model
+  // ("provider/id") and/or hard capability requirements. Lenient on the
+  // capability list, like every other list field; strict on the shape.
+  let execution: TaskContract["execution"];
+  if (raw.execution !== undefined) {
+    if (!isRecord(raw.execution)) {
+      errors.push(`${id}.execution must be an object`);
+    } else {
+      const e = raw.execution as Record<string, unknown>;
+      const parsed: { model?: string; capabilities?: string[] } = {};
+      if (e.model !== undefined) {
+        if (typeof e.model === "string" && e.model.trim()) parsed.model = e.model.trim();
+        else errors.push(`${id}.execution.model must be a non-empty string`);
+      }
+      if (e.capabilities !== undefined) {
+        const caps = stringList(e.capabilities, `${id}.execution.capabilities`, errors);
+        if (caps.length > 0) parsed.capabilities = caps;
+      }
+      if (Object.keys(parsed).length > 0) execution = parsed;
+    }
+  }
   let risk: ContractRisk = "medium";
   if (raw.risk !== undefined) {
     if (typeof raw.risk === "string" && (RISKS as readonly string[]).includes(raw.risk))
@@ -139,6 +160,7 @@ export function parseTaskContract(raw: unknown): ContractParse {
       risk,
       relevant_files,
       decisions,
+      ...(execution ? { execution } : {}),
     },
   };
 }

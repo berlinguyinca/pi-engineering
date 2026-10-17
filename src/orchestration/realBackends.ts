@@ -138,6 +138,14 @@ export interface RouteModelOptions {
   replacement?: boolean;
   /** The mission being dispatched: its operator pin, if any, places the role. */
   missionId?: string;
+  /**
+   * The task's required model ("provider/id") from its execution requirements
+   * (P3). Wins over role pins and ranking, but below the operator's live pin;
+   * an unserviceable requirement degrades to normal routing, never fails.
+   */
+  taskOverride?: string;
+  /** Hard capability requirements from the task's execution requirements (P3). */
+  extraRequires?: string[];
 }
 
 /** Resolve a worker role to a model placement, or undefined for the executor default. */
@@ -718,29 +726,63 @@ export function realBackends(opts: RealBackendsOptions) {
     return { run, route, model };
   };
   /** Takeover plan for a routed worker role: the next model the router offers. */
-  const routedPlan = async (role: string, context: { missionId?: string; taskId?: string }, prefix: string) => ({
-    // An unrouted role runs on the session default; when that provider is
-    // cooling, the registry places it on a live model instead.
-    initial: await (async () => {
-      const routed = await opts.routeModel?.(role, { missionId: context.missionId });
-      const fallback = opts.reviewFallbackModel;
-      if (routed ? !cooling(routed.provider) : !fallback || !cooling(fallback.provider)) return routed;
-      return (await registryRoute(role, routed ? [routed] : [], [])) ?? routed;
-    })(),
-    next: async (tried: ModelRef[]) => {
-      const routed = await opts.routeModel?.(role, { exclude: tried, replacement: true, missionId: context.missionId });
-      if (routed && !cooling(routed.provider)) return routed;
-      return (await registryRoute(role, routed ? [...tried, routed] : tried, [])) ?? routed;
-    },
-    onProviderUnreachable: (model: ModelRef) =>
-      unreachableProviders.set(model.provider, Date.now() + UNREACHABLE_PROVIDER_COOLDOWN_MS),
-    repick: async (tried: ModelRef[]) =>
-      opts.routeModel?.(role, { ...(tried.length > 0 ? { exclude: tried } : {}), missionId: context.missionId }),
-    freshSessionId: () => id(prefix),
-    context,
-    announceWarnings: true,
-    failoverWhenNoToolCalls: role === "implementer",
-  });
+  const routedPlan = async (
+    role: string,
+    context: { missionId?: string; taskId?: string },
+    prefix: string,
+    /** The task's execution requirements (P3): model override + capabilities. */
+    requirements?: Record<string, unknown>,
+  ) => {
+    // P3: the task's own routing requirement. The model override applies only
+    // to the initial placement (a failed required model must not block
+    // failover); capability requirements are task-intrinsic and stay in
+    // effect for the whole execution. An operator switch (repick) outranks
+    // the task's model override.
+    const req = requirements as { model?: unknown; capabilities?: unknown } | undefined;
+    const taskOverride = typeof req?.model === "string" && req.model.length > 0 ? req.model : undefined;
+    const extraRequires = Array.isArray(req?.capabilities)
+      ? (req.capabilities.filter((c): c is string => typeof c === "string" && c.length > 0) as string[])
+      : undefined;
+    const requirementOpts = {
+      ...(taskOverride ? { taskOverride } : {}),
+      ...(extraRequires?.length ? { extraRequires } : {}),
+    };
+    return ({
+      // An unrouted role runs on the session default; when that provider is
+      // cooling, the registry places it on a live model instead.
+      initial: await (async () => {
+        const routed = await opts.routeModel?.(role, { missionId: context.missionId, ...requirementOpts });
+        const fallback = opts.reviewFallbackModel;
+        if (routed ? !cooling(routed.provider) : !fallback || !cooling(fallback.provider)) return routed;
+        return (await registryRoute(role, routed ? [routed] : [], [])) ?? routed;
+      })(),
+      next: async (tried: ModelRef[]) => {
+        // Failover: the required model already failed, so drop the override
+        // but keep the task's capability requirements in force.
+        const routed = await opts.routeModel?.(role, {
+          exclude: tried,
+          replacement: true,
+          missionId: context.missionId,
+          ...(extraRequires?.length ? { extraRequires } : {}),
+        });
+        if (routed && !cooling(routed.provider)) return routed;
+        return (await registryRoute(role, routed ? [...tried, routed] : tried, [])) ?? routed;
+      },
+      onProviderUnreachable: (model: ModelRef) =>
+        unreachableProviders.set(model.provider, Date.now() + UNREACHABLE_PROVIDER_COOLDOWN_MS),
+      repick: async (tried: ModelRef[]) =>
+        // An operator switch outranks the task's model override; capabilities stay.
+        opts.routeModel?.(role, {
+          ...(tried.length > 0 ? { exclude: tried } : {}),
+          missionId: context.missionId,
+          ...(extraRequires?.length ? { extraRequires } : {}),
+        }),
+      freshSessionId: () => id(prefix),
+      context,
+      announceWarnings: true,
+      failoverWhenNoToolCalls: role === "implementer",
+    });
+  };
   return {
     agent: {
       async runAgent(input: {
@@ -797,7 +839,12 @@ export function realBackends(opts: RealBackendsOptions) {
         const { run, model } = await runWithModelTakeover(
           req,
           input,
-          await routedPlan(req.role, { missionId: input.missionId, taskId: input.taskId }, "WKS"),
+          await routedPlan(
+            req.role,
+            { missionId: input.missionId, taskId: input.taskId },
+            "WKS",
+            input.modelRequirements,
+          ),
         );
         recordProducer(input.missionId, model);
         return withModel(outcomeOf(run), model);

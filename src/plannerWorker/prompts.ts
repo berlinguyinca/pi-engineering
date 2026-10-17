@@ -13,9 +13,10 @@ Rules:
 - Use depends_on only for real ordering needs; independent contracts run in parallel, so give them disjoint scopes.
 - Assign risk: high for migrations, authentication, concurrency, distributed state, protocol changes, destructive operations or large refactors; low for trivial isolated edits; otherwise medium.
 - Prefer few contracts (usually 1-6).
+- Optionally give a contract "execution": {"model": "provider/id", "capabilities": ["long_context", ...]} when that task genuinely needs a specific model or capabilities (e.g. long_context for large refactors). Omit it when you are agnostic; the router then chooses.
 
 Reply with ONE JSON object and nothing else:
-{"decisions": ["..."], "architectural_context": ["..."], "contracts": [{"task_id": "a-1", "objective": "...", "depends_on": [], "scope": {"allowed": ["src/a/**"], "forbidden": []}, "acceptance": ["..."], "verification": ["npm test"], "constraints": ["..."], "risk": "medium", "relevant_files": ["src/a/x.ts"], "decisions": []}]}`;
+{"decisions": ["..."], "architectural_context": ["..."], "contracts": [{"task_id": "a-1", "objective": "...", "depends_on": [], "scope": {"allowed": ["src/a/**"], "forbidden": []}, "acceptance": ["..."], "verification": ["npm test"], "constraints": ["..."], "risk": "medium", "relevant_files": ["src/a/x.ts"], "decisions": [], "execution": {"capabilities": ["long_context"]}}]}`;
 
 export const REPLAN_PROMPT = `You are the PLANNER of an engineering mission. An implementer reported that a contract is impossible or contradictory, with evidence. Revise ONLY the contracts that are not yet passed so the mission can proceed. Keep passed contracts' ids untouched and do not include them. Reply with ONE JSON object in the same shape as the original plan: {"decisions": [...], "architectural_context": [...], "contracts": [...]}.`;
 

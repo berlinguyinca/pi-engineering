@@ -195,7 +195,14 @@ function toTasks(contracts: TaskContract[], acceptanceIds: string[], domains: Ma
     isolation: "worktree",
     depends_on: [...(deps.get(c.task_id) ?? [])],
     priority: 0,
-    execution_requirements: {},
+    // P3: carry the planner's per-task requirement (model / capabilities) so
+    // the broker records it and the router can route the task on it.
+    execution_requirements: c.execution
+      ? {
+          ...(c.execution.model ? { model: c.execution.model } : {}),
+          ...(c.execution.capabilities?.length ? { capabilities: [...c.execution.capabilities] } : {}),
+        }
+      : {},
     acceptance_ids: acceptanceIds,
     deliverables: ["implementation", "targeted-tests"],
     checkpoint_policy: { activity_milestone: 5, before_deadline_ms: 30_000 },
