@@ -54,6 +54,7 @@ function projection(over: {
       workflowProgress: { completed: 1, total: 3, approximatePercent: 33, basis: "weighted_dag" },
       health: "active",
       workers: { active: 1, waiting: 0, failed: 0 },
+      workersDetail: [],
       lastMeaningfulProgressAt: over.lastMeaningfulProgressAt,
       // The live projection types this as optional; the contract allows null.
       currentActivity: over.currentActivity as MissionProjection["summary"]["currentActivity"],
