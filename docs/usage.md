@@ -449,6 +449,18 @@ The policy applies to `openai-completions` models on providers `metabolomics`,
 comma-separated; entries match `host:port` or the bare hostname;
 `PI_THINKING_OFF_GATEWAYS` is the older name).
 
+### Model override: qwen3.8-27b never runs with thinking off
+
+Operator directive (2026-10-17): models whose id contains a `thinkingOnModels`
+fragment keep their thinking under **every** rule above — mission roles,
+compaction/summarisation, low-output-budget turns alike. The default fragment
+list is `qwen3.8-27b`; override with `PI_THINKING_ON_MODELS` (comma-separated
+fragments, lowercased; an empty value disables the default). Rationale: the
+27B mission implementer, run thinking-off, stalled in repeated file-read loops
+(APS `repeated_call` / `stale_tool_results`) and timed out on real missions;
+the model needs its hidden reasoning. Each mission-role request on a protected
+model logs `thinking: on (model override)` instead of the off notice.
+
 ## Planner/worker execution mode
 
 `/mission` can split a mission across models by cognitive role. A planner turns
