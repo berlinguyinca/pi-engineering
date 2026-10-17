@@ -12,6 +12,11 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
+import {
+  type CheckpointRefsInput,
+  attachCheckpointRefs,
+  buildCheckpointRefs,
+} from "../runtime/host/handoffCheckpointRefs.ts";
 import { type HandoffRecord, validateHandoffRecord } from "../runtime/host/handoffKinds.ts";
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import {
@@ -1874,6 +1879,28 @@ export class MissionStore {
       handoff: { ...result.record },
     });
     return { ...result.record };
+  }
+
+  /**
+   * Create and persist a HandoffRecord carrying an immutable checkpoint reference
+   * set. Builds the refs from the raw inputs (full 40-hex checkpoint + source
+   * SHAs and artifact ref/hash pairs) via `buildCheckpointRefs`, attaches them to
+   * the record (setting `checkpointSha`) via `attachCheckpointRefs`, and stores
+   * it. Throws a `HandoffRecordError` when either the refs or the base record are
+   * invalid. This is the foundation for phase-boundary handoffs that resume from
+   * a checkpoint (spec: handoff checkpoints).
+   */
+  addHandoffRecordWithCheckpointRefs(record: unknown, refsInput: CheckpointRefsInput): HandoffRecord {
+    const refsResult = buildCheckpointRefs(refsInput);
+    if (!refsResult.ok) {
+      throw new HandoffRecordError(refsResult.errors);
+    }
+    const base = validateHandoffRecord(record);
+    if (!base.ok) {
+      throw new HandoffRecordError(base.errors);
+    }
+    const withRefs = attachCheckpointRefs(base.record, refsResult.refs);
+    return this.addHandoffRecord(withRefs);
   }
 
   getHandoffRecord(id: string): HandoffRecord | undefined {

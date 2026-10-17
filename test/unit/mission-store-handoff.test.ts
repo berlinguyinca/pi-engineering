@@ -67,4 +67,55 @@ describe("MissionStore handoff records", () => {
     assert.equal(ok.state, "acknowledged");
     assert.equal(ok.successor?.sessionId, "s-2");
   });
+
+  it("stores a record with checkpoint refs attached (checkpointSha set)", () => {
+    const store = makeStore();
+    const stored = store.addHandoffRecordWithCheckpointRefs(validRecord({ id: "hf-cp" }), {
+      checkpointSha: "a".repeat(40),
+      sourceSha: "b".repeat(40),
+      artifactRefs: ["artifact://run-1/out.bin"],
+      artifactHashes: ["c".repeat(64)],
+    });
+    assert.equal(stored.checkpointSha, "a".repeat(40));
+    const fetched = store.getHandoffRecord("hf-cp");
+    assert.equal(fetched?.checkpointSha, "a".repeat(40));
+  });
+
+  it("rejects invalid checkpoint refs with a typed HandoffRecordError", () => {
+    const store = makeStore();
+    assert.throws(
+      () =>
+        store.addHandoffRecordWithCheckpointRefs(validRecord(), {
+          checkpointSha: "abc123",
+          sourceSha: "b".repeat(40),
+          artifactRefs: [],
+          artifactHashes: [],
+        }),
+      HandoffRecordError,
+    );
+    assert.throws(
+      () =>
+        store.addHandoffRecordWithCheckpointRefs(validRecord(), {
+          checkpointSha: "a".repeat(40),
+          sourceSha: "b".repeat(40),
+          artifactRefs: ["not-an-artifact-ref"],
+          artifactHashes: ["c".repeat(64)],
+        }),
+      HandoffRecordError,
+    );
+  });
+
+  it("rejects an invalid base record even when refs are valid", () => {
+    const store = makeStore();
+    assert.throws(
+      () =>
+        store.addHandoffRecordWithCheckpointRefs(validRecord({ missionId: "" }), {
+          checkpointSha: "a".repeat(40),
+          sourceSha: "b".repeat(40),
+          artifactRefs: [],
+          artifactHashes: [],
+        }),
+      HandoffRecordError,
+    );
+  });
 });
