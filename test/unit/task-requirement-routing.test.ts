@@ -19,7 +19,7 @@ import { normalizeModelRecord } from "../../src/capability/modelRecord.ts";
 import { ModelCapabilityRegistry } from "../../src/capability/registry.ts";
 import { RoleRouter } from "../../src/capability/router.ts";
 import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
-import { type ModelRef } from "../../src/lifecycle/types.ts";
+import type { ModelRef } from "../../src/lifecycle/types.ts";
 import { UnavailableModels, createRouteModel } from "../../src/runtime/modelRouting.ts";
 
 const SCRATCH = mkdtempSync(join(tmpdir(), "task-req-routing-"));
@@ -61,8 +61,8 @@ async function routerFixture() {
   // Pin the implementer onto GLM so a task requirement must beat a role pin.
   // (Only the implementer: pinning the reviewer too would reserve GLM for it
   // through separation of duties and change what "the role pin wins" means.)
-  policy.routing.roles["implementer"] = {
-    ...(policy.routing.roles["implementer"] ?? {}),
+  policy.routing.roles.implementer = {
+    ...(policy.routing.roles.implementer ?? {}),
     model: `${GLM.provider}/${GLM.id}`,
   };
   const router = new RoleRouter({ registry, policy });

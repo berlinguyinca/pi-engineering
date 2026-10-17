@@ -747,7 +747,7 @@ export function realBackends(opts: RealBackendsOptions) {
       ...(taskOverride ? { taskOverride } : {}),
       ...(extraRequires?.length ? { extraRequires } : {}),
     };
-    return ({
+    return {
       // An unrouted role runs on the session default; when that provider is
       // cooling, the registry places it on a live model instead.
       initial: await (async () => {
@@ -781,7 +781,7 @@ export function realBackends(opts: RealBackendsOptions) {
       context,
       announceWarnings: true,
       failoverWhenNoToolCalls: role === "implementer",
-    });
+    };
   };
   return {
     agent: {
