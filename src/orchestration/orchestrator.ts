@@ -27,7 +27,14 @@ import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import { TURN_SUMMARY } from "../workers/activity.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
-import { type BrokerBackends, ExecutionBroker, type ExecutionOutcome, PARTIAL_PROGRESS_SUMMARY } from "./broker.ts";
+import {
+  type BrokerBackends,
+  ExecutionBroker,
+  type ExecutionOutcome,
+  MergeQueueRejectedError,
+  type MissionMergeQueueOptions,
+  PARTIAL_PROGRESS_SUMMARY,
+} from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
 import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
@@ -115,6 +122,8 @@ export type PlanTaskInput = Omit<
 export interface OrchestratorOptions {
   store: MissionStore;
   backends: BrokerBackends;
+  /** Merge-queue policy and hooks for candidate promotion (issue #153). */
+  mergeQueue?: MissionMergeQueueOptions;
   /**
    * Optional observability read-model (spec 00 §observability). When present the
    * orchestrator feeds mission/phase/task transitions into it so a real run's
@@ -402,6 +411,7 @@ export class Orchestrator {
       onActivity: (event) => this.observeWorkerActivity(event),
       checkpoints,
       artifacts: opts.artifacts,
+      ...(opts.mergeQueue ? { mergeQueue: opts.mergeQueue } : {}),
       ...(opts.timeLimits?.workerInactivityMs !== undefined
         ? { inactivityTimeoutMs: opts.timeLimits.workerInactivityMs }
         : {}),
@@ -2984,26 +2994,28 @@ export class Orchestrator {
         // Legacy in-memory orchestrators have no lease provider. Production
         // runtimes always supply ownership; retain compatibility for isolated
         // deterministic harnesses while still using the guarded Git primitive.
-        integrated = await this.broker.promoteCandidate(missionId);
+        integrated = await this.promoteThroughQueue(missionId);
       } else {
         const promotionAuthority = await this.acquireTaskAuthorityWaiting(integrationTask);
         try {
           promotionAuthority.assertAuthoritative();
-          integrated = await this.broker.promoteCandidate(missionId, promotionAuthority);
+          integrated = await this.promoteThroughQueue(missionId, promotionAuthority);
         } catch (error) {
           integrated = false;
-          this.store.addFinding({
-            mission_id: missionId,
-            task_id: integrationTask.task_id,
-            severity: "blocking",
-            category: "integration",
-            file: null,
-            line: null,
-            summary: `Candidate promotion rejected: ${error instanceof Error ? error.message : String(error)}`,
-            evidence: null,
-            recommended_action:
-              "Inspect the preserved candidate and retry only from the originally bound incumbent base.",
-          });
+          // A bounded-out queue rejection already recorded its blocking finding.
+          if (!(error instanceof MergeQueueRejectedError))
+            this.store.addFinding({
+              mission_id: missionId,
+              task_id: integrationTask.task_id,
+              severity: "blocking",
+              category: "integration",
+              file: null,
+              line: null,
+              summary: `Candidate promotion rejected: ${error instanceof Error ? error.message : String(error)}`,
+              evidence: null,
+              recommended_action:
+                "Inspect the preserved candidate and retry only from the originally bound incumbent base.",
+            });
         } finally {
           await promotionAuthority.close();
         }
@@ -4005,6 +4017,23 @@ export class Orchestrator {
         return this.acquireTaskAuthority(task);
       },
     });
+  }
+
+  /**
+   * Promote through the broker's merge queue. A rejection the broker answered
+   * with REPAIRING is retried through the queue (each retry is a durably
+   * counted repair round); the broker answers BLOCKED once the rounds are spent,
+   * so this loop is bounded by store records, not by memory.
+   */
+  private async promoteThroughQueue(missionId: string, authority?: DispatchAuthority): Promise<boolean> {
+    for (;;) {
+      try {
+        return await this.broker.promoteCandidate(missionId, authority);
+      } catch (error) {
+        if (!(error instanceof MergeQueueRejectedError) || error.next !== "REPAIRING") throw error;
+        this.report(missionId, `[mission ${missionId}] ${error.message}; retrying through the merge queue`);
+      }
+    }
   }
 
   /** Reconcile a previously committed CAS before any new validation or review gates run. */

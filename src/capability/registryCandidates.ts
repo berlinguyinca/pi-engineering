@@ -61,3 +61,20 @@ export function filterEnabledModels<T extends ModelRef>(
   });
   return models.filter((model) => matchers.some((re) => re.test(modelKey(model)) || re.test(model.id)));
 }
+
+/**
+ * Whether a reviewer of another family than `reviewerModel` was available, from
+ * the same pool the reviewer picker draws on: live models within the operator's
+ * `enabledModels` scope, or every live model when nothing enabled is live. A
+ * model whose family is unknown, on either side, never counts as different.
+ */
+export function differentFamilyReviewerAvailable(
+  models: readonly ModelRef[],
+  reviewerModel: string,
+  options: { enabledPatterns?: readonly string[]; isUnavailable?: (model: ModelRef) => boolean } = {},
+): boolean {
+  const live = models.filter((model) => !options.isUnavailable?.(model));
+  const scoped = filterEnabledModels(live, options.enabledPatterns);
+  const pool = scoped.length > 0 ? scoped : live;
+  return pool.some((model) => !sameFamily(model.id, reviewerModel));
+}

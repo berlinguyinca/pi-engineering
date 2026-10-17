@@ -722,6 +722,26 @@ one and says so in its warnings. An integration run whose checks ran and failed
 is classified `VALIDATION_FAILED` (a code repair); `MERGE_CONFLICT` is reserved
 for an actual merge conflict.
 
+### Promotion through the merge queue
+
+A mission's candidate reaches the shared checkout only through the SHA-fenced
+merge queue (`src/merge/MergeQueue.ts`), which the broker builds once per
+repository and target branch. Promotion needs passing validation (a clean
+failure-baseline verdict) and an approving review for the exact candidate SHA.
+The entry is bound to that reviewed SHA and to the base it was validated on: a
+candidate branch or target that moved is never merged, required checks that
+fail or are pending block (none are configured unless a host supplies them, so
+GitHub is never required), and the queue reports `MERGE_QUEUED`, `MERGING`,
+`MERGED`. A same-model review (`same_model_reduced`) blocks promotion when a
+reviewer of another model family was available or
+`PI_ENGINEERING_REQUIRE_INDEPENDENT_REVIEW=1` is set; otherwise the mission
+promotes and records one `review_independence` warning. A queue rejection (stale
+base, conflict, failing checks) moves the mission to `REPAIRING` and retries; the
+third rejection in one resumption leaves it `BLOCKED` with a durable stop. A
+repair round re-enters the queue; it does not rebase the candidate onto a moved
+target, so a stale base ends `BLOCKED` for the operator to rebase and resume. A
+restart while `MERGING` finishes the committed promotion instead of merging again.
+
 ### Verification result reuse
 
 The full suite runs once per candidate commit. Integration stores its passing
