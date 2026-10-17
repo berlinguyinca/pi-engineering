@@ -1054,9 +1054,22 @@ export class EngineeringRuntime {
         custody,
         isOwnerGone: (ownerId) => isLeaseOwnerGone(ownerId, session),
       });
+      // Register the workspace authority for every mission so the repository
+      // binding survives a runtime restart (reopen/resume). A manifest whose
+      // bound worktree has been reclaimed (cleanup, disk pressure) must not
+      // prevent the orchestrator from starting: register each one defensively
+      // and log, rather than letting a single stale manifest abort init.
       for (const mission of rt.missionStore.listMissions()) {
         const manifest = rt.missionStore.getWorkspaceManifest(mission.mission_id);
-        if (manifest) await rt.repositoryRegistry.register(manifest);
+        if (manifest) {
+          try {
+            await rt.repositoryRegistry.register(manifest);
+          } catch (error) {
+            console.warn(
+              `[pi-engineering] Skipping workspace registration for ${mission.mission_id}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
       }
       // Mission observability shares the SAME durable event store as the mission
       // controller: its `mission.obs.*` events are ignored by MissionStore replay

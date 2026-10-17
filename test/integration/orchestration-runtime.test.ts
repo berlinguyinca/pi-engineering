@@ -747,6 +747,41 @@ describe("orchestration via real EngineeringRuntime (acceptance scenarios)", () 
     );
   });
 
+  it("reopening tolerates a finished mission whose workspace repo was reclaimed (stale manifest)", async () => {
+    const target = await greenFixture();
+    const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
+    fixtures.push(target, { root: metaRoot, cleanup: () => rm(metaRoot, { recursive: true, force: true }) });
+
+    // Run a mission to completion against a secondary repo so the runtime's
+    // durable mission store records a workspace manifest bound to `target.root`.
+    const rt1 = await openRuntime(metaRoot);
+    const targetGit = await (await import("../../src/git/GitRepo.ts")).GitRepo.open(target.root);
+    assert.ok(targetGit);
+    const result = await rt1.orchestrator!.orchestrate(`Add scoped support in ${target.root}`, {
+      repository: metaRoot,
+      baseRef: await targetGit.headCommit(),
+      mutationRequested: true,
+    });
+    assert.equal(result.completed, true, result.failureReason ?? "");
+    const manifest = rt1.missionStore!.getWorkspaceManifest(result.mission.mission_id);
+    assert.ok(manifest);
+    assert.equal(manifest.repositories[0]?.canonicalRoot, target.root);
+    await rt1.missionStore!.flush();
+    await rt1.close();
+
+    // Reclaim the bound worktree (cleanup / disk pressure) and reopen. A stale
+    // manifest for a FINISHED mission must not abort orchestrator initialization.
+    await rm(target.root, { recursive: true, force: true });
+    const rt2 = await openRuntime(metaRoot);
+    assert.ok(rt2.missionStore, "orchestrator must initialize despite a stale finished-mission manifest");
+    assert.equal(
+      rt2.missionStore!.getMission(result.mission.mission_id)?.status,
+      "COMPLETE",
+      "finished mission state must still be replayed",
+    );
+    await rt2.close();
+  });
+
   it("a mutating mission's change actually lands in the repository (worktree -> merge)", async () => {
     const fx = await greenFixture();
     fixtures.push(fx);
