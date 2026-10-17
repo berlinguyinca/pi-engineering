@@ -352,3 +352,45 @@ mission-ownership suite passes 19/19.
    or a longer `leaseMs`) so a long model request cannot starve the heartbeat into a lapse. The
    self-recovery now handles the lapse, but a wider margin avoids the unnecessary
    fence/reconcile cycle.
+
+## Bug 4: stale MISSION fencing identity latches the heartbeat dead (found live, 2026-10-17)
+
+**Observed (live, mission `MSN-83FqFm`, the disk-pressure mission):** the mission ran
+healthy for ~40 min, then on a recovery cycle the lease was re-fenced and the heartbeat
+latched dead with:
+
+```
+lease renewal failed 3 times in a row: stale mission fencing identity for MSN-83FqFm: generation=2 fencingToken=2
+lease renewal failed 3 times in a row: stale mission fencing identity for MSN-83FqFm: generation=1 fencingToken=1
+```
+
+The mission then spun in a `recovery.failed` → re-fence loop (gen 3→5→7→9) with
+`resumptionGeneration: 0`, and the operator agent gave up and re-launched a fresh mission.
+
+**Root cause:** the *same failure class as Bug 3, one lease level higher.* A
+`FENCE_RECONCILE_AND_RESUME` recovery re-fences the **mission** lease to a new
+generation/fencingToken. The dispatch authority's cached *mission* identity goes
+permanently stale; `renew()` rejects it via `assertSameEpoch(identity, current, "mission")`.
+
+The Bug 3 fix wrapped only the **repository** renewal in a stale-fencing guard, so the
+*mission* renewal error propagated to the heartbeat and latched it dead after
+`maxConsecutiveRenewFailures` (3) consecutive failures.
+
+**Fix (commit `03d783c`):** in `RenewableDispatchAuthority.pulse()`, wrap the mission
+renewal in the *same* guard as the repository renewal. On a `stale mission fencing
+identity` error, re-acquire the mission lease via `ownership.acquire(missionId)` (which
+renews the current re-fenced lease for the same owner) so the authority tracks the new
+generation instead of counting the permanent mismatch toward the failure threshold.
+
+**Test:** new `StaleMissionOwnership` mock + `re-acquires a re-fenced MISSION lease
+instead of lapping out on a stale epoch`. (Also repaired the pre-existing
+`StaleRepositoryOwnership` mock — it referenced the unimported `RepositoryLease` type and
+the private `store` field; now imports the type and captures `store` via a constructor.)
+
+**Verified:** mission-ownership + orphan-recovery + broker + repo-lease unit suites
+**108/108 pass**; mission-reliability-foundation integration **44/44 pass**; typecheck
+clean.
+
+**Status:** live re-verification pending — requires restarting the pi process to load the
+fixed `ownership.ts`, then re-launching the disk-pressure mission and watching a recovery
+cycle survive (both mission *and* repository leases).
