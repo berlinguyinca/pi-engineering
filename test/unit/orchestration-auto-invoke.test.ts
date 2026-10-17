@@ -21,13 +21,42 @@ describe("auto-invoke exported constants (spec 06)", () => {
 
 describe("isBareContinuation", () => {
   it("detects bare retry/continue nudges", () => {
-    for (const p of ["retry", "Retry", "try again", "try again!", "continue", "continue.", "go on", "go ahead", "keep going", "carry on", "resume", "proceed", "next", "ok", "okay", "yes", "y", "yep", "sure", "do it", "done", "please retry"]) {
+    for (const p of [
+      "retry",
+      "Retry",
+      "try again",
+      "try again!",
+      "continue",
+      "continue.",
+      "go on",
+      "go ahead",
+      "keep going",
+      "carry on",
+      "resume",
+      "proceed",
+      "next",
+      "ok",
+      "okay",
+      "yes",
+      "y",
+      "yep",
+      "sure",
+      "do it",
+      "done",
+      "please retry",
+    ]) {
       assert.equal(isBareContinuation(p), true, p);
     }
   });
 
   it("does not treat a real mission request as a bare continuation", () => {
-    for (const p of ["Add a health endpoint to the API server", "Fix the login bug", "review my changes", "retry the mission", "continue the migration plan"]) {
+    for (const p of [
+      "Add a health endpoint to the API server",
+      "Fix the login bug",
+      "review my changes",
+      "retry the mission",
+      "continue the migration plan",
+    ]) {
       assert.equal(isBareContinuation(p), false, p);
     }
   });
@@ -93,7 +122,15 @@ describe("mission auto-invoke decision (session review)", () => {
     assert.equal(typeof d.reason, "string");
     assert.ok(d.reason.length > 0);
     // workflow is at/above engineering (auto-invoke rank), never conversation.
-    const order = ["conversation", "research", "investigation", "engineering", "review", "engineering_review", "security_sensitive"];
+    const order = [
+      "conversation",
+      "research",
+      "investigation",
+      "engineering",
+      "review",
+      "engineering_review",
+      "security_sensitive",
+    ];
     assert.ok(order.indexOf(d.workflow) >= order.indexOf("engineering"), d.workflow);
   });
 
@@ -109,7 +146,11 @@ describe("mission auto-invoke decision (session review)", () => {
     assert.equal(decideAutoInvoke({ ...base, prompt: "/mission status" }).invoke, false);
     assert.equal(decideAutoInvoke({ ...base, prompt: "Explain what the scheduler module does today" }).invoke, false);
     // conversation-classified prompt that is long enough must not invoke.
-    assert.equal(decideAutoInvoke({ ...base, prompt: "Explain how the scheduler module distributes work across the worker pool" }).invoke, false);
+    assert.equal(
+      decideAutoInvoke({ ...base, prompt: "Explain how the scheduler module distributes work across the worker pool" })
+        .invoke,
+      false,
+    );
     const prompt = "Add a health endpoint to the API server";
     assert.equal(
       decideAutoInvoke({ ...base, prompt, lastAutoInvoked: { prompt, at: base.now - 5_000 } }).invoke,
