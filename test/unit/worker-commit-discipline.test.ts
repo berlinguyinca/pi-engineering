@@ -100,6 +100,7 @@ test("the flag is plumbed broker → realBackends → WorkerRequest only for a b
     objective: "x",
     worktree: "/wt",
     isolatedWorktree: true,
+    assignedWorktree: { path: "/wt", branch: "assigned", repositoryRoot: "/repo" },
     signal,
   });
   // The fallback: no worktree, the user's checkout.
@@ -110,6 +111,9 @@ test("the flag is plumbed broker → realBackends → WorkerRequest only for a b
     seen.map((r) => r.isolatedWorktree === true),
     [true, false, false],
   );
+
+  assert.deepEqual(seen[0]!.assignedWorktree, { path: "/wt", branch: "assigned", repositoryRoot: "/repo" });
+  assert.equal(seen[1]!.assignedWorktree, undefined);
 
   // The broker says so only when it really allocated one. Without a git
   // provider a requested isolated mutation fails closed before dispatch.
@@ -168,7 +172,11 @@ test("the broker reports isolatedWorktree: true when it allocated a real git wor
       risk_profile: "low",
       workflow_class: "engineering_review",
     });
-    const seen: Array<{ worktree?: string | null; isolatedWorktree?: boolean }> = [];
+    const seen: Array<{
+      worktree?: string | null;
+      isolatedWorktree?: boolean;
+      assignedWorktree?: WorkerRequest["assignedWorktree"];
+    }> = [];
     const broker = new ExecutionBroker({
       store,
       git,
@@ -176,7 +184,11 @@ test("the broker reports isolatedWorktree: true when it allocated a real git wor
       backends: {
         agent: {
           runAgent: async (input) => {
-            seen.push({ worktree: input.worktree, isolatedWorktree: input.isolatedWorktree });
+            seen.push({
+              worktree: input.worktree,
+              isolatedWorktree: input.isolatedWorktree,
+              assignedWorktree: input.assignedWorktree,
+            });
             return { executionId: "e", exitStatus: "succeeded", summary: "ok", artifactRefs: [], usage: {} };
           },
         },
@@ -205,6 +217,11 @@ test("the broker reports isolatedWorktree: true when it allocated a real git wor
     assert.equal(seen.length, 1);
     assert.ok(seen[0]!.worktree && seen[0]!.worktree !== fx.root, "a separate worktree was allocated");
     assert.equal(seen[0]!.isolatedWorktree, true);
+    assert.deepEqual(seen[0]!.assignedWorktree, {
+      path: seen[0]!.worktree,
+      branch: `pi-eng-orch-${t.task_id}`,
+      repositoryRoot: fx.root,
+    });
   } finally {
     await fx.cleanup();
   }

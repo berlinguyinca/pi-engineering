@@ -530,3 +530,48 @@ for (const tolerantFileTools of [false, true]) {
     });
   });
 }
+
+for (const scenario of [
+  "primary checkout",
+  "unrelated clone",
+  "changed branch",
+  "assigned worktree",
+  "detached worktree",
+] as const) {
+  test(`worker assignment: ${scenario} is checked before inference`, async () => {
+    await withProbe(
+      [toolCalls([{ name: "worker_result", args: result({ status: "blocked", summary: "nothing to change" }) }])],
+      async ({ executor, req, cwd, bodies }) => {
+        const assignedPath = join(cwd, "..", "assigned");
+        const branch = "assigned-worker";
+        git(cwd, "worktree", "add", "-qb", branch, assignedPath);
+        let workerCwd = assignedPath;
+        if (scenario === "primary checkout") workerCwd = cwd;
+        if (scenario === "unrelated clone") {
+          workerCwd = join(cwd, "..", "clone");
+          git(cwd, "clone", "-q", cwd, workerCwd);
+        }
+        if (scenario === "changed branch") git(assignedPath, "branch", "-m", "unexpected-branch");
+        if (scenario === "detached worktree") git(assignedPath, "checkout", "--detach", "-q");
+        const run = await executor.run(
+          req({
+            cwd: workerCwd,
+            assignedWorktree: {
+              path: scenario === "unrelated clone" ? workerCwd : assignedPath,
+              repositoryRoot: cwd,
+              ...(scenario === "detached worktree" ? {} : { branch }),
+            },
+          }),
+        );
+        if (scenario === "assigned worktree" || scenario === "detached worktree") {
+          assert.equal(run.result.status, "blocked", run.result.summary);
+          assert.equal(bodies.length, 1);
+        } else {
+          assert.equal(run.result.status, "failed", run.result.summary);
+          assert.equal(run.error, "worktree-mismatch");
+          assert.equal(bodies.length, 0, "assignment failure must precede any inference request");
+        }
+      },
+    );
+  });
+}
