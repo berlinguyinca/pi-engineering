@@ -10,6 +10,7 @@
 export * from "./config.ts";
 export * from "./duration.ts";
 export * from "./classify.ts";
+export * from "./diskPressure.ts";
 export * from "./circuitBreaker.ts";
 export * from "./retryWindow.ts";
 export * from "./probe.ts";
