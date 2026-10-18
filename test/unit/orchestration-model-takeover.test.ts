@@ -541,6 +541,63 @@ describe("model takeover: agent workers", () => {
 });
 
 describe("model takeover: reviewer", () => {
+  for (const role of ["reviewer", "vision_reviewer"]) {
+    for (const sessionFallback of [true, false]) {
+      it(`blocks ${role} before dispatch when the registry only has an incompatible model (session fallback: ${sessionFallback})`, async () => {
+        const seen: WorkerRequest[] = [];
+        const backends = realBackends({
+          worker: gatewayWorker(new Set(), seen),
+          verifier: {} as never,
+          artifacts: { readContentByUri: async () => undefined } as never,
+          git: null,
+          cwd: "/repo",
+          routeModel: async () => undefined,
+          registryModels: () => [{ ...B, contextWindow: 32_768, input: ["text"], toolCall: true }],
+          ...(sessionFallback ? { reviewFallbackModel: B } : {}),
+        });
+        const input = { role, objective: "review", signal: signal() };
+        const outcome =
+          role === "reviewer" ? await backends.review.runReview(input) : await backends.agent.runAgent(input);
+        assert.equal(outcome.exitStatus, "failed");
+        assert.equal(outcome.error, "transient:model_unavailable");
+        assert.match(outcome.summary, /no eligible .*reviewer model/);
+        assert.equal(seen.length, 0, "incompatible models must not execute review tools");
+      });
+    }
+  }
+
+  it("does not force a session fallback rejected by a configured router without registry metadata", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: gatewayWorker(new Set(), seen),
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async () => undefined,
+      reviewFallbackModel: B,
+    });
+    const outcome = await backends.review.runReview({ objective: "review", signal: signal() });
+    assert.equal(outcome.exitStatus, "failed");
+    assert.equal(outcome.error, "transient:model_unavailable");
+    assert.equal(seen.length, 0);
+  });
+
+  it("keeps standalone default review available when no routing or registry information is configured", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: gatewayWorker(new Set(), seen),
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: "/repo",
+    });
+    const outcome = await backends.review.runReview({ objective: "review", signal: signal() });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]?.modelOverride, undefined);
+  });
+
   it("takes over, announces the switch, and judges independence on the final model", async () => {
     const h = await harness({ pool: [A, B], gone: [A] });
     const activity: WorkerActivity[] = [];
@@ -564,19 +621,12 @@ describe("model takeover: reviewer", () => {
     );
   });
 
-  it("falls back once to the session model when no distinct reviewer is left", async () => {
+  it("does not bypass the capability router with an undiscovered session fallback", async () => {
     const h = await harness({ pool: [A], gone: [A] });
-    const activity: WorkerActivity[] = [];
-    const outcome = await h.backends.review.runReview({
-      objective: "review",
-      signal: signal(),
-      onActivity: (e) => activity.push(e),
-    });
-    assert.equal(outcome.exitStatus, "succeeded");
-    assert.deepEqual(h.models(), [modelKey(A), modelKey(SESSION)]);
-    assert.equal(outcome.reviewEvidence?.model, SESSION.id);
-    assert.equal(outcome.reviewEvidence?.independenceMode, "same_model_reduced");
-    assert.ok(activity.some((e) => e.stage === "review" && /reduced independence/.test(e.summary)));
+    const outcome = await h.backends.review.runReview({ objective: "review", signal: signal() });
+    assert.equal(outcome.exitStatus, "failed");
+    assert.equal(outcome.error, "transient:model_unavailable");
+    assert.deepEqual(h.models(), [modelKey(A)]);
   });
 
   it("does not fall back to a session model that is itself unavailable", async () => {

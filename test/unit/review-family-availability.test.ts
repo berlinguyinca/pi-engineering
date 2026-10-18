@@ -7,11 +7,24 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { differentFamilyReviewerAvailable } from "../../src/capability/registryCandidates.ts";
 
-const qwen = { provider: "local", id: "qwen3-32b" };
-const qwenSmall = { provider: "local", id: "qwen3-8b" };
-const claude = { provider: "anthropic", id: "claude-sonnet-4-5" };
+const qwen = { provider: "local", id: "qwen3-32b", toolCall: true, contextWindow: 262_144 };
+const qwenSmall = { provider: "local", id: "qwen3-8b", toolCall: true, contextWindow: 262_144 };
+const claude = { provider: "anthropic", id: "claude-sonnet-4-5", toolCall: true, contextWindow: 262_144 };
 
 describe("differentFamilyReviewerAvailable (issue #153)", () => {
+  it("does not count an incompatible different-family model as an independent reviewer", () => {
+    assert.equal(
+      differentFamilyReviewerAvailable(
+        [
+          { ...qwen, toolCall: true, contextWindow: 262_144 },
+          { ...claude, toolCall: true, contextWindow: 32_768, input: ["text"] },
+        ],
+        qwen.id,
+      ),
+      false,
+    );
+  });
+
   it("is false when every live model shares the reviewer's family", () => {
     assert.equal(differentFamilyReviewerAvailable([qwen, qwenSmall], qwen.id), false);
   });
