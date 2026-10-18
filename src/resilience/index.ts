@@ -17,4 +17,5 @@ export * from "./idempotency.ts";
 export * from "./watchdog.ts";
 export * from "./checkpoint.ts";
 export * from "./MissionSupervisor.ts";
+export * from "./storagePressure.ts";
 export * from "./metrics.ts";

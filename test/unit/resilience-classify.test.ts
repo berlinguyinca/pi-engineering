@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CATEGORY_TO_STATE, classifyInfraError } from "../../src/resilience/classify.ts";
+import { CATEGORY_TO_STATE, classifyInfraError, classifyStorageIncident } from "../../src/resilience/classify.ts";
 
 describe("classifyInfraError", () => {
   it("classifies 503 / no worker as transient infrastructure", () => {
@@ -84,5 +84,65 @@ describe("classifyInfraError", () => {
     assert.equal(CATEGORY_TO_STATE.CONTEXT_RECOVERABLE, "RECOVERING_CONTEXT");
     assert.equal(CATEGORY_TO_STATE.AUTH_CONFIG, "NEEDS_ATTENTION");
     assert.equal(CATEGORY_TO_STATE.INVALID_REQUEST, "NEEDS_ATTENTION");
+  });
+});
+
+describe("classifyStorageIncident", () => {
+  it("classifies plain ENOSPC as disk-full and auto-recoverable", () => {
+    const err = Object.assign(new Error("write"), { code: "ENOSPC", path: "/data/out" });
+    const inc = classifyStorageIncident(err);
+    assert.equal(inc.category, "DISK_FULL");
+    assert.equal(inc.recovery, "AUTO");
+    assert.equal(inc.autoRecover, true);
+    assert.equal(inc.needsOperator, false);
+    assert.equal(inc.code, "ENOSPC");
+    assert.equal(inc.path, "/data/out");
+  });
+
+  it("distinguishes inode exhaustion when bytes are plentiful", () => {
+    const err = Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    const inc = classifyStorageIncident(err, { freeBytes: 1_000_000, freeInodes: 0 });
+    assert.equal(inc.category, "INODE_EXHAUSTED");
+    assert.equal(inc.autoRecover, true);
+    assert.equal(inc.needsOperator, false);
+  });
+
+  it("treats EDQUOT as an auto-recoverable quota condition", () => {
+    const err = Object.assign(new Error("quota exceeded"), { code: "EDQUOT" });
+    const inc = classifyStorageIncident(err);
+    assert.equal(inc.category, "QUOTA_EXCEEDED");
+    assert.equal(inc.recovery, "AUTO");
+    assert.equal(inc.autoRecover, true);
+  });
+
+  it("flags EROFS as an operator action, never blind auto-retry", () => {
+    const err = Object.assign(new Error("write"), { code: "EROFS" });
+    const inc = classifyStorageIncident(err);
+    assert.equal(inc.category, "READ_ONLY_FS");
+    assert.equal(inc.recovery, "OPERATOR");
+    assert.equal(inc.autoRecover, false);
+    assert.equal(inc.needsOperator, true);
+  });
+
+  it("treats EACCES as an operator action", () => {
+    const err = Object.assign(new Error("permission denied"), { code: "EACCES" });
+    const inc = classifyStorageIncident(err);
+    assert.equal(inc.needsOperator, true);
+    assert.equal(inc.autoRecover, false);
+  });
+
+  it("treats EIO conservatively but probe-recoverable", () => {
+    const err = Object.assign(new Error("input/output error"), { code: "EIO" });
+    const inc = classifyStorageIncident(err);
+    assert.equal(inc.category, "IO_ERROR");
+    assert.equal(inc.recovery, "CONSERVATIVE");
+    assert.equal(inc.autoRecover, true);
+  });
+
+  it("never classifies a healthy path as a storage failure without evidence", () => {
+    const inc = classifyStorageIncident(new Error("boom"));
+    assert.equal(inc.autoRecover, false);
+    assert.equal(inc.needsOperator, true);
+    assert.equal(inc.category, "UNKNOWN_STORAGE");
   });
 });
