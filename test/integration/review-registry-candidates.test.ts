@@ -126,7 +126,7 @@ function setup(
       apiKey: "k",
       models: pool
         .filter((m) => m.provider === name)
-        .map((m) => ({ id: m.id, contextWindow: m.contextWindow ?? 100_000, maxTokens: 4096 })),
+        .map((m) => ({ id: m.id, contextWindow: m.contextWindow ?? 262_144, maxTokens: 4096 })),
     };
   }
   writeFileSync(join(dir, "models.json"), JSON.stringify({ providers }));
@@ -147,7 +147,7 @@ function setup(
     cwd: dir,
     routeModel,
     reviewFallbackModel: session,
-    registryModels: () => pool,
+    registryModels: () => pool.map((model) => ({ toolCall: true, contextWindow: 262_144, ...model })),
     enabledModels: () => enabledModels,
   });
   const review = () =>
@@ -296,7 +296,7 @@ test("the registry fallback stays inside Pi's enabledModels even when an exclude
   const good = await listen((_req, res) => reviewReply(res));
   const url = `http://127.0.0.1:${port(good)}/v1`;
   const beastBig: RegistryModel = { ...dead, contextWindow: 900_000 };
-  const hiveSmall: RegistryModel = { ...live, contextWindow: 100_000 };
+  const hiveSmall: RegistryModel = { ...live, contextWindow: 262_144 };
   const { dir, review } = setup({ beast: url, hive: url }, [beastBig, hiveSmall], noPolicy, dead, ["hive/*"]);
   try {
     const outcome = await review();

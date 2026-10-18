@@ -14,8 +14,14 @@
 
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
-import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
+import {
+  hasCapability,
+  modelFamily,
+  normalizeModelRecord,
+  sameFamily as sameFamilyId,
+} from "../capability/modelRecord.ts";
 import { type RegistryModel, filterEnabledModels, rankRegistryModels } from "../capability/registryCandidates.ts";
+import { ROLE_REQUIREMENTS, routerRoleFor } from "../capability/roles.ts";
 import { id } from "../core/ids.ts";
 import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
@@ -265,6 +271,9 @@ const sameFamily = (a: ModelRef, b: ModelRef): boolean => sameFamilyId(a.id, b.i
 /** Upper bound on routed candidates examined while looking for a different family. */
 const MAX_FAMILY_PROBES = 16;
 
+/** Bound a takeover even when refreshed discovery keeps returning new failing models. */
+const MAX_MODEL_TAKEOVER_ATTEMPTS = 16;
+
 /** Missions whose producing models are remembered for reviewer separation. */
 export const MAX_TRACKED_MISSIONS = 256;
 
@@ -456,6 +465,7 @@ export function realBackends(opts: RealBackendsOptions) {
     role: string,
     exclude: readonly ModelRef[],
     producers: readonly ModelRef[],
+    extraRequires: readonly string[] = [],
   ): Promise<ModelRoute | undefined> => {
     let models: readonly RegistryModel[];
     try {
@@ -463,7 +473,21 @@ export function realBackends(opts: RealBackendsOptions) {
     } catch {
       return undefined;
     }
-    const live = models.filter((model) => !opts.isModelUnavailable?.(model));
+    const routerRole = routerRoleFor(role);
+    if (!routerRole) return undefined;
+    const requirements = ROLE_REQUIREMENTS[routerRole];
+    const requires = [...requirements.requires, ...extraRequires];
+    const live = models.filter((model) => {
+      if (opts.isModelUnavailable?.(model)) return false;
+      // The emergency registry path must not bypass the role/task's hard
+      // requirements when the capability router offers no replacement.
+      if (requires.includes("tool_calling") && model.toolCall !== true) return false;
+      const record = normalizeModelRecord({ ...model, source: "session-registry" });
+      return (
+        requires.every((capability) => hasCapability(record, capability)) &&
+        (model.contextWindow ?? 0) >= (requirements.minContext ?? 0)
+      );
+    });
     const patterns = opts.enabledModels?.();
     const scoped = filterEnabledModels(live, patterns);
     const rank = (pool: readonly RegistryModel[]) =>
@@ -566,8 +590,12 @@ export function realBackends(opts: RealBackendsOptions) {
     const running = route ? modelKey(route) : null;
     const refused = route?.pinRefused ?? unservable;
     req.modelSuperseded = () => {
-      const pin = pinKeyOf(missionId);
-      return pin !== null && pin !== running && pin !== refused;
+      const selected = opts.currentOperatorPin?.(missionId);
+      // Registry fallbacks have no router pinRefused metadata. A confirmed
+      // unavailable pin is still the failed choice, not a new operator switch.
+      if (!selected || opts.isModelUnavailable?.(selected)) return false;
+      const pin = modelKey(selected);
+      return pin !== running && pin !== refused;
     };
   };
   /**
@@ -698,6 +726,12 @@ export function realBackends(opts: RealBackendsOptions) {
       if (gone && !REQUEST_SPECIFIC_REFUSAL.test(reason))
         opts.onModelUnavailable?.(failed, { ...plan.context, reason });
       tried.push(failed);
+      if (tried.length >= MAX_MODEL_TAKEOVER_ATTEMPTS) {
+        const notice = `model takeover exhausted after ${tried.length} model attempts; last failure on ${modelKey(failed)}`;
+        switches.push(notice);
+        announce(notice);
+        break;
+      }
       const next = await plan.next(tried);
       if (!next || tried.some((known) => sameModel(known, next))) break;
       const notice = providerFault
@@ -754,7 +788,7 @@ export function realBackends(opts: RealBackendsOptions) {
         const routed = await opts.routeModel?.(role, { missionId: context.missionId, ...requirementOpts });
         const fallback = opts.reviewFallbackModel;
         if (routed ? !cooling(routed.provider) : !fallback || !cooling(fallback.provider)) return routed;
-        return (await registryRoute(role, routed ? [routed] : [], [])) ?? routed;
+        return (await registryRoute(role, routed ? [routed] : [], [], extraRequires)) ?? routed;
       })(),
       next: async (tried: ModelRef[]) => {
         // Failover: the required model already failed, so drop the override
@@ -766,7 +800,7 @@ export function realBackends(opts: RealBackendsOptions) {
           ...(extraRequires?.length ? { extraRequires } : {}),
         });
         if (routed && !cooling(routed.provider)) return routed;
-        return (await registryRoute(role, routed ? [...tried, routed] : tried, [])) ?? routed;
+        return (await registryRoute(role, routed ? [...tried, routed] : tried, [], extraRequires)) ?? routed;
       },
       onProviderUnreachable: (model: ModelRef) =>
         unreachableProviders.set(model.provider, Date.now() + UNREACHABLE_PROVIDER_COOLDOWN_MS),

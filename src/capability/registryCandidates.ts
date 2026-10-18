@@ -11,6 +11,9 @@ import { modelFamily, sameFamily } from "./modelRecord.ts";
 /** A model the session registry can serve. */
 export interface RegistryModel extends ModelRef {
   contextWindow?: number;
+  toolCall?: boolean;
+  input?: string[];
+  reasoning?: boolean;
 }
 
 /**
