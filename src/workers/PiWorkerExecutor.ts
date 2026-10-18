@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { connect } from "node:net";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
@@ -50,6 +51,7 @@ import {
   parseGatewayWait,
 } from "../gateway/signals.ts";
 import { MAX_ESCALATED_WAIT_MS } from "../gateway/streamRetry.ts";
+import { GitRepo } from "../git/GitRepo.ts";
 import { GenerationGuard, type GuardAbortReason } from "../guard/GenerationGuard.ts";
 import { GUARD_STEER_PROMPT, TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import {
@@ -136,6 +138,7 @@ import {
   withBudgetNotice,
 } from "./wallClockBudget.ts";
 import { createWorkerResultTool } from "./workerResultTool.ts";
+import { createWorktreeFileTools } from "./worktreeFileTools.ts";
 
 /**
  * Maximum APS loop-recovery attempts (Phase 4). Bounded to one: after a
@@ -482,6 +485,47 @@ export class PiWorkerExecutor implements WorkerExecutor {
   }
 
   private async runOnce(req: WorkerRequest): Promise<WorkerRun> {
+    if (req.assignedWorktree) {
+      try {
+        const assigned = req.assignedWorktree;
+        const [actual, repository, expectedPath, cwd] = await Promise.all([
+          resolveWorktreeIdentity(req.cwd),
+          resolveWorktreeIdentity(assigned.repositoryRoot),
+          realpath(assigned.path),
+          realpath(req.cwd),
+        ]);
+        if (
+          actual.kind !== "git" ||
+          repository.kind !== "git" ||
+          cwd !== expectedPath ||
+          actual.worktreeRoot !== expectedPath ||
+          actual.gitCommonDir !== repository.gitCommonDir
+        ) {
+          throw new Error("Worker cwd does not match its allocated worktree and repository.");
+        }
+        if (assigned.branch !== undefined) {
+          const git = await GitRepo.open(req.cwd, req.signal);
+          if (!git || (await git.currentBranch()) !== assigned.branch) {
+            throw new Error("Worker branch does not match its allocated worktree branch.");
+          }
+        }
+      } catch (error) {
+        return {
+          result: {
+            status: "failed",
+            summary: `Worktree assignment verification failed: ${error instanceof Error ? error.message : String(error)}`,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {},
+            error: "worktree-mismatch",
+          },
+          usage: null,
+          error: "worktree-mismatch",
+        };
+      }
+    }
     const modelRuntime = await this.getModelRuntime();
     let model = this.model;
     // The capability router places a role on a specific provider model. When a
@@ -615,7 +659,14 @@ export class PiWorkerExecutor implements WorkerExecutor {
         : tool;
     const customTools = [
       ...this.customTools,
-      ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
+      ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd)] : []),
+      ...(req.isolatedWorktree
+        ? (await createWorktreeFileTools(req.cwd, req.tolerantFileTools === true)).filter((tool) =>
+            req.tools.includes(tool.name),
+          )
+        : req.tolerantFileTools
+          ? [createTolerantEditTool(req.cwd)]
+          : []),
       // Every worker bash command runs one mission-depth deeper (recursion
       // guard). The built-in tool is replaced by one with the same name; the
       // budget notice wraps it only for budgeted runs.

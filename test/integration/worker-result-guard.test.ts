@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -400,11 +400,18 @@ test("guard: untracked files alone are not changes", async () => {
   );
 });
 
-test("guard: an unreadable base lets the report through", async () => {
-  await withProbe([toolCalls([{ name: "worker_result", args: result() }])], async ({ executor, req }) => {
-    const run = await executor.run(req({ baseRef: "0000000000000000000000000000000000000000" }));
-    assert.equal(run.result.status, "completed");
-  });
+test("guard: an unreadable base rejects completion but accepts a blocked report", async () => {
+  await withProbe(
+    [
+      toolCalls([{ name: "worker_result", args: result() }]),
+      toolCalls([{ name: "worker_result", args: result({ status: "blocked" }) }]),
+    ],
+    async ({ executor, req, bodies }) => {
+      const run = await executor.run(req({ baseRef: "0000000000000000000000000000000000000000" }));
+      assert.equal(run.result.status, "blocked");
+      assert.match(bodies[1]!, /cannot verify worktree changes/);
+    },
+  );
 });
 
 test("repair worker: no change on a seeded tip is caught; a commit is not", async () => {
@@ -465,3 +472,106 @@ test("no nudge after an owner abort or a timeout", async () => {
     });
   }
 });
+
+for (const scenario of ["empty commit", "reverted commit", "invalid base"] as const) {
+  test(`implementer: ${scenario} cannot substantiate completed`, async () => {
+    await withProbe(
+      [
+        toolCalls([{ name: "worker_result", args: result() }]),
+        toolCalls([{ name: "worker_result", args: result({ status: "blocked", summary: "no verified diff" }) }]),
+      ],
+      async ({ executor, req, cwd, bodies }) => {
+        if (scenario === "empty commit") git(cwd, "commit", "--allow-empty", "-qm", "empty");
+        if (scenario === "reverted commit") {
+          writeFileSync(join(cwd, "note.txt"), "changed\n");
+          git(cwd, "commit", "-qam", "change");
+          git(cwd, "revert", "--no-edit", "HEAD");
+        }
+        const run = await executor.run(req(scenario === "invalid base" ? { baseRef: "missing-base" } : {}));
+        assert.equal(run.result.status, "blocked");
+        assert.equal(bodies.length, 2);
+        assert.match(bodies[1]!, scenario === "invalid base" ? /cannot verify worktree changes/ : /no changes vs base/);
+      },
+    );
+  });
+}
+
+for (const tolerantFileTools of [false, true]) {
+  test(`isolated file mutations stay in the assigned worktree (tolerant=${tolerantFileTools})`, async () => {
+    const replies: Reply[] = [];
+    await withProbe(replies, async ({ executor, req, cwd, bodies }) => {
+      const outside = join(cwd, "..", "outside.txt");
+      writeFileSync(outside, "original\n");
+      symlinkSync(join(cwd, ".."), join(cwd, "escape"));
+      symlinkSync(outside, join(cwd, "linked.txt"));
+      for (const path of [
+        outside,
+        "../outside.txt",
+        "escape/outside.txt",
+        "linked.txt",
+        `file://${outside}`,
+        `@${outside}`,
+      ]) {
+        replies.push(toolCalls([{ name: "write", args: { path, content: "wrong\n" } }]));
+        replies.push(toolCalls([{ name: "edit", args: { path, edits: [{ oldText: "original", newText: "wrong" }] } }]));
+      }
+      replies.push(toolCalls([{ name: "write", args: { path: "escape/new-dir/new.txt", content: "wrong\n" } }]));
+      const rejectedMutations = replies.length;
+      replies.push(toolCalls([{ name: "read", args: { path: outside } }]));
+      replies.push(toolCalls([{ name: "write", args: { path: "new-dir/local.txt", content: "local\n" } }]));
+      replies.push(toolCalls([{ name: "worker_result", args: result() }]));
+      const run = await executor.run(req({ tools: ["read", "write", "edit"], tolerantFileTools, baseRef: undefined }));
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.equal(readFileSync(outside, "utf8"), "original\n");
+      assert.equal(readFileSync(join(cwd, "new-dir/local.txt"), "utf8"), "local\n");
+      assert.equal(existsSync(join(cwd, "..", "new-dir")), false);
+      assert.match(bodies[rejectedMutations]!, /outside assigned worktree/);
+      assert.match(bodies[rejectedMutations + 1]!, /original/);
+    });
+  });
+}
+
+for (const scenario of [
+  "primary checkout",
+  "unrelated clone",
+  "changed branch",
+  "assigned worktree",
+  "detached worktree",
+] as const) {
+  test(`worker assignment: ${scenario} is checked before inference`, async () => {
+    await withProbe(
+      [toolCalls([{ name: "worker_result", args: result({ status: "blocked", summary: "nothing to change" }) }])],
+      async ({ executor, req, cwd, bodies }) => {
+        const assignedPath = join(cwd, "..", "assigned");
+        const branch = "assigned-worker";
+        git(cwd, "worktree", "add", "-qb", branch, assignedPath);
+        let workerCwd = assignedPath;
+        if (scenario === "primary checkout") workerCwd = cwd;
+        if (scenario === "unrelated clone") {
+          workerCwd = join(cwd, "..", "clone");
+          git(cwd, "clone", "-q", cwd, workerCwd);
+        }
+        if (scenario === "changed branch") git(assignedPath, "branch", "-m", "unexpected-branch");
+        if (scenario === "detached worktree") git(assignedPath, "checkout", "--detach", "-q");
+        const run = await executor.run(
+          req({
+            cwd: workerCwd,
+            assignedWorktree: {
+              path: scenario === "unrelated clone" ? workerCwd : assignedPath,
+              repositoryRoot: cwd,
+              ...(scenario === "detached worktree" ? {} : { branch }),
+            },
+          }),
+        );
+        if (scenario === "assigned worktree" || scenario === "detached worktree") {
+          assert.equal(run.result.status, "blocked", run.result.summary);
+          assert.equal(bodies.length, 1);
+        } else {
+          assert.equal(run.result.status, "failed", run.result.summary);
+          assert.equal(run.error, "worktree-mismatch");
+          assert.equal(bodies.length, 0, "assignment failure must precede any inference request");
+        }
+      },
+    );
+  });
+}

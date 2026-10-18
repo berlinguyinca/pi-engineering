@@ -15,7 +15,13 @@
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
-import { type RegistryModel, filterEnabledModels, rankRegistryModels } from "../capability/registryCandidates.ts";
+import {
+  type RegistryModel,
+  filterEnabledModels,
+  rankRegistryModels,
+  registryModelSupportsRole,
+} from "../capability/registryCandidates.ts";
+import { ROLE_REQUIREMENTS, routerRoleFor } from "../capability/roles.ts";
 import { id } from "../core/ids.ts";
 import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
@@ -265,6 +271,9 @@ const sameFamily = (a: ModelRef, b: ModelRef): boolean => sameFamilyId(a.id, b.i
 /** Upper bound on routed candidates examined while looking for a different family. */
 const MAX_FAMILY_PROBES = 16;
 
+/** Bound a takeover even when refreshed discovery keeps returning new failing models. */
+const MAX_MODEL_TAKEOVER_ATTEMPTS = 16;
+
 /** Missions whose producing models are remembered for reviewer separation. */
 export const MAX_TRACKED_MISSIONS = 256;
 
@@ -400,6 +409,23 @@ function validRawSpecGap(value: unknown): boolean {
   }
 }
 
+/** No review was dispatched: keep this a routing failure rather than a candidate defect. */
+function unavailableReviewer(role: string): WorkerRun {
+  return {
+    result: {
+      status: "blocked",
+      summary: `Review blocked: no eligible ${role} model satisfies the configured routing requirements.`,
+      error: "transient:model_unavailable",
+      claims: [],
+      evidence_refs: [],
+      new_hypotheses: [],
+      proposed_tasks: [],
+      details: {},
+    },
+    usage: null,
+  };
+}
+
 /** Convert a worker result into a bounded broker outcome. */
 function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): ExecutionOutcome {
   const completed = result.result.status === "completed";
@@ -456,6 +482,7 @@ export function realBackends(opts: RealBackendsOptions) {
     role: string,
     exclude: readonly ModelRef[],
     producers: readonly ModelRef[],
+    extraRequires: readonly string[] = [],
   ): Promise<ModelRoute | undefined> => {
     let models: readonly RegistryModel[];
     try {
@@ -463,7 +490,9 @@ export function realBackends(opts: RealBackendsOptions) {
     } catch {
       return undefined;
     }
-    const live = models.filter((model) => !opts.isModelUnavailable?.(model));
+    const live = models.filter(
+      (model) => !opts.isModelUnavailable?.(model) && registryModelSupportsRole(model, role, extraRequires),
+    );
     const patterns = opts.enabledModels?.();
     const scoped = filterEnabledModels(live, patterns);
     const rank = (pool: readonly RegistryModel[]) =>
@@ -566,9 +595,17 @@ export function realBackends(opts: RealBackendsOptions) {
     const running = route ? modelKey(route) : null;
     const refused = route?.pinRefused ?? unservable;
     req.modelSuperseded = () => {
-      const pin = pinKeyOf(missionId);
-      return pin !== null && pin !== running && pin !== refused;
+      const selected = opts.currentOperatorPin?.(missionId);
+      // Registry fallbacks have no router pinRefused metadata. A confirmed
+      // unavailable pin is still the failed choice, not a new operator switch.
+      if (!selected || opts.isModelUnavailable?.(selected)) return false;
+      const pin = modelKey(selected);
+      return pin !== running && pin !== refused;
     };
+  };
+  const requiresReviewRoute = (role: string): boolean => {
+    const routerRole = routerRoleFor(role);
+    return !!(opts.routeModel || opts.registryModels) && !!routerRole && ROLE_REQUIREMENTS[routerRole].independent;
   };
   /**
    * Run a worker on `plan.initial` (or, unrouted, on the executor default).
@@ -620,6 +657,7 @@ export function realBackends(opts: RealBackendsOptions) {
       }
     };
     let route = plan.initial;
+    if (!route && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route };
     if (plan.announceWarnings && route?.warning) announce(route.warning);
     if (route?.pinNotice) announce(route.pinNotice);
     const switches: string[] = [];
@@ -637,6 +675,7 @@ export function realBackends(opts: RealBackendsOptions) {
       const error = outcomeOf(run).error ?? "";
       if (error === MODEL_SUPERSEDED) {
         const next = await plan.repick(tried);
+        if (!next && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route: undefined };
         // The operator's choice resolves to the model already running: nothing
         // changes, so keep the session and carry on — no restart, no switch.
         if (next && route && modelKey(next) === modelKey(route)) {
@@ -698,6 +737,12 @@ export function realBackends(opts: RealBackendsOptions) {
       if (gone && !REQUEST_SPECIFIC_REFUSAL.test(reason))
         opts.onModelUnavailable?.(failed, { ...plan.context, reason });
       tried.push(failed);
+      if (tried.length >= MAX_MODEL_TAKEOVER_ATTEMPTS) {
+        const notice = `model takeover exhausted after ${tried.length} model attempts; last failure on ${modelKey(failed)}`;
+        switches.push(notice);
+        announce(notice);
+        break;
+      }
       const next = await plan.next(tried);
       if (!next || tried.some((known) => sameModel(known, next))) break;
       const notice = providerFault
@@ -753,8 +798,9 @@ export function realBackends(opts: RealBackendsOptions) {
       initial: await (async () => {
         const routed = await opts.routeModel?.(role, { missionId: context.missionId, ...requirementOpts });
         const fallback = opts.reviewFallbackModel;
+        if (!routed && requiresReviewRoute(role)) return registryRoute(role, [], [], extraRequires);
         if (routed ? !cooling(routed.provider) : !fallback || !cooling(fallback.provider)) return routed;
-        return (await registryRoute(role, routed ? [routed] : [], [])) ?? routed;
+        return (await registryRoute(role, routed ? [routed] : [], [], extraRequires)) ?? routed;
       })(),
       next: async (tried: ModelRef[]) => {
         // Failover: the required model already failed, so drop the override
@@ -766,7 +812,7 @@ export function realBackends(opts: RealBackendsOptions) {
           ...(extraRequires?.length ? { extraRequires } : {}),
         });
         if (routed && !cooling(routed.provider)) return routed;
-        return (await registryRoute(role, routed ? [...tried, routed] : tried, [])) ?? routed;
+        return (await registryRoute(role, routed ? [...tried, routed] : tried, [], extraRequires)) ?? routed;
       },
       onProviderUnreachable: (model: ModelRef) =>
         unreachableProviders.set(model.provider, Date.now() + UNREACHABLE_PROVIDER_COOLDOWN_MS),
@@ -792,6 +838,7 @@ export function realBackends(opts: RealBackendsOptions) {
         contextRef?: string;
         worktree?: string | null;
         isolatedWorktree?: boolean;
+        assignedWorktree?: WorkerRequest["assignedWorktree"];
         modelRequirements?: Record<string, unknown>;
         recovery?: CheckpointRecoveryContext;
         deliverables?: readonly string[];
@@ -824,6 +871,7 @@ export function realBackends(opts: RealBackendsOptions) {
           // Only the broker's word makes a directory an isolated worktree; the
           // fallback (no worktree) runs in the user's checkout.
           isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
+          assignedWorktree: input.assignedWorktree,
           recovery: input.recovery,
           deliverables: input.deliverables,
           // Every delegated implementation/recovery run is a fresh session;
@@ -1068,6 +1116,26 @@ export function realBackends(opts: RealBackendsOptions) {
         const fallback = opts.reviewFallbackModel;
         const independentOfProducers = (model: ModelRef): boolean =>
           modelFamily(model.id) !== undefined && !producers.some((m) => sameFamily(m, model));
+        const fallbackEligible = async (tried: ModelRef[]): Promise<boolean> => {
+          if (!fallback) return false;
+          // Standalone callers keep their session default. Configured routing
+          // must accept that exact model; absence of metadata is not approval.
+          if (!opts.registryModels) {
+            if (!opts.routeModel) return true;
+            const route = await opts.routeModel(req.role, {
+              exclude: tried,
+              missionId: input.missionId,
+              taskOverride: modelKey(fallback),
+            });
+            return !!route && sameModel(route, fallback);
+          }
+          try {
+            const model = (await opts.registryModels()).find((model) => sameModel(model, fallback));
+            return !!model && registryModelSupportsRole(model, req.role);
+          } catch {
+            return false;
+          }
+        };
         const pickReviewer = async (tried: ModelRef[]): Promise<ModelRoute | undefined> => {
           // Prefer a model of a different family on a reachable provider; remember
           // the first sibling of a producer's family (or unknown family), and the
@@ -1096,7 +1164,8 @@ export function realBackends(opts: RealBackendsOptions) {
             fallback &&
             !tried.some((m) => sameModel(m, fallback)) &&
             !opts.isModelUnavailable?.(fallback) &&
-            !cooling(fallback.provider)
+            !cooling(fallback.provider) &&
+            (await fallbackEligible(tried))
           ) {
             return { ...fallback, warning: reducedIndependence(fallback, "no distinct reviewer model is available") };
           }
@@ -1129,6 +1198,7 @@ export function realBackends(opts: RealBackendsOptions) {
           });
         };
         const initial = await pickReviewer([]);
+        if (!initial && requiresReviewRoute(req.role)) return outcomeOf(unavailableReviewer(req.role));
         const initialWarning = initial
           ? reviewWarning(initial)
           : "Warning: no distinct reviewer model is available; reviewing with the current worker model in a fresh session with reduced independence.";

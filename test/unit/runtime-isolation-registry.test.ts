@@ -47,6 +47,35 @@ describe("RuntimeRegistry", () => {
     }
   });
 
+  it("a stale unregister cannot release the current generation's leases", async () => {
+    const registry = RuntimeRegistry.open(await registryFile());
+    try {
+      const old = register(registry, "same-session");
+      const current = register(registry, "same-session");
+      const owned = registry.leases.acquire("res", {
+        sessionId: current.sessionId,
+        process: currentProcessIdentity(),
+      });
+      assert.ok(owned.ok);
+      assert.equal(registry.unregister(old.sessionId, old.generationId), false);
+      assert.equal(registry.get(current.sessionId)?.state, "healthy");
+      assert.equal(registry.leases.get("res")?.generationId, owned.lease.generationId);
+      register(registry, "contender");
+      assert.equal(
+        registry.leases.acquire("res", {
+          sessionId: "contender",
+          process: currentProcessIdentity(),
+        }).ok,
+        false,
+        "the live owner remains exclusive after stale shutdown",
+      );
+      assert.equal(registry.unregister(current.sessionId, current.generationId), true);
+      assert.equal(registry.leases.get("res"), undefined);
+    } finally {
+      registry.close();
+    }
+  });
+
   it("prevents session resurrection: a session declared dead cannot heartbeat its old generation back to life", async () => {
     const registry = RuntimeRegistry.open(await registryFile());
     try {
@@ -189,6 +218,29 @@ describe("LeaseManager", () => {
       assert.equal(again.lease.generationId, first.lease.generationId);
       registry.unregister("me", me.generationId);
       assert.equal(registry.leases.get("res"), undefined);
+    } finally {
+      registry.close();
+    }
+  });
+
+  it("a verifiably live holder keeps exclusive custody after a long heartbeat gap", async () => {
+    let now = Date.now();
+    const registry = RuntimeRegistry.open(await registryFile(), { now: () => now });
+    try {
+      register(registry, "live-owner");
+      const held = registry.leases.acquire("res", { sessionId: "live-owner", process: currentProcessIdentity() });
+      assert.ok(held.ok);
+      now += 12 * 60 * 60_000;
+      register(registry, "contender");
+      assert.equal(
+        registry.leases.acquire("res", {
+          sessionId: "contender",
+          process: currentProcessIdentity(),
+        }).ok,
+        false,
+      );
+      assert.deepEqual(registry.leases.reapStale(), []);
+      assert.equal(registry.leases.get("res")?.generationId, held.lease.generationId);
     } finally {
       registry.close();
     }

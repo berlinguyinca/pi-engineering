@@ -92,6 +92,17 @@ Only one live session drives a given mission (custody lease); every session sees
 every mission of the worktree. `PI_ENGINEERING_ORCHESTRATION_DIR` relocates the
 orchestration namespace but keeps per-session writers.
 
+A stale session generation cannot release leases during shutdown. A matching
+live process incarnation retains custody even when its heartbeat or lease TTL
+is old; contention alone does not justify reclamation.
+
+Lease contention diagnostics aggregate counts within a reporting window
+(default five minutes, `PI_RUNTIME_CONTENTION_SUMMARY_MS`). The first attempt
+per resource/holder is logged, and repeated attempts are summarized. Windows
+flush early at 200 distinct pairs to bound memory and summary size, and reset
+when the session log changes. Summary counts include the first attempt in that
+window; they are not cumulative process-lifetime totals.
+
 ## The Engineering Ledger
 
 The ledger is **event-sourced**: every mutation appends an event
@@ -106,6 +117,14 @@ stream to build materialized work items, candidates, and entities. Entities:
   fact** (INV-006); promoted only when backed by evidence.
 - `finding` — a reviewer finding with a severity.
 - `requirement` / `decision` — recorded goals and decisions.
+
+Worker hypotheses remain open even when they cite captured observations. A
+reference proves that an observation was recorded, not that the worker's causal
+interpretation is correct. `ledger_claim` resolves artifact and evidence IDs
+against local stores; invented IDs and records marked unverified cannot verify
+a fact. Its result explicitly reports whether the evidence reference resolved.
+For example, a heartbeat establishes liveness, while an unauthorized live probe
+leaves the requested production state unknown.
 
 ## Workers (fresh context, bounded results)
 
@@ -135,6 +154,23 @@ worktree. If the candidate passes verification and review, the runtime performs
 a **controlled merge** (`git merge --no-ff`) of the candidate branch into the
 incumbent branch — the worker never writes to the incumbent directly, and a
 conflicting merge is aborted without mutating the incumbent.
+
+The broker passes its allocated path, repository root and branch separately from
+the worker's session cwd. Before inference, the worker verifies the canonical
+root, shared Git directory and expected branch against that allocation. A
+mismatch fails the attempt before tools or model calls run.
+
+For workers marked `isolatedWorktree`, native `write` and `edit` operations
+resolve their filesystem destination and reject paths outside the assigned
+root, including symlink escapes. Read tools may inspect external references.
+This file-tool guard does not sandbox arbitrary shell commands; shell isolation
+remains the responsibility of the runtime's execution environment.
+
+A mutating worker with a known base cannot report `completed` without a tracked
+file diff against that base. Empty or reverted commits do not count, and Git
+inspection failures require a blocked/partial report until evidence is available.
+Untracked files must be staged or committed before they substantiate completion.
+Candidate verification and review still determine mission completion.
 
 ## Verification (INV-005)
 

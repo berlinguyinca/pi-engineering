@@ -91,7 +91,7 @@ function reviewReply(res: ServerResponse): void {
 const dead: ModelRef = { provider: "beast", id: "qwen3.8-27b-q4-lane2" };
 const live: ModelRef = { provider: "hive", id: "glm-5.3-flash" };
 
-function setup(baseUrls: Record<string, string>, pool: ModelRef[], routeModel: RouteModel) {
+function setup(baseUrls: Record<string, string>, pool: ModelRef[], routeModel: RouteModel, sessionDefault?: ModelRef) {
   const notices: string[] = [];
   const dir = mkdtempSync(join(tmpdir(), "pi-review-dead-"));
   const providers: Record<string, unknown> = {};
@@ -102,7 +102,7 @@ function setup(baseUrls: Record<string, string>, pool: ModelRef[], routeModel: R
       apiKey: "k",
       models: pool
         .filter((m) => m.provider === name)
-        .map((m) => ({ id: m.id, contextWindow: 100_000, maxTokens: 4096 })),
+        .map((m) => ({ id: m.id, contextWindow: 262_144, maxTokens: 4096 })),
     };
   }
   writeFileSync(join(dir, "models.json"), JSON.stringify({ providers }));
@@ -123,6 +123,7 @@ function setup(baseUrls: Record<string, string>, pool: ModelRef[], routeModel: R
     git: null,
     cwd: dir,
     routeModel,
+    reviewFallbackModel: sessionDefault,
   });
   const review = () =>
     backends.review.runReview({
@@ -185,23 +186,30 @@ test("a reviewer spends at most three attempts on a dead provider before failing
   }
 });
 
-test("an unrouted review whose default provider is dead still fails over, naming the model it attempted", async () => {
+test("a qualified session default on a dead provider still fails over, naming the model it attempted", async () => {
   const flaky = await resetting();
   const good = await listen((_req, res) => reviewReply(res));
-  // The catalogue offers no route up front (the session default, on the dead
-  // provider, would run); once that fails it offers the live metabolomics model.
-  const routeModel: RouteModel = async (_role, query) =>
-    (query?.exclude ?? []).length === 0 && !query?.replacement ? undefined : live;
-  const { dir, review } = setup(
+  // No distinct route exists initially, but the router can confirm the named
+  // session default's eligibility. Its failure makes the live route available.
+  const routeModel: RouteModel = async (_role, query) => {
+    if (query?.taskOverride === modelKey(dead)) return dead;
+    return (query?.exclude ?? []).length === 0 && !query?.replacement ? undefined : live;
+  };
+  const { dir, review, notices } = setup(
     { beast: `http://127.0.0.1:${port(flaky.server)}/v1`, hive: `http://127.0.0.1:${port(good)}/v1` },
     [dead, live],
     routeModel,
+    dead,
   );
   try {
     const outcome = await review();
     assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
     assert.equal(outcome.reviewEvidence?.model, live.id);
-    assert.ok(flaky.hits() <= 3, `dead provider was tried ${flaky.hits()} times`);
+    assert.ok(flaky.hits() >= 1 && flaky.hits() <= 3, `dead provider was tried ${flaky.hits()} times`);
+    assert.ok(
+      notices.some((notice) => notice.includes(modelKey(dead)) && notice.includes(modelKey(live))),
+      notices.join(" | "),
+    );
   } finally {
     await close(flaky.server, good);
     rmSync(dir, { recursive: true, force: true });

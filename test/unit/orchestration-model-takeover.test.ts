@@ -172,6 +172,127 @@ async function harness(opts: {
 const signal = () => new AbortController().signal;
 
 describe("model takeover: agent workers", () => {
+  it("keeps registry replacements running after the operator pin is confirmed unavailable", async () => {
+    const unavailable = new UnavailableModels();
+    let pin = A;
+    const seen: string[] = [];
+    const backends = realBackends({
+      worker: {
+        async run(req) {
+          const model = req.modelOverride!;
+          seen.push(modelKey(model));
+          if (modelKey(model) === modelKey(A)) return notFound;
+          assert.equal(req.modelSuperseded?.(), false, "a failed pin must not supersede its replacement");
+          pin = C;
+          assert.equal(req.modelSuperseded?.(), true, "a genuinely new operator choice still supersedes");
+          pin = A;
+          return workerRun({ status: "completed", summary: "replacement completed" });
+        },
+      },
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: createRouteModel({ router: await realRouter([A]), unavailable, operatorPin: () => pin }),
+      registryModels: () => [A, B].map((model) => ({ ...model, toolCall: true, contextWindow: 262_144 })),
+      currentOperatorPin: () => pin,
+      onModelUnavailable: (model, context) => unavailable.mark(model, context, { confirmed: true }),
+      isModelUnavailable: (model) => unavailable.has(model),
+    });
+    const outcome = await backends.agent.runAgent({
+      role: "implementer",
+      objective: "x",
+      missionId: "MSN-registry-pin",
+      signal: signal(),
+    });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.deepEqual(seen, [modelKey(A), modelKey(B)]);
+    assert.equal(unavailable.has(A), true);
+  });
+
+  for (const required of ["vision", "tool_calling"]) {
+    it(`does not bypass ${required} requirements through the registry after a 404`, async () => {
+      const seen: WorkerRequest[] = [];
+      const backends = realBackends({
+        worker: gatewayWorker(new Set([modelKey(A)]), seen),
+        verifier: {} as never,
+        artifacts: { readContentByUri: async () => undefined } as never,
+        git: null,
+        cwd: "/repo",
+        routeModel: async (_role, opts) => (opts?.replacement ? undefined : A),
+        registryModels: () => [{ ...B, contextWindow: 262_144, toolCall: required === "vision", input: ["text"] }],
+      });
+      const outcome = await backends.agent.runAgent({
+        role: "implementer",
+        objective: "x",
+        modelRequirements: { capabilities: [required] },
+        signal: signal(),
+      });
+      assert.equal(outcome.exitStatus, "failed");
+      assert.equal(outcome.error, "transient:model_unavailable");
+      assert.deepEqual(
+        seen.map((req) => modelKey(req.modelOverride!)),
+        [modelKey(A)],
+      );
+    });
+  }
+
+  it("selects a compatible vision replacement from fresh registry candidates", async () => {
+    const seen: WorkerRequest[] = [];
+    let discoveries = 0;
+    const backends = realBackends({
+      worker: gatewayWorker(new Set([modelKey(A)]), seen),
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async (_role, opts) => (opts?.replacement ? undefined : A),
+      registryModels: () => {
+        discoveries++;
+        return [
+          { ...B, contextWindow: 900_000, toolCall: true, input: ["text"] },
+          { ...C, contextWindow: 262_144, toolCall: true, input: ["text", "image"] },
+        ];
+      },
+    });
+    const outcome = await backends.agent.runAgent({
+      role: "implementer",
+      objective: "inspect screenshot",
+      modelRequirements: { capabilities: ["vision"] },
+      signal: signal(),
+    });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.deepEqual(
+      seen.map((req) => modelKey(req.modelOverride!)),
+      [modelKey(A), modelKey(C)],
+    );
+    assert.equal(discoveries, 1);
+  });
+
+  it("bounds takeover attempts even while discovery keeps offering new unavailable models", async () => {
+    let attempts = 0;
+    const backends = realBackends({
+      worker: {
+        async run() {
+          attempts++;
+          // Fail the test rather than hang indefinitely on the old implementation.
+          assert.ok(attempts <= 16, "takeover must stop after sixteen failed models");
+          return notFound;
+        },
+      },
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async () => ({ provider: "gw", id: `unavailable-${attempts}` }),
+    });
+    const outcome = await backends.agent.runAgent({ role: "implementer", objective: "x", signal: signal() });
+    assert.equal(outcome.exitStatus, "failed");
+    assert.equal(outcome.error, "transient:model_unavailable");
+    assert.equal(attempts, 16);
+    assert.match(outcome.summary, /takeover exhausted after 16 model attempts/);
+  });
+
   it("reruns the agent on the next eligible model with a fresh session and announces the switch", async () => {
     const h = await harness({ pool: [A, B], gone: [A] });
     const activity: WorkerActivity[] = [];
@@ -420,6 +541,63 @@ describe("model takeover: agent workers", () => {
 });
 
 describe("model takeover: reviewer", () => {
+  for (const role of ["reviewer", "vision_reviewer"]) {
+    for (const sessionFallback of [true, false]) {
+      it(`blocks ${role} before dispatch when the registry only has an incompatible model (session fallback: ${sessionFallback})`, async () => {
+        const seen: WorkerRequest[] = [];
+        const backends = realBackends({
+          worker: gatewayWorker(new Set(), seen),
+          verifier: {} as never,
+          artifacts: { readContentByUri: async () => undefined } as never,
+          git: null,
+          cwd: "/repo",
+          routeModel: async () => undefined,
+          registryModels: () => [{ ...B, contextWindow: 32_768, input: ["text"], toolCall: true }],
+          ...(sessionFallback ? { reviewFallbackModel: B } : {}),
+        });
+        const input = { role, objective: "review", signal: signal() };
+        const outcome =
+          role === "reviewer" ? await backends.review.runReview(input) : await backends.agent.runAgent(input);
+        assert.equal(outcome.exitStatus, "failed");
+        assert.equal(outcome.error, "transient:model_unavailable");
+        assert.match(outcome.summary, /no eligible .*reviewer model/);
+        assert.equal(seen.length, 0, "incompatible models must not execute review tools");
+      });
+    }
+  }
+
+  it("does not force a session fallback rejected by a configured router without registry metadata", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: gatewayWorker(new Set(), seen),
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: "/repo",
+      routeModel: async () => undefined,
+      reviewFallbackModel: B,
+    });
+    const outcome = await backends.review.runReview({ objective: "review", signal: signal() });
+    assert.equal(outcome.exitStatus, "failed");
+    assert.equal(outcome.error, "transient:model_unavailable");
+    assert.equal(seen.length, 0);
+  });
+
+  it("keeps standalone default review available when no routing or registry information is configured", async () => {
+    const seen: WorkerRequest[] = [];
+    const backends = realBackends({
+      worker: gatewayWorker(new Set(), seen),
+      verifier: {} as never,
+      artifacts: { readContentByUri: async () => undefined } as never,
+      git: null,
+      cwd: "/repo",
+    });
+    const outcome = await backends.review.runReview({ objective: "review", signal: signal() });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]?.modelOverride, undefined);
+  });
+
   it("takes over, announces the switch, and judges independence on the final model", async () => {
     const h = await harness({ pool: [A, B], gone: [A] });
     const activity: WorkerActivity[] = [];
@@ -443,19 +621,12 @@ describe("model takeover: reviewer", () => {
     );
   });
 
-  it("falls back once to the session model when no distinct reviewer is left", async () => {
+  it("does not bypass the capability router with an undiscovered session fallback", async () => {
     const h = await harness({ pool: [A], gone: [A] });
-    const activity: WorkerActivity[] = [];
-    const outcome = await h.backends.review.runReview({
-      objective: "review",
-      signal: signal(),
-      onActivity: (e) => activity.push(e),
-    });
-    assert.equal(outcome.exitStatus, "succeeded");
-    assert.deepEqual(h.models(), [modelKey(A), modelKey(SESSION)]);
-    assert.equal(outcome.reviewEvidence?.model, SESSION.id);
-    assert.equal(outcome.reviewEvidence?.independenceMode, "same_model_reduced");
-    assert.ok(activity.some((e) => e.stage === "review" && /reduced independence/.test(e.summary)));
+    const outcome = await h.backends.review.runReview({ objective: "review", signal: signal() });
+    assert.equal(outcome.exitStatus, "failed");
+    assert.equal(outcome.error, "transient:model_unavailable");
+    assert.deepEqual(h.models(), [modelKey(A)]);
   });
 
   it("does not fall back to a session model that is itself unavailable", async () => {
