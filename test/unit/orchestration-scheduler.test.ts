@@ -604,6 +604,103 @@ describe("MissionScheduler (spec 02)", () => {
     assert.ok(eventStore.all().some((event) => event.type === "execution.late_result_rejected"));
   });
 
+  for (const bulkCancel of [false, true]) {
+    it(`keeps work resumable when dispatch authority expires (bulk cancel: ${bulkCancel})`, async () => {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = createExecutingMission(store);
+      const owner = new MissionOwnership(store, { ownerId: "expired-owner", heartbeatMs: 5 });
+      const identity = await owner.acquire(mission.mission_id);
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "preserve unfinished work",
+        isolation: "none",
+      });
+      let dispatched!: () => void;
+      const started = new Promise<void>((resolve) => {
+        dispatched = resolve;
+      });
+      const broker = makeBroker(store, {
+        agent: {
+          runAgent: async ({ signal }) => {
+            dispatched();
+            await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+            return { executionId: "stale", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+          },
+        },
+      });
+      const scheduler = new MissionScheduler({ store, broker, acquireAuthority: () => owner.maintain(identity) });
+      const running = scheduler.runMission(mission.mission_id);
+      await Promise.race([
+        started,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(JSON.stringify(store.getTask(task.task_id)))), 2000),
+        ),
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      store.resumeMission(mission.mission_id, "replacement controller fenced old authority");
+      if (bulkCancel) await broker.cancelStaleResumptionExecutions(mission.mission_id, 1);
+      await Promise.race([
+        running,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(JSON.stringify(store.getTask(task.task_id)))), 2000),
+        ),
+      ]);
+      assert.equal(store.getTask(task.task_id)?.status, "RETRYING");
+      assert.equal(store.requeueResumableTasks(mission.mission_id), 1);
+      assert.equal(store.getTask(task.task_id)?.status, "READY");
+      assert.equal(store.listExecutions(mission.mission_id)[0]?.status, "CANCELED");
+    });
+  }
+
+  it("bulk cancellation of a stale execution cannot cancel its replacement task assignment", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "replace assignment",
+      isolation: "none",
+    });
+    const broker = makeBroker(store, {
+      agent: {
+        runAgent: async ({ signal }) => {
+          await new Promise<void>((resolve) => {
+            if (signal.aborted) resolve();
+            else signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          return { executionId: "stale", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    store.transitionTask(task.task_id, "READY");
+    const old = await broker.execute({
+      missionId: mission.mission_id,
+      taskId: task.task_id,
+      kind: "agent",
+      role: "implementer",
+      objective: task.objective,
+      isolation: "none",
+    });
+    store.transitionTask(task.task_id, "RUNNING", "system", { assigned_execution_id: old.executionId });
+    store.transitionTask(task.task_id, "RETRYING");
+    store.transitionTask(task.task_id, "READY");
+    const replacement = store.createExecution({
+      mission_id: mission.mission_id,
+      task_id: task.task_id,
+      backend: "agent",
+    });
+    store.transitionTask(task.task_id, "RUNNING", "system", { assigned_execution_id: replacement.execution_id });
+    store.setExecutionStatus(replacement.execution_id, "RUNNING");
+    await broker.cancelStaleResumptionExecutions(mission.mission_id, 1);
+    assert.equal(store.getExecution(old.executionId)?.status, "CANCELED");
+    assert.equal(store.getExecution(replacement.execution_id)?.status, "RUNNING");
+    assert.equal(store.getTask(task.task_id)?.status, "RUNNING");
+    assert.equal(store.getTask(task.task_id)?.assigned_execution_id, replacement.execution_id);
+  });
+
   it("serializes mutating dispatches from separate controllers by repository id", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const firstMission = createExecutingMission(store);

@@ -655,6 +655,28 @@ describe("MissionSupervisor", () => {
     assert.equal(waits.length, 1);
   });
 
+  it("preserves a taskless workspace preflight blocker before diagnosing an expired lease", async () => {
+    const h = harness();
+    const ownership = new MissionOwnership(h.store, { ownerId: "preflight", now: () => 0, leaseMs: 10 });
+    await ownership.acquire(h.mission.mission_id);
+    h.store.transitionMission(h.mission.mission_id, "BLOCKED");
+    h.store.classifyFailure({
+      classificationId: "FC-preflight",
+      missionId: h.mission.mission_id,
+      taskId: null,
+      executionId: null,
+      category: "WORKSPACE_SCOPE_MISMATCH",
+      summary: "workspace root was rejected",
+      fingerprint: "preflight",
+      evidenceRefs: [],
+      classifiedAt: new Date().toISOString(),
+    });
+    const [status] = await h.supervisor.tick();
+    assert.equal(status?.decision?.action, "REBUILD_WORKSPACE_MANIFEST");
+    assert.match(status?.reason ?? "", /workspace root was rejected/);
+    assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "WORKSPACE_SCOPE_MISMATCH");
+  });
+
   it("names planning that produced no tasks as an operator question, not an orphan stop", async () => {
     const h = harness();
 

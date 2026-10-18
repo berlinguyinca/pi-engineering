@@ -9,6 +9,7 @@ import {
   requestSession,
   sessionControlRoot,
 } from "./SessionControl.ts";
+import { parseMaintenanceRequest } from "./maintenance.ts";
 
 export interface SessionCliOptions {
   rootDir?: string;
@@ -80,8 +81,8 @@ export async function runSessionsCommand(args: string[], options: SessionCliOpti
     } while (!options.signal?.aborted);
     return 0;
   }
-  if (!(["ping", "status", "note"] as string[]).includes(action ?? "")) {
-    err("usage: pi-engineering sessions <list|watch|ping|status|note> [instance-id] [--json]\n");
+  if (!(["ping", "status", "note", "maintenance"] as string[]).includes(action ?? "")) {
+    err("usage: pi-engineering sessions <list|watch|ping|status|note|maintenance> [instance-id] [--json]\n");
     return 2;
   }
   const instanceId = args[1];
@@ -107,6 +108,25 @@ export async function runSessionsCommand(args: string[], options: SessionCliOpti
   }
   const nonce = randomUUID();
   try {
+    if (action === "maintenance") {
+      const index = args.indexOf("--request-json");
+      if (index < 0 || !args[index + 1]) {
+        err("usage: pi-engineering sessions maintenance <instance-id> --request-json <JSON>\n");
+        return 2;
+      }
+      const request = parseMaintenanceRequest(JSON.parse(args[index + 1]!));
+      if (request.expectedInstanceId !== instanceId) {
+        err("Maintenance target must match the exact instance ID.\n");
+        return 2;
+      }
+      const reply = await requestSession(descriptor, { version: 1, op: "maintenance", request });
+      if (!reply.ok) {
+        err(`${reply.error}\n`);
+        return 1;
+      }
+      out(`${JSON.stringify(reply.data)}\n`);
+      return reply.data.maintenance?.status === "failed" ? 1 : 0;
+    }
     const reply = await requestSession(
       descriptor,
       action === "ping"

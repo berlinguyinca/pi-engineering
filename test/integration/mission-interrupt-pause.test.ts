@@ -421,3 +421,178 @@ test("/mission resume clears the operator pause of a mission paused to PAUSED_IN
     await fixture.cleanup();
   }
 });
+
+test("maintenance drains an executing mission without setting operator pause and resumes the same work", async () => {
+  const fixture = await makeFixtureRepo();
+  const seen: WorkerRequest[] = [];
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const abort = new AbortController();
+  let runtime: EngineeringRuntime | undefined;
+  let finishRun: Promise<unknown> | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker(seen, started));
+    const running = runtime.orchestrator!.orchestrate("Make add return the sum", {
+      repository: fixture.root,
+      baseRef: await runtime.git!.headCommit(),
+      mutationRequested: true,
+      interrupt: "pause",
+      signal: abort.signal,
+    });
+    finishRun = running;
+    await workerStarted;
+    const prepared = await runtime.prepareForMaintenance({ timeoutMs: 5_000 });
+    assert.equal(prepared.status, "ready");
+    const paused = (await running).mission;
+    assert.equal(paused.status, "PAUSED_INFRASTRUCTURE");
+    assert.equal(paused.operator_paused_at ?? null, null);
+    const store = runtime.missionStore!;
+    const generation = store.listMissionResumptions(paused.mission_id).at(-1)?.generation ?? 0;
+    const result = await runtime.resumeMissionAfterMaintenance(paused.mission_id, {
+      expectedRevision: store.getMission(paused.mission_id)!.revision,
+      expectedResumptionGeneration: generation,
+    });
+    assert.equal(result.status, "resumed", JSON.stringify(result));
+    assert.equal(store.getMission(paused.mission_id)?.status, "COMPLETE");
+    assert.ok(
+      (await runtime.maintenanceOwnedMissionIds()).includes(paused.mission_id),
+      "completion remains discoverable after lease release",
+    );
+    assert.equal(seen.filter((request) => request.role === "implementer").length, 2);
+    assert.equal(store.listMissions().length, 1, "maintenance never creates a replacement mission");
+    const replay = await runtime.resumeMissionAfterMaintenance(paused.mission_id, {
+      expectedRevision: paused.revision,
+      expectedResumptionGeneration: generation,
+    });
+    assert.equal(replay.status, "skipped");
+  } finally {
+    abort.abort();
+    await finishRun?.catch(() => undefined);
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});
+
+test("operator Esc during a maintenance drain prevents automatic resumption", async () => {
+  const fixture = await makeFixtureRepo();
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const esc = new AbortController();
+  const underlying = capacityWorker([], started);
+  const worker: WorkerExecutor = {
+    run: async (request) => {
+      request.signal?.addEventListener("abort", () => esc.abort(), { once: true });
+      return underlying.run(request);
+    },
+  };
+  let runtime: EngineeringRuntime | undefined;
+  let finishRun: Promise<unknown> | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, worker);
+    const running = runtime.orchestrator!.orchestrate("Make add return the sum", {
+      repository: fixture.root,
+      baseRef: await runtime.git!.headCommit(),
+      mutationRequested: true,
+      interrupt: "pause",
+      signal: esc.signal,
+    });
+    finishRun = running;
+    await workerStarted;
+    assert.equal((await runtime.prepareForMaintenance({ timeoutMs: 5_000 })).status, "ready");
+    const mission = (await running).mission;
+    assert.ok(mission.operator_paused_at);
+    const result = await runtime.resumeMissionAfterMaintenance(mission.mission_id, {
+      expectedRevision: mission.revision,
+      expectedResumptionGeneration: 0,
+    });
+    assert.equal(result.status, "skipped");
+    assert.ok(runtime.missionStore!.getMission(mission.mission_id)?.operator_paused_at);
+    assert.equal(runtime.missionStore!.listMissionResumptions(mission.mission_id).length, 0);
+  } finally {
+    esc.abort();
+    await finishRun?.catch(() => undefined);
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});
+
+test("maintenance refuses integration without aborting its worker", async () => {
+  const fixture = await makeFixtureRepo();
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const abort = new AbortController();
+  let runtime: EngineeringRuntime | undefined;
+  let finishRun: Promise<unknown> | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker([], started));
+    finishRun = runtime.orchestrator!.orchestrate("Make add return the sum", {
+      repository: fixture.root,
+      baseRef: await runtime.git!.headCommit(),
+      mutationRequested: true,
+      interrupt: "pause",
+      signal: abort.signal,
+    });
+    await workerStarted;
+    const store = runtime.missionStore!;
+    const mission = store.listMissions().at(-1)!;
+    store.transitionMission(mission.mission_id, "INTEGRATING");
+    const result = await runtime.prepareForMaintenance({ timeoutMs: 50 });
+    assert.equal(result.status, "busy");
+    assert.match(result.status === "busy" ? result.reason : "", /critical phase INTEGRATING/);
+    assert.equal(store.getMission(mission.mission_id)?.status, "INTEGRATING");
+    assert.ok(store.listExecutions(mission.mission_id).some((execution) => execution.status === "RUNNING"));
+    assert.equal(store.listMissionStops(mission.mission_id).length, 0);
+  } finally {
+    abort.abort();
+    await finishRun?.catch(() => undefined);
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});
+
+test("maintenance refuses ambiguous legacy task cancellation without consuming a resumption", async () => {
+  const fixture = await makeFixtureRepo();
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const abort = new AbortController();
+  let runtime: EngineeringRuntime | undefined;
+  let finishRun: Promise<unknown> | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker([], started));
+    finishRun = runtime.orchestrator!.orchestrate("Make add return the sum", {
+      repository: fixture.root,
+      baseRef: await runtime.git!.headCommit(),
+      mutationRequested: true,
+      interrupt: "pause",
+      signal: abort.signal,
+    });
+    await workerStarted;
+    assert.equal((await runtime.prepareForMaintenance({ timeoutMs: 5_000 })).status, "ready");
+    await finishRun;
+    const store = runtime.missionStore!;
+    const mission = store.listMissions().at(-1)!;
+    const task = store.listTasks(mission.mission_id).find((task) => task.kind === "agent")!;
+    store.transitionTask(task.task_id, "CANCELED");
+    const result = await runtime.resumeMissionAfterMaintenance(mission.mission_id, {
+      expectedRevision: store.getMission(mission.mission_id)!.revision,
+      expectedResumptionGeneration: 0,
+    });
+    assert.equal(result.status, "skipped");
+    assert.equal(result.status === "skipped" ? result.code : "", "LEGACY_REPAIR_REQUIRED");
+    assert.equal(store.listMissionResumptions(mission.mission_id).length, 0);
+    assert.equal(store.getTask(task.task_id)?.status, "CANCELED");
+  } finally {
+    abort.abort();
+    await finishRun?.catch(() => undefined);
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});

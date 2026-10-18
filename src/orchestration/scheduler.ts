@@ -855,7 +855,7 @@ export class MissionScheduler {
           authority,
         });
         authority?.onInvalidated(() => {
-          void handle?.cancel();
+          void handle?.cancel({ resumable: true });
         });
         if (signal?.aborted) {
           await handle.cancel();
@@ -1039,7 +1039,7 @@ export class MissionScheduler {
           try {
             authority.assertAuthoritative();
           } catch (authorityError) {
-            await handle?.cancel().catch(() => undefined);
+            await handle?.cancel({ resumable: true }).catch(() => undefined);
             if (handle) {
               this.store.rejectLateExecution(
                 handle.executionId,

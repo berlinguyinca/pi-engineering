@@ -1194,7 +1194,11 @@ export class ExecutionBroker {
     // asked for cancellation, so the task must not be resumed — unless this is
     // an operator interrupt (pause), whose task must stay resumable.
     const cancelledTask = taskId ?? entry.taskId;
-    if (this.store.getTask(cancelledTask)?.status === "RUNNING") {
+    const currentTask = this.store.getTask(cancelledTask);
+    if (
+      currentTask?.status === "RUNNING" &&
+      (!currentTask.assigned_execution_id || currentTask.assigned_execution_id === executionId)
+    ) {
       if (opts.resumable) {
         this.store.transitionTask(cancelledTask, "RETRYING", "system", {
           failure_reason: "interrupted by the operator; resumable",
@@ -1214,7 +1218,9 @@ export class ExecutionBroker {
         (entry.authority?.resumptionGeneration ?? entry.authority?.missionIdentity.resumptionGeneration ?? 0) !==
           currentGeneration,
     );
-    await Promise.all(stale.map(([executionId, entry]) => this.cancelExecution(executionId, entry.taskId)));
+    await Promise.all(
+      stale.map(([executionId, entry]) => this.cancelExecution(executionId, entry.taskId, { resumable: true })),
+    );
   }
 
   private terminalizeAfterGrace(
@@ -1316,7 +1322,11 @@ export class ExecutionBroker {
     const task = this.store.getTask(taskId);
     // A hung (inactive) execution leaves its task RUNNING: the scheduler owns
     // the decision to resume it from its checkpoint instead of failing it.
-    if (task?.status === "RUNNING" && reason !== "inactivity") {
+    if (
+      task?.status === "RUNNING" &&
+      reason !== "inactivity" &&
+      (!task.assigned_execution_id || task.assigned_execution_id === executionId)
+    ) {
       if (reason === "canceled" && this.resumableCancels.has(executionId)) {
         // An operator interrupt (pause): the task stays resumable.
         this.store.transitionTask(taskId, "RETRYING", "system", {

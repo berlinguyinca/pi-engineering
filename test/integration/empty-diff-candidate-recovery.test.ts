@@ -500,13 +500,24 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
       });
       fresh.store.transitionTask("TSK-earlier-replacement", "READY");
       fresh.store.transitionTask("TSK-earlier-replacement", "CANCELED");
+      const recoveriesBefore = fresh.store.listRecoveryDecisions(missionId).length;
+      const resumptionsBefore = fresh.store.listMissionResumptions(missionId).length;
       const resumed = await fresh.orchestrator.repairBlockedMission(missionId);
-      const decision = fresh.store.listRecoveryDecisions(missionId).at(-1)!;
-      assert.equal(decision.action, "FENCE_RECONCILE_AND_RESUME");
+      assert.equal(
+        fresh.store.listRecoveryDecisions(missionId).length,
+        recoveriesBefore,
+        "ambiguous cancellation consumes no recovery",
+      );
+      assert.equal(fresh.store.listMissionResumptions(missionId).length, resumptionsBefore);
+      const stop = fresh.store.listMissionStops(missionId).at(-1);
+      assert.match(stop?.reason ?? "", /LEGACY_REPAIR_REQUIRED/);
+      assert.match(stop?.reason ?? "", /TSK-earlier-replacement/);
       assert.equal(fresh.calls.agent, 0, "no worker ran");
       assert.equal(fresh.calls.validation, 0, "gates are not re-run over a no-change candidate");
       assert.equal(resumed.status, "BLOCKED");
-      assert.notEqual(decision.status, "planned");
+      assert.equal(fresh.calls.review, 0, "review is not re-run over a no-change candidate");
+      assert.equal(fresh.orchestrator.gate.evaluate(resumed).can_complete, false);
+      assert.equal(fresh.store.getTask("TSK-earlier-replacement")?.status, "CANCELED");
     } finally {
       await h.fixture.cleanup();
     }

@@ -11,7 +11,7 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
@@ -34,6 +34,13 @@ import { HOST_SUPPORTED_RUNTIME_APIS, PI_ENGINEERING_RUNTIME_API } from "./contr
 import { ago, formatHandover, short, waitingText } from "./format.ts";
 import { type HandoverHooks, type HandoverResult, type HandoverTask, RuntimeBusyError, RuntimeHost } from "./host.ts";
 import { type RuntimeSource, snapshotRuntimeSource } from "./loader.ts";
+import {
+  type HostMaintenanceProvider,
+  type HostMaintenanceReloadRequest,
+  type HostMaintenanceReloadResult,
+  publishHostMaintenance,
+} from "./maintenance.ts";
+import { DEFAULT_SAFE_POINT_TIMEOUT_MS } from "./operations.ts";
 import { publishRuntimeStatus } from "./runtimeStatus.ts";
 import {
   DEFAULT_AUTO_RELOAD_INTERVAL_MS,
@@ -58,7 +65,7 @@ export interface HostExtensionConfig {
   devSource?: string;
   /** Copy the package checkout before importing it directly, so a failed reload can roll back to it. */
   baseline?: boolean;
-  /** Safe-point wait limit for handovers (ms). Absent: wait until cancelled. */
+  /** Safe-point wait limit for handovers (ms). Default: 30 seconds. */
   safePointTimeoutMs?: number;
   /** Update source (default: the package checkout's `origin`). */
   updateRemote?: string;
@@ -104,7 +111,7 @@ export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExt
     entry: env.PI_ENGINEERING_RUNTIME_ENTRY?.trim() || DEFAULT_RUNTIME_ENTRY,
     ...(devSource ? { devSource: resolve(devSource) } : {}),
     baseline: env.PI_ENGINEERING_BASELINE !== "0",
-    ...(Number.isFinite(timeout) && timeout > 0 ? { safePointTimeoutMs: timeout } : {}),
+    safePointTimeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_SAFE_POINT_TIMEOUT_MS,
     ...(env.PI_ENGINEERING_UPDATE_REMOTE?.trim() ? { updateRemote: env.PI_ENGINEERING_UPDATE_REMOTE.trim() } : {}),
     ...(env.PI_ENGINEERING_UPDATE_TRUSTED?.trim()
       ? {
@@ -217,6 +224,14 @@ export function describeSource(root: string): { version: string; commit: string 
       })
         .toString()
         .trim();
+      const dirty = execFileSync("git", ["-C", root, "status", "--porcelain", "--untracked-files=no"], {
+        timeout: 2000,
+        stdio: ["ignore", "pipe", "ignore"],
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+      })
+        .toString()
+        .trim();
+      if (dirty || !/^[0-9a-f]{40}$/.test(commit)) commit = null;
     } catch {
       commit = null;
     }
@@ -240,9 +255,12 @@ export class EngineeringHostExtension {
   recovery: RecoveryOutcome | undefined;
   readonly updates: UpdateManager;
   private pi: ExtensionAPI | undefined;
+  private readonly hostCommit: string | null;
+  private unpublishMaintenance: () => void = () => {};
 
   constructor(config: HostExtensionConfig) {
     this.config = config;
+    this.hostCommit = describeSource(config.packageRoot).commit;
     this.layout = new InstallLayout(config.installRoot);
     this.journal = new UpdateJournal(this.layout.journalFile);
     this.lock = new RuntimeMutationLock(this.layout.lockFile);
@@ -302,6 +320,7 @@ export class EngineeringHostExtension {
       if (this.checkTimer) clearTimeout(this.checkTimer);
       await this.stopSourceWatch();
       this.unpublish();
+      this.unpublishMaintenance();
       await this.host?.shutdown({ type: "session_shutdown", reason: "quit" }, undefined);
       return !this.host?.activeGeneration();
     } catch {
@@ -342,6 +361,7 @@ export class EngineeringHostExtension {
     host.bridge.onHostEvent("session_start", (_event, ctx) => this.onSessionStart(ctx as Ctx));
     host.bridge.onHostEvent("session_shutdown", () => this.dispose());
     await this.retain().catch(() => {});
+    if (result.ok) this.unpublishMaintenance = publishHostMaintenance(this.maintenanceProvider());
   }
 
   /**
@@ -361,6 +381,8 @@ export class EngineeringHostExtension {
   async dispose(): Promise<void> {
     if (this.checkTimer) clearTimeout(this.checkTimer);
     this.checkTimer = undefined;
+    this.host?.pendingTask()?.cancel();
+    this.unpublishMaintenance();
     await this.stopSourceWatch();
     this.unpublish();
     // A check in flight writes the preferences file; let it land before the
@@ -451,6 +473,7 @@ export class EngineeringHostExtension {
         // Another handover is in flight, or the session is on its way out:
         // leave the baseline and look again (never, once disposed).
         if (host.pendingTask() || !this.sourceWatcher?.active) return false;
+        if (host.activeGeneration()?.source.commit === next) return true;
         const latest = (host.latestContext() as Ctx | undefined) ?? ctx;
         // A handover snapshots the working tree, so a tracked file mid-edit
         // would run under the new commit's name. Wait for a clean tree (or
@@ -472,14 +495,12 @@ export class EngineeringHostExtension {
           return false;
         }
         dirtyWarnedFor = undefined;
-        // Quiet: a mutation lock held by another process (an update or
-        // retention elsewhere) is not worth a warning every poll. The
-        // baseline then stays put and the commit is picked up next time.
-        // A handover that ran and failed advances it: the operator was told,
-        // and retrying the same commit every 15 s would not change the answer.
-        const started = await this.reload(latest, { quiet: true });
-        if (started) notify(latest, `Pi Engineering source moved ${short(previous)} → ${short(next)} — hot-reloaded.`);
-        return started;
+        // Acceptance means the selected commit passed the full handover.
+        // Failed or deferred activation leaves the baseline available for retry.
+        const result = await this.reloadForMaintenance({ expectedCommit: next });
+        if (result.ok)
+          notify(latest, `Pi Engineering source moved ${short(previous)} → ${short(next)} — hot-reloaded.`);
+        return result.ok;
       },
       onError: (error) => {
         this.telemetry.emit("runtime.health.failed", {
@@ -712,7 +733,7 @@ export class EngineeringHostExtension {
       root,
       entry: this.config.entry,
       version: meta.version,
-      commit: meta.commit ?? active?.source.commit ?? null,
+      commit: meta.commit,
       label: active?.source.label ?? "package",
     };
   }
@@ -861,39 +882,130 @@ export class EngineeringHostExtension {
     }
   }
 
-  /**
-   * `/pie reload`. Resolves true once the handover has BEGUN (it may still be
-   * waiting for a safe point in the background), false when it could not
-   * start: the mutation lock is held elsewhere or a handover is already
-   * running. With `quiet`, those two are silent — the caller retries.
-   */
-  protected async reload(ctx: Ctx, opts: { quiet?: boolean } = {}): Promise<boolean> {
-    const host = this.host as RuntimeHost;
-    const source = this.reloadSource();
-    const lock = this.lockFor("reload", ctx, opts.quiet === true);
-    if (!lock) return false;
-    let task: HandoverTask;
+  /** Snapshot under the shared install lock; wait and switch under the Host's local mutex. */
+  private beginReload(source: RuntimeSource, timeoutMs?: number): HandoverTask {
+    const lock = this.lock.acquire("reload");
     try {
-      task = host.begin({
+      const task = (this.host as RuntimeHost).begin({
         kind: "reload",
         source,
-        ...(this.config.safePointTimeoutMs ? { safePointTimeoutMs: this.config.safePointTimeoutMs } : {}),
+        safePointTimeoutMs: timeoutMs ?? this.config.safePointTimeoutMs ?? DEFAULT_SAFE_POINT_TIMEOUT_MS,
+        hooks: {
+          onPhase: (phase) => {
+            if (phase === "waiting_safe_point") lock.release();
+          },
+        },
       });
+      void task.promise.finally(() => lock.release());
+      return task;
     } catch (error) {
       lock.release();
-      if (error instanceof RuntimeBusyError) {
-        if (!opts.quiet) notify(ctx, error.message);
+      throw error;
+    }
+  }
+
+  private maintenanceProvider(): HostMaintenanceProvider {
+    return {
+      describe: async () => {
+        const active = this.host?.activeGeneration();
+        return {
+          hostCommit: this.hostCommit,
+          commit: active?.source.commit ?? null,
+          generation: active?.generation ?? null,
+          capabilities: ["runtime.describe", "runtime.reload"],
+          pending: this.host?.pendingTask() != null,
+        };
+      },
+      reload: (request) => this.reloadForMaintenance(request),
+    };
+  }
+
+  private async reloadForMaintenance(request: HostMaintenanceReloadRequest): Promise<HostMaintenanceReloadResult> {
+    const outcome = (ok: boolean, error?: string): HostMaintenanceReloadResult => ({
+      ok,
+      commit: this.host?.activeGeneration()?.source.commit ?? null,
+      generation: this.host?.activeGeneration()?.generation ?? null,
+      ...(error ? { error } : {}),
+    });
+    let rebindWatcher = false;
+    try {
+      if (!/^[0-9a-f]{40}$/.test(request.expectedCommit))
+        return outcome(false, "expectedCommit must be a full lowercase commit SHA");
+      if (
+        request.timeoutMs !== undefined &&
+        (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0 || request.timeoutMs > 300_000)
+      ) {
+        return outcome(false, "timeoutMs must be between 1 and 300000");
+      }
+      if (request.sourceRoot !== undefined && !isAbsolute(request.sourceRoot))
+        return outcome(false, "sourceRoot must be absolute");
+      const source = request.sourceRoot
+        ? {
+            root: request.sourceRoot,
+            entry: declaredEntry(request.sourceRoot) ?? this.config.entry,
+            ...describeSource(request.sourceRoot),
+            label: "package",
+          }
+        : this.reloadSource();
+      if (source.commit !== request.expectedCommit)
+        return outcome(false, "source commit does not match expectedCommit");
+      if (!existsSync(join(source.root, ".git"))) return outcome(false, "exact activation requires a Git checkout");
+      const dirty = await trackedChanges(source.root);
+      if (dirty === null || dirty.length) return outcome(false, "source checkout must be readable and clean");
+      if (this.host?.pendingTask()) return outcome(false, "runtime handover already in progress");
+      if (request.sourceRoot && source.root !== this.host?.activeGeneration()?.source.root) {
+        rebindWatcher = true;
+        await this.stopSourceWatch();
+      }
+      const task = this.beginReload({ ...source, snapshotCommit: request.expectedCommit }, request.timeoutMs);
+      const result = await task.promise;
+      if (!result.ok || !result.health?.healthy)
+        return outcome(false, result.failure ?? "runtime handover did not pass health");
+      if (this.host?.activeGeneration()?.source.commit !== request.expectedCommit)
+        return outcome(false, "loaded commit does not match expectedCommit");
+      if (typeof this.pi?.sendMessage === "function") {
+        this.pi.sendMessage(
+          {
+            customType: "pi-engineering-maintenance",
+            content: `Pi Engineering has loaded verified runtime ${request.expectedCommit}. Existing mission IDs and preserved work remain authoritative. If this update belongs to a fleet rollout, let its coordinator resume eligible stopped missions and monitor status instead of issuing competing resume/cancel requests. Otherwise continue recovery using the existing mission ID. Never create duplicate missions or override operator pauses.`,
+            display: true,
+            details: {
+              kind: "runtime-activated",
+              commit: request.expectedCommit,
+              generation: this.host.activeGeneration()?.generation ?? null,
+            },
+          },
+          { triggerTurn: false },
+        );
+      }
+      return outcome(true);
+    } catch (error) {
+      return outcome(false, error instanceof Error ? error.message : String(error));
+    } finally {
+      if (rebindWatcher) this.startSourceWatch((this.host?.latestContext() as Ctx | undefined) ?? {});
+    }
+  }
+
+  /** Interactive reload reports waits immediately; completion remains the task's result. */
+  protected async reload(ctx: Ctx): Promise<boolean> {
+    const host = this.host as RuntimeHost;
+    const source = this.reloadSource();
+    let task: HandoverTask;
+    try {
+      task = this.beginReload(source);
+    } catch (error) {
+      if (error instanceof RuntimeBusyError || error instanceof MutationLockBusyError) {
+        notify(ctx, error.message);
         return false;
       }
       throw error;
     }
-    void task.promise.finally(() => lock.release());
     const from = host.activeGeneration()?.source.version;
     const result = await this.awaitOrBackground(task, ctx, `Reloading Pi Engineering ${source.version}.`, (r) =>
       formatHandover(r, { from, to: source.version, action: "Reloaded" }),
     );
     if (result) notify(ctx, formatHandover(result, { from, to: source.version, action: "Reloaded" }), level(result));
-    return true;
+    return result?.ok === true;
   }
 
   /**

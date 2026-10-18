@@ -1217,3 +1217,179 @@ test("runtime diagnoses a failed snapshot write and retries on the next activity
     await rm(root, { recursive: true, force: true });
   }
 });
+
+for (const failedFinalization of [false, true]) {
+  test(`production supervisor wakes a parked provider wait and redispatches unfinished work (failed finalization: ${failedFinalization})`, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const root = await mkdtemp(join(tmpdir(), "pi-eng-parked-wake-"));
+    let runtime: EngineeringRuntime | undefined;
+    try {
+      await initGit(root);
+      runtime = await EngineeringRuntime.open({
+        cwd: root,
+        worker: new FakeWorkerExecutor({}, () => ({ status: "completed", summary: "finished queued work" })),
+      });
+      const store = runtime.missionStore!;
+      const mission = store.createMission({
+        title: "parked provider",
+        goal: "finish queued work",
+        user_request: "finish queued work",
+        repository: root,
+        base_ref: await runtime.git!.headCommit(),
+        risk_profile: "low",
+        workflow_class: "engineering_review",
+      });
+      for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING", "BLOCKED"] as const)
+        store.transitionMission(mission.mission_id, status);
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "finish queued work",
+        isolation: "none",
+      });
+      store.transitionTask(task.task_id, "READY");
+      store.classifyFailure({
+        classificationId: "FC-parked",
+        missionId: mission.mission_id,
+        taskId: task.task_id,
+        executionId: null,
+        category: "PROVIDER_TRANSIENT",
+        summary: "provider unavailable",
+        fingerprint: "provider-down",
+        evidenceRefs: [],
+        classifiedAt: new Date().toISOString(),
+      });
+      let healthy = false;
+      runtime.orchestrator!.scheduler.gatewayHealthy = async () => healthy;
+      await runtime.orchestrator!.repairBlockedMission(mission.mission_id);
+      assert.equal(
+        store.listMissionStops(mission.mission_id).length,
+        0,
+        "a named wait must not permanently stop supervision",
+      );
+      await runtime.missionSupervisor!.tick(mission.mission_id);
+      assert.equal(store.listExecutions(mission.mission_id).length, 0, "unhealthy provider must not dispatch");
+      if (failedFinalization) {
+        (
+          runtime.orchestrator as unknown as { finalizeMission: (missionId: string) => Promise<unknown> }
+        ).finalizeMission = async (missionId) => {
+          const mission = store.transitionMission(missionId, "BLOCKED");
+          return {
+            mission,
+            completed: false,
+            verdict: runtime!.orchestrator!.gate.evaluate(mission),
+            failureReason: "gate failed",
+          };
+        };
+      }
+      healthy = true;
+      // Use the production consumer and recovery engine; only the readiness boundary is injected.
+      t.mock.timers.tick(31_000);
+      await runtime.missionSupervisor!.tick(mission.mission_id);
+      assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
+      assert.ok(store.listExecutions(mission.mission_id).length > 0);
+      if (failedFinalization) {
+        assert.equal(store.listRecoveryDecisions(mission.mission_id).at(-1)?.status, "failed");
+        assert.equal(
+          store.listMissionStops(mission.mission_id).length,
+          0,
+          "normal gate failure must not become an illegal settlement stop",
+        );
+      }
+    } finally {
+      await runtime?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("workspace recovery replans a taskless preflight failure in the existing mission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-preflight-replan-"));
+  let runtime: EngineeringRuntime | undefined;
+  let planned = 0;
+  try {
+    await initGit(root);
+    runtime = await EngineeringRuntime.open({
+      cwd: root,
+      worker: new FakeWorkerExecutor({}, () => ({ status: "completed", summary: "reviewed" })),
+      orchestrationPlanner: async (mission) => {
+        planned++;
+        return [
+          {
+            acceptance_ids: mission.acceptance_criteria.flatMap((criterion) =>
+              criterion.acceptance_id ? [criterion.acceptance_id] : [],
+            ),
+            kind: "agent",
+            role: "implementer",
+            objective: "review repository",
+            mutates_repo: false,
+            isolation: "none",
+            write_domains: [],
+            depends_on: [],
+            priority: 0,
+            execution_requirements: {},
+            max_attempts: 1,
+            failure_policy: "block",
+          },
+        ];
+      },
+    });
+    const store = runtime.missionStore!;
+    const mission = store.createMission({
+      title: "preflight recovery",
+      goal: "review repository",
+      user_request: `Review the repository at ${root}`,
+      repository: root,
+      base_ref: await runtime.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    store.transitionMission(mission.mission_id, "CLASSIFYING");
+    store.classifyFailure({
+      classificationId: "FC-preflight-replan",
+      missionId: mission.mission_id,
+      taskId: null,
+      executionId: null,
+      category: "WORKSPACE_SCOPE_MISMATCH",
+      summary: "workspace preflight failed before planning",
+      fingerprint: "preflight-replan",
+      evidenceRefs: [],
+      classifiedAt: new Date().toISOString(),
+    });
+    store.transitionMission(mission.mission_id, "BLOCKED");
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+    assert.equal(planned, 1, "rebuilding the manifest must return to planning unfinished work");
+    assert.ok(
+      store.listTasks(mission.mission_id).some((task) => task.status === "SUCCEEDED"),
+      JSON.stringify({
+        tasks: store.listTasks(mission.mission_id),
+        failures: store.listFailureClassifications(mission.mission_id),
+        stops: store.listMissionStops(mission.mission_id),
+      }),
+    );
+    assert.equal(store.listMissions().length, 1);
+  } finally {
+    await runtime?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("maintenance rollback releases the dispatch gate without resuming stopped missions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-maintenance-rollback-"));
+  let runtime: EngineeringRuntime | undefined;
+  try {
+    await initGit(root);
+    runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    assert.equal((await runtime.prepareForMaintenance({ timeoutMs: 100 })).status, "ready");
+    const options = { repository: root, baseRef: await runtime.git!.headCommit() };
+    await assert.rejects(runtime.orchestrator!.orchestrate("Hello", options), /maintenance is draining/);
+    runtime.endMaintenance();
+    const result = await runtime.orchestrator!.orchestrate("Hello", options);
+    assert.equal(result.mission.status, "COMPLETE");
+    assert.equal(runtime.missionStore!.listMissionResumptions().length, 0);
+  } finally {
+    await runtime?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

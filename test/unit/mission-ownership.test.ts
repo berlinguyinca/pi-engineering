@@ -436,17 +436,14 @@ describe("MissionOwnership", () => {
     }
   });
 
-  it("re-acquires a re-fenced repository lease instead of lapping out on a stale epoch", async () => {
+  it("invalidates a re-fenced repository dispatch without adopting the new epoch", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-lease-stale-repo");
     const owner = new StaleRepositoryOwnership(store, {
       ownerId: "controller",
       leaseMs: 5_000,
       heartbeatMs: 15,
-      // The stale epoch is a PERMANENT mismatch, so even the default threshold of 3
-      // consecutive failures would have lapsed a healthy controller lease and stopped
-      // the mission (the observed Bug 3: "stale repository fencing identity ... "
-      // failing 3 times in a row). The fix re-acquires instead of counting it.
+      // Stale epochs invalidate immediately even when transient errors are tolerated.
       maxConsecutiveRenewFailures: 3,
     });
     const identity = await owner.acquire("M-lease-stale-repo");
@@ -455,30 +452,26 @@ describe("MissionOwnership", () => {
     try {
       // A recovery re-fenced the repository lease to a new generation while the
       // authority still held the old identity. Inject the stale epoch on the next
-      // renewal and have the re-acquisition return the re-fenced lease.
+      // renewal; the dispatch must not acquire the replacement lease.
       owner.armStaleRepository();
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
-      // Still authoritative: the stale epoch was re-acquired, not latched dead.
-      authority.assertAuthoritative();
+      assert.throws(() => authority.assertAuthoritative(), /stale.*fencing identity/);
       assert.match(authority.lastPulseError?.message ?? "", /stale repository fencing identity/);
-      // The authority now tracks the re-fenced lease (one generation ahead).
-      assert.equal(authority.repositoryIdentity?.generation, originalGeneration + 1);
+      // The dispatch retains its original epoch.
+      assert.equal(authority.repositoryIdentity?.generation, originalGeneration);
     } finally {
       await authority.close();
     }
   });
 
-  it("re-acquires a re-fenced MISSION lease instead of lapping out on a stale epoch", async () => {
+  it("invalidates a re-fenced mission dispatch without adopting the new epoch", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     mission(store, "M-lease-stale-mission");
     const owner = new StaleMissionOwnership(store, {
       ownerId: "controller",
       leaseMs: 5_000,
       heartbeatMs: 15,
-      // The stale epoch is a PERMANENT mismatch, so even the default threshold of 3
-      // consecutive failures would have lapsed a healthy controller lease and stopped
-      // the mission (the observed Bug 4: "stale mission fencing identity ... "
-      // failing 3 times in a row). The fix re-acquires instead of counting it.
+      // Stale epochs invalidate immediately even when transient errors are tolerated.
       maxConsecutiveRenewFailures: 3,
     });
     const identity = await owner.acquire("M-lease-stale-mission");
@@ -487,14 +480,13 @@ describe("MissionOwnership", () => {
     try {
       // A recovery re-fenced the MISSION lease to a new generation while the
       // authority still held the old identity. Inject the stale epoch on the next
-      // renewal and have the re-acquisition return the re-fenced lease.
+      // renewal; the dispatch must not acquire the replacement lease.
       owner.armStaleMission();
       for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 25));
-      // Still authoritative: the stale epoch was re-acquired, not latched dead.
-      authority.assertAuthoritative();
+      assert.throws(() => authority.assertAuthoritative(), /stale.*fencing identity/);
       assert.match(authority.lastPulseError?.message ?? "", /stale mission fencing identity/);
-      // The authority now tracks the re-fenced lease (one generation ahead).
-      assert.equal(authority.missionIdentity?.generation, originalGeneration + 1);
+      // The dispatch retains its original epoch.
+      assert.equal(authority.missionIdentity?.generation, originalGeneration);
     } finally {
       await authority.close();
     }

@@ -122,6 +122,9 @@ export interface RepositoryWait {
   holderOwnerId: string;
 }
 
+const LEGACY_AUTHORITY_LOSS =
+  /stale (?:mission|repository) (?:fencing|resumption)|lease expired|lease renewal failed|custody of another live session/;
+
 const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEventType>([
   "mission.created",
   "mission.updated",
@@ -421,6 +424,8 @@ export class MissionStore {
     reused: string[];
   }> = [];
   private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
+  private readonly executionRejectionReasons = new Map<string, string>();
+  private readonly resumptionWriteFailures = new Map<string, Set<string>>();
   private readonly pendingWrites: Array<{
     event: OrchestrationEvent;
     stored: StoredEvent;
@@ -644,7 +649,11 @@ export class MissionStore {
       }
       case "execution.late_result_rejected": {
         const execution = e.payload.execution as Execution | undefined;
-        if (execution) this.executions.set(execution.execution_id, copyExecution(execution));
+        if (execution) {
+          this.executions.set(execution.execution_id, copyExecution(execution));
+          if (typeof e.payload.reason === "string" && LEGACY_AUTHORITY_LOSS.test(e.payload.reason))
+            this.executionRejectionReasons.set(execution.execution_id, e.payload.reason);
+        }
         break;
       }
       case "execution.orphaned":
@@ -1708,6 +1717,7 @@ export class MissionStore {
           }
         : execution;
     if (execution.status === "RUNNING") this.executions.set(executionId, rejected);
+    if (LEGACY_AUTHORITY_LOSS.test(reason)) this.executionRejectionReasons.set(executionId, reason);
     this.emit("execution.late_result_rejected", execution.mission_id, {
       actor: "system",
       execution: rejected,
@@ -1773,6 +1783,69 @@ export class MissionStore {
       }
     }
     return requeued;
+  }
+
+  /** Legacy canceled implementations need positive, execution-bound ownership-loss evidence. */
+  legacyCanceledRecovery(missionId: string): { recoverableTaskIds: string[]; ambiguousTaskIds: string[] } {
+    const mission = this.getMission(missionId);
+    const result = { recoverableTaskIds: [] as string[], ambiguousTaskIds: [] as string[] };
+    if (
+      !mission ||
+      mission.operator_paused_at ||
+      ["COMPLETE", "FAILED", "CANCELED", "CANCELING", "WAITING_FOR_USER"].includes(mission.status)
+    )
+      return result;
+    const generation = this.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    if (
+      this.listRecoveryDecisions(missionId).some(
+        (decision) =>
+          decision.action === "WAIT_FOR_REQUIREMENT" &&
+          (decision.resumptionGeneration ?? 0) === generation &&
+          ["planned", "started"].includes(decision.status),
+      )
+    )
+      return result;
+    for (const task of this.listTasks(missionId)) {
+      if (
+        task.status !== "CANCELED" ||
+        task.kind !== "agent" ||
+        task.role !== "implementer" ||
+        this.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === task.task_id)
+      )
+        continue;
+      const proven = this.legacyTaskCancellationWasAuthorityLoss(task.task_id);
+      (proven ? result.recoverableTaskIds : result.ambiguousTaskIds).push(task.task_id);
+    }
+    return result;
+  }
+
+  /** Read-only origin proof retained after supersession; never grants permission to revive a task. */
+  legacyTaskCancellationWasAuthorityLoss(taskId: string): boolean {
+    const task = this.getTask(taskId);
+    if (!task || task.status !== "CANCELED" || task.kind !== "agent" || task.role !== "implementer") return false;
+    const execution = task.assigned_execution_id ? this.getExecution(task.assigned_execution_id) : undefined;
+    const reason = execution
+      ? (this.executionRejectionReasons.get(execution.execution_id) ??
+        this.listFailureClassifications(task.mission_id).find(
+          (classification) =>
+            classification.category === "ORPHANED_EXECUTION" &&
+            classification.executionId === execution.execution_id &&
+            classification.taskId === task.task_id &&
+            LEGACY_AUTHORITY_LOSS.test(classification.summary),
+        )?.summary ??
+        execution.exit_status ??
+        "")
+      : "";
+    const ownershipLoss = LEGACY_AUTHORITY_LOSS.test(reason);
+    return (
+      this.listMissionStops(task.mission_id).length > 0 &&
+      execution?.status === "CANCELED" &&
+      execution.task_id === task.task_id &&
+      execution.mission_id === task.mission_id &&
+      ownershipLoss &&
+      task.steer_requests.length === 0 &&
+      !/operator|user|constraint|canceled by caller/i.test(task.failure_reason ?? "")
+    );
   }
 
   /** Append inert late evidence and keep append failures visible in persistenceDiagnostics(). */
@@ -2216,6 +2289,11 @@ export class MissionStore {
   transitionRecovery(recoveryId: string, status: Exclude<RecoveryStatus, "planned">): RecoveryDecision {
     const decision = this.recoveryDecisions.get(recoveryId);
     if (!decision) throw new Error(`unknown recovery ${recoveryId}`);
+    // The scheduler and orchestrator may observe the same terminal outcome.
+    // A replay may acknowledge it, but must never change that outcome.
+    if (decision.status === status && (status === "succeeded" || status === "failed" || status === "exhausted")) {
+      return copyRecoveryDecision(decision);
+    }
     if (!RECOVERY_TRANSITIONS[decision.status].includes(status)) {
       throw new Error(`illegal recovery transition ${decision.status} -> ${status}`);
     }
@@ -2244,7 +2322,14 @@ export class MissionStore {
 
   supersedeTask(supersession: TaskSupersession): TaskSupersession {
     const failed = this.tasks.get(supersession.failedTaskId);
-    if (!failed || failed.mission_id !== supersession.missionId || failed.status !== "FAILED") {
+    const legacyRecovery =
+      failed?.status === "CANCELED" &&
+      supersession.recoveryDecisionId &&
+      this.getRecoveryDecision(supersession.recoveryDecisionId)?.action === "FENCE_RECONCILE_AND_RESUME" &&
+      (this.getRecoveryDecision(supersession.recoveryDecisionId)?.resumptionGeneration ?? 0) ===
+        (this.listMissionResumptions(supersession.missionId).at(-1)?.generation ?? 0) &&
+      this.legacyCanceledRecovery(supersession.missionId).recoverableTaskIds.includes(failed.task_id);
+    if (!failed || failed.mission_id !== supersession.missionId || (failed.status !== "FAILED" && !legacyRecovery)) {
       throw new Error(`supersession requires a failed task ${supersession.failedTaskId}`);
     }
     if (supersession.replacementTaskIds.length === 0) throw new Error("supersession requires replacement task IDs");
@@ -2729,6 +2814,96 @@ export class MissionStore {
     this.missionResumptions.push(resumption);
     this.emit("mission.resumed", missionId, { actor: "system", resumption });
     return { ...resumption };
+  }
+
+  /** Conditional automatic resumption; operator intent is checked at the durable append boundary. */
+  resumeMissionIfCurrent(
+    missionId: string,
+    reason: string,
+    expected: MissionRevisionFence,
+  ): Promise<MissionResumption | undefined> {
+    const operationKey = JSON.stringify([
+      missionId,
+      expected.revision,
+      expected.status,
+      expected.blockedEpisodeId,
+      expected.resumptionGeneration,
+    ]);
+    const eligible = (store: MissionStore): boolean => {
+      const mission = store.getMission(missionId);
+      return (
+        store.matchesMissionFence(missionId, expected) &&
+        !mission?.operator_paused_at &&
+        !["WAITING_FOR_USER", "NEEDS_ATTENTION", "CANCELING"].includes(mission?.status ?? "") &&
+        !store
+          .listRecoveryDecisions(missionId)
+          .some(
+            (decision) =>
+              (decision.resumptionGeneration ?? 0) === expected.resumptionGeneration &&
+              decision.action === "WAIT_FOR_REQUIREMENT" &&
+              ["planned", "started"].includes(decision.status),
+          )
+      );
+    };
+    const settle = this.emitChain.then(async () => {
+      await this.drainPending();
+      const durable = MissionStore.open(this.backend);
+      if (!eligible(durable)) {
+        for (const eventId of this.resumptionWriteFailures.get(operationKey) ?? [])
+          this.clearPersistenceFailure(eventId);
+        this.resumptionWriteFailures.delete(operationKey);
+        return undefined;
+      }
+      if (!eligible(this)) return undefined;
+      const resumption: MissionResumption = {
+        missionId,
+        reason,
+        resumedAt: new Date().toISOString(),
+        generation: expected.resumptionGeneration + 1,
+        stopGeneration: durable.listMissionStops(missionId).at(-1)?.generation ?? 0,
+      };
+      const event: OrchestrationEvent = {
+        event_id: id("oevt"),
+        mission_id: missionId,
+        timestamp: resumption.resumedAt,
+        type: "mission.resumed",
+        actor: "system",
+        payload: { actor: "system", resumption },
+      };
+      try {
+        const appended = await this.backend.appendConditionally(
+          {
+            event_id: event.event_id,
+            timestamp: event.timestamp,
+            type: event.type,
+            project_id: null,
+            run_id: missionId,
+            worker_id: null,
+            payload: event.payload,
+          },
+          () => eligible(this) && eligible(MissionStore.open(this.backend)),
+          () => this.apply(event),
+        );
+        if (appended) {
+          for (const eventId of this.resumptionWriteFailures.get(operationKey) ?? [])
+            this.clearPersistenceFailure(eventId);
+          this.resumptionWriteFailures.delete(operationKey);
+          return { ...resumption };
+        }
+        return undefined;
+      } catch (error) {
+        const failed = this.resumptionWriteFailures.get(operationKey) ?? new Set<string>();
+        failed.add(event.event_id);
+        this.resumptionWriteFailures.set(operationKey, failed);
+        this.recordPersistenceFailure(event, error);
+        throw error;
+      }
+    });
+    this.emitChain = settle.then(
+      () => undefined,
+      () => undefined,
+    );
+    return settle;
   }
 
   listMissionResumptions(missionId?: string): MissionResumption[] {

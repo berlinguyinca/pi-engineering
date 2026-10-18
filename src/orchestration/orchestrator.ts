@@ -41,9 +41,12 @@ import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFin
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import {
   type InterruptMode,
+  MAINTENANCE_STOP_REASON,
   MISSION_CANCEL_REASON,
+  MISSION_MAINTENANCE_REASON,
   OPERATOR_PAUSE_STOP_REASON,
   interruptibleRun,
+  isMaintenanceAbort,
   isPauseAbort,
 } from "./interrupt.ts";
 import { transitionMissionToCanceled } from "./missionCancel.ts";
@@ -359,6 +362,8 @@ export class Orchestrator {
   };
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   /** Run controllers of missions executing in this process, for an explicit cancel. */
+  private maintenanceRequested = false;
+  private startingRuns = 0;
   private readonly liveRuns = new Map<string, AbortController>();
   private readonly runControllers = new WeakMap<AbortSignal, AbortController>();
   private readonly pauseHooks = new WeakMap<AbortController, (hook: () => void) => void>();
@@ -484,6 +489,7 @@ export class Orchestrator {
    */
   async repairBlockedMission(missionId: string, signal?: AbortSignal): Promise<Mission> {
     const paused = this.store.getMission(missionId);
+    if (this.maintenanceRequested && paused) return paused;
     // Only the operator resumes a mission the operator paused.
     if (paused?.operator_paused_at) return paused;
     const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
@@ -598,8 +604,44 @@ export class Orchestrator {
       const requeuedResumable = this.store.requeueResumableTasks(missionId);
       await this.store.flush();
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      const legacy = this.store.legacyCanceledRecovery(missionId);
+      if (legacy.ambiguousTaskIds.length) {
+        const fence = this.store.getMission(missionId)!;
+        const preservedWork = await this.preservedMissionWork(missionId);
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        await this.store.stopMissionIfCurrent(
+          missionId,
+          {
+            reason: `LEGACY_REPAIR_REQUIRED: canceled implementations lack exact ownership-loss evidence: ${legacy.ambiguousTaskIds.join(", ")}`,
+            preservedWork,
+            attemptedRecoveries: [],
+            resumeCondition: "explicitly reconcile the canceled task intent and preserved Git work before retrying",
+          },
+          {
+            revision: fence.revision,
+            status: fence.status,
+            blockedEpisodeId: fence.blocked_episode_id ?? null,
+            resumptionGeneration: expectedResumptionGeneration,
+          },
+        );
+        return this.store.getMission(missionId)!;
+      }
+
+      let legacyClassification: FailureClassification | undefined;
+      if (legacy.recoverableTaskIds.length) {
+        const classified = this.failureClassifier.classify({
+          missionId,
+          taskId: null,
+          executionId: null,
+          category: "ORPHANED_EXECUTION",
+          summary: `Recover legacy implementations canceled after proven ownership loss: ${legacy.recoverableTaskIds.join(", ")}`,
+          observedAt: new Date(this.scheduler.now()).toISOString(),
+        });
+        legacyClassification =
+          this.store.getFailureClassification(classified.classificationId) ?? this.store.classifyFailure(classified);
+      }
       const classifications = this.store.listFailureClassifications(missionId);
-      let classification = classifications.at(-1);
+      let classification = legacyClassification ?? classifications.at(-1);
       if (!classification) throw new Error(`blocked mission ${missionId} has no durable failure classification`);
       classification = this.rederiveLegacyGateClassification(classification);
       const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
@@ -646,15 +688,24 @@ export class Orchestrator {
             (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
             (entry.status === "planned" || entry.status === "started"),
         );
+      if (
+        legacy.recoverableTaskIds.length &&
+        repairDecision &&
+        repairDecision.classificationId !== classification.classificationId
+      ) {
+        this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        repairDecision = undefined;
+      }
       // The supervisor names a requirement wait before the mission is BLOCKED,
       // so its decision carries no episode: adopt it rather than plan a second
       // WAIT_FOR_REQUIREMENT for the same classification and resumption.
+      const currentClassificationId = classification.classificationId;
       repairDecision ??= this.store
         .listRecoveryDecisions(missionId)
         .filter(
           (entry) =>
             entry.action === "WAIT_FOR_REQUIREMENT" &&
-            entry.classificationId === classification.classificationId &&
+            entry.classificationId === currentClassificationId &&
             (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
             (entry.status === "planned" || entry.status === "started"),
         )
@@ -706,7 +757,11 @@ export class Orchestrator {
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
       }
-      if (repairDecision.action === "CREATE_REPAIR_TASKS" && !repairDecision.startingCandidateContent) {
+      if (
+        repairDecision.action === "CREATE_REPAIR_TASKS" &&
+        !repairDecision.startingCandidateContent &&
+        (!classification.taskId || this.store.getTask(classification.taskId)?.kind !== "agent")
+      ) {
         // Gate repair without an independently Git-verified candidate baseline
         // is refused (materiality could not be proven). The refusal is terminal
         // for this resumption: settle the decision whether it was planned or
@@ -717,13 +772,14 @@ export class Orchestrator {
         if (repairDecision.status === "planned" || repairDecision.status === "started") {
           this.store.transitionRecovery(repairDecision.recoveryId, "failed");
         }
+        const refusedRecoveryId = repairDecision.recoveryId;
         const recordedBaselineRefusal = this.store
           .listFindings(missionId)
           .some(
             (finding) =>
               finding.category === "recovery_candidate_baseline" &&
               finding.status === "open" &&
-              finding.evidence === repairDecision.recoveryId,
+              finding.evidence === refusedRecoveryId,
           );
         if (!recordedBaselineRefusal) {
           this.store.addFinding({
@@ -779,23 +835,54 @@ export class Orchestrator {
         return reran.mission;
       }
       if (repairDecision.action === "PAUSE_FOR_PERSISTENCE" || repairDecision.action === "PROBE_AND_BACKOFF") {
-        if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "started");
-        const preservedWork = await this.preservedMissionWork(missionId);
-        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
-        this.store.stopMission(missionId, {
-          reason: repairDecision.expectedMaterialChange,
-          preservedWork,
-          attemptedRecoveries: [repairDecision.recoveryId],
-          resumeCondition:
-            repairDecision.action === "PAUSE_FOR_PERSISTENCE"
-              ? "durable writes must succeed and persistence diagnostics must clear"
-              : repairDecision.deadline
-                ? `a healthy provider probe must succeed before ${repairDecision.deadline}`
-                : "a healthy provider probe must succeed (no deadline: the mission waits for capacity)",
-        });
+        if (repairDecision.status === "planned") {
+          this.store.transitionRecovery(repairDecision.recoveryId, "started");
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          return this.store.getMission(missionId)!;
+        }
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
-        return this.store.getMission(missionId)!;
+        // Keep a named wait open. Supervision owns subsequent bounded probes,
+        // including after restart; a durable stop would suppress that wake-up.
+        const ready =
+          repairDecision.action === "PAUSE_FOR_PERSISTENCE"
+            ? this.store.persistenceDiagnostics().length === 0
+            : await this.scheduler.gatewayHealthy(
+                AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(30_000)]),
+              );
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const current = this.store.getMission(missionId)!;
+        if (
+          !ready ||
+          signal?.aborted ||
+          current.operator_paused_at ||
+          !["BLOCKED", "REPAIRING"].includes(current.status)
+        )
+          return current;
+        this.store.transitionRecovery(repairDecision.recoveryId, "succeeded");
+        // A healthy provider is material evidence to resume the existing work,
+        // not a reason to manufacture another provider-wait decision.
+        classification = this.store.classifyFailure(
+          this.failureClassifier.classify({
+            missionId,
+            taskId: null,
+            executionId: null,
+            category: "ORPHANED_EXECUTION",
+            summary: `Recovery wait ${repairDecision.recoveryId} cleared; preserved mission work needs reconciliation`,
+            observedAt: new Date(this.scheduler.now()).toISOString(),
+          }),
+        );
+        repairDecision = this.store.planRecovery({
+          ...repairDecision,
+          classificationId: classification.classificationId,
+          failureFingerprint: classification.fingerprint,
+          recoveryId: id("RCV"),
+          action: "FENCE_RECONCILE_AND_RESUME",
+          status: "planned",
+          expectedMaterialChange: "redispatch preserved work after a healthy recovery probe",
+          decidedAt: new Date(this.scheduler.now()).toISOString(),
+        });
       }
 
       const manifestGenerationBefore = this.store.getWorkspaceManifest(missionId)?.generation;
@@ -832,6 +919,7 @@ export class Orchestrator {
             this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           }
           this.missionRepoIds.set(missionId, resolved.primaryRepoId);
+          this.repositoryRegistry?.activate(missionId, rebuilt.generation, rebuilt.hash, resolved.primaryRepoId);
         } catch (error) {
           if (error instanceof Error && error.message.startsWith("STALE_RECOVERY_GENERATION")) throw error;
           const summary = `workspace manifest rebuild failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -853,6 +941,32 @@ export class Orchestrator {
         }
       }
 
+      if (this.store.listTasks(missionId).length === 0) {
+        // Preflight and planner outages happened before a DAG existed. Once
+        // their condition is repaired, run the normal protected planning path
+        // against this mission rather than attempting to finalize an empty DAG.
+        if (this.store.getMission(missionId)?.status === "BLOCKED") {
+          this.store.transitionMission(missionId, "REPAIRING", "system", {
+            recoveryDecisionId: repairDecision.recoveryId,
+          });
+        }
+        const request = mission.user_request;
+        const outcome = await this.runMissionPipeline(this.store.getMission(missionId)!, {
+          request,
+          intent: { ...this.router.route({ request }), suggested_workflow: mission.workflow_class },
+          risk: mission.risk_profile,
+          resumePreflight: true,
+          opts: { signal, mutationRequested: workflowMutatesRepo(mission.workflow_class) },
+        });
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const currentDecision = this.store.getRecoveryDecision(repairDecision.recoveryId);
+        if (currentDecision?.status === "started") {
+          this.store.transitionRecovery(repairDecision.recoveryId, outcome.completed ? "succeeded" : "failed");
+        }
+        await this.store.flush();
+        return outcome.mission;
+      }
+
       const invalidationsBefore = this.store.listEvidenceInvalidations(missionId).length;
       const candidateIdentityBefore =
         repairDecision.startingCandidateIdentityHash !== undefined
@@ -863,7 +977,7 @@ export class Orchestrator {
         .listTasks(missionId)
         .filter(
           (task) =>
-            task.status === "FAILED" &&
+            (task.status === "FAILED" || legacy.recoverableTaskIds.includes(task.task_id)) &&
             !this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === task.task_id),
         );
       const actionTaskId = classification.taskId;
@@ -887,6 +1001,7 @@ export class Orchestrator {
               .map((task) => task.task_id),
       );
       const failedTasks = unresolvedFailedTasks.filter((task) => {
+        if (legacy.recoverableTaskIds.length && repairDecision.action === "FENCE_RECONCILE_AND_RESUME") return true;
         switch (repairDecision.action) {
           case "CHECKPOINT_SPLIT_AND_REPLACE":
           case "REPAIR_WORKER_OUTPUT":
@@ -907,7 +1022,14 @@ export class Orchestrator {
             return false;
         }
       });
-      if (repairDecision.action === "FENCE_RECONCILE_AND_RESUME" && failedTasks.length === 0 && gateRerunnable) {
+      if (
+        repairDecision.action === "FENCE_RECONCILE_AND_RESUME" &&
+        failedTasks.length === 0 &&
+        gateRerunnable &&
+        !this.store
+          .listTasks(missionId)
+          .some((task) => ["PENDING", "READY", "RUNNING", "RETRYING"].includes(task.status))
+      ) {
         // Nothing failed is left to replace: only the gates are outstanding, so
         // re-run them against the existing candidate (the #194 gate path)
         // instead of recording "no material progress".
@@ -1018,7 +1140,9 @@ export class Orchestrator {
             objective: createsRepair
               ? `Repair the repository defect exposed by ${failed.kind}: ${failed.objective}. Then leave the candidate ready for fresh gates.`
               : `Recover ${failed.objective}: complete remaining deliverable ${deliverable}${committedNote(checkpoint)}`,
-            depends_on: [...failed.depends_on],
+            depends_on: [
+              ...new Set([...failed.depends_on, ...(failed.kind !== "agent" ? legacy.recoverableTaskIds : [])]),
+            ],
             priority: failed.priority,
             mutates_repo: mutatesRepo,
             write_domains: createsRepair ? this.writableDomainsForMission(missionId) : [...failed.write_domains],
@@ -1214,7 +1338,14 @@ export class Orchestrator {
           case "RECONSTRUCT_EVIDENCE":
             return this.store.listEvidenceInvalidations(missionId).length > invalidationsBefore;
           case "FENCE_RECONCILE_AND_RESUME":
-            return reconciledOrphans.length > 0 || failedTasks.length > 0 || requeuedResumable > 0;
+            return (
+              reconciledOrphans.length > 0 ||
+              failedTasks.length > 0 ||
+              requeuedResumable > 0 ||
+              missionTasksNow.some(
+                (task) => task.status !== "SUCCEEDED" && this.store.getTask(task.task_id)?.status === "SUCCEEDED",
+              )
+            );
           case "CHECKPOINT_SPLIT_AND_REPLACE":
           case "REPAIR_WORKER_OUTPUT":
           case "REBUILD_INTEGRATION_CANDIDATE":
@@ -1576,17 +1707,69 @@ export class Orchestrator {
     };
   }
 
+  /** Fence new local dispatch, then drain only phases with resumable worker cancellation. */
+  async prepareForMaintenance({
+    timeoutMs,
+    missionIds,
+  }: { timeoutMs: number; missionIds?: readonly string[] }): Promise<
+    { status: "ready" } | { status: "busy"; reason: string }
+  > {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 120_000)
+      throw new Error("maintenance timeout must be between 0 and 120000ms");
+    const localExecution = (execution: { status: string; mission_id: string }) =>
+      execution.status === "RUNNING" && (!missionIds || missionIds.includes(execution.mission_id));
+    const safe = new Set([
+      "EXECUTING",
+      "WAITING_FOR_LLM",
+      "WAITING_FOR_CAPACITY",
+      "WAITING_FOR_GATEWAY",
+      "WAITING_FOR_MODEL",
+    ]);
+    if (this.blockedRepairFlights.size || this.startingRuns > this.liveRuns.size)
+      return { status: "busy", reason: "mission is planning or recovering" };
+    for (const missionId of this.liveRuns.keys()) {
+      const state = this.store.getMission(missionId)?.status;
+      if (!state || !safe.has(state))
+        return { status: "busy", reason: `mission ${missionId} is in critical phase ${state}` };
+    }
+    if (
+      this.store
+        .listExecutions()
+        .some((execution) => localExecution(execution) && !this.liveRuns.has(execution.mission_id))
+    ) {
+      return { status: "busy", reason: "execution has no local resumable controller" };
+    }
+    this.maintenanceRequested = true;
+    for (const controller of this.liveRuns.values()) controller.abort(MISSION_MAINTENANCE_REASON);
+    const deadline = performance.now() + timeoutMs;
+    while (this.liveRuns.size || this.startingRuns || this.store.listExecutions().some(localExecution)) {
+      if (performance.now() >= deadline)
+        return { status: "busy", reason: "waiting for resumable worker cancellation to settle" };
+      await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now()))));
+    }
+    await this.store.flush();
+    return { status: "ready" };
+  }
+
+  endMaintenance(): void {
+    this.maintenanceRequested = false;
+  }
+
   async orchestrate(
     request: string,
     options: OrchestrateOptions = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
-    await this.refreshMissionLimits();
+    if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
+    this.startingRuns++;
     const run = interruptibleRun(options.signal, options.interrupt);
     this.runControllers.set(run.signal, run.controller);
     this.pauseHooks.set(run.controller, run.onPause);
     try {
+      await this.refreshMissionLimits();
+      if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
       return await this.orchestrateLimited(request, { ...options, signal: run.signal });
     } finally {
+      this.startingRuns--;
       run.dispose();
     }
   }
@@ -1668,6 +1851,7 @@ export class Orchestrator {
         selectedBaseRef = targetCommit;
       }
     }
+    if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
     const mission = this.store.createMission({
       title: opts.title ?? request,
       goal: request,
@@ -1701,6 +1885,7 @@ export class Orchestrator {
       risk: RiskProfile;
       workspace?: Awaited<ReturnType<WorkspaceManifestResolver["resolve"]>> | undefined;
       workspaceError?: WorkspaceScopeError | undefined;
+      resumePreflight?: boolean;
       opts: Pick<
         OrchestrateOptions,
         "signal" | "onProgress" | "acceptanceCriteria" | "mutationRequested" | "changedFiles"
@@ -1740,8 +1925,10 @@ export class Orchestrator {
           mission.mission_id,
           `[mission ${mission.mission_id}] execution mode: ${mode.mode} — ${mode.reason}`,
         );
-      this.observability?.missionCreated(mission.mission_id, mission.title);
-      this.store.transitionMission(mission.mission_id, "CLASSIFYING");
+      if (!ctx.resumePreflight) {
+        this.observability?.missionCreated(mission.mission_id, mission.title);
+        this.store.transitionMission(mission.mission_id, "CLASSIFYING");
+      }
 
       if (workspaceError) {
         this.store.classifyFailure({
@@ -1842,9 +2029,16 @@ export class Orchestrator {
       }
 
       // Derive acceptance criteria.
-      const criteria = opts.acceptanceCriteria ?? (await this.deriveAcceptance?.(mission)) ?? [];
+      const criteria =
+        ctx.resumePreflight && mission.acceptance_criteria.length
+          ? []
+          : (opts.acceptanceCriteria ?? (await this.deriveAcceptance?.(mission)) ?? []);
       for (const c of criteria) this.store.addAcceptanceCriterion(mission.mission_id, c);
-      if (criteria.length === 0 && workflowMutatesRepo(intent.suggested_workflow)) {
+      if (
+        criteria.length === 0 &&
+        mission.acceptance_criteria.length === 0 &&
+        workflowMutatesRepo(intent.suggested_workflow)
+      ) {
         this.store.addAcceptanceCriterion(mission.mission_id, `Goal achieved: ${request}`);
       }
 
@@ -1861,7 +2055,7 @@ export class Orchestrator {
         });
       }
       this.phase(this.store.getMission(mission.mission_id)!, "classified");
-      this.store.transitionMission(mission.mission_id, "PLANNING");
+      if (!ctx.resumePreflight) this.store.transitionMission(mission.mission_id, "PLANNING");
 
       // Pure conversation/research has nothing to schedule — but ONLY when policy
       // attached no gates. Taking this shortcut while gates are set would complete
@@ -1872,7 +2066,7 @@ export class Orchestrator {
       const passive = intent.suggested_workflow === "conversation" || intent.suggested_workflow === "research";
       if (passive && gatesNow.length === 0) {
         // Walk the lifecycle legally instead of teleporting to COMPLETE.
-        this.store.transitionMission(mission.mission_id, "READY");
+        if (!ctx.resumePreflight) this.store.transitionMission(mission.mission_id, "READY");
         this.store.transitionMission(mission.mission_id, "EXECUTING");
         this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
         this.store.completeMission(mission.mission_id, {
@@ -2092,7 +2286,7 @@ export class Orchestrator {
           this.planning.delete(mission.mission_id);
         }
       }
-      this.store.transitionMission(mission.mission_id, "READY");
+      if (!ctx.resumePreflight) this.store.transitionMission(mission.mission_id, "READY");
 
       // Schedule + execute.
       this.store.transitionMission(mission.mission_id, "EXECUTING");
@@ -2101,15 +2295,18 @@ export class Orchestrator {
       await this.scheduler.runMission(mission.mission_id, opts.signal);
 
       if (isPauseAbort(opts.signal)) {
-        const pausedByOperator = await this.pauseInterruptedMission(mission.mission_id);
+        const pausedByOperator = await this.pauseInterruptedMission(
+          mission.mission_id,
+          isMaintenanceAbort(opts.signal),
+        );
         return {
           mission: pausedByOperator,
           intent,
           verdict: this.gate.evaluate(pausedByOperator),
           completed: false,
-          failureReason: OPERATOR_PAUSE_STOP_REASON,
+          failureReason: isMaintenanceAbort(opts.signal) ? MAINTENANCE_STOP_REASON : OPERATOR_PAUSE_STOP_REASON,
           paused: true,
-          pausedBy: "operator",
+          pausedBy: isMaintenanceAbort(opts.signal) ? "infrastructure" : "operator",
         };
       }
       if (opts.signal?.aborted) {
@@ -2309,7 +2506,10 @@ export class Orchestrator {
     missionId: string,
     opts: { signal?: AbortSignal; onProgress?: OrchestrateOptions["onProgress"] } = {},
   ): Promise<{ started: true; result: OrchestrateResult } | { started: false; reason: string }> {
+    if (this.maintenanceRequested) return { started: false, reason: "runtime_maintenance" };
     await this.refreshMissionLimits();
+    if (this.maintenanceRequested) return { started: false, reason: "runtime_maintenance" };
+    this.startingRuns++;
     const run = interruptibleRun(opts.signal);
     this.runControllers.set(run.signal, run.controller);
     this.pauseHooks.set(run.controller, run.onPause);
@@ -2393,6 +2593,7 @@ export class Orchestrator {
         throw error;
       }
     } finally {
+      this.startingRuns--;
       run.dispose();
     }
   }
@@ -2410,7 +2611,9 @@ export class Orchestrator {
     missionId: string,
     options?: { force?: boolean; signal?: AbortSignal; interrupt?: InterruptMode },
   ): Promise<Mission> {
+    if (this.maintenanceRequested) return this.store.getMission(missionId)!;
     await this.refreshMissionLimits();
+    if (this.maintenanceRequested) return this.store.getMission(missionId)!;
     const run = interruptibleRun(options?.signal, options?.interrupt);
     run.onPause(() => this.store.markOperatorPause(missionId));
     this.liveRuns.set(missionId, run.controller);
@@ -2424,7 +2627,7 @@ export class Orchestrator {
 
   private async resumePaused(missionId: string, opts: { force?: boolean; signal: AbortSignal }): Promise<Mission> {
     const expectedResumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
-    this.activateMissionRepository(missionId);
+    await this.activateMissionRepository(missionId);
     const mission = this.store.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
     if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission;
@@ -2434,7 +2637,11 @@ export class Orchestrator {
     if (!opts?.force && !(await this.scheduler.gatewayHealthy(opts?.signal))) {
       return opts?.signal?.aborted ? this.interruptedMission(missionId, opts.signal) : mission;
     }
-    if (this.ownership) this.ownershipByMission.set(missionId, await this.ownership.acquire(missionId));
+    if (this.ownership)
+      this.ownershipByMission.set(
+        missionId,
+        await this.ownership.acquire(missionId, { resumptionGeneration: expectedResumptionGeneration }),
+      );
     try {
       this.phase(mission, "executing");
       this.report(missionId, `[mission ${missionId}] resuming after infrastructure recovery`);
@@ -3744,7 +3951,7 @@ export class Orchestrator {
         try {
           authority.assertAuthoritative();
         } catch (authorityError) {
-          await handle?.cancel().catch(() => undefined);
+          await handle?.cancel({ resumable: true }).catch(() => undefined);
           if (handle) {
             this.store.rejectLateExecution(
               handle.executionId,
@@ -4086,13 +4293,19 @@ export class Orchestrator {
       mission,
       verdict: this.gate.evaluate(mission),
       completed: false,
-      failureReason: isPauseAbort(signal) ? OPERATOR_PAUSE_STOP_REASON : "canceled by caller",
+      failureReason: isMaintenanceAbort(signal)
+        ? MAINTENANCE_STOP_REASON
+        : isPauseAbort(signal)
+          ? OPERATOR_PAUSE_STOP_REASON
+          : "canceled by caller",
     };
   }
 
   /** An aborted run: a durable pause for an operator interrupt, otherwise a cancel. */
   private interruptedMission(missionId: string, signal: AbortSignal | undefined): Promise<Mission> {
-    return isPauseAbort(signal) ? this.pauseInterruptedMission(missionId) : this.cancelMission(missionId);
+    return isPauseAbort(signal)
+      ? this.pauseInterruptedMission(missionId, isMaintenanceAbort(signal))
+      : this.cancelMission(missionId);
   }
 
   /**
@@ -4101,9 +4314,10 @@ export class Orchestrator {
    * supervisor from resuming it on its own — the operator resumes it with
    * `/mission resume <id>` (or the mission tool's resume action).
    */
-  private async pauseInterruptedMission(missionId: string): Promise<Mission> {
+  private async pauseInterruptedMission(missionId: string, maintenance = false): Promise<Mission> {
+    const reason = maintenance ? MAINTENANCE_STOP_REASON : OPERATOR_PAUSE_STOP_REASON;
     // Normally recorded already, synchronously, when the interrupt landed.
-    this.store.markOperatorPause(missionId);
+    if (!maintenance) this.store.markOperatorPause(missionId);
     let mission = this.store.getMission(missionId)!;
     if (["COMPLETE", "FAILED", "CANCELED", "CANCELING"].includes(mission.status)) return mission;
     if (["NEW", "CLASSIFYING", "PLANNING"].includes(mission.status)) {
@@ -4118,7 +4332,7 @@ export class Orchestrator {
     }
     for (const task of this.store.listTasks(missionId)) {
       if (task.status === "RUNNING") {
-        this.store.transitionTask(task.task_id, "RETRYING", "system", { failure_reason: OPERATOR_PAUSE_STOP_REASON });
+        this.store.transitionTask(task.task_id, "RETRYING", "system", { failure_reason: reason });
       }
     }
     if (mission.status !== "PAUSED_INFRASTRUCTURE") {
@@ -4135,10 +4349,12 @@ export class Orchestrator {
       mission = this.store.transitionMission(missionId, "PAUSED_INFRASTRUCTURE");
     }
     this.store.stopMission(missionId, {
-      reason: OPERATOR_PAUSE_STOP_REASON,
+      reason,
       preservedWork: await this.preservedMissionWork(missionId),
       attemptedRecoveries: [],
-      resumeCondition: `the operator resumes it: /mission resume ${missionId}`,
+      resumeCondition: maintenance
+        ? "verified runtime maintenance resumes this existing mission"
+        : `the operator resumes it: /mission resume ${missionId}`,
     });
     await this.store.flush();
     this.report(

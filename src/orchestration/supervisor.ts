@@ -264,6 +264,15 @@ export class MissionSupervisor {
       return this.statusForStop(mission, currentStop.reason, currentStop.resumeCondition, expectedResumptionGeneration);
     }
 
+    const scheduledWait = this.currentWait(mission.mission_id);
+    if (
+      scheduledWait &&
+      scheduledWait.action !== "WAIT_FOR_REQUIREMENT" &&
+      this.now() >= Date.parse(scheduledWait.nextActionAt)
+    ) {
+      return this.status(mission, "HEALTHY", scheduledWait.expectedMaterialChange, undefined, scheduledWait);
+    }
+
     const diagnosis = this.diagnose(mission);
     if (!diagnosis) {
       this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
@@ -376,6 +385,36 @@ export class MissionSupervisor {
             reason: `Autonomous spec stage ${latestStage.stage} deadline expired at ${latestStage.deadlineAt}`,
           };
         }
+      }
+    }
+    // Preflight failures have no worker to orphan. Preserve their unresolved
+    // cause until recovery succeeds instead of replacing it with lease noise.
+    if (
+      (mission.status === "BLOCKED" || mission.status === "REPAIRING") &&
+      this.store.listTasks(mission.mission_id).length === 0 &&
+      !this.planningInFlight?.(mission.mission_id)
+    ) {
+      const blocker = this.store.listFailureClassifications(mission.mission_id).at(-1);
+      if (
+        blocker &&
+        blocker.category !== "ORPHANED_EXECUTION" &&
+        !this.store
+          .listRecoveryDecisions(mission.mission_id)
+          .some((decision) => decision.classificationId === blocker.classificationId && decision.status === "succeeded")
+      ) {
+        const operatorQuestion =
+          blocker.category === "REQUIREMENT_AMBIGUITY"
+            ? this.store
+                .listFindings(mission.mission_id)
+                .filter((finding) => finding.category === PLANNER_CLARIFICATION_CATEGORY && finding.status === "open")
+                .at(-1)?.evidence
+            : undefined;
+        return {
+          health: "REPAIR_REQUIRED",
+          category: blocker.category,
+          reason: blocker.summary,
+          ...(operatorQuestion ? { operatorQuestion } : {}),
+        };
       }
     }
     const lease = this.store.getMissionLease(mission.mission_id);

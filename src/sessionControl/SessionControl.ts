@@ -5,6 +5,15 @@ import { type Server, type Socket, createConnection, createServer } from "node:n
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { redactSecrets } from "../platform/redact.ts";
+import {
+  MaintenanceOperations,
+  type MaintenanceOutcome,
+  type MaintenanceReceipt,
+  type MaintenanceRequest,
+  type RuntimeDescription,
+  maintenanceStateRoot,
+  parseMaintenanceRequest,
+} from "./maintenance.ts";
 
 const VERSION = 1;
 const MAX_REQUEST_BYTES = 8192;
@@ -32,6 +41,11 @@ export interface MissionBrief {
   lastMeaningfulProgressAt: string | null;
   tasks: Array<{ id: string; status: string }>;
   lastError: string | null;
+  revision?: number;
+  resumptionGeneration?: number;
+  operatorPaused?: boolean;
+  resumeEligible?: boolean;
+  namedWait?: { action: string; nextActionAt: string | null; deadline: string | null };
 }
 
 export interface SessionStatus {
@@ -51,11 +65,14 @@ export interface SessionStatus {
   missions: MissionBrief[];
   nonce?: string;
   delivered?: boolean;
+  runtime?: RuntimeDescription;
+  maintenance?: MaintenanceReceipt;
 }
 
 export type ControlRequest =
   | { version: 1; op: "ping"; nonce: string }
   | { version: 1; op: "status" }
+  | { version: 1; op: "maintenance"; request: MaintenanceRequest }
   | { version: 1; op: "note"; messageId: string; text: string };
 export type ControlReply = { version: 1; ok: true; data: SessionStatus } | { version: 1; ok: false; error: string };
 export interface SessionQueryResult {
@@ -71,6 +88,10 @@ export interface StartSessionControlOptions {
   sessionId: string;
   onNote?: (text: string) => void | Promise<void>;
   getMissions?: (missionIds: readonly string[]) => Promise<MissionBrief[] | null>;
+  getOwnedMissions?: () => Promise<MissionBrief[]>;
+  getRuntime?: () => RuntimeDescription | undefined | Promise<RuntimeDescription | undefined>;
+  maintenanceRoot?: string;
+  onMaintenance?: (request: MaintenanceRequest) => Promise<MaintenanceOutcome>;
 }
 
 export function sessionControlRoot(env: NodeJS.ProcessEnv = process.env): string {
@@ -172,6 +193,9 @@ export class SessionControlServer {
   private lastToolProgress: string | null = null;
   private readonly activeTools = new Map<string, { name: string; startedAt: string }>();
   private readonly recentMissionIds: string[] = [];
+  private maintenance?: MaintenanceOperations;
+  private getOwnedMissions?: () => Promise<MissionBrief[]>;
+  private getRuntime?: () => RuntimeDescription | undefined | Promise<RuntimeDescription | undefined>;
 
   private constructor(
     rootDir: string,
@@ -211,6 +235,24 @@ export class SessionControlServer {
       options.onNote,
       options.getMissions,
     );
+    control.getOwnedMissions = options.getOwnedMissions;
+    control.getRuntime = options.getRuntime;
+    if (options.onMaintenance)
+      control.maintenance = new MaintenanceOperations(
+        options.maintenanceRoot ?? maintenanceStateRoot(),
+        options.sessionId,
+        async (request) =>
+          control.closed
+            ? {
+                status: "skipped",
+                result: {
+                  status: "skipped",
+                  code: "STALE_SESSION_INSTANCE",
+                  reason: "session retired before command execution",
+                },
+              }
+            : options.onMaintenance!(request),
+      );
     if (Buffer.byteLength(control.socketPath) > 100) throw new Error("control socket path exceeds Unix socket limit");
     server.on("connection", (socket) => control.handle(socket));
     try {
@@ -275,10 +317,14 @@ export class SessionControlServer {
   }
 
   private async status(includeMissions = true): Promise<SessionStatus> {
+    const runtimeDescription = await this.getRuntime?.();
     let snapshotAt: string | null = null;
     let missions: MissionBrief[] = [];
     let missionSource: SessionStatus["missionSource"] = "none";
-    if (includeMissions && this.recentMissionIds.length) {
+    if (includeMissions && this.getOwnedMissions) {
+      missions = await this.getOwnedMissions();
+      missionSource = "runtime";
+    } else if (includeMissions && this.recentMissionIds.length) {
       const runtime = await this.getMissions?.([...this.recentMissionIds]).catch(() => null);
       if (runtime) {
         missions = runtime;
@@ -303,8 +349,11 @@ export class SessionControlServer {
       lastToolProgress: this.lastToolProgress,
       snapshotAt,
       missionSource,
-      missionIds: [...this.recentMissionIds],
-      missions: missions.filter((mission) => this.recentMissionIds.includes(mission.id)),
+      missionIds: this.getOwnedMissions ? missions.map((mission) => mission.id) : [...this.recentMissionIds],
+      missions: this.getOwnedMissions
+        ? missions
+        : missions.filter((mission) => this.recentMissionIds.includes(mission.id)),
+      ...(runtimeDescription ? { runtime: runtimeDescription } : {}),
     };
   }
 
@@ -319,6 +368,17 @@ export class SessionControlServer {
       return { version: VERSION, ok: true, data: { ...(await this.status(false)), nonce: request.nonce } };
     }
     if (request.op === "status") return { version: VERSION, ok: true, data: await this.status() };
+    if (request.op === "maintenance") {
+      if (!this.maintenance) return failure("maintenance_unavailable");
+      try {
+        const parsed = parseMaintenanceRequest(request.request);
+        if (parsed.expectedInstanceId !== this.instanceId) return failure("stale_session_instance");
+        const maintenance = await this.maintenance.submit(parsed);
+        return { version: VERSION, ok: true, data: { ...(await this.status()), maintenance } };
+      } catch (error) {
+        return failure(redactSecrets(error instanceof Error ? error.message : "maintenance_failed"));
+      }
+    }
     if (request.op !== "note") return failure("unknown_operation");
     if (typeof request.messageId !== "string" || !/^[0-9a-f-]{36}$/.test(request.messageId))
       return failure("invalid_message_id");
@@ -340,6 +400,10 @@ export class SessionControlServer {
       if (this.noteIds.size > 128) this.noteIds.delete(this.noteIds.values().next().value!);
     }
     return { version: VERSION, ok: true, data: { ...(await this.status()), delivered: true } };
+  }
+
+  async waitForMaintenance(): Promise<void> {
+    await this.maintenance?.waitForIdle();
   }
 
   private handle(socket: Socket): void {
@@ -459,7 +523,13 @@ export async function requestSession(
       try {
         const reply = JSON.parse(body.slice(0, newline)) as ControlReply;
         if (reply.version !== VERSION || typeof reply.ok !== "boolean") return fail(new Error("invalid_reply"));
-        if (reply.ok && (!reply.data || reply.data.instanceId !== descriptor.instanceId))
+        if (
+          reply.ok &&
+          (!reply.data ||
+            reply.data.instanceId !== descriptor.instanceId ||
+            reply.data.pid !== descriptor.pid ||
+            reply.data.sessionId !== descriptor.sessionId)
+        )
           return fail(new Error("session_identity_mismatch"));
         settled = true;
         socket.end();

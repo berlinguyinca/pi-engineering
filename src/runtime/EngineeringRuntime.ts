@@ -31,7 +31,7 @@ import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
-import { OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
+import { MAINTENANCE_STOP_REASON, OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
 import { readAutospecFlags } from "../orchestration/missionMode.ts";
 import {
   PlannerTransientError,
@@ -681,6 +681,7 @@ export class EngineeringRuntime {
   runtimeBinding: RuntimeBinding | null = null;
   private closed = false;
   private openReferences = 1;
+  private readonly maintenanceObservedMissions = new Set<string>();
   private readonly missionResumeFlights = new Map<string, Promise<import("../orchestration/types.ts").Mission>>();
   private readonly supervisorSettlementFlights = new Map<string, Promise<void>>();
   /** Spaces out supervisor repairs that keep reporting the same unchanged decision. */
@@ -1579,8 +1580,131 @@ export class EngineeringRuntime {
     return mission;
   }
 
+  /** Current custody plus terminal outcomes previously observed here; never adopts sibling missions. */
+  async maintenanceOwnedMissionIds(): Promise<string[]> {
+    const namespace = this.orchestrationPath ? openedOrchestrationStores.get(this.orchestrationPath) : undefined;
+    if (!namespace || !this.missionStore) return [];
+    this.missionStore.syncExternal();
+    const owned: string[] = [];
+    for (const mission of this.missionStore.listMissions()) {
+      const resource = missionCustodyKey(mission.mission_id);
+      if (namespace.custody.holds(resource) && (await namespace.custody.claim(resource)).ok) {
+        this.maintenanceObservedMissions.add(mission.mission_id);
+        owned.push(mission.mission_id);
+      } else if (
+        this.maintenanceObservedMissions.has(mission.mission_id) &&
+        ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)
+      ) {
+        // Completion releases custody. Keep its read-only outcome visible to
+        // the maintenance receipt that observed this runtime owning it.
+        owned.push(mission.mission_id);
+      }
+    }
+    return owned;
+  }
+
+  async prepareForMaintenance(options: { timeoutMs: number }): Promise<
+    { status: "ready" } | { status: "busy"; reason: string }
+  > {
+    if (!this.orchestrator || !this.missionStore) return { status: "ready" };
+    const missionIds = await this.maintenanceOwnedMissionIds();
+    const result = await this.orchestrator.prepareForMaintenance({ ...options, missionIds });
+    if (result.status === "ready") {
+      const namespace = this.orchestrationPath ? openedOrchestrationStores.get(this.orchestrationPath) : undefined;
+      for (const missionId of missionIds) {
+        // Draining releases its worker lease; retain custody of only the missions
+        // this runtime proved it held before the drain, for the activation handoff.
+        if (!namespace || !(await namespace.custody.claim(missionCustodyKey(missionId))).ok) {
+          return { status: "busy", reason: `mission ${missionId} custody changed during maintenance` };
+        }
+      }
+    }
+    return result;
+  }
+
+  /** Release the dispatch gate after failed activation; durable mission stops remain intact. */
+  endMaintenance(): void {
+    this.orchestrator?.endMaintenance();
+  }
+
+  /** Automatic maintenance never clears operator pause or creates a replacement mission. */
+  async resumeMissionAfterMaintenance(
+    missionId: string,
+    expected: { expectedRevision: number; expectedResumptionGeneration: number },
+    signal?: AbortSignal,
+  ): Promise<{ status: "resumed"; mission: Mission } | { status: "skipped"; reason: string; code?: string }> {
+    const store = this.missionStore;
+    const orchestrator = this.orchestrator;
+    if (!store || !orchestrator)
+      return { status: "skipped", code: "RUNTIME_UNAVAILABLE", reason: "runtime unavailable" };
+    if (!(await this.maintenanceOwnedMissionIds()).includes(missionId))
+      return { status: "skipped", code: "CUSTODY_CHANGED", reason: "mission custody belongs to another session" };
+    store.syncExternal();
+    const mission = store.getMission(missionId);
+    const generation = store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
+    if (
+      !mission ||
+      mission.revision !== expected.expectedRevision ||
+      generation !== expected.expectedResumptionGeneration
+    )
+      return { status: "skipped", code: "STALE_MISSION_FENCE", reason: "mission revision or resumption changed" };
+    if (
+      signal?.aborted ||
+      mission.operator_paused_at ||
+      ["COMPLETE", "FAILED", "CANCELED", "CANCELING", "WAITING_FOR_USER", "NEEDS_ATTENTION"].includes(mission.status)
+    )
+      return {
+        status: "skipped",
+        code: "OPERATOR_INTENT",
+        reason: "mission is paused, terminal, or awaiting operator input",
+      };
+    if (store.listExecutions(missionId).some((execution) => execution.status === "RUNNING"))
+      return { status: "skipped", code: "ACTIVE_EXECUTION", reason: "mission has an active execution" };
+    const stop = store
+      .listMissionStops(missionId)
+      .filter((item) => item.resumptionGeneration === generation)
+      .at(-1);
+    if (!stop) return { status: "skipped", code: "NO_DURABLE_STOP", reason: "mission has no durable stop" };
+    const legacy = store.legacyCanceledRecovery(missionId);
+    if (legacy.ambiguousTaskIds.length)
+      return {
+        status: "skipped",
+        code: "LEGACY_REPAIR_REQUIRED",
+        reason: `Canceled implementation tasks lack exact ownership-loss evidence: ${legacy.ambiguousTaskIds.join(", ")}. Explicit repair must reconcile preserved work and operator intent.`,
+      };
+    const resumed = await store.resumeMissionIfCurrent(
+      missionId,
+      "verified runtime maintenance resumed preserved work",
+      {
+        revision: expected.expectedRevision,
+        resumptionGeneration: expected.expectedResumptionGeneration,
+        status: mission.status,
+        blockedEpisodeId: mission.blocked_episode_id ?? null,
+      },
+    );
+    if (!resumed)
+      return {
+        status: "skipped",
+        code: "STALE_MISSION_FENCE",
+        reason: "mission changed or operator intent prevents automatic resume",
+      };
+    store.syncExternal();
+    if (store.getMission(missionId)?.operator_paused_at || signal?.aborted)
+      return { status: "skipped", code: "OPERATOR_INTENT", reason: "operator interrupted maintenance recovery" };
+    orchestrator.endMaintenance();
+    let result: Mission;
+    if (mission.status === "PAUSED_INFRASTRUCTURE" && stop.reason === MAINTENANCE_STOP_REASON) {
+      result = await orchestrator.resume(missionId, { force: true, signal, interrupt: "pause" });
+    } else {
+      await this.normalizeMissionForRepair(missionId);
+      result = await orchestrator.repairBlockedMission(missionId, signal);
+    }
+    return { status: "resumed", mission: result };
+  }
+
   /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
   resumeBlockedMission(missionId: string, signal?: AbortSignal): Promise<import("../orchestration/types.ts").Mission> {
+    this.endMaintenance();
     const active = this.missionResumeFlights.get(missionId);
     if (active) return active;
     const flight = this.performBlockedMissionResume(missionId, signal).finally(() => {
@@ -1641,7 +1765,10 @@ export class EngineeringRuntime {
           .filter((value): value is string => !!value?.trim()),
         resumeCondition: "operator reopened a failed mission",
       } as Pick<MissionStop, "attemptedRecoveries" | "preservedWork" | "resumeCondition">);
-    if (stop?.reason === OPERATOR_PAUSE_STOP_REASON && mission.status === "PAUSED_INFRASTRUCTURE") {
+    if (
+      (stop?.reason === OPERATOR_PAUSE_STOP_REASON || stop?.reason === MAINTENANCE_STOP_REASON) &&
+      mission.status === "PAUSED_INFRASTRUCTURE"
+    ) {
       // Paused by an operator interrupt: continue exactly where it stopped. The
       // interrupted tasks were left resumable; another interrupt pauses again.
       this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission");
