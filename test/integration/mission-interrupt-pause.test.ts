@@ -555,3 +555,44 @@ test("maintenance refuses integration without aborting its worker", async () => 
     await fixture.cleanup();
   }
 });
+
+test("maintenance refuses ambiguous legacy task cancellation without consuming a resumption", async () => {
+  const fixture = await makeFixtureRepo();
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const abort = new AbortController();
+  let runtime: EngineeringRuntime | undefined;
+  let finishRun: Promise<unknown> | undefined;
+  try {
+    runtime = await openRuntime(fixture.root, capacityWorker([], started));
+    finishRun = runtime.orchestrator!.orchestrate("Make add return the sum", {
+      repository: fixture.root,
+      baseRef: await runtime.git!.headCommit(),
+      mutationRequested: true,
+      interrupt: "pause",
+      signal: abort.signal,
+    });
+    await workerStarted;
+    assert.equal((await runtime.prepareForMaintenance({ timeoutMs: 5_000 })).status, "ready");
+    await finishRun;
+    const store = runtime.missionStore!;
+    const mission = store.listMissions().at(-1)!;
+    const task = store.listTasks(mission.mission_id).find((task) => task.kind === "agent")!;
+    store.transitionTask(task.task_id, "CANCELED");
+    const result = await runtime.resumeMissionAfterMaintenance(mission.mission_id, {
+      expectedRevision: store.getMission(mission.mission_id)!.revision,
+      expectedResumptionGeneration: 0,
+    });
+    assert.equal(result.status, "skipped");
+    assert.equal(result.status === "skipped" ? result.code : "", "LEGACY_REPAIR_REQUIRED");
+    assert.equal(store.listMissionResumptions(mission.mission_id).length, 0);
+    assert.equal(store.getTask(task.task_id)?.status, "CANCELED");
+  } finally {
+    abort.abort();
+    await finishRun?.catch(() => undefined);
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});

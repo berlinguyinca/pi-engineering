@@ -604,8 +604,44 @@ export class Orchestrator {
       const requeuedResumable = this.store.requeueResumableTasks(missionId);
       await this.store.flush();
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      const legacy = this.store.legacyCanceledRecovery(missionId);
+      if (legacy.ambiguousTaskIds.length) {
+        const fence = this.store.getMission(missionId)!;
+        const preservedWork = await this.preservedMissionWork(missionId);
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        await this.store.stopMissionIfCurrent(
+          missionId,
+          {
+            reason: `LEGACY_REPAIR_REQUIRED: canceled implementations lack exact ownership-loss evidence: ${legacy.ambiguousTaskIds.join(", ")}`,
+            preservedWork,
+            attemptedRecoveries: [],
+            resumeCondition: "explicitly reconcile the canceled task intent and preserved Git work before retrying",
+          },
+          {
+            revision: fence.revision,
+            status: fence.status,
+            blockedEpisodeId: fence.blocked_episode_id ?? null,
+            resumptionGeneration: expectedResumptionGeneration,
+          },
+        );
+        return this.store.getMission(missionId)!;
+      }
+
+      let legacyClassification: FailureClassification | undefined;
+      if (legacy.recoverableTaskIds.length) {
+        const classified = this.failureClassifier.classify({
+          missionId,
+          taskId: null,
+          executionId: null,
+          category: "ORPHANED_EXECUTION",
+          summary: `Recover legacy implementations canceled after proven ownership loss: ${legacy.recoverableTaskIds.join(", ")}`,
+          observedAt: new Date(this.scheduler.now()).toISOString(),
+        });
+        legacyClassification =
+          this.store.getFailureClassification(classified.classificationId) ?? this.store.classifyFailure(classified);
+      }
       const classifications = this.store.listFailureClassifications(missionId);
-      let classification = classifications.at(-1);
+      let classification = legacyClassification ?? classifications.at(-1);
       if (!classification) throw new Error(`blocked mission ${missionId} has no durable failure classification`);
       classification = this.rederiveLegacyGateClassification(classification);
       const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
@@ -652,6 +688,14 @@ export class Orchestrator {
             (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
             (entry.status === "planned" || entry.status === "started"),
         );
+      if (
+        legacy.recoverableTaskIds.length &&
+        repairDecision &&
+        repairDecision.classificationId !== classification.classificationId
+      ) {
+        this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+        repairDecision = undefined;
+      }
       // The supervisor names a requirement wait before the mission is BLOCKED,
       // so its decision carries no episode: adopt it rather than plan a second
       // WAIT_FOR_REQUIREMENT for the same classification and resumption.
@@ -933,7 +977,7 @@ export class Orchestrator {
         .listTasks(missionId)
         .filter(
           (task) =>
-            task.status === "FAILED" &&
+            (task.status === "FAILED" || legacy.recoverableTaskIds.includes(task.task_id)) &&
             !this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === task.task_id),
         );
       const actionTaskId = classification.taskId;
@@ -957,6 +1001,7 @@ export class Orchestrator {
               .map((task) => task.task_id),
       );
       const failedTasks = unresolvedFailedTasks.filter((task) => {
+        if (legacy.recoverableTaskIds.length && repairDecision.action === "FENCE_RECONCILE_AND_RESUME") return true;
         switch (repairDecision.action) {
           case "CHECKPOINT_SPLIT_AND_REPLACE":
           case "REPAIR_WORKER_OUTPUT":
@@ -1095,7 +1140,9 @@ export class Orchestrator {
             objective: createsRepair
               ? `Repair the repository defect exposed by ${failed.kind}: ${failed.objective}. Then leave the candidate ready for fresh gates.`
               : `Recover ${failed.objective}: complete remaining deliverable ${deliverable}${committedNote(checkpoint)}`,
-            depends_on: [...failed.depends_on],
+            depends_on: [
+              ...new Set([...failed.depends_on, ...(failed.kind !== "agent" ? legacy.recoverableTaskIds : [])]),
+            ],
             priority: failed.priority,
             mutates_repo: mutatesRepo,
             write_domains: createsRepair ? this.writableDomainsForMission(missionId) : [...failed.write_domains],

@@ -1665,6 +1665,13 @@ export class EngineeringRuntime {
       .filter((item) => item.resumptionGeneration === generation)
       .at(-1);
     if (!stop) return { status: "skipped", code: "NO_DURABLE_STOP", reason: "mission has no durable stop" };
+    const legacy = store.legacyCanceledRecovery(missionId);
+    if (legacy.ambiguousTaskIds.length)
+      return {
+        status: "skipped",
+        code: "LEGACY_REPAIR_REQUIRED",
+        reason: `Canceled implementation tasks lack exact ownership-loss evidence: ${legacy.ambiguousTaskIds.join(", ")}. Explicit repair must reconcile preserved work and operator intent.`,
+      };
     const resumed = await store.resumeMissionIfCurrent(
       missionId,
       "verified runtime maintenance resumed preserved work",

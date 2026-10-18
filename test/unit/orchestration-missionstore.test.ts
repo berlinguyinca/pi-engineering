@@ -1468,6 +1468,44 @@ describe("MissionStore", () => {
 });
 
 describe("automatic maintenance resumption", () => {
+  for (const supersedingIntent of ["new_generation", "operator_pause"] as const) {
+    it(`retires a failed conditional write when durable ${supersedingIntent} supersedes its fence`, async () => {
+      const backend = new FailOnceBackend();
+      const s = MissionStore.open(backend);
+      const mission = s.createMission({
+        title: "obsolete resume",
+        goal: "preserve work",
+        user_request: "preserve work",
+        repository: ".",
+        base_ref: "base",
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+      s.transitionMission(mission.mission_id, "CLASSIFYING");
+      s.transitionMission(mission.mission_id, "BLOCKED");
+      await s.flush();
+      const before = s.getMission(mission.mission_id)!;
+      const fence = {
+        revision: before.revision,
+        status: before.status,
+        blockedEpisodeId: before.blocked_episode_id ?? null,
+        resumptionGeneration: 0,
+      };
+      backend.failNextAppend();
+      await assert.rejects(
+        s.resumeMissionIfCurrent(mission.mission_id, "maintenance", fence),
+        /persistence unavailable/,
+      );
+      assert.equal(s.persistenceDiagnostics().length, 1);
+      if (supersedingIntent === "new_generation") s.resumeMission(mission.mission_id, "operator recovery won");
+      else s.markOperatorPause(mission.mission_id);
+      await s.flush();
+      assert.equal(await s.resumeMissionIfCurrent(mission.mission_id, "maintenance", fence), undefined);
+      assert.deepEqual(s.persistenceDiagnostics(), []);
+      assert.equal(s.listMissionResumptions(mission.mission_id).length, supersedingIntent === "new_generation" ? 1 : 0);
+    });
+  }
+
   it("clears only the matching failed conditional write after a successful retry", async () => {
     const backend = new FailOnceBackend();
     const s = MissionStore.open(backend);
