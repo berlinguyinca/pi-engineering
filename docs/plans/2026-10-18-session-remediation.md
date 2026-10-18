@@ -69,9 +69,9 @@ deployment success remain unverified until their external prerequisites pass.
 ## Validation
 
 The broad local suite completed with 4,896 passes, zero failures, one skip, and
-ten existing TODOs (4,907 total tests). After the final review corrections, the
+ten existing TODOs (4,907 total tests). After the final review and CI fixture corrections, the
 affected routing, custom-executor, worker-isolation, recovery, ledger, lease,
-and storage suites passed again: 205 tests, zero failures or skips.
+and storage suites passed again: 240 tests, zero failures or skips.
 
 Core and script typechecks, repository lint, package/command smoke checks, and
 the roadmap structural check passed on the final implementation. Explicitly
