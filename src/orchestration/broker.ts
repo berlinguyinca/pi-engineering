@@ -3565,6 +3565,16 @@ export class ExecutionBroker {
                 exit_status: outcome.exitStatus,
                 artifact_refs: outcome.artifactRefs,
                 usage: outcome.usage,
+                // P4 provenance: the execution record's `model` is what
+                // /mission-status reads (task usage.model + workersDetail). It is
+                // seeded at creation with the *requested* model (often null for
+                // unrouted roles); settle it to the model that actually served,
+                // which the backend records on the outcome (withModel, from
+                // route ?? ranOn(run) ?? reviewFallbackModel). Absent that, keep
+                // the requested model recorded at creation.
+                ...(typeof outcome.usage?.model === "string" && outcome.usage.model.length > 0
+                  ? { model: outcome.usage.model }
+                  : {}),
                 // Failure visibility: backend outcomes (integration/validation/review)
                 // carry error + summary; without propagation the store recorded
                 // empty detail and real failures were undiagnosable.
