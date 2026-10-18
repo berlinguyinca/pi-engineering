@@ -16,6 +16,13 @@
 
 /** Abort reason: the operator interrupted; pause durably, keep the work. */
 export const MISSION_PAUSE_REASON = Object.freeze({ kind: "pi-engineering.mission-pause" as const });
+/** Abort reason: fleet maintenance interrupted resumably without operator intent. */
+export const MISSION_MAINTENANCE_REASON = Object.freeze({ kind: "pi-engineering.mission-maintenance" as const });
+export const MAINTENANCE_STOP_REASON = "paused for runtime maintenance; progress is preserved";
+export function isMaintenanceAbort(signal: AbortSignal | undefined): boolean {
+  return !!signal?.aborted && signal.reason === MISSION_MAINTENANCE_REASON;
+}
+
 /** Abort reason: the operator explicitly cancelled the mission. */
 export const MISSION_CANCEL_REASON = Object.freeze({ kind: "pi-engineering.mission-cancel" as const });
 
@@ -24,7 +31,7 @@ export const OPERATOR_PAUSE_STOP_REASON = "paused by the operator (interrupt); p
 
 /** True when `signal` was aborted to PAUSE the mission rather than cancel it. */
 export function isPauseAbort(signal: AbortSignal | undefined): boolean {
-  return !!signal?.aborted && signal.reason === MISSION_PAUSE_REASON;
+  return !!signal?.aborted && (signal.reason === MISSION_PAUSE_REASON || signal.reason === MISSION_MAINTENANCE_REASON);
 }
 
 /** How a caller's abort is treated: cancel (the API default) or a durable pause. */
@@ -51,7 +58,14 @@ export function interruptibleRun(
   let pauseHook: (() => void) | undefined;
   let paused = false;
   const forward = (): void => {
-    if (controller.signal.aborted) return;
+    if (controller.signal.aborted) {
+      // Esc during a maintenance drain still records explicit operator intent.
+      if (isMaintenanceAbort(controller.signal) && mode === "pause") {
+        paused = true;
+        pauseHook?.();
+      }
+      return;
+    }
     if (mode === "pause") {
       paused = true;
       try {

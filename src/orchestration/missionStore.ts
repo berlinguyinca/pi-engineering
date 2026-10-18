@@ -2736,6 +2736,75 @@ export class MissionStore {
     return { ...resumption };
   }
 
+  /** Conditional automatic resumption; operator intent is checked at the durable append boundary. */
+  resumeMissionIfCurrent(
+    missionId: string,
+    reason: string,
+    expected: MissionRevisionFence,
+  ): Promise<MissionResumption | undefined> {
+    const eligible = (store: MissionStore): boolean => {
+      const mission = store.getMission(missionId);
+      return (
+        store.matchesMissionFence(missionId, expected) &&
+        !mission?.operator_paused_at &&
+        !["WAITING_FOR_USER", "NEEDS_ATTENTION", "CANCELING"].includes(mission?.status ?? "") &&
+        !store
+          .listRecoveryDecisions(missionId)
+          .some(
+            (decision) =>
+              (decision.resumptionGeneration ?? 0) === expected.resumptionGeneration &&
+              decision.action === "WAIT_FOR_REQUIREMENT" &&
+              ["planned", "started"].includes(decision.status),
+          )
+      );
+    };
+    const settle = this.emitChain.then(async () => {
+      await this.drainPending();
+      if (!eligible(this)) return undefined;
+      const durable = MissionStore.open(this.backend);
+      if (!eligible(durable)) return undefined;
+      const resumption: MissionResumption = {
+        missionId,
+        reason,
+        resumedAt: new Date().toISOString(),
+        generation: expected.resumptionGeneration + 1,
+        stopGeneration: durable.listMissionStops(missionId).at(-1)?.generation ?? 0,
+      };
+      const event: OrchestrationEvent = {
+        event_id: id("oevt"),
+        mission_id: missionId,
+        timestamp: resumption.resumedAt,
+        type: "mission.resumed",
+        actor: "system",
+        payload: { actor: "system", resumption },
+      };
+      try {
+        const appended = await this.backend.appendConditionally(
+          {
+            event_id: event.event_id,
+            timestamp: event.timestamp,
+            type: event.type,
+            project_id: null,
+            run_id: missionId,
+            worker_id: null,
+            payload: event.payload,
+          },
+          () => eligible(this) && eligible(MissionStore.open(this.backend)),
+          () => this.apply(event),
+        );
+        return appended ? { ...resumption } : undefined;
+      } catch (error) {
+        this.recordPersistenceFailure(event, error);
+        throw error;
+      }
+    });
+    this.emitChain = settle.then(
+      () => undefined,
+      () => undefined,
+    );
+    return settle;
+  }
+
   listMissionResumptions(missionId?: string): MissionResumption[] {
     return this.missionResumptions
       .filter((resumption) => (missionId ? resumption.missionId === missionId : true))

@@ -1466,3 +1466,41 @@ describe("MissionStore", () => {
     assert.equal(reopened.getRecoveryDecision("RCV-repair")?.status, "exhausted");
   });
 });
+
+describe("automatic maintenance resumption", () => {
+  for (const race of ["operator_pause", "cancel", "new_generation"] as const) {
+    it(`rejects ${race} at the conditional append boundary`, async () => {
+      const backend = JsonlEventStore.inMemory();
+      const s = MissionStore.open(backend);
+      const mission = s.createMission({
+        title: "maintenance",
+        goal: "preserve work",
+        user_request: "preserve work",
+        repository: ".",
+        base_ref: "base",
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+      s.transitionMission(mission.mission_id, "CLASSIFYING");
+      s.transitionMission(mission.mission_id, "BLOCKED");
+      await s.flush();
+      const before = s.getMission(mission.mission_id)!;
+      const append = backend.appendConditionally.bind(backend);
+      backend.appendConditionally = async (event, condition, onCommit) => {
+        if (race === "operator_pause") s.markOperatorPause(mission.mission_id);
+        else if (race === "cancel") s.transitionMission(mission.mission_id, "CANCELED");
+        else s.resumeMission(mission.mission_id, "newer recovery won");
+        return append(event, condition, onCommit);
+      };
+      const resumed = await s.resumeMissionIfCurrent(mission.mission_id, "maintenance", {
+        revision: before.revision,
+        status: before.status,
+        blockedEpisodeId: before.blocked_episode_id ?? null,
+        resumptionGeneration: 0,
+      });
+      assert.equal(resumed, undefined);
+      await s.flush();
+      assert.equal(s.listMissionResumptions(mission.mission_id).length, race === "new_generation" ? 1 : 0);
+    });
+  }
+});

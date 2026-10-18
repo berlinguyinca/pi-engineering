@@ -41,9 +41,12 @@ import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFin
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import {
   type InterruptMode,
+  MAINTENANCE_STOP_REASON,
   MISSION_CANCEL_REASON,
+  MISSION_MAINTENANCE_REASON,
   OPERATOR_PAUSE_STOP_REASON,
   interruptibleRun,
+  isMaintenanceAbort,
   isPauseAbort,
 } from "./interrupt.ts";
 import { transitionMissionToCanceled } from "./missionCancel.ts";
@@ -359,6 +362,8 @@ export class Orchestrator {
   };
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   /** Run controllers of missions executing in this process, for an explicit cancel. */
+  private maintenanceRequested = false;
+  private startingRuns = 0;
   private readonly liveRuns = new Map<string, AbortController>();
   private readonly runControllers = new WeakMap<AbortSignal, AbortController>();
   private readonly pauseHooks = new WeakMap<AbortController, (hook: () => void) => void>();
@@ -484,6 +489,7 @@ export class Orchestrator {
    */
   async repairBlockedMission(missionId: string, signal?: AbortSignal): Promise<Mission> {
     const paused = this.store.getMission(missionId);
+    if (this.maintenanceRequested && paused) return paused;
     // Only the operator resumes a mission the operator paused.
     if (paused?.operator_paused_at) return paused;
     const resumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
@@ -1614,17 +1620,69 @@ export class Orchestrator {
     };
   }
 
+  /** Fence new local dispatch, then drain only phases with resumable worker cancellation. */
+  async prepareForMaintenance({
+    timeoutMs,
+    missionIds,
+  }: { timeoutMs: number; missionIds?: readonly string[] }): Promise<
+    { status: "ready" } | { status: "busy"; reason: string }
+  > {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 120_000)
+      throw new Error("maintenance timeout must be between 0 and 120000ms");
+    const localExecution = (execution: { status: string; mission_id: string }) =>
+      execution.status === "RUNNING" && (!missionIds || missionIds.includes(execution.mission_id));
+    const safe = new Set([
+      "EXECUTING",
+      "WAITING_FOR_LLM",
+      "WAITING_FOR_CAPACITY",
+      "WAITING_FOR_GATEWAY",
+      "WAITING_FOR_MODEL",
+    ]);
+    if (this.blockedRepairFlights.size || this.startingRuns > this.liveRuns.size)
+      return { status: "busy", reason: "mission is planning or recovering" };
+    for (const missionId of this.liveRuns.keys()) {
+      const state = this.store.getMission(missionId)?.status;
+      if (!state || !safe.has(state))
+        return { status: "busy", reason: `mission ${missionId} is in critical phase ${state}` };
+    }
+    if (
+      this.store
+        .listExecutions()
+        .some((execution) => localExecution(execution) && !this.liveRuns.has(execution.mission_id))
+    ) {
+      return { status: "busy", reason: "execution has no local resumable controller" };
+    }
+    this.maintenanceRequested = true;
+    for (const controller of this.liveRuns.values()) controller.abort(MISSION_MAINTENANCE_REASON);
+    const deadline = performance.now() + timeoutMs;
+    while (this.liveRuns.size || this.startingRuns || this.store.listExecutions().some(localExecution)) {
+      if (performance.now() >= deadline)
+        return { status: "busy", reason: "waiting for resumable worker cancellation to settle" };
+      await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - performance.now()))));
+    }
+    await this.store.flush();
+    return { status: "ready" };
+  }
+
+  endMaintenance(): void {
+    this.maintenanceRequested = false;
+  }
+
   async orchestrate(
     request: string,
     options: OrchestrateOptions = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
-    await this.refreshMissionLimits();
+    if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
+    this.startingRuns++;
     const run = interruptibleRun(options.signal, options.interrupt);
     this.runControllers.set(run.signal, run.controller);
     this.pauseHooks.set(run.controller, run.onPause);
     try {
+      await this.refreshMissionLimits();
+      if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
       return await this.orchestrateLimited(request, { ...options, signal: run.signal });
     } finally {
+      this.startingRuns--;
       run.dispose();
     }
   }
@@ -1706,6 +1764,7 @@ export class Orchestrator {
         selectedBaseRef = targetCommit;
       }
     }
+    if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
     const mission = this.store.createMission({
       title: opts.title ?? request,
       goal: request,
@@ -2139,15 +2198,18 @@ export class Orchestrator {
       await this.scheduler.runMission(mission.mission_id, opts.signal);
 
       if (isPauseAbort(opts.signal)) {
-        const pausedByOperator = await this.pauseInterruptedMission(mission.mission_id);
+        const pausedByOperator = await this.pauseInterruptedMission(
+          mission.mission_id,
+          isMaintenanceAbort(opts.signal),
+        );
         return {
           mission: pausedByOperator,
           intent,
           verdict: this.gate.evaluate(pausedByOperator),
           completed: false,
-          failureReason: OPERATOR_PAUSE_STOP_REASON,
+          failureReason: isMaintenanceAbort(opts.signal) ? MAINTENANCE_STOP_REASON : OPERATOR_PAUSE_STOP_REASON,
           paused: true,
-          pausedBy: "operator",
+          pausedBy: isMaintenanceAbort(opts.signal) ? "infrastructure" : "operator",
         };
       }
       if (opts.signal?.aborted) {
@@ -2347,7 +2409,10 @@ export class Orchestrator {
     missionId: string,
     opts: { signal?: AbortSignal; onProgress?: OrchestrateOptions["onProgress"] } = {},
   ): Promise<{ started: true; result: OrchestrateResult } | { started: false; reason: string }> {
+    if (this.maintenanceRequested) return { started: false, reason: "runtime_maintenance" };
     await this.refreshMissionLimits();
+    if (this.maintenanceRequested) return { started: false, reason: "runtime_maintenance" };
+    this.startingRuns++;
     const run = interruptibleRun(opts.signal);
     this.runControllers.set(run.signal, run.controller);
     this.pauseHooks.set(run.controller, run.onPause);
@@ -2431,6 +2496,7 @@ export class Orchestrator {
         throw error;
       }
     } finally {
+      this.startingRuns--;
       run.dispose();
     }
   }
@@ -2448,7 +2514,9 @@ export class Orchestrator {
     missionId: string,
     options?: { force?: boolean; signal?: AbortSignal; interrupt?: InterruptMode },
   ): Promise<Mission> {
+    if (this.maintenanceRequested) return this.store.getMission(missionId)!;
     await this.refreshMissionLimits();
+    if (this.maintenanceRequested) return this.store.getMission(missionId)!;
     const run = interruptibleRun(options?.signal, options?.interrupt);
     run.onPause(() => this.store.markOperatorPause(missionId));
     this.liveRuns.set(missionId, run.controller);
@@ -2472,7 +2540,11 @@ export class Orchestrator {
     if (!opts?.force && !(await this.scheduler.gatewayHealthy(opts?.signal))) {
       return opts?.signal?.aborted ? this.interruptedMission(missionId, opts.signal) : mission;
     }
-    if (this.ownership) this.ownershipByMission.set(missionId, await this.ownership.acquire(missionId));
+    if (this.ownership)
+      this.ownershipByMission.set(
+        missionId,
+        await this.ownership.acquire(missionId, { resumptionGeneration: expectedResumptionGeneration }),
+      );
     try {
       this.phase(mission, "executing");
       this.report(missionId, `[mission ${missionId}] resuming after infrastructure recovery`);
@@ -4124,13 +4196,19 @@ export class Orchestrator {
       mission,
       verdict: this.gate.evaluate(mission),
       completed: false,
-      failureReason: isPauseAbort(signal) ? OPERATOR_PAUSE_STOP_REASON : "canceled by caller",
+      failureReason: isMaintenanceAbort(signal)
+        ? MAINTENANCE_STOP_REASON
+        : isPauseAbort(signal)
+          ? OPERATOR_PAUSE_STOP_REASON
+          : "canceled by caller",
     };
   }
 
   /** An aborted run: a durable pause for an operator interrupt, otherwise a cancel. */
   private interruptedMission(missionId: string, signal: AbortSignal | undefined): Promise<Mission> {
-    return isPauseAbort(signal) ? this.pauseInterruptedMission(missionId) : this.cancelMission(missionId);
+    return isPauseAbort(signal)
+      ? this.pauseInterruptedMission(missionId, isMaintenanceAbort(signal))
+      : this.cancelMission(missionId);
   }
 
   /**
@@ -4139,9 +4217,10 @@ export class Orchestrator {
    * supervisor from resuming it on its own — the operator resumes it with
    * `/mission resume <id>` (or the mission tool's resume action).
    */
-  private async pauseInterruptedMission(missionId: string): Promise<Mission> {
+  private async pauseInterruptedMission(missionId: string, maintenance = false): Promise<Mission> {
+    const reason = maintenance ? MAINTENANCE_STOP_REASON : OPERATOR_PAUSE_STOP_REASON;
     // Normally recorded already, synchronously, when the interrupt landed.
-    this.store.markOperatorPause(missionId);
+    if (!maintenance) this.store.markOperatorPause(missionId);
     let mission = this.store.getMission(missionId)!;
     if (["COMPLETE", "FAILED", "CANCELED", "CANCELING"].includes(mission.status)) return mission;
     if (["NEW", "CLASSIFYING", "PLANNING"].includes(mission.status)) {
@@ -4156,7 +4235,7 @@ export class Orchestrator {
     }
     for (const task of this.store.listTasks(missionId)) {
       if (task.status === "RUNNING") {
-        this.store.transitionTask(task.task_id, "RETRYING", "system", { failure_reason: OPERATOR_PAUSE_STOP_REASON });
+        this.store.transitionTask(task.task_id, "RETRYING", "system", { failure_reason: reason });
       }
     }
     if (mission.status !== "PAUSED_INFRASTRUCTURE") {
@@ -4173,10 +4252,12 @@ export class Orchestrator {
       mission = this.store.transitionMission(missionId, "PAUSED_INFRASTRUCTURE");
     }
     this.store.stopMission(missionId, {
-      reason: OPERATOR_PAUSE_STOP_REASON,
+      reason,
       preservedWork: await this.preservedMissionWork(missionId),
       attemptedRecoveries: [],
-      resumeCondition: `the operator resumes it: /mission resume ${missionId}`,
+      resumeCondition: maintenance
+        ? "verified runtime maintenance resumes this existing mission"
+        : `the operator resumes it: /mission resume ${missionId}`,
     });
     await this.store.flush();
     this.report(
