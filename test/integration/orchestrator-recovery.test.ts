@@ -444,6 +444,7 @@ async function realGateRepairHarness(
   emptyRepair: boolean,
   race?: "integration" | "promotion" | "captureDiff",
   legacyCancellation: boolean | "intentional" = false,
+  preCandidate = false,
 ) {
   const fixture = await makeFixtureRepo();
   const git = (await GitRepo.open(fixture.root))!;
@@ -518,32 +519,33 @@ async function realGateRepairHarness(
     exit_status: "succeeded",
   });
   store.transitionTask(candidateTask.task_id, "SUCCEEDED");
-  store.recordCandidate(
-    mission.mission_id,
-    buildCandidateEvidenceIdentity({
-      workspaceManifestHash: manifest.hash,
-      missionGeneration: 0,
-      repoId: "repo-real-repair",
-      baseSha,
-      candidateSha,
-      diffHash: baselineDiffHash,
-      acceptanceIds: [],
-      artifactHashes: [],
-    }),
-    "verified candidate before repair",
-    {
-      taskId: candidateTask.task_id,
-      executionId: candidateExecution.execution_id,
-    },
-  );
+  if (!preCandidate)
+    store.recordCandidate(
+      mission.mission_id,
+      buildCandidateEvidenceIdentity({
+        workspaceManifestHash: manifest.hash,
+        missionGeneration: 0,
+        repoId: "repo-real-repair",
+        baseSha,
+        candidateSha,
+        diffHash: baselineDiffHash,
+        acceptanceIds: [],
+        artifactHashes: [],
+      }),
+      "verified candidate before repair",
+      {
+        taskId: candidateTask.task_id,
+        executionId: candidateExecution.execution_id,
+      },
+    );
   const failed = store.createTask({
     task_id: "TSK-failed-gate",
     mission_id: mission.mission_id,
-    kind: legacyCancellation ? "agent" : "validation",
-    role: legacyCancellation ? "implementer" : "validator",
-    mutates_repo: !!legacyCancellation,
-    write_domains: legacyCancellation ? ["**"] : [],
-    isolation: legacyCancellation ? "worktree" : "none",
+    kind: legacyCancellation || preCandidate ? "agent" : "validation",
+    role: legacyCancellation || preCandidate ? "implementer" : "validator",
+    mutates_repo: !!legacyCancellation || preCandidate,
+    write_domains: legacyCancellation || preCandidate ? ["**"] : [],
+    isolation: legacyCancellation || preCandidate ? "worktree" : "none",
     objective: legacyCancellation ? "finish preserved implementation" : "validation failed on current candidate",
     repo_id: "repo-real-repair",
     deliverables: ["repair validation defect"],
@@ -552,7 +554,7 @@ async function realGateRepairHarness(
   const failedExecution = store.createExecution({
     task_id: failed.task_id,
     mission_id: mission.mission_id,
-    backend: legacyCancellation ? "agent" : "validation",
+    backend: legacyCancellation || preCandidate ? "agent" : "validation",
     checkpoint_id: legacyCancellation ? "CHK-legacy" : undefined,
     repo_id: "repo-real-repair",
     base_sha: baseSha,
@@ -604,9 +606,9 @@ async function realGateRepairHarness(
   store.classifyFailure({
     classificationId: "FC-real-gate",
     missionId: mission.mission_id,
-    taskId: failed.task_id,
-    executionId: failedExecution.execution_id,
-    category: "VALIDATION_FAILED",
+    taskId: preCandidate ? null : failed.task_id,
+    executionId: preCandidate ? null : failedExecution.execution_id,
+    category: preCandidate ? "IMPLEMENTATION_DEFECT" : "VALIDATION_FAILED",
     evidenceRefs: [],
     fingerprint: `sha256:${(emptyRepair ? "e" : "f").repeat(64)}`,
     summary: "validation failed",
@@ -1513,6 +1515,93 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.throws(() => h.store.transitionRecovery(failed.recoveryId, "succeeded"), /illegal recovery transition/);
   });
 
+  it("recovers a mission-level implementation failure before its first candidate", async () => {
+    const h = blockedRepairHarness({ category: "IMPLEMENTATION_DEFECT", failedKind: "agent" });
+    h.store.classifyFailure({
+      ...h.store.listFailureClassifications(h.missionId).at(-1)!,
+      classificationId: "FC-mission-implementation",
+      taskId: null,
+      executionId: null,
+      fingerprint: "sha256:mission-implementation",
+    });
+
+    await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.ok(h.store.listTaskSupersessions(h.missionId).some((entry) => entry.failedTaskId === h.failed.task_id));
+    assert.equal(h.store.listMissionStops(h.missionId).length, 0);
+    assert.equal(
+      h.store.getCandidate(h.missionId),
+      undefined,
+      "a replacement alone never fabricates candidate evidence",
+    );
+    assert.notEqual(h.store.getMission(h.missionId)?.status, "COMPLETE");
+  });
+
+  it("replays pre-candidate repair after replacement publication without requiring a candidate early", async () => {
+    const h = blockedRepairHarness({ category: "IMPLEMENTATION_DEFECT", failedKind: "agent" });
+    h.store.classifyFailure({
+      ...h.store.listFailureClassifications(h.missionId).at(-1)!,
+      classificationId: "FC-replay-implementation",
+      taskId: null,
+      executionId: null,
+      fingerprint: "sha256:replay-implementation",
+    });
+    const runMission = h.orchestrator.scheduler.runMission.bind(h.orchestrator.scheduler);
+    h.orchestrator.scheduler.runMission = async () => {
+      throw new Error("controller interrupted");
+    };
+    await assert.rejects(h.orchestrator.repairBlockedMission(h.missionId), /controller interrupted/);
+    const lineageCount = h.store.listTaskSupersessions(h.missionId).length;
+    assert.ok(lineageCount > 0);
+    h.orchestrator.scheduler.runMission = runMission;
+
+    await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(h.store.listMissionStops(h.missionId).length, 0);
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, lineageCount);
+    assert.equal(
+      h.store.listFindings(h.missionId).some((entry) => entry.category === "recovery_candidate_baseline"),
+      false,
+    );
+  });
+
+  it("does not use failed implementers to bypass a mission-level gate failure's candidate requirement", async () => {
+    const h = blockedRepairHarness({ category: "VALIDATION_FAILED", failedKind: "agent" });
+    h.store.classifyFailure({
+      ...h.store.listFailureClassifications(h.missionId).at(-1)!,
+      classificationId: "FC-mission-validation",
+      taskId: null,
+      executionId: null,
+      fingerprint: "sha256:mission-validation",
+    });
+
+    await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.equal(h.store.listTaskSupersessions(h.missionId).length, 0);
+    assert.equal(h.store.listMissionStops(h.missionId).length, 1);
+    assert.deepEqual(h.observedRecoveries, []);
+  });
+
+  it("publishes and verifies the first real candidate after a mission-level implementation failure", async () => {
+    const h = await realGateRepairHarness(false, undefined, false, true);
+    try {
+      assert.equal(h.store.getCandidate(h.missionId), undefined);
+      const recovered = await h.orchestrator.repairBlockedMission(h.missionId);
+      assert.equal(recovered.status, "COMPLETE");
+      assert.deepEqual(h.order, ["implementer", "integration"]);
+      assert.ok(h.store.getCandidate(h.missionId));
+      assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.status, "succeeded");
+      const gates = h.store
+        .listExecutions(h.missionId)
+        .filter((entry) => ["validation", "review"].includes(entry.backend));
+      assert.ok(gates.some((entry) => entry.backend === "validation" && entry.status === "SUCCEEDED"));
+      assert.ok(gates.some((entry) => entry.backend === "review" && entry.status === "SUCCEEDED"));
+      assert.match(await readFile(join(h.fixture.root, "src", "actual-repair.ts"), "utf8"), /repaired = true/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("refuses gate repair when the current candidate cannot be independently verified", async () => {
     const h = blockedRepairHarness({
       category: "REVIEW_FAILED",
@@ -1752,6 +1841,35 @@ describe("orchestrator: durable blocked-mission repair", () => {
     } finally {
       await fixture.cleanup();
     }
+  });
+
+  it("reconciles stale recovery generations while honoring a later durable stop", async () => {
+    const h = blockedRepairHarness({ category: "PERSISTENCE_FAILURE" });
+    await h.orchestrator.repairBlockedMission(h.missionId);
+    const staleDecision = h.store.listRecoveryDecisions(h.missionId).at(-1)!;
+    h.store.resumeMission(h.missionId, "new recovery generation");
+    h.store.stopMission(h.missionId, {
+      reason: "operator requires investigation",
+      preservedWork: [],
+      attemptedRecoveries: [staleDecision.recoveryId],
+      resumeCondition: "explicit resumption",
+    });
+    const cancellations: Array<[string, number]> = [];
+    h.orchestrator.broker.cancelStaleResumptionExecutions = async (missionId, generation) => {
+      cancellations.push([missionId, generation]);
+    };
+
+    await h.orchestrator.repairBlockedMission(h.missionId);
+    await h.orchestrator.repairBlockedMission(h.missionId);
+
+    assert.deepEqual(cancellations, [
+      [h.missionId, 1],
+      [h.missionId, 1],
+    ]);
+    assert.equal(h.store.getRecoveryDecision(staleDecision.recoveryId)?.status, "failed");
+    assert.equal(h.store.listRecoveryDecisions(h.missionId).length, 1, "stopped missions dispatch no new recovery");
+    assert.deepEqual(h.observedRecoveries, []);
+    assert.equal(h.store.getMission(h.missionId)?.status, "BLOCKED");
   });
 
   it("starts a new generation-bound recovery after explicit resumption", async () => {
