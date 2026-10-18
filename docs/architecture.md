@@ -92,6 +92,17 @@ Only one live session drives a given mission (custody lease); every session sees
 every mission of the worktree. `PI_ENGINEERING_ORCHESTRATION_DIR` relocates the
 orchestration namespace but keeps per-session writers.
 
+A stale session generation cannot release leases during shutdown. A matching
+live process incarnation retains custody even when its heartbeat or lease TTL
+is old; contention alone does not justify reclamation.
+
+Lease contention diagnostics aggregate counts within a reporting window
+(default five minutes, `PI_RUNTIME_CONTENTION_SUMMARY_MS`). The first attempt
+per resource/holder is logged, and repeated attempts are summarized. Windows
+flush early at 200 distinct pairs to bound memory and summary size, and reset
+when the session log changes. Summary counts include the first attempt in that
+window; they are not cumulative process-lifetime totals.
+
 ## The Engineering Ledger
 
 The ledger is **event-sourced**: every mutation appends an event

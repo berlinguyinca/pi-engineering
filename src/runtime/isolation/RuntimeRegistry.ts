@@ -324,8 +324,9 @@ export class RuntimeRegistry {
           "UPDATE sessions SET state = 'stopped', ended_at = ? WHERE session_id = ? AND generation_id = ? AND ended_at IS NULL",
         )
         .run(new Date(this.now()).toISOString(), sessionId, generationId);
+      if (Number(result.changes) !== 1) return false;
       this.leases.releaseSessionLeasesInTransaction(sessionId);
-      return Number(result.changes) === 1;
+      return true;
     });
   }
 
