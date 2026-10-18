@@ -10,18 +10,22 @@ const exec = promisify(execFile);
 export const NO_CHANGES_VS_BASE = "no changes vs base: commit your work or report blocked/partial with a reason";
 
 /**
- * True when the worktree has neither commits past `baseRef` nor uncommitted
- * changes. Any git failure answers false: an unreadable worktree never blocks
- * a worker from reporting.
+ * Compare the harvestable tree, not the number of commits: empty commits and
+ * reverted changes cannot substantiate completion. Git failures are unknown
+ * evidence and must propagate so the worker can report blocked instead.
  */
 export async function hasNoChangesVsBase(cwd: string, baseRef: string): Promise<boolean> {
   try {
-    const ahead = await exec("git", ["rev-list", "--count", `${baseRef}..HEAD`], { cwd });
-    if (Number.parseInt(ahead.stdout.trim(), 10) > 0) return false;
-    const status = await exec("git", ["status", "--porcelain", "--untracked-files=no"], { cwd });
-    return status.stdout.trim().length === 0;
+    const base = await exec("git", ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`], { cwd });
+    try {
+      await exec("git", ["diff", "--quiet", "--no-ext-diff", "--no-textconv", base.stdout.trim(), "--"], { cwd });
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 1) return false;
+      throw error;
+    }
+    return true;
   } catch {
-    return false;
+    throw new Error("cannot verify worktree changes: restore Git access and a valid base or report blocked/partial");
   }
 }
 
