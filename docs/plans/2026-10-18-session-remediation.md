@@ -23,3 +23,45 @@ commits, reviews the combined diff separately, and runs relevant tests, typechec
 lint, and package smoke checks. Changes enter main through a green pull request.
 Live mission restarts and deployments require their normal prerequisite checks;
 neither test success nor heartbeat alone establishes live completion.
+
+## Verified outcomes
+
+- Failed model pins cannot cancel their replacements; takeover has a finite
+  attempt bound. Registry fallback retains role and task capability requirements.
+- Mission-level implementation failure before publication can produce its first
+  real candidate; durable stops still prevent new dispatch while stale work is
+  reconciled. Validation and review gates retain their candidate requirements.
+- Workers reject a mismatched allocated repository, path, or branch before
+  inference. Isolated native edit/write operations stay within that worktree;
+  actual tree differences, rather than commit counts, substantiate completion.
+  This does not introduce an arbitrary shell sandbox.
+- Ledger evidence references must resolve locally. Hypotheses remain open, and
+  tool results explicitly distinguish unresolved claims from recorded evidence.
+- The original Beast finding `FINDING-bOLnJ7` was marked rejected in its original
+  ledger. Appended correction `FINDING-ObcyNk` cites the captured measurements in
+  `artifact://audit/20261018-beast-diagnosis-correction`. No history was rewritten.
+- Storage-pressure wiring and the fresh-incident regression were already fixed
+  upstream; the controller and snapshot-guard tests passed in this worktree.
+- A stale runtime generation cannot release a newer generation's leases.
+  Contention reporting is bounded and records reporting-window counts. The
+  audited long-held owner was live with a fresh heartbeat, so no real leases
+  were revoked.
+- Deployment prerequisites and explicit inspection are implemented separately in
+  go-modules PR https://github.com/metabolomics-us/go-modules/pull/2384.
+
+## Interrupted-work inventory
+
+The original shared checkouts still contained ongoing work when inspected:
+
+| Repository | Branch | HEAD | Changed entries |
+| --- | --- | --- | --- |
+| pi-engineering | main | 44e1bfd | 2 |
+| inferweave-gateway | feat/node-systemone-adverts | f755574 | 10 |
+| inferweave | pi-eng-candidate-MSN-opbhoi-repo-0b2d84c8f589a772-1-0-EXC-IX4n6g | 26a60371 | 8 |
+| go-modules | fix/bound-each-module-build-in-a-shard | 5ea63e7a0 | 19 |
+| inferweave-harness-skills | main | 08dfed8 | 1 |
+
+These are observation-time snapshots, not ownership or completion evidence. No
+shared branch was switched or reset, and unrelated dirty files were not folded
+into the remediation PRs. Real mission restarts, model-serving recovery, and
+deployment success remain unverified until their external prerequisites pass.
