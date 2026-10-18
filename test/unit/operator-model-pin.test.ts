@@ -304,7 +304,7 @@ describe("operator model pin: switch at the inference boundary", () => {
     assert.deepEqual(h.seen, [{ model: modelKey(GLM), superseded: false }]);
   });
 
-  it("a pin the router cannot place for the role ends after one re-dispatch instead of spinning", async () => {
+  it("a pin the router cannot place for a review role blocks without dispatch", async () => {
     // Only a text model exists, and the role needs vision: the pin is refused
     // and routing has nowhere else to go.
     const registry = await ModelCapabilityRegistry.open({
@@ -328,9 +328,10 @@ describe("operator model pin: switch at the inference boundary", () => {
       () => DEEPSEEK,
     );
     const outcome = await h.run("vision_reviewer");
-    assert.equal(outcome.exitStatus, "succeeded");
-    assert.ok(h.seen.length <= 2, JSON.stringify(h.seen));
-    assert.equal(h.seen.at(-1)?.superseded, false);
+    assert.equal(outcome.exitStatus, "failed");
+    assert.equal(outcome.error, "transient:model_unavailable");
+    assert.match(outcome.summary, /no eligible vision_reviewer model/);
+    assert.deepEqual(h.seen, []);
   });
 });
 

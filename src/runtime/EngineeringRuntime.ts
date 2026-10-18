@@ -1450,6 +1450,10 @@ export class EngineeringRuntime {
               const models = (await (await rt.worker.getModelRuntime()).getAvailable()).map((model) => ({
                 provider: model.provider,
                 id: model.id,
+                contextWindow: model.contextWindow,
+                input: model.input,
+                reasoning: model.reasoning,
+                toolCall: true,
               }));
               let enabledPatterns: string[] | undefined;
               try {

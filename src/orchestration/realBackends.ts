@@ -14,13 +14,13 @@
 
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
 import {
-  hasCapability,
-  modelFamily,
-  normalizeModelRecord,
-  sameFamily as sameFamilyId,
-} from "../capability/modelRecord.ts";
-import { type RegistryModel, filterEnabledModels, rankRegistryModels } from "../capability/registryCandidates.ts";
+  type RegistryModel,
+  filterEnabledModels,
+  rankRegistryModels,
+  registryModelSupportsRole,
+} from "../capability/registryCandidates.ts";
 import { ROLE_REQUIREMENTS, routerRoleFor } from "../capability/roles.ts";
 import { id } from "../core/ids.ts";
 import { ROLE_BUDGETS } from "../core/types.ts";
@@ -409,6 +409,23 @@ function validRawSpecGap(value: unknown): boolean {
   }
 }
 
+/** No review was dispatched: keep this a routing failure rather than a candidate defect. */
+function unavailableReviewer(role: string): WorkerRun {
+  return {
+    result: {
+      status: "blocked",
+      summary: `Review blocked: no eligible ${role} model satisfies the configured routing requirements.`,
+      error: "transient:model_unavailable",
+      claims: [],
+      evidence_refs: [],
+      new_hypotheses: [],
+      proposed_tasks: [],
+      details: {},
+    },
+    usage: null,
+  };
+}
+
 /** Convert a worker result into a bounded broker outcome. */
 function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): ExecutionOutcome {
   const completed = result.result.status === "completed";
@@ -473,21 +490,9 @@ export function realBackends(opts: RealBackendsOptions) {
     } catch {
       return undefined;
     }
-    const routerRole = routerRoleFor(role);
-    if (!routerRole) return undefined;
-    const requirements = ROLE_REQUIREMENTS[routerRole];
-    const requires = [...requirements.requires, ...extraRequires];
-    const live = models.filter((model) => {
-      if (opts.isModelUnavailable?.(model)) return false;
-      // The emergency registry path must not bypass the role/task's hard
-      // requirements when the capability router offers no replacement.
-      if (requires.includes("tool_calling") && model.toolCall !== true) return false;
-      const record = normalizeModelRecord({ ...model, source: "session-registry" });
-      return (
-        requires.every((capability) => hasCapability(record, capability)) &&
-        (model.contextWindow ?? 0) >= (requirements.minContext ?? 0)
-      );
-    });
+    const live = models.filter(
+      (model) => !opts.isModelUnavailable?.(model) && registryModelSupportsRole(model, role, extraRequires),
+    );
     const patterns = opts.enabledModels?.();
     const scoped = filterEnabledModels(live, patterns);
     const rank = (pool: readonly RegistryModel[]) =>
@@ -598,6 +603,10 @@ export function realBackends(opts: RealBackendsOptions) {
       return pin !== running && pin !== refused;
     };
   };
+  const requiresReviewRoute = (role: string): boolean => {
+    const routerRole = routerRoleFor(role);
+    return !!(opts.routeModel || opts.registryModels) && !!routerRole && ROLE_REQUIREMENTS[routerRole].independent;
+  };
   /**
    * Run a worker on `plan.initial` (or, unrouted, on the executor default).
    * While the attempt fails because its model is not served, record the model
@@ -648,6 +657,7 @@ export function realBackends(opts: RealBackendsOptions) {
       }
     };
     let route = plan.initial;
+    if (!route && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route };
     if (plan.announceWarnings && route?.warning) announce(route.warning);
     if (route?.pinNotice) announce(route.pinNotice);
     const switches: string[] = [];
@@ -665,6 +675,7 @@ export function realBackends(opts: RealBackendsOptions) {
       const error = outcomeOf(run).error ?? "";
       if (error === MODEL_SUPERSEDED) {
         const next = await plan.repick(tried);
+        if (!next && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route: undefined };
         // The operator's choice resolves to the model already running: nothing
         // changes, so keep the session and carry on — no restart, no switch.
         if (next && route && modelKey(next) === modelKey(route)) {
@@ -787,6 +798,7 @@ export function realBackends(opts: RealBackendsOptions) {
       initial: await (async () => {
         const routed = await opts.routeModel?.(role, { missionId: context.missionId, ...requirementOpts });
         const fallback = opts.reviewFallbackModel;
+        if (!routed && requiresReviewRoute(role)) return registryRoute(role, [], [], extraRequires);
         if (routed ? !cooling(routed.provider) : !fallback || !cooling(fallback.provider)) return routed;
         return (await registryRoute(role, routed ? [routed] : [], [], extraRequires)) ?? routed;
       })(),
@@ -1104,6 +1116,26 @@ export function realBackends(opts: RealBackendsOptions) {
         const fallback = opts.reviewFallbackModel;
         const independentOfProducers = (model: ModelRef): boolean =>
           modelFamily(model.id) !== undefined && !producers.some((m) => sameFamily(m, model));
+        const fallbackEligible = async (tried: ModelRef[]): Promise<boolean> => {
+          if (!fallback) return false;
+          // Standalone callers keep their session default. Configured routing
+          // must accept that exact model; absence of metadata is not approval.
+          if (!opts.registryModels) {
+            if (!opts.routeModel) return true;
+            const route = await opts.routeModel(req.role, {
+              exclude: tried,
+              missionId: input.missionId,
+              taskOverride: modelKey(fallback),
+            });
+            return !!route && sameModel(route, fallback);
+          }
+          try {
+            const model = (await opts.registryModels()).find((model) => sameModel(model, fallback));
+            return !!model && registryModelSupportsRole(model, req.role);
+          } catch {
+            return false;
+          }
+        };
         const pickReviewer = async (tried: ModelRef[]): Promise<ModelRoute | undefined> => {
           // Prefer a model of a different family on a reachable provider; remember
           // the first sibling of a producer's family (or unknown family), and the
@@ -1132,7 +1164,8 @@ export function realBackends(opts: RealBackendsOptions) {
             fallback &&
             !tried.some((m) => sameModel(m, fallback)) &&
             !opts.isModelUnavailable?.(fallback) &&
-            !cooling(fallback.provider)
+            !cooling(fallback.provider) &&
+            (await fallbackEligible(tried))
           ) {
             return { ...fallback, warning: reducedIndependence(fallback, "no distinct reviewer model is available") };
           }
@@ -1165,6 +1198,7 @@ export function realBackends(opts: RealBackendsOptions) {
           });
         };
         const initial = await pickReviewer([]);
+        if (!initial && requiresReviewRoute(req.role)) return outcomeOf(unavailableReviewer(req.role));
         const initialWarning = initial
           ? reviewWarning(initial)
           : "Warning: no distinct reviewer model is available; reviewing with the current worker model in a fresh session with reduced independence.";

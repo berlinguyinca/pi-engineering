@@ -6,7 +6,8 @@
 
 import type { ModelRef } from "../lifecycle/types.ts";
 import { modelKey } from "../lifecycle/types.ts";
-import { modelFamily, sameFamily } from "./modelRecord.ts";
+import { hasCapability, modelFamily, normalizeModelRecord, sameFamily } from "./modelRecord.ts";
+import { ROLE_REQUIREMENTS, routerRoleFor } from "./roles.ts";
 
 /** A model the session registry can serve. */
 export interface RegistryModel extends ModelRef {
@@ -14,6 +15,24 @@ export interface RegistryModel extends ModelRef {
   toolCall?: boolean;
   input?: string[];
   reasoning?: boolean;
+}
+
+/** The same hard-capability filter is used for routing and merge-gate availability. */
+export function registryModelSupportsRole(
+  model: RegistryModel,
+  role: string,
+  extraRequires: readonly string[] = [],
+): boolean {
+  const routerRole = routerRoleFor(role);
+  if (!routerRole) return false;
+  const requirements = ROLE_REQUIREMENTS[routerRole];
+  const requires = [...requirements.requires, ...extraRequires];
+  if (requires.includes("tool_calling") && model.toolCall !== true) return false;
+  const record = normalizeModelRecord({ ...model, source: "session-registry" });
+  return (
+    requires.every((capability) => hasCapability(record, capability)) &&
+    (model.contextWindow ?? 0) >= (requirements.minContext ?? 0)
+  );
 }
 
 /**
@@ -72,11 +91,13 @@ export function filterEnabledModels<T extends ModelRef>(
  * model whose family is unknown, on either side, never counts as different.
  */
 export function differentFamilyReviewerAvailable(
-  models: readonly ModelRef[],
+  models: readonly RegistryModel[],
   reviewerModel: string,
   options: { enabledPatterns?: readonly string[]; isUnavailable?: (model: ModelRef) => boolean } = {},
 ): boolean {
-  const live = models.filter((model) => !options.isUnavailable?.(model));
+  const live = models.filter(
+    (model) => !options.isUnavailable?.(model) && registryModelSupportsRole(model, "reviewer"),
+  );
   const scoped = filterEnabledModels(live, options.enabledPatterns);
   const pool = scoped.length > 0 ? scoped : live;
   return pool.some((model) => !sameFamily(model.id, reviewerModel));
