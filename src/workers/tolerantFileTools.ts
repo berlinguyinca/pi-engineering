@@ -214,8 +214,11 @@ function resolveEdit(content: string, edit: EditPair, index: number, path: strin
 }
 
 /** Pi's `edit`, retried with whitespace-normalised matching when an exact match misses. */
-export function createTolerantEditTool(cwd: string): ToolDefinition {
-  const base = createEditToolDefinition(cwd) as unknown as ToolDefinition;
+export function createTolerantEditTool(
+  cwd: string,
+  options?: Parameters<typeof createEditToolDefinition>[1],
+): ToolDefinition {
+  const base = createEditToolDefinition(cwd, options) as unknown as ToolDefinition;
   return {
     ...base,
     description: `${base.description} If oldText differs from the file only in whitespace (trailing spaces, indentation width, line endings) the edit is still applied; otherwise the error quotes the closest lines with their line numbers.`,

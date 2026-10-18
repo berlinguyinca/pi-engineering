@@ -147,6 +147,18 @@ a **controlled merge** (`git merge --no-ff`) of the candidate branch into the
 incumbent branch — the worker never writes to the incumbent directly, and a
 conflicting merge is aborted without mutating the incumbent.
 
+For workers marked `isolatedWorktree`, native `write` and `edit` operations
+resolve their filesystem destination and reject paths outside the assigned
+root, including symlink escapes. Read tools may inspect external references.
+This file-tool guard does not sandbox arbitrary shell commands; shell isolation
+remains the responsibility of the runtime's execution environment.
+
+A mutating worker with a known base cannot report `completed` without a tracked
+file diff against that base. Empty or reverted commits do not count, and Git
+inspection failures require a blocked/partial report until evidence is available.
+Untracked files must be staged or committed before they substantiate completion.
+Candidate verification and review still determine mission completion.
+
 ## Verification (INV-005)
 
 `CommandVerifier.detect(cwd)` inspects the repo's `package.json` (and fallbacks)

@@ -136,6 +136,7 @@ import {
   withBudgetNotice,
 } from "./wallClockBudget.ts";
 import { createWorkerResultTool } from "./workerResultTool.ts";
+import { createWorktreeFileTools } from "./worktreeFileTools.ts";
 
 /**
  * Maximum APS loop-recovery attempts (Phase 4). Bounded to one: after a
@@ -615,7 +616,14 @@ export class PiWorkerExecutor implements WorkerExecutor {
         : tool;
     const customTools = [
       ...this.customTools,
-      ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd), createTolerantEditTool(req.cwd)] : []),
+      ...(req.tolerantFileTools ? [createNumberedReadTool(req.cwd)] : []),
+      ...(req.isolatedWorktree
+        ? (await createWorktreeFileTools(req.cwd, req.tolerantFileTools === true)).filter((tool) =>
+            req.tools.includes(tool.name),
+          )
+        : req.tolerantFileTools
+          ? [createTolerantEditTool(req.cwd)]
+          : []),
       // Every worker bash command runs one mission-depth deeper (recursion
       // guard). The built-in tool is replaced by one with the same name; the
       // budget notice wraps it only for budgeted runs.
