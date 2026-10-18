@@ -84,6 +84,7 @@ test("maintenance: reports actual loaded code and preserves bootstrap identity a
   const { original, commit, pi, observed } = await setup();
   const control = provider();
   assert.equal((await control.describe()).hostCommit, original);
+  assert.deepEqual((await control.describe()).capabilities, ["runtime.describe", "runtime.reload"]);
   const target = commit();
   assert.equal((await control.describe()).commit, original, "disk changes are not loaded changes");
   const result = await control.reload({ expectedCommit: target });
@@ -91,6 +92,13 @@ test("maintenance: reports actual loaded code and preserves bootstrap identity a
   assert.equal(result.commit, target);
   assert.equal(result.generation, 2);
   assert.equal((await control.describe()).hostCommit, original);
+  const notice = pi.session.messages.find(
+    (message) => "customType" in message && message.customType === "pi-engineering-maintenance",
+  );
+  assert.ok(
+    notice && "content" in notice && typeof notice.content === "string" && notice.content.includes(target),
+    "the real Pi conversation receives the verified update notice without a model turn",
+  );
   await pi.run("/probe");
   assert.equal(observed.values.at(-1), "cmd:B");
 });

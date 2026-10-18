@@ -912,7 +912,7 @@ export class EngineeringHostExtension {
           hostCommit: this.hostCommit,
           commit: active?.source.commit ?? null,
           generation: active?.generation ?? null,
-          capabilities: ["describe", "reload"],
+          capabilities: ["runtime.describe", "runtime.reload"],
           pending: this.host?.pendingTask() != null,
         };
       },
@@ -963,6 +963,21 @@ export class EngineeringHostExtension {
         return outcome(false, result.failure ?? "runtime handover did not pass health");
       if (this.host?.activeGeneration()?.source.commit !== request.expectedCommit)
         return outcome(false, "loaded commit does not match expectedCommit");
+      if (typeof this.pi?.sendMessage === "function") {
+        this.pi.sendMessage(
+          {
+            customType: "pi-engineering-maintenance",
+            content: `Pi Engineering has loaded verified runtime ${request.expectedCommit}. Existing mission IDs and preserved work remain authoritative. If this update belongs to a fleet rollout, let its coordinator resume eligible stopped missions and monitor status instead of issuing competing resume/cancel requests. Otherwise continue recovery using the existing mission ID. Never create duplicate missions or override operator pauses.`,
+            display: true,
+            details: {
+              kind: "runtime-activated",
+              commit: request.expectedCommit,
+              generation: this.host.activeGeneration()?.generation ?? null,
+            },
+          },
+          { triggerTurn: false },
+        );
+      }
       return outcome(true);
     } catch (error) {
       return outcome(false, error instanceof Error ? error.message : String(error));

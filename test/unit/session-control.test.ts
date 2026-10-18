@@ -330,7 +330,16 @@ test("notes and status preserve UTF-8 characters split across socket frames", as
     const fake = (await import("node:net")).createServer((socket) => {
       socket.on("data", () => {
         const reply = Buffer.from(
-          `${JSON.stringify({ version: 1, ok: true, data: { instanceId: fakeId, lastToolProgress: "café" } })}\n`,
+          `${JSON.stringify({
+            version: 1,
+            ok: true,
+            data: {
+              instanceId: fakeId,
+              pid: server.descriptor.pid,
+              sessionId: server.descriptor.sessionId,
+              lastToolProgress: "café",
+            },
+          })}\n`,
         );
         const split = reply.indexOf(Buffer.from("é")) + 1;
         socket.write(reply.subarray(0, split));

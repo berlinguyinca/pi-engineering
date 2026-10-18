@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -297,4 +298,69 @@ test("different operation IDs cannot mutate one conversation concurrently across
     finish();
     await first.waitForIdle();
   }
+});
+
+test("a matching instance alone does not authorize a different PID or conversation", async () => {
+  const dir = await root();
+  for (const mismatch of ["pid", "sessionId"] as const) {
+    const socketPath = join(dir, `${mismatch}.sock`);
+    const descriptor = {
+      version: 1 as const,
+      instanceId: "instance",
+      sessionId: "conversation",
+      cwd: dir,
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      socketPath,
+    };
+    const fake = createServer((socket) =>
+      socket.on("data", () =>
+        socket.end(
+          `${JSON.stringify({
+            version: 1,
+            ok: true,
+            data: {
+              instanceId: descriptor.instanceId,
+              pid: process.pid,
+              sessionId: descriptor.sessionId,
+              [mismatch]: mismatch === "pid" ? process.pid + 1 : "other",
+            },
+          })}\n`,
+        ),
+      ),
+    );
+    await new Promise<void>((resolve) => fake.listen(socketPath, resolve));
+    try {
+      await assert.rejects(requestSession(descriptor, { version: 1, op: "status" }), /identity_mismatch/);
+    } finally {
+      await new Promise<void>((resolve) => fake.close(() => resolve()));
+    }
+  }
+});
+
+test("retiring a session before its durable claim settles prevents a queued mutation", async () => {
+  const dir = await root();
+  let calls = 0;
+  const server = await startSessionControl({
+    rootDir: join(dir, "control"),
+    cwd: dir,
+    sessionId: "conversation",
+    maintenanceRoot: join(dir, "operations"),
+    onMaintenance: async () => {
+      calls++;
+      return { status: "succeeded" };
+    },
+  });
+  // Enter the real request handler directly to control the retirement boundary
+  // before its asynchronous receipt write completes, without a timing sleep.
+  const pending = (server as unknown as { reply(input: unknown): Promise<unknown> }).reply({
+    version: 1,
+    op: "maintenance",
+    request: { operationId: "retired", action: "prepare", expectedInstanceId: server.instanceId },
+  });
+  await server.close();
+  await pending;
+  await server.waitForMaintenance();
+  assert.equal(calls, 0);
 });

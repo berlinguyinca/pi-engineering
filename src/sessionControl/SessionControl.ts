@@ -241,7 +241,17 @@ export class SessionControlServer {
       control.maintenance = new MaintenanceOperations(
         options.maintenanceRoot ?? maintenanceStateRoot(),
         options.sessionId,
-        options.onMaintenance,
+        async (request) =>
+          control.closed
+            ? {
+                status: "skipped",
+                result: {
+                  status: "skipped",
+                  code: "STALE_SESSION_INSTANCE",
+                  reason: "session retired before command execution",
+                },
+              }
+            : options.onMaintenance!(request),
       );
     if (Buffer.byteLength(control.socketPath) > 100) throw new Error("control socket path exceeds Unix socket limit");
     server.on("connection", (socket) => control.handle(socket));
@@ -513,7 +523,13 @@ export async function requestSession(
       try {
         const reply = JSON.parse(body.slice(0, newline)) as ControlReply;
         if (reply.version !== VERSION || typeof reply.ok !== "boolean") return fail(new Error("invalid_reply"));
-        if (reply.ok && (!reply.data || reply.data.instanceId !== descriptor.instanceId))
+        if (
+          reply.ok &&
+          (!reply.data ||
+            reply.data.instanceId !== descriptor.instanceId ||
+            reply.data.pid !== descriptor.pid ||
+            reply.data.sessionId !== descriptor.sessionId)
+        )
           return fail(new Error("session_identity_mismatch"));
         settled = true;
         socket.end();
