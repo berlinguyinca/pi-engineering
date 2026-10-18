@@ -205,8 +205,17 @@ export function buildCoreTools(
         { evidence: machine ? [String(params.evidence)] : [], severity: params.severity as never },
       );
       return {
-        content: [{ type: "text", text: `Recorded ${entity.kind} ${entity.id} (status ${entity.status}).` }],
-        details: { id: entity.id, kind: entity.kind, status: entity.status },
+        content: [
+          {
+            type: "text",
+            text: `Recorded ${entity.kind} ${entity.id} (status ${entity.status}). ${
+              machine
+                ? "Evidence reference resolved; causal interpretations still require independent verification."
+                : "No recorded machine evidence; treat this as an unverified claim."
+            }`,
+          },
+        ],
+        details: { id: entity.id, kind: entity.kind, status: entity.status, evidenceResolved: machine },
       };
     },
   });

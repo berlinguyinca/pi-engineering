@@ -129,12 +129,13 @@ test("ledger_claim resolves evidence records and never verifies a hypothesis by 
       signal: undefined,
       update: undefined,
       ctx: { cwd: string },
-    ) => Promise<{ details: { id: string; status: string } }>;
+    ) => Promise<{ details: { id: string; status: string; evidenceResolved: boolean } }>;
     for (const evidence of ["EVID-invented", "test-run://invented", unverified.id]) {
       const result = await execute("claim", { kind: "fact", claim: "tests passed", evidence }, undefined, undefined, {
         cwd: dir,
       });
       assert.equal(result.details.status, "open", `${evidence} must not verify a fact`);
+      assert.equal(result.details.evidenceResolved, false, "unverified references must be explicit in tool results");
       assert.deepEqual(ledger.getEntity(result.details.id)?.evidence, []);
     }
     const fact = await execute(
@@ -145,6 +146,7 @@ test("ledger_claim resolves evidence records and never verifies a hypothesis by 
       { cwd: dir },
     );
     assert.equal(fact.details.status, "verified");
+    assert.equal(fact.details.evidenceResolved, true);
     const hypothesis = await execute(
       "hypothesis",
       { kind: "hypothesis", claim: "swap caused the timeout", evidence: stored.uri },

@@ -118,6 +118,14 @@ stream to build materialized work items, candidates, and entities. Entities:
 - `finding` — a reviewer finding with a severity.
 - `requirement` / `decision` — recorded goals and decisions.
 
+Worker hypotheses remain open even when they cite captured observations. A
+reference proves that an observation was recorded, not that the worker's causal
+interpretation is correct. `ledger_claim` resolves artifact and evidence IDs
+against local stores; invented IDs and records marked unverified cannot verify
+a fact. Its result explicitly reports whether the evidence reference resolved.
+For example, a heartbeat establishes liveness, while an unauthorized live probe
+leaves the requested production state unknown.
+
 ## Workers (fresh context, bounded results)
 
 A worker is a **fresh** pi SDK session (in-process `createAgentSession`) with a
