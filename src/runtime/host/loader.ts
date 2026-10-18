@@ -8,11 +8,13 @@
  * directory is new, so every module is fresh.
  */
 
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { cp, mkdir, readdir, readlink, rm, stat, symlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import { SourceCache } from "../../update/gitSource.ts";
 import { type EngineeringRuntimeModule, HOST_SUPPORTED_RUNTIME_APIS, isEngineeringRuntimeModule } from "./contract.ts";
 
 /** Top-level entries never copied into a generation snapshot. */
@@ -25,6 +27,8 @@ export interface RuntimeSource {
   entry: string;
   version: string;
   commit: string | null;
+  /** Export this exact Git tree instead of copying a mutable checkout. */
+  snapshotCommit?: string;
   /** "package" | "installed:<id>" | "baseline" ... for diagnostics. */
   label: string;
   /** Import straight from `root` (no snapshot). Only safe for the first load of a directory. */
@@ -54,24 +58,33 @@ export async function snapshotRuntimeSource(
   sourceRoot: string,
   generationsDir: string,
   label: string,
+  commit?: string,
 ): Promise<string> {
   const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 40);
   const dir = join(generationsDir, `${safeLabel}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`);
   await mkdir(generationsDir, { recursive: true });
   const root = resolve(sourceRoot);
   try {
-    await cp(root, dir, {
-      recursive: true,
-      // Symlinks are copied as links; one escaping the source is rejected below.
-      verbatimSymlinks: true,
-      filter: (src) => {
-        const rel = relative(root, src);
-        if (rel === "") return true;
-        const top = rel.split(sep)[0] as string;
-        if (SNAPSHOT_EXCLUDE.has(top)) return false;
-        return !rel.endsWith(".zip");
-      },
-    });
+    if (commit) {
+      const gitDir = execFileSync("git", ["-C", root, "rev-parse", "--absolute-git-dir"], {
+        timeout: 5000,
+        encoding: "utf8",
+      }).trim();
+      await new SourceCache(gitDir).exportTree(commit, dir);
+      for (const excluded of SNAPSHOT_EXCLUDE) await rm(join(dir, excluded), { recursive: true, force: true });
+    } else
+      await cp(root, dir, {
+        recursive: true,
+        // Symlinks are copied as links; one escaping the source is rejected below.
+        verbatimSymlinks: true,
+        filter: (src) => {
+          const rel = relative(root, src);
+          if (rel === "") return true;
+          const top = rel.split(sep)[0] as string;
+          if (SNAPSHOT_EXCLUDE.has(top)) return false;
+          return !rel.endsWith(".zip");
+        },
+      });
     await rejectEscapingLinks(dir, dir, root);
     await linkDependencies(root, dir);
   } catch (error) {
@@ -155,7 +168,7 @@ export async function loadRuntimeSource(
 ): Promise<{ module: EngineeringRuntimeModule; dir: string }> {
   const dir = source.direct
     ? resolve(source.root)
-    : await snapshotRuntimeSource(source.root, generationsDir, `g${generation}`);
+    : await snapshotRuntimeSource(source.root, generationsDir, `g${generation}`, source.snapshotCommit);
   try {
     const module = await importRuntimeModule(dir, source.entry, generation, supported);
     return { module, dir };
