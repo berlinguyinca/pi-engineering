@@ -278,3 +278,218 @@ export function classifyInfraError(error: unknown): InfraErrorClass {
     reason: "unclassified error",
   };
 }
+
+/* -------------------------------------------------------------------------- *
+ * Disk-pressure classification (disk-pressure recovery spec).
+ *
+ * A write can fail for reasons other than a shortage of free bytes: exhausted
+ * inodes, a per-directory quota, a read-only remount, a container-layer
+ * barrier, or reserved root blocks. The operator must not treat a healthy `/`
+ * as proof a separate output mount is healthy, and the system must not
+ * blind-retry a condition that only an operator can clear. This module turns a
+ * raw storage failure into a typed incident the suspension/recovery machinery
+ * can act on deterministically.
+ * -------------------------------------------------------------------------- */
+
+export type StoragePressureCategory =
+  | "DISK_FULL" // no free bytes (ENOSPC) — auto-recovers once space frees
+  | "INODE_EXHAUSTED" // no free inodes — auto-recovers once inodes free
+  | "QUOTA_EXCEEDED" // per-directory quota (EDQUOT) — auto-recovers once quota lifts
+  | "READ_ONLY_FS" // EROFS / read-only remount — needs an operator to remount
+  | "IO_ERROR" // EIO / EFBIG — conservative, probe-based
+  | "UNKNOWN_STORAGE"; // unclassified storage errno
+
+/** How the incident clears: by itself, or only after an operator acts. */
+export type StorageRecoveryClass = "AUTO" | "OPERATOR" | "CONSERVATIVE";
+
+/**
+ * Typed result of classifying a storage failure. Used to decide whether to
+ * suspend a mission (auto-recover via probes) or surface an operator action.
+ */
+export interface StoragePressureIncident {
+  category: StoragePressureCategory;
+  recovery: StorageRecoveryClass;
+  /** The errno code that triggered classification, e.g. "ENOSPC". */
+  code: string;
+  /** Human-readable reason for status surfaces. */
+  reason: string;
+  /** True when the mission should suspend and auto-resume via probes. */
+  autoRecover: boolean;
+  /** True when an operator action is required before resuming. */
+  needsOperator: boolean;
+  /** The filesystem/volume path the failure targeted, when known. */
+  path?: string;
+  /** Free bytes at detection, when supplied by the caller. */
+  freeBytes?: number;
+  /** Required bytes, when known. */
+  requiredBytes?: number;
+  /** Free inodes at detection, when supplied by the caller. */
+  freeInodes?: number;
+}
+
+/**
+ * Optional measurement hints a caller (e.g. the snapshot publisher) can attach
+ * so classification can distinguish an inode exhaustion from a plain byte
+ * shortage instead of guessing from the errno alone.
+ */
+export interface StorageHints {
+  path?: string;
+  freeBytes?: number;
+  requiredBytes?: number;
+  freeInodes?: number;
+}
+
+/** Errno codes that indicate a storage/disk condition at all. */
+const STORAGE_ERRNOS = new Set(["ENOSPC", "ENOMEM", "EIO", "EFBIG", "EROFS", "EDQUOT", "EACCES", "ENOTDIR"]);
+
+/** Read a storage-relevant field from an unknown thrown value. */
+function storageField(error: unknown, key: string): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const v = (error as Record<string, unknown>)[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+function storageCode(error: unknown): string | undefined {
+  const code = storageField(error, "code") ?? storageField(error, "errno");
+  if (code && /^[A-Z0-9_]+$/.test(code)) return code;
+  return undefined;
+}
+
+/**
+ * Classify a storage failure into a typed incident. Pure and deterministic;
+ * never throws. Prefer the errno code; fall back to message text and the
+ * optional measurement hints to disambiguate (inodes vs bytes vs quota).
+ */
+export function classifyStorageIncident(error: unknown, hints: StorageHints = {}): StoragePressureIncident {
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const msg = raw.toLowerCase();
+  const code = storageCode(error);
+  const codeLower = code?.toLowerCase() ?? "";
+  const path = hints.path ?? storageField(error, "path");
+  const freeBytes = hints.freeBytes;
+  const requiredBytes = hints.requiredBytes;
+  const freeInodes = hints.freeInodes;
+
+  const mentions = (...needles: string[]) => needles.some((n) => msg.includes(n));
+
+  const base = {
+    code: code ?? "UNKNOWN",
+    path,
+    freeBytes,
+    requiredBytes,
+    freeInodes,
+  };
+
+  // Inode exhaustion: the error text says so explicitly, or the free-inode
+  // hint is zero/absent while free bytes are plentiful (so bytes are not the
+  // binding constraint). Both self-heal once inodes are freed.
+  if (mentions("no space left on device", "enospc") && mentions("inode")) {
+    return {
+      ...base,
+      category: "INODE_EXHAUSTED",
+      recovery: "AUTO",
+      autoRecover: true,
+      needsOperator: false,
+      reason: "no free inodes on the target filesystem",
+    };
+  }
+  if (freeInodes === 0 && typeof freeBytes === "number" && freeBytes > 0) {
+    return {
+      ...base,
+      category: "INODE_EXHAUSTED",
+      recovery: "AUTO",
+      autoRecover: true,
+      needsOperator: false,
+      reason: "no free inodes (bytes remain but inodes are exhausted)",
+    };
+  }
+
+  // Quota exceeded.
+  if (code === "EDQUOT" || mentions("quota")) {
+    return {
+      ...base,
+      category: "QUOTA_EXCEEDED",
+      recovery: "AUTO",
+      autoRecover: true,
+      needsOperator: false,
+      reason: "per-directory or per-user quota exceeded",
+    };
+  }
+
+  // Read-only filesystem: only an operator can remount; blind retries cannot
+  // clear it.
+  if (code === "EROFS" || mentions("read-only file system", "readonly", "read only")) {
+    return {
+      ...base,
+      category: "READ_ONLY_FS",
+      recovery: "OPERATOR",
+      autoRecover: false,
+      needsOperator: true,
+      reason: "target filesystem is read-only — remount to recover",
+    };
+  }
+
+  // Permission denied on a storage path: an operator must fix ownership/mode.
+  if (code === "EACCES" || mentions("permission denied")) {
+    return {
+      ...base,
+      category: "READ_ONLY_FS",
+      recovery: "OPERATOR",
+      autoRecover: false,
+      needsOperator: true,
+      reason: "permission denied writing to the target path",
+    };
+  }
+
+  // I/O error / file too big: probe-based, treat conservatively.
+  if (code === "EIO" || code === "EFBIG" || mentions("input/output error", "file too large")) {
+    return {
+      ...base,
+      category: "IO_ERROR",
+      recovery: "CONSERVATIVE",
+      autoRecover: true,
+      needsOperator: false,
+      reason: "storage I/O error — probing before retrying",
+    };
+  }
+
+  // Plain ENOSPC / no free bytes.
+  if (
+    code === "ENOSPC" ||
+    code === "ENOMEM" ||
+    mentions("no space left on device", "enospc", "disk full", "storage")
+  ) {
+    return {
+      ...base,
+      category: "DISK_FULL",
+      recovery: "AUTO",
+      autoRecover: true,
+      needsOperator: false,
+      reason:
+        freeBytes === 0
+          ? "target filesystem has no free space"
+          : "no space left on the target filesystem",
+    };
+  }
+
+  // An unrecognised errno that is nonetheless storage-flavoured: conservative.
+  if (STORAGE_ERRNOS.has(code ?? "") || mentions("storage", "filesystem")) {
+    return {
+      ...base,
+      category: "UNKNOWN_STORAGE",
+      recovery: "CONSERVATIVE",
+      autoRecover: true,
+      needsOperator: false,
+      reason: "unclassified storage condition",
+    };
+  }
+
+  return {
+    ...base,
+    category: "UNKNOWN_STORAGE",
+    recovery: "OPERATOR",
+    autoRecover: false,
+    needsOperator: true,
+    reason: "not a storage failure — operator review required",
+  };
+}
