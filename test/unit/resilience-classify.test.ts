@@ -139,6 +139,19 @@ describe("classifyStorageIncident", () => {
     assert.equal(inc.autoRecover, true);
   });
 
+  it("treats ENOTDIR as an operator action, not auto-recoverable disk pressure", () => {
+    // "path is not a directory" is a path-shape/layout error (e.g. the work
+    // dir was replaced by a file), not a storage-pressure condition. A disk
+    // space probe can never clear it, so it must not suspend the mission.
+    const err = Object.assign(new Error("ENOTDIR: not a directory, open '/x/.pi-eng/snapshot.json'"), {
+      code: "ENOTDIR",
+    });
+    const inc = classifyStorageIncident(err);
+    assert.equal(inc.autoRecover, false);
+    assert.equal(inc.needsOperator, true);
+    assert.equal(inc.recovery, "OPERATOR");
+  });
+
   it("never classifies a healthy path as a storage failure without evidence", () => {
     const inc = classifyStorageIncident(new Error("boom"));
     assert.equal(inc.autoRecover, false);

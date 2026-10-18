@@ -12,6 +12,9 @@ new mission or repeating completed work.*
 | FR-03 durable blocked-state substatus, backwards compatible | `WAITING_FOR_DISK_SPACE` constant; existing mission state machine preserved (no new enum, no new scheduler) | AUDIT.md reuse matrix |
 | FR-04 warning coalescing | One `incident` event per incident + compact `status` events ≤1 per cooldown (default 10 min) | `emitCompactStatus`; FR-04 "exactly one incident" + "periodic compact status" tests |
 | FR-04 snapshot behavior | On ENOSPC snapshot marked dirty + stale with `snapshot_stale_at_ms`; `pauseSnapshotRetries()` keeps it dirty; `markSnapshotRepublished()` clears only after the dirty pipeline republishes | FR-04 snapshot tests; `SnapshotPressureState` |
+| FR-04 runtime wiring — publisher connected to controller | `SnapshotPressureGuard` (`src/resilience/snapshotPressureGuard.ts`) owns the controller and is wired into `EngineeringRuntime.publishMissionSnapshot`: ENOSPC-class failures suspend (publisher pauses, no retry storm), the published file carries the additive `storagePressure` substate (stale tag), the recovery probe republishes after resume, and the stale tag clears when the republish lands | `test/unit/resilience-snapshot-guard.test.ts` (12 tests); `test/unit/orchestration-snapshot.test.ts` threading tests |
+| FR-05 runtime wiring — probe loop | While suspended, the guard paces `sample()` at `probe_interval_ms` (30 s default, unref'd timer) against the AFFECTED mount only, with a bounded write/sync/rename sentinel probe (`sentinelProbeInDir`) | guard probe-loop tests (schedule injection, path scoping, sentinel-fail streak reset) |
+| Fresh-incident re-suspension | `suspend()` on a same-path incident after recovery re-suspends as a NEW incident (returns true, fresh incident event, stale tag re-marked) instead of coalescing — the publisher re-pauses on a second disk-full | controller "fresh incident re-opens" test (strengthened) |
 | FR-04 jittered exponential backoff | `postRecoveryBackoffMs(attempt)` — base `probe_interval * 2**(attempt-1)` capped at `post_recovery_backoff_cap_ms` (60s), plus jitter | "postRecoveryBackoffMs" test |
 | FR-05 wait-and-auto-recover | `sample(mount, sentinel?)` samples the AFFECTED mount only; requires `recovery_consecutive_checks` consecutive healthy samples + bounded write/rename/fsync sentinel probe; resets streak on unhealthy sample (flapping protection) | FR-05 suite (consecutive-checks, sentinel-fail, streak-reset, affected-path-only tests) |
 | FR-05 auto-resume default | `config.auto_resume = true` default; `sample()` auto-resumes; `auto_resume=false` requires explicit `resume()` | "auto_resume=false requires operator sign-off" test |
@@ -27,6 +30,7 @@ new mission or repeating completed work.*
 | `e0410b5` | Re-adopted FR-01 classification (`classifyStorageIncident`) |
 | `2fe61fe` | Re-adopted FR-01 biome format |
 | `3f033d6` | `StoragePressureController` + index export + 20 unit tests |
+| (wiring commit) | `SnapshotPressureGuard` runtime wiring: publisher → controller (suspend/pause/stale-tag), 30 s recovery probe with sentinel, additive `storagePressure` snapshot substate; ENOTDIR reclassified as operator action (path-shape error, not disk pressure); fresh-incident re-suspension fix; 12 new guard tests + 2 snapshot threading tests + 2 strengthened regression tests |
 
 ## Execution log
 
@@ -43,12 +47,17 @@ new mission or repeating completed work.*
 
 ## Remaining follow-up tasks (explicit, not done in this commit)
 
-- [ ] Runtime wiring: call `suspend()` from the snapshot publisher
-  (`EngineeringRuntime.ts` snapshot error path) and other storage write points.
-- [ ] Runtime wiring: drive `sample()` on `probe_interval_ms` for the affected
-  mount with a real sentinel probe.
-- [ ] Runtime wiring: on `resume()`, run the dirty-snapshot republish pipeline
-  and resume paused tasks from the last safe checkpoint.
+- [x] Runtime wiring: call `suspend()` from the snapshot publisher
+  (`EngineeringRuntime.ts` snapshot error path) — via `SnapshotPressureGuard`
+  (classify → suspend → pause retries → stale tag → yield to probe).
+- [x] Runtime wiring: drive `sample()` on `probe_interval_ms` for the affected
+  mount with a real sentinel probe — guard probe loop (unref'd timer, affected
+  mount only, bounded write/sync/rename sentinel).
+- [~] Runtime wiring: on `resume()`, run the dirty-snapshot republish pipeline
+  (done: forced republish + stale-tag finalization). "Resume paused tasks from
+  the last safe checkpoint" remains — mission-level work resumption is a
+  separate integration (the snapshot/state layer is durable; no work is
+  re-run because checkpointed state is the resume source).
 - [ ] FR-05 persistence integrity: integrate torn-tail JSONL repair in
   `src/platform/eventstore/jsonl.ts` (ownership-verified only).
 - [ ] End-to-end acceptance scenarios (spec §6 tests 1–13) via isolated temp

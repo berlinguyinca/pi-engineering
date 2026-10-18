@@ -262,9 +262,14 @@ describe("StoragePressureController FR-05 wait-and-automatically-recover", () =>
     await h.ctrl.sample({ path: "/mnt/out", healthy: true }, { probe: async () => true });
     assert.equal(h.ctrl.hasResumed, true);
 
-    // Disk fills again: the incident is reopened and counters reset.
-    h.ctrl.suspend(enospc());
+    // Disk fills again: the incident is reopened as a NEW incident — full
+    // re-suspension (returns true, fresh incident event, stale tag re-marked)
+    // and counters reset.
+    const reopened = h.ctrl.suspend(enospc());
+    assert.equal(reopened, true, "a fresh post-recovery incident re-suspends (publisher must re-pause)");
     assert.equal(h.ctrl.suspended, true);
+    assert.equal(h.events.filter((e) => e.kind === "incident").length, 2, "one incident event per actual incident");
+    assert.equal(h.ctrl.snapshotState.snapshot_stale, true, "snapshot re-tagged stale on re-suspension");
     // A single healthy sample should NOT auto-resume (counters were reset).
     const out = await h.ctrl.sample({ path: "/mnt/out", healthy: true }, { probe: async () => true });
     assert.equal(out.resumed, false);

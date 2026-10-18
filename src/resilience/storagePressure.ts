@@ -291,14 +291,14 @@ export class StoragePressureController {
     const isSame = this.incident !== undefined && this.incident.path === path;
 
     if (isSame && this.resumed) {
-      // A fresh incident on the same path after recovery: re-open.
+      // A fresh incident on the same path after recovery: re-open. It is a NEW
+      // incident — fall through to the full re-suspension below (fresh
+      // notification, stale tag, reset counters) instead of coalescing.
       this.resumed = false;
       this.healthyStreak = 0;
       this.samples = 0;
       this.suspendedAtMs = nowMs;
-    }
-
-    if (isSame) {
+    } else if (isSame) {
       // Coalesced: only a periodic compact status, never a duplicate incident.
       this.emitCompactStatus(nowMs);
       return false;

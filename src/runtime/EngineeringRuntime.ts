@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, rename, statfs, unlink, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
@@ -68,6 +68,7 @@ import { type Mission, type MissionStop, PLANNER_CLARIFICATION_CATEGORY } from "
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { redactSecrets } from "../platform/redact.ts";
+import type { StorageHints } from "../resilience/classify.ts";
 import { type GatewayResilienceConfig, resolveGatewayResilienceConfig } from "../resilience/config.ts";
 import {
   CatalogRecoveryProbe,
@@ -75,6 +76,7 @@ import {
   type RecoveryProbe,
   resolveCatalogProbeTarget,
 } from "../resilience/probe.ts";
+import { SnapshotPressureGuard } from "../resilience/snapshotPressureGuard.ts";
 import { ResourceRegistry } from "../resources/ResourceRegistry.ts";
 import type { StatfsReader } from "../resources/buildBudget.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
@@ -673,6 +675,15 @@ export class EngineeringRuntime {
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
   private snapshotPublishRetries = 0;
+  /**
+   * FR-03/04/05 — storage-pressure wiring: the controller the snapshot
+   * publisher is connected to (lazy; healthy runs never construct it).
+   */
+  private snapshotPressure: SnapshotPressureGuard | null = null;
+  /** Last successfully published snapshot; returned while publishing is paused. */
+  private lastPublishedSnapshot: MissionSnapshotFile | null = null;
+  /** Exactly one stale-tagged publish attempt is made after a new suspension. */
+  private snapshotPublishFinalAttempt = false;
   /** This runtime's mission-ownership identity (`session-<session-id>-<uuid>`). */
   private ownershipId: string | null = null;
   /** In-process key of the orchestration namespace this runtime shares. */
@@ -744,8 +755,13 @@ export class EngineeringRuntime {
    * snapshot. Never throws; callers may fire-and-forget it after any mission
    * mutation.
    */
-  async publishMissionSnapshot(): Promise<MissionSnapshotFile | null> {
+  async publishMissionSnapshot(opts?: { force?: boolean }): Promise<MissionSnapshotFile | null> {
     if (!this.missionStore) return null;
+    // FR-04: while a storage incident is suspended, do not touch the disk at
+    // all — the recovery probe republishes after resume. Callers still get the
+    // last successfully published snapshot so live views degrade gracefully.
+    // `force` bypasses the gate: it is the recovery republish pipeline itself.
+    if (!opts?.force && this.snapshotPressure?.publishPaused) return this.lastPublishedSnapshot;
     this.snapshotPublishDirty = true;
     if (this.snapshotPublishPending) return this.snapshotPublishPending;
     this.snapshotPublishPending = (async () => {
@@ -772,7 +788,11 @@ export class EngineeringRuntime {
             verifierStages: buildVerifierStages(this.missionStore!.listValidationEvidence(m.mission_id)),
             lifecycle: this.missionStore!.getCanonicalLifecycle(m.mission_id),
           }));
-          latest = buildMissionSnapshotFile(missions);
+          // FR-04: after recovery is granted, the republish finalizes the stale
+          // tag before the file is built so the freshly written file is clean;
+          // while suspended the guard is a no-op and the tag survives.
+          this.snapshotPressure?.notePublishSuccess();
+          latest = buildMissionSnapshotFile(missions, this.snapshotPressure?.state() ?? null);
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
           const temporary = join(this.workDir, `.${MISSION_SNAPSHOT_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
           try {
@@ -785,15 +805,32 @@ export class EngineeringRuntime {
           // A successful publish resets the in-call retry counter so the next
           // failure starts fresh instead of inheriting an elevated backoff.
           this.snapshotPublishRetries = 0;
+          this.snapshotPublishFinalAttempt = false;
+          this.lastPublishedSnapshot = latest;
         } catch (error) {
           latest = null;
           lastError = error;
+          // FR-03/04: a recoverable storage incident SUSPENDS instead of
+          // retrying — no retry storm against a full disk. One best-effort
+          // stale-tagged attempt is made, then the write yields to the recovery
+          // probe, which republishes after resume (no duplicate finding: the
+          // incident event already notified once).
+          if (await this.noteSnapshotStoragePressure(error)) {
+            this.snapshotPublishRetries = 0;
+            if (!this.snapshotPublishFinalAttempt) {
+              this.snapshotPublishFinalAttempt = true;
+              this.snapshotPublishDirty = true;
+              continue;
+            }
+            this.snapshotPublishDirty = false;
+            break;
+          }
           // Retry within this call with bounded backoff instead of giving up on
-          // the first error. A transient disk error (e.g. ENOSPC while the disk
-          // is full) self-heals once space frees; only after the in-call retries
-          // are exhausted do we surface the diagnostic and leave retry to a later
-          // observability change. The dirty flag stays set across retries so a
-          // concurrent publish call coalesces into this flight.
+          // the first error. A transient non-storage error self-heals once the
+          // condition clears; only after the in-call retries are exhausted do we
+          // surface the diagnostic and leave retry to a later observability
+          // change. The dirty flag stays set across retries so a concurrent
+          // publish call coalesces into this flight.
           if (this.snapshotPublishRetries < SNAPSHOT_PUBLISH_MAX_RETRIES) {
             this.snapshotPublishRetries += 1;
             this.snapshotPublishDirty = true;
@@ -820,6 +857,50 @@ export class EngineeringRuntime {
       if (this.snapshotPublishDirty) void this.publishMissionSnapshot();
     });
     return this.snapshotPublishPending;
+  }
+
+  /**
+   * Classify a snapshot publish failure. On a recoverable storage incident
+   * this suspends the pressure controller (pauses snapshot retries, tags the
+   * published snapshot stale, starts the recovery probe). Returns true while
+   * the publisher is paused — the caller must stop retrying.
+   */
+  private async noteSnapshotStoragePressure(error: unknown): Promise<boolean> {
+    const guard = this.snapshotPressureGuard;
+    await guard.notePublishError(error, await this.storagePressureHints());
+    return guard.publishPaused;
+  }
+
+  /** Best-effort measurement hints for storage classification (never throws). */
+  private async storagePressureHints(): Promise<StorageHints> {
+    const hints: StorageHints = { path: this.workDir };
+    try {
+      const st = await statfs(this.workDir);
+      hints.freeBytes = st.bavail * st.bsize;
+      hints.freeInodes = st.ffree;
+    } catch {
+      // Hints are best-effort; classification falls back to the errno code.
+    }
+    return hints;
+  }
+
+  /** The storage-pressure guard, created lazily on first need. */
+  private get snapshotPressureGuard(): SnapshotPressureGuard {
+    if (!this.snapshotPressure) {
+      this.snapshotPressure = new SnapshotPressureGuard({
+        workDir: this.workDir,
+        // The recovery republish pipeline (bypasses the pause gate).
+        republish: () => this.publishMissionSnapshot({ force: true }),
+        log: (_level, message) => {
+          try {
+            this.onMissionSnapshotError?.(message);
+          } catch {
+            // Diagnostics are observers, never participants in execution.
+          }
+        },
+      });
+    }
+    return this.snapshotPressure;
   }
 
   private currentMissionStop(missionId: string) {
@@ -1526,6 +1607,7 @@ export class EngineeringRuntime {
     if (path) EngineeringRuntime.releaseOrchestrationReference(path);
     this.closed = true;
     if (this.ownershipId) liveOwnerIds().delete(this.ownershipId);
+    this.snapshotPressure?.dispose();
     this.orchestrator = null;
     this.missionSupervisor = null;
     this.missionOwnership = null;

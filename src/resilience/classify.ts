@@ -339,8 +339,14 @@ export interface StorageHints {
   freeInodes?: number;
 }
 
-/** Errno codes that indicate a storage/disk condition at all. */
-const STORAGE_ERRNOS = new Set(["ENOSPC", "ENOMEM", "EIO", "EFBIG", "EROFS", "EDQUOT", "EACCES", "ENOTDIR"]);
+/**
+ * Errno codes that indicate a storage/disk condition at all. ENOTDIR is NOT
+ * included: "path is not a directory" is a path-shape/layout error (e.g. the
+ * work dir was replaced by a file), not a storage-pressure condition —
+ * waiting for disk space can never clear it, so it falls through to the
+ * operator-review fallback instead of suspending the mission.
+ */
+const STORAGE_ERRNOS = new Set(["ENOSPC", "ENOMEM", "EIO", "EFBIG", "EROFS", "EDQUOT", "EACCES"]);
 
 /** Read a storage-relevant field from an unknown thrown value. */
 function storageField(error: unknown, key: string): string | undefined {

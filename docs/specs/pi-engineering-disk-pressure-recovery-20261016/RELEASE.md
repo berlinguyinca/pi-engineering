@@ -50,10 +50,44 @@ pre-change `src/resilience/index.ts` and leaves FR-01 classification intact.
 - `node --test ... test/unit/resilience-*.test.ts` → 76/76 pass (incl. the
   re-adopted FR-01 classify tests, 17/17).
 
-## Operational notes for the follow-up wiring
+## Addendum — runtime wiring (follow-up commit)
 
-- The controller never touches the operator's real disk in tests (fault
-  injection only). Runtime wiring must also use isolated temp filesystems /
-  mocked fs.
-- `auto_resume=false` requires an explicit operator `resume()`; the controller
-  keeps the healthy streak so a later operator sign-off can complete.
+The snapshot publisher is now connected to the controller via
+`SnapshotPressureGuard` (`src/resilience/snapshotPressureGuard.ts`), created
+lazily by `EngineeringRuntime` on the first publish error (healthy runs are
+behaviorally unchanged):
+
+- **Retries stop**: an ENOSPC-class failure suspends the controller; the
+  publisher pauses (no further disk writes, no in-call retry storm) after one
+  best-effort stale-tagged attempt, and yields to the recovery probe.
+- **Published snapshot tagged stale**: the published file gains the additive
+  `storagePressure` substate (dirty / stale / staleAtMs / republished /
+  suspended / incident). Older plugins feature-detect and ignore it; contract
+  version unchanged. The tag clears only when a post-recovery republish lands.
+- **Recovery probe**: while suspended, one probe per `probe_interval_ms`
+  (30 s, unref'd timer) samples the AFFECTED mount and runs a bounded
+  write/sync/rename sentinel; resume unpauses the publisher and runs the
+  forced republish pipeline once.
+- **Classification fix**: ENOTDIR (path-shape error, e.g. work dir replaced
+  by a file) is no longer treated as auto-recoverable disk pressure — a space
+  probe can never clear it. It routes to operator review, preserving the
+  pre-existing retry+finding behavior for that failure.
+- **Fresh-incident fix**: a same-path incident after recovery re-suspends as a
+  NEW incident (the publisher re-pauses on a second disk-full).
+
+### Migration (wiring)
+
+No breaking change. `publishMissionSnapshot` gains an optional
+`{ force?: boolean }` argument (additive; existing call sites unchanged). The
+snapshot file's `storagePressure` field is additive. Operator diagnostics
+reuse the existing `onMissionSnapshotError` hook (coalesced — no flood).
+
+### Verification evidence (wiring)
+
+- `npm run typecheck` → exit 0.
+- `npx biome check` on all changed files → clean.
+- `test/unit/resilience-snapshot-guard.test.ts` → 12/12 (fault injection only).
+- Full suite: `npm test` → 4880 tests, 0 failures (10 pre-existing TODO,
+  1 skipped).
+- `test/integration/mission-snapshot-publication-error.test.ts` (pre-existing
+  error-path contract) → green after the ENOTDIR reclassification.
