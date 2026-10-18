@@ -33,7 +33,7 @@ import {
   type RuntimeSnapshot,
 } from "./contract.ts";
 import { type RuntimeSource, loadRuntimeSource, pruneGenerationSnapshots } from "./loader.ts";
-import { OperationRegistry } from "./operations.ts";
+import { DEFAULT_SAFE_POINT_TIMEOUT_MS, OperationRegistry } from "./operations.ts";
 import { type BridgeTarget, PiBridge } from "./piBridge.ts";
 import { RuntimeResourceRegistry } from "./resources.ts";
 import { type RuntimeEventFields, RuntimeTelemetry } from "./telemetry.ts";
@@ -481,7 +481,7 @@ export class RuntimeHost implements BridgeTarget {
     importFrom?: string,
   ): Promise<LiveGeneration> {
     const generation = ++this.counter;
-    const loadFrom = importFrom ? { ...source, root: importFrom, direct: false } : source;
+    const loadFrom = importFrom ? { ...source, root: importFrom, direct: false, snapshotCommit: undefined } : source;
     const loaded = await loadRuntimeSource(loadFrom, this.opts.generationsDir, generation, this.supported);
     this.telemetry.emit("runtime.generation.loaded", {
       new_generation: generation,
@@ -557,7 +557,7 @@ export class RuntimeHost implements BridgeTarget {
     const checks: RuntimeHealth["checks"] = [];
     let reported: RuntimeHealth;
     try {
-      reported = await live.runtime.health();
+      reported = await this.timed(live.runtime.health(), "health");
     } catch (error) {
       reported = { healthy: false, checks: [{ name: "runtime health()", ok: false, detail: message(error) }] };
     }
@@ -728,7 +728,9 @@ export class RuntimeHost implements BridgeTarget {
         this.telemetry.emit("runtime.quiesce.started", base);
         await this.timed(old.runtime.quiesce(request.kind), "quiesce");
         // Drain anything that started between the safe point and the gate.
-        const drained = await this.operations.waitForSafePoint({ timeoutMs: request.safePointTimeoutMs ?? 300_000 });
+        const drained = await this.operations.waitForSafePoint({
+          timeoutMs: request.safePointTimeoutMs ?? DEFAULT_SAFE_POINT_TIMEOUT_MS,
+        });
         if (!drained.reached) throw new HandoverAbort("quiescing", "operations did not drain after quiesce");
         this.telemetry.emit("runtime.quiesce.completed", base);
         await phase("snapshotting");

@@ -15,6 +15,8 @@ import type {
   SafePointResult,
 } from "./contract.ts";
 
+export const DEFAULT_SAFE_POINT_TIMEOUT_MS = 30_000;
+
 const DESCRIBE: Record<RuntimeOperationType, [string, string]> = {
   inference: ["active inference request", "active inference requests"],
   tool: ["tool execution", "tool executions"],
@@ -108,7 +110,6 @@ export class OperationRegistry {
     if (this.blocking().length === 0) return { reached: true, waitedMs: 0 };
     return new Promise<SafePointResult>((resolve) => {
       let lastKey = "";
-      let timer: ReturnType<typeof setTimeout> | undefined;
       const finish = (result: SafePointResult) => {
         this.listeners.delete(check);
         if (timer) clearTimeout(timer);
@@ -132,18 +133,15 @@ export class OperationRegistry {
       };
       const onAbort = () =>
         finish({ reached: false, reason: "cancelled", blocking: this.blocking(), waitedMs: this.now() - started });
+      const timer = setTimeout(
+        () => finish({ reached: false, reason: "timeout", blocking: this.blocking(), waitedMs: this.now() - started }),
+        options.timeoutMs ?? DEFAULT_SAFE_POINT_TIMEOUT_MS,
+      );
       if (options.signal?.aborted) {
         onAbort();
         return;
       }
       options.signal?.addEventListener("abort", onAbort, { once: true });
-      if (options.timeoutMs !== undefined) {
-        timer = setTimeout(
-          () =>
-            finish({ reached: false, reason: "timeout", blocking: this.blocking(), waitedMs: this.now() - started }),
-          options.timeoutMs,
-        );
-      }
       this.listeners.add(check);
       check();
     });

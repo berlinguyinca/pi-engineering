@@ -29,7 +29,7 @@ function git(root: string, ...args: string[]): string {
 }
 
 let seq = 0;
-async function setup(opts: { autoReload?: boolean } = {}) {
+async function setup(opts: { autoReload?: boolean; safePointTimeoutMs?: number } = {}) {
   const key = `__rt_autoreload_${process.pid}_${++seq}`;
   const b = bag(key);
   const root = mkdtempSync(join(tmpdir(), "rt-autoreload-"));
@@ -46,6 +46,7 @@ async function setup(opts: { autoReload?: boolean } = {}) {
     autoUpdateCheck: false,
     autoReload: opts.autoReload ?? true,
     autoReloadIntervalMs: 25,
+    safePointTimeoutMs: opts.safePointTimeoutMs,
   });
   const pi: PiTestSession = await startPiSession({ factories: [(api: never) => ext.install(api)] });
   cleanups.push(async () => {
@@ -269,4 +270,44 @@ test("auto reload: a commit does not reload while a tracked file is mid-edit; it
   assert.equal(host.activeGeneration()?.source.commit, git(source, "rev-parse", "HEAD"));
   await pi.emit({ type: "agent_settled" });
   assert.equal(b.values.at(-1), "B");
+});
+
+test("auto reload: a pending safe point never advances the accepted commit; timeout retries the same SHA", async () => {
+  const { host, ext, commit } = await setup({ safePointTimeoutMs: 60 });
+  const original = ext.sourceWatcher?.current;
+  const busy = host.operations.begin(1, "tool", "hung tool");
+  const sha = commit("B");
+  await until(() => host.pendingTask()?.phase === "waiting_safe_point", "safe point wait");
+  assert.equal(ext.sourceWatcher?.current, original, "starting a handover is not acceptance");
+  await until(() => host.lastHandover?.phase === "cancelled", "bounded cancellation");
+  assert.equal(ext.sourceWatcher?.current, original, "failed activation must not consume the SHA");
+  busy.end();
+  await until(() => host.activeGeneration()?.source.commit === sha, "retry of the same source commit");
+});
+
+test("auto reload: blocked session releases shared install lock after snapshotting", async () => {
+  const { host, ext, commit } = await setup({ safePointTimeoutMs: 200 });
+  const busy = host.operations.begin(1, "tool", "long tool");
+  commit("B");
+  await until(() => host.pendingTask()?.phase === "waiting_safe_point", "safe point wait");
+  let sibling: ReturnType<typeof ext.lock.acquire> | undefined;
+  try {
+    assert.doesNotThrow(() => {
+      sibling = ext.lock.acquire("sibling-session-update");
+    });
+  } finally {
+    sibling?.release();
+    busy.end();
+  }
+});
+
+test("auto reload: unhealthy target leaves baseline on last accepted code", async () => {
+  const { host, ext, source, key } = await setup();
+  const original = ext.sourceWatcher?.current;
+  writeFixtureRuntime(source, key, { value: "BROKEN", mode: "unhealthy" });
+  git(source, "add", "-A");
+  git(source, "commit", "-qm", "broken health");
+  await until(() => host.lastHandover?.rolledBack === true, "rollback");
+  assert.equal(ext.sourceWatcher?.current, original);
+  assert.equal(host.activeGeneration()?.source.commit, original);
 });
