@@ -20,12 +20,14 @@ import {
 function watcher(opts: {
   values: Array<string | null>;
   baseline?: string | null;
+  now?: () => number;
   act?: (next: string, previous: string) => boolean;
 }) {
   let i = 0;
   const changes: Array<[string, string]> = [];
   const w = new SourceWatcher({
     intervalMs: 5,
+    now: opts.now,
     ...(opts.baseline !== undefined ? { baseline: opts.baseline } : {}),
     fingerprint: async () => opts.values[Math.min(i++, opts.values.length - 1)] ?? null,
     onChange: (next, previous) => {
@@ -57,14 +59,16 @@ test("watcher: a supplied baseline fires on the first poll that differs (the che
   w.dispose();
 });
 
-test("watcher: onChange returning false keeps the baseline, so the change is retried next poll", async () => {
+test("watcher: onChange returning false keeps the baseline until a retry succeeds", async () => {
   let busy = true;
-  const { w, changes } = watcher({ values: ["a", "b", "b", "b"], act: () => !busy });
+  let clock = 0;
+  const { w, changes } = watcher({ values: ["a", "b", "b", "b"], act: () => !busy, now: () => clock });
   await w.poll();
   await w.poll();
   assert.equal(w.current, "a");
   assert.equal(changes.length, 1);
   busy = false;
+  clock = 30_000;
   await w.poll();
   assert.equal(w.current, "b");
   assert.equal(changes.length, 2);
@@ -234,4 +238,113 @@ test("dispose() resolves only once a poll in flight has finished", async () => {
   await disposal;
   assert.equal(disposed, true);
   assert.equal(w.active, false);
+});
+
+test("watcher: failed same-SHA activation backs off from 30 seconds to a five-minute cap", async () => {
+  let clock = 1000;
+  let attempts = 0;
+  const w = new SourceWatcher({
+    intervalMs: 15_000,
+    baseline: "running",
+    now: () => clock,
+    fingerprint: async () => "candidate",
+    onChange: () => {
+      attempts++;
+      return false;
+    },
+  });
+  try {
+    await w.poll();
+    assert.equal(attempts, 1);
+    for (const delay of [30_000, 60_000, 120_000, 240_000, 300_000, 300_000]) {
+      clock += delay - 1;
+      await w.poll();
+      assert.equal(w.current, "running");
+      const before: number = attempts;
+      await w.poll();
+      assert.equal(attempts, before, "repeated polls do not bypass the retry budget");
+      clock++;
+      await w.poll();
+      assert.equal(attempts, before + 1);
+    }
+  } finally {
+    await w.dispose();
+  }
+});
+
+test("watcher: a new SHA and successful activation reset failure backoff", async () => {
+  let clock = 0;
+  let sha = "b";
+  let success = false;
+  const attempts: string[] = [];
+  const w = new SourceWatcher({
+    intervalMs: 15_000,
+    baseline: "a",
+    now: () => clock,
+    fingerprint: async () => sha,
+    onChange: (next) => {
+      attempts.push(next);
+      return success;
+    },
+  });
+  try {
+    await w.poll();
+    clock = 30_000;
+    await w.poll();
+    sha = "c";
+    await w.poll();
+    assert.deepEqual(attempts, ["b", "b", "c"], "a new commit is attempted immediately");
+    success = true;
+    clock += 30_000;
+    await w.poll();
+    assert.equal(w.current, "c");
+    success = false;
+    sha = "b";
+    await w.poll();
+    clock += 29_999;
+    await w.poll();
+    assert.deepEqual(attempts, ["b", "b", "c", "c", "b"]);
+    clock++;
+    await w.poll();
+    assert.deepEqual(attempts, ["b", "b", "c", "c", "b", "b"]);
+  } finally {
+    await w.dispose();
+  }
+});
+
+test("watcher: throwing activation backs off and concurrent polls share one attempt", async () => {
+  let clock = 0;
+  let attempts = 0;
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const errors: unknown[] = [];
+  const w = new SourceWatcher({
+    intervalMs: 15_000,
+    baseline: "a",
+    now: () => clock,
+    fingerprint: async () => "b",
+    onChange: async () => {
+      attempts++;
+      await gate;
+      throw new Error("unhealthy");
+    },
+    onError: (error) => errors.push(error),
+  });
+  try {
+    const first = w.poll();
+    assert.equal(w.poll(), first);
+    release();
+    await first;
+    await w.poll();
+    assert.equal(attempts, 1);
+    assert.equal(errors.length, 1);
+    clock = 30_000;
+    await w.poll();
+    assert.equal(attempts, 2);
+    assert.equal(w.current, "a");
+  } finally {
+    await w.dispose();
+  }
 });

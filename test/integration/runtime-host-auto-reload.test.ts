@@ -229,7 +229,7 @@ test("/pie: a runtime command goes through the bridge (gated and tracked), not s
   assert.equal(b.values.at(-1), "cmd:A");
 });
 
-test("auto reload: a commit seen while the mutation lock is held elsewhere is picked up once it is free", async () => {
+test("auto reload: a commit seen while the mutation lock is held elsewhere is picked up once it is free", async (t) => {
   const { host, ext, commit } = await setup();
   const held = ext.lock.acquire("another-process");
   const sha = commit("B");
@@ -237,6 +237,8 @@ test("auto reload: a commit seen while the mutation lock is held elsewhere is pi
   assert.equal(host.activeGeneration()?.generation, 1, "no reload under a foreign lock");
   assert.notEqual(ext.sourceWatcher?.current, sha, "the baseline did not advance past the unloaded commit");
   held.release();
+  const now = Date.now.bind(Date);
+  t.mock.method(Date, "now", () => now() + 300_000);
   await until(() => host.activeGeneration()?.generation === 2, "reload after the lock was released");
   assert.equal(host.activeGeneration()?.source.commit, sha);
 });
@@ -249,7 +251,7 @@ test("auto reload: closing the session disposes the watcher", async () => {
   assert.equal(ext.sourceWatcher, undefined);
 });
 
-test("auto reload: a commit does not reload while a tracked file is mid-edit; it does once the tree is clean", async () => {
+test("auto reload: a commit does not reload while a tracked file is mid-edit; it does once the tree is clean", async (t) => {
   const { pi, host, b, source, ext, commit } = await setup();
   assert.equal(host.activeGeneration()?.generation, 1);
   // A tracked file the operator is still editing (unrelated to the commit):
@@ -266,13 +268,15 @@ test("auto reload: a commit does not reload while a tracked file is mid-edit; it
   assert.notEqual(ext.sourceWatcher?.current, sha, "the baseline waits with it");
 
   git(source, "checkout", "--", "package.json");
+  const now = Date.now.bind(Date);
+  t.mock.method(Date, "now", () => now() + 300_000);
   await until(() => host.activeGeneration()?.generation === 2, "handover once the tree is clean");
   assert.equal(host.activeGeneration()?.source.commit, git(source, "rev-parse", "HEAD"));
   await pi.emit({ type: "agent_settled" });
   assert.equal(b.values.at(-1), "B");
 });
 
-test("auto reload: a pending safe point never advances the accepted commit; timeout retries the same SHA", async () => {
+test("auto reload: a pending safe point never advances the accepted commit; timeout retries the same SHA", async (t) => {
   const { host, ext, commit } = await setup({ safePointTimeoutMs: 60 });
   const original = ext.sourceWatcher?.current;
   const busy = host.operations.begin(1, "tool", "hung tool");
@@ -282,6 +286,8 @@ test("auto reload: a pending safe point never advances the accepted commit; time
   await until(() => host.lastHandover?.phase === "cancelled", "bounded cancellation");
   assert.equal(ext.sourceWatcher?.current, original, "failed activation must not consume the SHA");
   busy.end();
+  const now = Date.now.bind(Date);
+  t.mock.method(Date, "now", () => now() + 300_000);
   await until(() => host.activeGeneration()?.source.commit === sha, "retry of the same source commit");
 });
 
