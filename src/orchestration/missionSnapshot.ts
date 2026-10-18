@@ -37,10 +37,34 @@ export const MISSION_SNAPSHOT_FILENAME = "orchestration-snapshot.json";
  * Additive v2: `observability` was added. Older plugins feature-detect the
  * optional field and continue to render the base mission/task/finding shape.
  */
+/**
+ * Additive: `storagePressure` was added (disk-pressure recovery FR-04). Older
+ * plugins feature-detect the optional field and continue to render the base
+ * mission/task/finding shape. It lets a plugin show the last published
+ * snapshot as stale instead of presenting it as current while writes are
+ * being dropped.
+ */
 export interface MissionSnapshotFile {
   contractVersion: number;
   generatedAt: string;
   missions: Array<MissionSnapshotMission>;
+  storagePressure?: StoragePressureSnapshot;
+}
+
+/** Storage-pressure substate of the publishing runtime (see resilience guard). */
+export interface StoragePressureSnapshot {
+  /** True while the snapshot is dirty (unpublished changes). */
+  dirty: boolean;
+  /** True when the last published snapshot is stale (post-incident). */
+  stale: boolean;
+  /** Wall-clock ms the published snapshot was marked stale. */
+  staleAtMs?: number;
+  /** True once the dirty snapshot has been republished post-recovery. */
+  republished: boolean;
+  /** True while the mission is suspended on storage pressure. */
+  suspended: boolean;
+  /** The active incident, when suspended. */
+  incident?: { category: string; code: string; path?: string };
 }
 
 export interface MissionObservabilitySnapshot {
@@ -385,6 +409,8 @@ export function buildMissionSnapshotFile(
     /** The store's recorded lifecycle; absent means derive it from the status. */
     lifecycle?: CanonicalLifecycle;
   }>,
+  /** Additive storage-pressure substate (disk-pressure recovery FR-04). */
+  storagePressure?: StoragePressureSnapshot | null,
 ): MissionSnapshotFile {
   return {
     contractVersion: MISSION_SNAPSHOT_CONTRACT_VERSION,
@@ -403,5 +429,6 @@ export function buildMissionSnapshotFile(
         m.lifecycle,
       ),
     ),
+    ...(storagePressure ? { storagePressure } : {}),
   };
 }
