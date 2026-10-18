@@ -65,6 +65,12 @@ commit and healthy replacement generation before reporting success. A failed
 handover retains the prior generation and does not consume that source commit
 as successfully reloaded.
 
+A successful verified activation also queues a custom message into the actual Pi
+conversation, identifying the loaded commit and preserving the existing mission
+identity. It does not trigger another model turn. A UI-only control `note` remains
+informational and is not a substitute for this conversation update or a recovery
+receipt.
+
 Automatic resumption checks current custody, loaded code, revision, resumption
 generation, and latest operator intent. It never clears an operator pause or
 creates another mission. The durable resumption write uses a conditional append
