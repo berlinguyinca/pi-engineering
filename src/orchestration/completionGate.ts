@@ -307,11 +307,23 @@ export class CompletionGate {
             (task) =>
               !!task.completed_at &&
               evidenceExecutions.every(
-                (execution) => !!execution?.ended_at && Date.parse(execution.ended_at) > Date.parse(task.completed_at!),
+                (execution) =>
+                  !!execution?.ended_at &&
+                  (Date.parse(execution.ended_at) > Date.parse(task.completed_at!) ||
+                    (candidateCurrent &&
+                      task.kind === "integration" &&
+                      execution.task_id === task.task_id &&
+                      candidate.taskId === task.task_id &&
+                      execution.execution_id === task.assigned_execution_id &&
+                      execution.execution_id === candidate.executionId)),
               ),
           ));
       const valid =
-        failed?.status === "FAILED" &&
+        (failed?.status === "FAILED" ||
+          (failed?.status === "CANCELED" &&
+            this.store.legacyTaskCancellationWasAuthorityLoss(failed.task_id) &&
+            !!lineage.recoveryDecisionId &&
+            this.store.getRecoveryDecision(lineage.recoveryDecisionId)?.action === "FENCE_RECONCILE_AND_RESUME")) &&
         failed.repo_id === lineage.repoId &&
         replacements.length > 0 &&
         lineage.coverageFingerprint === (failed ? taskCoverageFingerprint(failed) : "") &&

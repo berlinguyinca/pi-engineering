@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
@@ -440,7 +440,11 @@ function blockedRepairHarness(
   };
 }
 
-async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" | "promotion" | "captureDiff") {
+async function realGateRepairHarness(
+  emptyRepair: boolean,
+  race?: "integration" | "promotion" | "captureDiff",
+  legacyCancellation: boolean | "intentional" = false,
+) {
   const fixture = await makeFixtureRepo();
   const git = (await GitRepo.open(fixture.root))!;
   const baseSha = await git.headCommit();
@@ -535,9 +539,12 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
   const failed = store.createTask({
     task_id: "TSK-failed-gate",
     mission_id: mission.mission_id,
-    kind: "validation",
-    role: "validator",
-    objective: "validation failed on current candidate",
+    kind: legacyCancellation ? "agent" : "validation",
+    role: legacyCancellation ? "implementer" : "validator",
+    mutates_repo: !!legacyCancellation,
+    write_domains: legacyCancellation ? ["**"] : [],
+    isolation: legacyCancellation ? "worktree" : "none",
+    objective: legacyCancellation ? "finish preserved implementation" : "validation failed on current candidate",
     repo_id: "repo-real-repair",
     deliverables: ["repair validation defect"],
   });
@@ -545,7 +552,8 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
   const failedExecution = store.createExecution({
     task_id: failed.task_id,
     mission_id: mission.mission_id,
-    backend: "validation",
+    backend: legacyCancellation ? "agent" : "validation",
+    checkpoint_id: legacyCancellation ? "CHK-legacy" : undefined,
     repo_id: "repo-real-repair",
     base_sha: baseSha,
   });
@@ -553,12 +561,46 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
     assigned_execution_id: failedExecution.execution_id,
   });
   store.setExecutionStatus(failedExecution.execution_id, "RUNNING");
-  store.setExecutionStatus(failedExecution.execution_id, "FAILED", {
-    exit_status: "failed",
+  if (legacyCancellation) {
+    store.checkpointTask({
+      checkpointId: "CHK-legacy",
+      executionId: failedExecution.execution_id,
+      missionId: mission.mission_id,
+      taskId: failed.task_id,
+      repoId: "repo-real-repair",
+      baseSha,
+      candidateSha,
+      branch: baselineWorktree.branch,
+      worktree: baselineWorktree.path,
+      committedChanges: ["src/candidate-baseline.ts"],
+      preservedUncommittedChanges: [],
+      completedDeliverables: [],
+      remainingDeliverables: ["repair validation defect"],
+      acceptanceIds: [],
+      validationEvidenceRefs: [],
+      artifactRefs: [],
+      artifactHashes: [],
+      workerId: "old-worker",
+      sessionId: "old-session",
+      model: "test",
+      sequence: 1,
+      missionGeneration: 0,
+      candidateGeneration: 0,
+      fencingToken: 0,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  if (legacyCancellation === "intentional") store.steerTask(failed.task_id, "operator canceled this implementation");
+  store.setExecutionStatus(failedExecution.execution_id, legacyCancellation ? "CANCELED" : "FAILED", {
+    exit_status: legacyCancellation ? "canceled" : "failed",
   });
-  store.transitionTask(failed.task_id, "FAILED", "system", {
-    failure_reason: "validation failed",
+  store.transitionTask(failed.task_id, legacyCancellation ? "CANCELED" : "FAILED", "system", {
+    failure_reason: legacyCancellation ? undefined : "validation failed",
   });
+  if (legacyCancellation)
+    store.rejectLateExecution(failedExecution.execution_id, "stale mission fencing identity for legacy controller");
+  if (legacyCancellation)
+    store.rejectLateExecution(failedExecution.execution_id, "backend result arrived after cancellation");
   store.classifyFailure({
     classificationId: "FC-real-gate",
     missionId: mission.mission_id,
@@ -570,7 +612,35 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
     summary: "validation failed",
     classifiedAt: "2026-09-27T00:00:01.000Z",
   });
+  if (legacyCancellation) {
+    const downstream = store.createTask({
+      task_id: "TSK-legacy-integration",
+      mission_id: mission.mission_id,
+      kind: "integration",
+      role: "integrator",
+      objective: "integrate preserved implementation",
+      repo_id: "repo-real-repair",
+      mutates_repo: true,
+      write_domains: ["**"],
+      isolation: "none",
+      depends_on: [failed.task_id],
+    });
+    store.transitionTask(downstream.task_id, "READY");
+    store.transitionTask(downstream.task_id, "FAILED", "system", {
+      failure_reason: "integrated nothing after canceled worker",
+    });
+  }
   store.transitionMission(mission.mission_id, "BLOCKED");
+  if (legacyCancellation) {
+    store.stopMission(mission.mission_id, {
+      reason: "legacy recovery exhausted",
+      preservedWork: [baselineWorktree.path, baselineWorktree.branch, candidateSha],
+      attemptedRecoveries: [],
+      resumeCondition: "install recovery fix",
+    });
+    store.resumeMission(mission.mission_id, "verified maintenance recovery");
+  }
+  const order: string[] = [];
   const registry = new RepositoryRegistry();
   await registry.register(manifest);
   const ownership = race ? new MissionOwnership(store, { ownerId: `race-${race}` }) : undefined;
@@ -599,7 +669,12 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
     repositoryRegistry: registry,
     backends: {
       agent: {
-        runAgent: async ({ worktree }) => {
+        runAgent: async ({ worktree, recovery }) => {
+          order.push("implementer");
+          if (legacyCancellation) {
+            assert.equal(recovery?.checkpointId, "CHK-legacy");
+            assert.match(await readFile(join(worktree!, "src", "candidate-baseline.ts"), "utf8"), /baseline = true/);
+          }
           if (!worktree) throw new Error("repair worktree missing");
           if (emptyRepair) {
             await exec("git", ["-C", worktree, "commit", "--allow-empty", "-m", "empty repair"]);
@@ -619,6 +694,7 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
       integration: {
         candidateScoped: true,
         runIntegration: async (input) => {
+          order.push("integration");
           if (race === "integration") {
             store.resumeMission(mission.mission_id, "explicit resumption during integration");
           }
@@ -704,6 +780,8 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
   });
   return {
     fixture,
+    order,
+    failed,
     backend,
     store,
     missionId: mission.mission_id,
@@ -722,6 +800,60 @@ async function realGateRepairHarness(emptyRepair: boolean, race?: "integration" 
 }
 
 describe("orchestrator: durable blocked-mission repair", () => {
+  it("replaces a proven legacy authority-canceled implementation before integrating and preserves its Git checkpoint", async () => {
+    const h = await realGateRepairHarness(false, undefined, true);
+    try {
+      await h.store.flush();
+      assert.deepEqual(
+        MissionStore.open(h.backend).legacyCanceledRecovery(h.missionId).recoverableTaskIds,
+        [h.failed.task_id],
+        "proof survives replay",
+      );
+      h.store.markOperatorPause(h.missionId);
+      await h.orchestrator.repairBlockedMission(h.missionId);
+      assert.equal(h.order.length, 0, "operator pause still forbids legacy recovery");
+      h.store.clearOperatorPause(h.missionId);
+      await h.orchestrator.repairBlockedMission(h.missionId);
+      assert.equal(h.store.getTask(h.failed.task_id)?.status, "CANCELED", "terminal audit history is immutable");
+      assert.ok(h.store.isTaskSatisfiedBySupersession(h.failed.task_id));
+      assert.deepEqual(h.order.slice(0, 2), ["implementer", "integration"]);
+      assert.ok(h.store.isTaskSatisfiedBySupersession("TSK-legacy-integration"));
+      assert.equal(h.store.getMission(h.missionId)?.status, "COMPLETE");
+      assert.equal(await h.git.resolveCommit(h.candidateSha), h.candidateSha, "preserved commit remains available");
+      const candidate = h.store.getCandidate(h.missionId)!;
+      h.store.invalidateEvidence({
+        invalidationId: "legacy-stale-evidence",
+        missionId: h.missionId,
+        identity: candidate.identity,
+        reason: "candidate changed after recovery",
+        invalidatedAt: new Date().toISOString(),
+      });
+      assert.equal(
+        h.orchestrator.gate.evaluate(h.store.getMission(h.missionId)!).can_complete,
+        false,
+        "legacy supersession cannot bypass stale validation/review evidence",
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("never revives a canceled mission or a deliberately steered legacy task", async () => {
+    const h = await realGateRepairHarness(false, undefined, "intentional");
+    try {
+      assert.deepEqual(h.store.legacyCanceledRecovery(h.missionId).ambiguousTaskIds, [h.failed.task_id]);
+      await h.orchestrator.repairBlockedMission(h.missionId);
+      assert.match(h.store.listMissionStops(h.missionId).at(-1)?.reason ?? "", /LEGACY_REPAIR_REQUIRED/);
+      assert.equal(h.store.listTaskSupersessions(h.missionId).length, 0);
+      h.store.transitionMission(h.missionId, "CANCELED");
+      await h.orchestrator.repairBlockedMission(h.missionId);
+      assert.equal(h.store.getMission(h.missionId)?.status, "CANCELED");
+      assert.equal(h.order.length, 0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("continues past a foreign mismatched record and a quarantined bad record instead of stopping", async () => {
     const fixture = await makeFixtureRepo();
     try {
