@@ -1209,20 +1209,26 @@ export class EngineeringRuntime {
         }
         routerAdapter =
           opts.roleRouter ??
-          (await createRoleRouter({
-            cwd: repoRoot,
-            agentDir: opts.agentDir,
-            modelRuntime: sharedRuntime,
-            allowModelNetwork: false,
-          }));
+          (rt.worker instanceof PiWorkerExecutor
+            ? await createRoleRouter({
+                cwd: repoRoot,
+                agentDir: opts.agentDir,
+                modelRuntime: sharedRuntime,
+                allowModelNetwork: false,
+              })
+            : undefined);
         // Models the gateway stopped serving are excluded for a TTL, so a
         // mission's workers (and the recovery probe) move to another model.
-        routeModel = createRouteModel({
-          router: routerAdapter,
-          unavailable: rt.unavailableModels,
-          reviewFallbackModel,
-          operatorPin: currentOperatorPin,
-        });
+        // Custom executors own model execution unless the caller supplies a
+        // router. An absent Pi catalog is not an explicitly empty routing pool.
+        routeModel = routerAdapter
+          ? createRouteModel({
+              router: routerAdapter,
+              unavailable: rt.unavailableModels,
+              reviewFallbackModel,
+              operatorPin: currentOperatorPin,
+            })
+          : undefined;
       } catch {
         // No router: role pins and ranking are unavailable, an operator pin
         // still places every role.
@@ -1262,6 +1268,7 @@ export class EngineeringRuntime {
           });
         }
       }
+      const registryWorker = rt.worker instanceof PiWorkerExecutor ? rt.worker : undefined;
       const backends = realBackends({
         worker: rt.worker,
         verifier: rt.verifier,
@@ -1291,9 +1298,9 @@ export class EngineeringRuntime {
         reviewFallbackModel,
         // Gate roles routing cannot place (no repo policy, candidates dead) are
         // placed from the session's model registry.
-        registryModels: async () =>
-          rt.worker instanceof PiWorkerExecutor
-            ? (await (await rt.worker.getModelRuntime()).getAvailable()).map((model) => ({
+        registryModels: registryWorker
+          ? async () =>
+              (await (await registryWorker.getModelRuntime()).getAvailable()).map((model) => ({
                 provider: model.provider,
                 id: model.id,
                 contextWindow: model.contextWindow,
@@ -1302,7 +1309,7 @@ export class EngineeringRuntime {
                 // Match PiModelRuntimeSource: Pi registry models support tools.
                 toolCall: true,
               }))
-            : [],
+          : undefined,
         enabledModels: () => {
           try {
             return SettingsManager.create(repoRoot, opts.agentDir ?? getAgentDir()).getEnabledModels();
