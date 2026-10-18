@@ -40,8 +40,83 @@
 3. `summary()` (MissionObservability.ts:1131) projects `workersDetail` (lines 1169-1170).
 4. `/mission-status` (extensions/index.ts:2022) renders `workersDetail` as per-worker model/route lines (2068-2070); the mode decision is a mission-record field (`m.execution_mode`) persisted at orchestrateMission time (orchestrator.ts:1672) and rendered at extensions/index.ts:2012/2064.
 
+## P4 model provenance: two gaps that left `usage.model` / `workersDetail.model` null
+
+Symptom: for an unrouted in-session worker (e.g. an investigator with no
+`execution_requirements.model` and no pinned route), `/mission-status` rendered
+`usage.model` and the per-worker model as null, even though a model clearly
+served the run. Both surfaces read the **execution record's `model` field**
+(`ex.model`): task `usage.model` via `missionWhy.ts` and `workersDetail.model`
+via `orchestrator.ts:1366` (`store.getExecution(...).model`). The design intent
+(orchestrator.ts:1354-1358) is that "the recorded model wins over the requested
+one" — but `ex.model` was never actually set to the model that served.
+
+Two independent gaps had to be closed for the serving model to reach `ex.model`:
+
+### Gap 1 — executor success path never attached `details.model`
+
+- `PiWorkerExecutor`'s **failure** and **superseded** paths attached
+  `result.details.model` (the resolved serving model), but the **success** path
+  did not. So for a completed run, `ranOn(run)`
+  (`src/orchestration/realBackends.ts:272-277`, reads `run.result.details?.model`)
+  was always `undefined`, and the backend's model resolution
+  `model = route ?? ranOn(run) ?? reviewFallbackModel`
+  (`src/orchestration/realBackends.ts:634`) fell through to null for unpinned
+  roles.
+- Fix: on the success path, attach the resolved serving model to the completed
+  result's `details.model` (route when routed, else the executor default),
+  matching the failure-path pattern — `src/workers/PiWorkerExecutor.ts`.
+- Test: `test/integration/worker-model-provenance.test.ts` (in-session default
+  model + routed model; red→green).
+
+### Gap 2 — broker settlement never copied the serving model onto the execution record
+
+- The execution record is created **before** the backend runs, seeded with the
+  *requested* model: `model: modelRequirements?.model ?? null`
+  (`src/orchestration/broker.ts:2871`). Settlement
+  (`src/orchestration/broker.ts:3564`, the general non-gate path) recorded
+  `exit_status`, `artifact_refs`, `usage`, error/summary — but **not** `model`.
+  So `ex.model` stayed the requested value (null for unrouted roles) and the
+  serving model the backend recorded on the outcome (`outcome.usage.model`, set
+  by `withModel`, `src/orchestration/realBackends.ts:280-289`) was discarded.
+- Fix: at settlement, copy the serving model onto the record when the outcome
+  carries one: `...(typeof outcome.usage?.model === "string" && outcome.usage.model
+  ? { model: outcome.usage.model } : {})` — so the model that actually served
+  wins over the requested one, and the requested value is preserved when the
+  outcome records no model.
+- Test: `test/unit/orchestration-broker-model-provenance.test.ts` (unrouted
+  serving model recorded; serving model preferred over a differing requested
+  model on failover; requested model preserved when the outcome is unnamed;
+  red→green).
+
+### The complete provenance chain (both fixes in place)
+
+```
+PiWorkerExecutor success path  ->  result.details.model          (Gap 1 fix)
+        |  ranOn(run) reads details.model            realBackends.ts:272
+        v
+model = route ?? ranOn(run) ?? reviewFallbackModel   realBackends.ts:634
+        |  withModel(outcome, model)
+        v
+outcome.usage.model = modelKey(model)               realBackends.ts:280-289,850
+        |  broker settlement copies outcome.usage.model -> execution.model  (Gap 2 fix)
+        v
+execution.model (store)                               broker.ts:3564-3577
+        |  read by both surfaces
+        v
+missionWhy usage.model  +  orchestrator workersDetail.model
+```
+
+Note on live confirmation: both fixes are verified at the test level with the
+real `PiWorkerExecutor` and real `ExecutionBroker` at each link. A live in-session
+run requires the fixed build to be deployed to the runtime release the session
+uses (the running fleet is on the pre-fix release); it is therefore gated on a
+redeploy rather than blocked on a code gap.
+
 ## Tests covering this flow
 
+- `test/integration/worker-model-provenance.test.ts` — executor attaches the serving model to `details.model` (Gap 1).
+- `test/unit/orchestration-broker-model-provenance.test.ts` — broker settlement records the serving model on the execution record (Gap 2).
 - `test/integration/orchestrator-e2e.test.ts:851-880` — asserts `workersDetail` carries per-task routing provenance (model/route) in the summary.
 - `test/integration/extension-mission-commands.test.ts` — `/mission-status` rendering incl. `execution_mode` (lines 540, 616).
 - `test/integration/mission-observability-e2e.test.ts` — end-to-end observability summary assertions.
