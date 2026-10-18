@@ -2216,6 +2216,11 @@ export class MissionStore {
   transitionRecovery(recoveryId: string, status: Exclude<RecoveryStatus, "planned">): RecoveryDecision {
     const decision = this.recoveryDecisions.get(recoveryId);
     if (!decision) throw new Error(`unknown recovery ${recoveryId}`);
+    // The scheduler and orchestrator may observe the same terminal outcome.
+    // A replay may acknowledge it, but must never change that outcome.
+    if (decision.status === status && (status === "succeeded" || status === "failed" || status === "exhausted")) {
+      return copyRecoveryDecision(decision);
+    }
     if (!RECOVERY_TRANSITIONS[decision.status].includes(status)) {
       throw new Error(`illegal recovery transition ${decision.status} -> ${status}`);
     }
