@@ -248,9 +248,12 @@ describe("realBackends capability routing", () => {
       artifacts: {} as never,
       git: null,
       cwd: "/repo",
-      routeModel: async () => undefined,
+      // No distinct route exists, but the router confirms the named session
+      // fallback is eligible when explicitly queried (not an empty catalog).
+      routeModel: async (_role, query) =>
+        query?.taskOverride === "local/local" ? { provider: "local", id: "local" } : undefined,
       reviewFallbackModel: { provider: "local", id: "local" },
-    } as never);
+    });
 
     await backends.review.runReview({
       objective: "review",
@@ -258,6 +261,7 @@ describe("realBackends capability routing", () => {
       onActivity: (event) => activity.push(event),
     });
 
+    assert.equal(seen.length, 1);
     assert.deepEqual(seen[0]?.modelOverride, { provider: "local", id: "local" });
     assert.ok(activity.some((event) => /reduced independence/i.test(event.summary)));
   });
@@ -271,7 +275,7 @@ describe("realBackends capability routing", () => {
       artifacts: {} as never,
       git: null,
       cwd: "/repo",
-      routeModel: async () => undefined,
+      // Standalone custom workers have no configured model catalog/router.
     });
 
     await backends.review.runReview({
@@ -280,6 +284,7 @@ describe("realBackends capability routing", () => {
       onActivity: (event) => activity.push(event),
     });
 
+    assert.equal(seen.length, 1);
     assert.equal(seen[0]?.modelOverride, undefined);
     assert.ok(activity.some((event) => /current worker model.*reduced independence/i.test(event.summary)));
   });
