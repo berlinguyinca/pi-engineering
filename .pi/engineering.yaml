@@ -50,14 +50,25 @@ routing:
     #   verifier      -> metabolomics qwen3.8-27b vision q4 (≠ implementer, ≠ reviewer)
     #   spec_verifier -> metabolomics qwen3.8-27b vision q4 (≠ reviewer)
     #   test_reviewer -> metabolomics qwen3.8-27b vision q4
+    # NOTE (rev 6, 2026-10-18 — gateway roster reality check): G1 routes are
+    # still undeployed, and the rev-5 fallback (qwen3.8-flash_next text q4) is
+    # advertised in the gateway's /v1/models but 404s (model_not_found) on
+    # completion — a stale list that does NOT trip the UnavailableModels
+    # exclusion, so planner/implementer busy-wait instead of degrading.
+    # Verified served on 2026-10-18: deepseek_v4-flash (text, 200 OK),
+    # qwen3.8-27b vision q8 + ctx-c120k q4 (200 OK). Point the text-role
+    # fallbacks at deepseek_v4-flash until G1 lands or qwen3.8-flash_next is
+    # actually served; reviewer/verifier pins unchanged (verified served).
+    # Ledger: FINDING-QAyyZh (stale /models + no degradation),
+    # FINDING-GIbklY (APS escalation to unserved model).
     planner:
       model: "metabolomics/coding-planning"
-      fallback_model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
+      fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
       timeout_ms: 3600000
       max_context_tokens: 128000
     implementer:
       model: "metabolomics/coding-implementation"
-      fallback_model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
+      fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
       timeout_ms: 3600000
       max_context_tokens: 128000
     reviewer:
