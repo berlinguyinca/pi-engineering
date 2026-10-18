@@ -1297,6 +1297,10 @@ export class EngineeringRuntime {
                 provider: model.provider,
                 id: model.id,
                 contextWindow: model.contextWindow,
+                input: model.input,
+                reasoning: model.reasoning,
+                // Match PiModelRuntimeSource: Pi registry models support tools.
+                toolCall: true,
               }))
             : [],
         enabledModels: () => {
