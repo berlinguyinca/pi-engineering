@@ -84,6 +84,81 @@ test("ledger_claim does not verify a claim citing a fabricated artifact URI (rev
   }
 });
 
+test("ledger_claim resolves evidence records and never verifies a hypothesis by reference alone", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-claim-evidence-"));
+  try {
+    const ledger = await Ledger.create(join(dir, "ledger.jsonl"));
+    const artifacts = await ArtifactStore.create(join(dir, "artifacts"));
+    const stored = await artifacts.put("verify", "observed", "wa=0 id=50", "vmstat sample");
+    const observed = await ledger.recordEvidence(
+      null,
+      "measurement",
+      "bash",
+      "vmstat",
+      0,
+      "passed",
+      {},
+      [],
+      "observed",
+      null,
+      { type: "system" },
+    );
+    const unverified = await ledger.recordEvidence(
+      null,
+      "claim",
+      "agent",
+      null,
+      0,
+      "passed",
+      {},
+      [],
+      "unverified",
+      null,
+      { type: "agent" },
+    );
+    const tools = buildCoreTools(() => ({
+      ledger,
+      artifacts,
+      broker: null,
+      currentWorkItemId: () => null,
+      actor: () => ({ type: "agent" }),
+    }));
+    const execute = tools.find((tool) => tool.name === "ledger_claim")!.execute as unknown as (
+      id: string,
+      params: Record<string, unknown>,
+      signal: undefined,
+      update: undefined,
+      ctx: { cwd: string },
+    ) => Promise<{ details: { id: string; status: string } }>;
+    for (const evidence of ["EVID-invented", "test-run://invented", unverified.id]) {
+      const result = await execute("claim", { kind: "fact", claim: "tests passed", evidence }, undefined, undefined, {
+        cwd: dir,
+      });
+      assert.equal(result.details.status, "open", `${evidence} must not verify a fact`);
+      assert.deepEqual(ledger.getEntity(result.details.id)?.evidence, []);
+    }
+    const fact = await execute(
+      "fact",
+      { kind: "fact", claim: "sample captured", evidence: observed.id },
+      undefined,
+      undefined,
+      { cwd: dir },
+    );
+    assert.equal(fact.details.status, "verified");
+    const hypothesis = await execute(
+      "hypothesis",
+      { kind: "hypothesis", claim: "swap caused the timeout", evidence: stored.uri },
+      undefined,
+      undefined,
+      { cwd: dir },
+    );
+    assert.equal(hypothesis.details.status, "open", "capturing a sample does not prove a causal hypothesis");
+    assert.deepEqual(ledger.getEntity(hypothesis.details.id)?.evidence, [stored.uri]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("artifact_read errors (not silently empty) when the content file is missing (milestone MED #2)", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-tools-"));
   try {

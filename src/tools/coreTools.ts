@@ -34,6 +34,18 @@ export interface CoreServices {
   clearMissionModelPin?: (missionId: string) => Promise<Mission>;
 }
 
+/** Resolve a machine reference rather than trusting an agent-supplied prefix. */
+export function hasRecordedEvidence(
+  ref: string | undefined,
+  services: Pick<CoreServices, "ledger" | "artifacts">,
+): boolean {
+  if (!ref || !isMachineEvidence(ref)) return false;
+  if (ref.startsWith("artifact://")) return Boolean(services.artifacts.getByUri(ref));
+  const id = ref.startsWith("test-run://") ? ref.slice("test-run://".length) : ref;
+  const evidence = services.ledger.getEvidence(id);
+  return evidence !== undefined && evidence.trust !== "unverified";
+}
+
 /**
  * The semantic tools the runtime exposes to both the interactive session and
  * fresh-context workers (spec §10.3, §8.3 role tool schemas). They return compact
@@ -161,7 +173,7 @@ export function buildCoreTools(
     name: "ledger_claim",
     label: "Ledger Claim",
     description:
-      "Record an unverified hypothesis or an evidence-backed fact/finding into the Engineering Ledger. Hypotheses are never auto-promoted to facts.",
+      "Record an unverified hypothesis or an evidence-backed fact/finding into the Engineering Ledger. Hypotheses stay open even with evidence. Cite stored evidence for observations; a heartbeat proves liveness, not progress, and failed or unauthorized probes leave live state unknown. A reference does not establish a causal explanation.",
     parameters: Type.Object({
       kind: Type.Union([
         Type.Literal("fact"),
@@ -181,16 +193,9 @@ export function buildCoreTools(
           details: {},
         };
       const ref = params.evidence ? String(params.evidence) : undefined;
-      // A machine-prefixed reference only counts as verified evidence if it
-      // actually resolves in the artifact store. A fabricated artifact:// URI
-      // must NOT let an agent turn an unverified claim into a verified fact
-      // (INV-006). Non-artifact machine refs (test-run://, EVID-) stay trusted
-      // only as far as their prefix; the artifact case is the one we can prove.
-      let machine = isMachineEvidence(ref);
-      if (machine && ref?.startsWith("artifact://") && !services.artifacts.getByUri(ref)) {
-        machine = false;
-      }
-      const status = params.kind === "finding" ? "open" : machine ? "verified" : "open";
+      // Prefixes classify references; they cannot authenticate evidence (INV-006).
+      const machine = hasRecordedEvidence(ref, services);
+      const status = params.kind === "finding" || params.kind === "hypothesis" ? "open" : machine ? "verified" : "open";
       const entity = await services.ledger.recordEntity(
         params.kind as "fact" | "hypothesis" | "finding" | "decision",
         String(params.claim),

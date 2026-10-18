@@ -21,7 +21,7 @@ import type {
   WorkItemStatus,
   WorkerRole,
 } from "../core/types.ts";
-import { ROLE_BUDGETS, isMachineEvidence } from "../core/types.ts";
+import { ROLE_BUDGETS } from "../core/types.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
@@ -81,7 +81,7 @@ import { ResourceRegistry } from "../resources/ResourceRegistry.ts";
 import type { StatfsReader } from "../resources/buildBudget.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
-import { buildCoreTools } from "../tools/coreTools.ts";
+import { buildCoreTools, hasRecordedEvidence } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
@@ -2289,19 +2289,13 @@ export class EngineeringRuntime {
       this.telemetry.turns += run.usage.turns;
     }
 
-    // Record claims as ledger hypotheses (INV-006). Only machine evidence
-    // references mark a claim verified; agent-authored text stays an open
-    // hypothesis until confirmed by real verification output.
+    // A captured observation can support a hypothesis without proving its
+    // interpretation. Worker prose never auto-verifies a hypothesis (INV-006).
     for (const claim of run.result.claims) {
-      const machine = isMachineEvidence(claim.evidence);
-      await this.ledger.recordEntity(
-        "hypothesis",
-        claim.claim,
-        machine ? "verified" : "open",
-        this.actor(runId, role),
-        opts.wi.id,
-        { evidence: machine ? [claim.evidence!] : [] },
-      );
+      const machine = hasRecordedEvidence(claim.evidence, this);
+      await this.ledger.recordEntity("hypothesis", claim.claim, "open", this.actor(runId, role), opts.wi.id, {
+        evidence: machine ? [claim.evidence!] : [],
+      });
     }
     for (const h of run.result.new_hypotheses) {
       await this.ledger.recordEntity("hypothesis", h, "open", this.actor(runId, role), opts.wi.id);
@@ -2674,7 +2668,7 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
     }
     for (const c of run.result.claims) {
       await this.ledger.recordEntity("hypothesis", c.claim, "open", this.actor(runId, "reviewer"), wi.id, {
-        evidence: isMachineEvidence(c.evidence) ? [c.evidence] : [],
+        evidence: hasRecordedEvidence(c.evidence, this) ? [c.evidence] : [],
       });
     }
     return { summary: run.result.summary, findingIds, completed };
