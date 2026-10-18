@@ -454,21 +454,14 @@ export function classifyStorageIncident(error: unknown, hints: StorageHints = {}
   }
 
   // Plain ENOSPC / no free bytes.
-  if (
-    code === "ENOSPC" ||
-    code === "ENOMEM" ||
-    mentions("no space left on device", "enospc", "disk full", "storage")
-  ) {
+  if (code === "ENOSPC" || code === "ENOMEM" || mentions("no space left on device", "enospc", "disk full", "storage")) {
     return {
       ...base,
       category: "DISK_FULL",
       recovery: "AUTO",
       autoRecover: true,
       needsOperator: false,
-      reason:
-        freeBytes === 0
-          ? "target filesystem has no free space"
-          : "no space left on the target filesystem",
+      reason: freeBytes === 0 ? "target filesystem has no free space" : "no space left on the target filesystem",
     };
   }
 

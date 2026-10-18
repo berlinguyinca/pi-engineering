@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import {
-  CATEGORY_TO_STATE,
-  classifyInfraError,
-  classifyStorageIncident,
-} from "../../src/resilience/classify.ts";
+import { CATEGORY_TO_STATE, classifyInfraError, classifyStorageIncident } from "../../src/resilience/classify.ts";
 
 describe("classifyInfraError", () => {
   it("classifies 503 / no worker as transient infrastructure", () => {
