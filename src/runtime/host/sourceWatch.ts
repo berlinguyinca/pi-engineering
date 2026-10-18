@@ -24,19 +24,24 @@ import { join, resolve } from "node:path";
 import { type GitRunner, type SelfUpdateResult, checkForUpdate } from "../../update/selfUpdate.ts";
 
 export const DEFAULT_AUTO_RELOAD_INTERVAL_MS = 15_000;
+const INITIAL_RETRY_DELAY_MS = 30_000;
+const MAX_RETRY_DELAY_MS = 5 * 60_000;
 /** How often a tracking checkout is fetched and fast-forwarded (a network call; not every poll). */
 export const DEFAULT_FOLLOW_REMOTE_INTERVAL_MS = 5 * 60_000;
 
 export interface SourceWatchOptions {
   intervalMs: number;
+  /** Clock for retry deadlines; defaults to Date.now. */
+  now?(): number;
   /** The fingerprint the running code corresponds to; null when unknown (the first poll sets it). */
   baseline?: string | null;
   /** The source's current fingerprint, or null when it cannot be read (the poll is skipped). */
   fingerprint(): Promise<string | null>;
   /**
    * The fingerprint moved. Return true when the change was acted on (the
-   * baseline advances), false to leave the baseline and try again next poll —
-   * for instance while another handover is still running.
+   * baseline advances), false to leave it unaccepted. Repeated failures of
+   * the same fingerprint retry after 30s, doubling up to 5 minutes. A new
+   * fingerprint retries immediately; successful activation resets the delay.
    */
   onChange(next: string, previous: string): Promise<boolean> | boolean;
   /** A failed poll or handler; never thrown out of the timer. */
@@ -50,6 +55,7 @@ export class SourceWatcher {
   private disposed = false;
   private started = false;
   private polling: Promise<void> | undefined;
+  private retry: { fingerprint: string; delayMs: number; after: number } | undefined;
 
   constructor(opts: SourceWatchOptions) {
     this.opts = opts;
@@ -94,20 +100,38 @@ export class SourceWatcher {
     this.timer.unref?.();
   }
 
-  /** One poll now. Exposed for tests and for an explicit "check now". */
+  private deferRetry(fingerprint: string): void {
+    const delayMs = Math.min((this.retry?.delayMs ?? INITIAL_RETRY_DELAY_MS / 2) * 2, MAX_RETRY_DELAY_MS);
+    this.retry = { fingerprint, delayMs, after: (this.opts.now?.() ?? Date.now()) + delayMs };
+  }
+
+  /** One poll now. Reads the source immediately but respects any activation retry deadline. */
   poll(): Promise<void> {
     if (this.polling) return this.polling;
     this.polling = (async () => {
       try {
         const next = await this.opts.fingerprint();
         if (next === null || this.disposed) return;
+        if (this.retry?.fingerprint !== next) this.retry = undefined;
         if (this.baseline === null) {
           this.baseline = next;
           return;
         }
-        if (next === this.baseline) return;
-        const acted = await this.opts.onChange(next, this.baseline);
-        if (acted) this.baseline = next;
+        if (next === this.baseline) {
+          this.retry = undefined;
+          return;
+        }
+        if (this.retry && (this.opts.now?.() ?? Date.now()) < this.retry.after) return;
+        try {
+          const acted = await this.opts.onChange(next, this.baseline);
+          if (acted) {
+            this.baseline = next;
+            this.retry = undefined;
+          } else this.deferRetry(next);
+        } catch (error) {
+          this.deferRetry(next);
+          throw error;
+        }
       } catch (error) {
         this.opts.onError?.(error);
       } finally {
