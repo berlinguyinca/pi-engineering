@@ -72,6 +72,7 @@ import {
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
 import { type InspectorFeedHandle, attachInspectorFeedFromEnv } from "../src/runtime/herdr/InspectorFeed.ts";
+import { getHostMaintenance } from "../src/runtime/host/maintenance.ts";
 import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
@@ -93,6 +94,7 @@ import {
   type SessionControlServer,
   startSessionControl,
 } from "../src/sessionControl/SessionControl.ts";
+import { maintenanceHandler } from "../src/sessionControl/runtimeMaintenance.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
@@ -715,12 +717,108 @@ export default function (pi: ExtensionAPI) {
       const sessionId = ctx.sessionManager?.getSessionId?.();
       if (!sessionId) return;
       try {
+        const ownedMissions = async (): Promise<MissionBrief[]> => {
+          await getRuntimeByCwd(runtimeCwd(ctx.cwd)).catch(() => null);
+          return (
+            await Promise.all(
+              [...runtimes.values()].map(async ({ runtime }) => {
+                const store = runtime.missionStore;
+                if (!store) return [];
+                store.syncExternal();
+                const owned = new Set(await runtime.maintenanceOwnedMissionIds());
+                return store
+                  .listMissions((mission) => owned.has(mission.mission_id))
+                  .map((mission) => {
+                    const summary = runtime.missionObservability?.summary(mission.mission_id);
+                    const generation = store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0;
+                    const wait = store
+                      .listRecoveryDecisions(mission.mission_id)
+                      .filter(
+                        (decision) =>
+                          (decision.resumptionGeneration ?? 0) === generation &&
+                          ["WAIT_FOR_REQUIREMENT", "PROBE_AND_BACKOFF", "PAUSE_FOR_PERSISTENCE"].includes(
+                            decision.action,
+                          ) &&
+                          (decision.status === "planned" || decision.status === "started"),
+                      )
+                      .at(-1);
+                    const humanWait = wait?.action === "WAIT_FOR_REQUIREMENT";
+                    const operatorPaused = !!mission.operator_paused_at;
+                    return {
+                      id: mission.mission_id,
+                      status: mission.status,
+                      revision: mission.revision,
+                      resumptionGeneration: generation,
+                      operatorPaused,
+                      resumeEligible:
+                        !operatorPaused &&
+                        !humanWait &&
+                      ["BLOCKED", "PAUSED_INFRASTRUCTURE", "REPAIRING"].includes(mission.status),
+                      health: summary?.health ?? null,
+                      lastHeartbeatAt: summary?.lastHeartbeatAt ?? null,
+                      lastMeaningfulProgressAt: summary?.lastMeaningfulProgressAt ?? null,
+                      tasks: store
+                        .listTasks(mission.mission_id)
+                        .slice(-40)
+                        .map((task) => ({ id: task.task_id, status: task.status })),
+                      lastError: mission.failure_reason ? redactSecrets(mission.failure_reason).slice(0, 200) : null,
+                      ...(wait
+                        ? {
+                            namedWait: {
+                              action: wait.action,
+                              nextActionAt: wait.nextActionAt,
+                              deadline: wait.deadline,
+                            },
+                          }
+                        : {}),
+                    };
+                  });
+              }),
+            )
+          ).flat();
+        };
         activeControl = await startSessionControl({
           cwd: ctx.cwd,
           sessionId,
+          getOwnedMissions: ownedMissions,
+          getRuntime: async () => {
+            const host = getHostMaintenance();
+            if (!host) return undefined;
+            const description = await host.describe();
+            return {
+              ...description,
+              capabilities: [
+                ...new Set([...description.capabilities, "runtime.prepare", "mission.resumeAfterMaintenance"]),
+              ],
+            };
+          },
+          onMaintenance: maintenanceHandler({
+            getHost: getHostMaintenance,
+            getRuntime: async (missionId) => {
+              const active = await getRuntimeByCwd(runtimeCwd(ctx.cwd)).catch(() => null);
+              if (missionId) {
+                const matches: EngineeringRuntime[] = [];
+                for (const { runtime } of runtimes.values()) {
+                  if ((await runtime.maintenanceOwnedMissionIds()).includes(missionId)) matches.push(runtime);
+                }
+                return matches.length === 1 ? matches[0]! : null;
+              }
+              if (!active) return null;
+              return {
+                prepareForMaintenance: async (options) => {
+                  for (const { runtime } of runtimes.values()) {
+                    const result = await runtime.prepareForMaintenance(options);
+                    if (result.status !== "ready") return result;
+                  }
+                  return { status: "ready" };
+                },
+              };
+            },
+            ownedMissionIds: async () => (await ownedMissions()).map((mission) => mission.id),
+          }),
           onNote: ctx.hasUI ? (note) => ctx.ui.notify(`[PI session note] ${redactSecrets(note)}`, "info") : undefined,
           getMissions: async (missionIds) => {
-            const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+            const runtime = await getRuntimeByCwd(runtimeCwd(ctx.cwd)).catch(() => null);
             if (!runtime?.missionStore) return null;
             return missionIds.flatMap((id): MissionBrief[] => {
               const mission = runtime.missionStore?.getMission(id);
