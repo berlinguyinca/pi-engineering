@@ -533,7 +533,22 @@ export class Orchestrator {
     const blockedEpisodeId = mission.blocked_episode_id;
     const priorStop = this.store.listMissionStops(missionId).at(-1);
     const priorResumption = this.store.listMissionResumptions(missionId).at(-1);
-    if (priorStop && (!priorResumption || priorResumption.stopGeneration < priorStop.generation)) return mission;
+    if (priorStop && (!priorResumption || priorResumption.stopGeneration < priorStop.generation)) {
+      // A durable stop forbids new work, but must not leave backends from an
+      // older resumption running or their recovery decisions indefinitely open.
+      await this.broker.cancelStaleResumptionExecutions(missionId, expectedResumptionGeneration);
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      for (const stale of this.store
+        .listRecoveryDecisions(missionId)
+        .filter(
+          (entry) => entry.status === "started" && (entry.resumptionGeneration ?? 0) !== expectedResumptionGeneration,
+        )) {
+        this.store.transitionRecovery(stale.recoveryId, "failed");
+      }
+      await this.store.flush();
+      this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+      return this.store.getMission(missionId)!;
+    }
 
     let acquiredLease: Awaited<ReturnType<MissionOwnership["acquire"]>> | undefined;
     const recoveryLeaseKey = `${missionId}:${expectedResumptionGeneration}`;
@@ -757,10 +772,32 @@ export class Orchestrator {
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
       }
+      // Mission-level implementation failures can precede integration and
+      // therefore have neither a task id nor a candidate. Recover only failed
+      // implementers in that case, including this decision's replacements on
+      // replay; gate failures still need proof of the candidate they repair.
+      const activeRecoveryId = repairDecision.recoveryId;
+      const preCandidateImplementers =
+        !recoveryStartRecord && !classification.taskId && classification.category === "IMPLEMENTATION_DEFECT"
+          ? this.store
+              .listTasks(missionId)
+              .filter(
+                (task) =>
+                  task.kind === "agent" &&
+                  task.status === "FAILED" &&
+                  !this.store
+                    .listTaskSupersessions(missionId)
+                    .some(
+                      (lineage) =>
+                        lineage.failedTaskId === task.task_id && lineage.recoveryDecisionId !== activeRecoveryId,
+                    ),
+              )
+          : [];
       if (
         repairDecision.action === "CREATE_REPAIR_TASKS" &&
         !repairDecision.startingCandidateContent &&
-        (!classification.taskId || this.store.getTask(classification.taskId)?.kind !== "agent")
+        (!classification.taskId || this.store.getTask(classification.taskId)?.kind !== "agent") &&
+        preCandidateImplementers.length === 0
       ) {
         // Gate repair without an independently Git-verified candidate baseline
         // is refused (materiality could not be proven). The refusal is terminal
@@ -1010,6 +1047,8 @@ export class Orchestrator {
           case "REBUILD_INTEGRATION_CANDIDATE":
             return task.kind === "integration" && (!actionTaskId || task.task_id === actionTaskId);
           case "CREATE_REPAIR_TASKS":
+            if (preCandidateImplementers.length > 0)
+              return preCandidateImplementers.some((implementer) => implementer.task_id === task.task_id);
             return (
               ["validation", "review", "agent"].includes(task.kind) && (!actionTaskId || task.task_id === actionTaskId)
             );
