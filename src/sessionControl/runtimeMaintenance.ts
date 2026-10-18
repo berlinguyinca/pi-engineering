@@ -11,6 +11,7 @@ interface HostControl {
 }
 
 interface RuntimeControl {
+  endMaintenance?(): void;
   prepareForMaintenance?(options: { timeoutMs: number }): Promise<{ status: string; reason?: string }>;
   resumeMissionAfterMaintenance?(
     missionId: string,
@@ -18,7 +19,7 @@ interface RuntimeControl {
       expectedRevision: number;
       expectedResumptionGeneration: number;
     },
-  ): Promise<{ status: string; reason?: string; mission?: { mission_id: string } }>;
+  ): Promise<{ status: string; reason?: string; code?: string; mission?: { mission_id: string } }>;
 }
 
 export interface MaintenanceDependencies {
@@ -36,20 +37,36 @@ export function maintenanceHandler(
     if (!host) throw new Error("host_maintenance_unavailable_bootstrap_required");
     if (request.action === "describe") return { status: "succeeded", result: { ...(await host.describe()) } };
     if (request.action === "reload") {
-      const result = await host.reload({
-        expectedCommit: request.expectedCommit!,
-        ...(request.sourceRoot ? { sourceRoot: request.sourceRoot } : {}),
-        timeoutMs: request.timeoutMs ?? 30_000,
-      });
-      if (!result.ok || result.commit !== request.expectedCommit)
+      const previous = await deps.getRuntime();
+      let result: Awaited<ReturnType<HostControl["reload"]>>;
+      try {
+        result = await host.reload({
+          expectedCommit: request.expectedCommit!,
+          ...(request.sourceRoot ? { sourceRoot: request.sourceRoot } : {}),
+          timeoutMs: request.timeoutMs ?? 30_000,
+        });
+      } catch (error) {
+        previous?.endMaintenance?.();
+        throw error;
+      }
+      if (!result.ok || result.commit !== request.expectedCommit) {
+        previous?.endMaintenance?.();
         return { status: "failed", result: { ...result }, error: result.error ?? "activation_not_verified" };
+      }
       return { status: "succeeded", result: { ...result } };
     }
     if (request.action === "prepare") {
       const runtime = await deps.getRuntime();
       if (!runtime?.prepareForMaintenance)
         return { status: "skipped", result: { status: "busy", reason: "runtime_not_ready" } };
-      const result = await runtime.prepareForMaintenance({ timeoutMs: request.timeoutMs ?? 30_000 });
+      let result: { status: string; reason?: string };
+      try {
+        result = await runtime.prepareForMaintenance({ timeoutMs: request.timeoutMs ?? 30_000 });
+      } catch (error) {
+        runtime.endMaintenance?.();
+        throw error;
+      }
+      if (result.status !== "ready") runtime.endMaintenance?.();
       return { status: result.status === "ready" ? "succeeded" : "skipped", result: { ...result } };
     }
     if (request.action !== "resume") throw new Error("unsupported_maintenance_action");
@@ -70,6 +87,7 @@ export function maintenanceHandler(
       result: {
         status: result.status,
         ...(result.reason ? { reason: result.reason } : {}),
+        ...(result.code ? { code: result.code } : {}),
         missionId: request.missionId,
       },
     };

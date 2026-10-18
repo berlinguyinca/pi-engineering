@@ -57,3 +57,54 @@ test("an unavailable host and a busy drain cannot be presented as an activated r
   assert.equal(result.status, "skipped");
   assert.equal(result.result?.status, "busy");
 });
+
+test("failed activation releases the old dispatch gate while retaining its mission stops", async () => {
+  let released = 0;
+  const handler = maintenanceHandler({
+    getHost: () => ({
+      describe: async () => runtime,
+      reload: async () => ({ ok: false, commit: sha, generation: 2, error: "safe point expired" }),
+    }),
+    getRuntime: async () => ({
+      endMaintenance: () => {
+        released++;
+      },
+    }),
+    ownedMissionIds: async () => [],
+  });
+  assert.equal((await handler({ ...request, action: "reload" })).status, "failed");
+  assert.equal(released, 1);
+});
+
+test("machine-readable no-mutation skips survive the wire for safe bounded retry", async () => {
+  const handler = maintenanceHandler({
+    getHost: () => ({ describe: async () => runtime, reload: async () => ({ ok: true, commit: sha, generation: 3 }) }),
+    getRuntime: async () => ({
+      resumeMissionAfterMaintenance: async () => ({
+        status: "skipped",
+        code: "STALE_MISSION_FENCE",
+        reason: "mission revision changed",
+      }),
+    }),
+    ownedMissionIds: async () => ["MSN-owned"],
+  });
+  const result = await handler(request);
+  assert.equal(result.status, "skipped");
+  assert.equal(result.result?.code, "STALE_MISSION_FENCE");
+});
+
+test("a timed-out drain releases dispatch gating but does not resume preserved missions", async () => {
+  let released = 0;
+  const handler = maintenanceHandler({
+    getHost: () => ({ describe: async () => runtime, reload: async () => ({ ok: true, commit: sha, generation: 3 }) }),
+    getRuntime: async () => ({
+      prepareForMaintenance: async () => ({ status: "busy", reason: "worker cancellation still settling" }),
+      endMaintenance: () => {
+        released++;
+      },
+    }),
+    ownedMissionIds: async () => [],
+  });
+  assert.equal((await handler({ ...request, action: "prepare" })).status, "skipped");
+  assert.equal(released, 1);
+});

@@ -753,7 +753,7 @@ export default function (pi: ExtensionAPI) {
                       resumeEligible:
                         !operatorPaused &&
                         !humanWait &&
-                      ["BLOCKED", "PAUSED_INFRASTRUCTURE", "REPAIRING"].includes(mission.status),
+                        ["BLOCKED", "PAUSED_INFRASTRUCTURE", "REPAIRING"].includes(mission.status),
                       health: summary?.health ?? null,
                       lastHeartbeatAt: summary?.lastHeartbeatAt ?? null,
                       lastMeaningfulProgressAt: summary?.lastMeaningfulProgressAt ?? null,
@@ -805,6 +805,9 @@ export default function (pi: ExtensionAPI) {
               }
               if (!active) return null;
               return {
+                endMaintenance: () => {
+                  for (const { runtime } of runtimes.values()) runtime.endMaintenance();
+                },
                 prepareForMaintenance: async (options) => {
                   for (const { runtime } of runtimes.values()) {
                     const result = await runtime.prepareForMaintenance(options);
