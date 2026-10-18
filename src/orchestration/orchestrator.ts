@@ -706,7 +706,11 @@ export class Orchestrator {
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
         return this.store.getMission(missionId)!;
       }
-      if (repairDecision.action === "CREATE_REPAIR_TASKS" && !repairDecision.startingCandidateContent) {
+      if (
+        repairDecision.action === "CREATE_REPAIR_TASKS" &&
+        !repairDecision.startingCandidateContent &&
+        (!classification.taskId || this.store.getTask(classification.taskId)?.kind !== "agent")
+      ) {
         // Gate repair without an independently Git-verified candidate baseline
         // is refused (materiality could not be proven). The refusal is terminal
         // for this resumption: settle the decision whether it was planned or
@@ -717,13 +721,14 @@ export class Orchestrator {
         if (repairDecision.status === "planned" || repairDecision.status === "started") {
           this.store.transitionRecovery(repairDecision.recoveryId, "failed");
         }
+        const refusedRecoveryId = repairDecision.recoveryId;
         const recordedBaselineRefusal = this.store
           .listFindings(missionId)
           .some(
             (finding) =>
               finding.category === "recovery_candidate_baseline" &&
               finding.status === "open" &&
-              finding.evidence === repairDecision.recoveryId,
+              finding.evidence === refusedRecoveryId,
           );
         if (!recordedBaselineRefusal) {
           this.store.addFinding({
@@ -779,23 +784,42 @@ export class Orchestrator {
         return reran.mission;
       }
       if (repairDecision.action === "PAUSE_FOR_PERSISTENCE" || repairDecision.action === "PROBE_AND_BACKOFF") {
-        if (repairDecision.status === "planned") this.store.transitionRecovery(repairDecision.recoveryId, "started");
-        const preservedWork = await this.preservedMissionWork(missionId);
-        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
-        this.store.stopMission(missionId, {
-          reason: repairDecision.expectedMaterialChange,
-          preservedWork,
-          attemptedRecoveries: [repairDecision.recoveryId],
-          resumeCondition:
-            repairDecision.action === "PAUSE_FOR_PERSISTENCE"
-              ? "durable writes must succeed and persistence diagnostics must clear"
-              : repairDecision.deadline
-                ? `a healthy provider probe must succeed before ${repairDecision.deadline}`
-                : "a healthy provider probe must succeed (no deadline: the mission waits for capacity)",
-        });
+        if (repairDecision.status === "planned") {
+          this.store.transitionRecovery(repairDecision.recoveryId, "started");
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          return this.store.getMission(missionId)!;
+        }
         await this.store.flush();
         this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
-        return this.store.getMission(missionId)!;
+        // Keep a named wait open. Supervision owns subsequent bounded probes,
+        // including after restart; a durable stop would suppress that wake-up.
+        const ready =
+          repairDecision.action === "PAUSE_FOR_PERSISTENCE"
+            ? this.store.persistenceDiagnostics().length === 0
+            : await this.scheduler.gatewayHealthy(
+                AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(30_000)]),
+              );
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const current = this.store.getMission(missionId)!;
+        if (
+          !ready ||
+          signal?.aborted ||
+          current.operator_paused_at ||
+          !["BLOCKED", "REPAIRING"].includes(current.status)
+        )
+          return current;
+        this.store.transitionRecovery(repairDecision.recoveryId, "succeeded");
+        // A healthy provider is material evidence to resume the existing work,
+        // not a reason to manufacture another provider-wait decision.
+        repairDecision = this.store.planRecovery({
+          ...repairDecision,
+          recoveryId: id("RCV"),
+          action: "FENCE_RECONCILE_AND_RESUME",
+          status: "planned",
+          expectedMaterialChange: "redispatch preserved work after a healthy recovery probe",
+          decidedAt: new Date(this.scheduler.now()).toISOString(),
+        });
       }
 
       const manifestGenerationBefore = this.store.getWorkspaceManifest(missionId)?.generation;
@@ -907,7 +931,14 @@ export class Orchestrator {
             return false;
         }
       });
-      if (repairDecision.action === "FENCE_RECONCILE_AND_RESUME" && failedTasks.length === 0 && gateRerunnable) {
+      if (
+        repairDecision.action === "FENCE_RECONCILE_AND_RESUME" &&
+        failedTasks.length === 0 &&
+        gateRerunnable &&
+        !this.store
+          .listTasks(missionId)
+          .some((task) => ["PENDING", "READY", "RUNNING", "RETRYING"].includes(task.status))
+      ) {
         // Nothing failed is left to replace: only the gates are outstanding, so
         // re-run them against the existing candidate (the #194 gate path)
         // instead of recording "no material progress".
@@ -1214,7 +1245,14 @@ export class Orchestrator {
           case "RECONSTRUCT_EVIDENCE":
             return this.store.listEvidenceInvalidations(missionId).length > invalidationsBefore;
           case "FENCE_RECONCILE_AND_RESUME":
-            return reconciledOrphans.length > 0 || failedTasks.length > 0 || requeuedResumable > 0;
+            return (
+              reconciledOrphans.length > 0 ||
+              failedTasks.length > 0 ||
+              requeuedResumable > 0 ||
+              missionTasksNow.some(
+                (task) => task.status !== "SUCCEEDED" && this.store.getTask(task.task_id)?.status === "SUCCEEDED",
+              )
+            );
           case "CHECKPOINT_SPLIT_AND_REPLACE":
           case "REPAIR_WORKER_OUTPUT":
           case "REBUILD_INTEGRATION_CANDIDATE":
@@ -3744,7 +3782,7 @@ export class Orchestrator {
         try {
           authority.assertAuthoritative();
         } catch (authorityError) {
-          await handle?.cancel().catch(() => undefined);
+          await handle?.cancel({ resumable: true }).catch(() => undefined);
           if (handle) {
             this.store.rejectLateExecution(
               handle.executionId,

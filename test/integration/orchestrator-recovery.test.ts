@@ -182,6 +182,8 @@ function blockedRepairHarness(
       | "TASK_BUDGET_EXHAUSTED"
       | "REQUIREMENT_AMBIGUITY"
       | "PERSISTENCE_FAILURE"
+      | "PROVIDER_TRANSIENT"
+      | "IMPLEMENTATION_DEFECT"
       | "VALIDATION_FAILED"
       | "REVIEW_FAILED";
     failedKind?: "agent" | "validation" | "review";
@@ -1082,8 +1084,8 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.deepEqual(ownership.released.map((lease) => lease.generation).sort(), [1, 2]);
   });
 
-  it("checks resumption generation after preserved-work collection before stopping", async () => {
-    const h = blockedRepairHarness({ category: "PERSISTENCE_FAILURE" });
+  it("checks resumption generation after a provider probe before redispatching", async () => {
+    const h = blockedRepairHarness({ category: "PROVIDER_TRANSIENT" });
     let release!: () => void;
     let started!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -1092,10 +1094,11 @@ describe("orchestrator: durable blocked-mission repair", () => {
     const entered = new Promise<void>((resolve) => {
       started = resolve;
     });
-    h.orchestrator.broker.durableRepositoryStateRefs = async () => {
+    await h.orchestrator.repairBlockedMission(h.missionId);
+    h.orchestrator.scheduler.gatewayHealthy = async () => {
       started();
       await gate;
-      return ["durable-ref"];
+      return true;
     };
     const stale = h.orchestrator.repairBlockedMission(h.missionId);
     await entered;
@@ -1312,7 +1315,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
       false,
     );
     assert.equal(h.store.listRecoveryDecisions(h.missionId).at(-1)?.action, "PAUSE_FOR_PERSISTENCE");
-    assert.match(h.store.listMissionStops(h.missionId).at(-1)?.resumeCondition ?? "", /durable write/i);
+    assert.equal(h.store.listMissionStops(h.missionId).length, 0, "persistence wait remains supervised");
   });
 
   it("creates bounded mutating repair work for CREATE_REPAIR_TASKS and requires new candidate evidence", async () => {
@@ -1357,6 +1360,25 @@ describe("orchestrator: durable blocked-mission repair", () => {
       diffHash: "diff-hash",
     });
     assert.equal(repaired.status, "BLOCKED");
+  });
+
+  it("repairs a failed implementation even when no integration candidate exists yet", async () => {
+    const h = blockedRepairHarness({ category: "IMPLEMENTATION_DEFECT", failedKind: "agent" });
+    await h.orchestrator.repairBlockedMission(h.missionId);
+    assert.ok(
+      h.store.listTaskSupersessions(h.missionId).length > 0,
+      "implementation must run before a candidate can exist",
+    );
+    assert.equal(
+      h.store.listFindings(h.missionId).some((finding) => finding.category === "recovery_candidate_baseline"),
+      false,
+    );
+    const failed = h.store.listRecoveryDecisions(h.missionId).find((decision) => decision.status === "failed");
+    assert.ok(failed);
+    const count = h.store.listRecoveryDecisions(h.missionId).length;
+    assert.equal(h.store.transitionRecovery(failed.recoveryId, "failed").status, "failed");
+    assert.equal(h.store.listRecoveryDecisions(h.missionId).length, count, "identical settlement is idempotent");
+    assert.throws(() => h.store.transitionRecovery(failed.recoveryId, "succeeded"), /illegal recovery transition/);
   });
 
   it("refuses gate repair when the current candidate cannot be independently verified", async () => {

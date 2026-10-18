@@ -604,6 +604,53 @@ describe("MissionScheduler (spec 02)", () => {
     assert.ok(eventStore.all().some((event) => event.type === "execution.late_result_rejected"));
   });
 
+  it("keeps work resumable when dispatch authority expires before its result arrives", async () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const mission = createExecutingMission(store);
+    const owner = new MissionOwnership(store, { ownerId: "expired-owner", heartbeatMs: 5 });
+    const identity = await owner.acquire(mission.mission_id);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "preserve unfinished work",
+      isolation: "none",
+    });
+    let dispatched!: () => void;
+    const started = new Promise<void>((resolve) => {
+      dispatched = resolve;
+    });
+    const broker = makeBroker(store, {
+      agent: {
+        runAgent: async ({ signal }) => {
+          dispatched();
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+          return { executionId: "stale", exitStatus: "succeeded", summary: "late", artifactRefs: [], usage: {} };
+        },
+      },
+    });
+    const scheduler = new MissionScheduler({ store, broker, acquireAuthority: () => owner.maintain(identity) });
+    const running = scheduler.runMission(mission.mission_id);
+    await Promise.race([
+      started,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(JSON.stringify(store.getTask(task.task_id)))), 2000),
+      ),
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    store.resumeMission(mission.mission_id, "replacement controller fenced old authority");
+    await Promise.race([
+      running,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(JSON.stringify(store.getTask(task.task_id)))), 2000),
+      ),
+    ]);
+    assert.equal(store.getTask(task.task_id)?.status, "RETRYING");
+    assert.equal(store.requeueResumableTasks(mission.mission_id), 1);
+    assert.equal(store.getTask(task.task_id)?.status, "READY");
+    assert.equal(store.listExecutions(mission.mission_id)[0]?.status, "CANCELED");
+  });
+
   it("serializes mutating dispatches from separate controllers by repository id", async () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const firstMission = createExecutingMission(store);

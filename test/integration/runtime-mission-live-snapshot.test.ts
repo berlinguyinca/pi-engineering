@@ -1217,3 +1217,66 @@ test("runtime diagnoses a failed snapshot write and retries on the next activity
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("production supervisor wakes a parked provider wait and redispatches unfinished work", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-parked-wake-"));
+  let runtime: EngineeringRuntime | undefined;
+  try {
+    await initGit(root);
+    runtime = await EngineeringRuntime.open({
+      cwd: root,
+      worker: new FakeWorkerExecutor({}, () => ({ status: "completed", summary: "finished queued work" })),
+    });
+    const store = runtime.missionStore!;
+    const mission = store.createMission({
+      title: "parked provider",
+      goal: "finish queued work",
+      user_request: "finish queued work",
+      repository: root,
+      base_ref: await runtime.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering_review",
+    });
+    for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING", "BLOCKED"] as const)
+      store.transitionMission(mission.mission_id, status);
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "finish queued work",
+      isolation: "none",
+    });
+    store.transitionTask(task.task_id, "READY");
+    store.classifyFailure({
+      classificationId: "FC-parked",
+      missionId: mission.mission_id,
+      taskId: task.task_id,
+      executionId: null,
+      category: "PROVIDER_TRANSIENT",
+      summary: "provider unavailable",
+      fingerprint: "provider-down",
+      evidenceRefs: [],
+      classifiedAt: new Date().toISOString(),
+    });
+    let healthy = false;
+    runtime.orchestrator!.scheduler.gatewayHealthy = async () => healthy;
+    await runtime.orchestrator!.repairBlockedMission(mission.mission_id);
+    assert.equal(
+      store.listMissionStops(mission.mission_id).length,
+      0,
+      "a named wait must not permanently stop supervision",
+    );
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+    assert.equal(store.listExecutions(mission.mission_id).length, 0, "unhealthy provider must not dispatch");
+    healthy = true;
+    // Use the production consumer and recovery engine; only the readiness boundary is injected.
+    t.mock.timers.tick(31_000);
+    await runtime.missionSupervisor!.tick(mission.mission_id);
+    assert.equal(store.getTask(task.task_id)?.status, "SUCCEEDED");
+    assert.ok(store.listExecutions(mission.mission_id).length > 0);
+  } finally {
+    await runtime?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
