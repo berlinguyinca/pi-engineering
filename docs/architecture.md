@@ -147,6 +147,11 @@ a **controlled merge** (`git merge --no-ff`) of the candidate branch into the
 incumbent branch — the worker never writes to the incumbent directly, and a
 conflicting merge is aborted without mutating the incumbent.
 
+The broker passes its allocated path, repository root and branch separately from
+the worker's session cwd. Before inference, the worker verifies the canonical
+root, shared Git directory and expected branch against that allocation. A
+mismatch fails the attempt before tools or model calls run.
+
 For workers marked `isolatedWorktree`, native `write` and `edit` operations
 resolve their filesystem destination and reject paths outside the assigned
 root, including symlink escapes. Read tools may inspect external references.

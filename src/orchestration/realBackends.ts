@@ -826,6 +826,7 @@ export function realBackends(opts: RealBackendsOptions) {
         contextRef?: string;
         worktree?: string | null;
         isolatedWorktree?: boolean;
+        assignedWorktree?: WorkerRequest["assignedWorktree"];
         modelRequirements?: Record<string, unknown>;
         recovery?: CheckpointRecoveryContext;
         deliverables?: readonly string[];
@@ -858,6 +859,7 @@ export function realBackends(opts: RealBackendsOptions) {
           // Only the broker's word makes a directory an isolated worktree; the
           // fallback (no worktree) runs in the user's checkout.
           isolatedWorktree: input.isolatedWorktree === true && !!input.worktree,
+          assignedWorktree: input.assignedWorktree,
           recovery: input.recovery,
           deliverables: input.deliverables,
           // Every delegated implementation/recovery run is a fresh session;

@@ -93,6 +93,8 @@ export interface WorkerRequest {
    * own checkout (any fallback path) must never be told to commit there.
    */
   isolatedWorktree?: boolean;
+  /** Allocation identity supplied by the broker independently of the session cwd. */
+  assignedWorktree?: { path: string; repositoryRoot: string; branch?: string };
   /** Store-verified immutable checkpoint context for a fresh recovery worker. */
   recovery?: Readonly<CheckpointRecoveryContext>;
   /**

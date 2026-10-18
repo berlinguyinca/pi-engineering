@@ -40,7 +40,7 @@ import {
   type QueueEntry,
   type QueueState,
 } from "../merge/MergeQueue.ts";
-import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
+import type { WorkerActivity, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { TURN_SUMMARY, WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
@@ -288,6 +288,7 @@ export interface AgentRunner {
     worktree?: string | null;
     /** True only when `worktree` is one this broker allocated for the run. */
     isolatedWorktree?: boolean;
+    assignedWorktree?: WorkerRequest["assignedWorktree"];
     modelRequirements?: Record<string, unknown>;
     recovery?: CheckpointRecoveryContext;
     deliverables?: readonly string[];
@@ -3823,6 +3824,7 @@ export class ExecutionBroker {
       case "research": {
         const runner = this.backends.agent;
         if (!runner) throw new Error(`no agent backend registered for ${backend}`);
+        const assigned = this.allocatedWorktrees.get(executionId);
         return this.dispatchWithVerifiedRecovery(input, (recovery) =>
           runner.runAgent({
             repoId: input.repoId,
@@ -3831,6 +3833,9 @@ export class ExecutionBroker {
             contextRef: input.contextRef,
             worktree: base.worktree,
             isolatedWorktree: worktree !== null,
+            assignedWorktree: assigned
+              ? { path: assigned.path, branch: assigned.branch, repositoryRoot: assigned.git.root }
+              : undefined,
             modelRequirements: input.modelRequirements,
             recovery,
             deliverables: input.deliverables,
