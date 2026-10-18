@@ -456,6 +456,10 @@ test("maintenance drains an executing mission without setting operator pause and
     });
     assert.equal(result.status, "resumed", JSON.stringify(result));
     assert.equal(store.getMission(paused.mission_id)?.status, "COMPLETE");
+    assert.ok(
+      (await runtime.maintenanceOwnedMissionIds()).includes(paused.mission_id),
+      "completion remains discoverable after lease release",
+    );
     assert.equal(seen.filter((request) => request.role === "implementer").length, 2);
     assert.equal(store.listMissions().length, 1, "maintenance never creates a replacement mission");
     const replay = await runtime.resumeMissionAfterMaintenance(paused.mission_id, {

@@ -655,12 +655,13 @@ export class Orchestrator {
       // The supervisor names a requirement wait before the mission is BLOCKED,
       // so its decision carries no episode: adopt it rather than plan a second
       // WAIT_FOR_REQUIREMENT for the same classification and resumption.
+      const currentClassificationId = classification.classificationId;
       repairDecision ??= this.store
         .listRecoveryDecisions(missionId)
         .filter(
           (entry) =>
             entry.action === "WAIT_FOR_REQUIREMENT" &&
-            entry.classificationId === classification.classificationId &&
+            entry.classificationId === currentClassificationId &&
             (entry.resumptionGeneration ?? 0) === resumptionGeneration &&
             (entry.status === "planned" || entry.status === "started"),
         )
@@ -818,8 +819,20 @@ export class Orchestrator {
         this.store.transitionRecovery(repairDecision.recoveryId, "succeeded");
         // A healthy provider is material evidence to resume the existing work,
         // not a reason to manufacture another provider-wait decision.
+        classification = this.store.classifyFailure(
+          this.failureClassifier.classify({
+            missionId,
+            taskId: null,
+            executionId: null,
+            category: "ORPHANED_EXECUTION",
+            summary: `Recovery wait ${repairDecision.recoveryId} cleared; preserved mission work needs reconciliation`,
+            observedAt: new Date(this.scheduler.now()).toISOString(),
+          }),
+        );
         repairDecision = this.store.planRecovery({
           ...repairDecision,
+          classificationId: classification.classificationId,
+          failureFingerprint: classification.fingerprint,
           recoveryId: id("RCV"),
           action: "FENCE_RECONCILE_AND_RESUME",
           status: "planned",
@@ -862,6 +875,7 @@ export class Orchestrator {
             this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           }
           this.missionRepoIds.set(missionId, resolved.primaryRepoId);
+          this.repositoryRegistry?.activate(missionId, rebuilt.generation, rebuilt.hash, resolved.primaryRepoId);
         } catch (error) {
           if (error instanceof Error && error.message.startsWith("STALE_RECOVERY_GENERATION")) throw error;
           const summary = `workspace manifest rebuild failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -881,6 +895,32 @@ export class Orchestrator {
           this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           return this.store.getMission(missionId)!;
         }
+      }
+
+      if (this.store.listTasks(missionId).length === 0) {
+        // Preflight and planner outages happened before a DAG existed. Once
+        // their condition is repaired, run the normal protected planning path
+        // against this mission rather than attempting to finalize an empty DAG.
+        if (this.store.getMission(missionId)?.status === "BLOCKED") {
+          this.store.transitionMission(missionId, "REPAIRING", "system", {
+            recoveryDecisionId: repairDecision.recoveryId,
+          });
+        }
+        const request = mission.user_request;
+        const outcome = await this.runMissionPipeline(this.store.getMission(missionId)!, {
+          request,
+          intent: { ...this.router.route({ request }), suggested_workflow: mission.workflow_class },
+          risk: mission.risk_profile,
+          resumePreflight: true,
+          opts: { signal, mutationRequested: workflowMutatesRepo(mission.workflow_class) },
+        });
+        this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+        const currentDecision = this.store.getRecoveryDecision(repairDecision.recoveryId);
+        if (currentDecision?.status === "started") {
+          this.store.transitionRecovery(repairDecision.recoveryId, outcome.completed ? "succeeded" : "failed");
+        }
+        await this.store.flush();
+        return outcome.mission;
       }
 
       const invalidationsBefore = this.store.listEvidenceInvalidations(missionId).length;
@@ -1798,6 +1838,7 @@ export class Orchestrator {
       risk: RiskProfile;
       workspace?: Awaited<ReturnType<WorkspaceManifestResolver["resolve"]>> | undefined;
       workspaceError?: WorkspaceScopeError | undefined;
+      resumePreflight?: boolean;
       opts: Pick<
         OrchestrateOptions,
         "signal" | "onProgress" | "acceptanceCriteria" | "mutationRequested" | "changedFiles"
@@ -1837,8 +1878,10 @@ export class Orchestrator {
           mission.mission_id,
           `[mission ${mission.mission_id}] execution mode: ${mode.mode} — ${mode.reason}`,
         );
-      this.observability?.missionCreated(mission.mission_id, mission.title);
-      this.store.transitionMission(mission.mission_id, "CLASSIFYING");
+      if (!ctx.resumePreflight) {
+        this.observability?.missionCreated(mission.mission_id, mission.title);
+        this.store.transitionMission(mission.mission_id, "CLASSIFYING");
+      }
 
       if (workspaceError) {
         this.store.classifyFailure({
@@ -1939,9 +1982,16 @@ export class Orchestrator {
       }
 
       // Derive acceptance criteria.
-      const criteria = opts.acceptanceCriteria ?? (await this.deriveAcceptance?.(mission)) ?? [];
+      const criteria =
+        ctx.resumePreflight && mission.acceptance_criteria.length
+          ? []
+          : (opts.acceptanceCriteria ?? (await this.deriveAcceptance?.(mission)) ?? []);
       for (const c of criteria) this.store.addAcceptanceCriterion(mission.mission_id, c);
-      if (criteria.length === 0 && workflowMutatesRepo(intent.suggested_workflow)) {
+      if (
+        criteria.length === 0 &&
+        mission.acceptance_criteria.length === 0 &&
+        workflowMutatesRepo(intent.suggested_workflow)
+      ) {
         this.store.addAcceptanceCriterion(mission.mission_id, `Goal achieved: ${request}`);
       }
 
@@ -1958,7 +2008,7 @@ export class Orchestrator {
         });
       }
       this.phase(this.store.getMission(mission.mission_id)!, "classified");
-      this.store.transitionMission(mission.mission_id, "PLANNING");
+      if (!ctx.resumePreflight) this.store.transitionMission(mission.mission_id, "PLANNING");
 
       // Pure conversation/research has nothing to schedule — but ONLY when policy
       // attached no gates. Taking this shortcut while gates are set would complete
@@ -1969,7 +2019,7 @@ export class Orchestrator {
       const passive = intent.suggested_workflow === "conversation" || intent.suggested_workflow === "research";
       if (passive && gatesNow.length === 0) {
         // Walk the lifecycle legally instead of teleporting to COMPLETE.
-        this.store.transitionMission(mission.mission_id, "READY");
+        if (!ctx.resumePreflight) this.store.transitionMission(mission.mission_id, "READY");
         this.store.transitionMission(mission.mission_id, "EXECUTING");
         this.store.transitionMission(mission.mission_id, "FINAL_VALIDATION");
         this.store.completeMission(mission.mission_id, {
@@ -2189,7 +2239,7 @@ export class Orchestrator {
           this.planning.delete(mission.mission_id);
         }
       }
-      this.store.transitionMission(mission.mission_id, "READY");
+      if (!ctx.resumePreflight) this.store.transitionMission(mission.mission_id, "READY");
 
       // Schedule + execute.
       this.store.transitionMission(mission.mission_id, "EXECUTING");
@@ -2530,7 +2580,7 @@ export class Orchestrator {
 
   private async resumePaused(missionId: string, opts: { force?: boolean; signal: AbortSignal }): Promise<Mission> {
     const expectedResumptionGeneration = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
-    this.activateMissionRepository(missionId);
+    await this.activateMissionRepository(missionId);
     const mission = this.store.getMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
     if (mission.status !== "PAUSED_INFRASTRUCTURE") return mission;
