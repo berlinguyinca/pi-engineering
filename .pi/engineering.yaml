@@ -61,13 +61,33 @@ routing:
     # actually served; reviewer/verifier pins unchanged (verified served).
     # Ledger: FINDING-QAyyZh (stale /models + no degradation),
     # FINDING-GIbklY (APS escalation to unserved model).
+    # NOTE (rev 7, 2026-10-18 — P0 unblock, live-verified): rev 6 routed the
+    # text roles to deepseek_v4-flash because qwen3.8-flash_next was believed
+    # unserved. Re-verified against the live gateway (http://100.104.39.6:8290
+    # /v1, Bearer from models.json apiKey) on 2026-10-18:
+    #   - qwen3.8-27b (alias) -> resolves to qwen3.8-27b-modality-vision-quant-q8_k_xl
+    #     and IS served: 200 OK, produces correct usable tool-callable text
+    #     output (27b, 131k context). This is the only strong text-capable model
+    #     actually served on the gateway today.
+    #   - qwen3.8-flash_next-modality-text-quant-q4_k_xl -> 404 model_not_found
+    #     (confirms FINDING-QAyyZh stale /models list).
+    #   - deepseek_v4-flash-modality-text-quant-mxfp4 -> 200 OK but TOO WEAK:
+    #     on the disk-pressure P0 it read-thrashes (>=40 non-mutating actions,
+    #     no write/edit) and is loop_prevented via no_mutation_stall, so the
+    #     implementer never publishes a candidate. That dead-ends the gate.
+    # Action: pin planner + implementer to the strong 27b model (explicit pin,
+    # so it does not degrade to scoring). It shares the reviewer model (both
+    # qwen3.8-27b vision q8) because no DISTINCT strong text model is served —
+    # a documented separation-of-duties tradeoff to unblock the P0 with a model
+    # strong enough to actually write code. Revert to distinct text pins once G1
+    # routes land or a strong text model is served.
     planner:
-      model: "metabolomics/coding-planning"
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
       fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
       timeout_ms: 3600000
       max_context_tokens: 128000
     implementer:
-      model: "metabolomics/coding-implementation"
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
       fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
       timeout_ms: 3600000
       max_context_tokens: 128000
