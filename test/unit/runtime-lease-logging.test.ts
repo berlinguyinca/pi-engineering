@@ -70,3 +70,72 @@ test("suppressed contention is summarised when the log is closed", () => {
     else process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = saved;
   }
 });
+
+test("contention summaries only contain attempts from the current reporting window", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "pi-runtime-log-")), "runtime.jsonl");
+  const saved = process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS;
+  process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = "3600000";
+  setRuntimeEventLog(file);
+  try {
+    emitRuntimeEvent("lease.contended", { resource: "old-window", holder_session: "holder" });
+    process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = "0";
+    emitRuntimeEvent("lease.contended", { resource: "old-window", holder_session: "holder" });
+    process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = "3600000";
+    emitRuntimeEvent("lease.contended", { resource: "new-window", holder_session: "holder" });
+    process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = "0";
+    emitRuntimeEvent("lease.contended", { resource: "new-window", holder_session: "holder" });
+    const summaries = read(file).filter((r) => r.event === "lease.contended_summary");
+    assert.equal(summaries.length, 2);
+    assert.deepEqual(summaries[1].contentions, [{ resource: "new-window", holder_session: "holder", count: 2 }]);
+  } finally {
+    setRuntimeEventLog(null);
+    if (saved === undefined) delete process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS;
+    else process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = saved;
+  }
+});
+
+test("changing session logs records the first contention again without previous session counters", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-runtime-log-"));
+  const first = join(dir, "first.jsonl");
+  const second = join(dir, "second.jsonl");
+  setRuntimeEventLog(first);
+  try {
+    for (let i = 0; i < 3; i++) emitRuntimeEvent("lease.contended", { resource: "shared", holder_session: "holder" });
+    setRuntimeEventLog(second);
+    emitRuntimeEvent("lease.contended", { resource: "shared", holder_session: "holder" });
+    assert.ok(existsSync(second), "the new session records its first contention");
+    assert.equal(read(second)[0].event, "lease.contended");
+    setRuntimeEventLog(null);
+    assert.equal(read(second).length, 1, "no suppressed attempts from the previous session");
+  } finally {
+    setRuntimeEventLog(null);
+  }
+});
+
+test("contention aggregation stays bounded as resources and holders change", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "pi-runtime-log-")), "runtime.jsonl");
+  const saved = process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS;
+  process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = "3600000";
+  setRuntimeEventLog(file);
+  try {
+    for (let i = 0; i < 1000; i++) {
+      for (let repeat = 0; repeat < 2; repeat++) {
+        emitRuntimeEvent("lease.contended", { resource: `bounded-${i}`, holder_session: "holder" });
+      }
+    }
+    setRuntimeEventLog(null);
+    const summaries = read(file).filter((r) => r.event === "lease.contended_summary");
+    assert.ok(
+      summaries.every((r) => r.contentions.length <= 200),
+      "each aggregation holds at most 200 pairs",
+    );
+    assert.equal(
+      summaries.flatMap((r) => r.contentions).reduce((sum, c) => sum + c.count, 0),
+      2000,
+    );
+  } finally {
+    setRuntimeEventLog(null);
+    if (saved === undefined) delete process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS;
+    else process.env.PI_RUNTIME_CONTENTION_SUMMARY_MS = saved;
+  }
+});

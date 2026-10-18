@@ -47,13 +47,14 @@ export interface RuntimeEvent {
 export type RuntimeEventSink = (event: RuntimeEvent) => void;
 
 const RING_LIMIT = 200;
+const CONTENTION_LIMIT = 200;
 
 /** Process-wide ring, kept on globalThis so an in-process reload keeps history. */
 interface RuntimeEventState {
   ring: RuntimeEvent[];
   logFile: string | null;
   listeners: Set<RuntimeEventSink>;
-  /** Suppressed-contention counters per `resource|holder`, and when the last summary went out. */
+  /** Contention counters per `resource|holder` within the current reporting window. */
   contention: Map<string, { resource: unknown; holder_session: unknown; count: number }>;
   lastContentionSummaryMs: number;
   /** Repeats suppressed since the last summary line. */
@@ -127,25 +128,28 @@ function appendLog(file: string, record: RuntimeEvent): void {
   }
 }
 
-/**
- * Lease contention repeats every heartbeat for as long as a holder lives (one
- * log reached 440 MB). Log it once per (resource, holder), count the rest, and
- * emit a summary line per interval. Returns the record to log, or null.
- */
-/** Write the contention counters (when repeats were suppressed) to the current log. */
+/** Flush the reporting window and discard its counters, even without a log sink. */
 function flushContentionSummary(s: RuntimeEventState): void {
-  if (s.suppressedSinceSummary === 0 || !s.logFile) return;
+  if (s.suppressedSinceSummary > 0 && s.logFile) {
+    appendLog(s.logFile, {
+      event: "lease.contended_summary",
+      at: new Date().toISOString(),
+      contentions: [...s.contention.values()],
+    });
+  }
+  s.contention.clear();
   s.suppressedSinceSummary = 0;
   s.lastContentionSummaryMs = Date.now();
-  appendLog(s.logFile, {
-    event: "lease.contended_summary",
-    at: new Date().toISOString(),
-    contentions: [...s.contention.values()],
-  });
 }
 
+/**
+ * Log a resource/holder once per reporting window, then summarize repeats.
+ * Flush early at the pair limit so long-running sessions with changing
+ * resources cannot accumulate unbounded counters or summary lines.
+ */
 function throttleContention(s: RuntimeEventState, fields: Record<string, unknown>): RuntimeEvent | null {
   const key = `${String(fields.resource)}|${String(fields.holder_session)}`;
+  if (!s.contention.has(key) && s.contention.size >= CONTENTION_LIMIT) flushContentionSummary(s);
   const entry = s.contention.get(key);
   const now = Date.now();
   if (entry) {
