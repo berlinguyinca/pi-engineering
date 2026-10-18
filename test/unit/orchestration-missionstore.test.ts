@@ -1468,6 +1468,62 @@ describe("MissionStore", () => {
 });
 
 describe("automatic maintenance resumption", () => {
+  it("clears only the matching failed conditional write after a successful retry", async () => {
+    const backend = new FailOnceBackend();
+    const s = MissionStore.open(backend);
+    const mission = s.createMission({
+      title: "retry maintenance",
+      goal: "preserve work",
+      user_request: "preserve work",
+      repository: ".",
+      base_ref: "base",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    s.transitionMission(mission.mission_id, "CLASSIFYING");
+    s.transitionMission(mission.mission_id, "BLOCKED");
+    await s.flush();
+    const before = s.getMission(mission.mission_id)!;
+    const fence = {
+      revision: before.revision,
+      status: before.status,
+      blockedEpisodeId: before.blocked_episode_id ?? null,
+      resumptionGeneration: 0,
+    };
+    const unrelated = s.createMission({
+      title: "unrelated",
+      goal: "other work",
+      user_request: "other work",
+      repository: ".",
+      base_ref: "base",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    await s.flush();
+    const otherFence = {
+      revision: unrelated.revision,
+      status: unrelated.status,
+      blockedEpisodeId: null,
+      resumptionGeneration: 0,
+    };
+    backend.failNextAppend();
+    await assert.rejects(
+      s.resumeMissionIfCurrent(unrelated.mission_id, "other operation", otherFence),
+      /persistence unavailable/,
+    );
+    backend.failNextAppend();
+    await assert.rejects(s.resumeMissionIfCurrent(mission.mission_id, "maintenance", fence), /persistence unavailable/);
+    assert.equal(s.persistenceDiagnostics().length, 2);
+    const resumed = await s.resumeMissionIfCurrent(mission.mission_id, "maintenance", fence);
+    assert.equal(resumed?.generation, 1);
+    assert.deepEqual(
+      s.persistenceDiagnostics().map((diagnostic) => diagnostic.missionId),
+      [unrelated.mission_id],
+    );
+    assert.equal((await s.resumeMissionIfCurrent(unrelated.mission_id, "other operation", otherFence))?.generation, 1);
+    assert.deepEqual(s.persistenceDiagnostics(), []);
+  });
+
   for (const race of ["operator_pause", "cancel", "new_generation"] as const) {
     it(`rejects ${race} at the conditional append boundary`, async () => {
       const backend = JsonlEventStore.inMemory();

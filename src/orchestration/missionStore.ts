@@ -421,6 +421,7 @@ export class MissionStore {
     reused: string[];
   }> = [];
   private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
+  private readonly resumptionWriteFailures = new Map<string, Set<string>>();
   private readonly pendingWrites: Array<{
     event: OrchestrationEvent;
     stored: StoredEvent;
@@ -2742,6 +2743,13 @@ export class MissionStore {
     reason: string,
     expected: MissionRevisionFence,
   ): Promise<MissionResumption | undefined> {
+    const operationKey = JSON.stringify([
+      missionId,
+      expected.revision,
+      expected.status,
+      expected.blockedEpisodeId,
+      expected.resumptionGeneration,
+    ]);
     const eligible = (store: MissionStore): boolean => {
       const mission = store.getMission(missionId);
       return (
@@ -2792,8 +2800,17 @@ export class MissionStore {
           () => eligible(this) && eligible(MissionStore.open(this.backend)),
           () => this.apply(event),
         );
-        return appended ? { ...resumption } : undefined;
+        if (appended) {
+          for (const eventId of this.resumptionWriteFailures.get(operationKey) ?? [])
+            this.clearPersistenceFailure(eventId);
+          this.resumptionWriteFailures.delete(operationKey);
+          return { ...resumption };
+        }
+        return undefined;
       } catch (error) {
+        const failed = this.resumptionWriteFailures.get(operationKey) ?? new Set<string>();
+        failed.add(event.event_id);
+        this.resumptionWriteFailures.set(operationKey, failed);
         this.recordPersistenceFailure(event, error);
         throw error;
       }

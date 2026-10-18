@@ -681,6 +681,7 @@ export class EngineeringRuntime {
   runtimeBinding: RuntimeBinding | null = null;
   private closed = false;
   private openReferences = 1;
+  private readonly maintenanceObservedMissions = new Set<string>();
   private readonly missionResumeFlights = new Map<string, Promise<import("../orchestration/types.ts").Mission>>();
   private readonly supervisorSettlementFlights = new Map<string, Promise<void>>();
   /** Spaces out supervisor repairs that keep reporting the same unchanged decision. */
@@ -1579,7 +1580,7 @@ export class EngineeringRuntime {
     return mission;
   }
 
-  /** Only currently held custody is eligible; discovery never adopts sibling missions. */
+  /** Current custody plus terminal outcomes previously observed here; never adopts sibling missions. */
   async maintenanceOwnedMissionIds(): Promise<string[]> {
     const namespace = this.orchestrationPath ? openedOrchestrationStores.get(this.orchestrationPath) : undefined;
     if (!namespace || !this.missionStore) return [];
@@ -1587,8 +1588,17 @@ export class EngineeringRuntime {
     const owned: string[] = [];
     for (const mission of this.missionStore.listMissions()) {
       const resource = missionCustodyKey(mission.mission_id);
-      if (namespace.custody.holds(resource) && (await namespace.custody.claim(resource)).ok)
+      if (namespace.custody.holds(resource) && (await namespace.custody.claim(resource)).ok) {
+        this.maintenanceObservedMissions.add(mission.mission_id);
         owned.push(mission.mission_id);
+      } else if (
+        this.maintenanceObservedMissions.has(mission.mission_id) &&
+        ["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)
+      ) {
+        // Completion releases custody. Keep its read-only outcome visible to
+        // the maintenance receipt that observed this runtime owning it.
+        owned.push(mission.mission_id);
+      }
     }
     return owned;
   }
@@ -1612,17 +1622,23 @@ export class EngineeringRuntime {
     return result;
   }
 
+  /** Release the dispatch gate after failed activation; durable mission stops remain intact. */
+  endMaintenance(): void {
+    this.orchestrator?.endMaintenance();
+  }
+
   /** Automatic maintenance never clears operator pause or creates a replacement mission. */
   async resumeMissionAfterMaintenance(
     missionId: string,
     expected: { expectedRevision: number; expectedResumptionGeneration: number },
     signal?: AbortSignal,
-  ): Promise<{ status: "resumed"; mission: Mission } | { status: "skipped"; reason: string }> {
+  ): Promise<{ status: "resumed"; mission: Mission } | { status: "skipped"; reason: string; code?: string }> {
     const store = this.missionStore;
     const orchestrator = this.orchestrator;
-    if (!store || !orchestrator) return { status: "skipped", reason: "runtime unavailable" };
+    if (!store || !orchestrator)
+      return { status: "skipped", code: "RUNTIME_UNAVAILABLE", reason: "runtime unavailable" };
     if (!(await this.maintenanceOwnedMissionIds()).includes(missionId))
-      return { status: "skipped", reason: "mission custody belongs to another session" };
+      return { status: "skipped", code: "CUSTODY_CHANGED", reason: "mission custody belongs to another session" };
     store.syncExternal();
     const mission = store.getMission(missionId);
     const generation = store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
@@ -1631,20 +1647,24 @@ export class EngineeringRuntime {
       mission.revision !== expected.expectedRevision ||
       generation !== expected.expectedResumptionGeneration
     )
-      return { status: "skipped", reason: "mission revision or resumption changed" };
+      return { status: "skipped", code: "STALE_MISSION_FENCE", reason: "mission revision or resumption changed" };
     if (
       signal?.aborted ||
       mission.operator_paused_at ||
       ["COMPLETE", "FAILED", "CANCELED", "CANCELING", "WAITING_FOR_USER", "NEEDS_ATTENTION"].includes(mission.status)
     )
-      return { status: "skipped", reason: "mission is paused, terminal, or awaiting operator input" };
+      return {
+        status: "skipped",
+        code: "OPERATOR_INTENT",
+        reason: "mission is paused, terminal, or awaiting operator input",
+      };
     if (store.listExecutions(missionId).some((execution) => execution.status === "RUNNING"))
-      return { status: "skipped", reason: "mission has an active execution" };
+      return { status: "skipped", code: "ACTIVE_EXECUTION", reason: "mission has an active execution" };
     const stop = store
       .listMissionStops(missionId)
       .filter((item) => item.resumptionGeneration === generation)
       .at(-1);
-    if (!stop) return { status: "skipped", reason: "mission has no durable stop" };
+    if (!stop) return { status: "skipped", code: "NO_DURABLE_STOP", reason: "mission has no durable stop" };
     const resumed = await store.resumeMissionIfCurrent(
       missionId,
       "verified runtime maintenance resumed preserved work",
@@ -1655,10 +1675,15 @@ export class EngineeringRuntime {
         blockedEpisodeId: mission.blocked_episode_id ?? null,
       },
     );
-    if (!resumed) return { status: "skipped", reason: "mission changed or operator intent prevents automatic resume" };
+    if (!resumed)
+      return {
+        status: "skipped",
+        code: "STALE_MISSION_FENCE",
+        reason: "mission changed or operator intent prevents automatic resume",
+      };
     store.syncExternal();
     if (store.getMission(missionId)?.operator_paused_at || signal?.aborted)
-      return { status: "skipped", reason: "operator interrupted maintenance recovery" };
+      return { status: "skipped", code: "OPERATOR_INTENT", reason: "operator interrupted maintenance recovery" };
     orchestrator.endMaintenance();
     let result: Mission;
     if (mission.status === "PAUSED_INFRASTRUCTURE" && stop.reason === MAINTENANCE_STOP_REASON) {
@@ -1672,6 +1697,7 @@ export class EngineeringRuntime {
 
   /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
   resumeBlockedMission(missionId: string, signal?: AbortSignal): Promise<import("../orchestration/types.ts").Mission> {
+    this.endMaintenance();
     const active = this.missionResumeFlights.get(missionId);
     if (active) return active;
     const flight = this.performBlockedMissionResume(missionId, signal).finally(() => {
@@ -1732,7 +1758,10 @@ export class EngineeringRuntime {
           .filter((value): value is string => !!value?.trim()),
         resumeCondition: "operator reopened a failed mission",
       } as Pick<MissionStop, "attemptedRecoveries" | "preservedWork" | "resumeCondition">);
-    if (stop?.reason === OPERATOR_PAUSE_STOP_REASON && mission.status === "PAUSED_INFRASTRUCTURE") {
+    if (
+      (stop?.reason === OPERATOR_PAUSE_STOP_REASON || stop?.reason === MAINTENANCE_STOP_REASON) &&
+      mission.status === "PAUSED_INFRASTRUCTURE"
+    ) {
       // Paused by an operator interrupt: continue exactly where it stopped. The
       // interrupted tasks were left resumable; another interrupt pauses again.
       this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission");

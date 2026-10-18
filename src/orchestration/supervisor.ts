@@ -402,7 +402,19 @@ export class MissionSupervisor {
           .listRecoveryDecisions(mission.mission_id)
           .some((decision) => decision.classificationId === blocker.classificationId && decision.status === "succeeded")
       ) {
-        return { health: "REPAIR_REQUIRED", category: blocker.category, reason: blocker.summary };
+        const operatorQuestion =
+          blocker.category === "REQUIREMENT_AMBIGUITY"
+            ? this.store
+                .listFindings(mission.mission_id)
+                .filter((finding) => finding.category === PLANNER_CLARIFICATION_CATEGORY && finding.status === "open")
+                .at(-1)?.evidence
+            : undefined;
+        return {
+          health: "REPAIR_REQUIRED",
+          category: blocker.category,
+          reason: blocker.summary,
+          ...(operatorQuestion ? { operatorQuestion } : {}),
+        };
       }
     }
     const lease = this.store.getMissionLease(mission.mission_id);
