@@ -65,3 +65,15 @@ These are observation-time snapshots, not ownership or completion evidence. No
 shared branch was switched or reset, and unrelated dirty files were not folded
 into the remediation PRs. Real mission restarts, model-serving recovery, and
 deployment success remain unverified until their external prerequisites pass.
+
+## Validation
+
+The broad local suite completed with 4,896 passes, zero failures, one skip, and
+ten existing TODOs (4,907 total tests). After the final review corrections, the
+affected routing, custom-executor, worker-isolation, recovery, ledger, lease,
+and storage suites passed again: 205 tests, zero failures or skips.
+
+Core and script typechecks, repository lint, package/command smoke checks, and
+the roadmap structural check passed on the final implementation. Explicitly
+configured routing remains strict; injected executors without a Pi model
+catalog retain standalone operation, covered by three runtime-level cases.
