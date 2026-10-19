@@ -35,6 +35,7 @@ import {
   parseGatewayWait,
 } from "../src/gateway/signals.ts";
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
+import { registerTerminalRefusalGuard } from "../src/gateway/terminalRefusalGuard.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
@@ -624,6 +625,7 @@ function formatEntities(rt: EngineeringRuntime, kind?: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  if (typeof pi.on === "function") registerTerminalRefusalGuard(pi);
   registerInteractiveMemory(pi);
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;

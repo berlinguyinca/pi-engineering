@@ -193,6 +193,32 @@ test("wiring: the gateway hooks are actually registered", () => {
   }
 });
 
+test("wiring: explicit terminal InferWeave refusal aborts before the SDK can retry", async () => {
+  let aborts = 0;
+  const message = {
+    role: "assistant",
+    stopReason: "error",
+    errorMessage:
+      '503: {"action":"do_not_retry","action_code":"IW-ACT-DO-NOT-RETRY","code":"invalid_upstream_response",' +
+      '"message":"The upstream returned unsupported error guidance; do not automatically replay this request.",' +
+      '"reason":"invalid_upstream_response","replay_safe":false,"request_id":"80bba64a-76f6-44a5-9797-807bd3d68ae8",' +
+      '"request_state":"unknown","retryable":false,"scope":"model","type":"inferweave_backpressure"}',
+  };
+  const before = structuredClone(message);
+  const ctx = {
+    ...ctxStub(),
+    abort: () => {
+      aborts++;
+      return new Promise<void>(() => {});
+    },
+  };
+  for (const handler of loadExtension().get("message_end") ?? []) {
+    await handler({ message }, ctx);
+  }
+  assert.equal(aborts, 1);
+  assert.deepEqual(message, before, "the original error and request ID are preserved");
+});
+
 // ─── Command wiring ─────────────────────────────────────────────────────────
 // Both reviews flagged the commands as untested, and untested wiring is how a
 // scoping fix shipped unapplied earlier in this branch.

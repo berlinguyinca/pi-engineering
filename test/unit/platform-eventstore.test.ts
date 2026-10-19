@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { constants as bufferConstants } from "node:buffer";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstatSync, rmSync, writeFileSync } from "node:fs";
@@ -190,6 +191,26 @@ describe("EventStore backends", () => {
       ["evt-1", "evt-2", "evt-3"],
     );
     assert.equal(store.get("evt-2")?.payload.i, 2);
+  });
+
+  it("in-memory batches replay histories larger than a single V8 string", async () => {
+    const store = JsonlEventStore.inMemory();
+    // Share the payload so the history exceeds the string limit logically,
+    // without needing hundreds of megabytes of memory or any disk writes.
+    const text = "x".repeat(1024 * 1024);
+    const count = Math.floor(bufferConstants.MAX_STRING_LENGTH / text.length) + 1;
+    const events = Array.from({ length: count }, (_, i) => ({ ...evt(i), payload: { i, text } }));
+    assert.ok(count * text.length > bufferConstants.MAX_STRING_LENGTH);
+
+    await store.appendAll(events);
+
+    assert.equal(store.count(), count);
+    const replayed = store.all();
+    for (let i = 0; i < count; i++) {
+      assert.equal(replayed[i], events[i]);
+      assert.equal(store.get(`evt-${i}`), events[i]);
+    }
+    store.close();
   });
 
   it("repairTornTail truncates a torn partial line so a retried append lands cleanly", async () => {
