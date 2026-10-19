@@ -30,12 +30,23 @@ import {
 } from "../../src/request/thinkingPolicy.ts";
 import { setTelemetrySink } from "../../src/telemetry/sink.ts";
 
-const METABOLOMICS = {
+/** The 27B model the operator directive protects: thinking is never turned off for it. */
+const QWEN27 = {
   id: "qwen3.8-27b-modality-vision-quant-q8_k_xl",
   provider: "metabolomics",
   api: "openai-completions",
   baseUrl: "https://llm.example.com/v1",
   contextWindow: 262_144,
+  maxTokens: 32_768,
+  compat: { supportsReasoningEffort: true },
+};
+/** The other gateway model family: the thinking-off policy applies to it unchanged. */
+const METABOLOMICS = {
+  id: "deepseek_v4-flash-modality-text-quant-mxfp4",
+  provider: "metabolomics",
+  api: "openai-completions",
+  baseUrl: "https://llm.example.com/v1",
+  contextWindow: 100_000,
   maxTokens: 32_768,
   compat: { supportsReasoningEffort: true },
 };
@@ -74,6 +85,7 @@ test("config: summaries and low-budget turns default on; env can turn each off",
   assert.equal(config.lowOutputBudgetTokens, 16_384);
   assert.ok(config.gatewayHosts.includes("llm.example.com"));
   assert.ok(config.providers.includes("metabolomics"));
+  assert.deepEqual(config.thinkingOnModels, ["qwen3.8-27b"], "the 27B family is protected by default");
 
   const off = resolveThinkingOffConfig({
     PI_THINKING_OFF_SUMMARIES: "0",
@@ -85,6 +97,15 @@ test("config: summaries and low-budget turns default on; env can turn each off",
   assert.equal(off.lowOutputBudget, false);
   assert.equal(off.lowOutputBudgetTokens, 16_000);
   assert.deepEqual(off.gatewayHosts, ["gw.example:8443", "other.example"]);
+  assert.deepEqual(off.thinkingOnModels, ["qwen3.8-27b"], "unrelated env vars leave the override alone");
+
+  const overridden = resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "My-Model, other" });
+  assert.deepEqual(overridden.thinkingOnModels, ["my-model", "other"], "comma-separated, lowercased");
+  assert.deepEqual(
+    resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "" }).thinkingOnModels,
+    [],
+    "empty list disables the default",
+  );
 });
 
 test("detection: Pi's real compaction request is a summarization request; a normal turn is not", async () => {
@@ -103,6 +124,71 @@ test("policy: summarization on the metabolomics gateway → thinking off; elsewh
     thinkingOffReason(METABOLOMICS, summary, resolveThinkingOffConfig({ PI_THINKING_OFF_SUMMARIES: "0" })),
     undefined,
   );
+});
+
+test("override: qwen3.8-27b keeps thinking on for mission roles, summarization, and low budgets — never off", async () => {
+  const config = resolveThinkingOffConfig({});
+  const summary = await piSummarizationContext();
+  const ordinary = { systemPrompt: "You are Pi.", messages: [user("hi")] };
+  // Interactive contexts: every off-reason the policy knows must stay off for the 27B model.
+  assert.equal(thinkingOffReason(QWEN27, summary, config), undefined, "summarization stays on");
+  assert.equal(thinkingOffReason(QWEN27, ordinary, config, 4_000), undefined, "low budget stays on");
+  assert.equal(thinkingOffReason(QWEN27, ordinary, config, 999_999), undefined, "roomy turns stay on");
+  // Mission roles: the unconditional rule yields to the model override.
+  await runWithInferenceInvocation({ role: "implementer" }, async () => {
+    assert.equal(thinkingOffReason(QWEN27, ordinary, config, 4_000), undefined, "mission role stays on");
+    assert.equal(thinkingOffReason(QWEN27, summary, config), undefined, "mission-role summarization stays on");
+  });
+  // Other model families on the same gateway are untouched by the override.
+  await runWithInferenceInvocation({ role: "implementer" }, async () => {
+    assert.equal(thinkingOffReason(METABOLOMICS, ordinary, config, 4_000), "mission-role", "deepseek still off");
+  });
+});
+
+test("override: PI_THINKING_ON_MODELS replaces the default; an unrelated fragment re-exposes the 27B model", async () => {
+  await runWithInferenceInvocation({ role: "implementer" }, async () => {
+    const ordinary = { systemPrompt: "You are Pi.", messages: [user("hi")] };
+    const otherOnly = resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "some-other-model" });
+    assert.equal(
+      thinkingOffReason(QWEN27, ordinary, otherOnly, 4_000),
+      "mission-role",
+      "default no longer protects the 27B",
+    );
+    const added = resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "qwen3.8-27b, some-other-model" });
+    assert.equal(thinkingOffReason(QWEN27, ordinary, added, 4_000), undefined, "explicit fragment still protects it");
+    assert.equal(
+      thinkingOffReason({ ...QWEN27, id: "some-other-model-v1" }, ordinary, added, 4_000),
+      undefined,
+      "the added fragment protects its model",
+    );
+  });
+});
+
+test("override: a mission-role turn on a protected model sends no thinking-off fields and logs the override", async () => {
+  const notices: string[] = [];
+  const uninstall = setTelemetrySink((n) => notices.push(n.text));
+  try {
+    let sent: Record<string, unknown> | undefined;
+    const base = (_m: unknown, _c: unknown, options?: { onPayload?: (p: unknown, m: unknown) => unknown }) => ({
+      async *[Symbol.asyncIterator]() {},
+      result: async () => {
+        sent = (await options?.onPayload?.({ max_tokens: 4_000, reasoning_effort: "high" }, QWEN27)) as never;
+        return { stopReason: "stop" };
+      },
+    });
+    await runWithInferenceInvocation({ role: "implementer" }, async () => {
+      await streamWithThinkingPolicy(base as never, resolveThinkingOffConfig({}))(
+        QWEN27,
+        { messages: [user("hi")] } as never,
+        {} as never,
+      ).result();
+    });
+    assert.deepEqual(sent, { max_tokens: 4_000, reasoning_effort: "high" }, "the payload is untouched");
+    assert.equal(notices.length, 1);
+    assert.match(notices[0] ?? "", /thinking: on \(model override\) · implementer/);
+  } finally {
+    uninstall();
+  }
 });
 
 test("policy: an ordinary turn keeps thinking unless its real output allowance is small", () => {
@@ -277,5 +363,21 @@ test("planner role keeps thinking on even with a low allowance or a summarizatio
   });
   await runWithInferenceInvocation({ role: "implementer" }, async () => {
     assert.equal(thinkingOffReason(METABOLOMICS, ordinary, config, 4_000), "mission-role");
+  });
+});
+
+test("override: the 27B model on a non-policy gateway is also never touched", async () => {
+  const config = resolveThinkingOffConfig({});
+  await runWithInferenceInvocation({ role: "implementer" }, async () => {
+    const ordinary = { systemPrompt: "You are Pi.", messages: [user("hi")] };
+    assert.equal(
+      thinkingOffReason(
+        { ...QWEN27, provider: "openai", baseUrl: "https://api.openai.com/v1" },
+        ordinary,
+        config,
+        4_000,
+      ),
+      undefined,
+    );
   });
 });
