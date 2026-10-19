@@ -222,7 +222,9 @@ export class JsonlEventStore implements EventStoreBackend {
     if (this.readOnly) throw new Error("JsonlEventStore: opened read-only");
     if (this.closed) throw new Error("JsonlEventStore: appendAll after close");
     if (events.length === 0) return;
-    const body = events.map((event) => `${JSON.stringify(event)}\n`).join("");
+    // Snapshot replay needs no serialized copy, and a large history can exceed
+    // V8's single-string limit. Disk writes still capture bytes before queuing.
+    const body = this.memoryOnly ? "" : events.map((event) => `${JSON.stringify(event)}\n`).join("");
     this.pendingAppends++;
     const op = this.appendChain
       .then(async () => {
