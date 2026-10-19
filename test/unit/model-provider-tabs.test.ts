@@ -151,6 +151,7 @@ test("/models switches through setModel and reports a missing credential", async
   const notes: string[] = [];
   const models = MODELS.map((m) => ({ ...m, name: m.name ?? m.id }));
   const ctx = {
+    mode: "tui",
     hasUI: true,
     model: models[2],
     modelRegistry: { getAvailable: () => models },

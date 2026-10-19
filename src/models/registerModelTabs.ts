@@ -14,7 +14,11 @@ export function registerModelTabs(pi: ModelsHost): void {
   pi.registerCommand("models", {
     description: "Switch model, with a tab per provider",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      if (!ctx.hasUI) return;
+      // A custom terminal component needs the full TUI; RPC has dialogs but not this.
+      if (ctx.mode !== "tui") {
+        if (ctx.hasUI) ctx.ui.notify("/models needs the interactive terminal UI; use /model.", "warning");
+        return;
+      }
       const available = ctx.modelRegistry.getAvailable();
       if (available.length === 0) {
         ctx.ui.notify("No models are available. Use /login to add a provider.", "warning");
