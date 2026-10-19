@@ -336,6 +336,15 @@ capacity; … switch with /model to continue`, so you can move it without
 cancelling; a switch ends a capacity hold within about a quarter of a second,
 without waiting out the gateway's advertised retry time.
 
+`/models` is the model picker with a tab per provider. Pi's built-in `/model`
+offers only an all/scoped toggle that mixes every provider into one list, and an
+extension cannot replace it, so `/models` is a sibling command. It opens on the
+current model's provider; `Tab`/`Shift+Tab` (or `←`/`→`) move between the
+provider tabs and an `all` tab, typing filters within the tab (several words must
+all match), `↑`/`↓` move, `Enter` switches and `Esc` cancels. `/models qwen`
+opens with the filter filled in. The `all` tab labels each model with its
+provider; a provider tab does not need to.
+
 `/refresh-models` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each

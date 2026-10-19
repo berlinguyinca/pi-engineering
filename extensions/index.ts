@@ -45,6 +45,7 @@ import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
 import { refreshConfiguredProviders } from "../src/models/refresh.ts";
+import { registerModelTabs } from "../src/models/registerModelTabs.ts";
 import {
   MISSION_UNAVAILABLE_RETRY_TURNS,
   decideAutoInvoke,
@@ -626,6 +627,7 @@ function formatEntities(rt: EngineeringRuntime, kind?: string): string {
 
 export default function (pi: ExtensionAPI) {
   if (typeof pi.on === "function") registerTerminalRefusalGuard(pi);
+  registerModelTabs(pi);
   registerInteractiveMemory(pi);
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
