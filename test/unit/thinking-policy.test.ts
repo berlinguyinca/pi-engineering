@@ -101,7 +101,11 @@ test("config: summaries and low-budget turns default on; env can turn each off",
 
   const overridden = resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "My-Model, other" });
   assert.deepEqual(overridden.thinkingOnModels, ["my-model", "other"], "comma-separated, lowercased");
-  assert.deepEqual(resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "" }).thinkingOnModels, [], "empty list disables the default");
+  assert.deepEqual(
+    resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "" }).thinkingOnModels,
+    [],
+    "empty list disables the default",
+  );
 });
 
 test("detection: Pi's real compaction request is a summarization request; a normal turn is not", async () => {
@@ -145,7 +149,11 @@ test("override: PI_THINKING_ON_MODELS replaces the default; an unrelated fragmen
   await runWithInferenceInvocation({ role: "implementer" }, async () => {
     const ordinary = { systemPrompt: "You are Pi.", messages: [user("hi")] };
     const otherOnly = resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "some-other-model" });
-    assert.equal(thinkingOffReason(QWEN27, ordinary, otherOnly, 4_000), "mission-role", "default no longer protects the 27B");
+    assert.equal(
+      thinkingOffReason(QWEN27, ordinary, otherOnly, 4_000),
+      "mission-role",
+      "default no longer protects the 27B",
+    );
     const added = resolveThinkingOffConfig({ PI_THINKING_ON_MODELS: "qwen3.8-27b, some-other-model" });
     assert.equal(thinkingOffReason(QWEN27, ordinary, added, 4_000), undefined, "explicit fragment still protects it");
     assert.equal(
@@ -169,7 +177,11 @@ test("override: a mission-role turn on a protected model sends no thinking-off f
       },
     });
     await runWithInferenceInvocation({ role: "implementer" }, async () => {
-      await streamWithThinkingPolicy(base as never, resolveThinkingOffConfig({}))(QWEN27, { messages: [user("hi")] } as never, {} as never).result();
+      await streamWithThinkingPolicy(base as never, resolveThinkingOffConfig({}))(
+        QWEN27,
+        { messages: [user("hi")] } as never,
+        {} as never,
+      ).result();
     });
     assert.deepEqual(sent, { max_tokens: 4_000, reasoning_effort: "high" }, "the payload is untouched");
     assert.equal(notices.length, 1);
@@ -358,6 +370,14 @@ test("override: the 27B model on a non-policy gateway is also never touched", as
   const config = resolveThinkingOffConfig({});
   await runWithInferenceInvocation({ role: "implementer" }, async () => {
     const ordinary = { systemPrompt: "You are Pi.", messages: [user("hi")] };
-    assert.equal(thinkingOffReason({ ...QWEN27, provider: "openai", baseUrl: "https://api.openai.com/v1" }, ordinary, config, 4_000), undefined);
+    assert.equal(
+      thinkingOffReason(
+        { ...QWEN27, provider: "openai", baseUrl: "https://api.openai.com/v1" },
+        ordinary,
+        config,
+        4_000,
+      ),
+      undefined,
+    );
   });
 });

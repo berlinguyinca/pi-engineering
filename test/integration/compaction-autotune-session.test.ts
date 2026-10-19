@@ -270,8 +270,18 @@ test("B + A: compacts at the TUNED threshold (turn_end boundary), keeps the tune
     // Operator directive (2026-10-17): qwen3.8-27b never runs with thinking off,
     // not even for compaction summaries — the guarded path must not add the
     // thinking-off fields for a protected model id.
-    assert.equal("reasoning_effort" in (summaries[0]?.body ?? {}) && (summaries[0]?.body as { reasoning_effort?: unknown }).reasoning_effort !== undefined, false, "no reasoning_effort for the protected 27B model");
-    assert.equal((summaries[0]?.body as { chat_template_kwargs?: { enable_thinking?: unknown } } | undefined)?.chat_template_kwargs?.enable_thinking, undefined, "no enable_thinking:false for the protected 27B model");
+    assert.equal(
+      "reasoning_effort" in (summaries[0]?.body ?? {}) &&
+        (summaries[0]?.body as { reasoning_effort?: unknown }).reasoning_effort !== undefined,
+      false,
+      "no reasoning_effort for the protected 27B model",
+    );
+    assert.equal(
+      (summaries[0]?.body as { chat_template_kwargs?: { enable_thinking?: unknown } } | undefined)?.chat_template_kwargs
+        ?.enable_thinking,
+      undefined,
+      "no enable_thinking:false for the protected 27B model",
+    );
     assert.ok(outputCap(summaries[0]?.body) > 13_107, "summary budget from the tuned reserve (0.8 x 32768)");
     assert.ok(notices.some((t) => t.includes(`Compaction tuned for gw/${MODEL_ID}`)));
     // Pi emits no compaction_start/end for a boundary (draft) compaction, so we say it.
