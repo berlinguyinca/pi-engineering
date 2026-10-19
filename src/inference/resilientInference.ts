@@ -374,11 +374,14 @@ export class ResilientInference {
     role: string;
     envelope?: RequiredModelEnvelope;
     exclude: ModelRef[];
+    provider?: string;
   }): Promise<ModelRef | undefined> {
     const registry = this.registry;
     if (!registry) return undefined;
     const envelope: RequiredModelEnvelope = query.envelope ?? { role: query.role, requiredCapabilities: [] };
     const excluded = new Set([...query.exclude.map((m) => modelKey(m)), ...(envelope.excludedModels ?? [])]);
+    const sameProvider = (m: { provider: string }): boolean =>
+      query.provider === undefined || m.provider === query.provider;
 
     // 1) The existing RoleRouter (hard filters + scoring + separation of
     //    duties). Its pool already excludes penalized/unavailable models via
@@ -392,12 +395,12 @@ export class ResilientInference {
         ...(envelope.localRequired ? { preferLocal: true } : {}),
       });
       const picked = decision.selected;
-      if (picked && !excluded.has(modelKey(picked))) {
+      if (picked && !excluded.has(modelKey(picked)) && sameProvider(picked)) {
         const rec = registry.get(picked);
         if (!rec || envelopeSatisfied(rec, envelope)) return picked;
       }
       for (const cand of decision.candidates) {
-        if (excluded.has(modelKey(cand.model))) continue;
+        if (excluded.has(modelKey(cand.model)) || !sameProvider(cand.model)) continue;
         const rec = registry.get(cand.model);
         if (rec && envelopeSatisfied(rec, envelope)) return cand.model;
       }
@@ -407,7 +410,7 @@ export class ResilientInference {
     //    router): hard gate first, spec precedence after.
     const pool = registry.all().filter((rec) => {
       const key = modelKey({ provider: rec.provider, id: rec.id });
-      return rec.enabled && rec.healthy && rec.available && !excluded.has(key);
+      return rec.enabled && rec.healthy && rec.available && !excluded.has(key) && sameProvider(rec);
     });
     const ranked = scoreFallbackCandidates(pool, envelope, { now: this.now() });
     const best = ranked[0];

@@ -64,6 +64,9 @@ them into an `APIError`.
   *"out of admission budget"* — pi-ai's assistant-error classifier treats that
   phrase as a permanent provider limit, so the agent does not re-spend a budget
   that is already gone.
+- **Fallback stays inside the provider.** A stand-in for a busy model is chosen only from the
+  same provider (a session on `metabolomics/*` never lands on `development/*`). Set
+  `PI_INFERENCE_FALLBACK_SAME_PROVIDER_ONLY=false` to allow crossing providers.
 - **Fallback** is left to the existing RoleRouter (separation of duties): the
   harness emits `inference.fallback.triggered` and the model router decides the
   alternate model.

@@ -22,6 +22,7 @@
  */
 
 import type { Model } from "@earendil-works/pi-ai/compat";
+import { resolveInferenceResilienceConfig } from "../inference/resilienceConfig.ts";
 import type { ModelHealthProvider } from "../models/health.ts";
 import { type FallbackCandidate, chooseFallbackModel } from "./fallback.ts";
 import type { GatewayWaitSignal } from "./signals.ts";
@@ -399,8 +400,9 @@ async function chooseFallback(
   if (!current) return { action: "stay", skipped: "no-current-model" };
 
   const excluded = new Set(pending.excludeIds ?? []);
+  const sameProviderOnly = resolveInferenceResilienceConfig(process.env).fallbackSameProviderOnly;
   const available = (ctx.modelRegistry?.getAvailable?.() ?? []).filter(
-    (m) => m.id === current.id || !excluded.has(m.id),
+    (m) => (m.id === current.id || !excluded.has(m.id)) && (!sameProviderOnly || m.provider === current.provider),
   );
   if (available.length < 2) {
     deps.log?.(`[gateway-fallback] stay source=${pending.sourceModelId ?? current.id} (no alternatives)`);
@@ -424,6 +426,7 @@ async function chooseFallback(
     available: available.map((m) => toCandidate(m, health)),
     usedTokens: usage?.tokens ?? null,
     nowMs: (deps.now ?? Date.now)(),
+    sameProviderOnly,
     ...(pending.cooldownUntil ? { cooldownUntil: pending.cooldownUntil } : {}),
     ...(pending.retryAfterMs !== undefined ? { retryAfterMs: pending.retryAfterMs } : {}),
     ...(deps.random ? { random: deps.random } : {}),

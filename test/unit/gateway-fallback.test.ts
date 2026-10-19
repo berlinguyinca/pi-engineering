@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { type FallbackCandidate, chooseFallbackModel, isHealthy } from "../../src/gateway/fallback.ts";
+import { resolveInferenceResilienceConfig } from "../../src/inference/resilienceConfig.ts";
 
 function model(id: string, contextWindow: number, over: Partial<FallbackCandidate> = {}): FallbackCandidate {
   return {
@@ -239,4 +240,50 @@ test("fallback: head-room still outranks spare capacity", () => {
     usedTokens: 20_000,
   });
   assert.equal(decision.action === "switch" ? decision.model.id : "", "big-busy");
+});
+
+test("fallback: a metabolomics session never switches to the development provider", () => {
+  const dev = model("qwen3.8-27b-development", 1_048_576, { provider: "development" });
+  const decision = chooseFallbackModel({
+    current: QWEN_27B,
+    available: [QWEN_27B, dev],
+    usedTokens: 1_000,
+  });
+
+  assert.equal(decision.action, "stay");
+  assert.match(decision.reason, /no other metabolomics model/);
+});
+
+test("fallback: the stand-in is chosen inside the provider even when another provider ranks higher", () => {
+  const dev = model("qwen3.8-flash-development", 2_000_000, { provider: "development" });
+  const decision = chooseFallbackModel({
+    current: QWEN_27B,
+    available: [QWEN_27B, QWEN_NEXT, dev],
+    usedTokens: 1_000,
+  });
+
+  assert.equal(decision.action, "switch");
+  assert.equal(decision.action === "switch" && decision.model.provider, "metabolomics");
+  assert.equal(decision.action === "switch" && decision.model.id, "qwen3.8-flash-next");
+});
+
+test("fallback: crossing providers is possible only when explicitly allowed", () => {
+  const dev = model("qwen3.8-27b-development", 1_048_576, { provider: "development" });
+  const decision = chooseFallbackModel({
+    current: QWEN_27B,
+    available: [QWEN_27B, dev],
+    usedTokens: 1_000,
+    sameProviderOnly: false,
+  });
+
+  assert.equal(decision.action, "switch");
+  assert.equal(decision.action === "switch" && decision.model.provider, "development");
+});
+
+test("fallback: config keeps fallbacks inside the provider unless opted out", () => {
+  assert.equal(resolveInferenceResilienceConfig({}).fallbackSameProviderOnly, true);
+  assert.equal(
+    resolveInferenceResilienceConfig({ PI_INFERENCE_FALLBACK_SAME_PROVIDER_ONLY: "false" }).fallbackSameProviderOnly,
+    false,
+  );
 });

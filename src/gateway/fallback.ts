@@ -146,6 +146,11 @@ export interface FallbackInput {
   nowMs?: number;
   /** Ids never chosen. Defaults to the routing exclusion list (deepseek-v4.1-flash until InferWeave #538). */
   exclude?: readonly string[];
+  /**
+   * Only models of the current model's provider may be chosen (default true): a
+   * session on one provider group never lands on another when its model is busy.
+   */
+  sameProviderOnly?: boolean;
   /** Longest a BLOCKED decision may ask to wait; clamped to {@link MAX_BLOCKED_WAIT_MS}. */
   maxWaitMs?: number;
   /** The gateway's declared delay on the hold, honored with jitter. */
@@ -204,8 +209,18 @@ export function chooseFallbackModel(input: FallbackInput): FallbackDecision {
     };
   }
 
-  const others = available.filter((m) => !(m.id === current.id && m.provider === current.provider));
-  if (others.length === 0) return { action: "stay", reason: "no other model is available" };
+  const sameProviderOnly = input.sameProviderOnly ?? true;
+  const others = available.filter(
+    (m) =>
+      !(m.id === current.id && m.provider === current.provider) &&
+      (!sameProviderOnly || m.provider === current.provider),
+  );
+  if (others.length === 0) {
+    return {
+      action: "stay",
+      reason: sameProviderOnly ? `no other ${current.provider} model is available` : "no other model is available",
+    };
+  }
 
   const fits = others.filter((m) => m.contextWindow >= requiredWindow(usedTokens, m, headroom));
   if (fits.length === 0) {
