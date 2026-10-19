@@ -336,7 +336,32 @@ capacity; … switch with /model to continue`, so you can move it without
 cancelling; a switch ends a capacity hold within about a quarter of a second,
 without waiting out the gateway's advertised retry time.
 
-`/refresh-models` probes each model with one minimal request: 64 output tokens, no
+### Same providers on every machine: `/model-sync`
+
+`/model-refresh` is the only thing that edits a provider's model list, and it
+reloads Pi after a real write (not on `--dry-run`). `/model-sync` keeps the
+*provider definitions* identical across machines, then calls `/model-refresh`
+and reloads once. Pi's own `/model` stays the way to pick a model.
+
+Each machine pulls one canonical, key-free file, named in
+`~/.pi/agent/model-sync.json`:
+
+```json
+{ "source": "ssh://bender/home/me/.pi/agent/canonical-providers.json" }
+```
+
+`source` is a file path, an `http(s)://` URL, or `ssh://host/absolute/path`
+(plain `ssh`, batch mode, no shell). The canonical file is
+`{"providers": {"<id>": {"baseUrl": "...", ...}}}` and is refused if any provider
+carries `apiKey`, `headers`, a token or similar: credentials are per device, so
+each machine keeps its own. A provider the machine has no credential for is
+reported `needs-key` and not created. Only the keys the canonical file names are
+replaced (unknown keys survive); its `models` only seed a provider that has none.
+
+`/model-sync --dry-run` previews and writes nothing; `--no-refresh` aligns
+settings without probing models.
+
+`/model-refresh` (formerly `/refresh-models`, which still works) probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each
 model gets its own verdict:

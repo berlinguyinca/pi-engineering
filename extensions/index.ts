@@ -43,8 +43,10 @@ import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
 import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
-import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
+import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig } from "../src/models/modelsConfig.ts";
+import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
 import { refreshConfiguredProviders } from "../src/models/refresh.ts";
+import { fetchCanonicalText, parseSyncSource, readSyncSourceSetting } from "../src/models/syncSource.ts";
 import {
   MISSION_UNAVAILABLE_RETRY_TURNS,
   decideAutoInvoke,
@@ -1231,61 +1233,152 @@ ${RECOVERY_PROMPT}`;
   // damaging direction: Pi fills the context believing it fits, the request
   // fails, and because Pi computes usage from the configured window, compaction
   // fires far too late to save the turn.
+  /**
+   * The one place a provider's model list is edited. `/model-refresh` runs it
+   * directly and `/model-sync` calls it after aligning provider settings, so
+   * there is a single writer of models to reason about.
+   */
+  async function refreshModels(
+    ctx: ExtensionCommandContext,
+    opts: { providerIds?: string[]; dryRun: boolean; pruneMissing: boolean },
+  ): Promise<{ written: boolean; lines: string[]; failed: boolean }> {
+    // Unlike status-only commands, refresh must surface malformed JSON:
+    // treating it as an empty config could overwrite the operator's file.
+    const configuredProviders = Object.keys(readModelsConfig(defaultModelsPath()).providers ?? {});
+    const providerIds =
+      opts.providerIds ??
+      (configuredProviders.length > 0 ? configuredProviders : ctx.model?.provider ? [ctx.model.provider] : []);
+    if (providerIds.length === 0) {
+      throw new Error("No provider to refresh. Select a model first, or pass a provider name.");
+    }
+
+    const result = await refreshConfiguredProviders({
+      modelsPath: defaultModelsPath(),
+      providerIds,
+      authForProvider: async (providerId) => {
+        if (!ctx.modelRegistry) return {};
+        const status = ctx.modelRegistry.getProviderAuthStatus(providerId);
+        const resolved = await ctx.modelRegistry.getProviderAuth(providerId);
+        if (!resolved) {
+          if (status.configured) {
+            throw new Error(`Authentication for ${providerId} is configured but could not be resolved`);
+          }
+          return {};
+        }
+        return {
+          ...(resolved.auth.apiKey ? { apiKey: resolved.auth.apiKey } : {}),
+          ...(resolved.auth.headers ? { headers: resolved.auth.headers } : {}),
+          ...(resolved.auth.baseUrl ? { baseUrl: resolved.auth.baseUrl } : {}),
+        };
+      },
+      ...(opts.dryRun ? { dryRun: true } : {}),
+      ...(opts.pruneMissing ? { pruneMissing: true } : {}),
+      probeModels: true,
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    });
+    if (result.results.length === 0) {
+      throw new Error(result.failures.map(({ providerId, error }) => `${providerId}: ${error.message}`).join("; "));
+    }
+    return { written: result.written, lines: result.lines, failed: result.failures.length > 0 };
+  }
+
+  /** Pi caches models.json; without a reload a successful write changes nothing in the open session. */
+  async function reloadAfterWrite(ctx: ExtensionCommandContext): Promise<string> {
+    try {
+      await ctx.reload();
+      return "Reloaded.";
+    } catch (err) {
+      return `Reload failed (${err instanceof Error ? err.message : String(err)}); run /reload.`;
+    }
+  }
+
+  // ─── /model-refresh: make the configured catalogue match the gateway ─────
+  // Model configuration drifts silently and expensively. Measured against a
+  // live gateway, a working models.json had one model configured at 1,048,576
+  // tokens that the gateway caps at 262,144, another at 131,072 that actually
+  // accepts 250,112, and a model missing entirely. The over-statement is the
+  // damaging direction: Pi fills the context believing it fits, the request
+  // fails, and because Pi computes usage from the configured window, compaction
+  // fires far too late to save the turn.
+  const modelRefreshHandler = (name: string) => async (args: string, ctx: ExtensionCommandContext) => {
+    const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+    const dryRun = argv.includes("--dry-run");
+    const explicitProvider = argv.find((a) => !a.startsWith("--"));
+    try {
+      const out = await refreshModels(ctx, {
+        ...(explicitProvider ? { providerIds: [explicitProvider] } : {}),
+        dryRun,
+        pruneMissing: argv.includes("--prune"),
+      });
+      const lines = [...out.lines];
+      if (name === "refresh-models") lines.push("(/refresh-models is now /model-refresh; the old name still works.)");
+      if (out.written && !dryRun) lines.push(await reloadAfterWrite(ctx));
+      ctx.ui.notify(lines.join("\n"), out.failed ? "warning" : "info");
+    } catch (err) {
+      ctx.ui.notify(
+        `${name} failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
+        "error",
+      );
+    }
+  };
+  pi.registerCommand("model-refresh", {
+    description: "Refresh models.json with inference-tested working models, then reload. --dry-run to preview.",
+    handler: modelRefreshHandler("model-refresh"),
+  });
   pi.registerCommand("refresh-models", {
-    description: "Refresh models.json with inference-tested working models. --dry-run to preview.",
+    description: "Deprecated alias of /model-refresh.",
+    handler: modelRefreshHandler("refresh-models"),
+  });
+
+  // ─── /model-sync: same providers on every machine ───────────────────────
+  // Pulls one canonical, key-free definition, aligns provider settings (never
+  // the host's own key), then hands the model lists to /model-refresh.
+  pi.registerCommand("model-sync", {
+    description:
+      "Align providers with the canonical definition in model-sync.json, refresh models, reload. --dry-run, --no-refresh.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const dryRun = argv.includes("--dry-run");
-      const pruneMissing = argv.includes("--prune");
-      const explicitProvider = argv.find((a) => !a.startsWith("--"));
-
+      const skipRefresh = argv.includes("--no-refresh");
       try {
-        // Unlike status-only commands, refresh must surface malformed JSON:
-        // treating it as an empty config could overwrite the operator's file.
-        const configuredProviders = Object.keys(readModelsConfig(defaultModelsPath()).providers ?? {});
-        const providerIds = explicitProvider
-          ? [explicitProvider]
-          : configuredProviders.length > 0
-            ? configuredProviders
-            : ctx.model?.provider
-              ? [ctx.model.provider]
-              : [];
-        if (providerIds.length === 0) {
-          ctx.ui.notify("No provider to refresh. Select a model first, or pass a provider name.", "warning");
-          return;
+        const source = parseSyncSource(readSyncSourceSetting());
+        const canonical = parseCanonicalProviders(await fetchCanonicalText(source, ctx.signal));
+        const current = readModelsConfig(defaultModelsPath());
+        const plan = planProviderSync(
+          current,
+          canonical,
+          (id) => ctx.modelRegistry?.getProviderAuthStatus(id).configured === true,
+        );
+        const lines = describeProviderSync(plan, dryRun);
+        let written = false;
+        if (plan.dirty && !dryRun) {
+          const w = writeModelsConfig(defaultModelsPath(), plan.config);
+          written = true;
+          if (w.backupPath) lines.push(`Backup: ${w.backupPath}`);
         }
 
-        const result = await refreshConfiguredProviders({
-          modelsPath: defaultModelsPath(),
-          providerIds,
-          authForProvider: async (providerId) => {
-            if (!ctx.modelRegistry) return {};
-            const status = ctx.modelRegistry.getProviderAuthStatus(providerId);
-            const resolved = await ctx.modelRegistry.getProviderAuth(providerId);
-            if (!resolved) {
-              if (status.configured) {
-                throw new Error(`Authentication for ${providerId} is configured but could not be resolved`);
-              }
-              return {};
-            }
-            return {
-              ...(resolved.auth.apiKey ? { apiKey: resolved.auth.apiKey } : {}),
-              ...(resolved.auth.headers ? { headers: resolved.auth.headers } : {}),
-              ...(resolved.auth.baseUrl ? { baseUrl: resolved.auth.baseUrl } : {}),
-            };
-          },
-          ...(dryRun ? { dryRun: true } : {}),
-          ...(pruneMissing ? { pruneMissing: true } : {}),
-          probeModels: true,
-          ...(ctx.signal ? { signal: ctx.signal } : {}),
-        });
-        if (result.results.length === 0) {
-          throw new Error(result.failures.map(({ providerId, error }) => `${providerId}: ${error.message}`).join("; "));
+        const ready = plan.entries.filter((e) => e.state !== "needs-key").map((e) => e.providerId);
+        let failed = plan.entries.some((e) => e.state === "needs-key");
+        if (dryRun) {
+          lines.push("Dry run: nothing written, models not refreshed.");
+        } else if (skipRefresh || ready.length === 0) {
+          if (skipRefresh) lines.push("Models not refreshed (--no-refresh).");
+        } else {
+          try {
+            const out = await refreshModels(ctx, { providerIds: ready, dryRun: false, pruneMissing: false });
+            lines.push(...out.lines);
+            written ||= out.written;
+            failed ||= out.failed;
+          } catch (err) {
+            failed = true;
+            lines.push(`Model refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
         }
-        ctx.ui.notify(result.lines.join("\n"), result.failures.length > 0 ? "warning" : "info");
+        if (written) lines.push(await reloadAfterWrite(ctx));
+        ctx.ui.notify(lines.join("\n"), failed ? "warning" : "info");
       } catch (err) {
         ctx.ui.notify(
-          `refresh-models failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
+          `model-sync failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
           "error",
         );
       }
