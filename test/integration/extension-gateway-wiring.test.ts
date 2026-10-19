@@ -85,6 +85,7 @@ function ctxStub() {
     modelRegistry: undefined,
     getContextUsage: () => undefined,
     isIdle: () => true,
+    reload: async () => {},
   };
 }
 
@@ -606,4 +607,135 @@ test("wiring: a non-terminal stdout is never written to", async () => {
   }
 
   assert.equal(written.filter((w) => w.includes("[2J")).length, 0, "no escape codes when stdout is not a terminal");
+});
+
+test("wiring: /model-refresh reloads after a real write, and not on a dry run", async () => {
+  const commands = loadWithCommands();
+  assert.ok(commands.get("model-refresh"), "/model-refresh must be registered");
+  assert.ok(commands.get("refresh-models"), "the old name stays as an alias");
+
+  const dir = mkdtempSync(join(tmpdir(), "model-refresh-reload-"));
+  const modelsPath = join(dir, "models.json");
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const previousFetch = globalThis.fetch;
+  writeFileSync(
+    modelsPath,
+    JSON.stringify({
+      providers: { remote: { baseUrl: "https://healthy.example/v1", models: [{ id: "old", contextWindow: 8_192 }] } },
+    }),
+    { mode: 0o600 },
+  );
+  process.env.PI_AGENT_DIR = dir;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "OK" } }] }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ data: [{ id: "fresh", ctx_per_request: 262_144 }] }) };
+  }) as typeof fetch;
+
+  try {
+    let reloads = 0;
+    const { ctx, notices } = notifyingCtx();
+    const withReload = { ...ctx, reload: async () => void reloads++ };
+
+    await commands.get("model-refresh")?.handler("--dry-run", withReload);
+    assert.equal(reloads, 0, "a preview changes nothing, so there is nothing to reload");
+
+    await commands.get("model-refresh")?.handler("", withReload);
+    assert.equal(reloads, 1);
+    assert.match(notices.at(-1)?.text ?? "", /Reloaded\./);
+
+    await commands.get("refresh-models")?.handler("", withReload);
+    assert.match(notices.at(-1)?.text ?? "", /now \/model-refresh/);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wiring: /model-sync aligns provider settings, keeps the host key, refreshes once and reloads once", async () => {
+  const commands = loadWithCommands();
+  const cmd = commands.get("model-sync");
+  assert.ok(cmd, "/model-sync must be registered");
+
+  const dir = mkdtempSync(join(tmpdir(), "model-sync-wiring-"));
+  const modelsPath = join(dir, "models.json");
+  const canonicalPath = join(dir, "canonical.json");
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const previousFetch = globalThis.fetch;
+  writeFileSync(
+    modelsPath,
+    JSON.stringify({
+      providers: {
+        remote: {
+          baseUrl: "https://old.example/v1",
+          apiKey: "host-key",
+          models: [{ id: "old", contextWindow: 8_192 }],
+        },
+      },
+    }),
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    canonicalPath,
+    JSON.stringify({
+      providers: {
+        remote: { baseUrl: "https://healthy.example/v1" },
+        keyless: { baseUrl: "https://keyless.example/v1" },
+      },
+    }),
+  );
+  writeFileSync(join(dir, "model-sync.json"), JSON.stringify({ source: canonicalPath }));
+  process.env.PI_AGENT_DIR = dir;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "POST") {
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "OK" } }] }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ data: [{ id: "fresh", ctx_per_request: 262_144 }] }) };
+  }) as typeof fetch;
+
+  try {
+    let reloads = 0;
+    const { ctx, notices } = notifyingCtx();
+    const withReload = { ...ctx, reload: async () => void reloads++ };
+
+    await cmd.handler("--dry-run", withReload);
+    assert.equal(JSON.parse(readFileSync(modelsPath, "utf8")).providers.remote.baseUrl, "https://old.example/v1");
+    assert.equal(reloads, 0);
+
+    await cmd.handler("", withReload);
+    const written = JSON.parse(readFileSync(modelsPath, "utf8"));
+    assert.equal(written.providers.remote.baseUrl, "https://healthy.example/v1");
+    assert.equal(written.providers.remote.apiKey, "host-key");
+    assert.equal(written.providers.remote.models[0].id, "fresh");
+    assert.equal(written.providers.keyless, undefined, "no credential here, so the provider is not created");
+    assert.equal(reloads, 1);
+    assert.equal(notices.at(-1)?.level, "warning", "a provider that needs a key is a warning");
+    assert.match(notices.at(-1)?.text ?? "", /keyless: needs-key/);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wiring: /model-sync without a configured source says how to configure one", async () => {
+  const cmd = loadWithCommands().get("model-sync");
+  assert.ok(cmd);
+  const dir = mkdtempSync(join(tmpdir(), "model-sync-nosource-"));
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  process.env.PI_AGENT_DIR = dir;
+  try {
+    const { ctx, notices } = notifyingCtx();
+    await cmd.handler("", ctx);
+    assert.equal(notices[0]?.level, "error");
+    assert.match(notices[0]?.text ?? "", /no sync source configured/);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
