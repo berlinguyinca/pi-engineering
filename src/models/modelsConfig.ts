@@ -120,7 +120,12 @@ function createBackup(path: string, mode: number, now: Date): string {
  * cross a filesystem boundary, and at 0600 from the outset so the credentials
  * are never briefly readable at a wider mode.
  */
-export function writeModelsConfig(path: string, config: ModelsConfig, now: Date = new Date()): WriteResult {
+export function writeModelsConfig(
+  path: string,
+  config: ModelsConfig,
+  now: Date = new Date(),
+  writer = "unlabelled",
+): WriteResult {
   const existed = existsSync(path);
   const mode = existed ? statSync(path).mode & 0o777 : 0o600;
   const result: WriteResult = {};
@@ -143,9 +148,45 @@ export function writeModelsConfig(path: string, config: ModelsConfig, now: Date 
     throw err;
   }
 
+  recordWriter(path, config, now, writer);
   const pruned = pruneBackups(path, result.backupPath);
   if (pruned.length > 0) result.prunedBackups = pruned;
   return result;
+}
+
+const MAX_WRITER_LINES = 200;
+
+/**
+ * Append who wrote the file to `<path>.writers.log`, so an unexplained change
+ * (a provider that vanished, a URL that moved) can be traced to a process.
+ * Holds provider ids and base URLs only, never a key. Best effort: a log we
+ * cannot write must not fail a write that succeeded.
+ */
+function recordWriter(path: string, config: ModelsConfig, now: Date, writer: string): void {
+  try {
+    const providers = Object.fromEntries(
+      Object.entries(config.providers ?? {}).map(([id, p]) => [id, typeof p?.baseUrl === "string" ? p.baseUrl : null]),
+    );
+    const entry = JSON.stringify({
+      at: now.toISOString(),
+      writer,
+      pid: process.pid,
+      ppid: process.ppid,
+      argv: process.argv.slice(0, 2).map((a) => a.split("/").pop()),
+      providers,
+    });
+    const log = `${path}.writers.log`;
+    let lines: string[] = [];
+    try {
+      lines = readFileSync(log, "utf8").split("\n").filter(Boolean);
+    } catch {
+      // first write
+    }
+    lines.push(entry);
+    writeFileSync(log, `${lines.slice(-MAX_WRITER_LINES).join("\n")}\n`, { mode: 0o600 });
+  } catch {
+    // see above
+  }
 }
 
 /** Remove all but the newest `MAX_BACKUPS` backups of `path`. */
