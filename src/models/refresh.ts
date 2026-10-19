@@ -428,6 +428,7 @@ export async function refreshProviderModels(opts: RefreshOptions): Promise<Refre
     opts.modelsPath,
     withProviderModels(config, opts.providerId, result.plan.next),
     (opts.now ?? (() => new Date()))(),
+    "model-refresh",
   );
   result.lines.push(`Wrote ${opts.modelsPath}`);
   if (write.backupPath) result.lines.push(`Previous version kept at ${write.backupPath}`);
@@ -489,7 +490,7 @@ export async function refreshConfiguredProviders(
   if (!dirty || opts.dryRun) return { results, failures, written: false, lines };
 
   opts.signal?.throwIfAborted();
-  const write = writeModelsConfig(opts.modelsPath, nextConfig, (opts.now ?? (() => new Date()))());
+  const write = writeModelsConfig(opts.modelsPath, nextConfig, (opts.now ?? (() => new Date()))(), "model-refresh");
   const commonLines = [`Wrote ${opts.modelsPath}`];
   if (write.backupPath) commonLines.push(`Previous version kept at ${write.backupPath}`);
   commonLines.push("Restart Pi or run /reload for the new models to take effect.");
