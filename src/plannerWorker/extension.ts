@@ -33,13 +33,14 @@ import {
 } from "./config.ts";
 import { PlannerWorkerExecutor } from "./executor.ts";
 import { RouteEventFollower, fetchCatalog } from "./gateway.ts";
+import { runHandoff } from "./handoffCommand.ts";
 import { chooseExecutionMode } from "./mode.ts";
 import { RoleResolver } from "./resolver.ts";
 import { STATIC_ROUTER_ROLE } from "./roles.ts";
 import { assessSessionSwitch } from "./sessionSwitch.ts";
 import { latestState, renderPlan, renderStatus, renderWorkers } from "./status.ts";
 import { TransitionLog } from "./transitions.ts";
-import { ENGINEERING_MODES, type EngineeringMode, type PlannerWorkerReport } from "./types.ts";
+import { ENGINEERING_MODES, type EngineeringMode, type MissionBrief, type PlannerWorkerReport } from "./types.ts";
 
 /** What the integration needs from the engineering runtime. */
 export interface PlannerWorkerHost {
@@ -153,6 +154,45 @@ export function registerPlannerWorker(
       },
     });
   }
+
+  // Manual handoff (Unit B2): build a bounded HandoffArtifact for the latest
+  // plan and drive it prepared → committed (aborted on failure).
+  pi.registerCommand("handoff", {
+    description: "Drive a manual handoff: build a bounded HandoffArtifact for the latest plan and commit it.",
+    handler: async (args, ctx) => {
+      const host = await deps.host(ctx);
+      const state = await latestState(plannerWorkerDir(host.repoRoot));
+      const contracts = state?.plan.contracts ?? [];
+      const contract = contracts.find((c) => c.task_id === args.trim()) ?? contracts[0];
+      if (!contract) {
+        ctx.ui.notify("No planner-worker plan to hand off yet.", "info");
+        return;
+      }
+      const brief: MissionBrief = {
+        mission_id: state?.mission_id ?? "unknown",
+        summary: `Mission ${state?.mission_id ?? "unknown"}: ${contracts.length} contracts`,
+        architectural_context: state?.plan.architectural_context ?? [],
+        acceptance_criteria: [],
+        constraints: [],
+      };
+      const result = runHandoff({
+        kind: "planner_to_worker",
+        brief,
+        plan: {
+          decisions: state?.plan.decisions ?? [],
+          architectural_context: state?.plan.architectural_context ?? [],
+        },
+        contract,
+        from: "planner",
+        to: "implementer",
+      });
+      if (result.state === "committed" && result.artifact) {
+        ctx.ui.notify(`Handoff committed for ${contract.task_id} (${result.artifact.token_estimate} tokens).`, "info");
+      } else {
+        ctx.ui.notify(`Handoff aborted: ${result.error ?? "unknown"}`, "error");
+      }
+    },
+  });
 
   // Interactive session switches: same transition log, same context-fit check.
   if (typeof pi.on === "function") {
