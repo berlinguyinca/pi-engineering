@@ -584,6 +584,8 @@ export class ResilientAttemptFlow {
     }
     const exclude = [...this.tried, this.current];
     const excluded = new Set(exclude.map(modelKey));
+    const sameProvider = (m: { provider: string }): boolean =>
+      !this.config.fallbackSameProviderOnly || m.provider === this.current.provider;
     emit(this.opts.telemetry, "inference.fallback.requested", {
       ...base,
       failure_class: failure.class,
@@ -601,7 +603,7 @@ export class ResilientAttemptFlow {
         (m): m is ModelRef => m !== undefined,
       );
       for (const candidate of pool) {
-        if (excluded.has(modelKey(candidate))) continue;
+        if (excluded.has(modelKey(candidate)) || !sameProvider(candidate)) continue;
         if (this.health.isPenalized(candidate)) continue;
         // Breaker gating (spec §13): a tripped model is not reselected. The
         // check is allowRequest — OPEN before cooldown is refused, and the
@@ -616,7 +618,7 @@ export class ResilientAttemptFlow {
     }
     for (const record of registry.all()) {
       const ref: ModelRef = { provider: record.provider, id: record.id };
-      if (excluded.has(modelKey(ref))) continue;
+      if (excluded.has(modelKey(ref)) || !sameProvider(ref)) continue;
       if (!record.enabled || !record.healthy || !record.available) continue;
       if (this.health.isPenalized(ref)) continue;
       // Breaker gating (spec §13) — same rule as the router path above.

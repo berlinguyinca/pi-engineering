@@ -53,6 +53,11 @@ export interface InferenceResilienceConfig {
   modelFallbackForWorkers: boolean;
   /** Capability-based fallback for the interactive session (opt-in, default: off). */
   modelFallbackInteractive: boolean;
+  /**
+   * A fallback may only move within the failing model's provider (default: on),
+   * so a session on metabolomics/* never lands on development/* when busy.
+   */
+  fallbackSameProviderOnly: boolean;
   /** Refresh the capability catalog before a no_workers fallback (default: on). */
   catalogRefreshOnNoWorkers: boolean;
   /** model_activating wait budget before a fallback may be considered (default 10m). */
@@ -72,6 +77,7 @@ export const DEFAULT_INFERENCE_RESILIENCE: InferenceResilienceConfig = {
   circuitCooldownMs: 2 * 60_000,
   modelFallbackForWorkers: true,
   modelFallbackInteractive: false,
+  fallbackSameProviderOnly: true,
   catalogRefreshOnNoWorkers: true,
   activationFallbackAfterMs: 10 * 60_000,
   unavailabilityPenaltyMs: 2 * 60_000,
@@ -127,6 +133,7 @@ export function resolveInferenceResilienceConfig(
   const workerFallback = env.PI_INFERENCE_MODEL_FALLBACK ?? env.PI_GATEWAY_MODEL_FALLBACK_ENABLED;
   cfg.modelFallbackForWorkers = bool(workerFallback, cfg.modelFallbackForWorkers);
   cfg.modelFallbackInteractive = optIn(env.PI_INFERENCE_MODEL_FALLBACK_INTERACTIVE);
+  cfg.fallbackSameProviderOnly = bool(env.PI_INFERENCE_FALLBACK_SAME_PROVIDER_ONLY, cfg.fallbackSameProviderOnly);
   cfg.catalogRefreshOnNoWorkers = bool(env.PI_INFERENCE_CATALOG_REFRESH_ON_NO_WORKERS, cfg.catalogRefreshOnNoWorkers);
   cfg.activationFallbackAfterMs = parseRetryDurationMs(
     env.PI_INFERENCE_ACTIVATION_FALLBACK_AFTER,

@@ -88,6 +88,8 @@ export interface LadderHooks {
     role: string;
     envelope?: RequiredModelEnvelope;
     exclude: ModelRef[];
+    /** When set, only a model of this provider may be chosen. */
+    provider?: string;
   }): Promise<ModelRef | undefined>;
   /** Refresh InferWeave catalog/routing state (spec: stale route, no_workers). */
   refreshCatalog?(): Promise<void>;
@@ -878,6 +880,7 @@ export class RecoveryLadder {
         role: input.role,
         ...(input.requiredEnvelope ? { envelope: input.requiredEnvelope } : {}),
         exclude: state.tried,
+        ...(this.config.fallbackSameProviderOnly ? { provider: state.current.provider } : {}),
       });
     } catch {
       next = undefined;
