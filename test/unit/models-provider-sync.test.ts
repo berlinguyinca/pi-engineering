@@ -111,7 +111,7 @@ test("writing models.json records who wrote it, with provider URLs and no key", 
       .split("\n")
       .map((l) => JSON.parse(l));
     assert.equal(first.writer, "model-sync");
-    assert.deepEqual(first.providers, { p: "https://x.example/v1" });
+    assert.deepEqual(first.providers, { p: "https://x.example" });
     assert.equal(second.writer, "unlabelled");
     assert.deepEqual(second.providers, {});
   } finally {

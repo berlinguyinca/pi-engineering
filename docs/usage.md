@@ -364,8 +364,10 @@ sync." or "Out of sync"). Add `"checkOnStart": true` to `model-sync.json` for a
 quiet check at session start that speaks only on drift.
 
 Every write of `models.json` appends a line to `models.json.writers.log` (time,
-writer, pid, parent pid, provider ids and base URLs, never a key; last 200
-kept), so an unexplained change can be traced to the process that made it.
+writer, pid, parent pid, provider ids and HTTP(S) origins; last 200 kept), so an
+unexplained change can be traced to the process that made it. URL credentials,
+paths, queries and fragments are omitted because they can contain keys. The log
+is private (0600), and logging failures never fail a successful config write.
 
 `/model-refresh` (formerly `/refresh-models`, which still works) probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
