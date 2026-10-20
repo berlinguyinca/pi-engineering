@@ -345,6 +345,33 @@ all match), `↑`/`↓` move, `Enter` switches and `Esc` cancels. `/models qwen`
 opens with the filter filled in. The `all` tab labels each model with its
 provider; a provider tab does not need to.
 
+`/refresh-models [provider] [--timeout seconds] [--dry-run] [--prune]` refreshes
+all configured providers, or only the named provider. Probes run sequentially
+within each provider to avoid creating their own capacity contention. Each
+attempt now waits up to **120 seconds** by default; a timed-out probe is retried
+once. For a slower endpoint, use `/refresh-models metabolomics --timeout 300`.
+The timeout accepts 1–3600 seconds per attempt. Discovery has a separate
+15-second deadline.
+
+While refresh runs, the footer and a progress panel show the provider, a bar and
+completed-model percentage, plus the current model, attempt, elapsed seconds
+and deadline. For example: `metabolomics [##--------] 20% (1/5 probed)` and
+`Probing flash-next · attempt 1/2 · 42s / 120s`. The elapsed time updates every
+second; the percentage advances only when a model's probes finish, so it can
+remain at 20% while a slow model answers. The panel clears on completion,
+failure or cancellation.
+
+Gateway aliases are kept and probed under their advertised route ID; a working
+backing model does not prove that its aliases work. The progress panel and final
+report show `alias → backing-model` when the gateway supplies that relationship.
+New aliases inherit input, reasoning, output limit, cost and compatibility
+settings from their configured backing model when available, bounded by the
+alias's advertised context window. Other additions report inferred settings.
+Existing model names and settings survive refresh, and identical IDs in two
+providers remain separate entries. Aliases only listed as `x_aliases` on a
+concrete model are descriptive metadata; refresh does not invent route entries
+that the gateway has not separately advertised.
+
 `/refresh-models` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each
