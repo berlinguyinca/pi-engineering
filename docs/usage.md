@@ -336,6 +336,33 @@ capacity; … switch with /model to continue`, so you can move it without
 cancelling; a switch ends a capacity hold within about a quarter of a second,
 without waiting out the gateway's advertised retry time.
 
+### Same providers on every machine: `/model-sync`
+
+`/model-refresh` is the only thing that edits a provider's model list, and it
+reloads Pi after a real write (not on `--dry-run`). The old `/refresh-models`
+name remains an alias. `/model-sync` keeps the
+*provider definitions* identical across machines, then calls `/model-refresh`
+and reloads once. Pi's own `/model` stays the way to pick a model.
+
+Each machine pulls one canonical, key-free file, named in
+`~/.pi/agent/model-sync.json`:
+
+```json
+{ "source": "ssh://bender/home/me/.pi/agent/canonical-providers.json" }
+```
+
+`source` is a file path, an `http(s)://` URL, or `ssh://host/absolute/path`
+(plain `ssh`, batch mode, no shell). The canonical file is
+`{"providers": {"<id>": {"baseUrl": "...", ...}}}` and is refused if any provider
+carries `apiKey`, `headers`, a token or similar at any nesting level, including
+model overrides, or credentials in a URL: credentials are per device, so
+each machine keeps its own. A provider the machine has no credential for is
+reported `needs-key` and not created. Only the keys the canonical file names are
+replaced (unknown keys survive); its `models` only seed a provider that has none.
+
+`/model-sync --dry-run` previews and writes nothing; `--no-refresh` aligns
+settings without probing models.
+
 `/models` is the model picker with a tab per provider. Pi's built-in `/model`
 offers only an all/scoped toggle that mixes every provider into one list, and an
 extension cannot replace it, so `/models` is a sibling command. It opens on the
@@ -345,11 +372,11 @@ all match), `↑`/`↓` move, `Enter` switches and `Esc` cancels. `/models qwen`
 opens with the filter filled in. The `all` tab labels each model with its
 provider; a provider tab does not need to.
 
-`/refresh-models [provider] [--timeout seconds] [--dry-run] [--prune]` refreshes
+`/model-refresh [provider] [--timeout seconds] [--dry-run] [--prune]` refreshes
 all configured providers, or only the named provider. Probes run sequentially
 within each provider to avoid creating their own capacity contention. Each
 attempt now waits up to **120 seconds** by default; a timed-out probe is retried
-once. For a slower endpoint, use `/refresh-models metabolomics --timeout 300`.
+once. For a slower endpoint, use `/model-refresh metabolomics --timeout 300`.
 The timeout accepts 1–3600 seconds per attempt. Discovery has a separate
 15-second deadline.
 
@@ -372,7 +399,7 @@ providers remain separate entries. Aliases only listed as `x_aliases` on a
 concrete model are descriptive metadata; refresh does not invent route entries
 that the gateway has not separately advertised.
 
-`/refresh-models` probes each model with one minimal request: 64 output tokens, no
+`/model-refresh` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each
 model gets its own verdict:

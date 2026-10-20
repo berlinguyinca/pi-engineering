@@ -33,6 +33,8 @@ const expectedCommands = [
   "update",
   "gateway",
   "refresh-models",
+  "model-refresh",
+  "model-sync",
   "engineer",
   "tournament",
   "plan",
