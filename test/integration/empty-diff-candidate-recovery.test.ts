@@ -844,5 +844,127 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
     it("does block a mutating mission (control)", () => {
       assert.ok(reasonsFor(true, "agent").some((reason) => /identical to its base/.test(reason)));
     });
+
+    // A mutating mission that recorded NO candidate at all used to clear the gate
+    // entirely, because the check returned early on a missing candidate. What
+    // decides it now is the isolation the task asked for: "worktree" promised a
+    // candidate, "none" was a deliberate decision to edit the checkout directly.
+    function missionWithoutCandidate(mutates: boolean, isolation: "none" | "worktree") {
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        mission_id: "MSN-nocandidate",
+        title: "work",
+        goal: "work",
+        user_request: "change it",
+        repository: "/repo",
+        base_ref: "b".repeat(40),
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-nocandidate",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: "/repo", source: "existing_manifest" as const, access: "write" as const }],
+        repositories: [
+          {
+            repoId: "repo-nc",
+            canonicalRoot: "/repo",
+            baseRef: "b".repeat(40),
+            baseSha: "b".repeat(40),
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-nocandidate",
+        createdAt: "2026-09-27T00:00:00.000Z",
+      });
+      store.createTask({
+        task_id: "TSK-nc",
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "change it",
+        repo_id: "repo-nc",
+        mutates_repo: mutates,
+        isolation,
+      });
+      return store;
+    }
+    const reasonsWithout = (mutates: boolean, isolation: "none" | "worktree") => {
+      const store = missionWithoutCandidate(mutates, isolation);
+      return new CompletionGate(store).evaluate(store.getMission("MSN-nocandidate")!).reasons;
+    };
+
+    it("blocks a mutating task that asked for worktree isolation but recorded no candidate", () => {
+      assert.ok(
+        reasonsWithout(true, "worktree").some((reason) => /no candidate was ever recorded/.test(reason)),
+        "a requested-isolation mutator with nothing to show must not complete",
+      );
+    });
+
+    it("does not block a mutator that explicitly opted out of isolation", () => {
+      // `isolation: "none"` is a visible caller choice (deterministic harnesses,
+      // integration tasks), governed by the non-blocking no-git-provider finding.
+      // Blocking it here would deadlock every one of them.
+      assert.ok(
+        !reasonsWithout(true, "none").some((reason) => /no candidate was ever recorded/.test(reason)),
+        "an explicit isolation opt-out must not be reported as a lost candidate",
+      );
+    });
+
+    it("does not block a read-only mission with no candidate", () => {
+      assert.ok(!reasonsWithout(false, "none").some((reason) => /no candidate was ever recorded/.test(reason)));
+    });
+
+    it("defaults a mutating task to worktree isolation, so a missing candidate blocks it", () => {
+      // The isolation field is not supplied at all: a mutating task defaults to
+      // "worktree", which is exactly the production shape that let a mission
+      // report COMPLETE while its work landed in the user's own checkout.
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        mission_id: "MSN-default",
+        title: "work",
+        goal: "work",
+        user_request: "change it",
+        repository: "/repo",
+        base_ref: "b".repeat(40),
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-default",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: "/repo", source: "existing_manifest" as const, access: "write" as const }],
+        repositories: [
+          {
+            repoId: "repo-d",
+            canonicalRoot: "/repo",
+            baseRef: "b".repeat(40),
+            baseSha: "b".repeat(40),
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-default",
+        createdAt: "2026-09-27T00:00:00.000Z",
+      });
+      store.createTask({
+        task_id: "TSK-d",
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "change it",
+        repo_id: "repo-d",
+        mutates_repo: true,
+      });
+      assert.equal(store.getTask("TSK-d")?.isolation, "worktree");
+      assert.ok(
+        new CompletionGate(store)
+          .evaluate(store.getMission("MSN-default")!)
+          .reasons.some((reason) => /no candidate was ever recorded/.test(reason)),
+      );
+    });
   });
 });

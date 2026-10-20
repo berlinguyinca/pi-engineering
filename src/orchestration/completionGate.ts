@@ -113,8 +113,30 @@ export class CompletionGate {
   private emptyCandidateProblem(missionId: string): string | undefined {
     const manifest = this.store.getWorkspaceManifest(missionId);
     if ((manifest?.repositories.length ?? 0) !== 1) return undefined;
-    const candidate = this.store.getCandidate(missionId, manifest?.repositories[0]?.repoId);
-    if (!candidate || candidate.identity.candidateSha !== candidate.identity.baseSha) return undefined;
+    const repoId = manifest?.repositories[0]?.repoId;
+    const candidate = this.store.getCandidate(missionId, repoId);
+    // What was ASKED FOR decides this, not what happened to be recorded. A
+    // mutating task that declared `isolation: "worktree"` (the default for any
+    // mutating task) promised its edits would arrive on a candidate branch; if
+    // the candidate is missing, or is identical to base, the mission changed
+    // nothing it can show. A task that explicitly declared `isolation: "none"`
+    // opted into editing the checkout directly — that is a visible caller choice,
+    // governed by the non-blocking "no git provider" finding, and it must not be
+    // blocked here or every deterministic-harness and integration task deadlocks.
+    //
+    // The missing-candidate branch is the hole this closes: the old guard
+    // returned early on `!candidate`, so a mutating mission that recorded no
+    // candidate at all cleared the gate and reported COMPLETE having produced no
+    // diff, no integration and nothing to review.
+    const isolatedMutator = this.store
+      .listTasks(missionId)
+      .some((task) => task.mutates_repo && task.isolation === "worktree" && task.repo_id === repoId);
+    if (!candidate) {
+      return isolatedMutator
+        ? "a mutating task requested worktree isolation but no candidate was ever recorded: nothing proves the repository changed"
+        : undefined;
+    }
+    if (candidate.identity.candidateSha !== candidate.identity.baseSha) return undefined;
     const mutates = this.store
       .listTasks(missionId)
       .some((task) => task.mutates_repo && task.repo_id === candidate.identity.repoId);
