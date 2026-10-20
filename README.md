@@ -580,3 +580,21 @@ scripts/             real-model smoke tests + roadmap CLI + evidence recording
 ## License
 
 MIT
+
+### Automatic recovery when reopening a session
+
+Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`.
+It preserves the original Pi CLI and saves a backup at `~/.local/bin/pi.before-session-auto-resume`.
+On interactive `pi --session <id-or-file>` it supplies a continuation through Pi's
+normal initial-prompt path when the last assistant turn failed without output and the gateway
+explicitly marked replay safe. Pi finishes startup and restores/selects its model before work starts.
+Existing tool results and mission IDs remain in context. The server's remaining retry delay is honored.
+
+Recovery happens once per user turn. Completed, cancelled, partial-output, and ambiguous failures
+stay idle. Explicit CLI prompts or attachments, piped input, print/RPC modes, forks, and interactive
+session selection and `pi -c` are left to Pi. Local session IDs and file paths are supported; cross-project ID
+lookup is left to Pi. Set `PI_SESSION_AUTO_RESUME=0` to disable recovery for a launch.
+
+To uninstall, restore the saved launcher:
+`mv ~/.local/bin/pi.before-session-auto-resume ~/.local/bin/pi`.
+The installer accepts optional launcher and installation-directory arguments for isolated testing.
