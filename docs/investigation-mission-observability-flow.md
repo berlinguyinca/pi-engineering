@@ -107,11 +107,35 @@ execution.model (store)                               broker.ts:3564-3577
 missionWhy usage.model  +  orchestrator workersDetail.model
 ```
 
-Note on live confirmation: both fixes are verified at the test level with the
-real `PiWorkerExecutor` and real `ExecutionBroker` at each link. A live in-session
-run requires the fixed build to be deployed to the runtime release the session
-uses (the running fleet is on the pre-fix release); it is therefore gated on a
-redeploy rather than blocked on a code gap.
+### Live confirmation (no redeploy, no fleet disruption)
+
+Both fixes are verified at the test level with the real `PiWorkerExecutor` and
+real `ExecutionBroker` at each link. A live confirmation was then run **without**
+touching the deployed fleet: a scratch git repo plus a per-process agent dir
+(`PI_CODING_AGENT_DIR`) whose `settings.json` pointed only at a deployed
+pi-engineering release carrying the fix. The shared fleet release and config were
+left untouched, so no running session was affected.
+
+Result — `tasks[].usage.model` is populated with the serving model for every task
+that ran LLM inference:
+
+- Runtime `9f0d857`, mission `MSN-3lsyJt` (COMPLETE): both implementer tasks show
+  `usage.model = "qwen3.8-27b-modality-vision-quant-q8_k_xl"` (`inferenceMs`
+  31344 / 107696; completion tokens 884 / 2492). Unrouted roles (integrator ×2,
+  validator; 0 tokens) correctly show `model = null`.
+- Runtime `7565cf10`, mission `MSN-6erqDr`: the implementer task shows
+  `usage.model = "qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m"` — recorded
+  **even though the task settled FAILED**, confirming model provenance is captured
+  independent of task outcome. (That mission's failure is a separate
+  routing/verification issue in the newer runtime under print-mode invocation,
+  not a regression from the provenance fix, which only records the model.)
+
+Remaining provenance gap (out of scope for the P4 worker/broker fix): the
+reviewer / fresh-review task consumes real LLM tokens (`MSN-3lsyJt` `TSK-7qcSIT`:
+26651 prompt / 2908 completion) yet its `usage.model` is `null`
+(`wall.inferenceMs` 0). The reviewer runs in a separate fresh-review session whose
+serving model is not propagated onto the parent execution record, unlike the worker
+path closed above.
 
 ## Tests covering this flow
 
