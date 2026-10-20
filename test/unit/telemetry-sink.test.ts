@@ -166,7 +166,7 @@ test("sink: PI_TELEMETRY_STDERR restores the raw line alongside the notice", () 
 test("notice: the production 429 becomes one readable sentence", () => {
   const notice = describeAdmissionEvent({ type: "wait", waitMs: 30_000, signal: SIGNAL, concurrency: 4 });
   assert.equal(notice.level, "warning", "a stalled session is not an FYI");
-  assert.equal(notice.text, "gateway busy — waiting 30s · queue timeout · 31 of 100 queued · 4 admitted");
+  assert.equal(notice.text, "Gateway capacity wait — waiting 30s · queue timeout · 31 of 100 queued · 4 admitted");
   assert.ok(!notice.text.includes("{"), "no JSON reaches a human-facing line");
   assert.ok(notice.text.length < 90, "it must fit a panelled terminal without wrapping into a wall");
   assert.deepEqual((notice.detail as { type: string }).type, "wait", "the structure is kept, just not shown");
@@ -179,7 +179,7 @@ test("notice: a wait the gateway barely described still reads as a sentence", ()
     signal: { retryAfterMs: 5_000, retryable: true, source: "default", status: 503 },
     concurrency: 3,
   });
-  assert.equal(notice.text, "gateway busy — waiting 5s · HTTP 503");
+  assert.equal(notice.text, "Gateway retry wait — waiting 5s · HTTP 503");
 });
 
 test("notice: a clamp warns and a relax does not", () => {

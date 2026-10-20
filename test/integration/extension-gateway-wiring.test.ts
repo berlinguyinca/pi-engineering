@@ -737,3 +737,248 @@ for (const cancel of [false, true]) {
     }
   });
 }
+
+test("wiring: native working activity and gateway waits survive a disabled custom footer", async () => {
+  const previous = process.env.PI_STATUS_BAR_ENABLED;
+  process.env.PI_STATUS_BAR_ENABLED = "0";
+  const dir = mkdtempSync(join(tmpdir(), "working-wiring-"));
+  const { controller } = observableController();
+  const notices: string[] = [];
+  let text: string | undefined;
+  let panel: string[] | undefined;
+  const handlers = loadExtension();
+  const ctx = {
+    ...ctxStub(),
+    cwd: dir,
+    hasUI: true,
+    isProjectTrusted: () => false,
+    model: { provider: "metabolomics", id: "qwen" },
+    sessionManager: { getSessionId: () => "working-wiring" },
+    ui: {
+      ...ctxStub().ui,
+      notify: (message: string) => notices.push(message),
+      setStatus: () => {},
+      setWorkingMessage: (value?: string) => {
+        text = value;
+      },
+      setWidget: (key: string, value: string[] | undefined) => {
+        if (key === "engineering-working") panel = value;
+      },
+    },
+  };
+  const fire = async (name: string, event = {}) => {
+    for (const handler of handlers.get(name) ?? []) await handler({ type: name, ...event }, ctx);
+  };
+  try {
+    await fire("session_start");
+    await fire("agent_start");
+    assert.match(text!, /Waiting for model.*metabolomics\/qwen/);
+    controller.noteObservedWait({
+      retryAfterMs: 5_000,
+      retryable: true,
+      source: "transport-drop",
+      reason: "upstream_transport_error",
+      provider: "metabolomics",
+      model: "qwen",
+    });
+    assert.match(
+      text!,
+      /Waiting for model/,
+      "a background request on the same provider/model must not overwrite the foreground",
+    );
+    assert.equal(panel, undefined);
+    await fire("message_end", {
+      message: {
+        role: "assistant",
+        stopReason: "error",
+        provider: "metabolomics",
+        model: "qwen",
+        errorMessage:
+          '503: {"type":"inferweave_backpressure","reason":"upstream_transport_error","retryable":true,"retry_after_ms":5000,"replay_safe":true,"request_state":"queued","action":"backoff","action_code":"IW-ACT-BACKOFF"}',
+      },
+    });
+    assert.match(text!, /Gateway transport interruption/);
+    assert.ok(panel);
+    assert.ok(
+      notices.every((message) => !message.includes("— holding")),
+      "persistent UI suppresses the redundant fallback notification",
+    );
+    await fire("message_update", { assistantMessageEvent: { type: "text_delta", delta: "ok" } });
+    assert.match(text!, /Model responding/);
+    assert.equal(panel, undefined);
+    await fire("tool_execution_start", { toolCallId: "one", toolName: "bash", args: { command: "npm test" } });
+    assert.match(text!, /npm test/);
+    controller.noteObservedWait({
+      retryAfterMs: 5_000,
+      retryable: true,
+      source: "transport-drop",
+      reason: "upstream_transport_error",
+      provider: "metabolomics",
+      model: "qwen",
+    });
+    assert.match(text!, /npm test/, "background waits must not replace a foreground tool");
+    await fire("model_select", { model: { provider: "other-provider", id: "qwen" } });
+    await fire("message_end", {
+      message: {
+        role: "assistant",
+        stopReason: "error",
+        provider: "metabolomics",
+        model: "qwen",
+        errorMessage: PRODUCTION_429,
+      },
+    });
+    assert.equal(panel, undefined, "an old serving route cannot restore its wait after model selection");
+    assert.doesNotMatch(text!, /Gateway/);
+    await fire("agent_settled");
+    assert.equal(text, undefined);
+  } finally {
+    await fire("session_shutdown");
+    setSharedAdmissionController(undefined);
+    if (previous === undefined) delete process.env.PI_STATUS_BAR_ENABLED;
+    else process.env.PI_STATUS_BAR_ENABLED = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wiring: retry UI belongs to the foreground abort signal even for identical model routes", async () => {
+  const previous = process.env.PI_STATUS_BAR_ENABLED;
+  process.env.PI_STATUS_BAR_ENABLED = "0";
+  const dir = mkdtempSync(join(tmpdir(), "working-request-"));
+  let clock = 0;
+  let release: (() => void) | undefined;
+  const controller = new AdmissionController({
+    maxConcurrency: 4,
+    jitterMs: 0,
+    now: () => clock,
+    sleep: async (ms) => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      clock += ms;
+    },
+  });
+  setSharedAdmissionController(controller);
+  const model = {
+    provider: "working-request-test",
+    id: "qwen",
+    api: "openai-completions",
+    contextWindow: 100_000,
+    maxTokens: 1000,
+  };
+  let calls = 0;
+  let wrapped: ((model: unknown, context: unknown, options: unknown) => { result(): Promise<unknown> }) | undefined;
+  const base = {
+    streamSimple: () => {
+      const failed = ++calls % 2 === 1;
+      const message = {
+        role: "assistant",
+        content: failed ? [] : [{ type: "text", text: "ok" }],
+        provider: model.provider,
+        model: model.id,
+        api: model.api,
+        stopReason: failed ? "error" : "stop",
+        errorMessage: failed ? PRODUCTION_429 : undefined,
+        usage: {
+          input: 0,
+          output: 1,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 1,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        timestamp: Date.now(),
+      };
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield failed ? { type: "error", reason: "error", error: message } : { type: "done", reason: "stop", message };
+        },
+        result: async () => message,
+      };
+    },
+  };
+  const foreground = new AbortController();
+  let text: string | undefined;
+  let panel: string[] | undefined;
+  const handlers = loadExtension();
+  const ctx = {
+    ...ctxStub(),
+    cwd: dir,
+    hasUI: true,
+    signal: foreground.signal,
+    isProjectTrusted: () => false,
+    model,
+    sessionManager: { getSessionId: () => "working-request" },
+    modelRegistry: {
+      getProvider: () => base,
+      registerProvider: (_id: string, config: { streamSimple?: typeof wrapped }) => {
+        wrapped = config.streamSimple;
+      },
+    },
+    ui: {
+      ...ctxStub().ui,
+      setStatus: () => {},
+      setWorkingMessage: (value?: string) => {
+        text = value;
+      },
+      setWidget: (key: string, value: string[] | undefined) => {
+        if (key === "engineering-working") panel = value;
+      },
+    },
+  };
+  const fire = async (name: string, event = {}) => {
+    for (const handler of handlers.get(name) ?? []) await handler({ type: name, ...event }, ctx);
+  };
+  const waitForHold = async () => {
+    for (let i = 0; i < 100 && !release; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.ok(release, "wrapped provider must reach an admission hold");
+  };
+  try {
+    await fire("session_start");
+    assert.ok(wrapped);
+    await fire("agent_start");
+    await fire("tool_execution_start", { toolCallId: "tool", toolName: "bash", args: { command: "npm test" } });
+    const background = wrapped(model, { messages: [] }, { signal: new AbortController().signal });
+    await waitForHold();
+    assert.match(text!, /npm test/);
+    assert.equal(panel, undefined);
+    release!();
+    release = undefined;
+    await background.result();
+    assert.match(text!, /npm test/);
+    // Cache warming can emit this host hook with the foreground context even
+    // though its actual request uses a separate abort signal.
+    controller.noteWait({
+      retryAfterMs: 5_000,
+      retryable: true,
+      source: "body",
+      reason: "queue_timeout",
+      provider: model.provider,
+      model: model.id,
+    });
+    const warmingHook = fire("before_provider_request");
+    await waitForHold();
+    assert.match(text!, /npm test/, "a cache-warmer host hook must not take the foreground spinner");
+    assert.equal(panel, undefined);
+    release!();
+    release = undefined;
+    await warmingHook;
+    await fire("tool_execution_end", { toolCallId: "tool", toolName: "bash" });
+    const active = wrapped(model, { messages: [] }, { signal: foreground.signal });
+    await waitForHold();
+    assert.match(text!, /Gateway capacity wait.*retry in 30s/);
+    assert.match(panel!.join(" "), /30\/100 queued.*4 admitted/);
+    release!();
+    release = undefined;
+    await active.result();
+    assert.equal(panel, undefined, "actual foreground completion clears the wait");
+    await fire("agent_settled");
+    assert.equal(text, undefined);
+  } finally {
+    release?.();
+    await fire("session_shutdown");
+    setSharedAdmissionController(undefined);
+    if (previous === undefined) delete process.env.PI_STATUS_BAR_ENABLED;
+    else process.env.PI_STATUS_BAR_ENABLED = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

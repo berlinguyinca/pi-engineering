@@ -313,6 +313,24 @@ limits:
 full inventory of time limits and their classification is in
 [`docs/mission-time-limits.md`](docs/mission-time-limits.md).
 
+## Live working activity
+
+The native Pi working indicator updates every second during an active turn,
+including split view and sessions with the custom status bar disabled. It shows
+whether the model is waiting, thinking, responding, or preparing a tool call;
+running tools show a safe command label or file path, elapsed time, and time
+since output. Long periods without output stay visible rather than suggesting
+that an animated spinner means useful progress.
+
+Gateway waits remain visible in a persistent detail panel with provider/model,
+reason, reported queue depth/capacity and admission limit, retry countdown, and
+total waiting time. Queue depth is a gateway load snapshot, not your individual
+position in the queue. Transport interruptions have a separate label from
+capacity waits. After a countdown reaches zero the indicator says **Awaiting
+gateway response** until real activity resumes. Completion, cancellation,
+shutdown, and model switches clear stale wait state. Press Esc to cancel as
+usual; display updates do not change retry policy or send HerdR notifications.
+
 ## Live status bar
 
 The footer answers "what is it doing, and why is nothing happening":
