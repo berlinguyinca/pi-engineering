@@ -782,7 +782,13 @@ than 7 days or beyond 200 are pruned on write, with stale `.tmp`/`.lock` files.
 Concurrent processes asking for the same key compute it once (cross-process
 lock). When validation is a reuse, the review runs alongside it instead of
 waiting, starting only once validation has confirmed the reuse; if the entry
-vanished and validation really runs, the review waits for it. A finer per-test result cache is tracked separately (#149).
+vanished and validation really runs, the review waits for it.
+
+A finer, per-stage layer exists as a library (`src/verify/testResultCache.ts`,
+#149) and is not consulted by the verifier yet: a stage's passing result is
+reusable only when the source tree (content, including uncommitted changes), the
+lockfiles, the toolchain versions, the stage command, an explicit environment
+allowlist and the base SHA all match. A failed result is never stored.
 
 ## Verifiable roadmap completion
 
