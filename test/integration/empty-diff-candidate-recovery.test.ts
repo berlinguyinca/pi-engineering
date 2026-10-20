@@ -1102,32 +1102,26 @@ describe("a worker's already_satisfied assertion reaches the completion gate", (
   });
 
   it("survives rehydration from the event log on disk", async () => {
-    const { file, close } = await mission({ assertion: ASSERTION, fileBacked: true });
+    const { store, file, close } = await mission({ assertion: ASSERTION, fileBacked: true });
+    let reopenedBackend: JsonlEventStore | undefined;
     try {
-      // Appends drain asynchronously and open() refuses a second instance over a
-      // path still held, so wait for the assertion to be ON DISK before restarting
-      // against it — a fixed sleep here would be a flake waiting to happen.
+      // Seeing the assertion on disk is insufficient: later candidate/status
+      // events may still be queued. Drain every append before releasing the
+      // exclusive writer, then reopen immediately without timing assumptions.
+      await store.flush();
       const events = join(file!, "events.jsonl");
-      for (let waited = 0; ; waited += 20) {
-        // The backend creates the file on its first append, so it legitimately
-        // does not exist yet on the first pass.
-        const logged = await readFile(events, "utf8").catch(() => "");
-        if (logged.includes("already_satisfied")) break;
-        if (waited > 5_000) assert.fail("the assertion never reached the event log");
-        await new Promise((done) => setTimeout(done, 20));
-      }
+      assert.match(await readFile(events, "utf8"), /already_satisfied/);
       close();
-      const reopenedBackend = await JsonlEventStore.open(events);
+      reopenedBackend = await JsonlEventStore.open(events);
       const reopened = MissionStore.open(reopenedBackend);
       const execution = reopened.listExecutions("MSN-assert").at(-1)!;
       assert.deepEqual(execution.already_satisfied, ASSERTION, "the assertion must be durable, not session-local");
       const reason = new CompletionGate(reopened).evaluate(reopened.getMission("MSN-assert")!).reasons.join("; ");
       assert.match(reason, new RegExp(ALREADY_SATISFIED_MARKER));
       assert.match(reason, /commit a192077/);
-      reopenedBackend.close();
     } finally {
-      // The reopened backend releases its lock file on a deferred tick, so a plain
-      // rm races it; retrying is what makes cleanup deterministic.
+      close();
+      reopenedBackend?.close();
       await rm(file!, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
   });
