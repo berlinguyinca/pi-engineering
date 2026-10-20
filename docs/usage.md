@@ -345,6 +345,33 @@ all match), `↑`/`↓` move, `Enter` switches and `Esc` cancels. `/models qwen`
 opens with the filter filled in. The `all` tab labels each model with its
 provider; a provider tab does not need to.
 
+`/refresh-models [provider] [--timeout seconds] [--dry-run] [--prune]` refreshes
+all configured providers, or only the named provider. Probes run sequentially
+within each provider to avoid creating their own capacity contention. Each
+attempt now waits up to **120 seconds** by default; a timed-out probe is retried
+once. For a slower endpoint, use `/refresh-models metabolomics --timeout 300`.
+The timeout accepts 1–3600 seconds per attempt. Discovery has a separate
+15-second deadline.
+
+While refresh runs, the footer and a progress panel show the provider, a bar and
+completed-model percentage, plus the current model, attempt, elapsed seconds
+and deadline. For example: `metabolomics [##--------] 20% (1/5 probed)` and
+`Probing flash-next · attempt 1/2 · 42s / 120s`. The elapsed time updates every
+second; the percentage advances only when a model's probes finish, so it can
+remain at 20% while a slow model answers. The panel clears on completion,
+failure or cancellation.
+
+Gateway aliases are kept and probed under their advertised route ID; a working
+backing model does not prove that its aliases work. The progress panel and final
+report show `alias → backing-model` when the gateway supplies that relationship.
+New aliases inherit input, reasoning, output limit, cost and compatibility
+settings from their configured backing model when available, bounded by the
+alias's advertised context window. Other additions report inferred settings.
+Existing model names and settings survive refresh, and identical IDs in two
+providers remain separate entries. Aliases only listed as `x_aliases` on a
+concrete model are descriptive metadata; refresh does not invent route entries
+that the gateway has not separately advertised.
+
 `/refresh-models` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each
@@ -514,6 +541,7 @@ restart.
 
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
+| `/mission inspect <id> [workerId]` | Inspect current worker/model routing, recent activity (last 20 summaries), changed files, tests, retries, recovery and blockers. Supply a worker ID to filter its activity. |
 | `/mission why <id>` | Explains why a mission is not finishing: blocking task, failure category and reason, who holds the repository lease or custody (session and pid), cooldown scope and `nextActionAt`, retry counters, inherited failures, stranded branches, per-task typed usage (tokens, wall-time split, attempts, stream resumes, thinking), per-model error rollups (429, 404, connect-refused, stream stall, takeover, grammar 400) and the exact remedy command. Offline equivalent: `pi-engineering missions why --store <dir> <id> [--json]`. |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
@@ -782,7 +810,13 @@ than 7 days or beyond 200 are pruned on write, with stale `.tmp`/`.lock` files.
 Concurrent processes asking for the same key compute it once (cross-process
 lock). When validation is a reuse, the review runs alongside it instead of
 waiting, starting only once validation has confirmed the reuse; if the entry
-vanished and validation really runs, the review waits for it. A finer per-test result cache is tracked separately (#149).
+vanished and validation really runs, the review waits for it.
+
+A finer, per-stage layer exists as a library (`src/verify/testResultCache.ts`,
+#149) and is not consulted by the verifier yet: a stage's passing result is
+reusable only when the source tree (content, including uncommitted changes), the
+lockfiles, the toolchain versions, the stage command, an explicit environment
+allowlist and the base SHA all match. A failed result is never stored.
 
 ## Verifiable roadmap completion
 
@@ -1090,3 +1124,44 @@ Without `INFERWEAVE_BASE_URL` the integration is inert and the footer shows
 context only when Pi reports a window. The floor when nothing trustworthy is
 known is **128 000** tokens — never 260 000/262 144, which came from an admission
 implementation rather than from any model.
+
+
+### Live mission activity
+
+A visible mission footer refreshes every second while the mission is active. It shows health,
+current activity, elapsed activity/wait time, last output, worker heartbeat and last meaningful
+progress. These timestamps stay separate: a heartbeat proves the worker is alive, not that its
+work advanced. Acceptance and workflow counts remain evidence-based; model calls show elapsed
+time instead of a made-up completion percentage. A slow or stalled mission keeps its health
+and current activity visible even on narrow terminals.
+
+The serving model is shown as `route → provider/model` when both are recorded; this identifies
+the backing model without renaming aliases. Missing telemetry reads `not recorded`.
+`/mission-status` lists missions and `/mission inspect <id> [workerId]` opens a bounded readout
+of recorded activity, files, test failures/retries and blockers. Each worker also shows its latest
+captured tool output preview when available: actual tool result/update text with secrets and
+terminal control sequences removed, capped at 1,000 characters. Until a tool emits captured output,
+the inspector says `not recorded`. Model messages and private reasoning are never used as output
+previews. These previews appear in inspection, not compact bars or HerdR attention notifications.
+
+The mission refresh timer stops for completed, failed, canceled or operator-paused missions and
+on runtime shutdown. Local footer refreshes do not create repeated notices. With the existing
+`HERDR_INGEST_URL` integration configured, HerdR receives one attention event when a mission
+finishes, fails/crashes, or becomes stalled. Routine progress and heartbeats do not notify HerdR;
+a recovered mission can alert again if it stalls again. Reconnecting seeds current state without
+re-alerting about historical terminal or stalled missions.
+
+Stall detection is evaluated on the next live tick once the configured criteria are met. Defaults
+are slow after two minutes and stalled after five minutes without meaningful progress, together
+with the recorded silence/loop evidence; a normal quiet model request is not automatically a crash.
+Planner-worker missions use their configured silence watchdog and display its limit.
+
+Planner-worker missions also update their persistent widget/status once per second. Use
+`/engineering-workers [task]` to inspect a task's bounded recent activity, changed files and
+recorded result/blocker, or `/engineering-status` for the current activity summary. Verified
+contract counts determine percentage; live timers do not advance it.
+
+External web consumers receive additive `waitingSince`, `lastOutputAt`,
+`currentActivityStartedAt` and worker timing fields in the mission snapshot. They should derive
+elapsed times from these timestamps locally. This package does not control the separate web
+plugin's redraw loop; the runtime does not rewrite snapshots every second just to animate a timer.

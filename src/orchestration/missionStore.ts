@@ -297,6 +297,13 @@ export interface GateEvidencePublication {
   exitStatus: string;
   artifactRefs: string[];
   usage: Execution["usage"];
+  /**
+   * P4 provenance: the model that actually served the gate run. Gate executions
+   * (review/integration/validation) settle through this publication rather than
+   * the setExecutionStatus path, so the serving model must flow through here to
+   * reach the execution record's `model` field (what /mission-status reads).
+   */
+  model?: string;
   recoveredMerged?: NonNullable<Execution["recovered_merged"]>;
   reviewedRecovered?: NonNullable<Execution["reviewed_recovered"]>;
   identity: CandidateEvidenceIdentity;
@@ -1436,6 +1443,9 @@ export class MissionStore {
         exit_status: input.exitStatus,
         artifact_refs: [...input.artifactRefs],
         usage: structuredClone(input.usage),
+        // P4 provenance: settle the record to the model that actually served
+        // (the requested model seeded at creation is the fallback when absent).
+        ...(input.model ? { model: input.model } : {}),
         ...(input.recoveredMerged?.length ? { recovered_merged: [...input.recoveredMerged] } : {}),
         ...(input.reviewedRecovered?.length ? { reviewed_recovered: [...input.reviewedRecovered] } : {}),
       };
@@ -3215,6 +3225,7 @@ function copyExecution(ex: Execution): Execution {
     artifact_refs: [...ex.artifact_refs],
     ...(ex.recovered_merged ? { recovered_merged: ex.recovered_merged.map((r) => ({ ...r })) } : {}),
     ...(ex.reviewed_recovered ? { reviewed_recovered: [...ex.reviewed_recovered] } : {}),
+    ...(ex.already_satisfied ? { already_satisfied: { ...ex.already_satisfied } } : {}),
   };
 }
 

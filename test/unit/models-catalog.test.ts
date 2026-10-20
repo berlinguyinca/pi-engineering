@@ -357,3 +357,33 @@ test("catalog: route rows keep alias metadata and inherit the backing model's wi
     undefined,
   );
 });
+
+test("new aliases use their configured backing model metadata while retaining their route identity", () => {
+  const plan = planCatalogUpdate(
+    [
+      {
+        id: "vision-backend",
+        reasoning: false,
+        input: ["text", "image"],
+        maxTokens: 4096,
+        contextWindow: 131072,
+        compat: { supportsDeveloperRole: false },
+        baseUrl: "https://backend.invalid/v1",
+        headers: { "x-backend": "private" },
+      },
+      { id: "reasoner-a", reasoning: true, maxTokens: 16384 },
+      { id: "reasoner-b", reasoning: true, maxTokens: 16384 },
+    ],
+    [{ id: "fast", alias: true, backingModel: "vision-backend", contextWindow: 8192 }],
+  );
+  const alias = plan.next.find((model) => model.id === "fast")!;
+  assert.equal(alias.id, "fast");
+  assert.equal(alias.name, "fast (gateway)");
+  assert.equal(alias.contextWindow, 8192);
+  assert.equal(alias.reasoning, false);
+  assert.deepEqual(alias.input, ["text", "image"]);
+  assert.equal(alias.maxTokens, 4096);
+  assert.deepEqual(alias.compat, { supportsDeveloperRole: false });
+  assert.equal(alias.baseUrl, undefined, "alias requests must continue through the provider gateway");
+  assert.equal(alias.headers, undefined);
+});

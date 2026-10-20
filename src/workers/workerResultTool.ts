@@ -7,7 +7,10 @@ import type { WorkerResult } from "../core/types.ts";
 const exec = promisify(execFile);
 
 /** Message the worker sees when it reports `completed` for a mutating role with nothing to show. */
-export const NO_CHANGES_VS_BASE = "no changes vs base: commit your work or report blocked/partial with a reason";
+export const NO_CHANGES_VS_BASE =
+  "no changes vs base: commit your work or report blocked/partial with a reason. If the objective is ALREADY met " +
+  "and needs no change, do not repeat this report — call worker_result with already_satisfied: { reason, proof }, " +
+  "proof being a commit sha, file, test, artifact or PR the operator can check.";
 
 /**
  * Compare the harvestable tree, not the number of commits: empty commits and
@@ -39,7 +42,10 @@ export async function hasNoChangesVsBase(cwd: string, baseRef: string): Promise<
 export const workerResultTool = defineTool({
   name: "worker_result",
   label: "Worker Result",
-  description: "Return your final bounded structured result. Use this as your LAST action when your task is complete.",
+  description:
+    "Return your final bounded structured result. Use this as your LAST action when your task is complete. " +
+    "If you find the objective is already met and needs no change, report it with already_satisfied: { reason, proof } " +
+    "rather than repeating a no-change completion (which is rejected).",
   promptSnippet: "Emit your final bounded structured result as a terminating tool result",
   promptGuidelines: [
     "Call worker_result as your final action when the task is complete.",
@@ -76,12 +82,38 @@ export const workerResultTool = defineTool({
       maxItems: 20,
     }),
     details: Type.Optional(Type.Any({ description: "Role-specific structured payload, e.g. candidate_id" })),
+    /**
+     * "The objective is already met by the current state — there is nothing to
+     * change." This exists because of how a worker discovers that. When it finds
+     * the work already done (merged to base, fixed in an earlier commit, already
+     * satisfied), its only truthful report is `completed` with no diff — and the
+     * no-changes guard used to THROW that report away. The worker then repeated
+     * the identical answer until the loop guard killed the session
+     * (`agent.loop_prevented after 0 identical no-progress turns`), recovery read
+     * the failure as an IMPLEMENTATION_DEFECT, and another repair task was
+     * dispatched to rediscover the same fact — forever, because no path could
+     * conclude "nothing to do". Both fields are required so this cannot become a
+     * way to finish with no evidence: `proof` must be checkable by the operator.
+     */
+    already_satisfied: Type.Optional(
+      Type.Object(
+        {
+          reason: Type.String({ description: "Why the objective needs no change", maxLength: 2000 }),
+          proof: Type.String({
+            description: "A reference the operator can check: commit sha, file, test, artifact, PR",
+            maxLength: 2000,
+          }),
+        },
+        { additionalProperties: false },
+      ),
+    ),
   }),
 
   async execute(_toolCallId, params) {
     const cap = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n)}… [truncated]` : s);
     const partial = params.status === "partial";
     const details: Record<string, unknown> = params.details ?? {};
+    const assertion = validAlreadySatisfied(params.already_satisfied);
     const result: WorkerResult = {
       // A partial report is a blocked result that says so: callers keep the
       // three-state contract and the worker's own commits stay recoverable.
@@ -94,10 +126,21 @@ export const workerResultTool = defineTool({
       evidence_refs: (params.evidence_refs ?? []).slice(0, 20).map((r: string) => cap(String(r), 1000)),
       new_hypotheses: (params.new_hypotheses ?? []).slice(0, 20).map((h: string) => cap(String(h), 1000)),
       proposed_tasks: (params.proposed_tasks ?? []).slice(0, 20).map((t: string) => cap(String(t), 1000)),
-      details: partial ? { ...details, partial: true } : details,
+      details: assertion
+        ? { ...(partial ? { ...details, partial: true } : details), already_satisfied: assertion }
+        : partial
+          ? { ...details, partial: true }
+          : details,
     };
     return {
-      content: [{ type: "text", text: `Result recorded: ${result.status}` }],
+      content: [
+        {
+          type: "text",
+          text: assertion
+            ? `Result recorded: ${result.status} — already satisfied, nothing to change. Reason: ${assertion.reason}\nProof: ${assertion.proof}`
+            : `Result recorded: ${result.status}`,
+        },
+      ],
       details: result,
       terminate: true,
     };
@@ -105,9 +148,32 @@ export const workerResultTool = defineTool({
 });
 
 /**
+ * An `already_satisfied` assertion counts only when it carries both a reason and
+ * a checkable proof; a blank or whitespace-only field is no assertion, so the
+ * caller falls back to the ordinary no-changes rejection rather than letting an
+ * empty object close out a mutating task.
+ */
+function validAlreadySatisfied(value: unknown): { reason: string; proof: string } | undefined {
+  const raw = value as { reason?: unknown; proof?: unknown } | undefined;
+  if (!raw) return undefined;
+  const reason = String(raw.reason ?? "").trim();
+  const proof = String(raw.proof ?? "").trim();
+  return reason.length > 0 && proof.length > 0 ? { reason, proof } : undefined;
+}
+
+/**
  * The worker_result tool, optionally guarded: with a `guard`, a `completed`
  * report over a worktree with no changes vs `baseRef` is an error result (the
  * session continues) instead of a terminating result.
+ *
+ * The one exception is an explicit, evidenced `already_satisfied` assertion.
+ * Throwing at that report is what turned "the work is already done" into a
+ * non-terminating task: the worker restated the same conclusion, the guard threw
+ * again, and the session died on the loop guard (`agent.loop_prevented after 0
+ * identical no-progress turns`) to be re-dispatched by recovery as an
+ * implementation defect. A no-op must be a legal ANSWER, not a legal escape from
+ * doing work — which is why it is accepted only with a reason and a checkable
+ * proof, and is carried on the result so it stays visible downstream.
  */
 export function createWorkerResultTool(guard?: { cwd: string; baseRef: string }): typeof workerResultTool {
   if (!guard) return workerResultTool;
@@ -116,6 +182,7 @@ export function createWorkerResultTool(guard?: { cwd: string; baseRef: string })
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       if (
         (params as { status?: string }).status === "completed" &&
+        !validAlreadySatisfied((params as { already_satisfied?: unknown }).already_satisfied) &&
         (await hasNoChangesVsBase(guard.cwd, guard.baseRef))
       ) {
         throw new Error(NO_CHANGES_VS_BASE);

@@ -10,6 +10,14 @@ export interface WorkerActivity {
   phase?: "started" | "completed" | "failed" | "canceled";
   stage?: "agent" | "process" | "review" | "integration" | "validation" | "research";
   toolName?: string;
+  /** Normalized, redacted file target for known file tools; never edit contents. */
+  toolTarget?: string;
+  /** Fixed recognized command label, never the raw command or its arguments. */
+  toolCommand?: string;
+  /** Opaque signature of tool + arguments, stable within this runtime process. */
+  invocationSignature?: string;
+  /** Redacted, terminal-safe tail of actual tool output (at most 1000 characters). */
+  outputPreview?: string;
   /**
    * For a bash tool event: the build tool the command invokes, as a fixed
    * label (src/workers/buildActivity.ts BUILD_TOOLS). Never any part of the
@@ -118,7 +126,7 @@ export interface WorkerRequest {
   wallClock?: { startedAt: number; budgetMs: number };
   /** Show the elapsed/remaining budget in bash and claim_deliverable results every N tool calls (default 20). */
   budgetNoticeEveryToolCalls?: number;
-  /** Live bounded activity; never includes prompts, model text, tool arguments, or secrets. */
+  /** Live bounded activity; only safe file targets/fixed command labels, never prompts, model text, or raw arguments. */
   onActivity?: (event: WorkerActivity) => void;
   /** Abort the active model session when the owning execution is canceled. */
   signal?: AbortSignal;

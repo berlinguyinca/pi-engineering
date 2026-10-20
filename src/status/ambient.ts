@@ -37,6 +37,8 @@ export function renderAmbient(state: Readonly<PanelStateShape>): string | undefi
   const parts: string[] = [];
 
   const run = state.run;
+  // Mission telemetry is useful before the first file change or token count.
+  if (run?.missionStatus) return run.goal;
   const files = run?.files.length ?? state.workspace?.files.length ?? 0;
   if (files > 0) parts.push(`${files} file${files === 1 ? "" : "s"}`);
 

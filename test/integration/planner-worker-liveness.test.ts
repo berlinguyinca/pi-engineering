@@ -16,7 +16,7 @@ import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { PlannerWorkerExecutor } from "../../src/plannerWorker/executor.ts";
+import { type PlannerWorkerEvent, PlannerWorkerExecutor, runVerification } from "../../src/plannerWorker/executor.ts";
 import { fetchCatalog } from "../../src/plannerWorker/gateway.ts";
 import { GatewayChatWorkerExecutor } from "../../src/plannerWorker/gatewayWorker.ts";
 import { RoleResolver } from "../../src/plannerWorker/resolver.ts";
@@ -136,7 +136,11 @@ class ChildImplementer implements WorkerExecutor {
 async function mission(
   script: Behaviour[],
   opts: { workerInactivityMs?: number; signal?: AbortSignal } = {},
-): Promise<{ report: Awaited<ReturnType<PlannerWorkerExecutor["run"]>>; worker: ChildImplementer }> {
+): Promise<{
+  report: Awaited<ReturnType<PlannerWorkerExecutor["run"]>>;
+  worker: ChildImplementer;
+  events: PlannerWorkerEvent[];
+}> {
   const fixture = await makeFixtureRepo();
   cleanups.push(fixture.cleanup);
   const server = await startGatewayServer({
@@ -168,7 +172,9 @@ async function mission(
   cleanups.push(() => server.close());
   const conn = { baseUrl: server.baseUrl };
   const worker = new ChildImplementer(script, new GatewayChatWorkerExecutor({ ...conn, defaultModel: "flash-a" }));
+  const events: PlannerWorkerEvent[] = [];
   const report = await new PlannerWorkerExecutor({
+    onEvent: (event) => events.push(event),
     repoRoot: fixture.root,
     stateDir: join(fixture.root, ".pi-eng", "planner-worker", "PW-live"),
     worker,
@@ -182,14 +188,18 @@ async function mission(
     acceptance_criteria: [],
     constraints: [],
   });
-  return { report, worker };
+  return { report, worker, events };
 }
 
 test("without a mission signal, a silent worker is killed only after the configured inactivity window", async () => {
   const prev = process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS;
   process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS = "700";
   try {
-    const { report, worker } = await mission(["silent", "chatty"]);
+    const { report, worker, events } = await mission(["silent", "chatty"]);
+    assert.ok(
+      events.some((event) => event.type === "stalled" && event.task_id === "alpha" && /no activity/.test(event.text)),
+      "real watchdog stall is immediately observable",
+    );
     assert.equal(report.status, "completed", report.failure_reason ?? "");
     const [hung, retry] = worker.attempts;
     assert.ok(hung && retry);
@@ -231,4 +241,16 @@ test("waiting for inference capacity longer than the window does not fail the ta
   assert.equal(report.status, "completed", report.failure_reason ?? "");
   assert.equal(worker.attempts.length, 1, "no attempt was spent on the wait");
   assert.equal(worker.attempts[0]?.aborted, false);
+});
+
+test("verification reports real output without exposing it and observer failures cannot break the command", async () => {
+  let outputs = 0;
+  const result = await runVerification("printf secret-output", process.cwd(), {
+    onOutput: () => {
+      outputs++;
+      throw new Error("detached UI");
+    },
+  });
+  assert.equal(result.passed, true);
+  assert.ok(outputs > 0, "verification output reaches the activity observer");
 });
