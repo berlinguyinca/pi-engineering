@@ -26,6 +26,19 @@ import {
   writeModelsConfig,
 } from "./modelsConfig.ts";
 
+export interface RefreshProgress {
+  providerId: string;
+  phase: "listing" | "probing" | "complete";
+  /** Completed models in this provider, never an estimate of elapsed time. */
+  completed: number;
+  total: number;
+  modelId?: string;
+  backingModel?: string;
+  attempt?: number;
+  elapsedMs: number;
+  timeoutMs?: number;
+}
+
 export interface RefreshOptions {
   modelsPath: string;
   providerId: string;
@@ -43,6 +56,8 @@ export interface RefreshOptions {
   probeTimeoutMs?: number;
   /** Maximum inference probes in flight at once. */
   probeConcurrency?: number;
+  /** Called at discovery, each probe, and every second while a probe waits. */
+  onProgress?: (progress: RefreshProgress) => void;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   now?: () => Date;
@@ -74,6 +89,7 @@ export interface RefreshConfiguredProvidersOptions
     | "probeModels"
     | "probeTimeoutMs"
     | "probeConcurrency"
+    | "onProgress"
     | "signal"
     | "fetchImpl"
     | "now"
@@ -82,7 +98,7 @@ export interface RefreshConfiguredProvidersOptions
   authForProvider?: (providerId: string) => ProviderRefreshAuth | Promise<ProviderRefreshAuth>;
 }
 
-const DEFAULT_PROBE_TIMEOUT_MS = 15_000;
+export const DEFAULT_PROBE_TIMEOUT_MS = 120_000;
 // Backends commonly expose several model aliases through one GPU worker. Probe
 // sequentially by default so refresh itself does not manufacture a capacity
 // failure and hide an otherwise healthy model. Callers may opt into bounded
@@ -262,6 +278,34 @@ async function verifiedGatewayModels(
 ): Promise<Verification> {
   const verdicts = new Array<ProbeResult>(gateway.length);
   let next = 0;
+  let completed = 0;
+  const probe = async (
+    model: GatewayModelEntry,
+    optional: { disableThinking: boolean } | null,
+    budget: number,
+    attempt: number,
+  ) => {
+    const started = Date.now();
+    const report = () =>
+      opts.onProgress?.({
+        providerId: opts.providerId,
+        phase: "probing",
+        completed,
+        total: gateway.length,
+        modelId: model.id,
+        ...(model.backingModel ? { backingModel: model.backingModel } : {}),
+        attempt,
+        elapsedMs: Date.now() - started,
+        timeoutMs: opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
+      });
+    report();
+    const heartbeat = opts.onProgress ? setInterval(report, 1000) : undefined;
+    try {
+      return await probeGatewayModel(model, baseUrl, opts, optional, budget);
+    } finally {
+      clearInterval(heartbeat);
+    }
+  };
   const workers = Math.max(1, Math.min(opts.probeConcurrency ?? DEFAULT_PROBE_CONCURRENCY, gateway.length));
   await Promise.all(
     Array.from({ length: workers }, async () => {
@@ -269,15 +313,18 @@ async function verifiedGatewayModels(
         const index = next++;
         if (index >= gateway.length) return;
         const model = gateway[index]!;
-        const budget = reasoningIds.has(model.id) ? REASONING_PROBE_MAX_TOKENS : PROBE_MAX_TOKENS;
-        let result = await probeGatewayModel(model, baseUrl, opts, { disableThinking }, budget);
+        const budget =
+          reasoningIds.has(model.id) || (model.backingModel !== undefined && reasoningIds.has(model.backingModel))
+            ? REASONING_PROBE_MAX_TOKENS
+            : PROBE_MAX_TOKENS;
+        let result = await probe(model, { disableThinking }, budget, 1);
         if (result.verdict === "inconclusive" && result.reason === "probe timed out") {
-          result = await probeGatewayModel(model, baseUrl, opts, { disableThinking }, budget);
+          result = await probe(model, { disableThinking }, budget, 2);
         } else if (result.verdict === "rejected") {
           // A 400 is most often a parameter this model's backend does not
           // accept. Retry once with only the required fields; a second refusal
           // is the model's definitive answer to the minimal probe.
-          const retry = await probeGatewayModel(model, baseUrl, opts, null, budget);
+          const retry = await probe(model, null, budget, 2);
           // Whatever else the retry says, the model answered the full probe with
           // a 400: it is never pruned on the retry's word alone.
           result =
@@ -288,6 +335,15 @@ async function verifiedGatewayModels(
                 : retry;
         }
         verdicts[index] = result;
+        completed += 1;
+        opts.onProgress?.({
+          providerId: opts.providerId,
+          phase: completed === gateway.length ? "complete" : "probing",
+          completed,
+          total: gateway.length,
+          modelId: model.id,
+          elapsedMs: 0,
+        });
       }
     }),
   );
@@ -360,6 +416,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
       ...(opts.signal ? { signal: opts.signal } : {}),
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
+  opts.onProgress?.({ providerId: opts.providerId, phase: "listing", completed: 0, total: 0, elapsedMs: 0 });
   const advertised = await listing();
   const capacity = gatewayCapacityTotal(advertised);
   if (capacity !== undefined) sharedAdmissionController().applyGatewayCapacity(capacity);
@@ -467,6 +524,7 @@ export async function refreshConfiguredProviders(
         ...(opts.probeModels ? { probeModels: true } : {}),
         ...(opts.probeTimeoutMs !== undefined ? { probeTimeoutMs: opts.probeTimeoutMs } : {}),
         ...(opts.probeConcurrency !== undefined ? { probeConcurrency: opts.probeConcurrency } : {}),
+        ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
       });

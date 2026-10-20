@@ -40,6 +40,12 @@
  *    the one-shot planner): thinking off unconditionally, whatever the output
  *    allowance. A long-running worker makes ~46 model turns, and 8-13k hidden
  *    reasoning tokens per turn is minutes of decode that also eats the cap.
+ *    EXCEPTION (2026-10-17, operator directive): models whose id matches a
+ *    `thinkingOnModels` fragment (default: `qwen3.8-27b`, env
+ *    PI_THINKING_ON_MODELS) NEVER run with thinking off — for them every rule
+ *    above yields. The 27B implementer, run thinking-off, stalled in repeated
+ *    file-read loops (APS repeated_call / stale_tool_results) and timed out on
+ *    real missions; the operator requires its thinking to stay on.
  *
  *    For EVERY reason the wire field is always
  *    `chat_template_kwargs.enable_thinking: false` (the InferWeave node
@@ -64,6 +70,8 @@ export interface ThinkingOffConfig {
   lowOutputBudget: boolean;
   /** "Small" output room, in tokens (PI_THINKING_OFF_LOW_BUDGET_TOKENS). */
   lowOutputBudgetTokens: number;
+  /** Model-id fragments that NEVER run with thinking off, whatever the rule (PI_THINKING_ON_MODELS). */
+  thinkingOnModels: string[];
   /** Gateway hosts known to accept `reasoning_effort: "none"` (PI_THINKING_OFF_HOSTS, alias PI_THINKING_OFF_GATEWAYS). Entries match host:port or bare hostname. */
   gatewayHosts: string[];
   /** Provider ids known to accept it (PI_THINKING_OFF_PROVIDERS). */
@@ -74,6 +82,7 @@ export const DEFAULT_THINKING_OFF_CONFIG: ThinkingOffConfig = {
   summaries: true,
   lowOutputBudget: true,
   lowOutputBudgetTokens: 16_384,
+  thinkingOnModels: ["qwen3.8-27b"],
   gatewayHosts: ["llm.example.com", "llm.metabolomics.us", "127.0.0.1", "localhost"],
   providers: ["metabolomics", "beast", "bender"],
 };
@@ -103,16 +112,25 @@ export function resolveThinkingOffConfig(env: Record<string, string | undefined>
       DEFAULT_THINKING_OFF_CONFIG.gatewayHosts,
     ),
     providers: list(env.PI_THINKING_OFF_PROVIDERS, DEFAULT_THINKING_OFF_CONFIG.providers),
+    thinkingOnModels: list(env.PI_THINKING_ON_MODELS, DEFAULT_THINKING_OFF_CONFIG.thinkingOnModels),
   };
 }
 
 export interface ThinkingModel {
+  id?: string;
   api?: string;
   provider?: string;
   baseUrl?: string;
   contextWindow?: number;
   maxTokens?: number;
   compat?: { supportsReasoningEffort?: boolean };
+}
+
+/** Does `model`'s id carry a fragment that never runs with thinking off? */
+export function keepsThinkingOn(model: ThinkingModel, config: ThinkingOffConfig): boolean {
+  const id = (model.id ?? "").toLowerCase();
+  if (id.length === 0) return false;
+  return config.thinkingOnModels.some((fragment) => id.includes(fragment));
 }
 
 /** Is `model` served by a gateway known to accept `reasoning_effort: "none"`? */
@@ -210,6 +228,9 @@ export function thinkingOffReason(
   const invocation = currentInferenceInvocation();
   // The one-shot planner keeps thinking whatever the allowance or prompt.
   if (invocation && !invocation.interactive && THINKING_ROLES.has(invocation.role)) return undefined;
+  // Operator directive: these models keep their thinking under every rule —
+  // mission roles, summarization, low budgets alike (the "never" semantics).
+  if (keepsThinkingOn(model, config)) return undefined;
   if (isMissionRoleInvocation()) return "mission-role";
   if (config.summaries && isSummarizationRequest(context)) return "summarization";
   if (config.lowOutputBudget) {
@@ -342,6 +363,14 @@ export function streamWithThinkingPolicy<
             level: "info",
             key: "thinking-off:mission-role",
             text: `thinking: off (mission role) · ${currentInferenceInvocation()?.role ?? "worker"}`,
+          });
+        } else if (!reason && keepsThinkingOn(model, config) && isMissionRoleInvocation()) {
+          // The mission-role rule would have turned thinking off; the model
+          // override kept it on. Log it so the policy is visible in telemetry.
+          emitTelemetry({
+            level: "info",
+            key: "thinking-on:model-override",
+            text: `thinking: on (model override) · ${currentInferenceInvocation()?.role ?? "worker"}`,
           });
         }
         const requested = requestedReasoning(payload);

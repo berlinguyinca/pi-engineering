@@ -63,6 +63,8 @@ export interface PanelRunView {
   spend: PanelSpend[];
   /** Actionable mission status rendered as dedicated rows, never only in the run title. */
   missionStatus?: {
+    /** Live activity and age; preserved ahead of metadata at narrow widths. */
+    live?: string;
     token: string;
     reason: string;
     next: string;

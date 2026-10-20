@@ -16,7 +16,7 @@ describe("worker build activity: labelling", () => {
     assert.equal(buildToolOf(undefined), undefined);
   });
 
-  it("a bash start event carries only the label; other tools and unknown labels carry none", () => {
+  it("a bash start event carries fixed labels without command arguments; unknown build labels carry none", () => {
     const activity = activityFromSessionEvent({
       type: "tool_execution_start",
       toolName: "bash",
@@ -24,7 +24,8 @@ describe("worker build activity: labelling", () => {
       args: { command: "cargo test --secret-token=abc123" },
     });
     assert.equal(activity?.buildTool, "cargo");
-    assert.doesNotMatch(JSON.stringify(activity), /secret|abc123|test/);
+    assert.equal(activity?.toolCommand, "cargo test");
+    assert.doesNotMatch(JSON.stringify(activity), /secret|abc123/);
     assert.equal(
       activityFromSessionEvent({ type: "tool_execution_start", toolName: "read", args: { command: "cargo build" } })
         ?.buildTool,

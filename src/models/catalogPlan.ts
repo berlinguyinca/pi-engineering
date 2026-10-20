@@ -133,21 +133,30 @@ export function planCatalogUpdate(
     const current = byId.get(entry.id);
 
     if (!current) {
-      const { input, inferred } = inferInput(entry.id);
+      const backing = entry.backingModel ? byId.get(entry.backingModel) : undefined;
+      const { input, inferred } = inferInput(entry.backingModel ?? entry.id);
       // `cost` and `name` are fabricated too. A zero cost is a CLAIM that the
       // model is free — true for a self-hosted gateway, but `/models` never
       // said so, and an undeclared fabrication is the thing this field exists
       // to prevent.
-      const inferredFields = ["maxTokens", "reasoning", "cost", "name", ...(inferred ? ["input"] : [])];
+      const inferredFields = [
+        ...(!backing?.maxTokens ? ["maxTokens"] : []),
+        ...(backing?.reasoning === undefined ? ["reasoning"] : []),
+        ...(backing?.cost === undefined ? ["cost"] : []),
+        "name",
+        ...(!backing?.input && inferred ? ["input"] : []),
+      ];
       next.push({
+        // Reuse capability settings, never a backing model's routing/identity overrides.
+        ...(backing?.compat !== undefined ? { compat: backing.compat } : {}),
         id: entry.id,
         name: `${entry.id} (gateway)`,
-        reasoning: addReasoning,
-        input,
+        reasoning: backing?.reasoning ?? addReasoning,
+        input: backing?.input ?? input,
         contextWindow: entry.contextWindow,
         // Never promise more output than the model can hold in total.
-        maxTokens: Math.min(addMaxTokens, entry.contextWindow),
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        maxTokens: Math.min(backing?.maxTokens ?? addMaxTokens, entry.contextWindow),
+        cost: backing?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       });
       changes.push({
         kind: "add",

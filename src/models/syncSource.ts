@@ -11,7 +11,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { constants, closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { defaultModelsPath } from "./modelsConfig.ts";
@@ -77,12 +77,44 @@ export function readSyncSourceSetting(configPath: string = defaultSyncConfigPath
 export async function fetchCanonicalText(source: SyncSource, signal?: AbortSignal): Promise<string> {
   let text: string;
   if (source.kind === "file") {
-    text = readFileSync(source.path, "utf8");
+    const fd = openSync(source.path, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      if (!fstatSync(fd).isFile()) throw new Error("canonical providers source must be a regular file");
+      const buffer = Buffer.alloc(MAX_BYTES + 1);
+      let bytes = 0;
+      while (bytes < buffer.length) {
+        const count = readSync(fd, buffer, bytes, buffer.length - bytes, null);
+        if (count === 0) break;
+        bytes += count;
+      }
+      if (bytes > MAX_BYTES) throw new Error("canonical providers are larger than 1 MB");
+      text = buffer.subarray(0, bytes).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
   } else if (source.kind === "http") {
     const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
     const res = await fetch(source.url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
     if (!res.ok) throw new Error(`${source.url} answered HTTP ${res.status}`);
-    text = await res.text();
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error("canonical providers response has no body");
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        bytes += chunk.value.byteLength;
+        if (bytes > MAX_BYTES) {
+          await reader.cancel();
+          throw new Error("canonical providers are larger than 1 MB");
+        }
+        chunks.push(chunk.value);
+      }
+      text = Buffer.concat(chunks, bytes).toString("utf8");
+    } finally {
+      reader.releaseLock();
+    }
   } else {
     // No shell: host and path are separate argv entries, and `--` ends ssh's options.
     const { stdout } = await execFileAsync(
@@ -92,6 +124,6 @@ export async function fetchCanonicalText(source: SyncSource, signal?: AbortSigna
     );
     text = stdout;
   }
-  if (text.length > MAX_BYTES) throw new Error("canonical providers are larger than 1 MB");
+  if (Buffer.byteLength(text, "utf8") > MAX_BYTES) throw new Error("canonical providers are larger than 1 MB");
   return text;
 }

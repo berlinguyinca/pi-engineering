@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
+import { createIngestFromEnv } from "../src/runtime/herdr/ingestFromEnv.ts";
+import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -11,6 +14,7 @@ import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
 import { contextReading, planModelSwitch } from "../src/context/usage.ts";
+import { gatewayWaitLabel } from "../src/gateway/admissionNotice.ts";
 import { AdvisedModelSwitch } from "../src/gateway/advisedSwitch.ts";
 import { AfterOutputRetry } from "../src/gateway/afterOutputRetry.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
@@ -45,7 +49,8 @@ import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig } from "../src/models/modelsConfig.ts";
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
-import { refreshConfiguredProviders } from "../src/models/refresh.ts";
+import { DEFAULT_PROBE_TIMEOUT_MS, refreshConfiguredProviders } from "../src/models/refresh.ts";
+import { registerModelTabs } from "../src/models/registerModelTabs.ts";
 import { fetchCanonicalText, parseSyncSource, readSyncSourceSetting } from "../src/models/syncSource.ts";
 import {
   MISSION_UNAVAILABLE_RETRY_TURNS,
@@ -101,6 +106,7 @@ import { maintenanceHandler } from "../src/sessionControl/runtimeMaintenance.ts"
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
+import { WorkingStatusController } from "../src/status/working.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
@@ -334,6 +340,9 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
+  const attentionIngest = createIngestFromEnv(process.env);
+  const attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
+  let attentionReady = false;
   const opening = EngineeringRuntime.open({
     cwd,
     verifier: new CommandVerifier(),
@@ -351,7 +360,10 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       };
       if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
     },
-    onMissionActivity: (event) => publishMissionActivity(key, event),
+    onMissionActivity: (event) => {
+      publishMissionActivity(key, event);
+      if (attentionReady) void attention?.update(event).catch(() => {});
+    },
     // Pipeline progress -> status footer. Best-effort and read-only: the
     // runtime swallows anything thrown here, and the footer is the only
     // consumer today (the panel will subscribe to the same events).
@@ -374,7 +386,15 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       if (event.model) footer.setProducingModel(event.model);
     },
     ...(blackhole ? { blackhole } : {}),
-  }).then((runtime) => ({ runtime, memoryIdentity }));
+  }).then((runtime) => {
+    // Reconnect establishes a baseline; old terminal/stalled missions must not alert again.
+    for (const mission of runtime.missionStore?.listMissions() ?? []) {
+      const summary = runtime.missionObservability?.summary(mission.mission_id);
+      if (summary) attention?.seed({ ...summary, operatorPausedAt: mission.operator_paused_at });
+    }
+    attentionReady = true;
+    return { runtime, memoryIdentity };
+  });
   const openKey = `${key}\0${memoryIdentity}`;
   const entry: RuntimeOpen = { generation: openGeneration, promise: opening };
   runtimeOpens.set(openKey, entry);
@@ -397,14 +417,33 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
 export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
   phase: string;
   detail: string;
-  missionStatus: { token: string; reason: string; next: string };
+  missionStatus: { token: string; reason: string; next: string; live?: string };
 } {
-  const heartbeat = event.lastHeartbeatAt ? ` · hb ${new Date(event.lastHeartbeatAt).toISOString().slice(11, 19)}` : "";
+  const now = event.observedAt ? Date.parse(event.observedAt) : Date.now();
+  const age = (at?: string | null) => missionActivityAge(at, now);
+  const liveWorkers = event.workersDetail?.filter((entry) => entry.status === "running" || entry.status === "waiting");
+  const worker =
+    liveWorkers?.find((entry) => entry.health === "stalled") ??
+    liveWorkers?.[0] ??
+    event.workersDetail?.find((entry) => entry.status === "failed" || entry.status === "completed");
+  const activity = (worker?.currentActivity ?? event.summary).replace(/\s+/g, " ").slice(0, 100);
+  const duration = worker?.currentActivityStartedAt ? ` for ${age(worker.currentActivityStartedAt)}` : "";
+  const lastHeartbeat = worker ? worker.lastHeartbeatAt : event.lastHeartbeatAt;
+  const lastProgress = worker ? worker.lastMeaningfulProgressAt : event.lastMeaningfulProgressAt;
+  const heartbeat = ` · heartbeat ${age(lastHeartbeat)}${lastHeartbeat ? " ago" : ""}`;
+  const lastOutput = worker ? worker.lastOutputAt : event.lastOutputAt;
+  const output = `output ${age(lastOutput)}${lastOutput ? " ago" : ""}`;
+  const progress = `progress ${age(lastProgress)}${lastProgress ? " ago" : ""}`;
+  const model = worker?.model ? ` · ${worker.route ? `${worker.route} → ` : ""}${worker.model}` : "";
+  const waiting = event.waitingReason
+    ? ` · wait ${event.waitingReason.replaceAll("_", " ")}${event.waitingSince ? ` for ${age(event.waitingSince)}` : ""}`
+    : "";
+  const live = `${event.health.toUpperCase()} · ${activity.slice(0, 36)}${duration} · ${output}`;
   const workers = ` · workers ${event.activeWorkers} active/${event.waitingWorkers} waiting/${event.failedWorkers} failed`;
-  const lastProgress = event.lastMeaningfulProgressAt ?? "none";
+
   const compact = (value: string | null, fallback: string, length = 80) => (value ?? fallback).slice(0, length);
   const scope =
-    `repo ${compact(event.repository, "unknown")} · task ${compact(event.task, "none")} · ` +
+    `repo ${compact(event.repository, "unknown")} · task ${compact(worker?.taskId ?? event.task, "none")} · ` +
     `owner ${compact(event.owner, "unowned")}`;
   const recovery = `recovery ${event.recovery.attempt}/${event.recovery.maxAttempts}`;
   const next = `next ${event.nextAction.slice(0, 120)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`;
@@ -426,12 +465,13 @@ export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
       `(${event.acceptanceCoverage.approximatePercent}%) · workflow ${event.workflowProgress.completed}/` +
       `${event.workflowProgress.total} (${event.workflowProgress.approximatePercent}%) · ${event.health}`,
     detail:
-      `${event.summary.slice(0, 120)}${workers}${heartbeat} · ${scope} · last progress ${lastProgress} · ` +
+      `Now: ${activity}${duration} · ${output}${heartbeat} · ${progress}${model}${waiting}${workers} · ${scope} · ` +
       `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}${pin}`,
     missionStatus: pausedByOperator
       ? { token, reason: "paused by the operator (Esc); automatic repair is off", next: pausedByOperator }
       : {
           token,
+          live,
           reason: event.reason.slice(0, 160),
           next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
         },
@@ -627,7 +667,10 @@ function formatEntities(rt: EngineeringRuntime, kind?: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  let working: WorkingStatusController | undefined;
+  let workingSignal: AbortSignal | undefined;
   if (typeof pi.on === "function") registerTerminalRefusalGuard(pi);
+  registerModelTabs(pi);
   registerInteractiveMemory(pi);
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
@@ -1240,7 +1283,13 @@ ${RECOVERY_PROMPT}`;
    */
   async function refreshModels(
     ctx: ExtensionCommandContext,
-    opts: { providerIds?: string[]; dryRun: boolean; pruneMissing: boolean },
+    opts: {
+      providerIds?: string[];
+      dryRun: boolean;
+      pruneMissing: boolean;
+      probeTimeoutMs?: number;
+      useConfiguredBaseUrl?: boolean;
+    },
   ): Promise<{ written: boolean; lines: string[]; failed: boolean }> {
     // Unlike status-only commands, refresh must surface malformed JSON:
     // treating it as an empty config could overwrite the operator's file.
@@ -1252,6 +1301,7 @@ ${RECOVERY_PROMPT}`;
       throw new Error("No provider to refresh. Select a model first, or pass a provider name.");
     }
 
+    const probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
     const result = await refreshConfiguredProviders({
       modelsPath: defaultModelsPath(),
       providerIds,
@@ -1268,12 +1318,33 @@ ${RECOVERY_PROMPT}`;
         return {
           ...(resolved.auth.apiKey ? { apiKey: resolved.auth.apiKey } : {}),
           ...(resolved.auth.headers ? { headers: resolved.auth.headers } : {}),
-          ...(resolved.auth.baseUrl ? { baseUrl: resolved.auth.baseUrl } : {}),
+          ...(resolved.auth.baseUrl && !opts.useConfiguredBaseUrl ? { baseUrl: resolved.auth.baseUrl } : {}),
         };
       },
       ...(opts.dryRun ? { dryRun: true } : {}),
       ...(opts.pruneMissing ? { pruneMissing: true } : {}),
       probeModels: true,
+      probeTimeoutMs,
+      onProgress: (progress) => {
+        const percent = progress.total > 0 ? Math.floor((progress.completed * 100) / progress.total) : 0;
+        const filled = Math.floor(percent / 10);
+        const bar = `[${"#".repeat(filled)}${"-".repeat(10 - filled)}]`;
+        const summary =
+          progress.phase === "listing"
+            ? `${progress.providerId}: discovering models…`
+            : `${progress.providerId} ${bar} ${percent}% (${progress.completed}/${progress.total} probed)`;
+        const timing = progress.attempt
+          ? ` · attempt ${progress.attempt}/2 · ${Math.floor(progress.elapsedMs / 1000)}s / ${(progress.timeoutMs ?? probeTimeoutMs) / 1000}s`
+          : "";
+        const detail =
+          progress.phase === "complete"
+            ? "Probes finished; preparing results…"
+            : progress.phase === "listing"
+              ? "Fetching gateway catalogue…"
+              : `Probing ${progress.modelId}${progress.backingModel ? ` → ${progress.backingModel} (alias)` : ""}${timing}`;
+        ctx.ui.setStatus?.("model-refresh", summary);
+        ctx.ui.setWidget?.("model-refresh", [summary, detail]);
+      },
       ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     if (result.results.length === 0) {
@@ -1303,12 +1374,29 @@ ${RECOVERY_PROMPT}`;
   const modelRefreshHandler = (name: string) => async (args: string, ctx: ExtensionCommandContext) => {
     const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
     const dryRun = argv.includes("--dry-run");
-    const explicitProvider = argv.find((a) => !a.startsWith("--"));
+    let explicitProvider: string | undefined;
+    let probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS;
     try {
+      for (let i = 0; i < argv.length; i += 1) {
+        const arg = argv[i]!;
+        if (arg === "--dry-run" || arg === "--prune") continue;
+        if (arg === "--timeout") {
+          const seconds = Number(argv[++i]);
+          if (!Number.isFinite(seconds) || seconds < 1 || seconds > 3600) {
+            throw new Error("--timeout must be a number between 1 and 3600 seconds");
+          }
+          probeTimeoutMs = seconds * 1000;
+        } else if (arg.startsWith("--") || explicitProvider) {
+          throw new Error(`usage: /${name} [provider] [--timeout seconds] [--dry-run] [--prune]`);
+        } else {
+          explicitProvider = arg;
+        }
+      }
       const out = await refreshModels(ctx, {
         ...(explicitProvider ? { providerIds: [explicitProvider] } : {}),
         dryRun,
         pruneMissing: argv.includes("--prune"),
+        probeTimeoutMs,
       });
       const lines = [...out.lines];
       if (name === "refresh-models") lines.push("(/refresh-models is now /model-refresh; the old name still works.)");
@@ -1319,10 +1407,14 @@ ${RECOVERY_PROMPT}`;
         `${name} failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
         "error",
       );
+    } finally {
+      ctx.ui.setStatus?.("model-refresh", undefined);
+      ctx.ui.setWidget?.("model-refresh", undefined);
     }
   };
   pi.registerCommand("model-refresh", {
-    description: "Refresh models.json with inference-tested working models, then reload. --dry-run to preview.",
+    description:
+      "Refresh models with visible progress, then reload. [provider] [--timeout seconds] [--dry-run] [--prune].",
     handler: modelRefreshHandler("model-refresh"),
   });
   pi.registerCommand("refresh-models", {
@@ -1365,7 +1457,13 @@ ${RECOVERY_PROMPT}`;
           if (skipRefresh) lines.push("Models not refreshed (--no-refresh).");
         } else {
           try {
-            const out = await refreshModels(ctx, { providerIds: ready, dryRun: false, pruneMissing: false });
+            const out = await refreshModels(ctx, {
+              providerIds: ready,
+              dryRun: false,
+              pruneMissing: false,
+              // The registry still holds pre-sync URLs until the final reload.
+              useConfiguredBaseUrl: true,
+            });
             lines.push(...out.lines);
             written ||= out.written;
             failed ||= out.failed;
@@ -1381,6 +1479,9 @@ ${RECOVERY_PROMPT}`;
           `model-sync failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
           "error",
         );
+      } finally {
+        ctx.ui.setStatus?.("model-refresh", undefined);
+        ctx.ui.setWidget?.("model-refresh", undefined);
       }
     },
   });
@@ -1452,7 +1553,9 @@ ${RECOVERY_PROMPT}`;
     // family of paths disagreeing with each other; a rule stated in one place
     // and broken in another is not a rule, so all three now ask one function.
     pi.on("message_end", async (event, ctx) => {
-      const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+      const msg = event.message as
+        | { role?: string; stopReason?: string; errorMessage?: string; provider?: string; model?: string }
+        | undefined;
       if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
       const signal = parseGatewayWait({ text: msg.errorMessage });
       if (!signal?.retryable) return;
@@ -1460,9 +1563,15 @@ ${RECOVERY_PROMPT}`;
       // The status bar owns this now: a spinner, the countdown and the queue
       // position say everything the 429 body did, without a wall of warnings
       // every 30 seconds. Notify only when there is no status bar to read.
-      if (!statusBarConfig.enabled) {
+      working?.onGatewayEvent({
+        type: "wait",
+        waitMs,
+        concurrency: admission.status().concurrency,
+        signal: { ...signal, provider: msg.provider, model: msg.model },
+      });
+      if (!working && !statusBarConfig.enabled) {
         ctx.ui.notify(
-          `Model gateway is saturated — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
+          `${gatewayWaitLabel(signal)} — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
           "warning",
         );
       }
@@ -1485,7 +1594,7 @@ ${RECOVERY_PROMPT}`;
       const identity = ctx.model ? { provider: ctx.model.provider, model: ctx.model.id } : {};
       const remaining = admission.cooldownRemainingMs(identity);
       if (remaining <= 0) return;
-      if (!statusBarConfig.enabled) {
+      if (!working && !statusBarConfig.enabled) {
         const now = Date.now();
         if (now >= noticeSilentUntil) {
           noticeSilentUntil = now + remaining;
@@ -1557,6 +1666,16 @@ ${RECOVERY_PROMPT}`;
           hold: async (waitSignal, _attempt, abort, actualModel) => {
             const callModel = actualModel as Model<any>;
             const scopedSignal = { ...waitSignal, provider: callModel.provider, model: callModel.id };
+            // Only this interactive provider call owns the native working row.
+            // Shared admission events also describe background requests on the
+            // same route, so observing that bus would misattribute their waits.
+            if (abort && abort === workingSignal)
+              working?.onGatewayEvent({
+                type: "wait",
+                waitMs: scopedSignal.retryAfterMs,
+                concurrency: admission.status().concurrency,
+                signal: scopedSignal,
+              });
             const opts = {
               provider: callModel.provider,
               model: callModel.id,
@@ -1569,8 +1688,9 @@ ${RECOVERY_PROMPT}`;
           // "Consecutive" has to mean consecutive: without this the counter
           // accumulated across a whole session and would eventually trip a
           // fallback on unrelated, widely separated holds.
-          onProgress: () => {
+          onProgress: (_model, signal) => {
             fallbackCoordinator.onProgress();
+            if (signal && signal === workingSignal) working?.onModelProgress();
           },
           onHold: (info, actualModel) => {
             // Checked on a hold rather than on failure: by the time a turn
@@ -1619,7 +1739,33 @@ ${RECOVERY_PROMPT}`;
           // A stream cut after partial output is replayed by afterOutputRetry
           // (agent_before_settle); the wait it owes is taken here, against the
           // request's own abort signal, so Esc ends it at once.
-          beforeSend: (model, signal, context) => afterOutputRetry.beforeSend(model as never, signal, context as never),
+          beforeSend: (model, signal, context) => {
+            // before_provider_request may also be emitted by cache warming,
+            // which exposes the foreground ctx.signal rather than its own.
+            // This request callback retains the actual abort-signal identity.
+            if (signal && signal === workingSignal) {
+              const actual = model as Model<any>;
+              const identity = { provider: actual.provider, model: actual.id };
+              const remaining = admission.cooldownRemainingMs(identity);
+              if (remaining > 0) {
+                const observed = admission.status().lastSignal;
+                const matching = observed?.provider === actual.provider && observed?.model === actual.id;
+                working?.onGatewayEvent({
+                  type: "wait",
+                  waitMs: remaining,
+                  concurrency: admission.status().concurrency,
+                  signal: {
+                    ...(matching
+                      ? observed
+                      : { source: "default", retryable: true, reason: "shared_gateway_cooldown" }),
+                    retryAfterMs: remaining,
+                    ...identity,
+                  },
+                });
+              }
+            }
+            return afterOutputRetry.beforeSend(model as never, signal, context as never);
+          },
           // Thinking off for Pi's summaries (compaction) and near-full turns on
           // the metabolomics gateway, whose models think by default and would
           // otherwise spend the whole output budget on hidden reasoning.
@@ -1801,6 +1947,36 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_shutdown", () => {
       // Ephemeral fallback state must not leak across a session boundary.
       fallbackCoordinator.onSessionShutdown();
+    });
+  }
+
+  // The native working indicator remains informative even with the custom
+  // footer disabled. Split view retains Pi's native dock, so both layouts use
+  // this same local-only activity surface.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", (_event, ctx) => {
+      workingSignal = undefined;
+      working?.dispose();
+      working = ctx.hasUI ? new WorkingStatusController(ctx.ui) : undefined;
+      working?.onModelSelect(ctx.model);
+    });
+    pi.on("agent_start", (_event, ctx) => {
+      workingSignal = ctx.signal;
+      working?.onAgentStart();
+    });
+    pi.on("message_update", (event) => working?.onMessageUpdate(event));
+    pi.on("tool_execution_start", (event) => working?.onToolEvent(event));
+    pi.on("tool_execution_update", (event) => working?.onToolEvent(event));
+    pi.on("tool_execution_end", (event) => working?.onToolEvent(event));
+    pi.on("model_select", (event) => working?.onModelSelect(event.model));
+    pi.on("agent_settled", () => {
+      workingSignal = undefined;
+      working?.onAgentEnd();
+    });
+    pi.on("session_shutdown", () => {
+      workingSignal = undefined;
+      working?.dispose();
+      working = undefined;
     });
   }
 
@@ -2018,12 +2194,17 @@ ${RECOVERY_PROMPT}`;
   // never depends on it (the semantic tool + runtime gate enforce policy).
   // Planner/worker execution mode (docs/specs/planner-worker-hot-model-routing.md):
   // /engineering-* commands, and the mode `/mission` consults before orchestrating.
+  const plannerAttentionIngest = createIngestFromEnv(process.env);
+  const plannerAttention = plannerAttentionIngest ? new MissionAttentionReporter(plannerAttentionIngest) : null;
   const plannerWorker = registerPlannerWorker(pi, {
     host: async (ctx) => {
       const rt = await getRuntime(ctx);
       return {
         repoRoot: rt.git?.root ?? rt.cwd,
         worker: rt.worker,
+        reportAttention: (snapshot: Parameters<MissionAttentionReporter["update"]>[0]) => {
+          void plannerAttention?.update(snapshot).catch(() => {});
+        },
         // Live missions an operator paused or pinned, for /engineering-status.
         missionControlLines: () =>
           (rt.missionStore?.listMissions() ?? [])
@@ -2044,7 +2225,7 @@ ${RECOVERY_PROMPT}`;
 
   pi.registerCommand("mission", {
     description:
-      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
+      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission inspect <missionId> [workerId] shows recent activity; /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
@@ -2074,6 +2255,23 @@ ${RECOVERY_PROMPT}`;
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         }
+        return;
+      }
+      const inspect = /^inspect\s+(\S+)(?:\s+(\S+))?\s*$/i.exec(request);
+      if (/^inspect(?:\b|[:=])/i.test(request) && !inspect) {
+        ctx.ui.notify("/mission inspect <missionId> [workerId]", "error");
+        return;
+      }
+      if (inspect?.[1]) {
+        const rt = await openRuntime();
+        if (!rt) return;
+        const projection = rt.missionObservability?.projection(inspect[1]);
+        ctx.ui.notify(
+          projection
+            ? formatMissionInspection(projection, inspect[2])
+            : `No recorded telemetry for mission ${inspect[1]}.`,
+          projection ? "info" : "warning",
+        );
         return;
       }
       const why = /^why\s+(\S+)\s*$/i.exec(request);
@@ -2168,10 +2366,8 @@ ${RECOVERY_PROMPT}`;
       if (await plannerWorker.runIfSelected(newRequest, ctx)) return;
       const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
       ctx.ui.notify("Routing intent and running orchestration mission...", "info");
-      // Stream live mission/task progress to the operator instead of blocking
-      // silently for the whole worker budget (a long mission used to show one
-      // line, then nothing for 30+ minutes). Each task/phase transition is
-      // surfaced as a compact progress line as it happens.
+      // Persistent mission surfaces receive live activity separately. Keep the
+      // session guard informed without creating a notice for each timer tick.
       let lastLine = "";
       const result = await rt.orchestrator.orchestrate(newRequest, {
         repository: rt.cwd,
@@ -2187,7 +2383,6 @@ ${RECOVERY_PROMPT}`;
           if (line === lastLine) return;
           lastLine = line;
           activeControl?.missionProgress(line);
-          ctx.ui.notify(line, "info");
         },
       });
       const m = result.mission;
@@ -2258,6 +2453,8 @@ ${RECOVERY_PROMPT}`;
         return [
           `- ${m.mission_id} [${m.status}] rev ${m.revision} ${m.workflow_class} — ${m.title}`,
           ...(m.execution_mode ? [`  execution mode: ${m.execution_mode.mode} — ${m.execution_mode.reason}`] : []),
+          `  now: ${summary?.currentActivity?.summary ?? summary?.reason ?? "no activity recorded"} · heartbeat ${missionActivityAge(summary?.lastHeartbeatAt)} · progress ${missionActivityAge(summary?.lastMeaningfulProgressAt)}`,
+          `  inspect: /mission inspect ${m.mission_id} [workerId]`,
           `  ${acceptanceText} · workflow ${workflow.completed}/${workflow.total} (${workflow.approximatePercent}%) · health ${summary?.health ?? "unknown"}`,
           `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
           // P4: routing provenance — which model serves which task.

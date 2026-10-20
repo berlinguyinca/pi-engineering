@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../../src/models/providerSync.ts";
-import { parseSyncSource } from "../../src/models/syncSource.ts";
+import { fetchCanonicalText, parseSyncSource } from "../../src/models/syncSource.ts";
 
 const canonical = (providers: unknown) => parseCanonicalProviders(JSON.stringify({ providers }));
 
@@ -86,4 +89,72 @@ test("sync sources: file, http and ssh parse; hostile ssh forms do not", () => {
   assert.throws(() => parseSyncSource("ssh://h/p; rm -rf /"), /ssh:\/\/host/);
   assert.throws(() => parseSyncSource("ssh://h"), /ssh:\/\/host/);
   assert.throws(() => parseSyncSource("  "), /empty/);
+});
+
+test("canonical credentials are refused in nested model overrides and URL credentials", () => {
+  for (const settings of [
+    { models: [{ id: "seed", headers: { Authorization: "Bearer shared" } }] },
+    { compat: { access_token: "shared" } },
+    { baseUrl: "https://user:secret@x.example/v1" },
+    { baseUrl: "https://x.example/v1?api_key=shared" },
+    { models: [{ id: "seed", baseUrl: "https://x.example/v1?access_token=shared" }] },
+  ]) {
+    assert.throws(() => canonical({ p: { baseUrl: "https://x.example/v1", ...settings } }), /must hold no credential/);
+  }
+  assert.doesNotThrow(() =>
+    canonical({
+      p: {
+        baseUrl: "https://x.example/v1?api-version=2026",
+        models: [{ id: "seed", maxTokens: 8192, compat: { maxTokensField: "max_completion_tokens" } }],
+      },
+    }),
+  );
+});
+
+test("canonical local files enforce the size limit in bytes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "model-sync-size-"));
+  const path = join(dir, "canonical.json");
+  try {
+    writeFileSync(path, "é".repeat(500_001));
+    await assert.rejects(fetchCanonicalText({ kind: "file", path }), /larger than 1 MB/);
+    writeFileSync(path, "small");
+    assert.equal(await fetchCanonicalText({ kind: "file", path }), "small");
+    await assert.rejects(fetchCanonicalText({ kind: "file", path: dir }), /regular file/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("canonical HTTP reads stop and cancel at the byte limit", async () => {
+  const previousFetch = globalThis.fetch;
+  let cancelled = false;
+  let pulls = 0;
+  globalThis.fetch = (async () =>
+    new Response(
+      new ReadableStream({
+        pull(controller) {
+          pulls += 1;
+          controller.enqueue(new TextEncoder().encode("é".repeat(250_001)));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }),
+    )) as typeof fetch;
+  try {
+    await assert.rejects(
+      fetchCanonicalText({ kind: "http", url: "https://canonical.example/config" }),
+      /larger than 1 MB/,
+    );
+    assert.equal(cancelled, true);
+    assert.ok(pulls <= 3, "the source is not read to completion");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test("canonical model seeds must be objects with non-empty ids", () => {
+  for (const model of [null, 1, "model", [], {}, { id: 3 }, { id: "  " }]) {
+    assert.throws(() => canonical({ p: { baseUrl: "https://x.example/v1", models: [model] } }), /non-empty string id/);
+  }
 });

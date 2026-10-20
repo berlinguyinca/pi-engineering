@@ -96,8 +96,11 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
   }
   if (config.showTask && state.task?.missionStatus) {
     const mission = state.task.missionStatus;
-    full.push({ text: `${mission.token} · why ${mission.reason} · next ${mission.next}`, priority: 10 });
-    short.push({ text: mission.token, priority: 10 });
+    full.push({
+      text: `${mission.live ? `${mission.live} · ` : ""}${mission.token} · why ${mission.reason} · next ${mission.next}`,
+      priority: 10,
+    });
+    short.push({ text: mission.live ?? mission.token, priority: 10 });
   }
   if (config.showWait && state.wait) {
     const wait = formatWait(state.wait, nowMs);

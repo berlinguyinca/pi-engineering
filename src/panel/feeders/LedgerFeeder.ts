@@ -70,7 +70,7 @@ export class LedgerFeeder {
 
   /** Rebuild the current run view from the ledger (e.g. when the panel opens). */
   refresh(): void {
-    if (!this.activeWorkItemId) return;
+    if (!this.activeWorkItemId || this.state.snapshot.run?.missionStatus) return;
     try {
       this.publish({ workItemId: this.activeWorkItemId, phase: this.state.snapshot.run?.phase ?? "running" });
       this.state.clearError("run");

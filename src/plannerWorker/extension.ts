@@ -21,9 +21,11 @@ import { createRoleRouter } from "../capability/adapter.ts";
 import type { RoleName } from "../capability/roles.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workerInactivityMs } from "../orchestration/broker.ts";
+import type { MissionAttentionSnapshot } from "../runtime/herdr/MissionAttentionReporter.ts";
 import { RuntimeSession } from "../runtime/isolation/RuntimeSession.ts";
 import { describeModelChoice, sessionModelChoice } from "../runtime/operatorModelPin.ts";
 import type { WorkerExecutor } from "../workers/WorkerExecutor.ts";
+import { startPlannerDisplay } from "./activity.ts";
 import {
   type PlannerWorkerConfig,
   effectiveMode,
@@ -31,20 +33,23 @@ import {
   plannerWorkerDir,
   writeStoredMode,
 } from "./config.ts";
-import { PlannerWorkerExecutor } from "./executor.ts";
+import { type PlannerWorkerEvent, PlannerWorkerExecutor } from "./executor.ts";
 import { RouteEventFollower, fetchCatalog } from "./gateway.ts";
+import { runHandoff } from "./handoffCommand.ts";
 import { chooseExecutionMode } from "./mode.ts";
 import { RoleResolver } from "./resolver.ts";
 import { STATIC_ROUTER_ROLE } from "./roles.ts";
 import { assessSessionSwitch } from "./sessionSwitch.ts";
 import { latestState, renderPlan, renderStatus, renderWorkers } from "./status.ts";
 import { TransitionLog } from "./transitions.ts";
-import { ENGINEERING_MODES, type EngineeringMode, type PlannerWorkerReport } from "./types.ts";
+import { ENGINEERING_MODES, type EngineeringMode, type MissionBrief, type PlannerWorkerReport } from "./types.ts";
 
 /** What the integration needs from the engineering runtime. */
 export interface PlannerWorkerHost {
   repoRoot: string;
   worker: WorkerExecutor;
+  /** In-memory attention transition tracking; only terminal/stalled states publish to HerdR. */
+  reportAttention?: (snapshot: MissionAttentionSnapshot) => void;
   /** Operator-control lines (pause, model pin) of live orchestration missions. */
   missionControlLines?: () => string[];
 }
@@ -100,7 +105,7 @@ export async function engineeringCommand(
   if (!state) return { text: "No planner-worker mission has run in this repository yet.", level: "info" };
   if (name === "status") return { text: renderStatus(state, await effectiveMode(repoRoot, config)), level: "info" };
   if (name === "plan") return { text: renderPlan(state), level: "info" };
-  return { text: renderWorkers(state), level: "info" };
+  return { text: renderWorkers(state, args.trim()), level: "info" };
 }
 
 /** Gateway connection for the provider whose models serve the roles. */
@@ -129,7 +134,7 @@ export function registerPlannerWorker(
     ["mode", "Show or set the engineering execution mode: auto | planner-worker | single."],
     ["status", "Planner/worker mission status: planner, workers, reviewer, attempts, escalations."],
     ["plan", "The current planner/worker contract DAG."],
-    ["workers", "Planner/worker contracts and per role/model telemetry."],
+    ["workers", "Inspect planner/worker live activity, recent events and results: /engineering-workers [task]."],
   ];
   for (const [name, description] of commands) {
     pi.registerCommand(`engineering-${name}`, {
@@ -153,6 +158,45 @@ export function registerPlannerWorker(
       },
     });
   }
+
+  // Manual handoff (Unit B2): build a bounded HandoffArtifact for the latest
+  // plan and drive it prepared → committed (aborted on failure).
+  pi.registerCommand("handoff", {
+    description: "Drive a manual handoff: build a bounded HandoffArtifact for the latest plan and commit it.",
+    handler: async (args, ctx) => {
+      const host = await deps.host(ctx);
+      const state = await latestState(plannerWorkerDir(host.repoRoot));
+      const contracts = state?.plan.contracts ?? [];
+      const contract = contracts.find((c) => c.task_id === args.trim()) ?? contracts[0];
+      if (!contract) {
+        ctx.ui.notify("No planner-worker plan to hand off yet.", "info");
+        return;
+      }
+      const brief: MissionBrief = {
+        mission_id: state?.mission_id ?? "unknown",
+        summary: `Mission ${state?.mission_id ?? "unknown"}: ${contracts.length} contracts`,
+        architectural_context: state?.plan.architectural_context ?? [],
+        acceptance_criteria: [],
+        constraints: [],
+      };
+      const result = runHandoff({
+        kind: "planner_to_worker",
+        brief,
+        plan: {
+          decisions: state?.plan.decisions ?? [],
+          architectural_context: state?.plan.architectural_context ?? [],
+        },
+        contract,
+        from: "planner",
+        to: "implementer",
+      });
+      if (result.state === "committed" && result.artifact) {
+        ctx.ui.notify(`Handoff committed for ${contract.task_id} (${result.artifact.token_estimate} tokens).`, "info");
+      } else {
+        ctx.ui.notify(`Handoff aborted: ${result.error ?? "unknown"}`, "error");
+      }
+    },
+  });
 
   // Interactive session switches: same transition log, same context-fit check.
   if (typeof pi.on === "function") {
@@ -233,11 +277,12 @@ export function registerPlannerWorker(
     config: PlannerWorkerConfig,
     built: { resolver: RoleResolver; conn: { baseUrl: string; apiKey?: string } | null },
     missionId: string,
+    onEvent: (event: PlannerWorkerEvent) => void,
   ): Promise<PlannerWorkerExecutor> {
     // Same hung-worker window as every other mission worker: the environment
     // override wins, then `limits.worker_inactivity_ms`, then 1 h.
     const limits = await loadMissionLimits(host.repoRoot);
-    return new PlannerWorkerExecutor({
+    const executor = new PlannerWorkerExecutor({
       repoRoot: host.repoRoot,
       worker: host.worker,
       resolver: built.resolver,
@@ -250,28 +295,56 @@ export function registerPlannerWorker(
         : limits.worker_inactivity_ms,
       ...(built.conn ? { routeEvents: new RouteEventFollower(built.conn) } : {}),
       ...(ctx.signal ? { signal: ctx.signal } : {}),
-      onEvent: (e) => {
-        if (e.type !== "contract" || e.status === "passed" || e.status === "failed" || e.status === "escalated") {
-          ctx.ui.notify(
-            `[${missionId}] ${e.task_id ? `${e.task_id}: ` : ""}${e.status ?? ""} ${e.text}`.trim(),
-            "info",
-          );
-        }
+      onEvent: (event) => {
+        onEvent(event);
+        const stalled =
+          event.type === "stalled" ||
+          executor.liveSnapshot().activity.some((worker) => worker.ended_at === null && worker.status === "stalled");
+        attention(host, { missionId, title: missionId, state: "running", health: stalled ? "stalled" : "active" });
       },
     });
+    return executor;
   }
 
-  async function report(ctx: ExtensionCommandContext, missionId: string, work: () => Promise<PlannerWorkerReport>) {
+  function attention(host: PlannerWorkerHost, snapshot: MissionAttentionSnapshot): void {
+    try {
+      host.reportAttention?.(snapshot);
+    } catch {
+      /* Observers do not control the mission. */
+    }
+  }
+
+  async function report(
+    ctx: ExtensionCommandContext,
+    host: PlannerWorkerHost,
+    missionId: string,
+    executor: PlannerWorkerExecutor,
+    work: () => Promise<PlannerWorkerReport>,
+  ) {
     let r: PlannerWorkerReport;
     try {
       r = await work();
     } catch (error) {
+      if (executor.hasStartedExecution)
+        attention(host, {
+          missionId,
+          title: missionId,
+          state: ctx.signal?.aborted ? "canceled" : "failed",
+          health: "failed",
+        });
       ctx.ui.notify(
-        `planner-worker mission failed: ${error instanceof Error ? error.message : String(error)}`,
+        `planner-worker ${executor.hasStartedExecution ? "mission failed" : "request refused"}: ${error instanceof Error ? error.message : String(error)}`,
         "error",
       );
       return;
     }
+    attention(host, {
+      missionId,
+      title: missionId,
+      state: ctx.signal?.aborted ? "canceled" : r.status,
+      health:
+        r.status === "stalled" || r.status === "escalated" ? "stalled" : r.status === "rejected" ? "failed" : r.status,
+    });
     const passed = r.contracts.filter((c) => c.status === "passed").length;
     ctx.ui.notify(
       [
@@ -293,18 +366,25 @@ export function registerPlannerWorker(
       decided = null;
       const selected = await select(request, ctx).catch(() => null);
       if (!selected) return false;
-      ctx.ui.notify(`engineering mode: planner-worker (${selected.reason})`, "info");
       const missionId = newMissionId();
-      const executor = await executorFor(ctx, selected.host, selected.config, selected, missionId);
-      await report(ctx, missionId, () =>
-        executor.run({
-          mission_id: missionId,
-          summary: request,
-          architectural_context: [],
-          acceptance_criteria: [],
-          constraints: [],
-        }),
+      let display: ReturnType<typeof startPlannerDisplay> | undefined;
+      const executor = await executorFor(ctx, selected.host, selected.config, selected, missionId, (event) =>
+        display?.event(event),
       );
+      display = startPlannerDisplay(ctx.ui, missionId, () => executor.liveSnapshot());
+      try {
+        await report(ctx, selected.host, missionId, executor, () =>
+          executor.run({
+            mission_id: missionId,
+            summary: request,
+            architectural_context: [],
+            acceptance_criteria: [],
+            constraints: [],
+          }),
+        );
+      } finally {
+        display.stop();
+      }
       return true;
     },
 
@@ -318,8 +398,14 @@ export function registerPlannerWorker(
         resolver: new RoleResolver({ provider: "default", config: config.roles, operatorPin: currentOperatorPin }),
         conn: null,
       };
-      ctx.ui.notify(`[${missionId}] resuming planner-worker mission`, "info");
-      await report(ctx, missionId, async () => (await executorFor(ctx, host, config, built, missionId)).resume());
+      let display: ReturnType<typeof startPlannerDisplay> | undefined;
+      const executor = await executorFor(ctx, host, config, built, missionId, (event) => display?.event(event));
+      display = startPlannerDisplay(ctx.ui, missionId, () => executor.liveSnapshot());
+      try {
+        await report(ctx, host, missionId, executor, () => executor.resume());
+      } finally {
+        display.stop();
+      }
       return true;
     },
   };

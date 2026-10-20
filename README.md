@@ -313,6 +313,24 @@ limits:
 full inventory of time limits and their classification is in
 [`docs/mission-time-limits.md`](docs/mission-time-limits.md).
 
+## Live working activity
+
+The native Pi working indicator updates every second during an active turn,
+including split view and sessions with the custom status bar disabled. It shows
+whether the model is waiting, thinking, responding, or preparing a tool call;
+running tools show a safe command label or file path, elapsed time, and time
+since output. Long periods without output stay visible rather than suggesting
+that an animated spinner means useful progress.
+
+Gateway waits remain visible in a persistent detail panel with provider/model,
+reason, reported queue depth/capacity and admission limit, retry countdown, and
+total waiting time. Queue depth is a gateway load snapshot, not your individual
+position in the queue. Transport interruptions have a separate label from
+capacity waits. After a countdown reaches zero the indicator says **Awaiting
+gateway response** until real activity resumes. Completion, cancellation,
+shutdown, and model switches clear stale wait state. Press Esc to cancel as
+usual; display updates do not change retry policy or send HerdR notifications.
+
 ## Live status bar
 
 The footer answers "what is it doing, and why is nothing happening":
@@ -580,3 +598,21 @@ scripts/             real-model smoke tests + roadmap CLI + evidence recording
 ## License
 
 MIT
+
+### Automatic recovery when reopening a session
+
+Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`.
+It preserves the original Pi CLI and saves a backup at `~/.local/bin/pi.before-session-auto-resume`.
+On interactive `pi --session <id-or-file>` it supplies a continuation through Pi's
+normal initial-prompt path when the last assistant turn failed without output and the gateway
+explicitly marked replay safe. Pi finishes startup and restores/selects its model before work starts.
+Existing tool results and mission IDs remain in context. The server's remaining retry delay is honored.
+
+Recovery happens once per user turn. Completed, cancelled, partial-output, and ambiguous failures
+stay idle. Explicit CLI prompts or attachments, piped input, print/RPC modes, forks, and interactive
+session selection and `pi -c` are left to Pi. Local session IDs and file paths are supported; cross-project ID
+lookup is left to Pi. Set `PI_SESSION_AUTO_RESUME=0` to disable recovery for a launch.
+
+To uninstall, restore the saved launcher:
+`mv ~/.local/bin/pi.before-session-auto-resume ~/.local/bin/pi`.
+The installer accepts optional launcher and installation-directory arguments for isolated testing.

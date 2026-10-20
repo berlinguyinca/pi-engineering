@@ -448,11 +448,23 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
   if (!completed) outcome.error = result.result.error ?? result.result.summary;
   // A deliberate `partial` report keeps its done list so the broker can
   // checkpoint it instead of treating the run as a plain failure.
-  const details = result.result.details as { partial?: unknown; done?: unknown } | undefined;
+  const details = result.result.details as
+    | { partial?: unknown; done?: unknown; already_satisfied?: { reason?: unknown; proof?: unknown } }
+    | undefined;
   if (!completed && result.result.status === "blocked" && details?.partial === true) {
     outcome.partial = {
       done: Array.isArray(details.done) ? details.done.filter((d): d is string => typeof d === "string") : [],
     };
+  }
+  // An `already_satisfied` no-op is a RESULT, not a failure, so it must survive
+  // into durable state; the worker guard already refuses an assertion without
+  // both fields, and the tool trims them, so re-checking here only guards
+  // against a backend that produced the shape by some other route.
+  const asserted = details?.already_satisfied;
+  if (completed && typeof asserted?.reason === "string" && typeof asserted.proof === "string") {
+    const reason = asserted.reason.trim();
+    const proof = asserted.proof.trim();
+    if (reason && proof) outcome.alreadySatisfied = { reason, proof };
   }
   if (result.toolCalls !== undefined) outcome.toolCalls = result.toolCalls;
   return outcome;

@@ -36,7 +36,7 @@ export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-interface HandoffInput {
+export interface HandoffInput {
   kind: HandoffKind;
   brief: MissionBrief;
   plan: Pick<PlannerOutput, "decisions" | "architectural_context">;
