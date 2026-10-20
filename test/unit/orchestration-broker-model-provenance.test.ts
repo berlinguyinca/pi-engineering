@@ -12,9 +12,12 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { GitRepo } from "../../src/git/GitRepo.ts";
 import { ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 type BrokerBackends = import("../../src/orchestration/broker.ts").BrokerBackends;
 type RunAgent = NonNullable<BrokerBackends["agent"]>["runAgent"];
@@ -128,5 +131,100 @@ describe("P4 broker settlement model provenance", () => {
     // No serving model on the outcome -> the requested model recorded at
     // creation is preserved (not overwritten with null/undefined).
     assert.equal(execution.model, "gw/primary-model");
+  });
+
+  // Gate backends (review/integration/validation) settle through a DIFFERENT
+  // path than the agent backend: a successful gate execution is published via
+  // buildGateEvidencePublication -> publishGateEvidenceIfAuthoritative, NOT the
+  // setExecutionStatus path that carries the P4 Gap-2 model copy. So the
+  // serving model must also flow through the gate publication, or an unrouted
+  // reviewer's serving model is lost (usage.model null in /mission-status).
+  it("settles a gate execution (review) to the serving model via the gate publication path", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const baseSha = await git.headCommit();
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const mission = store.createMission({
+        title: "review model provenance",
+        goal: "g",
+        user_request: "u",
+        repository: fx.root,
+        base_ref: baseSha,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-review-prov",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          { repoId: "repo-review-prov", canonicalRoot: fx.root, baseRef: "main", baseSha, writableDomains: ["**"] },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-review-prov",
+        createdAt: "2026-09-27T00:00:00.000Z",
+      });
+      const ownership = new MissionOwnership(store, { ownerId: "review-prov", leaseMs: 60_000 });
+      const identity = await ownership.acquire(mission.mission_id, { resumptionGeneration: 0 });
+      const authority = await ownership.maintain(identity, "repo-review-prov");
+      const task = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "review",
+        role: "reviewer",
+        objective: "review the candidate",
+        repo_id: "repo-review-prov",
+      });
+      store.transitionTask(task.task_id, "READY");
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-review-prov", root: fx.root, git }),
+        backends: {
+          review: {
+            runReview: async () => ({
+              executionId: "review-w",
+              exitStatus: "succeeded",
+              summary: "approved",
+              artifactRefs: [],
+              // The real review backend records the serving model on the
+              // outcome (withModel from the routed reviewer model).
+              usage: { input: 26651, output: 2908, model: "metabolomics/review-model" },
+              reviewEvidence: {
+                reviewerSessionId: "RVS-test",
+                model: "metabolomics/review-model",
+                provider: "metabolomics",
+                verdict: "approve",
+                independenceMode: "independent",
+                findings: [],
+                outputValid: true,
+                accessible: true,
+                acceptanceResults: [],
+              },
+            }),
+          },
+        },
+      });
+      const handle = await broker.execute({
+        taskId: task.task_id,
+        missionId: mission.mission_id,
+        repoId: "repo-review-prov",
+        kind: "review",
+        role: "reviewer",
+        objective: task.objective,
+        authority,
+      });
+      await handle.result();
+      const execution = store.getExecution(handle.executionId);
+      assert.ok(execution, "execution record exists");
+      // Regression: without the gate-path model copy this stayed null (the
+      // requested model, seeded at creation) even though the review ran on a
+      // model and the outcome carried it.
+      assert.equal(execution.model, "metabolomics/review-model");
+      assert.equal(execution.status, "SUCCEEDED");
+      await authority.close();
+    } finally {
+      await fx.cleanup();
+    }
   });
 });

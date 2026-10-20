@@ -1140,6 +1140,13 @@ export class ExecutionBroker {
       exitStatus: outcome.exitStatus,
       artifactRefs: [...outcome.artifactRefs],
       usage: structuredClone(outcome.usage),
+      // P4 provenance: carry the serving model (recorded on the outcome by the
+      // backend via withModel) through the gate publication so it reaches the
+      // execution record's `model` field. Absent that, the requested model
+      // seeded at creation is preserved by the store.
+      ...(typeof outcome.usage?.model === "string" && outcome.usage.model.length > 0
+        ? { model: outcome.usage.model }
+        : {}),
       ...(outcome.recoveredMerged?.length ? { recoveredMerged: [...outcome.recoveredMerged] } : {}),
       ...(backend === "review" && input.reviewedRecovered?.length
         ? { reviewedRecovered: [...input.reviewedRecovered] }
