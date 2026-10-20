@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ExecutionOutcome } from "./broker.ts";
 import type {
+  AlreadySatisfied,
   Execution,
   FailureCategory,
   FailureClassification,
@@ -368,6 +369,50 @@ export const GATE_TRANSPORT_SIGNATURE =
 /** Prefix of the error a gate backend sets when its model's output could not be read; the gate re-runs. */
 export const INVALID_WORKER_OUTPUT_PREFIX = "INVALID_WORKER_OUTPUT";
 
+/**
+ * Machine-readable marker the completion gate writes into an empty-candidate
+ * reason when a worker asserted that the objective needs no change.
+ *
+ * Matched FIRST in classification, before every prose pattern. It is an explicit
+ * marker rather than an inference, and the worker's free-text reason and proof
+ * are interpolated into the same string — so prose patterns must not get a turn
+ * at it: an assertion whose text happens to mention a timeout or a review is not
+ * a PROVIDER_TRANSIENT or a REVIEW_FAILED. Lower-cased because classification
+ * normalizes the summary.
+ */
+export const ALREADY_SATISFIED_MARKER = "already_satisfied";
+
+/**
+ * The most recent evidenced `already_satisfied` assertion among a mission's
+ * successful MUTATING executions.
+ *
+ * Deliberately narrow. A failed, canceled or read-only run asserting that the
+ * objective needs no change is not evidence — only a worker that was asked to
+ * change this repository, and succeeded, may say it needed no changing. Shared by
+ * the completion gate and the orchestrator's integration check so both read the
+ * same fact the same way; the empty-candidate case is not the only place a
+ * no-change mission dead-ends, and two definitions would drift.
+ */
+export function latestAlreadySatisfied(
+  tasks: ReadonlyArray<Pick<OrchestrationTask, "task_id" | "mutates_repo" | "repo_id">>,
+  executions: ReadonlyArray<Pick<Execution, "task_id" | "status" | "already_satisfied">>,
+): AlreadySatisfied | undefined {
+  const mutators = new Set(tasks.filter((task) => task.mutates_repo).map((task) => task.task_id));
+  if (mutators.size === 0) return undefined;
+  return executions
+    .filter((execution) => mutators.has(execution.task_id) && execution.status === "SUCCEEDED")
+    .filter((execution) => execution.already_satisfied)
+    .at(-1)?.already_satisfied;
+}
+
+/** The marker clause appended to a no-change failure so recovery stops repairing it. */
+export function alreadySatisfiedClause(assertion: AlreadySatisfied): string {
+  return (
+    ` — ${ALREADY_SATISFIED_MARKER}: a worker asserted the objective needs no change` +
+    ` (reason: ${assertion.reason}; proof: ${assertion.proof})`
+  );
+}
+
 const GATE_FAILURE_CATEGORY: Partial<Record<OrchestrationTask["kind"], FailureCategory>> = {
   validation: "VALIDATION_FAILED",
   review: "REVIEW_FAILED",
@@ -416,10 +461,22 @@ export class FailureClassifier {
     // category (a backend wrapping a fenced execution in its own error) must
     // not be able to turn "execution EXE-x is no longer authoritative" into an
     // AUTHORIZATION_OR_CREDENTIAL STOP.
+    //
+    // Neither may it turn a no-change mission into a repair task. The gate and
+    // integration paths hand in a category outright, so matching the marker only
+    // inside inferRecognizedCategory would never have run: the loop that consumed
+    // a mission for a day was classified REVIEW_FAILED by exactly such a supplied
+    // category, over a summary that already said the work was proved done. The
+    // marker is appended in two places only — an empty candidate and an
+    // integration that produced no change — so it cannot arrive on a summary that
+    // reports a real defect on real changed code.
+    const summary = normalizedSummary(evidence.summary);
     const category =
-      evidence.category !== undefined && LOST_OWNERSHIP.test(normalizedSummary(evidence.summary))
+      evidence.category !== undefined && LOST_OWNERSHIP.test(summary)
         ? "ORPHANED_EXECUTION"
-        : (evidence.category ?? this.inferCategory(evidence));
+        : summary.includes(ALREADY_SATISFIED_MARKER)
+          ? "REQUIREMENT_AMBIGUITY"
+          : (evidence.category ?? this.inferCategory(evidence));
     const fingerprint = failureFingerprint({ ...evidence, category });
     return {
       classificationId: `FC-${fingerprint.slice("sha256:".length, "sha256:".length + 20)}`,
@@ -446,6 +503,12 @@ export class FailureClassifier {
   inferRecognizedCategory(evidence: FailureEvidence): FailureCategory | undefined {
     const summary = normalizedSummary(evidence.summary);
     const providerCode = evidence.providerCode?.trim().toUpperCase();
+    // An explicit "the objective needs no change" assertion is a question for the
+    // operator, not a defect to repair. Checking it ahead of the provider status
+    // below is deliberate: this is the one signal that is machine-asserted rather
+    // than inferred, and routing it to PROVIDER_* would restart the exact loop it
+    // exists to end. REQUIREMENT_AMBIGUITY parks the mission for the operator.
+    if (summary.includes(ALREADY_SATISFIED_MARKER)) return "REQUIREMENT_AMBIGUITY";
     // The worker compacted once and the prompt still overflows the model's
     // window (issue #180): replaying it never helps; split the task instead.
     if (/context[_ ]overflow/.test(summary)) return "TASK_BUDGET_EXHAUSTED";

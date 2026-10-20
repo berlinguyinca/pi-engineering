@@ -2,9 +2,9 @@ import type { NestedRepoPublication } from "../git/GitRepo.ts";
 import { evidenceIdentitiesEqual, hashCandidateEvidenceIdentity, taskCoverageFingerprint } from "./evidence.ts";
 import type { MissionStore } from "./missionStore.ts";
 import { hasAcceptableNestedPublication } from "./nestedPublicationGate.ts";
-import { taskFailureReason } from "./recovery.ts";
+import { alreadySatisfiedClause, latestAlreadySatisfied, taskFailureReason } from "./recovery.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
-import type { CompletionVerdict, Mission, RequiredGate } from "./types.ts";
+import type { AlreadySatisfied, CompletionVerdict, Mission, RequiredGate } from "./types.ts";
 
 export interface GateEvidence {
   missionId: string;
@@ -113,14 +113,54 @@ export class CompletionGate {
   private emptyCandidateProblem(missionId: string): string | undefined {
     const manifest = this.store.getWorkspaceManifest(missionId);
     if ((manifest?.repositories.length ?? 0) !== 1) return undefined;
-    const candidate = this.store.getCandidate(missionId, manifest?.repositories[0]?.repoId);
-    if (!candidate || candidate.identity.candidateSha !== candidate.identity.baseSha) return undefined;
+    const repoId = manifest?.repositories[0]?.repoId;
+    const candidate = this.store.getCandidate(missionId, repoId);
+    // What was ASKED FOR decides this, not what happened to be recorded. A
+    // mutating task that declared `isolation: "worktree"` (the default for any
+    // mutating task) promised its edits would arrive on a candidate branch; if
+    // the candidate is missing, or is identical to base, the mission changed
+    // nothing it can show. A task that explicitly declared `isolation: "none"`
+    // opted into editing the checkout directly — that is a visible caller choice,
+    // governed by the non-blocking "no git provider" finding, and it must not be
+    // blocked here or every deterministic-harness and integration task deadlocks.
+    //
+    // The missing-candidate branch is the hole this closes: the old guard
+    // returned early on `!candidate`, so a mutating mission that recorded no
+    // candidate at all cleared the gate and reported COMPLETE having produced no
+    // diff, no integration and nothing to review.
+    const isolatedMutator = this.store
+      .listTasks(missionId)
+      .some((task) => task.mutates_repo && task.isolation === "worktree" && task.repo_id === repoId);
+    // A worker that concluded "the objective needs no change" and carried proof
+    // is a DIFFERENT situation from a worker that produced nothing. Both stay
+    // blocked — an assertion is a claim, not a verified diff, so it must never
+    // complete a mutating mission silently — but the reason must say so, because
+    // recovery keys on it to park the mission for the operator instead of
+    // dispatching another repair task to rediscover the same fact. That loop was
+    // the observed failure: 34 hours of repair workers each independently
+    // reaching "already done" and being told it counted as nothing.
+    const asserted = this.alreadySatisfiedAssertion(missionId, repoId);
+    const suffix = asserted ? alreadySatisfiedClause(asserted) : "";
+    if (!candidate) {
+      return isolatedMutator
+        ? `a mutating task requested worktree isolation but no candidate was ever recorded: nothing proves the repository changed${suffix}`
+        : undefined;
+    }
+    if (candidate.identity.candidateSha !== candidate.identity.baseSha) return undefined;
     const mutates = this.store
       .listTasks(missionId)
       .some((task) => task.mutates_repo && task.repo_id === candidate.identity.repoId);
     return mutates
-      ? "the current candidate is identical to its base (empty diff): a mutating mission cannot complete on it"
+      ? `the current candidate is identical to its base (empty diff): a mutating mission cannot complete on it${suffix}`
       : undefined;
+  }
+
+  /** See {@link latestAlreadySatisfied}; the gate scopes it to this mission's repository. */
+  private alreadySatisfiedAssertion(missionId: string, repoId: string | undefined): AlreadySatisfied | undefined {
+    return latestAlreadySatisfied(
+      this.store.listTasks(missionId).filter((task) => task.repo_id === repoId),
+      this.store.listExecutions(missionId),
+    );
   }
 
   gather(missionId: string): GateEvidence {

@@ -80,8 +80,11 @@ export interface MissionObservabilitySnapshot {
   currentActivity?: { type: string; summary: string; workerId?: string } | null;
   workers: { active: number; waiting: number; failed: number };
   lastHeartbeatAt?: string;
+  lastOutputAt?: string;
+  currentActivityStartedAt?: string;
   lastMeaningfulProgressAt: string | null;
   waitingReason?: string;
+  waitingSince?: string;
   completionStatus: string;
   progressHistory: Array<{
     at: string;
@@ -219,8 +222,17 @@ function toObservabilitySnapshot(projection: MissionProjection): MissionObservab
     currentActivity: projection.summary.currentActivity,
     workers: { ...projection.summary.workers },
     lastHeartbeatAt: projection.summary.lastHeartbeatAt,
+    lastOutputAt: projection.workers
+      .map((worker) => worker.lastOutputAt)
+      .filter((at): at is string => !!at)
+      .sort()
+      .at(-1),
+    currentActivityStartedAt: projection.workers.find(
+      (worker) => worker.workerId === projection.summary.currentActivity?.workerId,
+    )?.currentActivityStartedAt,
     lastMeaningfulProgressAt: projection.summary.lastMeaningfulProgressAt,
     waitingReason: projection.summary.waitingReason,
+    waitingSince: projection.summary.waitingSince,
     completionStatus: projection.summary.completionStatus,
     progressHistory: projection.progressHistory.map((p) => ({
       at: p.at,

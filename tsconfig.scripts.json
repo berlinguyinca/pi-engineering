@@ -4,6 +4,8 @@
     "scripts/dogfood-mission-recovery.ts",
     "scripts/dogfood-real-mission.ts",
     "src/blackhole/pi-blackhole.d.ts",
-    "scripts/planner-worker-benchmark.ts"
+    "scripts/planner-worker-benchmark.ts",
+    "scripts/pi-session-auto-resume.ts",
+    "scripts/install-session-auto-resume.ts"
   ]
 }

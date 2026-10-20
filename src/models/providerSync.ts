@@ -25,7 +25,29 @@ import type { ConfiguredModel } from "./catalogPlan.ts";
 import type { ModelsConfig } from "./modelsConfig.ts";
 
 /** Keys that must never appear in a canonical definition: it is shared in the clear. */
-const SECRET_KEY = /^(api[-_]?key|apikey|token|secret|password|authorization|headers)$/i;
+const SECRET_KEY =
+  /^(?:x[-_]?)?api[-_]?key$|^(?:(?:access|refresh|auth)[-_]?)?token$|^(?:client[-_]?)?secret$|^(?:password|authorization|headers|credentials?)$/i;
+
+function assertCredentialFree(value: unknown, providerId: string): void {
+  if (typeof value === "string" && /^https?:\/\//i.test(value)) {
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error(`provider ${providerId} contains an invalid URL`);
+    }
+    if (url.username || url.password || [...url.searchParams.keys()].some((key) => SECRET_KEY.test(key))) {
+      throw new Error(`provider ${providerId}: canonical URLs must hold no credential`);
+    }
+  } else if (value && typeof value === "object") {
+    for (const [key, nested] of Object.entries(value)) {
+      if (SECRET_KEY.test(key)) {
+        throw new Error(`provider ${providerId} carries "${key}": a canonical definition must hold no credential`);
+      }
+      assertCredentialFree(nested, providerId);
+    }
+  }
+}
 
 export interface CanonicalProvider {
   baseUrl: string;
@@ -60,17 +82,25 @@ export function parseCanonicalProviders(text: string): CanonicalProviders {
   for (const [id, raw] of entries) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`provider ${id} must be an object`);
     const def = raw as Record<string, unknown>;
-    const secret = Object.keys(def).find((k) => SECRET_KEY.test(k));
-    if (secret) {
-      throw new Error(
-        `provider ${id} carries "${secret}": a canonical definition is shared in the clear and must hold no credential`,
-      );
-    }
+    assertCredentialFree(def, id);
     if (typeof def.baseUrl !== "string" || !/^https?:\/\//.test(def.baseUrl)) {
       throw new Error(`provider ${id} needs an http(s) baseUrl`);
     }
     if (def.models !== undefined && !Array.isArray(def.models))
       throw new Error(`provider ${id}: models must be a list`);
+    if (Array.isArray(def.models)) {
+      for (const model of def.models) {
+        if (
+          !model ||
+          typeof model !== "object" ||
+          Array.isArray(model) ||
+          typeof model.id !== "string" ||
+          !model.id.trim()
+        ) {
+          throw new Error(`provider ${id}: each model needs a non-empty string id`);
+        }
+      }
+    }
     out.providers[id] = def as CanonicalProvider;
   }
   return out;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import {
+  ALREADY_SATISFIED_MARKER,
   DEFAULT_MISSION_RECOVERY_CEILING,
   DEFAULT_STRATEGY_MAX_ATTEMPTS,
   FailureClassifier,
@@ -575,4 +576,53 @@ describe("replacement recovery fingerprint", () => {
       assert.notEqual(replacementRecoveryFingerprint(base), replacementRecoveryFingerprint(changed));
     });
   }
+});
+
+describe("an already_satisfied assertion parks the mission instead of looping repair", () => {
+  const classifier = new FailureClassifier();
+  const gateReason = (marker: string, proof: string) =>
+    `the current candidate is identical to its base (empty diff): a mutating mission cannot complete on it — ${marker}: a worker asserted the objective needs no change (reason: PR #599 already merged; proof: ${proof})`;
+
+  it("classifies the marker as a requirement question and defaults to waiting", () => {
+    const classification = classifier.classify(baseEvidence(gateReason(ALREADY_SATISFIED_MARKER, "commit a192077")));
+    assert.equal(classification.category, "REQUIREMENT_AMBIGUITY");
+    assert.equal(RecoveryPlanner.defaultAction("REQUIREMENT_AMBIGUITY"), "WAIT_FOR_REQUIREMENT");
+  });
+
+  it("beats a transient provider signature, which would restart the loop", () => {
+    // The whole point of matching first: a repair worker that hit a 503 while
+    // rediscovering "already done" must not be routed back into PROBE_AND_BACKOFF
+    // and then re-dispatched.
+    const classification = classifier.classify({
+      ...baseEvidence(`${gateReason(ALREADY_SATISFIED_MARKER, "commit a192077")} (gateway 503, connection reset)`),
+      providerStatus: 503,
+    });
+    assert.equal(classification.category, "REQUIREMENT_AMBIGUITY");
+  });
+
+  it("beats prose that would otherwise read as a defect, a review or a validation failure", () => {
+    for (const proof of [
+      "a bug in the reviewer flagged a defect here",
+      "review requested changes on the earlier PR",
+      "the validation suite failed on base",
+    ]) {
+      assert.equal(
+        classifier.classify(baseEvidence(gateReason(ALREADY_SATISFIED_MARKER, proof))).category,
+        "REQUIREMENT_AMBIGUITY",
+        `worker free text must not be reinterpreted by the prose patterns: ${proof}`,
+      );
+    }
+  });
+
+  it("leaves an assertion-free empty-candidate reason classified as before", () => {
+    // Control: the marker is the only thing that changes classification. Note what
+    // an assertion-free reason actually becomes — neither of the transport
+    // signatures is present, yet it falls through to the transport-capacity
+    // fallback, i.e. PROBE_AND_BACKOFF and then another attempt. That is the other
+    // half of why an unresolvable empty candidate kept being retried.
+    const plain =
+      "the current candidate is identical to its base (empty diff): a mutating mission cannot complete on it";
+    assert.equal(classifier.classify(baseEvidence(plain)).category, "PROVIDER_TRANSIENT");
+    assert.equal(RecoveryPlanner.defaultAction("PROVIDER_TRANSIENT"), "PROBE_AND_BACKOFF");
+  });
 });

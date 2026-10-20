@@ -55,6 +55,22 @@ function loadText(signal: GatewayWaitSignal): string {
   return parts.join(" · ");
 }
 
+/** A transient link failure is not evidence that the inference queue is full. */
+export function gatewayWaitLabel(signal: GatewayWaitSignal): string {
+  const reason = `${signal.reason ?? ""} ${signal.type ?? ""}`;
+  if (
+    signal.source === "transport-drop" ||
+    signal.source === "link-cut" ||
+    /transport|network|connection|link.cut/i.test(reason)
+  ) {
+    return "Gateway transport interruption";
+  }
+  if (signal.queued !== undefined || /queue|capacity|admission|concurrency|busy|saturat/i.test(reason)) {
+    return "Gateway capacity wait";
+  }
+  return "Gateway retry wait";
+}
+
 /**
  * Turn an admission event into one line.
  *
@@ -77,7 +93,7 @@ export function describeAdmissionEvent(event: AdmissionEvent, now: () => number 
       // waits, so two waits for the same reason are different strings and a
       // text-keyed throttle would never fire.
       key: `wait:${event.signal.reason ?? event.signal.type ?? event.signal.status ?? "unknown"}`,
-      text: `gateway busy — waiting ${formatDuration(event.waitMs)}${tail ? ` · ${tail}` : ""}`,
+      text: `${gatewayWaitLabel(event.signal)} — waiting ${formatDuration(event.waitMs)}${tail ? ` · ${tail}` : ""}`,
       detail: event,
     };
   }

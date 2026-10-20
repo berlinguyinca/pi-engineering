@@ -25,7 +25,12 @@ import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
-import { TURN_SUMMARY } from "../workers/activity.ts";
+import {
+  AWAITING_MODEL_RESPONSE_SUMMARY,
+  TOOL_PROGRESS_SUMMARY,
+  TURN_SUMMARY,
+  WAITING_FOR_INFERENCE_SUMMARY,
+} from "../workers/activity.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
 import {
   type BrokerBackends,
@@ -51,6 +56,7 @@ import {
 } from "./interrupt.ts";
 import { transitionMissionToCanceled } from "./missionCancel.ts";
 import type { MissionStore } from "./missionStore.ts";
+import { MissionActivityTicker } from "./observability/MissionActivityTicker.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
@@ -61,7 +67,9 @@ import {
   GATE_TRANSPORT_SIGNATURE,
   RecoveryPlanner,
   type RecoveryPlannerOptions,
+  alreadySatisfiedClause,
   classifyGateFailure,
+  latestAlreadySatisfied,
   replacementRecoveryFingerprint,
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
@@ -1570,9 +1578,13 @@ export class Orchestrator {
         summary: event.summary,
         workerId: event.executionId,
         meaningfulProgress: event.meaningfulProgress,
+        outputPreview: event.outputPreview,
+        output:
+          (event.kind === "tool" && (event.phase === "completed" || event.phase === "failed")) ||
+          ["Model streaming", "Model response received", TOOL_PROGRESS_SUMMARY].includes(event.summary),
       });
-      if (event.kind === "tool")
-        obs?.noteWorkerTool(event.missionId, event.executionId, `${event.toolName}:${event.phase}`);
+      if (event.kind === "tool" && event.phase === "started" && event.invocationSignature)
+        obs?.noteWorkerTool(event.missionId, event.executionId, event.invocationSignature);
       if (event.kind === "tool" && event.buildTool) this.noteBuildCommand(event);
       if ((event.kind === "state" || event.kind === "execution") && event.phase === "completed") {
         obs?.workerCompleted(event.missionId, event.executionId);
@@ -1617,6 +1629,8 @@ export class Orchestrator {
   }
 
   private activityType(event: WorkerActivity): ActivityType {
+    if (event.summary === WAITING_FOR_INFERENCE_SUMMARY) return "waiting_for_queue";
+    if (event.summary === AWAITING_MODEL_RESPONSE_SUMMARY) return "waiting_for_model";
     if (event.kind === "tool") return event.toolName === "bash" ? "running_command" : "tool_invocation";
     if (event.phase === "failed" || event.phase === "canceled") return "error";
     if (event.kind === "state") return event.phase === "completed" ? "worker_completed" : "worker_started";
@@ -1954,6 +1968,27 @@ export class Orchestrator {
       : undefined;
     leaseKeepAlive?.unref?.();
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
+    const activityTicker = new MissionActivityTicker({
+      state: (missionId) => this.store.getMission(missionId)?.status,
+      emit: (missionId) => {
+        const projection = this.observability?.projection(missionId);
+        if (!projection) return;
+        const summary = projection.summary;
+        const worker =
+          projection.workers.find((candidate) => candidate.health === "stalled") ??
+          projection.workers.find((candidate) => candidate.state === "running" || candidate.state === "waiting");
+        const elapsed = (at: string | null | undefined) =>
+          at ? `${Math.max(0, Math.floor((this.scheduler.now() - Date.parse(at)) / 1000))}s ago` : "not yet observed";
+        const model = worker?.model ? ` · ${worker.route ? `${worker.route} → ` : ""}${worker.model}` : "";
+        const activity =
+          worker?.currentActivity ?? summary.currentActivity?.summary ?? summary.currentObjective ?? summary.phase;
+        this.report(
+          missionId,
+          `[mission ${missionId}] ${summary.health.toUpperCase()} · ${worker ? `${worker.workerId}: ` : ""}${activity}${model} · last output ${elapsed(worker?.lastOutputAt)} · last heartbeat ${elapsed(worker?.lastHeartbeatAt ?? summary.lastHeartbeatAt)} · last progress ${elapsed(worker?.lastMeaningfulProgressAt ?? summary.lastMeaningfulProgressAt)}`,
+        );
+      },
+    });
+    if (opts.onProgress) activityTicker.watch(mission.mission_id);
     try {
       // The mode decision is persisted on the mission (orchestrateMission); the
       // reason is what the operator needs to act on (e.g. "configure logical
@@ -2503,6 +2538,7 @@ export class Orchestrator {
       const finalized = await this.finalizeMission(mission.mission_id, expectedResumptionGeneration, opts.signal);
       return { ...finalized, intent };
     } finally {
+      activityTicker.close();
       if (leaseKeepAlive) clearInterval(leaseKeepAlive);
       if (liveRun && this.liveRuns.get(mission.mission_id) === liveRun) this.liveRuns.delete(mission.mission_id);
       // Never release under an in-flight renewal: it would write the stale
@@ -3002,7 +3038,16 @@ export class Orchestrator {
         return category === "VALIDATION_FAILED" || (gateTask.kind !== "integration" && category === "REVIEW_FAILED");
       });
       if (openBlocking.length === 0 && codeFailedGates.length === 0 && blockerTask) {
-        if (blockerTask.kind === "integration" && mergeRetries < MAX_DETERMINISTIC_MERGE_RETRIES) {
+        if (
+          blockerTask.kind === "integration" &&
+          mergeRetries < MAX_DETERMINISTIC_MERGE_RETRIES &&
+          // Re-merging onto a newer base is the right reflex for a stale branch, but
+          // not for a mission whose integration produced nothing because a worker
+          // proved there was nothing to do: each retry costs another implementer to
+          // rediscover the same conclusion. "Classification decides" is already this
+          // function's rule; the retry simply wasn't listening to it.
+          classification.category !== "REQUIREMENT_AMBIGUITY"
+        ) {
           mergeRetries++;
           repairRounds--;
           if (this.store.getMission(missionId)!.status !== "REPAIRING") {
@@ -3020,6 +3065,23 @@ export class Orchestrator {
         }
         const stopRecovery =
           this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
+        // A requirement wait is not a failure to write off. Marking the decision
+        // failed and stopping the mission here contradicted the planner: it parked
+        // nothing, asked the operator nothing, and left a STOPPED mission whose own
+        // decision said WAIT_FOR_REQUIREMENT. Same handling as the repair path.
+        if (stopRecovery.action === "WAIT_FOR_REQUIREMENT") {
+          if (stopRecovery.status === "planned") this.store.transitionRecovery(stopRecovery.recoveryId, "started");
+          if (this.store.getMission(missionId)?.status === "BLOCKED") {
+            this.store.transitionMission(missionId, "WAITING_FOR_USER");
+          }
+          await this.store.flush();
+          return {
+            mission: this.store.getMission(missionId)!,
+            verdict,
+            completed: false,
+            failureReason: verdict.reasons.join("; ") || "awaiting operator clarification",
+          };
+        }
         if (stopRecovery.status === "planned") this.store.transitionRecovery(stopRecovery.recoveryId, "started");
         this.store.transitionRecovery(stopRecovery.recoveryId, "failed");
         this.store.stopMission(missionId, {
@@ -3042,6 +3104,25 @@ export class Orchestrator {
         });
       if (gateRecovery.status === "planned") this.store.transitionRecovery(gateRecovery.recoveryId, "started");
       await this.store.flush();
+
+      // The planner has just said "ask the operator", and this block does the
+      // opposite: it invalidates the evidence, hires another implementer and runs
+      // the whole cycle again. For a mission whose worker proved the objective needed
+      // no change, that is the loop itself — each round re-produced the same empty
+      // candidate and the same conclusion, and the mission never got to the operator.
+      // Repairs are dispatched on what the planner decided, not around it.
+      if (gateRecovery.action === "WAIT_FOR_REQUIREMENT") {
+        if (this.store.getMission(missionId)?.status === "BLOCKED") {
+          this.store.transitionMission(missionId, "WAITING_FOR_USER");
+        }
+        await this.store.flush();
+        return {
+          mission: this.store.getMission(missionId)!,
+          verdict,
+          completed: false,
+          failureReason: verdict.reasons.join("; ") || "awaiting operator clarification",
+        };
+      }
 
       const repairCandidate = this.store.getCandidate(missionId);
       if (repairCandidate) {
@@ -3680,6 +3761,20 @@ export class Orchestrator {
           // nothing; the second is a pipeline defect and must not be reported as
           // "the workers produced no work" — that would hide a lost integration.
           const committed = this.broker.hasCommittedWorkerWork(mission.mission_id);
+          // "No committed work" and "a worker proved there was nothing to do" are
+          // the same observable and used to be the same finding, which is what made
+          // a 34-hour loop out of a mission that was already finished: this finding
+          // is what recovery classifies, NOT the gate reason, so classifying it
+          // REVIEW_FAILED dispatched CREATE_REPAIR_TASKS and another implementer
+          // that reached the same conclusion, forever. A committed-but-lost branch
+          // stays exactly as before — that is a pipeline defect, and an assertion
+          // must never paper over a worker's lost work.
+          const asserted = committed
+            ? undefined
+            : latestAlreadySatisfied(
+                this.store.listTasks(mission.mission_id),
+                this.store.listExecutions(mission.mission_id),
+              );
           this.store.addFinding({
             mission_id: mission.mission_id,
             task_id: integ.task_id,
@@ -3689,11 +3784,15 @@ export class Orchestrator {
             line: null,
             summary: committed
               ? "Integration merged but the base checkout is unchanged despite committed worker work — a merge/harvest bug; the worker branches are preserved and must be inspected"
-              : "Integration produced no change: the worker branches held no committed work",
+              : `Integration produced no change: the worker branches held no committed work${
+                  asserted ? alreadySatisfiedClause(asserted) : ""
+                }`,
             evidence: null,
             recommended_action: committed
               ? "Inspect the preserved worker branches (git branch | grep pi-eng-orch) and the merge result; the worker's committed work must be recovered and integrated manually."
-              : "The implementer must actually edit files; harvested worktrees were empty.",
+              : asserted
+                ? "A worker concluded the objective needs no change and carried proof; nothing here can verify that. Confirm the assertion or restate the objective — do NOT dispatch another implementer to rediscover the same fact."
+                : "The implementer must actually edit files; harvested worktrees were empty.",
           });
         }
       }

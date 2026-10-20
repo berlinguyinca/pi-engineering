@@ -9,7 +9,7 @@ import { BlackholeManager } from "../../src/blackhole/BlackholeManager.ts";
 import type { MissionSnapshotFile } from "../../src/orchestration/missionSnapshot.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../../src/orchestration/supervisor.ts";
-import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
+import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 
@@ -1023,13 +1023,7 @@ test("sequential opens for one repository keep sharing the live mission view", a
 
 test("runtime exposes bounded redacted mission activity updates for persistent surfaces", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-live-surface-"));
-  const updates: Array<{
-    missionId: string;
-    phase: string;
-    summary: string;
-    activeWorkers: number;
-    lastHeartbeatAt?: string;
-  }> = [];
+  const updates: RuntimeMissionActivityEvent[] = [];
   try {
     const runtime = await EngineeringRuntime.open({
       cwd: root,
@@ -1046,11 +1040,16 @@ test("runtime exposes bounded redacted mission activity updates for persistent s
       workflow_class: "engineering",
     });
     runtime.missionObservability!.missionCreated(mission.mission_id, mission.title);
-    runtime.missionObservability!.workerStarted(mission.mission_id, "wk-1");
+    runtime.missionObservability!.workerStarted(mission.mission_id, "wk-1", {
+      model: "provider/backing-model",
+      route: "fast",
+    });
     const secret = `sk-${"s".repeat(32)}`;
     runtime.missionObservability!.activity(mission.mission_id, {
       type: "running_command",
       summary: `Running a very long command with ${secret} ${"detail ".repeat(80)}`,
+      output: true,
+      outputPreview: `Result: ${secret} tests passed`,
       workerId: "wk-1",
     });
     runtime.missionObservability!.heartbeat(mission.mission_id, "wk-1", { elapsedMs: 15_000 });
@@ -1064,6 +1063,14 @@ test("runtime exposes bounded redacted mission activity updates for persistent s
     assert.ok(latest.lastHeartbeatAt, "heartbeats must remain visible even when percentage does not move");
     assert.ok(latest.summary.length <= 240, `surface summary was not bounded: ${latest.summary.length}`);
     assert.doesNotMatch(latest.summary, /sk-ssss|\n|\r/);
+    assert.equal(latest.workersDetail?.[0]?.model, "provider/backing-model");
+    assert.equal(latest.workersDetail?.[0]?.route, "fast");
+    assert.ok(latest.observedAt);
+    assert.ok(latest.workersDetail?.[0]?.lastOutputAt);
+    assert.match(latest.workersDetail?.[0]?.lastOutputPreview ?? "", /tests passed/);
+    assert.doesNotMatch(JSON.stringify(latest.workersDetail), /sk-ssss/);
+    assert.doesNotMatch(JSON.stringify(latest.recentActivity), /sk-ssss/);
+    await runtime.close();
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1388,6 +1395,52 @@ test("maintenance rollback releases the dispatch gate without resuming stopped m
     const result = await runtime.orchestrator!.orchestrate("Hello", options);
     assert.equal(result.mission.status, "COMPLETE");
     assert.equal(runtime.missionStore!.listMissionResumptions().length, 0);
+  } finally {
+    await runtime?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("quiet mission activity refreshes locally each second without persisted heartbeat and stops on close", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-quiet-surface-"));
+  const updates: RuntimeMissionActivityEvent[] = [];
+  let runtime: EngineeringRuntime | undefined;
+  try {
+    runtime = await EngineeringRuntime.open({
+      cwd: root,
+      worker: new FakeWorkerExecutor({}),
+      onMissionActivity: (event) => updates.push(event),
+    });
+    await runtime.missionSupervisor!.shutdown();
+    const mission = runtime.missionStore!.createMission({
+      title: "Quiet worker",
+      goal: "Keep visibility",
+      user_request: "Keep visibility",
+      repository: root,
+      base_ref: "",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    runtime.missionObservability!.missionCreated(mission.mission_id, mission.title);
+    runtime.missionObservability!.workerStarted(mission.mission_id, "worker");
+    await runtime.missionStore!.flush();
+    await runtime.missionObservability!.flush();
+    await runtime.publishMissionSnapshot();
+    const before = updates.at(-1)!;
+    const count = runtime.orchestrationEvents().length;
+    const initialUpdates = updates.length;
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.ok(updates.length > initialUpdates, "a silent worker still gets clock-only redraws");
+    const after = updates.at(-1)!;
+    assert.notEqual(after.observedAt, before.observedAt);
+    assert.equal(after.lastHeartbeatAt, before.lastHeartbeatAt);
+    assert.equal(after.lastMeaningfulProgressAt, before.lastMeaningfulProgressAt);
+    assert.equal(after.lastOutputAt, undefined);
+    assert.equal(runtime.orchestrationEvents().length, count, "clock-only redraws append no durable events");
+    await runtime.close();
+    const closedCount = updates.length;
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.equal(updates.length, closedCount, "closed runtime emits no redraws");
   } finally {
     await runtime?.close();
     await rm(root, { recursive: true, force: true });

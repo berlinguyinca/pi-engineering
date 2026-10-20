@@ -10,6 +10,16 @@
 /** A normalized, unique identifier. */
 export type EntityId = string;
 
+/**
+ * A worker's evidenced conclusion that the objective needs NO change. Mirrors
+ * the `already_satisfied` parameter of the `worker_result` tool; declared here
+ * rather than imported because this file is deliberately dependency-free.
+ */
+export interface AlreadySatisfied {
+  reason: string;
+  proof: string;
+}
+
 /** Canonical mission lifecycle (spec 00 §4). */
 export type MissionStatus =
   | "NEW"
@@ -309,6 +319,16 @@ export interface Execution {
    * The completion gate counts only such a review for a recovery supersede.
    */
   reviewed_recovered?: EntityId[];
+  /**
+   * Worker executions only: the worker concluded that the objective needs NO
+   * change and carried the evidence for it (`worker_result`'s
+   * `already_satisfied`). Consumed by the completion gate and by recovery, so
+   * that "already satisfied on base" is a CONCLUSION rather than a failure to
+   * retry — without persisted state for it the fact died with the session and
+   * every repair task rediscovered it independently. Additive; absent on legacy
+   * events and on every execution that did not assert it.
+   */
+  already_satisfied?: AlreadySatisfied;
   /** Mission ownership generation at dispatch. Absent on legacy events. */
   mission_generation?: number;
   /** Explicit mission-resumption epoch at dispatch. Absent on legacy events. */
