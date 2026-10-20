@@ -6,7 +6,11 @@ import {
   type AutoSpecSubmission,
   StaleFencingTokenError,
 } from "../../src/adapters/Adapters.ts";
-import { type AutoSpecMissionSnapshot, ConcreteAutoSpecAdapter } from "../../src/adapters/AutoSpecAdapter.ts";
+import {
+  type AutoSpecMissionSnapshot,
+  ConcreteAutoSpecAdapter,
+  createConcreteAutoSpecAdapter,
+} from "../../src/adapters/AutoSpecAdapter.ts";
 
 const owner1: AutoSpecOwner = { ownerId: "pi-a", fencingToken: 3 };
 
@@ -212,4 +216,42 @@ test("cancel: a stale owner reports stale:true without throwing", async () => {
   assert.equal(takeover.cancelled, true);
   const late = await adapter.cancel(handle.externalId, owner1, "late");
   assert.deepEqual(late, { cancelled: false, stale: true });
+});
+
+test("observe: a read-only observer does not steal the fencing holder", async () => {
+  const deps = { submit: stubSubmit(), observe: stubObserve(), cancel: stubCancel() };
+  const adapter = make(deps);
+  const a: AutoSpecOwner = { ownerId: "pi-a", fencingToken: 1 };
+  const b: AutoSpecOwner = { ownerId: "pi-b", fencingToken: 2 };
+  const c: AutoSpecOwner = { ownerId: "pi-c", fencingToken: 0 };
+  const handle = await adapter.submit(submission({ owner: a }));
+  // B only reads state; its higher token must not make it the holder.
+  await adapter.observe(handle.externalId, b);
+  // Write path as original holder A still succeeds (A is NOT stale).
+  const cancel = await adapter.cancel(handle.externalId, a, "stop");
+  assert.deepEqual(cancel, { cancelled: true, stale: false });
+  // A stale reader (token below the holder) is still fenced out.
+  await assert.rejects(adapter.observe(handle.externalId, c), StaleFencingTokenError);
+});
+
+test("observe: a stale owner (token below the holder) still throws StaleFencingTokenError", async () => {
+  const deps = { submit: stubSubmit(), observe: stubObserve(), cancel: stubCancel() };
+  const adapter = make(deps);
+  const handle = await adapter.submit(submission()); // holder is pi-a@3
+  const stale: AutoSpecOwner = { ownerId: "pi-z", fencingToken: 2 };
+  await assert.rejects(adapter.observe(handle.externalId, stale), StaleFencingTokenError);
+});
+
+test("createConcreteAutoSpecAdapter: factory returns an adapter usable by submit (smoke)", async () => {
+  const deps = { submit: stubSubmit(), observe: stubObserve(), cancel: stubCancel() };
+  const adapter = createConcreteAutoSpecAdapter({
+    submit: deps.submit.fn,
+    observe: deps.observe.fn,
+    cancel: deps.cancel.fn,
+  });
+  assert.equal(adapter.name, "autospec");
+  const handle = await adapter.submit(submission());
+  assert.equal(handle.accepted, true);
+  assert.equal(handle.externalId, "MSN-ext-1");
+  assert.equal(deps.submit.calls.length, 1);
 });

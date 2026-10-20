@@ -80,6 +80,7 @@ export * from "./verify/farm/index.ts";
 export { runBenchmark, evaluateBenchmark } from "./bench/Benchmark.ts";
 export type { BenchmarkMetrics, BenchmarkBaseline, BenchmarkVerdict } from "./bench/Benchmark.ts";
 export { AdapterRegistry } from "./adapters/Adapters.ts";
+export { ConcreteAutoSpecAdapter, createConcreteAutoSpecAdapter } from "./adapters/AutoSpecAdapter.ts";
 export type { AutoSpecAdapter, InferWeaveAdapter } from "./adapters/Adapters.ts";
 // Orchestration module (spec pi-engineering-orchestration). Re-exported
 // explicitly to avoid colliding with the existing core/platform `TaskKind`,

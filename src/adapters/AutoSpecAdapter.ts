@@ -14,7 +14,8 @@
  * it only reads a snapshot (observe dependency) and drives submit/cancel
  * through the existing entry paths.
  *
- * Nothing outside `src/adapters/` imports this module.
+ * Re-exported from the public surface (`src/index.ts`) so runtime wiring can
+ * construct it; nothing else imports this module directly.
  */
 import {
   type AutoSpecAdapter,
@@ -174,7 +175,9 @@ export class ConcreteAutoSpecAdapter implements AutoSpecAdapter {
     let sequence: number;
     let lastProgressAt: string | undefined;
     if (run) {
-      run.holder = owner;
+      // An observer must NOT adopt fencing-holder ownership: a read-only
+      // caller that became run.holder would fence out the legitimate writer
+      // with its token. Only write paths (submit/cancel) move the holder.
       // The sequence is strictly monotonic: every observable read advances it
       // so a reader can tell this observation apart from the one before.
       run.sequence += 1;
@@ -199,4 +202,9 @@ export class ConcreteAutoSpecAdapter implements AutoSpecAdapter {
     }
     return { cancelled: result.cancelled, stale: false };
   }
+}
+
+/** Single construction surface for a future runtime wiring point. */
+export function createConcreteAutoSpecAdapter(options: AutoSpecAdapterOptions): ConcreteAutoSpecAdapter {
+  return new ConcreteAutoSpecAdapter(options);
 }
