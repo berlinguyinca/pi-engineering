@@ -607,3 +607,133 @@ test("wiring: a non-terminal stdout is never written to", async () => {
 
   assert.equal(written.filter((w) => w.includes("[2J")).length, 0, "no escape codes when stdout is not a terminal");
 });
+
+test("wiring: refresh accepts a timeout before the provider and clears its visible progress", async () => {
+  const cmd = loadWithCommands().get("refresh-models")!;
+  const dir = mkdtempSync(join(tmpdir(), "refresh-progress-wiring-"));
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const previousFetch = globalThis.fetch;
+  const path = join(dir, "models.json");
+  const before = JSON.stringify({
+    providers: {
+      remote: {
+        baseUrl: "https://refresh.example/v1",
+        models: [{ id: "flash-next", contextWindow: 8192 }],
+      },
+    },
+  });
+  writeFileSync(path, before);
+  process.env.PI_AGENT_DIR = dir;
+  let attempts = 0;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith("/models"))
+      return Response.json({ data: [{ id: "flash-next", ctx_per_request: 8192 }] });
+    attempts += 1;
+    return new Promise((_resolve, reject) =>
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true }),
+    );
+  }) as typeof fetch;
+  const { ctx, notices } = notifyingCtx();
+  const statuses: Array<string | undefined> = [];
+  const widgets: Array<string[] | undefined> = [];
+  try {
+    await cmd.handler("--timeout 1 remote", {
+      ...ctx,
+      ui: {
+        ...ctx.ui,
+        setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+        setWidget: (_key: string, value: string[] | undefined) => widgets.push(value),
+      },
+    });
+    assert.equal(attempts, 2, "CLI timeout must reach both probe attempts");
+    assert.ok(statuses.some((value) => /remote.*0%/.test(value ?? "")));
+    assert.ok(widgets.some((value) => /flash-next/.test(value?.join(" ") ?? "")));
+    assert.ok(widgets.some((value) => /attempt 2/.test(value?.join(" ") ?? "")));
+    assert.equal(statuses.at(-1), undefined);
+    assert.equal(widgets.at(-1), undefined);
+    assert.match(notices[0]?.text ?? "", /probe timed out/);
+    assert.equal(readFileSync(path, "utf8"), before);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wiring: refresh rejects invalid timeout and unknown arguments before accessing the gateway", async () => {
+  const cmd = loadWithCommands().get("refresh-models")!;
+  for (const args of [
+    "--timeout",
+    "--timeout 0",
+    "--timeout Infinity",
+    "--timeout 3601",
+    "--timeout abc",
+    "--timeout -5",
+    "--unknown",
+    "one two",
+  ]) {
+    const { ctx, notices } = notifyingCtx();
+    await cmd.handler(args, { ...ctx, signal: AbortSignal.abort() });
+    assert.equal(notices[0]?.level, "error");
+    assert.match(notices[0]?.text ?? "", /usage:|timeout.*1.*3600/i);
+  }
+});
+
+for (const cancel of [false, true]) {
+  test(`wiring: refresh progress ${cancel ? "clears on cancellation" : "shows 0, 50 and 100 percent with alias identity"}`, async () => {
+    const cmd = loadWithCommands().get("refresh-models")!;
+    const dir = mkdtempSync(join(tmpdir(), "refresh-visible-"));
+    const previousAgentDir = process.env.PI_AGENT_DIR;
+    const previousFetch = globalThis.fetch;
+    const path = join(dir, "models.json");
+    const before = JSON.stringify({ providers: { remote: { baseUrl: "https://refresh.example/v1", models: [] } } });
+    writeFileSync(path, before);
+    process.env.PI_AGENT_DIR = dir;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) =>
+      init?.method === "POST"
+        ? Response.json({ choices: [{ message: { content: "OK" } }] })
+        : Response.json({
+            data: [
+              { id: "fast", x_alias: true, x_backing_model: "qwen" },
+              { id: "qwen", ctx_per_request: 8192 },
+            ],
+          })) as typeof fetch;
+    const { ctx, notices } = notifyingCtx();
+    const controller = new AbortController();
+    const statuses: Array<string | undefined> = [];
+    const widgets: Array<string[] | undefined> = [];
+    try {
+      await cmd.handler("remote --dry-run", {
+        ...ctx,
+        signal: controller.signal,
+        ui: {
+          ...ctx.ui,
+          setStatus: (_key: string, value: string | undefined) => statuses.push(value),
+          setWidget: (_key: string, value: string[] | undefined) => {
+            widgets.push(value);
+            if (cancel && value?.join(" ").includes("Probing")) controller.abort();
+          },
+        },
+      });
+      assert.ok(widgets.some((value) => /Probing fast → qwen \(alias\)/.test(value?.join(" ") ?? "")));
+      if (cancel) assert.equal(notices[0]?.level, "error");
+      else {
+        const percentages = statuses
+          .filter(Boolean)
+          .map((value) => value!.match(/(\d+)%/)?.[1])
+          .filter(Boolean);
+        assert.deepEqual([...new Set(percentages)], ["0", "50", "100"]);
+        assert.equal(notices[0]?.level, "info");
+      }
+      assert.equal(statuses.at(-1), undefined);
+      assert.equal(widgets.at(-1), undefined);
+      assert.equal(readFileSync(path, "utf8"), before);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+      else process.env.PI_AGENT_DIR = previousAgentDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

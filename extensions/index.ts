@@ -44,7 +44,7 @@ import { guardFeedFor } from "../src/guard/streamText.ts";
 import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig } from "../src/models/modelsConfig.ts";
-import { refreshConfiguredProviders } from "../src/models/refresh.ts";
+import { DEFAULT_PROBE_TIMEOUT_MS, refreshConfiguredProviders } from "../src/models/refresh.ts";
 import { registerModelTabs } from "../src/models/registerModelTabs.ts";
 import {
   MISSION_UNAVAILABLE_RETRY_TURNS,
@@ -1234,14 +1234,31 @@ ${RECOVERY_PROMPT}`;
   // fails, and because Pi computes usage from the configured window, compaction
   // fires far too late to save the turn.
   pi.registerCommand("refresh-models", {
-    description: "Refresh models.json with inference-tested working models. --dry-run to preview.",
+    description:
+      "Refresh models.json with visible probe progress. [provider] [--timeout seconds] [--dry-run] [--prune].",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const dryRun = argv.includes("--dry-run");
       const pruneMissing = argv.includes("--prune");
-      const explicitProvider = argv.find((a) => !a.startsWith("--"));
+      let explicitProvider: string | undefined;
+      let probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS;
 
       try {
+        for (let i = 0; i < argv.length; i += 1) {
+          const arg = argv[i]!;
+          if (arg === "--dry-run" || arg === "--prune") continue;
+          if (arg === "--timeout") {
+            const seconds = Number(argv[++i]);
+            if (!Number.isFinite(seconds) || seconds < 1 || seconds > 3600) {
+              throw new Error("--timeout must be a number between 1 and 3600 seconds");
+            }
+            probeTimeoutMs = seconds * 1000;
+          } else if (arg.startsWith("--") || explicitProvider) {
+            throw new Error("usage: /refresh-models [provider] [--timeout seconds] [--dry-run] [--prune]");
+          } else {
+            explicitProvider = arg;
+          }
+        }
         // Unlike status-only commands, refresh must surface malformed JSON:
         // treating it as an empty config could overwrite the operator's file.
         const configuredProviders = Object.keys(readModelsConfig(defaultModelsPath()).providers ?? {});
@@ -1279,6 +1296,27 @@ ${RECOVERY_PROMPT}`;
           ...(dryRun ? { dryRun: true } : {}),
           ...(pruneMissing ? { pruneMissing: true } : {}),
           probeModels: true,
+          probeTimeoutMs,
+          onProgress: (progress) => {
+            const percent = progress.total > 0 ? Math.floor((progress.completed * 100) / progress.total) : 0;
+            const filled = Math.floor(percent / 10);
+            const bar = `[${"#".repeat(filled)}${"-".repeat(10 - filled)}]`;
+            const summary =
+              progress.phase === "listing"
+                ? `${progress.providerId}: discovering models…`
+                : `${progress.providerId} ${bar} ${percent}% (${progress.completed}/${progress.total} probed)`;
+            const timing = progress.attempt
+              ? ` · attempt ${progress.attempt}/2 · ${Math.floor(progress.elapsedMs / 1000)}s / ${(progress.timeoutMs ?? probeTimeoutMs) / 1000}s`
+              : "";
+            const detail =
+              progress.phase === "complete"
+                ? "Probes finished; preparing results…"
+                : progress.phase === "listing"
+                  ? "Fetching gateway catalogue…"
+                  : `Probing ${progress.modelId}${progress.backingModel ? ` → ${progress.backingModel} (alias)` : ""}${timing}`;
+            ctx.ui.setStatus?.("model-refresh", summary);
+            ctx.ui.setWidget?.("model-refresh", [summary, detail]);
+          },
           ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
         if (result.results.length === 0) {
@@ -1290,6 +1328,9 @@ ${RECOVERY_PROMPT}`;
           `refresh-models failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
           "error",
         );
+      } finally {
+        ctx.ui.setStatus?.("model-refresh", undefined);
+        ctx.ui.setWidget?.("model-refresh", undefined);
       }
     },
   });
