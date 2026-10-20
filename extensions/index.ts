@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
+import { createIngestFromEnv } from "../src/runtime/herdr/ingestFromEnv.ts";
+import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -333,6 +336,9 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
+  const attentionIngest = createIngestFromEnv(process.env);
+  const attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
+  let attentionReady = false;
   const opening = EngineeringRuntime.open({
     cwd,
     verifier: new CommandVerifier(),
@@ -350,7 +356,10 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       };
       if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
     },
-    onMissionActivity: (event) => publishMissionActivity(key, event),
+    onMissionActivity: (event) => {
+      publishMissionActivity(key, event);
+      if (attentionReady) void attention?.update(event).catch(() => {});
+    },
     // Pipeline progress -> status footer. Best-effort and read-only: the
     // runtime swallows anything thrown here, and the footer is the only
     // consumer today (the panel will subscribe to the same events).
@@ -373,7 +382,15 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       if (event.model) footer.setProducingModel(event.model);
     },
     ...(blackhole ? { blackhole } : {}),
-  }).then((runtime) => ({ runtime, memoryIdentity }));
+  }).then((runtime) => {
+    // Reconnect establishes a baseline; old terminal/stalled missions must not alert again.
+    for (const mission of runtime.missionStore?.listMissions() ?? []) {
+      const summary = runtime.missionObservability?.summary(mission.mission_id);
+      if (summary) attention?.seed({ ...summary, operatorPausedAt: mission.operator_paused_at });
+    }
+    attentionReady = true;
+    return { runtime, memoryIdentity };
+  });
   const openKey = `${key}\0${memoryIdentity}`;
   const entry: RuntimeOpen = { generation: openGeneration, promise: opening };
   runtimeOpens.set(openKey, entry);
@@ -396,14 +413,33 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
 export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
   phase: string;
   detail: string;
-  missionStatus: { token: string; reason: string; next: string };
+  missionStatus: { token: string; reason: string; next: string; live?: string };
 } {
-  const heartbeat = event.lastHeartbeatAt ? ` · hb ${new Date(event.lastHeartbeatAt).toISOString().slice(11, 19)}` : "";
+  const now = event.observedAt ? Date.parse(event.observedAt) : Date.now();
+  const age = (at?: string | null) => missionActivityAge(at, now);
+  const liveWorkers = event.workersDetail?.filter((entry) => entry.status === "running" || entry.status === "waiting");
+  const worker =
+    liveWorkers?.find((entry) => entry.health === "stalled") ??
+    liveWorkers?.[0] ??
+    event.workersDetail?.find((entry) => entry.status === "failed" || entry.status === "completed");
+  const activity = (worker?.currentActivity ?? event.summary).replace(/\s+/g, " ").slice(0, 100);
+  const duration = worker?.currentActivityStartedAt ? ` for ${age(worker.currentActivityStartedAt)}` : "";
+  const lastHeartbeat = worker ? worker.lastHeartbeatAt : event.lastHeartbeatAt;
+  const lastProgress = worker ? worker.lastMeaningfulProgressAt : event.lastMeaningfulProgressAt;
+  const heartbeat = ` · heartbeat ${age(lastHeartbeat)}${lastHeartbeat ? " ago" : ""}`;
+  const lastOutput = worker ? worker.lastOutputAt : event.lastOutputAt;
+  const output = `output ${age(lastOutput)}${lastOutput ? " ago" : ""}`;
+  const progress = `progress ${age(lastProgress)}${lastProgress ? " ago" : ""}`;
+  const model = worker?.model ? ` · ${worker.route ? `${worker.route} → ` : ""}${worker.model}` : "";
+  const waiting = event.waitingReason
+    ? ` · wait ${event.waitingReason.replaceAll("_", " ")}${event.waitingSince ? ` for ${age(event.waitingSince)}` : ""}`
+    : "";
+  const live = `${event.health.toUpperCase()} · ${activity.slice(0, 36)}${duration} · ${output}`;
   const workers = ` · workers ${event.activeWorkers} active/${event.waitingWorkers} waiting/${event.failedWorkers} failed`;
-  const lastProgress = event.lastMeaningfulProgressAt ?? "none";
+
   const compact = (value: string | null, fallback: string, length = 80) => (value ?? fallback).slice(0, length);
   const scope =
-    `repo ${compact(event.repository, "unknown")} · task ${compact(event.task, "none")} · ` +
+    `repo ${compact(event.repository, "unknown")} · task ${compact(worker?.taskId ?? event.task, "none")} · ` +
     `owner ${compact(event.owner, "unowned")}`;
   const recovery = `recovery ${event.recovery.attempt}/${event.recovery.maxAttempts}`;
   const next = `next ${event.nextAction.slice(0, 120)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`;
@@ -425,12 +461,13 @@ export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
       `(${event.acceptanceCoverage.approximatePercent}%) · workflow ${event.workflowProgress.completed}/` +
       `${event.workflowProgress.total} (${event.workflowProgress.approximatePercent}%) · ${event.health}`,
     detail:
-      `${event.summary.slice(0, 120)}${workers}${heartbeat} · ${scope} · last progress ${lastProgress} · ` +
+      `Now: ${activity}${duration} · ${output}${heartbeat} · ${progress}${model}${waiting}${workers} · ${scope} · ` +
       `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}${pin}`,
     missionStatus: pausedByOperator
       ? { token, reason: "paused by the operator (Esc); automatic repair is off", next: pausedByOperator }
       : {
           token,
+          live,
           reason: event.reason.slice(0, 160),
           next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
         },
@@ -1927,12 +1964,17 @@ ${RECOVERY_PROMPT}`;
   // never depends on it (the semantic tool + runtime gate enforce policy).
   // Planner/worker execution mode (docs/specs/planner-worker-hot-model-routing.md):
   // /engineering-* commands, and the mode `/mission` consults before orchestrating.
+  const plannerAttentionIngest = createIngestFromEnv(process.env);
+  const plannerAttention = plannerAttentionIngest ? new MissionAttentionReporter(plannerAttentionIngest) : null;
   const plannerWorker = registerPlannerWorker(pi, {
     host: async (ctx) => {
       const rt = await getRuntime(ctx);
       return {
         repoRoot: rt.git?.root ?? rt.cwd,
         worker: rt.worker,
+        reportAttention: (snapshot: Parameters<MissionAttentionReporter["update"]>[0]) => {
+          void plannerAttention?.update(snapshot).catch(() => {});
+        },
         // Live missions an operator paused or pinned, for /engineering-status.
         missionControlLines: () =>
           (rt.missionStore?.listMissions() ?? [])
@@ -1953,7 +1995,7 @@ ${RECOVERY_PROMPT}`;
 
   pi.registerCommand("mission", {
     description:
-      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
+      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission inspect <missionId> [workerId] shows recent activity; /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
@@ -1983,6 +2025,23 @@ ${RECOVERY_PROMPT}`;
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         }
+        return;
+      }
+      const inspect = /^inspect\s+(\S+)(?:\s+(\S+))?\s*$/i.exec(request);
+      if (/^inspect(?:\b|[:=])/i.test(request) && !inspect) {
+        ctx.ui.notify("/mission inspect <missionId> [workerId]", "error");
+        return;
+      }
+      if (inspect?.[1]) {
+        const rt = await openRuntime();
+        if (!rt) return;
+        const projection = rt.missionObservability?.projection(inspect[1]);
+        ctx.ui.notify(
+          projection
+            ? formatMissionInspection(projection, inspect[2])
+            : `No recorded telemetry for mission ${inspect[1]}.`,
+          projection ? "info" : "warning",
+        );
         return;
       }
       const why = /^why\s+(\S+)\s*$/i.exec(request);
@@ -2077,10 +2136,8 @@ ${RECOVERY_PROMPT}`;
       if (await plannerWorker.runIfSelected(newRequest, ctx)) return;
       const baseRef = (await rt.git?.headCommit().catch(() => "")) ?? "";
       ctx.ui.notify("Routing intent and running orchestration mission...", "info");
-      // Stream live mission/task progress to the operator instead of blocking
-      // silently for the whole worker budget (a long mission used to show one
-      // line, then nothing for 30+ minutes). Each task/phase transition is
-      // surfaced as a compact progress line as it happens.
+      // Persistent mission surfaces receive live activity separately. Keep the
+      // session guard informed without creating a notice for each timer tick.
       let lastLine = "";
       const result = await rt.orchestrator.orchestrate(newRequest, {
         repository: rt.cwd,
@@ -2096,7 +2153,6 @@ ${RECOVERY_PROMPT}`;
           if (line === lastLine) return;
           lastLine = line;
           activeControl?.missionProgress(line);
-          ctx.ui.notify(line, "info");
         },
       });
       const m = result.mission;
@@ -2167,6 +2223,8 @@ ${RECOVERY_PROMPT}`;
         return [
           `- ${m.mission_id} [${m.status}] rev ${m.revision} ${m.workflow_class} — ${m.title}`,
           ...(m.execution_mode ? [`  execution mode: ${m.execution_mode.mode} — ${m.execution_mode.reason}`] : []),
+          `  now: ${summary?.currentActivity?.summary ?? summary?.reason ?? "no activity recorded"} · heartbeat ${missionActivityAge(summary?.lastHeartbeatAt)} · progress ${missionActivityAge(summary?.lastMeaningfulProgressAt)}`,
+          `  inspect: /mission inspect ${m.mission_id} [workerId]`,
           `  ${acceptanceText} · workflow ${workflow.completed}/${workflow.total} (${workflow.approximatePercent}%) · health ${summary?.health ?? "unknown"}`,
           `  repo ${summary?.repository ?? m.repository} · task ${summary?.task ?? "none"} · owner ${summary?.owner ?? "unowned"} · last progress ${summary?.lastMeaningfulProgressAt ?? "none"}`,
           // P4: routing provenance — which model serves which task.

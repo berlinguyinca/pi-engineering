@@ -31,7 +31,8 @@ import { Scheduler } from "../sched/Scheduler.ts";
 import { DEFAULT_STAGE_INACTIVITY_MS, runWithInactivityGuard } from "../verify/Verifier.ts";
 import { sanitizeVerifierEnv } from "../verify/childEnv.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
-import { WAITING_FOR_INFERENCE_SUMMARY } from "../workers/activity.ts";
+import { WAITING_FOR_INFERENCE_SUMMARY, safeToolCommandLabel } from "../workers/activity.ts";
+import { PlannerActivity, type PlannerLiveSnapshot } from "./activity.ts";
 import { planTransition } from "./compatibility.ts";
 import { dagLayers, scopeConflict } from "./contract.ts";
 import { ConvergenceTracker, nextLadderAction, observeAttempt } from "./convergence.ts";
@@ -94,7 +95,7 @@ const WORKER_ROLE: Readonly<Record<PlannerWorkerRole, WorkerRole>> = {
 };
 
 export interface PlannerWorkerEvent {
-  type: "phase" | "contract" | "transition" | "stalled" | "replan";
+  type: "phase" | "contract" | "transition" | "stalled" | "replan" | "activity";
   text: string;
   task_id?: string;
   status?: ContractStatus;
@@ -166,13 +167,14 @@ async function git(cwd: string, args: string[]): Promise<{ code: number; stdout:
 export async function runVerification(
   command: string,
   cwd: string,
-  opts: { inactivityMs?: number; signal?: AbortSignal } = {},
+  opts: { inactivityMs?: number; signal?: AbortSignal; onOutput?: () => void } = {},
 ): Promise<VerificationRun> {
   const started = Date.now();
   try {
     const r = await runWithInactivityGuard("sh", ["-c", command], {
       cwd,
       env: verificationEnv(),
+      onOutput: opts.onOutput,
       inactivityMs: opts.inactivityMs ?? DEFAULT_STAGE_INACTIVITY_MS,
       ...(opts.signal ? { signal: opts.signal } : {}),
     });
@@ -201,6 +203,25 @@ export function plannerStateTempPath(stateDir: string): string {
 
 export class PlannerWorkerExecutor {
   private readonly opts: PlannerWorkerOptions;
+  private readonly activity = new PlannerActivity();
+  private lastActivityPersist = 0;
+
+  liveSnapshot(): PlannerLiveSnapshot {
+    return {
+      status: this.status,
+      passed: [...this.contracts.values()].filter((rt) => rt.state.status === "passed").length,
+      total: this.contracts.size,
+      activity: this.activity.snapshot(),
+    };
+  }
+
+  private activityChanged(task: string, force = false): void {
+    this.emit({ type: "activity", task_id: task, text: "Worker activity updated" });
+    if (force || Date.now() - this.lastActivityPersist >= 1000) {
+      this.lastActivityPersist = Date.now();
+      void this.persist();
+    }
+  }
   private readonly ladder: EscalationLadder;
   private readonly tracker: ConvergenceTracker;
   readonly transitions: TransitionLog;
@@ -240,12 +261,17 @@ export class PlannerWorkerExecutor {
     }
   }
 
+  /** True after exclusive ownership and, for resumes, persisted-state validation. */
+  get hasStartedExecution(): boolean {
+    return this.started > 0;
+  }
+
   async run(brief: MissionBrief): Promise<PlannerWorkerReport> {
     this.brief = brief;
-    this.started = Date.now();
     // One live owner per mission: a concurrent resume would delete our worktrees.
     const lock = await acquireMissionLock(this.opts.stateDir);
     try {
+      this.started = Date.now();
       const repo = await GitRepo.open(this.opts.repoRoot);
       if (!repo) throw new Error(`${this.opts.repoRoot} is not a git repository`);
       this.repo = repo;
@@ -628,14 +654,32 @@ export class PlannerWorkerExecutor {
     if (run.result.status !== "failed") {
       for (const cmd of rt.state.correction?.verification ?? c.verification) {
         if (this.opts.signal?.aborted) break;
-        rt.verification.push(
-          await runVerification(cmd, rt.worktree!.path, {
-            ...(this.opts.verificationInactivityMs !== undefined
-              ? { inactivityMs: this.opts.verificationInactivityMs }
-              : {}),
-            ...(this.opts.signal ? { signal: this.opts.signal } : {}),
-          }),
+        const inactivityMs = this.opts.verificationInactivityMs ?? DEFAULT_STAGE_INACTIVITY_MS;
+        const activityId = this.activity.start(c.task_id, "verification", undefined, undefined, inactivityMs);
+        const commandLabel = safeToolCommandLabel(cmd) ?? "verification command";
+        this.activity.describe(activityId, `Verifying: ${commandLabel}`);
+        this.activityChanged(c.task_id, true);
+        const verification = await runVerification(cmd, rt.worktree!.path, {
+          inactivityMs,
+          onOutput: () => {
+            this.activity.output(activityId);
+            this.activityChanged(c.task_id);
+          },
+          ...(this.opts.signal ? { signal: this.opts.signal } : {}),
+        });
+        rt.verification.push(verification);
+        this.activity.setOutputPreview(activityId, verification.output_tail);
+        if (verification.exit_code === 124 && verification.output_tail.includes("hung command")) {
+          const reason = `verification produced no output for ${inactivityMs}ms`;
+          this.activity.stall(activityId, reason);
+          this.emit({ type: "stalled", task_id: c.task_id, text: reason });
+        }
+        this.activity.describe(
+          activityId,
+          `Verification ${verification.passed ? "passed" : "failed"} (exit ${verification.exit_code}): ${commandLabel}`,
         );
+        this.activity.finish(activityId, verification.passed ? "completed" : "failed");
+        this.activityChanged(c.task_id, true);
       }
     }
     const failedVerification = rt.verification.filter((v) => !v.passed);
@@ -862,7 +906,12 @@ export class PlannerWorkerExecutor {
     for (let guard = 0; guard < 8; guard++) {
       await this.syncRoutes(task, role);
       const t0 = Date.now();
-      const run = await this.watched({ ...req, ...(resolved ? { modelOverride: resolved.model } : {}) });
+      const run = await this.watched(
+        { ...req, ...(resolved ? { modelOverride: resolved.model } : {}) },
+        role,
+        task,
+        resolved?.backing,
+      );
       this.telemetry.invocation(role, modelName(resolved), run, Date.now() - t0);
       this.observeRoute(run, role, task);
       if (this.opts.signal?.aborted) return run;
@@ -872,7 +921,21 @@ export class PlannerWorkerExecutor {
       strikes += 1;
       this.telemetry.count(role, modelName(resolved), "retry");
       if (decision.action === "wait") {
-        await sleep(decision.ms, this.opts.signal);
+        const waitId = this.activity.start(
+          task,
+          role,
+          resolved.model,
+          resolved.backing,
+          this.opts.workerInactivityMs ?? workerInactivityMs(),
+        );
+        this.activity.describe(waitId, `Waiting to retry: ${availability.code}`, Date.now(), Date.now() + decision.ms);
+        this.activityChanged(task, true);
+        try {
+          await sleep(decision.ms, this.opts.signal);
+        } finally {
+          this.activity.finish(waitId, "completed");
+          this.activityChanged(task, true);
+        }
         continue;
       }
       if (decision.action === "retry_same") continue;
@@ -899,13 +962,20 @@ export class PlannerWorkerExecutor {
    * gateway capacity without a retry cap. A total-duration limit exists only
    * when the operator opts in (`workerTimeoutMs`).
    */
-  private async watched(req: WorkerRequest): Promise<WorkerRun> {
+  private async watched(
+    req: WorkerRequest,
+    role: PlannerWorkerRole,
+    task: string,
+    backing?: string,
+  ): Promise<WorkerRun> {
     const ctl = new AbortController();
     const mission = this.opts.signal;
     const onMissionAbort = (): void => ctl.abort(mission?.reason);
     if (mission?.aborted) onMissionAbort();
     else mission?.addEventListener("abort", onMissionAbort, { once: true });
     const windowMs = this.opts.workerInactivityMs ?? workerInactivityMs();
+    const activityId = this.activity.start(task, role, req.modelOverride, backing, windowMs);
+    this.activityChanged(task, true);
     let lastActivity = Date.now();
     let waitingForInference = false;
     const onActivity = (event: WorkerActivity): void => {
@@ -913,6 +983,8 @@ export class PlannerWorkerExecutor {
         lastActivity = Date.now();
         waitingForInference = event.summary === WAITING_FOR_INFERENCE_SUMMARY;
       }
+      this.activity.note(activityId, event);
+      this.activityChanged(task);
       req.onActivity?.(event);
     };
     const watchdog = setInterval(
@@ -921,7 +993,11 @@ export class PlannerWorkerExecutor {
         const now = Date.now();
         if (waitingForInference) lastActivity = now;
         else if (now - lastActivity >= windowMs) {
-          ctl.abort(new DOMException(`worker showed no activity for ${windowMs}ms (hung worker)`, "InactivityError"));
+          const reason = `worker showed no activity for ${windowMs}ms (hung worker)`;
+          this.activity.stall(activityId, reason);
+          this.emit({ type: "stalled", task_id: task, text: reason });
+          this.activityChanged(task, true);
+          ctl.abort(new DOMException(reason, "InactivityError"));
         }
       },
       Math.max(5, Math.min(30_000, Math.floor(windowMs / 4))),
@@ -935,8 +1011,14 @@ export class PlannerWorkerExecutor {
             limit,
           );
     try {
-      return await this.opts.worker.run({ ...req, signal: ctl.signal, onActivity, unboundedInferenceWait: true });
+      const run = await this.opts.worker.run({ ...req, signal: ctl.signal, onActivity, unboundedInferenceWait: true });
+      this.activity.finish(activityId, run.result.status === "completed" ? "completed" : "failed");
+      return run;
+    } catch (error) {
+      this.activity.finish(activityId, "failed");
+      throw error;
     } finally {
+      this.activityChanged(task, true);
       clearInterval(watchdog);
       if (deadline) clearTimeout(deadline);
       mission?.removeEventListener("abort", onMissionAbort);
@@ -1416,6 +1498,7 @@ export class PlannerWorkerExecutor {
       integration_path: this.integration?.path ?? null,
       planner_model: this.plannerModel,
       plan: this.plan,
+      live_activity: this.activity.snapshot(),
       updated_at: new Date().toISOString(),
     });
     this.persistQueue = this.persistQueue

@@ -339,3 +339,31 @@ test("snapshot writes nullable timing fields and combines checkpoint and stopped
   assert.ok(snapshot.preservedWork.includes("branch-preserved"));
   assert.ok(snapshot.preservedWork.includes("artifact://stopped-work"));
 });
+
+test("snapshot includes timestamps needed for clients to animate mission activity without new writes", () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store });
+  const m = mission(store, "live snapshot");
+  obs.missionCreated(m.mission_id, m.title);
+  const projection = obs.projection(m.mission_id)!;
+  projection.summary.waitingSince = "2026-10-20T12:00:00Z";
+  projection.workers = [
+    {
+      workerId: "worker",
+      state: "running",
+      lastOutputAt: "2026-10-20T12:00:05Z",
+      currentActivityStartedAt: "2026-10-20T12:00:02Z",
+      repeatedFileReads: 0,
+      repeatedToolCalls: 0,
+      repeatedErrors: 0,
+      repeatedCycles: 0,
+    },
+  ];
+  projection.summary.currentActivity = { type: "running_command", summary: "running tests", workerId: "worker" };
+  const snapshot = buildMissionSnapshotFile([{ mission: m, tasks: [], findings: [], observability: projection }])
+    .missions[0]!.observability!;
+  assert.equal(snapshot.waitingSince, "2026-10-20T12:00:00Z");
+  assert.equal(snapshot.lastOutputAt, "2026-10-20T12:00:05Z");
+  assert.equal(snapshot.currentActivityStartedAt, "2026-10-20T12:00:02Z");
+});

@@ -514,6 +514,7 @@ restart.
 
 | Command        | Effect                                                        |
 | -------------- | ------------------------------------------------------------- |
+| `/mission inspect <id> [workerId]` | Inspect current worker/model routing, recent activity (last 20 summaries), changed files, tests, retries, recovery and blockers. Supply a worker ID to filter its activity. |
 | `/mission why <id>` | Explains why a mission is not finishing: blocking task, failure category and reason, who holds the repository lease or custody (session and pid), cooldown scope and `nextActionAt`, retry counters, inherited failures, stranded branches, per-task typed usage (tokens, wall-time split, attempts, stream resumes, thinking), per-model error rollups (429, 404, connect-refused, stream stall, takeover, grammar 400) and the exact remedy command. Offline equivalent: `pi-engineering missions why --store <dir> <id> [--json]`. |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
@@ -1096,3 +1097,44 @@ Without `INFERWEAVE_BASE_URL` the integration is inert and the footer shows
 context only when Pi reports a window. The floor when nothing trustworthy is
 known is **128 000** tokens — never 260 000/262 144, which came from an admission
 implementation rather than from any model.
+
+
+### Live mission activity
+
+A visible mission footer refreshes every second while the mission is active. It shows health,
+current activity, elapsed activity/wait time, last output, worker heartbeat and last meaningful
+progress. These timestamps stay separate: a heartbeat proves the worker is alive, not that its
+work advanced. Acceptance and workflow counts remain evidence-based; model calls show elapsed
+time instead of a made-up completion percentage. A slow or stalled mission keeps its health
+and current activity visible even on narrow terminals.
+
+The serving model is shown as `route → provider/model` when both are recorded; this identifies
+the backing model without renaming aliases. Missing telemetry reads `not recorded`.
+`/mission-status` lists missions and `/mission inspect <id> [workerId]` opens a bounded readout
+of recorded activity, files, test failures/retries and blockers. Each worker also shows its latest
+captured tool output preview when available: actual tool result/update text with secrets and
+terminal control sequences removed, capped at 1,000 characters. Until a tool emits captured output,
+the inspector says `not recorded`. Model messages and private reasoning are never used as output
+previews. These previews appear in inspection, not compact bars or HerdR attention notifications.
+
+The mission refresh timer stops for completed, failed, canceled or operator-paused missions and
+on runtime shutdown. Local footer refreshes do not create repeated notices. With the existing
+`HERDR_INGEST_URL` integration configured, HerdR receives one attention event when a mission
+finishes, fails/crashes, or becomes stalled. Routine progress and heartbeats do not notify HerdR;
+a recovered mission can alert again if it stalls again. Reconnecting seeds current state without
+re-alerting about historical terminal or stalled missions.
+
+Stall detection is evaluated on the next live tick once the configured criteria are met. Defaults
+are slow after two minutes and stalled after five minutes without meaningful progress, together
+with the recorded silence/loop evidence; a normal quiet model request is not automatically a crash.
+Planner-worker missions use their configured silence watchdog and display its limit.
+
+Planner-worker missions also update their persistent widget/status once per second. Use
+`/engineering-workers [task]` to inspect a task's bounded recent activity, changed files and
+recorded result/blocker, or `/engineering-status` for the current activity summary. Verified
+contract counts determine percentage; live timers do not advance it.
+
+External web consumers receive additive `waitingSince`, `lastOutputAt`,
+`currentActivityStartedAt` and worker timing fields in the mission snapshot. They should derive
+elapsed times from these timestamps locally. This package does not control the separate web
+plugin's redraw loop; the runtime does not rewrite snapshots every second just to animate a timer.

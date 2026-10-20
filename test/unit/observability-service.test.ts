@@ -525,3 +525,154 @@ test("a recent transition update suppresses the quiet-period summary", async () 
   assert.ok(h.updates.length > before, "quiet summary fires once the interval elapses");
   assert.ok(h.updates.some((m) => m.includes("Still running")));
 });
+
+test("real worker output timestamps stay independent of heartbeat and describe active command", () => {
+  const h = harness();
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "worker", { model: "provider/actual-model", route: "fast" });
+  h.clock.advance(1000);
+  h.obs.activity(id, { type: "running_command", summary: "Running tests", workerId: "worker" });
+  assert.equal(h.obs.projection(id)!.workers[0]!.lastOutputAt, undefined, "starting a command is not output");
+  h.obs.activity(id, { type: "running_command", summary: "Running tests", workerId: "worker", output: true });
+  h.clock.advance(1000);
+  h.obs.heartbeat(id, "worker");
+  const worker = h.obs.projection(id)!.workers[0]!;
+  assert.equal(worker.lastOutputAt, "2024-01-01T00:00:01.000Z");
+  assert.equal(worker.currentActivityStartedAt, "2024-01-01T00:00:01.000Z");
+  assert.equal(worker.lastHeartbeatAt, "2024-01-01T00:00:02.000Z");
+});
+
+test("known wait deadline expires while an unbounded legitimate wait stays waiting", () => {
+  const h = harness();
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "worker");
+  h.obs.setWaiting(id, "model_request", "Waiting for model", "2024-01-01T00:00:10.000Z");
+  h.clock.advance(10_000);
+  assert.equal(h.obs.summary(id)!.health, "stalled");
+  h.obs.clearWaiting(id);
+  h.obs.setWaiting(id, "inferweave_admission", "Queued for capacity");
+  h.clock.advance(24 * 60 * 60_000);
+  assert.equal(h.obs.summary(id)!.health, "waiting");
+});
+
+test("confirmed repeated no-progress loops surface as stalled despite current heartbeats", () => {
+  const h = harness({ stallAfterMs: 1000 });
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "worker");
+  for (let i = 0; i < 8; i++) h.obs.noteWorkerRead(id, "worker", "unchanged.ts");
+  h.clock.advance(1001);
+  h.obs.heartbeat(id, "worker");
+  assert.equal(h.obs.summary(id)!.health, "stalled");
+});
+
+test("controller heartbeat reporting stale worker activity does not hide a hung worker", () => {
+  const h = harness({ stallAfterMs: 1000, slowAfterMs: 500 });
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "worker");
+  h.clock.advance(2000);
+  h.obs.heartbeat(id, "worker", { lastActivityMs: 2000 });
+  assert.equal(h.obs.summary(id)!.health, "stalled");
+  assert.equal(h.obs.projection(id)!.workers[0]!.lastOutputAt, undefined);
+  h.obs.activity(id, { type: "running_command", summary: "New command", workerId: "worker" });
+  assert.equal(h.obs.summary(id)!.health, "slow", "real new work clears the stale activity signal");
+});
+
+test("unbounded capacity wait survives stale controller heartbeats and resumes on real work", () => {
+  const h = harness({ stallAfterMs: 1000, slowAfterMs: 500 });
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "worker");
+  h.obs.activity(id, { type: "waiting_for_queue", summary: "Waiting for inference capacity", workerId: "worker" });
+  h.clock.advance(10_000);
+  h.obs.heartbeat(id, "worker", { lastActivityMs: 10_000 });
+  assert.equal(h.obs.summary(id)!.health, "waiting");
+  assert.equal(h.obs.summary(id)!.waitingReason, "inferweave_admission");
+  assert.equal(h.obs.summary(id)!.workers.waiting, 1);
+  assert.equal(h.obs.projection(id)!.workers[0]!.lastOutputAt, undefined);
+  h.obs.activity(id, { type: "tool_invocation", summary: "Running tool: read", workerId: "worker" });
+  assert.equal(h.obs.summary(id)!.health, "slow");
+  assert.equal(h.obs.summary(id)!.waitingReason, undefined);
+  assert.equal(h.obs.summary(id)!.workers.active, 1);
+});
+
+test("one worker waiting for capacity does not hide another stalled worker", () => {
+  const h = harness({ stallAfterMs: 1000, slowAfterMs: 500 });
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "waiting");
+  h.obs.workerStarted(id, "silent");
+  h.obs.activity(id, { type: "waiting_for_queue", summary: "Waiting for inference capacity", workerId: "waiting" });
+  h.clock.advance(10_000);
+  h.obs.heartbeat(id, "waiting", { lastActivityMs: 10_000 });
+  h.obs.heartbeat(id, "silent", { lastActivityMs: 10_000 });
+  assert.equal(h.obs.summary(id)!.health, "stalled");
+});
+
+test("a busy worker cannot hide a different silent worker in the same mission", () => {
+  const h = harness({ stallAfterMs: 1000, slowAfterMs: 500 });
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "busy");
+  h.obs.workerStarted(id, "silent");
+  h.clock.advance(2000);
+  h.obs.heartbeat(id, "silent", { lastActivityMs: 2000 });
+  h.obs.activity(id, {
+    type: "running_test",
+    summary: "Test output",
+    workerId: "busy",
+    output: true,
+    meaningfulProgress: true,
+  });
+  assert.equal(h.obs.summary(id)!.health, "stalled");
+  const workers = h.obs.projection(id)!.workers;
+  assert.equal(workers.find((worker) => worker.workerId === "silent")?.health, "stalled");
+  assert.equal(workers.find((worker) => worker.workerId === "busy")?.health, "active");
+});
+
+test("multiple runtime views can subscribe independently and detach on close", () => {
+  const h = harness();
+  const id = makeMission(h);
+  const first: string[] = [];
+  const second: string[] = [];
+  const detach = h.obs.subscribe((missionId) => first.push(missionId));
+  h.obs.subscribe((missionId) => second.push(missionId));
+  h.obs.workerStarted(id, "worker");
+  detach();
+  h.obs.heartbeat(id, "worker");
+  assert.deepEqual(first, [id]);
+  assert.deepEqual(second, [id, id]);
+});
+
+test("assigned task progress keeps only its worker healthy", () => {
+  const h = harness({ stallAfterMs: 1000 });
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "tests", { taskId: "test-task" });
+  h.clock.advance(2000);
+  h.obs.taskProgress(id, "test-task", 4, 10);
+  assert.equal(h.obs.projection(id)!.workers[0]!.health, "active");
+  assert.equal(h.obs.projection(id)!.workers[0]!.lastOutputAt, undefined);
+});
+
+test("bounded actual output preview is redacted, replayed, and never fabricated by command starts", async () => {
+  const h = harness();
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "worker");
+  h.obs.activity(id, {
+    type: "running_command",
+    summary: "Running tool",
+    workerId: "worker",
+    outputPreview: "not actual output",
+  });
+  assert.equal(h.obs.projection(id)!.workers[0]!.lastOutputPreview, undefined);
+  h.obs.activity(id, {
+    type: "running_test",
+    summary: "Tool still producing output",
+    workerId: "worker",
+    output: true,
+    outputPreview: `token sk-${"s".repeat(32)}\n${"test passed\n".repeat(200)}`,
+  });
+  await h.obs.flush();
+  const preview = h.obs.projection(id)!.workers[0]!.lastOutputPreview;
+  assert.ok(preview && preview.length <= 1000);
+  assert.doesNotMatch(preview, /sk-ssss/);
+  const reopened = MissionObservability.open({ backend: h.backend, store: h.store, now: h.clock.now });
+  assert.equal(reopened.projection(id)!.workers[0]!.lastOutputPreview, preview);
+  assert.doesNotMatch(JSON.stringify(h.backend.all()), /sk-ssss/, "raw secrets never enter persisted preview metadata");
+});

@@ -163,6 +163,8 @@ export function runWithInactivityGuard(
     env?: NodeJS.ProcessEnv;
     signal?: AbortSignal;
     inactivityMs: number;
+    /** Observational notification of real stdout/stderr; no output content is exposed. */
+    onOutput?: () => void;
     /** Progress watchdog (#146): classifies the stage by real progress, not just output. */
     watchdog?: WatchdogSettings;
   },
@@ -228,6 +230,11 @@ export function runWithInactivityGuard(
     const append = (current: string, chunk: Buffer): string =>
       current.length >= MAX_STAGE_OUTPUT_BYTES ? current : current + chunk.toString("utf8");
     const noteOutput = (chunk: Buffer): void => {
+      try {
+        opts.onOutput?.();
+      } catch {
+        /* Observers never affect verification. */
+      }
       outputBytes += chunk.length;
       if (!opts.watchdog) return;
       const text = chunk.toString("utf8");
