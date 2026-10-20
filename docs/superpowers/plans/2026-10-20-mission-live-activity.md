@@ -54,7 +54,7 @@ Owner: leader.
 - [x] Review each lane against the user request and existing contracts, resolve interface mismatches.
 - [x] Run affected tests, core/scripts typechecks, changed-file Biome, diff checks and package-load smoke checks.
 - [x] Obtain independent review, resolve material findings and rerun affected checks.
-- [ ] Commit feature branch and open a PR with exact validation and deployment limits. Preserve the separately open refresh PR #374.
+- [x] Commit feature branch and open a PR with exact validation and deployment limits. Preserve the separately open refresh PR #374.
 
 ## Additional engine coverage
 
@@ -75,3 +75,4 @@ Owner: planner_visibility. Files: src/plannerWorker/** and dedicated planner-wor
 - Initial integration evidence: both TypeScript projects and package-load smoke checks pass. The combined 184-test run had one outdated SLOW expectation for a confirmed repeated-read loop; that expectation was strengthened to STALLED and the owning 50-test suite passed.
 
 - Final consolidated evidence: 191/191 tests across 19 affected test files; core and scripts TypeScript checks pass; Biome checks 39 changed TypeScript files; diff whitespace check clean.
+- Independent review approved; final package smoke checks passed (29 commands, 7 tools). PR: https://github.com/berlinguyinca/pi-engineering/pull/375. Pinned runtime deployment remains outside this change.
