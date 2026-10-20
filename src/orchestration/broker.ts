@@ -51,7 +51,13 @@ import type { DispatchAuthority } from "./ownership.ts";
 import { replacementRecoveryFingerprint, replacementTaskFingerprintSpec } from "./recovery.ts";
 import { canTransitionMission } from "./state.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
-import type { ExecutionBackend, RecoveredMerge, ReviewEvidence, ValidationEvidence } from "./types.ts";
+import type {
+  AlreadySatisfied,
+  ExecutionBackend,
+  RecoveredMerge,
+  ReviewEvidence,
+  ValidationEvidence,
+} from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
 
 export interface ExecutionRequestInput {
@@ -160,6 +166,13 @@ export interface ExecutionOutcome {
    * wall-clock timeout so recovery re-plans only the remainder.
    */
   partial?: { done: string[] };
+  /**
+   * Worker only: the worker reported an evidenced `already_satisfied` no-op.
+   * Persisted on the execution as `already_satisfied` for the completion gate
+   * and recovery, so a mission can CONCLUDE that the objective is already met
+   * instead of failing and dispatching another repair to rediscover it.
+   */
+  alreadySatisfied?: AlreadySatisfied;
   /**
    * Tool calls the worker session executed before it ended. Zero means the
    * execution had no side effects, so a provider failure is safe to re-run
@@ -3582,6 +3595,7 @@ export class ExecutionBroker {
                 ...(outcome.error ? { error: outcome.error } : {}),
                 ...(outcome.summary ? { summary: outcome.summary } : {}),
                 ...(outcome.recoveredMerged?.length ? { recovered_merged: outcome.recoveredMerged } : {}),
+                ...(outcome.alreadySatisfied ? { already_satisfied: { ...outcome.alreadySatisfied } } : {}),
                 ...(backend === "review" && input.reviewedRecovered?.length
                   ? { reviewed_recovered: [...input.reviewedRecovered] }
                   : {}),
