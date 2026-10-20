@@ -50,11 +50,18 @@ import {
   isPauseAbort,
 } from "./interrupt.ts";
 import { transitionMissionToCanceled } from "./missionCancel.ts";
-import type { MissionStore } from "./missionStore.ts";
+import { HandoffRecordError, type MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
 import { type DispatchAuthority, type MissionOwnership, RepositoryLeasedError } from "./ownership.ts";
+import {
+  type ContextWindowResolver,
+  buildPhaseTransitionRecord,
+  missionContextUtilization,
+  phaseHandoffFallback,
+  shouldEmitPhaseHandoff,
+} from "./phaseBoundaryHandoff.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import {
   FailureClassifier,
@@ -141,6 +148,26 @@ export interface OrchestratorOptions {
   deriveAcceptance?: (mission: Mission) => Promise<string[]>;
   /** Called on each mission phase transition. */
   onPhase?: (mission: Mission, phase: string) => void;
+  /**
+   * Phase-boundary handoff (spec Unit B1, issue #349). When enabled, each
+   * mission phase boundary at/above the context-utilization threshold emits a
+   * `phase_transition` HandoffRecord through the mission store so a fresh
+   * session can resume from the artifact. Native compaction stays fallback
+   * only: it is selected when the handoff cannot be emitted. Disabled by
+   * default; without `contextWindowForModel` no utilization signal exists and
+   * the boundary passes silently.
+   */
+  phaseHandoff?: {
+    /** Resolves a model id to its context window (tokens), or null when unknown. */
+    contextWindowForModel?: ContextWindowResolver;
+    /** Utilization at/above which a boundary hands off. Default 0.75. */
+    threshold?: number;
+    /**
+     * Resolves the handing-off session endpoint (predecessor) for a mission.
+     * Default: the orchestrator's parent session at generation 0, when set.
+     */
+    endpoint?: (mission: Mission) => { sessionId: string; generation: number } | null | undefined;
+  } | null;
   parentSessionId?: string | null;
   limits?: {
     maxActive?: number;
@@ -375,6 +402,9 @@ export class Orchestrator {
   private maxMissionWallClockMs?: number;
   private readonly specApproval?: OrchestratorOptions["specApproval"];
   private readonly recoveryPlanner: RecoveryPlanner;
+  private readonly phaseHandoffCfg: OrchestratorOptions["phaseHandoff"] | null;
+  /** Last phase observed per mission, so the boundary handoff fires once per transition. */
+  private readonly missionPhase = new Map<string, string>();
   private readonly failureClassifier = new FailureClassifier();
   private readonly blockedRepairFlights = new Map<string, Promise<Mission>>();
 
@@ -389,6 +419,7 @@ export class Orchestrator {
     this.limitsProvider = opts.limitsProvider;
     this.specApproval = opts.specApproval;
     this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
+    this.phaseHandoffCfg = opts.phaseHandoff ?? null;
     const checkpoints = new CheckpointManager({ store: this.store });
     this.broker = new ExecutionBroker({
       store: this.store,
@@ -1514,9 +1545,76 @@ export class Orchestrator {
   }
 
   private phase(mission: Mission, phase: string): void {
+    const previous = this.missionPhase.get(mission.mission_id) ?? null;
+    if (previous !== phase) {
+      this.missionPhase.set(mission.mission_id, phase);
+      this.emitPhaseBoundaryHandoff(mission, previous, phase);
+    }
     this.onPhase?.(mission, phase);
     this.report(mission.mission_id, `[mission ${mission.mission_id}] phase ${phase}`);
     this.observability?.phaseChanged(mission.mission_id, phase);
+  }
+
+  /**
+   * Phase-boundary handoff (spec Unit B1, issue #349). At a phase boundary
+   * with context utilization at/above the threshold, emit a
+   * `phase_transition` HandoffRecord (with the latest checkpoint SHA when one
+   * exists) so a fresh session can resume from the artifact. When the handoff
+   * cannot be emitted, the standard handoff-fallback rules select the
+   * fallback — native (selective) compaction under context pressure — and the
+   * decision is reported; the handoff path itself never triggers compaction.
+   */
+  private emitPhaseBoundaryHandoff(mission: Mission, fromPhase: string | null, toPhase: string): void {
+    const cfg = this.phaseHandoffCfg;
+    if (!cfg) return;
+    const utilization = missionContextUtilization(
+      this.store.listExecutions(mission.mission_id),
+      cfg.contextWindowForModel ?? (() => null),
+    );
+    const decision = shouldEmitPhaseHandoff({
+      fromPhase,
+      toPhase,
+      contextUtilization: utilization,
+      threshold: cfg.threshold,
+    });
+    if (!decision.emit) return;
+
+    const endpoint =
+      cfg.endpoint?.(mission) ?? (this.parentSessionId ? { sessionId: this.parentSessionId, generation: 0 } : null);
+    if (!endpoint) {
+      const errors = ["no session endpoint available"];
+      const fallback = phaseHandoffFallback(errors, utilization);
+      this.report(
+        mission.mission_id,
+        `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff failed (${errors.join("; ")}); fallback ${fallback.fallback} (${fallback.reason})`,
+      );
+      return;
+    }
+
+    const checkpointSha = this.store.listTaskCheckpoints(mission.mission_id).at(-1)?.candidateSha ?? undefined;
+    try {
+      const record = this.store.addHandoffRecord(
+        buildPhaseTransitionRecord({
+          missionId: mission.mission_id,
+          fromPhase,
+          toPhase,
+          endpoint,
+          ...(checkpointSha ? { checkpointSha } : {}),
+        }),
+      );
+      this.report(
+        mission.mission_id,
+        `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff ${record.id}${checkpointSha ? ` @ ${checkpointSha.slice(0, 7)}` : ""} (utilization ${utilization!.toFixed(2)})`,
+      );
+    } catch (error) {
+      const errors =
+        error instanceof HandoffRecordError ? error.errors : [error instanceof Error ? error.message : String(error)];
+      const fallback = phaseHandoffFallback(errors, utilization);
+      this.report(
+        mission.mission_id,
+        `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff failed (${errors.join("; ")}); fallback ${fallback.fallback} (${fallback.reason})`,
+      );
+    }
   }
 
   private observeWorkerActivity(
