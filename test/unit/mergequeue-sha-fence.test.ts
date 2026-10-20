@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -24,12 +24,17 @@ import type { FailureBaseline } from "../../src/verify/failureBaseline.ts";
 const run = promisify(execFile);
 
 /** A real fixture repo with `main` and helpers to commit on branches. */
-async function fixture() {
+async function fixture(traceFile?: string) {
   const root = await mkdtemp(join(tmpdir(), "pi-mergeq-"));
-  const g = async (...args: string[]) => (await run("git", ["-C", root, ...args])).stdout.trim();
+  const env = traceFile ? { ...process.env, GIT_TRACE2_EVENT: traceFile } : process.env;
+  const g = async (...args: string[]) => (await run("git", ["-C", root, ...args], { env })).stdout.trim();
   await run("git", ["init", "-q", "-b", "main", root]);
   await g("config", "user.email", "t@example.com");
   await g("config", "user.name", "T");
+  // Git may detach automatic maintenance after a successful commit/rebase/merge.
+  // These throwaway repos need none; a detached writer can race recursive cleanup.
+  await g("config", "maintenance.auto", "false");
+  await g("config", "gc.auto", "0");
   await writeFile(join(root, "base.txt"), "base\n");
   await g("add", "-A");
   await g("commit", "-q", "-m", "base");
@@ -86,6 +91,36 @@ async function fixture() {
   });
   return { root, g, commitOn, prims, calls, cleanup: () => rm(root, { recursive: true, force: true }) };
 }
+
+test("fixture commits, rebases and merges do not launch automatic maintenance during cleanup", async () => {
+  const traceRoot = await mkdtemp(join(tmpdir(), "pi-mergeq-trace-"));
+  const traceFile = join(traceRoot, "trace.jsonl");
+  const f = await fixture(traceFile);
+  try {
+    const reviewed = await f.commitOn("feat/trace", "trace.txt", "candidate\n", true);
+    const base = await f.g("rev-parse", "main");
+    await f.commitOn("main", "other.txt", "moved target\n");
+    const result = await new MergeQueue({ git: f.prims() }).enqueue({
+      branch: "feat/trace",
+      target: "main",
+      reviewedHeadSha: reviewed,
+      boundBaseSha: base,
+    });
+    assert.equal(result.ok, true, result.reason);
+    const events = (await readFile(traceFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const maintenance = events.filter(
+      (event) =>
+        event.event === "child_start" && event.argv?.some((arg: string) => arg === "maintenance" || arg === "gc"),
+    );
+    assert.deepEqual(maintenance, [], "fixture commands must not leave Git maintenance racing recursive removal");
+  } finally {
+    await f.cleanup();
+    await rm(traceRoot, { recursive: true, force: true });
+  }
+});
 
 test("a head that moved after review makes enqueue rebase and rerun the gate before merging", async () => {
   const f = await fixture();
