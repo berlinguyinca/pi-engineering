@@ -17,7 +17,13 @@ import {
   attachCheckpointRefs,
   buildCheckpointRefs,
 } from "../runtime/host/handoffCheckpointRefs.ts";
-import { type HandoffRecord, validateHandoffRecord } from "../runtime/host/handoffKinds.ts";
+import {
+  type HandoffEndpoint,
+  type HandoffRecord,
+  type HandoffState,
+  nextStates,
+  validateHandoffRecord,
+} from "../runtime/host/handoffKinds.ts";
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import {
   buildCandidateEvidenceIdentity,
@@ -1995,6 +2001,37 @@ export class MissionStore {
     return [...this.handoffRecords.values()]
       .filter((r) => (missionId ? r.missionId === missionId : true))
       .map((r) => ({ ...r }));
+  }
+
+  /**
+   * Advance a stored handoff record through the lifecycle state machine
+   * (spec Unit B1). The target state must be allowed by `nextStates` for the
+   * current state; `acknowledged`/`committed` additionally require the
+   * successor endpoint (the fresh session taking over) and stamp `ackAt`.
+   * Returns the updated record; throws a `HandoffRecordError` for an unknown
+   * id, an illegal transition, or a missing successor.
+   */
+  transitionHandoffRecord(id: string, to: HandoffState, successor?: HandoffEndpoint, ackAt?: string): HandoffRecord {
+    const current = this.handoffRecords.get(id);
+    if (!current) {
+      throw new HandoffRecordError([`unknown handoff record ${id}`]);
+    }
+    if (!nextStates(current.state).includes(to)) {
+      throw new HandoffRecordError([`illegal handoff transition ${current.state} -> ${to}`]);
+    }
+    const next: HandoffRecord = { ...current, state: to };
+    if (to === "acknowledged" || to === "committed") {
+      // A committed record inherits the successor + ackAt stamped at
+      // acknowledgement; only a missing one is an error.
+      const effectiveSuccessor = successor ?? current.successor;
+      if (!effectiveSuccessor) {
+        throw new HandoffRecordError([`successor is required for state ${to}`]);
+      }
+      next.successor = { ...effectiveSuccessor };
+      next.ackAt = ackAt ?? current.ackAt ?? new Date().toISOString();
+    }
+    this.handoffRecords.set(id, { ...next });
+    return { ...next };
   }
 
   /** Preserve a settled outcome while making failed lease cleanup durable and visible. */
