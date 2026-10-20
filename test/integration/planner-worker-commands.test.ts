@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { loadPlannerWorkerConfig, parsePlannerWorkerConfig, plannerWorkerDir } from "../../src/plannerWorker/config.ts";
@@ -108,7 +108,7 @@ test("/engineering-mode persists the mode; status, plan and workers render a rea
                 objective: "write one",
                 scope: { allowed: ["src/one/**"] },
                 acceptance: ["exists"],
-                verification: ["test -f src/one/x"],
+                verification: ["printf probe-output; test -f src/one/x"],
               },
               {
                 task_id: "two",
@@ -134,7 +134,11 @@ test("/engineering-mode persists the mode; status, plan and workers render a rea
   });
   cleanups.push(() => server.close());
   const conn = { baseUrl: server.baseUrl };
+  const activityEvents: unknown[] = [];
   const executor = new PlannerWorkerExecutor({
+    onEvent: (event) => {
+      if (event.type === "activity") activityEvents.push(event);
+    },
     repoRoot: root,
     worker: new GatewayChatWorkerExecutor({ ...conn, defaultModel: "flash-a" }),
     resolver: new RoleResolver({ provider: "iw", loadCatalog: () => fetchCatalog(conn) }),
@@ -148,6 +152,18 @@ test("/engineering-mode persists the mode; status, plan and workers render a rea
     constraints: [],
   });
   assert.equal(report.status, "completed", report.failure_reason ?? "");
+
+  const saved = JSON.parse(await readFile(join(plannerWorkerDir(root), "PW-1", "state.json"), "utf8"));
+  assert.ok(saved.live_activity?.length > 0, "persists worker activity for inspection");
+  assert.ok(
+    saved.live_activity.some(
+      (worker: { role: string; last_output_preview?: string }) =>
+        worker.role === "verification" && worker.last_output_preview?.includes("probe-output"),
+    ),
+    "actual verification output is preserved for inspection",
+  );
+  assert.ok(activityEvents.length > 0, "forwards live worker activity to the UI");
+  assert.match((await engineeringCommand("workers", "one", root, config)).text, /Activity:|Recent activity:/);
 
   const status = (await engineeringCommand("status", "", root, config)).text;
   assert.match(status, /Mission: PW-1 \[completed\] {2}mode=planner-worker/);

@@ -4,17 +4,27 @@
  * next step. Kept compact: bounded counts and truncated text, never logs.
  */
 
+import { stripVTControlCharacters } from "node:util";
 import { formatWaitingFor } from "../gateway/admissionNotice.ts";
 import { latestTaskCheckpoints } from "../orchestration/checkpoints.ts";
 import type { MissionStore } from "../orchestration/missionStore.ts";
 import { taskFailureReason } from "../orchestration/recovery.ts";
 import { PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
 import { describeMissionControl } from "../runtime/operatorModelPin.ts";
+import { redactSecrets } from "../security/SecurityPolicy.ts";
+
+export function missionActivityAge(at: string | null | undefined, now = Date.now()): string {
+  const stamp = at ? Date.parse(at) : Number.NaN;
+  return Number.isFinite(stamp) ? formatWaitingFor(Math.max(0, now - stamp)) : "not recorded";
+}
 
 const MAX_ITEMS = 5;
 
 function clip(text: string, max: number): string {
-  const flat = text.replace(/\s+/g, " ").trim();
+  const flat = redactSecrets(stripVTControlCharacters(text))
+    .replace(/[\p{Cc}\p{Cf}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
@@ -129,4 +139,68 @@ export function missionReportLines(store: MissionStore, missionId: string): stri
     );
   }
   return lines;
+}
+
+/** Operator-requested inspection of recorded, bounded telemetry; never hidden reasoning. */
+export function formatMissionInspection(
+  projection: import("../orchestration/observability/types.ts").MissionProjection,
+  workerId?: string,
+  now = Date.now(),
+): string {
+  const { summary, tests } = projection;
+  const workers = projection.workers.filter((worker) => !workerId || worker.workerId === workerId);
+  if (workerId && workers.length === 0) return `Worker ${clip(workerId, 80)} not found in ${summary.missionId}.`;
+  const age = (at?: string | null) => missionActivityAge(at, now);
+  const lines = [
+    `${clip(summary.missionId, 80)} — ${clip(summary.title, 120)} [${summary.state}; ${summary.health.toUpperCase()}]`,
+    `Acceptance ${summary.acceptanceCoverage.completed}/${summary.acceptanceCoverage.total} (${summary.acceptanceCoverage.approximatePercent}%) · workflow ${summary.workflowProgress.completed}/${summary.workflowProgress.total}`,
+    `Now: ${clip(summary.currentActivity?.summary ?? summary.reason, 240)}`,
+    `Heartbeat: ${age(summary.lastHeartbeatAt)} · meaningful progress: ${age(summary.lastMeaningfulProgressAt)}`,
+    ...(summary.waitingReason ? [`Waiting: ${summary.waitingReason} for ${age(summary.waitingSince)}`] : []),
+    `Next: ${clip(summary.nextAction, 240)}`,
+    "Workers:",
+  ];
+  for (const worker of workers.slice(0, 20)) {
+    lines.push(
+      `  ${clip(worker.workerId, 80)} · task ${clip(worker.taskId ?? "not recorded", 80)} · ${worker.health ?? worker.state} · ${worker.route ? `${clip(worker.route, 80)} → ` : ""}${clip(worker.model ?? "model not recorded", 160)}${worker.node ? ` · node ${clip(worker.node, 80)}` : ""}`,
+      `    ${clip(worker.currentActivity ?? "activity not recorded", 240)} · running ${age(worker.startedAt)} · output ${age(worker.lastOutputAt)} · heartbeat ${age(worker.lastHeartbeatAt)} · progress ${age(worker.lastMeaningfulProgressAt)}`,
+      worker.lastOutputPreview
+        ? `    Tool output (latest captured preview): ${clip(worker.lastOutputPreview, 1_000)}`
+        : "    Tool output: not recorded (no captured tool result/update yet).",
+    );
+  }
+  if (workers.length === 0) lines.push("  No workers recorded.");
+  if (workers.length > 20) lines.push(`  ${workers.length - 20} more workers; inspect one by worker ID.`);
+  lines.push("Recent activity (latest 20; recorded summaries):");
+  for (const entry of projection.activity
+    .filter((activity) => !workerId || activity.workerId === workerId)
+    .slice(-20)) {
+    lines.push(
+      `  ${clip(entry.at, 40)} ${entry.workerId ? `[${clip(entry.workerId, 80)}] ` : ""}${clip(entry.summary, 300)}`,
+    );
+  }
+  lines.push(
+    `Changed files: ${
+      projection.changes.changedFiles
+        .slice(0, 20)
+        .map((file) => clip(file, 120))
+        .join(", ") || "none recorded"
+    }`,
+    `Tests: ${tests.running ? "running · " : ""}${tests.passed} passed · ${tests.failed} failed · ${tests.skipped} skipped · ${tests.retries} retries`,
+    ...tests.failures.slice(-5).map((failure) => `  Failure: ${clip(failure, 240)}`),
+    `Recovery attempts: ${projection.recovery.length}`,
+    ...projection.recovery
+      .slice(-5)
+      .map(
+        (attempt) =>
+          `  ${attempt.attempt}: ${clip(attempt.action, 80)} [${attempt.status}] ${clip(attempt.summary, 240)}`,
+      ),
+    `Open blocking findings: ${projection.review.blockingOpen}`,
+    ...projection.review.findings
+      .filter((finding) => finding.severity === "blocking" && finding.status === "open")
+      .slice(-5)
+      .map((finding) => `  ${clip(finding.summary, 240)}`),
+    ...projection.errors.slice(-5).map((error) => `  Error (${error.count}): ${clip(error.example, 240)}`),
+  );
+  return lines.join("\n");
 }

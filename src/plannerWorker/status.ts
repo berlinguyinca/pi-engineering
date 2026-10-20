@@ -5,6 +5,8 @@
 
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { safeWorkerOutputPreview } from "../workers/activity.ts";
+import { type PlannerWorkerActivity, renderActivity, safeActivityText } from "./activity.ts";
 import { dagLayers } from "./contract.ts";
 import type { ContractState, ModelTransitionEvent, PlannerOutput, RoleModelMetrics } from "./types.ts";
 
@@ -20,6 +22,7 @@ export interface PersistedState {
   integration_branch: string | null;
   failure_reason: string | null;
   updated_at: string;
+  live_activity?: PlannerWorkerActivity[];
 }
 
 /** The most recently updated mission state under `dir`, if any. */
@@ -74,6 +77,13 @@ export function renderStatus(state: PersistedState, mode: string): string {
   if (state.stalled_events.length > 0) {
     lines.push(`Stalled: ${state.stalled_events.map((s) => `${s.task_id} (${s.reasons.join(", ")})`).join("; ")}`);
   }
+  if (state.live_activity?.length) {
+    lines.push(
+      "",
+      "Activity:",
+      ...state.live_activity.filter((w) => w.ended_at === null).map((w) => renderActivity(w)),
+    );
+  }
   if (state.failure_reason) lines.push(`Reason: ${state.failure_reason}`);
   if (state.integration_branch) lines.push(`Branch: ${state.integration_branch}`);
   return lines.join("\n");
@@ -103,12 +113,34 @@ export function renderPlan(state: PersistedState): string {
   return lines.join("\n");
 }
 
-export function renderWorkers(state: PersistedState): string {
+export function renderWorkers(state: PersistedState, task = ""): string {
   const lines = ["Contracts:"];
-  for (const c of state.contracts) {
+  for (const c of state.contracts.filter((c) => !task || c.contract.task_id === task)) {
     lines.push(
       `  ${c.contract.task_id}: ${c.status} rung=${c.rung} attempts=${c.attempt} model=${c.last_model ?? "-"}${c.worktree && ACTIVE.has(c.status) ? ` worktree=${c.worktree}` : ""}`,
     );
+  }
+  const activity = (state.live_activity ?? []).filter((w) => !task || w.task_id === task);
+  if (activity.length) {
+    lines.push("", "Recent activity:");
+    for (const worker of activity.slice(-12)) {
+      lines.push(renderActivity(worker));
+      const preview = safeWorkerOutputPreview(worker.last_output_preview);
+      lines.push(`  Output preview: ${preview ?? "not captured"}`);
+      for (const event of worker.recent)
+        lines.push(`  ${new Date(event.at).toISOString()} ${safeActivityText(event.text)}`);
+    }
+  }
+  for (const c of state.contracts.filter((c) => !task || c.contract.task_id === task)) {
+    if (c.changed_files.length)
+      lines.push(
+        `Changed files (${safeActivityText(c.contract.task_id)}): ${c.changed_files
+          .slice(0, 20)
+          .map((p) => safeActivityText(p))
+          .join(", ")}`,
+      );
+    if (c.blocked_reason) lines.push(`Blocked: ${safeActivityText(c.blocked_reason)}`);
+    if (c.summary) lines.push(`Result: ${safeActivityText(c.summary, 400)}`);
   }
   lines.push("", "Per role/model:");
   lines.push(

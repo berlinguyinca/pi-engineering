@@ -104,6 +104,9 @@ export interface WorkerObservability {
   workerId: string;
   taskId?: string;
   state: WorkerObsState;
+  /** Derived per worker so active siblings cannot conceal a stalled worker. */
+  health?: MissionHealth;
+  waitingReason?: WaitingReason;
   model?: string;
   runtime?: string;
   host?: string;
@@ -120,6 +123,11 @@ export interface WorkerObservability {
   lastHeartbeatAt?: string;
   lastMeaningfulProgressAt?: string;
   currentActivity?: string;
+  currentActivityStartedAt?: string;
+  /** Last actual worker output/activity, excluding controller heartbeats. */
+  lastOutputAt?: string;
+  /** Bounded redacted tail of actual tool output; never model reasoning. */
+  lastOutputPreview?: string;
   tokensPerSec?: number;
   /** Loop/no-progress signals (spec 03). */
   repeatedFileReads: number;

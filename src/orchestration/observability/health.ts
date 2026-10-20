@@ -13,6 +13,9 @@ import type { MissionHealth, WaitingReason } from "./types.ts";
 export interface HealthInput {
   missionStatus: MissionStatus;
   waitingReason?: WaitingReason;
+  waitingDeadline?: string;
+  /** Confirmed repeated identical actions, rather than merely the same tool name. */
+  hasLoop?: boolean;
   blocked: boolean;
   failed: boolean;
   complete: boolean;
@@ -46,9 +49,6 @@ export function deriveHealth(input: HealthInput): HealthResult {
   if (input.failed) return { health: "failed" };
   if (input.blocked) return { health: "blocked" };
 
-  // A named waiting reason is authoritative: a genuine wait is not a stall.
-  if (input.waitingReason) return { health: "waiting", waitingReason: input.waitingReason };
-
   // Mission is terminal-ish without explicit flags: treat COMPLETE/FAILED.
   if (input.missionStatus === "COMPLETE") return { health: "complete" };
   if (input.missionStatus === "FAILED") return { health: "failed" };
@@ -59,6 +59,15 @@ export function deriveHealth(input: HealthInput): HealthResult {
     return { health: "waiting", waitingReason: "human_approval" };
   }
 
+  // A named waiting reason is authoritative: a genuine wait is not a stall.
+  if (input.waitingReason) {
+    const deadline = input.waitingDeadline ? Date.parse(input.waitingDeadline) : Number.NaN;
+    return {
+      health: Number.isFinite(deadline) && now >= deadline ? "stalled" : "waiting",
+      waitingReason: input.waitingReason,
+    };
+  }
+
   // Meaningful-progress age drives SLOW/STALLED. Heartbeat alone is not progress.
   // STALLED additionally requires the raw-activity heartbeat to be stale: a
   // worker actively running tools (meaningfulProgress:false by design) with a
@@ -66,6 +75,7 @@ export function deriveHealth(input: HealthInput): HealthResult {
   const progressAge = ageMs(input.lastMeaningfulProgressAt, now);
   if (progressAge !== undefined) {
     if (progressAge > input.stallAfterMs && input.alive) {
+      if (input.hasLoop) return { health: "stalled" };
       const heartbeatAge = ageMs(input.lastHeartbeatAt, now);
       if (heartbeatAge !== undefined && heartbeatAge > input.stallAfterMs) return { health: "stalled" };
       return { health: "slow" };

@@ -17,8 +17,10 @@
  * never grounds to close communication.
  */
 
+import { stripVTControlCharacters } from "node:util";
 import { id } from "../../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../../platform/eventstore/backend.ts";
+import { redactSecrets } from "../../security/SecurityPolicy.ts";
 import { latestTaskCheckpoints } from "../checkpoints.ts";
 import { hashCandidateEvidenceIdentity } from "../evidence.ts";
 import type { MissionPersistenceDiagnostic, MissionStore } from "../missionStore.ts";
@@ -52,6 +54,13 @@ import type {
 } from "./types.ts";
 import { DEFAULT_OBSERVABILITY_CONFIG } from "./types.ts";
 
+/** Also sanitize direct observability callers and replay, not just worker callbacks. */
+export function boundedToolOutputPreview(value: string): string {
+  return redactSecrets(stripVTControlCharacters(value))
+    .replace(/[\p{Cc}\p{Cf}]/gu, (character) => (character === "\n" || character === "\t" ? character : " "))
+    .slice(-1000);
+}
+
 type CompletionStatusValue =
   | "not_ready"
   | "validating"
@@ -65,11 +74,13 @@ interface MissionObsState {
   title: string;
   runtimeStartedAt: string;
   lastHeartbeatAt?: string;
+  workerActivityAt: Map<string, string>;
   lastMeaningfulProgressAt?: string;
   currentObjective?: string;
   currentActivity?: CurrentActivity;
   waitingReason?: WaitingReason;
   waitingSince?: string;
+  waitingDeadline?: string;
   completionStatus: CompletionStatusValue;
   verifiedComplete: boolean;
   progressHistory: ProgressHistoryPoint[];
@@ -137,6 +148,7 @@ export class MissionObservability {
   private readonly backend: EventStoreBackend;
   private readonly onUpdate?: (missionId: string, message: string) => void;
   private readonly onChange?: (missionId: string) => void;
+  private readonly changeListeners = new Set<(missionId: string) => void>();
   private readonly nowFn: () => string;
   private readonly states = new Map<string, MissionObsState>();
   private readonly persistenceErrors: MissionPersistenceDiagnostic[] = [];
@@ -177,6 +189,7 @@ export class MissionObservability {
         title: title ?? missionId,
         runtimeStartedAt: this.now(),
         workers: new Map(),
+        workerActivityAt: new Map(),
         loopTrackers: new Map(),
         tests: emptyTestState(),
         review: emptyReviewState(),
@@ -253,6 +266,20 @@ export class MissionObservability {
     } catch {
       // Projection invalidators are observers, never participants.
     }
+    for (const listener of this.changeListeners) {
+      try {
+        listener(missionId);
+      } catch {
+        /* Each UI observer is independent. */
+      }
+    }
+  }
+
+  subscribe(listener: (missionId: string) => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
   }
 
   /** Await all pending event writes (tests assert durability). */
@@ -337,7 +364,14 @@ export class MissionObservability {
       case "TASK_PROGRESS": {
         const completed = (meta.completed as number) ?? 0;
         const total = (meta.total as number) ?? 0;
-        if (ev.taskId) s.taskUnits[ev.taskId] = { completed, total };
+        if (ev.taskId) {
+          s.taskUnits[ev.taskId] = { completed, total };
+          for (const worker of s.workers.values()) {
+            if (worker.taskId !== ev.taskId) continue;
+            worker.lastMeaningfulProgressAt = ev.timestamp;
+            s.loopTrackers.get(worker.workerId)?.reset();
+          }
+        }
         this.noteMeaningful(s, ev.timestamp);
         this.appendHistory(s, ev.timestamp, (meta.label as string) ?? undefined);
         break;
@@ -374,7 +408,12 @@ export class MissionObservability {
           const w = s.workers.get(ev.workerId);
           if (w) {
             w.lastHeartbeatAt = ev.timestamp;
-            w.state = "running";
+            if (typeof meta.lastActivityMs === "number" && Number.isFinite(meta.lastActivityMs)) {
+              s.workerActivityAt.set(
+                ev.workerId,
+                new Date(Date.parse(ev.timestamp) - Math.max(0, meta.lastActivityMs)).toISOString(),
+              );
+            }
             if (meta.tokensPerSec !== undefined) w.tokensPerSec = meta.tokensPerSec as number;
             s.workers.set(ev.workerId, w);
           }
@@ -406,12 +445,27 @@ export class MissionObservability {
           const w = s.workers.get(workerId);
           if (w) {
             w.lastHeartbeatAt = ev.timestamp;
+            if (w.currentActivity !== ev.summary) w.currentActivityStartedAt = ev.timestamp;
+            w.waitingReason =
+              type === "waiting_for_queue"
+                ? "inferweave_admission"
+                : type === "waiting_for_model"
+                  ? "model_request"
+                  : undefined;
+            if (w.state === "running" || w.state === "waiting") w.state = w.waitingReason ? "waiting" : "running";
             w.currentActivity = ev.summary;
+            if (meta.output === true) {
+              w.lastOutputAt = ev.timestamp;
+              if (typeof meta.outputPreview === "string")
+                w.lastOutputPreview = boundedToolOutputPreview(meta.outputPreview);
+            }
+            s.workerActivityAt.set(workerId, ev.timestamp);
             if (ev.meaningfulProgress) {
               w.lastMeaningfulProgressAt = ev.timestamp;
               w.repeatedFileReads = 0;
               w.repeatedToolCalls = 0;
               w.repeatedCycles = 0;
+              s.loopTrackers.get(workerId)?.reset();
             }
             s.workers.set(workerId, w);
           }
@@ -494,6 +548,7 @@ export class MissionObservability {
       case "MODEL_REQUEST_WAITING":
         s.waitingReason = (meta.reason as WaitingReason) ?? "model_request";
         s.waitingSince = s.waitingSince ?? ev.timestamp;
+        s.waitingDeadline = meta.deadline as string | undefined;
         s.currentActivity = {
           type:
             s.waitingReason === "inferweave_admission" || s.waitingReason === "rate_limit"
@@ -510,6 +565,7 @@ export class MissionObservability {
           // Explicit resume (clearWaiting) always clears any waiting reason.
           s.waitingReason = undefined;
           s.waitingSince = undefined;
+          s.waitingDeadline = undefined;
           s.currentActivity = {
             type: "recovery",
             summary: ev.summary,
@@ -517,6 +573,7 @@ export class MissionObservability {
         } else if (s.waitingReason === "model_request" || s.waitingReason === "inferweave_admission") {
           s.waitingReason = undefined;
           s.waitingSince = undefined;
+          s.waitingDeadline = undefined;
         }
         break;
       case "REVIEW_STARTED":
@@ -725,7 +782,7 @@ export class MissionObservability {
     });
   }
 
-  setWaiting(missionId: string, reason: WaitingReason, detail?: string): void {
+  setWaiting(missionId: string, reason: WaitingReason, detail?: string, deadline?: string): void {
     const s = this.state(missionId);
     if (!s.waitingSince) s.waitingSince = this.now();
     s.waitingReason = reason;
@@ -733,7 +790,7 @@ export class MissionObservability {
       missionId,
       type: "MODEL_REQUEST_WAITING",
       summary: detail ?? `Waiting — ${waitingReasonLabel(reason)}`,
-      metadata: { reason, detail },
+      metadata: { reason, detail, deadline },
     });
   }
 
@@ -764,6 +821,9 @@ export class MissionObservability {
       file?: string;
       command?: string;
       meaningfulProgress?: boolean;
+      /** Actual model/tool output was received, not a local liveness timer. */
+      output?: boolean;
+      outputPreview?: string;
     },
   ): void {
     this.record({
@@ -775,6 +835,10 @@ export class MissionObservability {
         activityType: input.type,
         file: input.file,
         command: input.command,
+        output: input.output,
+        ...(input.output && input.outputPreview
+          ? { outputPreview: boundedToolOutputPreview(input.outputPreview) }
+          : {}),
       },
       meaningfulProgress: input.meaningfulProgress ?? false,
     });
@@ -791,6 +855,9 @@ export class MissionObservability {
         const w = s.workers.get(workerId);
         if (w) {
           w.lastHeartbeatAt = now;
+          if (typeof metadata.lastActivityMs === "number" && Number.isFinite(metadata.lastActivityMs)) {
+            s.workerActivityAt.set(workerId, new Date(nowMs - Math.max(0, metadata.lastActivityMs)).toISOString());
+          }
           s.workers.set(workerId, w);
         }
       }
@@ -1180,7 +1247,11 @@ export class MissionObservability {
       lastHeartbeatAt: s.lastHeartbeatAt,
       lastMeaningfulProgressAt: s.lastMeaningfulProgressAt ?? null,
       waitingReason: health.waitingReason ?? s.waitingReason,
-      waitingSince: s.waitingSince,
+      waitingSince:
+        s.waitingSince ??
+        (health.health === "waiting"
+          ? [...s.workers.values()].find((worker) => worker.state === "waiting")?.currentActivityStartedAt
+          : undefined),
       completionStatus: s.completionStatus,
       runtimeStartedAt: s.runtimeStartedAt,
       ...actionable,
@@ -1334,20 +1405,61 @@ export class MissionObservability {
   private currentHealth(s: MissionObsState, status: string): { health: MissionHealth; waitingReason?: WaitingReason } {
     const now = this.now();
     const alive = this.anyWorkerRunning(s);
-    return deriveHealth({
+    const workers = [...s.workers.values()].filter(
+      (worker) => worker.state === "running" || worker.state === "waiting",
+    );
+    const onlyWaiting = workers.length > 0 && workers.every((worker) => worker.state === "waiting");
+    const result = deriveHealth({
       missionStatus: status as never,
-      waitingReason: s.waitingReason,
+      waitingReason: s.waitingReason ?? (onlyWaiting ? workers[0]?.waitingReason : undefined),
+      waitingDeadline:
+        s.waitingDeadline ??
+        this.store
+          .listRecoveryDecisions(s.missionId)
+          .filter((decision) => Date.parse(decision.decidedAt) >= Date.parse(s.waitingSince ?? this.now()))
+          .at(-1)?.deadline ??
+        undefined,
+      hasLoop: [...s.workers.values()].some(
+        (worker) => worker.state === "running" && s.loopTrackers.get(worker.workerId)?.hasLoop(),
+      ),
       blocked: status === "BLOCKED",
       failed: status === "FAILED",
       complete: status === "COMPLETE",
       verifiedComplete: s.verifiedComplete,
-      lastHeartbeatAt: s.lastHeartbeatAt,
+      lastHeartbeatAt:
+        [...s.workers.values()]
+          .filter((worker) => worker.state === "running" || worker.state === "waiting")
+          .map((worker) => s.workerActivityAt.get(worker.workerId) ?? worker.lastHeartbeatAt)
+          .filter((at): at is string => !!at)
+          .sort()
+          .at(-1) ?? s.lastHeartbeatAt,
       lastMeaningfulProgressAt: s.lastMeaningfulProgressAt,
       slowAfterMs: this.config.slowAfterMs,
       stallAfterMs: this.config.stallAfterMs,
       now,
       alive,
     });
+    if (["complete", "failed", "blocked"].includes(result.health) || s.waitingReason) return result;
+    if (workers.some((worker) => this.workerHealth(s, worker) === "stalled")) return { health: "stalled" };
+    return result;
+  }
+
+  private workerHealth(s: MissionObsState, worker: WorkerObservability): MissionHealth {
+    return deriveHealth({
+      missionStatus: "EXECUTING",
+      blocked: false,
+      failed: worker.state === "failed",
+      complete: worker.state === "completed",
+      verifiedComplete: false,
+      alive: worker.state === "running" || worker.state === "waiting",
+      waitingReason: worker.waitingReason,
+      hasLoop: s.loopTrackers.get(worker.workerId)?.hasLoop(),
+      lastHeartbeatAt: s.workerActivityAt.get(worker.workerId) ?? worker.lastHeartbeatAt,
+      lastMeaningfulProgressAt: worker.lastMeaningfulProgressAt ?? worker.startedAt,
+      slowAfterMs: this.config.slowAfterMs,
+      stallAfterMs: this.config.stallAfterMs,
+      now: this.now(),
+    }).health;
   }
 
   private anyWorkerRunning(s: MissionObsState): boolean {
@@ -1392,6 +1504,7 @@ export class MissionObservability {
       const signals = tracker?.signals() ?? [];
       workers.push({
         ...w,
+        health: this.workerHealth(s, w),
         repeatedFileReads: signals.find((x) => x.kind === "repeated_file_read")?.count ?? w.repeatedFileReads,
         repeatedToolCalls: signals.find((x) => x.kind === "repeated_tool_call")?.count ?? w.repeatedToolCalls,
         repeatedErrors: signals.find((x) => x.kind === "repeated_error")?.count ?? w.repeatedErrors,
@@ -1456,7 +1569,7 @@ export class MissionObservability {
 
   private ageLabel(iso?: string): string {
     if (!iso) return "n/a";
-    const ms = Math.max(0, Date.now() - Date.parse(iso));
+    const ms = Math.max(0, Date.parse(this.now()) - Date.parse(iso));
     const s = Math.floor(ms / 1000);
     if (s < 60) return `${s}s ago`;
     const m = Math.floor(s / 60);

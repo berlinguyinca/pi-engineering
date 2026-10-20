@@ -25,7 +25,12 @@ import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
-import { TURN_SUMMARY } from "../workers/activity.ts";
+import {
+  AWAITING_MODEL_RESPONSE_SUMMARY,
+  TOOL_PROGRESS_SUMMARY,
+  TURN_SUMMARY,
+  WAITING_FOR_INFERENCE_SUMMARY,
+} from "../workers/activity.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
 import {
   type BrokerBackends,
@@ -51,6 +56,7 @@ import {
 } from "./interrupt.ts";
 import { transitionMissionToCanceled } from "./missionCancel.ts";
 import type { MissionStore } from "./missionStore.ts";
+import { MissionActivityTicker } from "./observability/MissionActivityTicker.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
@@ -1572,9 +1578,13 @@ export class Orchestrator {
         summary: event.summary,
         workerId: event.executionId,
         meaningfulProgress: event.meaningfulProgress,
+        outputPreview: event.outputPreview,
+        output:
+          (event.kind === "tool" && (event.phase === "completed" || event.phase === "failed")) ||
+          ["Model streaming", "Model response received", TOOL_PROGRESS_SUMMARY].includes(event.summary),
       });
-      if (event.kind === "tool")
-        obs?.noteWorkerTool(event.missionId, event.executionId, `${event.toolName}:${event.phase}`);
+      if (event.kind === "tool" && event.phase === "started" && event.invocationSignature)
+        obs?.noteWorkerTool(event.missionId, event.executionId, event.invocationSignature);
       if (event.kind === "tool" && event.buildTool) this.noteBuildCommand(event);
       if ((event.kind === "state" || event.kind === "execution") && event.phase === "completed") {
         obs?.workerCompleted(event.missionId, event.executionId);
@@ -1619,6 +1629,8 @@ export class Orchestrator {
   }
 
   private activityType(event: WorkerActivity): ActivityType {
+    if (event.summary === WAITING_FOR_INFERENCE_SUMMARY) return "waiting_for_queue";
+    if (event.summary === AWAITING_MODEL_RESPONSE_SUMMARY) return "waiting_for_model";
     if (event.kind === "tool") return event.toolName === "bash" ? "running_command" : "tool_invocation";
     if (event.phase === "failed" || event.phase === "canceled") return "error";
     if (event.kind === "state") return event.phase === "completed" ? "worker_completed" : "worker_started";
@@ -1956,6 +1968,27 @@ export class Orchestrator {
       : undefined;
     leaseKeepAlive?.unref?.();
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
+    const activityTicker = new MissionActivityTicker({
+      state: (missionId) => this.store.getMission(missionId)?.status,
+      emit: (missionId) => {
+        const projection = this.observability?.projection(missionId);
+        if (!projection) return;
+        const summary = projection.summary;
+        const worker =
+          projection.workers.find((candidate) => candidate.health === "stalled") ??
+          projection.workers.find((candidate) => candidate.state === "running" || candidate.state === "waiting");
+        const elapsed = (at: string | null | undefined) =>
+          at ? `${Math.max(0, Math.floor((this.scheduler.now() - Date.parse(at)) / 1000))}s ago` : "not yet observed";
+        const model = worker?.model ? ` · ${worker.route ? `${worker.route} → ` : ""}${worker.model}` : "";
+        const activity =
+          worker?.currentActivity ?? summary.currentActivity?.summary ?? summary.currentObjective ?? summary.phase;
+        this.report(
+          missionId,
+          `[mission ${missionId}] ${summary.health.toUpperCase()} · ${worker ? `${worker.workerId}: ` : ""}${activity}${model} · last output ${elapsed(worker?.lastOutputAt)} · last heartbeat ${elapsed(worker?.lastHeartbeatAt ?? summary.lastHeartbeatAt)} · last progress ${elapsed(worker?.lastMeaningfulProgressAt ?? summary.lastMeaningfulProgressAt)}`,
+        );
+      },
+    });
+    if (opts.onProgress) activityTicker.watch(mission.mission_id);
     try {
       // The mode decision is persisted on the mission (orchestrateMission); the
       // reason is what the operator needs to act on (e.g. "configure logical
@@ -2505,6 +2538,7 @@ export class Orchestrator {
       const finalized = await this.finalizeMission(mission.mission_id, expectedResumptionGeneration, opts.signal);
       return { ...finalized, intent };
     } finally {
+      activityTicker.close();
       if (leaseKeepAlive) clearInterval(leaseKeepAlive);
       if (liveRun && this.liveRuns.get(mission.mission_id) === liveRun) this.liveRuns.delete(mission.mission_id);
       // Never release under an in-flight renewal: it would write the stale

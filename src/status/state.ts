@@ -57,6 +57,8 @@ export interface TaskState {
   label?: string;
   /** Actionable mission state kept structured so layout cannot elide its explanation. */
   missionStatus?: {
+    /** Live activity and age; preserved ahead of metadata at narrow widths. */
+    live?: string;
     token: string;
     reason: string;
     next: string;
