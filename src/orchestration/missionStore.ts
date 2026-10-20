@@ -3178,6 +3178,7 @@ function copyExecution(ex: Execution): Execution {
     artifact_refs: [...ex.artifact_refs],
     ...(ex.recovered_merged ? { recovered_merged: ex.recovered_merged.map((r) => ({ ...r })) } : {}),
     ...(ex.reviewed_recovered ? { reviewed_recovered: [...ex.reviewed_recovered] } : {}),
+    ...(ex.already_satisfied ? { already_satisfied: { ...ex.already_satisfied } } : {}),
   };
 }
 

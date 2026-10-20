@@ -7,7 +7,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
@@ -16,14 +17,14 @@ import { CompletionGate } from "../../src/orchestration/completionGate.ts";
 import { buildCandidateEvidenceIdentity, taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
-import { describeRecoveryOutcome } from "../../src/orchestration/recovery.ts";
+import { ALREADY_SATISFIED_MARKER, describeRecoveryOutcome } from "../../src/orchestration/recovery.ts";
 import { RepositoryRegistry } from "../../src/orchestration/repositoryRegistry.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const EMPTY_DIFF_HASH = `sha256:${createHash("sha256").update("").digest("hex")}`;
 
-type AgentMode = "die-after-commit" | "die-quietly" | "commit" | "nothing";
+type AgentMode = "die-after-commit" | "die-quietly" | "commit" | "nothing" | "already-satisfied";
 
 interface Calls {
   agent: number;
@@ -66,6 +67,19 @@ function backendsFor(git: GitRepo, calls: Calls, modes: AgentMode[]): BrokerBack
         if (mode === "commit") {
           await writeFile(join(worktree, "src", `real-diff-${calls.agent}.ts`), "export const real = true;\n");
           await git.commitAll(worktree, "real diff");
+        }
+        if (mode === "already-satisfied") {
+          // The worker changed nothing because it concluded nothing needed
+          // changing, and said so with proof. This is the shape that used to loop:
+          // an empty candidate plus a gate reason that read as a transient failure.
+          return {
+            executionId: "agent-already-satisfied",
+            exitStatus: "succeeded",
+            summary: "already merged upstream",
+            artifactRefs: [],
+            usage: {},
+            alreadySatisfied: { reason: "the work is already on main", proof: "commit a192077" },
+          };
         }
         return { executionId: "agent-ok", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
       },
@@ -966,5 +980,212 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
           .reasons.some((reason) => /no candidate was ever recorded/.test(reason)),
       );
     });
+  });
+});
+
+/**
+ * A worker's `already_satisfied` assertion has to REACH the completion gate to be
+ * worth anything: the assertion is produced inside a worker session, and if it
+ * dies with the session the gate sees only "empty diff" again and recovery
+ * dispatches another repair to rediscover the same fact. These pin the whole
+ * chain — outcome -> execution record -> event log -> replayed store -> gate
+ * reason — and that the assertion changes the REASON without ever letting a
+ * mutating mission complete on nothing.
+ */
+describe("a worker's already_satisfied assertion reaches the completion gate", () => {
+  async function mission(
+    opts: {
+      mutates?: boolean;
+      isolation?: "none" | "worktree";
+      executionStatus?: "SUCCEEDED" | "FAILED";
+      assertion?: { reason: string; proof: string };
+      fileBacked?: boolean;
+    } = {},
+  ): Promise<{ store: MissionStore; file?: string; reasons: () => string[]; close: () => void }> {
+    const file = opts.fileBacked ? await mkdtemp(join(tmpdir(), "pi-eng-already-satisfied-")) : undefined;
+    const backend = file ? await JsonlEventStore.open(join(file, "events.jsonl")) : JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    const mission = store.createMission({
+      mission_id: "MSN-assert",
+      title: "merge the analytics",
+      goal: "merge the analytics",
+      user_request: "review, PR and merge the committed work",
+      repository: "/repo",
+      base_ref: "b".repeat(40),
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    const manifest = {
+      manifestId: "WM-assert",
+      missionId: mission.mission_id,
+      generation: 1,
+      authorizedRoots: [{ canonicalPath: "/repo", source: "existing_manifest" as const, access: "write" as const }],
+      repositories: [
+        {
+          repoId: "repo-a",
+          canonicalRoot: "/repo",
+          baseRef: "b".repeat(40),
+          baseSha: "b".repeat(40),
+          writableDomains: ["**"],
+        },
+      ],
+      dependencyEdges: [],
+      hash: "manifest-assert",
+      createdAt: "2026-09-27T00:00:00.000Z",
+    };
+    store.bindWorkspaceManifest(manifest);
+    const task = store.createTask({
+      task_id: "TSK-assert",
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "merge the analytics",
+      repo_id: "repo-a",
+      mutates_repo: opts.mutates ?? true,
+      ...(opts.isolation ? { isolation: opts.isolation } : {}),
+    });
+    store.transitionTask(task.task_id, "READY");
+    const execution = store.createExecution({
+      task_id: task.task_id,
+      mission_id: mission.mission_id,
+      backend: "agent",
+      repo_id: "repo-a",
+      base_sha: "b".repeat(40),
+    });
+    store.transitionTask(task.task_id, "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+    store.setExecutionStatus(execution.execution_id, "RUNNING");
+    store.setExecutionStatus(execution.execution_id, opts.executionStatus ?? "SUCCEEDED", {
+      exit_status: (opts.executionStatus ?? "SUCCEEDED") === "SUCCEEDED" ? "succeeded" : "failed",
+      ...(opts.assertion ? { already_satisfied: { ...opts.assertion } } : {}),
+    });
+    store.transitionTask(task.task_id, (opts.executionStatus ?? "SUCCEEDED") === "SUCCEEDED" ? "SUCCEEDED" : "FAILED");
+    // recordCandidate only accepts a successful authoritative execution, so a
+    // FAILED run leaves the mission with no candidate at all — which exercises the
+    // other empty-candidate branch, and is still a reason without a marker.
+    if ((opts.executionStatus ?? "SUCCEEDED") === "SUCCEEDED") {
+      store.recordCandidate(
+        mission.mission_id,
+        buildCandidateEvidenceIdentity({
+          workspaceManifestHash: manifest.hash,
+          missionGeneration: 0,
+          repoId: "repo-a",
+          baseSha: "b".repeat(40),
+          candidateSha: "b".repeat(40),
+          diffHash: EMPTY_DIFF_HASH,
+          acceptanceIds: [],
+          artifactHashes: [],
+        }),
+        "base candidate",
+        { taskId: task.task_id, executionId: execution.execution_id },
+      );
+    }
+    const reasons = () => new CompletionGate(store).evaluate(store.getMission("MSN-assert")!).reasons;
+    return { store, ...(file ? { file } : {}), reasons, close: () => backend.close() };
+  }
+
+  const ASSERTION = {
+    reason: "PR #599 already merged the capacity analytics into main; nothing remains to merge",
+    proof: "commit a192077 on main",
+  };
+
+  it("persists on the execution and reaches the gate reason, still blocking completion", async () => {
+    const { store, reasons } = await mission({ assertion: ASSERTION });
+    assert.deepEqual(store.getExecution(store.listExecutions("MSN-assert")[0]!.execution_id)?.already_satisfied, {
+      reason: ASSERTION.reason,
+      proof: ASSERTION.proof,
+    });
+    const blocked = reasons().filter((reason) => /identical to its base/.test(reason));
+    assert.equal(blocked.length, 1, "an assertion must never let a mutating mission complete on an empty diff");
+    assert.match(blocked[0]!, new RegExp(ALREADY_SATISFIED_MARKER));
+    assert.match(blocked[0]!, /PR #599 already merged/);
+    assert.match(blocked[0]!, /commit a192077/);
+  });
+
+  it("survives rehydration from the event log on disk", async () => {
+    const { file, close } = await mission({ assertion: ASSERTION, fileBacked: true });
+    try {
+      // Appends drain asynchronously and open() refuses a second instance over a
+      // path still held, so wait for the assertion to be ON DISK before restarting
+      // against it — a fixed sleep here would be a flake waiting to happen.
+      const events = join(file!, "events.jsonl");
+      for (let waited = 0; ; waited += 20) {
+        // The backend creates the file on its first append, so it legitimately
+        // does not exist yet on the first pass.
+        const logged = await readFile(events, "utf8").catch(() => "");
+        if (logged.includes("already_satisfied")) break;
+        if (waited > 5_000) assert.fail("the assertion never reached the event log");
+        await new Promise((done) => setTimeout(done, 20));
+      }
+      close();
+      const reopenedBackend = await JsonlEventStore.open(events);
+      const reopened = MissionStore.open(reopenedBackend);
+      const execution = reopened.listExecutions("MSN-assert").at(-1)!;
+      assert.deepEqual(execution.already_satisfied, ASSERTION, "the assertion must be durable, not session-local");
+      const reason = new CompletionGate(reopened).evaluate(reopened.getMission("MSN-assert")!).reasons.join("; ");
+      assert.match(reason, new RegExp(ALREADY_SATISFIED_MARKER));
+      assert.match(reason, /commit a192077/);
+      reopenedBackend.close();
+    } finally {
+      // The reopened backend releases its lock file on a deferred tick, so a plain
+      // rm races it; retrying is what makes cleanup deterministic.
+      await rm(file!, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  it("ignores an assertion from a FAILED execution or a read-only task", async () => {
+    for (const opts of [
+      { executionStatus: "FAILED" as const, assertion: ASSERTION },
+      { mutates: false, assertion: ASSERTION },
+    ]) {
+      const { reasons } = await mission(opts);
+      const reasons_ = reasons();
+      assert.ok(
+        !reasons_.some((reason) => reason.includes(ALREADY_SATISFIED_MARKER)),
+        `a ${opts.executionStatus === "FAILED" ? "failed" : "read-only"} run asserting no-op is not evidence`,
+      );
+    }
+  });
+
+  it("leaves an assertion-free empty candidate worded as before", async () => {
+    const { reasons } = await mission();
+    const blocked = reasons().filter((reason) => /identical to its base/.test(reason));
+    assert.equal(blocked.length, 1);
+    assert.ok(!blocked[0]!.includes(ALREADY_SATISFIED_MARKER));
+  });
+
+  it("ends the repair loop end to end: real broker, real git, one worker, no retry", async () => {
+    const h = await flowHarness(["already-satisfied"]);
+    try {
+      const result = await h.orchestrator.orchestrate(`Merge the analytics already on main in ${h.fixture.root}`, {
+        repository: h.fixture.root,
+        baseRef: h.baseSha,
+        mutationRequested: true,
+      });
+      const missionId = result.mission.mission_id;
+      // The assertion travelled worker outcome -> broker settle -> execution record.
+      assert.ok(
+        h.store.listExecutions(missionId).some((execution) => execution.already_satisfied?.proof === "commit a192077"),
+        JSON.stringify(h.store.listExecutions(missionId).map((e) => e.already_satisfied)),
+      );
+      assert.notEqual(result.mission.status, "COMPLETE", "an assertion must never complete a mutating mission");
+      // The classification is the whole point: REVIEW_FAILED here means "dispatch a
+      // repair task", which is what ran a third and fourth implementer to rediscover
+      // the same conclusion. REQUIREMENT_AMBIGUITY parks it for the operator.
+      assert.ok(
+        h.store.listFailureClassifications(missionId).some((entry) => entry.category === "REQUIREMENT_AMBIGUITY"),
+        JSON.stringify(h.store.listFailureClassifications(missionId).map((entry) => [entry.category, entry.summary])),
+      );
+      assert.ok(
+        !h.store.listRecoveryDecisions(missionId).some((decision) => decision.action === "CREATE_REPAIR_TASKS"),
+        JSON.stringify(h.store.listRecoveryDecisions(missionId).map((decision) => decision.action)),
+      );
+      assert.equal(
+        h.calls.agent,
+        1,
+        `the assertion must park the mission, not dispatch another worker to rediscover it: ${h.calls.agent} agent runs`,
+      );
+    } finally {
+      await h.fixture.cleanup();
+    }
   });
 });
