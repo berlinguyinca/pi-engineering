@@ -14,6 +14,7 @@ import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
 import { contextReading, planModelSwitch } from "../src/context/usage.ts";
+import { gatewayWaitLabel } from "../src/gateway/admissionNotice.ts";
 import { AdvisedModelSwitch } from "../src/gateway/advisedSwitch.ts";
 import { AfterOutputRetry } from "../src/gateway/afterOutputRetry.ts";
 import { sharedAdmissionController, sharedGatewayConfig } from "../src/gateway/config.ts";
@@ -103,6 +104,7 @@ import { maintenanceHandler } from "../src/sessionControl/runtimeMaintenance.ts"
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
+import { WorkingStatusController } from "../src/status/working.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
@@ -663,6 +665,8 @@ function formatEntities(rt: EngineeringRuntime, kind?: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  let working: WorkingStatusController | undefined;
+  let workingSignal: AbortSignal | undefined;
   if (typeof pi.on === "function") registerTerminalRefusalGuard(pi);
   registerModelTabs(pi);
   registerInteractiveMemory(pi);
@@ -1439,7 +1443,9 @@ ${RECOVERY_PROMPT}`;
     // family of paths disagreeing with each other; a rule stated in one place
     // and broken in another is not a rule, so all three now ask one function.
     pi.on("message_end", async (event, ctx) => {
-      const msg = event.message as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+      const msg = event.message as
+        | { role?: string; stopReason?: string; errorMessage?: string; provider?: string; model?: string }
+        | undefined;
       if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
       const signal = parseGatewayWait({ text: msg.errorMessage });
       if (!signal?.retryable) return;
@@ -1447,9 +1453,15 @@ ${RECOVERY_PROMPT}`;
       // The status bar owns this now: a spinner, the countdown and the queue
       // position say everything the 429 body did, without a wall of warnings
       // every 30 seconds. Notify only when there is no status bar to read.
-      if (!statusBarConfig.enabled) {
+      working?.onGatewayEvent({
+        type: "wait",
+        waitMs,
+        concurrency: admission.status().concurrency,
+        signal: { ...signal, provider: msg.provider, model: msg.model },
+      });
+      if (!working && !statusBarConfig.enabled) {
         ctx.ui.notify(
-          `Model gateway is saturated — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
+          `${gatewayWaitLabel(signal)} — holding ${Math.round(waitMs / 1000)}s. ${describeGatewayWait(signal)}`,
           "warning",
         );
       }
@@ -1472,7 +1484,7 @@ ${RECOVERY_PROMPT}`;
       const identity = ctx.model ? { provider: ctx.model.provider, model: ctx.model.id } : {};
       const remaining = admission.cooldownRemainingMs(identity);
       if (remaining <= 0) return;
-      if (!statusBarConfig.enabled) {
+      if (!working && !statusBarConfig.enabled) {
         const now = Date.now();
         if (now >= noticeSilentUntil) {
           noticeSilentUntil = now + remaining;
@@ -1544,6 +1556,16 @@ ${RECOVERY_PROMPT}`;
           hold: async (waitSignal, _attempt, abort, actualModel) => {
             const callModel = actualModel as Model<any>;
             const scopedSignal = { ...waitSignal, provider: callModel.provider, model: callModel.id };
+            // Only this interactive provider call owns the native working row.
+            // Shared admission events also describe background requests on the
+            // same route, so observing that bus would misattribute their waits.
+            if (abort && abort === workingSignal)
+              working?.onGatewayEvent({
+                type: "wait",
+                waitMs: scopedSignal.retryAfterMs,
+                concurrency: admission.status().concurrency,
+                signal: scopedSignal,
+              });
             const opts = {
               provider: callModel.provider,
               model: callModel.id,
@@ -1556,8 +1578,9 @@ ${RECOVERY_PROMPT}`;
           // "Consecutive" has to mean consecutive: without this the counter
           // accumulated across a whole session and would eventually trip a
           // fallback on unrelated, widely separated holds.
-          onProgress: () => {
+          onProgress: (_model, signal) => {
             fallbackCoordinator.onProgress();
+            if (signal && signal === workingSignal) working?.onModelProgress();
           },
           onHold: (info, actualModel) => {
             // Checked on a hold rather than on failure: by the time a turn
@@ -1606,7 +1629,33 @@ ${RECOVERY_PROMPT}`;
           // A stream cut after partial output is replayed by afterOutputRetry
           // (agent_before_settle); the wait it owes is taken here, against the
           // request's own abort signal, so Esc ends it at once.
-          beforeSend: (model, signal, context) => afterOutputRetry.beforeSend(model as never, signal, context as never),
+          beforeSend: (model, signal, context) => {
+            // before_provider_request may also be emitted by cache warming,
+            // which exposes the foreground ctx.signal rather than its own.
+            // This request callback retains the actual abort-signal identity.
+            if (signal && signal === workingSignal) {
+              const actual = model as Model<any>;
+              const identity = { provider: actual.provider, model: actual.id };
+              const remaining = admission.cooldownRemainingMs(identity);
+              if (remaining > 0) {
+                const observed = admission.status().lastSignal;
+                const matching = observed?.provider === actual.provider && observed?.model === actual.id;
+                working?.onGatewayEvent({
+                  type: "wait",
+                  waitMs: remaining,
+                  concurrency: admission.status().concurrency,
+                  signal: {
+                    ...(matching
+                      ? observed
+                      : { source: "default", retryable: true, reason: "shared_gateway_cooldown" }),
+                    retryAfterMs: remaining,
+                    ...identity,
+                  },
+                });
+              }
+            }
+            return afterOutputRetry.beforeSend(model as never, signal, context as never);
+          },
           // Thinking off for Pi's summaries (compaction) and near-full turns on
           // the metabolomics gateway, whose models think by default and would
           // otherwise spend the whole output budget on hidden reasoning.
@@ -1788,6 +1837,36 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_shutdown", () => {
       // Ephemeral fallback state must not leak across a session boundary.
       fallbackCoordinator.onSessionShutdown();
+    });
+  }
+
+  // The native working indicator remains informative even with the custom
+  // footer disabled. Split view retains Pi's native dock, so both layouts use
+  // this same local-only activity surface.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", (_event, ctx) => {
+      workingSignal = undefined;
+      working?.dispose();
+      working = ctx.hasUI ? new WorkingStatusController(ctx.ui) : undefined;
+      working?.onModelSelect(ctx.model);
+    });
+    pi.on("agent_start", (_event, ctx) => {
+      workingSignal = ctx.signal;
+      working?.onAgentStart();
+    });
+    pi.on("message_update", (event) => working?.onMessageUpdate(event));
+    pi.on("tool_execution_start", (event) => working?.onToolEvent(event));
+    pi.on("tool_execution_update", (event) => working?.onToolEvent(event));
+    pi.on("tool_execution_end", (event) => working?.onToolEvent(event));
+    pi.on("model_select", (event) => working?.onModelSelect(event.model));
+    pi.on("agent_settled", () => {
+      workingSignal = undefined;
+      working?.onAgentEnd();
+    });
+    pi.on("session_shutdown", () => {
+      workingSignal = undefined;
+      working?.dispose();
+      working = undefined;
     });
   }
 
