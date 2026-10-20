@@ -158,3 +158,34 @@ test("canonical model seeds must be objects with non-empty ids", () => {
     assert.throws(() => canonical({ p: { baseUrl: "https://x.example/v1", models: [model] } }), /non-empty string id/);
   }
 });
+
+test("writing models.json records who wrote it, with provider URLs and no key", async () => {
+  const { mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { writeModelsConfig } = await import("../../src/models/modelsConfig.ts");
+  const dir = mkdtempSync(join(tmpdir(), "writers-"));
+  try {
+    const path = join(dir, "models.json");
+    writeFileSync(path, "{}", { mode: 0o600 });
+    writeModelsConfig(
+      path,
+      { providers: { p: { baseUrl: "https://x.example/v1", apiKey: "SECRET" } } },
+      new Date(),
+      "model-sync",
+    );
+    writeModelsConfig(path, { providers: {} });
+    const log = readFileSync(`${path}.writers.log`, "utf8");
+    assert.doesNotMatch(log, /SECRET/);
+    const [first, second] = log
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    assert.equal(first.writer, "model-sync");
+    assert.deepEqual(first.providers, { p: "https://x.example" });
+    assert.equal(second.writer, "unlabelled");
+    assert.deepEqual(second.providers, {});
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

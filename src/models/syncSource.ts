@@ -73,6 +73,15 @@ export function readSyncSourceSetting(configPath: string = defaultSyncConfigPath
   return source;
 }
 
+/** Whether `model-sync.json` asks for a quiet drift check at session start. Never throws. */
+export function readCheckOnStart(configPath: string = defaultSyncConfigPath()): boolean {
+  try {
+    return (JSON.parse(readFileSync(configPath, "utf8")) as { checkOnStart?: unknown }).checkOnStart === true;
+  } catch {
+    return false;
+  }
+}
+
 /** Fetch the canonical definition's text from `source`. */
 export async function fetchCanonicalText(source: SyncSource, signal?: AbortSignal): Promise<string> {
   let text: string;

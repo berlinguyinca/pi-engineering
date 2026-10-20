@@ -361,7 +361,15 @@ reported `needs-key` and not created. Only the keys the canonical file names are
 replaced (unknown keys survive); its `models` only seed a provider that has none.
 
 `/model-sync --dry-run` previews and writes nothing; `--no-refresh` aligns
-settings without probing models.
+settings without probing models; `--check` is a read-only drift report ("In
+sync." or "Out of sync"). Add `"checkOnStart": true` to `model-sync.json` for a
+quiet check at session start that speaks only on drift.
+
+Every write of `models.json` appends a line to `models.json.writers.log` (time,
+writer, pid, parent pid, provider ids and HTTP(S) origins; last 200 kept), so an
+unexplained change can be traced to the process that made it. URL credentials,
+paths, queries and fragments are omitted because they can contain keys. The log
+is private (0600), and logging failures never fail a successful config write.
 
 `/models` is the model picker with a tab per provider. Pi's built-in `/model`
 offers only an all/scoped toggle that mixes every provider into one list, and an

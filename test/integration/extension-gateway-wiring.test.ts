@@ -1128,3 +1128,38 @@ test("wiring: /model-sync without a configured source says how to configure one"
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("wiring: /model-sync --check reports drift and writes nothing", async () => {
+  const cmd = loadWithCommands().get("model-sync");
+  assert.ok(cmd);
+  const dir = mkdtempSync(join(tmpdir(), "model-sync-check-"));
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const modelsPath = join(dir, "models.json");
+  const before = JSON.stringify({ providers: { p: { baseUrl: "https://old.example/v1", apiKey: "k" } } });
+  writeFileSync(modelsPath, before, { mode: 0o600 });
+  writeFileSync(
+    join(dir, "canonical.json"),
+    JSON.stringify({ providers: { p: { baseUrl: "https://new.example/v1" } } }),
+  );
+  writeFileSync(join(dir, "model-sync.json"), JSON.stringify({ source: join(dir, "canonical.json") }));
+  process.env.PI_AGENT_DIR = dir;
+  try {
+    const { ctx, notices } = notifyingCtx();
+    await cmd.handler("--check", ctx);
+    assert.equal(notices[0]?.level, "warning");
+    assert.match(notices[0]?.text ?? "", /Out of sync/);
+    assert.equal(readFileSync(modelsPath, "utf8"), before);
+
+    writeFileSync(
+      join(dir, "canonical.json"),
+      JSON.stringify({ providers: { p: { baseUrl: "https://old.example/v1" } } }),
+    );
+    await cmd.handler("--check", ctx);
+    assert.equal(notices[1]?.level, "info");
+    assert.match(notices[1]?.text ?? "", /In sync/);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

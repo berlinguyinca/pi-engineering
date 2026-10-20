@@ -51,7 +51,12 @@ import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
 import { DEFAULT_PROBE_TIMEOUT_MS, refreshConfiguredProviders } from "../src/models/refresh.ts";
 import { registerModelTabs } from "../src/models/registerModelTabs.ts";
-import { fetchCanonicalText, parseSyncSource, readSyncSourceSetting } from "../src/models/syncSource.ts";
+import {
+  fetchCanonicalText,
+  parseSyncSource,
+  readCheckOnStart,
+  readSyncSourceSetting,
+} from "../src/models/syncSource.ts";
 import {
   MISSION_UNAVAILABLE_RETRY_TURNS,
   decideAutoInvoke,
@@ -1427,10 +1432,11 @@ ${RECOVERY_PROMPT}`;
   // the host's own key), then hands the model lists to /model-refresh.
   pi.registerCommand("model-sync", {
     description:
-      "Align providers with the canonical definition in model-sync.json, refresh models, reload. --dry-run, --no-refresh.",
+      "Align providers with the canonical definition in model-sync.json, refresh models, reload. --check, --dry-run, --no-refresh.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
-      const dryRun = argv.includes("--dry-run");
+      const check = argv.includes("--check");
+      const dryRun = check || argv.includes("--dry-run");
       const skipRefresh = argv.includes("--no-refresh");
       try {
         const source = parseSyncSource(readSyncSourceSetting());
@@ -1444,14 +1450,17 @@ ${RECOVERY_PROMPT}`;
         const lines = describeProviderSync(plan, dryRun);
         let written = false;
         if (plan.dirty && !dryRun) {
-          const w = writeModelsConfig(defaultModelsPath(), plan.config);
+          const w = writeModelsConfig(defaultModelsPath(), plan.config, new Date(), "model-sync");
           written = true;
           if (w.backupPath) lines.push(`Backup: ${w.backupPath}`);
         }
 
         const ready = plan.entries.filter((e) => e.state !== "needs-key").map((e) => e.providerId);
         let failed = plan.entries.some((e) => e.state === "needs-key");
-        if (dryRun) {
+        if (check) {
+          failed = plan.dirty || failed;
+          lines.push(failed ? "Out of sync: run /model-sync." : "In sync.");
+        } else if (dryRun) {
           lines.push("Dry run: nothing written, models not refreshed.");
         } else if (skipRefresh || ready.length === 0) {
           if (skipRefresh) lines.push("Models not refreshed (--no-refresh).");
@@ -1485,6 +1494,33 @@ ${RECOVERY_PROMPT}`;
       }
     },
   });
+
+  // Opt-in (`"checkOnStart": true` in model-sync.json): tell the operator when this
+  // machine has drifted from the canonical providers. Read-only and silent when
+  // in sync or when the source is unreachable, so an offline laptop starts quietly.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", (_event, ctx) => {
+      if (!ctx.hasUI || !readCheckOnStart()) return;
+      void (async () => {
+        try {
+          const source = parseSyncSource(readSyncSourceSetting());
+          const canonical = parseCanonicalProviders(await fetchCanonicalText(source));
+          const plan = planProviderSync(
+            readModelsConfig(defaultModelsPath()),
+            canonical,
+            (id) => ctx.modelRegistry?.getProviderAuthStatus(id).configured === true,
+          );
+          if (!plan.dirty && plan.entries.every((e) => e.state !== "needs-key")) return;
+          ctx.ui.notify(
+            `Providers differ from the canonical set:\n${describeProviderSync(plan, true).join("\n")}\nRun /model-sync.`,
+            "warning",
+          );
+        } catch {
+          // unreachable source or unreadable config: stay quiet at startup
+        }
+      })();
+    });
+  }
 
   // Registered outside the `pi.on` guard below: a command needs only
   // `registerCommand`, and burying it in there meant it never appeared in a
