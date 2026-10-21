@@ -2553,7 +2553,8 @@ export class MissionStore {
       throw new Error("reconstruction source checkpoint repository does not match the candidate identity");
     const key = candidateKey(missionId, identity.repoId);
     const prior = this.candidates.get(key);
-    if (prior && prior.identityHash !== identityHash) this.invalidateCandidate(prior, reason);
+    if (prior && prior.identityHash !== identityHash)
+      this.invalidateCandidate(prior, reason ?? "candidate reconstructed from preserved worker work");
     const candidate: CandidateRevision = {
       missionId,
       taskId: checkpoint.taskId,

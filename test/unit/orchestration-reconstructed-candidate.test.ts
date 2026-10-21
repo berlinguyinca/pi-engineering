@@ -156,7 +156,8 @@ describe("recordReconstructedCandidate (#360)", () => {
   it("rejects a candidate identity whose sha does not match the source checkpoint", () => {
     const { store, missionId } = seed();
     assert.throws(
-      () => store.recordReconstructedCandidate(missionId, identity("other-sha"), { checkpointId: "TCP-360", branch: null }),
+      () =>
+        store.recordReconstructedCandidate(missionId, identity("other-sha"), { checkpointId: "TCP-360", branch: null }),
       /does not match/,
     );
   });
@@ -164,7 +165,11 @@ describe("recordReconstructedCandidate (#360)", () => {
   it("rejects an unknown source checkpoint", () => {
     const { store, missionId } = seed();
     assert.throws(
-      () => store.recordReconstructedCandidate(missionId, identity("preserved-360"), { checkpointId: "TCP-nope", branch: null }),
+      () =>
+        store.recordReconstructedCandidate(missionId, identity("preserved-360"), {
+          checkpointId: "TCP-nope",
+          branch: null,
+        }),
       /checkpoint not found/,
     );
   });

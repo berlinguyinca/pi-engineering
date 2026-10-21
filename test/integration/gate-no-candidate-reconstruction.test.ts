@@ -122,10 +122,7 @@ async function harnessFor(reconstructable: boolean) {
   if (reconstructable) {
     preservedBranch = "preserved-worker-branch";
     const wt = await git.createWorktree(baseSha, preservedBranch);
-    await writeFile(
-      join(wt.path, "src", "add.js"),
-      "export function add(a, b) {\n  return a + b;\n}\n",
-    );
+    await writeFile(join(wt.path, "src", "add.js"), "export function add(a, b) {\n  return a + b;\n}\n");
     await git.commitAll(wt.path, "preserved work: implement add");
     preservedSha = await git.headCommitIn(wt.path);
   }
@@ -325,11 +322,7 @@ describe.skip("recovery gate with no recorded candidate (#360) — acceptance sp
         [],
         "no baseline refusal finding",
       );
-      assert.equal(
-        resumed.status,
-        "COMPLETE",
-        JSON.stringify({ stop: h.store.listMissionStops(h.missionId).at(-1) }),
-      );
+      assert.equal(resumed.status, "COMPLETE", JSON.stringify({ stop: h.store.listMissionStops(h.missionId).at(-1) }));
     } finally {
       await h.fixture.cleanup();
     }
@@ -352,11 +345,7 @@ describe.skip("recovery gate with no recorded candidate (#360) — acceptance sp
       // Finite: a second repair pass does not re-enter the refusal loop.
       const resumedAgain = await h.orchestrator.repairBlockedMission(h.missionId);
       const recoveriesAfter = h.store.listRecoveryDecisions(h.missionId).length;
-      assert.equal(
-        recoveriesAfter,
-        recoveriesBefore,
-        "no further recovery decisions are created on re-entry (finite)",
-      );
+      assert.equal(recoveriesAfter, recoveriesBefore, "no further recovery decisions are created on re-entry (finite)");
       assert.equal(h.calls.validation, 0, "the gate is not re-run with no candidate");
       assert.equal(resumed.status, "BLOCKED");
       assert.equal(resumedAgain.status, "BLOCKED");
