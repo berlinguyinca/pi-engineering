@@ -26,7 +26,25 @@ const TERMINAL = {
   type: "inferweave_backpressure",
 };
 
-async function exercise(options: { guard: boolean; terminal: boolean }) {
+// The weaker envelope the operator's Hive/Farm workers actually received: a
+// terminal reason (do_not_retry) on an admission envelope with a default
+// retry_after_ms but none of the explicit replay-contract fields. Before the
+// shared terminal-contract predicate it was not recognised as terminal, so the
+// host retried it.
+const WEAK_TERMINAL = {
+  active: 1,
+  active_limit: 1,
+  error: "invalid_upstream_response",
+  message: "inference admission: do_not_retry",
+  provider: "qwen3.8-27b",
+  reason: "do_not_retry",
+  retry_after_ms: 60_000,
+  scope: "worker",
+  type: "inference_admission",
+};
+
+async function exercise(options: { guard: boolean; terminal: boolean; terminalBody?: Record<string, unknown> }) {
+  const terminalBody = options.terminalBody ?? TERMINAL;
   let requests = 0;
   const server = createServer((req, res) => {
     req.resume();
@@ -35,7 +53,7 @@ async function exercise(options: { guard: boolean; terminal: boolean }) {
       if (options.terminal || requests === 1) {
         res.writeHead(503, { "content-type": "application/json" });
         res.end(
-          JSON.stringify(options.terminal ? { error: TERMINAL } : { error: { message: "503 temporary overload" } }),
+          JSON.stringify(options.terminal ? { error: terminalBody } : { error: { message: "503 temporary overload" } }),
         );
         return;
       }
@@ -142,6 +160,22 @@ test("terminal refusal makes exactly one HTTP request and retains the original e
         entry.message.errorMessage === error?.errorMessage,
     ),
   );
+});
+
+test("real SDK retries the weak do_not_retry 503 without the guard (regression control)", async () => {
+  const result = await exercise({ guard: false, terminal: true, terminalBody: WEAK_TERMINAL });
+  assert.equal(result.requests, 4);
+  assert.equal(result.retries, 3);
+});
+
+test("guard aborts the host retry on the weak do_not_retry 503 (operator payload)", async () => {
+  const result = await exercise({ guard: true, terminal: true, terminalBody: WEAK_TERMINAL });
+  assert.equal(result.requests, 1, JSON.stringify(result.errors));
+  assert.equal(result.retries, 0);
+  assert.equal(result.errors.length, 1);
+  const error = result.messages.filter((message) => message.role === "assistant").at(-1);
+  assert.equal(error?.stopReason, "error");
+  assert.match(error?.errorMessage ?? "", /do_not_retry/);
 });
 
 test("ordinary transient 503 still retries and succeeds with the guard installed", async () => {

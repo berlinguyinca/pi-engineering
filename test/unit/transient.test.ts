@@ -77,6 +77,32 @@ test("classify: the routing rule never overrides the admission contract's fail-c
   }
 });
 
+test("classify: a terminal do_not_retry admission is not retryable (even with a default wait)", () => {
+  // The payload the operator saw on the Hive/Farm workers: reason do_not_retry
+  // + a default retry_after_ms, no explicit replay-contract fields. It is a
+  // terminal gateway refusal — retrying re-sends a body the upstream rejected.
+  const cls = classifyError(
+    new Error(
+      '503: {"active":1,"active_limit":1,"error":"invalid_upstream_response","message":"inference admission: do_not_retry","provider":"qwen3.8-27b","reason":"do_not_retry","retry_after_ms":60000,"scope":"worker","type":"inference_admission"}',
+    ),
+  );
+  assert.equal(cls.retryable, false);
+  assert.equal(cls.category, "permanent");
+});
+
+test("classify: a retryable admission reason (no_workers) is not the terminal-refusal branch", () => {
+  // no_workers is a wait the admission controller owns, so the transient layer
+  // marks it permanent here too — but the reason must be the admission-refusal
+  // branch, not the terminal-refusal branch.
+  const cls = classifyError(
+    new Error(
+      '503: {"message":"inference admission: no_workers","reason":"no_workers","retry_after_ms":30000,"type":"inference_admission"}',
+    ),
+  );
+  assert.equal(cls.retryable, false);
+  assert.match(cls.reason ?? "", /admission/);
+});
+
 test("classify: a link cut stays with the network branch, not the routing rule", () => {
   const cls = classifyError(
     new Error("The route serving this model ended before the response did; the response is incomplete."),

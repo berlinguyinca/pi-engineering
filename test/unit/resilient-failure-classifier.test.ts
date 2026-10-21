@@ -278,3 +278,74 @@ describe("model- vs gateway-scoped behaviour (spec §10)", () => {
     );
   });
 });
+
+// ─── Terminal gateway refusal (do_not_retry) ────────────────────────────────
+
+describe("terminal gateway refusal (do_not_retry / replay-unsafe / post-dispatch)", () => {
+  it("classifies a 503 do_not_retry admission (reason + a default wait) as terminal", () => {
+    // The payload the operator saw: reason do_not_retry alongside a default
+    // retry_after_ms, no explicit replay-contract fields. The wait must NOT
+    // make it retryable.
+    const md = metadataFromResponse({
+      status: 503,
+      body: {
+        type: "inference_admission",
+        reason: "do_not_retry",
+        error: "invalid_upstream_response",
+        retry_after_ms: 60_000,
+      },
+    });
+    const f = classifyInferenceFailure({ error: new Error("503"), metadata: md });
+    assert.equal(f.retryable, false, "do_not_retry is terminal, not a wait");
+    assert.equal(f.action, "fail");
+    assert.equal(f.class, "invalid_request");
+    assert.equal(f.source, "inferweave_body");
+  });
+
+  it("classifies an explicit replay-unsafe / post-dispatch envelope as terminal", () => {
+    const md = metadataFromResponse({
+      status: 503,
+      body: {
+        type: "inferweave_backpressure",
+        reason: "internal_error",
+        retryable: false,
+        replay_safe: false,
+        request_state: "dispatched",
+        action: "do_not_retry",
+        action_code: "IW-ACT-DO-NOT-RETRY",
+      },
+    });
+    const f = classifyInferenceFailure({ error: new Error("503"), metadata: md });
+    assert.equal(f.retryable, false);
+    assert.equal(f.action, "fail");
+  });
+
+  it("detects the terminal contract from the rendered text when the body is reduced to { message }", () => {
+    // The decide path reduces the body to { message }, so the structured
+    // errorBody.reason is absent — the contract must still be recognised from
+    // the rendered `503: {…}` text.
+    const text =
+      '503: {"active":1,"active_limit":1,"error":"invalid_upstream_response","message":"inference admission: do_not_retry","provider":"qwen3.8-27b","reason":"do_not_retry","retry_after_ms":60000,"scope":"worker","type":"inference_admission"}';
+    const f = classifyInferenceFailure({
+      error: new Error(text),
+      metadata: metadataFromResponse({ status: 503, body: { message: text } }),
+    });
+    assert.equal(f.retryable, false);
+    assert.equal(f.action, "fail");
+    assert.equal(f.class, "invalid_request");
+  });
+
+  it("does NOT treat a retryable admission envelope as terminal (no_workers / queue_timeout)", () => {
+    for (const [status, reason] of [
+      [503, "no_workers"],
+      [429, "queue_timeout"],
+    ] as const) {
+      const md = metadataFromResponse({
+        status,
+        body: { type: "inference_admission", reason, retry_after_ms: 30_000 },
+      });
+      const f = classifyInferenceFailure({ error: new Error(String(status)), metadata: md });
+      assert.equal(f.retryable, true, `${reason} stays retryable`);
+    }
+  });
+});

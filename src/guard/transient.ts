@@ -23,7 +23,7 @@ import {
   isGatewayLinkCut,
   isTransportDrop,
 } from "../gateway/signals.ts";
-import { PERMANENT_ADMISSION_STATUSES } from "../inference/admissionContract.ts";
+import { PERMANENT_ADMISSION_STATUSES, isTerminalReplayContract } from "../inference/admissionContract.ts";
 import { type ClassifiedInferenceFailure, classifyInferenceFailure } from "../inference/failureClassifier.ts";
 
 export type TransientErrorCategory =
@@ -182,6 +182,22 @@ export function classifyError(error: unknown): ErrorClass {
       category: "permanent",
       retryable: false,
       reason: "gateway admission refusal — handled by the admission controller",
+    };
+  }
+
+  // A terminal gateway refusal — the gateway said explicitly do not replay this
+  // request (do_not_retry / fix_request / authenticate, a replay-unsafe
+  // envelope, or a request already dispatched/streaming/unknown). It carries no
+  // wait to honour, so it is not an admission-controller hold (the branch
+  // above); it is simply not retryable. Retrying amplifies load on a dying
+  // worker and re-sends a body the upstream already rejected. The unified
+  // classifier reaches the same verdict, but this keeps the worker's transient
+  // loop fail-closed even when only the rendered text is available.
+  if (isTerminalReplayContract(raw)) {
+    return {
+      category: "permanent",
+      retryable: false,
+      reason: "terminal gateway refusal (do_not_retry / replay-unsafe / post-dispatch) — not retryable",
     };
   }
 

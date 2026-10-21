@@ -17,6 +17,7 @@
  * needlessly switching models.
  */
 
+import { isTerminalReplayContract } from "./admissionContract.ts";
 import type { InferenceResponseMetadata } from "./inferweaveMetadata.ts";
 
 export type InferenceFailureClass =
@@ -446,6 +447,23 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
   const md = input.metadata;
   const text = errorText(input.error);
   const status = md?.status ?? extractStatus(input.error);
+
+  // 0. STRUCTURAL: an explicit terminal replay contract overrides every other
+  // source. The gateway said do not replay this request (do_not_retry /
+  // fix_request / authenticate, a replay-unsafe envelope, or a request already
+  // dispatched/streaming/whose state is unknown). No wait clears it and a
+  // replay re-sends a body the upstream rejected or duplicates side effects, so
+  // fail fast instead of burning a retry budget. The transport surfaces the 503
+  // body as the message, so detect it from the structured body when present,
+  // else from the rendered text.
+  if ((md?.errorBody !== undefined && isTerminalReplayContract(md.errorBody)) || isTerminalReplayContract(text)) {
+    return finish(input, "invalid_request", {
+      source: "inferweave_body",
+      reason: "terminal replay contract (do_not_retry / replay-unsafe / post-dispatch)",
+      retryable: false,
+      action: "fail",
+    });
+  }
 
   // 1. STRUCTURAL: InferWeave protocol — body reason token.
   const bodyReason = typeof md?.errorBody?.reason === "string" ? md.errorBody.reason : undefined;

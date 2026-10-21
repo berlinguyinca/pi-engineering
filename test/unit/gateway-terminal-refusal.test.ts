@@ -49,6 +49,42 @@ for (const [name, body] of Object.entries({
   });
 }
 
+// The payload the operator saw on the Hive/Farm workers: a terminal reason
+// (do_not_retry) on an admission envelope with a default retry_after_ms but
+// none of the explicit replay-contract fields. It is terminal even though it
+// looks like a transient 503 wait — the old guard missed exactly this shape.
+for (const [name, body] of Object.entries({
+  "terminal reason do_not_retry with a default wait (operator payload)": {
+    active: 1,
+    active_limit: 1,
+    error: "invalid_upstream_response",
+    message: "inference admission: do_not_retry",
+    provider: "qwen3.8-27b",
+    reason: "do_not_retry",
+    retry_after_ms: 60_000,
+    scope: "worker",
+    type: "inference_admission",
+  },
+  "terminal reason fix_request": { type: "inference_admission", reason: "fix_request", retry_after_ms: 30_000 },
+  "terminal reason in a detail envelope": {
+    detail: { type: "inference_admission", reason: "do_not_retry", retry_after_ms: 60_000 },
+  },
+})) {
+  test(`recognizes ${name} (terminal reason, no explicit contract fields)`, () => {
+    assert.equal(isTerminalGatewayRefusal(`503: ${JSON.stringify(body)}`), true);
+  });
+}
+
+// A retryable reason on the same envelope shape stays a wait, not terminal.
+for (const [name, body] of Object.entries({
+  "retryable reason no_workers": { type: "inference_admission", reason: "no_workers", retry_after_ms: 30_000 },
+  "retryable reason queue_timeout": { type: "inference_admission", reason: "queue_timeout", retry_after_ms: 30_000 },
+})) {
+  test(`leaves ${name} to existing retry policy (terminal-reason check stays negative)`, () => {
+    assert.equal(isTerminalGatewayRefusal(`503: ${JSON.stringify(body)}`), false);
+  });
+}
+
 for (const [name, text] of Object.entries({
   "bare 503": "503 overloaded, retry later",
   "unstructured do_not_retry wording": "503 do_not_retry inferweave_backpressure replay_safe:false",

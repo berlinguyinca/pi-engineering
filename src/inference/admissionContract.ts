@@ -270,6 +270,80 @@ export function isAutomaticReplayAllowed(info: AdmissionInfo, outputCommitted: b
   );
 }
 
+/** Dispositions the gateway uses to say "do not replay this request" (terminal). */
+const TERMINAL_REPLAY_TOKENS: ReadonlySet<string> = new Set([
+  "do_not_retry",
+  "fix_request",
+  "authenticate",
+  "request_access",
+  "resolve_conflict",
+  "reduce_input",
+]);
+const TERMINAL_REPLAY_ACTION_CODES: ReadonlySet<string> = new Set([
+  "IW-ACT-DO-NOT-RETRY",
+  "IW-ACT-FIX-REQUEST",
+  "IW-ACT-AUTHENTICATE",
+  "IW-ACT-REQUEST-ACCESS",
+  "IW-ACT-RESOLVE-CONFLICT",
+  "IW-ACT-REDUCE-INPUT",
+]);
+
+/**
+ * True when an InferWeave payload says do not replay this request. Two shapes
+ * are terminal:
+ *
+ *  1. An EXPLICIT replay contract (a `inferweave_backpressure` envelope, or one
+ *     that carries the replay fields) whose fields say so: `retryable: false`,
+ *     `replay_safe: false`, a request already `dispatched`/`streaming` or in an
+ *     `unknown` state, or a terminal action / action code.
+ *
+ *  2. An admission envelope that named a terminal disposition in `reason`
+ *     (`do_not_retry` / `fix_request` / …) even without those fields — e.g. a
+ *     `503 … inference_admission` with `reason: do_not_retry` and a default
+ *     `retry_after_ms`. The admission protocol marks these terminal; a default
+ *     wait alongside them does not make them retryable.
+ *
+ * Waiting or replaying cannot help a terminal refusal — a replay re-sends a
+ * body the upstream rejected or duplicates side effects, and a post-dispatch
+ * request has already been partially processed.
+ *
+ * Accepts the parsed body object, or a string that embeds it (the transport
+ * surfaces a 503 body as `503: {…}` in the message). Fails closed: anything
+ * that is not a structurally recognized envelope is not terminal here. Shared
+ * by the unified classifier, the transient layer, and the host's message-end
+ * guard so every retry path agrees on what is terminal.
+ */
+export function isTerminalReplayContract(body: unknown): boolean {
+  let candidate: unknown = body;
+  if (typeof body === "string") {
+    const start = body.indexOf("{");
+    const end = body.lastIndexOf("}");
+    if (start < 0 || end <= start) return false;
+    candidate = body.slice(start, end + 1);
+  }
+  const info = parseAdmissionPayload(candidate);
+  if (!info) return false;
+
+  if (info.explicitReplayContract) {
+    return (
+      info.retryable === false ||
+      info.replaySafe === false ||
+      info.requestState === "dispatched" ||
+      info.requestState === "streaming" ||
+      info.requestState === "unknown" ||
+      (info.action !== undefined && TERMINAL_REPLAY_TOKENS.has(info.action)) ||
+      (info.actionCode !== undefined && TERMINAL_REPLAY_ACTION_CODES.has(info.actionCode))
+    );
+  }
+
+  return (
+    info.type !== undefined &&
+    info.reason !== undefined &&
+    info.reason !== "unknown" &&
+    TERMINAL_REPLAY_TOKENS.has(info.reason)
+  );
+}
+
 /** Preserve normalized server guidance when a provider flattens the terminal error. */
 export function augmentInferenceErrorMessage(
   providerMessage: string | undefined,
