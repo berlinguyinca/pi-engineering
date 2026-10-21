@@ -159,7 +159,13 @@ function branchOrTagMutates(segment: string, verb: "branch" | "tag"): boolean {
   const rest = tokens.slice(i + 1);
   const first = rest[0];
   if (first === undefined) return false; // bare `git branch` / `git tag` lists
-  if (verb === "branch") return !(rest.length === 1 && first === "--list");
+  if (verb === "branch") {
+    // -d/-D/-f/-m/-c (incl. combined like -dv) create/rename/delete.
+    if (rest.some((t) => t.startsWith("-") && /[dDfmc]/.test(t.slice(1)))) return true;
+    if (rest.includes("--list")) return false; // `--list [pattern]` is read-only
+    if (rest.every((t) => ["-a", "-r", "-v", "-vv"].includes(t))) return false;
+    return true; // a name argument (create) or an unknown flag: be strict
+  }
   // `git tag` (list) vs `git tag <name> [commit]` (create).
   return !first.startsWith("-");
 }
