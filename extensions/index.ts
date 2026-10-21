@@ -85,7 +85,8 @@ import {
 } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
-import { type InspectorFeedHandle, attachInspectorFeedFromEnv } from "../src/runtime/herdr/InspectorFeed.ts";
+import { attachInspectorWhenReady } from "../src/runtime/herdr/attachInspector.ts";
+import type { InspectorFeedHandle } from "../src/runtime/herdr/InspectorFeed.ts";
 import { getHostMaintenance } from "../src/runtime/host/maintenance.ts";
 import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
@@ -680,16 +681,19 @@ export default function (pi: ExtensionAPI) {
   registerInteractiveMemory(pi);
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
-  // Agent-inspector feed to Herdr: OFF unless HERDR_CP_URL is set AND PI_INSPECTOR_FEED=1.
+  // Agent-inspector feed to Herdr: OFF unless this host's central fleet config
+  // (~/.config/herdr-engineering/host.json) sets inspector.enabled. Loaded in the
+  // background with a short timeout so session start never waits on the network;
+  // a missing config or unreachable control plane simply means no inspector.
   // Best-effort and bounded; see docs/split-view-and-inspector.md.
   let inspector: InspectorFeedHandle | null = null;
-  try {
-    inspector = attachInspectorFeedFromEnv(pi, process.env, {
-      modelReason: () => (automaticModelSwitch ? "fallback" : undefined),
-    });
-  } catch {
-    inspector = null;
-  }
+  void attachInspectorWhenReady(pi, {
+    modelReason: () => (automaticModelSwitch ? "fallback" : undefined),
+  })
+    .then((handle) => {
+      inspector = handle;
+    })
+    .catch(() => {});
   // Housekeeping: reclaim worktrees abandoned by crashed or killed runs and
   // expire unused Rust target caches. Live missions keep their worktrees, and
   // uncommitted work is committed to its branch before a checkout goes away,
