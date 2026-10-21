@@ -85,8 +85,7 @@ import {
 } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
-import { attachInspectorWhenReady } from "../src/runtime/herdr/attachInspector.ts";
-import type { InspectorFeedHandle } from "../src/runtime/herdr/InspectorFeed.ts";
+import { attachInspectorWhenReady, createInspectorSlot } from "../src/runtime/herdr/attachInspector.ts";
 import { getHostMaintenance } from "../src/runtime/host/maintenance.ts";
 import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
@@ -686,12 +685,12 @@ export default function (pi: ExtensionAPI) {
   // background with a short timeout so session start never waits on the network;
   // a missing config or unreachable control plane simply means no inspector.
   // Best-effort and bounded; see docs/split-view-and-inspector.md.
-  let inspector: InspectorFeedHandle | null = null;
+  const inspector = createInspectorSlot();
   void attachInspectorWhenReady(pi, {
     modelReason: () => (automaticModelSwitch ? "fallback" : undefined),
   })
     .then((handle) => {
-      inspector = handle;
+      inspector.set(handle);
     })
     .catch(() => {});
   // Housekeeping: reclaim worktrees abandoned by crashed or killed runs and
@@ -2401,7 +2400,7 @@ ${RECOVERY_PROMPT}`;
           await rt.resumeBlockedMission(missionId, ctx.signal);
           const mission = rt.missionStore?.getMission(missionId);
           if (!mission) throw new Error(`unknown mission ${missionId}`);
-          inspector?.associate({ mission_id: mission.mission_id });
+          inspector.associate({ mission_id: mission.mission_id });
           ctx.ui.notify(`Recovery ${mission.mission_id} — ${mission.title} [${mission.status}]`, "info");
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -2431,7 +2430,7 @@ ${RECOVERY_PROMPT}`;
         },
       });
       const m = result.mission;
-      inspector?.associate({ mission_id: m.mission_id });
+      inspector.associate({ mission_id: m.mission_id });
       const completion =
         result.pausedBy === "operator" && result.mission.status !== "PAUSED_INFRASTRUCTURE"
           ? `interrupt noted — mission left ${result.mission.status} (not canceled); /mission resume ${result.mission.mission_id} continues it`

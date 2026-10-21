@@ -13,7 +13,12 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HostConfigUnavailable } from "./HostConfig.ts";
-import { type InspectorFeedHandle, type InspectorFeedOptions, attachInspectorFeedFromHost } from "./InspectorFeed.ts";
+import {
+  type InspectorAssociation,
+  type InspectorFeedHandle,
+  type InspectorFeedOptions,
+  attachInspectorFeedFromHost,
+} from "./InspectorFeed.ts";
 import type { LoadHostConfigOptions } from "./HostConfig.ts";
 
 export interface AttachInspectorOptions extends Partial<InspectorFeedOptions> {
@@ -71,4 +76,29 @@ export async function attachInspectorWhenReady(
     }
     return null;
   }
+}
+
+/**
+ * Holds the feed handle that arrives asynchronously. `associate()` before the
+ * handle exists keeps only the LATEST association and applies it on `set()`;
+ * afterwards it goes straight through. Never throws.
+ */
+export function createInspectorSlot(): {
+  associate(a: InspectorAssociation): void;
+  set(handle: InspectorFeedHandle | null): void;
+} {
+  let handle: InspectorFeedHandle | null = null;
+  let pending: InspectorAssociation | undefined;
+  return {
+    associate(a) {
+      if (handle) handle.associate(a);
+      else pending = a;
+    },
+    set(h) {
+      handle = h;
+      const p = pending;
+      pending = undefined;
+      if (h && p) h.associate(p);
+    },
+  };
 }

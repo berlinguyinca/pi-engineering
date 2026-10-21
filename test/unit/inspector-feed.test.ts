@@ -7,6 +7,9 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { loadHostConfig } from "../../src/runtime/herdr/HostConfig.ts";
@@ -107,9 +110,6 @@ function toolRun(pi: FakePi, id: string, tool: string, args: any, result: string
 }
 
 // ── central host config wiring ──
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 function hostHome(values: object | null): { home: string; fetch: typeof fetch; ingest: Array<{ url: string; headers: any; body: any }> } {
   const home = mkdtempSync(join(tmpdir(), "inspcfg-"));

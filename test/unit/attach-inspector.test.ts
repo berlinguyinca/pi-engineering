@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { attachInspectorWhenReady } from "../../src/runtime/herdr/attachInspector.ts";
+import { attachInspectorWhenReady, createInspectorSlot } from "../../src/runtime/herdr/attachInspector.ts";
 
 class FakePi {
   handlers = new Map<string, Array<(e: any, c: any) => unknown>>();
@@ -79,6 +79,47 @@ test("enabled: attaches, and a session_start fired BEFORE the attach completed i
   assert.ok(handle);
   await new Promise((r) => setTimeout(r, 60));
   const kinds = ingest.flatMap((b) => b.payload.events.map((e: any) => `${e.kind}:${e.phase ?? ""}`));
-  assert.ok(kinds.includes("lifecycle:started"), `got ${kinds.join(",")}`);
+  assert.equal(kinds.filter((k) => k === "lifecycle:started").length, 1, `got ${kinds.join(",")}`);
   handle.dispose();
+});
+
+function fakeHandle() {
+  const calls: any[] = [];
+  return { calls, handle: { associate: (a: any) => calls.push(a) } as never };
+}
+
+test("slot: an association made before attach is applied after attach", () => {
+  const slot = createInspectorSlot();
+  const h = fakeHandle();
+  slot.associate({ mission_id: "m1" });
+  assert.equal(h.calls.length, 0);
+  slot.set(h.handle);
+  assert.deepEqual(h.calls, [{ mission_id: "m1" }]);
+});
+
+test("slot: a second association before attach replaces the first", () => {
+  const slot = createInspectorSlot();
+  const h = fakeHandle();
+  slot.associate({ mission_id: "m1" });
+  slot.associate({ mission_id: "m2" });
+  slot.set(h.handle);
+  assert.deepEqual(h.calls, [{ mission_id: "m2" }]);
+});
+
+test("slot: nothing pending -> no call; null handle drops silently", () => {
+  const slot = createInspectorSlot();
+  const h = fakeHandle();
+  slot.set(h.handle);
+  assert.deepEqual(h.calls, []);
+  const s2 = createInspectorSlot();
+  s2.associate({ mission_id: "x" });
+  s2.set(null);
+});
+
+test("slot: associate after attach goes straight through", () => {
+  const slot = createInspectorSlot();
+  const h = fakeHandle();
+  slot.set(h.handle);
+  slot.associate({ mission_id: "m3" });
+  assert.deepEqual(h.calls, [{ mission_id: "m3" }]);
 });

@@ -68,6 +68,10 @@ equals the `session` entity; it falls back to Pi's session id. The old `HERDR_CP
 **Disable**: set `inspector.enabled` to `false` centrally and restart Pi (config applies at process start only).
 A revoked host token (HTTP 401) discards the cache and disables the feed. Nothing persists.
 
+**Attach window**: the config is loaded in the background, so events emitted before the attach completes (up to
+~6 s worst case on a slow control plane; none when the config is cached or the control plane answers quickly) are
+not captured. Only the last `session_start` and the latest mission association made in that window are replayed.
+
 **Bounds and overhead**
 
 - Queue cap 500 events; when full, streaming `update` events are dropped first, then ordinary events.
