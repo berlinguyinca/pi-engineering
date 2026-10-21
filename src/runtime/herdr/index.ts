@@ -8,6 +8,25 @@ export type { HerdrCli, HerdrAgent, HerdrStatus, RealHerdrCliOptions } from "./H
 export { herdrEnsureLocal, detectHerdr } from "./ensureHerdr.ts";
 export type { HerdrEnsureLocalOptions, HerdrEnsureResult, HerdrDetection } from "./ensureHerdr.ts";
 export {
+  callHerdrLiveHandoff,
+  callHerdrSocket,
+  buildLiveHandoffParams,
+  deserializeLiveHandoffPayload,
+  LIVE_HANDOFF_METHOD,
+  LIVE_HANDOFF_PAYLOAD_VERSION,
+  PAYLOAD_MAX_DIFF_CHARS,
+  PAYLOAD_MAX_SUMMARY_CHARS,
+  probeLiveHandoffCapability,
+  serializeLiveHandoffPayload,
+  validateLiveHandoffParams,
+} from "./liveHandoff.ts";
+export type {
+  HerdrSocketOptions,
+  LiveHandoffCapability,
+  LiveHandoffParams,
+  LiveHandoffPayload,
+} from "./liveHandoff.ts";
+export {
   InspectorFeed,
   INSPECTOR_LIMITS,
   attachInspectorFeed,

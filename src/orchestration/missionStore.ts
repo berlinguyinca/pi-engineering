@@ -17,7 +17,13 @@ import {
   attachCheckpointRefs,
   buildCheckpointRefs,
 } from "../runtime/host/handoffCheckpointRefs.ts";
-import { type HandoffRecord, validateHandoffRecord } from "../runtime/host/handoffKinds.ts";
+import {
+  type HandoffEndpoint,
+  type HandoffRecord,
+  type HandoffState,
+  nextStates,
+  validateHandoffRecord,
+} from "../runtime/host/handoffKinds.ts";
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import {
   buildCandidateEvidenceIdentity,
@@ -292,6 +298,13 @@ export interface GateEvidencePublication {
   exitStatus: string;
   artifactRefs: string[];
   usage: Execution["usage"];
+  /**
+   * P4 provenance: the model that actually served the gate run. Gate executions
+   * (review/integration/validation) settle through this publication rather than
+   * the setExecutionStatus path, so the serving model must flow through here to
+   * reach the execution record's `model` field (what /mission-status reads).
+   */
+  model?: string;
   recoveredMerged?: NonNullable<Execution["recovered_merged"]>;
   reviewedRecovered?: NonNullable<Execution["reviewed_recovered"]>;
   identity: CandidateEvidenceIdentity;
@@ -1440,6 +1453,9 @@ export class MissionStore {
         exit_status: input.exitStatus,
         artifact_refs: [...input.artifactRefs],
         usage: structuredClone(input.usage),
+        // P4 provenance: settle the record to the model that actually served
+        // (the requested model seeded at creation is the fallback when absent).
+        ...(input.model ? { model: input.model } : {}),
         ...(input.recoveredMerged?.length ? { recovered_merged: [...input.recoveredMerged] } : {}),
         ...(input.reviewedRecovered?.length ? { reviewed_recovered: [...input.reviewedRecovered] } : {}),
       };
@@ -1995,6 +2011,37 @@ export class MissionStore {
     return [...this.handoffRecords.values()]
       .filter((r) => (missionId ? r.missionId === missionId : true))
       .map((r) => ({ ...r }));
+  }
+
+  /**
+   * Advance a stored handoff record through the lifecycle state machine
+   * (spec Unit B1). The target state must be allowed by `nextStates` for the
+   * current state; `acknowledged`/`committed` additionally require the
+   * successor endpoint (the fresh session taking over) and stamp `ackAt`.
+   * Returns the updated record; throws a `HandoffRecordError` for an unknown
+   * id, an illegal transition, or a missing successor.
+   */
+  transitionHandoffRecord(id: string, to: HandoffState, successor?: HandoffEndpoint, ackAt?: string): HandoffRecord {
+    const current = this.handoffRecords.get(id);
+    if (!current) {
+      throw new HandoffRecordError([`unknown handoff record ${id}`]);
+    }
+    if (!nextStates(current.state).includes(to)) {
+      throw new HandoffRecordError([`illegal handoff transition ${current.state} -> ${to}`]);
+    }
+    const next: HandoffRecord = { ...current, state: to };
+    if (to === "acknowledged" || to === "committed") {
+      // A committed record inherits the successor + ackAt stamped at
+      // acknowledgement; only a missing one is an error.
+      const effectiveSuccessor = successor ?? current.successor;
+      if (!effectiveSuccessor) {
+        throw new HandoffRecordError([`successor is required for state ${to}`]);
+      }
+      next.successor = { ...effectiveSuccessor };
+      next.ackAt = ackAt ?? current.ackAt ?? new Date().toISOString();
+    }
+    this.handoffRecords.set(id, { ...next });
+    return { ...next };
   }
 
   /** Preserve a settled outcome while making failed lease cleanup durable and visible. */
@@ -3260,6 +3307,7 @@ function copyExecution(ex: Execution): Execution {
     artifact_refs: [...ex.artifact_refs],
     ...(ex.recovered_merged ? { recovered_merged: ex.recovered_merged.map((r) => ({ ...r })) } : {}),
     ...(ex.reviewed_recovered ? { reviewed_recovered: [...ex.reviewed_recovered] } : {}),
+    ...(ex.already_satisfied ? { already_satisfied: { ...ex.already_satisfied } } : {}),
   };
 }
 

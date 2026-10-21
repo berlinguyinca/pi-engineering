@@ -49,6 +49,36 @@ Server / integration:
 - `integration.list/install/uninstall` (built-in agent integrations)
 - `plugin.*`
 
+## `server.live_handoff` wire contract (implemented, D1 — inspected live, herdr 0.9.1)
+
+`server.live_handoff` has **no CLI subcommand** (the `herdr server` CLI exposes
+only `stop` / `reload-config` / `agent-manifests` / `update-agent-manifests` /
+`reload-agent-manifests`), so Pi-Engineering calls it on the unix socket
+directly (`~/.config/herdr/herdr.sock`):
+
+- **Framing:** newline-delimited JSON; one request line answered by one
+  response line.
+- **Request:** `{"id": string, "method": "server.live_handoff",
+  "params": ServerLiveHandoffParams}`.
+- **`ServerLiveHandoffParams`** (from `herdr api schema --json`): all fields
+  nullable — `expected_protocol` (uint32), `expected_version` (string),
+  `import_exe` (string). The RPC hot-swaps the server under a
+  protocol/version expectation; it does NOT carry a payload body.
+- **Responses:** success `{"id", "result": {...}}`; errors
+  `{"id", "error": {"code", "message"}}` (same envelope as every other RPC).
+- **Capability gate:** `ping` returns
+  `result.capabilities.live_handoff: boolean` (a REQUIRED field of
+  `ServerCapabilities`). Pi-Engineering probes this before relying on the
+  method — it never assumes the capability (see
+  `probeLiveHandoffCapability` in `src/runtime/herdr/liveHandoff.ts`).
+
+Because the RPC body is fixed by Herdr (hot-swap params, no payload field), a
+`HandoffArtifact` + `HandoffCheckpointRefs` crosses the process boundary via a
+durable serialized payload (`payloadVersion` 1; summary ≤ 1500 chars, diff ≤
+24 000 chars — the B2 clip bounds) that the successor process deserializes and
+validates (`serializeLiveHandoffPayload` / `deserializeLiveHandoffPayload` in
+`src/runtime/herdr/liveHandoff.ts`).
+
 ## Agent lifecycle fidelity
 
 `AgentStatus` enum (schema `$defs/AgentStatus`):

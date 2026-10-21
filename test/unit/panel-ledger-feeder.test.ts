@@ -155,3 +155,25 @@ test("ledger feeder: a recovered read clears the error", async () => {
   feeder.onPhase({ workItemId: wi.id, phase: "implement" });
   assert.deepEqual(state.snapshot.errors, []);
 });
+
+test("ledger polling cannot replace mission activity with an older work item", async () => {
+  const ledger = freshLedger();
+  const wi = await ledger.createWorkItem("previous engineering work", "low", ["/repo"], planner);
+  const state = new PanelState();
+  const feeder = new LedgerFeeder({ ledger, state });
+  feeder.onPhase({ workItemId: wi.id, phase: "settled" });
+  feeder.onPhase({ workItemId: wi.id, phase: "implement" });
+  const mission = {
+    workItemId: "MSN-current",
+    goal: "Now: waiting for model",
+    phase: "waiting",
+    risk: "mission",
+    files: [],
+    findings: [],
+    spend: [],
+    missionStatus: { token: "WAITING", reason: "model request", next: "monitor" },
+  };
+  state.set({ run: mission });
+  feeder.refresh();
+  assert.deepEqual(state.snapshot.run, mission);
+});

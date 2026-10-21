@@ -273,3 +273,20 @@ test("task: showTask=false hides the segment", () => {
   const s = state({ task: { workItemId: "WI-12", phase: "implement" } });
   assert.doesNotMatch(renderStatus(s, 200, config, 0), /WI-12/);
 });
+
+test("mission live activity survives narrow layouts alongside its health", () => {
+  const task = {
+    workItemId: "MSN-1",
+    phase: "acceptance 0/14 (0%)",
+    missionStatus: {
+      token: "R0/3 CONTINUE",
+      reason: "running",
+      next: "monitor",
+      live: "STALLED · tests 42s · output 40s ago",
+    },
+  };
+  const line = renderStatus(state({ task }), 45, cfg, 0);
+  assert.match(line, /STALLED/);
+  assert.match(line, /tests 42s/);
+  assert.match(line, /output 40s ago/);
+});

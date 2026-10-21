@@ -25,7 +25,12 @@ import type { GatewayResilienceConfig } from "../resilience/config.ts";
 import type { RecoveryProbe } from "../resilience/probe.ts";
 import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
-import { TURN_SUMMARY } from "../workers/activity.ts";
+import {
+  AWAITING_MODEL_RESPONSE_SUMMARY,
+  TOOL_PROGRESS_SUMMARY,
+  TURN_SUMMARY,
+  WAITING_FOR_INFERENCE_SUMMARY,
+} from "../workers/activity.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
 import {
   type BrokerBackends,
@@ -50,18 +55,28 @@ import {
   isPauseAbort,
 } from "./interrupt.ts";
 import { transitionMissionToCanceled } from "./missionCancel.ts";
-import type { MissionStore } from "./missionStore.ts";
+import { HandoffRecordError, type MissionStore } from "./missionStore.ts";
+import { MissionActivityTicker } from "./observability/MissionActivityTicker.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
 import type { ActivityType, WaitingReason } from "./observability/types.ts";
 import { type DispatchAuthority, type MissionOwnership, RepositoryLeasedError } from "./ownership.ts";
+import {
+  type ContextWindowResolver,
+  buildPhaseTransitionRecord,
+  missionContextUtilization,
+  phaseHandoffFallback,
+  shouldEmitPhaseHandoff,
+} from "./phaseBoundaryHandoff.ts";
 import { deriveRequiredGates, mutationFactFromChangedFiles } from "./policies.ts";
 import {
   FailureClassifier,
   GATE_TRANSPORT_SIGNATURE,
   RecoveryPlanner,
   type RecoveryPlannerOptions,
+  alreadySatisfiedClause,
   classifyGateFailure,
+  latestAlreadySatisfied,
   replacementRecoveryFingerprint,
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
@@ -141,6 +156,26 @@ export interface OrchestratorOptions {
   deriveAcceptance?: (mission: Mission) => Promise<string[]>;
   /** Called on each mission phase transition. */
   onPhase?: (mission: Mission, phase: string) => void;
+  /**
+   * Phase-boundary handoff (spec Unit B1, issue #349). When enabled, each
+   * mission phase boundary at/above the context-utilization threshold emits a
+   * `phase_transition` HandoffRecord through the mission store so a fresh
+   * session can resume from the artifact. Native compaction stays fallback
+   * only: it is selected when the handoff cannot be emitted. Disabled by
+   * default; without `contextWindowForModel` no utilization signal exists and
+   * the boundary passes silently.
+   */
+  phaseHandoff?: {
+    /** Resolves a model id to its context window (tokens), or null when unknown. */
+    contextWindowForModel?: ContextWindowResolver;
+    /** Utilization at/above which a boundary hands off. Default 0.75. */
+    threshold?: number;
+    /**
+     * Resolves the handing-off session endpoint (predecessor) for a mission.
+     * Default: the orchestrator's parent session at generation 0, when set.
+     */
+    endpoint?: (mission: Mission) => { sessionId: string; generation: number } | null | undefined;
+  } | null;
   parentSessionId?: string | null;
   limits?: {
     maxActive?: number;
@@ -375,6 +410,9 @@ export class Orchestrator {
   private maxMissionWallClockMs?: number;
   private readonly specApproval?: OrchestratorOptions["specApproval"];
   private readonly recoveryPlanner: RecoveryPlanner;
+  private readonly phaseHandoffCfg: OrchestratorOptions["phaseHandoff"] | null;
+  /** Last phase observed per mission, so the boundary handoff fires once per transition. */
+  private readonly missionPhase = new Map<string, string>();
   private readonly failureClassifier = new FailureClassifier();
   private readonly blockedRepairFlights = new Map<string, Promise<Mission>>();
 
@@ -389,6 +427,7 @@ export class Orchestrator {
     this.limitsProvider = opts.limitsProvider;
     this.specApproval = opts.specApproval;
     this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
+    this.phaseHandoffCfg = opts.phaseHandoff ?? null;
     const checkpoints = new CheckpointManager({ store: this.store });
     this.broker = new ExecutionBroker({
       store: this.store,
@@ -1514,9 +1553,76 @@ export class Orchestrator {
   }
 
   private phase(mission: Mission, phase: string): void {
+    const previous = this.missionPhase.get(mission.mission_id) ?? null;
+    if (previous !== phase) {
+      this.missionPhase.set(mission.mission_id, phase);
+      this.emitPhaseBoundaryHandoff(mission, previous, phase);
+    }
     this.onPhase?.(mission, phase);
     this.report(mission.mission_id, `[mission ${mission.mission_id}] phase ${phase}`);
     this.observability?.phaseChanged(mission.mission_id, phase);
+  }
+
+  /**
+   * Phase-boundary handoff (spec Unit B1, issue #349). At a phase boundary
+   * with context utilization at/above the threshold, emit a
+   * `phase_transition` HandoffRecord (with the latest checkpoint SHA when one
+   * exists) so a fresh session can resume from the artifact. When the handoff
+   * cannot be emitted, the standard handoff-fallback rules select the
+   * fallback — native (selective) compaction under context pressure — and the
+   * decision is reported; the handoff path itself never triggers compaction.
+   */
+  private emitPhaseBoundaryHandoff(mission: Mission, fromPhase: string | null, toPhase: string): void {
+    const cfg = this.phaseHandoffCfg;
+    if (!cfg) return;
+    const utilization = missionContextUtilization(
+      this.store.listExecutions(mission.mission_id),
+      cfg.contextWindowForModel ?? (() => null),
+    );
+    const decision = shouldEmitPhaseHandoff({
+      fromPhase,
+      toPhase,
+      contextUtilization: utilization,
+      threshold: cfg.threshold,
+    });
+    if (!decision.emit) return;
+
+    const endpoint =
+      cfg.endpoint?.(mission) ?? (this.parentSessionId ? { sessionId: this.parentSessionId, generation: 0 } : null);
+    if (!endpoint) {
+      const errors = ["no session endpoint available"];
+      const fallback = phaseHandoffFallback(errors, utilization);
+      this.report(
+        mission.mission_id,
+        `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff failed (${errors.join("; ")}); fallback ${fallback.fallback} (${fallback.reason})`,
+      );
+      return;
+    }
+
+    const checkpointSha = this.store.listTaskCheckpoints(mission.mission_id).at(-1)?.candidateSha ?? undefined;
+    try {
+      const record = this.store.addHandoffRecord(
+        buildPhaseTransitionRecord({
+          missionId: mission.mission_id,
+          fromPhase,
+          toPhase,
+          endpoint,
+          ...(checkpointSha ? { checkpointSha } : {}),
+        }),
+      );
+      this.report(
+        mission.mission_id,
+        `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff ${record.id}${checkpointSha ? ` @ ${checkpointSha.slice(0, 7)}` : ""} (utilization ${utilization!.toFixed(2)})`,
+      );
+    } catch (error) {
+      const errors =
+        error instanceof HandoffRecordError ? error.errors : [error instanceof Error ? error.message : String(error)];
+      const fallback = phaseHandoffFallback(errors, utilization);
+      this.report(
+        mission.mission_id,
+        `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff failed (${errors.join("; ")}); fallback ${fallback.fallback} (${fallback.reason})`,
+      );
+    }
   }
 
   private observeWorkerActivity(
@@ -1570,9 +1676,13 @@ export class Orchestrator {
         summary: event.summary,
         workerId: event.executionId,
         meaningfulProgress: event.meaningfulProgress,
+        outputPreview: event.outputPreview,
+        output:
+          (event.kind === "tool" && (event.phase === "completed" || event.phase === "failed")) ||
+          ["Model streaming", "Model response received", TOOL_PROGRESS_SUMMARY].includes(event.summary),
       });
-      if (event.kind === "tool")
-        obs?.noteWorkerTool(event.missionId, event.executionId, `${event.toolName}:${event.phase}`);
+      if (event.kind === "tool" && event.phase === "started" && event.invocationSignature)
+        obs?.noteWorkerTool(event.missionId, event.executionId, event.invocationSignature);
       if (event.kind === "tool" && event.buildTool) this.noteBuildCommand(event);
       if ((event.kind === "state" || event.kind === "execution") && event.phase === "completed") {
         obs?.workerCompleted(event.missionId, event.executionId);
@@ -1617,6 +1727,8 @@ export class Orchestrator {
   }
 
   private activityType(event: WorkerActivity): ActivityType {
+    if (event.summary === WAITING_FOR_INFERENCE_SUMMARY) return "waiting_for_queue";
+    if (event.summary === AWAITING_MODEL_RESPONSE_SUMMARY) return "waiting_for_model";
     if (event.kind === "tool") return event.toolName === "bash" ? "running_command" : "tool_invocation";
     if (event.phase === "failed" || event.phase === "canceled") return "error";
     if (event.kind === "state") return event.phase === "completed" ? "worker_completed" : "worker_started";
@@ -1954,6 +2066,27 @@ export class Orchestrator {
       : undefined;
     leaseKeepAlive?.unref?.();
     if (opts.onProgress) this.progress.set(mission.mission_id, opts.onProgress);
+    const activityTicker = new MissionActivityTicker({
+      state: (missionId) => this.store.getMission(missionId)?.status,
+      emit: (missionId) => {
+        const projection = this.observability?.projection(missionId);
+        if (!projection) return;
+        const summary = projection.summary;
+        const worker =
+          projection.workers.find((candidate) => candidate.health === "stalled") ??
+          projection.workers.find((candidate) => candidate.state === "running" || candidate.state === "waiting");
+        const elapsed = (at: string | null | undefined) =>
+          at ? `${Math.max(0, Math.floor((this.scheduler.now() - Date.parse(at)) / 1000))}s ago` : "not yet observed";
+        const model = worker?.model ? ` · ${worker.route ? `${worker.route} → ` : ""}${worker.model}` : "";
+        const activity =
+          worker?.currentActivity ?? summary.currentActivity?.summary ?? summary.currentObjective ?? summary.phase;
+        this.report(
+          missionId,
+          `[mission ${missionId}] ${summary.health.toUpperCase()} · ${worker ? `${worker.workerId}: ` : ""}${activity}${model} · last output ${elapsed(worker?.lastOutputAt)} · last heartbeat ${elapsed(worker?.lastHeartbeatAt ?? summary.lastHeartbeatAt)} · last progress ${elapsed(worker?.lastMeaningfulProgressAt ?? summary.lastMeaningfulProgressAt)}`,
+        );
+      },
+    });
+    if (opts.onProgress) activityTicker.watch(mission.mission_id);
     try {
       // The mode decision is persisted on the mission (orchestrateMission); the
       // reason is what the operator needs to act on (e.g. "configure logical
@@ -2503,6 +2636,7 @@ export class Orchestrator {
       const finalized = await this.finalizeMission(mission.mission_id, expectedResumptionGeneration, opts.signal);
       return { ...finalized, intent };
     } finally {
+      activityTicker.close();
       if (leaseKeepAlive) clearInterval(leaseKeepAlive);
       if (liveRun && this.liveRuns.get(mission.mission_id) === liveRun) this.liveRuns.delete(mission.mission_id);
       // Never release under an in-flight renewal: it would write the stale
@@ -3002,7 +3136,16 @@ export class Orchestrator {
         return category === "VALIDATION_FAILED" || (gateTask.kind !== "integration" && category === "REVIEW_FAILED");
       });
       if (openBlocking.length === 0 && codeFailedGates.length === 0 && blockerTask) {
-        if (blockerTask.kind === "integration" && mergeRetries < MAX_DETERMINISTIC_MERGE_RETRIES) {
+        if (
+          blockerTask.kind === "integration" &&
+          mergeRetries < MAX_DETERMINISTIC_MERGE_RETRIES &&
+          // Re-merging onto a newer base is the right reflex for a stale branch, but
+          // not for a mission whose integration produced nothing because a worker
+          // proved there was nothing to do: each retry costs another implementer to
+          // rediscover the same conclusion. "Classification decides" is already this
+          // function's rule; the retry simply wasn't listening to it.
+          classification.category !== "REQUIREMENT_AMBIGUITY"
+        ) {
           mergeRetries++;
           repairRounds--;
           if (this.store.getMission(missionId)!.status !== "REPAIRING") {
@@ -3020,6 +3163,23 @@ export class Orchestrator {
         }
         const stopRecovery =
           this.store.getRecoveryDecision(recoveryChoice.recoveryId) ?? this.store.planRecovery(recoveryChoice);
+        // A requirement wait is not a failure to write off. Marking the decision
+        // failed and stopping the mission here contradicted the planner: it parked
+        // nothing, asked the operator nothing, and left a STOPPED mission whose own
+        // decision said WAIT_FOR_REQUIREMENT. Same handling as the repair path.
+        if (stopRecovery.action === "WAIT_FOR_REQUIREMENT") {
+          if (stopRecovery.status === "planned") this.store.transitionRecovery(stopRecovery.recoveryId, "started");
+          if (this.store.getMission(missionId)?.status === "BLOCKED") {
+            this.store.transitionMission(missionId, "WAITING_FOR_USER");
+          }
+          await this.store.flush();
+          return {
+            mission: this.store.getMission(missionId)!,
+            verdict,
+            completed: false,
+            failureReason: verdict.reasons.join("; ") || "awaiting operator clarification",
+          };
+        }
         if (stopRecovery.status === "planned") this.store.transitionRecovery(stopRecovery.recoveryId, "started");
         this.store.transitionRecovery(stopRecovery.recoveryId, "failed");
         this.store.stopMission(missionId, {
@@ -3042,6 +3202,25 @@ export class Orchestrator {
         });
       if (gateRecovery.status === "planned") this.store.transitionRecovery(gateRecovery.recoveryId, "started");
       await this.store.flush();
+
+      // The planner has just said "ask the operator", and this block does the
+      // opposite: it invalidates the evidence, hires another implementer and runs
+      // the whole cycle again. For a mission whose worker proved the objective needed
+      // no change, that is the loop itself — each round re-produced the same empty
+      // candidate and the same conclusion, and the mission never got to the operator.
+      // Repairs are dispatched on what the planner decided, not around it.
+      if (gateRecovery.action === "WAIT_FOR_REQUIREMENT") {
+        if (this.store.getMission(missionId)?.status === "BLOCKED") {
+          this.store.transitionMission(missionId, "WAITING_FOR_USER");
+        }
+        await this.store.flush();
+        return {
+          mission: this.store.getMission(missionId)!,
+          verdict,
+          completed: false,
+          failureReason: verdict.reasons.join("; ") || "awaiting operator clarification",
+        };
+      }
 
       const repairCandidate = this.store.getCandidate(missionId);
       if (repairCandidate) {
@@ -3680,6 +3859,20 @@ export class Orchestrator {
           // nothing; the second is a pipeline defect and must not be reported as
           // "the workers produced no work" — that would hide a lost integration.
           const committed = this.broker.hasCommittedWorkerWork(mission.mission_id);
+          // "No committed work" and "a worker proved there was nothing to do" are
+          // the same observable and used to be the same finding, which is what made
+          // a 34-hour loop out of a mission that was already finished: this finding
+          // is what recovery classifies, NOT the gate reason, so classifying it
+          // REVIEW_FAILED dispatched CREATE_REPAIR_TASKS and another implementer
+          // that reached the same conclusion, forever. A committed-but-lost branch
+          // stays exactly as before — that is a pipeline defect, and an assertion
+          // must never paper over a worker's lost work.
+          const asserted = committed
+            ? undefined
+            : latestAlreadySatisfied(
+                this.store.listTasks(mission.mission_id),
+                this.store.listExecutions(mission.mission_id),
+              );
           this.store.addFinding({
             mission_id: mission.mission_id,
             task_id: integ.task_id,
@@ -3689,11 +3882,15 @@ export class Orchestrator {
             line: null,
             summary: committed
               ? "Integration merged but the base checkout is unchanged despite committed worker work — a merge/harvest bug; the worker branches are preserved and must be inspected"
-              : "Integration produced no change: the worker branches held no committed work",
+              : `Integration produced no change: the worker branches held no committed work${
+                  asserted ? alreadySatisfiedClause(asserted) : ""
+                }`,
             evidence: null,
             recommended_action: committed
               ? "Inspect the preserved worker branches (git branch | grep pi-eng-orch) and the merge result; the worker's committed work must be recovered and integrated manually."
-              : "The implementer must actually edit files; harvested worktrees were empty.",
+              : asserted
+                ? "A worker concluded the objective needs no change and carried proof; nothing here can verify that. Confirm the assertion or restate the objective — do NOT dispatch another implementer to rediscover the same fact."
+                : "The implementer must actually edit files; harvested worktrees were empty.",
           });
         }
       }

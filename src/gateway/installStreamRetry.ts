@@ -126,7 +126,7 @@ export interface InstallDeps<M, O, C = unknown> {
    * Called when a stream first produces output. Exposed so a caller keeping its
    * own consecutive-hold count resets it on the same evidence this module does.
    */
-  onProgress?: (model: M) => void;
+  onProgress?: (model: M, signal?: AbortSignal) => void;
   /** Turn a thrown transport failure into an assistant error message. */
   errorMessage(model: M, error: unknown): RetryableResult;
   /** Read the turn's abort signal off the provider options. */
@@ -308,7 +308,7 @@ export function installGatewayStreamRetry<M, C, O>(
             responseCapture?.clear();
             consecutiveHolds = 0;
             waitingSinceMs = undefined;
-            deps.onProgress?.(model);
+            deps.onProgress?.(model, signal);
           },
           ...(deps.onHold ? { onHold: (info) => deps.onHold?.(info, model) } : {}),
           ...(deps.abandonForAlternate

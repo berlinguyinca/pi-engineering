@@ -1,12 +1,150 @@
+import { createHmac, randomBytes } from "node:crypto";
+import { posix } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { redactSecrets } from "../security/SecurityPolicy.ts";
 import type { WorkerActivity } from "./WorkerExecutor.ts";
 import { buildToolOf, isBuildTool } from "./buildActivity.ts";
 import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
 
 export const MAX_WORKER_ACTIVITY_SUMMARY = 160;
+export const MAX_WORKER_OUTPUT_PREVIEW = 1000;
+
+/** Redact before truncating, so a tail boundary cannot cut off a secret's prefix. */
+export function safeWorkerOutputPreview(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const plain = [...stripVTControlCharacters(value).replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069]/gu, "")]
+    .filter((character) => {
+      const code = character.charCodeAt(0);
+      // Keep line breaks for multiline private-key redaction. Strip other
+      // controls before redaction so they cannot split a credential prefix.
+      return code === 9 || code === 10 || code === 13 || (code >= 32 && (code < 127 || code > 159));
+    })
+    .join("");
+  const redacted = redactSecrets(plain);
+  const clean = [...redacted]
+    .map((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || (code >= 127 && code <= 159) ? " " : character;
+    })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean.slice(-MAX_WORKER_OUTPUT_PREVIEW) || undefined;
+}
+
+function toolOutputPreview(result: unknown): string | undefined {
+  if (!result || typeof result !== "object") return undefined;
+  const content = (result as { content?: unknown }).content;
+  if (!Array.isArray(content)) return undefined;
+  return safeWorkerOutputPreview(
+    content
+      .flatMap((block: unknown) => {
+        if (!block || typeof block !== "object") return [];
+        const item = block as { type?: unknown; text?: unknown };
+        return item.type === "text" && typeof item.text === "string" ? [item.text] : [];
+      })
+      .join("\n"),
+  );
+}
 
 /** Per-turn summary (mission.obs.worker): fixed shape, so the metrics are computable from events. */
 export const TURN_SUMMARY = /^Turn ended: stop=[a-zA-Z_]{1,32} tool_error=[a-z_]{1,32}$/;
+
+const FILE_TOOLS = new Set(["read", "edit", "write"]);
+const COMMAND_LABELS = new Set([
+  "npm test",
+  "npm run test",
+  "npm run build",
+  "npm run lint",
+  "npm run typecheck",
+  "pnpm test",
+  "pnpm build",
+  "pnpm lint",
+  "pnpm run test",
+  "pnpm run build",
+  "pnpm run lint",
+  "pnpm run typecheck",
+  "yarn test",
+  "yarn build",
+  "yarn lint",
+  "yarn typecheck",
+  "cargo test",
+  "cargo build",
+  "cargo check",
+  "cargo clippy",
+  "go test",
+  "go build",
+  "go vet",
+  "git diff",
+  "git status",
+  "git log",
+  "git show",
+  "git add",
+  "git commit",
+  "tsc",
+  "pytest",
+  "ruff check",
+  "ruff format",
+  "biome check",
+  "biome format",
+]);
+// A process-local key makes low-entropy secret arguments impractical to recover
+// from a public signature. Loop evidence naturally restarts with the runtime.
+const INVOCATION_KEY = randomBytes(32);
+
+function invocationSignature(toolName: string, args: unknown): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  let visited = 0;
+  const canonicalize = (value: unknown, depth = 0): unknown => {
+    if (++visited > 10_000 || depth > 20) throw new Error("Unbounded tool arguments");
+    if (!value || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.map((entry) => canonicalize(entry, depth + 1));
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, canonicalize(entry, depth + 1)]),
+    );
+  };
+  try {
+    const serialized = JSON.stringify([toolName, canonicalize(args)]);
+    if (serialized.length > 1_000_000) return undefined;
+    return createHmac("sha256", INVOCATION_KEY).update(serialized).digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
+function safeToolTarget(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim() || value.length > 4096) return undefined;
+  // Refuse terminal controls, bidi overrides and URLs; file details must not
+  // smuggle terminal instructions, credentials or query strings into the bar.
+  if (
+    [...value].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || (code >= 127 && code <= 159);
+    }) ||
+    /[\u200b-\u200f\u202a-\u202e\u2066-\u2069]|:\/\/|[?#]/u.test(value)
+  )
+    return undefined;
+  const redacted = redactSecrets(value.trim()).replaceAll("\\", "/");
+  const normalized = posix.normalize(redacted).replace(/^\/(?:home|Users)\/[^/]+\//, "~/");
+  return safeText(normalized, 112) || undefined;
+}
+
+export function safeToolCommandLabel(command: unknown): string | undefined {
+  if (typeof command !== "string") return undefined;
+  // Inspect only the first literal executable and verb. Do not parse shell
+  // substitutions, environment assignments, quoting or arbitrary npm scripts.
+  const words = command.trim().split(/\s+/);
+  if (words[0] === "npx" || (words[0] === "pnpm" && words[1] === "exec")) {
+    words.splice(0, words[0] === "npx" ? 1 : 2);
+  }
+  for (const count of [3, 2, 1]) {
+    const label = words.slice(0, count).join(" ");
+    if (COMMAND_LABELS.has(label)) return label;
+  }
+  return undefined;
+}
 
 function safeToolName(value: unknown): string {
   if (typeof value !== "string") return "tool";
@@ -96,14 +234,29 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
     // a build's duration only on its completion.
     const buildTool = isBuildTool(input.buildTool) ? input.buildTool : undefined;
     const elapsedMs = buildTool && input.phase !== "started" ? safeDuration(input.elapsedMs) : undefined;
+    const toolTarget = FILE_TOOLS.has(toolName) ? safeToolTarget(input.toolTarget) : undefined;
+    const toolCommand =
+      toolName === "bash" && typeof input.toolCommand === "string" && COMMAND_LABELS.has(input.toolCommand)
+        ? input.toolCommand
+        : undefined;
+    const signature =
+      typeof input.invocationSignature === "string" && /^[a-f0-9]{64}$/.test(input.invocationSignature)
+        ? input.invocationSignature
+        : undefined;
+    const detail = toolTarget ?? toolCommand;
+    const outputPreview = input.phase !== "started" ? safeWorkerOutputPreview(input.outputPreview) : undefined;
     return {
       kind: "tool",
       phase: input.phase,
       toolName,
-      summary: `${verb}: ${toolName}`,
+      summary: safeText(`${verb}: ${toolName}${detail ? ` · ${detail}` : ""}`),
       meaningfulProgress: false,
       ...(buildTool ? { buildTool } : {}),
       ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+      ...(toolTarget ? { toolTarget } : {}),
+      ...(toolCommand ? { toolCommand } : {}),
+      ...(signature ? { invocationSignature: signature } : {}),
+      ...(outputPreview ? { outputPreview } : {}),
     };
   }
   if (input.kind === "heartbeat") {
@@ -163,11 +316,13 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
       (typeof input.summary === "string" && TURN_SUMMARY.test(input.summary))
         ? input.summary
         : "Worker session started";
+    const outputPreview = summary === TOOL_PROGRESS_SUMMARY ? safeWorkerOutputPreview(input.outputPreview) : undefined;
     return {
       kind: "state",
       ...(input.phase ? { phase: input.phase } : {}),
       summary,
       meaningfulProgress: false,
+      ...(outputPreview ? { outputPreview } : {}),
     };
   }
   return null;
@@ -175,10 +330,9 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
 
 /**
  * Translate Pi session events into a deliberately small public activity shape.
- * Tool arguments and assistant content are never copied. The one inspection: a
- * bash command is classified into a fixed build-tool label (cargo, npm, ...),
- * so a budget-exhausted worker can say how much of its time went to building
- * (the executor pairs the start with the end event to time it).
+ * Assistant content and raw tool arguments are never copied. Known file tools
+ * expose a normalized/redacted path; shell operations expose only fixed labels.
+ * Invocation signatures distinguish repeated calls without exposing arguments.
  */
 export function activityFromSessionEvent(event: {
   type?: string;
@@ -189,8 +343,8 @@ export function activityFromSessionEvent(event: {
 }): WorkerActivity | null {
   if (event.type === "tool_execution_start") {
     const toolName = safeToolName(event.toolName);
-    const buildTool =
-      toolName === "bash" ? buildToolOf((event.args as { command?: unknown } | undefined)?.command) : undefined;
+    const args = event.args as { command?: unknown; path?: unknown } | undefined;
+    const buildTool = toolName === "bash" ? buildToolOf(args?.command) : undefined;
     return sanitizeWorkerActivity({
       kind: "tool",
       phase: "started",
@@ -198,6 +352,9 @@ export function activityFromSessionEvent(event: {
       summary: `Running tool: ${toolName}`,
       meaningfulProgress: false,
       ...(buildTool ? { buildTool } : {}),
+      toolTarget: FILE_TOOLS.has(toolName) ? safeToolTarget(args?.path) : undefined,
+      toolCommand: toolName === "bash" ? safeToolCommandLabel(args?.command) : undefined,
+      invocationSignature: invocationSignature(toolName, event.args),
     });
   }
   if (event.type === "tool_execution_end") {
@@ -211,6 +368,7 @@ export function activityFromSessionEvent(event: {
       // Completion of an arbitrary tool call is activity, not proof that the
       // repository or task advanced. The orchestrator's DAG remains authoritative.
       meaningfulProgress: false,
+      outputPreview: toolOutputPreview(event.result),
     });
   }
   if (event.type === "message_end") {
@@ -247,7 +405,8 @@ export const TOOL_PROGRESS_SUMMARY = "Tool still producing output";
  * Streamed tokens are activity: a worker writing a long answer is not idle,
  * and its heartbeat's "last activity" must not read as minutes of silence.
  * Token events arrive per delta, so they are reduced to one bounded state
- * activity per interval. Content is never inspected or copied.
+ * activity per interval. Model content is never inspected or copied; actual tool
+ * updates carry only a redacted, bounded preview of text output.
  */
 export class StreamingActivityThrottle {
   private lastAt = Number.NEGATIVE_INFINITY;
@@ -258,11 +417,20 @@ export class StreamingActivityThrottle {
     this.intervalMs = intervalMs;
   }
 
-  note(event: { type?: string; message?: unknown }, nowMs: number = Date.now()): WorkerActivity | null {
+  note(
+    event: { type?: string; message?: unknown; partialResult?: unknown },
+    nowMs: number = Date.now(),
+  ): WorkerActivity | null {
     if (event.type === "tool_execution_update") {
       if (nowMs - this.lastToolAt < this.intervalMs) return null;
       this.lastToolAt = nowMs;
-      return { kind: "state", summary: TOOL_PROGRESS_SUMMARY, meaningfulProgress: false };
+      const outputPreview = toolOutputPreview(event.partialResult);
+      return {
+        kind: "state",
+        summary: TOOL_PROGRESS_SUMMARY,
+        meaningfulProgress: false,
+        ...(outputPreview ? { outputPreview } : {}),
+      };
     }
     if (event.type !== "message_update") return null;
     if ((event.message as { role?: unknown } | undefined)?.role !== "assistant") return null;

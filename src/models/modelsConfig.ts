@@ -19,9 +19,13 @@ import { randomUUID } from "node:crypto";
 import {
   constants,
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
+  fstatSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -120,7 +124,12 @@ function createBackup(path: string, mode: number, now: Date): string {
  * cross a filesystem boundary, and at 0600 from the outset so the credentials
  * are never briefly readable at a wider mode.
  */
-export function writeModelsConfig(path: string, config: ModelsConfig, now: Date = new Date()): WriteResult {
+export function writeModelsConfig(
+  path: string,
+  config: ModelsConfig,
+  now: Date = new Date(),
+  writer = "unlabelled",
+): WriteResult {
   const existed = existsSync(path);
   const mode = existed ? statSync(path).mode & 0o777 : 0o600;
   const result: WriteResult = {};
@@ -143,9 +152,113 @@ export function writeModelsConfig(path: string, config: ModelsConfig, now: Date 
     throw err;
   }
 
+  recordWriter(path, config, now, writer);
   const pruned = pruneBackups(path, result.backupPath);
   if (pruned.length > 0) result.prunedBackups = pruned;
   return result;
+}
+
+const MAX_WRITER_LINES = 200;
+const MAX_WRITER_HISTORY_BYTES = 256 * 1024;
+
+/** Paths, credentials and query parameters may all contain API keys. */
+function writerProviderOrigins(config: ModelsConfig): Record<string, string | null> {
+  return Object.fromEntries(
+    Object.entries(config.providers ?? {}).map(([id, provider]) => {
+      if (typeof provider?.baseUrl !== "string") return [id, null];
+      try {
+        const url = new URL(provider.baseUrl);
+        if (url.protocol === "https:" || url.protocol === "http:") return [id, url.origin];
+      } catch {
+        // An unparseable endpoint must not be echoed into the audit log.
+      }
+      return [id, "(configured endpoint)"];
+    }),
+  );
+}
+
+function writerHistory(log: string): string[] {
+  let fd: number;
+  try {
+    fd = openSync(log, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.nlink !== 1) throw new Error("Not a private regular audit log");
+    const start = Math.max(0, info.size - MAX_WRITER_HISTORY_BYTES);
+    const buffer = Buffer.alloc(Math.min(info.size, MAX_WRITER_HISTORY_BYTES));
+    const bytes = readSync(fd, buffer, 0, buffer.length, start);
+    const lines = buffer.subarray(0, bytes).toString("utf8").split("\n");
+    if (start > 0) lines.shift(); // The bounded tail may begin inside a record.
+    return lines
+      .filter(Boolean)
+      .slice(-(MAX_WRITER_LINES - 1))
+      .flatMap((line) => {
+        try {
+          const entry = JSON.parse(line);
+          // Scrub URLs written by earlier versions, too. Invalid records are not
+          // copied forward: they may be truncated or contain unstructured secrets.
+          const providers = Object.fromEntries(
+            Object.entries(entry.providers).map(([id, baseUrl]) => [
+              id,
+              { baseUrl: typeof baseUrl === "string" ? baseUrl : undefined },
+            ]),
+          );
+          return [JSON.stringify({ ...entry, providers: writerProviderOrigins({ providers }) })];
+        } catch {
+          return [];
+        }
+      });
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Append who wrote the file to `<path>.writers.log`, so an unexplained change
+ * (a provider that vanished, a URL that moved) can be traced to a process.
+ * Holds provider ids and HTTP(S) origins only, never URL credentials or paths.
+ * Best effort: a log we cannot write must not fail a write that succeeded.
+ */
+function recordWriter(path: string, config: ModelsConfig, now: Date, writer: string): void {
+  let tmp: string | undefined;
+  try {
+    const providers = writerProviderOrigins(config);
+    const entry = JSON.stringify({
+      at: now.toISOString(),
+      writer,
+      pid: process.pid,
+      ppid: process.ppid,
+      argv: process.argv.slice(0, 2).map((a) => a.split("/").pop()),
+      providers,
+    });
+    const log = `${path}.writers.log`;
+    const lines = [...writerHistory(log), entry];
+    const candidate = join(dirname(path), `.models.writers.tmp-${randomUUID()}`);
+    const fd = openSync(candidate, "wx", 0o600);
+    tmp = candidate;
+    try {
+      writeFileSync(fd, `${lines.join("\n")}\n`);
+    } finally {
+      closeSync(fd);
+    }
+    // Replacing the inode enforces 0600 even for an old, permissive log and
+    // cannot write through a symlink/hardlink swapped in during the read.
+    renameSync(tmp, log);
+  } catch {
+    // see above
+  } finally {
+    if (tmp) {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        // Audit cleanup must not fail the successful models.json write either.
+      }
+    }
+  }
 }
 
 /** Remove all but the newest `MAX_BACKUPS` backups of `path`. */

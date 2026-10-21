@@ -544,6 +544,10 @@ test("/mission-status reports the execution mode decision and its reason (P6)", 
     await commands.get("mission-status")!.handler("", ctx);
     const text = notices.at(-1)?.text ?? "";
     assert.match(text, /execution mode: single — auto: the gateway does not advertise role capabilities/i);
+    assert.ok(
+      notices.every((notice) => !notice.text.startsWith("working: output")),
+      "live timer updates belong in persistent surfaces, not notifications",
+    );
     for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     await runtime.close();
   } finally {
@@ -615,22 +619,146 @@ test("/mission completion notification includes the execution mode decision (P6)
     runtime.missionStore!.updateMission(mission.mission_id, {
       execution_mode: { mode: "single", reason: "auto: the gateway does not advertise role capabilities" },
     });
-    Orchestrator.prototype.orchestrate = (async () => ({
-      mission: runtime.missionStore!.getMission(mission.mission_id)!,
-      intent: { intent: ["implement"], confidence: 0.9, suggested_workflow: "engineering" },
-      verdict: { completed: true },
-      completed: true,
-      failureReason: null,
-    })) as unknown as typeof Orchestrator.prototype.orchestrate;
+    Orchestrator.prototype.orchestrate = (async (
+      _request: string,
+      options: { onProgress?: (line: string) => void },
+    ) => {
+      for (let second = 1; second <= 3; second++) options.onProgress?.(`working: output ${second}s ago`);
+      return {
+        mission: runtime.missionStore!.getMission(mission.mission_id)!,
+        intent: { intent: ["implement"], confidence: 0.9, suggested_workflow: "engineering" },
+        verdict: { completed: true },
+        completed: true,
+        failureReason: null,
+      };
+    }) as unknown as typeof Orchestrator.prototype.orchestrate;
     const { commands, handlers } = loadHarness();
     const { ctx, notices } = commandContext(root);
     await commands.get("mission")!.handler("Add a health endpoint", ctx);
     const text = notices.at(-1)?.text ?? "";
     assert.match(text, /execution mode: single — auto: the gateway does not advertise role capabilities/i);
+    assert.ok(
+      notices.every((notice) => !notice.text.startsWith("working: output")),
+      "live timer updates belong in persistent surfaces, not notifications",
+    );
     for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     await runtime.close();
   } finally {
     Orchestrator.prototype.orchestrate = originalOrchestrate;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("mission activity foregrounds live ages and the serving model before truncated metadata", () => {
+  const event = {
+    missionId: "MSN-live",
+    title: "live",
+    phase: "EXECUTING",
+    state: "EXECUTING",
+    health: "waiting",
+    approximatePercent: 0,
+    acceptanceCoverage: { completed: 0, total: 1, approximatePercent: 0 },
+    workflowProgress: { completed: 0, total: 1, approximatePercent: 0 },
+    summary: "waiting for model",
+    activeWorkers: 1,
+    waitingWorkers: 0,
+    failedWorkers: 0,
+    lastMeaningfulProgressAt: "2026-10-20T12:00:00Z",
+    lastHeartbeatAt: "2026-10-20T12:00:18Z",
+    lastOutputAt: "2026-10-20T12:00:15Z",
+    observedAt: "2026-10-20T12:00:20Z",
+    waitingReason: "model_request",
+    waitingSince: "2026-10-20T12:00:00Z",
+    workersDetail: [
+      {
+        workerId: "w1",
+        taskId: "t1",
+        model: "metabolomics/flash-next",
+        lastOutputAt: "2026-10-20T12:00:15Z",
+        lastHeartbeatAt: "2026-10-20T12:00:18Z",
+        lastMeaningfulProgressAt: "2026-10-20T12:00:00Z",
+        route: "fast",
+        status: "running",
+        currentActivity: "waiting for model",
+      },
+    ],
+    action: "CONTINUE",
+    reason: "active",
+    recovery: { attempt: 0, maxAttempts: 3 },
+    nextAction: "monitor",
+    nextActionAt: null,
+    owner: "owner".repeat(100),
+    repository: "repo".repeat(100),
+    task: "t1",
+    preservedWork: [],
+  } satisfies RuntimeMissionActivityEvent;
+  const rendered = extensionModule.formatMissionActivity(event);
+  assert.match(rendered.detail.slice(0, 640), /Now: waiting for model/);
+  assert.match(rendered.detail.slice(0, 640), /output 5s ago/);
+  assert.match(rendered.detail.slice(0, 640), /heartbeat 2s ago/);
+  assert.match(rendered.detail.slice(0, 640), /progress 20s ago/);
+  assert.match(rendered.detail.slice(0, 640), /fast → metabolomics\/flash-next/);
+  assert.match(rendered.missionStatus.live ?? "", /WAITING/);
+
+  const mixed: RuntimeMissionActivityEvent = {
+    ...event,
+    health: "stalled",
+    lastMeaningfulProgressAt: "2026-10-20T12:00:19Z",
+    lastHeartbeatAt: "2026-10-20T12:00:19Z",
+    lastOutputAt: "2026-10-20T12:00:19Z",
+    workersDetail: [
+      { ...event.workersDetail[0], workerId: "busy", currentActivity: "writing tests", health: "active" },
+      {
+        ...event.workersDetail[0],
+        workerId: "stuck",
+        currentActivity: "running stuck tests",
+        health: "stalled",
+        lastHeartbeatAt: "2026-10-20T12:00:00Z",
+        lastOutputAt: "2026-10-20T12:00:01Z",
+        lastMeaningfulProgressAt: "2026-10-20T12:00:02Z",
+      },
+    ],
+  };
+  const stuck = extensionModule.formatMissionActivity(mixed);
+  assert.match(stuck.detail, /Now: running stuck tests/);
+  assert.match(stuck.detail, /output 19s ago/);
+  assert.match(stuck.detail, /heartbeat 20s ago/);
+  assert.match(stuck.detail, /progress 18s ago/);
+  assert.doesNotMatch(stuck.detail, /heartbeat 1s ago|progress 1s ago/);
+
+  const recovered = extensionModule.formatMissionActivity({
+    ...event,
+    health: "active",
+    workersDetail: [
+      {
+        ...event.workersDetail[0],
+        workerId: "previous-attempt",
+        status: "failed",
+        health: "failed",
+        currentActivity: "old failed attempt",
+        model: "old/model",
+      },
+      {
+        ...event.workersDetail[0],
+        workerId: "retry",
+        status: "running",
+        health: "active",
+        currentActivity: "verifying successful retry",
+        model: "new/model",
+        lastOutputAt: "2026-10-20T12:00:19Z",
+      },
+    ],
+  });
+  assert.match(recovered.detail, /Now: verifying successful retry/);
+  assert.match(recovered.detail, /new\/model/);
+  assert.match(recovered.detail, /output 1s ago/);
+  assert.doesNotMatch(recovered.detail, /old failed attempt|old\/model/);
+});
+
+test("/mission inspect rejects malformed syntax before opening a runtime or creating a mission", async () => {
+  const command = loadCommands().get("mission")!;
+  const { ctx, notices } = commandContext("/nonexistent/inspection-syntax-test");
+  for (const input of ["inspect", "inspect MSN-1 w1 extra"]) await command.handler(input, ctx);
+  assert.equal(notices.length, 2);
+  assert.ok(notices.every((notice) => notice.text === "/mission inspect <missionId> [workerId]"));
 });

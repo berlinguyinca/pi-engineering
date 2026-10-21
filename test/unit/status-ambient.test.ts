@@ -112,3 +112,19 @@ test("ambient: a mismatched repository yields no row rather than a wrong one", (
   assert.ok(resolve("/repo/a", "/repo/a"), "same repository renders");
   assert.equal(resolve("/repo/a", "/repo/b"), undefined, "a different repository renders nothing");
 });
+
+test("ambient: mission activity is visible even before files or tokens exist", () => {
+  const line = renderAmbient(
+    stateWith({
+      run: {
+        ...RUN,
+        files: [],
+        spend: [],
+        goal: "Now: waiting for model · output 20s ago",
+        missionStatus: { token: "WAITING", reason: "model request", next: "monitor" },
+      },
+    }).snapshot,
+  );
+  assert.match(line ?? "", /Now: waiting for model/);
+  assert.match(line ?? "", /output 20s ago/);
+});

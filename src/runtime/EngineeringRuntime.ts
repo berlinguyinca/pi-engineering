@@ -46,7 +46,8 @@ import {
 } from "../orchestration/missionSnapshot.ts";
 import { MissionStore } from "../orchestration/missionStore.ts";
 import { buildVerifierStages } from "../orchestration/missionWhy.ts";
-import { MissionObservability } from "../orchestration/observability/MissionObservability.ts";
+import { MissionActivityTicker } from "../orchestration/observability/MissionActivityTicker.ts";
+import { MissionObservability, boundedToolOutputPreview } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
@@ -401,6 +402,28 @@ export interface RuntimePhaseEvent {
 
 /** Bounded, display-safe mission state for persistent footer/panel surfaces. */
 export interface RuntimeMissionActivityEvent {
+  /** UI observation time; never evidence of worker activity. */
+  observedAt?: string;
+  waitingReason?: string;
+  waitingSince?: string;
+  lastOutputAt?: string;
+  workersDetail?: Array<{
+    workerId: string;
+    taskId?: string;
+    model?: string;
+    route?: string;
+    node?: string;
+    currentActivity?: string;
+    currentActivityStartedAt?: string;
+    startedAt?: string;
+    lastHeartbeatAt?: string;
+    lastMeaningfulProgressAt?: string;
+    lastOutputAt?: string;
+    lastOutputPreview?: string;
+    status?: string;
+    health?: string;
+  }>;
+  recentActivity?: Array<{ timestamp: string; summary: string; workerId?: string }>;
   missionId: string;
   title: string;
   phase: string;
@@ -670,6 +693,8 @@ export class EngineeringRuntime {
   private readonly onMissionSnapshotError: ((message: string) => void) | null;
   private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
+  private missionActivityTicker: MissionActivityTicker | null = null;
+  private unsubscribeMissionActivity: (() => void) | null = null;
   private currentWorkItemId = "";
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
@@ -954,12 +979,24 @@ export class EngineeringRuntime {
   }
 
   /** Project observability into a compact surface event without raw commands or metadata. */
-  private emitMissionActivity(missionId: string): void {
+  private emitMissionActivity(missionId: string, observedAt = new Date().toISOString()): void {
     if (!this.onMissionActivity) return;
+    this.missionActivityTicker?.watch(missionId);
     const projection = this.missionObservability?.projection(missionId);
     if (!projection) return;
     const summary = projection.summary;
     const mission = this.missionStore?.getMission(missionId);
+    const safe = (value: string) =>
+      redactSecrets(
+        [...value]
+          .map((character) => {
+            const code = character.charCodeAt(0);
+            return code < 32 || code === 127 ? " " : character;
+          })
+          .join(""),
+      )
+        .trim()
+        .slice(0, 240);
     const raw = summary.currentActivity?.summary ?? summary.currentObjective ?? summary.title;
     const bounded = redactSecrets(raw)
       .replace(/[\r\n\t]+/g, " ")
@@ -967,6 +1004,44 @@ export class EngineeringRuntime {
       .slice(0, 240);
     try {
       this.onMissionActivity({
+        observedAt,
+        waitingReason: summary.waitingReason,
+        waitingSince: summary.waitingSince,
+        lastOutputAt: projection.workers
+          .map((worker) => worker.lastOutputAt)
+          .filter((at): at is string => !!at)
+          .sort()
+          .at(-1),
+        workersDetail: [...projection.workers]
+          .sort((a, b) => {
+            const priority = (worker: typeof a) =>
+              worker.health === "stalled" ? 0 : worker.state === "running" || worker.state === "waiting" ? 1 : 2;
+            return priority(a) - priority(b);
+          })
+          .slice(0, 32)
+          .map((worker) => ({
+            workerId: safe(worker.workerId),
+            taskId: worker.taskId ? safe(worker.taskId) : undefined,
+            model: worker.model ? safe(worker.model) : undefined,
+            route: worker.route ? safe(worker.route) : undefined,
+            node: worker.node ? safe(worker.node) : undefined,
+            currentActivity: worker.currentActivity ? safe(worker.currentActivity) : undefined,
+            currentActivityStartedAt: worker.currentActivityStartedAt,
+            startedAt: worker.startedAt,
+            lastHeartbeatAt: worker.lastHeartbeatAt,
+            lastMeaningfulProgressAt: worker.lastMeaningfulProgressAt,
+            lastOutputAt: worker.lastOutputAt,
+            lastOutputPreview: worker.lastOutputPreview
+              ? boundedToolOutputPreview(worker.lastOutputPreview)
+              : undefined,
+            status: worker.state,
+            health: worker.health,
+          })),
+        recentActivity: projection.activity.slice(-8).map((activity) => ({
+          timestamp: activity.at,
+          summary: safe(activity.summary),
+          workerId: activity.workerId ? safe(activity.workerId) : undefined,
+        })),
         missionId,
         title: redactSecrets(summary.title)
           .replace(/[\r\n\t]+/g, " ")
@@ -984,7 +1059,7 @@ export class EngineeringRuntime {
         failedWorkers: summary.workers.failed,
         ...(summary.lastHeartbeatAt ? { lastHeartbeatAt: summary.lastHeartbeatAt } : {}),
         lastMeaningfulProgressAt: summary.lastMeaningfulProgressAt,
-        action: summary.action,
+        action: safe(summary.action),
         reason: redactSecrets(summary.reason)
           .replace(/[\r\n\t]+/g, " ")
           .trim()
@@ -1173,13 +1248,18 @@ export class EngineeringRuntime {
           backend: orchestrationBackend,
           store: rt.missionStore,
           onUpdate: opts.onMissionObservabilityUpdate,
-          onChange: (missionId) => {
-            void rt.publishMissionSnapshot();
-            rt.emitMissionActivity(missionId);
-          },
         });
         openedMissionObservability.set(orchestrationPath, rt.missionObservability);
       }
+      rt.missionActivityTicker = new MissionActivityTicker({
+        state: (missionId) => rt.missionStore?.getMission(missionId)?.status,
+        emit: (missionId, observedAt) => rt.emitMissionActivity(missionId, observedAt),
+      });
+      rt.unsubscribeMissionActivity = rt.missionObservability.subscribe((missionId) => {
+        void rt.publishMissionSnapshot();
+        rt.emitMissionActivity(missionId);
+      });
+      for (const missionId of rt.missionObservability.listMissionIds()) rt.emitMissionActivity(missionId);
       // Route orchestration worker roles through the capability router so per-role
       // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
       // is honored by the mission pipeline, matching the lifecycle roleRunner
@@ -1577,6 +1657,8 @@ export class EngineeringRuntime {
       return rt;
     } catch (error) {
       rt.externalPumpStopped = true;
+      rt.missionActivityTicker?.close();
+      rt.unsubscribeMissionActivity?.();
       await rt.missionSupervisor?.shutdown();
       if (rt.ownershipId) liveOwnerIds().delete(rt.ownershipId);
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
@@ -1621,6 +1703,8 @@ export class EngineeringRuntime {
     }
     if (path) EngineeringRuntime.releaseOrchestrationReference(path);
     this.closed = true;
+    this.missionActivityTicker?.close();
+    this.unsubscribeMissionActivity?.();
     if (this.ownershipId) liveOwnerIds().delete(this.ownershipId);
     this.snapshotPressure?.dispose();
     this.orchestrator = null;

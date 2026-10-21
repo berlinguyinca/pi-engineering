@@ -10,11 +10,14 @@ import assert from "node:assert/strict";
 import {
   chmodSync,
   existsSync,
+  linkSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -266,4 +269,102 @@ test("models config: a non-default file mode is preserved, not normalised to 060
 test("models config: a non-array models field reads as empty rather than crashing", () => {
   assert.deepEqual(providerModels({ providers: { p: { models: "nope" as unknown as [] } } }, "p"), []);
   assert.deepEqual(providerModels({ providers: { p: { models: null as unknown as [] } } }, "p"), []);
+});
+
+test("models config: writer audit strips URL credentials, paths, queries and malformed endpoints", () => {
+  const s = scratch();
+  try {
+    const secretUrl =
+      "https://user:password@gateway.example:8443/private-token/v1?api_key=query-secret#fragment-secret";
+    writeFileSync(`${s.path}.writers.log`, `${JSON.stringify({ writer: "old", providers: { p: secretUrl } })}\n`);
+    writeModelsConfig(s.path, {
+      providers: {
+        p: { baseUrl: secretUrl, apiKey: "key-secret" },
+        malformed: { baseUrl: "not-a-url-secret" },
+        unsupported: { baseUrl: "data:text/plain,data-secret" },
+      },
+    });
+    const log = readFileSync(`${s.path}.writers.log`, "utf8");
+    assert.doesNotMatch(log, /user|password|private-token|secret/);
+    const entries = log
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(entries[0].providers.p, "https://gateway.example:8443");
+    assert.deepEqual(entries[1].providers, {
+      p: "https://gateway.example:8443",
+      malformed: "(configured endpoint)",
+      unsupported: "(configured endpoint)",
+    });
+    assert.equal(readModelsConfig(s.path).providers?.p?.baseUrl, secretUrl);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("models config: writer audit tightens an existing public log to 0600", () => {
+  const s = scratch();
+  try {
+    writeFileSync(`${s.path}.writers.log`, "", { mode: 0o644 });
+    chmodSync(`${s.path}.writers.log`, 0o644);
+    writeModelsConfig(s.path, CONFIG);
+    assert.equal(statSync(`${s.path}.writers.log`).mode & 0o777, 0o600);
+  } finally {
+    s.cleanup();
+  }
+});
+
+for (const kind of ["symlink", "hardlink"] as const) {
+  test(`models config: writer audit cannot overwrite a ${kind} target`, () => {
+    const s = scratch();
+    try {
+      const target = join(s.dir, "credentials.json");
+      writeFileSync(target, "private-original-data", { mode: 0o600 });
+      if (kind === "symlink") symlinkSync(target, `${s.path}.writers.log`);
+      else linkSync(target, `${s.path}.writers.log`);
+      assert.doesNotThrow(() => writeModelsConfig(s.path, CONFIG));
+      assert.equal(readFileSync(target, "utf8"), "private-original-data");
+      assert.deepEqual(readModelsConfig(s.path), CONFIG);
+      assert.equal(
+        readdirSync(s.dir).some((name) => name.includes("tmp")),
+        false,
+      );
+    } finally {
+      s.cleanup();
+    }
+  });
+}
+
+test("models config: an unwritable audit destination does not fail a successful config write", () => {
+  const s = scratch();
+  try {
+    mkdirSync(`${s.path}.writers.log`);
+    assert.doesNotThrow(() => writeModelsConfig(s.path, CONFIG));
+    assert.deepEqual(readModelsConfig(s.path), CONFIG);
+    assert.equal(
+      readdirSync(s.dir).some((name) => name.includes("tmp")),
+      false,
+    );
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("models config: oversized writer history retains only the newest complete 200 records", () => {
+  const s = scratch();
+  try {
+    const lines = ["x".repeat(300_000)];
+    for (let i = 0; i < 250; i++) lines.push(JSON.stringify({ writer: `previous-${i}`, providers: {} }));
+    writeFileSync(`${s.path}.writers.log`, `${lines.join("\n")}\n`);
+    writeModelsConfig(s.path, CONFIG, new Date(), "newest");
+    const entries = readFileSync(`${s.path}.writers.log`, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(entries.length, 200);
+    assert.equal(entries[0].writer, "previous-51");
+    assert.equal(entries.at(-1)?.writer, "newest");
+  } finally {
+    s.cleanup();
+  }
 });
