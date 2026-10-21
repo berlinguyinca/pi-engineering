@@ -9,6 +9,9 @@
  */
 
 import assert from "node:assert/strict";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -18,6 +21,7 @@ import {
   buildSessionHandoff,
   decideSessionSwitch,
   messageText,
+  persistSessionHandoff,
   sessionBranchMessages,
 } from "../../src/plannerWorker/sessionHandoff.ts";
 
@@ -109,15 +113,20 @@ describe("decideSessionSwitch", () => {
     assert.equal(decision.action, "compact");
   });
 
-  it("falls back to compaction when the handoff itself does not fit", () => {
-    const huge = "y".repeat(90_000); // ~22.5k tokens of handoff > 20k window - reserve
+  it("falls back to compaction when no handoff can be built but the context does not fit", () => {
+    // `buildSessionHandoff` bounds the objective/summary to 1500 chars, so a
+    // single huge message no longer yields an oversized handoff — the handoff
+    // fits and is preferred. Compaction is the fallback when the handoff
+    // CANNOT be built (no user message); that case is asserted below.
+    const huge = "y".repeat(90_000);
     const decision = decideSessionSwitch({
       next: { id: "small-window", provider: "p", contextWindow: 20_000 },
       contextTokens: 50_000,
       sessionId: "s",
       messages: [{ role: "user", text: huge }],
     });
-    assert.equal(decision.action, "compact");
+    // The bounded handoff (≤ ~1500 chars) now fits the 20k window.
+    assert.equal(decision.action, "handoff");
   });
 
   it("rejects when neither the handoff nor compaction is possible", () => {
@@ -271,5 +280,57 @@ describe("sessionBranchMessages / messageText", () => {
     );
     assert.equal(messageText(null), "");
     assert.equal(messageText(42), "");
+  });
+});
+
+// ── persistSessionHandoff: best-effort persistence ──────────────────────────
+
+describe("persistSessionHandoff", () => {
+  it("does not throw when the planner-worker dir cannot be created (best-effort)", async () => {
+    // Point at an unwritable location: a path under a file, not a directory,
+    // so mkdir fails. The documented contract is that a persistence failure
+    // must never block the model switch.
+    const file = join(tmpdir(), `notadir-${process.pid}`);
+    writeFileSync(file, "i am a file");
+    const built = buildSessionHandoff({
+      sessionId: "s",
+      messages: [{ role: "user", text: "do the thing" }],
+    });
+    assert.equal(built.ok, true);
+    if (!built.ok) return;
+    const decision: Extract<SessionSwitchDecision, { action: "handoff" }> = {
+      action: "handoff",
+      artifact: built.artifact,
+      rendered: built.rendered,
+      tokenEstimate: built.tokenEstimate,
+      reason: "handoff fits",
+    };
+    await assert.doesNotReject(persistSessionHandoff(file, decision));
+    rmSync(file, { force: true });
+  });
+});
+
+// ── buildSessionHandoff: bounded session text ───────────────────────────────
+
+describe("buildSessionHandoff bounds session text", () => {
+  it("clips a long latest user message and long assistant message to 1500 chars", () => {
+    const hugeUser = "u".repeat(5_000);
+    const hugeAssistant = "a".repeat(5_000);
+    const result = buildSessionHandoff({
+      sessionId: "s",
+      messages: [
+        { role: "user", text: hugeUser },
+        { role: "assistant", text: hugeAssistant },
+      ],
+    });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    // summary and objective are clipped from the user text.
+    assert.ok(result.artifact.mission_summary.length <= 1_540);
+    assert.ok(result.artifact.objective.length <= 1_540);
+    // architectural_context carries the assistant text, clipped too.
+    for (const ctx of result.artifact.architectural_context) {
+      assert.ok(ctx.length <= 1_540, `architectural context must be bounded, got ${ctx.length}`);
+    }
   });
 });

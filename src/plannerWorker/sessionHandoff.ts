@@ -124,17 +124,25 @@ export function buildSessionHandoff(input: {
   const lastUser = last("user");
   if (!lastUser) return { ok: false, error: "no user message to hand off" };
   const lastAssistant = last("assistant");
+  // Bound the session text that enters the artifact. `summary` is already
+  // clipped by `buildHandoff` downstream, but `architectural_context` and
+  // `objective` are NOT, so a very long single user/assistant message would
+  // otherwise flow into the artifact unbounded. Cap those two here at the same
+  // 1500-char bound the summary uses.
+  const clip = (text: string, max: number) =>
+    text.length > max ? `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]` : text;
+  const MAX_SESSION_TEXT = 1_500;
 
   const brief: MissionBrief = {
     mission_id: `session:${input.sessionId}`,
     summary: lastUser.text,
-    architectural_context: lastAssistant ? [lastAssistant.text] : [],
+    architectural_context: lastAssistant ? [clip(lastAssistant.text, MAX_SESSION_TEXT)] : [],
     acceptance_criteria: [],
     constraints: [],
   };
   const contract: TaskContract = {
     task_id: "session",
-    objective: lastUser.text,
+    objective: clip(lastUser.text, MAX_SESSION_TEXT),
     depends_on: [],
     scope: { allowed: [], forbidden: [] },
     acceptance: [],
@@ -264,6 +272,14 @@ export async function persistSessionHandoff(
     token_estimate: decision.tokenEstimate,
     artifact: decision.artifact,
   };
-  await mkdir(dir, { recursive: true });
-  await appendFile(join(dir, "session-handoffs.jsonl"), `${JSON.stringify(entry)}\n`).catch(() => {});
+  // Both the directory creation AND the append are best-effort: a persistence
+  // failure (read-only checkout, permission, disk) must never block the model
+  // switch, which is the documented contract above. Guarded together so an
+  // unwritable planner-worker dir cannot reject out of the model_select handler.
+  try {
+    await mkdir(dir, { recursive: true });
+    await appendFile(join(dir, "session-handoffs.jsonl"), `${JSON.stringify(entry)}\n`);
+  } catch {
+    // Best-effort by design — the in-session handoff still succeeds.
+  }
 }
