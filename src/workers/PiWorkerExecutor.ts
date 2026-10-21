@@ -90,6 +90,7 @@ import {
 } from "../inference/streamResume.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { missionDepthSpawnHook } from "../orchestration/missionMode.ts";
+import { NO_CHANGE_LOOP_PREVENTED_MARKER } from "../orchestration/recovery.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
@@ -137,7 +138,7 @@ import {
   realClock,
   withBudgetNotice,
 } from "./wallClockBudget.ts";
-import { createWorkerResultTool } from "./workerResultTool.ts";
+import { createWorkerResultTool, hasNoChangesVsBase } from "./workerResultTool.ts";
 import { createWorktreeFileTools } from "./worktreeFileTools.ts";
 
 /**
@@ -1159,17 +1160,36 @@ export class PiWorkerExecutor implements WorkerExecutor {
           if (this.rollout.observability) this.observability.recordRecoveryOutcome(false);
           recoveryPending = false;
         }
+        // A MUTATING worker prevented from making progress, with nothing
+        // committed vs base, is the "nothing to do" signature — but the worker
+        // never reached the success-only `already_satisfied` assertion, so the
+        // bare loop_prevented failure would otherwise be auto-retried or
+        // auto-repaired forever. Mark it so recovery parks the mission for the
+        // operator (REQUIREMENT_AMBIGUITY -> WAIT_FOR_REQUIREMENT) instead.
+        let loopPreventedNoChange = false;
+        if (req.baseRef && MUTATING_ROLES.has(req.role)) {
+          try {
+            loopPreventedNoChange = await hasNoChangesVsBase(req.cwd, req.baseRef);
+          } catch {
+            // Git unknown is not proof of a no-op; leave the flag false.
+            loopPreventedNoChange = false;
+          }
+        }
         const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
         const detail = {
           loop_prevented: true,
+          loop_prevented_no_change_vs_base: loopPreventedNoChange,
           no_progress_turns: noProgressTurns,
           recovery: loopPreventedEvent !== undefined ? decideApsRecovery(loopPreventedEvent).action : "none",
           escalated_to_human: escalatedToHuman,
         };
+        const noChangeSuffix = loopPreventedNoChange
+          ? ` — ${NO_CHANGE_LOOP_PREVENTED_MARKER}: a mutating ${req.role} worker was prevented from making progress and produced no changes vs base; an operator must decide whether the objective is already met or needs a different approach.`
+          : "";
         return {
           result: {
             status: "failed",
-            summary: `Agent loop prevented after ${noProgressTurns} identical no-progress turns (${AGENT_LOOP_PREVENTED_EVENT}).`,
+            summary: `Agent loop prevented after ${noProgressTurns} identical no-progress turns (${AGENT_LOOP_PREVENTED_EVENT}).${noChangeSuffix}`,
             claims: [],
             evidence_refs: [],
             new_hypotheses: [],
