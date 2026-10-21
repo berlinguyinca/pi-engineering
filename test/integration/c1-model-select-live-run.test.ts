@@ -54,7 +54,11 @@ test("C1 live run: a model switch under context pressure transfers via handoff w
       getContextUsage: () => ({ tokens: 15_000 }), // just over the 16k window + reserve
       isIdle: () => true,
       isProjectTrusted: () => false,
-      modelRegistry: { getProvider: () => undefined, getApiKeyAndHeaders: async () => undefined, hasConfiguredAuth: () => true },
+      modelRegistry: {
+        getProvider: () => undefined,
+        getApiKeyAndHeaders: async () => undefined,
+        hasConfiguredAuth: () => true,
+      },
       sessionManager: {
         getSessionId: () => "sess-live-1",
         getBranch: () => branch,
@@ -103,10 +107,7 @@ test("C1 live run: a model switch under context pressure transfers via handoff w
     const contexts = parsed.map((entry) => entry.context);
 
     assert.ok(parsed.length > 0, "a MODEL_TRANSITION was recorded");
-    assert.ok(
-      contexts.includes("handoff"),
-      `the switch must cross via handoff, got contexts: ${contexts.join(", ")}`,
-    );
+    assert.ok(contexts.includes("handoff"), `the switch must cross via handoff, got contexts: ${contexts.join(", ")}`);
     assert.ok(
       !contexts.includes("compact"),
       `the switch must have ZERO compaction entries, got contexts: ${contexts.join(", ")}`,
