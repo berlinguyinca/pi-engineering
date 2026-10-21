@@ -247,14 +247,18 @@ export function createAdmissionCaptureFetch(
   baseFetch: AdmissionFetch = globalThis.fetch as AdmissionFetch,
   markNonRetryable = true,
   sessionId?: string,
+  identityHeaders?: Record<string, string>,
 ): AdmissionFetch {
   const session = sessionId !== undefined && SESSION_ID.test(sessionId) ? sessionId : undefined;
+  const identity =
+    identityHeaders !== undefined && Object.keys(identityHeaders).length > 0 ? identityHeaders : undefined;
   return async (input, init) => {
     let requestInit = init;
-    if (session !== undefined) {
+    if (session !== undefined || identity !== undefined) {
       // An init.headers replaces a Request's own headers, so start from them.
       const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-      headers.set(SESSION_HEADER, session);
+      if (session !== undefined) headers.set(SESSION_HEADER, session);
+      for (const [name, value] of Object.entries(identity ?? {})) headers.set(name, value);
       requestInit = { ...init, headers };
     }
     const response = await baseFetch(input, requestInit);
@@ -416,6 +420,41 @@ interface AttemptOutcome {
   committed: boolean;
   /** True when the attempt terminated as aborted. */
   aborted: boolean;
+}
+
+/** What gateway admission accepts in X-InferWeave-{Session,Agent,Client}-ID: 128 bytes of [A-Za-z0-9-_.:/]. */
+const ADMISSION_METADATA_UNSAFE = /[^A-Za-z0-9\-_.:/]/g;
+const ADMISSION_METADATA_MAX = 128;
+
+function admissionMetadata(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const clean = value.replace(ADMISSION_METADATA_UNSAFE, "_").slice(0, ADMISSION_METADATA_MAX);
+  return clean === "" ? undefined : clean;
+}
+
+/**
+ * The identity gateway admission buckets a request under (user + client +
+ * session + agent). Without these every request from one key shares the
+ * "default" session and agent bucket, so one stalled model's queued requests
+ * starve every other model for that caller.
+ *
+ * Values are sanitised, never rejected: the gateway answers 400 for metadata
+ * over 128 bytes or outside `[A-Za-z0-9-_.:/]`, and a header must not be able to
+ * turn a working request into a failed one.
+ */
+export function admissionIdentityHeaders(
+  scope: AdmissionScope | undefined,
+  laneSessionId: string | undefined,
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const session = admissionMetadata(scope?.sessionId ?? laneSessionId);
+  const agent = admissionMetadata(scope?.agentId ?? scope?.role);
+  const client = admissionMetadata(env.PI_INFERWEAVE_CLIENT_ID) ?? "pi";
+  if (session !== undefined) out["X-InferWeave-Session-ID"] = session;
+  if (agent !== undefined) out["X-InferWeave-Agent-ID"] = agent;
+  out["X-InferWeave-Client-ID"] = client;
+  return out;
 }
 
 /** Why a chain stopped waiting. */
@@ -995,6 +1034,7 @@ export function createAdmissionStreamSimple(opts: AdmissionTransportOptions): Ad
           baseFetch,
           effOpts.config.own_transport_retries,
           scope?.sessionId,
+          admissionIdentityHeaders(scope, options?.sessionId),
         );
         return delegate(model, context, { ...attemptOptions, fetch: fetchImpl });
       },

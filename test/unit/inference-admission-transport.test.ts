@@ -8,6 +8,7 @@ import { type AdmissionEvent, AdmissionEventBus, AdmissionMetrics } from "../../
 import {
   type AdmissionAttemptCapture,
   AdmissionBudgetLedger,
+  admissionIdentityHeaders,
   createAdmissionCaptureFetch,
   executeWithAdmissionRetry,
   terminalAssistantMessage,
@@ -26,6 +27,46 @@ test("capture fetch recognizes a raw inferweave_backpressure response", async ()
   const response = await fetch("https://example.invalid", {});
   assert.equal(capture.admission?.type, "inferweave_backpressure");
   assert.equal(response.headers.get("x-should-retry"), "false");
+});
+
+test("identity headers name the session, agent and client the gateway admits on", () => {
+  assert.deepEqual(admissionIdentityHeaders({ sessionId: "mission-1234", agentId: "implementer" }, undefined, {}), {
+    "X-InferWeave-Session-ID": "mission-1234",
+    "X-InferWeave-Agent-ID": "implementer",
+    "X-InferWeave-Client-ID": "pi",
+  });
+});
+
+test("identity headers fall back to the lane session, then the role, and honour PI_INFERWEAVE_CLIENT_ID", () => {
+  assert.deepEqual(admissionIdentityHeaders({ role: "reviewer" }, "lane-7", { PI_INFERWEAVE_CLIENT_ID: "pi:bender" }), {
+    "X-InferWeave-Session-ID": "lane-7",
+    "X-InferWeave-Agent-ID": "reviewer",
+    "X-InferWeave-Client-ID": "pi:bender",
+  });
+});
+
+test("identity headers are sanitised to what gateway admission accepts, never rejected", () => {
+  const h = admissionIdentityHeaders({ sessionId: `a b\u00e9#${"x".repeat(200)}` }, undefined, {});
+  assert.match(h["X-InferWeave-Session-ID"] ?? "", /^[A-Za-z0-9\-_.:/]{1,128}$/);
+  assert.deepEqual(admissionIdentityHeaders({}, undefined, {}), { "X-InferWeave-Client-ID": "pi" });
+});
+
+test("capture fetch sends identity headers on every attempt without clobbering existing headers", async () => {
+  let seen: Headers | undefined;
+  const fetch = createAdmissionCaptureFetch(
+    {},
+    async (_input, init) => {
+      seen = new Headers(init?.headers);
+      return new Response("{}", { status: 200 });
+    },
+    true,
+    undefined,
+    { "X-InferWeave-Session-ID": "s1", "X-InferWeave-Client-ID": "pi" },
+  );
+  await fetch("https://example.invalid", { headers: { authorization: "Bearer t" } });
+  assert.equal(seen?.get("x-inferweave-session-id"), "s1");
+  assert.equal(seen?.get("x-inferweave-client-id"), "pi");
+  assert.equal(seen?.get("authorization"), "Bearer t");
 });
 
 const SAFE_CAPTURE = {
