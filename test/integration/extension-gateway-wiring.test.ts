@@ -753,7 +753,7 @@ test("wiring: native working activity and gateway waits survive a disabled custo
     hasUI: true,
     isProjectTrusted: () => false,
     model: { provider: "metabolomics", id: "qwen" },
-    sessionManager: { getSessionId: () => "working-wiring" },
+    sessionManager: { getSessionId: () => "working-wiring", getBranch: () => [] },
     ui: {
       ...ctxStub().ui,
       notify: (message: string) => notices.push(message),
@@ -907,7 +907,7 @@ test("wiring: retry UI belongs to the foreground abort signal even for identical
     signal: foreground.signal,
     isProjectTrusted: () => false,
     model,
-    sessionManager: { getSessionId: () => "working-request" },
+    sessionManager: { getSessionId: () => "working-request", getBranch: () => [] },
     modelRegistry: {
       getProvider: () => base,
       registerProvider: (_id: string, config: { streamSimple?: typeof wrapped }) => {
