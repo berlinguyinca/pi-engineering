@@ -5,6 +5,9 @@
  * execution (the producing execution failed before publishing).
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, it } from "node:test";
 import { buildCandidateEvidenceIdentity } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
@@ -12,6 +15,10 @@ import type { TaskCheckpoint } from "../../src/orchestration/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 const MANIFEST_HASH = "manifest-360";
+
+function tempDir(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "pr372-durability-"));
+}
 
 function seed() {
   const store = MissionStore.open(JsonlEventStore.inMemory());
@@ -186,3 +193,136 @@ describe("recordReconstructedCandidate (#360)", () => {
     assert.equal(store.getCandidate(missionId)!.reconstructedFrom?.checkpointId, "TCP-360b");
   });
 });
+
+describe("reconstructed candidate durability (#372)", () => {
+  it("survives a close/reopen of a real JSONL backend with reconstructedFrom provenance intact", async () => {
+    const dir = tempDir();
+    const eventFile = path.join(dir, "events.jsonl");
+    try {
+      const first = await JsonlEventStore.open(eventFile);
+      const store = MissionStore.open(first);
+      const mission = store.createMission({
+        mission_id: "MSN-372",
+        title: "durable reconstruction",
+        goal: "durable reconstruction",
+        user_request: "durable reconstruction",
+        repository: "/workspace/repo",
+        base_ref: "base-372",
+        risk_profile: "high",
+        workflow_class: "engineering",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: `WM-${mission.mission_id}`,
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: "/workspace/repo", source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-372",
+            canonicalRoot: "/workspace/repo",
+            baseRef: "base-372",
+            baseSha: "base-372",
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: MANIFEST_HASH,
+        createdAt: "2026-09-27T00:00:00.000Z",
+      });
+      const task = store.createTask({
+        task_id: "TSK-372",
+        mission_id: mission.mission_id,
+        kind: "agent",
+        role: "implementer",
+        objective: "implement",
+        repo_id: "repo-372",
+        mutates_repo: true,
+        isolation: "worktree",
+        write_domains: ["src/**"],
+        deliverables: ["implement"],
+      });
+      store.transitionTask("TSK-372", "READY");
+      const execution = store.createExecution({
+        task_id: "TSK-372",
+        mission_id: mission.mission_id,
+        backend: "agent",
+        repo_id: "repo-372",
+        base_sha: "base-372",
+      });
+      store.transitionTask("TSK-372", "RUNNING", "system", { assigned_execution_id: execution.execution_id });
+      store.setExecutionStatus(execution.execution_id, "RUNNING");
+      // The producing execution FAILED before publishing — the #360 premise.
+      store.setExecutionStatus(execution.execution_id, "FAILED", { exit_status: "failed" });
+      store.transitionTask("TSK-372", "FAILED", "system", { failure_reason: "agent.loop_prevented" });
+      const checkpoint: TaskCheckpoint = {
+        checkpointId: "TCP-372",
+        executionId: execution.execution_id,
+        missionId: mission.mission_id,
+        taskId: "TSK-372",
+        repoId: "repo-372",
+        baseSha: "base-372",
+        candidateSha: "preserved-372",
+        branch: "pi-eng-orch-TSK-372",
+        worktree: null,
+        committedChanges: ["preserved-372"],
+        preservedUncommittedChanges: [],
+        completedDeliverables: ["implement"],
+        remainingDeliverables: [],
+        acceptanceIds: [],
+        validationEvidenceRefs: [],
+        artifactRefs: [],
+        artifactHashes: [],
+        workerId: null,
+        sessionId: null,
+        model: null,
+        sequence: 1,
+        missionGeneration: 0,
+        candidateGeneration: 0,
+        fencingToken: 0,
+        createdAt: "2026-09-27T00:00:01.000Z",
+      };
+      store.checkpointTask(checkpoint);
+      const recorded = store.recordReconstructedCandidate(
+        mission.mission_id,
+        identity372("preserved-372"),
+        { checkpointId: "TCP-372", branch: "pi-eng-orch-TSK-372" },
+        "reconstruct from preserved work",
+      );
+      // Drain pending event writes, close the durable backend (releases the
+      // file lock), then reopen from the same file to replay. Without the #372
+      // replay fix, the reconstructed candidate is quarantined on replay (its
+      // source execution is FAILED, not SUCCEEDED) and absent here.
+      await store.flush();
+      first.close();
+      const reopenedBackend = await JsonlEventStore.open(eventFile);
+      const reopened = MissionStore.open(reopenedBackend);
+      try {
+        const candidate = reopened.getCandidate(mission.mission_id);
+        assert.ok(candidate, "the reconstructed candidate survives reopen");
+        assert.equal(candidate!.identity.candidateSha, "preserved-372");
+        assert.equal(candidate!.identityHash, recorded.identityHash);
+        assert.ok(candidate!.reconstructedFrom, "reconstructedFrom provenance survives replay");
+        assert.equal(candidate!.reconstructedFrom!.checkpointId, "TCP-372");
+        assert.equal(candidate!.reconstructedFrom!.candidateSha, "preserved-372");
+        assert.equal(candidate!.reconstructedFrom!.branch, "pi-eng-orch-TSK-372");
+      } finally {
+        reopenedBackend.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+function identity372(candidateSha: string) {
+  return buildCandidateEvidenceIdentity({
+    workspaceManifestHash: MANIFEST_HASH,
+    missionGeneration: 0,
+    repoId: "repo-372",
+    baseSha: "base-372",
+    candidateSha,
+    diffHash: `sha256:${"1".repeat(64)}`,
+    acceptanceIds: [],
+    artifactHashes: [],
+  });
+}

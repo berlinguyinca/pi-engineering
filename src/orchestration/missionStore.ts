@@ -40,6 +40,7 @@ import type {
   MissionStatus,
   MissionStop,
   OrchestrationTask,
+  ReconstructedCandidateSource,
   RecoveryDecision,
   RecoveryStatus,
   RepositoryLease,
@@ -756,7 +757,16 @@ export class MissionStore {
               candidate.identity,
               candidate.identityHash,
             );
-            this.assertCandidateProvenance(candidate.missionId, identity, candidate.taskId, candidate.executionId);
+            if (candidate.reconstructedFrom) {
+              // A reconstructed candidate (#360) is anchored to a preserved
+              // checkpoint rather than to a SUCCEEDED authoritative execution —
+              // the producing execution deliberately FAILED before publishing.
+              // Validate the checkpoint trust anchor instead of the
+              // SUCCEEDED-execution provenance (mirrors recordReconstructedCandidate).
+              this.assertReconstructedCandidateProvenance(candidate.missionId, identity, candidate.reconstructedFrom);
+            } else {
+              this.assertCandidateProvenance(candidate.missionId, identity, candidate.taskId, candidate.executionId);
+            }
             this.assertUnusedCandidateExecution(candidate.executionId);
             this.candidates.set(
               candidateKey(candidate.missionId, identity.repoId),
@@ -2636,6 +2646,27 @@ export class MissionStore {
       execution.base_sha !== identity.baseSha
     )
       throw new Error("candidate provenance repository mismatch");
+  }
+
+  /**
+   * Replay-time validation for a reconstructed candidate (#360): the trust
+   * anchor is the source checkpoint, whose candidateSha and repoId must match
+   * the candidate identity — the same checks recordReconstructedCandidate
+   * performs at write time. The source checkpoint's producing execution is
+   * deliberately not SUCCEEDED, so assertCandidateProvenance must NOT apply.
+   */
+  private assertReconstructedCandidateProvenance(
+    missionId: string,
+    identity: CandidateEvidenceIdentity,
+    source: ReconstructedCandidateSource,
+  ): void {
+    const checkpoint = this.taskCheckpoints.get(source.checkpointId);
+    if (!checkpoint || checkpoint.missionId !== missionId)
+      throw new Error(`reconstruction source checkpoint not found for ${missionId}`);
+    if (checkpoint.candidateSha !== identity.candidateSha)
+      throw new Error("reconstruction source checkpoint sha does not match the candidate identity");
+    if (checkpoint.repoId !== identity.repoId)
+      throw new Error("reconstruction source checkpoint repository does not match the candidate identity");
   }
 
   private assertSettledExecutionIdentity(
