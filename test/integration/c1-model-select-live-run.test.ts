@@ -51,9 +51,10 @@ test("C1 live run: a model switch under context pressure transfers via handoff w
       hasUI: false,
       signal: undefined,
       model: BIG,
-      modelRegistry: undefined,
       getContextUsage: () => ({ tokens: 15_000 }), // just over the 16k window + reserve
       isIdle: () => true,
+      isProjectTrusted: () => false,
+      modelRegistry: { getProvider: () => undefined, getApiKeyAndHeaders: async () => undefined, hasConfiguredAuth: () => true },
       sessionManager: {
         getSessionId: () => "sess-live-1",
         getBranch: () => branch,
