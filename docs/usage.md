@@ -744,6 +744,47 @@ on by default):
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
 
+## Primary worktree guard
+
+The extension enforces the one-agent-one-worktree rule (AGENTS.md: each agent
+works in its own git worktree and never runs `git checkout` / `git switch` /
+`git reset` in a directory it does not own). Until this guard existed the rule
+was prose: a long-running session worked directly in a repository's PRIMARY
+checkout (the main / production worktree) while another session carried
+uncommitted work there; a force-switch destroyed the work, and a mission in
+the same checkout planned against a base that kept moving.
+
+`src/guard/primaryWorktreeGuard.ts` (on the `tool_call` hook, on by default)
+blocks the session's own **mutating** calls against any git repository's
+primary checkout:
+
+- `write` / `edit` to a path in the primary checkout;
+- bash `git` commands that change its state (`commit`, `checkout`, `switch`,
+  `reset`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `stash` (except
+  `list`/`show`), `add`, `rm`, `restore`, `update-ref`, `tag <name>`,
+  `branch <name>`/`-d`/`-D`/`-f`, `config` settings);
+- bash writes into it (`> f`, `>> f`, `tee f`, `sed -i … f`, `mv`/`cp` into
+  it).
+
+Read-only inspection (`git status`, `log`, `diff`, `show`, `fetch`, …) and
+worktree management (`git worktree add|remove|list|prune`) stay allowed —
+that is how a session observes the repo and **leaves** for its own worktree.
+The block reason tells the model the escape hatch: `git worktree add
+<sibling-dir> -b <branch> origin/<base>`.
+
+Knobs (set before starting the session):
+
+- `PI_ENG_PRIMARY=1` — this session is authorized to work in primary
+  checkouts (production ops: deploys, docker, branch inspection that must
+  happen in the production tree).
+- `PI_ENG_WORKTREE_GUARD=0` — disable the guard entirely.
+
+The bash checks are best-effort (no full shell parsing); an unrecognized
+mutating form is a gap to close when it bites, not a contract hole.
+The runtime's own in-process git operations (mission workers run in candidate
+worktrees; integration, janitor) do not go through the tool-call hook and are
+unaffected.
+
 ## Resuming a worker after a cut stream
 
 When a worker's model stream is cut ("Stream ended without finish_reason", a

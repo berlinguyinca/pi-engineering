@@ -44,6 +44,7 @@ import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
+import { registerPrimaryWorktreeGuard } from "../src/guard/primaryWorktreeGuard.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
 import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { admissionIdentityHeaders } from "../src/inference/admissionTransport.ts";
@@ -1006,6 +1007,12 @@ export default function (pi: ExtensionAPI) {
     // Identical-tool-call loops and unbounded bash test/build runs
     // (src/guard/toolCallGuard.ts; knobs in docs/usage.md, "Tool-call guard").
     registerToolCallGuard(pi as never);
+    // One agent, one worktree (AGENTS.md), enforced: block this session's own
+    // mutating calls against a repository's PRIMARY checkout so concurrent
+    // sessions cannot destroy each other's uncommitted work there. Production
+    // ops sessions set PI_ENG_PRIMARY=1; PI_ENG_WORKTREE_GUARD=0 disables
+    // (src/guard/primaryWorktreeGuard.ts; docs/usage.md, "Primary worktree guard").
+    registerPrimaryWorktreeGuard(pi as never, () => process.cwd());
     pi.on("tool_result", async (event) => {
       if (event.toolName !== "mission") return;
       const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
