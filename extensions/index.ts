@@ -46,6 +46,7 @@ import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from ".
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
 import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
+import { admissionIdentityHeaders } from "../src/inference/admissionTransport.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig } from "../src/models/modelsConfig.ts";
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
@@ -1692,6 +1693,10 @@ ${RECOVERY_PROMPT}`;
         { provider: model.provider, api: model.api },
         {
           createStream: () => createAssistantMessageEventStream() as never,
+          // Tell the gateway who is asking (client, and this Pi session), so its
+          // per-session admission buckets are not one shared "default" bucket.
+          requestHeaders: (_model, options) =>
+            admissionIdentityHeaders(undefined, (options as { sessionId?: string } | undefined)?.sessionId),
           // Scope decides which gate, keyed on what the refusal is ABOUT. A
           // 429 or an admission envelope speaks for the account — a shared
           // queue, a concurrency ceiling — so it parks every caller behind one
