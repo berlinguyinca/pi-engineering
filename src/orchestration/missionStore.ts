@@ -46,6 +46,7 @@ import type {
   MissionStatus,
   MissionStop,
   OrchestrationTask,
+  ReconstructedCandidateSource,
   RecoveryDecision,
   RecoveryStatus,
   RepositoryLease,
@@ -769,7 +770,16 @@ export class MissionStore {
               candidate.identity,
               candidate.identityHash,
             );
-            this.assertCandidateProvenance(candidate.missionId, identity, candidate.taskId, candidate.executionId);
+            if (candidate.reconstructedFrom) {
+              // A reconstructed candidate (#360) is anchored to a preserved
+              // checkpoint rather than to a SUCCEEDED authoritative execution —
+              // the producing execution deliberately FAILED before publishing.
+              // Validate the checkpoint trust anchor instead of the
+              // SUCCEEDED-execution provenance (mirrors recordReconstructedCandidate).
+              this.assertReconstructedCandidateProvenance(candidate.missionId, identity, candidate.reconstructedFrom);
+            } else {
+              this.assertCandidateProvenance(candidate.missionId, identity, candidate.taskId, candidate.executionId);
+            }
             this.assertUnusedCandidateExecution(candidate.executionId);
             this.candidates.set(
               candidateKey(candidate.missionId, identity.repoId),
@@ -2513,6 +2523,58 @@ export class MissionStore {
     return copyCandidateRevision(candidate);
   }
 
+  /**
+   * Record a candidate reconstructed (Git-verified) from preserved worker work
+   * after the producing execution failed before publishing (#360). Unlike
+   * {@link recordCandidate} this does NOT require a SUCCEEDED authoritative
+   * execution for provenance — the trust anchor is instead that the source
+   * checkpoint's candidateSha is Git-verifiable and matches this identity.
+   * The candidate is marked with `reconstructedFrom` so it stays auditable.
+   *
+   * NOTE(#360): the caller is responsible for ensuring the candidate target
+   * worktree carries this candidate's content before the gate runs (validation
+   * with candidateScoped backends throws CANDIDATE_UNAVAILABLE otherwise).
+   */
+  recordReconstructedCandidate(
+    missionId: string,
+    rawIdentity: CandidateEvidenceIdentity,
+    source: { checkpointId: string; branch: string | null },
+    reason?: string,
+  ): CandidateRevision {
+    if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
+    const identity = this.assertCandidateIdentity(missionId, rawIdentity, hashCandidateEvidenceIdentity(rawIdentity));
+    const identityHash = hashCandidateEvidenceIdentity(identity);
+    const checkpoint = this.taskCheckpoints.get(source.checkpointId);
+    if (!checkpoint || checkpoint.missionId !== missionId)
+      throw new Error(`reconstruction source checkpoint not found for ${missionId}`);
+    if (checkpoint.candidateSha !== identity.candidateSha)
+      throw new Error("reconstruction source checkpoint sha does not match the candidate identity");
+    if (checkpoint.repoId !== identity.repoId)
+      throw new Error("reconstruction source checkpoint repository does not match the candidate identity");
+    const key = candidateKey(missionId, identity.repoId);
+    const prior = this.candidates.get(key);
+    if (prior && prior.identityHash !== identityHash)
+      this.invalidateCandidate(prior, reason ?? "candidate reconstructed from preserved worker work");
+    const candidate: CandidateRevision = {
+      missionId,
+      taskId: checkpoint.taskId,
+      executionId: checkpoint.executionId,
+      identity,
+      identityHash,
+      reason: (reason ?? "").trim() || "candidate reconstructed from preserved worker work",
+      recordedAt: new Date().toISOString(),
+      reconstructedFrom: {
+        checkpointId: source.checkpointId,
+        branch: source.branch ?? checkpoint.branch,
+        candidateSha: identity.candidateSha,
+        reconstructedAt: new Date().toISOString(),
+      },
+    };
+    this.candidates.set(key, candidate);
+    this.emit("candidate.changed", missionId, { actor: "system", candidate });
+    return copyCandidateRevision(candidate);
+  }
+
   getCandidate(missionId: string, repoId?: string): CandidateRevision | undefined {
     const candidates = [...this.candidates.values()].filter((entry) => entry.missionId === missionId);
     const candidate = repoId
@@ -2632,6 +2694,27 @@ export class MissionStore {
       execution.base_sha !== identity.baseSha
     )
       throw new Error("candidate provenance repository mismatch");
+  }
+
+  /**
+   * Replay-time validation for a reconstructed candidate (#360): the trust
+   * anchor is the source checkpoint, whose candidateSha and repoId must match
+   * the candidate identity — the same checks recordReconstructedCandidate
+   * performs at write time. The source checkpoint's producing execution is
+   * deliberately not SUCCEEDED, so assertCandidateProvenance must NOT apply.
+   */
+  private assertReconstructedCandidateProvenance(
+    missionId: string,
+    identity: CandidateEvidenceIdentity,
+    source: ReconstructedCandidateSource,
+  ): void {
+    const checkpoint = this.taskCheckpoints.get(source.checkpointId);
+    if (!checkpoint || checkpoint.missionId !== missionId)
+      throw new Error(`reconstruction source checkpoint not found for ${missionId}`);
+    if (checkpoint.candidateSha !== identity.candidateSha)
+      throw new Error("reconstruction source checkpoint sha does not match the candidate identity");
+    if (checkpoint.repoId !== identity.repoId)
+      throw new Error("reconstruction source checkpoint repository does not match the candidate identity");
   }
 
   private assertSettledExecutionIdentity(
@@ -3334,7 +3417,11 @@ function copyEvidenceIdentity(identity: CandidateEvidenceIdentity): CandidateEvi
 }
 
 function copyCandidateRevision(candidate: CandidateRevision): CandidateRevision {
-  return { ...candidate, identity: copyEvidenceIdentity(candidate.identity) };
+  return {
+    ...candidate,
+    identity: copyEvidenceIdentity(candidate.identity),
+    reconstructedFrom: candidate.reconstructedFrom ? { ...candidate.reconstructedFrom } : undefined,
+  };
 }
 
 function copyValidationEvidence(evidence: ValidationEvidence): ValidationEvidence {

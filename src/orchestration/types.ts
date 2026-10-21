@@ -436,6 +436,19 @@ export interface CandidateEvidenceIdentity {
   artifactHashes: string[];
 }
 
+/**
+ * Provenance for a candidate that was not published by a SUCCEEDED
+ * authoritative execution but reconstructed (Git-verified) from preserved
+ * worker work after the producing execution failed before publishing a
+ * candidate (#360). The reconstruction is traceable to its source checkpoint.
+ */
+export interface ReconstructedCandidateSource {
+  checkpointId: EntityId;
+  branch: string | null;
+  candidateSha: string;
+  reconstructedAt: string;
+}
+
 /** The independently persisted revision that gate evidence must match exactly. */
 export interface CandidateRevision {
   missionId: EntityId;
@@ -445,6 +458,12 @@ export interface CandidateRevision {
   identityHash: string;
   reason: string;
   recordedAt: string;
+  /**
+   * Set only for candidates reconstructed from preserved work (#360). Its
+   * presence marks the candidate as Git-verified-from-checkpoint rather than
+   * execution-provenance, so downstream consumers can audit the difference.
+   */
+  reconstructedFrom?: ReconstructedCandidateSource;
 }
 
 export interface ValidationEvidence {
