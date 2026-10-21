@@ -98,10 +98,7 @@ console.log(`initial model: ${session.model?.provider}/${session.model?.id} (win
 
 // ── 3. seed ~40k tokens of real session content ─────────────────────────────
 
-const filler =
-  "Mission context: the gateway PR adds a /health endpoint behind the admission contract; " +
-  "decisions: keep the refusal guard on the terminal path, share the transient classifier with " +
-  "the resilience layer, and gate merges on verify plus GitGuardian. ".repeat(200); // one chunk
+const filler = `Mission context: the gateway PR adds a /health endpoint behind the admission contract; decisions: keep the refusal guard on the terminal path, share the transient classifier with ${"the resilience layer, and gate merges on verify plus GitGuardian. ".repeat(200)}`; // one chunk
 const latestAsk = "Now also add metrics for the health endpoint.";
 
 // Seed adaptively until pi's own estimate reports > 40k tokens (well past the
@@ -210,7 +207,7 @@ for (const h of handoffs) {
         artifact: {
           ...h.artifact,
           architectural_context: h.artifact?.architectural_context?.map((c: string) =>
-            c.length > 80 ? c.slice(0, 80) + "…" : c,
+            c.length > 80 ? `${c.slice(0, 80)}…` : c,
           ),
         },
       },
