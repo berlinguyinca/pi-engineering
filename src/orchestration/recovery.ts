@@ -383,6 +383,22 @@ export const INVALID_WORKER_OUTPUT_PREFIX = "INVALID_WORKER_OUTPUT";
 export const ALREADY_SATISFIED_MARKER = "already_satisfied";
 
 /**
+ * Marker clause appended to a `loop_prevented` failure when the worker is a
+ * MUTATING role that made NO changes vs base.
+ *
+ * Unlike {@link ALREADY_SATISFIED_MARKER}, this is NOT a worker assertion — the
+ * worker was killed by the loop guard before it could report. But the
+ * observable facts (a mutating task, prevented from making progress, nothing
+ * committed) are exactly the "nothing to do" signature, and without this the
+ * bare `loop_prevented` failure matches no classifier rule and is auto-retried
+ * or auto-repaired — a weak implementer that cannot conclude "already
+ * satisfied" (and so never emits the success-only marker) spirals forever,
+ * each repair task re-discovering the same wall. Routing this to
+ * REQUIREMENT_AMBIGUITY parks the mission for the operator instead.
+ */
+export const NO_CHANGE_LOOP_PREVENTED_MARKER = "loop_prevented_no_change_vs_base";
+
+/**
  * The most recent evidenced `already_satisfied` assertion among a mission's
  * successful MUTATING executions.
  *
@@ -474,7 +490,7 @@ export class FailureClassifier {
     const category =
       evidence.category !== undefined && LOST_OWNERSHIP.test(summary)
         ? "ORPHANED_EXECUTION"
-        : summary.includes(ALREADY_SATISFIED_MARKER)
+        : summary.includes(ALREADY_SATISFIED_MARKER) || summary.includes(NO_CHANGE_LOOP_PREVENTED_MARKER)
           ? "REQUIREMENT_AMBIGUITY"
           : (evidence.category ?? this.inferCategory(evidence));
     const fingerprint = failureFingerprint({ ...evidence, category });
@@ -509,6 +525,11 @@ export class FailureClassifier {
     // than inferred, and routing it to PROVIDER_* would restart the exact loop it
     // exists to end. REQUIREMENT_AMBIGUITY parks the mission for the operator.
     if (summary.includes(ALREADY_SATISFIED_MARKER)) return "REQUIREMENT_AMBIGUITY";
+    // A mutating worker prevented from making progress with nothing committed is
+    // a question for the operator, not a defect to repair: an implementer that
+    // cannot reach the success-only `already_satisfied` assertion otherwise
+    // spirals through repair tasks forever (see NO_CHANGE_LOOP_PREVENTED_MARKER).
+    if (summary.includes(NO_CHANGE_LOOP_PREVENTED_MARKER)) return "REQUIREMENT_AMBIGUITY";
     // The worker compacted once and the prompt still overflows the model's
     // window (issue #180): replaying it never helps; split the task instead.
     if (/context[_ ]overflow/.test(summary)) return "TASK_BUDGET_EXHAUSTED";
