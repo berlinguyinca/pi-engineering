@@ -5,7 +5,8 @@
  * Reads ~/.config/herdr-engineering/host.json {control_plane_url, host_id, token}
  * (written by `herdr-eng fleet join`), fetches GET {url}/api/v1/fleet/config and
  * caches it in ~/.cache/herdr-engineering/fleet-config.json (0600, dir 0700).
- * A revoked token (HTTP 401) deletes the cache. Redirects are never followed and
+ * A revoked token (HTTP 401) deletes the cache; any other failure (404, 403, 5xx, network)
+ * falls back to the valid cache and fails only when none exists. Redirects are never followed and
  * neither the token nor any value appears in an error message.
  */
 import { randomBytes } from "node:crypto";
@@ -195,10 +196,9 @@ export async function loadHostConfig(opts: LoadHostConfigOptions = {}): Promise<
     }
     return build(url, hostId, revision, values, "fetch");
   }
-  if (status !== null && status >= 400 && status < 500) {
-    throw new HostConfigUnavailable(`the control plane refused the configuration request (HTTP ${status})`);
-  }
-  const cached = readCache(cachePath, hostId); // unreachable, 3xx, 5xx or malformed
-  if (!cached) throw new HostConfigUnavailable(`control plane at ${url} unreachable and no cached configuration exists`);
+  // Everything else (404/403 from a control plane that predates the feature or was rolled back,
+  // 5xx, 3xx, network errors, malformed bodies) falls back to the cache; only 401 revokes.
+  const cached = readCache(cachePath, hostId); // 
+  if (!cached) throw new HostConfigUnavailable(`control plane at ${url} unreachable or refused the request and no cached configuration exists`);
   return build(url, hostId, cached.revision, cached.values, "cache");
 }

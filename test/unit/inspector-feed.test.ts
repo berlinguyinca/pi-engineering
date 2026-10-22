@@ -186,6 +186,18 @@ test("agent.api_key is preferred over ingest.api_key for the feed", async () => 
   handle.dispose();
 });
 
+test("an empty api key in the host config sends NO x-api-key header to ingest", async () => {
+  const h = hostHome({ inspector: { enabled: true }, agent: { api_key: "" }, ingest: { api_key: "" } });
+  const pi = new FakePi();
+  const handle = await attachInspectorFeedFromHost(pi as never, { hostConfig: { home: h.home, fetch: h.fetch }, fetch: h.fetch });
+  assert.ok(handle);
+  pi.fire("session_start", { reason: "startup" });
+  await drain(handle);
+  assert.ok(h.ingest.length > 0);
+  assert.ok(!Object.keys(h.ingest[0]!.headers).some((k) => k.toLowerCase() === "x-api-key"));
+  handle.dispose();
+});
+
 test("legacy env vars have NO effect: PI_INSPECTOR_FEED / HERDR_CP_URL / PI_INSPECTOR_REASONING / HERDR_CP_API_KEY", async () => {
   const saved = { ...process.env };
   process.env.PI_INSPECTOR_FEED = "1";

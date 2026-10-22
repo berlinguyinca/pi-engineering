@@ -107,12 +107,37 @@ test("401 deletes the cache and fails revoked=true without leaking the token or 
   assert.equal(existsSync(cachePath(home)), false);
 });
 
-test("other 4xx fails without using the cache, not revoked", async () => {
+const primeCache = (home: string) =>
+  loadHostConfig({ home, fetch: fakeFetch((c) => (c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r1", values: VALUES }))).fetch });
+
+for (const status of [404, 403]) {
+  test(`HTTP ${status} with a cache falls back to the cache (source cache) and keeps it`, async () => {
+    const home = homeWith();
+    await primeCache(home);
+    const cfg = await loadHostConfig({ home, fetch: fakeFetch(() => new Response("", { status })).fetch });
+    assert.equal(cfg.source, "cache");
+    assert.equal(cfg.revision, "r1");
+    assert.ok(existsSync(cachePath(home)), `${status} keeps the cache`);
+  });
+}
+
+test("HTTP 404 without a cache is a clear, non-revoked failure", async () => {
   const home = homeWith();
   await assert.rejects(
-    loadHostConfig({ home, fetch: fakeFetch(() => new Response("", { status: 403 })).fetch }),
-    (e: any) => e instanceof HostConfigUnavailable && e.revoked === false && /403/.test(e.message),
+    loadHostConfig({ home, fetch: fakeFetch(() => new Response("", { status: 404 })).fetch }),
+    (e: any) => e instanceof HostConfigUnavailable && e.revoked === false && /no cached configuration/.test(e.message) && !e.message.includes(TOKEN),
   );
+});
+
+test("empty apiKey values send no X-API-Key header downstream", async () => {
+  const home = homeWith();
+  const f = fakeFetch((c) => (c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r", values: { agent: { api_key: "" }, ingest: { api_key: "" } } })));
+  const cfg = await loadHostConfig({ home, fetch: f.fetch });
+  assert.equal(cfg.apiKey, null);
+  for (const c of f.calls) {
+    const keys = Object.keys(c.init.headers as object).map((k) => k.toLowerCase());
+    assert.ok(!keys.includes("x-api-key"), "host-config requests carry no api key header");
+  }
 });
 
 test("array / non-object values are rejected (falls back to cache or unavailable)", async () => {
