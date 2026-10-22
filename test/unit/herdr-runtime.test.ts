@@ -120,3 +120,25 @@ test("interrupt maps to send_keys and terminate maps to pane close", async () =>
   assert.equal(await rt.terminate(rid), true);
   assert.equal((await rt.get(rid))?.status, "TERMINATED");
 });
+
+test("a helper worker reports the worker that started it as its parent session", async () => {
+  const { ControlPlaneIngest } = await import("../../src/runtime/herdr/ControlPlaneIngest.ts");
+  const sent: Array<{ entity_id?: string; event_type?: string; payload?: Record<string, unknown> }> = [];
+  const ingest = new ControlPlaneIngest({
+    url: "http://cp",
+    host: { hostId: "bender" },
+    fetch: (async (_u: unknown, init?: RequestInit) => {
+      sent.push(JSON.parse(String(init?.body)));
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch,
+  });
+  const rt = new HerdrAgentRuntime({ cli: new FakeHerdrCli(), maxContextTokens: 128_000, ingest });
+  const lead = await rt.create({ role: "lead", objective: "x" });
+  await rt.start(lead);
+  const helper = await rt.create({ role: "helper", objective: "y", parentRuntimeId: lead });
+  await rt.start(helper);
+  await new Promise((r) => setTimeout(r, 20));
+  const started = sent.filter((e) => e.event_type === "session.started");
+  assert.equal(started.find((e) => e.entity_id === lead)?.payload?.parent_session_id, undefined);
+  assert.equal(started.find((e) => e.entity_id === helper)?.payload?.parent_session_id, lead);
+});
