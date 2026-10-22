@@ -138,7 +138,18 @@ export class ControlPlaneIngest {
   session(
     sessionId: string,
     eventType: "session.started" | "session.updated" | "session.terminated",
-    payload: { missionId?: string; hostId?: string; agentRole?: string; model?: string; status?: string } = {},
+    payload: {
+      missionId?: string;
+      hostId?: string;
+      agentRole?: string;
+      model?: string;
+      status?: string;
+      /** `pane:<host>:<pane>` link to the herdr pane (see CollabLayout). */
+      instanceId?: string;
+      /** Session that started this one, so the fabric view can draw the parent link. */
+      parentSessionId?: string;
+      name?: string;
+    } = {},
   ): Promise<boolean> {
     const missionId = payload.missionId ?? this.defaultMissionId;
     if (missionId) void this.missionStarted(missionId);
@@ -148,6 +159,9 @@ export class ControlPlaneIngest {
       agent_role: payload.agentRole ?? "",
       model: payload.model ?? null,
       status: payload.status ?? null,
+      ...(payload.instanceId ? { instance_id: payload.instanceId } : {}),
+      ...(payload.parentSessionId ? { parent_session_id: payload.parentSessionId } : {}),
+      ...(payload.name ? { name: payload.name } : {}),
     });
   }
 }

@@ -23,6 +23,7 @@ import type {
   RuntimeId,
 } from "../AgentRuntime.ts";
 import type { AgentRuntime } from "../AgentRuntime.ts";
+import { paneLink, tidyAgentName } from "./CollabLayout.ts";
 import type { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 import { type HerdrAgent, type HerdrCli, HerdrError } from "./HerdrCli.ts";
 
@@ -304,6 +305,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
         agentRole: rec.worker.role,
         model: rec.worker.model ?? undefined,
         status,
+        instanceId: this.ingest ? (paneLink(this.ingest.host.hostId, rec.target) ?? undefined) : undefined,
+        name: tidyAgentName(`${rec.worker.role}-${rec.worker.id.slice(-6)}`) ?? undefined,
       })
       .catch(() => {});
   }
