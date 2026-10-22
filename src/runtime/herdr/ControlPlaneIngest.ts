@@ -149,6 +149,8 @@ export class ControlPlaneIngest {
       /** Session that started this one, so the fabric view can draw the parent link. */
       parentSessionId?: string;
       name?: string;
+      /** Bare herdr pane id; the control plane stores this one today. */
+      paneId?: string;
     } = {},
   ): Promise<boolean> {
     const missionId = payload.missionId ?? this.defaultMissionId;
@@ -162,6 +164,7 @@ export class ControlPlaneIngest {
       ...(payload.instanceId ? { instance_id: payload.instanceId } : {}),
       ...(payload.parentSessionId ? { parent_session_id: payload.parentSessionId } : {}),
       ...(payload.name ? { name: payload.name } : {}),
+      ...(payload.paneId ? { pane_id: payload.paneId } : {}),
     });
   }
 }

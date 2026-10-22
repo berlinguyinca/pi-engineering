@@ -305,6 +305,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
         agentRole: rec.worker.role,
         model: rec.worker.model ?? undefined,
         status,
+        // rec.target is a workspace id after worktree provisioning; only a pane id (`w2B:p1`) is a pane
+        paneId: rec.target.includes(":") ? rec.target : undefined,
         // rec.target is a workspace id after worktree provisioning; only a pane id (`w2B:p1`) makes a pane link
         instanceId:
           this.ingest && rec.target.includes(":")
