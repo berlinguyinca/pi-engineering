@@ -253,3 +253,127 @@ test("PI_SETTLE_RECOVERY=0 turns the handler off", () => {
   assert.equal(settleRecoveryEnabled({ PI_SETTLE_RECOVERY: "0" }), false);
   assert.equal(settleRecoveryEnabled({}), true);
 });
+
+// ─── Reporting each decision ───────────────────────────────────────────────
+
+import { type RecoveryDecision, describeDecision } from "../../src/gateway/settleRecovery.ts";
+import { createInspectorSlot } from "../../src/runtime/herdr/attachInspector.ts";
+import { setTelemetrySink } from "../../src/telemetry/sink.ts";
+
+function reporting(options: Partial<ConstructorParameters<typeof SettleRecovery>[1]> = {}, throwing = false) {
+  const decisions: RecoveryDecision[] = [];
+  const handler = new SettleRecovery(
+    {
+      owe: () => {},
+      isPaced: () => true,
+      hasPendingWait: () => false,
+      onDecision: (d) => {
+        decisions.push(d);
+        if (throwing) throw new Error("sink down");
+      },
+    },
+    { random: () => 0, ...options },
+  );
+  const event = (text: string) => ({
+    outcome: "error" as const,
+    entries: [] as unknown[],
+    context: { contextEntries: [{ sourceEntry: { id: "e1" }, messages: [fail(text)] }] },
+  });
+  return { handler, decisions, event };
+}
+
+test("every continue and the give-up are reported, with the model and what failed", () => {
+  const r = reporting({ maxAttempts: 1 });
+  r.handler.onBeforeSettle(r.event("terminated"), { model: MODEL });
+  r.handler.onBeforeSettle(r.event("terminated"), { model: MODEL });
+  assert.deepEqual(
+    r.decisions.map((d) => [d.action, d.attempt, d.model]),
+    [
+      ["continue", 1, "qwen3.8-27b"],
+      ["giveup", 1, "qwen3.8-27b"],
+    ],
+  );
+  assert.equal(r.decisions[0]!.delayMs, 30_000);
+});
+
+test("a reporting sink that throws changes nothing about recovery", () => {
+  const r = reporting({}, true);
+  assert.equal(r.handler.onBeforeSettle(r.event("terminated"), { model: MODEL })?.continue, true);
+});
+
+test("decisions also reach a telemetry sink as structured detail", () => {
+  const seen: Array<{ key?: string; detail?: unknown }> = [];
+  const off = setTelemetrySink((n) => seen.push(n));
+  try {
+    const r = reporting();
+    r.handler.onBeforeSettle(r.event("terminated"), { model: MODEL });
+  } finally {
+    off();
+  }
+  const notice = seen.find((n) => n.key === "settle-recovery:attempt");
+  assert.equal((notice?.detail as { type?: string; action?: string }).type, "settle-recovery");
+  assert.equal((notice?.detail as { action?: string }).action, "continue");
+});
+
+test("describeDecision gives one readable line per action", () => {
+  const base = { attempt: 3, elapsedMs: 600_000, kind: "truncated stream", model: "qwen3.8-27b" };
+  assert.match(describeDecision({ ...base, action: "continue", delayMs: 120_000 }), /continuing in 2m \(attempt 3\)/);
+  assert.match(
+    describeDecision({ ...base, action: "giveup" }),
+    /gave up on qwen3.8-27b after 3 attempts over 10m.*needs an operator/,
+  );
+  assert.match(describeDecision({ ...base, action: "unpaced" }), /not recovering/);
+});
+
+test("the inspector slot turns a note into a system message, and drops it until the feed is attached", () => {
+  const slot = createInspectorSlot();
+  slot.note("[recovery] before attach");
+  const pushed: Array<Record<string, unknown>> = [];
+  slot.set({
+    feed: { push: (e: Record<string, unknown>) => pushed.push(e) },
+    associate() {},
+    flush() {},
+    dispose() {},
+  } as never);
+  slot.note("[recovery] attempt 1");
+  assert.equal(pushed.length, 1);
+  assert.equal(pushed[0]!.kind, "message");
+  assert.equal(pushed[0]!.role, "system");
+  assert.equal(pushed[0]!.text, "[recovery] attempt 1");
+  assert.match(String(pushed[0]!.message_id), /^recovery-/);
+});
+
+test("a model that bypasses the wrapper is reported as unpaced, once", () => {
+  const decisions: RecoveryDecision[] = [];
+  const handler = new SettleRecovery(
+    { owe: () => {}, isPaced: () => false, hasPendingWait: () => false, onDecision: (d) => decisions.push(d) },
+    { random: () => 0 },
+  );
+  const event = {
+    outcome: "error" as const,
+    entries: [] as unknown[],
+    context: { contextEntries: [{ sourceEntry: { id: "e1" }, messages: [fail("terminated")] }] },
+  };
+  assert.equal(handler.onBeforeSettle(event, { model: MODEL }), undefined);
+  assert.deepEqual(
+    decisions.map((d) => d.action),
+    ["unpaced"],
+  );
+});
+
+test("inspector notes carry a timestamp, are not truncated, and have unique ids", () => {
+  const slot = createInspectorSlot();
+  const pushed: Array<Record<string, unknown>> = [];
+  slot.set({
+    feed: { push: (e: Record<string, unknown>) => pushed.push(e) },
+    associate() {},
+    flush() {},
+    dispose() {},
+  } as never);
+  slot.note("one");
+  slot.note("two");
+  assert.equal(pushed.length, 2);
+  assert.notEqual(pushed[0]!.message_id, pushed[1]!.message_id);
+  assert.equal(pushed[0]!.truncated, false);
+  assert.ok(Number.isFinite(Date.parse(String(pushed[0]!.ts))));
+});

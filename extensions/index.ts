@@ -31,7 +31,7 @@ import {
   installedGatewayStreamRetries,
   isGatewayStreamRetryLive,
 } from "../src/gateway/installStreamRetry.ts";
-import { SettleRecovery, settleRecoveryEnabled } from "../src/gateway/settleRecovery.ts";
+import { SettleRecovery, describeDecision, settleRecoveryEnabled } from "../src/gateway/settleRecovery.ts";
 import {
   advisesAlternateModel,
   describeGatewayWait,
@@ -1936,6 +1936,7 @@ ${RECOVERY_PROMPT}`;
     // type "retry". Registered AFTER the other settle handlers on purpose.
     if (settleRecoveryEnabled()) {
       new SettleRecovery({
+        onDecision: (decision) => inspector.note(describeDecision(decision)),
         owe: (ctx, delayMs, attempt, label) => {
           const m = ctx.model;
           if (!m) return;

@@ -79,7 +79,32 @@ export const DEFAULT_SETTLE_RECOVERY: SettleRecoveryOptions = {
   maxAdvertisedWaitMs: 10 * 60_000,
 };
 
+/** One decision, for a sink that records rather than shows (the Herdr inspector). */
+export interface RecoveryDecision {
+  action: "continue" | "giveup" | "unpaced";
+  attempt: number;
+  elapsedMs: number;
+  /** What failed, in the classifier's words. */
+  kind: string;
+  model?: string;
+  /** The wait owed before the next request (continue only). */
+  delayMs?: number;
+  error?: string;
+}
+
+/** The one-line, human form of a decision. */
+export function describeDecision(d: RecoveryDecision): string {
+  const on = d.model ? ` on ${d.model}` : "";
+  if (d.action === "continue")
+    return `[recovery] turn failed before any output (${d.kind})${on}; continuing in ${formatWait(d.delayMs ?? 0)} (attempt ${d.attempt})`;
+  if (d.action === "giveup")
+    return `[recovery] gave up${on} after ${d.attempt} attempts over ${formatWait(d.elapsedMs)} (${d.kind}); the session needs an operator`;
+  return `[recovery] not recovering${on}: requests bypass the gateway wrapper, so no backoff can be applied (${d.kind})`;
+}
+
 export interface SettleRecoveryDeps {
+  /** Told of every decision. Must not throw into Pi; errors are swallowed. */
+  onDecision?(decision: RecoveryDecision): void;
   /** Owe `delayMs` before the next request on the current model (abortable, taken by the wrapper). */
   owe(ctx: SettleRecoveryContext, delayMs: number, attempt: number, label: string): void;
   /** Do this model's calls pass the gateway wrapper, so a wait can be taken? */
@@ -244,6 +269,16 @@ export class SettleRecovery {
     if (message?.role === "assistant" && message.stopReason !== "error") this.reset();
   }
 
+  /** Record a decision with the injected sink; returns it as the notice's structured detail. */
+  private decide(decision: RecoveryDecision): RecoveryDecision & { type: "settle-recovery" } {
+    try {
+      this.deps.onDecision?.(decision);
+    } catch {
+      // A reporting failure must never change what recovery does.
+    }
+    return { type: "settle-recovery", ...decision };
+  }
+
   reset(): void {
     this.attempt = 0;
     this.firstFailureAt = undefined;
@@ -281,6 +316,14 @@ export class SettleRecovery {
         level: "warning",
         key: "settle-recovery:unpaced",
         text: `Not recovering the failed turn: requests to ${ctx.model?.id ?? "this model"} do not pass the pi-engineering gateway wrapper, so no backoff can be applied (${errorText}).`,
+        detail: this.decide({
+          action: "unpaced",
+          attempt: this.attempt,
+          elapsedMs: 0,
+          kind: recoverable.kind,
+          model: ctx.model?.id,
+          error: errorText,
+        }),
       });
       this.reset();
       return undefined;
@@ -298,6 +341,14 @@ export class SettleRecovery {
         level: "warning",
         key: "settle-recovery:giveup",
         text: `Stopped recovering after ${this.attempt} attempts over ${formatWait(elapsed)} of failures (${recoverable.kind}): ${errorText}`,
+        detail: this.decide({
+          action: "giveup",
+          attempt: this.attempt,
+          elapsedMs: elapsed,
+          kind: recoverable.kind,
+          model: ctx.model?.id,
+          error: errorText,
+        }),
       });
       this.reset();
       return undefined;
@@ -314,6 +365,15 @@ export class SettleRecovery {
       level: "info",
       key: "settle-recovery:attempt",
       text: `Turn failed before any output (${recoverable.kind}); continuing in ${formatWait(delayMs)} (attempt ${this.attempt}, for up to ${formatWait(this.options.horizonMs)}; Esc stops).`,
+      detail: this.decide({
+        action: "continue",
+        attempt: this.attempt,
+        elapsedMs: elapsed,
+        kind: recoverable.kind,
+        model: ctx.model?.id,
+        delayMs,
+        error: errorText,
+      }),
     });
     return {
       entries: [...(event.entries ?? []), { type: "context_edit", targetId: failed.entryId, replacement: null }],
