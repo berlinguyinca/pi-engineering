@@ -40,6 +40,32 @@ The reply contains a maintenance receipt whose status is `running`, `succeeded`,
 terminal receipt exists, then independently verify loaded code and mission
 progress. The CLI prints JSON for failed receipts and returns exit code 1.
 
+## Recover with a selected model
+
+The `mission.resume.selected-model.v1` capability in `status.runtime.capabilities`
+and maintenance `describe` supports optional `selectedModel: {"provider":"gateway","id":"model-id"}`
+on a fenced `resume` request. Other actions reject this field. The controller must
+probe the exact model before submission and stagger attempts; the runtime validates
+its registered capability metadata, not remote inference availability.
+
+Selection preserves the previous pin/session context window, vision and reasoning
+requirements, role policy, and outstanding task capability and exact-model contracts.
+Unknown catalogues or previous-pin metadata fail closed. Existing independent-review
+routing still applies. Only the named mission's pin changes; session defaults and
+sibling missions retain their choices.
+
+`status.runtime.interactiveIdle` comes from the live SDK and compaction lifecycle.
+Exact-model resumption refuses busy/unknown interactive state, active mission workers,
+operator pauses, terminal missions, stale fences, or lost custody. Interactive idleness
+is checked again at the durable append boundary. Pin and resumption persist in one
+conditional event: a stale request or failed append changes neither.
+
+A terminal successful receipt reports `result.status: "resumed"` and the actual
+`result.selectedModel` pin after the runtime recovery call returns. A `running` receipt
+is acceptance only; it is not dispatch or inference evidence. Recheck mission progress
+and actual worker model independently. A newer operator choice may supersede this
+mission pin after the recovery, following the existing operator-choice rules.
+
 ## Persistence and replay
 
 Receipts are private files under `PI_ENGINEERING_STATE_DIR/maintenance`, or the

@@ -98,6 +98,7 @@ import {
 import { assessProcess } from "./isolation/processIdentity.ts";
 import { isReloadShutdown } from "./isolation/reloadCustody.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "./isolation/stateDir.ts";
+import { validateMaintenanceModel } from "./maintenanceModel.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 import {
   type PinTransition,
@@ -689,6 +690,9 @@ export class EngineeringRuntime {
    * takes over; the interactive session model is not affected.
    */
   readonly unavailableModels = new UnavailableModels();
+  readonly supportsMaintenanceModelSelection = true;
+  private maintenanceModelRouter?: Pick<RoleRouterAdapter, "registry" | "select">;
+  private maintenanceModelBaseline?: { contextWindow?: number; input?: readonly string[]; reasoning?: boolean };
   private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
   private readonly onMissionSnapshotError: ((message: string) => void) | null;
   private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
@@ -1086,6 +1090,9 @@ export class EngineeringRuntime {
 
   private constructor(opts: EngineeringRuntimeOptions) {
     this.cwd = opts.cwd;
+    this.maintenanceModelBaseline = opts.model
+      ? { contextWindow: opts.model.contextWindow, input: opts.model.input, reasoning: opts.model.reasoning }
+      : undefined;
     this.workDir = opts.workDir ?? "";
     this.worker = opts.worker ?? new PiWorkerExecutor({ model: opts.model, agentDir: opts.agentDir });
     this.reviewerWorker = opts.reviewerWorker ?? null;
@@ -1318,6 +1325,9 @@ export class EngineeringRuntime {
           operatorPin: currentOperatorPin,
         });
       }
+      const maintenanceRouter = routerAdapter as RoleRouterAdapter | undefined;
+      if (maintenanceRouter?.registry && typeof maintenanceRouter.select === "function")
+        rt.maintenanceModelRouter = maintenanceRouter;
       // Production arming (fault-tolerance spec §23): the capability pool
       // (registry + router) now exists, so arm the worker's resilient runtime
       // with capability-based fallback (RoleRouter + RequiredModelEnvelope),
@@ -1811,9 +1821,17 @@ export class EngineeringRuntime {
   /** Automatic maintenance never clears operator pause or creates a replacement mission. */
   async resumeMissionAfterMaintenance(
     missionId: string,
-    expected: { expectedRevision: number; expectedResumptionGeneration: number },
+    expected: {
+      expectedRevision: number;
+      expectedResumptionGeneration: number;
+      selectedModel?: { provider: string; id: string };
+      isInteractiveIdle?: () => boolean;
+    },
     signal?: AbortSignal,
-  ): Promise<{ status: "resumed"; mission: Mission } | { status: "skipped"; reason: string; code?: string }> {
+  ): Promise<
+    | { status: "resumed"; mission: Mission; selectedModel?: { provider: string; id: string } }
+    | { status: "skipped"; reason: string; code?: string }
+  > {
     const store = this.missionStore;
     const orchestrator = this.orchestrator;
     if (!store || !orchestrator)
@@ -1853,6 +1871,24 @@ export class EngineeringRuntime {
         code: "LEGACY_REPAIR_REQUIRED",
         reason: `Canceled implementation tasks lack exact ownership-loss evidence: ${legacy.ambiguousTaskIds.join(", ")}. Explicit repair must reconcile preserved work and operator intent.`,
       };
+    if (expected.selectedModel) {
+      const refusal = await validateMaintenanceModel({
+        router: this.maintenanceModelRouter,
+        selectedModel: expected.selectedModel,
+        previousModel: mission.operator_model_pin,
+        baseline: this.maintenanceModelBaseline,
+        tasks: store.listTasks(missionId),
+        unavailable: this.unavailableModels,
+      });
+      if (refusal) return { status: "skipped", code: "MODEL_INCOMPATIBLE", reason: refusal };
+      if (!(await this.maintenanceOwnedMissionIds()).includes(missionId))
+        return {
+          status: "skipped",
+          code: "CUSTODY_CHANGED",
+          reason: "mission custody changed during model validation",
+        };
+      if (signal?.aborted) return { status: "skipped", code: "OPERATOR_INTENT", reason: "recovery interrupted" };
+    }
     const resumed = await store.resumeMissionIfCurrent(
       missionId,
       "verified runtime maintenance resumed preserved work",
@@ -1862,6 +1898,8 @@ export class EngineeringRuntime {
         status: mission.status,
         blockedEpisodeId: mission.blocked_episode_id ?? null,
       },
+      expected.selectedModel ? { ...expected.selectedModel, set_at: new Date().toISOString() } : undefined,
+      expected.isInteractiveIdle,
     );
     if (!resumed)
       return {
@@ -1880,7 +1918,13 @@ export class EngineeringRuntime {
       await this.normalizeMissionForRepair(missionId);
       result = await orchestrator.repairBlockedMission(missionId, signal);
     }
-    return { status: "resumed", mission: result };
+    return {
+      status: "resumed",
+      mission: result,
+      ...(expected.selectedModel && result.operator_model_pin
+        ? { selectedModel: { provider: result.operator_model_pin.provider, id: result.operator_model_pin.id } }
+        : {}),
+    };
   }
 
   /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */

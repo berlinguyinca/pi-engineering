@@ -13,6 +13,7 @@ export interface RuntimeDescription {
   generation: number | null;
   capabilities: string[];
   pending: boolean;
+  interactiveIdle?: boolean;
 }
 
 export interface MaintenanceRequest {
@@ -25,6 +26,7 @@ export interface MaintenanceRequest {
   expectedRevision?: number;
   expectedResumptionGeneration?: number;
   timeoutMs?: number;
+  selectedModel?: { provider: string; id: string };
 }
 
 export interface MaintenanceOutcome {
@@ -76,8 +78,23 @@ export function parseMaintenanceRequest(value: unknown): MaintenanceRequest {
     "expectedRevision",
     "expectedResumptionGeneration",
     "timeoutMs",
+    "selectedModel",
   ]);
   if (Object.keys(r).some((key) => !allowed.has(key))) throw new Error("unknown_maintenance_field");
+  if (r.selectedModel !== undefined) {
+    const model = r.selectedModel as Record<string, unknown> | null;
+    if (
+      r.action !== "resume" ||
+      !model ||
+      typeof model !== "object" ||
+      Array.isArray(model) ||
+      Object.keys(model).some((key) => key !== "provider" && key !== "id") ||
+      [model.provider, model.id].some(
+        (part) => typeof part !== "string" || !part.trim() || part.length > 512 || /[\0\r\n]/.test(part),
+      )
+    )
+      throw new Error("invalid_selected_model");
+  }
   if (
     r.expectedCommit !== undefined &&
     (typeof r.expectedCommit !== "string" || !/^[0-9a-f]{40,64}$/.test(r.expectedCommit))
