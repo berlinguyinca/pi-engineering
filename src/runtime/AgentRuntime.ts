@@ -100,6 +100,8 @@ export interface AgentWorkerRequest {
   objective: string;
   /** Higher-level mission this worker belongs to (control-plane attribution). */
   missionId?: string;
+  /** Runtime id of the worker that started this one; the control plane draws the parent link from it. */
+  parentRuntimeId?: string;
   /** Requested capabilities; the runtime/InferWeave resolves placement. */
   capabilities?: AgentCapability[];
   /** Isolation requested (worktree vs none). */
