@@ -603,6 +603,16 @@ MIT
 
 Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`.
 It preserves the original Pi CLI and saves a backup at `~/.local/bin/pi.before-session-auto-resume`.
+
+On a host whose Pi is a *managed install* (`~/.pi/agent/bin/pi` with `install/current-version`), run
+`node scripts/install-session-auto-resume.ts --managed` instead. It leaves the managed wrapper in place
+and adds one marked block before its final `exec`, so the managed install can still switch releases:
+the Pi to run is resolved from `current-version` at every start, and the launcher's package links
+follow it. The block starts the launcher only after `node <launcher> --check` loads it, and otherwise
+falls through to the plain `exec`, so a missing or broken launcher never stops Pi starting.
+`PI_SESSION_AUTO_RESUME_BYPASS=1` skips it. The original wrapper is saved once as
+`~/.pi/agent/bin/pi.before-session-auto-resume`. Re-running the installer refreshes the files and
+the block; if Pi's own updater regenerates the wrapper, run it again to restore the hook.
 On interactive `pi --session <id-or-file>` or `pi -c` it supplies a continuation through Pi's
 normal initial-prompt path when the session stopped in one of three ways. Pi finishes startup and
 restores/selects its model before work starts. Existing tool results and mission IDs remain in context.
