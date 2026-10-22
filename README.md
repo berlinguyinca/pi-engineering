@@ -603,15 +603,26 @@ MIT
 
 Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`.
 It preserves the original Pi CLI and saves a backup at `~/.local/bin/pi.before-session-auto-resume`.
-On interactive `pi --session <id-or-file>` it supplies a continuation through Pi's
-normal initial-prompt path when the last assistant turn failed without output and the gateway
-explicitly marked replay safe. Pi finishes startup and restores/selects its model before work starts.
-Existing tool results and mission IDs remain in context. The server's remaining retry delay is honored.
+On interactive `pi --session <id-or-file>` or `pi -c` it supplies a continuation through Pi's
+normal initial-prompt path when the session stopped in one of three ways. Pi finishes startup and
+restores/selects its model before work starts. Existing tool results and mission IDs remain in context.
 
-Recovery happens once per user turn. Completed, cancelled, partial-output, and ambiguous failures
-stay idle. Explicit CLI prompts or attachments, piped input, print/RPC modes, forks, and interactive
-session selection and `pi -c` are left to Pi. Local session IDs and file paths are supported; cross-project ID
-lookup is left to Pi. Set `PI_SESSION_AUTO_RESUME=0` to disable recovery for a launch.
+- **Refused with a replay contract:** the last turn failed without output and the gateway explicitly
+  marked replay safe. The server's remaining retry delay is honored.
+- **Failed turn:** any other retryable inference failure (dropped stream, timeout, lost capacity),
+  with or without a partial answer. The in-session retry layers do not survive a restart.
+- **Interrupted:** the session ends on a tool call or result, so Pi was closed or died mid-turn. The
+  prompt says the last call may have run fully, partly or not at all, and to check state first.
+
+Safeguards: the last event must be at least 10 minutes old (`PI_SESSION_AUTO_RESUME_MIN_AGE_MS`), and
+no other Pi may be running in the session's directory (Linux, via `/proc`), because Pi takes no lock on
+a session file and two processes must never share one. Set `PI_SESSION_AUTO_RESUME_IGNORE_LIVE=1` to
+override. At most three recoveries follow one operator message. Completed, cancelled, final-refusal
+(`do_not_retry`, bad request, unknown model, exhausted quota), and operator-aborted tails stay idle.
+Explicit CLI prompts or attachments, piped input, print/RPC modes, forks, `--resume` and interactive
+session selection are left to Pi. `pi -c` is resolved to the file Pi itself would open (newest by
+mtime) and pinned. Local session IDs and file paths are supported; cross-project ID lookup is left
+to Pi. Set `PI_SESSION_AUTO_RESUME=0` to disable recovery for a launch.
 
 To uninstall, restore the saved launcher:
 `mv ~/.local/bin/pi.before-session-auto-resume ~/.local/bin/pi`.
