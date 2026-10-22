@@ -305,7 +305,11 @@ export class HerdrAgentRuntime implements AgentRuntime {
         agentRole: rec.worker.role,
         model: rec.worker.model ?? undefined,
         status,
-        instanceId: this.ingest ? (paneLink(this.ingest.host.hostId, rec.target) ?? undefined) : undefined,
+        // rec.target is a workspace id after worktree provisioning; only a pane id (`w2B:p1`) makes a pane link
+        instanceId:
+          this.ingest && rec.target.includes(":")
+            ? (paneLink(this.ingest.host.hostId, rec.target) ?? undefined)
+            : undefined,
         name: tidyAgentName(`${rec.worker.role}-${rec.worker.id.slice(-6)}`) ?? undefined,
       })
       .catch(() => {});

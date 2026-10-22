@@ -9,7 +9,9 @@ reader of the dashboard sees one picture of how everything coordinates. The cont
   panes split from the parent's tab, named after themselves.
 * **Link:** an agent's pane is `pane:<host>:<pane>` (`herdr:...` is the fabric session namespace, a different thing).
   The worker's session events (`session.started/updated/terminated`) now carry `instance_id` (that link) and,
-  when known, `parent_session_id` and `name`. All are additive and optional.
+  when known, `parent_session_id` and `name`. All are additive and optional. The control plane's session ingest currently ignores unknown keys, so these
+  are carried on the wire but not yet stored; a consumer must land on that side before they show anywhere.
+  `instance_id` is only sent when the target is a pane id, never a workspace id.
 * **Names:** 1-32 lowercase letters, digits, hyphens (`tidyAgentName`). The pane label equals the agent name; the
   web name wins ties when both sides rename within one runner cycle.
 * **Not done yet:** pi-engineering does not itself call the collaboration `agents/join-link`; that needs a join
