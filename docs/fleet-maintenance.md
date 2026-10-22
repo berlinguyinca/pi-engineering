@@ -18,6 +18,13 @@ session IDs and a shared repository snapshot do not grant custody. Each mission
 includes its current revision, resumption generation, operator pause state,
 resume eligibility, progress timestamp, and any named recovery wait.
 
+On macOS the default socket directory is `/tmp/pi-engineering-<uid>`, independent
+of GUI `TMPDIR`, to fit the Unix-domain socket path limit and support SSH discovery.
+Default discovery also reads older per-user temporary/XDG directories, including
+Darwin's `getconf DARWIN_USER_TEMP_DIR`. Discovery accepts only real same-user
+0700 directories and 0600 descriptor files. An explicit `PI_ENGINEERING_CONTROL_DIR`
+or client root remains an exact scope; an overlong explicit socket path still fails.
+
 ## Structured commands
 
 The same-user Unix socket supports the version-1 `maintenance` operation in

@@ -1,4 +1,5 @@
 /** Same-user, same-host status channel for one live PI process instance. */
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { type Server, type Socket, createConnection, createServer } from "node:net";
@@ -94,10 +95,38 @@ export interface StartSessionControlOptions {
   onMaintenance?: (request: MaintenanceRequest) => Promise<MaintenanceOutcome>;
 }
 
-export function sessionControlRoot(env: NodeJS.ProcessEnv = process.env): string {
+function temporaryControlRoot(base: string): string {
+  return join(base, `pi-engineering-${process.getuid?.() ?? "user"}`);
+}
+
+export function sessionControlRoot(env: NodeJS.ProcessEnv = process.env, platform = process.platform): string {
   if (env.PI_ENGINEERING_CONTROL_DIR) return resolve(env.PI_ENGINEERING_CONTROL_DIR);
-  const base = env.XDG_RUNTIME_DIR || tmpdir();
-  return join(base, env.XDG_RUNTIME_DIR ? "pi-engineering" : `pi-engineering-${process.getuid?.() ?? "user"}`);
+  // Darwin GUI TMPDIR paths can exceed sockaddr_un before the UUID is appended.
+  // A stable same-user root also makes GUI sessions discoverable from SSH.
+  if (platform === "darwin") return temporaryControlRoot("/tmp");
+  return env.XDG_RUNTIME_DIR
+    ? join(env.XDG_RUNTIME_DIR, "pi-engineering")
+    : temporaryControlRoot(env.TMPDIR || tmpdir());
+}
+
+function defaultDiscoveryRoots(): string[] {
+  if (process.env.PI_ENGINEERING_CONTROL_DIR) return [sessionControlRoot()];
+  const roots = [sessionControlRoot(), temporaryControlRoot(tmpdir())];
+  if (process.env.XDG_RUNTIME_DIR) roots.push(join(process.env.XDG_RUNTIME_DIR, "pi-engineering"));
+  if (process.platform === "darwin") {
+    try {
+      // SSH may have no TMPDIR while older GUI instances use Darwin's per-user directory.
+      const legacyTemp = execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], {
+        encoding: "utf8",
+        timeout: 1000,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+      if (legacyTemp.startsWith("/") && !/[\0\r\n]/.test(legacyTemp)) roots.push(temporaryControlRoot(legacyTemp));
+    } catch {
+      /* Missing legacy discovery must not hide the current control root. */
+    }
+  }
+  return [...new Set(roots)];
 }
 
 async function privateDirectory(path: string): Promise<void> {
@@ -106,6 +135,10 @@ async function privateDirectory(path: string): Promise<void> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
+  await verifyPrivateDirectory(path);
+}
+
+async function verifyPrivateDirectory(path: string): Promise<void> {
   const info = await lstat(path);
   if (info.isSymbolicLink() || !info.isDirectory())
     throw new Error("control directory must be a real directory, not a symlink");
@@ -461,9 +494,19 @@ export async function startSessionControl(options: StartSessionControlOptions): 
   return SessionControlServer.start({ ...options, rootDir: options.rootDir ?? sessionControlRoot() });
 }
 
-export async function discoverSessions(rootDir = sessionControlRoot()): Promise<SessionDescriptor[]> {
+export async function discoverSessions(rootDir?: string): Promise<SessionDescriptor[]> {
+  const roots = rootDir === undefined ? defaultDiscoveryRoots() : [rootDir];
+  const groups = await Promise.all(roots.map(discoverSessionsInRoot));
+  const found = new Map<string, SessionDescriptor>();
+  for (const group of groups)
+    for (const descriptor of group) if (!found.has(descriptor.instanceId)) found.set(descriptor.instanceId, descriptor);
+  return [...found.values()].sort((a, b) => a.instanceId.localeCompare(b.instanceId));
+}
+
+async function discoverSessionsInRoot(rootDir: string): Promise<SessionDescriptor[]> {
   let names: string[];
   try {
+    await verifyPrivateDirectory(rootDir);
     names = await readdir(rootDir);
   } catch {
     return [];
@@ -473,7 +516,13 @@ export async function discoverSessions(rootDir = sessionControlRoot()): Promise<
     try {
       const path = join(rootDir, name);
       const info = await lstat(path);
-      if (!info.isFile() || info.size > 4096) continue;
+      if (
+        !info.isFile() ||
+        info.size > 4096 ||
+        (info.mode & 0o777) !== 0o600 ||
+        (process.getuid && info.uid !== process.getuid())
+      )
+        continue;
       const d = JSON.parse(await readFile(path, "utf8")) as SessionDescriptor;
       if (
         d.version !== VERSION ||
@@ -545,7 +594,7 @@ export async function requestSession(
 }
 
 export async function queryAllSessions(
-  rootDir = sessionControlRoot(),
+  rootDir?: string,
   options: { concurrency?: number; timeoutMs?: number; fullStatus?: boolean } = {},
 ): Promise<SessionQueryResult[]> {
   const descriptors = await discoverSessions(rootDir);

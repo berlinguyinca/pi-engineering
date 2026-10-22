@@ -7,7 +7,6 @@ import {
   discoverSessions,
   queryAllSessions,
   requestSession,
-  sessionControlRoot,
 } from "./SessionControl.ts";
 import { parseMaintenanceRequest } from "./maintenance.ts";
 
@@ -57,7 +56,7 @@ function wait(ms: number, signal?: AbortSignal): Promise<void> {
 export async function runSessionsCommand(args: string[], options: SessionCliOptions = {}): Promise<number> {
   const out = options.write ?? ((value: string) => process.stdout.write(value));
   const err = options.error ?? ((value: string) => process.stderr.write(value));
-  const root = options.rootDir ?? sessionControlRoot();
+  const root = options.rootDir;
   const json = args.includes("--json");
   const repoArg = args.find((a) => a.startsWith("--repo="));
   const repo = repoArg ? resolve(repoArg.slice("--repo=".length)) : null;
