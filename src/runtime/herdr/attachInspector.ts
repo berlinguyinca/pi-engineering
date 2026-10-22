@@ -13,13 +13,13 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HostConfigUnavailable } from "./HostConfig.ts";
+import type { LoadHostConfigOptions } from "./HostConfig.ts";
 import {
   type InspectorAssociation,
   type InspectorFeedHandle,
   type InspectorFeedOptions,
   attachInspectorFeedFromHost,
 } from "./InspectorFeed.ts";
-import type { LoadHostConfigOptions } from "./HostConfig.ts";
 
 export interface AttachInspectorOptions extends Partial<InspectorFeedOptions> {
   fetch?: typeof globalThis.fetch;
@@ -85,14 +85,35 @@ export async function attachInspectorWhenReady(
  */
 export function createInspectorSlot(): {
   associate(a: InspectorAssociation): void;
+  /** A one-line system note in the session's inspector view; dropped until the feed is attached. */
+  note(text: string): void;
   set(handle: InspectorFeedHandle | null): void;
 } {
   let handle: InspectorFeedHandle | null = null;
   let pending: InspectorAssociation | undefined;
+  let notes = 0;
   return {
     associate(a) {
       if (handle) handle.associate(a);
       else pending = a;
+    },
+    note(text) {
+      // The contract's `message` kind with role "system": no new event kind.
+      try {
+        handle?.feed.push(
+          {
+            kind: "message",
+            ts: new Date().toISOString(),
+            message_id: `recovery-${Date.now()}-${++notes}`,
+            role: "system",
+            text,
+            truncated: false,
+          },
+          1,
+        );
+      } catch {
+        // Best-effort and bounded, like the rest of the feed.
+      }
     },
     set(h) {
       handle = h;
