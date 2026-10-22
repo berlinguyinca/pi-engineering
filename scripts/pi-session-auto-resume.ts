@@ -2,14 +2,19 @@
 /** Installed by install-session-auto-resume.ts; delegates to the existing Pi CLI. */
 import { setTimeout } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { prepareSessionAutoResume } from "../src/gateway/sessionAutoResume.ts";
 
 const [cli, ...argv] = process.argv.slice(2);
 if (!cli) throw new Error("Expected the original Pi CLI path");
-let prepared: Awaited<ReturnType<typeof prepareSessionAutoResume>> = { argv, waitMs: 0, recovering: false };
+type Prepared = { argv: string[]; waitMs: number; recovering: boolean; kind?: string; skipped?: string };
+let prepared: Prepared = { argv, waitMs: 0, recovering: false };
 try {
   // Piped input becomes Pi's initial prompt; never compete with it.
-  if (process.stdin.isTTY) prepared = await prepareSessionAutoResume(argv, process.cwd());
+  // Loaded here, not at the top: if anything the recovery rules import is missing
+  // or broken, Pi must still start. It then starts without recovery.
+  if (process.stdin.isTTY) {
+    const { prepareSessionAutoResume } = await import("../src/gateway/sessionAutoResume.ts");
+    prepared = await prepareSessionAutoResume(argv, process.cwd());
+  }
 } catch (error) {
   process.stderr.write(
     `[session recovery] Preflight skipped: ${error instanceof Error ? error.message : String(error)}\n`,
