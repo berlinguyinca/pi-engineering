@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type WeekStats, accumulate, parseSession, renderTable } from "../../scripts/pi-session-report.ts";
+import { type WeekStats, accumulate, parseSession, renderCuts, renderTable } from "../../scripts/pi-session-report.ts";
 
 const T0 = Date.parse("2026-10-20T12:00:00Z"); // a Tuesday; the week starts 2026-10-19
 const line = (minute: number, message: Record<string, unknown>) =>
@@ -135,4 +135,60 @@ test("malformed lines are skipped, and a session spanning two weeks counts in bo
   accumulate(weeks, events);
   assert.equal(weeks.size, 2);
   for (const w of weeks.values()) assert.equal(w.sessions, 1);
+});
+
+const cut = (minute: number, provider: string, content: unknown[] = []) =>
+  line(minute, {
+    role: "assistant",
+    stopReason: "error",
+    errorMessage: "Stream ended without finish_reason",
+    provider,
+    content,
+  });
+
+test("stream cuts are split by where they were cut, how long they ran, and how long recovery took", () => {
+  const w = report(
+    user(0, "go"),
+    // Cut 40 s after the request with nothing received: the idle-bound signature.
+    line(1, { role: "toolResult", content: [{ type: "text", text: "x" }] }),
+    cut(1.7, "dev"),
+    ok(2),
+    // Cut after text arrived; recovered quickly.
+    user(3, "more"),
+    cut(4, "public", [{ type: "text", text: "partial answer" }]),
+    ok(5),
+    // Cut with nothing received, 5 s in, and nobody picks it up for an hour.
+    user(6, "again"),
+    cut(6.1, "public"),
+    ok(100),
+  );
+  assert.equal(w.cuts, 3);
+  assert.equal(w.cutsBeforeOutput, 2);
+  assert.equal(w.cutsNearIdleBound, 1);
+  assert.equal(w.cutsSlowRecovery, 1);
+  assert.deepEqual(w.cutsByProvider, { dev: 1, public: 2 });
+});
+
+test("a cut with no later good turn counts as a slow recovery; other errors are not cuts", () => {
+  const dead = report(user(0, "go"), cut(1, "dev"));
+  assert.equal(dead.cuts, 1);
+  assert.equal(dead.cutsSlowRecovery, 1);
+  const other = report(user(0, "go"), err(1, "terminated"), ok(2));
+  assert.equal(other.cuts, 0);
+  assert.equal(other.cutsSlowRecovery, 0);
+});
+
+test("the cut table shows providers in descending order", () => {
+  const w = report(
+    user(0, "go"),
+    cut(1, "a"),
+    ok(2),
+    user(3, "x"),
+    cut(4, "b"),
+    ok(5),
+    user(6, "y"),
+    cut(7, "b"),
+    ok(8),
+  );
+  assert.match(renderCuts([w]), /b:2 a:1/);
 });

@@ -26,6 +26,13 @@ import { recoverableFailure } from "../src/gateway/settleRecovery.ts";
 export const STALL_GAP_MS = 10 * 60_000;
 /** Pi's retry budget is three; a run of four consecutive errors means it was spent. */
 export const EXHAUSTED_RUN = 4;
+/** The error Pi shows when a response stream closes without a terminal frame. */
+const STREAM_CUT = /finish_reason/;
+/** A pre-output cut this long after its request fits a 30 s freshness or 60 s idle bound somewhere on the path. */
+export const IDLE_BOUND_MIN_MS = 25_000;
+export const IDLE_BOUND_MAX_MS = 70_000;
+/** Recovery slower than this means a person, not Pi's retries, got the session going again. */
+export const SLOW_RECOVERY_MS = 30 * 60_000;
 /** A short message that only asks the agent to try again. */
 const HUMAN_RETRY = /^\s*(please\s+)?(re-?try|try again|continue|go on)\b[^\n]{0,40}$/i;
 
@@ -43,6 +50,14 @@ export interface WeekStats {
   stallsUnresumed: number;
   humanRetryMessages: number;
   automaticRecoveryPrompts: number;
+  /** Responses that ended without a terminal frame ("Stream ended without finish_reason"). */
+  cuts: number;
+  cutsBeforeOutput: number;
+  /** Before any output, after 25-70 s: the signature of an idle or freshness bound. */
+  cutsNearIdleBound: number;
+  /** No good turn followed within 30 minutes (or ever). */
+  cutsSlowRecovery: number;
+  cutsByProvider: Record<string, number>;
 }
 
 interface Event {
@@ -50,6 +65,7 @@ interface Event {
   role?: string;
   stopReason?: string;
   errorMessage?: string;
+  provider?: string;
   content?: unknown;
   text: string;
 }
@@ -87,6 +103,7 @@ export function parseSession(raw: string): Event[] {
       role: m.role as string,
       stopReason: m.stopReason as string | undefined,
       errorMessage: m.errorMessage as string | undefined,
+      provider: typeof m.provider === "string" ? m.provider : undefined,
       content: m.content,
       text: textOf(m.content),
     });
@@ -110,7 +127,27 @@ const blank = (week: string): WeekStats => ({
   stallsUnresumed: 0,
   humanRetryMessages: 0,
   automaticRecoveryPrompts: 0,
+  cuts: 0,
+  cutsBeforeOutput: 0,
+  cutsNearIdleBound: 0,
+  cutsSlowRecovery: 0,
+  cutsByProvider: {},
 });
+
+/** Classify one "ended without finish_reason" turn: where it was cut, and how long recovery took. */
+function countCut(w: WeekStats, events: Event[], i: number): void {
+  const e = events[i]!;
+  w.cuts++;
+  const provider = e.provider ?? "unknown";
+  w.cutsByProvider[provider] = (w.cutsByProvider[provider] ?? 0) + 1;
+  if (!hasVisibleOutput(e as never)) {
+    w.cutsBeforeOutput++;
+    const ran = i > 0 ? e.at - events[i - 1]!.at : Number.NaN;
+    if (ran >= IDLE_BOUND_MIN_MS && ran <= IDLE_BOUND_MAX_MS) w.cutsNearIdleBound++;
+  }
+  const good = events.slice(i + 1).find((n) => n.role === "assistant" && n.stopReason !== "error");
+  if (!good || good.at - e.at > SLOW_RECOVERY_MS) w.cutsSlowRecovery++;
+}
 
 export function accumulate(weeks: Map<string, WeekStats>, events: Event[], nowMs = Date.now()): void {
   const touched = new Set<string>();
@@ -142,6 +179,7 @@ export function accumulate(weeks: Map<string, WeekStats>, events: Event[], nowMs
     w.errors++;
     run++;
     if (run === EXHAUSTED_RUN) w.exhaustedRuns++;
+    if (STREAM_CUT.test(e.errorMessage ?? "")) countCut(w, events, i);
     let final = false;
     if (hasVisibleOutput(e as never)) w.afterOutput++;
     else if (recoverableFailure(e as never)) w.recoverableBeforeOutput++;
@@ -202,6 +240,28 @@ export function renderTable(rows: WeekStats[]): string {
   return [head, rule, ...body].join("\n");
 }
 
+export function renderCuts(rows: WeekStats[]): string {
+  const cols: Array<[string, (w: WeekStats) => number | string]> = [
+    ["week of", (w) => w.week],
+    ["cuts", (w) => w.cuts],
+    ["before output", (w) => w.cutsBeforeOutput],
+    ["25-70s silent", (w) => w.cutsNearIdleBound],
+    ["slow recovery", (w) => w.cutsSlowRecovery],
+    [
+      "by provider",
+      (w) =>
+        Object.entries(w.cutsByProvider)
+          .sort((a, b) => b[1] - a[1])
+          .map(([p, n]) => `${p}:${n}`)
+          .join(" ") || "-",
+    ],
+  ];
+  const head = `| ${cols.map(([n]) => n).join(" | ")} |`;
+  const rule = `|${cols.map(() => "---").join("|")}|`;
+  const body = rows.map((w) => `| ${cols.map(([, f]) => f(w)).join(" | ")} |`);
+  return [head, rule, ...body].join("\n");
+}
+
 function main(argv: string[]): void {
   const get = (flag: string) => {
     const i = argv.indexOf(flag);
@@ -209,7 +269,11 @@ function main(argv: string[]): void {
   };
   const dir = get("--dir") ?? join(homedir(), ".pi", "agent", "sessions");
   const rows = buildReport(dir, get("--since"));
-  process.stdout.write(argv.includes("--json") ? `${JSON.stringify(rows, null, 2)}\n` : `${renderTable(rows)}\n`);
+  process.stdout.write(
+    argv.includes("--json")
+      ? `${JSON.stringify(rows, null, 2)}\n`
+      : `${renderTable(rows)}\n\nStream cuts (responses that ended without finish_reason)\n${renderCuts(rows)}\n`,
+  );
 }
 
 function isMain(): boolean {
