@@ -785,6 +785,21 @@ The runtime's own in-process git operations (mission workers run in candidate
 worktrees; integration, janitor) do not go through the tool-call hook and are
 unaffected.
 
+## Recovering an interactive turn after the gateway wait is spent
+
+Pi retries a failed turn three times, and the gateway wrapper waits a short transient out for about five minutes (fifteen with alternate-model advice). Before this, a turn that failed before any output after that ended and sat until the operator typed "retry".
+
+`SettleRecovery` (`src/gateway/settleRecovery.ts`) is the last settle-boundary handler. When a turn failed with a retryable error and nothing was written, and no earlier handler continued it, it continues the turn after a paced wait: 30 s doubling to a 5 min cap with jitter, or the gateway's own advertised wait (up to 10 min) when that is longer. The wait is taken by the gateway wrapper, so Esc stops it.
+
+It never retries a final refusal (`do_not_retry`, `fix_request`, unknown model, context overflow, oversize body, exhausted quota or spend limits) or an abort, and it does nothing for a model whose requests bypass the wrapper. A successful assistant message, a model switch, or the end of the run starts a fresh budget. It gives up after 150 attempts or the shared retry window (12 h), whichever comes first, and says so in the telemetry line. A turn cut after output has begun stays with `AfterOutputRetry`.
+
+| Variable | Effect |
+|---|---|
+| `PI_SETTLE_RECOVERY=0` | Turn the handler off. |
+| `PI_SETTLE_RECOVERY_HORIZON_MS` | Give up this long after the first failure. Defaults to `PI_GATEWAY_MAX_ELAPSED_MS`. |
+| `PI_SETTLE_RECOVERY_BASE_MS`, `_CAP_MS` | First wait and the longest wait. |
+| `PI_SETTLE_RECOVERY_MAX_ATTEMPTS` | Continues per episode. |
+
 ## Resuming a worker after a cut stream
 
 When a worker's model stream is cut ("Stream ended without finish_reason", a

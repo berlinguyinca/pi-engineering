@@ -31,6 +31,7 @@ import {
   installedGatewayStreamRetries,
   isGatewayStreamRetryLive,
 } from "../src/gateway/installStreamRetry.ts";
+import { SettleRecovery, settleRecoveryEnabled } from "../src/gateway/settleRecovery.ts";
 import {
   advisesAlternateModel,
   describeGatewayWait,
@@ -1926,6 +1927,22 @@ ${RECOVERY_PROMPT}`;
             `${m.id} is out of capacity and no other model fits this session`,
           );
         },
+      }).register(pi as never);
+    }
+
+    // Last resort for a turn that failed before any output once the pump's
+    // bounded budget and the advised switch are spent: wait on an escalating
+    // schedule and continue, instead of leaving the session for the operator to
+    // type "retry". Registered AFTER the other settle handlers on purpose.
+    if (settleRecoveryEnabled()) {
+      new SettleRecovery({
+        owe: (ctx, delayMs, attempt, label) => {
+          const m = ctx.model;
+          if (!m) return;
+          afterOutputRetry.owe({ provider: m.provider, id: m.id }, delayMs, attempt, "gateway failure", label);
+        },
+        isPaced: (ctx) => afterOutputRetry.isPaced({ provider: ctx.model?.provider, id: ctx.model?.id }),
+        hasPendingWait: (ctx) => afterOutputRetry.hasPendingWait({ provider: ctx.model?.provider, id: ctx.model?.id }),
       }).register(pi as never);
     }
 

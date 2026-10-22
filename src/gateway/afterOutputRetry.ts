@@ -274,6 +274,16 @@ export class AfterOutputRetry {
     this.paced.add(keyOf(model));
   }
 
+  /** Do this model's calls pass the gateway wrapper (so an owed wait can be taken)? */
+  isPaced(model: ModelKey): boolean {
+    return this.paced.has(keyOf(model));
+  }
+
+  /** Is a wait already owed for this model's next call? */
+  hasPendingWait(model: ModelKey): boolean {
+    return this.pending.has(keyOf(model));
+  }
+
   /**
    * Owe a wait before `model`'s next (non-summary) call. `label` replaces the
    * "Answer cut off (kind)" status text for a wait owed for another reason
