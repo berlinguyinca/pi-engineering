@@ -1,10 +1,27 @@
 #!/usr/bin/env node
 /** Installed by install-session-auto-resume.ts; delegates to the existing Pi CLI. */
+import { realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const [cli, ...argv] = process.argv.slice(2);
-if (!cli) throw new Error("Expected the original Pi CLI path");
+// `--check` lets the managed hook prove this file loads before it hands Pi over to it.
+if (process.argv[2] === "--check") process.exit(0);
+const [given, ...argv] = process.argv.slice(2);
+if (!given) throw new Error("Expected the original Pi CLI path");
+let cli = given;
+try {
+  // A managed Pi switches releases under this launcher, so the Pi to run is resolved at
+  // every start (the wrapper passes its release's bin entry, a symlink to the real CLI),
+  // and the Pi packages the recovery rules import are re-pointed at that same release.
+  cli = realpathSync(given);
+  const { refreshLinks } = await import("../src/gateway/launcherLinks.ts");
+  refreshLinks(resolve(dirname(fileURLToPath(import.meta.url)), ".."), cli);
+} catch (error) {
+  process.stderr.write(
+    `[session recovery] Could not align the launcher with this Pi: ${error instanceof Error ? error.message : String(error)}\n`,
+  );
+}
 type Prepared = { argv: string[]; waitMs: number; recovering: boolean; kind?: string; skipped?: string };
 let prepared: Prepared = { argv, waitMs: 0, recovering: false };
 try {
