@@ -34,10 +34,12 @@ test("session events carry the pane link, parent and name only when given", asyn
     instanceId: "pane:bender:p1",
     parentSessionId: "s0",
     name: "worker-1",
+    paneId: "w1:p1",
   });
   await ingest.session("s2", "session.started", {});
   const text = JSON.stringify(bodies);
   assert.match(text, /"instance_id":"pane:bender:p1"/);
   assert.match(text, /"parent_session_id":"s0"/);
+  assert.match(text, /"pane_id":"w1:p1"/);
   assert.equal((text.match(/instance_id/g) ?? []).length, 1);
 });
