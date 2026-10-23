@@ -9,6 +9,7 @@ import {
 } from "../../src/github/discovery.ts";
 import { linkClosingIssues, linkPullRequest, parsePrCreateOutput } from "../../src/github/prLinks.ts";
 import { parseGithubRef } from "../../src/github/refs.ts";
+import { suggestionIdFor } from "../../src/github/types.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { FakeGithubClient } from "../support/fakeGithubClient.ts";
@@ -333,6 +334,118 @@ describe("PR linkage", () => {
       0,
       "unknown kind is never defaulted to pr",
     );
+  });
+
+  it("rejects an unverified short SHA and a PR GitHub says does not exist", async () => {
+    const { store, mission, client } = setup();
+    const pr = ref("https://github.com/acme/widgets/pull/30");
+    assert.equal(
+      (
+        await linkPullRequest(
+          null,
+          store,
+          { missionId: mission.mission_id, prRef: pr, subjects: [{ kind: "task", id: "t1" }], headSha: "abc1234" },
+          NOW,
+        )
+      ).length,
+      0,
+      "short SHA without a client",
+    );
+    const ghost = ref("https://github.com/acme/widgets/pull/404");
+    assert.equal(
+      (
+        await linkPullRequest(
+          client,
+          store,
+          {
+            missionId: mission.mission_id,
+            prRef: ghost,
+            subjects: [{ kind: "task", id: "t1" }],
+            headSha: "d".repeat(40),
+          },
+          NOW,
+        )
+      ).length,
+      0,
+      "404 beats a caller-supplied SHA",
+    );
+    client.fail("github.com/acme/widgets#30", "transient");
+    assert.equal(
+      (
+        await linkPullRequest(
+          client,
+          store,
+          { missionId: mission.mission_id, prRef: pr, subjects: [{ kind: "task", id: "t1" }], headSha: "d".repeat(40) },
+          NOW,
+        )
+      ).length,
+      1,
+      "transient error keeps explicit caller data for later reconciliation",
+    );
+  });
+
+  it("a closing keyword for ANOTHER repo becomes a suggestion, never a link", async () => {
+    const { store, mission, client } = setup();
+    client.put("github.com/victim/secret#5", { title: "Private-ish", state: "open" });
+    const links = await linkClosingIssues(
+      client,
+      store,
+      cfg,
+      {
+        missionId: mission.mission_id,
+        prRef: ref("https://github.com/acme/widgets/pull/30"),
+        prBody: "Fixes #12 and fixes victim/secret#5",
+        subjects: [{ kind: "task", id: "t1" }],
+      },
+      NOW,
+    );
+    assert.deepEqual(
+      links.map((l) => l.target),
+      ["issue:github.com/acme/widgets#12"],
+    );
+    const s = store.listGithubSuggestions(mission.mission_id);
+    assert.equal(s.length, 1);
+    assert.equal(s[0]?.target, "issue:github.com/victim/secret#5");
+    assert.match(s[0]?.reason ?? "", /another repository/);
+  });
+
+  it("closing refs after 8 KiB are found, and a truncated body's last line is never read", () => {
+    assert.deepEqual(
+      closingRefs(`${"x\n".repeat(9000)}Fixes #12\n`, cfg).map((r) => r.number),
+      [12],
+    );
+    assert.deepEqual(
+      closingRefs("Fixes #12\nFixes #1", cfg, { truncated: true }).map((r) => r.number),
+      [12],
+    );
+  });
+
+  it("a suggestion is skipped when the subject is already linked to that target", async () => {
+    const { store, mission, client } = setup();
+    const link = await linkPullRequest(
+      client,
+      store,
+      {
+        missionId: mission.mission_id,
+        prRef: ref("https://github.com/acme/widgets/pull/30"),
+        subjects: [{ kind: "mission", id: mission.mission_id }],
+      },
+      NOW,
+    );
+    assert.equal(link.length, 1);
+    const got = store.suggestGithubLink({
+      suggestionId: suggestionIdFor(mission.mission_id, { kind: "mission", id: mission.mission_id }, link[0]!.target),
+      missionId: mission.mission_id,
+      subject: { kind: "mission", id: mission.mission_id },
+      target: link[0]!.target,
+      targetKind: "pr",
+      reason: "r",
+      title: "t",
+      state: "pending",
+      recordedAt: NOW(),
+    });
+    assert.equal(got, undefined);
+    assert.equal(store.listGithubSuggestions().length, 0);
   });
 
   it("links closing issues of a PR body and remembers the PR", async () => {

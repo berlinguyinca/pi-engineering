@@ -188,14 +188,108 @@ describe("reconciler", () => {
     assert.equal((await reconcileGithubLinks(client, store, cfg, { now: NOW })).corrections.length, 0);
   });
 
-  it("deleted target: 404 is an explicit not_found correction, never 'closed'", async () => {
+  it("deleted target: deactivates only after 3 consecutive 404s, never as 'closed'", async () => {
     const { store, client } = await world();
     client.items.delete("github.com/acme/widgets#12");
-    const r = await reconcileGithubLinks(client, store, cfg, { now: NOW });
-    assert.ok(r.corrections.every((c) => c.patch.status === "not_found"));
+    for (let pass = 1; pass <= 2; pass++) {
+      const r = await reconcileGithubLinks(client, store, cfg, { now: NOW });
+      assert.ok(r.corrections.every((c) => c.patch.status === undefined && c.patch.notFoundCount === pass));
+      assert.ok(
+        store
+          .listGithubLinks()
+          .filter((l) => l.targetKind === "issue")
+          .every((l) => l.status === "active"),
+      );
+    }
+    const third = await reconcileGithubLinks(client, store, cfg, { now: NOW });
+    assert.ok(third.corrections.every((c) => c.patch.status === "not_found"));
     const missing = store.listGithubLinks().filter((l) => l.status === "not_found");
     assert.ok(missing.length >= 1 && missing.every((l) => l.observed.state === "open"), "state untouched");
+    assert.equal(
+      (await reconcileGithubLinks(client, store, cfg, { now: NOW })).corrections.length,
+      0,
+      "still missing: quiet",
+    );
+  });
+
+  it("a transient 404 heals: the counter resets, and a deactivated link is reactivated", async () => {
+    const { store, client } = await world();
+    client.failTimes("github.com/acme/widgets#12", "not_found", 2);
+    await reconcileGithubLinks(client, store, cfg, { now: NOW });
+    await reconcileGithubLinks(client, store, cfg, { now: NOW });
+    assert.ok(store.listGithubLinks().some((l) => l.notFoundCount === 2));
+    const healed = await reconcileGithubLinks(client, store, cfg, { now: NOW });
+    assert.ok(healed.corrections.length >= 1);
+    assert.ok(
+      store
+        .listGithubLinks()
+        .filter((l) => l.targetKind === "issue")
+        .every((l) => l.status === "active" && !l.notFoundCount),
+    );
+
+    client.failTimes("github.com/acme/widgets#12", "not_found", 3);
+    for (let i = 0; i < 3; i++) await reconcileGithubLinks(client, store, cfg, { now: NOW });
+    assert.ok(store.listGithubLinks().some((l) => l.status === "not_found"));
+    const sink = new RecordingSink();
+    await reconcileGithubLinks(client, store, cfg, { now: NOW, sink });
+    assert.ok(
+      store
+        .listGithubLinks()
+        .filter((l) => l.targetKind === "issue")
+        .every((l) => l.status === "active"),
+      "recovered",
+    );
+    assert.ok(
+      sink.events.some((e) => e[0] === "edgeAdd" && e[1] === "issue_link"),
+      "edge re-added on recovery",
+    );
+  });
+
+  it("head A->B->A->B yields four distinct stale signals and distinct lineage transition ids", async () => {
+    const { store, client } = await world();
+    const pr = client.items.get("github.com/acme/widgets#30");
+    assert.ok(pr?.pr);
+    const sink = new RecordingSink();
+    const ids = new Set<string>();
+    let total = 0;
+    for (const sha of [SHA2, SHA1, SHA2, SHA1]) {
+      pr.pr.headSha = sha;
+      const r = await reconcileGithubLinks(client, store, cfg, { now: NOW, sink });
+      total += r.staleSignals.length;
+      for (const sig of r.staleSignals) ids.add(sig.signalId);
+    }
+    assert.equal(total, 8, "two PR links x four moves");
+    assert.equal(ids.size, 8);
+    const upserts = sink.events.filter(
+      (e) => e[0] === "nodeUpsert" && (e[2] as { attrs?: { head_sha?: string } }).attrs?.head_sha,
+    );
+    assert.equal(new Set(upserts.map((e) => `${e[1]}|${e[3]}`)).size, upserts.length, "no repeated transition id");
+  });
+
+  it("an abbreviated recorded SHA is the same commit, not a head change", async () => {
+    const { store, client } = await world();
+    const link = store.listGithubLinks().find((l) => l.targetKind === "pr");
+    assert.ok(link);
+    store.correctGithubLink(link.linkId, { observed: { headSha: SHA1.slice(0, 9) } }, "test: short sha");
+    const r = await reconcileGithubLinks(client, store, cfg, { now: NOW });
+    assert.equal(r.staleSignals.length, 0);
+    assert.equal(store.getGithubLink(link.linkId)?.observed.headSha, SHA1, "upgraded to the full SHA quietly");
     assert.equal((await reconcileGithubLinks(client, store, cfg, { now: NOW })).corrections.length, 0);
+  });
+
+  it("a PR body past the 8 KiB storage bound still counts; a truncated one never tombstones", async () => {
+    const { store, client } = await world();
+    const pr = client.items.get("github.com/acme/widgets#30");
+    assert.ok(pr?.pr);
+    pr.pr.body = `${"padding\n".repeat(3000)}Fixes #12\n`;
+    assert.equal(
+      (await reconcileGithubLinks(client, store, cfg, { now: NOW })).corrections.length,
+      0,
+      "closing line after 8 KiB found",
+    );
+    pr.pr.body = `${"padding\n".repeat(200_000)}`; // > 1 MiB: complete body unavailable
+    await reconcileGithubLinks(client, store, cfg, { now: NOW });
+    assert.ok(store.listGithubLinks().every((l) => l.status !== "removed"));
   });
 
   it("transient/auth errors change nothing and are visible; healing resumes normally", async () => {
@@ -316,24 +410,78 @@ describe("lineage through an injected sink", () => {
     assert.deepEqual(sink.events[0]?.[5], { source: "operator", cross_repo: true });
   });
 
-  it("validated edges only for passing checks on the exact head, bound by attrs.commit", () => {
+  it("validated edges only when the head is green, bound by attrs.commit", () => {
     const sink = new RecordingSink();
+    const pr = ref("https://github.com/acme/widgets/pull/30");
     const runs: CheckRun[] = normalizeCheckRuns({
       headSha: SHA1,
       restCheckRuns: [
         { name: "build", head_sha: SHA1, status: "completed", conclusion: "success" },
         { name: "lint", head_sha: SHA1, status: "completed", conclusion: "failure" },
         { name: "stale-run", head_sha: SHA2, status: "completed", conclusion: "success" },
-        { name: "queued", head_sha: SHA1, status: "queued" },
       ],
     });
-    emitCiValidation(sink, ref("https://github.com/acme/widgets/pull/30"), SHA1, runs);
-    const validated = sink.events.filter((e) => e[0] === "edgeAdd" && e[1] === "validated");
+    emitCiValidation(sink, pr, SHA1, runs);
+    assert.equal(
+      sink.events.filter((e) => e[0] === "edgeAdd" && e[1] === "validated").length,
+      0,
+      "a failing check blocks validation",
+    );
+    assert.ok(
+      sink.events.some((e) => e[0] === "nodeUpsert" && (e[2] as { state?: string }).state === "failed"),
+      "failure still visible",
+    );
+
+    const green = new RecordingSink();
+    emitCiValidation(
+      green,
+      pr,
+      SHA1,
+      runs.filter((r) => r.name === "build"),
+    );
+    const validated = green.events.filter((e) => e[0] === "edgeAdd" && e[1] === "validated");
     assert.equal(validated.length, 1);
     assert.deepEqual(validated[0]?.[5], { commit: SHA1 });
     assert.equal(validated[0]?.[3], "pr:github.com/acme/widgets#30");
-    assert.match(String(validated[0]?.[2]), /^ci:github\.com\/acme\/widgets#30@1{12}\/build$/);
-    assert.ok(!sink.events.some((e) => String(e[1] ?? e[2]).includes("stale-run")));
+    assert.match(String(validated[0]?.[2]), /^ci:github\.com\/acme\/widgets#30@1{12}\/build~[0-9a-f]{10}$/);
+
+    const pending = new RecordingSink();
+    emitCiValidation(pending, pr, SHA1, [
+      { name: "build", sha: SHA1, status: "pass" },
+      { name: "slow", sha: SHA1, status: "pending" },
+    ]);
+    assert.equal(pending.events.filter((e) => e[1] === "validated").length, 0, "pending blocks validation");
+  });
+
+  it("required checks decide validation when configured", () => {
+    const pr = ref("https://github.com/acme/widgets/pull/30");
+    const runs: CheckRun[] = [
+      { name: "build", sha: SHA1, status: "pass" },
+      { name: "optional-lint", sha: SHA1, status: "fail" },
+    ];
+    const sink = new RecordingSink();
+    emitCiValidation(sink, pr, SHA1, runs, {}, { required: ["build"] });
+    assert.equal(sink.events.filter((e) => e[1] === "validated").length, 1);
+    const missing = new RecordingSink();
+    emitCiValidation(missing, pr, SHA1, runs, {}, { required: ["build", "deploy"] });
+    assert.equal(missing.events.filter((e) => e[1] === "validated").length, 0, "a missing required check is not green");
+  });
+
+  it("ci node ids stay distinct for colliding sanitised names and within 200 chars", () => {
+    const pr = ref("https://github.com/acme/widgets/pull/30");
+    const sink = new RecordingSink();
+    emitCiValidation(sink, pr, SHA1, [
+      { name: "build_x", sha: SHA1, status: "fail" },
+      { name: "build/x", sha: SHA1, status: "fail" },
+      { name: "y".repeat(500), sha: SHA1, status: "fail" },
+    ]);
+    const ids = sink.events.filter((e) => e[0] === "nodeUpsert").map((e) => String(e[1]));
+    assert.equal(new Set(ids).size, 3);
+    assert.ok(ids.every((id) => id.length <= 200));
+    const longRepo = { ...pr, repo: "r".repeat(100), owner: "o".repeat(39) };
+    const s2 = new RecordingSink();
+    emitCiValidation(s2, longRepo, SHA1, [{ name: "z".repeat(500), sha: SHA1, status: "fail" }]);
+    assert.ok(String(s2.events[0]?.[1]).length <= 200);
   });
 
   it("drops events for unusable ids instead of guessing", () => {

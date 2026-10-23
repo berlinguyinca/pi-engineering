@@ -61,12 +61,20 @@ import type {
   WorkspaceManifest,
 } from "./types.ts";
 
-import type { GithubLinkPatch, GithubLinkRecord, GithubLinkSuggestion, GithubStaleSignal } from "../github/types.ts";
+import {
+  type GithubLinkPatch,
+  type GithubLinkRecord,
+  type GithubLinkSuggestion,
+  type GithubStaleSignal,
+  linkIdFor,
+} from "../github/types.ts";
 
 function applyGithubLinkPatch(link: GithubLinkRecord, patch: GithubLinkPatch): GithubLinkRecord {
   return {
     ...link,
     ...(patch.status ? { status: patch.status } : {}),
+    ...(patch.notFoundCount !== undefined ? { notFoundCount: patch.notFoundCount } : {}),
+    ...(patch.epoch !== undefined ? { epoch: patch.epoch } : {}),
     observed: { ...link.observed, ...(patch.observed ?? {}) },
   };
 }
@@ -2911,6 +2919,8 @@ export class MissionStore {
   suggestGithubLink(suggestion: GithubLinkSuggestion): GithubLinkSuggestion | undefined {
     if (!this.missions.has(suggestion.missionId)) throw new Error(`unknown mission ${suggestion.missionId}`);
     if (this.githubSuggestions.has(suggestion.suggestionId)) return undefined;
+    const linked = this.githubLinks.get(linkIdFor(suggestion.missionId, suggestion.subject, suggestion.target));
+    if (linked && linked.status === "active") return undefined;
     const copy = structuredClone({ ...suggestion, state: "pending" as const });
     this.githubSuggestions.set(copy.suggestionId, copy);
     this.emit("github.link_suggested", copy.missionId, { actor: "system", suggestion: copy });

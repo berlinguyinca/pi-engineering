@@ -36,3 +36,16 @@ export function boundTitle(raw: unknown): string {
 export function boundBody(raw: unknown): BoundedText {
   return boundUntrusted(raw, MAX_BODY_CHARS);
 }
+
+export const MAX_PARSE_BODY_CHARS = 1024 * 1024;
+
+/**
+ * The body as PARSING input (dependency sections, closing keywords). Never stored or emitted:
+ * only control/invisible characters are stripped (no redaction, no marker), capped at 1 MiB.
+ * `truncated` is true when the cap cut the text, which callers must treat as "incomplete: fail closed".
+ */
+export function parseableBody(raw: unknown): BoundedText {
+  if (typeof raw !== "string") return { text: "", truncated: false };
+  const head = raw.length > MAX_PARSE_BODY_CHARS ? raw.slice(0, MAX_PARSE_BODY_CHARS) : raw;
+  return { text: head.replace(CONTROL, " ").replace(INVISIBLE, ""), truncated: raw.length > head.length };
+}

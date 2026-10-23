@@ -5,10 +5,10 @@
  * worker ran ({@link parsePrCreateOutput}) or is handed in. The head SHA is recorded so the
  * reconciler can detect movement with the same SHA-fence convention as `src/merge`.
  */
-import type { GithubClient } from "./client.ts";
+import { type GithubClient, GithubClientError } from "./client.ts";
 import { type GithubLinkStore, closingRefs, linkExistingRef } from "./discovery.ts";
-import { type GithubRef, type RefConfig, canonicalId, extractGithubRefs, withKind } from "./refs.ts";
-import { type GithubLinkRecord, type LinkSubject, linkIdFor } from "./types.ts";
+import { type GithubRef, type RefConfig, canonicalId, extractGithubRefs, sameRepo, withKind } from "./refs.ts";
+import { type GithubLinkRecord, type LinkSubject, linkIdFor, suggestionIdFor } from "./types.ts";
 
 /** The PR URL printed by `gh pr create`: exactly one distinct PR URL, or nothing (no guessing). */
 export function parsePrCreateOutput(stdout: string, cfg: RefConfig): GithubRef | undefined {
@@ -46,12 +46,17 @@ export async function linkPullRequest(
       headSha = pr.headSha;
       state = pr.state;
       title = pr.title;
-    } catch {
-      if (!headSha) return []; // nothing verified and nothing provided: record nothing
+    } catch (error) {
+      // A PR GitHub says does not exist is never linked; other failures keep caller-provided data
+      // (the reconciler verifies it later), but nothing is recorded without a head SHA.
+      if (error instanceof GithubClientError && error.kind === "not_found") return [];
+      if (!headSha) return [];
     }
   } else if (!headSha) {
     return [];
   }
+  // A caller-provided SHA must be a full object name: a short one cannot be compared reliably.
+  if (headSha && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(headSha) && !(client && state)) return [];
   if (headSha && !/^[0-9a-f]{7,64}$/.test(headSha)) return [];
   const out: GithubLinkRecord[] = [];
   for (const subject of input.subjects) {
@@ -86,14 +91,46 @@ export async function linkClosingIssues(
   client: GithubClient | null,
   store: GithubLinkStore,
   cfg: RefConfig,
-  input: { missionId: string; prRef: GithubRef; prBody: string; subjects: readonly LinkSubject[] },
+  input: {
+    missionId: string;
+    prRef: GithubRef;
+    /** FULL body for parsing (GhPullRequest.parseBody). */
+    prBody: string;
+    prBodyTruncated?: boolean;
+    subjects: readonly LinkSubject[];
+  },
   now: () => string = () => new Date().toISOString(),
 ): Promise<GithubLinkRecord[]> {
   if (!client) return [];
-  const viaPr = canonicalId(withKind(input.prRef, "pr") ?? input.prRef);
-  if (!viaPr) return [];
+  const pr = withKind(input.prRef, "pr");
+  const viaPr = pr ? canonicalId(pr) : undefined;
+  if (!pr || !viaPr) return [];
   const out: GithubLinkRecord[] = [];
-  for (const ref of closingRefs(input.prBody, cfg)) {
+  for (const ref of closingRefs(input.prBody, cfg, { truncated: input.prBodyTruncated === true })) {
+    if (!sameRepo(ref, pr)) {
+      // A PR may only close issues in its own repo. A closing keyword aimed elsewhere is a hint, not a link.
+      for (const subject of input.subjects) {
+        try {
+          const item = await client.getIssue(ref);
+          const target = canonicalId(item.ref);
+          if (target)
+            store.suggestGithubLink({
+              suggestionId: suggestionIdFor(input.missionId, subject, target),
+              missionId: input.missionId,
+              subject,
+              target,
+              targetKind: item.ref.kind,
+              reason: "PR body has a closing keyword for another repository (needs confirmation)",
+              title: item.title,
+              state: "pending",
+              recordedAt: now(),
+            });
+        } catch {
+          // an unreachable foreign ref is simply not suggested
+        }
+      }
+      continue;
+    }
     for (const subject of input.subjects) {
       const link = await linkExistingRef(
         client,

@@ -42,6 +42,10 @@ export interface GithubLinkRecord {
   viaPr?: string;
   observed: LinkObservation;
   status: LinkStatus;
+  /** Consecutive reconcile passes that got a definitive 404 (reset on success). */
+  notFoundCount?: number;
+  /** Increments on every observed PR head change, so A->B->A->B yields distinct signal/transition ids. */
+  epoch?: number;
   recordedAt: string;
 }
 
@@ -67,12 +71,16 @@ export interface GithubStaleSignal {
   reason: "pr_head_changed";
   previousHeadSha: string;
   headSha: string;
+  /** The link epoch this head change produced. */
+  epoch: number;
   recordedAt: string;
 }
 
 export interface GithubLinkPatch {
   status?: LinkStatus;
   observed?: LinkObservation;
+  notFoundCount?: number;
+  epoch?: number;
 }
 
 function digest(parts: readonly string[]): string {
@@ -85,6 +93,6 @@ export function linkIdFor(missionId: string, subject: LinkSubject, target: strin
 export function suggestionIdFor(missionId: string, subject: LinkSubject, target: string): string {
   return `ghs_${digest([missionId, subject.kind, subject.id, target])}`;
 }
-export function staleSignalIdFor(linkId: string, previousHeadSha: string, headSha: string): string {
-  return `ghx_${digest([linkId, previousHeadSha, headSha])}`;
+export function staleSignalIdFor(linkId: string, previousHeadSha: string, headSha: string, epoch: number): string {
+  return `ghx_${digest([linkId, previousHeadSha, headSha, String(epoch)])}`;
 }

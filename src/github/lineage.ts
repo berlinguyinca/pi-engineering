@@ -11,6 +11,7 @@
  * `produced` producer -> artifact; `validated` validator -> subject with `attrs.commit` required;
  * `edge.remove` needs a reason. A missing/invalid id drops the event, it never guesses one.
  */
+import { createHash } from "node:crypto";
 import type { CheckRun } from "../merge/mergeGate.ts";
 import type { DependencyEdge } from "./dependencies.ts";
 import { type GithubRef, canonicalId, parseCanonicalId } from "./refs.ts";
@@ -83,7 +84,7 @@ export function emitLinkRecorded(sink: GithubLineageSink | null | undefined, lin
   if (!sink || link.status !== "active") return;
   const from = subjectNodeId(link.subject);
   const scope = scopeOf(link);
-  const t = `ghl:${link.linkId}:${link.observed.state ?? "-"}:${link.observed.headSha?.slice(0, 12) ?? "-"}`;
+  const t = `ghl:${link.linkId}:${link.observed.state ?? "-"}:${link.observed.headSha?.slice(0, 12) ?? "-"}:e${link.epoch ?? 0}:n${link.notFoundCount ?? 0}`;
   sink.nodeUpsert(
     link.target,
     {
@@ -119,7 +120,7 @@ export function emitLinkCorrection(
 ): void {
   if (!sink) return;
   const scope = scopeOf(before);
-  const t = `ghc:${after.linkId}:${after.status}:${after.observed.state ?? "-"}:${after.observed.headSha?.slice(0, 12) ?? "-"}`;
+  const t = `ghc:${after.linkId}:${after.status}:${after.observed.state ?? "-"}:${after.observed.headSha?.slice(0, 12) ?? "-"}:e${after.epoch ?? 0}:n${after.notFoundCount ?? 0}`;
   if (after.status !== "active") {
     sink.edgeRemove("issue_link", subjectNodeId(before.subject), before.target, reason, t, scope);
     return;
@@ -166,13 +167,33 @@ export function emitDependencyEdges(
 }
 
 function safeName(name: string): string {
-  return name.replace(/[^A-Za-z0-9._ -]+/g, "_").slice(0, 80);
+  return name.replace(/[^A-Za-z0-9._ -]+/g, "_").slice(0, 40);
+}
+
+function shortHash(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 10);
 }
 
 /**
- * CI evidence for the exact head: a `ci:` node per known check run whose SHA equals `headSha`,
- * and a `validated` edge (ci -> PR, `attrs.commit = headSha`) for each passing one. Runs for any
- * other SHA are ignored (the same fence mergeGate applies).
+ * `ci:` node id for one check run: readable prefix plus a hash of the ORIGINAL name, so two names that
+ * sanitise alike (`build_x` / `build/x`) stay distinct, and bounded to the contract's 200 characters.
+ */
+export function ciNodeId(prKey: string, headSha: string, name: string): string {
+  const tail = `${headSha.slice(0, 12)}/${safeName(name)}~${shortHash(name)}`;
+  const id = `ci:${prKey}@${tail}`;
+  return id.length <= 200 ? id : `ci:${shortHash(prKey)}@${tail}`;
+}
+
+export interface CiValidationOptions {
+  /** Check names that must pass. Default: EVERY known run on the head must be pass/skipped. */
+  required?: readonly string[];
+}
+
+/**
+ * CI evidence for the exact head: a `ci:` node per known, completed check run whose SHA equals
+ * `headSha`. A `validated` edge (ci -> PR, `attrs.commit = headSha`) is added for the passing runs
+ * only when the head is GREEN as a whole: no pending, no failing run (or, with `required`, every
+ * required check present and passing). One green check among failures validates nothing.
  */
 export function emitCiValidation(
   sink: GithubLineageSink | null | undefined,
@@ -180,13 +201,19 @@ export function emitCiValidation(
   headSha: string,
   runs: readonly CheckRun[],
   scope: GithubLineageScope = {},
+  options: CiValidationOptions = {},
 ): void {
   const prId = canonicalId({ ...pr, kind: "pr" });
   if (!sink || !prId || !/^[0-9a-f]{7,64}$/.test(headSha)) return;
-  for (const run of runs) {
-    if (run.sha.toLowerCase() !== headSha) continue;
-    const ci = `ci:${prId.slice(3)}@${headSha.slice(0, 12)}/${safeName(run.name)}`;
+  const onHead = runs.filter((r) => r.sha.toLowerCase() === headSha);
+  const prKey = prId.slice(3);
+  const required = options.required;
+  const green = required
+    ? required.every((name) => onHead.some((r) => r.name === name && r.status === "pass"))
+    : onHead.length > 0 && onHead.every((r) => r.status === "pass" || r.status === "skipped");
+  for (const run of onHead) {
     if (run.status === "pending") continue;
+    const ci = ciNodeId(prKey, headSha, run.name);
     const t = `ghv:${ci}:${run.status}`;
     sink.nodeUpsert(
       ci,
@@ -198,7 +225,8 @@ export function emitCiValidation(
       t,
       scope,
     );
-    if (run.status === "pass") sink.edgeAdd("validated", ci, prId, t, { commit: headSha }, scope);
+    const counts = run.status === "pass" && (!required || required.includes(run.name));
+    if (green && counts) sink.edgeAdd("validated", ci, prId, t, { commit: headSha }, scope);
   }
 }
 

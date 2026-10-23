@@ -16,7 +16,7 @@
 import { execFile } from "node:child_process";
 import type { RestCheckRun } from "../merge/checkRunIngest.ts";
 import { type GithubRef, type RefConfig, type RepoKey, normaliseRepo, parseGithubRef, refKey } from "./refs.ts";
-import { boundBody, boundTitle } from "./sanitize.ts";
+import { boundBody, boundTitle, parseableBody } from "./sanitize.ts";
 
 export type GithubErrorKind = "not_found" | "rate_limited" | "auth" | "transient" | "unsupported" | "invalid";
 
@@ -37,7 +37,11 @@ export type ItemState = "open" | "closed";
 export interface GhIssue {
   ref: GithubRef & { kind: "issue" | "pr" };
   title: string;
+  /** Bounded + redacted: for storage and display only. */
   body: string;
+  /** Full body for PARSING (never stored); `bodyTruncated` when even that was cut (fail closed). */
+  parseBody: string;
+  bodyTruncated: boolean;
   state: ItemState;
   stateReason?: string;
   url: string;
@@ -50,6 +54,8 @@ export interface GhPullRequest {
   ref: GithubRef & { kind: "pr" };
   title: string;
   body: string;
+  parseBody: string;
+  bodyTruncated: boolean;
   state: "open" | "closed" | "merged";
   headSha: string;
   headRef: string;
@@ -185,6 +191,19 @@ export class GhCliClient implements GithubClient {
     }
   }
 
+  /** All pages of a list endpoint (`--paginate --slurp`, 100 per page), flattened one level. A cut-off listing is an error, never a short list. */
+  private async apiPages(host: string, path: string, itemsKey?: string): Promise<unknown[]> {
+    const pages = await this.api(host, path, ["--paginate", "--slurp", "-X", "GET", "-F", "per_page=100"]);
+    if (!Array.isArray(pages)) throw new GithubClientError("transient", "unexpected paginated payload");
+    const out: unknown[] = [];
+    for (const page of pages) {
+      const list = itemsKey ? asRecord(page)[itemsKey] : page;
+      if (Array.isArray(list)) out.push(...list);
+      if (out.length > 2000) throw new GithubClientError("invalid", "listing too large");
+    }
+    return out;
+  }
+
   private numberPath(ref: GithubRef, tail: string): { repo: RepoKey; path: string } {
     const repo = this.repoOf(ref);
     if (!Number.isSafeInteger(ref.number) || ref.number < 1) throw new GithubClientError("invalid", "bad number");
@@ -204,6 +223,8 @@ export class GhCliClient implements GithubClient {
       ref: { ...repo, number: ref.number, kind: isPullRequest ? "pr" : "issue" },
       title: boundTitle(raw.title),
       body: boundBody(raw.body).text,
+      parseBody: parseableBody(raw.body).text,
+      bodyTruncated: parseableBody(raw.body).truncated,
       state,
       ...(typeof raw.state_reason === "string" ? { stateReason: boundTitle(raw.state_reason) } : {}),
       url: str(raw.html_url).slice(0, 500),
@@ -225,6 +246,8 @@ export class GhCliClient implements GithubClient {
       ref: { ...repo, number: ref.number, kind: "pr" },
       title: boundTitle(raw.title),
       body: boundBody(raw.body).text,
+      parseBody: parseableBody(raw.body).text,
+      bodyTruncated: parseableBody(raw.body).truncated,
       state,
       headSha: headSha.toLowerCase(),
       headRef: boundTitle(head.ref).slice(0, 255),
@@ -264,9 +287,9 @@ export class GhCliClient implements GithubClient {
   async listDependencies(ref: GithubRef): Promise<GhDependencies> {
     const read = async (tail: string): Promise<GithubRef[]> => {
       const { repo, path } = this.numberPath(ref, tail);
-      let raw: unknown;
+      let raw: unknown[];
       try {
-        raw = await this.api(repo.host, path);
+        raw = await this.apiPages(repo.host, path);
       } catch (error) {
         // The relation endpoints do not exist on older GHES: that is "unsupported", not "issue missing".
         if (error instanceof GithubClientError && error.kind === "not_found")
@@ -274,7 +297,7 @@ export class GhCliClient implements GithubClient {
         throw error;
       }
       const refs: GithubRef[] = [];
-      for (const item of Array.isArray(raw) ? raw.slice(0, 200) : []) {
+      for (const item of raw) {
         const r = asRecord(item);
         const url = str(r.html_url);
         const parsed = parseGithubRef(url, this.refConfig);
@@ -291,16 +314,13 @@ export class GhCliClient implements GithubClient {
   async listCheckRuns(ref: GithubRef, sha: string): Promise<RestCheckRun[]> {
     if (!/^[0-9a-f]{7,64}$/i.test(sha)) throw new GithubClientError("invalid", "bad sha");
     const { repo } = this.numberPath(ref, "issues/{n}");
-    const raw = asRecord(
-      await this.api(repo.host, `repos/${repo.owner}/${repo.repo}/commits/${sha.toLowerCase()}/check-runs`, [
-        "-X",
-        "GET",
-        "-F",
-        "per_page=100",
-      ]),
+    const items = await this.apiPages(
+      repo.host,
+      `repos/${repo.owner}/${repo.repo}/commits/${sha.toLowerCase()}/check-runs`,
+      "check_runs",
     );
     const out: RestCheckRun[] = [];
-    for (const item of Array.isArray(raw.check_runs) ? raw.check_runs.slice(0, 100) : []) {
+    for (const item of items) {
       const r = asRecord(item);
       if (typeof r.name !== "string") continue;
       out.push({

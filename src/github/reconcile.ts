@@ -14,7 +14,7 @@
 import { type GhIssue, type GhPullRequest, type GithubClient, GithubClientError } from "./client.ts";
 import { closingRefs } from "./discovery.ts";
 import type { GithubLinkStore } from "./discovery.ts";
-import { type GithubLineageSink, emitLinkCorrection } from "./lineage.ts";
+import { type GithubLineageSink, emitLinkCorrection, emitLinkRecorded } from "./lineage.ts";
 import { type RefConfig, parseCanonicalId, refKey } from "./refs.ts";
 import { boundTitle } from "./sanitize.ts";
 import { type GithubLinkPatch, type GithubLinkRecord, type GithubStaleSignal, staleSignalIdFor } from "./types.ts";
@@ -49,7 +49,11 @@ export interface ReconcileResult {
   errors: ReconcileError[];
 }
 
+export const NOT_FOUND_CONFIRMATIONS = 3;
+
 export interface ReconcileOptions {
+  /** Consecutive 404 passes before a link is deactivated as not_found (default 3). */
+  notFoundConfirmations?: number;
   missionId?: string;
   sink?: GithubLineageSink | null;
   now?: () => string;
@@ -99,7 +103,11 @@ export async function reconcileGithubLinks(
   };
 
   let limited = false;
-  const links = store.listGithubLinks(options.missionId).filter((l) => l.status === "active");
+  // `not_found` links are re-checked too, so a transient 404 can heal; `removed` is final.
+  const links = store
+    .listGithubLinks(options.missionId)
+    .filter((l) => l.status === "active" || l.status === "not_found");
+  const notFoundLimit = options.notFoundConfirmations ?? NOT_FOUND_CONFIRMATIONS;
   for (let i = 0; i < links.length; i++) {
     const link = links[i] as GithubLinkRecord;
     if (limited) {
@@ -132,27 +140,47 @@ export async function reconcileGithubLinks(
       if (!store.correctGithubLink(link.linkId, patch, reason)) return;
       const after = store.getGithubLink(link.linkId);
       result.corrections.push({ linkId: link.linkId, target: link.target, reason, patch });
-      if (after) emitLinkCorrection(options.sink, before, after, reason);
+      if (!after) return;
+      if (before.status !== "active" && after.status === "active") emitLinkRecorded(options.sink, after);
+      else if (
+        before.status !== after.status ||
+        before.observed.state !== after.observed.state ||
+        before.observed.headSha !== after.observed.headSha
+      )
+        emitLinkCorrection(options.sink, before, after, reason);
     };
+    /** A definitive 404: count it; deactivate only after N consecutive confirmations. */
+    const missing = (what: string): void => {
+      if (link.status === "not_found") return; // already deactivated and still missing: nothing to say
+      const count = (link.notFoundCount ?? 0) + 1;
+      if (count >= notFoundLimit) apply({ status: "not_found", notFoundCount: count }, `${what} (confirmed ${count}x)`);
+      else apply({ notFoundCount: count }, `${what} (${count}/${notFoundLimit}, will re-check)`);
+    };
+    /** A successful read: reactivate a not_found link and clear the miss counter. */
+    const present = (patch: GithubLinkPatch): GithubLinkPatch => ({
+      ...patch,
+      ...(link.status === "not_found" ? { status: "active" as const } : {}),
+      ...(link.notFoundCount ? { notFoundCount: 0 } : {}),
+    });
 
-    // 1. A closing line that came from a PR body must still be there.
-    if (link.viaPr) {
+    // 1. A closing line that came from a PR body must still be there (only judged on a COMPLETE body).
+    if (link.viaPr && link.status === "active") {
       const via = parseCanonicalId(link.viaPr, cfg);
       if (via) {
         const pr = await fetchOnce(prs, refKey(via), () => client.getPullRequest(via));
         if (pr.ok) {
-          const still = closingRefs(pr.value.body, cfg).some((r) => refKey(r) === refKey(ref));
-          if (!still) {
-            apply({ status: "removed" }, "closing reference no longer present in the PR body");
-            continue;
+          if (!pr.value.bodyTruncated) {
+            const still = closingRefs(pr.value.parseBody, cfg).some((r) => refKey(r) === refKey(ref));
+            if (!still) {
+              apply({ status: "removed" }, "closing reference no longer present in the PR body");
+              continue;
+            }
           }
-        } else if (pr.error.kind === "not_found") {
-          apply({ status: "removed" }, "the PR carrying the closing reference no longer exists");
-          continue;
-        } else {
+        } else if (pr.error.kind !== "not_found") {
           fail(pr.error);
           continue;
         }
+        // The carrying PR being 404 is NOT proof the line was removed (it may be transient): fall through to the target check.
       }
     }
     if (limited) {
@@ -164,35 +192,48 @@ export async function reconcileGithubLinks(
     if (link.targetKind === "pr") {
       const pr = await fetchOnce(prs, refKey(ref), () => client.getPullRequest(ref));
       if (!pr.ok) {
-        if (pr.error.kind === "not_found") apply({ status: "not_found" }, "pull request not found on GitHub");
+        if (pr.error.kind === "not_found") missing("pull request not found on GitHub");
         else fail(pr.error);
         continue;
       }
       const observed = pr.value;
       const prev = link.observed.headSha;
-      const patch: GithubLinkPatch = {
-        observed: { state: observed.state, headSha: observed.headSha, observedAt: now() },
-      };
-      const changed = link.observed.state !== observed.state || prev !== observed.headSha;
-      if (!changed) continue;
-      if (prev && prev !== observed.headSha) {
+      const moved = prev !== undefined && !sameSha(prev, observed.headSha);
+      const upgraded = prev !== undefined && !moved && prev !== observed.headSha; // short -> full SHA, same commit
+      const changed = link.observed.state !== observed.state || prev === undefined || moved || upgraded;
+      const recover = link.status === "not_found" || Boolean(link.notFoundCount);
+      if (!changed && !recover) continue;
+      let epoch: number | undefined;
+      if (moved) {
+        epoch = (link.epoch ?? 0) + 1;
         const signal: GithubStaleSignal = {
-          signalId: staleSignalIdFor(link.linkId, prev, observed.headSha),
+          signalId: staleSignalIdFor(link.linkId, prev as string, observed.headSha, epoch),
           missionId: link.missionId,
           linkId: link.linkId,
           target: link.target,
           reason: "pr_head_changed",
-          previousHeadSha: prev,
+          previousHeadSha: prev as string,
           headSha: observed.headSha,
+          epoch,
           recordedAt: now(),
         };
         if (store.recordGithubStale(signal)) result.staleSignals.push(signal);
       }
-      apply(patch, prev && prev !== observed.headSha ? "PR head SHA changed" : `PR is ${observed.state}`);
+      apply(
+        present({
+          observed: { state: observed.state, headSha: observed.headSha, observedAt: now() },
+          ...(epoch !== undefined ? { epoch } : {}),
+        }),
+        recover && !changed
+          ? "pull request reachable again"
+          : moved
+            ? "PR head SHA changed"
+            : `PR is ${observed.state}`,
+      );
     } else {
       const issue = await fetchOnce(issues, refKey(ref), () => client.getIssue(ref));
       if (!issue.ok) {
-        if (issue.error.kind === "not_found") apply({ status: "not_found" }, "issue not found on GitHub");
+        if (issue.error.kind === "not_found") missing("issue not found on GitHub");
         else fail(issue.error);
         continue;
       }
@@ -200,15 +241,25 @@ export async function reconcileGithubLinks(
         fail(new GithubClientError("invalid", "recorded as an issue but GitHub says it is a pull request"));
         continue;
       }
-      if (link.observed.state === issue.value.state) continue;
+      const recover = link.status === "not_found" || Boolean(link.notFoundCount);
+      if (link.observed.state === issue.value.state && !recover) continue;
       apply(
-        { observed: { state: issue.value.state, observedAt: now() } },
-        link.observed.state === "closed" && issue.value.state === "open"
-          ? "issue reopened"
-          : `issue ${issue.value.state}`,
+        present({ observed: { state: issue.value.state, observedAt: now() } }),
+        link.observed.state === issue.value.state
+          ? "issue reachable again"
+          : link.observed.state === "closed" && issue.value.state === "open"
+            ? "issue reopened"
+            : `issue ${issue.value.state}`,
       );
     }
   }
   if (limited) result.status = "rate_limited";
   return result;
+}
+
+/** Same commit, tolerating an abbreviated recorded SHA (prefix of the other). */
+export function sameSha(a: string, b: string): boolean {
+  const x = a.toLowerCase();
+  const y = b.toLowerCase();
+  return x === y || (Math.min(x.length, y.length) >= 7 && (x.startsWith(y) || y.startsWith(x)));
 }

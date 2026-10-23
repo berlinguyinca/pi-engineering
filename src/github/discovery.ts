@@ -106,9 +106,13 @@ export function branchIssueRef(branch: string, cfg: RefConfig): BranchRef | unde
 }
 
 /** References introduced by closing keywords (`Closes #1, fixes o/r#2`) in a PR body. */
-export function closingRefs(body: string, cfg: RefConfig): GithubRef[] {
+export function closingRefs(body: string, cfg: RefConfig, opts: { truncated?: boolean } = {}): GithubRef[] {
   const out = new Map<string, GithubRef>();
-  const text = (typeof body === "string" ? body.slice(0, 64 * 1024) : "")
+  let source = typeof body === "string" ? body : "";
+  // A cut body ends in a possibly partial token (`#12345` -> `#1`): never read the last line.
+  if (opts.truncated) source = source.includes("\n") ? source.slice(0, source.lastIndexOf("\n")) : "";
+  const text = source
+    .slice(0, 1024 * 1024)
     .replace(/```[\s\S]*?```/g, "")
     .replace(/~~~[\s\S]*?~~~/g, "")
     .replace(/<!--[\s\S]*?-->/g, "");

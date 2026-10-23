@@ -34,14 +34,14 @@ export interface SectionParse {
 }
 
 export const DEFAULT_DEP_MARKERS: readonly string[] = ["Blocked by", "Depends on"];
-const MAX_BODY_SCAN = 64 * 1024;
+const MAX_BODY_SCAN = 1024 * 1024 + 16;
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Body text of every `## Dependencies` section, with code fences and HTML comments removed first. */
-export function dependenciesSections(body: string): string {
+/** Lines of every `## Dependencies` (or `## Dependencies:`) section, code fences and HTML comments removed first. */
+export function dependenciesSectionLines(body: string): string[] {
   const text = (typeof body === "string" ? body.slice(0, MAX_BODY_SCAN) : "")
     .replace(/```[\s\S]*?```/g, "")
     .replace(/~~~[\s\S]*?~~~/g, "")
@@ -50,51 +50,96 @@ export function dependenciesSections(body: string): string {
   let inSection = false;
   for (const line of text.split(/\r?\n/)) {
     if (/^##\s/.test(line)) {
-      inSection = /^##\s+Dependencies\s*$/i.test(line);
+      inSection = /^##\s+Dependencies\s*:?\s*$/i.test(line);
       continue;
     }
     if (inSection) out.push(line);
   }
-  return out.join("\n");
+  return out;
 }
 
-/** Prerequisites declared by an issue body. `selfRepo` resolves bare `#N`. */
+export function dependenciesSections(body: string): string {
+  return dependenciesSectionLines(body).join("\n");
+}
+
+const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+(.*)$/;
+
+/**
+ * Prerequisites declared by an issue body. `selfRepo` resolves bare `#N`.
+ *
+ * EVERY marker occurrence counts: refs are unioned, and any marker that yields no reference makes
+ * the issue unresolvable (fail closed) even when another marker parsed. A marker that ends its line
+ * (`Blocked by:`) reads the list items that follow it. When `truncated` is set the text is
+ * incomplete: its last (possibly partial) line is discarded, and with no complete marker seen the
+ * result is unresolvable, so a cut body can never read as "no dependencies".
+ */
 export function parseDependencyBody(
   body: string,
   selfRepo: RepoKey,
   cfg: RefConfig = {},
   markers: readonly string[] = DEFAULT_DEP_MARKERS,
+  truncated = false,
 ): SectionParse {
-  const section = dependenciesSections(body);
+  let text = typeof body === "string" ? body : "";
+  if (truncated) text = text.includes("\n") ? text.slice(0, text.lastIndexOf("\n")) : "";
+  const lines = dependenciesSectionLines(text);
   const alt = markers
     .map((m) => m.trim())
     .filter(Boolean)
     .map(escapeRegex)
     .join("|");
-  if (!section || !alt) return { refs: [], unresolvable: false };
-  const marker = new RegExp(`(?:${alt})[ \\t]*:?[ \\t]*([^\\n]*)`, "gi");
+  if (!alt) return { refs: [], unresolvable: truncated, ...(truncated ? { reason: "body truncated" } : {}) };
   const scopedCfg: RefConfig = { ...cfg, defaultRepo: selfRepo };
   const refs = new Map<string, GithubRef>();
   let unresolvable = false;
-  for (const m of section.matchAll(marker)) {
-    const rest = (m[1] ?? "").trim();
-    if (/^none\b/i.test(rest)) continue;
-    const found = extractGithubRefs(rest, scopedCfg);
-    if (found.length === 0) unresolvable = true;
-    for (const ref of found) refs.set(refKey(ref), ref);
+  let sawMarker = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const hits = [...line.matchAll(new RegExp(`(?:${alt})[ \\t]*:?`, "gi"))];
+    for (let k = 0; k < hits.length; k++) {
+      sawMarker = true;
+      const hit = hits[k] as RegExpMatchArray;
+      const start = (hit.index ?? 0) + hit[0].length;
+      const end = k + 1 < hits.length ? (hits[k + 1]?.index ?? line.length) : line.length;
+      let rest = line.slice(start, end).trim();
+      if (!rest && k === hits.length - 1) {
+        const items: string[] = [];
+        for (let j = i + 1; j < lines.length; j++) {
+          const item = LIST_ITEM.exec(lines[j] as string);
+          if (!item) break;
+          items.push(item[1] as string);
+        }
+        rest = items.join("\n").trim();
+      }
+      if (/^none\b/i.test(rest)) continue;
+      const found = extractGithubRefs(rest, scopedCfg);
+      if (found.length === 0) unresolvable = true;
+      for (const ref of found) refs.set(refKey(ref), ref);
+    }
   }
   const list = [...refs.values()];
-  if (list.length > 0) return { refs: list, unresolvable: false };
-  return unresolvable
-    ? { refs: [], unresolvable: true, reason: "## Dependencies names a marker phrase but no reference could be parsed" }
-    : { refs: [], unresolvable: false };
+  if (truncated && !sawMarker)
+    return { refs: list, unresolvable: true, reason: "body truncated before a complete Dependencies section" };
+  if (unresolvable)
+    return {
+      refs: list,
+      unresolvable: true,
+      reason: "## Dependencies names a marker phrase but no reference could be parsed from it",
+    };
+  return { refs: list, unresolvable: false };
 }
 
 export interface DependencyItem {
   ref: GithubRef;
   state: "open" | "closed";
-  /** Untrusted body; only the Dependencies section is read. */
+  /** GitHub's close reason (`completed`, `not_planned`, `duplicate`). Only a completed close satisfies a dependent. */
+  stateReason?: string;
+  /** For a PR: merged. A PR closed unmerged never satisfies a dependent. */
+  merged?: boolean;
+  /** Untrusted FULL body (GhIssue.parseBody); only the Dependencies section is read. */
   body?: string;
+  /** The body was cut before parsing (GhIssue.bodyTruncated): fail closed. */
+  bodyTruncated?: boolean;
   /** GitHub native "blocked by" relation, when the client exposed it. */
   nativeBlockedBy?: readonly GithubRef[];
   /** GitHub native sub-issues of this issue. */
@@ -114,7 +159,7 @@ export interface DependencyGraphOptions {
 }
 
 export interface DependencyGraph {
-  nodes: Map<string, { key: string; ref: GithubRef; state: "open" | "closed" }>;
+  nodes: Map<string, { key: string; ref: GithubRef; state: "open" | "closed"; satisfied: boolean }>;
   edges: DependencyEdge[];
   unresolvable: Map<string, string>;
 }
@@ -127,7 +172,15 @@ export function buildDependencyGraph(
   const nodes: DependencyGraph["nodes"] = new Map();
   const edgeMap = new Map<string, DependencyEdge>();
   const unresolvable = new Map<string, string>();
-  for (const item of items) nodes.set(refKey(item.ref), { key: refKey(item.ref), ref: item.ref, state: item.state });
+  for (const item of items) {
+    const reason = item.stateReason?.toLowerCase();
+    const satisfied =
+      item.state === "closed" &&
+      reason !== "not_planned" &&
+      reason !== "duplicate" &&
+      (item.ref.kind !== "pr" || item.merged === true);
+    nodes.set(refKey(item.ref), { key: refKey(item.ref), ref: item.ref, state: item.state, satisfied });
+  }
 
   const addEdge = (dependent: GithubRef, prerequisite: GithubRef, source: DependencySource): void => {
     const edge: DependencyEdge = {
@@ -142,8 +195,8 @@ export function buildDependencyGraph(
 
   for (const item of items) {
     const key = refKey(item.ref);
-    if (item.body) {
-      const parsed = parseDependencyBody(item.body, item.ref, cfg, options.markers);
+    if (item.body || item.bodyTruncated) {
+      const parsed = parseDependencyBody(item.body ?? "", item.ref, cfg, options.markers, item.bodyTruncated === true);
       for (const ref of parsed.refs) addEdge(item.ref, ref, "body");
       if (parsed.unresolvable) unresolvable.set(key, parsed.reason ?? "unresolvable dependency declaration");
     }
@@ -274,6 +327,8 @@ export function computeReadiness(graph: DependencyGraph): ReadinessReport {
       const target = graph.nodes.get(p);
       if (!target) reasons.push(`prerequisite ${p} is unknown`);
       else if (target.state !== "closed") reasons.push(`prerequisite ${p} is open`);
+      else if (!target.satisfied)
+        reasons.push(`prerequisite ${p} is closed but not satisfied (not planned, duplicate or unmerged)`);
     }
     if (reasons.length === 0) ready.push(key);
     else blocked.push({ key, reasons });

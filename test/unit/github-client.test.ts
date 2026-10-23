@@ -161,8 +161,8 @@ describe("gh client: error classes", () => {
 
   it("reads native blocked_by and sub_issues as refs", async () => {
     const { run } = scripted([
-      json([{ html_url: "https://github.com/acme/api/issues/4" }, { html_url: "not a url" }]),
-      json([{ html_url: "https://github.com/acme/widgets/issues/9" }]),
+      json([[{ html_url: "https://github.com/acme/api/issues/4" }, { html_url: "not a url" }], []]),
+      json([[{ html_url: "https://github.com/acme/widgets/issues/9" }]]),
     ]);
     const deps = await new GhCliClient(config, run).listDependencies(ref("#1"));
     assert.deepEqual(
@@ -173,6 +173,51 @@ describe("gh client: error classes", () => {
       deps.subIssues.map((r) => `${r.repo}#${r.number}`),
       ["widgets#9"],
     );
+  });
+});
+
+describe("gh client: pagination and full bodies", () => {
+  it("requests every page of the relation and check-run listings", async () => {
+    const { run, calls } = scripted([
+      json([
+        [{ html_url: "https://github.com/acme/widgets/issues/2" }],
+        [{ html_url: "https://github.com/acme/widgets/issues/3" }],
+      ]),
+      json([]),
+      json([
+        { check_runs: [{ name: "a", head_sha: "a".repeat(40), status: "completed", conclusion: "success" }] },
+        { check_runs: [{ name: "b", head_sha: "a".repeat(40), status: "completed", conclusion: "failure" }] },
+      ]),
+    ]);
+    const client = new GhCliClient(config, run);
+    const deps = await client.listDependencies(ref("#1"));
+    assert.deepEqual(
+      deps.blockedBy.map((r) => r.number),
+      [2, 3],
+      "second page kept",
+    );
+    for (const c of calls.slice(0, 2))
+      assert.ok(c.argv.includes("--paginate") && c.argv.includes("--slurp") && c.argv.includes("per_page=100"));
+    const runs = await client.listCheckRuns(ref("#1"), "a".repeat(40));
+    assert.deepEqual(
+      runs.map((r) => r.name),
+      ["a", "b"],
+    );
+  });
+
+  it("keeps the FULL body for parsing while the stored body stays bounded", async () => {
+    const big = `${"filler line\n".repeat(2000)}## Dependencies\nBlocked by #5\n`;
+    const { run } = scripted([json({ number: 1, state: "open", title: "t", body: big })]);
+    const issue = await new GhCliClient(config, run).getIssue(ref("#1"));
+    assert.ok(issue.body.length <= 8 * 1024);
+    assert.equal(issue.parseBody, big);
+    assert.equal(issue.bodyTruncated, false);
+  });
+
+  it("flags a body beyond the parse cap as truncated", async () => {
+    const { run } = scripted([json({ number: 1, state: "open", title: "t", body: "x".repeat(1024 * 1024 + 5) })]);
+    const issue = await new GhCliClient(config, run).getIssue(ref("#1"));
+    assert.equal(issue.bodyTruncated, true);
   });
 });
 

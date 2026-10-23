@@ -172,3 +172,92 @@ describe("dependency graph", () => {
     assert.deepEqual(mk("closed").ready, [K("acme/widgets#1")]);
   });
 });
+
+describe("dependency parsing: fail-closed regressions", () => {
+  it("every marker counts: a later unparseable one makes the issue unresolvable, earlier refs are kept", () => {
+    const p = parseDependencyBody("## Dependencies\nBlocked by #1\nDepends on the auth rollout\n", self, cfg);
+    assert.deepEqual(
+      p.refs.map((r) => r.number),
+      [1],
+    );
+    assert.equal(p.unresolvable, true);
+    const two = parseDependencyBody("## Dependencies\nBlocked by #1, Depends on the rollout", self, cfg);
+    assert.equal(two.unresolvable, true);
+  });
+
+  it("a marker ending its line reads the list that follows", () => {
+    const p = parseDependencyBody("## Dependencies\nBlocked by:\n- #1\n* acme/api#2\n1. #3\n\nprose #9\n", self, cfg);
+    assert.deepEqual(p.refs.map((r) => r.number).sort(), [1, 2, 3]);
+    assert.equal(p.unresolvable, false);
+    assert.equal(
+      parseDependencyBody("## Dependencies\nBlocked by:\n\n- #1\n", self, cfg).unresolvable,
+      true,
+      "blank line ends the list",
+    );
+    assert.equal(parseDependencyBody("## Dependencies\nBlocked by:\n- none\n", self, cfg).unresolvable, false);
+  });
+
+  it("accepts '## Dependencies:' headings", () => {
+    assert.deepEqual(
+      parseDependencyBody("## Dependencies:\nDepends on #4\n", self, cfg).refs.map((r) => r.number),
+      [4],
+    );
+  });
+
+  it("a truncated body never reads as 'no dependencies' and never yields a partial number", () => {
+    const cut = parseDependencyBody("intro\n## Dependencies\nDepends on #7\nBlocked by #1", self, cfg, undefined, true);
+    assert.deepEqual(
+      cut.refs.map((r) => r.number),
+      [7],
+      "the last (possibly partial) line is dropped: #1 might be #12345",
+    );
+    const noSection = parseDependencyBody("only intro text, then cut", self, cfg, undefined, true);
+    assert.equal(noSection.unresolvable, true);
+    assert.equal(parseDependencyBody("", self, cfg, undefined, true).unresolvable, true);
+    const graph = buildDependencyGraph([{ ...item("acme/widgets#1", "open"), body: "x\ny", bodyTruncated: true }], {
+      cfg,
+    });
+    assert.deepEqual(computeReadiness(graph).ready, []);
+  });
+
+  it("a Dependencies section after 8 KiB is parsed from the full body", async () => {
+    const { FakeGithubClient } = await import("../support/fakeGithubClient.ts");
+    const fake = new FakeGithubClient();
+    fake.put("github.com/acme/widgets#1", {
+      title: "t",
+      state: "open",
+      body: `${"filler\n".repeat(5000)}## Dependencies\nBlocked by #5\n`,
+    });
+    const issue = await fake.getIssue(ref("acme/widgets#1"));
+    assert.ok(issue.body.length <= 8 * 1024 && !issue.body.includes("Blocked by #5"), "stored body is bounded");
+    const g = buildDependencyGraph(
+      [
+        { ref: ref("acme/widgets#1"), state: "open", body: issue.parseBody, bodyTruncated: issue.bodyTruncated },
+        item("acme/widgets#5", "open"),
+      ],
+      { cfg },
+    );
+    assert.equal(g.edges.length, 1);
+    assert.deepEqual(computeReadiness(g).ready, [K("acme/widgets#5")]);
+  });
+});
+
+describe("dependency satisfaction", () => {
+  it("closed not_planned / duplicate issues and closed-unmerged PRs do not satisfy a dependent", () => {
+    const mk = (prereq: DependencyItem) =>
+      computeReadiness(
+        buildDependencyGraph([item("acme/widgets#1", "open", { operatorDeps: [prereq.ref] }), prereq], { cfg }),
+      ).ready.includes(K("acme/widgets#1"));
+    assert.equal(mk(item("acme/widgets#2", "closed", { stateReason: "completed" })), true);
+    assert.equal(mk(item("acme/widgets#2", "closed")), true, "legacy: no reason recorded");
+    assert.equal(mk(item("acme/widgets#2", "closed", { stateReason: "not_planned" })), false);
+    assert.equal(mk(item("acme/widgets#2", "closed", { stateReason: "duplicate" })), false);
+    const pr = (merged: boolean): DependencyItem => ({
+      ref: { ...ref("acme/widgets#2"), kind: "pr" },
+      state: "closed",
+      merged,
+    });
+    assert.equal(mk(pr(true)), true);
+    assert.equal(mk(pr(false)), false);
+  });
+});
