@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { rm } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -10,6 +10,7 @@ import {
   discoverSessions,
   queryAllSessions,
   requestSession,
+  sessionControlRoot,
   startSessionControl,
 } from "../../src/sessionControl/SessionControl.ts";
 
@@ -400,4 +401,104 @@ test("a symlinked control directory is rejected", async () => {
     startSessionControl({ rootDir: join(dir, "control"), cwd: dir, sessionId: "s" }),
     /symlink|directory/i,
   );
+});
+
+test("Darwin default root stays below the socket limit despite a long GUI TMPDIR", () => {
+  const env = {
+    TMPDIR: "/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/",
+    XDG_RUNTIME_DIR: "/var/folders/another-long-runtime-directory",
+  };
+  const selected = sessionControlRoot(env, "darwin");
+  assert.equal(selected, `/tmp/pi-engineering-${process.getuid?.() ?? "user"}`);
+  assert.ok(Buffer.byteLength(join(selected, `${randomUUID()}.sock`)) <= 100);
+  assert.equal(
+    sessionControlRoot({ ...env, PI_ENGINEERING_CONTROL_DIR: "/explicit/private" }, "darwin"),
+    "/explicit/private",
+  );
+});
+
+test("default discovery keeps sessions in current and legacy environment roots without duplicate entries", async (t) => {
+  const dir = await mkdtemp("/tmp/pc-");
+  roots.push(dir);
+  const temp = join(dir, "t");
+  const runtime = join(dir, "r");
+  await mkdir(temp);
+  await mkdir(runtime);
+  const old = {
+    TMPDIR: process.env.TMPDIR,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR,
+    PI_ENGINEERING_CONTROL_DIR: process.env.PI_ENGINEERING_CONTROL_DIR,
+  };
+  t.after(() => {
+    for (const [key, value] of Object.entries(old)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+  process.env.TMPDIR = temp;
+  process.env.XDG_RUNTIME_DIR = runtime;
+  delete process.env.PI_ENGINEERING_CONTROL_DIR;
+  const legacy = join(temp, `pi-engineering-${process.getuid?.() ?? "user"}`);
+  const one = await startSessionControl({
+    rootDir: join(runtime, "pi-engineering"),
+    cwd: dir,
+    sessionId: "current-test",
+  });
+  const two = await startSessionControl({ rootDir: legacy, cwd: dir, sessionId: "legacy-test" });
+  try {
+    const ids = (await discoverSessions()).map((entry) => entry.instanceId);
+    assert.equal(ids.filter((id) => id === one.instanceId).length, 1);
+    assert.equal(ids.filter((id) => id === two.instanceId).length, 1);
+    assert.deepEqual(
+      (await discoverSessions(legacy)).map((entry) => entry.instanceId),
+      [two.instanceId],
+    );
+    const rows = await queryAllSessions();
+    assert.equal(rows.find((row) => row.descriptor.instanceId === two.instanceId)?.reachable, true);
+    const { runSessionsCommand } = await import("../../src/sessionControl/cli.ts");
+    let output = "";
+    assert.equal(
+      await runSessionsCommand(["list", "--json"], {
+        write: (text) => {
+          output += text;
+        },
+      }),
+      0,
+    );
+    const listed = JSON.parse(output) as { descriptor: { instanceId: string } }[];
+    assert.ok(listed.some((row) => row.descriptor.instanceId === two.instanceId));
+    process.env.PI_ENGINEERING_CONTROL_DIR = legacy;
+    assert.deepEqual(
+      (await discoverSessions()).map((entry) => entry.instanceId),
+      [two.instanceId],
+    );
+  } finally {
+    await one.close();
+    await two.close();
+  }
+});
+
+test("discovery rejects symlinked, permissive or foreign-owned directories and descriptors", async (t) => {
+  const dir = await root();
+  const control = join(dir, "control");
+  const server = await startSessionControl({ rootDir: control, cwd: dir, sessionId: "private-test" });
+  try {
+    await symlink(control, join(dir, "link"));
+    assert.deepEqual(await discoverSessions(join(dir, "link")), []);
+    await chmod(control, 0o755);
+    assert.deepEqual(await discoverSessions(control), []);
+    await chmod(control, 0o700);
+    await chmod(server.descriptorPath, 0o644);
+    assert.deepEqual(await discoverSessions(control), []);
+    await chmod(server.descriptorPath, 0o600);
+    if (process.getuid) {
+      const actual = process.getuid();
+      t.mock.method(process as NodeJS.Process & { getuid: () => number }, "getuid", () => actual + 1);
+      assert.deepEqual(await discoverSessions(control), []);
+      t.mock.restoreAll();
+    }
+    assert.equal((await discoverSessions(control)).length, 1);
+  } finally {
+    await server.close();
+  }
 });

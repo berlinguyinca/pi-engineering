@@ -12,7 +12,12 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { formatMissionActivity } from "../../extensions/index.ts";
+import type { RoleRouterAdapter } from "../../src/capability/adapter.ts";
+import { normalizeModelRecord } from "../../src/capability/modelRecord.ts";
+import { ModelCapabilityRegistry } from "../../src/capability/registry.ts";
+import { RoleRouter } from "../../src/capability/router.ts";
 import { EngineeringRuntime } from "../../src/index.ts";
+import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
 import type { ModelRef } from "../../src/lifecycle/types.ts";
 import { OPERATOR_PAUSE_STOP_REASON } from "../../src/orchestration/interrupt.ts";
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
@@ -75,11 +80,12 @@ async function openRuntime(
   root: string,
   worker: WorkerExecutor,
   onMissionActivity?: (event: RuntimeMissionActivityEvent) => void,
+  roleRouter?: RoleRouterAdapter,
 ) {
   return EngineeringRuntime.open({
     cwd: root,
     workDir: join(root, ".pi-eng"),
-    roleRouter: { route: async () => ({ ...GLM }) },
+    roleRouter: roleRouter ?? { route: async () => ({ ...GLM }) },
     model: { ...GLM, api: "openai-completions", contextWindow: 262_144, maxTokens: 4096 } as never,
     worker,
     ...(onMissionActivity ? { onMissionActivity } : {}),
@@ -508,6 +514,7 @@ test("operator Esc during a maintenance drain prevents automatic resumption", as
     const result = await runtime.resumeMissionAfterMaintenance(mission.mission_id, {
       expectedRevision: mission.revision,
       expectedResumptionGeneration: 0,
+      selectedModel: DEEPSEEK,
     });
     assert.equal(result.status, "skipped");
     assert.ok(runtime.missionStore!.getMission(mission.mission_id)?.operator_paused_at);
@@ -592,6 +599,90 @@ test("maintenance refuses ambiguous legacy task cancellation without consuming a
   } finally {
     abort.abort();
     await finishRun?.catch(() => undefined);
+    await runtime?.close();
+    await fixture.cleanup();
+  }
+});
+
+test("exact maintenance selection changes only the fenced mission and dispatches the validated model", async () => {
+  const fixture = await makeFixtureRepo();
+  const seen: WorkerRequest[] = [];
+  let started!: () => void;
+  const workerStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const abort = new AbortController();
+  let runtime: EngineeringRuntime | undefined;
+  let running: Promise<unknown> | undefined;
+  try {
+    const records = [GLM, DEEPSEEK].map((ref) =>
+      normalizeModelRecord({ ...ref, source: "test", toolCall: true, contextWindow: 262144, input: ["text", "image"] }),
+    );
+    const registry = await ModelCapabilityRegistry.open({
+      sources: [{ name: "test", discover: async () => records }],
+      context: { cwd: fixture.root, agentDir: fixture.root },
+    });
+    await registry.refresh();
+    const router = new RoleRouter({ registry, policy: structuredClone(DEFAULT_POLICY) });
+    const adapter: RoleRouterAdapter = {
+      registry,
+      router,
+      select: (role, query) => router.select({ ...query, role }),
+      route: async (role, query) => (await router.select({ ...query, role })).selected,
+    };
+    runtime = await openRuntime(fixture.root, capacityWorker(seen, started), undefined, adapter);
+    resetSessionModelChoice(RuntimeSession.current().sessionId, GLM);
+    onOperatorModelSelect(RuntimeSession.current().sessionId, { model: GLM, source: "set" });
+    const flight = runtime.orchestrator!.orchestrate("Make add return the sum", {
+      repository: fixture.root,
+      baseRef: await runtime.git!.headCommit(),
+      mutationRequested: true,
+      interrupt: "pause",
+      signal: abort.signal,
+    });
+    running = flight;
+    await workerStarted;
+    const active = runtime.missionStore!.listMissions()[0]!;
+    const activeResult = await runtime.resumeMissionAfterMaintenance(active.mission_id, {
+      expectedRevision: active.revision,
+      expectedResumptionGeneration: 0,
+      selectedModel: DEEPSEEK,
+    });
+    assert.equal(activeResult.status, "skipped");
+    assert.equal(activeResult.status === "skipped" && activeResult.code, "ACTIVE_EXECUTION");
+    assert.equal(runtime.missionStore!.getMission(active.mission_id)?.operator_model_pin ?? null, null);
+    assert.equal((await runtime.prepareForMaintenance({ timeoutMs: 5000 })).status, "ready");
+    const mission = (await flight).mission;
+    const store = runtime.missionStore!;
+    store.updateMission(mission.mission_id, { operator_model_pin: { ...GLM, set_at: new Date(0).toISOString() } });
+    await store.flush();
+    const fence = {
+      expectedRevision: store.getMission(mission.mission_id)!.revision,
+      expectedResumptionGeneration: store.listMissionResumptions(mission.mission_id).at(-1)?.generation ?? 0,
+    };
+    const bad = await runtime.resumeMissionAfterMaintenance(mission.mission_id, {
+      ...fence,
+      selectedModel: { provider: "gw", id: "missing" },
+    });
+    assert.equal(bad.status, "skipped");
+    assert.equal(store.getMission(mission.mission_id)?.operator_model_pin?.id, GLM.id);
+    assert.equal(store.listMissionResumptions(mission.mission_id).length, fence.expectedResumptionGeneration);
+    const result = await runtime.resumeMissionAfterMaintenance(mission.mission_id, {
+      ...fence,
+      selectedModel: DEEPSEEK,
+    });
+    assert.equal(result.status, "resumed", JSON.stringify(result));
+    assert.deepEqual(result.status === "resumed" && result.selectedModel, DEEPSEEK);
+    assert.equal(store.getMission(mission.mission_id)?.operator_model_pin?.id, DEEPSEEK.id);
+    const implementations = seen.filter((entry) => entry.role === "implementer");
+    assert.equal(implementations.length, 2);
+    assert.deepEqual(implementations.at(-1)?.modelOverride, DEEPSEEK);
+    const replay = await runtime.resumeMissionAfterMaintenance(mission.mission_id, { ...fence, selectedModel: GLM });
+    assert.equal(replay.status, "skipped");
+    assert.equal(store.getMission(mission.mission_id)?.operator_model_pin?.id, DEEPSEEK.id);
+  } finally {
+    abort.abort();
+    await running?.catch(() => undefined);
     await runtime?.close();
     await fixture.cleanup();
   }

@@ -11,6 +11,7 @@ interface HostControl {
 }
 
 interface RuntimeControl {
+  supportsMaintenanceModelSelection?: boolean;
   endMaintenance?(): void;
   prepareForMaintenance?(options: { timeoutMs: number }): Promise<{ status: string; reason?: string }>;
   resumeMissionAfterMaintenance?(
@@ -18,14 +19,23 @@ interface RuntimeControl {
     fence: {
       expectedRevision: number;
       expectedResumptionGeneration: number;
+      selectedModel?: { provider: string; id: string };
+      isInteractiveIdle?: () => boolean;
     },
-  ): Promise<{ status: string; reason?: string; code?: string; mission?: { mission_id: string } }>;
+  ): Promise<{
+    status: string;
+    reason?: string;
+    code?: string;
+    mission?: { mission_id: string };
+    selectedModel?: { provider: string; id: string };
+  }>;
 }
 
 export interface MaintenanceDependencies {
   getHost: () => HostControl | undefined;
   getRuntime: (missionId?: string) => Promise<RuntimeControl | null>;
   ownedMissionIds: () => Promise<string[]>;
+  isInteractiveIdle?: () => boolean;
 }
 
 /** Control is executed directly by the runtime, never translated to model prompts. */
@@ -35,7 +45,16 @@ export function maintenanceHandler(
   return async (request) => {
     const host = deps.getHost();
     if (!host) throw new Error("host_maintenance_unavailable_bootstrap_required");
-    if (request.action === "describe") return { status: "succeeded", result: { ...(await host.describe()) } };
+    if (request.action === "describe") {
+      const description = await host.describe();
+      return {
+        status: "succeeded",
+        result: {
+          ...description,
+          capabilities: [...new Set([...description.capabilities, "mission.resume.selected-model.v1"])],
+        },
+      };
+    }
     if (request.action === "reload") {
       const previous = await deps.getRuntime();
       let result: Awaited<ReturnType<HostControl["reload"]>>;
@@ -78,9 +97,24 @@ export function maintenanceHandler(
     if (current.commit !== description.commit || current.generation !== description.generation || current.pending)
       throw new Error("runtime_generation_changed");
     if (!runtime?.resumeMissionAfterMaintenance) throw new Error("maintenance_resume_unavailable");
+    if (request.selectedModel && runtime.supportsMaintenanceModelSelection !== true)
+      throw new Error("maintenance_selected_model_unavailable");
+    if (request.selectedModel && deps.isInteractiveIdle?.() !== true)
+      return {
+        status: "skipped",
+        result: {
+          status: "skipped",
+          code: "INTERACTIVE_BUSY",
+          reason: "interactive session is busy or idle state is unknown",
+          missionId: request.missionId,
+        },
+      };
     const result = await runtime.resumeMissionAfterMaintenance(request.missionId!, {
       expectedRevision: request.expectedRevision!,
       expectedResumptionGeneration: request.expectedResumptionGeneration!,
+      ...(request.selectedModel
+        ? { selectedModel: request.selectedModel, isInteractiveIdle: deps.isInteractiveIdle }
+        : {}),
     });
     return {
       status: result.status === "resumed" ? "succeeded" : "skipped",
@@ -89,6 +123,7 @@ export function maintenanceHandler(
         ...(result.reason ? { reason: result.reason } : {}),
         ...(result.code ? { code: result.code } : {}),
         missionId: request.missionId,
+        ...(result.status === "resumed" && result.selectedModel ? { selectedModel: result.selectedModel } : {}),
       },
     };
   };

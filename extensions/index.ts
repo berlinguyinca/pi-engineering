@@ -768,10 +768,21 @@ export default function (pi: ExtensionAPI) {
   // a mission tool is awaiting a worker; another PI process never opens this
   // session's transcript or writes its event store to ask for status.
   let activeControl: SessionControlServer | null = null;
+  let maintenanceCompacting = false;
   if (typeof pi.on === "function") {
+    pi.on("session_before_compact", () => {
+      maintenanceCompacting = true;
+    });
+    pi.on("session_compact", () => {
+      maintenanceCompacting = false;
+    });
+    pi.on("session_compact_failed", () => {
+      maintenanceCompacting = false;
+    });
     pi.on("session_start", async (_event, ctx) => {
       await activeControl?.close();
       activeControl = null;
+      maintenanceCompacting = false;
       const sessionId = ctx.sessionManager?.getSessionId?.();
       if (!sessionId) return;
       try {
@@ -835,6 +846,7 @@ export default function (pi: ExtensionAPI) {
             )
           ).flat();
         };
+        const isInteractiveIdle = () => !maintenanceCompacting && ctx.isIdle() && !ctx.hasPendingMessages?.();
         activeControl = await startSessionControl({
           cwd: ctx.cwd,
           sessionId,
@@ -845,12 +857,19 @@ export default function (pi: ExtensionAPI) {
             const description = await host.describe();
             return {
               ...description,
+              interactiveIdle: isInteractiveIdle(),
               capabilities: [
-                ...new Set([...description.capabilities, "runtime.prepare", "mission.resumeAfterMaintenance"]),
+                ...new Set([
+                  ...description.capabilities,
+                  "runtime.prepare",
+                  "mission.resumeAfterMaintenance",
+                  "mission.resume.selected-model.v1",
+                ]),
               ],
             };
           },
           onMaintenance: maintenanceHandler({
+            isInteractiveIdle,
             getHost: getHostMaintenance,
             getRuntime: async (missionId) => {
               const active = await getRuntimeByCwd(runtimeCwd(ctx.cwd)).catch(() => null);

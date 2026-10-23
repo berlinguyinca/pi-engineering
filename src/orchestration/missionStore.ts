@@ -45,6 +45,7 @@ import type {
   MissionResumption,
   MissionStatus,
   MissionStop,
+  OperatorModelPin,
   OrchestrationTask,
   ReconstructedCandidateSource,
   RecoveryDecision,
@@ -843,7 +844,15 @@ export class MissionStore {
       }
       case "mission.resumed": {
         const resumption = e.payload.resumption as MissionResumption;
-        if (resumption) this.missionResumptions.push({ ...resumption });
+        if (resumption) {
+          this.missionResumptions.push({ ...resumption });
+          const selectedModel = e.payload.selectedModel as OperatorModelPin | undefined;
+          const mission = this.missions.get(resumption.missionId);
+          if (selectedModel && mission) {
+            mission.operator_model_pin = { ...selectedModel };
+            mission.operator_model_decided_at = selectedModel.set_at;
+          }
+        }
         break;
       }
       case "mission.stopped": {
@@ -2951,6 +2960,8 @@ export class MissionStore {
     missionId: string,
     reason: string,
     expected: MissionRevisionFence,
+    selectedModel?: OperatorModelPin,
+    canResume?: () => boolean,
   ): Promise<MissionResumption | undefined> {
     const operationKey = JSON.stringify([
       missionId,
@@ -2963,6 +2974,8 @@ export class MissionStore {
       const mission = store.getMission(missionId);
       return (
         store.matchesMissionFence(missionId, expected) &&
+        (!canResume || canResume()) &&
+        (!selectedModel || !store.listExecutions(missionId).some((execution) => execution.status === "RUNNING")) &&
         !mission?.operator_paused_at &&
         !["WAITING_FOR_USER", "NEEDS_ATTENTION", "CANCELING"].includes(mission?.status ?? "") &&
         !store
@@ -2998,7 +3011,7 @@ export class MissionStore {
         timestamp: resumption.resumedAt,
         type: "mission.resumed",
         actor: "system",
-        payload: { actor: "system", resumption },
+        payload: { actor: "system", resumption, ...(selectedModel ? { selectedModel } : {}) },
       };
       try {
         const appended = await this.backend.appendConditionally(

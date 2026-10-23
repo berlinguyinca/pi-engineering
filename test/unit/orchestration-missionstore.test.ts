@@ -1598,3 +1598,94 @@ describe("automatic maintenance resumption", () => {
     });
   }
 });
+
+describe("exact model conditional maintenance resumption", () => {
+  for (const outcome of ["success", "stale", "paused", "write_failure"] as const) {
+    it(`persists the selected pin atomically with the resumption: ${outcome}`, async () => {
+      const backend = new FailOnceBackend();
+      const store = MissionStore.open(backend);
+      const mission = store.createMission({
+        title: "recover",
+        goal: "recover",
+        user_request: "recover",
+        repository: ".",
+        base_ref: "base",
+        risk_profile: "low",
+        workflow_class: "engineering",
+      });
+      store.transitionMission(mission.mission_id, "CLASSIFYING");
+      store.transitionMission(mission.mission_id, "BLOCKED");
+      store.updateMission(mission.mission_id, {
+        operator_model_pin: { provider: "gw", id: "old", set_at: new Date(0).toISOString() },
+      });
+      await store.flush();
+      const before = store.getMission(mission.mission_id)!;
+      const fence = {
+        revision: before.revision,
+        status: before.status,
+        blockedEpisodeId: before.blocked_episode_id ?? null,
+        resumptionGeneration: 0,
+      };
+      const pin = { provider: "gw", id: "working", set_at: new Date().toISOString() };
+      if (outcome === "stale")
+        store.updateMission(mission.mission_id, { operator_model_decided_at: new Date().toISOString() });
+      if (outcome === "paused") store.markOperatorPause(mission.mission_id);
+      await store.flush();
+      if (outcome === "write_failure") backend.failNextAppend();
+      const operation = store.resumeMissionIfCurrent(mission.mission_id, "verified recovery", fence, pin);
+      if (outcome === "write_failure") await assert.rejects(operation, /persistence unavailable/);
+      else assert.equal(!!(await operation), outcome === "success");
+      const reopened = MissionStore.open(backend);
+      assert.equal(
+        reopened.getMission(mission.mission_id)?.operator_model_pin?.id,
+        outcome === "success" ? "working" : "old",
+      );
+      assert.equal(
+        store.getMission(mission.mission_id)?.operator_model_pin?.id,
+        outcome === "success" ? "working" : "old",
+      );
+      assert.equal(reopened.listMissionResumptions(mission.mission_id).length, outcome === "success" ? 1 : 0);
+      if (outcome === "success")
+        assert.equal(reopened.getMission(mission.mission_id)?.operator_model_decided_at, pin.set_at);
+    });
+  }
+});
+
+it("concurrent exact-model resumptions select one pin and recheck interactive idleness at append", async () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const mission = store.createMission({
+    title: "recover",
+    goal: "recover",
+    user_request: "recover",
+    repository: ".",
+    base_ref: "base",
+    risk_profile: "low",
+    workflow_class: "engineering",
+  });
+  store.transitionMission(mission.mission_id, "CLASSIFYING");
+  store.transitionMission(mission.mission_id, "BLOCKED");
+  await store.flush();
+  const before = store.getMission(mission.mission_id)!;
+  const fence = {
+    revision: before.revision,
+    status: before.status,
+    blockedEpisodeId: before.blocked_episode_id ?? null,
+    resumptionGeneration: 0,
+  };
+  const pin = { provider: "gw", id: "one", set_at: new Date().toISOString() };
+  let idle = true;
+  const busy = store.resumeMissionIfCurrent(mission.mission_id, "maintenance", fence, pin, () => idle);
+  idle = false;
+  assert.equal(await busy, undefined);
+  assert.equal(store.getMission(mission.mission_id)?.operator_model_pin, undefined);
+  const other = MissionStore.open(backend);
+  const outcomes = await Promise.all([
+    store.resumeMissionIfCurrent(mission.mission_id, "maintenance", fence, pin),
+    other.resumeMissionIfCurrent(mission.mission_id, "maintenance", fence, { ...pin, id: "two" }),
+  ]);
+  assert.equal(outcomes.filter(Boolean).length, 1);
+  const durable = MissionStore.open(backend);
+  assert.equal(durable.listMissionResumptions(mission.mission_id).length, 1);
+  assert.equal(durable.getMission(mission.mission_id)?.operator_model_pin?.id, outcomes[0] ? "one" : "two");
+});
