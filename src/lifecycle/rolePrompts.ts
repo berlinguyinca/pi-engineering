@@ -193,6 +193,8 @@ export function buildCompletionReport(args: {
   reports: ReviewReport[];
   verification?: VerificationReport;
   models: string[];
+  /** Optional checklist lines from integrations (e.g. AutoSpec); absent = unchanged output. */
+  extraLines?: string[];
 }): string {
   const { state, pass, gateBlockers, rounds, files, reports, verification, models } = args;
   const lines: string[] = [];
@@ -205,5 +207,6 @@ export function buildCompletionReport(args: {
     `Verification: ${verification ? `${verification.status} (${verification.outcomes.map((o) => `${o.spec.name}=${o.status}`).join(", ") || "no commands"})` : "not run"}`,
   );
   lines.push(`Changes: ${files} file(s). Models used: ${[...new Set(models)].join(", ") || "session model"}.`);
+  if (args.extraLines?.length) lines.push(...args.extraLines);
   return lines.join("\n");
 }
