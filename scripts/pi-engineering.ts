@@ -25,6 +25,7 @@ import { blackholeTelemetry, formatBlackholeTelemetry } from "../src/blackhole/t
 import { Ledger } from "../src/ledger/Ledger.ts";
 import { runExternalEntry } from "../src/orchestration/externalEntry.ts";
 import { runMissionsCommand } from "../src/orchestration/missionCancelCli.ts";
+import { runStandalonePlan } from "../src/orchestration/standaloneEntry.ts";
 import { defaultCliPaths, runRoadmapCheck, runRoadmapStatus, runRoadmapStructural } from "../src/roadmap/cli.ts";
 import { doctorExitCode, formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { runSessionsCommand } from "../src/sessionControl/cli.ts";
@@ -45,6 +46,7 @@ async function main(): Promise<number> {
   if (cmd === "sessions") return runSessionsCommand(rest);
   if (cmd === "missions") return runMissionsCommand(rest);
   if (cmd === "mission") return runExternalEntry(rest, await readStdin(), process.env);
+  if (cmd === "plan") return runStandalonePlan(rest, await readStdin(), process.env);
   if (cmd === "doctor") return doctorCommand(rest);
   if (cmd === "blackhole") {
     const sub = rest.find((a) => !a.startsWith("--"));
@@ -61,7 +63,7 @@ async function main(): Promise<number> {
   }
   if (cmd !== "roadmap") {
     console.error(
-      "usage: pi-engineering <doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions why|missions cancel|blackhole ...|benchmark|cav status|...> [flags]",
+      "usage: pi-engineering <plan --store <dir>|doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions why|missions cancel|blackhole ...|benchmark|cav status|...> [flags]",
     );
     return 2;
   }

@@ -52,6 +52,7 @@ import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
+import { gatePlanBeforeWorkers } from "../orchestration/planReview.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import {
   DEFAULT_MISSION_RECOVERY_CEILING,
@@ -552,6 +553,16 @@ export interface EngineeringRuntimeOptions {
     mission: import("../orchestration/types.ts").Mission,
     risk: import("../orchestration/types.ts").RiskProfile,
   ) => Promise<PlanTaskInput[]>;
+  /**
+   * Pre-implementation plan gate (T03). Off unless given. When set, the default
+   * planner's tasks pass through {@link gatePlanBeforeWorkers} before any worker
+   * starts: risk-based skip | offer | require review bound to the plan digest.
+   * A blocked plan yields no tasks (fail closed) and an open finding that says why.
+   */
+  planReview?: Pick<
+    import("../orchestration/planReview.ts").PlanGateInput,
+    "adapter" | "policy" | "emitter" | "replan" | "maxRevisions"
+  >;
   /**
    * Optional autonomous spec approval hook (design 2026-09-28). When provided,
    * material mutations are reviewed/refined/approved and their tasks are
@@ -1583,6 +1594,33 @@ export class EngineeringRuntime {
             evidence: planned.clarification.slice(0, 1000),
             recommended_action: "Confirm or restate what this mission should do.",
           });
+        }
+        if (opts.planReview && rt.missionStore && !planned.clarification && planned.tasks.length > 0) {
+          const gated = await gatePlanBeforeWorkers({
+            ...opts.planReview,
+            missionId: mission.mission_id,
+            goal: mission.goal,
+            plan: async () => planned.tasks,
+            ledger: rt.missionStore,
+          });
+          if (gated.status === "blocked") {
+            rt.missionStore.addFinding({
+              mission_id: mission.mission_id,
+              task_id: null,
+              severity: "major",
+              category: PLANNER_CLARIFICATION_CATEGORY,
+              file: null,
+              line: null,
+              summary: `Plan review blocked implementation (${gated.code}).`,
+              evidence: gated.reason.slice(0, 1000),
+              recommended_action:
+                gated.code === "plannotator_unavailable"
+                  ? "Restore the plan review service or record an explicit operator override with a reason."
+                  : "Revise the plan and resubmit for review.",
+            });
+            return [];
+          }
+          return gated.tasks;
         }
         return planned.tasks;
       };
