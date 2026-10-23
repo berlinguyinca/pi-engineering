@@ -18,6 +18,8 @@
  * correlation state: a pending decision survives restart (see `pendingPlans`).
  */
 
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { id } from "../core/ids.ts";
 import type { RiskClass } from "./types.ts";
 
@@ -29,6 +31,12 @@ export interface PlanProposal {
   planRef: string;
   goal: string;
   riskClass: RiskClass;
+  /** Hex sha256 over the canonical plan text; the binding key of a decision (T03). */
+  planDigest?: string;
+  /** The exact plan text the digest was computed over. */
+  planText?: string;
+  /** Plan revision number within the run. */
+  revision?: number;
 }
 
 export interface PlanDecision {
@@ -40,6 +48,16 @@ export interface PlanDecision {
   reason: string | null;
   annotations: string[];
   decidedAt: string;
+  /** The plan digest this decision is bound to (T03). Absent on legacy records. */
+  planDigest?: string | null;
+  revision?: number | null;
+  /** Review-record state for digest-bound reviews (T03); `decision` is "none" unless `decided`. */
+  state?: "pending" | "decided" | "unavailable" | "digest_mismatch";
+}
+
+function lastWhere<T>(items: T[], pred: (item: T) => boolean): T | undefined {
+  for (let i = items.length - 1; i >= 0; i--) if (pred(items[i]!)) return items[i];
+  return undefined;
 }
 
 /**
@@ -53,7 +71,20 @@ export interface PlannotatorTransport {
     externalDecisionId: string | null;
     approvedBy?: string | null;
     annotations?: string[];
+    /** The digest the reviewer actually decided on, when it echoes one. */
+    planDigest?: string | null;
   }>;
+  /**
+   * Optional: look up an already-submitted plan's decision (null = still
+   * pending). Used to resume after a restart without resubmitting.
+   */
+  fetchDecision?(plan: PlanProposal): Promise<{
+    decision: PlannotatorDecision;
+    externalDecisionId: string | null;
+    approvedBy?: string | null;
+    annotations?: string[];
+    planDigest?: string | null;
+  } | null>;
 }
 
 /** In-memory pending-plan store; the WorkGraph persists correlation. */
@@ -61,6 +92,48 @@ export interface PendingPlanStore {
   add(decision: PlanDecision): void;
   all(): PlanDecision[];
   byRun(runId: string): PlanDecision | undefined;
+}
+
+/**
+ * Durable pending-plan store: an append-only JSONL file, replayed on open, so a
+ * pending (or decided) plan survives a restart. A torn last line is ignored.
+ */
+export class FilePendingPlanStore implements PendingPlanStore {
+  private readonly plans: PlanDecision[] = [];
+  private readonly file: string;
+  constructor(file: string) {
+    this.file = file;
+    if (!existsSync(file)) return;
+    for (const line of readFileSync(file, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        this.plans.push(JSON.parse(line) as PlanDecision);
+      } catch {
+        // torn tail from a crash mid-append
+      }
+    }
+  }
+  add(decision: PlanDecision): void {
+    mkdirSync(dirname(this.file), { recursive: true });
+    appendFileSync(this.file, `${JSON.stringify(decision)}\n`, { mode: 0o600 });
+    this.plans.push(decision);
+  }
+  all(): PlanDecision[] {
+    return this.plans.slice();
+  }
+  byRun(runId: string): PlanDecision | undefined {
+    return lastWhere(this.plans, (p) => p.runId === runId);
+  }
+}
+
+/** What a plan review concluded for ONE digest. */
+export type PlanReviewOutcome = "approved" | "changes_requested" | "rejected" | "unavailable" | "digest_mismatch";
+
+export interface PlanReviewResult {
+  outcome: PlanReviewOutcome;
+  decision: PlanDecision;
+  /** Why this outcome, e.g. the timeout or the mismatching digest. */
+  reason: string;
 }
 
 class MemoryPendingStore implements PendingPlanStore {
@@ -72,7 +145,7 @@ class MemoryPendingStore implements PendingPlanStore {
     return this.plans.slice();
   }
   byRun(runId: string): PlanDecision | undefined {
-    return this.plans.find((p) => p.runId === runId);
+    return lastWhere(this.plans, (p) => p.runId === runId);
   }
 }
 
@@ -220,6 +293,119 @@ export class PlannotatorAdapter {
       annotations: boundedAnnotations(result.annotations),
       decidedAt,
     });
+  }
+
+  /** The latest record for exactly this run and digest (never another digest's). */
+  decisionFor(runId: string, planDigest: string): PlanDecision | undefined {
+    return lastWhere(this.store.all(), (p) => p.runId === runId && p.planDigest === planDigest);
+  }
+
+  /**
+   * Ask the external Plannotator to review ONE plan digest (T03; modes
+   * offer|require are chosen by policy elsewhere). Rules:
+   *  - the request is written to the store BEFORE the call, so a restart finds
+   *    it pending and resumes instead of losing it;
+   *  - a decision is only ever read back for the same digest; one that echoes a
+   *    different digest is `digest_mismatch` and authorises nothing;
+   *  - a gate that is missing, errors or times out is `unavailable`, never an
+   *    approval or a rejection (the caller decides: block for require);
+   *  - approved / rejected / annotated are final for that digest and are
+   *    returned from the store without asking again.
+   */
+  async reviewPlan(plan: PlanProposal & { planDigest: string }): Promise<PlanReviewResult> {
+    const base = {
+      runId: plan.runId,
+      mode: "interactive" as const,
+      planDigest: plan.planDigest,
+      revision: plan.revision ?? null,
+    };
+    const prior = this.decisionFor(plan.runId, plan.planDigest);
+    if (prior?.state === "decided" && prior.decision !== "none" && prior.decision !== "bypassed") {
+      return {
+        outcome:
+          prior.decision === "approved" ? "approved" : prior.decision === "rejected" ? "rejected" : "changes_requested",
+        decision: { ...prior },
+        reason: "decision already recorded for this plan digest",
+      };
+    }
+    if (!this.transport) return this.unavailable(base, "no Plannotator transport configured");
+
+    if (prior?.state !== "pending") {
+      this.store.add({
+        ...base,
+        decision: "none",
+        state: "pending",
+        externalDecisionId: null,
+        approvedBy: null,
+        reason: "awaiting external decision",
+        annotations: [],
+        decidedAt: new Date().toISOString(),
+      });
+    }
+
+    let result: Awaited<ReturnType<PlannotatorTransport["submitPlan"]>> | null;
+    try {
+      const resume = prior?.state === "pending" && this.transport.fetchDecision;
+      result = await withDeadline(
+        resume ? this.transport.fetchDecision!(plan) : this.transport.submitPlan(plan),
+        this.decisionTimeoutMs,
+      );
+      if (result === null) {
+        // Resumed and still undecided: submit once (idempotent by digest).
+        result = await withDeadline(this.transport.submitPlan(plan), this.decisionTimeoutMs);
+      }
+    } catch (err) {
+      return this.unavailable(base, err instanceof Error ? err.message : "plan gate did not answer");
+    }
+
+    const echoed = typeof result.planDigest === "string" && result.planDigest !== "" ? result.planDigest : null;
+    if (echoed !== null && echoed !== plan.planDigest) {
+      const reason = `decision is bound to ${echoed}, not ${plan.planDigest}`;
+      const decision = this.record({
+        ...base,
+        decision: "none",
+        state: "digest_mismatch",
+        externalDecisionId: boundedString(result.externalDecisionId, MAX_DECISION_ID),
+        approvedBy: null,
+        reason: `digest_mismatch: ${reason}`,
+        annotations: [],
+        decidedAt: new Date().toISOString(),
+      });
+      return { outcome: "digest_mismatch", decision, reason };
+    }
+    const verdict = validDecision(result.decision);
+    const decision = this.record({
+      ...base,
+      decision: verdict,
+      state: "decided",
+      externalDecisionId: boundedString(result.externalDecisionId, MAX_DECISION_ID),
+      approvedBy: boundedString(result.approvedBy, MAX_FIELD) ?? this.operator,
+      reason: null,
+      annotations: boundedAnnotations(result.annotations),
+      decidedAt: new Date().toISOString(),
+    });
+    return {
+      outcome: verdict === "approved" ? "approved" : verdict === "rejected" ? "rejected" : "changes_requested",
+      decision,
+      reason: `Plannotator ${verdict}`,
+    };
+  }
+
+  private unavailable(
+    base: { runId: string; mode: "interactive"; planDigest: string; revision: number | null },
+    reason: string,
+  ): PlanReviewResult {
+    const decision = this.record({
+      ...base,
+      decision: "none",
+      state: "unavailable",
+      externalDecisionId: null,
+      approvedBy: null,
+      reason,
+      annotations: [],
+      decidedAt: new Date().toISOString(),
+    });
+    return { outcome: "unavailable", decision, reason };
   }
 
   private record(d: Omit<PlanDecision, "runId"> & { runId: string }): PlanDecision {
