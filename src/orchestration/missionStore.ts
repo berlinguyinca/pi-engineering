@@ -484,7 +484,7 @@ export class MissionStore {
       l.attemptState(
         { attempt: ex.execution_id, agent: ex.task_id, missionId: ex.mission_id, taskId: ex.task_id },
         state,
-        ex.ended_at ?? state,
+        "end", // an attempt ends once: a retried end dedupes
         reason ?? ex.exit_status ?? undefined,
         ex.ended_at ?? undefined,
       ),
@@ -1527,7 +1527,7 @@ export class MissionStore {
           l.attemptState(
             { attempt: next.execution_id, agent: next.task_id, missionId: next.mission_id, taskId: next.task_id },
             "running",
-            `${status}:${now}`,
+            "start",
             undefined,
             now,
           ),

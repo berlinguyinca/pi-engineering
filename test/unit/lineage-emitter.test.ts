@@ -229,6 +229,38 @@ describe("lineage: no parent, no spawn edge", () => {
   });
 });
 
+describe("lineage: hook-level dedupe", () => {
+  it("a repeated start/terminate/complete at the hook does not add events", async () => {
+    const { store: envStore, emitter } = rig();
+    const rt = new HerdrAgentRuntime({ cli: new FakeCli(), lineage: emitter });
+    const lead = await rt.create({ role: "lead", objective: "o" });
+    const child = await rt.create({ role: "helper", objective: "o", parentRuntimeId: lead });
+    await rt.start(child);
+    await rt.terminate(child);
+    const once = (await lineageEvents(envStore, emitter)).length;
+    assert.ok(once > 0);
+    await rt.start(child);
+    await rt.terminate(child);
+    assert.equal((await lineageEvents(envStore, emitter)).length, once, "runtime hooks dedupe");
+
+    const graph = WorkGraph.create(JsonlEventStore.inMemory());
+    graph.setLineage(emitter);
+    const w = graph.createWorker({ projectId: "P", role: "r" });
+    graph.complete(w.id);
+    const afterFirst = (await lineageEvents(envStore, emitter)).length;
+    await new Promise((r) => setTimeout(r, 5));
+    graph.complete(w.id);
+    assert.equal((await lineageEvents(envStore, emitter)).length, afterFirst, "WorkGraph terminal state dedupes");
+
+    const m = missionRig(emitter);
+    m.store.setExecutionStatus(m.execution.execution_id, "FAILED", {});
+    const afterFail = (await lineageEvents(envStore, emitter)).length;
+    await new Promise((r) => setTimeout(r, 5));
+    m.store.setExecutionStatus(m.execution.execution_id, "FAILED", {});
+    assert.equal((await lineageEvents(envStore, emitter)).length, afterFail, "MissionStore end dedupes");
+  });
+});
+
 describe("lineage: session rollover and migration", () => {
   it("a new session under the same attempt keeps agent and attempt ids", async () => {
     const { store: envStore, emitter } = rig();

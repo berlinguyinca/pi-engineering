@@ -5,8 +5,9 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -30,15 +31,20 @@ test("a mission runs end to end with every optional adapter absent and touches n
   }
   const calls: string[] = [];
   const realFetch = globalThis.fetch;
-  const realConnect = net.connect;
   globalThis.fetch = (async (input: unknown) => {
     calls.push(`fetch ${String(input)}`);
     throw new Error("network is forbidden in standalone mode");
   }) as typeof fetch;
-  (net as { connect: unknown }).connect = (...args: unknown[]) => {
-    calls.push(`connect ${JSON.stringify(args[0])}`);
-    throw new Error("sockets are forbidden in standalone mode");
-  };
+  // Every net-based client (http, https, named imports of connect) goes through Socket.prototype.connect.
+  const realSocketConnect = net.Socket.prototype.connect;
+  net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
+    const target = args[0] as { path?: string } | string | undefined;
+    const isUnixPath = typeof target === "string" ? Number.isNaN(Number(target)) : typeof target?.path === "string";
+    if (!isUnixPath) calls.push(`connect ${JSON.stringify(args[0])}`);
+    if (!isUnixPath) throw new Error("TCP sockets are forbidden in standalone mode");
+    return (realSocketConnect as (...a: unknown[]) => net.Socket).apply(this, args);
+  } as typeof net.Socket.prototype.connect;
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-standalone-agent-"));
   const fixture = await makeFixtureRepo();
   try {
     assert.equal(createIngestFromEnv(process.env), null, "no Herdr ingest without configuration");
@@ -66,7 +72,12 @@ test("a mission runs end to end with every optional adapter absent and touches n
       },
       reviewer: () => ({ status: "completed", summary: "clean", details: { findings: [] } }),
     });
-    const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker, verifier: new CommandVerifier() });
+    const rt = await EngineeringRuntime.open({
+      cwd: fixture.root,
+      worker,
+      verifier: new CommandVerifier(),
+      agentDir, // empty: nothing from the operator's real providers / settings
+    });
     try {
       const plan = await rt.plan("build add");
       const result = await rt.executePlan(plan.plan_work_item.id, { parallel: false });
@@ -79,13 +90,14 @@ test("a mission runs end to end with every optional adapter absent and touches n
     const controlPlane = join(resolveStateRoot(), "control-plane");
     const leftovers = existsSync(controlPlane) ? readdirSync(controlPlane) : [];
     assert.deepEqual(
-      leftovers.filter((f) => f.startsWith("outbox") || f.startsWith("seq")),
+      leftovers.filter((f) => f.startsWith("outbox") || f.startsWith("seq") || f === "instance-id"),
       [],
       "no outbox or sequence state without an emitter",
     );
   } finally {
     globalThis.fetch = realFetch;
-    (net as { connect: unknown }).connect = realConnect;
+    net.Socket.prototype.connect = realSocketConnect;
+    rmSync(agentDir, { recursive: true, force: true });
     for (const [key, value] of Object.entries(saved)) if (value !== undefined) process.env[key] = value;
     await fixture.cleanup();
   }

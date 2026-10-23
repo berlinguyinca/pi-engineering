@@ -338,7 +338,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
       lineage.attemptState(
         { attempt: rec.worker.id, agent: rec.worker.id, missionId: rec.worker.missionId },
         state,
-        `${state}:${rec.worker.updated_at}`,
+        // done/cancelled end the run once (a repeated terminate dedupes); blocked can recur.
+        state === "blocked" ? `${state}:${rec.worker.updated_at}` : "end",
         undefined,
         rec.worker.updated_at,
       );

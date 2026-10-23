@@ -307,7 +307,7 @@ export class WorkGraph {
         l.attemptState(
           { attempt: WorkGraph.attemptId(w), agent: w.id },
           lineageState,
-          `${status}:${w.updated_at}`,
+          TERMINAL_WORKER.has(status) ? "end" : `${status}:${w.updated_at}`,
           undefined,
           w.updated_at,
         ),
@@ -449,6 +449,9 @@ export class WorkGraph {
     return graph;
   }
 }
+
+/** A worker run ends once; re-entrant states (running, blocked) key on their timestamp instead. */
+const TERMINAL_WORKER: ReadonlySet<WorkerStatus> = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 
 const WORKER_LINEAGE_STATE: Partial<Record<WorkerStatus, LineageState>> = {
   RUNNING: "running",
