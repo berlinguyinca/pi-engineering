@@ -222,7 +222,7 @@ export class Plane {
     for (;;) {
       if (!this.alive()) throw new Error(`control plane exited during startup:\n${this.tail()}`);
       try {
-        if ((await this.call("GET", "/api/v1/ingest/sources", { key: "viewer" })).status === 200) break;
+        if ((await this.call("GET", "/api/v1/ingest/sources", { key: "operator" })).status === 200) break;
       } catch {
         /* not up yet */
       }
@@ -355,7 +355,7 @@ export class Plane {
   }
 
   async sources(
-    key = "viewer",
+    key = "operator",
   ): Promise<Record<string, { source?: string; actor?: string; last_sequence?: number; gaps?: unknown[] }>> {
     const r = await this.call("GET", "/api/v1/ingest/sources", { key });
     return Object.fromEntries((r.body.sources ?? []).map((s: { source: string }) => [s.source, s]));
