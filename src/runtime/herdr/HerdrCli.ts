@@ -136,8 +136,9 @@ export class RealHerdrCli implements HerdrCli {
   }
 
   async wait(target: string, until: string[], timeoutMs?: number): Promise<HerdrAgent> {
-    const args = ["agent", "wait", target, "--until", until.join(",")];
-    if (timeoutMs && timeoutMs > 0) args.push("--timeout-ms", String(timeoutMs));
+    // herdr 0.9.1: --until repeats per state, and the timeout flag is --timeout (milliseconds)
+    const args = ["agent", "wait", target, ...until.flatMap((u) => ["--until", u])];
+    if (timeoutMs && timeoutMs > 0) args.push("--timeout", String(timeoutMs));
     const out = await this.run(args);
     const parsed = JSON.parse(out) as { result?: HerdrAgent };
     if (!parsed.result) throw new HerdrError("agent_wait_no_result", "agent.wait returned no agent");
@@ -154,7 +155,8 @@ export class RealHerdrCli implements HerdrCli {
   }
 
   async startAgent(paneId: string, kind: string, name: string): Promise<void> {
-    await this.run(["agent", "start", "--pane-id", paneId, "--kind", kind, "--name", name]);
+    // herdr 0.9.1: the name is positional and the pane flag is --pane
+    await this.run(["agent", "start", name, "--kind", kind, "--pane", paneId]);
   }
 
   async sendKeys(target: string, keys: string): Promise<void> {
