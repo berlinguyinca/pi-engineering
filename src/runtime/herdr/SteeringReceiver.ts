@@ -1,8 +1,9 @@
 /**
  * Outbound-only poller for Herdr steering requests (T12).
  *
- * Pi connects OUT to the control plane it already reports to, with the same ingest key (Herdr pins a request to the
- * key that reported the target, so a different key receives nothing). It asks `GET /api/v1/steering/pending`, hands
+ * Pi connects OUT to the control plane named in the global engineering YAML (`herdr:`, see herdrConnection.ts), with
+ * the same ingest key it reports with (Herdr pins a request to the key that reported the target, so a different key
+ * receives nothing; `instance_id` further separates several Pi instances that share one key). It asks `GET /api/v1/steering/pending`, hands
  * each well-formed item to `applySteering` and reports `POST /api/v1/steering/<id>/ack`. Nothing listens, nothing is
  * pushed in, no port is opened, and the key is never logged or placed in an error.
  *
@@ -20,6 +21,7 @@ import {
   applySteering,
   parseSteeringItems,
 } from "../../orchestration/steering.ts";
+import { loadHerdrConnection } from "./herdrConnection.ts";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const DEFAULT_INTERVAL_MS = 5_000;
@@ -30,6 +32,8 @@ export interface SteeringReceiverOptions {
   /** Control plane base URL (http/https, no credentials, query or fragment). */
   baseUrl: string;
   apiKey?: string;
+  /** Names this Pi to Herdr; requests for nodes registered by another instance are not offered to it. */
+  instanceId?: string;
   ports: SteeringPorts;
   ledger: SteeringLedger;
   fetch?: typeof globalThis.fetch;
@@ -41,6 +45,8 @@ export interface SteeringReceiverOptions {
 
 export interface PollResult {
   received: number;
+  /** Requests for a target this instance does not know: left alone so another instance can take them. */
+  skipped: number;
   acked: number;
   dropped: number;
   error: string | null;
@@ -66,16 +72,37 @@ export class SteeringReceiver {
     return { accept: "application/json", ...(this.opts.apiKey ? { "x-api-key": this.opts.apiKey } : {}) };
   }
 
+  private query(): string {
+    return this.opts.instanceId ? `?instance_id=${encodeURIComponent(this.opts.instanceId)}` : "";
+  }
+
+  /** Read at most MAX_BODY_BYTES; the stream is cancelled the moment it goes over (never buffered whole first). */
   private async readJson(res: Response): Promise<unknown> {
-    const text = await res.text();
-    if (text.length > MAX_BODY_BYTES) throw new Error("response too large");
+    const declared = Number(res.headers.get("content-length") ?? "0");
+    if (declared > MAX_BODY_BYTES) throw new Error("response too large");
+    if (!res.body) return {};
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error("response too large");
+      }
+      chunks.push(value);
+    }
+    const text = Buffer.concat(chunks).toString("utf8");
     return text ? JSON.parse(text) : {};
   }
 
   private async ack(id: string, ack: SteeringAck): Promise<boolean> {
     try {
-      const res = await this.fetchImpl(`${this.base}/api/v1/steering/${encodeURIComponent(id)}/ack`, {
+      const res = await this.fetchImpl(`${this.base}/api/v1/steering/${encodeURIComponent(id)}/ack${this.query()}`, {
         method: "POST",
+        redirect: "error",
         headers: { ...this.headers(), "content-type": "application/json" },
         body: JSON.stringify({ outcome: ack.outcome, note: ack.note }),
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000),
@@ -88,10 +115,11 @@ export class SteeringReceiver {
 
   /** One round trip. Never throws; a failed ack is retried on the next poll because Herdr re-offers it. */
   async pollOnce(): Promise<PollResult> {
-    const out: PollResult = { received: 0, acked: 0, dropped: 0, error: null };
+    const out: PollResult = { received: 0, skipped: 0, acked: 0, dropped: 0, error: null };
     let body: unknown;
     try {
-      const res = await this.fetchImpl(`${this.base}/api/v1/steering/pending`, {
+      const res = await this.fetchImpl(`${this.base}/api/v1/steering/pending${this.query()}`, {
+        redirect: "error",
         headers: this.headers(),
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000),
       });
@@ -109,6 +137,10 @@ export class SteeringReceiver {
     out.dropped = dropped;
     for (const item of items) {
       const result = await applySteering(item, this.opts.ports, this.opts.ledger);
+      if (!result) {
+        out.skipped++;
+        continue;
+      }
       if (await this.ack(item.steeringId, result)) out.acked++;
     }
     return out;
@@ -176,32 +208,13 @@ export async function loadSteeringSettings(agentDir: string): Promise<SteeringSe
   return { enabled: block.enabled, intervalMs, notes: [] };
 }
 
-/** The control plane Pi already reports to (same variables as the convergence emitter), or null. */
-export function steeringEndpointFromEnv(env: NodeJS.ProcessEnv): { baseUrl: string; apiKey?: string } | null {
-  const raw = env.HERDR_INGEST_URL?.trim() ?? "";
-  if (!raw) return null;
-  let u: URL;
-  try {
-    u = new URL(raw);
-  } catch {
-    return null;
-  }
-  if ((u.protocol !== "http:" && u.protocol !== "https:") || u.username || u.password || u.search || u.hash)
-    return null;
-  const key = env.HERDR_INGEST_API_KEY?.trim() ?? "";
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: a key with control characters could never be sent
-  if (/[\u0000-\u001f\u007f]/.test(key)) return null;
-  return { baseUrl: u.toString().replace(/\/+$/, ""), ...(key ? { apiKey: key } : {}) };
-}
-
 /**
- * Build the receiver, or return null when it is not enabled in the global YAML or no control plane is configured.
- * `stateDir` holds the at-most-once ledger.
+ * Build the receiver, or return null when it is not enabled in the global YAML or no safe `herdr:` connection is
+ * configured. `stateDir` holds the at-most-once ledger.
  */
 export async function createSteeringReceiver(input: {
   agentDir: string;
   stateDir: string;
-  env: NodeJS.ProcessEnv;
   ports: SteeringPorts;
   fetch?: typeof globalThis.fetch;
   log?: (message: string) => void;
@@ -209,13 +222,16 @@ export async function createSteeringReceiver(input: {
   const settings = await loadSteeringSettings(input.agentDir);
   for (const n of settings.notes) input.log?.(n);
   if (!settings.enabled) return null;
-  const endpoint = steeringEndpointFromEnv(input.env);
-  if (!endpoint) {
-    input.log?.("steering off: no control plane is configured");
+  const { connection, notes } = await loadHerdrConnection(input.agentDir);
+  for (const n of notes) input.log?.(n);
+  if (!connection) {
+    input.log?.("steering off: no usable `herdr:` connection in the global engineering.yaml");
     return null;
   }
   return new SteeringReceiver({
-    ...endpoint,
+    baseUrl: connection.baseUrl,
+    ...(connection.apiKey ? { apiKey: connection.apiKey } : {}),
+    ...(connection.instanceId ? { instanceId: connection.instanceId } : {}),
     ports: input.ports,
     ledger: new FileSteeringLedger(join(input.stateDir, "steering-ledger.jsonl")),
     intervalMs: settings.intervalMs,

@@ -1820,6 +1820,10 @@ export class EngineeringRuntime {
   ): Promise<SteeringReceiver | null> {
     const store = rt.missionStore;
     if (!store) return null;
+    const orchestrator = (): NonNullable<EngineeringRuntime["orchestrator"]> => {
+      if (!rt.orchestrator) throw new Error("orchestrator is not running");
+      return rt.orchestrator;
+    };
     const ports: import("../orchestration/steering.ts").SteeringPorts = {
       now: () => Date.now() / 1000,
       resolve: (nodeId) => {
@@ -1832,6 +1836,7 @@ export class EngineeringRuntime {
             kind: "task",
             taskId: t.task_id,
             missionId: t.mission_id,
+            running: t.status === "RUNNING",
             terminal: ["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(t.status),
           };
         }
@@ -1842,24 +1847,23 @@ export class EngineeringRuntime {
             kind: "mission",
             missionId: m.mission_id,
             paused: m.status === "PAUSED_INFRASTRUCTURE",
+            operatorPaused: Boolean(m.operator_paused_at),
             terminal: ["COMPLETE", "FAILED", "CANCELED"].includes(m.status),
           };
         }
         return null;
       },
-      steerTask: (taskId, text) => {
-        store.steerTask(taskId, text, "herdr-steering");
-      },
+      steerRunning: (taskId, text) => orchestrator().broker.steerRunningTask(taskId, text, "herdr-steering"),
       resumeMission: async (missionId) => {
-        if (!rt.orchestrator) throw new Error("orchestrator is not running");
-        await rt.orchestrator.resume(missionId);
+        const mission = await orchestrator().resume(missionId);
+        return { changed: mission.status !== "PAUSED_INFRASTRUCTURE" };
       },
+      log: (message) => console.error(message),
     };
     if (opts.steeringReceiver !== undefined) return opts.steeringReceiver;
     const receiver = await createSteeringReceiver({
       agentDir: opts.agentDir ?? getAgentDir(),
       stateDir: resolveStateRoot(),
-      env: process.env,
       ports,
     });
     receiver?.start();

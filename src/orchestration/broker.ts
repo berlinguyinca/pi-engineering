@@ -660,11 +660,32 @@ export class ExecutionBroker {
       worktree: string | null;
       taskId: string;
       missionId: string;
+      backend?: string;
       cancelCheckpoint?: () => Promise<void>;
       terminalPromise?: Promise<ExecutionOutcome>;
       authority?: DispatchAuthority;
     }
   >();
+  /**
+   * Deliver a steering request to the RUNNING execution of `taskId` through the same path as `handle.steer`:
+   * recorded on the task and handed to the backend's `onSteer`. Answers truthfully: "not_running" when the task has
+   * no running execution in this process, "no_channel" when its backend cannot take steering (nothing is recorded,
+   * since no model would ever read it), otherwise "delivered".
+   */
+  steerRunningTask(taskId: string, request: string, actor = "system"): "delivered" | "not_running" | "no_channel" {
+    for (const entry of this.active.values()) {
+      if (entry.taskId !== taskId || entry.status !== "RUNNING") continue;
+      const runner = entry.backend
+        ? (this.backends[entry.backend as keyof BrokerBackends] as { onSteer?: (s: string) => void } | undefined)
+        : undefined;
+      if (typeof runner?.onSteer !== "function") return "no_channel";
+      this.store.steerTask(taskId, request, actor);
+      runner.onSteer(request);
+      return "delivered";
+    }
+    return "not_running";
+  }
+
   /** Allocated worktrees, cleaned up when their execution settles. */
   readonly allocatedWorktrees = new Map<
     string,
@@ -3706,6 +3727,7 @@ export class ExecutionBroker {
       worktree: null,
       taskId: input.taskId,
       missionId: input.missionId,
+      backend,
       authority: input.authority,
     });
     input.authority?.assertAuthoritative();
