@@ -4,7 +4,10 @@
  * with no network and no AutoSpec / GitHub / Herdr / InferWeave.
  */
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import { mkdtempSync } from "node:fs";
+import http from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -13,6 +16,7 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { runStandalonePlan } from "../../src/orchestration/standaloneEntry.ts";
 import { PlannotatorAdapter } from "../../src/platform/Plannotator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { installOutsideWorldGuard } from "../support/outsideWorldGuard.ts";
 
 const CLEAN_ENV: NodeJS.ProcessEnv = {}; // no PI_AUTOSPEC_*, no GitHub/Herdr/InferWeave variables
 
@@ -148,5 +152,62 @@ describe("standalone plan flow", () => {
     const code = await runExternalEntry(["submit", "--store", dir], "{}", CLEAN_ENV, { error: (t) => err.push(t) });
     assert.equal(code, 2);
     assert.match(err.join(""), /PI_AUTOSPEC_ENABLED/);
+  });
+
+  it("the same idempotency key with a different plan is refused, never answered with the first plan's go-ahead", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-standalone-"));
+    const docs = {
+      goal: "ship it",
+      idempotencyKey: "k1",
+      tasks: [{ objective: "fix typo", write_domains: ["README.md"] }],
+    };
+    const infra = {
+      goal: "ship it",
+      idempotencyKey: "k1",
+      tasks: [
+        { objective: "rewrite auth and drop tables", write_domains: ["src/auth/**", "db/migrations/**", "infra/**"] },
+      ],
+    };
+    const a = await run(["--store", dir], docs);
+    assert.equal(a.code, 0, a.err);
+    assert.equal(a.json.outcome, "skipped");
+    const b = await run(["--store", dir], infra);
+    assert.equal(b.code, 2);
+    assert.equal(b.json.code, "IDEMPOTENCY_CONFLICT");
+    assert.notEqual(b.json.result, "may_proceed");
+    // The same plan under a NEW key is judged on its own risk (require, no reviewer => blocked).
+    const c = await run(["--store", dir], { ...infra, idempotencyKey: "k2" });
+    assert.equal(c.code, 1);
+    assert.equal(c.json.mode, "require");
+    assert.notEqual(c.json.planDigest, a.json.planDigest);
+    assert.deepEqual(
+      c.json.tasks.map((t: { taskId: string }) => t.taskId),
+      ["t1"],
+    );
+  });
+
+  it("touches no network, DNS or subprocess (guarded, not just fetch)", async () => {
+    const fake = mkdtempSync(join(tmpdir(), "pi-standalone-fake-"));
+    const guard = installOutsideWorldGuard({ allowSpawnUnder: fake });
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "pi-standalone-"));
+      const r = await run(["--store", dir], {
+        goal: "tidy docs",
+        tasks: [{ objective: "tidy", write_domains: ["docs/x.md"] }],
+      });
+      assert.equal(r.code, 0, r.err);
+      assert.deepEqual(guard.attempts, []);
+      // The guard really bites:
+      assert.throws(() => net.connect(80, "127.0.0.1"), /outside world blocked/);
+      assert.throws(() => http.request("http://127.0.0.1:1/"), /outside world blocked/);
+      assert.throws(() => childProcess.spawnSync("/bin/true"), /outside world blocked/);
+      await assert.rejects(
+        Promise.resolve().then(() => fetch("http://127.0.0.1:1/")),
+        /outside world blocked/,
+      );
+      assert.equal(guard.attempts.length, 4);
+    } finally {
+      guard.restore();
+    }
   });
 });
