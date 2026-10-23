@@ -46,7 +46,7 @@ import {
 } from "../orchestration/missionSnapshot.ts";
 import { MissionStore } from "../orchestration/missionStore.ts";
 import { buildVerifierStages } from "../orchestration/missionWhy.ts";
-import { MissionActivityTicker } from "../orchestration/observability/MissionActivityTicker.ts";
+import { ClockOnlyGate, MissionActivityTicker } from "../orchestration/observability/MissionActivityTicker.ts";
 import { MissionObservability, boundedToolOutputPreview } from "../orchestration/observability/MissionObservability.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
@@ -724,6 +724,7 @@ export class EngineeringRuntime {
   private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private missionActivityTicker: MissionActivityTicker | null = null;
+  private readonly missionActivityClock = new ClockOnlyGate();
   private unsubscribeMissionActivity: (() => void) | null = null;
   private currentWorkItemId = "";
   private currentPhaseGoal = "";
@@ -1039,7 +1040,7 @@ export class EngineeringRuntime {
       .trim()
       .slice(0, 240);
     try {
-      this.onMissionActivity({
+      const event: RuntimeMissionActivityEvent = {
         observedAt,
         waitingReason: summary.waitingReason,
         waitingSince: summary.waitingSince,
@@ -1114,7 +1115,24 @@ export class EngineeringRuntime {
         operatorModelPin: mission?.operator_model_pin
           ? `${mission.operator_model_pin.provider}/${mission.operator_model_pin.id}`
           : null,
-      });
+      };
+      this.missionActivityClock.remember(
+        missionId,
+        [
+          event.waitingSince,
+          event.lastOutputAt,
+          event.lastHeartbeatAt,
+          event.lastMeaningfulProgressAt,
+          ...(event.workersDetail ?? []).flatMap((worker) => [
+            worker.currentActivityStartedAt,
+            worker.lastHeartbeatAt,
+            worker.lastMeaningfulProgressAt,
+            worker.lastOutputAt,
+          ]),
+        ],
+        Date.parse(observedAt),
+      );
+      this.onMissionActivity(event);
     } catch {
       // UI listeners are observers, never participants in mission execution.
     }
@@ -1294,7 +1312,11 @@ export class EngineeringRuntime {
       }
       rt.missionActivityTicker = new MissionActivityTicker({
         state: (missionId) => rt.missionStore?.getMission(missionId)?.status,
-        emit: (missionId, observedAt) => rt.emitMissionActivity(missionId, observedAt),
+        emit: (missionId, observedAt) => {
+          // Clock-only tick: skip the rebuild and redraw while no displayed age has changed.
+          if (!rt.missionActivityClock.due(missionId, Date.parse(observedAt))) return;
+          rt.emitMissionActivity(missionId, observedAt);
+        },
       });
       rt.unsubscribeMissionActivity = rt.missionObservability.subscribe((missionId) => {
         void rt.publishMissionSnapshot();
@@ -1702,6 +1724,7 @@ export class EngineeringRuntime {
     } catch (error) {
       rt.externalPumpStopped = true;
       rt.missionActivityTicker?.close();
+      rt.missionActivityClock.clear();
       rt.unsubscribeMissionActivity?.();
       await rt.missionSupervisor?.shutdown();
       if (rt.ownershipId) liveOwnerIds().delete(rt.ownershipId);
@@ -1748,6 +1771,7 @@ export class EngineeringRuntime {
     if (path) EngineeringRuntime.releaseOrchestrationReference(path);
     this.closed = true;
     this.missionActivityTicker?.close();
+    this.missionActivityClock.clear();
     this.unsubscribeMissionActivity?.();
     if (this.ownershipId) liveOwnerIds().delete(this.ownershipId);
     this.snapshotPressure?.dispose();

@@ -395,3 +395,27 @@ test("lifecycle: the queue position reaches the rendered footer line", () => {
     controller.dispose();
   }
 });
+
+test("lifecycle: republishing an identical task does not redraw the footer", () => {
+  const h = makeHarness();
+  const controller = new FooterController({ ctx: h.ctx as never, config: cfg, now: fixedClock() });
+  try {
+    const task = {
+      workItemId: "m1",
+      phase: "mission",
+      label: "EXECUTING · build",
+      missionStatus: { token: "running", reason: "r", next: "n" },
+    };
+    controller.setTask(task);
+    const afterFirst = h.renderCount;
+    controller.setTask({ ...task, missionStatus: { ...task.missionStatus } });
+    assert.equal(h.renderCount, afterFirst, "an identical task is not a change");
+    controller.setTask({ ...task, label: "EXECUTING · test" });
+    assert.ok(h.renderCount > afterFirst, "a changed task still redraws");
+    const afterChange = h.renderCount;
+    controller.setTask(undefined);
+    assert.ok(h.renderCount > afterChange, "clearing the task still redraws");
+  } finally {
+    controller.dispose();
+  }
+});

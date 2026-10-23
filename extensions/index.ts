@@ -494,6 +494,16 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
   if (plumbing) {
     const previous = plumbing.state.snapshot.run;
     const sameMission = previous?.workItemId === event.missionId;
+    // Skip a redraw for output identical to what the panel already shows.
+    if (
+      sameMission &&
+      previous.goal === detail &&
+      previous.phase === rendered.phase &&
+      JSON.stringify(previous.missionStatus) === JSON.stringify(rendered.missionStatus)
+    ) {
+      publishMissionActivityFooter(key, event, rendered, detail);
+      return;
+    }
     plumbing.state.set({
       run: {
         workItemId: event.missionId,
@@ -508,6 +518,15 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
       updatedAt: Date.now(),
     });
   }
+  publishMissionActivityFooter(key, event, rendered, detail);
+}
+
+function publishMissionActivityFooter(
+  key: string,
+  event: RuntimeMissionActivityEvent,
+  rendered: ReturnType<typeof formatMissionActivity>,
+  detail: string,
+): void {
   if (ambientPanel?.key !== key) return;
   activeFooter?.setTask({
     workItemId: event.missionId,
