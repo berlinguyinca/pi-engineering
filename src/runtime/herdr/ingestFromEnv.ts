@@ -29,7 +29,8 @@ function stampedFetch(apiKey: string | undefined): typeof globalThis.fetch {
     let body = init?.body;
     if (body !== undefined && body !== null) {
       const parsed = JSON.parse(String(body)) as Record<string, unknown>;
-      parsed.source = "pi";
+      // v2 envelopes carry their own per-instance source; only stamp legacy bodies
+      if (parsed.source === undefined) parsed.source = "pi";
       body = JSON.stringify(parsed);
     }
 
