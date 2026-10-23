@@ -23,6 +23,8 @@
 
 import os from "node:os";
 
+import { emitTelemetry } from "../../telemetry/sink.ts";
+
 import type { EnvelopeDraft, EnvelopeV2 } from "./envelope.ts";
 import { scopeIdsFromPayload } from "./envelopeAdapters.ts";
 import type { EnvelopeStore } from "./envelopeStore.ts";
@@ -70,6 +72,11 @@ export interface ControlPlaneDiagnostics extends OutboxStats {
   backoffUntil: string | null;
   lastStatus: number | null;
   credentialProblem: boolean;
+  /** Events dead-lettered by a 409 that a sequence resync could not repair. */
+  conflictDeadLettered: number;
+  sequenceRegressions: number;
+  sequenceResyncs: number;
+  resequenced: number;
 }
 
 function retryAfterMs(res: Response): number | undefined {
@@ -81,11 +88,18 @@ function retryAfterMs(res: Response): number | undefined {
 /** Longest response body read to classify a refusal. */
 const MAX_REFUSAL_BODY_BYTES = 4096;
 
+interface RefusalBody {
+  reason?: string;
+  error?: string;
+  /** The server's high-water mark for this source, when the refusal carries one (`last_sequence`). */
+  lastSequence?: number;
+}
+
 /**
- * The `reason` of a JSON refusal body, or undefined for anything else (non-JSON, oversized,
- * unreadable, slow). Defensive: an unreadable body never changes how a plain 401/403 is treated.
+ * The classification fields of a JSON refusal body, or {} for anything else (non-JSON, oversized, unreadable,
+ * slow). Defensive: an unreadable body never changes how a plain 401/403 is treated.
  */
-async function refusalReason(res: Response): Promise<string | undefined> {
+async function refusalBody(res: Response): Promise<RefusalBody> {
   try {
     const read = async (): Promise<string> => {
       const reader = res.body?.getReader();
@@ -105,14 +119,29 @@ async function refusalReason(res: Response): Promise<string | undefined> {
       read(),
       new Promise<string>((resolve) => setTimeout(() => resolve(""), 1000).unref()),
     ]);
-    if (Buffer.byteLength(text) > MAX_REFUSAL_BODY_BYTES) return undefined;
-    const parsed: unknown = JSON.parse(text);
-    const reason = (parsed as { reason?: unknown } | null)?.reason;
-    return typeof reason === "string" ? reason : undefined;
+    if (Buffer.byteLength(text) > MAX_REFUSAL_BODY_BYTES) return {};
+    const parsed = JSON.parse(text) as { reason?: unknown; error?: unknown; last_sequence?: unknown } | null;
+    const hint = parsed?.last_sequence;
+    return {
+      ...(typeof parsed?.reason === "string" ? { reason: parsed.reason } : {}),
+      ...(typeof parsed?.error === "string" ? { error: parsed.error.slice(0, 300) } : {}),
+      ...(typeof hint === "number" && Number.isSafeInteger(hint) && hint >= 0 ? { lastSequence: hint } : {}),
+    };
   } catch {
-    return undefined;
+    return {};
   }
 }
+
+const refusalReason = async (res: Response): Promise<string | undefined> => (await refusalBody(res)).reason;
+
+/** A 409 that says a (source, source_sequence) pair belongs to another event, as opposed to a content contradiction. */
+function isSequenceCollision(body: RefusalBody): boolean {
+  const text = body.error ?? "";
+  return /sequence/i.test(text) && !/different content/i.test(text);
+}
+
+/** Largest body accepted from the ingest sources listing. */
+const MAX_SOURCES_BYTES = 2 * 1024 * 1024;
 
 /** Hard cap on events replayed by one flush pass. */
 const MAX_FLUSH = 500;
@@ -191,54 +220,63 @@ export class ControlPlaneIngest {
       const toAck: string[] = [];
       try {
         if (this.now() < this.nextAttemptAt) return acked;
-        const pending = await store.outbox.peek(MAX_FLUSH);
-        for (const envelope of pending) {
-          let res: Response;
-          try {
-            res = await this.post(envelope);
-          } catch {
-            this.failed(); // network / timeout: transient
-            break;
-          }
-          const status = res.status;
-          if (res.ok) {
-            acked.add(envelope.event_id);
-            toAck.push(envelope.event_id);
-            this.succeeded();
-            store.outbox.markHealthy();
-          } else if (status === 400 || status === 409 || status === 422) {
-            await store.outbox.deadLetter(envelope, "server_rejected", status);
-            this.headId = undefined;
-          } else if (status === 403 && (await refusalReason(res)) === "lineage_forbidden") {
-            // A graph-ownership refusal of THIS event (not a credentials problem): terminal,
-            // never delivered, the queue continues.
-            await store.outbox.deadLetter(envelope, "lineage_forbidden", status);
-            this.headId = undefined;
-          } else if (status === 401 || status === 403) {
-            this.credentialProblem = true;
-            this.failed(status);
-            break;
-          } else if (status === 408 || status === 425 || status === 429) {
-            this.failed(status, retryAfterMs(res));
-            break;
-          } else if (status >= 500) {
-            if (this.headId !== envelope.event_id) {
-              this.headId = envelope.event_id;
-              this.headFailures = 0;
+        let restart = true;
+        for (let round = 0; restart && round < 3; round++) {
+          restart = false;
+          const pending = await store.outbox.peek(MAX_FLUSH);
+          for (const envelope of pending) {
+            let res: Response;
+            try {
+              res = await this.post(envelope);
+            } catch {
+              this.failed(); // network / timeout: transient
+              break;
             }
-            if (++this.headFailures >= this.backoff.deadLetterAfter) {
-              await store.outbox.deadLetter(envelope, "repeated_5xx", status);
+            const status = res.status;
+            if (res.ok) {
+              acked.add(envelope.event_id);
+              toAck.push(envelope.event_id);
+              this.succeeded();
+              store.outbox.markHealthy();
+            } else if (status === 409 && (await this.resyncAfterCollision(res, envelope, store))) {
+              // The pending queue was re-numbered; start over from the head with the new numbers.
+              restart = true;
+              break;
+            } else if (status === 400 || status === 409 || status === 422) {
+              await store.outbox.deadLetter(envelope, "server_rejected", status);
+              if (status === 409) this.conflictDeadLettered++;
               this.headId = undefined;
-              continue;
+            } else if (status === 403 && (await refusalReason(res)) === "lineage_forbidden") {
+              // A graph-ownership refusal of THIS event (not a credentials problem): terminal,
+              // never delivered, the queue continues.
+              await store.outbox.deadLetter(envelope, "lineage_forbidden", status);
+              this.headId = undefined;
+            } else if (status === 401 || status === 403) {
+              this.credentialProblem = true;
+              this.failed(status);
+              break;
+            } else if (status === 408 || status === 425 || status === 429) {
+              this.failed(status, retryAfterMs(res));
+              break;
+            } else if (status >= 500) {
+              if (this.headId !== envelope.event_id) {
+                this.headId = envelope.event_id;
+                this.headFailures = 0;
+              }
+              if (++this.headFailures >= this.backoff.deadLetterAfter) {
+                await store.outbox.deadLetter(envelope, "repeated_5xx", status);
+                this.headId = undefined;
+                continue;
+              }
+              this.failed(status);
+              break;
+            } else if (status >= 400) {
+              await store.outbox.deadLetter(envelope, "client_error", status);
+              this.headId = undefined;
+            } else {
+              this.failed(status); // unexpected non-2xx below 400
+              break;
             }
-            this.failed(status);
-            break;
-          } else if (status >= 400) {
-            await store.outbox.deadLetter(envelope, "client_error", status);
-            this.headId = undefined;
-          } else {
-            this.failed(status); // unexpected non-2xx below 400
-            break;
           }
         }
       } catch {
@@ -253,6 +291,79 @@ export class ControlPlaneIngest {
     });
     this.flushChain = run.catch(() => {});
     return run;
+  }
+
+  /** Events dead-lettered by a 409 the sequence resync could not repair. */
+  conflictDeadLettered = 0;
+  private readonly resequencedIds = new Set<string>();
+
+  /** Ask the server for its high-water mark of `source` (best effort; undefined when it cannot be learned). */
+  private async serverHighWater(source: string): Promise<number | undefined> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await this.fetchImpl(`${this.url}/api/v1/ingest/sources`, {
+        method: "GET",
+        headers: this.apiKey ? { "x-api-key": this.apiKey } : {},
+        signal: controller.signal,
+      });
+      if (!res.ok) return undefined;
+      const text = await res.text();
+      if (text.length > MAX_SOURCES_BYTES) return undefined;
+      const rows = (JSON.parse(text) as { sources?: unknown }).sources;
+      if (!Array.isArray(rows)) return undefined;
+      let high: number | undefined;
+      for (const row of rows as Array<{ source?: unknown; last_sequence?: unknown }>) {
+        const seq = row.last_sequence;
+        if (row.source === source && typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0) {
+          high = Math.max(high ?? 0, seq);
+        }
+      }
+      return high;
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * A 409 whose text says the sequence number is taken by another event means OUR counter is behind the server's
+   * (state restored from an older copy, sequence file lost, cloned install). Dead-lettering would lose this event and
+   * every later one, silently, forever. Instead: learn the server's high-water mark (the 409 body's `last_sequence`
+   * when the server sends one, else the ingest sources listing), move the allocator above it and re-number every
+   * pending envelope. Returns true when the queue was re-numbered; false means "treat as a plain rejection"
+   * (not a sequence collision, already re-numbered once, or the high-water mark cannot be learned) and the failure is
+   * reported through telemetry at error level.
+   */
+  private async resyncAfterCollision(res: Response, envelope: EnvelopeV2, store: EnvelopeStore): Promise<boolean> {
+    const body = await refusalBody(res);
+    if (!isSequenceCollision(body)) return false;
+    if (this.resequencedIds.has(envelope.event_id)) {
+      this.reportConflict(envelope, "still collides after a resync");
+      return false;
+    }
+    const high = body.lastSequence ?? (await this.serverHighWater(store.source));
+    if (high === undefined) {
+      this.reportConflict(envelope, "the server's high-water mark for this source could not be learned");
+      return false;
+    }
+    try {
+      for (const e of await store.outbox.peek()) this.resequencedIds.add(e.event_id);
+      await store.resync(high);
+      return true;
+    } catch {
+      this.reportConflict(envelope, "re-numbering the pending queue failed");
+      return false;
+    }
+  }
+
+  private reportConflict(envelope: EnvelopeV2, why: string): void {
+    emitTelemetry({
+      level: "error",
+      key: `herdr-sequence-conflict:${envelope.event_id}`,
+      text: `control-plane rejected event ${envelope.event_id} (source_sequence ${envelope.source_sequence}) and it is being dead-lettered: ${why}. See the dead-letter file next to the outbox.`,
+    });
   }
 
   private failed(status?: number, retryAfter?: number): void {
@@ -285,6 +396,7 @@ export class ControlPlaneIngest {
       backoffUntil: this.nextAttemptAt > this.now() ? new Date(this.nextAttemptAt).toISOString() : null,
       lastStatus: this.lastStatus ?? null,
       credentialProblem: this.credentialProblem,
+      conflictDeadLettered: this.conflictDeadLettered,
     };
   }
 

@@ -17,6 +17,7 @@ import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 import { scriptCommand } from "../verify/Verifier.ts";
 import type { EngineeringPolicy } from "./policy.ts";
 import type { CheckKind, CheckOutcome, CheckSpec, GateStatus, VerificationReport } from "./types.ts";
+import { workerCommandEnv } from "./workerEnv.ts";
 
 const exec = promisify(execFile);
 
@@ -282,7 +283,8 @@ async function runOne(
   // literal argument, so e.g. `npm run typecheck:core && npm run
   // typecheck:scripts` fails the gate with TS6231 every time.
   const { command, args } = scriptCommand(spec.command);
-  const env = { ...process.env };
+  // Worker-authored commands run here: Pi's own credentials stay out of their environment (T16 M14).
+  const env = workerCommandEnv();
   delete env.NODE_TEST_CONTEXT;
   await withRustBuildEnv(env, cwd);
   try {

@@ -21,6 +21,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { redactDeep, redactSecrets } from "../../platform/redact.ts";
+import { emitTelemetry } from "../../telemetry/sink.ts";
 import { resolveStateRoot } from "../isolation/stateDir.ts";
 import { type EnvelopeDraft, type EnvelopeV2, SOURCE_PATTERN, buildEnvelope } from "./envelope.ts";
 import { EnvelopeOutbox, type OutboxStats } from "./outbox.ts";
@@ -144,8 +145,41 @@ export class EnvelopeStore {
     if (!SOURCE_PATTERN.test(this.source)) throw new TypeError(`invalid source "${this.source}"`);
     this.maxEventBytes = opts.maxEventBytes ?? 256 * 1024;
     this.idSecret = loadIdSecret(dir);
-    this.sequence = new SourceSequence({ dir, source: this.source, blockSize: opts.sequenceBlock ?? 1 });
     this.outbox = new EnvelopeOutbox({ file: join(dir, `outbox-${this.source}.jsonl`), maxPending: opts.maxPending });
+    // The outbox survives a lost / restored sequence file: never allocate at or below what it already holds.
+    this.sequence = new SourceSequence({
+      dir,
+      source: this.source,
+      blockSize: opts.sequenceBlock ?? 1,
+      floor: async () => (await this.outbox.highestSequence()) + 1,
+    });
+  }
+
+  /** Times the sequence was re-synchronised with the server's high-water mark after a collision. */
+  resyncs = 0;
+
+  /**
+   * The server said some of our (source, source_sequence) pairs belong to other events (state restored from an
+   * older copy, deleted file, cloned install): move the allocator above the server's `highWater` and give every
+   * pending envelope a fresh number, keeping event_id and payload, so nothing is lost. Serialized with `stage`.
+   */
+  resync(highWater: number): Promise<{ restamped: number; from: number }> {
+    const run = this.tail.then(async () => {
+      const from = await this.sequence.advanceTo(highWater + 1);
+      const pending = await this.outbox.peek();
+      const next: EnvelopeV2[] = [];
+      for (const e of pending) next.push({ ...e, source_sequence: await this.sequence.next() });
+      const restamped = await this.outbox.replacePending(next);
+      this.resyncs++;
+      emitTelemetry({
+        level: "warning",
+        key: "herdr-sequence-resync",
+        text: `control-plane source_sequence for "${this.source}" collided with the server (high-water ${highWater}); resumed at ${from} and re-numbered ${restamped} pending event(s), none dropped`,
+      });
+      return { restamped, from };
+    });
+    this.tail = run.catch(() => {});
+    return run;
   }
 
   /**
@@ -161,8 +195,21 @@ export class EnvelopeStore {
   }
 
   /** Counters for the health / diagnostic path. */
-  stats(): OutboxStats & { sequenceFailures: number; source: string } {
-    return { ...this.outbox.stats(), sequenceFailures: this.sequence.failures, source: this.source };
+  stats(): OutboxStats & {
+    sequenceFailures: number;
+    sequenceRegressions: number;
+    sequenceResyncs: number;
+    resequenced: number;
+    source: string;
+  } {
+    return {
+      ...this.outbox.stats(),
+      sequenceFailures: this.sequence.failures,
+      sequenceRegressions: this.sequence.regressions,
+      sequenceResyncs: this.resyncs,
+      resequenced: this.outbox.resequenced,
+      source: this.source,
+    };
   }
 
   /**

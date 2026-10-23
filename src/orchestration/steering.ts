@@ -21,7 +21,7 @@
  *    Herdr control plane is configured (see runtime/herdr/SteeringReceiver.ts).
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { type ForkParams, parseForkParams } from "./forkParams.ts";
 
@@ -59,8 +59,22 @@ export interface SteeringAck {
   note: string;
 }
 
+/**
+ * `digest` is the current plan digest of the target's mission (what Herdr's gate digest `expected_digest` names);
+ * `fence` is Pi's own current fence token for the node, when Pi has one that is comparable with Herdr's. Herdr's fence
+ * is a hash of Herdr's view of the node (state, last event, attrs) that Pi cannot recompute, so today no Pi runtime
+ * supplies `fence`; the comparison exists for the day one can.
+ */
 export type ResolvedTarget =
-  | { kind: "task"; taskId: string; missionId: string; running: boolean; terminal: boolean; digest?: string | null }
+  | {
+      kind: "task";
+      taskId: string;
+      missionId: string;
+      running: boolean;
+      terminal: boolean;
+      digest?: string | null;
+      fence?: string | null;
+    }
   | {
       kind: "mission";
       missionId: string;
@@ -69,6 +83,7 @@ export type ResolvedTarget =
       operatorPaused: boolean;
       terminal: boolean;
       digest?: string | null;
+      fence?: string | null;
     };
 
 export type SteerResult = "delivered" | "not_running" | "no_channel";
@@ -98,6 +113,24 @@ export interface SteeringPorts {
   /** How long to wait for a resume to show its result before acknowledging it as in progress. Default 2000. */
   resumeWindowMs?: number;
 }
+
+/**
+ * Herdr's clock, as best Pi can tell: `valid_until_epoch` is written on Herdr's clock, so judging it on Pi's wall
+ * clock is wrong whenever the two differ (a Pi 100 s behind applies an expired request). The receiver estimates
+ * Herdr's current epoch from the response (`Date` header) plus monotonic time elapsed since, which is also immune
+ * to Pi's wall clock being stepped. Absent = unknown; the Pi clock is then used with a stricter margin.
+ */
+export interface ServerClock {
+  /** Estimated Herdr epoch seconds right now, or undefined when no response time was available. */
+  now(): number | undefined;
+}
+
+/** Margin used when Herdr's clock is unknown: a request this close to its expiry on Pi's clock counts as expired. */
+export const CLOCK_SKEW_ALLOWANCE_S = 5;
+/** A Pi/Herdr clock difference above this is reported (the Herdr clock is still the one trusted). */
+export const CLOCK_SKEW_WARN_S = 120;
+/** Longest validity accepted from a delivery: well inside the ledger retention, so a pruned row cannot re-apply. */
+export const MAX_VALIDITY_S = 7 * 24 * 3600;
 
 const MAX_ID = 128;
 const MAX_NAME = 64;
@@ -207,12 +240,14 @@ interface LedgerRow {
   state: "applying" | "done";
   outcome?: SteeringOutcome;
   note?: string;
+  /** The fence the request carried when it was first seen (a different fence later is an anomaly, never applied). */
+  fence?: string | null;
   at: string;
 }
 
 export interface SteeringLedger {
   get(id: string): LedgerRow | undefined;
-  begin(id: string): void;
+  begin(id: string, fence?: string | null): void;
   finish(id: string, ack: SteeringAck): void;
 }
 
@@ -221,11 +256,49 @@ export class MemorySteeringLedger implements SteeringLedger {
   get(id: string): LedgerRow | undefined {
     return this.rows.get(id);
   }
-  begin(id: string): void {
-    this.rows.set(id, { id, state: "applying", at: new Date().toISOString() });
+  begin(id: string, fence?: string | null): void {
+    this.rows.set(id, {
+      id,
+      state: "applying",
+      ...(fence !== undefined ? { fence } : {}),
+      at: new Date().toISOString(),
+    });
   }
   finish(id: string, ack: SteeringAck): void {
-    this.rows.set(id, { id, state: "done", ...ack, at: new Date().toISOString() });
+    const prior = this.rows.get(id);
+    this.rows.set(id, {
+      id,
+      state: "done",
+      ...ack,
+      ...(prior?.fence !== undefined ? { fence: prior.fence } : {}),
+      at: new Date().toISOString(),
+    });
+  }
+}
+
+/** Append `text` and fsync before returning: a row that was reported written survives a crash or power loss. */
+function appendDurable(file: string, text: string): void {
+  const fresh = !existsSync(file);
+  const fd = openSync(file, "a", 0o600);
+  try {
+    writeSync(fd, text);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  if (fresh) fsyncDir(dirname(file));
+}
+
+function fsyncDir(dir: string): void {
+  try {
+    const fd = openSync(dir, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // directory fsync is not supported everywhere; the rename / append is still atomic
   }
 }
 
@@ -270,22 +343,36 @@ export class FileSteeringLedger implements SteeringLedger {
     this.rows.clear();
     for (const r of final) this.rows.set(r.id, r);
     const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, final.map((r) => `${JSON.stringify(r)}\n`).join(""), { mode: 0o600 });
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeSync(fd, final.map((r) => `${JSON.stringify(r)}\n`).join(""));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, this.file);
+    fsyncDir(dirname(this.file));
   }
   private put(row: LedgerRow): void {
     mkdirSync(dirname(this.file), { recursive: true });
-    appendFileSync(this.file, `${JSON.stringify(row)}\n`, { mode: 0o600 });
+    appendDurable(this.file, `${JSON.stringify(row)}\n`);
     this.rows.set(row.id, row);
   }
   get(id: string): LedgerRow | undefined {
     return this.rows.get(id);
   }
-  begin(id: string): void {
-    this.put({ id, state: "applying", at: new Date().toISOString() });
+  begin(id: string, fence?: string | null): void {
+    this.put({ id, state: "applying", ...(fence !== undefined ? { fence } : {}), at: new Date().toISOString() });
   }
   finish(id: string, ack: SteeringAck): void {
-    this.put({ id, state: "done", ...ack, at: new Date().toISOString() });
+    const prior = this.rows.get(id);
+    this.put({
+      id,
+      state: "done",
+      ...ack,
+      ...(prior?.fence !== undefined ? { fence: prior.fence } : {}),
+      at: new Date().toISOString(),
+    });
   }
 }
 
@@ -301,6 +388,25 @@ const UNSUPPORTED: Partial<Record<SteeringAction, string>> = {
 const RESUME_WINDOW_MS = 2000;
 
 /**
+ * Why a request can no longer be applied by time, or null. Herdr's clock decides when it is known; the Pi clock is only
+ * a fallback and then judges strictly. A validity longer than the ledger retention is refused outright, so a request
+ * whose ledger row has been pruned can never be applied a second time.
+ */
+export function expiredReason(item: SteeringItem, ports: SteeringPorts, clock?: ServerClock): string | null {
+  const piNow = ports.now();
+  const serverNow = clock?.now();
+  if (serverNow !== undefined && Math.abs(serverNow - piNow) > CLOCK_SKEW_WARN_S) {
+    ports.log?.(
+      `steering: this host's clock differs from Herdr's by ${Math.round(Math.abs(serverNow - piNow))}s; using Herdr's`,
+    );
+  }
+  const now = serverNow ?? piNow + CLOCK_SKEW_ALLOWANCE_S;
+  if (now >= item.validUntilEpoch) return "expired before it was applied";
+  if (item.validUntilEpoch - now > MAX_VALIDITY_S) return "validity window longer than this host keeps its ledger";
+  return null;
+}
+
+/**
  * T13: hand a fork or promote request to the fork port, with the same at-most-once ledger as every other action.
  * Without the port (forks not enabled in the global YAML) the honest answer is `unsupported`.
  */
@@ -308,6 +414,7 @@ async function applyFork(
   item: SteeringItem,
   ports: SteeringPorts,
   ledger: SteeringLedger,
+  clock?: ServerClock,
 ): Promise<SteeringAck | null> {
   const finish = (a: SteeringAck): SteeringAck => {
     const bounded = { outcome: a.outcome, note: a.note.slice(0, 280) };
@@ -317,8 +424,9 @@ async function applyFork(
   const port = ports.forks;
   if (!port) return finish({ outcome: "unsupported", note: "forks are not enabled on this host" });
   if (!(await port.knows(item))) return null;
-  if (ports.now() >= item.validUntilEpoch) return finish({ outcome: "stale", note: "expired before it was applied" });
-  ledger.begin(item.steeringId);
+  const gone = expiredReason(item, ports, clock);
+  if (gone) return finish({ outcome: "stale", note: gone });
+  ledger.begin(item.steeringId, item.fence);
   try {
     return finish(await port.apply(item));
   } catch (err) {
@@ -335,15 +443,22 @@ export async function applySteering(
   item: SteeringItem,
   ports: SteeringPorts,
   ledger: SteeringLedger,
+  clock?: ServerClock,
 ): Promise<SteeringAck | null> {
   const prior = ledger.get(item.steeringId);
   if (prior?.state === "done" && prior.outcome) return { outcome: prior.outcome, note: prior.note ?? "" };
   if (prior?.state === "applying") {
-    const ack: SteeringAck = { outcome: "stale", note: "interrupted before completion; not applied again" };
+    const ack: SteeringAck = {
+      outcome: "stale",
+      note:
+        prior.fence !== undefined && prior.fence !== item.fence
+          ? "interrupted before completion and redelivered with a different fence; not applied again"
+          : "interrupted before completion; not applied again",
+    };
     ledger.finish(item.steeringId, ack);
     return ack;
   }
-  if (item.action === "fork" || item.action === "promote") return applyFork(item, ports, ledger);
+  if (item.action === "fork" || item.action === "promote") return applyFork(item, ports, ledger, clock);
   const target = ports.resolve(item.nodeId);
   if (!target) return null;
   const finish = (ack: SteeringAck): SteeringAck => {
@@ -351,14 +466,24 @@ export async function applySteering(
     ledger.finish(item.steeringId, bounded);
     return bounded;
   };
-  if (ports.now() >= item.validUntilEpoch) return finish({ outcome: "stale", note: "expired before it was applied" });
+  const gone = expiredReason(item, ports, clock);
+  if (gone) return finish({ outcome: "stale", note: gone });
   const unsupported = UNSUPPORTED[item.action];
   if (unsupported) return finish({ outcome: "unsupported", note: unsupported });
   if (target.terminal) return finish({ outcome: "stale", note: "the target has already finished" });
-  if (item.expectedDigest && target.digest && target.digest !== item.expectedDigest) {
-    return finish({ outcome: "stale", note: "the target changed since the request was made (digest mismatch)" });
+  // Fail closed: a request that names the digest the person saw is only applied when Pi can show it still holds.
+  if (item.expectedDigest) {
+    if (!target.digest) {
+      return finish({ outcome: "stale", note: "the request names a digest and this host cannot verify it" });
+    }
+    if (target.digest !== item.expectedDigest) {
+      return finish({ outcome: "stale", note: "the target changed since the request was made (digest mismatch)" });
+    }
   }
-  ledger.begin(item.steeringId);
+  if (item.fence && target.fence && target.fence !== item.fence) {
+    return finish({ outcome: "stale", note: "the target changed since the request was made (fence mismatch)" });
+  }
+  ledger.begin(item.steeringId, item.fence);
   try {
     if (item.action === "redirect") {
       if (target.kind !== "task") return finish({ outcome: "refused", note: "redirect needs a task target" });

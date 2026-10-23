@@ -52,7 +52,10 @@ export interface EnvelopeOutboxOptions {
   deadLetterFile?: string;
 }
 
-type Line = { t: "event"; envelope: EnvelopeV2 } | { t: "ack"; event_id: string; s?: "delivered" | "dead" };
+type Line =
+  | { t: "event"; envelope: EnvelopeV2 }
+  | { t: "reseq"; envelope: EnvelopeV2 }
+  | { t: "ack"; event_id: string; s?: "delivered" | "dead" };
 
 const RECENT_MAX = 2000;
 const chains = new Map<string, Promise<unknown>>();
@@ -74,6 +77,8 @@ export class EnvelopeOutbox {
   dropped = 0;
   rejected = 0;
   deadLettered = 0;
+  /** Pending envelopes given a new source_sequence after the server reported a collision. */
+  resequenced = 0;
 
   private readonly maxPending: number;
   private readonly compactMin: number;
@@ -83,6 +88,7 @@ export class EnvelopeOutbox {
   private offset = 0;
   private ino: number | undefined;
   private tombstones = 0;
+  private highSeq = 0;
   private tornTail = false;
   private episodeLogged = false;
   private prepared = false;
@@ -123,6 +129,29 @@ export class EnvelopeOutbox {
         );
       }
       return envelope;
+    });
+  }
+
+  /** Highest source_sequence of any envelope still present in the file (0 when none). */
+  async highestSequence(): Promise<number> {
+    await this.sync();
+    return this.highSeq;
+  }
+
+  /**
+   * Replace pending envelopes in place (same event_id, new source_sequence), keeping queue order. Used after the
+   * server reports that the old numbers belong to other events; nothing is dropped.
+   */
+  replacePending(envelopes: readonly EnvelopeV2[]): Promise<number> {
+    return this.locked(async () => {
+      const live = envelopes.filter((e) => this.index.has(e.event_id));
+      if (live.length === 0) return 0;
+      await this.writeLines(
+        live.map((envelope) => ({ t: "reseq", envelope }) as Line),
+        true,
+      );
+      this.resequenced += live.length;
+      return live.length;
     });
   }
 
@@ -284,6 +313,7 @@ export class EnvelopeOutbox {
   private reset(): void {
     this.index = new Map();
     this.offset = 0;
+    this.highSeq = 0;
     this.tombstones = 0;
     this.tornTail = false;
   }
@@ -325,9 +355,13 @@ export class EnvelopeOutbox {
         continue; // torn / corrupt line
       }
       if (line.t === "event" && line.envelope?.event_id) {
+        this.highSeq = Math.max(this.highSeq, line.envelope.source_sequence ?? 0);
         if (!this.index.has(line.envelope.event_id) && !this.recent.has(line.envelope.event_id)) {
           this.index.set(line.envelope.event_id, line.envelope);
         }
+      } else if (line.t === "reseq" && line.envelope?.event_id) {
+        this.highSeq = Math.max(this.highSeq, line.envelope.source_sequence ?? 0);
+        if (this.index.has(line.envelope.event_id)) this.index.set(line.envelope.event_id, line.envelope);
       } else if (line.t === "ack") {
         this.tombstones++;
         this.index.delete(line.event_id);

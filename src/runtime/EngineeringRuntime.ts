@@ -66,6 +66,7 @@ import {
 } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
+import { resolveSteeringTarget } from "../orchestration/steeringResolve.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
 import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
 import { type Mission, type MissionStop, PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
@@ -1865,33 +1866,7 @@ export class EngineeringRuntime {
     };
     const ports: import("../orchestration/steering.ts").SteeringPorts = {
       now: () => Date.now() / 1000,
-      resolve: (nodeId) => {
-        const [kind, ...rest] = nodeId.split(":");
-        const id = rest.join(":");
-        if (kind === "task") {
-          const t = store.getTask(id);
-          if (!t) return null;
-          return {
-            kind: "task",
-            taskId: t.task_id,
-            missionId: t.mission_id,
-            running: t.status === "RUNNING",
-            terminal: ["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(t.status),
-          };
-        }
-        if (kind === "mission") {
-          const m = store.getMission(id);
-          if (!m) return null;
-          return {
-            kind: "mission",
-            missionId: m.mission_id,
-            paused: m.status === "PAUSED_INFRASTRUCTURE",
-            operatorPaused: Boolean(m.operator_paused_at),
-            terminal: ["COMPLETE", "FAILED", "CANCELED"].includes(m.status),
-          };
-        }
-        return null;
-      },
+      resolve: (nodeId) => resolveSteeringTarget(store, nodeId),
       steerRunning: (taskId, text) => orchestrator().broker.steerRunningTask(taskId, text, "herdr-steering"),
       resumeMission: async (missionId) => {
         const mission = await orchestrator().resume(missionId);

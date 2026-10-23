@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { safeGitOrThrow } from "../git/safeGit.ts";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 import type { VerificationProfile } from "./Verifier.ts";
 import { hashProfile } from "./failureBaseline.ts";
@@ -128,7 +129,7 @@ export async function environmentFingerprint(cwd: string, profile: VerificationP
 
 async function git(cwd: string, args: string[]): Promise<string | undefined> {
   try {
-    return (await exec("git", ["-C", cwd, ...args], { maxBuffer: 16 * 1024 * 1024 })).stdout;
+    return (await safeGitOrThrow(args, { cwd, trust: "operator", maxBuffer: 16 * 1024 * 1024 })).stdout;
   } catch {
     return undefined;
   }

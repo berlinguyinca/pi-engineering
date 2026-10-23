@@ -1295,8 +1295,7 @@ the inspector says `not recorded`. Model messages and private reasoning are neve
 previews. These previews appear in inspection, not compact bars or HerdR attention notifications.
 
 The mission refresh timer stops for completed, failed, canceled or operator-paused missions and
-on runtime shutdown. Local footer refreshes do not create repeated notices. With the existing
-`HERDR_INGEST_URL` integration configured, HerdR receives one attention event when a mission
+on runtime shutdown. Local footer refreshes do not create repeated notices. With the `herdr:` block of the global `engineering.yaml` configured (see "Herdr connection" below), HerdR receives one attention event when a mission
 finishes, fails/crashes, or becomes stalled. Routine progress and heartbeats do not notify HerdR;
 a recovered mission can alert again if it stalls again. Reconnecting seeds current state without
 re-alerting about historical terminal or stalled missions.
@@ -1310,6 +1309,39 @@ Planner-worker missions also update their persistent widget/status once per seco
 `/engineering-workers [task]` to inspect a task's bounded recent activity, changed files and
 recorded result/blocker, or `/engineering-status` for the current activity summary. Verified
 contract counts determine percentage; live timers do not advance it.
+
+### Herdr connection (global `engineering.yaml` only, no environment variables)
+
+One block configures every Pi-to-Herdr path (attention events, lineage, steering, forks). It is read from the
+GLOBAL `engineering.yaml` in Pi's agent directory only; a repository file cannot set it, and the old
+`HERDR_INGEST_URL`, `HERDR_INGEST_API_KEY` and `HERDR_HOST_ID` variables are no longer read. If one of them is set,
+Pi prints an error to stderr (once per process) saying so; there is no silent fallback.
+
+```yaml
+herdr:
+  url: https://herdr.example.org       # https, or http only for localhost / 127.0.0.1 / ::1
+  api_key_file: /home/me/.config/herdr/key   # absolute path, mode 0600, owned by you, one line
+  instance_id: pi-laptop-1             # optional: names this Pi when several share one key
+  lineage: true                        # optional (default false): emit typed lineage events
+  visibility: room                     # optional: private | mission | room | org (default private)
+  room_id: room-abc                    # optional: stamped on every lineage event (Herdr lineage_key_scopes)
+  workspace_id: ws-1                   # optional
+  mission_id: m-1                      # optional default mission for events that carry none
+```
+
+Absent block means Pi does not talk to Herdr at all. The key is read from the file, never logged, and is not placed
+in the environment of anything Pi starts. Commands whose text a worker can author (the verifier's check commands,
+CAV test runs) run with a scrubbed environment: every `HERDR_*` variable, GitHub tokens, `SSH_AUTH_SOCK` and
+anything named `*_API_KEY`, `*_SECRET` or `*_PASSWORD` are removed.
+
+Sequence recovery: Herdr orders each source by `source_sequence`. If Pi's sequence file is lost or restored from an
+older copy, Pi lifts the counter above its own outbox, and on a `409` naming a taken sequence it learns the server's
+high-water mark (`last_sequence` in the 409 body when Herdr sends one, otherwise `GET /api/v1/ingest/sources`),
+resumes above it and re-numbers the pending events; nothing is dropped. When that cannot be done, the event is
+dead-lettered with an error notice and `conflictDeadLettered` in the ingest diagnostics.
+
+Steering requests are judged on Herdr's clock (the `Date` header of the poll response plus monotonic time since),
+not on Pi's wall clock; a request naming a digest is applied only while the mission's current plan digest equals it.
 
 External web consumers receive additive `waitingSince`, `lastOutputAt`,
 `currentActivityStartedAt` and worker timing fields in the mission snapshot. They should derive

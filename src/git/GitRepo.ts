@@ -1,12 +1,9 @@
-import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
-
-const exec = promisify(execFile);
+import { safeGit } from "./safeGit.ts";
 
 /** Short, stable, filesystem-safe hash of a path for unique worktree dirs. */
 export function shortHash(input: string): string {
@@ -205,7 +202,6 @@ export interface DurableRecordInventory<T> {
  */
 export class GitRepo {
   private readonly cwd: string;
-  private readonly gitArgs: string[];
   private readonly repoRoot: string;
 
   // Serializes worktree-admin mutations (`git worktree add/remove`, admin-dir
@@ -224,7 +220,6 @@ export class GitRepo {
   private constructor(cwd: string, repoRoot: string) {
     this.cwd = cwd;
     this.repoRoot = repoRoot;
-    this.gitArgs = ["-C", repoRoot];
   }
 
   /** Run `fn` while no other worktree-admin mutation is in flight on this repo. */
@@ -242,11 +237,14 @@ export class GitRepo {
     try {
       // Resolve the actual repository toplevel so a caller in a subdirectory
       // (e.g. <repo>/src) still treats the whole repo as its root.
-      const { stdout } = await exec("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
-        timeout: 120_000,
-        signal,
+      const top = await safeGit(["rev-parse", "--show-toplevel"], {
+        cwd,
+        trust: "operator",
+        timeoutMs: 120_000,
+        ...(signal ? { signal } : {}),
       });
-      if (!stdout.trim()) return null;
+      if (top.code !== 0 || !top.stdout.trim()) return null;
+      const stdout = top.stdout;
       const repo = new GitRepo(cwd, stdout.trim());
       repo.signal = signal;
       await repo.git(["rev-parse", "--is-inside-work-tree"]);
@@ -260,23 +258,17 @@ export class GitRepo {
     args: string[],
     opts: { timeout?: number; preserveStdout?: boolean; env?: Record<string, string> } = {},
   ): Promise<GitResult> {
-    const timeoutMs = opts.timeout ?? 120_000;
-    try {
-      const { stdout, stderr } = await exec("git", [...this.gitArgs, ...args], {
-        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
-        timeout: timeoutMs,
-        maxBuffer: 64 * 1024 * 1024,
-        signal: this.signal,
-      });
-      return { stdout: opts.preserveStdout ? stdout : stdout.trim(), stderr: stderr.trim(), code: 0 };
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException & { code?: number; stdout?: string; stderr?: string };
-      return {
-        stdout: opts.preserveStdout ? ((e.stdout as string) ?? "") : ((e.stdout as string) ?? "").trim(),
-        stderr: (e.stderr as string) ?? e.message ?? String(e),
-        code: typeof e.code === "number" ? e.code : 1,
-      };
-    }
+    // Every spawn goes through safeGit (operator trust): repository-local drivers, hooks, fsmonitor and helpers
+    // planted by a worker are neutralised, the operator's own global config is kept. See src/git/safeGit.ts.
+    const r = await safeGit(args, {
+      cwd: this.repoRoot,
+      trust: "operator",
+      timeoutMs: opts.timeout ?? 120_000,
+      maxBuffer: 64 * 1024 * 1024,
+      ...(opts.env ? { env: opts.env } : {}),
+      ...(this.signal ? { signal: this.signal } : {}),
+    });
+    return { stdout: opts.preserveStdout ? r.stdout : r.stdout.trim(), stderr: r.stderr.trim(), code: r.code };
   }
 
   private identityFallback: Promise<string[]> | undefined;
@@ -306,30 +298,14 @@ export class GitRepo {
    * mktree, commit-tree). execFile has no `input` option, so this spawns and writes
    * stdin for real, with a kill timeout and GitResult mapping matching git().
    */
-  private gitWithStdin(args: string[], input: string, env: NodeJS.ProcessEnv, timeoutMs = 120_000): Promise<GitResult> {
-    return new Promise((done) => {
-      const child = spawn("git", [...this.gitArgs, ...args], { env, timeout: timeoutMs, stdio: "pipe" });
-      const stdout: Buffer[] = [];
-      const stderr: Buffer[] = [];
-      let spawnError: Error | undefined;
-      child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-      child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-      // A git that exits early (bad args) closes stdin; the exit code reports it.
-      child.stdin.on("error", () => {});
-      child.on("error", (err) => {
-        spawnError = err;
-      });
-      child.on("close", (code, signal) => {
-        const err = Buffer.concat(stderr).toString("utf8").trim();
-        const failure = spawnError?.message ?? (signal ? `killed by ${signal} (timeout ${timeoutMs}ms)` : "");
-        done({
-          stdout: Buffer.concat(stdout).toString("utf8").trim(),
-          stderr: [err, failure].filter(Boolean).join("\n"),
-          code: code ?? 1,
-        });
-      });
-      child.stdin.end(input);
-    });
+  private async gitWithStdin(
+    args: string[],
+    input: string,
+    env: Record<string, string>,
+    timeoutMs = 120_000,
+  ): Promise<GitResult> {
+    const r = await safeGit(args, { cwd: this.repoRoot, trust: "operator", timeoutMs, input, env });
+    return { stdout: r.stdout.trim(), stderr: r.stderr.trim(), code: r.code };
   }
 
   get root(): string {
@@ -1404,7 +1380,6 @@ export class GitRepo {
     expectedSha: string | null,
   ): Promise<{ ok: boolean; remoteSha: string | null }> {
     const env = {
-      ...process.env,
       GIT_AUTHOR_NAME: "pi-engineering",
       GIT_AUTHOR_EMAIL: "lanes@pi-engineering.local",
       GIT_COMMITTER_NAME: "pi-engineering",
@@ -2551,21 +2526,13 @@ export class GitRepo {
     args: string[],
     opts: { timeout?: number; preserveStdout?: boolean } = {},
   ): Promise<GitResult> {
-    const timeoutMs = opts.timeout ?? 120_000;
-    try {
-      const { stdout, stderr } = await exec("git", ["-C", dir, ...args], {
-        timeout: timeoutMs,
-        maxBuffer: 64 * 1024 * 1024,
-      });
-      return { stdout: opts.preserveStdout ? stdout : stdout.trim(), stderr: stderr.trim(), code: 0 };
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException & { code?: number; stdout?: string; stderr?: string };
-      return {
-        stdout: opts.preserveStdout ? ((e.stdout as string) ?? "") : ((e.stdout as string) ?? "").trim(),
-        stderr: (e.stderr as string) ?? e.message ?? String(e),
-        code: typeof e.code === "number" ? e.code : 1,
-      };
-    }
+    const r = await safeGit(args, {
+      cwd: dir,
+      trust: "operator",
+      timeoutMs: opts.timeout ?? 120_000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return { stdout: opts.preserveStdout ? r.stdout : r.stdout.trim(), stderr: r.stderr.trim(), code: r.code };
   }
 
   private async nestedRepoHead(absolutePath: string): Promise<string | null> {

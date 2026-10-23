@@ -17,14 +17,11 @@
  * queue's job (it is SHA-fenced like any other entry). Remote PR creation is out
  * of scope.
  */
-import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
+import { safeGitOrThrow } from "../git/safeGit.ts";
 import type { PromoteResult, QueueEntry } from "./MergeQueue.ts";
-
-const run = promisify(execFile);
 
 export type RevertPolicy = "off" | "propose" | "auto";
 export const DEFAULT_REVERT_POLICY: RevertPolicy = "propose";
@@ -122,7 +119,7 @@ export async function postMergeCheck(
 /** Real git over the repository at `repoDir`. */
 export function gitPostMerge(repoDir: string): PostMergeGit {
   const git = async (cwd: string, ...args: string[]): Promise<string> =>
-    (await run("git", ["-C", cwd, ...args], { maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
+    (await safeGitOrThrow(args, { cwd, trust: "operator", maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
   return {
     resolveRef: (ref) => git(repoDir, "rev-parse", "--verify", `${ref}^{commit}`),
     async createRevertBranch({ branch, mergedSha, base }) {

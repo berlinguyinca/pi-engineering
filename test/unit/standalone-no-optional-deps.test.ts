@@ -13,7 +13,7 @@ import { test } from "node:test";
 
 import { writeFile } from "node:fs/promises";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
-import { createIngestFromEnv } from "../../src/runtime/herdr/ingestFromEnv.ts";
+import { resolveAttentionIngest } from "../../src/runtime/herdr/attentionIngest.ts";
 import { resolveStateRoot } from "../../src/runtime/isolation/stateDir.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
@@ -47,7 +47,7 @@ test("a mission runs end to end with every optional adapter absent and touches n
   const agentDir = mkdtempSync(join(tmpdir(), "pi-standalone-agent-"));
   const fixture = await makeFixtureRepo();
   try {
-    assert.equal(createIngestFromEnv(process.env), null, "no Herdr ingest without configuration");
+    assert.equal(await resolveAttentionIngest({}, agentDir), null, "no Herdr ingest without configuration");
 
     const worker = new FakeWorkerExecutor({
       planner: () => ({

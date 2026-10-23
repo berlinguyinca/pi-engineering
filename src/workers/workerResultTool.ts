@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { WorkerResult } from "../core/types.ts";
-
-const exec = promisify(execFile);
+import { safeGitOrThrow } from "../git/safeGit.ts";
 
 /** Message the worker sees when it reports `completed` for a mutating role with nothing to show. */
 export const NO_CHANGES_VS_BASE =
@@ -19,9 +16,12 @@ export const NO_CHANGES_VS_BASE =
  */
 export async function hasNoChangesVsBase(cwd: string, baseRef: string): Promise<boolean> {
   try {
-    const base = await exec("git", ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`], { cwd });
+    const base = await safeGitOrThrow(["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`], {
+      cwd,
+      trust: "operator",
+    });
     try {
-      await exec("git", ["diff", "--quiet", "--no-ext-diff", "--no-textconv", base.stdout.trim(), "--"], { cwd });
+      await safeGitOrThrow(["diff", "--quiet", base.stdout.trim(), "--"], { cwd, trust: "operator" });
     } catch (error) {
       if ((error as { code?: unknown }).code === 1) return false;
       throw error;
