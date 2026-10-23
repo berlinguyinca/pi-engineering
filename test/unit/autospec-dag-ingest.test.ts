@@ -244,12 +244,12 @@ describe("AutoSpec DAG ingestion", () => {
     );
     assert.equal(r.ok, true);
     if (!r.ok) return;
-    assert.deepEqual(r.issueRefs, {
+    assert.deepEqual(Object.fromEntries(r.issueRefs), {
       "t-1": ["berlinguyinca/autospec#12", "berlinguyinca/pi-engineering#7"],
       "t-2": ["berlinguyinca/herdr-engineering#3"],
     });
     const meta = r.tasks[0]!.execution_requirements.autospec as { issue_refs: string[]; task_id: string };
-    assert.deepEqual(meta.issue_refs, r.issueRefs["t-1"]);
+    assert.deepEqual(meta.issue_refs, r.issueRefs.get("t-1"));
     assert.match(r.tasks[0]!.objective, /berlinguyinca\/autospec#12/);
   });
 
@@ -352,5 +352,121 @@ describe("AutoSpec DAG ingestion", () => {
     const digest = (r: typeof a) => planDigestOf(canonicalPlanText(r.goal, r.tasks));
     assert.equal(digest(a), digest(b));
     assert.equal(digest(a), digest(c));
+  });
+
+  it("handles a 12k-task chain without recursion and caps the task count", () => {
+    const n = 12_000;
+    const deps = new Map<string, string[]>();
+    for (let i = 0; i < n; i++) deps.set(`t${i}`, i === 0 ? [] : [`t${i - 1}`]);
+    assert.equal(findCycle(deps), null);
+    deps.set("t0", [`t${n - 1}`]);
+    assert.equal(findCycle(deps)?.length, n + 1);
+    const tasks = Array.from({ length: 2001 }, (_, i) => extraTask(`x${i}`, i + 1, []));
+    const r = ingestAutoSpecDag({ mission: dag().mission, tasks });
+    assert.equal(r.ok, false);
+    assert.equal(!r.ok && r.code, "TOO_MANY_TASKS");
+  });
+
+  it("treats a __proto__ task id as plain data or rejects it; never pollutes", () => {
+    reject(
+      dag((d) => {
+        d.tasks[0]!.task_id = "__proto__";
+      }),
+      "INVALID_TASK_ID",
+    );
+    reject(
+      dag((d) => {
+        d.tasks[1]!.depends_on = ["__proto__"];
+      }),
+      "INVALID_TASK_ID",
+    );
+    assert.equal(({} as Record<string, unknown>).polluted, undefined);
+    const r = run(dag());
+    assert.equal(r.ok && Object.getPrototypeOf(Object.fromEntries(r.issueRefs)) === Object.prototype, true);
+  });
+
+  it("rejects protected, home and wildcard surfaces", () => {
+    for (const p of [
+      ".git/config",
+      ".git/",
+      "a/.git/hooks/x",
+      ".pi/engineering.yaml",
+      ".autospec/reports/x",
+      ".PI/x",
+      "~/x",
+      "~",
+      "**",
+      "*",
+      "src/**",
+      "a/*.ts",
+      "a?b",
+      "a{b,c}",
+      "a[0]",
+      "./",
+      "a//b",
+    ]) {
+      reject(
+        dag((d) => {
+          d.tasks[0]!.affected_surfaces = [{ path: p }];
+        }),
+        "UNSAFE_PATH",
+      );
+    }
+  });
+
+  it("rejects control characters and newlines in paths, symbols and ids; the objective stays one clean line", () => {
+    for (const p of ["a\nb.ts", "a\u0000b", "a\tb", "a\u2028b", "a\rb"]) {
+      reject(
+        dag((d) => {
+          d.tasks[0]!.affected_surfaces = [{ path: p }];
+        }),
+        "UNSAFE_PATH",
+      );
+    }
+    reject(
+      dag((d) => {
+        d.tasks[0]!.affected_surfaces = [{ path: "a.ts", symbols: ["x\ny"] }];
+      }),
+      "UNSAFE_PATH",
+    );
+    reject(
+      dag((d) => {
+        d.tasks[0]!.task_id = "t\n1";
+      }),
+      "INVALID_TASK_ID",
+    );
+    const r = run(dag());
+    assert.equal(r.ok && r.tasks.every((t) => !/[\n\r]/.test(t.objective)), true);
+  });
+
+  it("tightens issue refs: valid owner/repo only, no dot segments", () => {
+    for (const bad of [
+      "a/../b#1",
+      "a/x..y#1",
+      "a/./b#1",
+      "a/..#1",
+      "a/.#1",
+      "-a/b#1",
+      "a-/b#1",
+      "a--b/c#1",
+      "a/b#01",
+      "a/b#1\n",
+      "a b/c#1",
+      "/b#1",
+      "a/#1",
+    ]) {
+      reject(
+        dag((d) => {
+          d.tasks[0]!.extensions = { [ISSUE_REFS_EXTENSION]: [bad] };
+        }),
+        "INVALID_ISSUE_REF",
+      );
+    }
+    const ok = run(
+      dag((d) => {
+        d.tasks[0]!.extensions = { [ISSUE_REFS_EXTENSION]: ["a-b/c.d_e-f#12", "x/.foo#2"] };
+      }),
+    );
+    assert.equal(ok.ok, true);
   });
 });

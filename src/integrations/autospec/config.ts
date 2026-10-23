@@ -27,6 +27,8 @@ export interface AutoSpecConfig {
   designGate: null | {
     reportPath: string;
     rulesFile: string | null;
+    /** Operator-held HMAC key file (global only). Null = reports are only "committed", not attested. */
+    attestationKeyFile: string | null;
     uiPaths: string[];
     requireForUi: boolean;
   };
@@ -71,7 +73,13 @@ function bool(v: unknown, where: string): boolean {
 
 interface Block {
   dag?: { enabled: boolean };
-  design?: { reportPath?: string; rulesFile?: string; uiPaths?: string[]; requireForUi?: boolean };
+  design?: {
+    reportPath?: string;
+    rulesFile?: string;
+    attestationKeyFile?: string;
+    uiPaths?: string[];
+    requireForUi?: boolean;
+  };
   law?: { profileFile?: string; profileId?: string; gateFiles?: string[] };
 }
 
@@ -89,20 +97,34 @@ function parseBlock(raw: unknown, where: string, global: boolean, notes: string[
   if (raw.design_gate !== undefined) {
     const d = raw.design_gate;
     if (!isPlain(d)) throw new Bad(`${where}: autospec.design_gate must be a mapping`);
-    exact(d, ["report", "rules_file", "ui_paths", "require_for_ui"], `${where}: autospec.design_gate`);
+    exact(
+      d,
+      ["report", "rules_file", "attestation_key_file", "ui_paths", "require_for_ui"],
+      `${where}: autospec.design_gate`,
+    );
     const design: NonNullable<Block["design"]> = {};
-    if (d.ui_paths !== undefined) design.uiPaths = strList(d.ui_paths, `${where}: design_gate.ui_paths`);
+    if (d.ui_paths !== undefined) {
+      design.uiPaths = strList(d.ui_paths, `${where}: design_gate.ui_paths`).map((p) => {
+        const clean = p.replace(/^\.\//, "");
+        if (!clean || clean.startsWith("/") || clean.includes("\\") || clean.split("/").includes("..")) {
+          throw new Bad(`${where}: design_gate.ui_paths entry ${JSON.stringify(p)} must be repo-relative without ".."`);
+        }
+        // A directory-style entry ("src/ui/") means everything beneath it.
+        return clean.endsWith("/") ? `${clean}**` : clean;
+      });
+    }
     if (d.require_for_ui !== undefined) {
       const v = bool(d.require_for_ui, `${where}: design_gate.require_for_ui`);
       if (global || v) design.requireForUi = v;
       else notes.push("repo design_gate.require_for_ui: false ignored (a repo cannot relax the design gate)");
     }
-    for (const k of ["report", "rules_file"] as const) {
+    for (const k of ["report", "rules_file", "attestation_key_file"] as const) {
       if (d[k] === undefined) continue;
       if (!global) notes.push(`repo design_gate.${k} ignored (only the global/user config may set it)`);
       else if (k === "report") design.reportPath = relInRepo(d[k], `${where}: design_gate.report`);
-      else if (typeof d[k] !== "string" || !d[k]) throw new Bad(`${where}: design_gate.rules_file must be a string`);
-      else design.rulesFile = d[k] as string;
+      else if (typeof d[k] !== "string" || !d[k]) throw new Bad(`${where}: design_gate.${k} must be a string`);
+      else if (k === "rules_file") design.rulesFile = d[k] as string;
+      else design.attestationKeyFile = d[k] as string;
     }
     out.design = design;
   }
@@ -177,6 +199,7 @@ export function mergeAutoSpecLayers(layers: { global: AutoSpecLayer; repo: AutoS
         ? {
             reportPath: g?.design?.reportPath ?? DEFAULT_REPORT_PATH,
             rulesFile: g?.design?.rulesFile ?? null,
+            attestationKeyFile: g?.design?.attestationKeyFile ?? null,
             uiPaths,
             requireForUi,
           }

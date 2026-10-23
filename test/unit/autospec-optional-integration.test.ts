@@ -34,6 +34,7 @@ describe("autospec config layers", () => {
     assert.deepEqual(c.designGate, {
       reportPath: ".autospec/reports/design-gates.json",
       rulesFile: "/x/rules.yaml",
+      attestationKeyFile: null,
       uiPaths: ["src/ui/**"],
       requireForUi: true,
     });
@@ -68,6 +69,26 @@ describe("autospec config layers", () => {
     );
     assert.equal(repoOnly.dag.enabled, false);
     assert.equal(repoOnly.designGate?.requireForUi, true);
+  });
+
+  it("directory-style ui_paths are normalised; the attestation key is global-only; bad ui_paths are rejected", () => {
+    const g = on(
+      mergeAutoSpecLayers({
+        global: {
+          raw: { design_gate: { ui_paths: ["src/ui/", "./web/app.css"], attestation_key_file: "/k/design.key" } },
+        },
+        repo: { raw: { design_gate: { attestation_key_file: "/evil" } } },
+      }),
+    );
+    assert.deepEqual(g.designGate?.uiPaths, ["src/ui/**", "web/app.css"]);
+    assert.equal(g.designGate?.attestationKeyFile, "/k/design.key");
+    for (const bad of ["../x/", "/abs/", "a\\b/"]) {
+      assert.equal(
+        mergeAutoSpecLayers({ global: { raw: { design_gate: { ui_paths: [bad] } } }, repo: {} }).kind,
+        "invalid",
+        bad,
+      );
+    }
   });
 
   it("malformed config fails closed (never OFF)", () => {
@@ -153,6 +174,17 @@ describe("standalone: nothing loads or touches disk without autospec config", ()
       if (/^\s*(import|export)\b[^;]*from\s+["'][^"']*integrations\/autospec\//m.test(text)) offenders.push(rel);
     }
     assert.deepEqual(offenders, []);
+    // Every production caller loads it dynamically, behind its own switch.
+    const entry = readFileSync(join(SRC, "orchestration/standaloneEntry.ts"), "utf8");
+    assert.match(
+      entry,
+      /if \(argv\.includes\("--from-autospec"\)\)[\s\S]*await import\("\.\.\/integrations\/autospec\/planCli\.ts"\)/,
+    );
+    const runtime = readFileSync(join(SRC, "runtime/EngineeringRuntime.ts"), "utf8");
+    assert.match(
+      runtime,
+      /effective\.policy\.autospec !== undefined[\s\S]*await import\("\.\.\/integrations\/autospec\/provider\.ts"\)/,
+    );
     const harness = readFileSync(join(SRC, "lifecycle/harness.ts"), "utf8");
     assert.match(
       harness,

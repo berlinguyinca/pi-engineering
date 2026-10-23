@@ -124,6 +124,7 @@ const cfg = (requireForUi: boolean): AutoSpecConfigResult => ({
     designGate: {
       reportPath: ".autospec/reports/design-gates.json",
       rulesFile: null,
+      attestationKeyFile: null,
       uiPaths: ["src/ui/**"],
       requireForUi,
     },

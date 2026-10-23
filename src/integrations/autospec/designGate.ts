@@ -43,6 +43,8 @@ export interface DesignGateEvidence {
   failedGates: string[];
   /** Blocker-severity auto gates that did not run (unmapped). */
   unmappedBlockers: string[];
+  /** Auto-class rules (Pi's table / operator rules_file) the report does not mention at all. */
+  missingRules: string[];
   /** Checklist: vlm / review rules and pack quality gates. Never "passed". */
   advisory: AdvisoryItem[];
   packQualityGates: string[];
@@ -64,6 +66,17 @@ export interface DesignGateInput {
    * table; the report's own view of a rule's class is never trusted.
    */
   ruleClasses?: ReadonlyMap<string, RuleCheckClass>;
+  /**
+   * Whether the commit the report states covers `headCommit`: equal, or an
+   * ancestor with no UI/report change since. Supplied by the provider (git).
+   * Default is strict equality.
+   */
+  commitCovers?: (stated: string) => boolean;
+  /**
+   * HMAC attestation of the report, produced outside the worktree with an
+   * operator-held key. `not_configured` means provenance is only "committed".
+   */
+  attestation?: "valid" | "invalid" | "not_configured";
 }
 
 const SHA = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
@@ -76,6 +89,7 @@ const base = (state: DesignGateState, reason: string, extra: Partial<DesignGateE
   reason,
   failedGates: [],
   unmappedBlockers: [],
+  missingRules: [],
   advisory: [],
   packQualityGates: [],
   commitSha: null,
@@ -169,7 +183,8 @@ function judge(input: DesignGateInput): DesignGateEvidence {
     run++;
     if (g.status === "fail") {
       failedCount++;
-      if (g.blocking || cls !== "auto") {
+      // severity "blocker" blocks whatever the report's own `blocking` flag says.
+      if (g.blocking || g.severity === "blocker" || cls !== "auto") {
         // A failure is never forgiven; an advisory-class failure is still reported.
         blockingFailure = true;
         failedGates.push(g.id);
@@ -199,7 +214,12 @@ function judge(input: DesignGateInput): DesignGateEvidence {
   if (r.status === "skipped" && (r.gates.length > 0 || run > 0))
     throw new Invalid("status skipped but gates[] is not empty");
 
-  const common = { advisory, packQualityGates: pack, commitSha, failedGates, unmappedBlockers };
+  const mentioned = new Set((r.gates as Array<Record<string, unknown>>).map((g) => g.id as string));
+  const missingRules = [...classes]
+    .filter(([id, c]) => c === "auto" && !mentioned.has(id))
+    .map(([id]) => id)
+    .sort();
+  const common = { advisory, packQualityGates: pack, commitSha, failedGates, unmappedBlockers, missingRules };
 
   if (r.status === "skipped") {
     // A UI change was made yet the report says it was not UI (or no config): not run, never n/a.
@@ -211,17 +231,28 @@ function judge(input: DesignGateInput): DesignGateEvidence {
   }
   // Binding comes before the verdict: a stale FAIL or PASS says nothing about this tree.
   if (!commitSha) return base("unbound", "report states no commit_sha and no sidecar commit accompanies it", common);
-  if (commitSha !== input.headCommit) {
+  const covers = input.commitCovers ? input.commitCovers(commitSha) : commitSha === input.headCommit;
+  if (!covers) {
     return base("stale", `report is for ${commitSha.slice(0, 12)}, HEAD is ${input.headCommit.slice(0, 12)}`, common);
   }
   if (input.uiUncommitted) {
     return base("stale", "UI files changed after the commit the report was produced for (uncommitted edits)", common);
+  }
+  if (input.attestation === "invalid") {
+    return base("invalid", "the report's attestation is missing or does not verify against the operator key", common);
   }
   if (blockingFailure) return base("failed", `blocking design gate(s) failed: ${failedGates.join(", ")}`, common);
   if (unmappedBlockers.length > 0) {
     return base(
       "incomplete",
       `blocker rule(s) have no mapped command and did not run: ${unmappedBlockers.join(", ")}`,
+      common,
+    );
+  }
+  if (missingRules.length > 0) {
+    return base(
+      "incomplete",
+      `report omits ${missingRules.length} auto rule(s): ${missingRules.slice(0, 5).join(", ")}${missingRules.length > 5 ? ", ..." : ""}`,
       common,
     );
   }

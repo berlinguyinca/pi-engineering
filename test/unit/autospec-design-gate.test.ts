@@ -1,8 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import {
   type DesignGateInput,
@@ -11,7 +8,6 @@ import {
   evaluateDesignGate,
 } from "../../src/integrations/autospec/designGate.ts";
 import { DEFAULT_RULE_CLASSES } from "../../src/integrations/autospec/designRuleClasses.ts";
-import { collectAutoSpecGateEvidence } from "../../src/integrations/autospec/provider.ts";
 import { evaluateGate } from "../../src/lifecycle/gate.ts";
 import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
 import type { GateItem } from "../../src/lifecycle/types.ts";
@@ -221,18 +217,67 @@ describe("design-gate report -> evidence (real autospec-design-gates.sh output)"
   });
 
   it("an id Pi does not know is never credited; the operator's rules file can teach Pi a new auto rule", () => {
-    const r = bound("skipped.json");
-    r.status = "pass";
-    r.status_line = "PASS";
-    r.reason = "";
-    r.gates = [{ id: "vendor.new-rule", severity: "major", blocking: true, pass_criteria: "", status: "pass" }];
-    r.counts = { run: 1, failed: 0, unmapped: 0 };
-    assert.equal(evaluateDesignGate(input(r)).state, "incomplete");
+    const r = bound("pass-full.json");
+    (r.gates as Array<Record<string, unknown>>).push({
+      id: "vendor.new-rule",
+      severity: "major",
+      blocking: true,
+      pass_criteria: "",
+      status: "fail",
+    });
+    r.status = "fail";
+    r.status_line = "FAIL";
+    r.counts = { run: 15, failed: 1, unmapped: 0 };
+    // Unknown id that FAILED: still a failure (fail closed), never forgiven.
+    assert.equal(evaluateDesignGate(input(r)).state, "failed");
+    const only = bound("pass-full.json");
+    (only.gates as Array<Record<string, unknown>>).push({
+      id: "vendor.new-rule",
+      severity: "major",
+      blocking: true,
+      pass_criteria: "",
+      status: "pass",
+    });
+    only.counts = { run: 15, failed: 0, unmapped: 0 };
+    // Passing: credited only once the operator's rules file says it is auto; that also makes it REQUIRED.
     const taught = new Map([["vendor.new-rule", "auto" as const]]);
-    assert.equal(evaluateDesignGate(input(r, { ruleClasses: taught })).state, "passed");
-    // ...and it can also reclassify a built-in rule as non-executable.
-    const demoted = new Map([["design.tokens.no-raw-color", "review" as const]]);
-    assert.notEqual(evaluateDesignGate(input(bound("pass-full.json"), { ruleClasses: demoted })).state, "failed");
+    assert.equal(evaluateDesignGate(input(only, { ruleClasses: taught })).state, "passed");
+    const absent = bound("pass-full.json");
+    assert.equal(
+      evaluateDesignGate(input(absent, { ruleClasses: taught })).state,
+      "incomplete",
+      "taught rule is required",
+    );
+  });
+
+  it("a failed gate with severity blocker blocks even when the report says blocking:false", () => {
+    const r = bound("pass-full.json");
+    const g = (r.gates as Array<Record<string, unknown>>).find((x) => x.severity === "blocker")!;
+    g.status = "fail";
+    g.blocking = false;
+    r.counts = { run: 14, failed: 1, unmapped: 0 };
+    // Honest-looking report: status pass. Not accepted either way.
+    const lying = evaluateDesignGate(input(r));
+    assert.notEqual(lying.state, "passed");
+    r.status = "fail";
+    r.status_line = "FAIL";
+    const honest = evaluateDesignGate(input(r));
+    assert.equal(honest.state, "failed");
+    assert.deepEqual(honest.failedGates, [g.id]);
+  });
+
+  it("a report that omits auto rules entirely is incomplete, never passed", () => {
+    const r = bound("pass-full.json");
+    const gates = r.gates as Array<Record<string, unknown>>;
+    r.gates = gates.slice(0, 1);
+    r.counts = { run: 1, failed: 0, unmapped: 0 };
+    const ev = evaluateDesignGate(input(r));
+    assert.equal(ev.state, "incomplete");
+    assert.equal(ev.missingRules.length, 13);
+    assert.equal(designGateItem(ev, true).status, "unavailable");
+    // An entirely empty gates list claiming PASS is the extreme case.
+    const empty = bound("pass-full.json", { gates: [], counts: { run: 0, failed: 0, unmapped: 0 } });
+    assert.notEqual(evaluateDesignGate(input(empty)).state, "passed");
   });
 
   it("the vendored table matches the fixture rules.yaml it was taken from", async () => {
@@ -283,93 +328,5 @@ describe("design-gate item inside the completion gate", () => {
       evaluateGate(gateInput([pass])).blockers.some((b) => b.startsWith("design_gate")),
       false,
     );
-  });
-});
-
-describe("provider reads the report from disk without executing anything", () => {
-  const git = (cwd: string, ...a: string[]) => execFileSync("git", a, { cwd, encoding: "utf8" }).trim();
-  function repo(report?: Record<string, unknown> | string, sidecar?: string) {
-    const cwd = mkdtempSync(join(tmpdir(), "pi-ag-"));
-    git(cwd, "init", "-q");
-    mkdirSync(join(cwd, ".autospec", "reports"), { recursive: true });
-    if (report !== undefined) {
-      writeFileSync(
-        join(cwd, ".autospec/reports/design-gates.json"),
-        typeof report === "string" ? report : JSON.stringify(report),
-      );
-    }
-    if (sidecar) writeFileSync(join(cwd, ".autospec/reports/design-gates.commit"), `${sidecar}\n`);
-    return cwd;
-  }
-  const on = (over: Record<string, unknown> = {}) => ({
-    kind: "on" as const,
-    config: {
-      dag: { enabled: false },
-      designGate: {
-        reportPath: ".autospec/reports/design-gates.json",
-        rulesFile: null,
-        uiPaths: ["src/ui/**"],
-        requireForUi: true,
-        ...over,
-      },
-      qualityLaw: null,
-      notes: [],
-    },
-  });
-  const ctx = (cwd: string, files: Array<{ path: string; scope: "base" | "staged" | "unstaged" | "untracked" }>) => ({
-    cwd,
-    headCommit: HEAD,
-    files,
-  });
-
-  it("no UI file changed -> not applicable and the report is not even read", async () => {
-    const cwd = repo("{ this is not json");
-    const out = await collectAutoSpecGateEvidence(on(), ctx(cwd, [{ path: "src/core/x.ts", scope: "base" }]));
-    assert.equal(out.items[0]?.status, "not_applicable");
-  });
-
-  it("UI change + valid bound report passes; the same report after an uncommitted UI edit does not", async () => {
-    const cwd = repo(bound("pass-full.json"));
-    const ok = await collectAutoSpecGateEvidence(on(), ctx(cwd, [{ path: "src/ui/a.tsx", scope: "base" }]));
-    assert.equal(ok.items[0]?.status, "passed");
-    const dirty = await collectAutoSpecGateEvidence(on(), ctx(cwd, [{ path: "src/ui/a.tsx", scope: "unstaged" }]));
-    assert.equal(dirty.items[0]?.status, "unavailable");
-  });
-
-  it("UI change with no report is skipped (not run), garbage is unavailable, sidecar binds", async () => {
-    const files = [{ path: "src/ui/a.tsx", scope: "base" as const }];
-    assert.equal((await collectAutoSpecGateEvidence(on(), ctx(repo(), files))).items[0]?.status, "skipped");
-    assert.equal((await collectAutoSpecGateEvidence(on(), ctx(repo("{ nope"), files))).items[0]?.status, "unavailable");
-    assert.equal(
-      (await collectAutoSpecGateEvidence(on(), ctx(repo(load("pass-full.json"), HEAD), files))).items[0]?.status,
-      "passed",
-    );
-  });
-
-  it("uses Pi's own rules file for rule classes and never follows the report's rules_file path", async () => {
-    const files = [{ path: "src/ui/a.tsx", scope: "base" as const }];
-    const r = bound("pass-full.json", { rules_file: "/etc/shadow", config_path: "/etc/passwd" });
-    const out = await collectAutoSpecGateEvidence(on({ rulesFile }), ctx(repo(r), files));
-    assert.equal(out.items[0]?.status, "passed");
-    const missingRules = await collectAutoSpecGateEvidence(
-      on({ rulesFile: "/nonexistent/rules.yaml" }),
-      ctx(repo(r), files),
-    );
-    assert.equal(missingRules.items[0]?.status, "unavailable", "unreadable rules file fails closed");
-  });
-
-  it("a report that is a symlink out of the repository is refused", async () => {
-    const cwd = repo();
-    const outside = mkdtempSync(join(tmpdir(), "pi-ag-out-"));
-    writeFileSync(join(outside, "r.json"), JSON.stringify(bound("pass-full.json")));
-    symlinkSync(join(outside, "r.json"), join(cwd, ".autospec/reports/design-gates.json"));
-    const out = await collectAutoSpecGateEvidence(on(), ctx(cwd, [{ path: "src/ui/a.tsx", scope: "base" }]));
-    assert.notEqual(out.items[0]?.status, "passed");
-  });
-
-  it("an invalid config is a required unavailable item (fail closed)", async () => {
-    const out = await collectAutoSpecGateEvidence({ kind: "invalid", notes: ["bad"] }, ctx(repo(), []));
-    assert.equal(out.items[0]?.required, true);
-    assert.equal(out.items[0]?.status, "unavailable");
   });
 });

@@ -725,20 +725,37 @@ autospec:
     gate_files: [/path/to/quality-gate.json]
 ```
 
-- **DAG ingestion** (`ingestAutoSpecDag`, `bindAutoSpecPlan`): maps `autospec.protocol.mission/task.v1`
-  records to plan tasks (`depends_on` = prerequisites), keeps repo-qualified issue refs
-  (`owner/repo#N`, from the `autospec.issue_refs` extension) in `execution_requirements.autospec`
-  so they are covered by the plan digest, and fails closed on cycles, missing dependencies,
-  unknown *required* extensions, `autospec-managed` executors, started work and unsafe paths.
-  The plan then goes through the same T03 plan-review gate and policy as any other plan.
-  Pi stays the execution authority.
+- **DAG ingestion**: `pi-engineering plan --store <dir> --from-autospec <file|dir>` (a file
+  `{mission, tasks}` or a directory with `mission.json` and `tasks.json`). Refused unless
+  `autospec.dag.enabled: true` is set in the global config; a repo layer cannot enable it. It maps
+  `autospec.protocol.mission/task.v1` records to plan tasks (`depends_on` = prerequisites), keeps
+  repo-qualified issue refs (`owner/repo#N`, from the `autospec.issue_refs` extension) in
+  `execution_requirements.autospec` so they are covered by the plan digest, and fails closed on cycles
+  (iterative, at most 2000 tasks), missing dependencies, unknown *required* extensions,
+  `autospec-managed` executors, started work, odd task ids, and surfaces that are wildcards, `~`,
+  control characters or under `.git/`, `.pi/`, `.autospec/`. The plan then goes through the same T03
+  plan-review gate and policy as any other plan. Like the standalone plan it stops before any worker
+  starts; Pi stays the execution authority.
 - **Design gate evidence**: Pi never runs the design gates. It reads the report AutoSpec's
-  `autospec-design-gates.sh` wrote, recomputes the verdict from `gates[]`, and accepts it only
-  for the commit it states (`commit_sha`, or a `design-gates.commit` sidecar) when that commit is
-  HEAD and no UI file is uncommitted. SKIPPED, missing, stale, unbound or malformed reports are
-  "not run" / unavailable, never a pass. `vlm` and `review` rules are an advisory checklist.
-  With `require_for_ui: true` the completion gate blocks a UI change without valid evidence;
-  without it the item is shown but never blocks.
+  `autospec-design-gates.sh` wrote, **from the commit under evaluation** (`git show <sha>:<report>`);
+  an untracked or edited worktree copy is ignored. It recomputes the verdict from `gates[]`
+  (a failed `severity: blocker` gate blocks whatever its `blocking` flag says) and requires every
+  `auto` rule in Pi's vendored table (or the operator's `rules_file`) to be present. The report must
+  name the commit it was produced for (`commit_sha`, or a `design-gates.commit` sidecar); that commit
+  must be the evaluated commit or an ancestor with no UI-path change since (the report cannot name its
+  own commit, so it is normally committed one commit later). SKIPPED, missing, stale, unbound,
+  malformed or incomplete reports are "not run" / unavailable, never a pass. `vlm` and `review`
+  rules are an advisory checklist.
+  With `require_for_ui: true` the interactive completion gate blocks a UI change without valid
+  evidence, **and so does the orchestrated-mission completion gate**: it evaluates the candidate commit
+  (`CandidateEvidenceIdentity.candidateSha`) against the changed UI paths, synchronously, from a
+  committed report. A mission with several repository candidates is blocked rather than skipped.
+  Without `require_for_ui` the item is shown but never blocks.
+- **Attestation (recommended)**: set `design_gate.attestation_key_file` (global only) to a key file
+  outside any worker's reach. The report must then be accompanied, in the same commit, by
+  `design-gates.sig` = hex HMAC-SHA256 over `<commit_sha>\n<sha256 hex of the report bytes>`,
+  produced by the operator's trusted runner. Without a key, provenance is only "committed": a worker
+  that can commit can still commit a forged report. That is a residual trust assumption, not a fix.
 - **Quality law**: the profile's Constitution `quality_gates` are listed in the finalization
   output as "not verified".
 

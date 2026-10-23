@@ -22,7 +22,15 @@ import { type ProtocolRejection, parseMission, parseTask } from "./protocol.ts";
 export const ISSUE_REFS_EXTENSION = "autospec.issue_refs";
 export const KNOWN_REQUIRED_EXTENSIONS: readonly string[] = [ISSUE_REFS_EXTENSION];
 
-const ISSUE_REF = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[1-9][0-9]{0,9}$/;
+/** GitHub owner (alnum + single hyphens, no edge hyphen), repo (no "." / ".." / ".git"), issue number. */
+const ISSUE_REF =
+  /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}\/(?!\.{1,2}#)(?![^#]*\.\.)[A-Za-z0-9._-]{1,100}#[1-9][0-9]{0,9}$/;
+const MAX_TASKS = 2000;
+const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+const GLOB = /[*?[\]{}]/;
+const PROTECTED_DIRS = new Set([".git", ".pi", ".autospec"]);
 const INGESTABLE_MISSION_STATES = ["CREATED", "PLANNED", "READY"];
 const INGESTABLE_TASK_STATES = ["DEFINED", "BLOCKED", "READY"];
 
@@ -46,6 +54,8 @@ export type DagRejectionCode =
   | "UNSAFE_PATH"
   | "INVALID_ISSUE_REF"
   | "EMPTY_DAG"
+  | "TOO_MANY_TASKS"
+  | "INVALID_TASK_ID"
   | "NO_SURFACES";
 
 export type DagIngestResult =
@@ -54,8 +64,8 @@ export type DagIngestResult =
       missionId: string;
       goal: string;
       tasks: PlanTaskInput[];
-      /** task_id -> sorted repo-qualified issue refs ("owner/repo#N"). */
-      issueRefs: Record<string, string[]>;
+      /** task_id -> sorted repo-qualified issue refs ("owner/repo#N"). A Map: ids are untrusted keys. */
+      issueRefs: Map<string, string[]>;
       /** Names of optional, non-required extension keys that were NOT carried over. */
       ignoredExtensions: string[];
     }
@@ -72,12 +82,16 @@ class Reject extends Error {
 }
 
 function safeDomain(path: string, taskId: string): string {
+  const segments = path.split("/").filter((seg, i, all) => !(seg === "" && i === all.length - 1));
   if (
     !path ||
+    CONTROL.test(path) ||
+    GLOB.test(path) ||
     path.startsWith("/") ||
+    path.startsWith("~") ||
     path.includes("\\") ||
-    path.includes("\0") ||
-    path.split("/").some((seg) => seg === ".." || seg === ".")
+    segments.some((seg) => seg === ".." || seg === "." || seg === "") ||
+    segments.some((seg) => PROTECTED_DIRS.has(seg.toLowerCase()))
   ) {
     throw new Reject("UNSAFE_PATH", `task ${taskId}: unsafe affected path ${JSON.stringify(path)}`);
   }
@@ -123,29 +137,33 @@ function issueRefsOf(ext: Record<string, unknown> | undefined, taskId: string): 
   return [...out].sort();
 }
 
-/** First dependency cycle as a path (a -> b -> a), or null. Deterministic. */
+/** First dependency cycle as a path (a -> b -> a), or null. Deterministic and iterative (no recursion). */
 export function findCycle(deps: ReadonlyMap<string, readonly string[]>): string[] | null {
   const state = new Map<string, 1 | 2>();
-  const stack: string[] = [];
-  const visit = (id: string): string[] | null => {
-    state.set(id, 1);
-    stack.push(id);
-    for (const next of [...(deps.get(id) ?? [])].sort()) {
-      if (state.get(next) === 1) return [...stack.slice(stack.indexOf(next)), next];
-      if (!state.has(next)) {
-        const found = visit(next);
-        if (found) return found;
+  for (const root of [...deps.keys()].sort()) {
+    if (state.has(root)) continue;
+    const stack: Array<{ id: string; next: string[]; i: number }> = [
+      { id: root, next: [...(deps.get(root) ?? [])].sort(), i: 0 },
+    ];
+    state.set(root, 1);
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]!;
+      if (top.i >= top.next.length) {
+        state.set(top.id, 2);
+        stack.pop();
+        continue;
+      }
+      const dep = top.next[top.i++]!;
+      if (state.get(dep) === 1) {
+        const path = stack.map((f) => f.id);
+        return [...path.slice(path.indexOf(dep)), dep];
+      }
+      if (!state.has(dep)) {
+        state.set(dep, 1);
+        stack.push({ id: dep, next: [...(deps.get(dep) ?? [])].sort(), i: 0 });
       }
     }
-    stack.pop();
-    state.set(id, 2);
-    return null;
-  };
-  for (const id of [...deps.keys()].sort())
-    if (!state.has(id)) {
-      const found = visit(id);
-      if (found) return found;
-    }
+  }
   return null;
 }
 
@@ -178,6 +196,12 @@ function ingest(input: DagIngestInput): DagIngestResult {
     );
   }
   if (input.tasks.length === 0) throw new Reject("EMPTY_DAG", "the mission has no tasks");
+  if (input.tasks.length > MAX_TASKS) {
+    throw new Reject(
+      "TOO_MANY_TASKS",
+      `the mission has ${input.tasks.length} tasks; at most ${MAX_TASKS} are accepted`,
+    );
+  }
 
   const parsed = input.tasks.map((t) => parseTask(t));
   parsed.sort((a, b) => a.sequence - b.sequence);
@@ -185,7 +209,14 @@ function ingest(input: DagIngestInput): DagIngestResult {
   const keys = new Map<string, number>();
   const exclusivity = new Map<string, string>();
   parsed.forEach((t, i) => {
-    const where = `task ${t.task_id}`;
+    const where = `task ${t.task_id.slice(0, 40)}`;
+    if (!TASK_ID.test(t.task_id)) {
+      throw new Reject("INVALID_TASK_ID", `task id ${JSON.stringify(t.task_id.slice(0, 40))} must match ${TASK_ID}`);
+    }
+    for (const d of t.depends_on) {
+      if (!TASK_ID.test(d))
+        throw new Reject("INVALID_TASK_ID", `${where}: dependency id ${JSON.stringify(d.slice(0, 40))} is invalid`);
+    }
     if (t.mission_id !== mission.mission_id) {
       throw new Reject("MISSION_ID_MISMATCH", `${where} belongs to mission ${t.mission_id}, not ${mission.mission_id}`);
     }
@@ -233,11 +264,16 @@ function ingest(input: DagIngestInput): DagIngestResult {
   const cycle = findCycle(deps);
   if (cycle) throw new Reject("CYCLE", `dependency cycle: ${cycle.join(" -> ")}`);
 
-  const issueRefs: Record<string, string[]> = {};
+  const issueRefs = new Map<string, string[]>();
   const tasks: PlanTaskInput[] = parsed.map((t) => {
     const refs = issueRefsOf(t.extensions, t.task_id);
-    issueRefs[t.task_id] = refs;
+    issueRefs.set(t.task_id, refs);
     const paths = t.affected_surfaces.map((s) => s.path);
+    for (const s of t.affected_surfaces) {
+      if (s.symbols?.some((x) => CONTROL.test(x) || x.length > 200)) {
+        throw new Reject("UNSAFE_PATH", `task ${t.task_id}: symbol with control characters or over 200 characters`);
+      }
+    }
     const symbols = t.affected_surfaces
       .filter((s) => s.symbols?.length)
       .map((s) => ({ path: s.path, symbols: [...(s.symbols ?? [])].sort() }));
@@ -245,7 +281,7 @@ function ingest(input: DagIngestInput): DagIngestResult {
       task_id: t.task_id,
       kind: "agent",
       role: "implementer",
-      objective: `AutoSpec task ${t.task_id}: implement changes in ${paths.join(", ")}${refs.length ? ` (issues: ${refs.join(", ")})` : ""}`,
+      objective: `AutoSpec task ${t.task_id}: implement changes in ${paths.join(", ").replace(CONTROL, " ")}${refs.length ? ` (issues: ${refs.join(", ")})` : ""}`,
       // Dependent -> prerequisite, as AutoSpec states it.
       depends_on: deps.get(t.task_id) ?? [],
       priority: 0,
