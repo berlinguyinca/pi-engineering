@@ -82,7 +82,23 @@ export interface GithubClient {
   /** Native issue dependency / sub-issue relations; absent when the server cannot answer. */
   listDependencies?(ref: GithubRef): Promise<GhDependencies>;
   listCheckRuns?(ref: GithubRef, sha: string): Promise<RestCheckRun[]>;
+  /** T13: an OPEN pull request from `branch` of the same repository, or null. */
+  findOpenPullRequestByHead?(repo: RepoKey, branch: string): Promise<GhPullRequest | null>;
+  /** T13: open a pull request (draft by default at the caller). Never merges, never closes. */
+  createPullRequest?(input: CreatePullRequestInput): Promise<GhPullRequest>;
 }
+
+export interface CreatePullRequestInput {
+  repo: RepoKey;
+  head: string;
+  base: string;
+  title: string;
+  body: string;
+  draft: boolean;
+}
+
+/** A branch name safe to hand to the API: the shape Git allows for ordinary branches, nothing option-like. */
+const SAFE_BRANCH = /^[A-Za-z0-9][A-Za-z0-9._\-]*(?:\/[A-Za-z0-9][A-Za-z0-9._\-]*)*$/;
 
 export interface GithubConfig {
   enabled?: boolean;
@@ -254,6 +270,57 @@ export class GhCliClient implements GithubClient {
       baseRef: boundTitle(base.ref).slice(0, 255),
       url: str(raw.html_url).slice(0, 500),
     };
+  }
+
+  async findOpenPullRequestByHead(repoIn: RepoKey, branch: string): Promise<GhPullRequest | null> {
+    const repo = this.repoOf(repoIn);
+    if (!SAFE_BRANCH.test(branch) || branch.length > 200) throw new GithubClientError("invalid", "bad branch");
+    const raw = await this.api(repo.host, `repos/${repo.owner}/${repo.repo}/pulls`, [
+      "-X",
+      "GET",
+      "-f",
+      `head=${repo.owner}:${branch}`,
+      "-f",
+      "state=open",
+      "-F",
+      "per_page=5",
+    ]);
+    if (!Array.isArray(raw)) throw new GithubClientError("transient", "unexpected pull request list");
+    for (const item of raw) {
+      const r = asRecord(item);
+      const head = asRecord(r.head);
+      const headRepo = asRecord(head.repo);
+      // only a branch of THIS repository: a fork's branch of the same name is somebody else's work
+      if (head.ref !== branch || str(headRepo.full_name).toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase())
+        continue;
+      if (typeof r.number !== "number") continue;
+      return this.getPullRequest({ ...repo, number: r.number, kind: "pr" });
+    }
+    return null;
+  }
+
+  async createPullRequest(input: CreatePullRequestInput): Promise<GhPullRequest> {
+    const repo = this.repoOf(input.repo);
+    if (!SAFE_BRANCH.test(input.head) || !SAFE_BRANCH.test(input.base))
+      throw new GithubClientError("invalid", "bad branch");
+    const raw = asRecord(
+      await this.api(repo.host, `repos/${repo.owner}/${repo.repo}/pulls`, [
+        "-X",
+        "POST",
+        "-f",
+        `title=${boundTitle(input.title)}`,
+        "-f",
+        `head=${input.head}`,
+        "-f",
+        `base=${input.base}`,
+        "-f",
+        `body=${boundBody(input.body).text}`,
+        "-F",
+        `draft=${input.draft ? "true" : "false"}`,
+      ]),
+    );
+    if (typeof raw.number !== "number") throw new GithubClientError("transient", "unexpected pull request payload");
+    return this.getPullRequest({ ...repo, number: raw.number, kind: "pr" });
   }
 
   async searchIssues(repoIn: RepoKey, terms: string, limit: number): Promise<GhIssueSummary[]> {
