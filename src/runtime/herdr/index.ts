@@ -46,3 +46,5 @@ export type {
   InspectorSink,
   ReasoningMode,
 } from "./InspectorFeed.ts";
+export { LineageEmitter, createLineageEmitter, lineageNodeId } from "./lineage.ts";
+export type { LineageSink, LineageEmitterOptions } from "./lineage.ts";
