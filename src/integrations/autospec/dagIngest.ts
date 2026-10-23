@@ -89,9 +89,11 @@ function checkExtensions(
   rec: { required_extensions: string[]; extensions?: Record<string, unknown> },
   where: string,
   ignored: Set<string>,
+  /** Extensions Pi understands on THIS kind of record (the mission carries none). */
+  understood: readonly string[],
 ): void {
   for (const name of rec.required_extensions) {
-    if (!KNOWN_REQUIRED_EXTENSIONS.includes(name)) {
+    if (!understood.includes(name)) {
       throw new Reject("UNKNOWN_REQUIRED_FIELD", `${where}: required extension "${name}" is not understood`);
     }
     if (rec.extensions?.[name] === undefined) {
@@ -99,7 +101,7 @@ function checkExtensions(
     }
   }
   for (const key of Object.keys(rec.extensions ?? {})) {
-    if (key !== ISSUE_REFS_EXTENSION) ignored.add(key);
+    if (!understood.includes(key)) ignored.add(key);
   }
 }
 
@@ -168,7 +170,7 @@ export function ingestAutoSpecDag(input: DagIngestInput): DagIngestResult {
 function ingest(input: DagIngestInput): DagIngestResult {
   const mission = parseMission(input.mission);
   const ignored = new Set<string>();
-  checkExtensions(mission, `mission ${mission.mission_id}`, ignored);
+  checkExtensions(mission, `mission ${mission.mission_id}`, ignored, []);
   if (!INGESTABLE_MISSION_STATES.includes(mission.state)) {
     throw new Reject(
       "MISSION_NOT_INGESTABLE",
@@ -196,7 +198,7 @@ function ingest(input: DagIngestInput): DagIngestResult {
     keys.set(t.idempotency_key, t.sequence);
     if (ids.has(t.task_id)) throw new Reject("DUPLICATE_TASK", `duplicate task_id ${t.task_id}`);
     ids.add(t.task_id);
-    checkExtensions(t, where, ignored);
+    checkExtensions(t, where, ignored, KNOWN_REQUIRED_EXTENSIONS);
     if (!INGESTABLE_TASK_STATES.includes(t.state)) {
       throw new Reject(
         "TASK_NOT_INGESTABLE",

@@ -10,7 +10,7 @@ import {
   uiFilesOf,
 } from "../../src/integrations/autospec/provider.ts";
 import { mapQualityLaw, qualityLawChecklist } from "../../src/integrations/autospec/qualityLaw.ts";
-import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
+import { DEFAULT_POLICY, loadPolicy } from "../../src/lifecycle/policy.ts";
 import { buildCompletionReport } from "../../src/lifecycle/rolePrompts.ts";
 
 const GLOBAL = {
@@ -192,6 +192,25 @@ describe("standalone: nothing loads or touches disk without autospec config", ()
     assert.deepEqual(out, { items: [], checklist: [] });
     // Missing config files altogether is also off.
     assert.deepEqual(await loadAutoSpecConfig(join(repo, "nope"), { agentDir: join(agent, "nope") }), { kind: "off" });
+  });
+
+  it("loadPolicy keeps `autospec` when configured and leaves it undefined otherwise (the harness keys off it)", async () => {
+    const agent = mkdtempSync(join(tmpdir(), "pi-ag-agent-"));
+    const repo = mkdtempSync(join(tmpdir(), "pi-ag-repo-"));
+    const without = await loadPolicy({ cwd: repo, agentDir: agent, env: {} });
+    assert.equal(without.policy.autospec, undefined);
+    writeFileSync(join(agent, "engineering.yaml"), "autospec:\n  design_gate:\n    ui_paths: ['a/**']\n");
+    const withBlock = await loadPolicy({ cwd: repo, agentDir: agent, env: {} });
+    assert.notEqual(withBlock.policy.autospec, undefined);
+    assert.equal(
+      withBlock.issues.some((i) => i.severity === "error"),
+      false,
+    );
+    // A repo layer alone also surfaces it, so a repo that only tightens still loads the provider.
+    const agent2 = mkdtempSync(join(tmpdir(), "pi-ag-agent-"));
+    mkdirSync(join(repo, ".pi"));
+    writeFileSync(join(repo, ".pi/engineering.yaml"), "autospec:\n  design_gate:\n    require_for_ui: true\n");
+    assert.notEqual((await loadPolicy({ cwd: repo, agentDir: agent2, env: {} })).policy.autospec, undefined);
   });
 
   it("an autospec block in the YAML is picked up (global) and tightened by the repo layer", async () => {

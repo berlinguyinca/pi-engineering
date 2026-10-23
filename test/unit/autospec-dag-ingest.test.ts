@@ -199,6 +199,22 @@ describe("AutoSpec DAG ingestion", () => {
     );
   });
 
+  it("the mission record understands no extension: a required issue_refs there is rejected", () => {
+    reject(
+      dag((d) => {
+        d.mission.required_extensions = [ISSUE_REFS_EXTENSION];
+        d.mission.extensions = { [ISSUE_REFS_EXTENSION]: ["a/b#1"] };
+      }),
+      "UNKNOWN_REQUIRED_FIELD",
+    );
+    const r = run(
+      dag((d) => {
+        d.mission.extensions = { [ISSUE_REFS_EXTENSION]: ["a/b#1"], "vendor.x": 1 };
+      }),
+    );
+    assert.equal(r.ok && r.ignoredExtensions.join(","), `${ISSUE_REFS_EXTENSION},vendor.x`);
+  });
+
   it("does not carry optional unknown extensions into the plan, but names them", () => {
     const r = run(
       dag((d) => {

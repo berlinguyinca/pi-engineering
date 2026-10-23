@@ -10,6 +10,7 @@ import {
   designGateItem,
   evaluateDesignGate,
 } from "../../src/integrations/autospec/designGate.ts";
+import { DEFAULT_RULE_CLASSES } from "../../src/integrations/autospec/designRuleClasses.ts";
 import { collectAutoSpecGateEvidence } from "../../src/integrations/autospec/provider.ts";
 import { evaluateGate } from "../../src/lifecycle/gate.ts";
 import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
@@ -206,17 +207,42 @@ describe("design-gate report -> evidence (real autospec-design-gates.sh output)"
     assert.match(designGateChecklist(ev).join("\n"), /report claimed it ran; not credited/);
   });
 
-  it("Pi's own rules.yaml classification overrides the report's view of a rule", () => {
+  it("Pi's vendored rule table decides: a vlm rule listed as an executed pass is not credited even with no configured rules file", () => {
     const r = bound("skipped.json");
     r.status = "pass";
     r.status_line = "PASS";
     r.reason = "";
+    // Not in critic_checklist, no `check` on the entry: the report does not admit it is vlm.
     r.gates = [{ id: "motion.coherent", severity: "minor", blocking: false, pass_criteria: "", status: "pass" }];
     r.counts = { run: 1, failed: 0, unmapped: 0 };
-    const classes = new Map([["motion.coherent", "vlm" as const]]);
-    assert.equal(evaluateDesignGate(input(r, { ruleClasses: classes })).state, "incomplete");
-    // Without Pi's view, the report's (absent) class defaults to auto and would credit it.
-    assert.equal(evaluateDesignGate(input(r)).state, "passed");
+    const ev = evaluateDesignGate(input(r));
+    assert.equal(ev.state, "incomplete");
+    assert.equal(ev.advisory.find((a) => a.id === "motion.coherent")?.check, "vlm");
+  });
+
+  it("an id Pi does not know is never credited; the operator's rules file can teach Pi a new auto rule", () => {
+    const r = bound("skipped.json");
+    r.status = "pass";
+    r.status_line = "PASS";
+    r.reason = "";
+    r.gates = [{ id: "vendor.new-rule", severity: "major", blocking: true, pass_criteria: "", status: "pass" }];
+    r.counts = { run: 1, failed: 0, unmapped: 0 };
+    assert.equal(evaluateDesignGate(input(r)).state, "incomplete");
+    const taught = new Map([["vendor.new-rule", "auto" as const]]);
+    assert.equal(evaluateDesignGate(input(r, { ruleClasses: taught })).state, "passed");
+    // ...and it can also reclassify a built-in rule as non-executable.
+    const demoted = new Map([["design.tokens.no-raw-color", "review" as const]]);
+    assert.notEqual(evaluateDesignGate(input(bound("pass-full.json"), { ruleClasses: demoted })).state, "failed");
+  });
+
+  it("the vendored table matches the fixture rules.yaml it was taken from", async () => {
+    const { parse } = await import("yaml");
+    const rules = parse(readFileSync(new URL("rules.yaml", dir), "utf8")).rules as Array<{
+      id: string;
+      check?: string;
+    }>;
+    assert.equal(DEFAULT_RULE_CLASSES.size, rules.length);
+    for (const r of rules) assert.equal(DEFAULT_RULE_CLASSES.get(r.id), r.check ?? "review", r.id);
   });
 });
 

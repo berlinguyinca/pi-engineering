@@ -18,6 +18,8 @@ export type AutoSpecPlanOutcome =
 
 export interface BindOptions
   extends Pick<PlanGateInput, "ledger" | "adapter" | "policy" | "emitter" | "maxRevisions" | "now" | "replan"> {
+  /** `autospec.dag.enabled` from Pi's own config. False refuses the plan (no ingestion unless configured). */
+  dagEnabled: boolean;
   /**
    * Whether plan review is configured at all (loadPlanReviewSettings != null).
    * When false the plan is returned `unreviewed` with its digest: nothing is
@@ -27,6 +29,13 @@ export interface BindOptions
 }
 
 export async function bindAutoSpecPlan(ingest: DagIngestResult, opts: BindOptions): Promise<AutoSpecPlanOutcome> {
+  if (!opts.dagEnabled) {
+    return {
+      status: "rejected",
+      code: "DAG_DISABLED",
+      message: "autospec.dag.enabled is not set in Pi's configuration",
+    };
+  }
   if (!ingest.ok) return { status: "rejected", code: ingest.code, message: ingest.message };
   if (!opts.planReviewConfigured) {
     return {

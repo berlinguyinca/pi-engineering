@@ -38,10 +38,17 @@ const approver = (calls: string[]): PlannotatorTransport => ({
 });
 
 describe("AutoSpec plan -> T03 plan-review binding", () => {
+  it("refuses to bind when autospec.dag.enabled is off, even for a valid DAG", async () => {
+    const ledger = new MemoryPlanLedger();
+    const out = await bindAutoSpecPlan(ingest(), { ledger, dagEnabled: false, planReviewConfigured: true });
+    assert.equal(out.status === "rejected" && out.code, "DAG_DISABLED");
+    assert.equal(ledger.listPlanRevisions("m-fixture-1").length, 0);
+  });
+
   it("a rejected ingest never reaches the gate", async () => {
     const bad = ingestAutoSpecDag({ mission: fixture.mission, tasks: fixture.tasks });
     const ledger = new MemoryPlanLedger();
-    const out = await bindAutoSpecPlan(bad, { ledger, planReviewConfigured: true });
+    const out = await bindAutoSpecPlan(bad, { ledger, dagEnabled: true, planReviewConfigured: true });
     assert.equal(out.status, "rejected");
     assert.equal(ledger.listPlanRevisions("m-fixture-1").length, 0);
   });
@@ -49,7 +56,7 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
   it("without plan review configured the plan is returned unreviewed, nothing recorded", async () => {
     const ledger = new MemoryPlanLedger();
     const ing = ingest(highRisk);
-    const out = await bindAutoSpecPlan(ing, { ledger, planReviewConfigured: false });
+    const out = await bindAutoSpecPlan(ing, { ledger, dagEnabled: true, planReviewConfigured: false });
     assert.equal(out.status, "unreviewed");
     assert.equal(out.status === "unreviewed" && out.planDigest, planDigestOf(canonicalPlanText(ing.goal, ing.tasks)));
     assert.equal(ledger.listPlanDecisions("m-fixture-1").length, 0);
@@ -58,7 +65,12 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
 
   it("a high-risk AutoSpec plan with `require` and no reviewer is blocked (no exemption)", async () => {
     const ledger = new MemoryPlanLedger();
-    const out = await bindAutoSpecPlan(ingest(highRisk), { ledger, adapter: null, planReviewConfigured: true });
+    const out = await bindAutoSpecPlan(ingest(highRisk), {
+      ledger,
+      adapter: null,
+      dagEnabled: true,
+      planReviewConfigured: true,
+    });
     assert.equal(out.status, "gated");
     if (out.status !== "gated") return;
     assert.equal(out.gate.status, "blocked");
@@ -72,7 +84,7 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
     const calls: string[] = [];
     const adapter = new PlannotatorAdapter({ transport: approver(calls) });
     const ing = ingest(highRisk);
-    const out = await bindAutoSpecPlan(ing, { ledger, adapter, planReviewConfigured: true });
+    const out = await bindAutoSpecPlan(ing, { ledger, adapter, dagEnabled: true, planReviewConfigured: true });
     assert.equal(out.status === "gated" && out.gate.status, "proceed");
     const digest = planDigestOf(canonicalPlanText(ing.goal, ing.tasks));
     assert.deepEqual(calls, [digest]);
@@ -84,7 +96,7 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
       ["t-1", "t-2"],
     );
     // Restart/replay: same plan, same digest -> no second review.
-    const again = await bindAutoSpecPlan(ing, { ledger, adapter, planReviewConfigured: true });
+    const again = await bindAutoSpecPlan(ing, { ledger, adapter, dagEnabled: true, planReviewConfigured: true });
     assert.equal(again.status === "gated" && again.gate.status, "proceed");
     assert.equal(calls.length, 1);
   });
@@ -93,7 +105,7 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
     const ledger = new MemoryPlanLedger();
     const calls: string[] = [];
     const adapter = new PlannotatorAdapter({ transport: approver(calls) });
-    await bindAutoSpecPlan(ingest(highRisk), { ledger, adapter, planReviewConfigured: true });
+    await bindAutoSpecPlan(ingest(highRisk), { ledger, adapter, dagEnabled: true, planReviewConfigured: true });
     assert.equal(calls.length, 1);
 
     // One extra prerequisite edge.
@@ -110,7 +122,7 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
         affected_surfaces: [{ path: "src/auth/session.ts" }],
       });
     });
-    const o2 = await bindAutoSpecPlan(edge, { ledger, adapter, planReviewConfigured: true });
+    const o2 = await bindAutoSpecPlan(edge, { ledger, adapter, dagEnabled: true, planReviewConfigured: true });
     assert.equal(o2.status === "gated" && o2.gate.status, "proceed");
     assert.equal(calls.length, 2);
     assert.notEqual(calls[0], calls[1]);
@@ -121,8 +133,18 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
         highRisk(d);
         d.tasks[0]!.extensions = { [ISSUE_REFS_EXTENSION]: [ref] };
       });
-    await bindAutoSpecPlan(withRef("berlinguyinca/autospec#1"), { ledger, adapter, planReviewConfigured: true });
-    await bindAutoSpecPlan(withRef("berlinguyinca/autospec#2"), { ledger, adapter, planReviewConfigured: true });
+    await bindAutoSpecPlan(withRef("berlinguyinca/autospec#1"), {
+      ledger,
+      adapter,
+      dagEnabled: true,
+      planReviewConfigured: true,
+    });
+    await bindAutoSpecPlan(withRef("berlinguyinca/autospec#2"), {
+      ledger,
+      adapter,
+      dagEnabled: true,
+      planReviewConfigured: true,
+    });
     assert.equal(calls.length, 4);
     assert.equal(new Set(calls).size, 4);
   });
@@ -130,18 +152,23 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
   it("an approval for plan A does not let an edited plan B through when no reviewer answers", async () => {
     const ledger = new MemoryPlanLedger();
     const adapter = new PlannotatorAdapter({ transport: approver([]) });
-    await bindAutoSpecPlan(ingest(highRisk), { ledger, adapter, planReviewConfigured: true });
+    await bindAutoSpecPlan(ingest(highRisk), { ledger, adapter, dagEnabled: true, planReviewConfigured: true });
     const edited = ingest((d) => {
       highRisk(d);
       d.tasks[1]!.depends_on = [];
     });
-    const out = await bindAutoSpecPlan(edited, { ledger, adapter: null, planReviewConfigured: true });
+    const out = await bindAutoSpecPlan(edited, { ledger, adapter: null, dagEnabled: true, planReviewConfigured: true });
     assert.equal(out.status === "gated" && out.gate.status, "blocked");
   });
 
   it("the configured policy decides: a medium-risk plan under default policy is only offered review", async () => {
     const ledger = new MemoryPlanLedger();
-    const out = await bindAutoSpecPlan(ingest(), { ledger, adapter: null, planReviewConfigured: true });
+    const out = await bindAutoSpecPlan(ingest(), {
+      ledger,
+      adapter: null,
+      dagEnabled: true,
+      planReviewConfigured: true,
+    });
     assert.equal(out.status === "gated" && out.gate.status, "proceed");
     assert.equal(out.status === "gated" && out.gate.mode, "offer");
     assert.equal(ledger.listPlanDecisions("m-fixture-1")[0]?.outcome, "skipped");
@@ -150,6 +177,7 @@ describe("AutoSpec plan -> T03 plan-review binding", () => {
       ledger: new MemoryPlanLedger(),
       adapter: null,
       policy: { modes: { low: "require", medium: "require", high: "require", critical: "require" } },
+      dagEnabled: true,
       planReviewConfigured: true,
     });
     assert.equal(strict.status === "gated" && strict.gate.status, "blocked");

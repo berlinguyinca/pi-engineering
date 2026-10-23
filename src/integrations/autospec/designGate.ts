@@ -14,6 +14,7 @@
  */
 
 import type { GateItem } from "../../lifecycle/types.ts";
+import { DEFAULT_RULE_CLASSES } from "./designRuleClasses.ts";
 
 export type RuleCheckClass = "auto" | "vlm" | "review";
 
@@ -58,7 +59,10 @@ export interface DesignGateInput {
   uiTouched: boolean;
   /** At least one UI file is uncommitted (staged/unstaged/untracked). */
   uiUncommitted: boolean;
-  /** Rule id -> class from a Pi-configured rules.yaml; overrides the report's view. */
+  /**
+   * Rule id -> class from a Pi-configured rules.yaml. Merged OVER Pi's vendored
+   * table; the report's own view of a rule's class is never trusted.
+   */
   ruleClasses?: ReadonlyMap<string, RuleCheckClass>;
 }
 
@@ -125,12 +129,9 @@ function judge(input: DesignGateInput): DesignGateEvidence {
     throw new Invalid("commit_sha disagrees with the sidecar commit");
   const commitSha = (stated ?? sidecar) as string | null;
 
-  // Classification of every rule the report talks about.
-  const classOf = (id: string, reported: string | undefined): RuleCheckClass => {
-    const mine = input.ruleClasses?.get(id);
-    if (mine) return mine;
-    return reported === "vlm" || reported === "review" ? reported : "auto";
-  };
+  // Classification of every rule the report talks about: Pi's table, never the report's.
+  const classes = new Map<string, RuleCheckClass>([...DEFAULT_RULE_CLASSES, ...(input.ruleClasses ?? [])]);
+  const classOf = (id: string): RuleCheckClass | "unknown" => classes.get(id) ?? "unknown";
   const advisory: AdvisoryItem[] = [];
   const advisoryIds = new Set<string>();
   for (const c of r.critic_checklist) {
@@ -159,10 +160,10 @@ function judge(input: DesignGateInput): DesignGateEvidence {
     }
     if (g.status !== "pass" && g.status !== "fail" && g.status !== "unmapped")
       throw new Invalid(`gate ${g.id} has status ${String(g.status)}`);
-    const cls = advisoryIds.has(g.id) ? "review" : classOf(g.id, typeof g.check === "string" ? g.check : undefined);
+    const cls = advisoryIds.has(g.id) ? "review" : classOf(g.id);
     if (g.status === "unmapped") {
       unmapped++;
-      if (cls === "auto" && g.severity === "blocker") unmappedBlockers.push(g.id);
+      if (cls !== "vlm" && cls !== "review" && g.severity === "blocker") unmappedBlockers.push(g.id);
       continue;
     }
     run++;
