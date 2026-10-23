@@ -361,7 +361,35 @@ export class LifecycleHarness {
       }
     }
 
+    // Optional AutoSpec integration (T04): nothing from it is imported, read or
+    // executed unless the `autospec` block exists in the effective policy.
+    let extraGateEvidence: ConstructorParameters<typeof LifecycleController>[0]["extraGateEvidence"];
+    if (policy.autospec !== undefined) {
+      try {
+        const provider = await import("../integrations/autospec/provider.ts");
+        const autospecConfig = await provider.loadAutoSpecConfig(ctx.cwd);
+        extraGateEvidence = (gateCtx) => provider.collectAutoSpecGateEvidence(autospecConfig, gateCtx);
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err);
+        this.say(ctx, `AutoSpec integration failed to load: ${why}`, "warning");
+        // Configured but unusable: fail closed rather than silently dropping the gate.
+        extraGateEvidence = async () => ({
+          items: [
+            {
+              key: "autospec_config",
+              status: "unavailable",
+              required: true,
+              reason: `AutoSpec integration failed to load: ${why}`,
+              blockers: ["autospec_config: integration failed to load"],
+            },
+          ],
+          checklist: [`AutoSpec integration failed to load: ${why}`],
+        });
+      }
+    }
+
     this.controller = new LifecycleController({
+      ...(extraGateEvidence ? { extraGateEvidence } : {}),
       cwd: ctx.cwd,
       sessionKey,
       policy,

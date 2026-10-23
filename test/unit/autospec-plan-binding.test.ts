@@ -26,7 +26,9 @@ function ingest(mutate?: (d: { mission: Rec; tasks: Rec[] }) => void): Extract<D
   return r as Extract<DagIngestResult, { ok: true }>;
 }
 /** An auth-path surface makes the plan high risk: the default policy is `require`. */
-const highRisk = (d: { tasks: Rec[] }) => (d.tasks[0]!.affected_surfaces = [{ path: "src/auth/login.ts" }]);
+const highRisk = (d: { tasks: Rec[] }) => {
+  d.tasks[0]!.affected_surfaces = [{ path: "src/auth/login.ts" }];
+};
 
 const approver = (calls: string[]): PlannotatorTransport => ({
   submitPlan: async (p) => {

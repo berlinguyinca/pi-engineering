@@ -83,28 +83,42 @@ describe("AutoSpec DAG ingestion", () => {
 
   it("rejects a mission that already started, and tasks that are not yet to-start", () => {
     reject(
-      dag((d) => (d.mission.state = "RUNNING")),
+      dag((d) => {
+        d.mission.state = "RUNNING";
+      }),
       "MISSION_NOT_INGESTABLE",
     );
     reject(
-      dag((d) => (d.tasks[0]!.state = "LEASED")),
+      dag((d) => {
+        d.tasks[0]!.state = "LEASED";
+      }),
       "TASK_NOT_INGESTABLE",
     );
     reject(
-      dag((d) => (d.tasks[0]!.state = "VERIFIED")),
+      dag((d) => {
+        d.tasks[0]!.state = "VERIFIED";
+      }),
       "TASK_NOT_INGESTABLE",
     );
   });
 
   it("rejects a cycle and reports the path; rejects a self-dependency", () => {
     reject(
-      dag((d) => (d.tasks[0]!.depends_on = ["t-2"])),
+      dag((d) => {
+        d.tasks[0]!.depends_on = ["t-2"];
+      }),
       "CYCLE",
     );
-    const r = run(dag((d) => (d.tasks[0]!.depends_on = ["t-2"])));
+    const r = run(
+      dag((d) => {
+        d.tasks[0]!.depends_on = ["t-2"];
+      }),
+    );
     assert.match(!r.ok ? r.message : "", /t-1 -> t-2 -> t-1/);
     reject(
-      dag((d) => (d.tasks[0]!.depends_on = ["t-1"])),
+      dag((d) => {
+        d.tasks[0]!.depends_on = ["t-1"];
+      }),
       "CYCLE",
     );
     assert.deepEqual(
@@ -130,23 +144,33 @@ describe("AutoSpec DAG ingestion", () => {
 
   it("rejects a missing dependency, duplicate ids, id mismatch and sequence gaps", () => {
     reject(
-      dag((d) => (d.tasks[1]!.depends_on = ["nope"])),
+      dag((d) => {
+        d.tasks[1]!.depends_on = ["nope"];
+      }),
       "MISSING_DEPENDENCY",
     );
     reject(
-      dag((d) => (d.tasks[1]!.task_id = "t-1")),
+      dag((d) => {
+        d.tasks[1]!.task_id = "t-1";
+      }),
       "DUPLICATE_TASK",
     );
     reject(
-      dag((d) => (d.tasks[1]!.mission_id = "other")),
+      dag((d) => {
+        d.tasks[1]!.mission_id = "other";
+      }),
       "MISSION_ID_MISMATCH",
     );
     reject(
-      dag((d) => (d.tasks[1]!.sequence = 3)),
+      dag((d) => {
+        d.tasks[1]!.sequence = 3;
+      }),
       "SEQUENCE_GAP",
     );
     reject(
-      dag((d) => (d.tasks[1]!.idempotency_key = d.tasks[0]!.idempotency_key)),
+      dag((d) => {
+        d.tasks[1]!.idempotency_key = d.tasks[0]!.idempotency_key;
+      }),
       "IDEMPOTENCY_KEY_REUSED",
     );
     reject({ mission: dag().mission, tasks: [] }, "EMPTY_DAG");
@@ -161,12 +185,16 @@ describe("AutoSpec DAG ingestion", () => {
       "UNKNOWN_REQUIRED_FIELD",
     );
     reject(
-      dag((d) => (d.mission.required_extensions = ["vendor.x"])),
+      dag((d) => {
+        d.mission.required_extensions = ["vendor.x"];
+      }),
       "UNKNOWN_REQUIRED_FIELD",
     );
     // Known required extension must actually be present.
     reject(
-      dag((d) => (d.tasks[0]!.required_extensions = [ISSUE_REFS_EXTENSION])),
+      dag((d) => {
+        d.tasks[0]!.required_extensions = [ISSUE_REFS_EXTENSION];
+      }),
       "MISSING_FIELD",
     );
   });
@@ -212,12 +240,16 @@ describe("AutoSpec DAG ingestion", () => {
   it("rejects unqualified or malformed issue refs", () => {
     for (const bad of ["#12", "autospec#12", "a/b#0", "a/b#x", "a/b/c#1", 12, "a/b#1 ; rm"]) {
       reject(
-        dag((d) => (d.tasks[0]!.extensions = { [ISSUE_REFS_EXTENSION]: [bad] })),
+        dag((d) => {
+          d.tasks[0]!.extensions = { [ISSUE_REFS_EXTENSION]: [bad] };
+        }),
         "INVALID_ISSUE_REF",
       );
     }
     reject(
-      dag((d) => (d.tasks[0]!.extensions = { [ISSUE_REFS_EXTENSION]: "a/b#1" })),
+      dag((d) => {
+        d.tasks[0]!.extensions = { [ISSUE_REFS_EXTENSION]: "a/b#1" };
+      }),
       "INVALID_ISSUE_REF",
     );
   });
@@ -225,39 +257,55 @@ describe("AutoSpec DAG ingestion", () => {
   it("rejects unsafe paths, empty surfaces and shared exclusivity", () => {
     for (const p of ["/etc/passwd", "../x", "a/../../x", "a\\b", ""]) {
       reject(
-        dag((d) => (d.tasks[0]!.affected_surfaces = [{ path: p }])),
+        dag((d) => {
+          d.tasks[0]!.affected_surfaces = [{ path: p }];
+        }),
         "UNSAFE_PATH",
       );
     }
     reject(
-      dag((d) => (d.tasks[0]!.affected_surfaces = [])),
+      dag((d) => {
+        d.tasks[0]!.affected_surfaces = [];
+      }),
       "NO_SURFACES",
     );
     reject(
-      dag((d) => (d.tasks[0]!.exclusivity = "schemas")),
+      dag((d) => {
+        d.tasks[0]!.exclusivity = "schemas";
+      }),
       "EXCLUSIVITY_CONFLICT",
     );
   });
 
   it("fails closed on protocol violations: version, schema, unknown fields, enums", () => {
     reject(
-      dag((d) => (d.tasks[0]!.protocol_version = 2)),
+      dag((d) => {
+        d.tasks[0]!.protocol_version = 2;
+      }),
       "PROTOCOL_VERSION_UNSUPPORTED",
     );
     reject(
-      dag((d) => (d.tasks[0]!.schema = "autospec.protocol.mission.v1")),
+      dag((d) => {
+        d.tasks[0]!.schema = "autospec.protocol.mission.v1";
+      }),
       "SCHEMA_VIOLATION",
     );
     reject(
-      dag((d) => (d.tasks[0]!.surprise = true)),
+      dag((d) => {
+        d.tasks[0]!.surprise = true;
+      }),
       "UNKNOWN_FIELD",
     );
     reject(
-      dag((d) => ((d.tasks[0]!.affected_surfaces as Rec[])[0]!.extra = 1)),
+      dag((d) => {
+        (d.tasks[0]!.affected_surfaces as Rec[])[0]!.extra = 1;
+      }),
       "UNKNOWN_FIELD",
     );
     reject(
-      dag((d) => (d.tasks[0]!.state = "WHATEVER")),
+      dag((d) => {
+        d.tasks[0]!.state = "WHATEVER";
+      }),
       "INVALID_FIELD",
     );
     reject(
@@ -265,7 +313,9 @@ describe("AutoSpec DAG ingestion", () => {
       "MISSING_FIELD",
     );
     reject(
-      dag((d) => (d.mission.authority = "autospec-managed")),
+      dag((d) => {
+        d.mission.authority = "autospec-managed";
+      }),
       "INVALID_FIELD",
     );
     reject(

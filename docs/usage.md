@@ -704,6 +704,44 @@ pi-engineering mission submit --store <dir> < submit.json # {result:"created", m
 pi-engineering mission observe --store <dir> < observe.json # {result:"ok", mission:<snapshot>}
 ```
 
+## Optional AutoSpec DAG, design-gate evidence and quality law
+
+Everything here is OFF unless an `autospec:` block exists in `~/.pi/agent/engineering.yaml`
+(global) or `<repo>/.pi/engineering.yaml` (repo). There are no environment variables, and
+with no block nothing from `src/integrations/autospec/` is imported, read or executed. The
+`mission submit|observe|cancel` contract is unchanged.
+
+```yaml
+autospec:
+  dag: {enabled: true}                  # global only
+  design_gate:
+    report: .autospec/reports/design-gates.json   # global only, repo-relative
+    rules_file: /path/to/autospec-design/rules.yaml  # global only: Pi's own view of vlm/review rules
+    ui_paths: ["src/ui/**"]             # global sets; a repo layer may only add
+    require_for_ui: true                # a repo layer may only turn it ON
+  quality_law:                          # global only, informational
+    profile_file: /path/to/profile.json
+    profile_id: web
+    gate_files: [/path/to/quality-gate.json]
+```
+
+- **DAG ingestion** (`ingestAutoSpecDag`, `bindAutoSpecPlan`): maps `autospec.protocol.mission/task.v1`
+  records to plan tasks (`depends_on` = prerequisites), keeps repo-qualified issue refs
+  (`owner/repo#N`, from the `autospec.issue_refs` extension) in `execution_requirements.autospec`
+  so they are covered by the plan digest, and fails closed on cycles, missing dependencies,
+  unknown *required* extensions, `autospec-managed` executors, started work and unsafe paths.
+  The plan then goes through the same T03 plan-review gate and policy as any other plan.
+  Pi stays the execution authority.
+- **Design gate evidence**: Pi never runs the design gates. It reads the report AutoSpec's
+  `autospec-design-gates.sh` wrote, recomputes the verdict from `gates[]`, and accepts it only
+  for the commit it states (`commit_sha`, or a `design-gates.commit` sidecar) when that commit is
+  HEAD and no UI file is uncommitted. SKIPPED, missing, stale, unbound or malformed reports are
+  "not run" / unavailable, never a pass. `vlm` and `review` rules are an advisory checklist.
+  With `require_for_ui: true` the completion gate blocks a UI change without valid evidence;
+  without it the item is shown but never blocks.
+- **Quality law**: the profile's Constitution `quality_gates` are listed in the finalization
+  output as "not verified".
+
 ## Mission worker tools
 
 Mission implementer and repair workers get `read`, `edit`, `write`, `bash`,
