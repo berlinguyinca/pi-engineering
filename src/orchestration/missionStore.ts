@@ -62,6 +62,24 @@ import type {
   WorkspaceManifest,
 } from "./types.ts";
 
+import {
+  type GithubLinkPatch,
+  type GithubLinkRecord,
+  type GithubLinkSuggestion,
+  type GithubStaleSignal,
+  linkIdFor,
+} from "../github/types.ts";
+
+function applyGithubLinkPatch(link: GithubLinkRecord, patch: GithubLinkPatch): GithubLinkRecord {
+  return {
+    ...link,
+    ...(patch.status ? { status: patch.status } : {}),
+    ...(patch.notFoundCount !== undefined ? { notFoundCount: patch.notFoundCount } : {}),
+    ...(patch.epoch !== undefined ? { epoch: patch.epoch } : {}),
+    observed: { ...link.observed, ...(patch.observed ?? {}) },
+  };
+}
+
 export type OrchestrationEventType =
   | "mission.created"
   | "mission.updated"
@@ -105,6 +123,11 @@ export type OrchestrationEventType =
   | "lease.expired"
   | "lease.fenced"
   | "evidence.invalidated"
+  | "github.link_recorded"
+  | "github.link_suggested"
+  | "github.suggestion_resolved"
+  | "github.link_corrected"
+  | "github.evidence_stale"
   | "candidate.changed"
   | "evidence.validation_recorded"
   | "evidence.review_recorded"
@@ -181,6 +204,11 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "lease.expired",
   "lease.fenced",
   "evidence.invalidated",
+  "github.link_recorded",
+  "github.link_suggested",
+  "github.suggestion_resolved",
+  "github.link_corrected",
+  "github.evidence_stale",
   "candidate.changed",
   "evidence.validation_recorded",
   "evidence.review_recorded",
@@ -421,6 +449,10 @@ export class MissionStore {
   private readonly recoveryDecisions = new Map<string, RecoveryDecision>();
   private readonly taskSupersessions = new Map<string, TaskSupersession>();
   private readonly evidenceInvalidations = new Map<string, EvidenceInvalidation>();
+  /** Optional GitHub linkage (T05): inert unless something records into it. */
+  private readonly githubLinks = new Map<string, GithubLinkRecord>();
+  private readonly githubSuggestions = new Map<string, GithubLinkSuggestion>();
+  private readonly githubStaleSignals = new Map<string, GithubStaleSignal>();
   private readonly candidates = new Map<string, CandidateRevision>();
   private readonly validationEvidence = new Map<string, ValidationEvidence>();
   private readonly reviewEvidence = new Map<string, ReviewEvidence>();
@@ -864,6 +896,35 @@ export class MissionStore {
         if (invalidation) {
           this.evidenceInvalidations.set(invalidation.invalidationId, copyEvidenceInvalidation(invalidation));
         }
+        break;
+      }
+      case "github.link_recorded": {
+        const link = e.payload.link as GithubLinkRecord | undefined;
+        if (link?.linkId) this.githubLinks.set(link.linkId, structuredClone(link));
+        break;
+      }
+      case "github.link_suggested": {
+        const suggestion = e.payload.suggestion as GithubLinkSuggestion | undefined;
+        if (suggestion?.suggestionId && !this.githubSuggestions.has(suggestion.suggestionId)) {
+          this.githubSuggestions.set(suggestion.suggestionId, structuredClone(suggestion));
+        }
+        break;
+      }
+      case "github.suggestion_resolved": {
+        const existing = this.githubSuggestions.get(String(e.payload.suggestionId));
+        const resolution = e.payload.resolution;
+        if (existing && (resolution === "confirmed" || resolution === "dismissed")) existing.state = resolution;
+        break;
+      }
+      case "github.link_corrected": {
+        const existing = this.githubLinks.get(String(e.payload.linkId));
+        const patch = e.payload.patch as GithubLinkPatch | undefined;
+        if (existing && patch) this.githubLinks.set(existing.linkId, applyGithubLinkPatch(existing, patch));
+        break;
+      }
+      case "github.evidence_stale": {
+        const signal = e.payload.signal as GithubStaleSignal | undefined;
+        if (signal?.signalId) this.githubStaleSignals.set(signal.signalId, structuredClone(signal));
         break;
       }
       case "candidate.changed": {
@@ -3056,6 +3117,97 @@ export class MissionStore {
   getEvidenceInvalidation(invalidationId: string): EvidenceInvalidation | undefined {
     const invalidation = this.evidenceInvalidations.get(invalidationId);
     return invalidation ? copyEvidenceInvalidation(invalidation) : undefined;
+  }
+
+  // ── Optional GitHub linkage (T05) ────────────────────────────────────────────
+
+  /** Record (or re-record) an explicit link. Idempotent: an identical active link emits nothing. */
+  recordGithubLink(record: GithubLinkRecord): GithubLinkRecord {
+    if (!this.missions.has(record.missionId)) throw new Error(`unknown mission ${record.missionId}`);
+    const existing = this.githubLinks.get(record.linkId);
+    if (existing && existing.status === "active" && record.status === "active") return structuredClone(existing);
+    const copy = structuredClone(record);
+    this.githubLinks.set(copy.linkId, copy);
+    this.emit("github.link_recorded", copy.missionId, { actor: "system", link: copy });
+    return structuredClone(copy);
+  }
+
+  /** Record a SUGGESTION (never a link). Idempotent per (mission, subject, target); skipped when already linked. */
+  suggestGithubLink(suggestion: GithubLinkSuggestion): GithubLinkSuggestion | undefined {
+    if (!this.missions.has(suggestion.missionId)) throw new Error(`unknown mission ${suggestion.missionId}`);
+    if (this.githubSuggestions.has(suggestion.suggestionId)) return undefined;
+    const linked = this.githubLinks.get(linkIdFor(suggestion.missionId, suggestion.subject, suggestion.target));
+    if (linked && linked.status === "active") return undefined;
+    const copy = structuredClone({ ...suggestion, state: "pending" as const });
+    this.githubSuggestions.set(copy.suggestionId, copy);
+    this.emit("github.link_suggested", copy.missionId, { actor: "system", suggestion: copy });
+    return structuredClone(copy);
+  }
+
+  resolveGithubSuggestion(
+    suggestionId: string,
+    resolution: "confirmed" | "dismissed",
+    actor: "user" | "system" = "user",
+  ): boolean {
+    const existing = this.githubSuggestions.get(suggestionId);
+    if (!existing || existing.state !== "pending") return false;
+    existing.state = resolution;
+    this.emit("github.suggestion_resolved", existing.missionId, { actor, suggestionId, resolution });
+    return true;
+  }
+
+  /** Apply a reconciliation correction. Returns false (and emits nothing) when it would change nothing. */
+  correctGithubLink(linkId: string, patch: GithubLinkPatch, reason: string): boolean {
+    const existing = this.githubLinks.get(linkId);
+    if (!existing) return false;
+    const next = applyGithubLinkPatch(existing, patch);
+    if (JSON.stringify(next) === JSON.stringify(existing)) return false;
+    this.githubLinks.set(linkId, next);
+    this.emit("github.link_corrected", existing.missionId, {
+      actor: "system",
+      linkId,
+      patch: structuredClone(patch),
+      reason,
+    });
+    return true;
+  }
+
+  /** Signal that a PR head moved so evidence bound to the old SHA is stale (consumed by T06). Idempotent. */
+  recordGithubStale(signal: GithubStaleSignal): boolean {
+    if (!this.missions.has(signal.missionId)) throw new Error(`unknown mission ${signal.missionId}`);
+    if (this.githubStaleSignals.has(signal.signalId)) return false;
+    const copy = structuredClone(signal);
+    this.githubStaleSignals.set(copy.signalId, copy);
+    this.emit("github.evidence_stale", copy.missionId, { actor: "system", signal: copy });
+    return true;
+  }
+
+  listGithubLinks(missionId?: string): GithubLinkRecord[] {
+    return [...this.githubLinks.values()]
+      .filter((l) => !missionId || l.missionId === missionId)
+      .map((l) => structuredClone(l));
+  }
+
+  getGithubLink(linkId: string): GithubLinkRecord | undefined {
+    const link = this.githubLinks.get(linkId);
+    return link ? structuredClone(link) : undefined;
+  }
+
+  listGithubSuggestions(missionId?: string): GithubLinkSuggestion[] {
+    return [...this.githubSuggestions.values()]
+      .filter((s) => !missionId || s.missionId === missionId)
+      .map((s) => structuredClone(s));
+  }
+
+  getGithubSuggestion(suggestionId: string): GithubLinkSuggestion | undefined {
+    const s = this.githubSuggestions.get(suggestionId);
+    return s ? structuredClone(s) : undefined;
+  }
+
+  listGithubStaleSignals(missionId?: string): GithubStaleSignal[] {
+    return [...this.githubStaleSignals.values()]
+      .filter((s) => !missionId || s.missionId === missionId)
+      .map((s) => structuredClone(s));
   }
 
   transitionMissionLease(transition: LeaseTransition, lease: MissionLease): MissionLease {
