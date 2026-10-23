@@ -750,9 +750,13 @@ autospec:
   evidence, **and so does the orchestrated-mission completion gate**: it evaluates the candidate commit
   (`CandidateEvidenceIdentity.candidateSha`) against the changed UI paths, synchronously, from a
   committed report. A mission with several repository candidates is blocked rather than skipped.
-  Without `require_for_ui` the item is shown but never blocks.
-- **Attestation (recommended)**: set `design_gate.attestation_key_file` (global only) to a key file
-  outside any worker's reach. The report must then be accompanied, in the same commit, by
+  Without `require_for_ui` the item is shown but never blocks. A malformed `engineering.yaml` (either layer)
+  counts as configured and blocks; it never silently switches the gate off. `ui_paths` are case-insensitive
+  anchored globs (`*` within a segment, `**` across; `dir/**` also matches `dir` itself; `? [ ] { }` are
+  rejected; use a leading `**` segment to match a file name at any depth). `report` must end in `.json`.
+- **Attestation (recommended)**: set `design_gate.attestation_key_file` (global only) to an ABSOLUTE
+  path of an owner-only (mode 0600) regular file, not a symlink, outside the repository, its top level
+  and every linked worktree; anything else is rejected. The report must then be accompanied, in the same commit, by
   `design-gates.sig` = hex HMAC-SHA256 over `<commit_sha>\n<sha256 hex of the report bytes>`,
   produced by the operator's trusted runner. Without a key, provenance is only "committed": a worker
   that can commit can still commit a forged report. That is a residual trust assumption, not a fix.

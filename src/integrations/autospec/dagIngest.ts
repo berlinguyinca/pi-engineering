@@ -30,7 +30,11 @@ const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 const GLOB = /[*?[\]{}]/;
-const PROTECTED_DIRS = new Set([".git", ".pi", ".autospec"]);
+const PROTECTED_DIRS = new Set([".git", ".pi", ".autospec", ".github", ".gitmodules"]);
+const MAX_PATH_CHARS = 512;
+const MAX_SEGMENTS = 40;
+/** Control (Cc), format/bidi (Cf) and line/paragraph separators (Zl, Zp). */
+const HIDDEN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const INGESTABLE_MISSION_STATES = ["CREATED", "PLANNED", "READY"];
 const INGESTABLE_TASK_STATES = ["DEFINED", "BLOCKED", "READY"];
 
@@ -85,7 +89,12 @@ function safeDomain(path: string, taskId: string): string {
   const segments = path.split("/").filter((seg, i, all) => !(seg === "" && i === all.length - 1));
   if (
     !path ||
+    path.length > MAX_PATH_CHARS ||
+    segments.length > MAX_SEGMENTS ||
     CONTROL.test(path) ||
+    HIDDEN.test(path) ||
+    // Windows-style trimming: "a " and "a." name the same entry as "a".
+    segments.some((seg) => seg !== seg.trim() || seg.endsWith(".")) ||
     GLOB.test(path) ||
     path.startsWith("/") ||
     path.startsWith("~") ||
@@ -126,7 +135,7 @@ function issueRefsOf(ext: Record<string, unknown> | undefined, taskId: string): 
     throw new Reject("INVALID_ISSUE_REF", `task ${taskId}: ${ISSUE_REFS_EXTENSION} must be an array`);
   const out = new Set<string>();
   for (const ref of raw) {
-    if (typeof ref !== "string" || !ISSUE_REF.test(ref)) {
+    if (typeof ref !== "string" || !ISSUE_REF.test(ref) || /\.git#/i.test(ref)) {
       throw new Reject(
         "INVALID_ISSUE_REF",
         `task ${taskId}: issue ref ${JSON.stringify(ref)} must be repo-qualified "owner/repo#N"`,
@@ -270,7 +279,7 @@ function ingest(input: DagIngestInput): DagIngestResult {
     issueRefs.set(t.task_id, refs);
     const paths = t.affected_surfaces.map((s) => s.path);
     for (const s of t.affected_surfaces) {
-      if (s.symbols?.some((x) => CONTROL.test(x) || x.length > 200)) {
+      if (s.symbols?.some((x) => CONTROL.test(x) || HIDDEN.test(x) || x.length > 200)) {
         throw new Reject("UNSAFE_PATH", `task ${t.task_id}: symbol with control characters or over 200 characters`);
       }
     }

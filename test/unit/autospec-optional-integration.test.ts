@@ -10,6 +10,7 @@ import {
   uiFilesOf,
 } from "../../src/integrations/autospec/provider.ts";
 import { mapQualityLaw, qualityLawChecklist } from "../../src/integrations/autospec/qualityLaw.ts";
+import { autospecConfigured } from "../../src/lifecycle/autospecProbe.ts";
 import { DEFAULT_POLICY, loadPolicy } from "../../src/lifecycle/policy.ts";
 import { buildCompletionReport } from "../../src/lifecycle/rolePrompts.ts";
 
@@ -89,6 +90,20 @@ describe("autospec config layers", () => {
         bad,
       );
     }
+  });
+
+  it("rejects a report path without .json, a relative attestation key, and unsupported glob characters", () => {
+    const bad = (design: Record<string, unknown>) =>
+      mergeAutoSpecLayers({ global: { raw: { design_gate: design } }, repo: {} }).kind;
+    assert.equal(bad({ report: ".autospec/reports/design-gates.txt" }), "invalid");
+    assert.equal(bad({ report: ".autospec/reports/design-gates" }), "invalid");
+    assert.equal(bad({ attestation_key_file: "keys/design.key" }), "invalid");
+    for (const p of ["src/?.tsx", "src/[ab].tsx", "src/{a,b}.tsx"]) assert.equal(bad({ ui_paths: [p] }), "invalid", p);
+  });
+
+  it("an unreadable repo layer is invalid, not ignored", () => {
+    assert.equal(mergeAutoSpecLayers({ global: {}, repo: { error: "EACCES" } }).kind, "invalid");
+    assert.equal(mergeAutoSpecLayers({ global: { raw: GLOBAL }, repo: { error: "bad yaml" } }).kind, "invalid");
   });
 
   it("malformed config fails closed (never OFF)", () => {
@@ -183,12 +198,12 @@ describe("standalone: nothing loads or touches disk without autospec config", ()
     const runtime = readFileSync(join(SRC, "runtime/EngineeringRuntime.ts"), "utf8");
     assert.match(
       runtime,
-      /effective\.policy\.autospec !== undefined[\s\S]*await import\("\.\.\/integrations\/autospec\/provider\.ts"\)/,
+      /await autospecConfigured\(repoRoot[\s\S]*await import\("\.\.\/integrations\/autospec\/provider\.ts"\)/,
     );
     const harness = readFileSync(join(SRC, "lifecycle/harness.ts"), "utf8");
     assert.match(
       harness,
-      /if \(policy\.autospec !== undefined\)[\s\S]*await import\("\.\.\/integrations\/autospec\/provider\.ts"\)/,
+      /if \(await autospecConfigured\(ctx\.cwd\)\)[\s\S]*await import\("\.\.\/integrations\/autospec\/provider\.ts"\)/,
     );
   });
 
@@ -254,6 +269,42 @@ describe("standalone: nothing loads or touches disk without autospec config", ()
     const c = on(await loadAutoSpecConfig(repo, { agentDir: agent }));
     assert.equal(c.designGate?.requireForUi, true);
     assert.deepEqual(c.designGate?.uiPaths, ["src/ui/**"]);
+  });
+
+  it("ui_paths: dir/** also matches the directory entry itself; matching is case-insensitive; *.tsx is top-level only", () => {
+    const hit = (p: string, globs: string[]) => uiFilesOf([{ path: p, scope: "base" }], globs).length > 0;
+    assert.equal(hit("src/ui", ["src/ui/**"]), true, "gitlink/symlink at the directory path");
+    assert.equal(hit("src/ui/a/b.tsx", ["src/ui/**"]), true);
+    assert.equal(hit("src/uix", ["src/ui/**"]), false);
+    assert.equal(hit("SRC/UI/A.TSX", ["src/ui/**"]), true);
+    assert.equal(hit("a.tsx", ["*.tsx"]), true);
+    assert.equal(hit("a/b.tsx", ["*.tsx"]), false);
+    assert.equal(hit("a/b.tsx", ["**/*.tsx"]), true);
+  });
+
+  it("autospecConfigured: malformed or non-mapping layers count as configured (no fail-open); absent does not", async () => {
+    const mk = (global?: string, repo?: string) => {
+      const agent = mkdtempSync(join(tmpdir(), "pi-ag-agent-"));
+      const cwd = mkdtempSync(join(tmpdir(), "pi-ag-repo-"));
+      if (global !== undefined) writeFileSync(join(agent, "engineering.yaml"), global);
+      if (repo !== undefined) {
+        mkdirSync(join(cwd, ".pi"));
+        writeFileSync(join(cwd, ".pi/engineering.yaml"), repo);
+      }
+      return { cwd, agentDir: agent };
+    };
+    const probe = (m: { cwd: string; agentDir: string }) => autospecConfigured(m.cwd, { agentDir: m.agentDir });
+    assert.equal(await probe(mk()), false);
+    assert.equal(await probe(mk("policies:\n  review:\n    require_independent_review: true\n")), false);
+    assert.equal(await probe(mk("autospec:\n  dag:\n    enabled: false\n")), true);
+    assert.equal(await probe(mk(undefined, "autospec:\n  design_gate:\n    require_for_ui: true\n")), true);
+    assert.equal(await probe(mk("autospec: [unclosed\n  - : :\n")), true, "unparsable global");
+    assert.equal(await probe(mk("{ not: yaml: at all")), true);
+    assert.equal(await probe(mk("- a\n- b\n")), true, "not a mapping");
+    assert.equal(await probe(mk(undefined, "autospec: [")), true, "unparsable repo layer");
+    // ...and the integration then reports it as invalid, which blocks.
+    const m = mk("autospec: [unclosed\n  - : :\n");
+    assert.equal((await loadAutoSpecConfig(m.cwd, { agentDir: m.agentDir })).kind, "invalid");
   });
 
   it("ui_paths matching follows the same glob rules as the design-gates script", () => {

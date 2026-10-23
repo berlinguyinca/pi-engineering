@@ -469,4 +469,51 @@ describe("AutoSpec DAG ingestion", () => {
     );
     assert.equal(ok.ok, true);
   });
+
+  it("rejects .gitmodules, .github, trailing-space/dot segments, bidi/format chars, and over-long paths", () => {
+    const long = `${"a/".repeat(41)}x.ts`;
+    for (const p of [
+      ".gitmodules",
+      ".github/workflows/ci.yml",
+      "a/.GITHUB/x",
+      "src/a ",
+      "src/a./x",
+      " src/x",
+      "src/\u202Etxt.ts",
+      "src/a\u200Bb.ts",
+      "src/a\uFEFFb.ts",
+      `${"x".repeat(513)}`,
+      long,
+    ]) {
+      reject(
+        dag((d) => {
+          d.tasks[0]!.affected_surfaces = [{ path: p }];
+        }),
+        "UNSAFE_PATH",
+      );
+    }
+    reject(
+      dag((d) => {
+        d.tasks[0]!.affected_surfaces = [{ path: "a.ts", symbols: ["x\u202Ey"] }];
+      }),
+      "UNSAFE_PATH",
+    );
+    const ok = run(
+      dag((d) => {
+        d.tasks[0]!.affected_surfaces = [{ path: "src/deep/ünï.ts" }];
+      }),
+    );
+    assert.equal(ok.ok, true);
+  });
+
+  it("rejects a .git repo-name suffix in issue refs", () => {
+    for (const bad of ["a/b.git#1", "a/b.GIT#1", "a/x.y.git#9"]) {
+      reject(
+        dag((d) => {
+          d.tasks[0]!.extensions = { [ISSUE_REFS_EXTENSION]: [bad] };
+        }),
+        "INVALID_ISSUE_REF",
+      );
+    }
+  });
 });

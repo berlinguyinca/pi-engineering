@@ -12,8 +12,8 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { readYaml } from "../../lifecycle/policy.ts";
 import type { GateItem } from "../../lifecycle/types.ts";
@@ -105,6 +105,11 @@ function readCommitted(cwd: string, sha: string, rel: string): string | undefine
 }
 
 function globToRegex(pattern: string): RegExp {
+  // `dir/**` also matches the entry `dir` itself (a gitlink or symlink added at that path).
+  if (pattern.endsWith("/**")) {
+    const base = globToRegex(pattern.slice(0, -3)).source.slice(1, -1);
+    return new RegExp(`^${base}(?:/.*)?$`, "i");
+  }
   let out = "";
   for (let i = 0; i < pattern.length; ) {
     if (pattern.startsWith("**/", i)) {
@@ -121,7 +126,7 @@ function globToRegex(pattern: string): RegExp {
       i++;
     }
   }
-  return new RegExp(`^${out}$`);
+  return new RegExp(`^${out}$`, "i");
 }
 
 /** Files (and rename sources) that match any ui_paths glob. */
@@ -149,6 +154,34 @@ function ruleClasses(path: string, cwd: string): Map<string, RuleCheckClass> {
   return map;
 }
 
+/**
+ * The attestation key must be out of a worker's reach: an absolute path, not a
+ * symlink, owner-only (no group/world access), and outside the repository, its
+ * top level and every linked worktree. A relative path would resolve inside the
+ * worker-controlled checkout, where a worker could plant a key and its own HMAC.
+ */
+function trustedKey(keyFile: string, cwd: string): string | undefined {
+  if (!isAbsolute(keyFile)) return undefined;
+  const st = lstatSync(keyFile);
+  if (!st.isFile() || st.isSymbolicLink()) return undefined;
+  if ((st.mode & 0o077) !== 0) return undefined;
+  const real = realpathSync(keyFile);
+  const roots = new Set<string>([realpathSync(cwd)]);
+  const top = git(cwd, ["rev-parse", "--show-toplevel"]);
+  if (top.ok && top.out.trim()) roots.add(realpathSync(top.out.trim()));
+  for (const line of git(cwd, ["worktree", "list", "--porcelain"]).out.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      try {
+        roots.add(realpathSync(line.slice(9).trim()));
+      } catch {
+        // a pruned worktree path cannot hold the key
+      }
+    }
+  }
+  for (const root of roots) if (real === root || real.startsWith(`${root}${sep}`)) return undefined;
+  return readSmallSync(real)?.trim();
+}
+
 function attestationOf(
   keyFile: string | null,
   cwd: string,
@@ -159,7 +192,7 @@ function attestationOf(
 ): "valid" | "invalid" | "not_configured" {
   if (!keyFile) return "not_configured";
   try {
-    const key = readSmallSync(isAbsolute(keyFile) ? keyFile : join(cwd, keyFile))?.trim();
+    const key = trustedKey(keyFile, cwd);
     if (!key || key.length < 16) return "invalid";
     const sig = readCommitted(cwd, sha, sigPath)?.trim().toLowerCase();
     if (!sig || !/^[0-9a-f]{64}$/.test(sig) || !statedCommit) return "invalid";
@@ -254,20 +287,25 @@ export function missionDesignGateReasons(
   if (result.kind === "invalid") return [`autospec_config: invalid configuration: ${result.notes.join("; ")}`];
   const cfg = result.config.designGate;
   if (!cfg?.requireForUi) return [];
-  if (a.candidates.length === 0) return [];
-  if (a.candidates.length > 1) {
-    return ["design_gate: missions with several repository candidates are not supported by the design gate yet"];
+  const reasons: string[] = [];
+  // Each candidate is judged on its own changed files; a candidate that touches no UI path needs nothing.
+  for (const { baseSha, candidateSha } of a.candidates) {
+    const diff = git(a.repoRoot, ["diff", "--no-renames", "--name-only", "-z", baseSha, candidateSha]);
+    if (!diff.ok) {
+      reasons.push(
+        `design_gate: cannot list the changed files of candidate ${candidateSha.slice(0, 12)} in ${a.repoRoot} (git diff failed)`,
+      );
+      continue;
+    }
+    const files = diff.out
+      .split("\0")
+      .filter(Boolean)
+      .map((path) => ({ path, scope: "base" as const }));
+    const { evidence, note } = evaluateAt(cfg, { cwd: a.repoRoot, sha: candidateSha, files });
+    if (evidence.state === "passed" || evidence.state === "not_applicable") continue;
+    reasons.push(`design_gate (${evidence.state}): ${evidence.reason}${note ? ` (${note})` : ""}`);
   }
-  const { baseSha, candidateSha } = a.candidates[0]!;
-  const diff = git(a.repoRoot, ["diff", "--no-renames", "--name-only", "-z", baseSha, candidateSha]);
-  if (!diff.ok) return ["design_gate: cannot list the candidate's changed files (git diff failed)"];
-  const files = diff.out
-    .split("\0")
-    .filter(Boolean)
-    .map((path) => ({ path, scope: "base" as const }));
-  const { evidence, note } = evaluateAt(cfg, { cwd: a.repoRoot, sha: candidateSha, files });
-  if (evidence.state === "passed" || evidence.state === "not_applicable") return [];
-  return [`design_gate (${evidence.state}): ${evidence.reason}${note ? ` (${note})` : ""}`];
+  return reasons;
 }
 
 /**

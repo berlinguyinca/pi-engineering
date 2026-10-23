@@ -32,6 +32,7 @@ import type { AdmissionSaturation } from "../inference/admissionTransport.ts";
 import type { AdmissionBudgetLedger } from "../inference/admissionTransport.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
+import { autospecConfigured } from "./autospecProbe.ts";
 import { LifecycleController } from "./controller.ts";
 import type { ApprovalRequest } from "./controller.ts";
 import { loadPolicy } from "./policy.ts";
@@ -362,9 +363,9 @@ export class LifecycleHarness {
     }
 
     // Optional AutoSpec integration (T04): nothing from it is imported, read or
-    // executed unless the `autospec` block exists in the effective policy.
+    // executed unless an `autospec` block exists, or a layer is unparsable (fail closed).
     let extraGateEvidence: ConstructorParameters<typeof LifecycleController>[0]["extraGateEvidence"];
-    if (policy.autospec !== undefined) {
+    if (await autospecConfigured(ctx.cwd)) {
       try {
         const provider = await import("../integrations/autospec/provider.ts");
         const autospecConfig = await provider.loadAutoSpecConfig(ctx.cwd);

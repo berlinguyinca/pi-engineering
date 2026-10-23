@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -144,7 +144,8 @@ describe("design-gate provenance (reports are read from the commit, never the wo
 describe("design-gate attestation (operator key outside the worktree)", () => {
   const key = "k".repeat(32);
   const keyFile = join(mkdtempSync(join(tmpdir(), "pi-ag-key-")), "design.key");
-  writeFileSync(keyFile, `${key}\n`);
+  writeFileSync(keyFile, `${key}\n`, { mode: 0o600 });
+  chmodSync(keyFile, 0o600);
   const sign = (k: string) => (c1: string, text: string) =>
     createHmac("sha256", k)
       .update(`${c1}\n${createHash("sha256").update(text, "utf8").digest("hex")}`)
@@ -161,6 +162,55 @@ describe("design-gate attestation (operator key outside the worktree)", () => {
     assert.equal(await status(cfg({ attestationKeyFile: keyFile }), r.cwd, r.head), "unavailable");
     // Unreadable or too-short key: fail closed.
     assert.equal(await status(cfg({ attestationKeyFile: "/nonexistent/key" }), good.cwd, good.head), "unavailable");
+  });
+});
+
+describe("attestation key placement and permissions", () => {
+  const key = "k".repeat(32);
+  const sign = (k: string) => (c1: string, text: string) =>
+    createHmac("sha256", k)
+      .update(`${c1}\n${createHash("sha256").update(text, "utf8").digest("hex")}`)
+      .digest("hex");
+  const outside = (mode: number) => {
+    const f = join(mkdtempSync(join(tmpdir(), "pi-ag-key2-")), "k");
+    writeFileSync(f, `${key}\n`);
+    chmodSync(f, mode);
+    return f;
+  };
+
+  it("an owner-only key outside the repository works; group/world-readable keys do not", async () => {
+    const r = withReport({}, sign(key));
+    assert.equal(await status(cfg({ attestationKeyFile: outside(0o600) }), r.cwd, r.head), "passed");
+    for (const mode of [0o666, 0o644, 0o640, 0o604]) {
+      assert.equal(
+        await status(cfg({ attestationKeyFile: outside(mode) }), r.cwd, r.head),
+        "unavailable",
+        mode.toString(8),
+      );
+    }
+  });
+
+  it("a key inside the checkout, a relative path, or a symlink is refused even with a matching HMAC", async () => {
+    const r = withReport({}, sign(key));
+    const planted = join(r.cwd, "planted.key");
+    writeFileSync(planted, `${key}\n`);
+    chmodSync(planted, 0o600);
+    assert.equal(await status(cfg({ attestationKeyFile: planted }), r.cwd, r.head), "unavailable");
+    assert.equal(await status(cfg({ attestationKeyFile: "planted.key" }), r.cwd, r.head), "unavailable");
+    const real = outside(0o600);
+    const link = join(mkdtempSync(join(tmpdir(), "pi-ag-link-")), "k");
+    symlinkSync(real, link);
+    assert.equal(await status(cfg({ attestationKeyFile: link }), r.cwd, r.head), "unavailable");
+  });
+
+  it("a key inside a LINKED worktree of the repository is refused too", async () => {
+    const r = withReport({}, sign(key));
+    const wt = join(mkdtempSync(join(tmpdir(), "pi-ag-wt-")), "wt");
+    git(r.cwd, "worktree", "add", "-q", wt, "-b", "other");
+    const k = join(wt, "k");
+    writeFileSync(k, `${key}\n`);
+    chmodSync(k, 0o600);
+    assert.equal(await status(cfg({ attestationKeyFile: k }), r.cwd, r.head), "unavailable");
   });
 });
 
@@ -204,13 +254,32 @@ describe("orchestrated missions: design gate on the candidate commit", () => {
     );
   });
 
-  it("fails closed on several candidates, a bad config, or an unusable repo; off/optional never block", () => {
+  it("several candidates: only those that touch UI paths need evidence; unreadable ones block", () => {
+    const r = newRepo();
+    put(r.cwd, "src/core/x.ts", "x\n");
+    const core = commit(r.cwd, "core");
+    const noUi = [
+      { baseSha: r.base, candidateSha: core },
+      { baseSha: r.base, candidateSha: core },
+    ];
+    assert.deepEqual(missionDesignGateReasons(cfg(), { repoRoot: r.cwd, candidates: noUi }), []);
+    put(r.cwd, "src/ui/a.tsx", "x\n");
+    const uiSha = commit(r.cwd, "ui");
+    const mixed = [
+      { baseSha: r.base, candidateSha: core },
+      { baseSha: core, candidateSha: uiSha },
+    ];
+    assert.equal(missionDesignGateReasons(cfg(), { repoRoot: r.cwd, candidates: mixed }).length, 1);
+    const unknown = [{ baseSha: "a".repeat(40), candidateSha: "b".repeat(40) }];
+    assert.equal(missionDesignGateReasons(cfg(), { repoRoot: r.cwd, candidates: unknown }).length, 1);
+  });
+
+  it("fails closed on a bad config or an unusable repo; off/optional never block", () => {
     const r = newRepo();
     const two = [
       { baseSha: r.base, candidateSha: r.base },
       { baseSha: r.base, candidateSha: r.base },
     ];
-    assert.equal(missionDesignGateReasons(cfg(), { repoRoot: r.cwd, candidates: two }).length, 1);
     assert.equal(
       missionDesignGateReasons({ kind: "invalid", notes: ["x"] }, { repoRoot: r.cwd, candidates: [] }).length,
       1,

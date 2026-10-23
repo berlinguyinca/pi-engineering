@@ -17,10 +17,16 @@
  *       profile_id: web-app
  *       gate_files: [/path/gate.json]
  *
+ * ui_paths are case-insensitive, anchored globs: `*` stays within a segment, `**` crosses
+ * segments, `dir/**` also matches `dir` itself, so a top-level `*.tsx` does not match
+ * `a/b.tsx` (prefix it with a double-star segment to recurse); `? [ ] { }` are rejected rather than taken literally.
+ *
  * Malformed config FAILS CLOSED: `invalid` carries the reason and the design gate
  * becomes a required, unavailable item. Nothing here touches disk; the caller
  * supplies the parsed layers.
  */
+
+import { isAbsolute } from "node:path";
 
 export interface AutoSpecConfig {
   dag: { enabled: boolean };
@@ -106,6 +112,11 @@ function parseBlock(raw: unknown, where: string, global: boolean, notes: string[
     if (d.ui_paths !== undefined) {
       design.uiPaths = strList(d.ui_paths, `${where}: design_gate.ui_paths`).map((p) => {
         const clean = p.replace(/^\.\//, "");
+        if (/[?[\]{}]/.test(clean)) {
+          throw new Bad(
+            `${where}: design_gate.ui_paths entry ${JSON.stringify(p)} uses ? [ ] { } which are not supported; only * and ** are`,
+          );
+        }
         if (!clean || clean.startsWith("/") || clean.includes("\\") || clean.split("/").includes("..")) {
           throw new Bad(`${where}: design_gate.ui_paths entry ${JSON.stringify(p)} must be repo-relative without ".."`);
         }
@@ -121,10 +132,17 @@ function parseBlock(raw: unknown, where: string, global: boolean, notes: string[
     for (const k of ["report", "rules_file", "attestation_key_file"] as const) {
       if (d[k] === undefined) continue;
       if (!global) notes.push(`repo design_gate.${k} ignored (only the global/user config may set it)`);
-      else if (k === "report") design.reportPath = relInRepo(d[k], `${where}: design_gate.report`);
-      else if (typeof d[k] !== "string" || !d[k]) throw new Bad(`${where}: design_gate.${k} must be a string`);
+      else if (k === "report") {
+        design.reportPath = relInRepo(d[k], `${where}: design_gate.report`);
+        if (!design.reportPath.endsWith(".json")) throw new Bad(`${where}: design_gate.report must end in .json`);
+      } else if (typeof d[k] !== "string" || !d[k]) throw new Bad(`${where}: design_gate.${k} must be a string`);
       else if (k === "rules_file") design.rulesFile = d[k] as string;
-      else design.attestationKeyFile = d[k] as string;
+      else {
+        // Absolute only: a relative path would resolve inside the worker-controlled checkout.
+        if (!isAbsolute(d[k] as string))
+          throw new Bad(`${where}: design_gate.attestation_key_file must be an absolute path`);
+        design.attestationKeyFile = d[k] as string;
+      }
     }
     out.design = design;
   }
@@ -168,8 +186,8 @@ export function mergeAutoSpecLayers(layers: { global: AutoSpecLayer; repo: AutoS
     }
   }
   if (layers.repo.error) {
-    // A repo layer cannot loosen anything; an unreadable one that might have tightened is noted.
-    notes.push(`repo config unreadable, autospec from it ignored: ${layers.repo.error}`);
+    // An unreadable repo layer might have held a tightening or a typo: fail closed, never ignore.
+    errors.push(`repo config unreadable: ${layers.repo.error}`);
   } else if (layers.repo.raw !== undefined) {
     try {
       r = parseBlock(layers.repo.raw, "repo", false, notes);
@@ -178,7 +196,8 @@ export function mergeAutoSpecLayers(layers: { global: AutoSpecLayer; repo: AutoS
       errors.push(e.message);
     }
   }
-  const present = layers.global.raw !== undefined || layers.repo.raw !== undefined || !!layers.global.error;
+  const present =
+    layers.global.raw !== undefined || layers.repo.raw !== undefined || !!layers.global.error || !!layers.repo.error;
   if (!present) return { kind: "off" };
   if (errors.length) return { kind: "invalid", notes: [...errors, ...notes] };
 
