@@ -89,6 +89,7 @@ import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "
 import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
 import { resolveWorktreeIdentity } from "./isolation/WorktreeIdentity.ts";
@@ -471,6 +472,8 @@ export interface EngineeringRuntimeOptions {
   verifier?: VerificationProvider;
   model?: Model<any>;
   agentDir?: string;
+  /** T12: inject a steering receiver (tests); undefined = decide from the global YAML and the configured control plane. */
+  steeringReceiver?: SteeringReceiver | null;
   /**
    * Route mission roles through this instead of a router built from the
    * agent dir's policy and discovered models. Hosts and tests that must not
@@ -693,6 +696,8 @@ export class EngineeringRuntime {
   missionOwnership: MissionOwnership | null;
   /** Clock-driven owner of startup and periodic nonterminal-mission reconciliation. */
   missionSupervisor: MissionSupervisor | null;
+  /** T12: outbound-only steering poller; null unless enabled in the global YAML with a control plane configured. */
+  steeringReceiver: SteeringReceiver | null = null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /** The planner the orchestrator uses to turn a mission into tasks. */
@@ -1789,8 +1794,10 @@ export class EngineeringRuntime {
       });
       await rt.missionSupervisor.reconcileOnStartup();
       rt.missionSupervisor.start();
+      rt.steeringReceiver = await EngineeringRuntime.startSteering(rt, opts);
       return rt;
     } catch (error) {
+      rt.steeringReceiver?.stop();
       rt.externalPumpStopped = true;
       rt.missionActivityTicker?.close();
       rt.missionActivityClock.clear();
@@ -1800,6 +1807,63 @@ export class EngineeringRuntime {
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
       throw error;
     }
+  }
+
+  /**
+   * T12. Start the steering poller only when the GLOBAL engineering YAML enables it and a Herdr control plane is
+   * configured; otherwise nothing is constructed and no network call is ever made. The poller can reach exactly two
+   * things: `MissionStore.steerTask` (labelled, untrusted text) and `Orchestrator.resume`.
+   */
+  private static async startSteering(
+    rt: EngineeringRuntime,
+    opts: EngineeringRuntimeOptions,
+  ): Promise<SteeringReceiver | null> {
+    const store = rt.missionStore;
+    if (!store) return null;
+    const ports: import("../orchestration/steering.ts").SteeringPorts = {
+      now: () => Date.now() / 1000,
+      resolve: (nodeId) => {
+        const [kind, ...rest] = nodeId.split(":");
+        const id = rest.join(":");
+        if (kind === "task") {
+          const t = store.getTask(id);
+          if (!t) return null;
+          return {
+            kind: "task",
+            taskId: t.task_id,
+            missionId: t.mission_id,
+            terminal: ["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"].includes(t.status),
+          };
+        }
+        if (kind === "mission") {
+          const m = store.getMission(id);
+          if (!m) return null;
+          return {
+            kind: "mission",
+            missionId: m.mission_id,
+            paused: m.status === "PAUSED_INFRASTRUCTURE",
+            terminal: ["COMPLETE", "FAILED", "CANCELED"].includes(m.status),
+          };
+        }
+        return null;
+      },
+      steerTask: (taskId, text) => {
+        store.steerTask(taskId, text, "herdr-steering");
+      },
+      resumeMission: async (missionId) => {
+        if (!rt.orchestrator) throw new Error("orchestrator is not running");
+        await rt.orchestrator.resume(missionId);
+      },
+    };
+    if (opts.steeringReceiver !== undefined) return opts.steeringReceiver;
+    const receiver = await createSteeringReceiver({
+      agentDir: opts.agentDir ?? getAgentDir(),
+      stateDir: resolveStateRoot(),
+      env: process.env,
+      ports,
+    });
+    receiver?.start();
+    return receiver;
   }
 
   /**
@@ -1827,6 +1891,7 @@ export class EngineeringRuntime {
     }
     const path = this.orchestrationPath;
     try {
+      this.steeringReceiver?.stop();
       await this.missionSupervisor?.shutdown();
       await this.missionStore?.flush();
       await this.missionObservability?.flush();
