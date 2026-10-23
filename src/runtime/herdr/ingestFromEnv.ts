@@ -19,6 +19,7 @@
 import os from "node:os";
 
 import { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
+import { createIngestFromConnection, loadHerdrConnection } from "./herdrConnection.ts";
 
 /** Wrap the default fetch to stamp the ingest request with the api key + source. */
 function stampedFetch(apiKey: string | undefined): typeof globalThis.fetch {
@@ -79,4 +80,25 @@ export function createIngestFromEnv(env: NodeJS.ProcessEnv): ControlPlaneIngest 
     host: { hostId },
     fetch: stampedFetch(apiKey),
   });
+}
+
+/**
+ * The attention/status emitter: the legacy environment factory wins when it yields a client (no behaviour
+ * change for existing installs); otherwise the global engineering.yaml `herdr:` block is used (v1 ingest, the
+ * runtime caller of createIngestFromConnection). Null when neither is configured. Never rejects.
+ */
+export async function resolveAttentionIngest(
+  env: NodeJS.ProcessEnv,
+  agentDir: string,
+  opts: { fetch?: typeof globalThis.fetch } = {},
+): Promise<ControlPlaneIngest | null> {
+  const fromEnv = createIngestFromEnv(env);
+  if (fromEnv) return fromEnv;
+  try {
+    const { connection } = await loadHerdrConnection(agentDir);
+    if (!connection) return null;
+    return createIngestFromConnection(connection, connection.instanceId ?? os.hostname(), opts);
+  } catch {
+    return null;
+  }
 }

@@ -105,6 +105,11 @@ export interface LineageEmitterOptions {
   host?: string;
   visibility?: VisibilityScope;
   /**
+   * Scope ids stamped on every draft (e.g. the HCN room this Pi reports into, from the global YAML).
+   * Per-call scope fields win; `mission_id` here is only a default for events that carry none.
+   */
+  defaultScope?: { room_id?: string; workspace_id?: string; mission_id?: string };
+  /**
    * Keyed id derivation (EnvelopeStore.deriveEventId). Without it ids fall back to a bare
    * sha256 of public data, which is only acceptable for tests with a private sink.
    */
@@ -259,6 +264,7 @@ export class LineageEmitter {
   private readonly sink: LineageSink;
   private readonly host?: string;
   private readonly visibility?: VisibilityScope;
+  private readonly defaultScope: { room_id?: string; workspace_id?: string; mission_id?: string };
   private readonly now: () => Date;
   private readonly onError?: (error: unknown) => void;
   private readonly deriveKeyed?: (prefix: string, parts: readonly unknown[]) => string;
@@ -270,6 +276,7 @@ export class LineageEmitter {
     this.source = opts.source;
     this.host = opts.host;
     this.visibility = opts.visibility;
+    this.defaultScope = opts.defaultScope ?? {};
     this.now = opts.now ?? (() => new Date());
     this.onError = opts.onError;
     this.deriveKeyed = opts.deriveEventId;
@@ -673,6 +680,7 @@ export class LineageEmitter {
         entity_id: subject,
         event_type: eventType,
         payload,
+        ...this.defaultScope,
         ...scope,
         ...(this.visibility ? { visibility_scope: this.visibility } : {}),
       };

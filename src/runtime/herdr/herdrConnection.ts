@@ -5,6 +5,11 @@
  *     url: https://herdr.example.org          # https, or http only for localhost / 127.0.0.1 / ::1
  *     api_key_file: /home/me/.config/herdr/key # absolute, mode 0600, owned by you, one line
  *     instance_id: pi-laptop-1                 # optional; names this Pi when several share one key
+ *     lineage: true                            # optional (default false): emit typed lineage events
+ *     visibility: room                         # optional private|mission|room|org (default private)
+ *     room_id: room-abc                        # optional: stamped on every lineage event
+ *     workspace_id: ws-1                       # optional
+ *     mission_id: m-1                          # optional default mission for events that carry none
  *
  * A repository file cannot set it. Anything malformed or unsafe yields `null` plus a note and the caller stays
  * silent. The key is read from the file and never logged, copied into an error, or accepted inline.
@@ -14,12 +19,24 @@ import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { readYaml } from "../../lifecycle/policy.ts";
 import { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
+import type { VisibilityScope } from "./envelope.ts";
+import type { EnvelopeStore } from "./envelopeStore.ts";
 
 export interface HerdrConnection {
   baseUrl: string;
   apiKey?: string;
   instanceId?: string;
+  /** `lineage: true` in the YAML block. */
+  lineage?: boolean;
+  visibility?: VisibilityScope;
+  roomId?: string;
+  workspaceId?: string;
+  missionId?: string;
 }
+
+const SCOPE_KEYS = ["room_id", "workspace_id", "mission_id"] as const;
+const VISIBILITIES: readonly string[] = ["private", "mission", "room", "org"];
+const KNOWN_KEYS = new Set(["url", "api_key_file", "instance_id", "lineage", "visibility", ...SCOPE_KEYS]);
 
 const LOOPBACK = new Set(["127.0.0.1", "[::1]", "localhost"]);
 const INSTANCE_RE = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -78,7 +95,7 @@ export async function loadHerdrConnection(
   if (block === undefined) return { connection: null, notes: [] };
   const off = (note: string) => ({ connection: null, notes: [`herdr off: ${note}`] });
   if (!isPlain(block)) return off("`herdr` must be a mapping");
-  const unknown = Object.keys(block).filter((k) => k !== "url" && k !== "api_key_file" && k !== "instance_id");
+  const unknown = Object.keys(block).filter((k) => !KNOWN_KEYS.has(k));
   if (unknown.length) return off(`unknown keys ${unknown.join(", ")}`);
   if (typeof block.url !== "string") return off("`herdr.url` is required");
   const url = checkHerdrUrl(block.url);
@@ -96,11 +113,36 @@ export async function loadHerdrConnection(
     }
     out.instanceId = block.instance_id;
   }
+  if (block.lineage !== undefined) {
+    if (typeof block.lineage !== "boolean") return off("`herdr.lineage` must be true or false");
+    out.lineage = block.lineage;
+  }
+  if (block.visibility !== undefined) {
+    if (typeof block.visibility !== "string" || !VISIBILITIES.includes(block.visibility)) {
+      return off("`herdr.visibility` must be private, mission, room or org");
+    }
+    out.visibility = block.visibility as VisibilityScope;
+  }
+  for (const key of SCOPE_KEYS) {
+    const v = block[key];
+    if (v === undefined) continue;
+    if (typeof v !== "string" || !INSTANCE_RE.test(v)) return off(`\`herdr.${key}\` must be 1-128 of A-Za-z0-9._:-`);
+    if (key === "room_id") out.roomId = v;
+    else if (key === "workspace_id") out.workspaceId = v;
+    else out.missionId = v;
+  }
   return { connection: out, notes: [] };
 }
 
 /** The ingest emitter built from the same YAML block (replaces the environment variables). */
-export function createIngestFromConnection(conn: HerdrConnection, hostId: string): ControlPlaneIngest {
+export function createIngestFromConnection(
+  conn: HerdrConnection,
+  hostId: string,
+  opts: { envelopeStore?: EnvelopeStore; fetch?: typeof globalThis.fetch } = {},
+): ControlPlaneIngest {
+  // Without `envelopeStore` this is a v1 emitter: diagnostics() is undefined, so
+  // createLineageEmitter({ingest}) returns null and it cannot carry lineage. Pass a store
+  // (see createLineageFromConnection) for the durable v2 outbox lineage needs.
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
     const headers = new Headers(init?.headers);
     if (conn.apiKey) headers.set("x-api-key", conn.apiKey);
@@ -110,7 +152,12 @@ export function createIngestFromConnection(conn: HerdrConnection, hostId: string
       if (parsed.source === undefined) parsed.source = "pi";
       body = JSON.stringify(parsed);
     }
-    return globalThis.fetch(input, { ...init, headers, body, redirect: "error" });
+    return (opts.fetch ?? globalThis.fetch)(input, { ...init, headers, body, redirect: "error" });
   }) as typeof globalThis.fetch;
-  return new ControlPlaneIngest({ url: `${conn.baseUrl}/`, host: { hostId }, fetch: fetchImpl });
+  return new ControlPlaneIngest({
+    url: `${conn.baseUrl}/`,
+    host: { hostId },
+    fetch: fetchImpl,
+    ...(opts.envelopeStore ? { envelopeStore: opts.envelopeStore } : {}),
+  });
 }
