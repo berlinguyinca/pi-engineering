@@ -87,7 +87,10 @@ function resolveRefs(node: unknown, keys: Record<string, string>): unknown {
   if (Array.isArray(node)) return node.map((v) => resolveRefs(v, keys));
   if (node && typeof node === "object") {
     return Object.fromEntries(
-      Object.entries(node as Record<string, unknown>).map(([k, v]) => [String(resolveRefs(k, keys)), resolveRefs(v, keys)]),
+      Object.entries(node as Record<string, unknown>).map(([k, v]) => [
+        String(resolveRefs(k, keys)),
+        resolveRefs(v, keys),
+      ]),
     );
   }
   return node;
@@ -149,10 +152,16 @@ export class Plane {
     if (this.opts.quorum !== undefined) cp.review_quorum = resolveRefs(this.opts.quorum, this.keys);
     if (this.opts.pgDsn) cp.pg_dsn = this.opts.pgDsn;
     const fleet = join(this.workdir, `${name}-fleet.yaml`);
-    writeFileSync(fleet, JSON.stringify({ version: 1, hosts: {}, sections: { control_plane: { roles: ["admin"], values: cp } } }));
+    writeFileSync(
+      fleet,
+      JSON.stringify({ version: 1, hosts: {}, sections: { control_plane: { roles: ["admin"], values: cp } } }),
+    );
     chmodSync(fleet, 0o600);
     const users = join(this.workdir, `${name}-users.json`);
-    writeFileSync(users, JSON.stringify(Object.fromEntries(Object.entries(this.tokens).map(([u, t]) => [u, sha256(t)]))));
+    writeFileSync(
+      users,
+      JSON.stringify(Object.fromEntries(Object.entries(this.tokens).map(([u, t]) => [u, sha256(t)]))),
+    );
     chmodSync(users, 0o600);
     return { fleet, users };
   }
@@ -160,10 +169,25 @@ export class Plane {
   async start(): Promise<void> {
     const { fleet, users } = this.writeConfig();
     this.port = await freePort();
-    const args = ["-m", "herdr_engineering.cli", "control-plane", "web", "--host", "127.0.0.1", "--port", String(this.port), "--fleet-config", fleet];
+    const args = [
+      "-m",
+      "herdr_engineering.cli",
+      "control-plane",
+      "web",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(this.port),
+      "--fleet-config",
+      fleet,
+    ];
     if (Object.keys(this.tokens).length) args.push("--collab-users-file", users);
     const log = openSync(join(this.workdir, `${this.opts.name ?? "plane"}.log`), "a");
-    this.proc = spawn(this.acc.python, args, { cwd: this.acc.herdrRepo, stdio: ["ignore", log, log], env: { PATH: process.env.PATH ?? "" } });
+    this.proc = spawn(this.acc.python, args, {
+      cwd: this.acc.herdrRepo,
+      stdio: ["ignore", log, log],
+      env: { PATH: process.env.PATH ?? "" },
+    });
     closeSync(log);
     const deadline = Date.now() + this.acc.startupSeconds * 1000;
     for (;;) {
@@ -180,13 +204,18 @@ export class Plane {
       await new Promise((r) => setTimeout(r, 150));
     }
     // only OUR process accepts our random key and refuses a wrong one (guards a recycled port)
-    const wrong = await this.call("GET", "/api/v1/ingest/sources", { headers: { "x-api-key": `wrong-${randomBytes(4).toString("hex")}` } });
+    const wrong = await this.call("GET", "/api/v1/ingest/sources", {
+      headers: { "x-api-key": `wrong-${randomBytes(4).toString("hex")}` },
+    });
     if (wrong.status !== 401) throw new Error("port is served by a different control plane");
   }
 
   tail(): string {
     try {
-      return readFileSync(join(this.workdir, `${this.opts.name ?? "plane"}.log`), "utf8").split("\n").slice(-40).join("\n");
+      return readFileSync(join(this.workdir, `${this.opts.name ?? "plane"}.log`), "utf8")
+        .split("\n")
+        .slice(-40)
+        .join("\n");
     } catch {
       return "";
     }
@@ -225,7 +254,13 @@ export class Plane {
       body = JSON.stringify(o.body);
       h["content-type"] = "application/json";
     }
-    const res = await fetch(`${this.url}${path}`, { method, headers: h, body, redirect: "error", signal: AbortSignal.timeout(10_000) });
+    const res = await fetch(`${this.url}${path}`, {
+      method,
+      headers: h,
+      body,
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    });
     const text = await res.text();
     let parsed: unknown = {};
     try {
@@ -259,14 +294,19 @@ export class Plane {
     const { roomId } = await this.makeRoom(owner, "feature-probe", "feature-probe-room");
     for (const p of ["xlinks", "delegations", "proposals", "consultations"]) {
       const r = await this.c("GET", `/rooms/${roomId}/${p}`, { user: owner });
-      if (r.status !== 200 || r.body.enabled !== true) throw new Error(`feature probe ${p}: ${r.status} ${JSON.stringify(r.body)}`);
+      if (r.status !== 200 || r.body.enabled !== true)
+        throw new Error(`feature probe ${p}: ${r.status} ${JSON.stringify(r.body)}`);
     }
     for (const p of ["attention", "progress", "analytics"]) {
       const r = await this.c("GET", `/rooms/${roomId}/${p}`, { user: owner });
       if (r.status !== 200) throw new Error(`feature probe ${p}: ${r.status} ${JSON.stringify(r.body)}`);
     }
-    const st = await this.c("POST", `/rooms/${roomId}/steering`, { user: owner, body: { node_id: "agent:probe", action: "pause", instruction: "x" } });
-    if (st.status === 403 || st.body.code === "steering_disabled") throw new Error(`feature probe steering: ${JSON.stringify(st.body)}`);
+    const st = await this.c("POST", `/rooms/${roomId}/steering`, {
+      user: owner,
+      body: { node_id: "agent:probe", action: "pause", instruction: "x" },
+    });
+    if (st.status === 403 || st.body.code === "steering_disabled")
+      throw new Error(`feature probe steering: ${JSON.stringify(st.body)}`);
   }
 
   async node(id: string, key = "operator"): Promise<Reply> {
@@ -292,7 +332,11 @@ export class Plane {
 }
 
 /** Poll until `fn` returns a truthy value (outbox delivery is asynchronous). */
-export async function eventually<T>(fn: () => Promise<T | false | undefined | null>, what: string, ms = 15_000): Promise<T> {
+export async function eventually<T>(
+  fn: () => Promise<T | false | undefined | null>,
+  what: string,
+  ms = 15_000,
+): Promise<T> {
   const end = Date.now() + ms;
   let last: unknown;
   for (;;) {
