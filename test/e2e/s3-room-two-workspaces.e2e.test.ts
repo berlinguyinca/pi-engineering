@@ -1,3 +1,16 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
+import { WorkGraph } from "../../src/platform/WorkGraph.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { enclosingMethods } from "./support/codeGraph.ts";
+import { type PiHost, startPiHost } from "./support/piHost.ts";
+import { Plane, eventually, loadAcceptance } from "./support/plane.ts";
 /**
  * ACCEPTANCE SCENARIO 3 (Pi side). One HCN room spans two workspaces on two different hosts; a parent agent (tab)
  * spawns two child agents (panes); the graph and timeline keep spawn, handoff and peer consultation apart; closing a
@@ -12,22 +25,10 @@
  *
  * Gaps are named `GAP:` and assert the CURRENT behaviour. Nothing here calls an emitter primitive to fill a gap.
  */
-import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, before, describe, it } from "node:test";
-import { pathToFileURL } from "node:url";
-import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
-import { WorkGraph } from "../../src/platform/WorkGraph.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { type PiHost, startPiHost } from "./support/piHost.ts";
-import { Plane, eventually, loadAcceptance } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 function gitRepo(): string {
-  const d = mkdtempSync(join(tmpdir(), "t16-s3-repo-"));
+  const d = scratch("t16-s3-repo-");
   const g = (...a: string[]) => execFileSync("git", ["-C", d, ...a], { stdio: "pipe" });
   g("init", "-q", "-b", "main");
   g("config", "user.email", "t16@example.invalid");
@@ -376,10 +377,15 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
       assert.equal(r.status, 200);
       assert.deepEqual(r.body.nodes, [], `Pi emitted a ${type} node: lineage.ts has no tab/pane primitive`);
     }
-    // the only closePane call in Pi is Terminate (which cancels the attempt on purpose), never a "surface closed" report
-    const src = readFileSync(new URL("../../src/runtime/herdr/HerdrAgentRuntime.ts", import.meta.url), "utf8");
-    assert.equal((src.match(/closePane\(/g) ?? []).length, 1);
-    assert.match(src, /async terminate[\s\S]{0,1200}closePane\(/);
+    // structural: the only closePane call in Pi's Herdr runtime is inside terminate() (which cancels the attempt on
+    // purpose), never a "surface closed" report
+    assert.deepEqual(
+      enclosingMethods(
+        fileURLToPath(new URL("../../src/runtime/herdr/HerdrAgentRuntime.ts", import.meta.url)),
+        "closePane",
+      ),
+      ["terminate"],
+    );
   });
 
   it("closing a pane never kills the worker (SERVER CONTRACT via raw ingest, not Pi-path evidence)", async () => {

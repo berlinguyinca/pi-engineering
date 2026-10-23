@@ -1,3 +1,27 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import {
+  appendFileSync,
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import { GitRepo } from "../../src/git/GitRepo.ts";
+import { forkIdFor } from "../../src/orchestration/forks.ts";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { SteeringPorts } from "../../src/orchestration/steering.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { type SteeringReceiver, createSteeringReceiver } from "../../src/runtime/herdr/SteeringReceiver.ts";
+import { type ForkRuntime, createForkRuntime } from "../../src/runtime/herdr/forkWiring.ts";
+import { type PiHost, startPiHost } from "./support/piHost.ts";
+import { Plane, eventually } from "./support/plane.ts";
 /**
  * ACCEPTANCE SCENARIO 5 (Pi side). A reviewer's verdict failed at a historical commit. A room contributor comments on
  * the failed review, proposes a fork of the attempt from that historical commit with a changed requirement, the room
@@ -13,31 +37,7 @@
  *
  * Gaps are named `GAP:` and assert the CURRENT behaviour. Nothing here calls an emitter primitive to fill a gap.
  */
-import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import {
-  appendFileSync,
-  chmodSync,
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { after, before, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
-import { GitRepo } from "../../src/git/GitRepo.ts";
-import { forkIdFor } from "../../src/orchestration/forks.ts";
-import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import type { SteeringPorts } from "../../src/orchestration/steering.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { type SteeringReceiver, createSteeringReceiver } from "../../src/runtime/herdr/SteeringReceiver.ts";
-import { type ForkRuntime, createForkRuntime } from "../../src/runtime/herdr/forkWiring.ts";
-import { type PiHost, startPiHost } from "./support/piHost.ts";
-import { Plane, eventually } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const enc = encodeURIComponent;
@@ -143,6 +143,8 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     doc.sections.control_plane.values.collab.steering = {
       enabled: true,
       self_confirm: false,
+      propose_per_10min: 200, // this suite proposes far more than the production default of a real room
+      confirm_per_10min: 200,
       actions: ["pause", "redirect", "fork", "promote"],
       forks: {
         enabled: true,
@@ -214,7 +216,7 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     setSteering({});
 
     // a real repository: C0 base, C1 the attempt's (reviewed, failed) result, C2 main moved on since
-    const parent = mkdtempSync(join(tmpdir(), "t16-s5-"));
+    const parent = scratch("t16-s5-");
     repo = join(parent, "repo");
     bare = join(parent, "origin.git");
     execFileSync("git", ["init", "-q", "--bare", "-b", "main", bare]);
@@ -236,7 +238,7 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     mainAtStart = sha.C2;
 
     // the fake gh and its sidecar config (the bare repository is the "remote")
-    ghDir = mkdtempSync(join(tmpdir(), "t16-s5-gh-"));
+    ghDir = scratch("t16-s5-gh-");
     copyFileSync(join(HERE, "fake_gh_s5", "gh"), join(ghDir, "gh"));
     const script = readFileSync(join(ghDir, "gh"), "utf8").replace("#!/usr/bin/env node", `#!${process.execPath}`);
     writeFileSync(join(ghDir, "gh"), script);
@@ -822,6 +824,104 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     assert.ok(validatedB && !validatedB.removed && !validatedB.stale);
     assert.equal(JSON.stringify(await edgeKeys("pr:github.com/acme/widgets#11")), rec.gateEdgesBefore);
     assert.equal(JSON.stringify(await edgeKeys("pr:github.com/acme/widgets#12")), rec.gateBEdgesBefore);
+  });
+
+  // ------------------------------------------------------------------------------------------------ fences, one stage at a time
+  // The target moves ONLY in a fenced attribute (fencing_token) through the REAL Pi emitter: it stays `running`, `pause`
+  // stays eligible, the instance pin is unchanged, so nothing but the fence can notice (the fork tests above move
+  // head_sha, which other guards also see).
+  const liveNode = async (id: string, token: string) => {
+    const before = (await target(id)).body.fence as string | undefined; // undefined: the node does not exist yet
+    host.emitter.nodeUpsert(id, { label: id, state: "running", attrs: { fencing_token: token } }, `t16.fence.${token}`);
+    await host.drain();
+    // (fencing_token itself is a secret-named key and is redacted on read, so wait on the fence it feeds)
+    await eventually(async () => (await target(id)).body.fence !== before, `${id} at ${token}`);
+  };
+  const confirmWith = (st: { steering_id: string; digest: string }, fence: string) =>
+    plane.c("POST", `/rooms/${roomId}/steering/${st.steering_id}/confirm`, {
+      user: "alice",
+      body: { digest: st.digest, expected_fence: fence },
+    });
+
+  it("fence at PROPOSE: a target that moved only in a fenced attribute is refused, the fresh fence is accepted", async () => {
+    await liveNode("attempt:fence-p", "t1");
+    const old = (await target("attempt:fence-p")).body.fence as string;
+    await liveNode("attempt:fence-p", "t2");
+    const fresh = await target("attempt:fence-p");
+    assert.notEqual(fresh.body.fence, old);
+    assert.ok((fresh.body.actions as string[]).includes("pause"), "still eligible: only the fence differs");
+    const late = await plane.c("POST", `/rooms/${roomId}/steering`, {
+      user: "bob",
+      body: { action: "pause", node_id: "attempt:fence-p", expected_fence: old, idempotency_key: "fp-1" },
+    });
+    assert.equal(late.status, 409);
+    assert.equal(late.body.code, "stale_fence");
+    assert.ok([200, 201].includes((await propose("bob", "pause", "attempt:fence-p")).status), "control: fresh fence");
+  });
+
+  it("fence at CONFIRM: a wrong expected_fence on an unchanged target, and a target that moved after the proposal, are both refused", async () => {
+    await liveNode("attempt:fence-c", "t1");
+    const a = await propose("bob", "pause", "attempt:fence-c");
+    assert.ok([200, 201].includes(a.status), JSON.stringify(a.body));
+    const stored = (await target("attempt:fence-c")).body.fence as string;
+    const bogus = await confirmWith(a.body.steering, "0".repeat(stored.length));
+    assert.equal(bogus.status, 409);
+    assert.equal(bogus.body.code, "stale_fence", "target unchanged: only expected_fence is wrong");
+    const b = await propose("bob", "pause", "attempt:fence-c");
+    assert.equal((await confirmWith(b.body.steering, stored)).status, 200, "control: the right fence confirms");
+    const c = await propose("bob", "pause", "attempt:fence-c");
+    await liveNode("attempt:fence-c", "t2");
+    const moved = await confirmWith(c.body.steering, stored); // the proposal's own fence, but the target has moved on
+    assert.equal(moved.status, 409);
+    assert.equal(moved.body.code, "stale_fence");
+    assert.equal((await statusOf(c.body.steering.steering_id))?.status, "fenced");
+    await receiver.pollOnce(); // drain the one confirmed request (b) so later tests see a clean queue
+  });
+
+  it("fence at DELIVERY: a confirmed request is not handed to the Pi receiver once the target moved", async () => {
+    await liveNode("attempt:fence-d1", "t1");
+    const keep = await propose("bob", "pause", "attempt:fence-d1");
+    assert.ok([200, 201].includes(keep.status), JSON.stringify(keep.body));
+    assert.equal((await confirm("alice", keep.body.steering, "attempt:fence-d1")).status, 200);
+    const pending = async () =>
+      (
+        (await plane.call("GET", "/api/v1/steering/pending?instance_id=inst-a", { key: "pi" })).body.steering as Array<{
+          steering_id: string;
+        }>
+      ).map((x) => x.steering_id);
+    assert.ok(
+      (await pending()).includes(keep.body.steering.steering_id),
+      "control: an untouched confirmed request is offered",
+    );
+    await liveNode("attempt:fence-d2", "u1");
+    const st = await propose("bob", "pause", "attempt:fence-d2");
+    assert.equal((await confirm("alice", st.body.steering, "attempt:fence-d2")).status, 200);
+    await liveNode("attempt:fence-d2", "u2"); // moved between confirmation and the emitter's poll
+    const got = await pending();
+    assert.ok(!got.includes(st.body.steering.steering_id), "withheld");
+    assert.equal((await statusOf(st.body.steering.steering_id))?.status, "fenced");
+    const r = await receiver.pollOnce(); // the real Pi receiver agrees: it is never handed the fenced request
+    assert.ok(r.received <= 1, "at most the untouched, unacked pause is re-offered");
+  });
+
+  it("self-confirmation: an owner cannot confirm their own proposal; the operator's hot self_confirm switch is the control", async () => {
+    await liveNode("attempt:fence-s", "t1");
+    const mine = await propose("alice", "pause", "attempt:fence-s"); // the owner may PROPOSE
+    const refused = await confirm("alice", mine.body.steering, "attempt:fence-s");
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.code, "self_confirm");
+    assert.equal((await statusOf(mine.body.steering.steering_id))?.status, "pending");
+    setSteering({ self_confirm: true });
+    try {
+      assert.equal(
+        (await confirm("alice", mine.body.steering, "attempt:fence-s")).status,
+        200,
+        "control: allowed when on",
+      );
+    } finally {
+      setSteering({});
+    }
+    await receiver.pollOnce();
   });
 
   it("GAP: AutoSpec's review publisher writes org-scoped nodes that room members cannot comment on", async () => {

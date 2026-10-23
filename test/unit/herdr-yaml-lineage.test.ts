@@ -119,6 +119,22 @@ describe("loadLineageEmitter from engineering.yaml", () => {
     }
   });
 
+  it("visibility defaults to PRIVATE when the YAML does not say otherwise (and a stated value is honoured)", async () => {
+    const run = async (block: string) => {
+      const { dir } = await setup(block);
+      const state = await mkdtemp(join(tmpdir(), "pi-yaml-lineage-state-"));
+      const { calls, fetch } = recorder();
+      const em = await loadLineageEmitter({ agentDir: dir, envelopeDir: state, fetch });
+      assert.ok(em instanceof LineageEmitter);
+      em.workerSpawned({ agent: "lead", attempt: "lead.1", transition: "t" });
+      await em.idle();
+      assert.ok(calls.length > 0);
+      return new Set(calls.map((c) => c.body.visibility_scope));
+    };
+    assert.deepEqual([...(await run("  lineage: true\n  room_id: room-9\n"))], ["private"]);
+    assert.deepEqual([...(await run("  lineage: true\n  visibility: org\n  room_id: room-9\n"))], ["org"]); // control
+  });
+
   it("instance_id from the YAML is stamped on upserted nodes (Herdr pins steering to it); absent = unpinned", async () => {
     const withId = await setup("  lineage: true\n  instance_id: pi-laptop-1\n");
     const noId = await setup("  lineage: true\n");

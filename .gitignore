@@ -31,3 +31,6 @@ npm-debug.log*
 # oh-my-claudecode hook state (written by local agent hooks)
 .omc/
 rr*.ts
+
+# T16 e2e local acceptance override
+test/e2e/acceptance.local.yaml

@@ -1,3 +1,22 @@
+import assert from "node:assert/strict";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import { GitRepo } from "../../src/git/GitRepo.ts";
+import { createGithubClient } from "../../src/github/client.ts";
+import { emitLinkRecorded } from "../../src/github/lineage.ts";
+import { linkPullRequest } from "../../src/github/prLinks.ts";
+import { reconcileGithubLinks } from "../../src/github/reconcile.ts";
+import { ingestAutoSpecDag } from "../../src/integrations/autospec/dagIngest.ts";
+import { decideMerge } from "../../src/merge/mergeGate.ts";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
+import { callers, mentions, reachable } from "./support/codeGraph.ts";
+import { Plane, eventually, sha40 } from "./support/plane.ts";
 /**
  * ACCEPTANCE SCENARIO 2 - AutoSpec mission.
  * "existing GitHub issue DAG, Pi adapter, multiple worktrees, PR, independent AI reviewer, defect repair, head change
@@ -14,25 +33,7 @@
  *
  * Gaps are named `GAP: ...` and assert today's behaviour; none is filled by calling emitter primitives from the test.
  */
-import assert from "node:assert/strict";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { after, before, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
-import { GitRepo } from "../../src/git/GitRepo.ts";
-import { createGithubClient } from "../../src/github/client.ts";
-import { emitLinkRecorded } from "../../src/github/lineage.ts";
-import { linkPullRequest } from "../../src/github/prLinks.ts";
-import { reconcileGithubLinks } from "../../src/github/reconcile.ts";
-import { ingestAutoSpecDag } from "../../src/integrations/autospec/dagIngest.ts";
-import { decideMerge } from "../../src/merge/mergeGate.ts";
-import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
-import { Plane, eventually, sha40 } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 const PI = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const FAKE_GH = join(PI, "test/e2e/fake_gh_s2");
@@ -172,7 +173,7 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
         reviewers: { "@r1": {}, "@r2": {} },
       },
     });
-    tmp = mkdtempSync(join(tmpdir(), "t16-s2-"));
+    tmp = scratch("t16-s2-");
     agentDir = join(tmp, "agent");
     mkdirSync(agentDir, { recursive: true });
     const keyFile = join(agentDir, "ingest.key");
@@ -440,14 +441,20 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
   });
 
   // ---------------------------------------------------------------------------------------- merge gate (before repair)
-  const decision = (candidate: string, prHead: string, reviewSha: string | null, ci: "pass" | "fail" | "pending") =>
+  const decision = (
+    candidate: string,
+    prHead: string,
+    reviewSha: string | null,
+    ci: "pass" | "fail" | "pending",
+    checkSha: string = prHead,
+  ) =>
     decideMerge({
       repo: REPO,
       prNumber,
       candidateSha: candidate,
       prHeadSha: prHead,
       baseSha: git(clone, "rev-parse", "main"),
-      checks: [{ name: "ci", status: ci, sha: prHead }],
+      checks: [{ name: "ci", status: ci, sha: checkSha }],
       requiredChecks: ["ci"],
       review: reviewSha === null ? null : { verdict: "PASS", sha: reviewSha },
       queue: [],
@@ -505,6 +512,14 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     assert.equal(decision(head2, head2, head2, "pass").decision, "merge"); // control: everything on the new head
   });
 
+  it("a GREEN CI check pinned to the previous head cannot merge a PR whose review is on the current head", async () => {
+    // only the CHECK's sha differs from the live head: review, candidate and head all agree on head2
+    const stale = decision(head2, head2, head2, "pass", head1);
+    assert.equal(stale.decision, "reject");
+    assert.match(stale.reasons.join(";"), /check ci sha .* != head/);
+    assert.equal(decision(head2, head2, head2, "pass", head2).decision, "merge"); // control: same call, check on the live head
+  });
+
   it("fresh independent verdicts at the new head satisfy the quorum again, and then the gate merges", async () => {
     // a verdict that arrives late for the OLD head is accepted as history but counts for nothing
     publish(autospecBin, tmp, plane, "r1", PR_NODE(prNumber), head1, 6);
@@ -528,36 +543,25 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
   });
 
   it("GAP: nothing in Pi calls the reconciler or reacts to github.evidence_stale (no automatic re-review request)", async () => {
-    const callers = spawnSync("grep", ["-rlE", "reconcileGithubLinks|github\\.evidence_stale", join(PI, "src")], {
-      encoding: "utf8",
-    })
-      .stdout.trim()
-      .split("\n")
-      .map((f) => f.replace(`${PI}/`, ""))
-      .sort();
-    assert.ok(callers.includes("src/github/reconcile.ts"), "control: the reconciler exists");
-    assert.ok(
-      !callers.some((f) => f.startsWith("src/runtime/") || f.startsWith("src/orchestration/forks")),
-      callers.join(","),
-    );
+    const reach = reachable();
+    assert.ok(existsSync(join(PI, "src/github/reconcile.ts")), "control: the reconciler exists");
+    // structural: the product entry points reach no call of the reconciler, and no module but the reconciler and the
+    // store's event table even names the stale signal (so nothing can react to it)
+    assert.deepEqual(callers(reach, ["reconcileGithubLinks"]), []);
+    assert.deepEqual(mentions(reach, /^github\.evidence_stale$/, ["src/github/reconcile.ts"]), [
+      "src/orchestration/missionStore.ts",
+    ]);
   });
 
   it("GAP: nothing in Pi connects Herdr's review quorum to its merge gate (decideMerge has no runtime caller, no quorum reader)", async () => {
-    const src = (p: string) => readFileSync(join(PI, p), "utf8");
-    assert.ok(src("src/merge/mergeGate.ts").includes("export function decideMerge"), "control: the gate exists");
-    const callers = execFileSync("grep", ["-rl", "decideMerge", join(PI, "src")], { encoding: "utf8" })
-      .trim()
-      .split("\n")
-      .map((f) => f.replace(`${PI}/`, ""))
-      .filter((f) => f !== "src/merge/mergeGate.ts");
-    assert.ok(
-      callers.every((f) => f.startsWith("src/merge/")),
-      `no non-merge caller: ${callers.join(",")}`,
+    const reach = reachable();
+    assert.ok(existsSync(join(PI, "src/merge/mergeGate.ts")), "control: the gate exists");
+    assert.deepEqual(
+      callers(reach, ["decideMerge"]),
+      [],
+      "no module reachable from a product entry point calls the gate",
     );
-    const quorumReaders = spawnSync("grep", ["-rliE", "review-quorum|review_quorum", join(PI, "src")], {
-      encoding: "utf8",
-    });
-    assert.equal(quorumReaders.status, 1, `grep finds no reader: ${quorumReaders.stdout}`); // 1 = no match
+    assert.deepEqual(mentions(reach, /review[-_]?quorum/i), [], "no reachable module reads Herdr's review quorum");
   });
 
   it("the fake gh was only asked for the calls Pi's client makes (no merge, no review-write)", async () => {

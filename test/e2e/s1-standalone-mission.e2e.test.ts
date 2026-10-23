@@ -1,16 +1,6 @@
-/**
- * ACCEPTANCE SCENARIO 1 - standalone Pi mission, AutoSpec disabled.
- * "risk-based plan, skipped or approved Plannotator, worker spawn, review, evidence and Herdr graph."
- *
- * Real pieces: the `scripts/pi-engineering.ts plan` CLI as a child process (clean environment, network/subprocess guard
- * preloaded), Pi's real HerdrPlannotatorTransport driving a FAKE bridge script, the real MissionStore/CheckpointManager/
- * WorkGraph lineage hooks, the real YAML-configured emitter (loadLineageEmitter) and a REAL Herdr control-plane process.
- * Nothing here calls AutoSpec, GitHub or a model.
- */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -24,6 +14,16 @@ import { EnvelopeStore } from "../../src/runtime/herdr/envelopeStore.ts";
 import { loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
 import { type FakePlannotator, makeFakePlannotator } from "./support/fakePlannotator.ts";
 import { Plane, eventually } from "./support/plane.ts";
+/**
+ * ACCEPTANCE SCENARIO 1 - standalone Pi mission, AutoSpec disabled.
+ * "risk-based plan, skipped or approved Plannotator, worker spawn, review, evidence and Herdr graph."
+ *
+ * Real pieces: the `scripts/pi-engineering.ts plan` CLI as a child process (clean environment, network/subprocess guard
+ * preloaded), Pi's real HerdrPlannotatorTransport driving a FAKE bridge script, the real MissionStore/CheckpointManager/
+ * WorkGraph lineage hooks, the real YAML-configured emitter (loadLineageEmitter) and a REAL Herdr control-plane process.
+ * Nothing here calls AutoSpec, GitHub or a model.
+ */
+import { scratch } from "./support/scratch.ts";
 
 const PI = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const GUARD = join(PI, "test/e2e/support/guardPreload.ts");
@@ -97,7 +97,7 @@ const HIGH = {
 };
 
 function workdir(label: string): { cwd: string; agentDir: string; store: string } {
-  const cwd = mkdtempSync(join(tmpdir(), `t16-s1-${label}-`));
+  const cwd = scratch(`t16-s1-${label}-`);
   const agentDir = join(cwd, "agent");
   mkdirSync(agentDir, { recursive: true });
   return { cwd, agentDir, store: join(cwd, "store") };

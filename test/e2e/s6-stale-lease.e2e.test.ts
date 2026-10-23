@@ -1,3 +1,14 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { MissionOwnership } from "../../src/orchestration/ownership.ts";
+import type { MissionLease, WorkspaceManifest } from "../../src/orchestration/types.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { startPiHost } from "./support/piHost.ts";
+import { Plane, eventually } from "./support/plane.ts";
 /**
  * ACCEPTANCE SCENARIO 6 (Pi side, stale lease). A mission controller loses its lease (it stalled past the lease TTL);
  * a second controller on ANOTHER host takes over with a higher generation and fencing token. The old holder's
@@ -8,21 +19,10 @@
  * hosts with their own YAML-configured emitters against a real control plane. Time is injected into the Pi lease
  * clock (a Pi test seam), not faked on the server.
  */
-import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, before, describe, it } from "node:test";
-import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { MissionOwnership } from "../../src/orchestration/ownership.ts";
-import type { MissionLease, WorkspaceManifest } from "../../src/orchestration/types.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { startPiHost } from "./support/piHost.ts";
-import { Plane, eventually } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 function gitRepo(): string {
-  const d = mkdtempSync(join(tmpdir(), "t16-s6lease-repo-"));
+  const d = scratch("t16-s6lease-repo-");
   const g = (...a: string[]) => execFileSync("git", ["-C", d, ...a], { stdio: "pipe" });
   g("init", "-q", "-b", "main");
   g("config", "user.email", "t16@example.invalid");
@@ -66,7 +66,7 @@ describe("scenario 6 (Pi): stale lease, takeover, fencing", () => {
     roomId = (await plane.makeRoom("alice", "lease", "lease-room")).roomId;
     const repo = gitRepo();
     const base = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"]).toString().trim();
-    const dir = mkdtempSync(join(tmpdir(), "t16-s6lease-"));
+    const dir = scratch("t16-s6lease-");
     const file = join(dir, "events.jsonl");
     let now = Date.parse("2026-09-26T10:00:00.000Z");
 
@@ -183,6 +183,35 @@ describe("scenario 6 (Pi): stale lease, takeover, fencing", () => {
     assert.ok(leaseB.fencingToken > leaseA.fencingToken);
     assert.throws(() => ownershipB.assertAuthoritative(leaseA), /stale.*fencing/i);
     assert.doesNotThrow(() => ownershipB.assertAuthoritative(leaseB));
+  });
+
+  it("the SAME owner id re-acquiring after expiry gets a higher generation/token, and its own older identity is refused", async () => {
+    // Same ownerId on purpose: the owner-id comparison cannot tell the two epochs apart, only generation/fencingToken can.
+    let now = Date.parse("2026-09-26T12:00:00.000Z");
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    store.createMission({
+      mission_id: "MSN-same-owner",
+      title: "t",
+      goal: "g",
+      user_request: "u",
+      repository: "/tmp/none",
+      base_ref: "main",
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const own = new MissionOwnership(store, { ownerId: "controller-same", now: () => now, leaseMs: 10_000 });
+    const first = await own.acquire("MSN-same-owner");
+    assert.doesNotThrow(() => own.assertAuthoritative(first)); // control: before expiry it IS authoritative
+    now += 10_001;
+    const second = await own.acquire("MSN-same-owner");
+    assert.equal(second.ownerId, first.ownerId);
+    assert.ok(second.generation > first.generation && second.fencingToken > first.fencingToken);
+    assert.throws(() => own.assertAuthoritative(first), /stale.*fencing/i);
+    await assert.rejects(() => own.renew(first), /stale.*fencing/i);
+    assert.doesNotThrow(() => own.assertAuthoritative(second)); // control: the new epoch is authoritative
+    // a forged identity: right owner, right generation, OLD token
+    assert.throws(() => own.assertAuthoritative({ ...second, fencingToken: first.fencingToken }), /stale.*fencing/i);
+    assert.throws(() => own.assertAuthoritative({ ...second, generation: first.generation }), /stale.*fencing/i);
   });
 
   it("Herdr shows the takeover under ONE stable logical agent with two attempts, attributed to their own hosts", async () => {
