@@ -12,6 +12,7 @@
  */
 
 import { id, newRunId } from "../core/ids.ts";
+import { AttemptTransitions, type LineageEmitter, type LineageState } from "../runtime/herdr/lineage.ts";
 import type { EventStoreBackend } from "./eventstore/backend.ts";
 import { redactDeep } from "./redact.ts";
 import type { ApprovalRecord, PlatformEvent, Run, RunStatus, Worker, WorkerLimits, WorkerStatus } from "./types.ts";
@@ -58,6 +59,9 @@ export class WorkGraph {
   private emitChain: Promise<void> = Promise.resolve();
   private emitFailures: Error[] = [];
   private readonly onEmitError: (err: Error) => void;
+  /** Optional lineage emitter (T02); null = none, every hook is a no-op. */
+  private lineage: LineageEmitter | null = null;
+  private readonly attemptTransitions = new AttemptTransitions();
 
   private constructor(store: EventStoreBackend, onEmitError?: (err: Error) => void) {
     this.store = store;
@@ -66,6 +70,45 @@ export class WorkGraph {
 
   static create(store: EventStoreBackend, onEmitError?: (err: Error) => void): WorkGraph {
     return new WorkGraph(store, onEmitError);
+  }
+
+  /** Attach (or detach) the lineage emitter. Replay/rebuild never emit lineage. */
+  setLineage(emitter: LineageEmitter | null): void {
+    this.lineage = emitter;
+  }
+
+  /** Attempt id of one worker run: a restart (generation bump) is a new run of the same agent. */
+  private static attemptId(worker: Pick<Worker, "id" | "generation">): string {
+    return `${worker.id}.g${worker.generation}`;
+  }
+
+  private lineageDo(hook: (lineage: LineageEmitter) => void): void {
+    const lineage = this.lineage;
+    if (!lineage) return;
+    try {
+      hook(lineage);
+    } catch {
+      // observational only
+    }
+  }
+
+  private lineageSpawned(w: Worker, transition: string, withParent = true): void {
+    this.lineageDo((l) => {
+      const parent = withParent && w.parentWorkerId ? this.workers.get(w.parentWorkerId) : undefined;
+      l.workerSpawned({
+        agent: w.id,
+        attempt: WorkGraph.attemptId(w),
+        // Only a parent this graph actually holds contributes an attempt; the agent link is the recorded parentWorkerId.
+        parentAgent: withParent ? w.parentWorkerId : null,
+        parentAttempt: parent ? WorkGraph.attemptId(parent) : null,
+        role: w.role,
+        model: w.model,
+        taskId: null,
+        missionId: null,
+        transition,
+        at: w.created_at,
+      });
+    });
   }
 
   /**
@@ -230,6 +273,7 @@ export class WorkGraph {
       generation: 1,
     };
     this.workers.set(worker.id, worker);
+    this.lineageSpawned(worker, `created:g${worker.generation}`);
     void this.emit({
       type: "platform.worker.created",
       project_id: worker.projectId,
@@ -256,8 +300,19 @@ export class WorkGraph {
   setWorkerStatus(workerId: string, status: WorkerStatus): Worker | undefined {
     const w = this.workers.get(workerId);
     if (!w) return undefined;
+    const previous = w.status;
     w.status = status;
     w.updated_at = new Date().toISOString();
+    const lineageState = WORKER_LINEAGE_STATE[status];
+    if (lineageState) {
+      this.lineageDo((l) => {
+        const attempt = WorkGraph.attemptId(w);
+        // Unchanged states and anything after done/cancelled add nothing; the discriminator is a change counter.
+        const transition = this.attemptTransitions.advance(attempt, lineageState, WORKER_LINEAGE_STATE[previous]);
+        if (transition === null) return;
+        l.attemptState({ attempt, agent: w.id }, lineageState, transition, undefined, w.updated_at);
+      });
+    }
     void this.emit({
       type: "platform.worker.status",
       project_id: w.projectId,
@@ -297,6 +352,8 @@ export class WorkGraph {
     w.status = "IDLE";
     w.heartbeat_at = null;
     w.updated_at = new Date().toISOString();
+    // Same logical agent, new run (no new spawn edge: the parent did not start it again).
+    this.lineageSpawned(w, `restarted:g${w.generation}`, false);
     void this.emit({
       type: "platform.worker.restarted",
       project_id: w.projectId,
@@ -392,6 +449,15 @@ export class WorkGraph {
     return graph;
   }
 }
+
+const WORKER_LINEAGE_STATE: Partial<Record<WorkerStatus, LineageState>> = {
+  RUNNING: "running",
+  BLOCKED: "blocked",
+  WAITING: "blocked",
+  COMPLETED: "done",
+  FAILED: "failed",
+  CANCELLED: "cancelled",
+};
 
 /** Minimal in-memory backend so `rebuild` needs no external store. */
 function JsonlEventStoreLike(): EventStoreBackend {

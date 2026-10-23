@@ -90,6 +90,7 @@ import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
+import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
 import { resolveWorktreeIdentity } from "./isolation/WorktreeIdentity.ts";
@@ -459,6 +460,12 @@ export interface RuntimeMissionActivityEvent {
 
 export interface EngineeringRuntimeOptions {
   cwd: string;
+  /**
+   * Optional lineage emitter (T02): mission executions, handoffs and verified
+   * checkpoints are reported as typed lineage events. Absent (the default) Pi
+   * emits nothing and behaves exactly as before.
+   */
+  lineage?: LineageEmitter;
   worker?: WorkerExecutor;
   /**
    * Optional distinct worker for the independent review + clean-room challenger
@@ -1289,6 +1296,7 @@ export class EngineeringRuntime {
       rt.orchestrationPath = orchestrationPath;
       rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
       openedMissionStores.set(orchestrationPath, rt.missionStore);
+      if (opts.lineage) rt.missionStore.setLineage(opts.lineage);
       rt.ownershipId = `session-${session.sessionId}-${randomUUID()}`;
       liveOwnerIds().add(rt.ownershipId);
       rt.missionOwnership = new MissionOwnership(rt.missionStore, {
