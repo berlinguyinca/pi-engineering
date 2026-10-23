@@ -209,6 +209,11 @@ export interface EngineeringPolicy {
       admission?: AdmissionRetrySettings;
     };
   };
+  /**
+   * Pre-implementation plan review (T03). Absent means OFF; see
+   * orchestration/planReviewConfig.ts for the accepted shape.
+   */
+  plan_review?: unknown;
 }
 
 export const DEFAULT_POLICY: EngineeringPolicy = {
