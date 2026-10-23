@@ -7,10 +7,12 @@
  *     max_total: 6             # live forks on this host
  *     max_per_origin: 3
  *     min_free_mb: 2048        # a fork is refused below this much free disk
+ *     retention_warn: 20       # warn (never delete) when this many finished forks are kept on disk
  *     refresh_seconds: 30      # how often fork heads/diffs are re-reported
  *     promote:                 # separate, default OFF: pushing a branch and opening a draft PR
  *       enabled: false
  *       draft: true
+ *       remote_url: git@github.com:owner/name.git   # the ONLY place a promotion may push to (else default_repo is used)
  *       github: { hosts: [github.com], default_repo: owner/name, gh_path: gh }
  */
 import { join } from "node:path";
@@ -23,11 +25,15 @@ export interface ForkSettings {
   refreshMs: number;
   promote: null | {
     draft: boolean;
+    /** Operator-pinned push destination; when absent the destination is pinned to `github.default_repo`. */
+    remoteUrl?: string;
     github: { hosts?: string[]; defaultRepo?: string; ghPath?: string };
   };
   notes: string[];
 }
 
+const PINNED_URL =
+  /^(?:https:\/\/[A-Za-z0-9.\-]+\/[A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+|ssh:\/\/git@[A-Za-z0-9.\-]+\/[A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+|git@[A-Za-z0-9.\-]+:[A-Za-z0-9_.\-]+\/[A-Za-z0-9_.\-]+|\/[A-Za-z0-9_.\-/]{1,250})$/;
 const isPlain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 const int = (v: unknown, lo: number, hi: number): number | null =>
   typeof v === "number" && Number.isInteger(v) && v >= lo && v <= hi ? v : null;
@@ -51,7 +57,16 @@ export async function loadForkSettings(agentDir: string): Promise<ForkSettings> 
   if (block === undefined) return base;
   if (!isPlain(block)) return off("`forks` must be a mapping");
   const unknown = Object.keys(block).filter(
-    (k) => !["enabled", "max_total", "max_per_origin", "min_free_mb", "refresh_seconds", "promote"].includes(k),
+    (k) =>
+      ![
+        "enabled",
+        "max_total",
+        "max_per_origin",
+        "min_free_mb",
+        "retention_warn",
+        "refresh_seconds",
+        "promote",
+      ].includes(k),
   );
   if (unknown.length) return off(`unknown keys ${unknown.join(", ")}`);
   if (typeof block.enabled !== "boolean") return off("`forks.enabled` must be true or false");
@@ -60,6 +75,7 @@ export async function loadForkSettings(agentDir: string): Promise<ForkSettings> 
     ["max_total", "maxTotal", 1, 50],
     ["max_per_origin", "maxPerOrigin", 1, 10],
     ["min_free_mb", "minFreeMb", 0, 10_000_000],
+    ["retention_warn", "retentionWarn", 1, 100_000],
   ] as const) {
     if (block[key] === undefined) continue;
     const v = int(block[key], lo, hi);
@@ -76,11 +92,17 @@ export async function loadForkSettings(agentDir: string): Promise<ForkSettings> 
   if (block.promote !== undefined) {
     const p = block.promote;
     if (!isPlain(p)) return off("`forks.promote` must be a mapping");
-    const pu = Object.keys(p).filter((k) => !["enabled", "draft", "github"].includes(k));
+    const pu = Object.keys(p).filter((k) => !["enabled", "draft", "github", "remote_url"].includes(k));
     if (pu.length) return off(`unknown keys forks.promote.${pu.join(", ")}`);
     if (typeof p.enabled !== "boolean") return off("`forks.promote.enabled` must be true or false");
     if (p.draft !== undefined && typeof p.draft !== "boolean")
       return off("`forks.promote.draft` must be true or false");
+    let remoteUrl: string | undefined;
+    if (p.remote_url !== undefined) {
+      if (typeof p.remote_url !== "string" || !PINNED_URL.test(p.remote_url) || p.remote_url.startsWith("-"))
+        return off("`forks.promote.remote_url` must be an https://, ssh://git@, git@host: or absolute path URL");
+      remoteUrl = p.remote_url;
+    }
     const gh = p.github;
     const github: { hosts?: string[]; defaultRepo?: string; ghPath?: string } = {};
     if (gh !== undefined) {
@@ -106,7 +128,7 @@ export async function loadForkSettings(agentDir: string): Promise<ForkSettings> 
         github.ghPath = gh.gh_path;
       }
     }
-    if (p.enabled) promote = { draft: p.draft !== false, github };
+    if (p.enabled) promote = { draft: p.draft !== false, github, ...(remoteUrl ? { remoteUrl } : {}) };
   }
   return { enabled: block.enabled, limits, refreshMs, promote: block.enabled ? promote : null, notes: [] };
 }

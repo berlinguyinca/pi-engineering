@@ -128,6 +128,17 @@ export interface GhRunOptions {
 }
 export type GhRunner = (argv: readonly string[], options: GhRunOptions) => Promise<GhRunResult>;
 
+/**
+ * Environment for `gh`: the caller's environment (gh needs its token, HOME and proxy settings) minus every `GIT_*`
+ * variable, so a variable set for some other tool (GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, GIT_CONFIG_*) cannot make a
+ * git subprocess of gh run something unexpected. Only `gh api` is used here and it never reads repository config.
+ */
+export function ghEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(source)) if (!k.toUpperCase().startsWith("GIT_")) env[k] = v;
+  return { ...env, GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", GH_PAGER: "cat", NO_COLOR: "1" };
+}
+
 export function execGh(ghPath: string): GhRunner {
   return (argv, options) =>
     new Promise((resolve, reject) => {
@@ -138,7 +149,7 @@ export function execGh(ghPath: string): GhRunner {
           timeout: options.timeoutMs,
           maxBuffer: options.maxOutputBytes,
           windowsHide: true,
-          env: { ...process.env, GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", GH_PAGER: "cat", NO_COLOR: "1" },
+          env: ghEnv(),
         },
         (error, stdout, stderr) => {
           if (!error) return resolve({ stdout: String(stdout), stderr: String(stderr), code: 0 });

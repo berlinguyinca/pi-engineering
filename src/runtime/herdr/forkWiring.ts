@@ -3,7 +3,6 @@
  * YAML. Returns null (nothing constructed, no timer, no network) unless `forks.enabled` is true, so standalone Pi,
  * with or without Herdr or AutoSpec, behaves exactly as before.
  */
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { CliForkGit } from "../../git/forkGit.ts";
@@ -14,6 +13,7 @@ import {
   type ForkOrigin,
   ForkRegistry,
   type OriginResolution,
+  type RemotePin,
 } from "../../orchestration/forks.ts";
 import type { ForkSteeringPort } from "../../orchestration/steering.ts";
 import { loadForkSettings } from "./forkSettings.ts";
@@ -36,14 +36,6 @@ export interface ForkRuntime {
   port: ForkSteeringPort;
   manager: ForkManager;
   stop(): void;
-}
-
-function originUrl(repoRoot: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    execFile("git", ["-C", repoRoot, "remote", "get-url", "origin"], { timeout: 10_000 }, (err, out) =>
-      resolve(err ? null : String(out).trim() || null),
-    );
-  });
 }
 
 export async function createForkRuntime(input: {
@@ -72,13 +64,24 @@ export async function createForkRuntime(input: {
       const [owner, name] = g.defaultRepo ? g.defaultRepo.split("/") : [];
       const host = g.hosts?.[0] ?? "github.com";
       const defaultRepo = owner && name ? normaliseRepo(host, owner, name, refCfg) : undefined;
-      promote = {
-        client,
-        store: input.sources.links,
-        refCfg,
-        draft: settings.promote.draft,
-        ...(defaultRepo ? { defaultRepo } : {}),
-      };
+      const remote: RemotePin | null = settings.promote.remoteUrl
+        ? { exact: settings.promote.remoteUrl }
+        : defaultRepo
+          ? { slug: defaultRepo }
+          : null;
+      if (!remote)
+        input.log?.(
+          "forks: promotion off: set forks.promote.remote_url or github.default_repo to pin the push destination",
+        );
+      else
+        promote = {
+          client,
+          store: input.sources.links,
+          refCfg,
+          draft: settings.promote.draft,
+          remote,
+          ...(defaultRepo ? { defaultRepo } : {}),
+        };
     }
   }
   const manager = new ForkManager({
@@ -87,7 +90,6 @@ export async function createForkRuntime(input: {
     lineage: input.lineage,
     limits: settings.limits,
     promote,
-    originUrl,
     ...(input.log ? { log: input.log } : {}),
   });
   const s = input.sources;

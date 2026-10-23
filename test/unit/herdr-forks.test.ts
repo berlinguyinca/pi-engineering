@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { CliForkGit, type ForkGit } from "../../src/git/forkGit.ts";
-import { GhCliClient, type GhRunner } from "../../src/github/client.ts";
+import { safeGitEnv, tidyStderr } from "../../src/git/safeGit.ts";
+import { GhCliClient, type GhRunner, ghEnv } from "../../src/github/client.ts";
 import type { GithubLinkStore } from "../../src/github/discovery.ts";
 import { parseGithubRef } from "../../src/github/refs.ts";
 import { parseForkParams } from "../../src/orchestration/forkParams.ts";
@@ -141,7 +142,7 @@ const item = (over: Partial<SteeringItem> & { action: SteeringItem["action"] }):
 function setup(
   opts: {
     promote?: boolean;
-    limits?: Partial<{ maxTotal: number; maxPerOrigin: number; minFreeMb: number }>;
+    limits?: Partial<{ maxTotal: number; maxPerOrigin: number; minFreeMb: number; retentionWarn: number }>;
     git?: (g: ForkGit) => ForkGit;
   } = {},
 ) {
@@ -162,6 +163,7 @@ function setup(
         store,
         refCfg: { defaultRepo: "acme/widgets" },
         draft: true,
+        remote: { exact: r.origin },
         defaultRepo: { host: "github.com", owner: "acme", repo: "widgets" },
       }
     : null;
@@ -170,9 +172,8 @@ function setup(
     registry,
     git: (root) => (opts.git ? opts.git(new CliForkGit(root)) : new CliForkGit(root)),
     lineage,
-    limits: { maxTotal: 6, maxPerOrigin: 3, minFreeMb: 0, ...opts.limits },
+    limits: { maxTotal: 6, maxPerOrigin: 3, minFreeMb: 0, retentionWarn: 20, ...opts.limits },
     promote,
-    originUrl: async () => "https://github.com/acme/widgets.git",
   });
   const origin: ForkOrigin = { nodeId: "task:t1", missionId: "m1", taskId: "t1", repoRoot: r.root, baseBranch: "main" };
   return { ...r, bare: r.origin, state, lineage, store, client, registry, mgr, origin };
@@ -539,15 +540,15 @@ describe("promotion", () => {
       registry: new ForkRegistry(join(s.state, "forks.json")),
       git: (root) => new CliForkGit(root),
       lineage: new Lineage(),
-      limits: { maxTotal: 6, maxPerOrigin: 3, minFreeMb: 0 },
+      limits: { maxTotal: 6, maxPerOrigin: 3, minFreeMb: 0, retentionWarn: 20 },
       promote: {
         client: s.client,
         store: s.store,
         refCfg: { defaultRepo: "acme/widgets" },
         draft: true,
+        remote: { exact: s.bare },
         defaultRepo: { host: "github.com", owner: "acme", repo: "widgets" },
       },
-      originUrl: async () => "https://github.com/acme/widgets.git",
     });
     const results = await Promise.all([
       promote(s, f, head),
@@ -737,6 +738,11 @@ describe("forks settings: global YAML only, off unless valid", () => {
     assert.equal(s.promote?.draft, true);
     assert.equal(s.promote?.github.defaultRepo, "acme/widgets");
     assert.equal((await write("forks:\n  enabled: true\n")).promote, null, "promotion has its own switch");
+    const pinned = await write(
+      "forks:\n  enabled: true\n  retention_warn: 5\n  promote:\n    enabled: true\n    remote_url: git@github.com:acme/widgets.git\n",
+    );
+    assert.equal(pinned.promote?.remoteUrl, "git@github.com:acme/widgets.git");
+    assert.equal(pinned.limits.retentionWarn, 5);
   });
   it("anything malformed turns the whole feature off with a note", async () => {
     for (const bad of [
@@ -744,6 +750,9 @@ describe("forks settings: global YAML only, off unless valid", () => {
       "forks:\n  enabled: yes please\n",
       "forks:\n  enabled: true\n  nope: 1\n",
       "forks:\n  enabled: true\n  max_total: 0\n",
+      "forks:\n  enabled: true\n  promote:\n    enabled: true\n    remote_url: --upload-pack=x\n",
+      "forks:\n  enabled: true\n  promote:\n    enabled: true\n    remote_url: ext::sh -c evil\n",
+      "forks:\n  enabled: true\n  retention_warn: 0\n",
       "forks:\n  enabled: true\n  promote:\n    enabled: true\n    github:\n      gh_path: --exec\n",
       "forks:\n  enabled: true\n  promote:\n    enabled: true\n    github:\n      default_repo: not-a-repo\n",
     ]) {
@@ -831,5 +840,244 @@ describe("production wiring (createForkRuntime)", () => {
     } finally {
       ok?.stop();
     }
+  });
+});
+
+describe("git hardening: repository-controlled state cannot run code or redirect a push", () => {
+  const prepare = async () => {
+    const s = setup({ promote: true });
+    const f = await fork(s, 1);
+    const marker = join(s.state, "PWNED");
+    const sh2 = (...a: string[]) => sh(s.root, ...a);
+    return { s, f, marker, sh2 };
+  };
+  const planted = (marker: string): string[] =>
+    existsSync(marker) ? readFileSync(marker, "utf8").trim().split("\n") : [];
+
+  it("pre-push, post-checkout, fsmonitor and sshCommand planted in the repository never run", async () => {
+    const { s, f, marker } = await prepare();
+    const head = commit(f.rec.worktreePath, "b.txt", "x\n"); // made BEFORE planting: the test's own git is not hardened
+    for (const hook of ["pre-push", "post-checkout", "reference-transaction"]) {
+      const path = join(s.root, ".git/hooks", hook);
+      writeFileSync(path, `#!/bin/sh\necho ${hook} >> ${marker}\n`);
+      chmodSync(path, 0o755);
+    }
+    execFileSync("git", ["-C", f.rec.worktreePath, "config", "core.fsmonitor", `echo fsmon >> ${marker}; true`]);
+    execFileSync("git", [
+      "-C",
+      f.rec.worktreePath,
+      "config",
+      "core.sshCommand",
+      `sh -c 'echo ssh >> ${marker}; exit 1' #`,
+    ]);
+    execFileSync("git", ["-C", f.rec.worktreePath, "config", "diff.external", `sh -c 'echo ext >> ${marker}' #`]);
+    // a second fork exercises worktree add (post-checkout) under the planted hooks
+    const g = await fork(s, 2);
+    const a = await s.mgr.promote(
+      item({ action: "promote", steeringId: "pr-1", nodeId: f.node, params: { expectedHead: head } }),
+    );
+    assert.equal(a.outcome, "applied", a.note);
+    await s.mgr.refreshAll();
+    assert.deepEqual(planted(marker), []);
+    assert.equal(sh(s.bare, "rev-parse", `refs/heads/${f.rec.branch}`), head);
+    assert.ok(g.rec.worktreePath);
+  });
+
+  it("a remote.origin.pushurl redirect is refused and the attacker's repository receives nothing", async () => {
+    const { s, f, sh2 } = await prepare();
+    const evil = join(s.state, "evil.git");
+    execFileSync("git", ["init", "--bare", "-q", evil]);
+    sh2("config", "remote.origin.pushurl", evil);
+    const head = commit(f.rec.worktreePath, "b.txt", "x\n");
+    const a = await s.mgr.promote(
+      item({ action: "promote", steeringId: "pr-1", nodeId: f.node, params: { expectedHead: head } }),
+    );
+    assert.equal(a.outcome, "refused");
+    assert.match(a.note, /does not point at the remote/);
+    assert.equal(sh(evil, "for-each-ref"), "");
+    assert.throws(() => sh(s.bare, "rev-parse", "--verify", `refs/heads/${f.rec.branch}`));
+    assert.equal(s.client.created.length, 0);
+    assert.equal(s.registry.get(f.id)?.status, "active");
+  });
+
+  it("insteadOf, pushInsteadOf and include files that could rewrite the URL are refused", async () => {
+    for (const setKey of [
+      (s: ReturnType<typeof setup>) => sh(s.root, "config", `url.${join(s.state, "evil.git")}.insteadOf`, s.bare),
+      (s: ReturnType<typeof setup>) => sh(s.root, "config", `url.${join(s.state, "evil.git")}.pushInsteadOf`, s.bare),
+      (s: ReturnType<typeof setup>) => {
+        writeFileSync(join(s.state, "extra.cfg"), "[core]\n\tabbrev = 9\n");
+        sh(s.root, "config", "include.path", join(s.state, "extra.cfg"));
+      },
+    ]) {
+      const { s, f } = await prepare();
+      execFileSync("git", ["init", "--bare", "-q", join(s.state, "evil.git")]);
+      setKey(s);
+      const head = commit(f.rec.worktreePath, "b.txt", "x\n");
+      const a = await s.mgr.promote(
+        item({ action: "promote", steeringId: "pr-1", nodeId: f.node, params: { expectedHead: head } }),
+      );
+      assert.equal(a.outcome, "refused", a.note);
+      assert.match(a.note, /can redirect URLs/);
+      assert.equal(sh(join(s.state, "evil.git"), "for-each-ref"), "");
+      assert.throws(() => sh(s.bare, "rev-parse", "--verify", `refs/heads/${f.rec.branch}`));
+    }
+  });
+
+  it("an origin that is not the operator-pinned remote is refused, even with clean config", async () => {
+    const { s, f, sh2 } = await prepare();
+    const other = join(s.state, "other.git");
+    execFileSync("git", ["init", "--bare", "-q", other]);
+    sh2("remote", "set-url", "origin", other);
+    const head = commit(f.rec.worktreePath, "b.txt", "x\n");
+    const a = await s.mgr.promote(
+      item({ action: "promote", steeringId: "pr-1", nodeId: f.node, params: { expectedHead: head } }),
+    );
+    assert.equal(a.outcome, "refused");
+    assert.equal(sh(other, "for-each-ref"), "");
+  });
+
+  it("the git environment is rebuilt: inherited GIT_* never reaches git", () => {
+    const env = safeGitEnv({
+      PATH: "/bin",
+      HOME: "/h",
+      GIT_SSH_COMMAND: "evil",
+      GIT_EXTERNAL_DIFF: "evil",
+      GIT_DIR: "/x",
+      FOO: "bar",
+    });
+    assert.equal(env.GIT_SSH_COMMAND, undefined);
+    assert.equal(env.GIT_EXTERNAL_DIFF, undefined);
+    assert.equal(env.GIT_DIR, undefined);
+    assert.equal(env.FOO, undefined);
+    assert.equal(env.GIT_CONFIG_GLOBAL, "/dev/null");
+    assert.equal(env.GIT_CONFIG_NOSYSTEM, "1");
+    assert.equal(env.GIT_TERMINAL_PROMPT, "0");
+    const gh = ghEnv({ GIT_SSH_COMMAND: "evil", GH_TOKEN: "x", PATH: "/bin" });
+    assert.equal(gh.GIT_SSH_COMMAND, undefined);
+    assert.equal(gh.PATH, "/bin");
+  });
+
+  it("a GIT_SSH_COMMAND in Pi's own environment does not run during a push", async () => {
+    const { s, f, marker } = await prepare();
+    process.env.GIT_SSH_COMMAND = `sh -c 'echo envssh >> ${marker}; exit 1' #`;
+    try {
+      const head = commit(f.rec.worktreePath, "b.txt", "x\n");
+      const a = await s.mgr.promote(
+        item({ action: "promote", steeringId: "pr-1", nodeId: f.node, params: { expectedHead: head } }),
+      );
+      assert.equal(a.outcome, "applied", a.note);
+      assert.deepEqual(planted(marker), []);
+    } finally {
+      Reflect.deleteProperty(process.env, "GIT_SSH_COMMAND");
+    }
+  });
+
+  it("a dangling commit is not a valid base, and a dangling symlink is not a free worktree path", async () => {
+    const s = setup();
+    sh(s.root, "checkout", "-q", "-b", "secret");
+    writeFileSync(join(s.root, "s.txt"), "SECRET");
+    sh(s.root, "add", ".");
+    sh(s.root, "commit", "-m", "s");
+    const dangling = sh(s.root, "rev-parse", "HEAD");
+    sh(s.root, "checkout", "-q", "main");
+    sh(s.root, "branch", "-D", "secret");
+    const a = await s.mgr.create(item({ action: "fork", params: { baseSha: dangling } }), s.origin);
+    assert.equal(a.outcome, "refused");
+    assert.match(a.note, /dangling/);
+    assert.equal(s.registry.list().length, 0);
+    // a symlink squatting on the derived path
+    const id = forkIdFor("st-7");
+    const path = join(dirname(s.root), `pi-fork-${(await import("../../src/git/GitRepo.ts")).shortHash(s.root)}-${id}`);
+    const target = join(s.state, "elsewhere");
+    symlinkSync(target, path);
+    const b = await s.mgr.create(item({ action: "fork", steeringId: "st-7", params: { baseSha: s.base } }), s.origin);
+    assert.equal(b.outcome, "refused");
+    assert.equal(existsSync(target), false);
+  });
+
+  it("worktree-add failures name git's last stderr lines, sanitised", () => {
+    assert.equal(tidyStderr("fatal: a\n\u202efatal: b\u0000\nfatal: c\n"), "fatal: b | fatal: c");
+    assert.ok(tidyStderr("x".repeat(900)).length <= 200);
+  });
+});
+
+describe("promotion lease: only the holder of a claim may release or finish it", () => {
+  const prep = async () => {
+    const s = setup({ promote: true });
+    const a = await fork(s, 1);
+    const b = await fork(s, 2);
+    const ha = commit(a.rec.worktreePath, "a.txt", "A\n");
+    const hb = commit(b.rec.worktreePath, "b.txt", "B\n");
+    return { s, a, b, ha, hb };
+  };
+  const claimA = (s: ReturnType<typeof setup>, id: string, until: number, pid = process.pid) =>
+    s.registry.mutate((r) => {
+      const x = r[id];
+      if (x)
+        r[id] = { ...x, status: "promoting", leaseToken: "held-by-someone-else", leaseUntil: until, leasePid: pid };
+    });
+  const pr = (s: ReturnType<typeof setup>, f: { node: string }, head: string, id: string) =>
+    s.mgr.promote(item({ action: "promote", steeringId: id, nodeId: f.node, params: { expectedHead: head } }));
+
+  it("a second attempt on a fork whose claim is live is refused and does NOT release the first claim", async () => {
+    const { s, a, b, ha, hb } = await prep();
+    await claimA(s, a.id, Date.now() + 60_000);
+    const dup = await pr(s, a, ha, "pr-dup");
+    assert.equal(dup.outcome, "refused");
+    assert.match(dup.note, /already in progress/);
+    assert.equal(s.registry.get(a.id)?.status, "promoting");
+    assert.equal(s.registry.get(a.id)?.leaseToken, "held-by-someone-else");
+    const sib = await pr(s, b, hb, "pr-b");
+    assert.equal(sib.outcome, "refused");
+    assert.match(sib.note, /already holds the promotion/);
+    assert.equal(s.client.created.length, 0);
+    assert.notEqual(s.registry.get(b.id)?.status, "selected");
+  });
+
+  it("an expired or dead-process lease can be resumed, exactly one fork ends up selected", async () => {
+    const { s, a, b, ha, hb } = await prep();
+    await claimA(s, a.id, Date.now() - 1);
+    const r1 = await pr(s, a, ha, "pr-a");
+    assert.equal(r1.outcome, "applied", r1.note);
+    assert.equal(s.registry.get(a.id)?.leaseToken, undefined);
+    assert.equal(s.registry.get(b.id)?.status, "superseded");
+    const r2 = await pr(s, b, hb, "pr-b");
+    assert.equal(r2.outcome, "refused");
+    assert.deepEqual(
+      s.registry
+        .list()
+        .filter((r) => r.status === "selected")
+        .map((r) => r.approachId),
+      [a.id],
+    );
+    // a dead owner (pid that does not exist) with an unexpired lease is also resumable
+    const t = await prep();
+    await claimA(t.s, t.a.id, Date.now() + 600_000, 2_147_483_000);
+    assert.equal((await pr(t.s, t.a, t.ha, "pr-a2")).outcome, "applied");
+  });
+
+  it("many concurrent attempts across both siblings never leave two forks selected", async () => {
+    const { s, a, b, ha, hb } = await prep();
+    const results = await Promise.all([pr(s, a, ha, "p1"), pr(s, a, ha, "p2"), pr(s, b, hb, "p3"), pr(s, b, hb, "p4")]);
+    assert.equal(results.filter((r) => r.outcome === "applied").length >= 1, true);
+    assert.equal(s.registry.list().filter((r) => r.status === "selected").length, 1);
+    assert.equal(s.client.created.length, 1);
+  });
+});
+
+describe("retention is reported, never enforced by deleting", () => {
+  it("warns once enough finished forks are kept, and deletes nothing", async () => {
+    const s = setup({ limits: { retentionWarn: 2, maxPerOrigin: 5, maxTotal: 10 } });
+    const f1 = await fork(s, 1);
+    await s.registry.mutate((r) => {
+      for (const x of Object.values(r)) r[x.approachId] = { ...x, status: "superseded" };
+    });
+    await s.registry.mutate((r) => {
+      r.zz = { ...(r[f1.id] as NonNullable<(typeof r)[string]>), approachId: "zz", status: "failed" };
+    });
+    const a = await s.mgr.create(item({ action: "fork", steeringId: "st-2", params: { baseSha: s.base } }), s.origin);
+    assert.equal(a.outcome, "applied");
+    assert.match(a.note, /2 selected\/superseded\/failed forks are still kept on disk/);
+    assert.ok(existsSync(f1.rec.worktreePath));
   });
 });

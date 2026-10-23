@@ -17,6 +17,7 @@
  * Herdr control plane is configured (see runtime wiring), and promotion has its own, separate switch.
  */
 
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { shortHash } from "../git/GitRepo.ts";
@@ -73,14 +74,38 @@ export interface ForkRecord {
   promotedAt?: string;
   supersededBy?: string;
   note?: string;
+  /** Promotion lease: only the holder of this token may release or finish the claim. */
+  leaseToken?: string;
+  leaseUntil?: number;
+  leasePid?: number;
 }
 
 export interface ForkLimits {
   maxTotal: number;
   maxPerOrigin: number;
   minFreeMb: number;
+  /** Warn (never delete) when this many selected/superseded/failed forks are still kept on disk. */
+  retentionWarn: number;
 }
-export const DEFAULT_FORK_LIMITS: ForkLimits = { maxTotal: 6, maxPerOrigin: 3, minFreeMb: 2048 };
+export const DEFAULT_FORK_LIMITS: ForkLimits = { maxTotal: 6, maxPerOrigin: 3, minFreeMb: 2048, retentionWarn: 20 };
+
+/** How long a promotion claim stays exclusive without a heartbeat. */
+export const PROMOTION_LEASE_MS = 10 * 60_000;
+const RETIRED: ReadonlySet<ForkStatus> = new Set(["selected", "superseded", "failed"]);
+
+function pidAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+/** A claim excludes others while its lease is unexpired and its process is alive. */
+function leaseHeld(r: ForkRecord, nowMs: number): boolean {
+  return r.status === "promoting" && (r.leaseUntil ?? 0) > nowMs && pidAlive(r.leasePid);
+}
 
 const LIVE: ReadonlySet<ForkStatus> = new Set(["creating", "active", "promoting"]);
 const isPlain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
@@ -159,6 +184,27 @@ export interface PromoteDeps {
   draft: boolean;
   /** Used when the origin remote cannot be parsed. */
   defaultRepo?: RepoKey;
+  /** The ONLY destination a promotion may push to, pinned by operator YAML, never by repository config. */
+  remote: RemotePin;
+}
+
+export type RemotePin = { exact: string } | { slug: RepoKey };
+
+const REMOTE_URL =
+  /^(?:https:\/\/(?:[^@/]+@)?|ssh:\/\/git@|git@)([A-Za-z0-9.\-]+)[/:]([A-Za-z0-9_.\-]+)\/([A-Za-z0-9_.\-]+?)(?:\.git)?\/?$/;
+
+/** Does a URL, as Git resolved it, equal the operator-pinned destination? */
+export function matchesPin(url: string | null, pin: RemotePin): boolean {
+  if (!url) return false;
+  if ("exact" in pin) return url === pin.exact;
+  const m = REMOTE_URL.exec(url);
+  if (!m) return false;
+  const p = pin.slug;
+  return (
+    (m[1] as string).toLowerCase() === p.host.toLowerCase() &&
+    (m[2] as string).toLowerCase() === p.owner.toLowerCase() &&
+    (m[3] as string).toLowerCase() === p.repo.toLowerCase()
+  );
 }
 
 export interface ForkVerifier {
@@ -173,7 +219,6 @@ export interface ForkManagerOptions {
   /** Present only when promotion is enabled in the global YAML. */
   promote?: PromoteDeps | null;
   verify?: ForkVerifier | null;
-  originUrl?: (repoRoot: string) => Promise<string | null>;
   now?: () => number;
   log?: (message: string) => void;
 }
@@ -248,6 +293,8 @@ export class ForkManager {
     }
     const git = this.o.git(origin.repoRoot);
     if (!(await git.commitExists(baseSha))) return ack("refused", "that commit is not in this repository");
+    if (!(await git.commitReachable(baseSha)))
+      return ack("refused", "that commit is not reachable from any branch, remote branch or tag (a dangling object)");
     const path = join(dirname(origin.repoRoot), `pi-fork-${shortHash(origin.repoRoot)}-${id}`);
     const free = git.freeDiskMb(path);
     if (free < this.limits.minFreeMb)
@@ -321,9 +368,15 @@ export class ForkManager {
       undefined,
       this.scope(created),
     );
+    const retired = this.o.registry.list().filter((r) => RETIRED.has(r.status)).length;
+    const warn =
+      retired >= this.limits.retentionWarn
+        ? ` Warning: ${retired} selected/superseded/failed forks are still kept on disk; nothing is deleted automatically, remove old worktrees and branches yourself.`
+        : "";
+    if (warn) this.o.log?.(`forks: ${retired} retired forks kept on disk`);
     return ack(
       "applied",
-      `created ${approachNodeId(id)} on branch ${branch}; start work in its worktree. The original is untouched.`,
+      `created ${approachNodeId(id)} on branch ${branch}; start work in its worktree. The original is untouched.${warn}`,
     );
   }
 
@@ -421,33 +474,53 @@ export class ForkManager {
     if (rec0.status === "selected" && rec0.pr) return ack("applied", `already promoted as ${rec0.pr}`);
     if (rec0.status !== "active" && rec0.status !== "promoting") return ack("refused", `the fork is ${rec0.status}`);
 
-    // Compare-and-set: one promotion per origin, across processes. A leftover `promoting` claim of THIS approach
-    // (a retry after a failed pull request) is resumable; anyone else's claim is not.
+    // Compare-and-set with a per-attempt lease token. One promotion per origin, across processes. A claim of THIS
+    // approach can be resumed only once its lease expired or its process died; another fork's live claim blocks us.
+    const token = randomBytes(12).toString("hex");
     const claim = await this.o.registry.mutate((records) => {
+      const nowMs = this.now();
       const me = records[id];
       if (!me || (me.status !== "active" && me.status !== "promoting"))
         return { ok: false as const, why: "the fork is not promotable" };
+      if (leaseHeld(me, nowMs)) return { ok: false as const, why: "a promotion of this fork is already in progress" };
       const other = Object.values(records).find(
         (r) =>
-          r.approachId !== id &&
-          r.originNodeId === me.originNodeId &&
-          (r.status === "promoting" || r.status === "selected"),
+          r.approachId !== id && r.originNodeId === me.originNodeId && (r.status === "selected" || leaseHeld(r, nowMs)),
       );
       if (other)
         return {
           ok: false as const,
           why: `${approachNodeId(other.approachId)} already holds the promotion for this origin`,
         };
-      records[id] = { ...me, status: "promoting" };
+      records[id] = {
+        ...me,
+        status: "promoting",
+        leaseToken: token,
+        leaseUntil: nowMs + PROMOTION_LEASE_MS,
+        leasePid: process.pid,
+      };
       return { ok: true as const };
     });
     if (!claim.ok) return ack("refused", claim.why);
+    /** Release only OUR claim: a lease that was taken over belongs to someone else now. */
     const release = async (note: string): Promise<void> => {
       await this.o.registry.mutate((records) => {
         const r = records[id];
-        if (r && r.status === "promoting") records[id] = { ...r, status: "active", note: note.slice(0, 200) };
+        if (r && r.status === "promoting" && r.leaseToken === token) {
+          const { leaseToken: _t, leaseUntil: _u, leasePid: _p, ...rest } = r;
+          records[id] = { ...rest, status: "active", note: note.slice(0, 200) };
+        }
       });
     };
+    /** Extend our lease; false means it was lost and nothing more may be done. */
+    const beat = async (): Promise<boolean> =>
+      this.o.registry.mutate((records) => {
+        const r = records[id];
+        if (!r || r.status !== "promoting" || r.leaseToken !== token) return false;
+        records[id] = { ...r, leaseUntil: this.now() + PROMOTION_LEASE_MS };
+        return true;
+      });
+    const lost = () => ack("stale", "the promotion claim was taken over by another attempt; nothing more was done");
     try {
       const rec = this.o.registry.get(id) as ForkRecord;
       const git = this.o.git(rec.repoRoot);
@@ -467,7 +540,24 @@ export class ForkManager {
         await release("not based on base");
         return ack("refused", "the fork no longer descends from its base commit; nothing was pushed");
       }
-      const repo = await this.repoOf(rec, deps);
+      // The destination is pinned by operator YAML. Whatever the repository's own config says must resolve to it.
+      const rc = await git.remoteConfig();
+      if (rc.rewrites.length) {
+        await release("remote config");
+        return ack(
+          "refused",
+          `the repository config can redirect URLs (${rc.rewrites.slice(0, 3).join(", ")}); nothing was pushed`,
+        );
+      }
+      if (!matchesPin(rc.fetch, deps.remote) || !matchesPin(rc.push, deps.remote) || !rc.push) {
+        await release("remote not pinned");
+        return ack(
+          "refused",
+          "origin does not point at the remote this host is configured to promote to; nothing was pushed",
+        );
+      }
+      const pushUrl = rc.push;
+      const repo = await this.repoOf(pushUrl, deps);
       if (!repo) {
         await release("no repo");
         return ack("refused", "cannot tell which GitHub repository this is; set forks.promote.github.default_repo");
@@ -476,14 +566,15 @@ export class ForkManager {
         await release("client");
         return ack("unsupported", "the GitHub client on this host cannot open pull requests");
       }
-      // Remote check BEFORE pushing: an existing remote branch with other content is never overwritten.
-      const remote = await git.remoteBranchHead(rec.branch);
+      if (!(await beat())) return lost();
+      // Remote check BEFORE pushing, against the SAME pinned URL: an existing remote branch with other content is never overwritten.
+      const remote = await git.remoteBranchHead(pushUrl, rec.branch);
       if (remote !== null && remote !== head) {
         await release("remote differs");
-        return ack("refused", "the branch already exists on origin with different content; nothing was changed");
+        return ack("refused", "the branch already exists on the remote with different content; nothing was changed");
       }
       if (remote === null) {
-        const pushed = await git.push(rec.branch, head);
+        const pushed = await git.push(pushUrl, rec.branch, head);
         if (!pushed.ok) {
           await release("push refused");
           return ack("refused", `push refused: ${pushed.reason ?? "unknown"}`);
@@ -491,8 +582,9 @@ export class ForkManager {
       }
       await this.o.registry.mutate((records) => {
         const r = records[id];
-        if (r) records[id] = { ...r, pushed: true };
+        if (r && r.leaseToken === token) records[id] = { ...r, pushed: true };
       });
+      if (!(await beat())) return lost();
       // Reuse the PR if one is already open for this exact branch; otherwise open a DRAFT. Never merge.
       let pr: GhPullRequest | null = await deps.client.findOpenPullRequestByHead(repo, rec.branch);
       if (!pr) {
@@ -526,24 +618,36 @@ export class ForkManager {
       });
       if (this.o.lineage) for (const l of links) emitLinkRecorded(this.o.lineage, l);
       const prNode = `pr:${pr.ref.host}/${pr.ref.owner}/${pr.ref.repo}#${pr.ref.number}`.toLowerCase();
+      if (!(await beat())) return lost();
       const final = await this.o.registry.mutate((records) => {
         const r = records[id];
-        if (r) records[id] = { ...r, status: "selected", pr: prNode, promotedAt: new Date(this.now()).toISOString() };
+        if (!r || r.status !== "promoting" || r.leaseToken !== token) return { kind: "lost" as const };
+        const rival = Object.values(records).find(
+          (s) => s.approachId !== id && s.originNodeId === rec.originNodeId && s.status === "selected",
+        );
+        if (rival) return { kind: "rival" as const, id: rival.approachId };
+        const { leaseToken: _t, leaseUntil: _u, leasePid: _p, ...rest } = r;
+        records[id] = { ...rest, status: "selected", pr: prNode, promotedAt: new Date(this.now()).toISOString() };
         const marked: string[] = [];
         for (const s of Object.values(records)) {
           if (
             s.approachId !== id &&
             s.originNodeId === rec.originNodeId &&
-            (s.status === "active" || s.status === "creating")
+            (s.status === "active" || s.status === "creating" || s.status === "promoting")
           ) {
             records[s.approachId] = { ...s, status: "superseded", supersededBy: id };
             marked.push(s.approachId);
           }
         }
-        return { rec: records[id], marked };
+        return { kind: "ok" as const, rec: records[id] as ForkRecord, marked };
       });
+      if (final.kind === "lost") return lost();
+      if (final.kind === "rival") {
+        await release("rival selected");
+        return ack("refused", `${approachNodeId(final.id)} was promoted first; this one was not marked selected`);
+      }
       const winner = approachNodeId(id);
-      this.emitApproach(final.rec as ForkRecord, { pr: prNode, pushed_head: head }, "selected");
+      this.emitApproach(final.rec, { pr: prNode, pushed_head: head }, "selected");
       this.o.lineage?.edgeAdd("produced", winner, prNode, `promote:${id}`, { commit: head }, this.scope(rec));
       const siblings = new Set<string>([...final.marked.map(approachNodeId), ...(item.params?.siblings ?? [])]);
       siblings.delete(winner);
@@ -573,13 +677,9 @@ export class ForkManager {
     }
   }
 
-  private async repoOf(rec: ForkRecord, deps: PromoteDeps): Promise<RepoKey | undefined> {
-    const url = this.o.originUrl ? await this.o.originUrl(rec.repoRoot).catch(() => null) : null;
-    const m = url
-      ? /^(?:https:\/\/|ssh:\/\/git@|git@)([A-Za-z0-9.\-]+)[/:]([A-Za-z0-9_.\-]+)\/([A-Za-z0-9_.\-]+?)(?:\.git)?\/?$/.exec(
-          url,
-        )
-      : null;
+  /** The GitHub repository of the (already pinned) push URL. */
+  private async repoOf(url: string, deps: PromoteDeps): Promise<RepoKey | undefined> {
+    const m = REMOTE_URL.exec(url);
     if (m) {
       const parsed = normaliseRepo(m[1] as string, m[2] as string, m[3] as string, deps.refCfg);
       if (parsed) return parsed;
