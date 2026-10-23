@@ -1667,11 +1667,17 @@ export class EngineeringRuntime {
         if (effective.policy.autospec !== undefined) {
           autospecConfigured = true;
           const provider = await import("../integrations/autospec/provider.ts");
-          const autospecConfig = await provider.loadAutoSpecConfig(repoRoot, opts.agentDir ? { agentDir: opts.agentDir } : {});
+          const autospecConfig = await provider.loadAutoSpecConfig(
+            repoRoot,
+            opts.agentDir ? { agentDir: opts.agentDir } : {},
+          );
           completionEvidence = (_mission, candidates) =>
             provider.missionDesignGateReasons(autospecConfig, {
               repoRoot,
-              candidates: candidates.map((c) => ({ baseSha: c.identity.baseSha, candidateSha: c.identity.candidateSha })),
+              candidates: candidates.map((c) => ({
+                baseSha: c.identity.baseSha,
+                candidateSha: c.identity.candidateSha,
+              })),
             });
         }
       } catch (error) {
