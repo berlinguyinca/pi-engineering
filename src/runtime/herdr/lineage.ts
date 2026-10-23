@@ -128,14 +128,42 @@ function nonEmpty(value: unknown): value is string {
 const KIND_SET: ReadonlySet<string> = new Set(LINEAGE_NODE_KINDS);
 const EDGE_SET: ReadonlySet<string> = new Set(LINEAGE_EDGE_TYPES);
 
-/** `kind:id`, or undefined when the id is empty (so callers can drop instead of guess). */
+/** Longest id (after the `kind:` prefix) and label that are sent as-is. */
+export const MAX_LINEAGE_ID_CHARS = 200;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+/**
+ * `kind:id`, or undefined when the id is empty or holds a control character (so
+ * callers drop instead of guess). An id longer than 200 chars is truncated and
+ * suffixed with a hash of the full id, so it stays bounded and distinct.
+ */
 export function lineageNodeId(kind: LineageNodeKind, id: string | null | undefined): string | undefined {
-  return nonEmpty(id) ? `${kind}:${id.trim()}` : undefined;
+  if (!nonEmpty(id)) return undefined;
+  const trimmed = id.trim();
+  if (CONTROL_CHARS.test(trimmed)) return undefined;
+  const bounded =
+    trimmed.length > MAX_LINEAGE_ID_CHARS
+      ? `${trimmed.slice(0, MAX_LINEAGE_ID_CHARS - 17)}~${createHash("sha256").update(trimmed).digest("hex").slice(0, 16)}`
+      : trimmed;
+  return `${kind}:${bounded}`;
+}
+
+/** A label with control characters removed and bounded length; undefined when nothing is left. */
+function cleanLabel(label: string | undefined): string | undefined {
+  if (!label) return undefined;
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters is the point
+  const cleaned = label
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .trim()
+    .slice(0, MAX_LINEAGE_ID_CHARS);
+  return cleaned || undefined;
 }
 
 function kindOf(nodeId: string): string | undefined {
   const i = nodeId.indexOf(":");
   if (i <= 0 || i === nodeId.length - 1) return undefined;
+  if (nodeId.length - i - 1 > MAX_LINEAGE_ID_CHARS || CONTROL_CHARS.test(nodeId)) return undefined;
   const kind = nodeId.slice(0, i);
   return KIND_SET.has(kind) ? kind : undefined;
 }
@@ -154,6 +182,8 @@ export interface WorkerLineageInput {
   taskId?: string | null;
   role?: string | null;
   model?: string | null;
+  /** False when the agent node already exists: skip its upsert (label/state are set once). Default true. */
+  upsertAgent?: boolean;
   /** Discriminator of this transition (so a retry dedupes). */
   transition: string;
   at?: string | Date;
@@ -183,6 +213,41 @@ export interface CheckpointLineageInput {
   sequence: number;
   commit?: string | null;
   at?: string | Date;
+}
+
+/**
+ * Decides whether an attempt's state change is a real transition and names it.
+ * Unchanged state yields null (polling a blocked worker adds nothing), `done` and
+ * `cancelled` are final (a later terminate cannot flip a completed run), and the
+ * discriminator is a per-attempt change counter, not a timestamp, so two changes
+ * in the same millisecond cannot collide and a replayed identical sequence derives
+ * identical ids. `failed` may be left again (a resume).
+ */
+export class AttemptTransitions {
+  private readonly seen = new Map<string, { state: LineageState; seq: number }>();
+
+  private readonly maxTracked: number;
+
+  constructor(maxTracked = 10_000) {
+    this.maxTracked = maxTracked;
+  }
+
+  advance(key: string, state: LineageState, seedFrom?: LineageState): string | null {
+    let cur = this.seen.get(key);
+    if (!cur && seedFrom) cur = { state: seedFrom, seq: 0 };
+    if (cur) {
+      if (cur.state === state) return null;
+      if (cur.state === "done" || cur.state === "cancelled") return null;
+    }
+    const seq = (cur?.seq ?? 0) + 1;
+    this.seen.delete(key);
+    this.seen.set(key, { state, seq });
+    if (this.seen.size > this.maxTracked) {
+      const oldest = this.seen.keys().next().value;
+      if (oldest !== undefined) this.seen.delete(oldest);
+    }
+    return `n${seq}`;
+  }
 }
 
 export class LineageEmitter {
@@ -228,7 +293,8 @@ export class LineageEmitter {
     }
     const nodeType = kindOf(nodeId) as string;
     const payload: Record<string, unknown> = { node_type: nodeType, node_id: nodeId };
-    if (spec.label) payload.label = spec.label;
+    const label = cleanLabel(spec.label);
+    if (label) payload.label = label;
     if (spec.state) payload.state = spec.state;
     const attrs = this.withHost(spec.attrs);
     if (attrs) payload.attrs = attrs;
@@ -265,10 +331,48 @@ export class LineageEmitter {
       this.drop();
       return;
     }
+    // Every edge endpoint exists as a node in the same emission batch: a minimal upsert
+    // (same id as the caller's richer one, which therefore wins when staged first).
+    this.ensureNode(from, transition, scope, at);
+    this.ensureNode(to, transition, scope, at);
     const payload: Record<string, unknown> = { edge_type: edgeType, from_id: from, to_id: to };
     const a = this.withHost(attrs);
     if (a) payload.attrs = a;
     this.send("edge.add", from as string, payload, [edgeType, from, to, transition], scope, at);
+  }
+
+  private ensureNode(nodeId: string | undefined, transition: string, scope: LineageScope, at?: string | Date): void {
+    if (!nodeId || !kindOf(nodeId)) return;
+    this.send(
+      "node.upsert",
+      nodeId,
+      { node_type: kindOf(nodeId) as string, node_id: nodeId },
+      [nodeId, transition],
+      scope,
+      at,
+    );
+  }
+
+  /** State of the LOGICAL agent (e.g. aggregated from its attempts). Never from a pane/tab closing. */
+  agentState(
+    input: { agent: string; missionId?: string | null; taskId?: string | null },
+    state: LineageState,
+    transition: string,
+    reason?: string,
+    at?: string | Date,
+  ): void {
+    try {
+      this.nodeState(
+        lineageNodeId("agent", input.agent),
+        state,
+        transition,
+        { reason },
+        scopeOf(input, input.agent),
+        at,
+      );
+    } catch (error) {
+      this.fail(error);
+    }
   }
 
   edgeRemove(
@@ -308,13 +412,15 @@ export class LineageEmitter {
       const scope = scopeOf(input, input.agent);
       const t = input.transition;
       const attrs = { agent_id: agent, ...(input.taskId ? { task_id: input.taskId } : {}) };
-      this.nodeUpsert(
-        agent,
-        { label: input.role ?? undefined, state: "running", attrs: { ...(input.role ? { role: input.role } : {}) } },
-        t,
-        scope,
-        input.at,
-      );
+      if (input.upsertAgent !== false) {
+        this.nodeUpsert(
+          agent,
+          { label: input.role ?? undefined, state: "running", attrs: { ...(input.role ? { role: input.role } : {}) } },
+          t,
+          scope,
+          input.at,
+        );
+      }
       this.nodeUpsert(
         attempt,
         { state: "pending", attrs: { ...attrs, ...(input.model ? { model: input.model } : {}) } },
@@ -455,6 +561,10 @@ export class LineageEmitter {
       if (to) attrs.to_session_id = to;
       this.nodeUpsert(node, { state: input.state, attrs }, input.state, scope, input.at);
       if (to && to !== from && (input.state === "acknowledged" || input.state === "committed")) {
+        // Both endpoint sessions are upserted (with the handoff they belong to) before the edge.
+        const endpointAttrs = { handoff_id: node, ...(input.missionId ? { mission_id: input.missionId } : {}) };
+        this.nodeUpsert(from, { attrs: endpointAttrs }, input.id, scope, input.at);
+        this.nodeUpsert(to, { attrs: endpointAttrs }, input.id, scope, input.at);
         this.edgeAdd("handoff", from, to, input.id, { handoff_id: node, handoff_kind: input.kind }, scope, input.at);
       }
     } catch (error) {

@@ -84,6 +84,7 @@ export type OrchestrationEventType =
   | "finding.created"
   | "finding.resolved"
   | "handoff.created"
+  | "handoff.transitioned"
   | "workspace.authorized"
   | "workspace.rebound"
   | "workspace.rebind_failed"
@@ -156,6 +157,7 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "finding.created",
   "finding.resolved",
   "handoff.created",
+  "handoff.transitioned",
   "workspace.authorized",
   "workspace.rebound",
   "workspace.rebind_failed",
@@ -449,6 +451,8 @@ export class MissionStore {
   private emitChain: Promise<void> = Promise.resolve();
   /** Optional lineage emitter (T02). Null = no lineage; every hook below is then a no-op. */
   private lineage: LineageEmitter | null = null;
+  /** Logical agents (one per task) whose node was upserted, and whether they are currently ended. */
+  private readonly lineageAgents = new Map<string, "live" | "ended">();
 
   private constructor(backend: EventStoreBackend) {
     this.backend = backend;
@@ -480,15 +484,33 @@ export class MissionStore {
 
   private lineageAttemptEnded(ex: Execution, state: "done" | "failed" | "cancelled", reason?: string): void {
     if (!this.lineageAgentExecution(ex)) return;
-    this.lineageDo((l) =>
+    this.lineageDo((l) => {
+      const ended = ex.ended_at ?? undefined;
       l.attemptState(
         { attempt: ex.execution_id, agent: ex.task_id, missionId: ex.mission_id, taskId: ex.task_id },
         state,
         "end", // an attempt ends once: a retried end dedupes
         reason ?? ex.exit_status ?? undefined,
-        ex.ended_at ?? undefined,
-      ),
-    );
+        ended,
+      );
+      // The agent's state is the aggregate of its attempts: it ends only when none is still live.
+      const stillLive = [...this.executions.values()].some(
+        (other) =>
+          other.task_id === ex.task_id &&
+          other.execution_id !== ex.execution_id &&
+          (other.status === "PENDING" || other.status === "RUNNING"),
+      );
+      if (!stillLive) {
+        this.lineageAgents.set(ex.task_id, "ended");
+        l.agentState(
+          { agent: ex.task_id, missionId: ex.mission_id, taskId: ex.task_id },
+          state,
+          `end:${ex.execution_id}`,
+          reason ?? ex.exit_status ?? undefined,
+          ended,
+        );
+      }
+    });
   }
 
   /** A model session attached to (or replacing the one on) an attempt. */
@@ -781,6 +803,12 @@ export class MissionStore {
       case "workspace.rebound": {
         const manifest = e.payload.manifest as WorkspaceManifest;
         if (manifest) this.workspaceManifests.set(manifest.missionId, copyWorkspaceManifest(manifest));
+        break;
+      }
+      case "handoff.created":
+      case "handoff.transitioned": {
+        const handoff = e.payload.handoff as HandoffRecord | undefined;
+        if (handoff?.id) this.handoffRecords.set(handoff.id, { ...handoff });
         break;
       }
       case "task.checkpointed": {
@@ -1482,18 +1510,30 @@ export class MissionStore {
     });
     // No parent attempt is recorded on an execution, so no spawn edge (nothing is guessed).
     if (this.lineageAgentExecution(ex)) {
-      this.lineageDo((l) =>
+      this.lineageDo((l) => {
+        // The logical agent is the task; its label (the task's role) and running state are set once.
+        // A later attempt only revives it if it had ended.
+        const known = this.lineageAgents.get(ex.task_id);
         l.workerSpawned({
           agent: ex.task_id,
           attempt: ex.execution_id,
           session: ex.session_id,
           missionId: ex.mission_id,
           taskId: ex.task_id,
-          role: ex.backend,
+          role: task?.role ?? null,
           model: ex.model,
+          upsertAgent: known === undefined,
           transition: `created:${ex.execution_id}`,
-        }),
-      );
+        });
+        if (known === "ended") {
+          l.agentState(
+            { agent: ex.task_id, missionId: ex.mission_id, taskId: ex.task_id },
+            "running",
+            `resume:${ex.execution_id}`,
+          );
+        }
+        this.lineageAgents.set(ex.task_id, "live");
+      });
     }
     return copyExecution(ex);
   }
@@ -2151,6 +2191,8 @@ export class MissionStore {
       next.ackAt = ackAt ?? current.ackAt ?? new Date().toISOString();
     }
     this.handoffRecords.set(id, { ...next });
+    // Persist the transition: a restart restores the state lineage reported, not `prepared`.
+    this.emit("handoff.transitioned", next.missionId, { actor: "system", handoff: { ...next } });
     this.lineageHandoff(next);
     return { ...next };
   }
@@ -2389,7 +2431,8 @@ export class MissionStore {
     const earlier = this.listTaskCheckpoints(checkpoint.missionId, checkpoint.taskId).filter(
       (candidate) => candidate.executionId === checkpoint.executionId && candidate.sessionId,
     );
-    return earlier.at(-1)?.sessionId ?? null;
+    // No earlier checkpoint: the session the execution itself recorded is the one being replaced.
+    return earlier.at(-1)?.sessionId ?? this.executions.get(checkpoint.executionId)?.session_id ?? null;
   }
 
   /** Verified checkpoint: artifact produced by the attempt; a changed session id is a rollover of the same attempt. */

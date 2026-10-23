@@ -12,7 +12,7 @@
  */
 
 import { id, newRunId } from "../core/ids.ts";
-import type { LineageEmitter, LineageState } from "../runtime/herdr/lineage.ts";
+import { AttemptTransitions, type LineageEmitter, type LineageState } from "../runtime/herdr/lineage.ts";
 import type { EventStoreBackend } from "./eventstore/backend.ts";
 import { redactDeep } from "./redact.ts";
 import type { ApprovalRecord, PlatformEvent, Run, RunStatus, Worker, WorkerLimits, WorkerStatus } from "./types.ts";
@@ -61,6 +61,7 @@ export class WorkGraph {
   private readonly onEmitError: (err: Error) => void;
   /** Optional lineage emitter (T02); null = none, every hook is a no-op. */
   private lineage: LineageEmitter | null = null;
+  private readonly attemptTransitions = new AttemptTransitions();
 
   private constructor(store: EventStoreBackend, onEmitError?: (err: Error) => void) {
     this.store = store;
@@ -299,19 +300,18 @@ export class WorkGraph {
   setWorkerStatus(workerId: string, status: WorkerStatus): Worker | undefined {
     const w = this.workers.get(workerId);
     if (!w) return undefined;
+    const previous = w.status;
     w.status = status;
     w.updated_at = new Date().toISOString();
     const lineageState = WORKER_LINEAGE_STATE[status];
     if (lineageState) {
-      this.lineageDo((l) =>
-        l.attemptState(
-          { attempt: WorkGraph.attemptId(w), agent: w.id },
-          lineageState,
-          TERMINAL_WORKER.has(status) ? "end" : `${status}:${w.updated_at}`,
-          undefined,
-          w.updated_at,
-        ),
-      );
+      this.lineageDo((l) => {
+        const attempt = WorkGraph.attemptId(w);
+        // Unchanged states and anything after done/cancelled add nothing; the discriminator is a change counter.
+        const transition = this.attemptTransitions.advance(attempt, lineageState, WORKER_LINEAGE_STATE[previous]);
+        if (transition === null) return;
+        l.attemptState({ attempt, agent: w.id }, lineageState, transition, undefined, w.updated_at);
+      });
     }
     void this.emit({
       type: "platform.worker.status",
@@ -449,9 +449,6 @@ export class WorkGraph {
     return graph;
   }
 }
-
-/** A worker run ends once; re-entrant states (running, blocked) key on their timestamp instead. */
-const TERMINAL_WORKER: ReadonlySet<WorkerStatus> = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
 
 const WORKER_LINEAGE_STATE: Partial<Record<WorkerStatus, LineageState>> = {
   RUNNING: "running",

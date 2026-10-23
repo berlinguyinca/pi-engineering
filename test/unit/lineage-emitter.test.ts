@@ -50,6 +50,25 @@ const edges = (events: EnvelopeV2[], type?: string) =>
 const nodeIds = (events: EnvelopeV2[]) =>
   new Set(events.filter((e) => e.event_type === "node.upsert").map((e) => String(e.payload.node_id)));
 
+/** Every edge endpoint was upserted as a node at or before the edge, in the same stream. */
+function assertEndpointsUpserted(events: EnvelopeV2[]): void {
+  const upserted = new Map<string, number>();
+  for (const e of events) {
+    if (e.event_type === "node.upsert") {
+      const id = String(e.payload.node_id);
+      if (!upserted.has(id)) upserted.set(id, e.source_sequence);
+    }
+  }
+  const all = events.filter((e) => e.event_type === "edge.add");
+  for (const e of all) {
+    const p = e.payload as { from_id: string; to_id: string };
+    for (const end of [p.from_id, p.to_id]) {
+      const at = upserted.get(end);
+      assert.ok(at !== undefined && at < e.source_sequence, `edge endpoint ${end} must be upserted before the edge`);
+    }
+  }
+}
+
 function manifest(missionId: string): WorkspaceManifest {
   return {
     manifestId: "WM-1",
@@ -154,6 +173,8 @@ describe("lineage: spawn vs handoff", () => {
       assert.equal(e.entity_type, "lineage");
       assert.equal(e.visibility_scope, "private");
     }
+    assertEndpointsUpserted(events);
+    for (const session of ["session:s-old", "session:s-new"]) assert.ok(nodeIds(events).has(session), session);
   });
 
   it("a same-session generation bump is not a rollover: no handoff edge and no new session", async () => {
@@ -313,6 +334,7 @@ describe("lineage: session rollover and migration", () => {
       produced.map((e) => [e.from_id, e.to_id, e.attrs?.commit]),
       [[`attempt:${execution.execution_id}`, "artifact:TCP-lin", SHA]],
     );
+    assertEndpointsUpserted(events);
     const node = events.find((e) => e.payload.node_id === "artifact:TCP-lin" && e.event_type === "node.upsert");
     assert.equal((node?.payload.attrs as Record<string, unknown>).kind, "checkpoint");
   });
@@ -362,7 +384,7 @@ describe("lineage: dedupe and ids", () => {
     spawn("created");
     await emitter.idle();
     const once = (await store.outbox.pending()).length;
-    assert.equal(once, 3, "agent + attempt + spawn edge, no duplicates");
+    assert.equal(once, 4, "agent + attempt + parent endpoint + spawn edge, no duplicates");
     spawn("created");
     await emitter.idle();
     assert.equal((await store.outbox.pending()).length, once);
@@ -392,7 +414,176 @@ describe("lineage: dedupe and ids", () => {
     assert.equal(emitter.stats().dropped, 7);
     emitter.edgeAdd("validated", "agent:a", "commit:c", "t", { commit: SHA });
     await emitter.idle();
-    assert.equal((await store.outbox.pending()).length, 1);
+    assert.equal((await store.outbox.pending()).length, 3, "both endpoints upserted, then the edge");
+  });
+});
+
+describe("lineage: attempt state transitions", () => {
+  const stateEvents = (events: EnvelopeV2[]) =>
+    events.filter((e) => e.event_type === "node.state").map((e) => [e.payload.node_id, e.payload.state]);
+
+  it("Herdr: terminate on a completed worker is a no-op; wait failures emit failed; resume emits running", async () => {
+    const { store: envStore, emitter } = rig();
+    const cli = new FakeCli();
+    const rt = new HerdrAgentRuntime({ cli, lineage: emitter });
+    const a = await rt.create({ role: "r", objective: "o" });
+    await rt.start(a);
+    cli.waitStatus = "done";
+    await rt.waitFor(a);
+    await rt.terminate(a);
+    assert.deepEqual(
+      stateEvents(await lineageEvents(envStore, emitter)),
+      [[`attempt:${a}`, "done"]],
+      "done is not flipped",
+    );
+
+    const b = await rt.create({ role: "r", objective: "o" });
+    await rt.start(b);
+    cli.waitThrows = true;
+    await assert.rejects(rt.waitFor(b), /timed out/);
+    const failed = (await lineageEvents(envStore, emitter)).filter(
+      (e) => e.event_type === "node.state" && e.payload.node_id === `attempt:${b}`,
+    );
+    assert.deepEqual(
+      failed.map((e) => e.payload.state),
+      ["failed"],
+    );
+    cli.waitThrows = false;
+  });
+
+  it("Herdr: polling a blocked worker adds one event; blocked -> working emits running", async () => {
+    const { store: envStore, emitter } = rig();
+    const cli = new FakeCli();
+    const rt = new HerdrAgentRuntime({ cli, lineage: emitter });
+    const a = await rt.create({ role: "r", objective: "o" });
+    await rt.start(a);
+    cli.waitStatus = "blocked";
+    for (let i = 0; i < 5; i++) await rt.waitFor(a);
+    assert.deepEqual(stateEvents(await lineageEvents(envStore, emitter)), [[`attempt:${a}`, "blocked"]]);
+    cli.waitStatus = "working";
+    await rt.waitFor(a);
+    cli.waitStatus = "blocked";
+    await rt.waitFor(a);
+    const states = stateEvents(await lineageEvents(envStore, emitter)).map((s) => s[1]);
+    assert.deepEqual(states, ["blocked", "running", "blocked"]);
+    const ids = (await lineageEvents(envStore, emitter))
+      .filter((e) => e.event_type === "node.state")
+      .map((e) => e.event_id);
+    assert.equal(new Set(ids).size, 3, "a repeated state is a distinct event only after a real change");
+  });
+
+  it("WorkGraph: same-millisecond changes stay distinct, repeats dedupe, completed is final", async () => {
+    const { store: envStore, emitter } = rig();
+    const graph = WorkGraph.create(JsonlEventStore.inMemory());
+    graph.setLineage(emitter);
+    const w = graph.createWorker({ projectId: "P", role: "r" });
+    const realNow = Date.now;
+    Date.now = () => 1_700_000_000_000;
+    const RealDate = Date;
+    // freeze ISO timestamps too: new Date() is what WorkGraph stamps with
+    globalThis.Date = class extends RealDate {
+      constructor(...args: unknown[]) {
+        super(...((args.length ? args : [1_700_000_000_000]) as [number]));
+      }
+    } as DateConstructor;
+    try {
+      for (const st of ["RUNNING", "BLOCKED", "BLOCKED", "RUNNING", "BLOCKED"] as const)
+        graph.setWorkerStatus(w.id, st);
+      graph.complete(w.id);
+      graph.cancel(w.id);
+      graph.complete(w.id);
+    } finally {
+      globalThis.Date = RealDate;
+      Date.now = realNow;
+    }
+    const events = await lineageEvents(envStore, emitter);
+    assert.deepEqual(
+      stateEvents(events).map((s) => s[1]),
+      ["running", "blocked", "running", "blocked", "done"],
+    );
+    assert.equal(new Set(events.filter((e) => e.event_type === "node.state").map((e) => e.event_id)).size, 5);
+  });
+
+  it("MissionStore: the logical agent is upserted once; its state follows the aggregate of attempts", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store, execution } = missionRig(emitter);
+    store.setExecutionStatus(execution.execution_id, "FAILED", { exit_status: "x" });
+    const retry = store.createExecution({
+      task_id: "task-a",
+      mission_id: "MSN-lin",
+      backend: "agent",
+      repo_id: "repo-a",
+      base_sha: "base-a",
+    });
+    store.setExecutionStatus(retry.execution_id, "RUNNING", {});
+    store.setExecutionStatus(retry.execution_id, "SUCCEEDED", {});
+    const events = await lineageEvents(envStore, emitter);
+    const agentUpserts = events.filter((e) => e.event_type === "node.upsert" && e.payload.node_id === "agent:task-a");
+    assert.equal(agentUpserts.filter((e) => e.payload.label !== undefined).length, 1, "label/state set once");
+    assert.equal(agentUpserts[0]?.payload.label, "implementer", "label is the task's role, not the backend");
+    const agentStates = events
+      .filter((e) => e.event_type === "node.state" && e.payload.node_id === "agent:task-a")
+      .map((e) => e.payload.state);
+    assert.deepEqual(agentStates, ["failed", "running", "done"]);
+  });
+
+  it("MissionStore: a first checkpoint carrying a new session rolls over the execution's recorded session", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store, task, execution } = missionRig(emitter);
+    store.setExecutionStatus(execution.execution_id, "RUNNING", { session_id: "S1" });
+    await new CheckpointManager({ store }).persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      sessionId: "S2",
+    });
+    const events = await lineageEvents(envStore, emitter);
+    assert.ok(nodeIds(events).has("session:S1"));
+    assert.ok(nodeIds(events).has("session:S2"));
+    assert.deepEqual(
+      events
+        .filter((e) => e.event_type === "node.state" && e.payload.state === "rolled_over")
+        .map((e) => e.payload.node_id),
+      ["session:S1"],
+    );
+  });
+
+  it("a handoff transition is persisted, so a restart restores the state lineage reported", async () => {
+    const { emitter } = rig();
+    const { store, backend } = missionRig(emitter);
+    store.addHandoffRecord({
+      id: "hf-p",
+      kind: "supervisor",
+      state: "prepared",
+      missionId: "MSN-lin",
+      predecessor: { sessionId: "s-1", generation: 1 },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionHandoffRecord("hf-p", "validated");
+    store.transitionHandoffRecord("hf-p", "acknowledged", { sessionId: "s-2", generation: 2 });
+    await store.flush();
+    const reopened = MissionStore.open(backend);
+    assert.equal(reopened.getHandoffRecord("hf-p")?.state, "acknowledged");
+    assert.equal(reopened.getHandoffRecord("hf-p")?.successor?.sessionId, "s-2");
+  });
+});
+
+describe("lineage: id and label bounds", () => {
+  it("rejects control characters, bounds long ids with a hash, cleans labels", async () => {
+    const { lineageNodeId } = await import("../../src/runtime/herdr/lineage.ts");
+    assert.equal(lineageNodeId("agent", "a\nb"), undefined);
+    assert.equal(lineageNodeId("agent", "a\u0000"), undefined);
+    const long = "x".repeat(500);
+    const id = lineageNodeId("agent", long)!;
+    assert.ok(id.length <= "agent:".length + 200);
+    assert.notEqual(id, lineageNodeId("agent", `${long}y`), "distinct long ids stay distinct");
+    const { store, emitter } = rig();
+    emitter.nodeUpsert("agent:a", { label: `bad\u0007label${"z".repeat(400)}` }, "t");
+    emitter.nodeUpsert(`agent:${"q".repeat(300)}`, {}, "t");
+    await emitter.idle();
+    const pending = await store.outbox.pending();
+    assert.equal(pending.length, 1, "an over-long raw node id is refused");
+    const label = String(pending[0]?.payload.label);
+    assert.ok(label.length <= 200 && [...label].every((c) => c.charCodeAt(0) > 31));
   });
 });
 
@@ -468,8 +659,18 @@ class FakeCli implements HerdrCli {
     return "";
   }
   async prompt(): Promise<void> {}
+  waitStatus: HerdrAgent["agent_status"] = "done";
+  waitThrows = false;
   async wait(target: string): Promise<HerdrAgent> {
-    return { agent_status: "done", cwd: "/tmp", pane_id: target, workspace_id: "w", revision: 1, state_change_seq: 1 };
+    if (this.waitThrows) throw new Error("wait timed out");
+    return {
+      agent_status: this.waitStatus,
+      cwd: "/tmp",
+      pane_id: target,
+      workspace_id: "w",
+      revision: 1,
+      state_change_seq: 1,
+    };
   }
   async startAgent(): Promise<void> {}
   async sendKeys(): Promise<void> {}

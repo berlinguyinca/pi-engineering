@@ -26,7 +26,7 @@ import type { AgentRuntime } from "../AgentRuntime.ts";
 import { paneLink, tidyAgentName } from "./CollabLayout.ts";
 import type { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 import { type HerdrAgent, type HerdrCli, HerdrError } from "./HerdrCli.ts";
-import type { LineageEmitter, LineageState } from "./lineage.ts";
+import { AttemptTransitions, type LineageEmitter, type LineageState } from "./lineage.ts";
 
 const VERSION = "herdr-0.9.1";
 
@@ -35,7 +35,20 @@ interface Rec {
   request: AgentWorkerRequest;
   target: string;
   provisioned: boolean;
+  /** True once the lineage spawn was emitted; attempt states are only sent for a known attempt. */
+  lineageSpawned?: boolean;
 }
+
+/** Runtime status -> lineage attempt state. Unlisted statuses (READY, CREATED, INTERRUPTED...) are not transitions. */
+const LINEAGE_STATE: Partial<Record<AgentStatus, LineageState>> = {
+  WORKING: "running",
+  RECOVERING: "running",
+  BLOCKED: "blocked",
+  COMPLETED: "done",
+  FAILED: "failed",
+  LOST: "failed",
+  TERMINATED: "cancelled",
+};
 
 /** Map a Herdr agent status to the normalized AgentStatus. */
 function normalizeStatus(s: HerdrAgent["agent_status"]): AgentStatus {
@@ -79,6 +92,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private readonly records = new Map<RuntimeId, Rec>();
   private readonly ingest?: ControlPlaneIngest;
   private readonly lineage?: LineageEmitter;
+  private readonly lineageTransitions = new AttemptTransitions();
 
   constructor(opts: HerdrAgentRuntimeOptions) {
     this.cli = opts.cli;
@@ -183,7 +197,18 @@ export class HerdrAgentRuntime implements AgentRuntime {
     const rec = this.require(rid);
     if (signal?.aborted) throw new Error("waitFor aborted");
     const until = ["done", "blocked", "working", "idle"];
-    const agent = await this.cli.wait(rec.target, until, timeoutMs ?? 300_000);
+    let agent: HerdrAgent;
+    try {
+      agent = await this.cli.wait(rec.target, until, timeoutMs ?? 300_000);
+    } catch (err) {
+      // A wait that times out or fails leaves the attempt neither running nor done: say so.
+      this.emitAttemptState(
+        rec,
+        "failed",
+        `wait failed: ${err instanceof Error ? err.message : "error"}`.slice(0, 200),
+      );
+      throw err;
+    }
     const status = normalizeStatus(agent.agent_status);
     const result: AgentWorkerResult =
       status === "COMPLETED"
@@ -197,8 +222,6 @@ export class HerdrAgentRuntime implements AgentRuntime {
           : { status: "failed", summary: "did not reach a terminal state", artifactRefs: [] };
     this.mutate(rec, { status, currentOperation: "waitFor", result });
     this.emitSession(rec, "session.updated", status);
-    if (status === "COMPLETED") this.emitAttemptState(rec, "done");
-    else if (status === "BLOCKED") this.emitAttemptState(rec, "blocked");
     return rec.worker;
   }
 
@@ -224,8 +247,6 @@ export class HerdrAgentRuntime implements AgentRuntime {
     }
     this.mutate(rec, { status: "TERMINATED", currentOperation: "terminate" });
     this.emitSession(rec, "session.terminated", "TERMINATED");
-    // Pi explicitly ended this run: the ATTEMPT is cancelled. The logical agent is untouched.
-    this.emitAttemptState(rec, "cancelled");
     return true;
   }
 
@@ -304,6 +325,10 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private mutate(rec: Rec, patch: Partial<AgentWorker>): void {
     rec.worker = { ...rec.worker, ...patch, updated_at: new Date().toISOString() };
     this.records.set(rec.worker.id, rec);
+    // The attempt state follows the runtime status through this one choke point, so polling
+    // (sync), waiting, resuming and terminating all share the same dedupe and finality rules.
+    const state = patch.status ? LINEAGE_STATE[patch.status] : undefined;
+    if (state) this.emitAttemptState(rec, state);
   }
 
   /** Lineage: this runtime worker is one agent, one attempt, one session. start() is idempotent per id. */
@@ -326,21 +351,24 @@ export class HerdrAgentRuntime implements AgentRuntime {
         transition: "start",
         at: rec.worker.updated_at,
       });
+      rec.lineageSpawned = true;
     } catch {
       /* observational */
     }
   }
 
-  private emitAttemptState(rec: Rec, state: LineageState): void {
+  private emitAttemptState(rec: Rec, state: LineageState, reason?: string): void {
     const lineage = this.lineage;
-    if (!lineage) return;
+    if (!lineage || !rec.lineageSpawned) return;
     try {
+      // Unchanged state => null; done/cancelled are final, so terminate() on a completed worker is a no-op.
+      const transition = this.lineageTransitions.advance(rec.worker.id, state);
+      if (transition === null) return;
       lineage.attemptState(
         { attempt: rec.worker.id, agent: rec.worker.id, missionId: rec.worker.missionId },
         state,
-        // done/cancelled end the run once (a repeated terminate dedupes); blocked can recur.
-        state === "blocked" ? `${state}:${rec.worker.updated_at}` : "end",
-        undefined,
+        transition,
+        reason,
         rec.worker.updated_at,
       );
     } catch {
