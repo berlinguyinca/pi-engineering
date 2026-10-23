@@ -240,6 +240,58 @@ describe("EventStore backends", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("repairTornTail refuses to truncate while a live writer owns the lock (FR-05)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-torn-owned-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(file, `${JSON.stringify(evt(1))}\n{"partial"`, "utf-8");
+
+    // A live owner (this process) holds the writer lock. An unowned repair must
+    // return the readable prefix but leave the FILE untouched — truncating here
+    // would race the owner's in-flight writes.
+    const lock = await ExclusiveFileLock.acquire(file);
+    try {
+      const complete = await repairTornTail(file);
+      assert.ok(complete, "the readable prefix is still returned");
+      assert.equal(complete!.split("\n").filter((l) => l.trim()).length, 1);
+      const onDisk = await readFile(file, "utf-8");
+      assert.ok(onDisk.includes("partial"), "the file is NOT truncated while a live owner holds the lock");
+
+      // The owner itself may repair: proven ownership passes the gate.
+      const owned = await repairTornTail(file, { owner: lock });
+      assert.ok(owned);
+      const after = await readFile(file, "utf-8");
+      assert.ok(!after.includes("partial"), "the owner's repair truncates the torn fragment");
+      assert.ok(after.endsWith("\n"));
+    } finally {
+      lock.release();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("repairTornTail repairs when the lock owner is provably stale (FR-05)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pie-store-torn-stale-"));
+    const file = join(dir, "events.jsonl");
+    await writeFile(file, `${JSON.stringify(evt(1))}\n{"partial"`, "utf-8");
+    // A lock record whose incarnation is provably dead (different boot id) does
+    // not block repair: recovery of a crashed writer's file must still work.
+    const staleOwner = {
+      pid: 999_999,
+      host: hostname(),
+      openedAt: new Date().toISOString(),
+      ownerToken: "stale-token",
+      bootId: "00000000-0000-4000-8000-000000000000",
+      processStartTime: "1",
+    };
+    await writeFile(`${file}.lock`, `${JSON.stringify(staleOwner)}\n`, "utf-8");
+
+    const complete = await repairTornTail(file);
+    assert.ok(complete);
+    const after = await readFile(file, "utf-8");
+    assert.ok(!after.includes("partial"), "a stale owner does not block the repair");
+    assert.ok(after.endsWith("\n"));
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("JsonlEventStore persists to disk and reloads", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pie-store-"));
     const file = join(dir, "events.jsonl");

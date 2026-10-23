@@ -133,6 +133,27 @@ function ownerState(owner: FileLockOwner): "live" | "stale" | "unknown" {
   return start.value === owner.processStartTime ? "live" : "stale";
 }
 
+/**
+ * True when `file`'s writer lock is held by a process we cannot prove is gone.
+ * Gates DESTRUCTIVE operations (torn-tail repair truncates the file) so a
+ * second process never truncates a file a live owner is still writing:
+ *   - no lock record / unreadable  -> false (no provable owner; repair is safe)
+ *   - stale owner (provably dead)  -> false (repair is safe)
+ *   - live or unverifiable owner   -> true  (fail closed; refuse the repair)
+ * This is a best-effort read: the authoritative guarantee for a store owner is
+ * holding the {@link ExclusiveFileLock} itself, not this check.
+ */
+export async function lockHeldByLiveOwner(file: string): Promise<boolean> {
+  const record = await readOwnerRecord(lockDirectory(file));
+  if (!record) return false;
+  try {
+    const state = ownerState(record.owner);
+    return state !== "stale";
+  } finally {
+    await closeOwnerRecord(record);
+  }
+}
+
 function recoveryClaimPath(path: string, ownerToken: string): string {
   const tokenHash = createHash("sha256").update(ownerToken).digest("hex").slice(0, 24);
   return `${path}.recover.${tokenHash}`;
