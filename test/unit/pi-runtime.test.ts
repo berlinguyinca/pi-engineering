@@ -141,3 +141,25 @@ test("verified binary is selected; every defect falls back with a reason", async
     rmSync(b.dir, { recursive: true, force: true });
   }
 });
+
+test("runtimeFacts tags the agent from the launcher env and defaults to standard Pi", async () => {
+  const { runtimeFacts } = await import("../../src/runtime/piRuntime.ts");
+  const proc = {
+    versions: { node: "22.1.0", bun: "1.4.3" },
+    cpuUsage: () => ({ user: 1_500_000, system: 500_000 }),
+    memoryUsage: () => ({ rss: 52_428_800 }),
+  };
+  const bolt = runtimeFacts({ PI_RUNTIME_KIND: "pi-bolt", PI_RUNTIME_SOURCE: "role" }, proc);
+  assert.deepEqual(bolt, {
+    runtime_kind: "pi-bolt",
+    runtime_source: "role",
+    js_engine: "bun",
+    js_engine_version: "1.4.3",
+    cpu_s: 2,
+    rss_mib: 50,
+  });
+  const std = runtimeFacts({ PI_RUNTIME_KIND: "garbage" }, { ...proc, versions: { node: "22.1.0" } });
+  assert.equal(std.runtime_kind, "standard-pi");
+  assert.equal(std.runtime_source, "default");
+  assert.equal(std.js_engine, "node");
+});

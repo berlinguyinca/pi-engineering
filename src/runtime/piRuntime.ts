@@ -389,3 +389,41 @@ export async function decideLaunchRuntime(
     };
   }
 }
+
+/** The slice of `process` that `runtimeFacts` reads (fakeable in tests). */
+export interface ProcessLike {
+  versions: { node?: string; bun?: string };
+  cpuUsage(): { user: number; system: number };
+  memoryUsage(): { rss: number };
+}
+
+export interface RuntimeFacts {
+  runtime_kind: PiRuntimeName;
+  runtime_source: string;
+  /** "bun" under Pi-Bolt, else "node". */
+  js_engine: "bun" | "node";
+  js_engine_version: string;
+  cpu_s: number;
+  rss_mib: number;
+}
+
+/**
+ * What the running agent is, for the runtime event log / dashboard. The launcher tags a
+ * non-standard child with PI_RUNTIME_KIND / PI_RUNTIME_SOURCE; anything else is standard Pi.
+ * Runtime metrics only: inference (tokens, latency, queue) stays in the inference metrics.
+ */
+export function runtimeFacts(env: NodeJS.ProcessEnv = process.env, proc: ProcessLike = process): RuntimeFacts {
+  const kind = (PI_RUNTIMES as readonly string[]).includes(env.PI_RUNTIME_KIND ?? "")
+    ? (env.PI_RUNTIME_KIND as PiRuntimeName)
+    : "standard-pi";
+  const bun = proc.versions.bun;
+  const cpu = proc.cpuUsage();
+  return {
+    runtime_kind: kind,
+    runtime_source: kind === "standard-pi" ? "default" : (env.PI_RUNTIME_SOURCE ?? "unknown"),
+    js_engine: bun ? "bun" : "node",
+    js_engine_version: bun ?? proc.versions.node ?? "unknown",
+    cpu_s: Math.round(((cpu.user + cpu.system) / 1e6) * 1000) / 1000,
+    rss_mib: Math.round((proc.memoryUsage().rss / 1048576) * 10) / 10,
+  };
+}
