@@ -405,6 +405,8 @@ export interface RuntimeFacts {
   js_engine_version: string;
   cpu_s: number;
   rss_mib: number;
+  /** Why the requested runtime was not used (launcher fell back to standard Pi), if it was. */
+  fallback_reason?: string;
 }
 
 /**
@@ -425,5 +427,6 @@ export function runtimeFacts(env: NodeJS.ProcessEnv = process.env, proc: Process
     js_engine_version: bun ?? proc.versions.node ?? "unknown",
     cpu_s: Math.round(((cpu.user + cpu.system) / 1e6) * 1000) / 1000,
     rss_mib: Math.round((proc.memoryUsage().rss / 1048576) * 10) / 10,
+    ...(env.PI_RUNTIME_FALLBACK_REASON ? { fallback_reason: env.PI_RUNTIME_FALLBACK_REASON.slice(0, 200) } : {}),
   };
 }

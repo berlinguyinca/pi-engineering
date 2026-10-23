@@ -70,6 +70,8 @@ try {
       `${JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...decision })}\n`,
     );
     if (decision.fallbackReason) {
+      // Seen by the agent that starts in this process, so it can report why it is on standard Pi.
+      process.env.PI_RUNTIME_FALLBACK_REASON = decision.fallbackReason;
       process.stderr.write(
         `[pi runtime] ${decision.requested} unavailable, using standard Pi: ${decision.fallbackReason}\n`,
       );
