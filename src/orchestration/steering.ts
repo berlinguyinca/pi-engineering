@@ -65,7 +65,8 @@ const ID_RE = /^[A-Za-z0-9._:\-]{1,128}$/;
 const SPOOF_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
 
 const isPlain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
-const clean = (v: string, max: number): string => v.replace(SPOOF_RE, "").trim().slice(0, max);
+// Line breaks are collapsed so a person cannot start a fresh line that looks like a system message after the label.
+const clean = (v: string, max: number): string => v.replace(SPOOF_RE, "").replace(/\s+/g, " ").trim().slice(0, max);
 
 /** Validate one delivery; null when it is not exactly the documented shape (it is then ignored and never acked). */
 export function parseSteeringItem(raw: unknown): SteeringItem | null {
