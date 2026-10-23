@@ -503,6 +503,24 @@ export interface EngineeringRuntimeOptions {
   /** Bounded diagnostic when the live mission snapshot cannot be written. */
   onMissionSnapshotError?: (message: string) => void;
   /**
+   * Overrides for the snapshot storage-pressure guard (sampler, sentinel,
+   * probe scheduling, controller config, typed event hook). Production omits
+   * this; the runtime owns `republish`, `workDir`, and `log`. House style of
+   * `FileLockRecoveryHooks`: deterministic fault-injection seam, never used
+   * in production paths.
+   */
+  snapshotPressureOverrides?: Partial<
+    import("../resilience/snapshotPressureGuard.ts").SnapshotPressureGuardOptions & {
+      config?: Partial<import("../resilience/storagePressure.ts").StoragePressureConfig>;
+    }
+  >;
+  /**
+   * TEST-ONLY fault injection: when set, each snapshot publish calls this and
+   * throws the returned error (return null to allow the write). Models an
+   * ENOSPC-class write failure without filling a real disk.
+   */
+  snapshotWriteFault?: () => unknown | null;
+  /**
    * Optional orchestrator planner (spec 06). Defaults to a single implementer
    * task. Injected so deterministic tests and the extension can supply one.
    */
@@ -668,6 +686,14 @@ export class EngineeringRuntime {
   readonly unavailableModels = new UnavailableModels();
   private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
   private readonly onMissionSnapshotError: ((message: string) => void) | null;
+  /** TEST-ONLY write-fault injector (see EngineeringRuntimeOptions). */
+  private readonly snapshotWriteFault: (() => unknown | null) | null;
+  /** Guard construction overrides (sampler/sentinel/schedule/config/events). */
+  private readonly snapshotPressureOverrides: Partial<
+    import("../resilience/snapshotPressureGuard.ts").SnapshotPressureGuardOptions & {
+      config?: Partial<import("../resilience/storagePressure.ts").StoragePressureConfig>;
+    }
+  > | null;
   private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private currentWorkItemId = "";
@@ -793,6 +819,11 @@ export class EngineeringRuntime {
           // while suspended the guard is a no-op and the tag survives.
           this.snapshotPressure?.notePublishSuccess();
           latest = buildMissionSnapshotFile(missions, this.snapshotPressure?.state() ?? null);
+          // TEST-ONLY fault seam (see EngineeringRuntimeOptions.snapshotWriteFault):
+          // throws at the exact point an fs write would fail, so tests can
+          // model ENOSPC without filling a disk.
+          const writeFault = this.snapshotWriteFault?.();
+          if (writeFault) throw writeFault;
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
           const temporary = join(this.workDir, `.${MISSION_SNAPSHOT_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
           try {
@@ -888,6 +919,7 @@ export class EngineeringRuntime {
   private get snapshotPressureGuard(): SnapshotPressureGuard {
     if (!this.snapshotPressure) {
       this.snapshotPressure = new SnapshotPressureGuard({
+        ...(this.snapshotPressureOverrides ?? {}),
         workDir: this.workDir,
         // The recovery republish pipeline (bypasses the pause gate).
         republish: () => this.publishMissionSnapshot({ force: true }),
@@ -1018,6 +1050,8 @@ export class EngineeringRuntime {
     this.roadmapComplete = opts.roadmapComplete ?? null;
     this.onPhase = opts.onPhase ?? null;
     this.onMissionSnapshotError = opts.onMissionSnapshotError ?? null;
+    this.snapshotWriteFault = opts.snapshotWriteFault ?? null;
+    this.snapshotPressureOverrides = opts.snapshotPressureOverrides ?? null;
     this.onMissionActivity = opts.onMissionActivity ?? null;
     this.blackhole = null;
     this.telemetry = {

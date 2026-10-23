@@ -85,6 +85,8 @@ export interface SnapshotPressureGuardOptions {
   onEvent?: (event: StoragePressureEvent) => void;
   /** Controller owner id. Default `workDir ?? "runtime"`. */
   owner?: string;
+  /** Controller config overrides (probe interval, consecutive checks, jitter). */
+  config?: Partial<import("./storagePressure.ts").StoragePressureConfig>;
 }
 
 /** Default mount sampler: a mount is healthy when it has free blocks AND inodes. */
@@ -165,6 +167,7 @@ export class SnapshotPressureGuard {
     this.opts = opts;
     this.controller = new StoragePressureController({
       owner: opts.owner ?? opts.workDir ?? "runtime",
+      ...(opts.config ? { config: opts.config } : {}),
       hooks: {
         transition: (_from, to) => {
           this.log("info", `storage-pressure state → ${to}`);
