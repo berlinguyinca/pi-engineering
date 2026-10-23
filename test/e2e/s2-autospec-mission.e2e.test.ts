@@ -81,8 +81,12 @@ function runPlan(args: string[], cwd: string, agentDir: string): Promise<CliRun>
     });
     let out = "";
     let err = "";
-    child.stdout.on("data", (d) => (out += d));
-    child.stderr.on("data", (d) => (err += d));
+    child.stdout.on("data", (d) => {
+      out += d;
+    });
+    child.stderr.on("data", (d) => {
+      err += d;
+    });
     child.on("error", rej);
     child.on("close", (code) => {
       let json: any = null;
@@ -251,7 +255,7 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
 
   it("negative control: a task that AutoSpec has not assigned to Pi (autospec-managed) is rejected by the same CLI", async () => {
     const bad = dagFixture();
-    bad.tasks[1].executor = "autospec-managed";
+    (bad.tasks[1] as { executor: string }).executor = "autospec-managed";
     const f = join(tmp, "dag-bad.json");
     writeFileSync(f, JSON.stringify(bad));
     const r = await runPlan(["--store", join(tmp, "store-bad"), "--from-autospec", f], tmp, agentDir);
@@ -364,7 +368,7 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
   it("Pi opens a PR through its GhCliClient (fake gh over the real remote) and links it to the task and the cross-repo issue", async () => {
     git(worktrees["t-1"]!.path, "push", "-q", "origin", `${worktrees["t-1"]!.branch}:${worktrees["t-1"]!.branch}`);
     const client = createGithubClient({ enabled: true, ghPath: join(tmp, "gh", "gh") });
-    assert.ok(client);
+    assert.ok(client?.createPullRequest);
     const pr = await client.createPullRequest({
       repo: { host: "github.com", owner: "acme", repo: "widgets" },
       head: worktrees["t-1"]!.branch,
@@ -517,10 +521,10 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     assert.equal(decision(head2, head2, q.head, "pass").decision, "merge");
   });
 
-  it("GAP: the author attr Pi writes for the PR is stored as [REDACTED] by Herdr (any key containing 'auth' is treated as a secret)", async () => {
+  it("the author attr Pi writes for the PR reaches Herdr readable (was stored as [REDACTED] until the T16 redact fix)", async () => {
     const attrs = (await plane.node(PR_NODE(prNumber))).body.node.attrs;
     assert.equal(attrs.head_sha, head2, "control: sibling attrs survive");
-    assert.equal(attrs.author, "[REDACTED]");
+    assert.equal(attrs.author, "pi-bot", "the head-bound quorum needs the login to exclude the author's own approval");
   });
 
   it("GAP: nothing in Pi calls the reconciler or reacts to github.evidence_stale (no automatic re-review request)", async () => {

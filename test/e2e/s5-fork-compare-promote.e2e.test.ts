@@ -529,13 +529,14 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     assert.ok(plane.alive());
   });
 
-  it("GAP: the same key under another instance_id is still offered the request", async () => {
-    // Herdr pins a request to a node's attrs.instance_id when the node has one, but Pi's lineage emitter never stamps
-    // instance_id on the nodes it reports (it stamps `host`), so nothing separates two Pi instances that share a key.
+  it("the same key under another instance_id is NOT offered the request: the emitter stamps attrs.instance_id (T16 glue)", async () => {
+    // Herdr pins a request to the target node's attrs.instance_id. Pi's emitter now stamps the YAML `herdr.instance_id`
+    // on every node it upserts, so two Pi instances sharing a key are separated.
     const node = (await plane.node(attemptNode)).body.node;
-    assert.equal(node.attrs.instance_id, undefined);
+    assert.equal(node.attrs.instance_id, "inst-a");
     const sameKey = await rxOtherInstance.pollOnce();
-    assert.deepEqual([sameKey.received, sameKey.skipped, sameKey.acked], [1, 1, 0]);
+    assert.deepEqual([sameKey.received, sameKey.skipped, sameKey.acked], [0, 0, 0]);
+    // positive control: the instance named in the pin IS offered it (the next test applies and acks it)
   });
 
   it("the right host applies the confirmed fork at its own boundary: isolated worktree, original untouched, acked", async () => {

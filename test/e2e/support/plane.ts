@@ -324,7 +324,9 @@ export class Plane {
       .sort();
   }
 
-  async sources(key = "viewer"): Promise<Record<string, { last_sequence?: number; gaps?: unknown[] }>> {
+  async sources(
+    key = "viewer",
+  ): Promise<Record<string, { source?: string; actor?: string; last_sequence?: number; gaps?: unknown[] }>> {
     const r = await this.call("GET", "/api/v1/ingest/sources", { key });
     return Object.fromEntries((r.body.sources ?? []).map((s: { source: string }) => [s.source, s]));
   }

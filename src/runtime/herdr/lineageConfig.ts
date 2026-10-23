@@ -61,7 +61,11 @@ export function createLineageFromConnection(
   };
   return createLineageEmitter(
     { ingest },
-    { visibility: conn.visibility ?? "private", ...(Object.keys(defaultScope).length ? { defaultScope } : {}) },
+    {
+      visibility: conn.visibility ?? "private",
+      ...(Object.keys(defaultScope).length ? { defaultScope } : {}),
+      ...(conn.instanceId ? { instanceId: conn.instanceId } : {}),
+    },
   );
 }
 

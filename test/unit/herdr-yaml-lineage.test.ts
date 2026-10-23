@@ -119,6 +119,27 @@ describe("loadLineageEmitter from engineering.yaml", () => {
     }
   });
 
+  it("instance_id from the YAML is stamped on upserted nodes (Herdr pins steering to it); absent = unpinned", async () => {
+    const withId = await setup("  lineage: true\n  instance_id: pi-laptop-1\n");
+    const noId = await setup("  lineage: true\n");
+    const seen: Array<Record<string, unknown> | undefined> = [];
+    for (const { dir } of [withId, noId]) {
+      const state = await mkdtemp(join(tmpdir(), "pi-yaml-lineage-state-"));
+      const { calls, fetch } = recorder();
+      const em = await loadLineageEmitter({ agentDir: dir, envelopeDir: state, fetch });
+      assert.ok(em);
+      em.workerSpawned({ agent: "lead", attempt: "lead.1", transition: "t" });
+      await em.idle();
+      const attempt = calls.find(
+        (c) =>
+          (c.body.payload as { node_id?: string }).node_id === "attempt:lead.1" && c.body.event_type === "node.upsert",
+      );
+      seen.push((attempt?.body.payload as { attrs?: Record<string, unknown> }).attrs);
+    }
+    assert.equal(seen[0]?.instance_id, "pi-laptop-1");
+    assert.equal(seen[1]?.instance_id, undefined);
+  });
+
   it("lineage false or absent: falls back to host config (none here) and sends nothing", async () => {
     const { dir } = await setup("  lineage: false\n");
     const home = await mkdtemp(join(tmpdir(), "pi-yaml-nohome-"));

@@ -110,6 +110,12 @@ export interface LineageEmitterOptions {
    */
   defaultScope?: { room_id?: string; workspace_id?: string; mission_id?: string };
   /**
+   * Names this Pi (`herdr.instance_id` in the global YAML). Stamped as `attrs.instance_id` on every node this
+   * emitter upserts, which is what Herdr pins a steering request to: another instance sharing the same key is not
+   * offered it. Absent = unpinned (any holder of the key may receive it).
+   */
+  instanceId?: string;
+  /**
    * Keyed id derivation (EnvelopeStore.deriveEventId). Without it ids fall back to a bare
    * sha256 of public data, which is only acceptable for tests with a private sink.
    */
@@ -265,6 +271,7 @@ export class LineageEmitter {
   private readonly host?: string;
   private readonly visibility?: VisibilityScope;
   private readonly defaultScope: { room_id?: string; workspace_id?: string; mission_id?: string };
+  private readonly instanceId?: string;
   private readonly now: () => Date;
   private readonly onError?: (error: unknown) => void;
   private readonly deriveKeyed?: (prefix: string, parts: readonly unknown[]) => string;
@@ -277,6 +284,7 @@ export class LineageEmitter {
     this.host = opts.host;
     this.visibility = opts.visibility;
     this.defaultScope = opts.defaultScope ?? {};
+    this.instanceId = opts.instanceId;
     this.now = opts.now ?? (() => new Date());
     this.onError = opts.onError;
     this.deriveKeyed = opts.deriveEventId;
@@ -309,7 +317,7 @@ export class LineageEmitter {
     const label = cleanLabel(spec.label);
     if (label) payload.label = label;
     if (spec.state) payload.state = spec.state;
-    const attrs = this.withHost(spec.attrs);
+    const attrs = this.withHost(this.instanceId ? { ...spec.attrs, instance_id: this.instanceId } : spec.attrs);
     if (attrs) payload.attrs = attrs;
     this.send("node.upsert", nodeId, payload, [nodeId, transition], scope, at);
   }

@@ -87,7 +87,8 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
     plane.c("GET", `/graph/nodes?node_type=${type}&edge_type=spawn&room_id=${room}`, { user });
   const edgesOf = async (user = "alice"): Promise<Edge[]> =>
     ((await lineage(user)).body.edges as Edge[]).filter((e) => !e.removed);
-  const ofType = (es: Edge[], t: string) => es.filter((e) => e.edge_type === t).map((e) => [e.from_id, e.to_id]);
+  const ofType = (es: Edge[], t: string) =>
+    es.filter((e) => e.edge_type === t).map((e) => [e.from_id, e.to_id] as [string, string]);
   const raw = (
     src: string,
     seq: number,
