@@ -136,6 +136,9 @@ const refusalReason = async (res: Response): Promise<string | undefined> => (awa
 
 /** A 409 that says a (source, source_sequence) pair belongs to another event, as opposed to a content contradiction. */
 function isSequenceCollision(body: RefusalBody): boolean {
+  // The explicit classification Herdr is asked to send wins; the message text is the fallback for servers that only
+  // send `reason: "conflict"` with a human sentence.
+  if (body.reason === "sequence_conflict") return true;
   const text = body.error ?? "";
   return /sequence/i.test(text) && !/different content/i.test(text);
 }

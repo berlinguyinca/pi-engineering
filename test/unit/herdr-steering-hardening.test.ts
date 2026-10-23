@@ -240,3 +240,123 @@ test("the receiver judges a delivery on the Date header, whatever the Pi clock s
   assert.deepEqual(sent, [{ id: "st-1", outcome: "stale" }]);
   assert.deepEqual(steered, []);
 });
+
+// ─── review round: digest on every action Pi can apply, and the fence in the ledger on every path ───────────────
+
+const SHA = "a".repeat(40);
+const forkItem = (over: Record<string, unknown> = {}, target: Record<string, unknown> = {}) =>
+  item({ action: "fork", params: { base_sha: SHA }, ...over }, target);
+const promoteItem = (over: Record<string, unknown> = {}, target: Record<string, unknown> = {}) =>
+  item({ action: "promote", params: { expected_head: SHA }, ...over }, target);
+
+function forkPorts(opts: { digest?: string | null | "absent" }): { p: SteeringPorts; applied: string[] } {
+  const applied: string[] = [];
+  const port: NonNullable<SteeringPorts["forks"]> = {
+    knows: () => true,
+    apply: async (it) => {
+      applied.push(it.steeringId);
+      return { outcome: "applied", note: "ok" };
+    },
+    ...(opts.digest === "absent" ? {} : { digest: () => opts.digest ?? null }),
+  };
+  return { p: { ...ports(task(), 900), forks: port }, applied };
+}
+
+test("fork and promote verify a named digest too: unverifiable, mismatched and matching", async () => {
+  for (const make of [forkItem, promoteItem]) {
+    const named = make({}, { expected_digest: "D1" });
+    const none = forkPorts({ digest: "absent" });
+    const a = await applySteering(named, none.p, new MemorySteeringLedger());
+    assert.equal(a?.outcome, "stale", `${named.action}: a port that cannot compute a digest cannot satisfy one`);
+    assert.match(a?.note ?? "", /cannot verify/);
+    assert.deepEqual(none.applied, [], "nothing was applied");
+
+    const wrong = forkPorts({ digest: "D2" });
+    const b = await applySteering(
+      make({ steering_id: "st-b" }, { expected_digest: "D1" }),
+      wrong.p,
+      new MemorySteeringLedger(),
+    );
+    assert.equal(b?.outcome, "stale");
+    assert.match(b?.note ?? "", /digest mismatch/);
+    assert.deepEqual(wrong.applied, []);
+
+    const right = forkPorts({ digest: "D1" });
+    const c = await applySteering(
+      make({ steering_id: "st-c" }, { expected_digest: "D1" }),
+      right.p,
+      new MemorySteeringLedger(),
+    );
+    assert.equal(c?.outcome, "applied");
+    assert.deepEqual(right.applied, ["st-c"]);
+
+    const unnamed = forkPorts({ digest: "absent" });
+    const d = await applySteering(make({ steering_id: "st-d" }), unnamed.p, new MemorySteeringLedger());
+    assert.equal(d?.outcome, "applied", "a request that names no digest is unaffected");
+  }
+});
+
+test("resume verifies a named digest like redirect does", async () => {
+  const mission = (over: Record<string, unknown> = {}) =>
+    ({
+      kind: "mission",
+      missionId: "m1",
+      paused: true,
+      operatorPaused: false,
+      terminal: false,
+      ...over,
+    }) as ResolvedTarget;
+  const named = item({ action: "resume", target: { node_id: "mission:m1", expected_digest: "D1" } });
+  assert.equal(
+    (await applySteering(named, ports(mission({ digest: "D2" }), 900), new MemorySteeringLedger()))?.outcome,
+    "stale",
+  );
+  assert.equal(
+    (await applySteering(named, ports(mission(), 900), new MemorySteeringLedger()))?.outcome,
+    "stale",
+    "no digest available: fail closed",
+  );
+  assert.equal(
+    (await applySteering(named, ports(mission({ digest: "D1" }), 900), new MemorySteeringLedger()))?.outcome,
+    "applied",
+  );
+});
+
+test("approve and reject are answered `unsupported` before any digest is looked at (what Herdr sends a digest for)", async () => {
+  // Herdr sends expected_digest only for gate decisions. Pi does not take gate decisions from steering, so those
+  // requests are never applied, whatever the digest says. This test pins that so nobody mistakes the digest check
+  // for something that protects an applied approve/reject.
+  for (const action of ["approve", "reject"]) {
+    const ack = await applySteering(
+      item({ action }, { expected_digest: "D1" }),
+      ports(task({ digest: "D1" }), 900),
+      new MemorySteeringLedger(),
+    );
+    assert.equal(ack?.outcome, "unsupported", action);
+  }
+});
+
+test("the fence is recorded in the ledger on the redirect, resume and fork paths", async () => {
+  const begun: Array<[string, string | null | undefined]> = [];
+  class Spy extends MemorySteeringLedger {
+    override begin(id: string, fence?: string | null): void {
+      begun.push([id, fence]);
+      super.begin(id, fence);
+    }
+  }
+  const ledger = new Spy();
+  await applySteering(item({ steering_id: "r1" }, { fence: "FR" }), ports(task(), 900), ledger);
+  await applySteering(
+    item({ steering_id: "m1", action: "resume", target: { node_id: "mission:m1", fence: "FM" } }),
+    ports({ kind: "mission", missionId: "m1", paused: true, operatorPaused: false, terminal: false }, 900),
+    ledger,
+  );
+  await applySteering(forkItem({ steering_id: "f1" }, { fence: "FF" }), forkPorts({ digest: "absent" }).p, ledger);
+  assert.deepEqual(begun, [
+    ["r1", "FR"],
+    ["m1", "FM"],
+    ["f1", "FF"],
+  ]);
+  assert.equal(ledger.get("r1")?.fence, "FR");
+  assert.equal(ledger.get("f1")?.fence, "FF");
+});

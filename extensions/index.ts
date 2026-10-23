@@ -2315,7 +2315,7 @@ ${RECOVERY_PROMPT}`;
   // never depends on it (the semantic tool + runtime gate enforce policy).
   // Planner/worker execution mode (docs/specs/planner-worker-hot-model-routing.md):
   // /engineering-* commands, and the mode `/mission` consults before orchestrating.
-  // env first, then the engineering.yaml `herdr:` block; resolved lazily because this site is synchronous
+  // the global engineering.yaml `herdr:` block only (no environment variables); resolved lazily because this site is synchronous
   const plannerAttention = resolveAttentionIngest(process.env, getAgentDir()).then((i) =>
     i ? new MissionAttentionReporter(i) : null,
   );

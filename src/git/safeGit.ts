@@ -18,7 +18,7 @@
  * Callers that push therefore pass an explicit, operator-pinned URL and refuse such config (see `rewriteKeys` in
  * `forkGit.ts`).
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 
 /**
@@ -33,7 +33,9 @@ import { resolve } from "node:path";
  * Both modes: no hooks, no fsmonitor, no gpg, no external diff, no editor, no pager, and every `filter.*`
  * (clean/smudge/process), `diff.*.textconv`, `merge.*.driver`, `credential.*.helper`, `remote.*.uploadpack`,
  * `core.sshCommand`, `core.gitProxy`, `core.askpass`, `core.alternateRefsCommand` defined by the repository is
- * neutralised on the command line (which outranks every config file). `diff`/`show`/`log` additionally get
+ * neutralised through GIT_CONFIG_COUNT/KEY_n/VALUE_n set by safeGit itself (command scope outranks every config file, and a
+ * key containing `=` survives, which `-c key=value` cannot carry); `core.gitProxy` is first-wins in git, so it is pinned with
+ * GIT_PROXY_COMMAND instead. `diff`/`show`/`log` additionally get
  * `--no-ext-diff --no-textconv`.
  *
  * Spawns that INTENTIONALLY run worker-authored commands are exempt and listed in `RAW_GIT_EXCEPTIONS`
@@ -61,6 +63,7 @@ const OPERATOR_ENV = [
   "GIT_SSL_NO_VERIFY",
   "GIT_SSH",
   "GIT_SSH_COMMAND",
+  "GIT_PROXY_COMMAND",
   "GIT_AUTHOR_NAME",
   "GIT_AUTHOR_EMAIL",
   "GIT_AUTHOR_DATE",
@@ -130,9 +133,10 @@ const NEUTRAL: ReadonlyArray<readonly [RegExp, (key: string) => string]> = [
   [/^merge\..+\.driver$/, () => ""],
   [/^trailer\..+\.command$/, () => ""],
   [/^core\.sshcommand$/, () => "ssh"],
-  [/^core\.gitproxy$/, () => ""],
+  [/^core\.gitproxy$/, () => "false"],
   [/^core\.askpass$/, () => ""],
-  [/^core\.alternaterefscommand$/, () => ""],
+  [/^core\.alternaterefscommand$/, () => "true"],
+  [/^submodule\..+\.update$/, () => "checkout"],
   [/^core\.editor$/, () => "true"],
   [/^sequence\.editor$/, () => "true"],
   [/^gpg(\..+)?\.program$/, () => "false"],
@@ -146,6 +150,12 @@ const REMOTE_EXEC_KEY = /^remote\..+\.(uploadpack|receivepack|vcs)$/;
 const NETWORK_SUBCOMMANDS = new Set(["fetch", "pull", "push", "ls-remote", "clone", "remote", "submodule"]);
 const CREDENTIAL_HELPER = /^credential(\..+)?\.helper$/;
 const TRUSTED_SCOPES = new Set(["system", "global"]);
+
+/** One `key = value` override. Carried in GIT_CONFIG_KEY_n/VALUE_n, never in a `-c key=value` argument (git splits that at the FIRST `=`, so a driver named `a=b` could not be addressed). */
+export interface ConfigPair {
+  key: string;
+  value: string;
+}
 
 interface ConfigEntry {
   scope: string;
@@ -170,9 +180,9 @@ export function parseScopedConfig(out: string): ConfigEntry[] {
  * `-c` overrides that replace every execution vector the repository (local / worktree / command scope) defines.
  * Pure: exported for tests.
  */
-export function neutralisers(entries: readonly ConfigEntry[], trust: GitTrust): string[] {
+export function neutralisers(entries: readonly ConfigEntry[], trust: GitTrust): ConfigPair[] {
   const trusted = (e: ConfigEntry) => trust === "operator" && TRUSTED_SCOPES.has(e.scope);
-  const args: string[] = [];
+  const args: ConfigPair[] = [];
   const done = new Set<string>();
   for (const e of entries) {
     if (trusted(e)) continue;
@@ -180,8 +190,9 @@ export function neutralisers(entries: readonly ConfigEntry[], trust: GitTrust): 
     if (done.has(lower)) continue;
     if (CREDENTIAL_HELPER.test(lower)) {
       done.add(lower);
-      args.push("-c", `${e.key}=`);
-      for (const t of entries) if (trusted(t) && t.key.toLowerCase() === lower) args.push("-c", `${t.key}=${t.value}`);
+      args.push({ key: e.key, value: "" });
+      for (const t of entries)
+        if (trusted(t) && t.key.toLowerCase() === lower) args.push({ key: t.key, value: t.value });
       continue;
     }
     const rule = NEUTRAL.find(([re]) => re.test(lower));
@@ -189,7 +200,7 @@ export function neutralisers(entries: readonly ConfigEntry[], trust: GitTrust): 
     done.add(lower);
     let value = rule[1](lower);
     for (const t of entries) if (trusted(t) && t.key.toLowerCase() === lower) value = t.value;
-    args.push("-c", `${e.key}=${value}`);
+    args.push({ key: e.key, value });
   }
   return args;
 }
@@ -295,58 +306,174 @@ export function setConfigListLimitForTests(bytes: number): void {
 
 /** The full argv prefix (before the subcommand) for one invocation, including repository-specific neutralisers. */
 export async function safeGitPrefix(cwd: string, trust: GitTrust = "strict", env = safeGitEnv(process.env, trust)) {
-  return (await planGit(cwd, trust, env)).prefix;
+  const plan = await planGit(cwd, trust, env);
+  return [...plan.prefix, ...plan.config.flatMap((c) => ["-c", `${c.key}=${c.value}`])];
 }
 
-async function planGit(cwd: string, trust: GitTrust, env: NodeJS.ProcessEnv, timeoutMs = 15_000) {
-  const listed = await spawnGit(["-C", cwd, "config", "--list", "--show-scope", "-z"], env, {
-    // Never shorter than the caller's own budget for the command: on a loaded host the listing is as slow as the command.
-    timeoutMs: Math.max(15_000, timeoutMs),
-    maxBuffer: configListMax,
+/** Config overrides as environment (GIT_CONFIG_COUNT/KEY_n/VALUE_n): a key may contain `=`, `.`, spaces, quotes. */
+export function configEnv(pairs: readonly ConfigPair[]): Record<string, string> {
+  const out: Record<string, string> = { GIT_CONFIG_COUNT: String(pairs.length) };
+  pairs.forEach((c, i) => {
+    out[`GIT_CONFIG_KEY_${i}`] = c.key;
+    out[`GIT_CONFIG_VALUE_${i}`] = c.value;
   });
+  return out;
+}
+
+/** Variables through which a caller or the ambient environment could inject config; removed before ours are set. */
+function withoutInjectedConfig(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS" || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+interface Plan {
+  prefix: string[];
+  config: ConfigPair[];
+  extraEnv: Record<string, string>;
+  remoteExec: string[];
+  unreadable: string | undefined;
+}
+
+const unplanned = (unreadable: string): Plan => ({ prefix: [], config: [], extraEnv: {}, remoteExec: [], unreadable });
+
+/** Pure: turn the output of `git config --list --show-scope -z` (or its failure) into the invocation plan. */
+function planFromListing(listed: SafeGitResult, cwd: string, trust: GitTrust, env: NodeJS.ProcessEnv): Plan {
   // Fail closed: a listing that failed or was cut short (a worker can pad the shared config with junk keys) means the
   // neutralisers cannot be computed, and running the command anyway would run every planted driver.
   if (listed.code !== 0 || listed.truncated) {
-    return {
-      prefix: [] as string[],
-      remoteExec: [] as string[],
-      unreadable: listed.truncated
-        ? "the repository config is too large to inspect"
-        : "the repository config is unreadable",
-    };
+    return unplanned(
+      listed.truncated ? "the repository config is too large to inspect" : "the repository config is unreadable",
+    );
   }
   const entries = parseScopedConfig(listed.stdout);
+  // A key that cannot be carried in an environment variable cannot be neutralised: refuse rather than guess.
+  if (entries.some((e) => e.key.includes("\n") || e.key.includes("\0"))) {
+    return unplanned("the repository config has a key that cannot be neutralised");
+  }
+  // core.gitProxy: git keeps the FIRST value it reads and reads the environment variable before any config, so the
+  // only reliable override is GIT_PROXY_COMMAND (a `-c core.gitProxy=` is ignored once the repository's value is read).
+  // The operator's own proxy, from env or from trusted config, is kept; otherwise it is pinned to a no-op.
+  const extraEnv: Record<string, string> = {};
+  const operatorProxy =
+    trust === "operator" &&
+    (env.GIT_PROXY_COMMAND !== undefined ||
+      entries.some((e) => TRUSTED_SCOPES.has(e.scope) && e.key.toLowerCase() === "core.gitproxy"));
+  if (!operatorProxy) extraEnv.GIT_PROXY_COMMAND = "false";
   return {
-    unreadable: undefined as string | undefined,
-    prefix: [...(trust === "operator" ? OPERATOR_FORCED : SAFE_GIT_CONFIG), ...neutralisers(entries, trust), "-C", cwd],
+    unreadable: undefined,
+    prefix: [...(trust === "operator" ? OPERATOR_FORCED : SAFE_GIT_CONFIG), "-C", cwd],
+    config: neutralisers(entries, trust),
+    extraEnv,
     remoteExec: remoteExecKeys(entries, trust),
   };
 }
 
+const LISTING = ["config", "--list", "--show-scope", "-z"];
+
+async function planGit(cwd: string, trust: GitTrust, env: NodeJS.ProcessEnv, timeoutMs = 15_000): Promise<Plan> {
+  const listed = await spawnGit(["-C", cwd, ...LISTING], withoutInjectedConfig(env), {
+    // Never shorter than the caller's own budget for the command: on a loaded host the listing is as slow as the command.
+    timeoutMs: Math.max(15_000, timeoutMs),
+    maxBuffer: configListMax,
+  });
+  return planFromListing(listed, cwd, trust, env);
+}
+
+function runSync(argv: readonly string[], env: NodeJS.ProcessEnv, timeoutMs: number, maxBuffer: number): SafeGitResult {
+  const r = spawnSync("git", [...argv], {
+    env,
+    timeout: timeoutMs,
+    maxBuffer,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const overflow = (r.error as NodeJS.ErrnoException | undefined)?.code === "ENOBUFS";
+  return {
+    code: r.status ?? 1,
+    stdout: r.stdout ?? "",
+    stderr: [r.stderr ?? "", r.error?.message ?? ""].filter(Boolean).join("\n"),
+    ...(overflow ? { truncated: true } : {}),
+  };
+}
+
+/**
+ * Synchronous twin of `safeGit` for the few callers that cannot be async (version/commit probes in the update host).
+ * Same environment, same neutralisers, same refusals.
+ */
+export function safeGitSync(args: readonly string[], opts: SafeGitOptions): SafeGitResult {
+  const trust = opts.trust ?? "strict";
+  const env = withoutInjectedConfig({ ...safeGitEnv(process.env, trust), ...(opts.env ?? {}) });
+  const at = subcommandIndex(args);
+  let where = opts.cwd;
+  for (let i = 0; i < at; i++)
+    if (args[i] === "-C" && args[i + 1] !== undefined) where = resolve(where, args[i + 1] as string);
+  const timeoutMs = opts.timeoutMs ?? 60_000;
+  const plan = planFromListing(
+    runSync(["-C", where, ...LISTING], env, Math.max(15_000, timeoutMs), configListMax),
+    where,
+    trust,
+    env,
+  );
+  const refused = refusal(plan, args, at);
+  if (refused) return refused;
+  return runSync(
+    [...plan.prefix, ...diffing(args, at)],
+    { ...env, ...plan.extraEnv, ...configEnv(plan.config) },
+    timeoutMs,
+    opts.maxBuffer ?? 16 * 1024 * 1024,
+  );
+}
+
+function refusal(plan: Plan, args: readonly string[], at: number): SafeGitResult | null {
+  if (plan.unreadable) return { code: 128, stdout: "", stderr: `refused: ${plan.unreadable}` };
+  const sub = args[at];
+  if (sub && NETWORK_SUBCOMMANDS.has(sub) && plan.remoteExec.length > 0) {
+    return { code: 128, stdout: "", stderr: `refused: the repository config defines ${plan.remoteExec.join(", ")}` };
+  }
+  return null;
+}
+
+function diffing(args: readonly string[], at: number): string[] {
+  const sub = args[at];
+  return sub && DIFFING.has(sub)
+    ? [...args.slice(0, at + 1), "--no-ext-diff", "--no-textconv", ...args.slice(at + 1)]
+    : [...args];
+}
+
 export async function safeGit(args: readonly string[], opts: SafeGitOptions): Promise<SafeGitResult> {
   const trust = opts.trust ?? "strict";
-  const env = { ...safeGitEnv(process.env, trust), ...(opts.env ?? {}) };
+  const env = withoutInjectedConfig({ ...safeGitEnv(process.env, trust), ...(opts.env ?? {}) });
   const at = subcommandIndex(args);
   // `-C <dir>` among git's own leading options moves the repository: read THAT repository's (and worktree's) config.
   let where = opts.cwd;
   for (let i = 0; i < at; i++)
     if (args[i] === "-C" && args[i + 1] !== undefined) where = resolve(where, args[i + 1] as string);
-  const { prefix, remoteExec, unreadable } = await planGit(where, trust, env, opts.timeoutMs ?? 60_000);
-  if (unreadable) return { code: 128, stdout: "", stderr: `refused: ${unreadable}` };
-  const sub = args[at];
-  if (sub && NETWORK_SUBCOMMANDS.has(sub) && remoteExec.length > 0) {
-    return { code: 128, stdout: "", stderr: `refused: the repository config defines ${remoteExec.join(", ")}` };
-  }
-  const argv =
-    sub && DIFFING.has(sub)
-      ? [...args.slice(0, at + 1), "--no-ext-diff", "--no-textconv", ...args.slice(at + 1)]
-      : [...args];
-  return spawnGit([...prefix, ...argv], env, {
-    timeoutMs: opts.timeoutMs ?? 60_000,
-    maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
-    ...(opts.input !== undefined ? { input: opts.input } : {}),
-    ...(opts.signal ? { signal: opts.signal } : {}),
-  });
+  const plan = await planGit(where, trust, env, opts.timeoutMs ?? 60_000);
+  const refused = refusal(plan, args, at);
+  if (refused) return refused;
+  const argv = diffing(args, at);
+  const { prefix, config, extraEnv } = plan;
+  return spawnGit(
+    [...prefix, ...argv],
+    { ...env, ...extraEnv, ...configEnv(config) },
+    {
+      timeoutMs: opts.timeoutMs ?? 60_000,
+      maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
+      ...(opts.input !== undefined ? { input: opts.input } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    },
+  );
+}
+
+/** Synchronous `safeGitOrThrow` returning stdout (operator trust unless stated); for the update host's probes. */
+export function safeGitSyncOut(args: readonly string[], opts: SafeGitOptions): string {
+  const r = safeGitSync(args, { trust: "operator", ...opts });
+  if (r.code !== 0) throw new Error(r.stderr.trim() || `git ${args[0]} failed (${r.code})`);
+  return r.stdout;
 }
 
 /** Like `safeGit` but rejects (message = git's stderr, `.code` = exit status) on a non-zero exit. */
@@ -397,10 +524,6 @@ export const RAW_GIT_EXCEPTIONS: Readonly<Record<string, RawSpawnException>> = {
     kind: "git-plumbing",
     why: "cat-file / show of a committed blob; never reads the worktree or index",
   },
-  "src/runtime/host/extension.ts": {
-    kind: "pi-owned",
-    why: "Pi's own checkout: rev-parse, remote get-url, status for the version stamp",
-  },
   "src/runtime/host/loader.ts": { kind: "git-plumbing", why: "rev-parse --absolute-git-dir" },
   "src/runtime/host/sourceWatch.ts": {
     kind: "pi-owned",
@@ -410,10 +533,6 @@ export const RAW_GIT_EXCEPTIONS: Readonly<Record<string, RawSpawnException>> = {
   "src/update/gitSource.ts": {
     kind: "pi-owned",
     why: "Pi-owned --git-dir cache with its own -c hardening and scrubbed env",
-  },
-  "src/update/manager.ts": {
-    kind: "pi-owned",
-    why: "Pi's own install checkout: rev-list root / status for the dirty check",
   },
   "src/benchmark/PlannerWorkerBenchmark.ts": {
     kind: "pi-owned",

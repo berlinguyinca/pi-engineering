@@ -31,7 +31,15 @@ interface Server {
   sourcesCalls: number;
 }
 
-function toyServer(opts: { hint?: boolean; sources?: "ok" | "404" } = {}): Server {
+function toyServer(
+  opts: {
+    hint?: boolean;
+    sources?: "ok" | "404";
+    explicitReason?: boolean;
+    decoys?: boolean;
+    alwaysCollide?: boolean;
+  } = {},
+): Server {
   const server: Server = { seqOwner: new Map(), events: new Map(), sourcesCalls: 0, fetch: undefined as never };
   const high = () => Math.max(0, ...server.seqOwner.keys());
   server.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -41,7 +49,13 @@ function toyServer(opts: { hint?: boolean; sources?: "ok" | "404" } = {}): Serve
     if (url.endsWith("/api/v1/ingest/sources")) {
       server.sourcesCalls++;
       if (opts.sources === "404") return json(404, { error: "not found" });
-      return json(200, { sources: [{ source: SOURCE, actor: "key:abc", last_sequence: high() || null }] });
+      const decoys = opts.decoys
+        ? [
+            { source: "someone-else", actor: "key:zzz", last_sequence: 9_000 },
+            { source: `${SOURCE}-2`, actor: "key:abc", last_sequence: 8_000 },
+          ]
+        : [];
+      return json(200, { sources: [...decoys, { source: SOURCE, actor: "key:abc", last_sequence: high() || null }] });
     }
     const e = JSON.parse(String(init?.body)) as { event_id: string; source_sequence: number; payload: unknown };
     const body = JSON.stringify(e.payload);
@@ -51,10 +65,12 @@ function toyServer(opts: { hint?: boolean; sources?: "ok" | "404" } = {}): Serve
       return json(409, { error: `event_id '${e.event_id}' already stored with different content`, reason: "conflict" });
     }
     const owner = server.seqOwner.get(e.source_sequence);
-    if (owner !== undefined && owner !== e.event_id) {
+    if (opts.alwaysCollide || (owner !== undefined && owner !== e.event_id)) {
       return json(409, {
-        error: `sequence ${e.source_sequence} of source '${SOURCE}' already belongs to event '${owner}'`,
-        reason: "conflict",
+        error: opts.explicitReason
+          ? "conflict"
+          : `sequence ${e.source_sequence} of source '${SOURCE}' already belongs to event '${owner}'`,
+        reason: opts.explicitReason ? "sequence_conflict" : "conflict",
         ...(opts.hint ? { last_sequence: high() } : {}),
       });
     }
@@ -200,5 +216,38 @@ describe("source_sequence recovery (T16 H6)", () => {
     await ingest.flushOutbox();
     assert.equal(store.resyncs, 0);
     assert.equal(ingest.diagnostics()?.conflictDeadLettered, 1);
+  });
+
+  it("an explicit reason: sequence_conflict is enough, whatever the message says", async () => {
+    const server = toyServer({ explicitReason: true, hint: true });
+    const first = setup(tmp(), server);
+    for (let i = 1; i <= 3; i++) await first.ingest.emitDraft(draft(i));
+    const { ingest } = setup(tmp(), server);
+    assert.equal(await ingest.emitDraft(draft(4)), true);
+    assert.equal(server.events.size, 4);
+    assert.equal(server.sourcesCalls, 0, "last_sequence from the body was used");
+  });
+
+  it("the sources listing is matched on OUR source exactly; other sources' numbers are ignored", async () => {
+    const server = toyServer({ decoys: true });
+    const first = setup(tmp(), server);
+    for (let i = 1; i <= 3; i++) await first.ingest.emitDraft(draft(i));
+    const { ingest } = setup(tmp(), server);
+    assert.equal(await ingest.emitDraft(draft(4)), true);
+    assert.ok(
+      Math.max(...server.seqOwner.keys()) < 100,
+      `numbers continued from our own high-water mark, not a neighbour's (max ${Math.max(...server.seqOwner.keys())})`,
+    );
+  });
+
+  it("a server that keeps colliding after one re-numbering is dead-lettered loudly, not retried for ever", async () => {
+    const server = toyServer({ alwaysCollide: true, hint: true });
+    const notices: TelemetryNotice[] = [];
+    setTelemetrySink((n) => notices.push(n));
+    const { store, ingest } = setup(tmp(), server);
+    assert.equal(await ingest.emitDraft(draft(1)), false);
+    assert.equal(store.resyncs, 1, "exactly one re-numbering per event id");
+    assert.equal(ingest.diagnostics()?.conflictDeadLettered, 1);
+    assert.ok(notices.some((n) => n.level === "error" && /still collides/.test(n.text ?? "")));
   });
 });

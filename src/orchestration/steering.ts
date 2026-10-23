@@ -94,6 +94,11 @@ export type SteerResult = "delivered" | "not_running" | "no_channel";
  */
 export interface ForkSteeringPort {
   knows(item: SteeringItem): boolean | Promise<boolean>;
+  /**
+   * The digest the target currently holds, when this port can compute one. A request that names `expected_digest` is
+   * only applied if this returns the same value; a port without it can never satisfy such a request (fail closed).
+   */
+  digest?(item: SteeringItem): string | null | Promise<string | null>;
   apply(item: SteeringItem): Promise<SteeringAck>;
 }
 
@@ -426,6 +431,13 @@ async function applyFork(
   if (!(await port.knows(item))) return null;
   const gone = expiredReason(item, ports, clock);
   if (gone) return finish({ outcome: "stale", note: gone });
+  if (item.expectedDigest) {
+    const held = port.digest ? await Promise.resolve(port.digest(item)).catch(() => null) : null;
+    if (!held) return finish({ outcome: "stale", note: "the request names a digest and this host cannot verify it" });
+    if (held !== item.expectedDigest) {
+      return finish({ outcome: "stale", note: "the target changed since the request was made (digest mismatch)" });
+    }
+  }
   ledger.begin(item.steeringId, item.fence);
   try {
     return finish(await port.apply(item));

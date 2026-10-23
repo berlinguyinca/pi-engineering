@@ -180,7 +180,7 @@ test("operator mode keeps the operator's own global config and neutralises only 
   );
   assert.equal(entries.length, 6);
   const op = neutralisers(entries, "operator");
-  const pairs = op.filter((a) => a !== "-c");
+  const pairs = op.map((c) => `${c.key}=${c.value}`);
   assert.ok(pairs.includes("filter.lfs.clean=git-lfs clean -- %f"), "operator's lfs filter is restored");
   assert.ok(pairs.includes("filter.evil.smudge="), "repo-only filter is blanked");
   assert.deepEqual(
@@ -189,7 +189,7 @@ test("operator mode keeps the operator's own global config and neutralises only 
     "reset then the operator's own helper",
   );
   assert.ok(!pairs.some((p) => p.includes("touch")), "no repository command survives");
-  const strict = neutralisers(entries, "strict").filter((a) => a !== "-c");
+  const strict = neutralisers(entries, "strict").map((c) => `${c.key}=${c.value}`);
   assert.ok(strict.includes("filter.lfs.clean="), "strict mode trusts no scope");
 });
 

@@ -1336,12 +1336,18 @@ anything named `*_API_KEY`, `*_SECRET` or `*_PASSWORD` are removed.
 
 Sequence recovery: Herdr orders each source by `source_sequence`. If Pi's sequence file is lost or restored from an
 older copy, Pi lifts the counter above its own outbox, and on a `409` naming a taken sequence it learns the server's
-high-water mark (`last_sequence` in the 409 body when Herdr sends one, otherwise `GET /api/v1/ingest/sources`),
+high-water mark (`reason: "sequence_conflict"` and `last_sequence` in the 409 body when Herdr sends them, otherwise the message text and `GET /api/v1/ingest/sources`),
 resumes above it and re-numbers the pending events; nothing is dropped. When that cannot be done, the event is
 dead-lettered with an error notice and `conflictDeadLettered` in the ingest diagnostics.
 
 Steering requests are judged on Herdr's clock (the `Date` header of the poll response plus monotonic time since),
-not on Pi's wall clock; a request naming a digest is applied only while the mission's current plan digest equals it.
+not on Pi's wall clock. A request that names a digest (`expected_digest`) is applied (redirect, resume, fork, promote)
+only while the target's current plan digest equals it, and is answered `stale` when Pi cannot compute one. Today Herdr
+sends `expected_digest` only on `approve`/`reject`, which Pi answers `unsupported` (gate decisions are not taken from
+steering), so in practice the digest check guards nothing that is applied yet; it is there so a Herdr that starts
+sending it on the other actions cannot be trusted by accident. Herdr's `fence` is an opaque hash Pi cannot recompute:
+it is compared only where a runtime supplies a fence for the target (none does today) and is always recorded in the
+at-most-once ledger.
 
 External web consumers receive additive `waitingSince`, `lastOutputAt`,
 `currentActivityStartedAt` and worker timing fields in the mission snapshot. They should derive

@@ -52,9 +52,21 @@ export function checkHerdrUrl(raw: string): URL | null {
   } catch {
     return null;
   }
-  if (u.username || u.password || u.search || u.hash) return null;
+  if (u.username || u.password || u.search || u.hash || /[?#]/.test(raw)) return null;
   if (u.protocol === "https:") return u;
   if (u.protocol === "http:" && LOOPBACK.has(u.hostname)) return u;
+  return null;
+}
+
+/** Pure: what is wrong with a key file's stat, given the current user's uid (undefined on platforms without one). */
+export function keyFileStatProblem(
+  st: { mode: number; uid: number; size: number; isFile(): boolean },
+  uid: number | undefined,
+): string | null {
+  if (!st.isFile()) return "api_key_file is not a regular file";
+  if ((st.mode & 0o077) !== 0) return "api_key_file must not be readable by group or others (mode 0600)";
+  if (uid !== undefined && st.uid !== uid) return "api_key_file must be owned by the current user";
+  if (st.size > MAX_KEY_FILE) return "api_key_file is too large";
   return null;
 }
 
@@ -66,12 +78,8 @@ function readKeyFile(path: string): { key: string } | { error: string } {
   } catch {
     return { error: "api_key_file cannot be read" };
   }
-  if (!st.isFile()) return { error: "api_key_file is not a regular file" };
-  if ((st.mode & 0o077) !== 0) return { error: "api_key_file must not be readable by group or others (mode 0600)" };
-  if (typeof process.getuid === "function" && st.uid !== process.getuid()) {
-    return { error: "api_key_file must be owned by the current user" };
-  }
-  if (st.size > MAX_KEY_FILE) return { error: "api_key_file is too large" };
+  const problem = keyFileStatProblem(st, typeof process.getuid === "function" ? process.getuid() : undefined);
+  if (problem) return { error: problem };
   const key = readFileSync(path, "utf8").trim();
   if (!key) return { error: "api_key_file is empty" };
   for (const ch of key) {
