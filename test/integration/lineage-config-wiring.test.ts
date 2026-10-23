@@ -180,7 +180,9 @@ test("config enables lineage: real envelopes reach the control plane in order", 
 });
 
 test("lineage stays OFF unless both config keys are true: nothing is built or sent", async () => {
-  for (const values of [{}, { lineage: { enabled: true } }, { ingest: { outbox: true } }]) {
+  for (const values of [{}, { lineage: { enabled: true } }, { ingest: { outbox: true } }] as Array<
+    Record<string, Record<string, unknown>>
+  >) {
     const plane = await fakeControlPlane(values);
     const home = hostHome(plane.url);
     const envelopeDir = mkdtempSync(join(tmpdir(), "pi-lineage-env-"));

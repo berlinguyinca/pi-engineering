@@ -90,7 +90,9 @@ test("a mission runs end to end with every optional adapter absent and touches n
     const controlPlane = join(resolveStateRoot(), "control-plane");
     const leftovers = existsSync(controlPlane) ? readdirSync(controlPlane) : [];
     assert.deepEqual(
-      leftovers.filter((f) => f.startsWith("outbox") || f.startsWith("seq") || f === "instance-id"),
+      leftovers.filter(
+        (f) => f.startsWith("outbox") || f.startsWith("seq") || f === "instance-id" || f === "id-secret",
+      ),
       [],
       "no outbox or sequence state without an emitter",
     );
@@ -180,7 +182,9 @@ test("lineage code present but no emitter configured: hooks run, stage is never 
     const controlPlane = join(resolveStateRoot(), "control-plane");
     const leftovers = existsSync(controlPlane) ? readdirSync(controlPlane) : [];
     assert.deepEqual(
-      leftovers.filter((f) => f.startsWith("outbox") || f.startsWith("seq") || f === "instance-id"),
+      leftovers.filter(
+        (f) => f.startsWith("outbox") || f.startsWith("seq") || f === "instance-id" || f === "id-secret",
+      ),
       [],
     );
 

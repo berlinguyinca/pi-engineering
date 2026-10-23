@@ -103,6 +103,11 @@ export interface LineageEmitterOptions {
   /** Host label recorded in attrs only (never in an id), so migration is visible but ids stay put. */
   host?: string;
   visibility?: VisibilityScope;
+  /**
+   * Keyed id derivation (EnvelopeStore.deriveEventId). Without it ids fall back to a bare
+   * sha256 of public data, which is only acceptable for tests with a private sink.
+   */
+  deriveEventId?: (prefix: string, parts: readonly unknown[]) => string;
   now?: () => Date;
   /** Called (never throws into the caller) for each swallowed sink error. */
   onError?: (error: unknown) => void;
@@ -132,6 +137,8 @@ const EDGE_SET: ReadonlySet<string> = new Set(LINEAGE_EDGE_TYPES);
 export const MAX_LINEAGE_ID_CHARS = 200;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters is the point
+const CONTROL_RUNS = /[\u0000-\u001f\u007f]+/g;
 
 /**
  * `kind:id`, or undefined when the id is empty or holds a control character (so
@@ -152,11 +159,7 @@ export function lineageNodeId(kind: LineageNodeKind, id: string | null | undefin
 /** A label with control characters removed and bounded length; undefined when nothing is left. */
 function cleanLabel(label: string | undefined): string | undefined {
   if (!label) return undefined;
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters is the point
-  const cleaned = label
-    .replace(/[\u0000-\u001f\u007f]+/g, " ")
-    .trim()
-    .slice(0, MAX_LINEAGE_ID_CHARS);
+  const cleaned = label.replace(CONTROL_RUNS, " ").trim().slice(0, MAX_LINEAGE_ID_CHARS);
   return cleaned || undefined;
 }
 
@@ -257,6 +260,7 @@ export class LineageEmitter {
   private readonly visibility?: VisibilityScope;
   private readonly now: () => Date;
   private readonly onError?: (error: unknown) => void;
+  private readonly deriveKeyed?: (prefix: string, parts: readonly unknown[]) => string;
   private readonly inflight = new Set<Promise<void>>();
   private readonly counters: LineageCounters = { emitted: 0, dropped: 0, errors: 0 };
 
@@ -267,6 +271,7 @@ export class LineageEmitter {
     this.visibility = opts.visibility;
     this.now = opts.now ?? (() => new Date());
     this.onError = opts.onError;
+    this.deriveKeyed = opts.deriveEventId;
   }
 
   stats(): LineageCounters {
@@ -641,6 +646,7 @@ export class LineageEmitter {
   }
 
   private eventId(eventType: string, parts: readonly unknown[]): string {
+    if (this.deriveKeyed) return this.deriveKeyed("lin", [this.source, eventType, ...parts]);
     const digest = createHash("sha256")
       .update(JSON.stringify([this.source, eventType, ...parts]))
       .digest("hex")
@@ -703,7 +709,13 @@ export function createLineageEmitter(
   opts: Omit<LineageEmitterOptions, "sink" | "source"> = {},
 ): LineageEmitter | null {
   if ("store" in from) {
-    return new LineageEmitter({ ...opts, sink: from.store, source: from.store.source });
+    const store = from.store;
+    return new LineageEmitter({
+      ...opts,
+      sink: store,
+      source: store.source,
+      deriveEventId: (prefix, parts) => store.deriveEventId(prefix, parts),
+    });
   }
   const diag = from.ingest.diagnostics();
   if (!diag) return null;
@@ -712,6 +724,7 @@ export function createLineageEmitter(
     host: ingest.host.hostId,
     ...opts,
     source: diag.source,
+    deriveEventId: (prefix, parts) => ingest.deriveEventId(prefix, parts) as string,
     sink: { stage: (draft) => ingest.emitDraft(draft) },
   });
 }
