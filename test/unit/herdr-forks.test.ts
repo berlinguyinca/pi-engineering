@@ -25,6 +25,7 @@ import {
   parseSteeringItem,
 } from "../../src/orchestration/steering.ts";
 import { loadForkSettings } from "../../src/runtime/herdr/forkSettings.ts";
+import { type ForkRuntimeSources, createForkRuntime } from "../../src/runtime/herdr/forkWiring.ts";
 import { FakeGithubClient } from "../support/fakeGithubClient.ts";
 
 const sh = (cwd: string, ...args: string[]): string =>
@@ -243,6 +244,50 @@ describe("fork parameters are typed and strict", () => {
     assert.equal(parseSteeringItem(wire({ params: { base_sha: "HEAD" } })), null);
     assert.equal(parseSteeringItem(wire({ action: "pause", params: { base_sha: SHA("a") } })), null);
     assert.notEqual(parseSteeringItem(wire({ action: "pause", params: {} })), null);
+  });
+});
+
+describe("the exact deliveries Herdr's control plane produces (captured from test_forks.py)", () => {
+  const common = {
+    trust: "untrusted",
+    provenance: "herdr-steering/v1 (human-proposed, owner-confirmed, delivered by Herdr)",
+    room: { id: "room_01m5md867m00006g0jk2ya9exr", name: "r" },
+    instruction: null,
+    instruction_trust: "untrusted_text_from_proposed_by",
+    proposed_by: { type: "user", id: "bob", at: "2027-01-15T08:00:00+00:00" },
+    confirmed_by: { type: "user", id: "alice", at_epoch: 1800000000.0 },
+    valid_until_epoch: 1800000300.0,
+    delivery: 1,
+  };
+  it("a fork with a label, a fork with an empty label, and a promote all parse", () => {
+    const fork = parseSteeringItem({
+      ...common,
+      steering_id: "collab_01m5md868a00006ktpjtp2xz7e",
+      idempotency_key: "collab_01m5md868a00006ktpjtp2xz7e",
+      action: "fork",
+      target: { node_id: "attempt:a1", node_type: "attempt", fence: "e446", expected_digest: null },
+      params: { base_sha: SHA("a"), label: "alt one", origin: "attempt:a1" },
+    });
+    assert.deepEqual(fork?.params, { baseSha: SHA("a"), label: "alt one", origin: "attempt:a1" });
+    const empty = parseSteeringItem({
+      ...common,
+      steering_id: "collab_01m5md868j00006nhckdbngpks",
+      idempotency_key: "collab_01m5md868j00006nhckdbngpks",
+      action: "fork",
+      target: { node_id: "attempt:a1", node_type: "attempt", fence: "e446", expected_digest: null },
+      params: { base_sha: SHA("a"), label: "", origin: "attempt:a1" },
+    });
+    assert.equal(empty?.params?.baseSha, SHA("a"));
+    const promo = parseSteeringItem({
+      ...common,
+      steering_id: "collab_01m5md869200006rx0yk9pg3jh",
+      idempotency_key: "collab_01m5md869200006rx0yk9pg3jh",
+      action: "promote",
+      target: { node_id: "approach:f1", node_type: "approach", fence: "c000", expected_digest: null },
+      params: { expected_head: SHA("b"), origin: "attempt:a1", head: SHA("b"), siblings: [] },
+    });
+    assert.equal(promo?.params?.expectedHead, SHA("b"));
+    assert.equal(promo?.nodeId, "approach:f1");
   });
 });
 
@@ -705,6 +750,86 @@ describe("forks settings: global YAML only, off unless valid", () => {
       const s = await write(bad);
       assert.equal(s.enabled, false, bad);
       assert.ok(s.notes[0]?.startsWith("forks off:"), bad);
+    }
+  });
+});
+
+describe("production wiring (createForkRuntime)", () => {
+  const sources = (over: Partial<ForkRuntimeSources> = {}): ForkRuntimeSources => ({
+    getTask: (id) => (id === "t1" ? { task_id: "t1", mission_id: "m1" } : undefined),
+    getExecution: () => undefined,
+    getMission: (id) => (id === "m1" ? { mission_id: "m1", repository: "relative/repo", base_ref: "main" } : undefined),
+    boundRoot: () => null,
+    openRoot: async (p) => p,
+    links: new Store(),
+    ...over,
+  });
+  const boot = async (yaml: string, src: ForkRuntimeSources) => {
+    const agentDir = tmp();
+    writeFileSync(join(agentDir, "engineering.yaml"), yaml);
+    return createForkRuntime({ agentDir, stateDir: tmp(), sources: src, lineage: null });
+  };
+  it("defaults build nothing: no port, so a fork request is acknowledged unsupported (standalone Pi unchanged)", async () => {
+    const rt = await boot("other: 1\n", sources());
+    assert.equal(rt, null);
+    const a = await applySteering(
+      item({ action: "fork", params: { baseSha: SHA("a") } }),
+      {
+        now: () => 1,
+        resolve: () => null,
+        steerRunning: () => "no_channel",
+        resumeMission: async () => ({ changed: false }),
+      },
+      new MemorySteeringLedger(),
+    );
+    assert.equal(a?.outcome, "unsupported");
+  });
+  it("a relative or unregistered repository path is never resolved to a checkout", async () => {
+    const rt = await boot("forks:\n  enabled: true\n", sources());
+    assert.ok(rt);
+    try {
+      assert.equal(
+        await rt.port.knows(item({ action: "fork", nodeId: "task:t1", params: { baseSha: SHA("a") } })),
+        true,
+      );
+      const a = await rt.port.apply(item({ action: "fork", nodeId: "task:t1", params: { baseSha: SHA("a") } }));
+      assert.equal(a.outcome, "refused");
+      assert.match(a.note, /repository of that mission is not available/);
+      assert.equal(
+        await rt.port.knows(item({ action: "fork", nodeId: "task:nope", params: { baseSha: SHA("a") } })),
+        false,
+      );
+      assert.equal(
+        await rt.port.knows(item({ action: "fork", nodeId: "weird", params: { baseSha: SHA("a") } })),
+        false,
+      );
+    } finally {
+      rt.stop();
+    }
+  });
+  it("a hostile base ref is refused, and a registered absolute checkout works", async () => {
+    const r = mkRepo();
+    const bad = await boot(
+      "forks:\n  enabled: true\n",
+      sources({ getMission: () => ({ mission_id: "m1", repository: r.root, base_ref: "--upload-pack=x" }) }),
+    );
+    try {
+      assert.match(
+        (await bad!.port.apply(item({ action: "fork", nodeId: "task:t1", params: { baseSha: r.base } }))).note,
+        /plain branch name/,
+      );
+    } finally {
+      bad?.stop();
+    }
+    const ok = await boot(
+      "forks:\n  enabled: true\n  min_free_mb: 1\n",
+      sources({ getMission: () => ({ mission_id: "m1", repository: r.root, base_ref: "main" }) }),
+    );
+    try {
+      const a = await ok!.port.apply(item({ action: "fork", nodeId: "task:t1", params: { baseSha: r.base } }));
+      assert.equal(a.outcome, "applied", a.note);
+    } finally {
+      ok?.stop();
     }
   });
 });
