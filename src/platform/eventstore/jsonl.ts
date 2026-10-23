@@ -33,7 +33,7 @@ import { appendFile, mkdir, readFile, rename, truncate, writeFile } from "node:f
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
 import type { EventStoreBackend, StoredEvent } from "./backend.ts";
-import { ExclusiveFileLock, type FileLockRecoveryHooks } from "./fileLock.ts";
+import { ExclusiveFileLock, lockHeldByLiveOwner, type FileLockRecoveryHooks } from "./fileLock.ts";
 
 /** Files held by a live instance in this process, so two cannot diverge silently. */
 const openFiles = new Set<string>();
@@ -126,7 +126,7 @@ export class JsonlEventStore implements EventStoreBackend {
     // from the FILE, not merely skipped in memory, or the next append fuses
     // onto it and takes a committed event down with it. repairTornTail returns
     // the complete prefix (with any torn tail truncated) to parse.
-    const complete = await repairTornTail(this.file);
+    const complete = await repairTornTail(this.file, { owner: this.writerLock });
     if (complete === null) return;
 
     for (const line of complete.split("\n")) {
@@ -161,7 +161,7 @@ export class JsonlEventStore implements EventStoreBackend {
             // Repair the tail so a retried append lands cleanly instead of
             // fusing onto the fragment (the failed head stays queued for the
             // caller's flush() to retry once space frees).
-            await repairTornTail(this.file);
+            await repairTornTail(this.file, { owner: this.writerLock });
             throw error;
           }
         }
@@ -193,7 +193,7 @@ export class JsonlEventStore implements EventStoreBackend {
           try {
             appendFileSync(this.file, line, "utf-8");
           } catch (error) {
-            await repairTornTail(this.file);
+            await repairTornTail(this.file, { owner: this.writerLock });
             throw error;
           }
         }
@@ -233,7 +233,7 @@ export class JsonlEventStore implements EventStoreBackend {
           try {
             await appendFile(this.file, body, "utf-8");
           } catch (error) {
-            await repairTornTail(this.file);
+            await repairTornTail(this.file, { owner: this.writerLock });
             throw error;
           }
         }
@@ -284,7 +284,10 @@ export class JsonlEventStore implements EventStoreBackend {
  * Returns the file's complete prefix (with any torn tail truncated) for the
  * caller to parse, or `null` when the file is missing/unreadable.
  */
-export async function repairTornTail(file: string): Promise<string | null> {
+export async function repairTornTail(
+  file: string,
+  options: { owner?: ExclusiveFileLock | null } = {},
+): Promise<string | null> {
   let raw: string;
   try {
     raw = await readFile(file, "utf-8");
@@ -294,6 +297,18 @@ export async function repairTornTail(file: string): Promise<string | null> {
   }
   if (raw.length === 0 || raw.endsWith("\n")) return raw;
   const complete = raw.slice(0, raw.lastIndexOf("\n") + 1);
+  // Ownership gate (FR-05): a torn tail is only TRUNCATED when the caller proves
+  // it owns the writer lock, or when no live owner exists. A caller that cannot
+  // prove ownership (e.g. recovery tooling reaching a file another live process
+  // is still writing) must not truncate — it returns the readable prefix so the
+  // caller can still parse, but leaves the file untouched.
+  if (!options.owner && (await lockHeldByLiveOwner(file))) {
+    emitTelemetry({
+      level: "warning",
+      text: `event store: refused torn-tail TRUNCATION for ${file}; a live writer owns it (prefix returned, file untouched)`,
+    });
+    return complete;
+  }
   await truncate(file, Buffer.byteLength(complete, "utf-8")).catch(() => undefined);
   emitTelemetry({ level: "warning", text: `event store: repaired a torn tail in ${file}` });
   return complete;
