@@ -78,7 +78,6 @@ export interface CallOptions {
 
 export interface Reply {
   status: number;
-  // biome-ignore lint/suspicious/noExplicitAny: responses are arbitrary JSON in tests
   body: any;
 }
 
