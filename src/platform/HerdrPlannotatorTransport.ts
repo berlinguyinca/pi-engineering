@@ -39,8 +39,46 @@ export interface HerdrPlannotatorConfig {
   timeoutMs?: number;
   /** Cap on captured stdout bytes; default 256 KiB. */
   maxOutputBytes?: number;
-  /** PATH to resolve a bare command against; default the process PATH. */
+  /**
+   * PATH a bare command is resolved against. Default {@link TRUSTED_COMMAND_PATH},
+   * never the caller's PATH.
+   */
   searchPath?: string;
+  /** Extra environment variable NAMES passed through (on top of the fixed allowlist). */
+  envAllow?: string[];
+}
+
+/** Fixed, documented lookup path for a bare command name. */
+export const TRUSTED_COMMAND_PATH = "/usr/local/bin:/usr/bin:/bin";
+
+/**
+ * The only environment the bridge receives: basics, locale/tmp/XDG state (it
+ * reads host.json and its key file from there) and the variables Herdr's docs
+ * name for the bridge. Everything else (SSH_AUTH_SOCK, *_PAT, DATABASE_URL, AWS_*,
+ * ...) is left out by construction, not by pattern.
+ */
+export const CHILD_ENV_ALLOWLIST: readonly string[] = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "TMPDIR",
+  "XDG_CONFIG_HOME",
+  "XDG_STATE_HOME",
+  "XDG_RUNTIME_DIR",
+  "HERDR_ENGINEERING_CONTROL_PLANE_URL",
+  "HERDR_ENGINEERING_CONTROL_PLANE_KEY",
+  "PLANNOTATOR_URL_HOST",
+];
+
+/** A command is a bare name or an absolute path; './x', '../x' and 'dir/x' are refused. */
+export function assertTrustedCommand(command: string): void {
+  if (!command || command.includes("\0")) throw new Error("plannotator command is empty");
+  if (command.includes("/") && !isAbsolute(command)) {
+    throw new Error(`plannotator command "${command}" must be an absolute path or a bare name`);
+  }
 }
 
 export const DEFAULT_HERDR_PLANNOTATOR_COMMAND = "herdr-plannotator";
@@ -48,12 +86,9 @@ const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_MAX_OUTPUT = 256 * 1024;
 /** Mirrors the bridge's plan limit (MAX_TEXT); larger plans are refused up front. */
 const MAX_PLAN_BYTES = 200_000;
-const SECRETISH = /TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|AUTHORIZATION|CREDENTIAL|_KEY$/i;
-/** The one secret-shaped name the bridge itself documents as its credential source. */
-const BRIDGE_KEY = "HERDR_ENGINEERING_CONTROL_PLANE_KEY";
-
 function resolveCommand(command: string, searchPath: string): string {
-  if (isAbsolute(command) || command.includes("/")) return command;
+  assertTrustedCommand(command);
+  if (isAbsolute(command)) return command;
   for (const dir of searchPath.split(delimiter)) {
     if (!dir) continue;
     const candidate = join(dir, command);
@@ -67,12 +102,11 @@ function resolveCommand(command: string, searchPath: string): string {
   throw new Error(`${command} is not installed or is not on PATH`);
 }
 
-function childEnv(): NodeJS.ProcessEnv {
+function childEnv(extra: readonly string[]): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v === undefined || k.toUpperCase().startsWith("GIT_")) continue;
-    if (SECRETISH.test(k) && k !== BRIDGE_KEY) continue;
-    env[k] = v;
+  for (const name of [...CHILD_ENV_ALLOWLIST, ...extra]) {
+    const v = process.env[name];
+    if (v !== undefined) env[name] = v;
   }
   return env;
 }
@@ -121,7 +155,7 @@ export function createHerdrPlannotatorTransport(config: HerdrPlannotatorConfig =
       }
       const executable = resolveCommand(
         config.command ?? DEFAULT_HERDR_PLANNOTATOR_COMMAND,
-        config.searchPath ?? process.env.PATH ?? "",
+        config.searchPath ?? TRUSTED_COMMAND_PATH,
       );
       const dir = mkdtempSync(join(tmpdir(), "pi-plan-review-"));
       try {
@@ -137,7 +171,14 @@ export function createHerdrPlannotatorTransport(config: HerdrPlannotatorConfig =
           `Plan ${plan.runId} revision ${plan.revision ?? 1}`,
           ...(config.args ?? []),
         ];
-        const { stdout } = await run(executable, argv, config.cwd ?? process.cwd(), timeoutMs, maxOutput);
+        const { stdout } = await run(
+          executable,
+          argv,
+          config.cwd ?? process.cwd(),
+          timeoutMs,
+          maxOutput,
+          config.envAllow ?? [],
+        );
         const result = parseResult(stdout);
         const echoed = result.plan_digest;
         const feedback =
@@ -160,17 +201,56 @@ export function createHerdrPlannotatorTransport(config: HerdrPlannotatorConfig =
   };
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+function groupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** SIGTERM then SIGKILL the child's whole process group, and wait until it is gone. */
+async function terminateGroup(pid: number): Promise<void> {
+  for (const [signal, waitMs] of [
+    ["SIGTERM", 2_000],
+    ["SIGKILL", 3_000],
+  ] as const) {
+    try {
+      process.kill(-pid, signal);
+    } catch {
+      return; // already gone
+    }
+    const end = Date.now() + waitMs;
+    while (Date.now() < end) {
+      if (!groupAlive(pid)) return;
+      await sleep(25);
+    }
+  }
+}
+
 function run(
   file: string,
   argv: string[],
   cwd: string,
   timeoutMs: number,
   maxOutput: number,
+  envAllow: readonly string[],
 ): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
     try {
-      child = spawn(file, argv, { cwd, env: childEnv(), stdio: ["ignore", "pipe", "pipe"], shell: false });
+      // detached: the child leads its own process group, so a timeout reaches
+      // the upstream Plannotator it launches too.
+      child = spawn(file, argv, {
+        cwd,
+        env: childEnv(envAllow),
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: false,
+        detached: true,
+      });
     } catch (err) {
       reject(err);
       return;
@@ -178,36 +258,32 @@ function run(
     const chunks: Buffer[] = [];
     let size = 0;
     let settled = false;
-    const finish = (fn: () => void): void => {
+    const fail = (error: Error): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      fn();
+      // Reject only once the whole group is gone, so the caller may delete the plan dir.
+      const pid = child.pid;
+      (pid ? terminateGroup(pid) : Promise.resolve()).then(() => reject(error));
     };
-    const kill = (): void => {
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
-    };
-    const timer = setTimeout(() => {
-      kill();
-      finish(() => reject(new Error(`Plannotator bridge timed out after ${timeoutMs}ms`)));
-    }, timeoutMs);
+    const timer = setTimeout(() => fail(new Error(`Plannotator bridge timed out after ${timeoutMs}ms`)), timeoutMs);
     child.stdout?.on("data", (d: Buffer) => {
       size += d.length;
-      if (size > maxOutput) {
-        kill();
-        finish(() => reject(new Error("Plannotator bridge output exceeded the limit")));
-        return;
-      }
-      chunks.push(d);
+      if (size > maxOutput) fail(new Error("Plannotator bridge output exceeded the limit"));
+      else chunks.push(d);
     });
     child.stderr?.resume(); // diagnostics are not captured: they may carry plan text
-    child.on("error", (err) => finish(() => reject(err)));
-    child.on("close", (code, signal) =>
-      finish(() => {
+    child.on("error", (err) => fail(err));
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const pid = child.pid;
+      const done = (pid && groupAlive(pid) ? terminateGroup(pid) : Promise.resolve()).then(() => {
         if (code === 0) resolve({ stdout: Buffer.concat(chunks).toString("utf8") });
         else reject(new Error(`Plannotator bridge exited with ${signal ?? `status ${code}`}`));
-      }),
-    );
+      });
+      void done;
+    });
   });
 }

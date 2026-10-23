@@ -563,7 +563,7 @@ export interface EngineeringRuntimeOptions {
   planReview?: Pick<
     import("../orchestration/planReview.ts").PlanGateInput,
     "adapter" | "policy" | "emitter" | "replan" | "maxRevisions"
-  >;
+  > & { configNotes?: string[] };
   /**
    * Optional autonomous spec approval hook (design 2026-09-28). When provided,
    * material mutations are reviewed/refined/approved and their tasks are
@@ -1630,13 +1630,26 @@ export class EngineeringRuntime {
               file: null,
               line: null,
               summary: `Plan review blocked implementation (${gated.code}).`,
-              evidence: gated.reason.slice(0, 1000),
+              evidence: [gated.reason, ...(planReviewSettings.configNotes ?? [])].join("\n").slice(0, 1000),
               recommended_action:
                 gated.code === "plannotator_unavailable"
                   ? "Restore the plan review service or record an explicit operator override with a reason."
                   : "Revise the plan and resubmit for review.",
             });
             return [];
+          }
+          if (planReviewSettings.configNotes?.length) {
+            rt.missionStore.addFinding({
+              mission_id: mission.mission_id,
+              task_id: null,
+              severity: "minor",
+              category: "plan_review_config",
+              file: null,
+              line: null,
+              summary: "Plan review configuration was only partly honoured.",
+              evidence: planReviewSettings.configNotes.join("\n").slice(0, 1000),
+              recommended_action: "Fix or remove the ignored plan_review settings.",
+            });
           }
           return gated.tasks;
         }

@@ -145,4 +145,67 @@ describe("HerdrPlannotatorTransport", () => {
     const crash = await run("process.exit(1);");
     assert.equal(crash.status === "blocked" && crash.code, "plannotator_unavailable");
   });
+
+  it("the child gets an ALLOWLISTED environment, not the caller's minus some patterns", async () => {
+    const leaks = ["SSH_AUTH_SOCK", "GITHUB_PAT", "DB_PASS", "DATABASE_URL", "AWS_ACCESS_KEY_ID", "OPENAI_THING"];
+    for (const k of leaks) process.env[k] = "v";
+    process.env.EXTRA_OK = "yes";
+    try {
+      const cli = fakeCli(
+        'fs.writeFileSync(process.argv[1] + ".env", JSON.stringify(Object.keys(process.env))); process.stdout.write(JSON.stringify({decision:"approved"}));',
+      );
+      await createHerdrPlannotatorTransport({ command: cli.bin, envAllow: ["EXTRA_OK"] }).submitPlan(proposal);
+      const keys: string[] = JSON.parse(readFileSync(`${cli.bin}.env`, "utf8"));
+      for (const k of leaks) assert.ok(!keys.includes(k), `${k} must not reach the bridge`);
+      assert.ok(keys.includes("EXTRA_OK"));
+      assert.ok(keys.includes("PATH"));
+    } finally {
+      for (const k of [...leaks, "EXTRA_OK"]) delete process.env[k];
+    }
+  });
+
+  it("refuses relative and path-qualified commands; a bare name uses the fixed trusted PATH, not the caller's", async () => {
+    for (const command of ["./evil.sh", "../evil.sh", "bin/evil.sh"]) {
+      await assert.rejects(
+        createHerdrPlannotatorTransport({ command }).submitPlan(proposal),
+        /absolute path or a bare name/,
+        command,
+      );
+    }
+    const cli = fakeCli(out({ decision: "approved" }));
+    const before = process.env.PATH;
+    process.env.PATH = `${cli.dir}:${before}`;
+    try {
+      await assert.rejects(
+        createHerdrPlannotatorTransport({ command: "herdr-plannotator" }).submitPlan(proposal),
+        /not installed or is not on PATH/,
+        "a caller-PATH entry is not trusted",
+      );
+    } finally {
+      process.env.PATH = before;
+    }
+  });
+
+  it("a timeout kills the whole process group (the upstream grandchild too) before the plan dir is removed", async () => {
+    const pidFile = join(mkdtempSync(join(tmpdir(), "pi-gc-")), "grandchild.pid");
+    const cli = fakeCli(
+      `const cp = require("child_process");
+const gc = cp.spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(gc.pid));
+setInterval(() => {}, 1000);`,
+    );
+    await assert.rejects(
+      createHerdrPlannotatorTransport({ command: cli.bin, timeoutMs: 400 }).submitPlan(proposal),
+      /timed out/,
+    );
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    assert.ok(pid > 0);
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    assert.equal(alive, false, "grandchild must be gone");
+  });
 });

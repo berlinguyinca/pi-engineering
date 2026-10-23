@@ -531,7 +531,7 @@ function stripComments(text: string): string {
   return text;
 }
 
-async function readYaml(path: string): Promise<{ raw: unknown; text?: string }> {
+export async function readYaml(path: string): Promise<{ raw: unknown; text?: string }> {
   try {
     const text = await readFile(path, "utf-8");
     return { raw: parseYaml(stripComments(text)), text };

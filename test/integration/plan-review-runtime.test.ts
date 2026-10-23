@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { EngineeringRuntime } from "../../src/index.ts";
-import { parsePlanReviewConfig } from "../../src/orchestration/planReviewConfig.ts";
+import { mergePlanReviewLayers } from "../../src/orchestration/planReviewConfig.ts";
 import { PLANNER_CLARIFICATION_CATEGORY } from "../../src/orchestration/types.ts";
 import { PlannotatorAdapter, type PlannotatorTransport } from "../../src/platform/Plannotator.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -19,10 +19,11 @@ after(async () => {
   for (const c of cleanups) await c();
 });
 
-async function open(extra: Record<string, unknown> = {}, yaml?: string) {
+async function open(extra: Record<string, unknown> = {}, yaml?: string, globalYaml?: string) {
   const fx = await makeFixtureRepo();
   const agentDir = await mkdtemp(join(tmpdir(), "pi-plan-agent-"));
   cleanups.push(() => rm(agentDir, { recursive: true, force: true }));
+  if (globalYaml !== undefined) await writeFile(join(agentDir, "engineering.yaml"), globalYaml);
   if (yaml !== undefined) {
     await mkdir(join(fx.root, ".pi"), { recursive: true });
     await writeFile(join(fx.root, ".pi", "engineering.yaml"), yaml);
@@ -136,9 +137,10 @@ describe("plan review on the orchestrator path", () => {
     );
   });
 
-  it("enabled from the repo YAML with a CLI that is not installed: fail closed; skip override from YAML is recorded", async () => {
+  it("enabled from the GLOBAL YAML with a CLI that is not installed: fail closed; a global skip override is recorded", async () => {
     const closed = await open(
       {},
+      undefined,
       "plan_review:\n  enabled: true\n  plannotator:\n    command: definitely-not-installed-plannotator\n",
     );
     assert.deepEqual(await closed.plan(), []);
@@ -146,6 +148,7 @@ describe("plan review on the orchestrator path", () => {
 
     const skipped = await open(
       {},
+      undefined,
       'plan_review:\n  enabled: true\n  override:\n    mode: skip\n    reason: "offline hotfix"\n    operator: alice\n',
     );
     assert.equal((await skipped.plan()).length, 1);
@@ -154,17 +157,56 @@ describe("plan review on the orchestrator path", () => {
     assert.equal(policy?.overrideReason, "offline hotfix");
   });
 
-  it("a malformed enabled block fails closed; a disabled or absent block is off", () => {
-    assert.equal(parsePlanReviewConfig(undefined, "/tmp"), null);
-    assert.equal(parsePlanReviewConfig({ enabled: false }, "/tmp"), null);
-    const bad = parsePlanReviewConfig({ enabled: true, modes: { high: "sometimes" } }, "/tmp");
+  it("a repo YAML cannot disable, lower or override the global gate, and says so", async () => {
+    const global =
+      "plan_review:\n  enabled: true\n  modes: {high: require}\n  plannotator:\n    command: definitely-not-installed-plannotator\n";
+    const repo =
+      'plan_review:\n  enabled: false\n  modes: {high: skip}\n  override: {mode: skip, reason: "trust me"}\n  plannotator: {command: ./evil.sh}\n';
+    const { plan, store, mission } = await open({}, repo, global);
+    assert.deepEqual(await plan(), [], "still blocked");
+    const f = store.listFindings(mission.mission_id)[0];
+    assert.match(f?.summary ?? "", /blocked implementation/);
+    assert.equal(store.listPlanPolicies(mission.mission_id)[0]?.source, "policy");
+    assert.equal(store.listPlanPolicies(mission.mission_id)[0]?.mode, "require");
+  });
+
+  it("a malformed global file or a typo'd block fails closed with the reason in the finding", async () => {
+    for (const [global, expected] of [
+      ["plan_review: [unclosed", /global config unreadable/],
+      ['plan_review:\n  enabled: "true"\n', /must be true or false/],
+      ["plan_review: true\n", /must be a mapping/],
+    ] as const) {
+      const { plan, store, mission } = await open({}, undefined, global);
+      assert.deepEqual(await plan(), [], global);
+      assert.match(store.listFindings(mission.mission_id)[0]?.evidence ?? "", expected);
+    }
+  });
+
+  it("layer merge: absent/disabled is off; malformed fails closed; repo can only raise", () => {
+    const L = (raw?: unknown) => ({ raw });
+    assert.equal(mergePlanReviewLayers({ global: L(), repo: L() }, "/tmp"), null);
+    assert.equal(mergePlanReviewLayers({ global: L({ enabled: false }), repo: L() }, "/tmp"), null);
+    const bad = mergePlanReviewLayers(
+      { global: L({ enabled: true, modes: { high: "sometimes" } }), repo: L() },
+      "/tmp",
+    );
     assert.equal(bad?.adapter, null);
     assert.deepEqual(bad?.policy?.modes, { low: "require", medium: "require", high: "require", critical: "require" });
-    const noReason = parsePlanReviewConfig({ enabled: true, override: { mode: "skip" } }, "/tmp");
-    assert.equal(noReason?.adapter, null);
-    const good = parsePlanReviewConfig({ enabled: true, max_revisions: 2, modes: { medium: "require" } }, "/tmp/x");
-    assert.equal(good?.maxRevisions, 2);
-    assert.equal(good?.policy?.modes?.medium, "require");
-    assert.ok(good?.adapter);
+    assert.ok(bad?.configNotes.some((n) => /modes.high must be one of/.test(n)));
+    const raised = mergePlanReviewLayers(
+      {
+        global: L({ enabled: true, modes: { low: "skip" }, max_revisions: 2 }),
+        repo: L({ modes: { low: "offer", high: "skip" }, max_revisions: 1 }),
+      },
+      "/tmp/x",
+    );
+    assert.equal(raised?.policy?.modes?.low, "offer");
+    assert.equal(raised?.policy?.modes?.high, "require");
+    assert.equal(raised?.maxRevisions, 1);
+    assert.ok(raised?.adapter);
+    assert.equal(
+      mergePlanReviewLayers({ global: L(), repo: L({ modes: { low: "offer" } }) }, "/tmp/x")?.policy?.modes?.low,
+      "offer",
+    );
   });
 });
