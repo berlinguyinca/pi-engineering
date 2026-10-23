@@ -26,6 +26,7 @@ import type { AgentRuntime } from "../AgentRuntime.ts";
 import { paneLink, tidyAgentName } from "./CollabLayout.ts";
 import type { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 import { type HerdrAgent, type HerdrCli, HerdrError } from "./HerdrCli.ts";
+import type { LineageEmitter, LineageState } from "./lineage.ts";
 
 const VERSION = "herdr-0.9.1";
 
@@ -64,6 +65,11 @@ export interface HerdrAgentRuntimeOptions {
    * by default (no emitter = no network).
    */
   ingest?: ControlPlaneIngest;
+  /**
+   * Optional lineage emitter (T02). Off by default: without it no lineage is
+   * built and behaviour is unchanged.
+   */
+  lineage?: LineageEmitter;
 }
 
 export class HerdrAgentRuntime implements AgentRuntime {
@@ -72,11 +78,13 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private readonly agentKind: string;
   private readonly records = new Map<RuntimeId, Rec>();
   private readonly ingest?: ControlPlaneIngest;
+  private readonly lineage?: LineageEmitter;
 
   constructor(opts: HerdrAgentRuntimeOptions) {
     this.cli = opts.cli;
     this.agentKind = opts.agentKind ?? "pi";
     this.ingest = opts.ingest;
+    this.lineage = opts.lineage;
     if (this.ingest) void this.ingest.hostRegistered().catch(() => {});
     this.capabilities = {
       name: "herdr",
@@ -132,6 +140,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     await this.provision(rec);
     this.mutate(rec, { status: "READY", currentOperation: "start" });
     this.emitSession(rec, "session.started", rec.worker.status);
+    this.emitSpawn(rec);
     return rec.worker;
   }
 
@@ -188,6 +197,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
           : { status: "failed", summary: "did not reach a terminal state", artifactRefs: [] };
     this.mutate(rec, { status, currentOperation: "waitFor", result });
     this.emitSession(rec, "session.updated", status);
+    if (status === "COMPLETED") this.emitAttemptState(rec, "done");
+    else if (status === "BLOCKED") this.emitAttemptState(rec, "blocked");
     return rec.worker;
   }
 
@@ -213,6 +224,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
     }
     this.mutate(rec, { status: "TERMINATED", currentOperation: "terminate" });
     this.emitSession(rec, "session.terminated", "TERMINATED");
+    // Pi explicitly ended this run: the ATTEMPT is cancelled. The logical agent is untouched.
+    this.emitAttemptState(rec, "cancelled");
     return true;
   }
 
@@ -291,6 +304,47 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private mutate(rec: Rec, patch: Partial<AgentWorker>): void {
     rec.worker = { ...rec.worker, ...patch, updated_at: new Date().toISOString() };
     this.records.set(rec.worker.id, rec);
+  }
+
+  /** Lineage: this runtime worker is one agent, one attempt, one session. start() is idempotent per id. */
+  private emitSpawn(rec: Rec): void {
+    const lineage = this.lineage;
+    if (!lineage) return;
+    try {
+      const wid = rec.worker.id;
+      const parent = rec.request.parentRuntimeId;
+      lineage.workerSpawned({
+        agent: wid,
+        attempt: wid,
+        session: wid,
+        // parentRuntimeId is the one real parent datum; absent => no spawn edge.
+        parentAgent: parent,
+        parentAttempt: parent,
+        missionId: rec.worker.missionId,
+        role: rec.worker.role,
+        model: rec.worker.model,
+        transition: "start",
+        at: rec.worker.updated_at,
+      });
+    } catch {
+      /* observational */
+    }
+  }
+
+  private emitAttemptState(rec: Rec, state: LineageState): void {
+    const lineage = this.lineage;
+    if (!lineage) return;
+    try {
+      lineage.attemptState(
+        { attempt: rec.worker.id, agent: rec.worker.id, missionId: rec.worker.missionId },
+        state,
+        `${state}:${rec.worker.updated_at}`,
+        undefined,
+        rec.worker.updated_at,
+      );
+    } catch {
+      /* observational */
+    }
   }
 
   /** Fire-and-forget control-plane session event (best-effort, never blocks). */

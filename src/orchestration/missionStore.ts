@@ -12,6 +12,7 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
+import type { LineageEmitter } from "../runtime/herdr/lineage.ts";
 import {
   type CheckpointRefsInput,
   attachCheckpointRefs,
@@ -446,9 +447,75 @@ export class MissionStore {
     stored: StoredEvent;
   }> = [];
   private emitChain: Promise<void> = Promise.resolve();
+  /** Optional lineage emitter (T02). Null = no lineage; every hook below is then a no-op. */
+  private lineage: LineageEmitter | null = null;
 
   private constructor(backend: EventStoreBackend) {
     this.backend = backend;
+  }
+
+  /**
+   * Attach (or detach with null) the lineage emitter. Hooks fire from the
+   * mutators only, never from `apply()`, so replaying history on open emits nothing.
+   */
+  setLineage(emitter: LineageEmitter | null): void {
+    this.lineage = emitter;
+  }
+
+  /** Run a lineage hook fire-and-forget: absent emitter = no-op, errors never reach the caller. */
+  private lineageDo(hook: (lineage: LineageEmitter) => void): void {
+    const lineage = this.lineage;
+    if (!lineage) return;
+    try {
+      hook(lineage);
+    } catch {
+      // lineage is observational; it must never disturb the mission path
+    }
+  }
+
+  /** Model-driven executions only: process/integration/validation runs are not agents. */
+  private lineageAgentExecution(ex: Execution): boolean {
+    return ex.backend === "agent" || ex.backend === "research" || ex.backend === "review";
+  }
+
+  private lineageAttemptEnded(ex: Execution, state: "done" | "failed" | "cancelled", reason?: string): void {
+    if (!this.lineageAgentExecution(ex)) return;
+    this.lineageDo((l) =>
+      l.attemptState(
+        { attempt: ex.execution_id, agent: ex.task_id, missionId: ex.mission_id, taskId: ex.task_id },
+        state,
+        ex.ended_at ?? state,
+        reason ?? ex.exit_status ?? undefined,
+        ex.ended_at ?? undefined,
+      ),
+    );
+  }
+
+  /** A model session attached to (or replacing the one on) an attempt. */
+  private lineageSessionChange(ex: Execution, previous: string | null, next: string | null, at: string): void {
+    if (!next || next === previous || !this.lineageAgentExecution(ex)) return;
+    this.lineageDo((l) =>
+      previous
+        ? l.sessionRolledOver({
+            agent: ex.task_id,
+            attempt: ex.execution_id,
+            fromSession: previous,
+            toSession: next,
+            missionId: ex.mission_id,
+            taskId: ex.task_id,
+            transition: `${previous}>${next}`,
+            at,
+          })
+        : l.sessionAttached({
+            agent: ex.task_id,
+            attempt: ex.execution_id,
+            session: next,
+            missionId: ex.mission_id,
+            taskId: ex.task_id,
+            transition: `attach:${next}`,
+            at,
+          }),
+    );
   }
 
   /** Open a store over a backend, replaying existing events. */
@@ -1413,6 +1480,21 @@ export class MissionStore {
       actor: "system",
       execution: ex,
     });
+    // No parent attempt is recorded on an execution, so no spawn edge (nothing is guessed).
+    if (this.lineageAgentExecution(ex)) {
+      this.lineageDo((l) =>
+        l.workerSpawned({
+          agent: ex.task_id,
+          attempt: ex.execution_id,
+          session: ex.session_id,
+          missionId: ex.mission_id,
+          taskId: ex.task_id,
+          role: ex.backend,
+          model: ex.model,
+          transition: `created:${ex.execution_id}`,
+        }),
+      );
+    }
     return copyExecution(ex);
   }
 
@@ -1438,6 +1520,22 @@ export class MissionStore {
             ? "execution.failed"
             : "execution.canceled";
     this.emit(type, ex.mission_id, { actor: "system", execution: next });
+    if (this.lineageAgentExecution(next)) {
+      this.lineageSessionChange(next, ex.session_id, next.session_id, now);
+      if (status === "RUNNING") {
+        this.lineageDo((l) =>
+          l.attemptState(
+            { attempt: next.execution_id, agent: next.task_id, missionId: next.mission_id, taskId: next.task_id },
+            "running",
+            `${status}:${now}`,
+            undefined,
+            now,
+          ),
+        );
+      } else if (status === "SUCCEEDED") this.lineageAttemptEnded(next, "done");
+      else if (status === "FAILED") this.lineageAttemptEnded(next, "failed");
+      else if (status === "CANCELED") this.lineageAttemptEnded(next, "cancelled");
+    }
     return this.getExecution(executionId)!;
   }
 
@@ -1557,6 +1655,7 @@ export class MissionStore {
       }
       if (!appended) throw authorityError ?? new Error("gate evidence authority changed before publication");
       this.clearPersistenceFailure(event.event_id);
+      this.lineageAttemptEnded(execution, "done");
       return this.getExecution(input.executionId)!;
     });
     this.emitChain = publish.then(
@@ -1787,6 +1886,7 @@ export class MissionStore {
         execution: terminal,
         reason: "prior execution fenced before replacement dispatch",
       });
+      this.lineageAttemptEnded(terminal, "cancelled", "orphaned execution reconciled");
       const task = this.tasks.get(execution.task_id);
       if (task?.status === "RUNNING" && task.assigned_execution_id === execution.execution_id) {
         this.transitionTask(task.task_id, "RETRYING", "system", {
@@ -1986,6 +2086,7 @@ export class MissionStore {
       actor: "system",
       handoff: { ...result.record },
     });
+    this.lineageHandoff(result.record);
     return { ...result.record };
   }
 
@@ -2050,7 +2151,28 @@ export class MissionStore {
       next.ackAt = ackAt ?? current.ackAt ?? new Date().toISOString();
     }
     this.handoffRecords.set(id, { ...next });
+    this.lineageHandoff(next);
     return { ...next };
+  }
+
+  private lineageHandoff(record: HandoffRecord): void {
+    this.lineageDo((l) =>
+      l.handoff({
+        id: record.id,
+        kind: record.kind,
+        missionId: record.missionId,
+        fromSession: record.predecessor.sessionId,
+        toSession: record.successor?.sessionId,
+        state: record.state,
+        checkpointSha: record.checkpointSha,
+        fromGeneration: record.predecessor.generation,
+        toGeneration: record.successor?.generation,
+        at:
+          record.ackAt && (record.state === "acknowledged" || record.state === "committed")
+            ? record.ackAt
+            : record.createdAt,
+      }),
+    );
   }
 
   /** Preserve a settled outcome while making failed lease cleanup durable and visible. */
@@ -2212,6 +2334,7 @@ export class MissionStore {
       this.assertCheckpointAuthoritative(checkpoint);
 
       const copy = copyTaskCheckpoint(checkpoint);
+      const priorSession = this.lineage ? this.priorCheckpointSession(checkpoint) : null;
       const payload = structuredClone({ actor: "system", checkpoint: copy });
       const event: OrchestrationEvent = {
         event_id: id("oevt"),
@@ -2251,6 +2374,7 @@ export class MissionStore {
         throw error;
       }
       this.clearPersistenceFailure(event.event_id);
+      this.lineageCheckpointVerified(copy, priorSession);
       return copyTaskCheckpoint(copy);
     });
     this.emitChain = publish.then(
@@ -2258,6 +2382,32 @@ export class MissionStore {
       () => undefined,
     );
     return publish;
+  }
+
+  /** Session of the latest earlier checkpoint of the same execution, if any. */
+  private priorCheckpointSession(checkpoint: TaskCheckpoint): string | null {
+    const earlier = this.listTaskCheckpoints(checkpoint.missionId, checkpoint.taskId).filter(
+      (candidate) => candidate.executionId === checkpoint.executionId && candidate.sessionId,
+    );
+    return earlier.at(-1)?.sessionId ?? null;
+  }
+
+  /** Verified checkpoint: artifact produced by the attempt; a changed session id is a rollover of the same attempt. */
+  private lineageCheckpointVerified(checkpoint: TaskCheckpoint, priorSession: string | null): void {
+    const execution = this.executions.get(checkpoint.executionId);
+    if (!execution || !this.lineageAgentExecution(execution)) return;
+    this.lineageSessionChange(execution, priorSession, checkpoint.sessionId ?? null, checkpoint.createdAt);
+    this.lineageDo((l) =>
+      l.checkpointVerified({
+        checkpointId: checkpoint.checkpointId,
+        attempt: checkpoint.executionId,
+        missionId: checkpoint.missionId,
+        taskId: checkpoint.taskId,
+        sequence: checkpoint.sequence,
+        commit: checkpoint.candidateSha,
+        at: checkpoint.createdAt,
+      }),
+    );
   }
 
   private assertCheckpointAuthoritative(checkpoint: TaskCheckpoint): void {
