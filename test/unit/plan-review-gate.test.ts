@@ -425,4 +425,125 @@ describe("gatePlanBeforeWorkers", () => {
     });
     assert.equal(r.status, "proceed");
   });
+
+  it("a changed submission under the same mission mints a new revision and needs a fresh decision", async () => {
+    const ledger = new MemoryPlanLedger();
+    const t = transport((d) => ({ decision: "approved", externalDecisionId: "E", planDigest: d }));
+    const adapter = new PlannotatorAdapter({ transport: t });
+    const first = await gatePlanBeforeWorkers({
+      missionId: "M20",
+      goal: "g",
+      plan: async () => HIGH("v1"),
+      current: HIGH("v1"),
+      ledger,
+      adapter,
+    });
+    assert.equal(first.revision, 1);
+    const second = await gatePlanBeforeWorkers({
+      missionId: "M20",
+      goal: "g",
+      plan: async () => HIGH("v1"),
+      current: HIGH("totally different"),
+      ledger,
+      adapter,
+    });
+    assert.equal(second.status, "proceed");
+    assert.equal(second.revision, 2);
+    assert.notEqual(second.planDigest, first.planDigest);
+    assert.equal(second.status === "proceed" && second.tasks[0]?.objective, "totally different");
+    assert.equal(t.calls.length, 2, "the new plan was reviewed, not waved through on the first approval");
+    assert.equal(ledger.listPlanRevisions("M20")[1]?.parentDigest, first.planDigest);
+  });
+
+  it("the digest covers every execution-relevant field and cannot collide on separators", () => {
+    const d = (t: PlanTaskInput) => planDigestOf(canonicalPlanText("g", [t]));
+    const base = task("x", ["a/**"]);
+    assert.notEqual(d({ ...base, deliverables: ["a, b"] }), d({ ...base, deliverables: ["a", "b"] }));
+    for (const change of [
+      { isolation: "none" },
+      { kind: "aggregation" },
+      { max_attempts: 9 },
+      { failure_policy: "fail" },
+      { execution_requirements: { model: "m" } },
+      { priority: 5 },
+      { execution_budget_ms: 1000 },
+      { context_ref: "other" },
+    ]) {
+      assert.notEqual(d({ ...base, ...(change as object) } as PlanTaskInput), d(base), JSON.stringify(change));
+    }
+    assert.equal(d({ ...base, write_domains: ["b/**", "a/**"] }), d({ ...base, write_domains: ["a/**", "b/**"] }));
+  });
+
+  it("a recorded skip does not satisfy a now-stricter policy; a recorded approval does", async () => {
+    const ledger = new MemoryPlanLedger();
+    const skipped = await gatePlanBeforeWorkers({
+      missionId: "M21",
+      goal: "g",
+      plan: async () => HIGH(),
+      ledger,
+      policy: { override: { mode: "skip", reason: "hotfix" } },
+    });
+    assert.equal(skipped.status, "proceed");
+    const now = await gatePlanBeforeWorkers({ missionId: "M21", goal: "g", plan: async () => HIGH(), ledger });
+    assert.equal(now.status === "blocked" && now.code, "plannotator_unavailable", "default policy is require");
+
+    const approvedLedger = new MemoryPlanLedger();
+    const adapter = new PlannotatorAdapter({
+      transport: transport((d) => ({ decision: "approved", externalDecisionId: "E", planDigest: d })),
+    });
+    await gatePlanBeforeWorkers({
+      missionId: "M22",
+      goal: "g",
+      plan: async () => HIGH(),
+      ledger: approvedLedger,
+      adapter,
+    });
+    const stillOk = await gatePlanBeforeWorkers({
+      missionId: "M22",
+      goal: "g",
+      plan: async () => HIGH(),
+      ledger: approvedLedger,
+      policy: { modes: { high: "require" } },
+    });
+    assert.equal(stillOk.status, "proceed");
+  });
+
+  it("an unidentified approver is recorded as null, and approvals need a digest echo when required", async () => {
+    const adapter = new PlannotatorAdapter({
+      operator: "someone-configured",
+      transport: { submitPlan: async () => ({ decision: "approved", externalDecisionId: "E" }) },
+    });
+    const r = await adapter.reviewPlan({
+      runId: "R",
+      planRef: "p",
+      goal: "g",
+      riskClass: "high",
+      planDigest: "a".repeat(64),
+    });
+    assert.equal(r.outcome, "approved");
+    assert.equal(r.decision.approvedBy, null);
+
+    const strict = new PlannotatorAdapter({
+      requireDigestEcho: true,
+      transport: { submitPlan: async () => ({ decision: "approved", externalDecisionId: "E" }) },
+    });
+    const bad = await strict.reviewPlan({
+      runId: "R2",
+      planRef: "p",
+      goal: "g",
+      riskClass: "high",
+      planDigest: "a".repeat(64),
+    });
+    assert.equal(bad.outcome, "digest_mismatch");
+    assert.match(bad.reason, /did not echo/);
+    const empty = new PlannotatorAdapter({
+      requireDigestEcho: true,
+      transport: { submitPlan: async () => ({ decision: "approved", externalDecisionId: "E", planDigest: "" }) },
+    });
+    assert.equal(
+      (await empty.reviewPlan({ runId: "R3", planRef: "p", goal: "g", riskClass: "high", planDigest: "a".repeat(64) }))
+        .outcome,
+      "digest_mismatch",
+    );
+  });
 });

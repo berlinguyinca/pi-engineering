@@ -110,38 +110,39 @@ export class MemoryPlanLedger implements PlanLedger {
 
 // ── Canonical text and digest ───────────────────────────────────────────────
 
-const norm = (text: string): string =>
-  text
-    .replace(/\r\n?/g, "\n")
-    .split("\n")
-    .map((line) => line.replace(/\s+$/, ""))
-    .join("\n")
-    .trim();
+/** Task fields whose order is meaningless: sorted and de-duplicated in the canonical form. */
+const SET_LIKE = new Set(["write_domains", "depends_on", "acceptance_ids", "deliverables", "required_output_artifacts"]);
 
-const list = (items: readonly string[] | undefined): string => [...new Set(items ?? [])].sort().join(", ");
+function canon(value: unknown, key?: string): unknown {
+  if (Array.isArray(value)) {
+    const items = value.map((v) => canon(v));
+    if (key && SET_LIKE.has(key)) return [...new Set(items.map((i) => JSON.stringify(i)))].sort().map((j) => JSON.parse(j));
+    return items;
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      const v = (value as Record<string, unknown>)[k];
+      if (v !== undefined) out[k] = canon(v, k);
+    }
+    return out;
+  }
+  return typeof value === "string" ? value.replace(/\r\n?/g, "\n") : value;
+}
 
 /**
- * Deterministic text of a plan. Order of tasks is meaningful and kept; set-like
- * fields (domains, acceptance ids, deliverables, dependencies) are sorted so
- * the same plan always yields the same text. Volatile fields (ids minted later,
- * timestamps, priorities) are excluded.
+ * Deterministic text of a plan, and the EXACT bytes sent to the reviewer: the
+ * digest is taken over this text, so what is reviewed is what runs.
+ *
+ * The body is JSON (strings are quoted, so `["a, b"]` and `["a", "b"]` can never
+ * collide) over EVERY field of every task: keys are sorted, set-like fields
+ * (domains, dependencies, acceptance, deliverables) are sorted and de-duplicated,
+ * and order of tasks is kept. Only a task_id that the planner chose is included;
+ * ids minted later by the orchestrator are not part of the plan.
  */
 export function canonicalPlanText(goal: string, tasks: readonly PlanTaskInput[]): string {
-  const lines = ["# Plan", `goal: ${norm(goal)}`];
-  tasks.forEach((task, index) => {
-    lines.push(
-      "",
-      `## task ${task.task_id ?? `t${index + 1}`}`,
-      `role: ${task.role}`,
-      `objective: ${norm(task.objective)}`,
-      `mutates_repo: ${task.mutates_repo ? "true" : "false"}`,
-      `write_domains: ${list(task.write_domains)}`,
-      `depends_on: ${list(task.depends_on)}`,
-      `acceptance_ids: ${list(task.acceptance_ids)}`,
-      `deliverables: ${list(task.deliverables)}`,
-    );
-  });
-  return `${lines.join("\n")}\n`;
+  const body = { format: "pi-plan/2", goal: canon(goal.trim()), tasks: tasks.map((t) => canon(t)) };
+  return `# Plan\n\n\`\`\`json\n${JSON.stringify(body, null, 2)}\n\`\`\`\n`;
 }
 
 /**

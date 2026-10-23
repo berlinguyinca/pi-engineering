@@ -174,6 +174,11 @@ export interface PlannotatorOptions {
   operator?: string | null;
   store?: PendingPlanStore;
   audit?: BypassAudit;
+  /**
+   * Require a digest echo from the reviewer for approvals. A transport that
+   * cannot echo (a test fake) leaves this off; the Herdr bridge turns it on.
+   */
+  requireDigestEcho?: boolean;
   /** How long the external gate may hold a plan before silence becomes a rejection. */
   decisionTimeoutMs?: number;
 }
@@ -181,7 +186,7 @@ export interface PlannotatorOptions {
 export class PlannotatorAdapter {
   private readonly transport: PlannotatorTransport | null;
   private readonly policyRiskClasses: RiskClass[];
-  private readonly operator: string | null;
+  private readonly requireDigestEcho: boolean;
   private readonly store: PendingPlanStore;
   private readonly audit: BypassAudit;
   private readonly decisionTimeoutMs: number;
@@ -189,7 +194,7 @@ export class PlannotatorAdapter {
   constructor(opts: PlannotatorOptions = {}) {
     this.transport = opts.transport ?? null;
     this.policyRiskClasses = opts.policyRiskClasses ?? ["high", "critical"];
-    this.operator = opts.operator ?? null;
+    this.requireDigestEcho = opts.requireDigestEcho ?? false;
     this.store = opts.store ?? new MemoryPendingStore();
     this.audit = opts.audit ?? new MemoryBypassAudit();
     this.decisionTimeoutMs = opts.decisionTimeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS;
@@ -288,7 +293,7 @@ export class PlannotatorAdapter {
       decision: validDecision(result.decision),
       mode,
       externalDecisionId: boundedString(result.externalDecisionId, MAX_DECISION_ID),
-      approvedBy: boundedString(result.approvedBy, MAX_FIELD) ?? this.operator,
+      approvedBy: boundedString(result.approvedBy, MAX_FIELD),
       reason: null,
       annotations: boundedAnnotations(result.annotations),
       decidedAt,
@@ -359,8 +364,11 @@ export class PlannotatorAdapter {
     }
 
     const echoed = typeof result.planDigest === "string" && result.planDigest !== "" ? result.planDigest : null;
-    if (echoed !== null && echoed !== plan.planDigest) {
-      const reason = `decision is bound to ${echoed}, not ${plan.planDigest}`;
+    const noEcho = echoed === null && this.requireDigestEcho && validDecision(result.decision) === "approved";
+    if (noEcho || (echoed !== null && echoed !== plan.planDigest)) {
+      const reason = noEcho
+        ? `approval did not echo the plan digest ${plan.planDigest}`
+        : `decision is bound to ${echoed}, not ${plan.planDigest}`;
       const decision = this.record({
         ...base,
         decision: "none",
@@ -379,7 +387,7 @@ export class PlannotatorAdapter {
       decision: verdict,
       state: "decided",
       externalDecisionId: boundedString(result.externalDecisionId, MAX_DECISION_ID),
-      approvedBy: boundedString(result.approvedBy, MAX_FIELD) ?? this.operator,
+      approvedBy: boundedString(result.approvedBy, MAX_FIELD),
       reason: null,
       annotations: boundedAnnotations(result.annotations),
       decidedAt: new Date().toISOString(),

@@ -54,6 +54,13 @@ export interface PlanGateInput {
   goal: string;
   /** Produces the first plan. Not called when the ledger already holds a revision (restart). */
   plan: () => Promise<PlanTaskInput[]>;
+  /**
+   * The plan the caller will actually run, when it is already known (a
+   * submission). If its digest differs from the ledger's latest revision, a new
+   * revision (parent = that one) is minted and needs its own decision: the gate
+   * binds to what will run, never to what was stored for the same mission id.
+   */
+  current?: PlanTaskInput[];
   /** Produces a revised plan from reviewer feedback; without it, changes requested blocks. */
   replan?: (feedback: PlanFeedback) => Promise<PlanTaskInput[]>;
   ledger: PlanLedger;
@@ -160,6 +167,9 @@ export async function gatePlanBeforeWorkers(input: PlanGateInput): Promise<PlanG
 
   let rev = lastOf(ledger.listPlanRevisions(missionId));
   if (!rev) rev = await create(await input.plan(), null, "initial");
+  else if (input.current && planDigestOf(canonicalPlanText(input.goal, input.current)) !== rev.planDigest) {
+    rev = await create(input.current, rev, "operator");
+  }
 
   for (;;) {
     const decisions = ledger.listPlanDecisions(missionId).filter((d) => d.planDigest === rev!.planDigest);
@@ -172,7 +182,7 @@ export async function gatePlanBeforeWorkers(input: PlanGateInput): Promise<PlanG
     };
 
     // Restart / replay: a recorded go-ahead for exactly this digest is final.
-    if (prior?.proceed) {
+    if (prior?.proceed && satisfiesCurrentPolicy(prior, rev, input.policy)) {
       return {
         status: "proceed",
         tasks: rev.tasks,
@@ -234,6 +244,22 @@ export async function gatePlanBeforeWorkers(input: PlanGateInput): Promise<PlanG
           : "plannotator_unavailable";
     return blocked(code, decision, base, decision.reason);
   }
+}
+
+const MODE_RANK: Record<PlanReviewMode, number> = { skip: 0, offer: 1, require: 2 };
+
+/**
+ * A recorded approval stands. A recorded skip (policy skip, or offer with the
+ * reviewer unavailable) only stands while the CURRENT policy for this risk is no
+ * stricter than the mode it was recorded under.
+ */
+function satisfiesCurrentPolicy(
+  prior: PlanDecisionRecord,
+  rev: PlanRevisionRecord,
+  policy: PlanReviewPolicyConfig | undefined,
+): boolean {
+  if (prior.outcome === "approved") return true;
+  return MODE_RANK[resolvePlanReviewPolicy(rev.riskClass, policy).mode] <= MODE_RANK[prior.mode];
 }
 
 function blocked(
