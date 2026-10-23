@@ -244,6 +244,8 @@ export class FooterController {
   /** Publish (or clear) the engineering task in flight. */
   setTask(task: TaskState | undefined): void {
     if (this.disposed) return;
+    // Quiet missions republish an identical task on every clock tick; redrawing for it is pure cost.
+    if (JSON.stringify(this.status.snapshot.task) === JSON.stringify(task)) return;
     this.status.set({ task });
     this.requestRender();
   }
