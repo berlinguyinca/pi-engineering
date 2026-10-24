@@ -434,7 +434,7 @@ function attributeNames(
 ): { names: Array<[string, string]>; problem: string | null } {
   const files: string[] = [];
   const local = entries.find((e) => e.scope === "local" && e.origin.startsWith("file:"));
-  if (local) files.push(join(dirname(local.origin.slice(5)), "info", "attributes"));
+  if (local) files.push(join(dirname(resolve(where, local.origin.slice(5))), "info", "attributes"));
   if (nested.code !== 0 || nested.truncated) return { names: [], problem: "the attribute files cannot be listed" };
   for (const rel of nested.stdout.split("\0")) if (rel) files.push(resolve(where, rel));
   if (files.length > MAX_ATTR_FILES) return { names: [], problem: "too many attribute files to inspect" };
@@ -709,7 +709,7 @@ export function planFromListing(
     extraEnv,
     remoteExec: remoteExecKeys(entries, trust),
     digest: policyDigest(entries, trust),
-    pinKey: local ? local.origin : "",
+    pinKey: local ? `file:${resolve(cwd, local.origin.slice(5))}` : "",
     pinValue: remoteUrls(entries, trust),
   };
 }
@@ -740,6 +740,8 @@ function pinProblem(plan: Plan, sub: string | undefined): string | null {
   }
   const pinned = remotePins.get(plan.pinKey);
   if (pinned === undefined) {
+    // Nothing to pin until the repository has a remote: adding the first one is how a remote is normally set up.
+    if (plan.pinValue === "") return null;
     if (remotePins.size >= MAX_PINS) remotePins.delete(remotePins.keys().next().value as string);
     remotePins.set(plan.pinKey, plan.pinValue);
     return null;

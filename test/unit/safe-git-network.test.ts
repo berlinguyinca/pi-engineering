@@ -191,3 +191,25 @@ test("the operator's own http/url config (global scope) is honoured", async () =
     l.close();
   }
 });
+
+test("pins are per repository: two repositories with different remotes in one process do not trip each other", async () => {
+  const l = await lab();
+  try {
+    l.sh(`git init -q -b main other && cd other && git remote add origin http://127.0.0.1:${l.B.port}/o.git`);
+    l.sh(`git remote add origin http://127.0.0.1:${l.A.port}/a.git`, l.repo);
+    forgetRemotePinsForTests();
+    const a = await safeGit(["ls-remote", "origin"], { cwd: l.repo, trust: "operator", timeoutMs: 20_000 });
+    const b = await safeGit(["ls-remote", "origin"], {
+      cwd: join(l.root, "other"),
+      trust: "operator",
+      timeoutMs: 20_000,
+    });
+    assert.doesNotMatch(a.stderr, /refused/);
+    assert.doesNotMatch(b.stderr, /refused/);
+    l.sh(`git remote add upstream http://127.0.0.1:${l.A.port}/u.git`, l.repo);
+    const c = await safeGit(["ls-remote", "origin"], { cwd: l.repo, trust: "operator", timeoutMs: 20_000 });
+    assert.match(c.stderr, /remote URLs changed/);
+  } finally {
+    l.close();
+  }
+});
