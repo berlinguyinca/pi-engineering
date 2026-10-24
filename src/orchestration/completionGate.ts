@@ -4,7 +4,7 @@ import type { MissionStore } from "./missionStore.ts";
 import { hasAcceptableNestedPublication } from "./nestedPublicationGate.ts";
 import { alreadySatisfiedClause, latestAlreadySatisfied, taskFailureReason } from "./recovery.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
-import type { AlreadySatisfied, CompletionVerdict, Mission, RequiredGate } from "./types.ts";
+import type { AlreadySatisfied, CandidateRevision, CompletionVerdict, Mission, RequiredGate } from "./types.ts";
 
 export interface GateEvidence {
   missionId: string;
@@ -32,12 +32,21 @@ export class CompletionGate {
    */
   private readonly nestedPublicationsFor?: (missionId: string) => ReadonlyArray<NestedRepoPublication>;
 
+  /**
+   * Optional integration check (T04, AutoSpec design gate). Synchronous: the
+   * caller pre-collects whatever it needs. Returns reasons that block
+   * completion; absent (every standalone run) the gate is unchanged.
+   */
+  private readonly extraBlockers?: (mission: Mission, candidates: CandidateRevision[]) => string[];
+
   constructor(
     store: MissionStore,
     nestedPublicationsFor?: (missionId: string) => ReadonlyArray<NestedRepoPublication>,
+    extraBlockers?: (mission: Mission, candidates: CandidateRevision[]) => string[],
   ) {
     this.store = store;
     this.nestedPublicationsFor = nestedPublicationsFor;
+    this.extraBlockers = extraBlockers;
   }
 
   evaluate(mission: Mission): CompletionVerdict {
@@ -88,12 +97,25 @@ export class CompletionGate {
     const emptyCandidateProblem = this.emptyCandidateProblem(mission.mission_id);
     if (emptyCandidateProblem) reasons.push(emptyCandidateProblem);
 
+    let integrationBlockers: string[] = [];
+    if (this.extraBlockers) {
+      try {
+        integrationBlockers = this.extraBlockers(mission, this.store.listCandidates(mission.mission_id));
+      } catch (error) {
+        integrationBlockers = [
+          `integration evidence failed: ${error instanceof Error ? error.message : String(error)}`,
+        ];
+      }
+      reasons.push(...integrationBlockers);
+    }
+
     const structuralProblems =
       (emptyCandidateProblem ? 1 : 0) +
       (evidence.terminalTaskProblems?.length ?? 0) +
       (evidence.supersessionProblems?.length ?? 0) +
       (evidence.activeExecutionProblems?.length ?? 0) +
-      (evidence.acceptanceProblems?.length ?? 0);
+      (evidence.acceptanceProblems?.length ?? 0) +
+      integrationBlockers.length;
     return {
       can_complete:
         missingGates.length === 0 &&

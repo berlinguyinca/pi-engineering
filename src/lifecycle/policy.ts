@@ -214,6 +214,11 @@ export interface EngineeringPolicy {
    * orchestration/planReviewConfig.ts for the accepted shape.
    */
   plan_review?: unknown;
+  /**
+   * Optional AutoSpec integration (T04). Absent means the integration is never
+   * loaded; see integrations/autospec/config.ts for the accepted shape.
+   */
+  autospec?: unknown;
 }
 
 export const DEFAULT_POLICY: EngineeringPolicy = {

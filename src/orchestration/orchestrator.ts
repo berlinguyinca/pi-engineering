@@ -89,6 +89,7 @@ import { canTransitionMission, canTransitionTask } from "./state.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
 import type {
   AcceptanceCriterion,
+  CandidateRevision,
   CompletionVerdict,
   FailureClassification,
   Mission,
@@ -152,6 +153,12 @@ export interface OrchestratorOptions {
   observability?: MissionObservability | null;
   /** Planner: decomposes a goal into tasks. Injected for determinism. */
   planner: (mission: Mission, risk: RiskProfile) => Promise<PlanTaskInput[]>;
+  /**
+   * Optional synchronous integration check evaluated by the completion gate
+   * (e.g. the AutoSpec design gate against the candidate commit). Returned
+   * reasons block completion. Absent = unchanged.
+   */
+  completionEvidence?: (mission: Mission, candidates: CandidateRevision[]) => string[];
   /** Acceptance criterion deriver. */
   deriveAcceptance?: (mission: Mission) => Promise<string[]>;
   /** Called on each mission phase transition. */
@@ -510,7 +517,7 @@ export class Orchestrator {
         this.observeTaskSettled(missionId, taskId, status);
       },
     });
-    this.gate = new CompletionGate(this.store);
+    this.gate = new CompletionGate(this.store, undefined, opts.completionEvidence);
     this.planner = opts.planner;
     this.deriveAcceptance = opts.deriveAcceptance;
     this.onPhase = opts.onPhase;

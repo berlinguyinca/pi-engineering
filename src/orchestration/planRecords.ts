@@ -111,12 +111,19 @@ export class MemoryPlanLedger implements PlanLedger {
 // ── Canonical text and digest ───────────────────────────────────────────────
 
 /** Task fields whose order is meaningless: sorted and de-duplicated in the canonical form. */
-const SET_LIKE = new Set(["write_domains", "depends_on", "acceptance_ids", "deliverables", "required_output_artifacts"]);
+const SET_LIKE = new Set([
+  "write_domains",
+  "depends_on",
+  "acceptance_ids",
+  "deliverables",
+  "required_output_artifacts",
+]);
 
 function canon(value: unknown, key?: string): unknown {
   if (Array.isArray(value)) {
     const items = value.map((v) => canon(v));
-    if (key && SET_LIKE.has(key)) return [...new Set(items.map((i) => JSON.stringify(i)))].sort().map((j) => JSON.parse(j));
+    if (key && SET_LIKE.has(key))
+      return [...new Set(items.map((i) => JSON.stringify(i)))].sort().map((j) => JSON.parse(j));
     return items;
   }
   if (value && typeof value === "object") {

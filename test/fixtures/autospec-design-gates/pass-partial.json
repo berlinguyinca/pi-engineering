@@ -1,0 +1,191 @@
+{
+  "config_path": "/fixture/repo/.autospec/design-gates.yml",
+  "counts": {
+    "failed": 0,
+    "run": 2,
+    "unmapped": 12
+  },
+  "critic_checklist": [
+    {
+      "check": "vlm",
+      "id": "motion.coherent",
+      "pass_criteria": "",
+      "severity": "minor"
+    },
+    {
+      "check": "vlm",
+      "id": "device.safe-area",
+      "pass_criteria": "",
+      "severity": "major"
+    },
+    {
+      "check": "vlm",
+      "id": "composition.hierarchy",
+      "pass_criteria": "",
+      "severity": "minor"
+    },
+    {
+      "check": "vlm",
+      "id": "composition.states-complete",
+      "pass_criteria": "",
+      "severity": "major"
+    },
+    {
+      "check": "vlm",
+      "id": "composition.density",
+      "pass_criteria": "",
+      "severity": "minor"
+    },
+    {
+      "check": "review",
+      "id": "a11y.alt-text-meaningful",
+      "pass_criteria": "",
+      "severity": "blocker"
+    },
+    {
+      "check": "review",
+      "id": "a11y.link-text-meaningful",
+      "pass_criteria": "",
+      "severity": "major"
+    },
+    {
+      "check": "review",
+      "id": "a11y.reading-order",
+      "pass_criteria": "",
+      "severity": "blocker"
+    }
+  ],
+  "gates": [
+    {
+      "blocking": true,
+      "command": "true",
+      "exit_code": 0,
+      "id": "design.tokens.no-raw-color",
+      "output_tail": "",
+      "pass_criteria": "",
+      "severity": "blocker",
+      "status": "pass",
+      "tool_hint": ""
+    },
+    {
+      "blocking": false,
+      "id": "design.tokens.spacing-on-scale",
+      "pass_criteria": "",
+      "severity": "major",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": false,
+      "id": "design.tokens.zindex-on-scale",
+      "pass_criteria": "",
+      "severity": "major",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": false,
+      "id": "design.tokens.font-from-tokens",
+      "pass_criteria": "",
+      "severity": "major",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": true,
+      "command": "true",
+      "exit_code": 0,
+      "id": "motion.reduced-motion-fallback",
+      "output_tail": "",
+      "pass_criteria": "",
+      "severity": "blocker",
+      "status": "pass",
+      "tool_hint": ""
+    },
+    {
+      "blocking": true,
+      "id": "motion.no-unstoppable-animation",
+      "pass_criteria": "",
+      "severity": "blocker",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": false,
+      "id": "motion.duration-from-scale",
+      "pass_criteria": "",
+      "severity": "major",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": false,
+      "id": "motion.happens-by-default",
+      "pass_criteria": "",
+      "severity": "major",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": true,
+      "id": "motion.no-flash",
+      "pass_criteria": "",
+      "severity": "blocker",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": true,
+      "id": "device.zoom-not-blocked",
+      "pass_criteria": "",
+      "severity": "blocker",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": true,
+      "id": "device.hover-has-equivalent",
+      "pass_criteria": "",
+      "severity": "blocker",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": true,
+      "id": "device.reflow-at-320",
+      "pass_criteria": "",
+      "severity": "blocker",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": false,
+      "id": "device.target-size",
+      "pass_criteria": "",
+      "severity": "major",
+      "status": "unmapped",
+      "tool_hint": ""
+    },
+    {
+      "blocking": false,
+      "id": "device.orientation",
+      "pass_criteria": "",
+      "severity": "major",
+      "status": "unmapped",
+      "tool_hint": ""
+    }
+  ],
+  "generated_at": "2026-10-23T07:39:17Z",
+  "pack_quality_gates": [
+    "System instructions cannot be overridden by ordinary user or retrieved content.",
+    "Tool calls require explicit schemas and least-privilege permissions.",
+    "Sensitive data is not included in prompts unless justified and documented.",
+    "Model outputs that drive actions are validated before execution.",
+    "Quality, latency, and cost expectations are measured for release-critical paths."
+  ],
+  "reason": "",
+  "rules_file": "/fixture/repo/rules.yaml",
+  "status": "pass",
+  "status_line": "PASS",
+  "version": 1
+}

@@ -420,9 +420,7 @@ test("payload secrets are redacted before they reach disk", async () => {
   const fakeKey = ["sk", "x".repeat(24)].join("-");
   const fakePass = ["not", "a", "real", "value", "1"].join("");
   const store = new EnvelopeStore({ dir: tmp() });
-  await store.stage(
-    draft("r1", { payload: { note: `api_key=${fakeKey} ok`, nested: { password: fakePass } } }),
-  );
+  await store.stage(draft("r1", { payload: { note: `api_key=${fakeKey} ok`, nested: { password: fakePass } } }));
   const disk = readFileSync(store.outbox.file, "utf8");
   assert.equal(disk.includes(fakeKey), false);
   assert.equal(disk.includes(fakePass), false);

@@ -78,6 +78,42 @@ function retryAfterMs(res: Response): number | undefined {
   return Number.isFinite(secs) && secs >= 0 ? secs * 1000 : undefined;
 }
 
+/** Longest response body read to classify a refusal. */
+const MAX_REFUSAL_BODY_BYTES = 4096;
+
+/**
+ * The `reason` of a JSON refusal body, or undefined for anything else (non-JSON, oversized,
+ * unreadable, slow). Defensive: an unreadable body never changes how a plain 401/403 is treated.
+ */
+async function refusalReason(res: Response): Promise<string | undefined> {
+  try {
+    const read = async (): Promise<string> => {
+      const reader = res.body?.getReader();
+      if (!reader) return (await res.text()).slice(0, MAX_REFUSAL_BODY_BYTES + 1);
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      while (total <= MAX_REFUSAL_BODY_BYTES) {
+        const { done, value } = await reader.read();
+        if (done || !value) break;
+        chunks.push(value);
+        total += value.byteLength;
+      }
+      void reader.cancel().catch(() => {});
+      return Buffer.concat(chunks).toString("utf8");
+    };
+    const text = await Promise.race([
+      read(),
+      new Promise<string>((resolve) => setTimeout(() => resolve(""), 1000).unref()),
+    ]);
+    if (Buffer.byteLength(text) > MAX_REFUSAL_BODY_BYTES) return undefined;
+    const parsed: unknown = JSON.parse(text);
+    const reason = (parsed as { reason?: unknown } | null)?.reason;
+    return typeof reason === "string" ? reason : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Hard cap on events replayed by one flush pass. */
 const MAX_FLUSH = 500;
 
@@ -173,6 +209,11 @@ export class ControlPlaneIngest {
           } else if (status === 400 || status === 409 || status === 422) {
             await store.outbox.deadLetter(envelope, "server_rejected", status);
             this.headId = undefined;
+          } else if (status === 403 && (await refusalReason(res)) === "lineage_forbidden") {
+            // A graph-ownership refusal of THIS event (not a credentials problem): terminal,
+            // never delivered, the queue continues.
+            await store.outbox.deadLetter(envelope, "lineage_forbidden", status);
+            this.headId = undefined;
           } else if (status === 401 || status === 403) {
             this.credentialProblem = true;
             this.failed(status);
@@ -227,6 +268,11 @@ export class ControlPlaneIngest {
     this.credentialProblem = false;
     this.headId = undefined;
     this.lastStatus = undefined;
+  }
+
+  /** Keyed event-id derivation of the underlying envelope store (see EnvelopeStore.deriveEventId). */
+  deriveEventId(prefix: string, parts: readonly unknown[]): string | undefined {
+    return this.envelopeStore?.deriveEventId(prefix, parts);
   }
 
   /** Health / diagnostic snapshot: queue depth, loss counters and back-off state. */
@@ -348,6 +394,8 @@ export class ControlPlaneIngest {
       name?: string;
       /** Bare herdr pane id; the control plane stores this one today. */
       paneId?: string;
+      /** Which Pi binary this agent runs on, plus engine/CPU/RSS (see `runtimeFacts`). Runtime metrics only. */
+      runtime?: Record<string, unknown>;
     } = {},
   ): Promise<boolean> {
     const missionId = payload.missionId ?? this.defaultMissionId;
@@ -362,6 +410,7 @@ export class ControlPlaneIngest {
       ...(payload.parentSessionId ? { parent_session_id: payload.parentSessionId } : {}),
       ...(payload.name ? { name: payload.name } : {}),
       ...(payload.paneId ? { pane_id: payload.paneId } : {}),
+      ...(payload.runtime ? { runtime: payload.runtime } : {}),
     });
   }
 }
