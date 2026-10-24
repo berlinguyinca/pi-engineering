@@ -432,7 +432,12 @@ async function applyFork(
   const gone = expiredReason(item, ports, clock);
   if (gone) return finish({ outcome: "stale", note: gone });
   if (item.expectedDigest) {
-    const held = port.digest ? await Promise.resolve(port.digest(item)).catch(() => null) : null;
+    let held: string | null = null;
+    try {
+      held = port.digest ? await port.digest(item) : null;
+    } catch {
+      held = null;
+    }
     if (!held) return finish({ outcome: "stale", note: "the request names a digest and this host cannot verify it" });
     if (held !== item.expectedDigest) {
       return finish({ outcome: "stale", note: "the target changed since the request was made (digest mismatch)" });

@@ -354,7 +354,10 @@ test("config injected through the environment (ambient or caller-supplied) is dr
 });
 
 test("neutralisers: pairs keep the exact key, so names with = or newlines are addressable or refused", async () => {
-  const pairs = neutralisers([{ scope: "local", key: "filter.a=b.clean", value: "touch /x" }], "strict");
+  const pairs = neutralisers(
+    [{ scope: "local", origin: "file:/x", key: "filter.a=b.clean", value: "touch /x" }],
+    "strict",
+  );
   assert.deepEqual(pairs, [{ key: "filter.a=b.clean", value: "" }]);
   const l = lab();
   try {

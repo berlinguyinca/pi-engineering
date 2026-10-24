@@ -169,12 +169,12 @@ for (const trust of MODES) {
 test("operator mode keeps the operator's own global config and neutralises only the repository's", () => {
   const entries = parseScopedConfig(
     [
-      "global\0filter.lfs.clean\ngit-lfs clean -- %f",
-      "global\0credential.helper\nstore",
-      "global\0user.name\nOp",
-      "local\0filter.lfs.clean\ntouch /x",
-      "local\0filter.evil.smudge\ntouch /y",
-      "local\0credential.helper\n!touch /z",
+      "global\0file:/x/global\0filter.lfs.clean\ngit-lfs clean -- %f",
+      "global\0file:/x/global\0credential.helper\nstore",
+      "global\0file:/x/global\0user.name\nOp",
+      "local\0file:/x/local\0filter.lfs.clean\ntouch /x",
+      "local\0file:/x/local\0filter.evil.smudge\ntouch /y",
+      "local\0file:/x/local\0credential.helper\n!touch /z",
       "",
     ].join("\0"),
   );
