@@ -55,6 +55,8 @@ export interface HerdrCli {
   /** Wait until the agent reaches one of `until` states or times out. */
   wait(target: string, until: string[], timeoutMs?: number): Promise<HerdrAgent>;
   startAgent(paneId: string, kind: string, name: string): Promise<void>;
+  /** Export environment variables into a pane's shell (before an agent starts there). Optional: older clients lack it. */
+  exportEnv?(paneId: string, vars: Record<string, string>): Promise<void>;
   sendKeys(target: string, keys: string): Promise<void>;
   closePane(target: string): Promise<void>;
   /** Create a Git worktree-backed workspace; returns its id/path. */
@@ -134,16 +136,27 @@ export class RealHerdrCli implements HerdrCli {
   }
 
   async wait(target: string, until: string[], timeoutMs?: number): Promise<HerdrAgent> {
-    const args = ["agent", "wait", target, "--until", until.join(",")];
-    if (timeoutMs && timeoutMs > 0) args.push("--timeout-ms", String(timeoutMs));
+    // herdr 0.9.1: --until repeats per state, and the timeout flag is --timeout (milliseconds)
+    const args = ["agent", "wait", target, ...until.flatMap((u) => ["--until", u])];
+    if (timeoutMs && timeoutMs > 0) args.push("--timeout", String(timeoutMs));
     const out = await this.run(args);
     const parsed = JSON.parse(out) as { result?: HerdrAgent };
     if (!parsed.result) throw new HerdrError("agent_wait_no_result", "agent.wait returned no agent");
     return parsed.result;
   }
 
+  async exportEnv(paneId: string, vars: Record<string, string>): Promise<void> {
+    const safe = /^[A-Za-z0-9._:@/-]{1,128}$/;
+    const parts = Object.entries(vars).map(([k, v]) => {
+      if (!/^[A-Z][A-Z0-9_]*$/.test(k) || !safe.test(v)) throw new Error(`refusing to export unsafe value for ${k}`);
+      return `${k}=${v}`;
+    });
+    if (parts.length) await this.run(["pane", "run", paneId, `export ${parts.join(" ")}`]);
+  }
+
   async startAgent(paneId: string, kind: string, name: string): Promise<void> {
-    await this.run(["agent", "start", "--pane-id", paneId, "--kind", kind, "--name", name]);
+    // herdr 0.9.1: the name is positional and the pane flag is --pane
+    await this.run(["agent", "start", name, "--kind", kind, "--pane", paneId]);
   }
 
   async sendKeys(target: string, keys: string): Promise<void> {

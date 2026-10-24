@@ -32,6 +32,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { contextReading } from "../../context/usage.ts";
 import { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 import { type HostConfig, type LoadHostConfigOptions, loadHostConfig } from "./HostConfig.ts";
+import { reportRuntimeFacts } from "./runtimeReport.ts";
 
 // ── limits ───────────────────────────────────────────────────────────────────
 
@@ -960,5 +961,12 @@ export async function attachInspectorFeedFromHost(
     ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
     ...(fetch ? { fetch } : {}),
   });
-  return attachInspectorFeed(pi, { reasoning: cfg.reasoning, ingest, ...rest });
+  const handle = attachInspectorFeed(pi, { reasoning: cfg.reasoning, ingest, ...rest });
+  const env = rest.env ?? process.env;
+  const paneId = rest.sessionId ?? env.HERDR_PANE_ID?.trim();
+  if (handle && paneId) {
+    const reporter = reportRuntimeFacts(ingest, paneId, env);
+    pi.on?.("session_shutdown" as never, (() => reporter.stop()) as never);
+  }
+  return handle;
 }
