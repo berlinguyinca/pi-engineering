@@ -93,6 +93,7 @@ import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
+import { type ExternalBridge, startExternalBridge } from "./herdr/externalAgent.ts";
 import { type ForkRuntime, createForkRuntime } from "./herdr/forkWiring.ts";
 import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
@@ -710,6 +711,7 @@ export class EngineeringRuntime {
   /** T12: outbound-only steering poller; null unless enabled in the global YAML with a control plane configured. */
   steeringReceiver: SteeringReceiver | null = null;
   forkRuntime: ForkRuntime | null = null;
+  externalBridge: ExternalBridge | null = null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /** The planner the orchestrator uses to turn a mission into tasks. */
@@ -1843,10 +1845,18 @@ export class EngineeringRuntime {
       await rt.missionSupervisor.reconcileOnStartup();
       rt.missionSupervisor.start();
       rt.steeringReceiver = await EngineeringRuntime.startSteering(rt, opts);
+      // Pi as an external coworker agent: only when `pi-engineering herdr join` stored a credential AND the global YAML
+      // names a control plane. Otherwise null: no timer, no request.
+      rt.externalBridge = await startExternalBridge({
+        agentDir: opts.agentDir ?? getAgentDir(),
+        stateDir: resolveStateRoot(),
+        log: (message) => console.error(message),
+      }).catch(() => null);
       return rt;
     } catch (error) {
       rt.steeringReceiver?.stop();
       rt.forkRuntime?.stop();
+      rt.externalBridge?.stop();
       rt.externalPumpStopped = true;
       rt.missionActivityTicker?.close();
       rt.missionActivityClock.clear();
@@ -1937,6 +1947,7 @@ export class EngineeringRuntime {
     try {
       this.steeringReceiver?.stop();
       this.forkRuntime?.stop();
+      this.externalBridge?.stop();
       await this.missionSupervisor?.shutdown();
       await this.missionStore?.flush();
       await this.missionObservability?.flush();

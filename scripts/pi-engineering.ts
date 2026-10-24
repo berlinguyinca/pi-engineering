@@ -28,6 +28,7 @@ import { runExternalEntry } from "../src/orchestration/externalEntry.ts";
 import { runMissionsCommand } from "../src/orchestration/missionCancelCli.ts";
 import { runStandalonePlan } from "../src/orchestration/standaloneEntry.ts";
 import { defaultCliPaths, runRoadmapCheck, runRoadmapStatus, runRoadmapStructural } from "../src/roadmap/cli.ts";
+import { runHerdrExternalCli } from "../src/runtime/herdr/externalCli.ts";
 import { doctorExitCode, formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { runSessionsCommand } from "../src/sessionControl/cli.ts";
 
@@ -48,6 +49,7 @@ async function main(): Promise<number> {
   if (cmd === "missions") return runMissionsCommand(rest);
   if (cmd === "mission") return runExternalEntry(rest, await readStdin(), process.env);
   if (cmd === "plan") return runStandalonePlan(rest, await readStdin(), process.env);
+  if (cmd === "herdr") return runHerdrExternalCli(rest, process.env, readStdin);
   if (cmd === "github") return runGithubSyncCli(rest, process.env);
   if (cmd === "doctor") return doctorCommand(rest);
   if (cmd === "blackhole") {
