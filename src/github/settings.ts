@@ -11,7 +11,7 @@
  *
  * Anything malformed or unsafe turns the layer off with a note.
  */
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { readYaml } from "../lifecycle/policy.ts";
 import type { GithubConfig } from "./client.ts";
 
@@ -19,10 +19,19 @@ export interface GithubSettings {
   config: GithubConfig;
   requiredChecks: string[];
   rereviewCommand: string[];
+  rereviewEnv: string[];
 }
 
 const isPlain = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
-const KEYS = new Set(["enabled", "hosts", "default_repo", "gh_path", "required_checks", "rereview_command"]);
+const KEYS = new Set([
+  "enabled",
+  "hosts",
+  "default_repo",
+  "gh_path",
+  "required_checks",
+  "rereview_command",
+  "rereview_env",
+]);
 const NAME = /^[A-Za-z0-9._ \-/]{1,100}$/;
 
 export async function loadGithubSettings(
@@ -76,10 +85,19 @@ export async function loadGithubSettings(
       !Array.isArray(c) ||
       c.length === 0 ||
       !c.every((a) => typeof a === "string" && a.length > 0 && a.length < 500) ||
-      (c[0] as string).startsWith("-")
+      !(c[0] as string).startsWith("/")
     )
-      return off("`github.rereview_command` must be a non-empty argv list");
+      return off("`github.rereview_command` must be a non-empty argv list with an absolute executable path");
     rereviewCommand = c as string[];
   }
-  return { settings: { config, requiredChecks, rereviewCommand }, notes: [] };
+  let rereviewEnv: string[] = [];
+  if (block.rereview_env !== undefined) {
+    if (
+      !Array.isArray(block.rereview_env) ||
+      !block.rereview_env.every((n) => typeof n === "string" && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(n))
+    )
+      return off("`github.rereview_env` must be a list of variable names");
+    rereviewEnv = block.rereview_env as string[];
+  }
+  return { settings: { config, requiredChecks, rereviewCommand, rereviewEnv }, notes: [] };
 }

@@ -85,6 +85,7 @@ export async function runGithubSyncCli(
       ...(mission ? { missionId: mission } : {}),
       ...(settings?.requiredChecks.length ? { requiredChecks: settings.requiredChecks } : {}),
       ...(settings?.rereviewCommand.length ? { rereviewCommand: settings.rereviewCommand } : {}),
+      ...(settings?.rereviewEnv.length ? { rereviewEnv: settings.rereviewEnv } : {}),
       quorum,
       ...(deps.run ? { run: deps.run } : {}),
     });

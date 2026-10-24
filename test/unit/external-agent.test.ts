@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -104,5 +104,76 @@ describe("external agent client", () => {
     assert.equal(calls.filter((c) => c.url.endsWith("/heartbeat")).length, beats, "stopped after the 401");
     assert.ok(beats >= 2);
     bridge.stop();
+  });
+  describe("the stored credential is trusted only when it is safe", () => {
+    const joined = async (calls: Call[]) => {
+      const dir = tmp();
+      const f = fakeFetch(calls, (c) => (c.url.endsWith("/agents/join") ? joinReply() : new Response("{}")));
+      await ExternalAgentClient.join("http://127.0.0.1:1", "c", dir, { fetch: f });
+      return { dir, f };
+    };
+
+    it("a group/world-accessible file is refused, even with the right contents", async () => {
+      const { dir } = await joined([]);
+      chmodSync(join(dir, EXTERNAL_STATE_FILE), 0o666);
+      assert.equal(ExternalAgentClient.fromState(dir), null);
+      chmodSync(join(dir, EXTERNAL_STATE_FILE), 0o640);
+      assert.equal(ExternalAgentClient.fromState(dir), null);
+      chmodSync(join(dir, EXTERNAL_STATE_FILE), 0o600);
+      assert.ok(ExternalAgentClient.fromState(dir));
+    });
+
+    it("a symlink, a directory and an oversized file are refused", async () => {
+      const { dir } = await joined([]);
+      const real = join(dir, "real.json");
+      writeFileSync(real, readFileSync(join(dir, EXTERNAL_STATE_FILE)), { mode: 0o600 });
+      const linked = tmp();
+      symlinkSync(real, join(linked, EXTERNAL_STATE_FILE));
+      assert.equal(ExternalAgentClient.fromState(linked), null);
+      const big = tmp();
+      const body = JSON.parse(readFileSync(real, "utf8"));
+      writeFileSync(join(big, EXTERNAL_STATE_FILE), JSON.stringify({ ...body, pad: "x".repeat(10000) }), {
+        mode: 0o600,
+      });
+      assert.equal(ExternalAgentClient.fromState(big), null);
+      const asDir = tmp();
+      mkdirSync(join(asDir, EXTERNAL_STATE_FILE), { mode: 0o700 });
+      assert.equal(ExternalAgentClient.fromState(asDir), null);
+    });
+
+    it("a stored baseUrl that is not the YAML herdr.url is never sent the credential", async () => {
+      const calls: Call[] = [];
+      const { dir } = await joined(calls);
+      const file = join(dir, EXTERNAL_STATE_FILE);
+      const evil = { ...JSON.parse(readFileSync(file, "utf8")), baseUrl: "http://evil.example" };
+      writeFileSync(file, JSON.stringify(evil), { mode: 0o600 });
+      assert.equal(ExternalAgentClient.fromState(dir, {}, "http://127.0.0.1:1"), null);
+      const agentDir = tmp();
+      writeFileSync(join(agentDir, "engineering.yaml"), "herdr:\n  url: http://127.0.0.1:1\n");
+      const seen: Call[] = [];
+      const spy = fakeFetch(seen, () => new Response("{}"));
+      assert.equal(await startExternalBridge({ agentDir, stateDir: dir, fetch: spy }), null);
+      assert.equal(seen.length, 0, "nothing was sent anywhere");
+    });
+
+    it("no error message carries the credential, and leave forgets it", async () => {
+      const dir = tmp();
+      const f = fakeFetch([], (c) =>
+        c.url.endsWith("/agents/join") ? joinReply() : new Response(`bad ${CRED}`, { status: 500 }),
+      );
+      const client = await ExternalAgentClient.join("http://127.0.0.1:1", "c", dir, { fetch: f });
+      await assert.rejects(client.heartbeat("working", "x"), (e: Error) => !e.message.includes(CRED));
+      const bad = fakeFetch([], () => new Response(CRED, { status: 400 }));
+      await assert.rejects(
+        ExternalAgentClient.join("http://127.0.0.1:1", "c", tmp(), { fetch: bad }),
+        (e: Error) => !e.message.includes(CRED),
+      );
+      const ok = fakeFetch([], () => new Response("{}"));
+      const c2 = ExternalAgentClient.fromState(dir, { fetch: ok });
+      assert.ok(c2);
+      await c2.leave();
+      assert.equal(ExternalAgentClient.fromState(dir), null, "the credential is gone after leave");
+      assert.ok(!readFileSync(join(dir, EXTERNAL_STATE_FILE), "utf8").includes(CRED));
+    });
   });
 });

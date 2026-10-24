@@ -25,12 +25,52 @@ export interface DagLineageSummary {
   skipped: number;
 }
 
+export interface DagProjectionRecord {
+  missionId: string;
+  tasks: string[];
+  dependencies: Array<[string, string]>;
+  issueLinks: Array<[string, string]>;
+}
+
+/**
+ * Re-plan: what the PREVIOUS projection of this mission had and the new plan no longer does is withdrawn, so a dropped
+ * dependency or issue link does not stay in the graph. Edges are removed with a reason; a dropped task becomes
+ * `cancelled`. Returns what this plan now projects (the caller records it for the next re-plan).
+ */
+export function withdrawDroppedDag(
+  lineage: LineageEmitter | null | undefined,
+  previous: DagProjectionRecord | undefined,
+  current: DagProjectionRecord,
+): void {
+  if (!lineage || !previous) return;
+  const scope = { mission_id: current.missionId };
+  const keep = (list: Array<[string, string]>) => new Set(list.map(([a, b]) => `${a}\u0000${b}`));
+  const dep = keep(current.dependencies);
+  const links = keep(current.issueLinks);
+  const reason = "no longer in the re-planned DAG";
+  for (const [a, b] of previous.dependencies)
+    if (!dep.has(`${a}\u0000${b}`)) lineage.edgeRemove("dependency", a, b, reason, `dag-drop:${a}>${b}`, scope);
+  for (const [a, b] of previous.issueLinks)
+    if (!links.has(`${a}\u0000${b}`)) lineage.edgeRemove("issue_link", a, b, reason, `dag-drop:${a}>${b}`, scope);
+  const tasks = new Set(current.tasks);
+  for (const t of previous.tasks)
+    if (!tasks.has(t)) lineage.nodeState(t, "cancelled", `dag-drop:${t}`, { reason }, scope);
+}
+
 export function emitDagLineage(
   lineage: LineageEmitter | null | undefined,
   ingest: Extract<DagIngestResult, { ok: true }>,
   hosts?: readonly string[],
-): DagLineageSummary {
-  const out: DagLineageSummary = { tasks: 0, issues: 0, dependencies: 0, skipped: 0 };
+  previous?: DagProjectionRecord,
+): DagLineageSummary & { projection: DagProjectionRecord } {
+  const projection: DagProjectionRecord = { missionId: ingest.missionId, tasks: [], dependencies: [], issueLinks: [] };
+  const out: DagLineageSummary & { projection: DagProjectionRecord } = {
+    tasks: 0,
+    issues: 0,
+    dependencies: 0,
+    skipped: 0,
+    projection,
+  };
   if (!lineage) return out;
   const scope = { mission_id: ingest.missionId };
   const seenIssues = new Set<string>();
@@ -48,10 +88,14 @@ export function emitDagLineage(
       { ...scope, task_id: taskId },
     );
     out.tasks++;
+    projection.tasks.push(node);
     for (const dep of task.depends_on ?? []) {
       const to = dagTaskNodeId(ingest.missionId, dep);
       lineage.edgeAdd("dependency", node, to, `dag:${taskId}>${dep}`, { source: "autospec" }, scope);
-      if (to) out.dependencies++;
+      if (to) {
+        out.dependencies++;
+        projection.dependencies.push([node, to]);
+      }
     }
     for (const text of ingest.issueRefs.get(taskId) ?? []) {
       const parsed = parseGithubRef(text, hosts ? { hosts } : {});
@@ -78,6 +122,7 @@ export function emitDagLineage(
         );
         out.issues++;
       }
+      projection.issueLinks.push([node, id]);
       lineage.edgeAdd(
         "issue_link",
         node,
@@ -91,5 +136,6 @@ export function emitDagLineage(
       );
     }
   }
+  withdrawDroppedDag(lineage, previous, projection);
   return out;
 }

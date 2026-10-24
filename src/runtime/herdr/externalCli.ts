@@ -54,9 +54,12 @@ export async function runHerdrExternalCli(
       io.out(`${JSON.stringify({ result: "joined", agentId: client.agentId })}\n`);
       return 0;
     }
-    const client = ExternalAgentClient.fromState(stateDir, d);
+    const { connection: yamlConn } = await loadHerdrConnection(agentDir);
+    const client = yamlConn ? ExternalAgentClient.fromState(stateDir, d, yamlConn.baseUrl) : null;
     if (!client && (sub === "status" || sub === "heartbeat" || sub === "report" || sub === "leave")) {
-      io.err("not joined: run `pi-engineering herdr join` first\n");
+      io.err(
+        "not joined (or the stored credential is not for the herdr.url in engineering.yaml, or its file is not private): run `pi-engineering herdr join`\n",
+      );
       return 2;
     }
     if (sub === "status" && client) {

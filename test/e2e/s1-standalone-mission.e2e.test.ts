@@ -496,9 +496,45 @@ describe("scenario 1 / worker spawn, review evidence and the Herdr graph (real p
       acceptanceResults: [{ acceptanceId: "AC-1", status: "passed", detail: "reviewed against criterion" }],
       recordedAt: new Date().toISOString(),
     } as never);
+    // a review whose output was not valid gave no verdict: it must never be projected
+    task("TSK-s1-review-bad", "review", "independent-reviewer");
+    store.transitionTask("TSK-s1-review-bad", "READY");
+    const exInvalid = store.createExecution({
+      task_id: "TSK-s1-review-bad",
+      backend: "review",
+      mission_id: mission,
+      repo_id: "repo-1",
+      base_sha: "base-a",
+    });
+    store.transitionTask("TSK-s1-review-bad", "RUNNING", "system", { assigned_execution_id: exInvalid.execution_id });
+    store.setExecutionStatus(exInvalid.execution_id, "RUNNING");
+    store.setExecutionStatus(exInvalid.execution_id, "SUCCEEDED");
+    store.transitionTask("TSK-s1-review-bad", "SUCCEEDED");
+    store.recordCandidate(mission, identity, "integration", {
+      taskId: "TSK-s1-review-bad",
+      executionId: exInvalid.execution_id,
+    });
+    store.recordReviewEvidence({
+      evidenceId: "RE-s1-invalid",
+      missionId: mission,
+      taskId: "TSK-s1-review-bad",
+      executionId: exInvalid.execution_id,
+      identity,
+      identityHash: hashCandidateEvidenceIdentity(identity),
+      reviewerSessionId: "review-session-2",
+      model: "model-a",
+      provider: "provider-a",
+      verdict: "approve",
+      independenceMode: "independent",
+      findings: [],
+      outputValid: false,
+      accessible: true,
+      acceptanceResults: [],
+      recordedAt: new Date().toISOString(),
+    } as never);
     await store.flush();
     await emitterRef.idle();
-    const rec = store.listReviewEvidence(mission);
+    const rec = store.listReviewEvidence(mission).filter((r) => r.evidenceId === "RE-s1");
     assert.equal(rec.length, 1);
     assert.equal(rec[0]?.verdict, "approve");
     assert.equal(rec[0]?.identity.candidateSha, SHA);
@@ -534,6 +570,7 @@ describe("scenario 1 / worker spawn, review evidence and the Herdr graph (real p
     // paired negative: a signed-in non-member sees nothing, and a request-changes style id that was never recorded is absent
     assert.equal((await read("review:RE-s1", "bob")).status, 404);
     assert.equal((await read("review:RE-never", "alice")).status, 404);
+    assert.equal((await read("review:RE-s1-invalid", "alice")).status, 404, "an invalid review is not a verdict");
   });
 
   it("the plan revision, digest and Plannotator decision reach Herdr FROM THE CLI: mission and plan nodes bound to the digest, a produced edge, and an approval as a reviewed edge on the same digest", async () => {

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { loadGithubSettings } from "../../src/github/settings.ts";
+import { runRereviewCommand } from "../../src/github/sync.ts";
 import { runGithubSyncCli } from "../../src/github/syncCli.ts";
 
 const dirWith = (yaml?: string) => {
@@ -65,5 +66,63 @@ describe("github: YAML settings", () => {
     assert.deepEqual(JSON.parse(out), { result: "disabled" });
     assert.equal(fetched, 0);
     assert.equal(await runGithubSyncCli(["bogus"], {}, { out: () => undefined, err: () => undefined }), 2);
+  });
+});
+
+describe("rereview_command execution", () => {
+  it("settings: a relative executable and a bad env name are refused; the env allow-list is read", async () => {
+    assert.equal(
+      (await loadGithubSettings(dirWith('github:\n  enabled: true\n  rereview_command: ["relative.sh"]\n'))).settings,
+      null,
+    );
+    assert.equal(
+      (await loadGithubSettings(dirWith('github:\n  enabled: true\n  rereview_env: ["bad name"]\n'))).settings,
+      null,
+    );
+    const ok = await loadGithubSettings(
+      dirWith('github:\n  enabled: true\n  rereview_command: ["/bin/true"]\n  rereview_env: [MY_TOKEN]\n'),
+    );
+    assert.deepEqual(ok.settings?.rereviewEnv, ["MY_TOKEN"]);
+  });
+
+  it("runs WITHOUT the caller's secrets, with only the YAML-listed names, and refuses a relative executable", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rr-"));
+    const out = join(dir, "env.json");
+    const script = join(dir, "dump.mjs");
+    writeFileSync(
+      script,
+      `import {writeFileSync} from "node:fs"; writeFileSync(${JSON.stringify(out)}, JSON.stringify(process.env));\n`,
+    );
+    chmodSync(script, 0o755);
+    const source = {
+      PATH: process.env.PATH,
+      HOME: "/h",
+      GH_TOKEN: "t1",
+      GIT_SSH_COMMAND: "x",
+      SSH_AUTH_SOCK: "/s",
+      MY_TOKEN: "allowed",
+    };
+    const node = process.execPath;
+    assert.equal(await runRereviewCommand([node, script], ["MY_TOKEN"], source), true);
+    const seen = JSON.parse(readFileSync(out, "utf8"));
+    assert.equal(seen.GH_TOKEN, undefined);
+    assert.equal(seen.GIT_SSH_COMMAND, undefined);
+    assert.equal(seen.SSH_AUTH_SOCK, undefined);
+    assert.equal(seen.MY_TOKEN, "allowed");
+    assert.equal(seen.HOME, "/h");
+    assert.equal(await runRereviewCommand(["node", script], [], source), false, "a relative executable is refused");
+  });
+
+  it("no shell: metacharacters in arguments are data; output beyond the cap kills the command (false); a failing exit is false", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "rr-"));
+    const marker = join(dir, "pwned");
+    assert.equal(await runRereviewCommand([process.execPath, "-e", "0", `; touch ${marker}`], []), true);
+    assert.equal(existsSync(marker), false, "the argument was not run by a shell");
+    assert.equal(
+      await runRereviewCommand([process.execPath, "-e", "process.stdout.write('x'.repeat(200000))"], []),
+      false,
+      "unbounded output is cut",
+    );
+    assert.equal(await runRereviewCommand([process.execPath, "-e", "process.exit(3)"], []), false);
   });
 });

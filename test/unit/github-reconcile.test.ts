@@ -478,6 +478,23 @@ describe("lineage through an injected sink", () => {
     assert.equal(missing.events.filter((e) => e[1] === "validated").length, 0, "a missing required check is not green");
   });
 
+  it("a head is validated only when EVERY run is green: pass+pending, pass+fail and an empty head validate nothing", () => {
+    const pr = ref("https://github.com/acme/widgets/pull/30");
+    const count = (runs: CheckRun[], opts = {}) => {
+      const sink = new RecordingSink();
+      emitCiValidation(sink, pr, SHA1, runs, {}, opts);
+      return sink.events.filter((e) => e[0] === "edgeAdd" && e[1] === "validated").length;
+    };
+    const pass: CheckRun = { name: "build", sha: SHA1, status: "pass" };
+    assert.equal(count([pass, { name: "slow", sha: SHA1, status: "pending" }]), 0);
+    assert.equal(count([pass, { name: "lint", sha: SHA1, status: "fail" }]), 0);
+    assert.equal(count([]), 0);
+    assert.equal(count([{ name: "slow", sha: SHA1, status: "pending" }]), 0);
+    assert.equal(count([pass, { name: "opt", sha: SHA1, status: "skipped" }]), 1, "skipped does not block");
+    assert.equal(count([pass, { name: "slow", sha: SHA1, status: "pending" }], { required: ["build"] }), 1);
+    assert.equal(count([{ ...pass, sha: SHA2 }]), 0, "a pass on another head validates nothing");
+  });
+
   it("ci node ids stay distinct for colliding sanitised names and within 200 chars", () => {
     const pr = ref("https://github.com/acme/widgets/pull/30");
     const sink = new RecordingSink();

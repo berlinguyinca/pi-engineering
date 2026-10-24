@@ -10,7 +10,7 @@
  * no `herdr.url`: nothing starts and nothing connects. The join code is read from a file or stdin, never argv; the
  * credential is never logged, put in an error message or sent anywhere except the `Authorization` header to `herdr.url`.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { loadHerdrConnection } from "./herdrConnection.ts";
 
@@ -56,10 +56,20 @@ function save(stateDir: string, cred: ExternalCredential): void {
   renameSync(tmp, file);
 }
 
+const MAX_STATE_FILE = 4096;
+
+/**
+ * The stored credential, or null. The file must be a regular file (not a link), owned by the current user, not
+ * readable by group or others, and small: the same rules as the Herdr key file. A file that breaks any of them is no
+ * credential, so a planted or world-readable one is never used.
+ */
 export function loadExternalCredential(stateDir: string): ExternalCredential | null {
   const file = stateFile(stateDir);
   if (!existsSync(file)) return null;
   try {
+    const st = lstatSync(file);
+    if (!st.isFile() || (st.mode & 0o077) !== 0 || st.size > MAX_STATE_FILE) return null;
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) return null;
     const v = JSON.parse(readFileSync(file, "utf8")) as Partial<ExternalCredential>;
     if (
       typeof v.baseUrl === "string" &&
@@ -88,9 +98,19 @@ export class ExternalAgentClient {
     this.fetchImpl = deps.fetch ?? globalThis.fetch;
   }
 
-  static fromState(stateDir: string, deps: ExternalAgentDeps = {}): ExternalAgentClient | null {
+  /**
+   * `expectedBaseUrl` is the YAML `herdr.url`. When given, a stored credential for any OTHER url is refused: the
+   * credential is only ever sent where the operator's own config says Herdr is, never to a url read from a state file.
+   */
+  static fromState(
+    stateDir: string,
+    deps: ExternalAgentDeps = {},
+    expectedBaseUrl?: string,
+  ): ExternalAgentClient | null {
     const cred = loadExternalCredential(stateDir);
-    return cred ? new ExternalAgentClient(stateDir, cred, deps) : null;
+    if (!cred) return null;
+    if (expectedBaseUrl !== undefined && cred.baseUrl !== expectedBaseUrl) return null;
+    return new ExternalAgentClient(stateDir, cred, deps);
   }
 
   /** Redeem a one-time join code. The public route: the code is the authentication; nothing else is sent. */
@@ -224,10 +244,14 @@ export async function startExternalBridge(input: {
   intervalMs?: number;
   log?: (line: string) => void;
 }): Promise<ExternalBridge | null> {
-  const client = ExternalAgentClient.fromState(input.stateDir, input.fetch ? { fetch: input.fetch } : {});
-  if (!client) return null;
   const { connection } = await loadHerdrConnection(input.agentDir);
   if (!connection) return null;
+  const client = ExternalAgentClient.fromState(
+    input.stateDir,
+    input.fetch ? { fetch: input.fetch } : {},
+    connection.baseUrl,
+  );
+  if (!client) return null;
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
   const beat = async (): Promise<void> => {

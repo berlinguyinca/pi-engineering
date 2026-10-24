@@ -138,7 +138,11 @@ export async function runAutoSpecPlan(
       out(`${JSON.stringify({ result: "rejected", code: outcome.code, reason: outcome.message })}\n`);
       return 2;
     }
-    emitDagLineage(lineage, ingest);
+    const projected = emitDagLineage(lineage, ingest, undefined, store.getDagProjection(ingest.missionId));
+    if (lineage) {
+      store.recordDagProjection(projected.projection);
+      await store.flush();
+    }
     const issueRefs = Object.fromEntries(ingest.issueRefs);
     const base = {
       missionId: ingest.missionId,

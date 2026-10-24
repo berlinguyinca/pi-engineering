@@ -88,8 +88,23 @@ export interface GithubRereviewRequest {
   headSha: string;
   previousHeadSha: string;
   requestedAt: string;
-  /** What happened to the operator's dispatch command: not configured, ran, or failed. */
-  dispatch: "none" | "ok" | "failed";
+  /**
+   * What happened to the operator's dispatch command: `none` (not configured), `inflight` (written BEFORE the command
+   * runs, so a crash is visible: delivery is at-least-once), `ok`, or `failed` (retried after `nextAttemptAt`).
+   */
+  dispatch: "none" | "inflight" | "ok" | "failed";
+  attempts?: number;
+  nextAttemptAt?: string;
+  inflightAt?: string;
+}
+
+/** The merge-gate decision last projected for a PR; `revision` moves only when head or decision changes. */
+export interface GithubGateDecision {
+  missionId: string;
+  target: string;
+  head: string;
+  decision: string;
+  revision: number;
 }
 
 export interface GithubLinkPatch {

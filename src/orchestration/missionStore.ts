@@ -62,7 +62,16 @@ import type {
   WorkspaceManifest,
 } from "./types.ts";
 
+export interface DagProjection {
+  missionId: string;
+  /** Task node ids, dependency edges `[from, to]` and issue links `[task, issue]` as last projected. */
+  tasks: string[];
+  dependencies: Array<[string, string]>;
+  issueLinks: Array<[string, string]>;
+}
+
 import {
+  type GithubGateDecision,
   type GithubLinkPatch,
   type GithubLinkRecord,
   type GithubLinkSuggestion,
@@ -130,6 +139,8 @@ export type OrchestrationEventType =
   | "github.link_corrected"
   | "github.evidence_stale"
   | "github.rereview_requested"
+  | "github.gate_decided"
+  | "dag.projected"
   | "candidate.changed"
   | "evidence.validation_recorded"
   | "evidence.review_recorded"
@@ -212,6 +223,8 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "github.link_corrected",
   "github.evidence_stale",
   "github.rereview_requested",
+  "github.gate_decided",
+  "dag.projected",
   "candidate.changed",
   "evidence.validation_recorded",
   "evidence.review_recorded",
@@ -457,6 +470,8 @@ export class MissionStore {
   private readonly githubSuggestions = new Map<string, GithubLinkSuggestion>();
   private readonly githubStaleSignals = new Map<string, GithubStaleSignal>();
   private readonly githubRereviews = new Map<string, GithubRereviewRequest>();
+  private readonly githubGates = new Map<string, GithubGateDecision>();
+  private readonly dagProjections = new Map<string, DagProjection>();
   private readonly candidates = new Map<string, CandidateRevision>();
   private readonly validationEvidence = new Map<string, ValidationEvidence>();
   private readonly reviewEvidence = new Map<string, ReviewEvidence>();
@@ -981,6 +996,16 @@ export class MissionStore {
       case "github.evidence_stale": {
         const signal = e.payload.signal as GithubStaleSignal | undefined;
         if (signal?.signalId) this.githubStaleSignals.set(signal.signalId, structuredClone(signal));
+        break;
+      }
+      case "github.gate_decided": {
+        const g = e.payload.gate as GithubGateDecision | undefined;
+        if (g?.target) this.githubGates.set(g.target, structuredClone(g));
+        break;
+      }
+      case "dag.projected": {
+        const d = e.payload.projection as DagProjection | undefined;
+        if (d?.missionId) this.dagProjections.set(d.missionId, structuredClone(d));
         break;
       }
       case "github.rereview_requested": {
@@ -3273,10 +3298,59 @@ export class MissionStore {
   recordGithubRereview(request: GithubRereviewRequest): boolean {
     if (!this.missions.has(request.missionId)) throw new Error(`unknown mission ${request.missionId}`);
     if (this.githubRereviews.has(request.signalId)) return false;
+    return this.writeGithubRereview(request);
+  }
+
+  /** Replace the record of a request (an in-flight marker, a retry outcome). Replay keeps the last write. */
+  updateGithubRereview(request: GithubRereviewRequest): boolean {
+    if (!this.githubRereviews.has(request.signalId)) return false;
+    return this.writeGithubRereview(request);
+  }
+
+  getGithubRereview(signalId: string): GithubRereviewRequest | undefined {
+    const r = this.githubRereviews.get(signalId);
+    return r ? structuredClone(r) : undefined;
+  }
+
+  private writeGithubRereview(request: GithubRereviewRequest): boolean {
     const copy = structuredClone(request);
     this.githubRereviews.set(copy.signalId, copy);
     this.emit("github.rereview_requested", copy.missionId, { actor: "system", request: copy });
     return true;
+  }
+
+  /**
+   * The merge-gate decision for a PR, with a revision that moves only when (head, decision) CHANGES. The revision
+   * goes into the lineage event ids: a replay of the same decision dedupes, a flip (merge -> wait -> merge) is a new
+   * event, so Herdr's final state follows Pi's. Returns the current record and what it replaced.
+   */
+  recordGithubGate(
+    missionId: string,
+    target: string,
+    head: string,
+    decision: string,
+  ): {
+    gate: GithubGateDecision;
+    previous: GithubGateDecision | undefined;
+  } {
+    const previous = this.githubGates.get(target);
+    if (previous && previous.head === head && previous.decision === decision)
+      return { gate: structuredClone(previous), previous: structuredClone(previous) };
+    const gate: GithubGateDecision = { missionId, target, head, decision, revision: (previous?.revision ?? 0) + 1 };
+    this.githubGates.set(target, gate);
+    this.emit("github.gate_decided", missionId, { actor: "system", gate: structuredClone(gate) });
+    return { gate: structuredClone(gate), previous: previous ? structuredClone(previous) : undefined };
+  }
+
+  /** What the plan CLI last projected for a mission (so a re-plan can withdraw what the new plan dropped). */
+  getDagProjection(missionId: string): DagProjection | undefined {
+    const d = this.dagProjections.get(missionId);
+    return d ? structuredClone(d) : undefined;
+  }
+
+  recordDagProjection(projection: DagProjection): void {
+    this.dagProjections.set(projection.missionId, structuredClone(projection));
+    this.emit("dag.projected", projection.missionId, { actor: "system", projection: structuredClone(projection) });
   }
 
   listGithubRereviews(missionId?: string): GithubRereviewRequest[] {

@@ -13,6 +13,7 @@
  * Inert without a client. Every Herdr write goes through the lineage emitter and so is best-effort.
  */
 import { execFile } from "node:child_process";
+import { isAbsolute } from "node:path";
 import { normalizeCheckRuns } from "../merge/checkRunIngest.ts";
 import { decideMerge } from "../merge/mergeGate.ts";
 import type { CheckRun, MergeDecision } from "../merge/mergeGate.ts";
@@ -23,11 +24,19 @@ import { type GithubLineageSink, emitCiValidation, emitDependencyEdges, targetSt
 import type { QuorumReader } from "./quorum.ts";
 import { type ReconcileResult, type ReconcileStore, reconcileGithubLinks } from "./reconcile.ts";
 import { type GithubRef, type RefConfig, canonicalId, parseCanonicalId, refKey } from "./refs.ts";
-import type { GithubRereviewRequest, GithubStaleSignal } from "./types.ts";
+import type { GithubGateDecision, GithubRereviewRequest, GithubStaleSignal } from "./types.ts";
 
 export interface SyncStore extends ReconcileStore {
   listGithubStaleSignals(missionId?: string): GithubStaleSignal[];
   recordGithubRereview(request: GithubRereviewRequest): boolean;
+  updateGithubRereview(request: GithubRereviewRequest): boolean;
+  getGithubRereview(signalId: string): GithubRereviewRequest | undefined;
+  recordGithubGate(
+    missionId: string,
+    target: string,
+    head: string,
+    decision: string,
+  ): { gate: GithubGateDecision; previous: GithubGateDecision | undefined };
   listGithubRereviews(missionId?: string): GithubRereviewRequest[];
 }
 
@@ -39,6 +48,8 @@ export interface GithubSyncDeps {
   missionId?: string;
   requiredChecks?: readonly string[];
   rereviewCommand?: readonly string[];
+  /** Names of environment variables the re-review command may see (YAML `github.rereview_env`); none by default. */
+  rereviewEnv?: readonly string[];
   quorum?: QuorumReader | null;
   /** Runs the operator's re-review command; resolves true on exit 0. Test seam. */
   run?: (argv: string[]) => Promise<boolean>;
@@ -62,10 +73,38 @@ export interface GithubSyncReport {
   gates: GateOutcome[];
 }
 
-const defaultRun = (argv: string[]): Promise<boolean> =>
-  new Promise((resolve) => {
-    execFile(argv[0] as string, argv.slice(1), { timeout: 30_000, windowsHide: true }, (err) => resolve(!err));
+export const REREVIEW_TIMEOUT_MS = 30_000;
+export const REREVIEW_MAX_OUTPUT = 64 * 1024;
+export const REREVIEW_MAX_ATTEMPTS = 5;
+export const REREVIEW_BACKOFF_MS = 30_000;
+/** A crash between "inflight" and the outcome is re-dispatched after this long (delivery is at-least-once). */
+export const REREVIEW_INFLIGHT_LEASE_MS = 5 * 60_000;
+const BASE_ENV = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER"];
+
+/**
+ * Run the operator's re-review command: no shell, an absolute executable, a scrubbed environment (the base variables
+ * plus only the names the YAML lists: never GIT_*, GH_* or tokens by default), bounded output and time.
+ */
+export function runRereviewCommand(
+  argv: string[],
+  allowEnv: readonly string[] = [],
+  source: NodeJS.ProcessEnv = process.env,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const exe = argv[0];
+    if (!exe || !isAbsolute(exe)) return resolve(false);
+    const env: NodeJS.ProcessEnv = {};
+    for (const k of [...BASE_ENV, ...allowEnv]) if (source[k] !== undefined) env[k] = source[k];
+    execFile(
+      exe,
+      argv.slice(1),
+      { timeout: REREVIEW_TIMEOUT_MS, maxBuffer: REREVIEW_MAX_OUTPUT, windowsHide: true, env, shell: false },
+      (err) => resolve(!err),
+    );
   });
+}
+
+const inflightHere = new Set<string>();
 
 const lower = (s: string | undefined): string | undefined => (s ? s.toLowerCase() : undefined);
 
@@ -92,35 +131,74 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
   report.reconcile = reconcile;
   report.status = reconcile.status;
 
-  // 2. the stale reaction: every signal gets exactly one durable request.
-  const run = deps.run ?? defaultRun;
-  const done = new Set(store.listGithubRereviews(deps.missionId).map((r) => r.signalId));
+  // 2. the stale reaction: every signal gets one durable request, written BEFORE the command runs (at-least-once on a
+  // crash), retried with backoff while the command fails, and never run twice by two overlapping ticks in this process
+  // (a second PROCESS cannot open the same store: the journal's writer lock).
+  const run = deps.run ?? ((argv: string[]) => runRereviewCommand(argv, deps.rereviewEnv ?? []));
+  const hasCommand = Boolean(deps.rereviewCommand?.length);
   for (const signal of store.listGithubStaleSignals(deps.missionId)) {
-    if (done.has(signal.signalId)) continue;
-    let dispatch: GithubRereviewRequest["dispatch"] = "none";
-    if (deps.rereviewCommand?.length) {
-      const argv = [
-        ...deps.rereviewCommand,
-        "--pr",
-        signal.target,
-        "--head",
-        signal.headSha,
-        "--signal",
-        signal.signalId,
-      ];
-      dispatch = (await run(argv)) ? "ok" : "failed";
+    const existing = store.getGithubRereview(signal.signalId);
+    const nowMs = Date.parse(now());
+    if (existing) {
+      if (existing.dispatch === "ok" || existing.dispatch === "none") continue;
+      if (!hasCommand) continue;
+      const attempts = existing.attempts ?? 1;
+      if (existing.dispatch === "failed") {
+        if (attempts >= REREVIEW_MAX_ATTEMPTS) continue;
+        if (existing.nextAttemptAt && Date.parse(existing.nextAttemptAt) > nowMs) continue;
+      }
+      if (
+        existing.dispatch === "inflight" &&
+        Date.parse(existing.inflightAt ?? existing.requestedAt) + REREVIEW_INFLIGHT_LEASE_MS > nowMs
+      )
+        continue;
     }
-    const request: GithubRereviewRequest = {
+    if (inflightHere.has(signal.signalId)) continue;
+    const attempts = (existing?.attempts ?? 0) + (hasCommand ? 1 : 0);
+    const base: GithubRereviewRequest = {
       signalId: signal.signalId,
       missionId: signal.missionId,
       target: signal.target,
       headSha: signal.headSha,
       previousHeadSha: signal.previousHeadSha,
-      requestedAt: now(),
-      dispatch,
+      requestedAt: existing?.requestedAt ?? now(),
+      dispatch: hasCommand ? "inflight" : "none",
+      attempts,
+      ...(hasCommand ? { inflightAt: now() } : {}),
     };
-    if (!store.recordGithubRereview(request)) continue;
-    report.rereviews.push(request);
+    if (existing) store.updateGithubRereview(base);
+    else if (!store.recordGithubRereview(base)) continue;
+    let final = base;
+    if (hasCommand) {
+      inflightHere.add(signal.signalId);
+      let ok = false;
+      try {
+        ok = await run([
+          ...(deps.rereviewCommand as string[]),
+          "--pr",
+          signal.target,
+          "--head",
+          signal.headSha,
+          "--signal",
+          signal.signalId,
+        ]);
+      } catch {
+        ok = false;
+      } finally {
+        inflightHere.delete(signal.signalId);
+      }
+      const { inflightAt: _i, ...rest } = base;
+      final = ok
+        ? { ...rest, dispatch: "ok" }
+        : {
+            ...rest,
+            dispatch: "failed",
+            nextAttemptAt: new Date(Date.parse(now()) + REREVIEW_BACKOFF_MS * 2 ** (attempts - 1)).toISOString(),
+          };
+      store.updateGithubRereview(final);
+    }
+    if (!existing) report.rereviews.push(final);
+    else if (final.dispatch === "ok") report.rereviews.push(final);
     lineage?.nodeUpsert(
       signal.target,
       { attrs: { rereview_head: signal.headSha, rereview_signal: signal.signalId } },
@@ -141,11 +219,14 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
     if (!ref || ref.kind !== "pr" || !head || !/^[0-9a-f]{7,64}$/.test(head)) continue;
     const scope = { mission_id: link.missionId };
     let runs: CheckRun[] = [];
+    // No answer from the checks API (absent, failing or malformed) is "no CI evidence", never "no checks needed".
+    let checksUnavailable = !client.listCheckRuns;
     if (client.listCheckRuns) {
       try {
         runs = normalizeCheckRuns({ headSha: head, restCheckRuns: await client.listCheckRuns(ref, head) });
       } catch {
         runs = [];
+        checksUnavailable = true;
       }
     }
     const required = deps.requiredChecks?.length ? [...deps.requiredChecks] : undefined;
@@ -162,17 +243,29 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
           : null;
     // Pi's candidate is the head it last saw before this tick: a head that moved since is rejected, not merged.
     const candidate = before.get(link.linkId) ?? head;
-    const decision = decideMerge({
+    const onHead = runs.filter((r) => r.sha === head);
+    let decision = decideMerge({
       repo: `${ref.host}/${ref.owner}/${ref.repo}`,
       prNumber: ref.number,
       candidateSha: candidate,
       prHeadSha: head,
       baseSha: "",
-      checks: runs.filter((r) => r.sha === head),
-      requiredChecks: required ?? runs.map((r) => r.name),
+      checks: onHead,
+      requiredChecks: required ?? onHead.map((r) => r.name),
       review,
       queue: [],
     });
+    // Fail closed: a merge needs CI evidence for this head. A broken checks API, a client that cannot list checks, or
+    // a head with no check at all (when no required_checks are configured) waits.
+    if (decision.decision === "merge" && (checksUnavailable || onHead.length === 0)) {
+      decision = {
+        ...decision,
+        decision: "wait",
+        reasons: [
+          checksUnavailable ? "no CI evidence: the checks could not be read" : "no CI evidence: no checks on this head",
+        ],
+      };
+    }
     report.gates.push({
       target: link.target,
       head,
@@ -181,6 +274,8 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
       quorum: q?.status ?? null,
     });
     const gate = lineageNodeId("gate", refKey(ref));
+    const { gate: rec, previous } = store.recordGithubGate(link.missionId, link.target, head, decision.decision);
+    const rev = rec.revision;
     lineage?.nodeUpsert(
       gate,
       {
@@ -193,18 +288,29 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
           quorum: q?.status ?? "unavailable",
         },
       },
-      `gate:${head}:${decision.decision}`,
+      `gate:${head}:${decision.decision}:${rev}`,
       scope,
     );
-    if (decision.decision === "merge")
+    if (decision.decision === "merge") {
       lineage?.edgeAdd(
         "validated",
         gate,
         link.target,
-        `gate-valid:${head}`,
+        `gate-valid:${head}:${rev}`,
         { commit: head, source: "merge-gate" },
         scope,
       );
+    } else if (previous?.decision === "merge") {
+      // The gate no longer says merge (at this or another head): withdraw Pi's own edge, with the reason.
+      lineage?.edgeRemove(
+        "validated",
+        gate,
+        link.target,
+        `merge gate is now ${decision.decision}: ${decision.reasons[0] ?? "no reason"}`.slice(0, 300),
+        `gate-void:${head}:${rev}`,
+        scope,
+      );
+    }
   }
 
   // 4. dependency edges between the linked issues.

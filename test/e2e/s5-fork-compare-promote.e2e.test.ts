@@ -720,7 +720,12 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
   });
 
   it("Pi's own merge gate for the downstream task's PR is validated at the current head (written by Pi's sync tick, not by the test)", async () => {
-    const client = new FakeGithubClient();
+    // a head with a green check: the gate fails closed (wait) without CI evidence, so the client must report one
+    const client = new (class extends FakeGithubClient {
+      async listCheckRuns(_ref: unknown, headSha: string) {
+        return [{ name: "ci", status: "completed", conclusion: "success", head_sha: headSha }];
+      }
+    })();
     client.put("github.com/acme/widgets#21", {
       title: "downstream",
       state: "open",
@@ -922,5 +927,16 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     });
     assert.equal(missing.status, c.status, "the refusal does not reveal that the org node exists");
     assert.deepEqual(missing.body, c.body);
+  });
+  it("GAP: no Pi runtime supplies a steering fence, so the receiver's own fence comparison never fires (PI-WIRING-HERDR-NEEDS item 11)", async () => {
+    // Herdr's fence cannot be recomputed by Pi and no ingest-key read returns it. EngineeringRuntime therefore resolves
+    // targets WITHOUT a fence. When Herdr adds the read and the runtime starts filling `fence`, this test must be
+    // replaced by one that asserts the comparison; until then it records the current behaviour.
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../../src/runtime/EngineeringRuntime.ts", import.meta.url), "utf8");
+    const at = src.indexOf("private static async startSteering");
+    assert.ok(at > 0);
+    const body = src.slice(at, src.indexOf("\n  }\n", at));
+    assert.equal(/\bfence\s*:/.test(body), false, "startSteering supplies no fence today");
   });
 });

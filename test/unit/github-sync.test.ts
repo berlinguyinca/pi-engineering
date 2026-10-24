@@ -191,3 +191,222 @@ describe("githubSync", () => {
       assert.ok(order.indexOf(`nodeUpsert:${n}`) !== -1 && order.indexOf(`nodeUpsert:${n}`) < edgeAt, n);
   });
 });
+
+const transitions = (rec: Recorder, op: string) =>
+  rec.calls.filter((c) => c.op === op).map((c) => c.args[op === "nodeUpsert" ? 2 : 3] as string);
+const gateEdgeOps = (rec: Recorder) =>
+  rec.calls.filter(
+    (c) =>
+      (c.op === "edgeAdd" || c.op === "edgeRemove") &&
+      c.args[0] === "validated" &&
+      String(c.args[1]).startsWith("gate:"),
+  );
+
+describe("githubSync: the merge gate fails closed without CI evidence", () => {
+  const sat = { quorum: quorum({ status: "satisfied" }) };
+
+  it("a failing checks API, a client that cannot list checks, and a head with no checks all WAIT", async () => {
+    const a = await world();
+    a.client.listCheckRuns = async () => {
+      throw new Error("checks API down");
+    };
+    const ra = await githubSync({ client: a.client, store: a.store, cfg, lineage: a.rec as never, now: NOW, ...sat });
+    assert.equal(ra.gates[0]?.decision, "wait");
+    assert.match(ra.gates[0]?.reasons[0] ?? "", /no CI evidence/);
+    assert.equal(gateEdgeOps(a.rec).length, 0, "no validated gate edge");
+
+    const b = await world();
+    const plain = new FakeGithubClient(); // no listCheckRuns at all
+    for (const [k, v] of b.client.items) plain.items.set(k, v);
+    const rb = await githubSync({ client: plain, store: b.store, cfg, lineage: b.rec as never, now: NOW, ...sat });
+    assert.equal(rb.gates[0]?.decision, "wait");
+
+    const c = await world();
+    c.client.runs = []; // a head with zero checks and no required_checks configured
+    const rc = await githubSync({ client: c.client, store: c.store, cfg, lineage: c.rec as never, now: NOW, ...sat });
+    assert.equal(rc.gates[0]?.decision, "wait");
+    assert.match(rc.gates[0]?.reasons[0] ?? "", /no checks on this head/);
+
+    // positive control: green CI on the head merges
+    const d = await world();
+    d.client.runs = green;
+    const rd = await githubSync({ client: d.client, store: d.store, cfg, lineage: d.rec as never, now: NOW, ...sat });
+    assert.equal(rd.gates[0]?.decision, "merge");
+  });
+});
+
+describe("githubSync: the gate edge follows Pi's decision", () => {
+  const redRuns: RestCheckRun[] = [{ name: "ci", status: "completed", conclusion: "failure" }];
+  it("merge -> reject withdraws the validated edge (with a reason) on the same head", async () => {
+    const w = await world();
+    const base = { client: w.client, store: w.store, cfg, lineage: w.rec as never, now: NOW };
+    w.client.runs = green;
+    await githubSync({ ...base, quorum: quorum({ status: "satisfied" }) });
+    w.client.runs = redRuns;
+    const r = await githubSync({ ...base, quorum: quorum({ status: "satisfied" }) });
+    assert.equal(r.gates[0]?.decision, "reject");
+    const ops = gateEdgeOps(w.rec).map((c) => c.op);
+    assert.deepEqual(ops, ["edgeAdd", "edgeRemove"]);
+    const removal = gateEdgeOps(w.rec)[1];
+    assert.match(String(removal?.args[3]), /merge gate is now reject/);
+  });
+
+  it("merge -> wait -> merge: the flips are distinct events, a replay of the same decision is not", async () => {
+    const w = await world();
+    const base = { client: w.client, store: w.store, cfg, lineage: w.rec as never, now: NOW };
+    w.client.runs = green;
+    await githubSync({ ...base, quorum: quorum({ status: "satisfied" }) }); // merge  (rev 1)
+    await githubSync({ ...base, quorum: quorum({ status: "satisfied" }) }); // replay (still rev 1)
+    await githubSync({ ...base, quorum: quorum({ status: "insufficient" }) }); // wait (rev 2)
+    await githubSync({ ...base, quorum: quorum({ status: "satisfied" }) }); // merge  (rev 3)
+    const adds = gateEdgeOps(w.rec)
+      .filter((c) => c.op === "edgeAdd")
+      .map((c) => c.args[3]);
+    assert.equal(adds[0], adds[1], "a replay of the same decision keeps the same id");
+    assert.notEqual(adds[0], adds[adds.length - 1], "the second merge is a new event, not a dedupe of the first");
+    assert.deepEqual(
+      gateEdgeOps(w.rec).map((c) => c.op),
+      ["edgeAdd", "edgeAdd", "edgeRemove", "edgeAdd"],
+    );
+    // the revision is durable: a fresh run over the same store continues, it does not restart at 1
+    assert.equal(w.store.recordGithubGate(w.mission.mission_id, PR, SHA1, "merge").gate.revision, 3);
+  });
+
+  it("ids are deterministic across identical runs (no randomness)", async () => {
+    const run = async () => {
+      const w = await world();
+      w.client.runs = green;
+      await githubSync({
+        client: w.client,
+        store: w.store,
+        cfg,
+        lineage: w.rec as never,
+        now: NOW,
+        quorum: quorum({ status: "satisfied" }),
+      });
+      return transitions(w.rec, "nodeUpsert").concat(transitions(w.rec, "edgeAdd"));
+    };
+    assert.deepEqual(await run(), await run());
+  });
+});
+
+describe("githubSync: the quorum is read, and only a current satisfied quorum counts", () => {
+  it("a satisfied quorum for ANOTHER head does not merge; blocked rejects; unreadable waits", async () => {
+    const w = await world();
+    w.client.runs = green;
+    const base = { client: w.client, store: w.store, cfg, lineage: w.rec as never, now: NOW };
+    assert.equal(
+      (await githubSync({ ...base, quorum: quorum({ status: "satisfied", head: SHA2 }) })).gates[0]?.decision,
+      "wait",
+    );
+    assert.equal((await githubSync({ ...base, quorum: quorum({ status: "blocked" }) })).gates[0]?.decision, "reject");
+    assert.equal((await githubSync({ ...base, quorum: async () => null })).gates[0]?.decision, "wait");
+    assert.equal(
+      (await githubSync({ ...base, quorum: quorum({ status: "satisfied", head: SHA1 }) })).gates[0]?.decision,
+      "merge",
+    );
+  });
+});
+
+describe("githubSync: the re-review dispatch", () => {
+  const movedWorld = async () => {
+    const w = await world();
+    const calls: string[][] = [];
+    let ok = false;
+    let clock = Date.parse("2026-10-23T00:00:00.000Z");
+    const now = () => new Date(clock).toISOString();
+    const tick = (over: Record<string, unknown> = {}) =>
+      githubSync({
+        client: w.client,
+        store: w.store,
+        cfg,
+        lineage: w.rec as never,
+        now,
+        rereviewCommand: ["/bin/request"],
+        run: async (argv: string[]) => {
+          calls.push(argv);
+          return ok;
+        },
+        ...over,
+      });
+    await tick();
+    w.client.items.get("github.com/acme/widgets#30")!.pr!.headSha = SHA2;
+    const advance = (ms: number) => {
+      clock += ms;
+    };
+    const setOk = (v: boolean) => {
+      ok = v;
+    };
+    return { w, calls, tick, advance, setOk };
+  };
+
+  it("a failed dispatch is retried after a backoff and then succeeds; it is not marked done", async () => {
+    const { w, calls, tick, advance, setOk } = await movedWorld();
+    const first = await tick();
+    assert.equal(first.rereviews[0]?.dispatch, "failed");
+    assert.equal(calls.length, 1);
+    await tick();
+    assert.equal(calls.length, 1, "inside the backoff nothing runs");
+    advance(31_000);
+    setOk(true);
+    const retry = await tick();
+    assert.equal(calls.length, 2);
+    assert.equal(retry.rereviews[0]?.dispatch, "ok");
+    assert.equal(w.store.listGithubRereviews()[0]?.attempts, 2);
+    advance(10 * 60_000);
+    await tick();
+    assert.equal(calls.length, 2, "ok is final");
+  });
+
+  it("attempts are bounded", async () => {
+    const { calls, tick, advance } = await movedWorld();
+    for (let i = 0; i < 12; i++) {
+      await tick();
+      advance(60 * 60_000);
+    }
+    assert.equal(calls.length, 5);
+  });
+
+  it("an in-flight marker is durable BEFORE the command runs, and a crashed one is re-dispatched after the lease", async () => {
+    const { w, tick, advance } = await movedWorld();
+    let seen: string | undefined;
+    await tick({
+      run: async () => {
+        seen = w.store.listGithubRereviews()[0]?.dispatch;
+        return true;
+      },
+    });
+    assert.equal(seen, "inflight");
+    // simulate a crash: the record is left in-flight
+    const rec = w.store.listGithubRereviews()[0]!;
+    w.store.updateGithubRereview({ ...rec, dispatch: "inflight", inflightAt: "2026-10-23T00:00:00.000Z" });
+    const calls: number[] = [];
+    await tick({
+      run: async () => {
+        calls.push(1);
+        return true;
+      },
+    });
+    assert.equal(calls.length, 0, "a recent in-flight record is not run again");
+    advance(6 * 60_000);
+    await tick({
+      run: async () => {
+        calls.push(1);
+        return true;
+      },
+    });
+    assert.equal(calls.length, 1, "after the lease the request is re-dispatched (at-least-once)");
+  });
+
+  it("two overlapping ticks run the command once", async () => {
+    const { tick } = await movedWorld();
+    let runs = 0;
+    const slow = async () => {
+      runs++;
+      await new Promise((r) => setTimeout(r, 30));
+      return true;
+    };
+    await Promise.all([tick({ run: slow }), tick({ run: slow })]);
+    assert.equal(runs, 1);
+  });
+});
