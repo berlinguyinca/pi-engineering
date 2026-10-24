@@ -23,8 +23,18 @@
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { type ForkParams, parseForkParams } from "./forkParams.ts";
 
-export const STEERING_ACTIONS = ["pause", "resume", "stop_after_step", "redirect", "approve", "reject"] as const;
+export const STEERING_ACTIONS = [
+  "pause",
+  "resume",
+  "stop_after_step",
+  "redirect",
+  "approve",
+  "reject",
+  "fork",
+  "promote",
+] as const;
 export type SteeringAction = (typeof STEERING_ACTIONS)[number];
 export type SteeringOutcome = "applied" | "refused" | "unsupported" | "stale";
 
@@ -40,6 +50,8 @@ export interface SteeringItem {
   /** Herdr's fence over the node head (opaque; Pi cannot recompute it) and the gate digest the person saw. */
   fence: string | null;
   expectedDigest: string | null;
+  /** fork / promote only: typed, validated parameters (never a branch, a path or a command). */
+  params?: ForkParams;
 }
 
 export interface SteeringAck {
@@ -61,8 +73,18 @@ export type ResolvedTarget =
 
 export type SteerResult = "delivered" | "not_running" | "no_channel";
 
+/**
+ * Fork and promote (T13). Absent unless the global YAML enables `forks:`. `knows` decides whether this instance is the
+ * one the request is for (false = skip, so another instance can take it); `apply` does the work and never throws.
+ */
+export interface ForkSteeringPort {
+  knows(item: SteeringItem): boolean | Promise<boolean>;
+  apply(item: SteeringItem): Promise<SteeringAck>;
+}
+
 /** The only things a steering request can reach. Injected, so tests and the runtime choose what they are. */
 export interface SteeringPorts {
+  forks?: ForkSteeringPort;
   /** Map a Herdr graph node id to something Pi owns right now; null when Pi does not know it. */
   resolve(nodeId: string): ResolvedTarget | null;
   /** Hand framed text to the RUNNING task through the broker's steer path. */
@@ -118,6 +140,14 @@ export function parseSteeringItem(raw: unknown): SteeringItem | null {
     if (typeof raw.instruction !== "string") return null;
     instruction = clean(raw.instruction, MAX_TEXT);
   }
+  let params: ForkParams | undefined;
+  if (action === "fork" || action === "promote") {
+    const parsed = parseForkParams(action, raw.params);
+    if (!parsed) return null;
+    params = parsed;
+  } else if (raw.params !== undefined && !(isPlain(raw.params) && Object.keys(raw.params).length === 0)) {
+    return null;
+  }
   return {
     steeringId: id,
     action: action as SteeringAction,
@@ -129,6 +159,7 @@ export function parseSteeringItem(raw: unknown): SteeringItem | null {
     validUntilEpoch: until,
     fence,
     expectedDigest,
+    ...(params ? { params } : {}),
   };
 }
 
@@ -270,6 +301,32 @@ const UNSUPPORTED: Partial<Record<SteeringAction, string>> = {
 const RESUME_WINDOW_MS = 2000;
 
 /**
+ * T13: hand a fork or promote request to the fork port, with the same at-most-once ledger as every other action.
+ * Without the port (forks not enabled in the global YAML) the honest answer is `unsupported`.
+ */
+async function applyFork(
+  item: SteeringItem,
+  ports: SteeringPorts,
+  ledger: SteeringLedger,
+): Promise<SteeringAck | null> {
+  const finish = (a: SteeringAck): SteeringAck => {
+    const bounded = { outcome: a.outcome, note: a.note.slice(0, 280) };
+    ledger.finish(item.steeringId, bounded);
+    return bounded;
+  };
+  const port = ports.forks;
+  if (!port) return finish({ outcome: "unsupported", note: "forks are not enabled on this host" });
+  if (!(await port.knows(item))) return null;
+  if (ports.now() >= item.validUntilEpoch) return finish({ outcome: "stale", note: "expired before it was applied" });
+  ledger.begin(item.steeringId);
+  try {
+    return finish(await port.apply(item));
+  } catch (err) {
+    return finish({ outcome: "refused", note: `could not apply: ${(err as Error).message ?? "error"}` });
+  }
+}
+
+/**
  * Decide and apply one request. Returns the acknowledgement to send, or `null` when this instance does not know the
  * target (nothing is recorded or acknowledged, so Herdr offers it again to the instance that does). Never throws.
  * `ledger` makes the effect at-most-once across restarts and redelivery.
@@ -286,6 +343,7 @@ export async function applySteering(
     ledger.finish(item.steeringId, ack);
     return ack;
   }
+  if (item.action === "fork" || item.action === "promote") return applyFork(item, ports, ledger);
   const target = ports.resolve(item.nodeId);
   if (!target) return null;
   const finish = (ack: SteeringAck): SteeringAck => {

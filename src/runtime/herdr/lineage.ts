@@ -84,6 +84,7 @@ export type LineageState =
   | "failed"
   | "cancelled"
   | "superseded"
+  | "selected"
   | "rolled_over"
   | "prepared"
   | "validated"

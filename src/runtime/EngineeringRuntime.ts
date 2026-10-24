@@ -91,6 +91,7 @@ import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
+import { type ForkRuntime, createForkRuntime } from "./herdr/forkWiring.ts";
 import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
@@ -706,6 +707,7 @@ export class EngineeringRuntime {
   missionSupervisor: MissionSupervisor | null;
   /** T12: outbound-only steering poller; null unless enabled in the global YAML with a control plane configured. */
   steeringReceiver: SteeringReceiver | null = null;
+  forkRuntime: ForkRuntime | null = null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /** The planner the orchestrator uses to turn a mission into tasks. */
@@ -1834,6 +1836,7 @@ export class EngineeringRuntime {
       return rt;
     } catch (error) {
       rt.steeringReceiver?.stop();
+      rt.forkRuntime?.stop();
       rt.externalPumpStopped = true;
       rt.missionActivityTicker?.close();
       rt.missionActivityClock.clear();
@@ -1897,6 +1900,23 @@ export class EngineeringRuntime {
       log: (message) => console.error(message),
     };
     if (opts.steeringReceiver !== undefined) return opts.steeringReceiver;
+    // T13: forks and promotion. Constructed only when the global YAML enables `forks:`; otherwise the port is absent
+    // and a fork/promote request is acknowledged `unsupported`.
+    rt.forkRuntime = await createForkRuntime({
+      agentDir: opts.agentDir ?? getAgentDir(),
+      stateDir: resolveStateRoot(),
+      lineage: opts.lineage ?? null,
+      log: (message) => console.error(message),
+      sources: {
+        getTask: (id) => store.getTask(id),
+        getExecution: (id) => store.getExecution(id),
+        getMission: (id) => store.getMission(id),
+        boundRoot: (repoId) => rt.repositoryRegistry.get(repoId).root,
+        openRoot: async (path) => (await GitRepo.open(path))?.root ?? null,
+        links: store,
+      },
+    });
+    if (rt.forkRuntime) ports.forks = rt.forkRuntime.port;
     const receiver = await createSteeringReceiver({
       agentDir: opts.agentDir ?? getAgentDir(),
       stateDir: resolveStateRoot(),
@@ -1932,6 +1952,7 @@ export class EngineeringRuntime {
     const path = this.orchestrationPath;
     try {
       this.steeringReceiver?.stop();
+      this.forkRuntime?.stop();
       await this.missionSupervisor?.shutdown();
       await this.missionStore?.flush();
       await this.missionObservability?.flush();

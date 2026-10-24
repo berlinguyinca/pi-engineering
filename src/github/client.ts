@@ -84,7 +84,23 @@ export interface GithubClient {
   /** Native issue dependency / sub-issue relations; absent when the server cannot answer. */
   listDependencies?(ref: GithubRef): Promise<GhDependencies>;
   listCheckRuns?(ref: GithubRef, sha: string): Promise<RestCheckRun[]>;
+  /** T13: an OPEN pull request from `branch` of the same repository, or null. */
+  findOpenPullRequestByHead?(repo: RepoKey, branch: string): Promise<GhPullRequest | null>;
+  /** T13: open a pull request (draft by default at the caller). Never merges, never closes. */
+  createPullRequest?(input: CreatePullRequestInput): Promise<GhPullRequest>;
 }
+
+export interface CreatePullRequestInput {
+  repo: RepoKey;
+  head: string;
+  base: string;
+  title: string;
+  body: string;
+  draft: boolean;
+}
+
+/** A branch name safe to hand to the API: the shape Git allows for ordinary branches, nothing option-like. */
+const SAFE_BRANCH = /^[A-Za-z0-9][A-Za-z0-9._\-]*(?:\/[A-Za-z0-9][A-Za-z0-9._\-]*)*$/;
 
 export interface GithubConfig {
   enabled?: boolean;
@@ -114,6 +130,17 @@ export interface GhRunOptions {
 }
 export type GhRunner = (argv: readonly string[], options: GhRunOptions) => Promise<GhRunResult>;
 
+/**
+ * Environment for `gh`: the caller's environment (gh needs its token, HOME and proxy settings) minus every `GIT_*`
+ * variable, so a variable set for some other tool (GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, GIT_CONFIG_*) cannot make a
+ * git subprocess of gh run something unexpected. Only `gh api` is used here and it never reads repository config.
+ */
+export function ghEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(source)) if (!k.toUpperCase().startsWith("GIT_")) env[k] = v;
+  return { ...env, GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", GH_PAGER: "cat", NO_COLOR: "1" };
+}
+
 export function execGh(ghPath: string): GhRunner {
   return (argv, options) =>
     new Promise((resolve, reject) => {
@@ -124,7 +151,7 @@ export function execGh(ghPath: string): GhRunner {
           timeout: options.timeoutMs,
           maxBuffer: options.maxOutputBytes,
           windowsHide: true,
-          env: { ...process.env, GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1", GH_PAGER: "cat", NO_COLOR: "1" },
+          env: ghEnv(),
         },
         (error, stdout, stderr) => {
           if (!error) return resolve({ stdout: String(stdout), stderr: String(stderr), code: 0 });
@@ -263,6 +290,57 @@ export class GhCliClient implements GithubClient {
       baseRef: boundTitle(base.ref).slice(0, 255),
       url: str(raw.html_url).slice(0, 500),
     };
+  }
+
+  async findOpenPullRequestByHead(repoIn: RepoKey, branch: string): Promise<GhPullRequest | null> {
+    const repo = this.repoOf(repoIn);
+    if (!SAFE_BRANCH.test(branch) || branch.length > 200) throw new GithubClientError("invalid", "bad branch");
+    const raw = await this.api(repo.host, `repos/${repo.owner}/${repo.repo}/pulls`, [
+      "-X",
+      "GET",
+      "-f",
+      `head=${repo.owner}:${branch}`,
+      "-f",
+      "state=open",
+      "-F",
+      "per_page=5",
+    ]);
+    if (!Array.isArray(raw)) throw new GithubClientError("transient", "unexpected pull request list");
+    for (const item of raw) {
+      const r = asRecord(item);
+      const head = asRecord(r.head);
+      const headRepo = asRecord(head.repo);
+      // only a branch of THIS repository: a fork's branch of the same name is somebody else's work
+      if (head.ref !== branch || str(headRepo.full_name).toLowerCase() !== `${repo.owner}/${repo.repo}`.toLowerCase())
+        continue;
+      if (typeof r.number !== "number") continue;
+      return this.getPullRequest({ ...repo, number: r.number, kind: "pr" });
+    }
+    return null;
+  }
+
+  async createPullRequest(input: CreatePullRequestInput): Promise<GhPullRequest> {
+    const repo = this.repoOf(input.repo);
+    if (!SAFE_BRANCH.test(input.head) || !SAFE_BRANCH.test(input.base))
+      throw new GithubClientError("invalid", "bad branch");
+    const raw = asRecord(
+      await this.api(repo.host, `repos/${repo.owner}/${repo.repo}/pulls`, [
+        "-X",
+        "POST",
+        "-f",
+        `title=${boundTitle(input.title)}`,
+        "-f",
+        `head=${input.head}`,
+        "-f",
+        `base=${input.base}`,
+        "-f",
+        `body=${boundBody(input.body).text}`,
+        "-F",
+        `draft=${input.draft ? "true" : "false"}`,
+      ]),
+    );
+    if (typeof raw.number !== "number") throw new GithubClientError("transient", "unexpected pull request payload");
+    return this.getPullRequest({ ...repo, number: raw.number, kind: "pr" });
   }
 
   async searchIssues(repoIn: RepoKey, terms: string, limit: number): Promise<GhIssueSummary[]> {
