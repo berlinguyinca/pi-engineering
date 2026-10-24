@@ -21,6 +21,7 @@ export type EventType =
   | "agent.started"
   | "agent.completed"
   | "agent.failed"
+  | "incident.detected"
   | "candidate.created"
   | "candidate.changed"
   | "candidate.rejected"
