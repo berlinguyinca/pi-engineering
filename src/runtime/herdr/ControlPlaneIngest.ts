@@ -23,6 +23,11 @@
 
 import os from "node:os";
 
+import type { EnvelopeDraft, EnvelopeV2 } from "./envelope.ts";
+import { scopeIdsFromPayload } from "./envelopeAdapters.ts";
+import type { EnvelopeStore } from "./envelopeStore.ts";
+import type { OutboxStats } from "./outbox.ts";
+
 export interface ControlPlaneIngestOptions {
   /** Control-plane base URL, e.g. "http://dev.lan" (no trailing slash). */
   url: string;
@@ -36,7 +41,45 @@ export interface ControlPlaneIngestOptions {
   timeoutMs?: number;
   /** Optional control-plane API key (sent as X-API-Key; use an `ingest`-role key). */
   apiKey?: string;
+  /**
+   * Opt-in envelope v2 + durable outbox. When set, every emit is stamped with a
+   * persisted source_sequence, appended to the local outbox and then delivered
+   * in order; undelivered events replay on the next emit / {@link flushOutbox}.
+   * Absent (the default) the client behaves exactly as before: v1 body, no disk.
+   */
+  envelopeStore?: EnvelopeStore;
+  /** Delivery back-off / dead-letter tuning (outbox mode only). */
+  backoff?: BackoffOptions;
+  /** Injectable clock (ms) for tests. */
+  now?: () => number;
 }
+
+export interface BackoffOptions {
+  /** First retry delay (default 1000); doubles per consecutive failure. */
+  baseMs?: number;
+  /** Cap on any delay (default 60000). */
+  maxMs?: number;
+  /** Consecutive 5xx on the same head event before it is dead-lettered (default 5). */
+  deadLetterAfter?: number;
+}
+
+export interface ControlPlaneDiagnostics extends OutboxStats {
+  source: string;
+  sequenceFailures: number;
+  consecutiveFailures: number;
+  backoffUntil: string | null;
+  lastStatus: number | null;
+  credentialProblem: boolean;
+}
+
+function retryAfterMs(res: Response): number | undefined {
+  const raw = res.headers?.get("retry-after");
+  const secs = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(secs) && secs >= 0 ? secs * 1000 : undefined;
+}
+
+/** Hard cap on events replayed by one flush pass. */
+const MAX_FLUSH = 500;
 
 export class ControlPlaneIngest {
   readonly url: string;
@@ -48,6 +91,16 @@ export class ControlPlaneIngest {
   private readonly timeoutMs: number;
   private readonly apiKey?: string;
   private readonly seenMissions = new Set<string>();
+  private readonly envelopeStore?: EnvelopeStore;
+  private flushChain: Promise<unknown> = Promise.resolve();
+  private readonly now: () => number;
+  private readonly backoff: Required<BackoffOptions>;
+  private consecutiveFailures = 0;
+  private nextAttemptAt = 0;
+  private lastStatus: number | undefined;
+  private credentialProblem = false;
+  private headId: string | undefined;
+  private headFailures = 0;
 
   constructor(opts: ControlPlaneIngestOptions) {
     const hostId = opts.host?.hostId ?? os.hostname();
@@ -61,6 +114,152 @@ export class ControlPlaneIngest {
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.timeoutMs = opts.timeoutMs ?? 1500;
     this.apiKey = opts.apiKey?.trim() || undefined;
+    this.envelopeStore = opts.envelopeStore;
+    this.now = opts.now ?? Date.now;
+    this.backoff = { baseMs: 1000, maxMs: 60_000, deadLetterAfter: 5, ...opts.backoff };
+  }
+
+  private async post(body: unknown): Promise<Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      return await this.fetchImpl(`${this.url}/api/v1/ingest`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(this.apiKey ? { "x-api-key": this.apiKey } : {}) },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Deliver pending outbox events in order. Per response:
+   *  - 2xx: delivered (an acknowledged duplicate is also 2xx).
+   *  - 400 / 409 / 422: terminal server rejection -> dead-letter, continue.
+   *  - 401 / 403: credentials problem -> keep everything queued, back off, never drop.
+   *  - 408 / 425 / 429: transient -> back off (honouring Retry-After), never dead-letter.
+   *  - 5xx: transient with back-off; after `deadLetterAfter` consecutive 5xx on the
+   *    SAME head event it is dead-lettered so one poison event cannot block the queue.
+   *  - network error / timeout: transient, never counts toward dead-lettering.
+   *  - any other 4xx (404, 413, ...): terminal -> dead-letter, continue.
+   * Back-off is time-based (no timers): a pass during back-off does nothing.
+   * Never throws. Returns the ids delivered by this pass.
+   */
+  flushOutbox(): Promise<Set<string>> {
+    const store = this.envelopeStore;
+    if (!store || !this.enabled) return Promise.resolve(new Set());
+    const run = this.flushChain.then(async () => {
+      const acked = new Set<string>();
+      const toAck: string[] = [];
+      try {
+        if (this.now() < this.nextAttemptAt) return acked;
+        const pending = await store.outbox.peek(MAX_FLUSH);
+        for (const envelope of pending) {
+          let res: Response;
+          try {
+            res = await this.post(envelope);
+          } catch {
+            this.failed(); // network / timeout: transient
+            break;
+          }
+          const status = res.status;
+          if (res.ok) {
+            acked.add(envelope.event_id);
+            toAck.push(envelope.event_id);
+            this.succeeded();
+            store.outbox.markHealthy();
+          } else if (status === 400 || status === 409 || status === 422) {
+            await store.outbox.deadLetter(envelope, "server_rejected", status);
+            this.headId = undefined;
+          } else if (status === 401 || status === 403) {
+            this.credentialProblem = true;
+            this.failed(status);
+            break;
+          } else if (status === 408 || status === 425 || status === 429) {
+            this.failed(status, retryAfterMs(res));
+            break;
+          } else if (status >= 500) {
+            if (this.headId !== envelope.event_id) {
+              this.headId = envelope.event_id;
+              this.headFailures = 0;
+            }
+            if (++this.headFailures >= this.backoff.deadLetterAfter) {
+              await store.outbox.deadLetter(envelope, "repeated_5xx", status);
+              this.headId = undefined;
+              continue;
+            }
+            this.failed(status);
+            break;
+          } else if (status >= 400) {
+            await store.outbox.deadLetter(envelope, "client_error", status);
+            this.headId = undefined;
+          } else {
+            this.failed(status); // unexpected non-2xx below 400
+            break;
+          }
+        }
+      } catch {
+        // best-effort: leave the rest pending for the next pass
+      }
+      try {
+        await store.outbox.ackMany(toAck); // one lock + one write for the whole pass
+      } catch {
+        acked.clear(); // not durably acked: will be re-sent and deduped by the server
+      }
+      return acked;
+    });
+    this.flushChain = run.catch(() => {});
+    return run;
+  }
+
+  private failed(status?: number, retryAfter?: number): void {
+    this.consecutiveFailures++;
+    this.lastStatus = status;
+    const exp = Math.min(this.backoff.maxMs, this.backoff.baseMs * 2 ** (this.consecutiveFailures - 1));
+    this.nextAttemptAt = this.now() + Math.max(exp, Math.min(retryAfter ?? 0, this.backoff.maxMs));
+  }
+
+  private succeeded(): void {
+    this.consecutiveFailures = 0;
+    this.nextAttemptAt = 0;
+    this.credentialProblem = false;
+    this.headId = undefined;
+    this.lastStatus = undefined;
+  }
+
+  /** Health / diagnostic snapshot: queue depth, loss counters and back-off state. */
+  diagnostics(): ControlPlaneDiagnostics | undefined {
+    const store = this.envelopeStore;
+    if (!store) return undefined;
+    return {
+      ...store.stats(),
+      consecutiveFailures: this.consecutiveFailures,
+      backoffUntil: this.nextAttemptAt > this.now() ? new Date(this.nextAttemptAt).toISOString() : null,
+      lastStatus: this.lastStatus ?? null,
+      credentialProblem: this.credentialProblem,
+    };
+  }
+
+  /** Terminal server rejections (kept for compatibility with the counter's earlier home). */
+  get rejected(): number {
+    return this.envelopeStore?.outbox.rejected ?? 0;
+  }
+
+  /** Stage a draft in the outbox and try to deliver. False when disabled/failed/not (yet) delivered. */
+  async emitDraft(draft: EnvelopeDraft): Promise<boolean> {
+    const store = this.envelopeStore;
+    if (!this.enabled || !store) return false;
+    let staged: Awaited<ReturnType<EnvelopeStore["stage"]>>;
+    try {
+      staged = await store.stage(draft);
+    } catch {
+      return false;
+    }
+    if (!("envelope" in staged)) return staged.status === "delivered";
+    const acked = await this.flushOutbox();
+    return acked.has(staged.envelope.event_id);
   }
 
   /**
@@ -75,20 +274,18 @@ export class ControlPlaneIngest {
     payload: Record<string, unknown> = {},
   ): Promise<boolean> {
     if (!this.enabled) return false;
-    let res: Response;
+    if (this.envelopeStore) {
+      return this.emitDraft({
+        occurred_at: new Date(),
+        entity_type: entityType,
+        entity_id: entityId,
+        event_type: eventType,
+        payload,
+        ...scopeIdsFromPayload(payload),
+      });
+    }
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-      try {
-        res = await this.fetchImpl(`${this.url}/api/v1/ingest`, {
-          method: "POST",
-          headers: { "content-type": "application/json", ...(this.apiKey ? { "x-api-key": this.apiKey } : {}) },
-          body: JSON.stringify({ entity_type: entityType, entity_id: entityId, event_type: eventType, payload }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
+      const res = await this.post({ entity_type: entityType, entity_id: entityId, event_type: eventType, payload });
       return res.ok;
     } catch {
       return false;
