@@ -3,11 +3,11 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
-import { createIngestFromEnv } from "../src/runtime/herdr/ingestFromEnv.ts";
+import { resolveAttentionIngest } from "../src/runtime/herdr/ingestFromEnv.ts";
 import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
@@ -361,7 +361,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
   const lineage = await lineageEmitter();
-  const attentionIngest = createIngestFromEnv(process.env);
+  const attentionIngest = await resolveAttentionIngest(process.env, getAgentDir());
   const attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
   let attentionReady = false;
   const opening = EngineeringRuntime.open({
@@ -2315,8 +2315,10 @@ ${RECOVERY_PROMPT}`;
   // never depends on it (the semantic tool + runtime gate enforce policy).
   // Planner/worker execution mode (docs/specs/planner-worker-hot-model-routing.md):
   // /engineering-* commands, and the mode `/mission` consults before orchestrating.
-  const plannerAttentionIngest = createIngestFromEnv(process.env);
-  const plannerAttention = plannerAttentionIngest ? new MissionAttentionReporter(plannerAttentionIngest) : null;
+  // env first, then the engineering.yaml `herdr:` block; resolved lazily because this site is synchronous
+  const plannerAttention = resolveAttentionIngest(process.env, getAgentDir()).then((i) =>
+    i ? new MissionAttentionReporter(i) : null,
+  );
   const plannerWorker = registerPlannerWorker(pi, {
     host: async (ctx) => {
       const rt = await getRuntime(ctx);
@@ -2324,7 +2326,7 @@ ${RECOVERY_PROMPT}`;
         repoRoot: rt.git?.root ?? rt.cwd,
         worker: rt.worker,
         reportAttention: (snapshot: Parameters<MissionAttentionReporter["update"]>[0]) => {
-          void plannerAttention?.update(snapshot).catch(() => {});
+          void plannerAttention.then((r) => r?.update(snapshot)).catch(() => {});
         },
         // Live missions an operator paused or pinned, for /engineering-status.
         missionControlLines: () =>
