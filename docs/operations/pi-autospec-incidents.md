@@ -21,8 +21,11 @@ autospec incident ingest \
 
 Dry-run validates the versioned `agent_failure` event and returns the projected
 issue, labels, fingerprint, and debugger dispatch without contacting GitHub.
-Live ingestion deduplicates open `origin:pi-incident` issues by the stable
-fingerprint marker before creating a new issue.
-
-The current slice does not merge PRs or deploy code. It produces the durable,
-safe handoff required for the next AutoSpec autonomous-run integration slice.
+Live ingestion deduplicates `origin:pi-incident` issues by the stable
+fingerprint marker before creating a new issue, then dispatches the existing
+issue-scoped autonomous conductor. That conductor owns the verified PR and
+merge gates. Pi's `DeploymentController` provides the
+deployment boundary for a configured adapter: it requires a distinct previous
+artifact, promotes the new version, runs health checks, and rolls back on
+failure while recording `deployment.*` evidence. It does not select or invoke
+a production command by itself.
