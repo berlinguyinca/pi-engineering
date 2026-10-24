@@ -24,7 +24,13 @@ import { emitTelemetry } from "../../telemetry/sink.ts";
 import type { EnvelopeV2 } from "./envelope.ts";
 import { atomicWriteFile, cleanupLeakedTmp, withFileLock } from "./portableLock.ts";
 
-export type DeadLetterReason = "server_rejected" | "client_error" | "repeated_5xx" | "oversized" | "overflow_dropped";
+export type DeadLetterReason =
+  | "server_rejected"
+  | "lineage_forbidden"
+  | "client_error"
+  | "repeated_5xx"
+  | "oversized"
+  | "overflow_dropped";
 
 export interface OutboxStats {
   pending: number;
@@ -150,7 +156,7 @@ export class EnvelopeOutbox {
   deadLetter(envelope: EnvelopeV2, reason: DeadLetterReason, httpStatus?: number): Promise<void> {
     return this.locked(async () => {
       await this.writeDeadLetter(envelope, reason, httpStatus);
-      if (reason === "server_rejected") this.rejected++;
+      if (reason === "server_rejected" || reason === "lineage_forbidden") this.rejected++;
       else this.deadLettered++;
       if (this.index.has(envelope.event_id)) {
         await this.writeLine({ t: "ack", event_id: envelope.event_id, s: "dead" }, false);
