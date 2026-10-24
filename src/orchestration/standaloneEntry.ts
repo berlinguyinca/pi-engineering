@@ -134,6 +134,12 @@ export async function runStandalonePlan(
   io: StandalonePlanIo = {},
   deps: StandalonePlanDeps = {},
 ): Promise<number> {
+  // Optional AutoSpec DAG source (T04): loaded only when asked for, and refused
+  // unless autospec.dag.enabled is set in Pi's own config.
+  if (argv.includes("--from-autospec")) {
+    const { runAutoSpecPlan } = await import("../integrations/autospec/planCli.ts");
+    return runAutoSpecPlan(argv, env, io, deps);
+  }
   const out = io.write ?? ((t: string) => process.stdout.write(t));
   const err = io.error ?? ((t: string) => process.stderr.write(t));
 

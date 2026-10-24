@@ -1,0 +1,15 @@
+{
+  "counts": {
+    "failed": 0,
+    "run": 0,
+    "unmapped": 0
+  },
+  "critic_checklist": [],
+  "gates": [],
+  "generated_at": "2026-10-23T07:39:17Z",
+  "pack_quality_gates": [],
+  "reason": "no-config",
+  "status": "skipped",
+  "status_line": "SKIPPED",
+  "version": 1
+}

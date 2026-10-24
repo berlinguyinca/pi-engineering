@@ -26,6 +26,7 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
@@ -1666,7 +1667,34 @@ export class EngineeringRuntime {
       rt.missionPlanner = opts.orchestrationPlanner ?? defaultPlanner;
       const limits = await loadMissionLimits(repoRoot, opts.agentDir);
       const recoveryBudget = missionRecoveryBudget(rt.resilience);
+      // Optional AutoSpec design gate for orchestrated missions (T04). Nothing from
+      // the integration is imported unless an `autospec` block exists or a layer is unparsable.
+      let completionEvidence: ConstructorParameters<typeof Orchestrator>[0]["completionEvidence"];
+      let autospecOn = false;
+      try {
+        if (await autospecConfigured(repoRoot, opts.agentDir ? { agentDir: opts.agentDir } : {})) {
+          autospecOn = true;
+          const provider = await import("../integrations/autospec/provider.ts");
+          const autospecConfig = await provider.loadAutoSpecConfig(
+            repoRoot,
+            opts.agentDir ? { agentDir: opts.agentDir } : {},
+          );
+          completionEvidence = (_mission, candidates) =>
+            provider.missionDesignGateReasons(autospecConfig, {
+              repoRoot,
+              candidates: candidates.map((c) => ({
+                baseSha: c.identity.baseSha,
+                candidateSha: c.identity.candidateSha,
+              })),
+            });
+        }
+      } catch (error) {
+        // Configured-but-unloadable must block, not silently disable.
+        const why = error instanceof Error ? error.message : String(error);
+        if (autospecOn) completionEvidence = () => [`autospec_config: integration failed to load: ${why}`];
+      }
       rt.orchestrator = new Orchestrator({
+        ...(completionEvidence ? { completionEvidence } : {}),
         recovery: recoveryBudget,
         store: rt.missionStore,
         backends,
