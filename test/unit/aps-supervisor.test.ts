@@ -10,6 +10,7 @@ import { ToolCallNormalizer, semanticFingerprint } from "../../src/aps/fingerpri
 import { AGENT_LOOP_CANDIDATE_EVENT, AgentProgressSupervisor } from "../../src/aps/supervisor.ts";
 import type { AgentAction } from "../../src/aps/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { IncidentController } from "../../src/incidents/IncidentController.ts";
 import type { TelemetryNotice } from "../../src/telemetry/sink.ts";
 import { setTelemetrySink } from "../../src/telemetry/sink.ts";
 
@@ -120,6 +121,29 @@ test("emits a structured agent.loop_candidate event on loop detection", async ()
   assert.equal(stored.event_id, event.event_id);
   assert.equal((stored.payload as { reason: string }).reason, "repeated_call");
   assert.equal((stored.payload as { family: string }).family, "READ_FILE");
+});
+
+test("records a prevented loop as a durable incident when incident wiring is configured", async () => {
+  const store = JsonlEventStore.inMemory();
+  const incidents = new IncidentController({ backend: store, publish: async () => {} });
+  const supervisor = new AgentProgressSupervisor({
+    eventStore: store,
+    incidentController: incidents,
+    incidentContext: { repo: "owner/repo", revision: "abc123", worktree: "/tmp/worktree" },
+    prevention: { enabled: true, noProgressTurns: 2, noMutationStall: 0 },
+    now: () => "2026-01-01T00:00:00.000Z",
+  });
+
+  await supervisor.observe(READ_X());
+  await supervisor.observe(READ_X());
+  const result = await supervisor.observe(READ_X());
+
+  assert.equal(result.prevented, true);
+  const incident = store.all().find((event) => event.type === "incident.detected");
+  assert.ok(incident);
+  assert.equal(incident.payload.type, "agent_failure");
+  assert.equal(incident.payload.repo, "owner/repo");
+  assert.equal(incident.payload.classification, "runtime_tooling");
 });
 
 test("dedupes the same loop; re-emits after progress resumes", async () => {
