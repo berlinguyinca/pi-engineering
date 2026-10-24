@@ -83,6 +83,23 @@ describe("gh client: argv-only execution", () => {
     assert.equal(pr.headSha, sha);
   });
 
+  it("keeps only a well-formed author login from the pulls payload", async () => {
+    const sha = "b".repeat(40);
+    const pr = (user: unknown) =>
+      json({ number: 7, state: "open", title: "PR", head: { sha, ref: "f" }, base: { ref: "main" }, user });
+    const { run } = scripted([
+      pr({ login: "octo-author" }),
+      pr({ login: "dependabot[bot]" }),
+      pr({ login: "bad login; rm -rf" }),
+      pr(null),
+    ]);
+    const client = new GhCliClient(config, run);
+    assert.equal((await client.getPullRequest(ref("#7"))).author, "octo-author");
+    assert.equal((await client.getPullRequest(ref("#7"))).author, "dependabot[bot]");
+    assert.equal((await client.getPullRequest(ref("#7"))).author, undefined);
+    assert.equal((await client.getPullRequest(ref("#7"))).author, undefined);
+  });
+
   it("untrusted search text can neither add a flag nor a qualifier", async () => {
     const { run, calls } = scripted([json({ items: [{ number: 3, title: "x", state: "open" }] })]);
     const client = new GhCliClient(config, run);

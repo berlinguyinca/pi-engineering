@@ -25,6 +25,8 @@ export interface LinkObservation {
   headSha?: string;
   /** Bounded, redacted title. */
   title?: string;
+  /** PR author's GitHub login as observed (untrusted display/exclusion hint, never an identity grant). */
+  author?: string;
   observedAt?: string;
 }
 

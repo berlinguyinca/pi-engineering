@@ -15,7 +15,7 @@ interface FakeIssue {
   body?: string;
   state: "open" | "closed";
   stateReason?: string;
-  pr?: { state: "open" | "closed" | "merged"; headSha: string; body?: string };
+  pr?: { state: "open" | "closed" | "merged"; headSha: string; body?: string; author?: string };
   deps?: GhDependencies;
 }
 
@@ -84,6 +84,7 @@ export class FakeGithubClient implements GithubClient {
       bodyTruncated: parseableBody(item.pr.body ?? item.body).truncated,
       state: item.pr.state,
       headSha: item.pr.headSha,
+      ...(item.pr.author ? { author: item.pr.author } : {}),
       headRef: "feature",
       baseRef: "main",
       url: `https://${ref.host}/${ref.owner}/${ref.repo}/pull/${ref.number}`,

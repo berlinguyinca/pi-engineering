@@ -40,12 +40,14 @@ export async function linkPullRequest(
   let headSha = input.headSha?.toLowerCase();
   let state: "open" | "closed" | "merged" | undefined;
   let title: string | undefined;
+  let author: string | undefined;
   if (client) {
     try {
       const pr = await client.getPullRequest(ref);
       headSha = pr.headSha;
       state = pr.state;
       title = pr.title;
+      author = pr.author;
     } catch (error) {
       // A PR GitHub says does not exist is never linked; other failures keep caller-provided data
       // (the reconciler verifies it later), but nothing is recorded without a head SHA.
@@ -73,6 +75,7 @@ export async function linkPullRequest(
           ...(state ? { state } : {}),
           ...(headSha ? { headSha } : {}),
           ...(title ? { title } : {}),
+          ...(author ? { author } : {}),
           observedAt: now(),
         },
         status: "active",

@@ -93,6 +93,7 @@ export function emitLinkRecorded(sink: GithubLineageSink | null | undefined, lin
       attrs: {
         ...(link.observed.state ? { github_state: link.observed.state } : {}),
         ...(link.observed.headSha ? { head_sha: link.observed.headSha } : {}),
+        ...(link.targetKind === "pr" && link.observed.author ? { author: link.observed.author } : {}),
       },
     },
     t,

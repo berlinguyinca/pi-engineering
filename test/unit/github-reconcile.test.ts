@@ -65,7 +65,7 @@ async function world() {
   client.put("github.com/acme/widgets#30", {
     title: "PR",
     state: "open",
-    pr: { state: "open", headSha: SHA1, body: "Fixes #12" },
+    pr: { state: "open", headSha: SHA1, body: "Fixes #12", author: "octo-author" },
   });
   const subjects = [
     { kind: "task" as const, id: "t1" },
@@ -387,6 +387,17 @@ describe("lineage through an injected sink", () => {
     assert.deepEqual([produced?.[2], produced?.[3]], ["attempt:a1", "pr:github.com/acme/widgets#30"]);
     for (const e of edges)
       assert.match(String(e[3]), /^(issue|pr):github\.com\/acme\/widgets#\d+$/, "issue_link only targets issue/pr");
+  });
+
+  it("the PR node carries the observed author login so Herdr can exclude the author from review quorum", async () => {
+    const { store } = await world();
+    const sink = new RecordingSink();
+    for (const l of store.listGithubLinks()) emitLinkRecorded(sink, l);
+    const upserts = sink.events.filter((e) => e[0] === "nodeUpsert");
+    const prNode = upserts.find((e) => e[1] === "pr:github.com/acme/widgets#30");
+    assert.equal((prNode?.[2] as { attrs?: { author?: string } }).attrs?.author, "octo-author");
+    const issueNode = upserts.find((e) => e[1] === "issue:github.com/acme/widgets#12");
+    assert.equal((issueNode?.[2] as { attrs?: Record<string, unknown> }).attrs?.author, undefined);
   });
 
   it("dependency edges run dependent -> prerequisite with repo-qualified ids", () => {
