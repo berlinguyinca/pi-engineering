@@ -520,6 +520,25 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
     );
   });
 
+  it("Pi's real path with a key scoped to ONE room: Pi stamps the YAML room_id, so a scoped key delivers for its room and is refused for another", async () => {
+    const mine = await startPiHost(plane, { key: "scoped", instanceId: "pi-scoped", roomId: "room-elsewhere" });
+    const g = WorkGraph.create(JsonlEventStore.inMemory());
+    g.setLineage(mine.emitter);
+    const ok = g.createWorker({ projectId: "P-scoped", role: "lead" }).id;
+    await mine.drain();
+    await eventually(
+      async () => (await plane.node(`agent:${ok}`)).status === 200,
+      "the scoped key's own room delivers",
+    );
+    // negative control: the SAME key, YAML pointed at a room the operator did not list, is refused by Herdr
+    const wrong = await startPiHost(plane, { key: "scoped", instanceId: "pi-scoped-2", roomId });
+    const g2 = WorkGraph.create(JsonlEventStore.inMemory());
+    g2.setLineage(wrong.emitter);
+    const bad = g2.createWorker({ projectId: "P-scoped", role: "lead" }).id;
+    await wrong.drain();
+    assert.equal((await plane.node(`agent:${bad}`)).status, 404, "a room the key may not address leaves no trace");
+  });
+
   it("membership-scoped reads: members read; guests, outsiders and other rooms' members get one indistinguishable 404", async () => {
     for (const who of ["alice", "bob"]) {
       const r = await listing(who);
