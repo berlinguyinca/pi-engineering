@@ -1691,6 +1691,13 @@ export class MissionStore {
         ...(input.recoveredMerged?.length ? { recovered_merged: [...input.recoveredMerged] } : {}),
         ...(input.reviewedRecovered?.length ? { reviewed_recovered: [...input.reviewedRecovered] } : {}),
       };
+      // A gate publication over the SAME content keeps a reconstruction origin
+      // (#360): the marker records where the candidate content came from, and
+      // re-affirming evidence does not change that origin. The marker rides on
+      // the publication payload, so replay reproduces the same state.
+      const originPrior = this.candidates.get(candidateKey(current.mission_id, identity.repoId));
+      const carriedOrigin =
+        originPrior && originPrior.identityHash === identityHash ? originPrior.reconstructedFrom : undefined;
       const candidate: CandidateRevision = {
         missionId: current.mission_id,
         taskId: task.task_id,
@@ -1699,6 +1706,7 @@ export class MissionStore {
         identityHash,
         reason: input.reason.trim() || "candidate changed",
         recordedAt: now,
+        ...(carriedOrigin ? { reconstructedFrom: carriedOrigin } : {}),
       };
       const evidenceRecordedAt = this.freshEvidenceTimestamp({
         missionId: current.mission_id,
@@ -2795,6 +2803,11 @@ export class MissionStore {
     const key = candidateKey(missionId, identity.repoId);
     const prior = this.candidates.get(key);
     if (prior && prior.identityHash !== identityHash) this.invalidateCandidate(prior, reason);
+    // A same-content re-record (e.g. gate evidence re-published over the
+    // reconstructed candidate) keeps the reconstruction origin: the marker
+    // documents where the content CAME FROM, which later evidence does not
+    // change. A different-content candidate starts a fresh origin.
+    const carriedOrigin = prior && prior.identityHash === identityHash ? prior.reconstructedFrom : undefined;
     const candidate: CandidateRevision = {
       missionId,
       taskId: provenance.taskId,
@@ -2803,6 +2816,7 @@ export class MissionStore {
       identityHash,
       reason: reason.trim() || "candidate changed",
       recordedAt: new Date().toISOString(),
+      ...(carriedOrigin ? { reconstructedFrom: carriedOrigin } : {}),
     };
     this.candidates.set(key, candidate);
     this.candidateExecutionIds.add(candidate.executionId);
