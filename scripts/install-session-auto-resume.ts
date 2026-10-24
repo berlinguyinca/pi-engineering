@@ -97,7 +97,17 @@ for (const file of files) {
   renameSync(staged, join(install, file));
 }
 writeFileSync(join(install, "package.json"), JSON.stringify({ private: true, type: "module" }));
-for (const name of packages) linkPackage(install, name, locatePackage(packageRoot, name));
+// Packages only the optional runtime-selection step imports: where this Pi does not bundle one, the
+// launcher still installs and that step falls back to standard Pi at start (it never blocks Pi).
+const optionalPackages = new Set(["yaml"]);
+for (const name of packages) {
+  try {
+    linkPackage(install, name, locatePackage(packageRoot, name));
+  } catch (error) {
+    if (!optionalPackages.has(name)) throw error;
+    console.warn(`Optional package ${name} not found in this Pi; pi_runtime selection will fall back to standard Pi`);
+  }
+}
 if (managed) {
   installManagedHook();
   process.exit(0);
