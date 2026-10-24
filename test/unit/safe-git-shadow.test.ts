@@ -20,10 +20,20 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { type GitTrust, forgetRemotePinsForTests, safeGit, safeGitSync, testHooks } from "../../src/git/safeGit.ts";
+import {
+  type GitTrust,
+  forgetRemotePinsForTests,
+  safeGit,
+  safeGitSync,
+  stateHooks,
+  testHooks,
+} from "../../src/git/safeGit.ts";
 import { resetTelemetrySinks, setTelemetrySink } from "../../src/telemetry/sink.ts";
 
 const MODES: GitTrust[] = ["strict", "operator"];
+// a private shadow root for this file alone: other test files running in parallel never add to or remove from it
+const shadowDir = mkdtempSync(join(tmpdir(), "safe-git-shadow-root-"));
+stateHooks.shadowRoot = shadowDir;
 
 afterEach(() => {
   testHooks.afterPlan = undefined;
@@ -59,7 +69,7 @@ function lab() {
   };
 }
 
-const leftovers = (): string[] => readdirSync(tmpdir()).filter((n) => n.startsWith("pi-safegit-"));
+const leftovers = (): string[] => readdirSync(shadowDir);
 
 test("no shadow directory is left behind, for success, failure and refusal, async and sync", async () => {
   const l = lab();
@@ -106,7 +116,7 @@ test("commits, branches, tags, merges and ref deletion leave the real repository
       assert.equal(l.sh("git tag --list", l.repo).trim(), "");
       assert.equal(l.sh("git fsck --strict 2>&1 | grep -c -E '^(error|fatal)' || true", l.repo).trim(), "0");
       assert.deepEqual(
-        readdirSync(join(l.repo, ".git")).filter((n) => n.endsWith(".lock") || n.includes("pi-safegit")),
+        readdirSync(join(l.repo, ".git")).filter((n) => n.endsWith(".lock") || n.includes(shadowDir)),
         [],
       );
     } finally {
@@ -180,7 +190,7 @@ test("a file git creates in the common directory because it does not exist yet (
   }
 });
 
-test("config the command itself writes (remote add/set-url/rename/remove, upstream, git config) reaches the real config; other keys are untouched", async () => {
+test("config the command itself writes (remote add/set-url/rename/remove, upstream, git config) reaches the real config (allow-listed keys only); other keys are untouched", async () => {
   for (const trust of MODES) {
     const l = lab();
     try {
@@ -201,7 +211,8 @@ test("config the command itself writes (remote add/set-url/rename/remove, upstre
       assert.match(cfg, /remote\.second\.url=https:\/\/example\.invalid\/up\.git/);
       assert.match(cfg, /remote\.origin\.url=https:\/\/example\.invalid\/o\.git/);
       assert.match(cfg, /user\.name=Changed/);
-      assert.match(cfg, /branch\.main\.description=dropped-by-allowlist-but-written/);
+      // round 4: only allow-listed keys are replayed; a key git was never meant to write into the generated config is reported, not copied
+      assert.doesNotMatch(cfg, /branch\.main\.description/);
       assert.match(cfg, /core\.fsmonitor=/, "keys the generated config did not carry stay in the real file");
       assert.match(cfg, /filter\.keep\.clean=cat/);
       assert.doesNotMatch(cfg, /remote\.up\./);
@@ -256,18 +267,18 @@ test("worktree add / list / remove / prune: paths are real, the new worktree's .
       assert.equal(add.code, 0, add.stderr);
       const link = readFileSync(join(wt, ".git"), "utf8");
       assert.equal(link.trim(), `gitdir: ${join(l.repo, ".git", "worktrees", `wt-${trust}`)}`);
-      assert.ok(!link.includes("pi-safegit"));
+      assert.ok(!link.includes(shadowDir));
       for (const f of readdirSync(join(l.repo, ".git", "worktrees", `wt-${trust}`), { withFileTypes: true })
         .filter((e) => e.isFile())
         .map((e) => e.name)) {
         const body = readFileSync(join(l.repo, ".git", "worktrees", `wt-${trust}`, f), "utf8");
-        assert.ok(!body.includes("pi-safegit"), `${f} names the shadow directory`);
+        assert.ok(!body.includes(shadowDir), `${f} names the shadow directory`);
       }
       assert.equal(l.sh("git status --porcelain", wt), "");
       const list = await safeGit(["worktree", "list", "--porcelain"], { cwd: l.repo, trust });
       assert.match(list.stdout, new RegExp(`worktree ${l.repo}\\n`));
       assert.match(list.stdout, new RegExp(`worktree ${wt}\\n`));
-      assert.ok(!list.stdout.includes("pi-safegit"));
+      assert.ok(!list.stdout.includes(shadowDir));
       const common = await safeGit(["rev-parse", "--git-common-dir", "--git-dir", "--show-toplevel"], {
         cwd: wt,
         trust,
@@ -399,7 +410,7 @@ test("a repository with no remote is not pinned to 'nothing': a remote added lat
   }
 });
 
-test("strict mode ignores a core.attributesFile and the default per-user attributes file; operator mode keeps the operator's", async () => {
+test("no mode reads a core.attributesFile or the default per-user attributes file (attributes are cut off at the source)", async () => {
   const l = lab();
   try {
     mkdirSync(join(l.root, "home", ".config", "git"), { recursive: true });
@@ -419,9 +430,10 @@ test("strict mode ignores a core.attributesFile and the default per-user attribu
       const strict = await safeGit(["diff"], { cwd: l.repo, trust: "strict" });
       assert.match(strict.stdout, /\+changed/, "strict: the per-user attributes file is not read");
       if (/Binary files/.test(raw)) {
-        // GIT_ATTR_NOSYSTEM only drops the system file; the per-user one is operator territory in operator mode
+        // round 4: attributes are cut off at the source in BOTH modes (see safeGitAttrs.ts): the operator's per-user
+        // attributes file is not read either; only git-lfs lines generated by Pi apply
         const operator = await safeGit(["diff"], { cwd: l.repo, trust: "operator" });
-        assert.match(operator.stdout, /Binary files/);
+        assert.match(operator.stdout, /\+changed/);
       }
     } finally {
       if (prior.h === undefined) Reflect.deleteProperty(process.env, "HOME");
@@ -457,5 +469,24 @@ test("parallel calls on one repository (commits, ref updates, fetches, status) a
     );
   } finally {
     rmSync(l.root, { recursive: true, force: true });
+  }
+});
+
+test("outside any repository git is fenced at the directory it was told about: a repository that appears above it after discovery is not picked up", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "safe-git-ceil-"));
+  try {
+    const sub = join(dir, "sub");
+    mkdirSync(sub);
+    testHooks.afterPlan = () => {
+      execFileSync("git", ["init", "-q", dir], { stdio: "pipe" });
+    };
+    for (const trust of MODES) {
+      rmSync(join(dir, ".git"), { recursive: true, force: true });
+      const r = await safeGit(["rev-parse", "--show-toplevel"], { cwd: sub, trust });
+      assert.equal(r.code, 128, `${trust}: ${r.stdout}`);
+      assert.equal(r.stdout, "");
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

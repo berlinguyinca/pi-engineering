@@ -242,8 +242,9 @@ For each call `safeGit` finds the repository without running git (walk up from t
 `gitdir:` file, `commondir`, bare `HEAD+objects+refs`; `core.worktree` and `core.bare` are never read; a `.git` file that
 is malformed is refused, an empty `.git` directory is skipped like git does), lists the repository's `config` once with
 `git config --file` (reads one file, follows no includes), writes a generated config containing only allow-listed keys
-with validated values into a private shadow common directory (`$TMPDIR/pi-safegit-*`), symlinks the rest of the real
-common directory into it with an empty `hooks`, and runs git with `GIT_COMMON_DIR` = shadow, `GIT_DIR` = the real
+with validated values into a private shadow common directory (`<state dir>/safegit/shadow/s-XXXXXX`, 0700, see
+"Round 4" below), symlinks the rest of the real common directory into it with an empty `hooks` and a generated `info/attributes`,
+and runs git with `GIT_COMMON_DIR` = shadow, `GIT_DIR` = the real
 per-worktree directory and `GIT_WORK_TREE`. Refs, packed-refs, the index, HEAD and objects are the real files (git takes
 refs from the real directory and its `commondir` file), so their locks are the real locks. Afterwards files git created
 in the shadow (for example `shallow`) are moved into the real directory, the shadow path is mapped out of stdout/stderr
@@ -268,15 +269,17 @@ hooks of the repository do not run; `git submodule update|add|sync|foreach` and 
 (`GIT_LFS_SKIP_SMUDGE=1`) when one exists; `gc.auto` is off for Pi's calls; `diff`/`status` ignore submodule changes;
 `git add` leaves tracked nested repositories out (`:(exclude)` pathspecs) and `describe --dirty` is refused while one
 exists; an ignored key is announced once per repository with an `info` notice when it looked like an exec or network
-vector. Operator trust defaults `GIT_ALLOW_PROTOCOL` to `https:http:ssh:file:git`.
+vector. Transports: `GIT_ALLOW_PROTOCOL` is `https:ssh` in strict mode and `https:http:ssh:git` in operator mode; `file` is
+enabled for one call only when a local remote was allow-listed (Round 4).
 
 Remote pin: the remote URLs of a repository are remembered the first time Pi sees a remote (keyed by the real common
 directory, so a symlinked spelling is the same repository). Network commands (`fetch`, `pull`, `push`, `ls-remote`,
 `lfs`, `remote update|prune|show|set-head`) are refused while the URLs differ. Pi's own reads never clear the pin; Pi's
 own `remote add|set-url|rename|remove` (through safeGit) moves it by exactly what the command changed. An operator who
 wants the pin to survive restarts lists allowed remotes in the global git config:
-`git config --global --add pi.allowedRemote 'https://github.com/org/*'` (exact URL, or a prefix ending in `*`); in
-`operator` trust a network command is refused when any remote URL is not on that list.
+`git config --global --add pi.allowedRemote 'https://github.com/org/*'` (exact URL, or a prefix ending in `*`); a network
+command is refused when any remote URL is not on that list, in both trust modes (strict mode ignores the operator's git
+config for git itself, not for this check).
 
 `operator` trust passes a short list of Pi's own process environment through (`OPERATOR_ENV` in `safeGit.ts`: config
 isolation, CA bundle, proxy, ssh and identity variables) on the premise that the operator started Pi; it never passes
@@ -284,8 +287,76 @@ isolation, CA bundle, proxy, ssh and identity variables) on the premise that the
 inherited `GIT_CONFIG_COUNT/KEY/VALUE`. A Pi started from inside a worker's shell would trust that shell's variables;
 that is outside this module.
 
+#### Round 4: same-user worker, shared `.git`, credentials
+
+Threat model, stated plainly. Everything above defends against a worker that can write the repository (its work tree and
+the shared `.git`) but is not Pi. A worker that runs as the SAME user and can read and write Pi's own private state
+directory, the operator's home directory, or Pi's code is outside what git hardening can enforce: it can edit the pins,
+the shadow, `~/.gitconfig` and the extension itself. Closing that needs a worker sandbox (a separate uid, or a mount /
+user namespace). **What the sandbox must hide from the worker:** `<state dir>/safegit/` (the private shadow directories and
+`pins.json`), the operator's `~/.gitconfig` and `~/.config/git/`, `~/.ssh`, Pi's installation under `~/.pi/pi-engineering`,
+and `$TMPDIR` entries that are not the worker's own. Everything below is defence in depth plus tripwires for that case;
+none of it replaces the sandbox.
+
+- Private shadow. The shadow directories live in `<state root>/safegit/shadow/` (the machine-local state directory:
+  `$PI_ENGINEERING_STATE_DIR`, `$XDG_STATE_HOME/pi-engineering` or `~/.local/state/pi-engineering`), created 0700, with
+  `mkdtemp` names, and verified on every use (a directory, not a symlink, owned by the user; too-open permissions are
+  repaired, anything else refuses the call). Nothing git reads is created in the shared `/tmp` any more, so a worker watching
+  `/tmp` with `fs.watch` finds nothing to race (probe: the poller that hit 19/20 strict and 9/10 operator now sees 0/40).
+- Read-only while git runs, verified afterwards. The generated `config` is 0400; for every subcommand that has no business
+  writing config (everything except `config remote branch push pull fetch checkout switch worktree lfs submodule clone init
+  maintenance sparse-checkout gc repack bisect rebase`) the shadow directory itself is 0500. After the command Pi checks the
+  config, `info/attributes`, the attributes file, the empty `hooks` directory and every symlink: a changed shadow discards the
+  result (code 128, empty stdout), copies nothing back, and emits an `error` notice `git-shadow-tampered`. This is a tripwire,
+  not a barrier: a same-user process can `chmod` back, and the command has already run. For config writers only keys on the
+  allow-list are replayed onto the real config (a key git was never meant to write into the generated file is reported as
+  `git-shadow-config-unexpected` and not copied).
+- Attributes cut off at the source. `GIT_ATTR_SOURCE` = the empty tree (git 2.40+; the measured git is 2.43), `info/attributes`
+  of the shadow is empty and Pi-generated, and `core.attributesFile` is a Pi-generated file in the shadow: no `.gitattributes`,
+  `info/attributes`, global attributes file or tree can select a filter, diff or merge driver, whatever the config says. Lost, on
+  purpose: attribute-driven `text`/`eol`/`-text` normalisation (`core.autocrlf` and `core.eol` still apply), `ident`,
+  `export-subst`/`export-ignore`, `working-tree-encoding`, `merge=union` and custom merge/diff drivers, `-diff`/`binary` hints,
+  `linguist-*`; the operator's own per-user attributes file is no longer read either. Kept: git-lfs. In operator mode, when the
+  operator's own config defines `filter.lfs.*`, Pi reads the repository's root `.gitattributes` (also while untracked) and the
+  tracked nested ones itself and carries over ONLY `<pattern> filter=lfs diff=lfs merge=lfs -text` lines; any other driver name on
+  the same line, any other attribute and any other driver are dropped. An untracked nested `.gitattributes` applies once tracked.
+- Symbolic links in the shared git directories. Before every call Pi lists (readdir entry types, no per-file stat) the top level
+  of the common and per-worktree git directories, `refs/**`, `logs/**`, `info/**`, `objects/` and its `info`/`pack`, and every
+  `worktrees/<n>/` (and its `logs/**`), and refuses the call when an entry is a symbolic link, FIFO, socket or device where a
+  regular file or directory belongs (`index`, `packed-refs`, `FETCH_HEAD`, `shallow`, `HEAD`, `config`, a ref, a reflog ...).
+  Repositories that symlink `objects`, `logs` or another top-level entry to shared storage are refused too: they must use
+  `objects/info/alternates` (a regular file) instead. More than 100,000 entries is refused (fail closed). The stderr relayed to a
+  caller is bounded (1 KiB per line, 64 KiB total).
+- Credentials and git-lfs. `GIT_LFS_SKIP_SMUDGE=1` for every command that writes the work tree (`checkout switch merge pull reset
+  stash rebase cherry-pick revert worktree clone restore am apply read-tree checkout-index sparse-checkout submodule bisect`),
+  so a `.lfsconfig` that arrives during the checkout contacts nothing and LFS content is not downloaded by Pi (the files stay
+  pointers until the operator runs `git lfs pull`). `lfs.url`, `lfs.pushurl` and `lfs.locksurl` are forced on the command
+  line (they beat `.lfsconfig`, measured with git-lfs 3.4): the endpoint git-lfs derives from the repository's own https remote, the
+  operator's own configured value when the operator's global config sets one, or empty (git-lfs then fails with "missing
+  protocol" instead of contacting anything) for ssh and other remotes. Hooks are off, so the `pre-push` hook that runs
+  `git lfs push` never runs: a `push` of a repository that tracks LFS patterns (operator mode with `filter.lfs` configured) is
+  refused with a message that says why, instead of sending pointer files without their objects. Push such a repository from a
+  shell, or untrack the patterns.
+- Repository identity and transports. Pi remembers, per work tree, which repository it belongs to (recorded when Pi creates a
+  worktree with `git worktree add`, otherwise at first sight) and refuses the call when the work tree's `.git` file now names
+  another repository. `expectCommonDir` lets a caller that knows its repository say so. Local-path, `file://` and
+  `<helper>::<address>` remotes, and URL-like arguments (`push /path`, `fetch file://...`, `clone /path`), are refused for
+  network commands unless the operator listed them in `pi.allowedRemote` (helpers never run, listed or not): pushing to a local
+  repository runs ITS hooks as the user. The pins and work-tree records are persisted in `<state root>/safegit/pins.json`
+  (0600, atomic rename), so a restart no longer forgets them; a corrupt file is refused rather than read as "nothing pinned".
+  After a deliberate remote change or a re-clone at the same path: `pi-engineering git-pins list`, `pi-engineering git-pins
+  reset [<path>]`. git skips its own `safe.directory` ownership check when `GIT_DIR` is explicit, so Pi enforces it: a repository
+  or work tree owned by another user is refused unless the operator's own git config lists it (`safe.directory`, or `*`).
+- Housekeeping and identity probes. A sweeper (first shadow of each process) removes shadow directories of ours older than 30
+  minutes that this process does not consider live, and the `pi-safegit-*` directories earlier versions left in `$TMPDIR`.
+  `WorktreeIdentity` and `primaryWorktreeGuard` run `rev-parse` through safeGit, so a worker-written `core.worktree` / `core.bare`
+  cannot change which work tree they report.
+
 Residuals: the first sight of a repository is trusted unless `pi.allowedRemote` is set (a worker that repoints a remote
-before Pi ever looks wins); a worker that can write the operator's home directory can change the operator's config;
-nested repositories are handled for the commands measured with git 2.43 (the matrix in
-`test/unit/safe-git-nested.test.ts` is the regression guard for other git versions); the shadow lives in the temp
-directory and is not a sandbox (a worker that can write `.git` can still run its own git).
+before Pi ever looks wins); a same-user worker with access to Pi's private state directory, the operator's home directory or
+Pi's code defeats all of this and needs the sandbox above; nested repositories are handled for the commands measured with git
+2.43 (the matrix in `test/unit/safe-git-nested.test.ts` is the regression guard for other git versions); the shadow is not a
+sandbox (a worker that can write `.git` can still run its own git); the symlink scan and the shadow verification are checks
+before and after a call, so a worker that swaps a path for a link during the few milliseconds of a call is not caught by the scan
+(the generated config and attributes do not depend on it); an LFS repository cannot be pushed through Pi, and untracked nested
+`.gitattributes` files are not applied.

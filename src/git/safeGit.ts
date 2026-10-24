@@ -9,9 +9,12 @@
  *  1. finds the repository itself (walking up from the working directory, reading `.git`, `gitdir:` and `commondir`
  *     files - no git process, so `core.worktree` or `core.bare` in a planted config cannot redirect the search),
  *  2. lists the repository's `config` once (`git config --file`, which reads exactly one file and runs nothing),
- *  3. writes a GENERATED config into a private shadow common directory that contains only the keys on an explicit
- *     allow-list, each value validated, and symlinks to everything else in the real common directory (objects, refs,
- *     packed-refs, logs, worktrees ...), with an EMPTY `hooks` directory,
+ *  3. writes a GENERATED config into a private shadow common directory (under the Pi state directory, 0700, see
+ *     safeGitState.ts) that contains only the keys on an explicit allow-list, each value validated, and symlinks to
+ *     everything else in the real common directory (objects, refs, packed-refs, logs, worktrees ...), with an EMPTY
+ *     `hooks` directory and an empty, generated `info/attributes` (attributes are cut off at the source, see
+ *     safeGitAttrs.ts; the shadow is read-only while git runs unless the command may write config, and verified
+ *     afterwards),
  *  4. runs git with `GIT_COMMON_DIR` = the shadow, `GIT_DIR` = the real per-worktree directory and `GIT_WORK_TREE`,
  *  5. afterwards moves into the real directory what git created in the shadow because it did not exist yet (`shallow`),
  *     maps the shadow path out of git's output and out of the files it wrote (worktree `.git` files), and replays the
@@ -45,13 +48,17 @@
  * enough, `--ignore-submodules=all` is added (diff-files, diff-index), the nested paths are excluded from `git add`
  * with `:(exclude)` pathspecs, and `describe --dirty` is refused while a nested repository exists.
  *
- * Limits (documented, not hidden): see docs/architecture.md. The shadow directory lives in the temp directory and is
- * removed after each call; it is not a security boundary against a worker that can already write the operator's
- * home directory, and a worker that can swap `.git` for a symlink between calls changes which repository is used
- * (the repository is re-discovered on every call, so that is the repository git would have used too).
+ * Before any of that, Pi refuses the call when a symbolic link or special file sits where git expects a plain file
+ * (safeGitTree.ts), when the work tree now names another repository than the one Pi saw it use, when a local-path or
+ * helper remote is not on the operator's `pi.allowedRemote` list, and when the repository belongs to another user.
+ *
+ * Limits (documented, not hidden): see docs/architecture.md. A worker that runs as the same user and can write Pi's
+ * private state directory or the operator's home directory is outside what this module can enforce (it needs a worker
+ * sandbox); the shadow directory is removed after each call and is not a security boundary of its own.
  */
 import { type SpawnSyncReturns, spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   closeSync,
   copyFileSync,
   cpSync,
@@ -62,6 +69,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -73,6 +81,16 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import { generateLfsAttributes } from "./safeGitAttrs.ts";
+import {
+  forgetPinsForTests,
+  makeShadowRoot,
+  markShadowDone,
+  pinStore,
+  removeShadow,
+  sweepOnce,
+} from "./safeGitState.ts";
+import { scanRepoTree } from "./safeGitTree.ts";
 
 /**
  * Trust model (T16 H5). The repository's LOCAL and WORKTREE config, `info/attributes`, `.gitattributes`, `.lfsconfig`
@@ -128,6 +146,9 @@ const OPERATOR_ENV = [
   "SSL_CERT_DIR",
 ] as const;
 
+/** The empty tree: git knows it without the object being present. */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 export function safeGitEnv(source: NodeJS.ProcessEnv = process.env, trust: GitTrust = "strict"): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const k of KEEP_ENV) if (source[k] !== undefined) env[k] = source[k];
@@ -141,9 +162,13 @@ export function safeGitEnv(source: NodeJS.ProcessEnv = process.env, trust: GitTr
   env.GIT_ASKPASS = "echo";
   // Both modes pin the transports (operator mode keeps an operator-supplied GIT_ALLOW_PROTOCOL, strict ignores it).
   // `protocol.ext.allow=never` is forced on the command line either way; the pin also stops `<helper>::<url>` remotes.
-  if (trust === "strict") env.GIT_ALLOW_PROTOCOL = "https:ssh:file";
-  else if (env.GIT_ALLOW_PROTOCOL === undefined) env.GIT_ALLOW_PROTOCOL = "https:http:ssh:file:git";
+  // `file` (a local path or file:// remote) is NOT allowed by default: a local remote is another repository whose hooks
+  // `receive-pack` / `upload-pack` would run, so it is enabled per call, and only for a URL on the operator's allow-list.
+  if (trust === "strict") env.GIT_ALLOW_PROTOCOL = "https:ssh";
+  else if (env.GIT_ALLOW_PROTOCOL === undefined) env.GIT_ALLOW_PROTOCOL = "https:http:ssh:git";
   env.GIT_ATTR_NOSYSTEM = "1";
+  // no attribute from the work tree, the index or a tree applies (see safeGitAttrs.ts): no driver can be selected
+  env.GIT_ATTR_SOURCE = EMPTY_TREE;
   env.GIT_EDITOR = "true";
   env.GIT_SEQUENCE_EDITOR = "true";
   env.GIT_PAGER = "cat";
@@ -153,6 +178,7 @@ export function safeGitEnv(source: NodeJS.ProcessEnv = process.env, trust: GitTr
 
 const FORCED_SETTINGS = [
   "core.hooksPath=/dev/null",
+  "core.attributesFile=/dev/null",
   "core.fsmonitor=false",
   "protocol.ext.allow=never",
   "core.pager=cat",
@@ -176,7 +202,7 @@ const FORCED_SETTINGS = [
   "maintenance.auto=false",
 ] as const;
 /** Strict mode additionally pins ssh and credential settings, because it also ignores the operator's own config. */
-const STRICT_ONLY_SETTINGS = ["core.sshCommand=ssh", "credential.helper=", "core.attributesFile=/dev/null"] as const;
+const STRICT_ONLY_SETTINGS = ["core.sshCommand=ssh", "credential.helper="] as const;
 const pairs = (list: readonly string[]) => list.flatMap((kv) => ["-c", kv]);
 
 export const SAFE_GIT_CONFIG: readonly string[] = pairs([...STRICT_ONLY_SETTINGS, ...FORCED_SETTINGS]);
@@ -689,10 +715,23 @@ export interface SafeGitOptions {
   signal?: AbortSignal;
   /** Start git in its own session (no controlling terminal), for unattended timers where nothing may prompt. Async only. */
   detached?: boolean;
+  /**
+   * The common git directory the caller knows this call belongs to. When the repository found from `cwd` has a
+   * different one (a worktree's `.git` file rewritten to name another repository), the call is refused.
+   */
+  expectCommonDir?: string;
 }
 
 /** Test seam: runs between the preparation (config snapshot) and the command, so a test can edit the repository exactly there. */
-export const testHooks: { afterPlan?: () => void | Promise<void> } = {};
+export const testHooks: {
+  afterPlan?: () => void | Promise<void>;
+  /** Tests only: treat local-path / file:// remotes as allow-listed (the test repositories use local bare remotes). */
+  localTransports?: boolean;
+  /** Tests only: runs right after the shadow exists, before Pi's own internal git calls (nested-repo check) use it. */
+  afterShadow?: (shadowRoot: string) => void;
+  /** Tests only: the user id the ownership check compares against (a repository cannot be chowned without privileges). */
+  uid?: number;
+} = {};
 
 const failed = (stderr: string): SafeGitResult => ({ code: 128, stdout: "", stderr });
 
@@ -821,37 +860,79 @@ export function withoutInjectedConfig(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv
 // Remote URLs as first seen per repository (keyed by the REAL common directory, so a symlinked spelling is the same
 // repository): a worker-writable `remote.origin.url` must not redirect Pi's credentials. Reads by Pi never clear it;
 // only the delta of Pi's own successful write (`git remote add|set-url|rename|remove`, `git config remote.x.url`)
-// moves it. The operator's `pi.allowedRemote` list (global/system git config, operator trust) survives restarts.
-const remotePins = new Map<string, string>();
-const MAX_PINS = 256;
+// moves it. Pins are PERSISTED (pins.json in the private state directory, atomic, 0600), so a restart does not
+// forget them; `resetSafeGitPins()` is the operator's way to start again. The operator's `pi.allowedRemote` list
+// (global/system git config) is enforced in both trust modes. A work tree is also remembered against the repository
+// Pi saw it use, so rewriting a worktree's `.git` file to name another repository is refused.
+export { dropPinCacheForTests, listSafeGitPins, resetSafeGitPins, stateHooks } from "./safeGitState.ts";
+
 export function forgetRemotePinsForTests(): void {
-  remotePins.clear();
+  forgetPinsForTests();
   allowCache = undefined;
   noticed.clear();
 }
 
-function setPin(key: string, value: string): void {
-  if (!remotePins.has(key) && remotePins.size >= MAX_PINS) remotePins.delete(remotePins.keys().next().value as string);
-  remotePins.set(key, value);
+/** What the operator's own (system and global) git config says that safeGit needs. Cached for a few seconds. */
+export interface OperatorConfig {
+  allowedRemotes: string[];
+  safeDirectories: string[];
+  /** The operator's config defines `filter.lfs` (git-lfs installed globally). */
+  hasLfsFilter: boolean;
+  lfsUrl?: string;
+  lfsPushUrl?: string;
+  lfsLocksUrl?: string;
 }
 
-let allowCache: { at: number; key: string; list: string[] } | undefined;
+let allowCache: { at: number; key: string; cfg: OperatorConfig } | undefined;
 const ALLOW_TTL_MS = 10_000;
 
-/** The operator's `pi.allowedRemote` entries (system/global scope only), cached for a few seconds. */
-function operatorAllowedRemotes(env: NodeJS.ProcessEnv): string[] {
-  const key = `${env.HOME ?? ""}\0${env.XDG_CONFIG_HOME ?? ""}\0${env.GIT_CONFIG_GLOBAL ?? ""}\0${env.GIT_CONFIG_SYSTEM ?? ""}`;
+/** mtime+size of the operator's own config files, so an edit is seen at once instead of after the cache expires. */
+function operatorConfigStamp(env: NodeJS.ProcessEnv): string {
+  const home = env.HOME ?? "";
+  const files = [
+    env.GIT_CONFIG_GLOBAL,
+    home ? join(home, ".gitconfig") : undefined,
+    env.XDG_CONFIG_HOME
+      ? join(env.XDG_CONFIG_HOME, "git", "config")
+      : home
+        ? join(home, ".config", "git", "config")
+        : undefined,
+    env.GIT_CONFIG_SYSTEM ?? (env.GIT_CONFIG_NOSYSTEM ? undefined : "/etc/gitconfig"),
+  ];
+  return files
+    .map((f) => {
+      if (!f) return "-";
+      try {
+        const st = statSync(f);
+        return `${st.mtimeMs}:${st.size}`;
+      } catch {
+        return "absent";
+      }
+    })
+    .join(",");
+}
+
+function operatorConfig(env: NodeJS.ProcessEnv): OperatorConfig {
+  const key = `${env.HOME ?? ""}\0${env.XDG_CONFIG_HOME ?? ""}\0${env.GIT_CONFIG_GLOBAL ?? ""}\0${env.GIT_CONFIG_SYSTEM ?? ""}\0${env.GIT_CONFIG_NOSYSTEM ?? ""}\0${operatorConfigStamp(env)}`;
   const now = Date.now();
-  if (allowCache && allowCache.key === key && now - allowCache.at < ALLOW_TTL_MS) return allowCache.list;
+  if (allowCache && allowCache.key === key && now - allowCache.at < ALLOW_TTL_MS) return allowCache.cfg;
   const r = runSync(["config", "--list", "--show-scope", "--show-origin", "-z"], env, 5_000, configListMax, tmpdir());
-  const list =
-    r.code === 0 && !r.truncated
-      ? parseScopedConfig(r.stdout)
-          .filter((e) => TRUSTED_SCOPES.has(e.scope) && e.key.toLowerCase() === "pi.allowedremote" && e.value !== "")
-          .map((e) => e.value)
-      : [];
-  allowCache = { at: now, key, list };
-  return list;
+  const cfg: OperatorConfig = { allowedRemotes: [], safeDirectories: [], hasLfsFilter: false };
+  if (r.code === 0 && !r.truncated) {
+    for (const e of parseScopedConfig(r.stdout)) {
+      if (!TRUSTED_SCOPES.has(e.scope)) continue;
+      const k = e.key.toLowerCase();
+      if (k === "pi.allowedremote" && e.value !== "") cfg.allowedRemotes.push(e.value);
+      else if (k === "safe.directory" && e.value !== "") cfg.safeDirectories.push(e.value);
+      else if (k === "filter.lfs.clean" || k === "filter.lfs.smudge" || k === "filter.lfs.process")
+        cfg.hasLfsFilter = true;
+      else if (k === "lfs.url") cfg.lfsUrl = e.value;
+      else if (k === "lfs.pushurl") cfg.lfsPushUrl = e.value;
+      else if (k === "lfs.locksurl") cfg.lfsLocksUrl = e.value;
+    }
+  }
+  allowCache = { at: now, key, cfg };
+  return cfg;
 }
 
 /** Exact match, or a prefix when the entry ends in `*`. */
@@ -859,11 +940,41 @@ export function remoteAllowed(url: string, allowed: readonly string[]): boolean 
   return allowed.some((a) => (a.endsWith("*") ? url.startsWith(a.slice(0, -1)) : url === a));
 }
 
+export type UrlClass = "net" | "local" | "ext";
+
+/**
+ * What a remote URL (or a URL-like argument) is: `ext` for `<helper>::<address>` (never run), `net` for https/http/ssh/git
+ * and scp-like `user@host:path`, and `local` for everything else (`file://`, absolute or relative paths). A local
+ * remote is another repository: `push` runs ITS hooks as the user, `fetch` runs its `upload-pack` config.
+ */
+export function urlClass(u: string): UrlClass {
+  if (/^[A-Za-z][A-Za-z0-9+.-]*::/.test(u)) return "ext";
+  if (/^(https?|ssh|git|git\+ssh|ssh\+git):\/\//i.test(u)) return "net";
+  if (/^file:\/\//i.test(u)) return "local";
+  if (/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:/.test(u) || /^[A-Za-z0-9._-]+:(?!\/\/)[^/\\]/.test(u)) return "net";
+  return "local";
+}
+
+/** Positional arguments of a network command that name a repository by path or helper rather than by remote name. */
+const PATHISH = /^(\/|\.\.?\/|~|file:)|::|^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+export function urlArguments(args: readonly string[], at: number, remoteNames: ReadonlySet<string>): string[] {
+  let positional = args.slice(at + 1).filter((a) => !a.startsWith("-"));
+  // `git clone <repository> [<directory>]`: the directory is where the clone goes, not a remote
+  if (args[at] === "clone" && positional.length >= 2) positional = positional.slice(0, -1);
+  return positional.filter((a) => !remoteNames.has(a) && PATHISH.test(a));
+}
+
 // ─── per-call preparation and completion ─────────────────────────────────────────────────────────────────────────
 
 interface Shadow {
   root: string;
   common: string;
+  /** The generated global attributes file (git-lfs lines only). */
+  attributes: string;
+  /** What was written to the attributes file (compared after the command). */
+  attributesText: string;
+  /** `git` may legitimately write to the shadow's config/info (config, remote, branch, push ...): the directory stays writable. */
+  writer: boolean;
 }
 
 interface Prepared {
@@ -879,31 +990,92 @@ interface Prepared {
   cleanEnv: NodeJS.ProcessEnv;
 }
 
-const SHADOW_SKIP = new Set(["config", "hooks"]);
+const SHADOW_SKIP = new Set(["config", "hooks", "info"]);
 const DERIVED_KEYS = new Set(["core.repositoryformatversion", "core.bare"]);
 const noticed = new Set<string>();
 
-function makeShadow(layout: RepoLayout, configText: string): Shadow {
-  const root = mkdtempSync(join(tmpdir(), "pi-safegit-"));
+/**
+ * Subcommands that may write the repository config (or `info/`): everything else gets a shadow directory that is
+ * read-only while git runs, so a command that has no business creating files in it cannot.
+ */
+const CONFIG_WRITERS = new Set([
+  "config",
+  "remote",
+  "branch",
+  "push",
+  "pull",
+  "fetch",
+  "checkout",
+  "switch",
+  "worktree",
+  "lfs",
+  "submodule",
+  "clone",
+  "init",
+  "maintenance",
+  "sparse-checkout",
+  "gc",
+  "repack",
+  "bisect",
+  "rebase",
+]);
+
+function makeShadow(
+  layout: RepoLayout,
+  configText: string,
+  writer: boolean,
+  attributesFor: (common: string) => string,
+): Shadow {
+  sweepOnce();
+  const root = makeShadowRoot();
   const common = join(root, ".git");
-  mkdirSync(common, { mode: 0o700 });
   try {
+    mkdirSync(common, { mode: 0o700 });
     for (const name of readdirSync(layout.commonDir)) {
       if (SHADOW_SKIP.has(name)) continue;
       symlinkSync(join(layout.commonDir, name), join(common, name));
     }
-    mkdirSync(join(common, "hooks"));
-    writeFileSync(join(common, "config"), configText, { mode: 0o600 });
+    mkdirSync(join(common, "hooks"), { mode: 0o700 });
+    // `info` is Pi's own directory: its `attributes` is empty (the repository's would select drivers); the rest links back
+    mkdirSync(join(common, "info"), { mode: 0o700 });
+    writeFileSync(join(common, "info", "attributes"), "", { mode: 0o400 });
+    let infoNames: string[] = [];
+    try {
+      infoNames = readdirSync(join(layout.commonDir, "info"));
+    } catch {
+      /* no info directory */
+    }
+    for (const name of infoNames) {
+      if (name === "attributes") continue;
+      symlinkSync(join(layout.commonDir, "info", name), join(common, "info", name));
+    }
+    writeFileSync(join(common, "config"), configText, { mode: 0o400 });
+    const attributes = join(root, "attributes");
+    const attributesText = attributesFor(common);
+    writeFileSync(attributes, attributesText, { mode: 0o400 });
+    if (!writer) {
+      chmodSync(join(common, "info"), 0o500);
+      chmodSync(join(common, "hooks"), 0o500);
+      chmodSync(common, 0o500);
+    }
+    return { root, common, attributes, attributesText, writer };
   } catch (e) {
-    rmSync(root, { recursive: true, force: true });
+    markShadowDone(root);
+    removeShadow(root);
     throw e;
   }
-  return { root, common };
+}
+
+/** Drop a shadow directory (also when it was made read-only). */
+function dropShadow(shadow: Shadow): void {
+  markShadowDone(shadow.root);
+  removeShadow(shadow.root);
 }
 
 function gitlinksWithRepo(layout: RepoLayout, env: NodeJS.ProcessEnv): string[] | null {
   if (!layout.workTree) return [];
-  const r = runSync(["ls-files", "--stage", "-z"], env, 5_000, 16 * 1024 * 1024, layout.workTree);
+  // the same forced settings as the command itself: even an internal ls-files must not start an fsmonitor or hook
+  const r = runSync([...OPERATOR_FORCED, "ls-files", "--stage", "-z"], env, 5_000, 16 * 1024 * 1024, layout.workTree);
   if (r.code !== 0 || r.truncated) return null;
   const found: string[] = [];
   for (const rec of r.stdout.split("\0")) {
@@ -913,6 +1085,133 @@ function gitlinksWithRepo(layout: RepoLayout, env: NodeJS.ProcessEnv): string[] 
     if (exists(join(layout.workTree, rel, ".git"))) found.push(rel);
   }
   return found;
+}
+
+const CHECKOUT_SUBCOMMANDS = new Set([
+  "checkout",
+  "switch",
+  "merge",
+  "pull",
+  "reset",
+  "stash",
+  "rebase",
+  "cherry-pick",
+  "revert",
+  "worktree",
+  "clone",
+  "restore",
+  "am",
+  "apply",
+  "read-tree",
+  "checkout-index",
+  "sparse-checkout",
+  "submodule",
+  "bisect",
+]);
+
+/** Commands that write files into the work tree run git-lfs's smudge filter, which contacts a server; never from Pi. */
+function skipSmudge(env: NodeJS.ProcessEnv, sub: string | undefined): void {
+  if (sub !== undefined && CHECKOUT_SUBCOMMANDS.has(sub)) env.GIT_LFS_SKIP_SMUDGE = "1";
+}
+
+/** `file` is added to the transports only when a local remote was allow-listed; an operator-chosen GIT_ALLOW_PROTOCOL is theirs. */
+function applyProtocols(env: NodeJS.ProcessEnv, trust: GitTrust, local: boolean): void {
+  if (!local) return;
+  if (trust === "operator" && process.env.GIT_ALLOW_PROTOCOL !== undefined) return;
+  const have = (env.GIT_ALLOW_PROTOCOL ?? "").split(":").filter(Boolean);
+  if (!have.includes("file")) env.GIT_ALLOW_PROTOCOL = [...have, "file"].join(":");
+}
+
+const shorten = (u: string): string => (u.length > 120 ? `${u.slice(0, 117)}...` : u);
+
+/** Local-path and helper remotes need the operator's allow-list; with a list, every remote URL must be on it. */
+function checkTransports(
+  urls: readonly string[],
+  argUrls: readonly string[],
+  cfg: OperatorConfig,
+): { why: string; local: boolean } {
+  let local = false;
+  for (const u of [...urls, ...argUrls]) {
+    const cls = urlClass(u);
+    if (cls === "ext") {
+      return {
+        why: `the remote ${shorten(u)} uses a helper transport (<helper>::<address>), which Pi never runs`,
+        local,
+      };
+    }
+    if (cls === "local") {
+      if (testHooks.localTransports || remoteAllowed(u, cfg.allowedRemotes)) {
+        local = true;
+        continue;
+      }
+      return {
+        why: `the remote ${shorten(u)} is a local path or file:// URL: fetching or pushing there would run that repository's own hooks and configuration. List it with: git config --global --add pi.allowedRemote '<url>' (the operator's pi.allowedRemote)`,
+        local,
+      };
+    }
+    if (cfg.allowedRemotes.length > 0 && !remoteAllowed(u, cfg.allowedRemotes)) {
+      return { why: "a remote URL of this repository is not in the operator's pi.allowedRemote list", local };
+    }
+  }
+  return { why: "", local };
+}
+
+/** The LFS endpoint git-lfs derives from an https remote (`<url>.git/info/lfs`); empty for anything else. */
+function lfsEndpoint(url: string): string {
+  if (!/^https?:\/\//i.test(url)) return "";
+  const u = url.replace(/\/+$/, "");
+  return u.endsWith("/info/lfs") ? u : `${u}${u.endsWith(".git") ? "" : ".git"}/info/lfs`;
+}
+
+/**
+ * `lfs.url` / `lfs.pushurl` / `lfs.locksurl` on the command line beat `.lfsconfig` (measured with git-lfs 3.4): whatever a
+ * `.lfsconfig` that arrives during a checkout says, credentials go only to the endpoint of the repository's own remote
+ * (or to the operator's own configured endpoint). An empty value makes git-lfs fail with "missing protocol" instead of
+ * contacting anything.
+ */
+function lfsForced(cfg: OperatorConfig, kept: readonly FileEntry[], trust: GitTrust): string[] {
+  const urls = new Map<string, { url?: string; pushurl?: string }>();
+  for (const k of kept) {
+    const p = parseKey(k.key);
+    if (!p || p.section !== "remote" || p.sub === null || !URL_VARIABLES.has(p.variable)) continue;
+    const e = urls.get(p.sub) ?? {};
+    if (p.variable === "url") e.url = k.value ?? "";
+    else e.pushurl = k.value ?? "";
+    urls.set(p.sub, e);
+  }
+  const names = [...urls.keys()].sort();
+  const name = urls.has("origin") ? "origin" : names[0];
+  const r = name === undefined ? {} : (urls.get(name) as { url?: string; pushurl?: string });
+  const base = lfsEndpoint(r.url ?? r.pushurl ?? "");
+  const push = lfsEndpoint(r.pushurl ?? r.url ?? "");
+  const own = trust === "operator";
+  const url = own && cfg.lfsUrl !== undefined ? cfg.lfsUrl : base;
+  const pushurl = own && cfg.lfsPushUrl !== undefined ? cfg.lfsPushUrl : push;
+  const locks = own && cfg.lfsLocksUrl !== undefined ? cfg.lfsLocksUrl : base ? `${base}/locks` : "";
+  return pairs([`lfs.url=${url}`, `lfs.pushurl=${pushurl}`, `lfs.locksurl=${locks}`]);
+}
+
+/** git skips its `safe.directory` ownership check when GIT_DIR is given explicitly, so Pi does the check. */
+export function unsafeOwner(
+  layout: RepoLayout,
+  cfg: OperatorConfig,
+  me: number | null | undefined = typeof process.getuid === "function" ? process.getuid() : null,
+): string | null {
+  if (me === null || me === undefined) return null;
+  for (const path of [layout.workTree, layout.commonDir]) {
+    if (path === null) continue;
+    let uid: number;
+    try {
+      uid = lstatSync(path).uid;
+    } catch {
+      continue;
+    }
+    if (uid === me) continue;
+    const listed = (d: string): boolean => d === "*" || d === path || d === layout.workTree || d === layout.commonDir;
+    if (cfg.safeDirectories.some(listed)) continue;
+    return `${path} is owned by another user; add it to safe.directory in your own git config to use it`;
+  }
+  return null;
 }
 
 function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
@@ -941,6 +1240,9 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
   // A `.git` that is there but is not a usable repository is refused: running git without a shadow would let it read it as is.
   if (found === "invalid") return refuse("the repository at this path is not usable (broken .git)");
   const layout = found;
+  const network = contactsNetwork(args, at);
+  // one place that knows the operator's own config, in BOTH modes (strict ignores it for git, not for Pi's own checks)
+  const opCfg = operatorConfig(withoutInjectedConfig(safeGitEnv(process.env, "operator")));
   if (!layout) {
     // Nothing found, so git must not find anything either (an enclosing repository would be read unfiltered).
     const env = { ...cleanEnv };
@@ -949,8 +1251,59 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
     } catch {
       /* where does not exist: git will say so */
     }
-    return { ...base, env, argv: [...prefix, ...diffing(args, at)] };
+    let why = "";
+    let local = false;
+    if (network) {
+      const r = checkTransports([], urlArguments(args, at, new Set()), opCfg);
+      why = r.why;
+      local = r.local;
+    }
+    if (why) return refuse(why);
+    applyProtocols(env, trust, local);
+    skipSmudge(env, sub);
+    return { ...base, env, argv: [...prefix, ...lfsForced(opCfg, [], trust), ...diffing(args, at)] };
   }
+
+  // 0. is this the repository the caller (and Pi, last time) saw at this path?
+  try {
+    if (opts.expectCommonDir !== undefined) {
+      let expected = opts.expectCommonDir;
+      try {
+        expected = realpathSync(expected);
+      } catch {
+        /* compare as given */
+      }
+      if (expected !== layout.commonDir) {
+        return refuse(`this work tree now belongs to another repository (${layout.commonDir}, expected ${expected})`);
+      }
+    }
+    if (layout.workTree !== null) {
+      const known = pinStore.getRepo(layout.workTree);
+      if (known === undefined) pinStore.setRepo(layout.workTree, layout.commonDir);
+      else if (known !== layout.commonDir) {
+        return refuse(
+          `the work tree ${layout.workTree} belonged to the repository ${known} and now names ${layout.commonDir} (a rewritten .git file?). If this is intended, run: pi-engineering git-pins reset ${layout.workTree}`,
+        );
+      }
+    }
+  } catch (e) {
+    return refuse(`the remembered repository state could not be used (${(e as Error).message})`);
+  }
+
+  // 0b. ownership: git skips its own `safe.directory` check when GIT_DIR is explicit, so it is enforced here
+  const unsafe = unsafeOwner(layout, opCfg, testHooks.uid);
+  if (unsafe) return refuse(unsafe);
+
+  // 0c. symbolic links and special files where git expects plain files or directories
+  let scan: string | null;
+  try {
+    scan = scanRepoTree(layout);
+  } catch (e) {
+    return refuse(
+      `the repository could not be inspected (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`,
+    );
+  }
+  if (scan) return refuse(`the repository's git directory contains ${scan}`);
 
   // 1. snapshot the repository's own config (one file, no includes, runs nothing)
   const realConfig = join(layout.commonDir, "config");
@@ -974,37 +1327,83 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
   }
   const generated = generateConfig(entries, layout.workTree === null);
 
-  // 2. network refusals: remote URLs must match the pin / the operator's list
-  const pinKey = layout.commonDir;
-  const pinned = remotePins.get(pinKey);
-  if (contactsNetwork(args, at)) {
+  // 2. network refusals: remote URLs must match the pin, the operator's list, and not be a local path / helper
+  let pinned: string | undefined;
+  try {
+    pinned = pinStore.getPin(layout.commonDir);
+  } catch (e) {
+    return refuse((e as Error).message);
+  }
+  let localTransport = false;
+  if (network) {
     if (pinned !== undefined && pinned !== generated.remoteUrls) {
-      return refuse("this repository's remote URLs changed since Pi first used it");
+      return refuse(
+        `this repository's remote URLs changed since Pi first used it. If this is intended, run: pi-engineering git-pins reset ${layout.commonDir}`,
+      );
     }
-    if (trust === "operator") {
-      const allowed = operatorAllowedRemotes(cleanEnv);
-      const bad = allowed.length > 0 ? generated.urls.find((u) => !remoteAllowed(u, allowed)) : undefined;
-      if (bad !== undefined)
-        return refuse("a remote URL of this repository is not in the operator's pi.allowedRemote list");
-    }
+    const remoteNames = new Set(
+      generated.kept
+        .map((k) => parseKey(k.key))
+        .filter((k): k is ParsedKey => k !== null && k.section === "remote" && k.sub !== null)
+        .map((k) => k.sub as string),
+    );
+    const r = checkTransports(generated.urls, urlArguments(args, at, remoteNames), opCfg);
+    if (r.why) return refuse(r.why);
+    localTransport = r.local;
     // LFS reads `.lfsconfig` from the work tree (lfs.url / pushurl): a worker-controlled endpoint would receive credentials
     if (sub === "lfs" && layout.workTree && exists(join(layout.workTree, ".lfsconfig"))) {
       return refuse("the work tree has a .lfsconfig, which can point git-lfs at another server");
     }
   }
 
-  // 3. the shadow
+  // 3. the shadow (and, in operator mode with git-lfs, the generated attributes: read by Pi through the shadow itself)
   let shadow: Shadow;
+  let lfsPatterns = 0;
   try {
-    shadow = makeShadow(layout, generated.text);
+    // git creates `logs/` in the common directory on the first branch update; the shadow may be read-only, so it exists first
+    if (!exists(join(layout.commonDir, "logs"))) mkdirSync(join(layout.commonDir, "logs"), { recursive: true });
+    shadow = makeShadow(layout, generated.text, CONFIG_WRITERS.has(sub ?? ""), (common) => {
+      if (trust !== "operator" || !opCfg.hasLfsFilter || !layout.workTree) return "";
+      const gitEnv: NodeJS.ProcessEnv = {
+        ...cleanEnv,
+        GIT_DIR: layout.gitDir,
+        GIT_COMMON_DIR: common,
+        GIT_WORK_TREE: layout.workTree,
+      };
+      const listed = runSync(
+        [...OPERATOR_FORCED, "ls-files", "-z", "--", ".gitattributes", "*/.gitattributes"],
+        gitEnv,
+        5_000,
+        16 * 1024 * 1024,
+        layout.workTree,
+      );
+      if (listed.code !== 0 || listed.truncated) return "";
+      // the root file is read even while untracked (git applies it at once); nested ones once they are tracked
+      const gen = generateLfsAttributes(layout.workTree, [
+        ".gitattributes",
+        ...listed.stdout.split("\0").filter(Boolean),
+      ]);
+      lfsPatterns = gen.patterns;
+      return gen.text;
+    });
   } catch (e) {
     return refuse(
       `could not prepare an isolated git view (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`,
     );
   }
+  testHooks.afterShadow?.(shadow.root);
+  // hooks are off, so `git lfs push` (the pre-push hook) never runs: pointers would reach the remote without their objects
+  if (network && sub === "push" && lfsPatterns > 0) {
+    dropShadow(shadow);
+    return refuse(
+      "this repository tracks files with git-lfs, and Pi runs git without hooks, so `git lfs push` would not run and the remote would receive pointer files without their objects. Push it yourself (git push) from a shell, or untrack the LFS patterns",
+    );
+  }
   const env: NodeJS.ProcessEnv = { ...cleanEnv, GIT_DIR: layout.gitDir, GIT_COMMON_DIR: shadow.common };
   if (layout.workTree) env.GIT_WORK_TREE = layout.workTree;
   if (layout.workTree && exists(join(layout.workTree, ".lfsconfig"))) env.GIT_LFS_SKIP_SMUDGE = "1";
+  skipSmudge(env, sub);
+  applyProtocols(env, trust, localTransport);
 
   // 4. nested repositories
   let argv = diffing(args, at);
@@ -1014,7 +1413,7 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
     } else {
       const nested = gitlinksWithRepo(layout, env);
       if (nested === null) {
-        rmSync(shadow.root, { recursive: true, force: true });
+        dropShadow(shadow);
         return refuse("the index cannot be inspected for nested repositories");
       }
       if (nested.length > 0) {
@@ -1023,12 +1422,12 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
           sub === "describe" &&
           rest.some((a) => a === "--dirty" || a.startsWith("--dirty=") || a === "--broken" || a.startsWith("--broken="))
         ) {
-          rmSync(shadow.root, { recursive: true, force: true });
+          dropShadow(shadow);
           return refuse(`describe --dirty would run the configuration of the nested repository at ${nested[0]}`);
         }
         if (sub === "add") {
           if (rest.some((a) => a === "--pathspec-from-file" || a.startsWith("--pathspec-from-file="))) {
-            rmSync(shadow.root, { recursive: true, force: true });
+            dropShadow(shadow);
             return refuse(`add --pathspec-from-file cannot exclude the nested repository at ${nested[0]}`);
           }
           if (addHasSelector(rest))
@@ -1045,7 +1444,14 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
     generated,
     pinBefore: pinned,
     // with GIT_COMMON_DIR set git no longer learns `core.bare` from the config it reads, so a bare repository is declared
-    argv: [...(layout.workTree === null ? ["--bare"] : []), ...prefix, ...argv],
+    argv: [
+      ...(layout.workTree === null ? ["--bare"] : []),
+      ...prefix,
+      "-c",
+      `core.attributesFile=${shadow.attributes}`,
+      ...lfsForced(opCfg, generated.kept, trust),
+      ...argv,
+    ],
   };
 }
 
@@ -1093,6 +1499,15 @@ function writeBack(p: Prepared): string | null {
     if (lstatSync(from).isSymbolicLink()) continue;
     moveBack(from, join(layout.commonDir, name));
   }
+  // files git created in `info/` (the symlinks and the generated empty `attributes` stay behind)
+  const infoReal = join(layout.commonDir, "info");
+  for (const name of readdirSync(join(shadow.common, "info"))) {
+    if (name === "attributes" || name.endsWith(".lock")) continue;
+    const from = join(shadow.common, "info", name);
+    if (lstatSync(from).isSymbolicLink()) continue;
+    mkdirSync(infoReal, { recursive: true });
+    moveBack(from, join(infoReal, name));
+  }
   return null;
 }
 
@@ -1114,6 +1529,12 @@ function fixWorktreeLinks(p: Prepared): void {
       const body = readFileSync(pointer, "utf8");
       if (!body.includes(shadow.root)) continue;
       writeFileSync(pointer, body.split(shadow.common).join(layout.commonDir));
+      // Pi created this work tree: remember which repository it belongs to, so a later rewrite of its `.git` file is noticed
+      try {
+        pinStore.setRepo(realpathSync(dirname(pointer)), layout.commonDir);
+      } catch {
+        /* the first call that finds it records it */
+      }
     } catch {
       /* a stale or foreign entry: leave it alone */
     }
@@ -1154,8 +1575,19 @@ function replayConfig(p: Prepared): { after: FileEntry[]; remove: FileEntry[]; a
     });
     return null;
   }
-  // the two derived keys (see generateConfig) are never replayed: where the repository lives is not config
-  const after = parseFileConfig(listed.stdout).filter((e) => !DERIVED_KEYS.has(e.key.toLowerCase()));
+  // Only what is on the allow-list is replayed (the same generator that wrote the file reads it back): a key git was
+  // never meant to write there is reported and NOT copied. The two derived keys are never replayed either.
+  const written = parseFileConfig(listed.stdout).filter((e) => !DERIVED_KEYS.has(e.key.toLowerCase()));
+  const readBack = generateConfig(written, layout.workTree === null);
+  const unexpected = readBack.dropped.filter((k) => !DERIVED_KEYS.has(k.toLowerCase()));
+  if (unexpected.length > 0) {
+    emitTelemetry({
+      level: "error",
+      key: "git-shadow-config-unexpected",
+      text: `git ${p.sub ?? ""}: the command left key(s) in the generated config that are not allowed and were not copied to the repository: ${tidyStderr(unexpected.slice(0, 6).join(", "), 160, 1)}`,
+    });
+  }
+  const after = readBack.kept;
   const real = join(layout.commonDir, "config");
   const { remove, add } = configDelta(generated.kept, after);
   for (const e of remove) {
@@ -1184,12 +1616,67 @@ export function applyPinDelta(pin: string, remove: readonly FileEntry[], add: re
   return rows.sort().join("\u0001");
 }
 
+/** Tidy what a command printed: no line longer than a screenful and no more than 64 KiB of stderr reaches the caller. */
+const STDERR_LINE = 1024;
+const STDERR_TOTAL = 64 * 1024;
+export function limitStderr(stderr: string): string {
+  if (stderr.length <= STDERR_LINE && stderr.length <= STDERR_TOTAL) return stderr;
+  const lines = stderr
+    .split("\n")
+    .map((l) => (l.length > STDERR_LINE ? `${l.slice(0, STDERR_LINE)} ...[line truncated]` : l));
+  const joined = lines.join("\n");
+  return joined.length > STDERR_TOTAL ? `${joined.slice(0, STDERR_TOTAL)}\n...[stderr truncated]` : joined;
+}
+const clamp = (r: SafeGitResult): SafeGitResult =>
+  r.stderr.length > STDERR_LINE ? { ...r, stderr: limitStderr(r.stderr) } : r;
+
+/**
+ * After the command: is the shadow still what Pi made it? The directory is private (see safeGitState.ts), so this is
+ * a tripwire for a same-user process that reached it anyway, not a barrier: it cannot undo what git already did,
+ * it makes the caller not trust the result and puts a loud line in the telemetry.
+ */
+export function verifyShadow(shadow: Shadow, layout: RepoLayout, generatedText: string): string | null {
+  try {
+    const cfg = join(shadow.common, "config");
+    const st = lstatSync(cfg);
+    if (!st.isFile()) return "the generated config is no longer a regular file";
+    if (!shadow.writer && readFileSync(cfg, "utf8") !== generatedText)
+      return "the generated config was modified while git ran";
+    const attrs = lstatSync(join(shadow.common, "info", "attributes"));
+    if (!attrs.isFile() || readFileSync(join(shadow.common, "info", "attributes"), "utf8") !== "") {
+      return "the generated info/attributes was modified while git ran";
+    }
+    const own = lstatSync(shadow.attributes);
+    if (!own.isFile() || readFileSync(shadow.attributes, "utf8") !== shadow.attributesText) {
+      return "the generated attributes file was modified while git ran";
+    }
+    if (readdirSync(join(shadow.common, "hooks")).length > 0) return "a hook appeared in the empty hooks directory";
+    for (const name of readdirSync(shadow.common)) {
+      const full = join(shadow.common, name);
+      if (!lstatSync(full).isSymbolicLink()) continue;
+      if (readlinkSync(full) !== join(layout.commonDir, name)) return `the link ${name} was repointed while git ran`;
+    }
+  } catch (e) {
+    return `the shadow could not be verified (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
+  }
+  return null;
+}
+
 function complete(p: Prepared, result: SafeGitResult): SafeGitResult {
-  if (!p.shadow || !p.layout || !p.generated) return result;
+  if (!p.shadow || !p.layout || !p.generated) return clamp(result);
   const layout = p.layout;
   const shadow = p.shadow;
   let out = result;
   try {
+    const tampered = verifyShadow(shadow, layout, p.generated.text);
+    if (tampered) {
+      emitTelemetry({
+        level: "error",
+        key: "git-shadow-tampered",
+        text: `git ${p.sub ?? ""}: ${tampered}; the result was discarded and nothing was copied back into the repository. Something with access to Pi's private state directory changed it (see docs/architecture.md, git hardening).`,
+      });
+      return failed(`refused: ${tampered}; the result was discarded`);
+    }
     let problem: string | null = null;
     try {
       problem = writeBack(p);
@@ -1204,17 +1691,21 @@ function complete(p: Prepared, result: SafeGitResult): SafeGitResult {
       problem ??= `finishing the command's repository changes failed (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
     }
     // Pi's own edit of a remote URL moves the pin by exactly what the command changed; a read, or a worker's edit, never does
-    const current = remotePins.get(layout.commonDir);
-    const base = current ?? (p.generated as Generated).remoteUrls;
-    const next = changed ? applyPinDelta(base, changed.remove, changed.add) : base;
-    // nothing to pin until the repository has a remote: adding the first one is how a remote is normally set up
-    if (current === undefined ? next !== "" : next !== current) setPin(layout.commonDir, next);
-    notifyIgnored(layout, p.generated as Generated);
-    out = {
+    try {
+      const current = pinStore.getPin(layout.commonDir);
+      const base = current ?? p.generated.remoteUrls;
+      const next = changed ? applyPinDelta(base, changed.remove, changed.add) : base;
+      // nothing to pin until the repository has a remote: adding the first one is how a remote is normally set up
+      if (current === undefined ? next !== "" : next !== current) pinStore.setPin(layout.commonDir, next);
+    } catch (e) {
+      problem ??= `the remote pin could not be saved (${(e as Error).message})`;
+    }
+    notifyIgnored(layout, p.generated);
+    out = clamp({
       ...result,
       stdout: mapOut(result.stdout, p),
       stderr: mapOut(result.stderr, p),
-    };
+    });
     if (problem) {
       emitTelemetry({ level: "error", key: "git-writeback-failed", text: `git ${p.sub ?? ""}: ${problem}.` });
       out = {
@@ -1224,7 +1715,7 @@ function complete(p: Prepared, result: SafeGitResult): SafeGitResult {
       };
     }
   } finally {
-    rmSync(shadow.root, { recursive: true, force: true });
+    dropShadow(shadow);
   }
   return out;
 }
@@ -1243,7 +1734,7 @@ export async function safeGit(args: readonly string[], opts: SafeGitOptions): Pr
     });
     return complete(p, result);
   } catch (e) {
-    if (p.shadow) rmSync(p.shadow.root, { recursive: true, force: true });
+    if (p.shadow) dropShadow(p.shadow);
     throw e;
   }
 }
@@ -1261,7 +1752,7 @@ export function safeGitSync(args: readonly string[], opts: SafeGitOptions): Safe
     const result = runSync(p.argv, p.env, opts.timeoutMs ?? 60_000, opts.maxBuffer ?? 16 * 1024 * 1024);
     return complete(p, result);
   } catch (e) {
-    if (p.shadow) rmSync(p.shadow.root, { recursive: true, force: true });
+    if (p.shadow) dropShadow(p.shadow);
     throw e;
   }
 }
@@ -1318,16 +1809,11 @@ export const RAW_GIT_EXCEPTIONS: Readonly<Record<string, RawSpawnException>> = {
   "src/bar/scope.ts": { kind: "git-plumbing", why: "rev-parse HEAD only" },
   "src/blackhole/connectionSetup.ts": { kind: "git-plumbing", why: "rev-parse HEAD only" },
   "src/git/rustBuildCache.ts": { kind: "git-plumbing", why: "rev-parse --show-toplevel / --git-common-dir only" },
-  "src/guard/primaryWorktreeGuard.ts": {
-    kind: "git-plumbing",
-    why: "rev-parse of the worker's cwd; the guard must see exactly what the worker's own git sees",
-  },
   "src/integrations/autospec/provider.ts": {
     kind: "git-plumbing",
     why: "cat-file / show of a committed blob; never reads the worktree or index",
   },
   "src/runtime/host/loader.ts": { kind: "git-plumbing", why: "rev-parse --absolute-git-dir" },
-  "src/runtime/isolation/WorktreeIdentity.ts": { kind: "git-plumbing", why: "rev-parse of toplevel / git dirs" },
   "src/update/gitSource.ts": {
     kind: "pi-owned",
     why: "Pi-owned --git-dir cache with its own -c hardening and scrubbed env",

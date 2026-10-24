@@ -17,8 +17,13 @@ import {
   parseFileConfig,
   safeGit,
   safeGitPrefix,
+  stateHooks,
   testHooks,
 } from "../../src/git/safeGit.ts";
+
+// a private shadow root for this file alone (no other file's directories are ever counted)
+const shadowDir = mkdtempSync(join(tmpdir(), "safe-git-surv-shadows-"));
+stateHooks.shadowRoot = shadowDir;
 
 afterEach(() => {
   testHooks.afterPlan = undefined;
@@ -107,7 +112,7 @@ test("worktree add in a repository that has no worktrees directory yet lands in 
   const l = lab();
   try {
     assert.equal(existsSync(join(l.repo, ".git", "worktrees")), false);
-    const left = () => readdirSync(tmpdir()).filter((n) => n.startsWith("pi-safegit-")).length;
+    const left = () => readdirSync(shadowDir).length;
     const before = left();
     const r = await safeGit(["worktree", "add", "-b", "feat", join(l.root, "wt")], { cwd: l.repo, trust: "strict" });
     assert.equal(r.code, 0, r.stderr);
@@ -125,7 +130,7 @@ test("stderr paths are the real ones, never the shadow's", async () => {
     const r = await safeGit(["fsck", "--verbose"], { cwd: l.repo, trust: "strict" });
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stderr, /Checking cache tree of /);
-    assert.doesNotMatch(`${r.stdout}${r.stderr}`, /pi-safegit-/);
+    assert.ok(!`${r.stdout}${r.stderr}`.includes(shadowDir));
   } finally {
     rmSync(l.root, { recursive: true, force: true });
   }
@@ -163,9 +168,9 @@ test("the operator pi.allowedRemote cache follows the operator's config location
   try {
     const a = join(l.root, "a.gitconfig");
     const b = join(l.root, "b.gitconfig");
-    l.sh(`git config remote.origin.url file://${l.root}/remote.git`, l.repo);
-    writeFileSync(a, "[pi]\n\tallowedRemote = file:///nowhere/*\n");
-    writeFileSync(b, `[pi]\n\tallowedRemote = file://${l.root}/*\n`);
+    l.sh("git config remote.origin.url https://good.example/org/r.git", l.repo);
+    writeFileSync(a, "[pi]\n\tallowedRemote = https://nowhere.example/*\n");
+    writeFileSync(b, "[pi]\n\tallowedRemote = https://good.example/*\n");
     process.env.GIT_CONFIG_NOSYSTEM = "1";
     process.env.GIT_CONFIG_GLOBAL = a;
     const refused = await safeGit(["ls-remote", "origin"], { cwd: l.repo, trust: "operator" });

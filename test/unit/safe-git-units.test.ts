@@ -105,9 +105,9 @@ test("excludePathspecs spells nested repositories as literal, top-anchored exclu
 });
 
 test("safeGitEnv pins transports in both modes; operator keeps its own GIT_ALLOW_PROTOCOL, strict never does", () => {
-  assert.equal(safeGitEnv({}, "strict").GIT_ALLOW_PROTOCOL, "https:ssh:file");
-  assert.equal(safeGitEnv({ GIT_ALLOW_PROTOCOL: "ext" }, "strict").GIT_ALLOW_PROTOCOL, "https:ssh:file");
-  assert.equal(safeGitEnv({}, "operator").GIT_ALLOW_PROTOCOL, "https:http:ssh:file:git");
+  assert.equal(safeGitEnv({}, "strict").GIT_ALLOW_PROTOCOL, "https:ssh");
+  assert.equal(safeGitEnv({ GIT_ALLOW_PROTOCOL: "ext" }, "strict").GIT_ALLOW_PROTOCOL, "https:ssh");
+  assert.equal(safeGitEnv({}, "operator").GIT_ALLOW_PROTOCOL, "https:http:ssh:git");
   assert.equal(safeGitEnv({ GIT_ALLOW_PROTOCOL: "https" }, "operator").GIT_ALLOW_PROTOCOL, "https");
 });
 

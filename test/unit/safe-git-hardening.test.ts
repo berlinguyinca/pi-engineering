@@ -158,7 +158,7 @@ for (const trust of MODES) {
   });
 }
 
-test("operator mode keeps the operator's own global drivers and credential helper, never the repository's; strict mode keeps neither", async () => {
+test("operator mode keeps the operator's own global config (alias, credential helper) but no repository attribute selects a driver; strict mode keeps nothing", async () => {
   const f = fixture();
   try {
     const opMark = join(f.marks, "operator-clean");
@@ -174,7 +174,9 @@ test("operator mode keeps the operator's own global drivers and credential helpe
       writeFileSync(join(f.linked, "f.txt"), "changed\n");
       f.reset();
       await safeGit(["add", "-A"], { cwd: f.linked, trust: "operator" });
-      assert.deepEqual(f.seen(), ["operator-clean"], "the operator's own driver runs, the repository's do not");
+      // round 4: attributes are cut off at the source, so a repository's attributes cannot select ANY driver, the
+      // operator's own included (only git-lfs lines that Pi itself generated apply: test/unit/safe-git-attrs.test.ts)
+      assert.deepEqual(f.seen(), [], "neither the operator's driver nor the repository's runs");
       sh("git reset -q", f.linked, { GIT_CONFIG_GLOBAL: "/dev/null" });
       writeFileSync(join(f.linked, "f.txt"), "changed again\n");
       f.reset();
@@ -260,7 +262,7 @@ test("operator mode honours the operator's own git environment; strict mode does
   assert.equal(op.GIT_EDITOR, "true");
   const strict = safeGitEnv(source, "strict");
   assert.equal(strict.GIT_CONFIG_GLOBAL, "/dev/null");
-  assert.equal(strict.GIT_ALLOW_PROTOCOL, "https:ssh:file");
+  assert.equal(strict.GIT_ALLOW_PROTOCOL, "https:ssh");
   assert.equal(strict.GIT_SSL_CAINFO, undefined);
 });
 

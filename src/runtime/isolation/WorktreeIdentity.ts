@@ -12,13 +12,10 @@
  * A directory that is not inside a git worktree still gets a stable identity
  * from its canonical path, so non-git launches keep durable history.
  */
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { safeGit } from "../../git/safeGit.ts";
 
 export interface WorktreeIdentity {
   kind: "git" | "directory";
@@ -49,18 +46,17 @@ async function canonical(path: string): Promise<string> {
 }
 
 async function gitLines(cwd: string): Promise<[string, string, string] | null> {
-  try {
-    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel", "--git-common-dir", "--git-dir"], {
-      cwd,
-      timeout: 10_000,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-    });
-    const [top, common, dir] = stdout.split("\n").map((line) => line.trim());
-    if (!top || !common || !dir) return null;
-    return [top, common, dir];
-  } catch {
-    return null;
-  }
+  // through safeGit: the repository is found without reading its config, so a `core.worktree` a worker wrote into the
+  // shared config cannot move the answer (round 4)
+  const r = await safeGit(["rev-parse", "--show-toplevel", "--git-common-dir", "--git-dir"], {
+    cwd,
+    timeoutMs: 10_000,
+    env: { GIT_OPTIONAL_LOCKS: "0" },
+  });
+  if (r.code !== 0) return null;
+  const [top, common, dir] = r.stdout.split("\n").map((line) => line.trim());
+  if (!top || !common || !dir) return null;
+  return [top, common, dir];
 }
 
 /** Resolve the worktree that contains `dir`. Never throws. */
