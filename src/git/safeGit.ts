@@ -3,54 +3,84 @@
  * written by someone else (for example the agent working in a fork's worktree, which shares the repository's
  * `.git` directory with the original).
  *
- * What it closes:
- *  - the environment is rebuilt from a short allow-list: no inherited `GIT_*` (GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF,
- *    GIT_CONFIG_*, GIT_DIR ...), only what git and ssh need to run;
- *  - system and global config are not read (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL=/dev/null), so nothing in the
- *    caller's dotfiles redirects a command either;
- *  - command-line `-c` settings outrank every config file, so hooks (`core.hooksPath`), the filesystem monitor
- *    (`core.fsmonitor`, which runs a command on status), `core.sshCommand`, credential helpers and `ext::`
- *    transports are switched off for this invocation whatever the repository says;
- *  - only https, ssh and file transports are allowed.
+ * Design: an ALLOW-LIST, not a deny-list.
  *
- * Residual race (measured, documented, not hidden). The execution-relevant part of the repository config is listed
- * with `git config --list` and the command runs afterwards, so a worker that rewrites `.git/config` in that window
- * can still introduce a section that was not there when the policy was computed. What is done about it:
- *  - every driver name that an attributes file (info/attributes, any .gitattributes in the work tree) REFERENCES is
- *    neutralised up front whether or not a config section for it exists yet, so "attributes already there, config
- *    appears in the window" (the flip loop in test/unit/safe-git-race.test.ts) cannot run a driver: 0 hits in 300
- *    strict-mode runs, against 7 in 40 for the listing-only design;
- *  - strict mode points core.attributesFile at /dev/null;
- *  - after every command that can run a driver or touch the network the config is listed again; if the execution-
- *    relevant entries differ, the result is discarded (code 128, "changed while the command ran") and an error
- *    notice `git-config-changed-during-command` is emitted;
- *  - remote URLs are pinned per repository the first time Pi looks (see `pinProblem`).
- * Not closed: a worker that writes BOTH the attributes line and the config section inside the few milliseconds
- * between the listing and the command can still run one driver once; the post-command check then reports it, but
- * cannot undo it. Measured with both files flipping: see docs/architecture.md. A complete fix needs the worker not
- * to be able to write the shared `.git` at all (sandbox / read-only bind mount), which is outside this module.
+ * The repository's own `config` is never handed to git. For every call safeGit
+ *  1. finds the repository itself (walking up from the working directory, reading `.git`, `gitdir:` and `commondir`
+ *     files - no git process, so `core.worktree` or `core.bare` in a planted config cannot redirect the search),
+ *  2. lists the repository's `config` once (`git config --file`, which reads exactly one file and runs nothing),
+ *  3. writes a GENERATED config into a private shadow common directory that contains only the keys on an explicit
+ *     allow-list, each value validated, and symlinks to everything else in the real common directory (objects, refs,
+ *     packed-refs, logs, worktrees ...), with an EMPTY `hooks` directory,
+ *  4. runs git with `GIT_COMMON_DIR` = the shadow, `GIT_DIR` = the real per-worktree directory and `GIT_WORK_TREE`,
+ *  5. afterwards moves into the real directory what git created in the shadow because it did not exist yet (`shallow`),
+ *     maps the shadow path out of git's output and out of the files it wrote (worktree `.git` files), and replays the
+ *     config entries that the command itself added or removed (`git remote add`, `git config`,
+ *     `branch --set-upstream-to`, LFS auth) onto the real config. Refs, packed-refs, HEAD and the index are the REAL
+ *     files: git takes them from the real per-worktree directory (and its `commondir` file), so their locks are the
+ *     real locks.
+ *
+ * Consequences:
+ *  - there is no window between "list the config" and "run the command": git reads the generated file, so a worker
+ *    that rewrites `.git/config` (or adds an attributes file, a `.lfsconfig`, `core.attributesFile` ...) at any
+ *    moment changes nothing for the command that is running. The flip loops in test/unit/safe-git-race.test.ts
+ *    measure 0 hits in 400 runs per mode;
+ *  - execution vectors are ABSENT instead of neutralised: no `filter.*`, `diff.*.textconv`, `merge.*.driver`,
+ *    `credential.*.helper`, `core.fsmonitor`, `core.sshCommand`, `core.gitProxy`, `core.askpass`, `core.editor`,
+ *    `core.attributesFile`, `core.hooksPath`, `core.alternateRefsCommand`, `gpg.*`, `submodule.*.update`,
+ *    `remote.*.vcs|uploadpack|receivepack|proxy|promisor`, `extensions.partialclone`, `url.*.insteadOf`,
+ *    `include*`, `lfs.*` (except `lfs.<url>.access`) reaches git, whatever their spelling (the allow-list never
+ *    parses names to reject them), including keys this module has never heard of;
+ *  - credentials cannot be steered to another host: `remote.<n>.url|pushurl` are checked against the first-seen pin
+ *    (and the operator's optional `pi.allowedRemote` list), `branch.<b>.remote|pushRemote` and `remote.pushDefault`
+ *    must name a remote that exists, `url.<x>.insteadOf` is not honoured, `http.*` / `credential.*` of the
+ *    repository are not honoured;
+ *  - the environment is rebuilt from a short allow-list (no inherited `GIT_*`), system and global config are not read
+ *    in `strict` mode, and command-line settings switch off hooks, fsmonitor, signing, pagers, `ext::` transports,
+ *    submodule recursion, auto-gc and the submodule status that would run a NESTED repository's own config.
+ *
+ * Nested repositories and submodules: a tracked gitlink whose directory holds its own `.git` makes `git add`,
+ * `diff-files`, `diff-index` and `describe --dirty` spawn a child `git status` that reads THAT repository's config
+ * (a filter there would run). The generated environment forces `diff.ignoreSubmodules=all` etc.; where that is not
+ * enough, `--ignore-submodules=all` is added (diff-files, diff-index), the nested paths are excluded from `git add`
+ * with `:(exclude)` pathspecs, and `describe --dirty` is refused while a nested repository exists.
+ *
+ * Limits (documented, not hidden): see docs/architecture.md. The shadow directory lives in the temp directory and is
+ * removed after each call; it is not a security boundary against a worker that can already write the operator's
+ * home directory, and a worker that can swap `.git` for a symlink between calls changes which repository is used
+ * (the repository is re-discovered on every call, so that is the repository git would have used too).
  */
-import { spawn, spawnSync } from "node:child_process";
-import { readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { type SpawnSyncReturns, spawn, spawnSync } from "node:child_process";
+import {
+  closeSync,
+  copyFileSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { emitTelemetry } from "../telemetry/sink.ts";
 
 /**
- * Trust model (T16 H5). The repository's LOCAL and WORKTREE config, `info/attributes`, `.gitattributes` and hooks can
- * be written by the agent working in a linked worktree (they share the primary's `.git`). Two modes:
+ * Trust model (T16 H5). The repository's LOCAL and WORKTREE config, `info/attributes`, `.gitattributes`, `.lfsconfig`
+ * and hooks can be written by the agent working in a linked worktree (they share the primary's `.git`). Two modes:
  *
  *  - `strict` (default): system and global config are ignored too (forks / promotion path).
  *  - `operator`: the operator's own system/global config is kept (identity, credential helpers, git-lfs, ssh
- *    settings) but every execution vector that the repo-local or worktree scope defines is replaced by the
- *    operator's value, or by a neutral one when the operator has none.
- *
- * Both modes: no hooks, no fsmonitor, no gpg, no external diff, no editor, no pager, and every `filter.*`
- * (clean/smudge/process), `diff.*.textconv`, `merge.*.driver`, `credential.*.helper`, `remote.*.uploadpack`,
- * `core.sshCommand`, `core.gitProxy`, `core.askpass`, `core.alternateRefsCommand` defined by the repository is
- * neutralised through GIT_CONFIG_COUNT/KEY_n/VALUE_n set by safeGit itself (command scope outranks every config file, and a
- * key containing `=` survives, which `-c key=value` cannot carry); `core.gitProxy` is first-wins in git, so it is pinned with
- * GIT_PROXY_COMMAND instead. `diff`/`show`/`log` additionally get
- * `--no-ext-diff --no-textconv`.
+ *    settings, `url.*.insteadOf`). The repository-local scope is the generated allow-list in both modes.
  *
  * Spawns that INTENTIONALLY run worker-authored commands are exempt and listed in `RAW_GIT_EXCEPTIONS`
  * (test/unit/safe-git-callers.test.ts enforces that no other source file spawns git directly).
@@ -62,7 +92,9 @@ const KEEP_ENV = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "SSH_AUTH
 /**
  * Extra variables kept in `operator` mode: Pi's own process environment belongs to the operator (a worker cannot
  * change it), so the operator's config isolation, CA bundle, transport and identity choices are honoured. Never
- * GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / GIT_EXTERNAL_DIFF / GIT_EDITOR / GIT_PAGER and the like.
+ * GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR / GIT_INDEX_FILE / GIT_EXTERNAL_DIFF / GIT_EDITOR / GIT_PAGER and the like.
+ * (Pi's own environment is trusted; a variable that only a worker's shell could have set never reaches this list
+ * because Pi does not run in the worker's shell.)
  */
 const OPERATOR_ENV = [
   "XDG_CONFIG_HOME",
@@ -107,9 +139,10 @@ export function safeGitEnv(source: NodeJS.ProcessEnv = process.env, trust: GitTr
   }
   env.GIT_TERMINAL_PROMPT = "0";
   env.GIT_ASKPASS = "echo";
-  // Strict mode pins the transports; in operator mode the operator's own GIT_ALLOW_PROTOCOL (if any) stands, and
-  // `protocol.ext.allow=never` is forced on the command line either way.
+  // Both modes pin the transports (operator mode keeps an operator-supplied GIT_ALLOW_PROTOCOL, strict ignores it).
+  // `protocol.ext.allow=never` is forced on the command line either way; the pin also stops `<helper>::<url>` remotes.
   if (trust === "strict") env.GIT_ALLOW_PROTOCOL = "https:ssh:file";
+  else if (env.GIT_ALLOW_PROTOCOL === undefined) env.GIT_ALLOW_PROTOCOL = "https:http:ssh:file:git";
   env.GIT_ATTR_NOSYSTEM = "1";
   env.GIT_EDITOR = "true";
   env.GIT_SEQUENCE_EDITOR = "true";
@@ -130,6 +163,17 @@ const FORCED_SETTINGS = [
   "push.gpgsign=false",
   "log.showsignature=false",
   "merge.verifysignatures=false",
+  // nested repositories / submodules: never let git start a child that reads another repository's config
+  "submodule.recurse=false",
+  "diff.submodule=log",
+  "diff.ignoreSubmodules=all",
+  "status.submoduleSummary=false",
+  "fetch.recurseSubmodules=false",
+  "push.recurseSubmodules=no",
+  // a detached `gc --auto` would outlive the shadow directory it was started in
+  "gc.auto=0",
+  "gc.autoDetach=false",
+  "maintenance.auto=false",
 ] as const;
 /** Strict mode additionally pins ssh and credential settings, because it also ignores the operator's own config. */
 const STRICT_ONLY_SETTINGS = ["core.sshCommand=ssh", "credential.helper=", "core.attributesFile=/dev/null"] as const;
@@ -140,7 +184,7 @@ const OPERATOR_FORCED: readonly string[] = pairs(FORCED_SETTINGS);
 
 const TRUSTED_SCOPES = new Set(["system", "global"]);
 
-/** One `key = value` override. Carried in GIT_CONFIG_KEY_n/VALUE_n, never in a `-c key=value` argument (git splits that at the FIRST `=`, so a driver named `a=b` could not be addressed). */
+/** One `key = value` override. Carried in GIT_CONFIG_KEY_n/VALUE_n, never in a `-c key=value` argument (git splits that at the FIRST `=`). */
 export interface ConfigPair {
   key: string;
   value: string;
@@ -156,7 +200,7 @@ export interface ConfigEntry {
 
 /**
  * Parse `git config --list --show-scope --show-origin -z`: records `scope \0 origin \0 key \n value \0`.
- * A record that does not have all three fields is dropped (it cannot be classified).
+ * A record that does not have all three fields is dropped.
  */
 export function parseScopedConfig(out: string): ConfigEntry[] {
   const parts = out.split("\0");
@@ -174,11 +218,27 @@ export function parseScopedConfig(out: string): ConfigEntry[] {
   return entries;
 }
 
-// ─── key classification ──────────────────────────────────────────────────────────────────────────────────────────
+/** One entry of a single config file as `git config --file F --list -z` prints it. `value` is null for a bare boolean key. */
+export interface FileEntry {
+  key: string;
+  value: string | null;
+}
+
+/** Parse `git config --file F --list -z`: records `key \n value \0` (no newline = a key without a value). */
+export function parseFileConfig(out: string): FileEntry[] {
+  const entries: FileEntry[] = [];
+  for (const rec of out.split("\0")) {
+    if (rec === "") continue;
+    const nl = rec.indexOf("\n");
+    entries.push(nl < 0 ? { key: rec, value: null } : { key: rec.slice(0, nl), value: rec.slice(nl + 1) });
+  }
+  return entries;
+}
+
+// ─── key parsing ─────────────────────────────────────────────────────────────────────────────────────────────────
 // A configuration key is `section[.subsection].variable`. Git's own rule: the section ends at the FIRST dot, the
 // variable starts after the LAST dot, and everything between (any bytes except a newline, possibly empty) is the
-// subsection, which is case-sensitive. Section and variable are case-insensitive. Classification is done on these
-// parts, never by a regular expression over the whole key, so no subsection spelling can slip past a rule.
+// subsection, which is case-sensitive. Section and variable are case-insensitive.
 
 export interface ParsedKey {
   section: string;
@@ -197,271 +257,345 @@ export function parseKey(key: string): ParsedKey | null {
   return { section, sub: key.slice(first + 1, last), variable };
 }
 
-/** Identity of a key as git sees it: case-insensitive section/variable, CASE-SENSITIVE subsection. */
-export function keyId(p: ParsedKey): string {
-  return `${p.section}\0${p.sub === null ? "N" : `S${p.sub}`}\0${p.variable}`;
-}
+// ─── the allow-list ──────────────────────────────────────────────────────────────────────────────────────────────
 
-const NEUTRAL_CORE: Record<string, string> = {
-  sshcommand: "ssh",
-  gitproxy: "false",
-  askpass: "",
-  alternaterefscommand: "true",
-  editor: "true",
+type Validator = (value: string | null) => string | null;
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
+const SAFE_TEXT = /^[^\x00-\x08\x0a-\x1f\x7f]{0,4096}$/;
+const text: Validator = (v) => (v !== null && SAFE_TEXT.test(v) ? v : null);
+const BOOL = /^(true|false|yes|no|on|off|1|0)$/i;
+const bool: Validator = (v) => (v === null ? "true" : BOOL.test(v) ? v : null);
+const INT = /^\d{1,12}[kKmMgG]?$/;
+const int: Validator = (v) => (v !== null && INT.test(v) ? v : null);
+const oneOf =
+  (...allowed: string[]): Validator =>
+  (v) =>
+    v !== null && allowed.includes(v.toLowerCase()) ? v : null;
+const boolOr = (...more: string[]): Validator => {
+  return (v) => (v === null ? "true" : BOOL.test(v) || more.includes(v.toLowerCase()) ? v : null);
 };
 
-/** The harmless value that replaces a repository-defined execution vector, or null when the key is not one. */
-export function neutralFor(p: ParsedKey): string | null {
-  const { section, sub, variable } = p;
-  switch (section) {
-    case "filter":
-      if (sub === null) return null;
-      if (variable === "clean" || variable === "smudge" || variable === "process") return "";
-      return variable === "required" ? "false" : null;
-    case "diff":
-      if (sub === null) return null;
-      return variable === "textconv" ? "cat" : variable === "command" ? "" : null;
-    case "merge":
-      return sub !== null && variable === "driver" ? "" : null;
-    case "trailer":
-      return sub !== null && (variable === "command" || variable === "cmd") ? "" : null;
-    case "core":
-      return sub === null && variable in NEUTRAL_CORE ? (NEUTRAL_CORE[variable] as string) : null;
-    case "sequence":
-      return sub === null && variable === "editor" ? "true" : null;
-    case "gpg":
-      if (variable === "program") return "false";
-      return sub === "ssh" && variable === "defaultkeycommand" ? "" : null;
-    case "submodule":
-      return sub !== null && variable === "update" ? "checkout" : null;
-    case "lfs":
-      // git-lfs runs `lfs.extension.<n>.clean|smudge` as filters and `lfs.customtransfer.<n>.path` as a transfer agent
-      if (sub !== null && (sub.startsWith("extension.") || sub.startsWith("customtransfer."))) {
-        return variable === "clean" || variable === "smudge" || variable === "path" || variable === "args" ? "" : null;
-      }
-      return null;
-    default:
-      return null;
-  }
-}
-
-export const isCredentialHelper = (p: ParsedKey): boolean => p.section === "credential" && p.variable === "helper";
-
-/**
- * Keys that decide WHERE a network command goes or what it sends, or that run a command on one. A `-c` override of
- * these is either ignored by git (first value wins) or unsafe (an empty `url.<x>.insteadOf` matches everything), so a
- * network command is refused while the repository (not the operator) defines one.
- */
-export function refusesNetwork(p: ParsedKey): boolean {
-  const { section, sub, variable } = p;
-  switch (section) {
-    case "remote":
-      return (
-        sub !== null &&
-        (variable === "uploadpack" ||
-          variable === "receivepack" ||
-          variable === "vcs" ||
-          variable === "proxy" ||
-          variable === "proxyauthmethod")
-      );
-    case "http":
-    case "protocol":
-    case "url":
-      return true;
-    case "lfs":
-      return (
-        variable === "url" ||
-        variable === "pushurl" ||
-        variable === "access" ||
-        variable === "standalonetransferagent" ||
-        variable === "locksverify"
-      );
-    default:
-      return false;
-  }
-}
-
-const isRemoteUrl = (p: ParsedKey): boolean =>
-  p.section === "remote" && p.sub !== null && (p.variable === "url" || p.variable === "pushurl");
-
-const trustedScope = (e: ConfigEntry, trust: GitTrust): boolean => trust === "operator" && TRUSTED_SCOPES.has(e.scope);
-
-/** The vectors a driver NAME taken from a gitattributes file can reach, per attribute. */
-const ATTRIBUTE_VARIABLES: Record<string, ReadonlyArray<readonly [string, string]>> = {
-  filter: [
-    ["clean", ""],
-    ["smudge", ""],
-    ["process", ""],
-    ["required", "false"],
-  ],
-  diff: [
-    ["textconv", "cat"],
-    ["command", ""],
-  ],
-  merge: [["driver", ""]],
+/** Keys without a subsection: `section.variable`. Everything else is dropped. */
+const ALLOWED_PLAIN: Record<string, Validator> = {
+  "core.filemode": bool,
+  "core.ignorecase": bool,
+  "core.symlinks": bool,
+  "core.logallrefupdates": boolOr("always"),
+  "core.precomposeunicode": bool,
+  "core.autocrlf": boolOr("input"),
+  "core.eol": oneOf("lf", "crlf", "native"),
+  "core.safecrlf": boolOr("warn"),
+  "core.quotepath": bool,
+  "core.trustctime": bool,
+  "core.checkstat": oneOf("default", "minimal"),
+  "core.untrackedcache": boolOr("keep"),
+  "core.sparsecheckout": bool,
+  "core.sparsecheckoutcone": bool,
+  "core.compression": int,
+  "core.loosecompression": int,
+  "core.bigfilethreshold": int,
+  "core.preloadindex": bool,
+  "core.longpaths": bool,
+  "core.abbrev": int,
+  "core.warnambiguousrefs": boolOr("warn"),
+  "core.fsync": text,
+  "extensions.objectformat": oneOf("sha1", "sha256"),
+  "extensions.compatobjectformat": oneOf("sha1", "sha256"),
+  "extensions.refstorage": oneOf("files", "reftable"),
+  "extensions.preciousobjects": bool,
+  "extensions.noop": bool,
+  "user.name": text,
+  "user.email": text,
+  "user.useconfigonly": bool,
+  "push.default": oneOf("nothing", "current", "upstream", "tracking", "simple", "matching"),
+  "push.autosetupremote": bool,
+  "pull.rebase": boolOr("merges", "interactive"),
+  "pull.ff": boolOr("only"),
+  "merge.ff": boolOr("only"),
+  "fetch.prune": bool,
+  "fetch.prunetags": bool,
+  "rebase.autostash": bool,
+  "diff.renames": boolOr("copy", "copies"),
+  "diff.algorithm": oneOf("default", "myers", "minimal", "patience", "histogram"),
+  "merge.conflictstyle": oneOf("merge", "diff3", "zdiff3"),
+  "rerere.enabled": bool,
+  "init.defaultbranch": text,
 };
 
+/** Keys with a subsection: `section.*.variable` (the subsection is a branch / remote name, or a URL for lfs). */
+const ALLOWED_SUB: Record<string, Validator> = {
+  "branch.*.merge": text,
+  "branch.*.rebase": boolOr("merges", "interactive"),
+  "remote.*.fetch": text,
+  "remote.*.push": text,
+  "remote.*.tagopt": oneOf("--no-tags", "--tags"),
+  "remote.*.prune": bool,
+  "remote.*.prunetags": bool,
+  "remote.*.mirror": bool,
+  "remote.*.skipdefaultupdate": bool,
+  "remote.*.skipfetchall": bool,
+  // git-lfs records "basic" after a first authenticated request; the value picks no host (that is decided by the remote URL)
+  "lfs.*.access": oneOf("basic", "none", "negotiate"),
+};
+
+/** `remote.<n>.url` / `pushurl`, `branch.<b>.remote|pushremote` and `remote.pushdefault` are handled specially (see `generateConfig`). */
+const URL_VARIABLES = new Set(["url", "pushurl"]);
+
+export interface Generated {
+  /** The text of the generated `config` file. */
+  text: string;
+  /** What the generated file contains, as key/value rows (for the delta after the command). */
+  kept: FileEntry[];
+  /** Repository-local keys that were left out, as they were spelled. */
+  dropped: string[];
+  /** `remote.<n>.url|pushurl` as kept, canonical text (the pin). */
+  remoteUrls: string;
+  /** Every remote URL that was kept (for the operator allow-list). */
+  urls: string[];
+}
+
+const ESC = (s: string): string => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\t/g, "\\t");
+const SECTION = /^[a-z][a-z0-9-]*$/i;
+
+function emit(section: string, sub: string | null, variable: string, value: string | null): string {
+  const head = sub === null ? `[${section}]` : `[${section} "${ESC(sub)}"]`;
+  return value === null ? `${head}\n\t${variable}\n` : `${head}\n\t${variable} = "${ESC(value)}"\n`;
+}
+
 /**
- * `-c`-style overrides (as key/value pairs) that replace every execution vector the repository (any non-trusted scope)
- * defines, plus - for each driver name that an attributes file REFERENCES - the same neutral values even when no
- * config section for it exists yet. Naming the drivers up front is what keeps a section that appears between the
- * listing and the command from running (see "Residual race" in the header).
- *
- * In operator mode a key the operator's own system/global config defines keeps the operator's value. Pure.
+ * Pure: build the generated repository config from the real one. `bare` decides `core.bare`.
+ * Nothing is copied that is not on the allow-list; a value that fails its validator is dropped, not repaired.
  */
-export function neutralisers(
-  entries: readonly ConfigEntry[],
-  trust: GitTrust,
-  attributeDrivers: ReadonlyArray<readonly [string, string]> = [],
-): ConfigPair[] {
-  const out: ConfigPair[] = [];
-  const done = new Set<string>();
-  const trustedValues = (id: string): string[] =>
-    entries
-      .filter((t) => {
-        if (!trustedScope(t, trust)) return false;
-        const tp = parseKey(t.key);
-        return tp !== null && keyId(tp) === id;
-      })
-      .map((t) => t.value);
+export function generateConfig(entries: readonly FileEntry[], bare: boolean): Generated {
+  const kept: FileEntry[] = [];
+  const dropped: string[] = [];
+  const out: string[] = [];
+  const parsed: Array<{ e: FileEntry; p: ParsedKey }> = [];
   for (const e of entries) {
-    if (trustedScope(e, trust)) continue;
     const p = parseKey(e.key);
-    if (!p) continue;
-    const id = keyId(p);
-    if (done.has(id)) continue;
-    if (isCredentialHelper(p)) {
-      done.add(id);
-      out.push({ key: e.key, value: "" });
-      for (const v of trustedValues(id)) out.push({ key: e.key, value: v });
+    if (p) parsed.push({ e, p });
+    else dropped.push(e.key);
+  }
+  const keep = (e: FileEntry, p: ParsedKey, value: string | null): void => {
+    if (!SECTION.test(p.section) || !SECTION.test(p.variable)) {
+      dropped.push(e.key);
+      return;
+    }
+    if (p.sub !== null && /[\n\0]/.test(p.sub)) {
+      dropped.push(e.key);
+      return;
+    }
+    out.push(emit(p.section, p.sub, p.variable, value));
+    kept.push({ key: e.key, value });
+  };
+
+  // remotes that exist (have a URL that survived validation): branch.*.remote may only name one of these
+  const remoteNames = new Set<string>();
+  for (const { e, p } of parsed) {
+    if (p.section === "remote" && p.sub !== null && URL_VARIABLES.has(p.variable) && text(e.value) !== null) {
+      remoteNames.add(p.sub);
+    }
+  }
+
+  let version = "0";
+  let extensions = false;
+  for (const { e, p } of parsed) {
+    const id = p.sub === null ? `${p.section}.${p.variable}` : `${p.section}.*.${p.variable}`;
+    if (p.sub === null && p.section === "core" && p.variable === "repositoryformatversion") {
+      if (e.value === "0" || e.value === "1") version = e.value;
       continue;
     }
-    const neutral = neutralFor(p);
-    if (neutral === null) continue;
-    done.add(id);
-    const kept = trustedValues(id);
-    out.push({ key: e.key, value: kept.length > 0 ? (kept[kept.length - 1] as string) : neutral });
-  }
-  for (const [kind, name] of attributeDrivers) {
-    for (const [variable, neutral] of ATTRIBUTE_VARIABLES[kind] ?? []) {
-      const p: ParsedKey = { section: kind, sub: name, variable };
-      const id = keyId(p);
-      if (done.has(id)) continue;
-      done.add(id);
-      const kept = trustedValues(id);
-      out.push({
-        key: `${kind}.${name}.${variable}`,
-        value: kept.length > 0 ? (kept[kept.length - 1] as string) : neutral,
-      });
+    if (p.sub === null && p.section === "core" && p.variable === "bare") continue; // derived from where the repository was found
+    if (p.sub !== null && p.section === "remote" && URL_VARIABLES.has(p.variable)) {
+      const v = text(e.value);
+      if (v === null || v === "") dropped.push(e.key);
+      else keep(e, p, v);
+      continue;
     }
+    if (p.sub !== null && p.section === "branch" && (p.variable === "remote" || p.variable === "pushremote")) {
+      const v = text(e.value);
+      if (v !== null && (v === "." || remoteNames.has(v))) keep(e, p, v);
+      else dropped.push(e.key);
+      continue;
+    }
+    if (p.sub === null && p.section === "remote" && p.variable === "pushdefault") {
+      const v = text(e.value);
+      if (v !== null && remoteNames.has(v)) keep(e, p, v);
+      else dropped.push(e.key);
+      continue;
+    }
+    const validator = (p.sub === null ? ALLOWED_PLAIN : ALLOWED_SUB)[id];
+    if (!validator) {
+      dropped.push(e.key);
+      continue;
+    }
+    const v = validator(e.value);
+    if (v === null) {
+      dropped.push(e.key);
+      continue;
+    }
+    if (p.section === "extensions") extensions = true;
+    keep(e, p, v);
   }
-  return out;
-}
-
-/** Repository-defined keys that make a network command unsafe (see `refusesNetwork`), by their spelling in the config. */
-export function remoteExecKeys(entries: readonly ConfigEntry[], trust: GitTrust): string[] {
-  return entries
-    .filter((e) => {
-      if (trustedScope(e, trust)) return false;
-      const p = parseKey(e.key);
-      return p !== null && refusesNetwork(p);
+  const head = [
+    emit("core", null, "repositoryformatversion", extensions ? "1" : version),
+    emit("core", null, "bare", bare ? "true" : "false"),
+  ];
+  const urlRows = kept
+    .filter((k) => {
+      const p = parseKey(k.key);
+      return p !== null && p.section === "remote" && p.sub !== null && URL_VARIABLES.has(p.variable);
     })
-    .map((e) => e.key);
+    .map((k) => `${k.key}\0${k.value ?? ""}`)
+    .sort();
+  return {
+    text: head.join("") + out.join(""),
+    kept,
+    dropped,
+    remoteUrls: urlRows.join("\u0001"),
+    urls: kept
+      .filter((k) => {
+        const p = parseKey(k.key);
+        return p !== null && p.section === "remote" && p.sub !== null && URL_VARIABLES.has(p.variable);
+      })
+      .map((k) => k.value ?? ""),
+  };
 }
 
-/** Canonical text of every entry that matters to the policy (used to notice a change while a command ran). */
-export function policyDigest(entries: readonly ConfigEntry[], trust: GitTrust): string {
-  const rows: string[] = [];
-  for (const e of entries) {
-    if (trustedScope(e, trust)) continue;
-    const p = parseKey(e.key);
-    if (p && (neutralFor(p) !== null || isCredentialHelper(p) || refusesNetwork(p))) {
-      rows.push(`${e.scope}\0${e.key}\0${e.value}`);
+/**
+ * Pure: the changes a command made to the generated config, as (key, value) rows to remove and to add.
+ * Multi-valued keys are compared as multisets; order is not meaningful.
+ */
+export function configDelta(
+  before: readonly FileEntry[],
+  after: readonly FileEntry[],
+): { remove: FileEntry[]; add: FileEntry[] } {
+  const keyOf = (e: FileEntry) => `${e.key}\0${e.value ?? ""}`;
+  const count = (list: readonly FileEntry[]) => {
+    const m = new Map<string, number>();
+    for (const e of list) m.set(keyOf(e), (m.get(keyOf(e)) ?? 0) + 1);
+    return m;
+  };
+  const missingFrom = (list: readonly FileEntry[], other: Map<string, number>): FileEntry[] => {
+    const left = new Map(other);
+    const rows: FileEntry[] = [];
+    for (const e of list) {
+      const n = left.get(keyOf(e)) ?? 0;
+      if (n > 0) left.set(keyOf(e), n - 1);
+      else rows.push(e);
     }
-  }
-  return rows.sort().join("\u0001");
+    return rows;
+  };
+  return { remove: missingFrom(before, count(after)), add: missingFrom(after, count(before)) };
 }
 
-/** Remote URLs the repository defines, in a stable text form (for the pin). */
-function remoteUrls(entries: readonly ConfigEntry[], trust: GitTrust): string {
-  const rows: string[] = [];
-  for (const e of entries) {
-    if (trustedScope(e, trust)) continue;
-    const p = parseKey(e.key);
-    if (p && isRemoteUrl(p)) rows.push(`${e.key}\0${e.value}`);
-  }
-  return rows.sort().join("\u0001");
+/** Does this spelling look like something that runs a command or steers the network? (Only for the "ignored" notice.) */
+const LOOKS_DANGEROUS =
+  /(^|\.)(clean|smudge|process|textconv|driver|command|cmd|helper|hookspath|fsmonitor|sshcommand|gitproxy|askpass|uploadpack|receivepack|vcs|proxy|insteadof|pushinsteadof|partialclone|promisor|attributesfile|alternaterefscommand|editor|program|update|include|path|worktree|url)$/i;
+
+// ─── finding the repository (no git process) ─────────────────────────────────────────────────────────────────────
+
+export interface RepoLayout {
+  /** The per-worktree git directory (real). */
+  gitDir: string;
+  /** The common git directory (real); equals `gitDir` for a main worktree or a bare repository. */
+  commonDir: string;
+  /** The work tree, or null for a bare repository. */
+  workTree: string | null;
 }
 
-// ─── gitattributes: driver names ─────────────────────────────────────────────────────────────────────────────────
+const isFile = (p: string): boolean => {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+};
+const isDir = (p: string): boolean => {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+};
+const exists = (p: string): boolean => {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
-const MAX_ATTR_FILES = 4096;
-const MAX_ATTR_BYTES = 1024 * 1024;
-const MAX_ATTR_NAMES = 4096;
+function looksLikeGitDir(d: string): boolean {
+  if (!exists(join(d, "HEAD"))) return false;
+  if (isFile(join(d, "commondir"))) return true;
+  return isDir(join(d, "objects")) && isDir(join(d, "refs"));
+}
 
-/** Pure: the `filter=`/`diff=`/`merge=` driver names a gitattributes text refers to. */
-export function attributeDriverNames(text: string): Array<[string, string]> {
-  const found: Array<[string, string]> = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    // the pattern is the first token (it may be a double-quoted string with spaces); the attributes follow
-    let rest: string;
-    if (line.startsWith('"')) {
-      let i = 1;
-      while (i < line.length && line[i] !== '"') i += line[i] === "\\" ? 2 : 1;
-      rest = line.slice(i + 1);
-    } else {
-      const m = /^\S+/.exec(line);
-      rest = m ? line.slice(m[0].length) : "";
+/** Mirrors git's own search (`.git` directory, `.git` file, or the directory itself being a git directory) without running git. */
+export function discoverRepo(
+  start: string,
+  devOf: (path: string) => number = (path) => statSync(path).dev,
+): RepoLayout | null | "invalid" {
+  let dir: string;
+  let dev: number;
+  try {
+    dir = realpathSync(resolve(start));
+    dev = devOf(dir);
+  } catch {
+    return null;
+  }
+  for (let depth = 0; depth < 4096; depth++) {
+    const dot = join(dir, ".git");
+    if (isDir(dot)) {
+      // like git: a `.git` directory that is not a repository is skipped and the search goes on upward
+      const here = finishLayout(dot, dir);
+      if (here) return here;
+    } else if (isFile(dot)) {
+      // a `.git` FILE that is malformed or points nowhere is fatal for git, so it is refused here too
+      let gitDir: string | null = null;
+      try {
+        const m = /^gitdir:[ \t]*([^\r\n]+)/.exec(readFileSync(dot, "utf8").slice(0, 4096));
+        if (m) gitDir = resolve(dir, (m[1] as string).trim());
+      } catch {
+        /* unreadable */
+      }
+      return (gitDir !== null ? finishLayout(gitDir, dir) : null) ?? "invalid";
     }
-    for (const token of rest.split(/[ \t]+/)) {
-      const eq = token.indexOf("=");
-      if (eq <= 0) continue;
-      const kind = token.slice(0, eq);
-      const name = token.slice(eq + 1);
-      if ((kind === "filter" || kind === "diff" || kind === "merge") && name) found.push([kind, name]);
+    if (looksLikeGitDir(dir)) {
+      const bare = finishLayout(dir, null);
+      if (bare) return bare;
     }
-  }
-  return found;
-}
-
-/** Driver names referenced by info/attributes and every .gitattributes of the work tree (`nested` = the ls-files result). */
-function attributeNames(
-  entries: readonly ConfigEntry[],
-  where: string,
-  nested: SafeGitResult,
-): { names: Array<[string, string]>; problem: string | null } {
-  const files: string[] = [];
-  const local = entries.find((e) => e.scope === "local" && e.origin.startsWith("file:"));
-  if (local) files.push(join(dirname(resolve(where, local.origin.slice(5))), "info", "attributes"));
-  if (nested.code !== 0 || nested.truncated) return { names: [], problem: "the attribute files cannot be listed" };
-  for (const rel of nested.stdout.split("\0")) if (rel) files.push(resolve(where, rel));
-  if (files.length > MAX_ATTR_FILES) return { names: [], problem: "too many attribute files to inspect" };
-  const seen = new Set<string>();
-  const names: Array<[string, string]> = [];
-  for (const f of files) {
-    let text: string;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    // like git, do not cross a filesystem boundary while looking for a repository
     try {
-      const st = statSync(f);
-      if (!st.isFile()) continue;
-      if (st.size > MAX_ATTR_BYTES) return { names, problem: "an attribute file is too large to inspect" };
-      text = readFileSync(f, "utf8");
+      if (devOf(parent) !== dev) return null;
     } catch {
-      continue;
+      return null;
     }
-    for (const [kind, name] of attributeDriverNames(text)) {
-      const k = `${kind}\0${name}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      names.push([kind, name]);
-      if (names.length > MAX_ATTR_NAMES) return { names, problem: "too many attribute drivers to inspect" };
-    }
+    dir = parent;
   }
-  return { names, problem: null };
+  return null;
 }
 
-// ─── running git ─────────────────────────────────────────────────────────────────────────────────────────────────
+function finishLayout(gitDirIn: string, workTree: string | null): RepoLayout | null {
+  try {
+    const gitDir = realpathSync(gitDirIn);
+    if (!looksLikeGitDir(gitDir)) return null;
+    let commonDir = gitDir;
+    const cd = join(gitDir, "commondir");
+    if (isFile(cd)) commonDir = realpathSync(resolve(gitDir, readFileSync(cd, "utf8").trim()));
+    if (!isDir(join(commonDir, "objects"))) return null;
+    return { gitDir, commonDir, workTree: workTree === null ? null : realpathSync(workTree) };
+  } catch {
+    return null;
+  }
+}
+
+// ─── subcommands ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** Index of the subcommand, skipping git's own leading options (`-c k=v`, `-C dir`, `--no-pager` ...). */
 export function subcommandIndex(args: readonly string[]): number {
@@ -476,49 +610,63 @@ export function subcommandIndex(args: readonly string[]): number {
 }
 
 const DIFFING = new Set(["diff", "show", "log"]);
-/** Network subcommands: refused while the repository defines a network-steering key, and while its remote URLs changed. */
-const NETWORK_SUBCOMMANDS = new Set(["fetch", "pull", "push", "ls-remote", "clone", "remote", "submodule", "lfs"]);
-/** Subcommands that can run an attribute-selected driver (filter, textconv, merge driver) or read the work tree through one. */
-const DRIVER_SUBCOMMANDS = new Set([
-  "add",
-  "am",
-  "apply",
-  "archive",
-  "blame",
-  "cat-file",
-  "checkout",
-  "checkout-index",
-  "cherry-pick",
-  "clean",
-  "commit",
-  "diff",
-  "diff-files",
-  "diff-index",
-  "diff-tree",
-  "format-patch",
-  "grep",
-  "log",
-  "merge",
-  "merge-file",
-  "mv",
-  "pull",
-  "read-tree",
-  "rebase",
-  "reset",
-  "restore",
-  "revert",
-  "rm",
-  "show",
-  "stash",
-  "status",
-  "switch",
-  "update-index",
-  "worktree",
-  "hash-object",
-  "fetch",
-  "push",
-  "submodule",
-]);
+/** Network subcommands: refused while the remote URLs differ from the pin or the operator's allow-list. */
+const NETWORK_SUBCOMMANDS = new Set(["fetch", "pull", "push", "ls-remote", "clone", "submodule", "lfs"]);
+const SUBMODULE_NETWORK_VERBS = new Set(["update", "add", "sync", "set-url", "foreach"]);
+/** `git remote <verb>`: only these verbs contact the remote (add / set-url / rename / remove / -v are local edits, and how Pi repairs a pin). */
+const REMOTE_NETWORK_VERBS = new Set(["update", "prune", "show", "set-head"]);
+
+/** Does this invocation contact a remote? */
+export function contactsNetwork(args: readonly string[], at: number): boolean {
+  const sub = args[at];
+  if (sub === undefined) return false;
+  if (NETWORK_SUBCOMMANDS.has(sub)) return true;
+  if (sub !== "remote") return false;
+  const verb = args.slice(at + 1).find((a) => !a.startsWith("-"));
+  return verb !== undefined && REMOTE_NETWORK_VERBS.has(verb);
+}
+
+/** `--git-dir` / `--work-tree` among git's own options would redirect the repository away from the one that was inspected. */
+export function redirectsRepository(args: readonly string[], at: number): boolean {
+  for (let i = 0; i < at; i++) {
+    const a = args[i] ?? "";
+    if (a === "--git-dir" || a === "--work-tree" || a.startsWith("--git-dir=") || a.startsWith("--work-tree="))
+      return true;
+  }
+  return false;
+}
+
+export function diffing(args: readonly string[], at: number): string[] {
+  const sub = args[at];
+  return sub && DIFFING.has(sub)
+    ? [...args.slice(0, at + 1), "--no-ext-diff", "--no-textconv", ...args.slice(at + 1)]
+    : [...args];
+}
+
+/** `-C <dir>` among git's own leading options moves the repository: read THAT repository's (and worktree's) config. */
+function configRoot(args: readonly string[], at: number, cwd: string): string {
+  let where = cwd;
+  for (let i = 0; i < at; i++)
+    if (args[i] === "-C" && args[i + 1] !== undefined) where = resolve(where, args[i + 1] as string);
+  return where;
+}
+
+/** Commands that make git start a CHILD `git status` inside a tracked nested repository (measured, see the header). */
+const FLAG_IGNORING = new Set(["diff-files", "diff-index"]);
+
+/** Does `add` (or another selector) name anything? Appending `:(exclude)` pathspecs to a bare `git add` would stage everything. */
+function addHasSelector(rest: readonly string[]): boolean {
+  return rest.some(
+    (a) => a === "-A" || a === "--all" || a === "-u" || a === "--update" || a === "--" || !a.startsWith("-"),
+  );
+}
+
+/** Absolute literal pathspecs that exclude nested repositories from `git add`. */
+export function excludePathspecs(nested: readonly string[]): string[] {
+  return nested.map((p) => `:(exclude,top,literal)${p}`);
+}
+
+// ─── running git ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 export interface SafeGitResult {
   code: number;
@@ -539,9 +687,11 @@ export interface SafeGitOptions {
   /** Payload for stdin (hash-object, mktree ...). */
   input?: string;
   signal?: AbortSignal;
+  /** Start git in its own session (no controlling terminal), for unattended timers where nothing may prompt. Async only. */
+  detached?: boolean;
 }
 
-/** Test seam: runs between the plan and the command, so a test can edit the config exactly there. */
+/** Test seam: runs between the preparation (config snapshot) and the command, so a test can edit the repository exactly there. */
 export const testHooks: { afterPlan?: () => void | Promise<void> } = {};
 
 const failed = (stderr: string): SafeGitResult => ({ code: 128, stdout: "", stderr });
@@ -549,7 +699,14 @@ const failed = (stderr: string): SafeGitResult => ({ code: 128, stdout: "", stde
 function spawnGit(
   argv: readonly string[],
   env: NodeJS.ProcessEnv,
-  opts: { cwd?: string; timeoutMs: number; maxBuffer: number; input?: string; signal?: AbortSignal },
+  opts: {
+    cwd?: string;
+    timeoutMs: number;
+    maxBuffer: number;
+    input?: string;
+    signal?: AbortSignal;
+    detached?: boolean;
+  },
 ): Promise<SafeGitResult> {
   return new Promise((resolvePromise) => {
     let child: ReturnType<typeof spawn>;
@@ -559,6 +716,7 @@ function spawnGit(
         ...(opts.cwd ? { cwd: opts.cwd } : {}),
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
+        ...(opts.detached ? { detached: true } : {}),
         ...(opts.signal ? { signal: opts.signal } : {}),
       });
     } catch (e) {
@@ -606,6 +764,31 @@ function spawnGit(
   });
 }
 
+function runSync(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+  maxBuffer: number,
+  cwd?: string,
+): SafeGitResult {
+  const r: SpawnSyncReturns<string> = spawnSync("git", [...argv], {
+    env,
+    timeout: timeoutMs,
+    maxBuffer,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    ...(cwd ? { cwd } : {}),
+  });
+  const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
+  if (code === "E2BIG" || code === "ENOENT") return failed(`refused: git could not be started (${code})`);
+  return {
+    code: r.status ?? 1,
+    stdout: r.stdout ?? "",
+    stderr: [r.stderr ?? "", r.error?.message ?? ""].filter(Boolean).join("\n"),
+    ...(code === "ENOBUFS" ? { truncated: true } : {}),
+  };
+}
+
 let configListMax = 64 * 1024 * 1024;
 /** Test hook: shrink the config-listing buffer so the fail-closed path can be exercised cheaply. */
 export function setConfigListLimitForTests(bytes: number): void {
@@ -622,292 +805,470 @@ export function configEnv(pairs: readonly ConfigPair[]): Record<string, string> 
   return out;
 }
 
-/** Variables through which a caller or the ambient environment could inject config; removed before ours are set. */
+/** Variables through which a caller or the ambient environment could inject config or redirect the repository; removed before ours are set. */
 export function withoutInjectedConfig(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) {
     if (k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS" || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) continue;
+    if (k === "GIT_DIR" || k === "GIT_WORK_TREE" || k === "GIT_COMMON_DIR" || k === "GIT_CEILING_DIRECTORIES") continue;
     out[k] = v;
   }
   return out;
 }
 
-/** One environment entry may not exceed MAX_ARG_STRLEN (128 KiB) on Linux, and the total is bounded too. */
-const MAX_PAIR_BYTES = 32 * 1024;
-const MAX_PAIRS_BYTES = 512 * 1024;
+// ─── remote pin ──────────────────────────────────────────────────────────────────────────────────────────────────
 
-export interface Plan {
-  prefix: string[];
-  config: ConfigPair[];
-  extraEnv: Record<string, string>;
-  remoteExec: string[];
-  unreadable: string | undefined;
-  /** policy digest of the listing this plan was built from (compared after the command) */
-  digest: string;
-  /** remote URLs at planning time (for the pin) and the repository the pin belongs to */
-  pinKey: string;
-  pinValue: string;
-}
-
-const unplanned = (unreadable: string): Plan => ({
-  prefix: [],
-  config: [],
-  extraEnv: {},
-  remoteExec: [],
-  unreadable,
-  digest: "",
-  pinKey: "",
-  pinValue: "",
-});
-
-/**
- * Pure: turn the config listing (or its failure) and the driver names found in attribute files into the plan.
- * `attrs` is null for subcommands that cannot run a driver.
- */
-export function planFromListing(
-  listed: SafeGitResult,
-  cwd: string,
-  trust: GitTrust,
-  env: NodeJS.ProcessEnv,
-  attrs: ReadonlyArray<readonly [string, string]> | null,
-): Plan {
-  // Fail closed: a listing that failed or was cut short (a worker can pad the shared config with junk keys) means the
-  // neutralisers cannot be computed, and running the command anyway would run every planted driver.
-  if (listed.code !== 0 || listed.truncated) {
-    return unplanned(
-      listed.truncated ? "the repository config is too large to inspect" : "the repository config is unreadable",
-    );
-  }
-  const entries = parseScopedConfig(listed.stdout);
-  // (A key cannot contain a newline: the listing ends a key at the first one, and the file syntax forbids it.)
-  const config = neutralisers(entries, trust, attrs ?? []);
-  let total = 0;
-  for (const c of config) {
-    const n = Buffer.byteLength(c.key) + Buffer.byteLength(c.value);
-    if (n > MAX_PAIR_BYTES) return unplanned("a config key is too long to neutralise");
-    total += n + 32;
-  }
-  if (total > MAX_PAIRS_BYTES) return unplanned("the repository config defines too many drivers to neutralise");
-  // core.gitProxy: git keeps the FIRST value it reads and reads the environment variable before any config, so the
-  // only reliable override is GIT_PROXY_COMMAND (a `-c core.gitProxy=` is ignored once the repository's value is read).
-  // The operator's own proxy, from env or from trusted config, is kept; otherwise it is pinned to a no-op.
-  const extraEnv: Record<string, string> = {};
-  const operatorProxy =
-    trust === "operator" &&
-    (env.GIT_PROXY_COMMAND !== undefined ||
-      entries.some((e) => {
-        if (!TRUSTED_SCOPES.has(e.scope)) return false;
-        const p = parseKey(e.key);
-        return p !== null && p.section === "core" && p.sub === null && p.variable === "gitproxy";
-      }));
-  if (!operatorProxy) extraEnv.GIT_PROXY_COMMAND = "false";
-  const local = entries.find((e) => e.scope === "local" && e.origin.startsWith("file:"));
-  return {
-    unreadable: undefined,
-    prefix: [...(trust === "operator" ? OPERATOR_FORCED : SAFE_GIT_CONFIG), "-C", cwd],
-    config,
-    extraEnv,
-    remoteExec: remoteExecKeys(entries, trust),
-    digest: policyDigest(entries, trust),
-    pinKey: local ? `file:${resolve(cwd, local.origin.slice(5))}` : "",
-    pinValue: remoteUrls(entries, trust),
-  };
-}
-
-const LISTING = ["config", "--list", "--show-scope", "--show-origin", "-z"];
-const ATTR_LISTING = [
-  "ls-files",
-  "-z",
-  "--cached",
-  "--others",
-  "--exclude-standard",
-  "--",
-  ":(top,glob)**/.gitattributes",
-];
-
-// Remote URLs as first seen per repository: a worker-writable `remote.origin.url` must not redirect Pi's credentials.
+// Remote URLs as first seen per repository (keyed by the REAL common directory, so a symlinked spelling is the same
+// repository): a worker-writable `remote.origin.url` must not redirect Pi's credentials. Reads by Pi never clear it;
+// only the delta of Pi's own successful write (`git remote add|set-url|rename|remove`, `git config remote.x.url`)
+// moves it. The operator's `pi.allowedRemote` list (global/system git config, operator trust) survives restarts.
 const remotePins = new Map<string, string>();
 const MAX_PINS = 256;
 export function forgetRemotePinsForTests(): void {
   remotePins.clear();
+  allowCache = undefined;
+  noticed.clear();
 }
 
-function pinProblem(plan: Plan, sub: string | undefined): string | null {
-  if (!plan.pinKey) return null;
-  if (sub === "remote" || sub === "config" || sub === "init" || sub === "clone") {
-    remotePins.delete(plan.pinKey);
-    return null;
+function setPin(key: string, value: string): void {
+  if (!remotePins.has(key) && remotePins.size >= MAX_PINS) remotePins.delete(remotePins.keys().next().value as string);
+  remotePins.set(key, value);
+}
+
+let allowCache: { at: number; key: string; list: string[] } | undefined;
+const ALLOW_TTL_MS = 10_000;
+
+/** The operator's `pi.allowedRemote` entries (system/global scope only), cached for a few seconds. */
+function operatorAllowedRemotes(env: NodeJS.ProcessEnv): string[] {
+  const key = `${env.HOME ?? ""}\0${env.XDG_CONFIG_HOME ?? ""}\0${env.GIT_CONFIG_GLOBAL ?? ""}\0${env.GIT_CONFIG_SYSTEM ?? ""}`;
+  const now = Date.now();
+  if (allowCache && allowCache.key === key && now - allowCache.at < ALLOW_TTL_MS) return allowCache.list;
+  const r = runSync(["config", "--list", "--show-scope", "--show-origin", "-z"], env, 5_000, configListMax, tmpdir());
+  const list =
+    r.code === 0 && !r.truncated
+      ? parseScopedConfig(r.stdout)
+          .filter((e) => TRUSTED_SCOPES.has(e.scope) && e.key.toLowerCase() === "pi.allowedremote" && e.value !== "")
+          .map((e) => e.value)
+      : [];
+  allowCache = { at: now, key, list };
+  return list;
+}
+
+/** Exact match, or a prefix when the entry ends in `*`. */
+export function remoteAllowed(url: string, allowed: readonly string[]): boolean {
+  return allowed.some((a) => (a.endsWith("*") ? url.startsWith(a.slice(0, -1)) : url === a));
+}
+
+// ─── per-call preparation and completion ─────────────────────────────────────────────────────────────────────────
+
+interface Shadow {
+  root: string;
+  common: string;
+}
+
+interface Prepared {
+  refused?: SafeGitResult;
+  argv: string[];
+  env: NodeJS.ProcessEnv;
+  sub: string | undefined;
+  layout: RepoLayout | null;
+  shadow?: Shadow;
+  generated?: Generated;
+  pinBefore?: string | undefined;
+  trust: GitTrust;
+  cleanEnv: NodeJS.ProcessEnv;
+}
+
+const SHADOW_SKIP = new Set(["config", "hooks"]);
+const DERIVED_KEYS = new Set(["core.repositoryformatversion", "core.bare"]);
+const noticed = new Set<string>();
+
+function makeShadow(layout: RepoLayout, configText: string): Shadow {
+  const root = mkdtempSync(join(tmpdir(), "pi-safegit-"));
+  const common = join(root, ".git");
+  mkdirSync(common, { mode: 0o700 });
+  try {
+    for (const name of readdirSync(layout.commonDir)) {
+      if (SHADOW_SKIP.has(name)) continue;
+      symlinkSync(join(layout.commonDir, name), join(common, name));
+    }
+    mkdirSync(join(common, "hooks"));
+    writeFileSync(join(common, "config"), configText, { mode: 0o600 });
+  } catch (e) {
+    rmSync(root, { recursive: true, force: true });
+    throw e;
   }
-  const pinned = remotePins.get(plan.pinKey);
-  if (pinned === undefined) {
-    // Nothing to pin until the repository has a remote: adding the first one is how a remote is normally set up.
-    if (plan.pinValue === "") return null;
-    if (remotePins.size >= MAX_PINS) remotePins.delete(remotePins.keys().next().value as string);
-    remotePins.set(plan.pinKey, plan.pinValue);
-    return null;
+  return { root, common };
+}
+
+function gitlinksWithRepo(layout: RepoLayout, env: NodeJS.ProcessEnv): string[] | null {
+  if (!layout.workTree) return [];
+  const r = runSync(["ls-files", "--stage", "-z"], env, 5_000, 16 * 1024 * 1024, layout.workTree);
+  if (r.code !== 0 || r.truncated) return null;
+  const found: string[] = [];
+  for (const rec of r.stdout.split("\0")) {
+    const m = /^160000 [0-9a-f]+ \d\t(.+)$/s.exec(rec);
+    if (!m) continue;
+    const rel = m[1] as string;
+    if (exists(join(layout.workTree, rel, ".git"))) found.push(rel);
   }
-  if (sub && NETWORK_SUBCOMMANDS.has(sub) && pinned !== plan.pinValue) {
-    return "this repository's remote URLs changed since Pi first used it";
-  }
-  return null;
+  return found;
 }
 
-function refusal(plan: Plan, args: readonly string[], at: number): SafeGitResult | null {
-  if (plan.unreadable) return failed(`refused: ${plan.unreadable}`);
-  const sub = args[at];
-  if (sub && NETWORK_SUBCOMMANDS.has(sub) && plan.remoteExec.length > 0) {
-    return failed(`refused: the repository config defines ${plan.remoteExec.slice(0, 5).join(", ")}`);
-  }
-  const pin = pinProblem(plan, sub);
-  if (pin) return failed(`refused: ${pin}`);
-  return null;
-}
-
-export function diffing(args: readonly string[], at: number): string[] {
-  const sub = args[at];
-  return sub && DIFFING.has(sub)
-    ? [...args.slice(0, at + 1), "--no-ext-diff", "--no-textconv", ...args.slice(at + 1)]
-    : [...args];
-}
-
-const watched = (sub: string | undefined): boolean =>
-  sub !== undefined && (DRIVER_SUBCOMMANDS.has(sub) || NETWORK_SUBCOMMANDS.has(sub));
-
-/** `-C <dir>` among git's own leading options moves the repository: read THAT repository's (and worktree's) config. */
-function configRoot(args: readonly string[], at: number, cwd: string): string {
-  let where = cwd;
-  for (let i = 0; i < at; i++)
-    if (args[i] === "-C" && args[i + 1] !== undefined) where = resolve(where, args[i + 1] as string);
-  return where;
-}
-
-function tainted(): SafeGitResult {
-  return failed(
-    "refused: the repository config changed while the command ran; its result is discarded (a worker may be editing it)",
-  );
-}
-
-function reportTaint(sub: string | undefined): void {
-  emitTelemetry({
-    level: "error",
-    key: "git-config-changed-during-command",
-    text: `git ${sub ?? ""}: the repository's execution-relevant config changed while the command ran; the result was discarded. Something is editing .git/config concurrently.`,
-  });
-}
-
-export async function safeGit(args: readonly string[], opts: SafeGitOptions): Promise<SafeGitResult> {
+function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
   const trust = opts.trust ?? "strict";
-  const env = withoutInjectedConfig({ ...safeGitEnv(process.env, trust), ...(opts.env ?? {}) });
+  const cleanEnv = withoutInjectedConfig({ ...safeGitEnv(process.env, trust), ...(opts.env ?? {}) });
   const at = subcommandIndex(args);
   const sub = args[at];
   const where = configRoot(args, at, opts.cwd);
   const timeoutMs = opts.timeoutMs ?? 60_000;
-  const listOpts = { timeoutMs: Math.max(15_000, timeoutMs), maxBuffer: configListMax };
-  const listed = await spawnGit(["-C", where, ...LISTING], env, listOpts);
-  let attrs: Array<[string, string]> | null = null;
-  if (DRIVER_SUBCOMMANDS.has(sub ?? "") && listed.code === 0 && !listed.truncated) {
-    const nested = await spawnGit([...OPERATOR_FORCED, "-C", where, ...ATTR_LISTING], env, {
-      ...listOpts,
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    const r = attributeNames(parseScopedConfig(listed.stdout), where, nested);
-    if (r.problem) return failed(`refused: ${r.problem}`);
-    attrs = r.names;
+  const prefix = [...(trust === "operator" ? OPERATOR_FORCED : SAFE_GIT_CONFIG), "-C", opts.cwd];
+  const base: Prepared = { refused: undefined, argv: [], env: cleanEnv, sub, layout: null, trust, cleanEnv };
+  const refuse = (why: string): Prepared => ({ ...base, refused: failed(`refused: ${why}`) });
+  if (redirectsRepository(args, at))
+    return refuse("--git-dir / --work-tree would point git at a repository that was not inspected");
+
+  // URLs that come from the work tree (.gitmodules) rather than from config cannot be allow-listed: no submodule fetching at all
+  if (sub === "submodule" && args.slice(at + 1).some((a) => SUBMODULE_NETWORK_VERBS.has(a))) {
+    return refuse("submodule update/add/sync use URLs from .gitmodules, which whoever works in the tree controls");
   }
-  const plan = planFromListing(listed, opts.cwd, trust, env, attrs);
-  const refused = refusal(plan, args, at);
-  if (refused) return refused;
-  await testHooks.afterPlan?.();
-  const result = await spawnGit(
-    [...plan.prefix, ...diffing(args, at)],
-    { ...env, ...plan.extraEnv, ...configEnv(plan.config) },
-    {
-      timeoutMs,
-      maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
-      ...(opts.input !== undefined ? { input: opts.input } : {}),
-      ...(opts.signal ? { signal: opts.signal } : {}),
-    },
-  );
-  if (watched(sub)) {
-    const after = await spawnGit(["-C", where, ...LISTING], env, listOpts);
-    if (after.code === 0 && !after.truncated && policyDigest(parseScopedConfig(after.stdout), trust) !== plan.digest) {
-      reportTaint(sub);
-      return tainted();
+  if (args.some((a) => a === "--recurse-submodules" || a.startsWith("--recurse-submodules=") || a === "--recursive")) {
+    return refuse("recursing into submodules would use URLs from .gitmodules and run nested repositories' own config");
+  }
+
+  // no repository to defend (git init / clone, or not inside one): nothing local to read, and never an enclosing one
+  const found = sub === "init" || sub === "clone" ? null : discoverRepo(where);
+  // A `.git` that is there but is not a usable repository is refused: running git without a shadow would let it read it as is.
+  if (found === "invalid") return refuse("the repository at this path is not usable (broken .git)");
+  const layout = found;
+  if (!layout) {
+    // Nothing found, so git must not find anything either (an enclosing repository would be read unfiltered).
+    const env = { ...cleanEnv };
+    try {
+      env.GIT_CEILING_DIRECTORIES = dirname(realpathSync(where));
+    } catch {
+      /* where does not exist: git will say so */
+    }
+    return { ...base, env, argv: [...prefix, ...diffing(args, at)] };
+  }
+
+  // 1. snapshot the repository's own config (one file, no includes, runs nothing)
+  const realConfig = join(layout.commonDir, "config");
+  let entries: FileEntry[] = [];
+  if (exists(realConfig)) {
+    const listed = runSync(
+      ["config", "--file", realConfig, "--list", "-z"],
+      cleanEnv,
+      Math.min(5_000, Math.max(1_000, timeoutMs)),
+      configListMax,
+      tmpdir(),
+    );
+    // Fail closed: a listing that failed or was cut short (a worker can pad the shared config with junk keys) means
+    // the allow-list cannot be applied, and running anyway would hand git the unfiltered file.
+    if (listed.code !== 0 || listed.truncated) {
+      return refuse(
+        listed.truncated ? "the repository config is too large to inspect" : "the repository config is unreadable",
+      );
+    }
+    entries = parseFileConfig(listed.stdout);
+  }
+  const generated = generateConfig(entries, layout.workTree === null);
+
+  // 2. network refusals: remote URLs must match the pin / the operator's list
+  const pinKey = layout.commonDir;
+  const pinned = remotePins.get(pinKey);
+  if (contactsNetwork(args, at)) {
+    if (pinned !== undefined && pinned !== generated.remoteUrls) {
+      return refuse("this repository's remote URLs changed since Pi first used it");
+    }
+    if (trust === "operator") {
+      const allowed = operatorAllowedRemotes(cleanEnv);
+      const bad = allowed.length > 0 ? generated.urls.find((u) => !remoteAllowed(u, allowed)) : undefined;
+      if (bad !== undefined)
+        return refuse("a remote URL of this repository is not in the operator's pi.allowedRemote list");
+    }
+    // LFS reads `.lfsconfig` from the work tree (lfs.url / pushurl): a worker-controlled endpoint would receive credentials
+    if (sub === "lfs" && layout.workTree && exists(join(layout.workTree, ".lfsconfig"))) {
+      return refuse("the work tree has a .lfsconfig, which can point git-lfs at another server");
     }
   }
-  return result;
-}
 
-function runSync(argv: readonly string[], env: NodeJS.ProcessEnv, timeoutMs: number, maxBuffer: number): SafeGitResult {
-  const r = spawnSync("git", [...argv], {
-    env,
-    timeout: timeoutMs,
-    maxBuffer,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const code = (r.error as NodeJS.ErrnoException | undefined)?.code;
-  if (code === "E2BIG" || code === "ENOENT") return failed(`refused: git could not be started (${code})`);
+  // 3. the shadow
+  let shadow: Shadow;
+  try {
+    shadow = makeShadow(layout, generated.text);
+  } catch (e) {
+    return refuse(
+      `could not prepare an isolated git view (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`,
+    );
+  }
+  const env: NodeJS.ProcessEnv = { ...cleanEnv, GIT_DIR: layout.gitDir, GIT_COMMON_DIR: shadow.common };
+  if (layout.workTree) env.GIT_WORK_TREE = layout.workTree;
+  if (layout.workTree && exists(join(layout.workTree, ".lfsconfig"))) env.GIT_LFS_SKIP_SMUDGE = "1";
+
+  // 4. nested repositories
+  let argv = diffing(args, at);
+  if (sub !== undefined && (FLAG_IGNORING.has(sub) || sub === "add" || sub === "describe")) {
+    if (FLAG_IGNORING.has(sub)) {
+      argv = [...argv.slice(0, at + 1), "--ignore-submodules=all", ...argv.slice(at + 1)];
+    } else {
+      const nested = gitlinksWithRepo(layout, env);
+      if (nested === null) {
+        rmSync(shadow.root, { recursive: true, force: true });
+        return refuse("the index cannot be inspected for nested repositories");
+      }
+      if (nested.length > 0) {
+        const rest = args.slice(at + 1);
+        if (
+          sub === "describe" &&
+          rest.some((a) => a === "--dirty" || a.startsWith("--dirty=") || a === "--broken" || a.startsWith("--broken="))
+        ) {
+          rmSync(shadow.root, { recursive: true, force: true });
+          return refuse(`describe --dirty would run the configuration of the nested repository at ${nested[0]}`);
+        }
+        if (sub === "add") {
+          if (rest.some((a) => a === "--pathspec-from-file" || a.startsWith("--pathspec-from-file="))) {
+            rmSync(shadow.root, { recursive: true, force: true });
+            return refuse(`add --pathspec-from-file cannot exclude the nested repository at ${nested[0]}`);
+          }
+          if (addHasSelector(rest))
+            argv = [...argv, ...(rest.includes("--") ? [] : ["--"]), ...excludePathspecs(nested)];
+        }
+      }
+    }
+  }
   return {
-    code: r.status ?? 1,
-    stdout: r.stdout ?? "",
-    stderr: [r.stderr ?? "", r.error?.message ?? ""].filter(Boolean).join("\n"),
-    ...(code === "ENOBUFS" ? { truncated: true } : {}),
+    ...base,
+    env,
+    layout,
+    shadow,
+    generated,
+    pinBefore: pinned,
+    // with GIT_COMMON_DIR set git no longer learns `core.bare` from the config it reads, so a bare repository is declared
+    argv: [...(layout.workTree === null ? ["--bare"] : []), ...prefix, ...argv],
   };
 }
 
-/** Longest time the synchronous variant blocks the event loop on its own config probes. */
-const SYNC_PROBE_CAP_MS = 5_000;
+function notifyIgnored(layout: RepoLayout, generated: Generated): void {
+  const bad = generated.dropped.filter((k) => LOOKS_DANGEROUS.test(k));
+  if (bad.length === 0) return;
+  const id = `${layout.commonDir}\0${bad.slice().sort().join("\0")}`;
+  if (noticed.has(id)) return;
+  if (noticed.size >= 256) noticed.clear();
+  noticed.add(id);
+  emitTelemetry({
+    level: "info",
+    key: "git-repo-config-ignored",
+    text: `git: ignoring ${bad.length} repository-local config key(s) in ${basename(dirname(layout.commonDir)) || layout.commonDir} that could run a command or redirect the network: ${tidyStderr(bad.slice(0, 6).join(", "), 160, 1)}`,
+  });
+}
+
+function moveBack(from: string, to: string): void {
+  const st = lstatSync(from);
+  if (st.isDirectory()) {
+    cpSync(from, to, { recursive: true, force: false, errorOnExist: false });
+    return;
+  }
+  try {
+    renameSync(from, to);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
+    const tmp = `${to}.pi-safegit-${process.pid}`;
+    copyFileSync(from, tmp);
+    renameSync(tmp, to);
+  }
+}
+
+/**
+ * Whatever git left in the shadow as a regular file or directory instead of a symlink (a file it created because it
+ * did not exist yet, such as `shallow`) belongs in the real common directory. Refs, packed-refs and the index are not
+ * among them: git takes those from the real per-worktree directory (and its `commondir` file), not from the shadow.
+ */
+function writeBack(p: Prepared): string | null {
+  const layout = p.layout as RepoLayout;
+  const shadow = p.shadow as Shadow;
+  for (const name of readdirSync(shadow.common)) {
+    if (SHADOW_SKIP.has(name) || name.endsWith(".lock")) continue;
+    const from = join(shadow.common, name);
+    if (lstatSync(from).isSymbolicLink()) continue;
+    moveBack(from, join(layout.commonDir, name));
+  }
+  return null;
+}
+
+/** A worktree's `.git` file written by `git worktree add` names the shadow directory; point it at the real one. */
+function fixWorktreeLinks(p: Prepared): void {
+  const layout = p.layout as RepoLayout;
+  const shadow = p.shadow as Shadow;
+  const dir = join(layout.commonDir, "worktrees");
+  let names: string[];
+  try {
+    names = readdirSync(dir).slice(0, 4096);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    try {
+      const pointer = readFileSync(join(dir, name, "gitdir"), "utf8").trim();
+      if (!pointer.endsWith("/.git") || !isFile(pointer)) continue;
+      const body = readFileSync(pointer, "utf8");
+      if (!body.includes(shadow.root)) continue;
+      writeFileSync(pointer, body.split(shadow.common).join(layout.commonDir));
+    } catch {
+      /* a stale or foreign entry: leave it alone */
+    }
+  }
+}
+
+function mapOut(s: string, p: Prepared): string {
+  const layout = p.layout as RepoLayout;
+  const shadow = p.shadow as Shadow;
+  if (!s.includes(shadow.root)) return s;
+  let out = s.split(shadow.common).join(layout.commonDir);
+  if (basename(layout.commonDir) === ".git") out = out.split(shadow.root).join(dirname(layout.commonDir));
+  return out;
+}
+
+const gitConfigFile = (file: string, args: readonly string[], env: NodeJS.ProcessEnv): SafeGitResult =>
+  runSync(["config", "--file", file, ...args], env, 5_000, configListMax, tmpdir());
+
+/** Replay what the command wrote to the (generated) config onto the real one. Returns what changed, or null when nothing did. */
+function replayConfig(p: Prepared): { after: FileEntry[]; remove: FileEntry[]; add: FileEntry[] } | null {
+  const layout = p.layout as RepoLayout;
+  const shadow = p.shadow as Shadow;
+  const generated = p.generated as Generated;
+  const path = join(shadow.common, "config");
+  let now: string;
+  try {
+    now = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  if (now === generated.text) return null;
+  const listed = gitConfigFile(path, ["--list", "-z"], p.cleanEnv);
+  if (listed.code !== 0 || listed.truncated) {
+    emitTelemetry({
+      level: "error",
+      key: "git-config-writeback-failed",
+      text: "git: the config written by a command could not be read back; its config changes were not applied to the repository.",
+    });
+    return null;
+  }
+  // the two derived keys (see generateConfig) are never replayed: where the repository lives is not config
+  const after = parseFileConfig(listed.stdout).filter((e) => !DERIVED_KEYS.has(e.key.toLowerCase()));
+  const real = join(layout.commonDir, "config");
+  const { remove, add } = configDelta(generated.kept, after);
+  for (const e of remove) {
+    gitConfigFile(real, ["--fixed-value", "--unset", e.key, e.value ?? ""], p.cleanEnv);
+  }
+  for (const e of add) {
+    gitConfigFile(real, ["--add", e.key, e.value ?? "true"], p.cleanEnv);
+  }
+  return { after, remove, add };
+}
+
+const isUrlRow = (e: FileEntry): boolean => {
+  const k = parseKey(e.key);
+  return k !== null && k.section === "remote" && k.sub !== null && URL_VARIABLES.has(k.variable);
+};
+const pinRow = (e: FileEntry): string => `${e.key}\0${e.value ?? ""}`;
+
+/** Apply Pi's own URL edits to a pin: only what the command changed, never what a worker left lying around. */
+export function applyPinDelta(pin: string, remove: readonly FileEntry[], add: readonly FileEntry[]): string {
+  const rows = pin === "" ? [] : pin.split("\u0001");
+  for (const e of remove.filter(isUrlRow)) {
+    const i = rows.indexOf(pinRow(e));
+    if (i >= 0) rows.splice(i, 1);
+  }
+  for (const e of add.filter(isUrlRow)) rows.push(pinRow(e));
+  return rows.sort().join("\u0001");
+}
+
+function complete(p: Prepared, result: SafeGitResult): SafeGitResult {
+  if (!p.shadow || !p.layout || !p.generated) return result;
+  const layout = p.layout;
+  const shadow = p.shadow;
+  let out = result;
+  try {
+    let problem: string | null = null;
+    try {
+      problem = writeBack(p);
+    } catch (e) {
+      problem = `moving the command's files back into the repository failed (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
+    }
+    let changed: ReturnType<typeof replayConfig> = null;
+    try {
+      changed = replayConfig(p);
+      if (p.sub === "worktree") fixWorktreeLinks(p);
+    } catch (e) {
+      problem ??= `finishing the command's repository changes failed (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
+    }
+    // Pi's own edit of a remote URL moves the pin by exactly what the command changed; a read, or a worker's edit, never does
+    const current = remotePins.get(layout.commonDir);
+    const base = current ?? (p.generated as Generated).remoteUrls;
+    const next = changed ? applyPinDelta(base, changed.remove, changed.add) : base;
+    // nothing to pin until the repository has a remote: adding the first one is how a remote is normally set up
+    if (current === undefined ? next !== "" : next !== current) setPin(layout.commonDir, next);
+    notifyIgnored(layout, p.generated as Generated);
+    out = {
+      ...result,
+      stdout: mapOut(result.stdout, p),
+      stderr: mapOut(result.stderr, p),
+    };
+    if (problem) {
+      emitTelemetry({ level: "error", key: "git-writeback-failed", text: `git ${p.sub ?? ""}: ${problem}.` });
+      out = {
+        ...out,
+        code: out.code === 0 ? 128 : out.code,
+        stderr: [out.stderr, `warning: ${problem}`].filter(Boolean).join("\n"),
+      };
+    }
+  } finally {
+    rmSync(shadow.root, { recursive: true, force: true });
+  }
+  return out;
+}
+
+export async function safeGit(args: readonly string[], opts: SafeGitOptions): Promise<SafeGitResult> {
+  const p = prepare(args, opts);
+  if (p.refused) return p.refused;
+  try {
+    await testHooks.afterPlan?.();
+    const result = await spawnGit(p.argv, p.env, {
+      timeoutMs: opts.timeoutMs ?? 60_000,
+      maxBuffer: opts.maxBuffer ?? 16 * 1024 * 1024,
+      ...(opts.input !== undefined ? { input: opts.input } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(opts.detached ? { detached: true } : {}),
+    });
+    return complete(p, result);
+  } catch (e) {
+    if (p.shadow) rmSync(p.shadow.root, { recursive: true, force: true });
+    throw e;
+  }
+}
 
 /**
  * Synchronous twin of `safeGit` for the few callers that cannot be async (version/commit probes in the update host).
- * Same environment, neutralisers, refusals and post-command check. It blocks the event loop for as long as git runs,
- * so its own config probes are capped at 5 s and callers must pass a small `timeoutMs`.
+ * Same environment, allow-list, refusals and write-back. It blocks the event loop for as long as git runs, so callers
+ * must pass a small `timeoutMs`.
  */
 export function safeGitSync(args: readonly string[], opts: SafeGitOptions): SafeGitResult {
-  const trust = opts.trust ?? "strict";
-  const env = withoutInjectedConfig({ ...safeGitEnv(process.env, trust), ...(opts.env ?? {}) });
-  const at = subcommandIndex(args);
-  const sub = args[at];
-  const where = configRoot(args, at, opts.cwd);
-  const timeoutMs = opts.timeoutMs ?? 60_000;
-  const probeMs = Math.min(SYNC_PROBE_CAP_MS, Math.max(1_000, timeoutMs));
-  const listed = runSync(["-C", where, ...LISTING], env, probeMs, configListMax);
-  let attrs: Array<[string, string]> | null = null;
-  if (DRIVER_SUBCOMMANDS.has(sub ?? "") && listed.code === 0 && !listed.truncated) {
-    const nested = runSync([...OPERATOR_FORCED, "-C", where, ...ATTR_LISTING], env, probeMs, 16 * 1024 * 1024);
-    const r = attributeNames(parseScopedConfig(listed.stdout), where, nested);
-    if (r.problem) return failed(`refused: ${r.problem}`);
-    attrs = r.names;
+  const p = prepare(args, opts);
+  if (p.refused) return p.refused;
+  try {
+    void testHooks.afterPlan?.();
+    const result = runSync(p.argv, p.env, opts.timeoutMs ?? 60_000, opts.maxBuffer ?? 16 * 1024 * 1024);
+    return complete(p, result);
+  } catch (e) {
+    if (p.shadow) rmSync(p.shadow.root, { recursive: true, force: true });
+    throw e;
   }
-  const plan = planFromListing(listed, opts.cwd, trust, env, attrs);
-  const refused = refusal(plan, args, at);
-  if (refused) return refused;
-  void testHooks.afterPlan?.();
-  const result = runSync(
-    [...plan.prefix, ...diffing(args, at)],
-    { ...env, ...plan.extraEnv, ...configEnv(plan.config) },
-    timeoutMs,
-    opts.maxBuffer ?? 16 * 1024 * 1024,
-  );
-  if (watched(sub)) {
-    const after = runSync(["-C", where, ...LISTING], env, probeMs, configListMax);
-    if (after.code === 0 && !after.truncated && policyDigest(parseScopedConfig(after.stdout), trust) !== plan.digest) {
-      reportTaint(sub);
-      return tainted();
-    }
-  }
-  return result;
 }
 
-/** The full argv prefix (before the subcommand) for one invocation, including repository-specific neutralisers (as `-c`, for display and tests). */
-export async function safeGitPrefix(cwd: string, trust: GitTrust = "strict", env = safeGitEnv(process.env, trust)) {
-  const listed = await spawnGit(["-C", cwd, ...LISTING], withoutInjectedConfig(env), {
-    timeoutMs: 15_000,
-    maxBuffer: configListMax,
-  });
-  const plan = planFromListing(listed, cwd, trust, env, null);
-  return [...plan.prefix, ...plan.config.flatMap((c) => ["-c", `${c.key}=${c.value}`])];
+/** The argv prefix (before the subcommand) for one invocation: the forced command-line settings and `-C`. For display and tests. */
+export async function safeGitPrefix(cwd: string, trust: GitTrust = "strict"): Promise<string[]> {
+  return [...(trust === "operator" ? OPERATOR_FORCED : SAFE_GIT_CONFIG), "-C", cwd];
 }
 
 /** Synchronous `safeGitOrThrow` returning stdout (operator trust unless stated); for the update host's probes. */
@@ -966,10 +1327,6 @@ export const RAW_GIT_EXCEPTIONS: Readonly<Record<string, RawSpawnException>> = {
     why: "cat-file / show of a committed blob; never reads the worktree or index",
   },
   "src/runtime/host/loader.ts": { kind: "git-plumbing", why: "rev-parse --absolute-git-dir" },
-  "src/runtime/host/sourceWatch.ts": {
-    kind: "pi-owned",
-    why: "Pi's own checkout: follow-remote fetch under an unattended env that already pins ssh",
-  },
   "src/runtime/isolation/WorktreeIdentity.ts": { kind: "git-plumbing", why: "rev-parse of toplevel / git dirs" },
   "src/update/gitSource.ts": {
     kind: "pi-owned",

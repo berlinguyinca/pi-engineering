@@ -167,15 +167,15 @@ This file-tool guard does not sandbox arbitrary shell commands; shell isolation
 remains the responsibility of the runtime's execution environment.
 
 Git run by Pi itself against a repository a worker can write (every call in `GitRepo`, the worktree janitor, the
-change observer, post-merge reverts, `worker_result`, the result caches and review guards) goes through
-`src/git/safeGit.ts`. A worker can plant `core.fsmonitor`, hooks, `filter.*.clean/smudge/process`,
-`diff.*.textconv`, `merge.*.driver`, `commit.gpgsign` + `gpg.program`, `core.sshCommand`, credential helpers or
-`remote.*.uploadpack` in the shared `.git` (or `info/attributes`); `safeGit` rebuilds the environment, blanks every such
-key the repository defines on the command line (the operator's own global config is kept), adds
-`--no-ext-diff --no-textconv` to `diff`/`show`/`log`, and refuses fetch/push/ls-remote while a per-remote command is
-planted. `test/unit/safe-git-callers.test.ts` fails when a source file spawns `git` outside it unless the file is listed,
-with a reason, in `RAW_GIT_EXCEPTIONS`. The verifier and CAV runner intentionally run worker-authored commands (they are
-the point of a verification gate); they get a scrubbed environment (`src/lifecycle/workerEnv.ts`) but are not sandboxed.
+change observer, post-merge reverts, `worker_result`, the result caches, review guards, the update host and the source
+watcher) goes through `src/git/safeGit.ts`. A worker can plant `core.fsmonitor`, hooks, `filter.*`, `diff.*.textconv`,
+`merge.*.driver`, `gpg.*`, `core.sshCommand`, credential helpers, `remote.*.uploadpack`, `url.*.insteadOf`,
+`branch.*.remote`, `extensions.partialclone`, `.lfsconfig` or an attributes file in the shared `.git` or the work tree.
+`safeGit` does not filter that config: git is run against a GENERATED config that contains only an allow-list of keys
+(see "git hardening" below). `test/unit/safe-git-callers.test.ts` fails when a source file spawns `git` outside it
+unless the file is listed, with a reason, in `RAW_GIT_EXCEPTIONS`. The verifier and CAV runner intentionally run
+worker-authored commands (they are the point of a verification gate); they get a scrubbed environment
+(`src/lifecycle/workerEnv.ts`) but are not sandboxed.
 
 A mutating worker with a known base cannot report `completed` without a tracked
 file diff against that base. Empty or reverted commits do not count, and Git
@@ -234,16 +234,58 @@ State persists under `<repoRoot>/.pi-eng/lifecycle/`. See
   `tests_for` — resolved against the runtime for the calling cwd, so worker
   sessions and the interactive session share one durable ledger.
 
-### git hardening: classification, residual race, network pin
+### git hardening: allow-list config, shadow common directory, remote pin
 
-`src/git/safeGit.ts` classifies config keys by their parts (section at the first dot, variable after the last dot,
-subsection = anything between, case-sensitive), never by a regular expression over the whole key, so names containing
-newlines, U+2028/2029, `=`, dots, quotes or nothing at all are neutralised like any other. Neutralisers travel in
-`GIT_CONFIG_COUNT/KEY_n/VALUE_n`. Driver names referenced by `info/attributes` and every `.gitattributes` are
-neutralised up front even when no config section exists yet, which closes the listing-to-command race for the
-attribute-driven vectors (0 hits in 200 strict and 200 operator flip-loop runs, against 7 in 40 before). The residual:
-a worker that writes both the attribute line and the config section inside the few milliseconds between listing and
-command can run one driver once; the config is listed again afterwards and a change discards the result and emits an
-error notice. A complete fix needs the worker unable to write the shared `.git`. Repository-defined `http.*`,
-`protocol.*`, `url.*`, `remote.*.proxy` and `lfs.url` refuse network commands, and a repository's remote URLs are pinned
-the first time Pi uses it. `safeGitSync` caps its own config probes at 5 s and blocks the event loop while git runs.
+Round 3 replaced the deny-list (blank every vector the listing mentions) with an allow-list.
+
+For each call `safeGit` finds the repository without running git (walk up from the cwd, `.git` directory or
+`gitdir:` file, `commondir`, bare `HEAD+objects+refs`; `core.worktree` and `core.bare` are never read; a `.git` file that
+is malformed is refused, an empty `.git` directory is skipped like git does), lists the repository's `config` once with
+`git config --file` (reads one file, follows no includes), writes a generated config containing only allow-listed keys
+with validated values into a private shadow common directory (`$TMPDIR/pi-safegit-*`), symlinks the rest of the real
+common directory into it with an empty `hooks`, and runs git with `GIT_COMMON_DIR` = shadow, `GIT_DIR` = the real
+per-worktree directory and `GIT_WORK_TREE`. Refs, packed-refs, the index, HEAD and objects are the real files (git takes
+refs from the real directory and its `commondir` file), so their locks are the real locks. Afterwards files git created
+in the shadow (for example `shallow`) are moved into the real directory, the shadow path is mapped out of stdout/stderr
+and out of a new worktree's `.git` file, and the config rows the command itself added or removed (`remote add|set-url`,
+`config`, `branch --set-upstream-to`, LFS `lfs.<url>.access`) are replayed onto the real config. The shadow is removed
+after each call.
+
+What this closes, by construction rather than by naming: there is no window between "inspect the config" and "run the
+command" (the flip loops run 400 iterations per mode and case with 0 hits, against 109/400 and 82/400 for the deny-list
+design on ignored attribute files and `core.attributesFile`); a key nobody has named is dropped like a named one; a
+subsection spelling cannot matter because nothing is matched by name; LFS access writes no longer change a digest.
+Allowed repository-local keys: a small set of `core.*` / `extensions.objectformat|refstorage` format and
+platform settings, `user.name|email`, `branch.<b>.merge|rebase`, `remote.<n>.url|pushurl|fetch|push|tagopt|prune`,
+`push|pull|merge|fetch|rebase|diff|rerere` behaviour switches, and `lfs.<url>.access=basic|none|negotiate`.
+`branch.<b>.remote|pushRemote` and `remote.pushDefault` are kept only when they name an existing remote (or `.`).
+
+Operator-visible behaviour changes: repository-local `credential.*`, `http.*`, `url.*`, `include*`, `filter.*`,
+`diff.<driver>.*`, `merge.<driver>.*`, `alias.*`, `core.editor|pager|hooksPath|sshCommand|attributesFile` and
+`submodule.*` are not honoured by Pi's git calls (the operator's own global/system config is, in `operator` trust);
+hooks of the repository do not run; `git submodule update|add|sync|foreach` and `--recurse-submodules` are refused
+(URLs in `.gitmodules` live in the work tree); `git lfs` is refused while a `.lfsconfig` exists and smudge is skipped
+(`GIT_LFS_SKIP_SMUDGE=1`) when one exists; `gc.auto` is off for Pi's calls; `diff`/`status` ignore submodule changes;
+`git add` leaves tracked nested repositories out (`:(exclude)` pathspecs) and `describe --dirty` is refused while one
+exists; an ignored key is announced once per repository with an `info` notice when it looked like an exec or network
+vector. Operator trust defaults `GIT_ALLOW_PROTOCOL` to `https:http:ssh:file:git`.
+
+Remote pin: the remote URLs of a repository are remembered the first time Pi sees a remote (keyed by the real common
+directory, so a symlinked spelling is the same repository). Network commands (`fetch`, `pull`, `push`, `ls-remote`,
+`lfs`, `remote update|prune|show|set-head`) are refused while the URLs differ. Pi's own reads never clear the pin; Pi's
+own `remote add|set-url|rename|remove` (through safeGit) moves it by exactly what the command changed. An operator who
+wants the pin to survive restarts lists allowed remotes in the global git config:
+`git config --global --add pi.allowedRemote 'https://github.com/org/*'` (exact URL, or a prefix ending in `*`); in
+`operator` trust a network command is refused when any remote URL is not on that list.
+
+`operator` trust passes a short list of Pi's own process environment through (`OPERATOR_ENV` in `safeGit.ts`: config
+isolation, CA bundle, proxy, ssh and identity variables) on the premise that the operator started Pi; it never passes
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_EXTERNAL_DIFF`, `GIT_EDITOR`, `GIT_PAGER` or any
+inherited `GIT_CONFIG_COUNT/KEY/VALUE`. A Pi started from inside a worker's shell would trust that shell's variables;
+that is outside this module.
+
+Residuals: the first sight of a repository is trusted unless `pi.allowedRemote` is set (a worker that repoints a remote
+before Pi ever looks wins); a worker that can write the operator's home directory can change the operator's config;
+nested repositories are handled for the commands measured with git 2.43 (the matrix in
+`test/unit/safe-git-nested.test.ts` is the regression guard for other git versions); the shadow lives in the temp
+directory and is not a sandbox (a worker that can write `.git` can still run its own git).

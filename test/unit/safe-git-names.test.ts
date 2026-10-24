@@ -1,7 +1,7 @@
 /**
- * T16 review round 2: classification works on the PARTS of a key (git's own split: first dot, last dot), never on a
- * regular expression over the whole key, so no subsection spelling escapes a rule. Real git, both trust modes, with a
- * raw-git control for every payload.
+ * T16 round 3: the repository's config reaches git only through the allow-list (`generateConfig`). These tests cover
+ * the pure generator (every spelling of every vector, including ones nobody has named), round-tripping through real
+ * git, and the end-to-end behaviour with odd names.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -10,14 +10,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  type FileEntry,
   type GitTrust,
-  attributeDriverNames,
-  keyId,
-  neutralFor,
-  neutralisers,
+  configDelta,
+  generateConfig,
+  parseFileConfig,
   parseKey,
   parseScopedConfig,
-  remoteExecKeys,
   safeGit,
 } from "../../src/git/safeGit.ts";
 
@@ -42,112 +41,191 @@ const ODD_NAMES = [
   "upper",
 ];
 const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-const entry = (key: string, value = "x", scope = "local") => ({ scope, origin: "file:/r/.git/config", key, value });
+const row = (key: string, value: string | null = "x"): FileEntry => ({ key, value });
+const keptKeys = (rows: FileEntry[]) => generateConfig(rows, false).kept.map((k) => k.key);
 
 test("parseKey splits like git: section at the first dot, variable after the last, subsection is everything between", () => {
   assert.deepEqual(parseKey("filter.a.b.clean"), { section: "filter", sub: "a.b", variable: "clean" });
   assert.deepEqual(parseKey("Filter..CLEAN"), { section: "filter", sub: "", variable: "clean" });
   assert.deepEqual(parseKey("core.sshCommand"), { section: "core", sub: null, variable: "sshcommand" });
-  assert.deepEqual(parseKey("filter.a b.smudge"), { section: "filter", sub: "a b", variable: "smudge" });
+  assert.deepEqual(parseKey("filter.a b.smudge"), { section: "filter", sub: "a b", variable: "smudge" });
   assert.deepEqual(parseKey("filter.a\rb.smudge"), { section: "filter", sub: "a\rb", variable: "smudge" });
   assert.equal(parseKey("nodots"), null);
   assert.equal(parseKey("trailing."), null);
   assert.equal(parseKey(".lead"), null);
 });
 
-test("every odd subsection name is neutralised for every exec vector (pure)", () => {
+const VECTORS = [
+  "filter.N.clean",
+  "filter.N.smudge",
+  "filter.N.process",
+  "filter.N.required",
+  "diff.N.textconv",
+  "diff.N.command",
+  "merge.N.driver",
+  "merge.N.name",
+  "trailer.N.command",
+  "trailer.N.cmd",
+  "submodule.N.update",
+  "submodule.N.url",
+  "lfs.extension.N.clean",
+  "lfs.extension.N.smudge",
+  "lfs.customtransfer.N.path",
+  "gpg.N.program",
+  "credential.N.helper",
+  "credential.helper",
+  "remote.N.uploadpack",
+  "remote.N.receivepack",
+  "remote.N.vcs",
+  "remote.N.proxy",
+  "remote.N.promisor",
+  "remote.N.partialclonefilter",
+  "url.N.insteadOf",
+  "url.N.pushInsteadOf",
+  "http.N.proxy",
+  "http.proxy",
+  "http.extraHeader",
+  "http.curloptResolve",
+  "protocol.N.allow",
+  "core.fsmonitor",
+  "core.hooksPath",
+  "core.sshCommand",
+  "core.gitProxy",
+  "core.askPass",
+  "core.editor",
+  "core.pager",
+  "core.attributesFile",
+  "core.excludesFile",
+  "core.alternateRefsCommand",
+  "core.worktree",
+  "core.bare",
+  "core.untrackedCache.x",
+  "sequence.editor",
+  "gpg.program",
+  "gpg.ssh.defaultKeyCommand",
+  "gpg.ssh.program",
+  "extensions.partialclone",
+  "extensions.worktreeConfig",
+  "include.path",
+  "includeIf.gitdir:/.path",
+  "lfs.url",
+  "lfs.pushurl",
+  "lfs.standalonetransferagent",
+  "diff.external",
+  "difftool.N.cmd",
+  "mergetool.N.cmd",
+  "alias.x",
+  "uploadpack.packObjectsHook",
+  "pager.log",
+  "web.browser",
+  "sendemail.smtpServer",
+  "credential.N.username",
+  "transfer.hideRefs",
+  "receive.denyCurrentBranch",
+];
+
+test("every vector under every odd subsection name is absent from the generated config (pure)", () => {
   for (const name of ODD_NAMES) {
-    const keys: Array<[string, string]> = [
-      [`filter.${name}.clean`, ""],
-      [`filter.${name}.smudge`, ""],
-      [`filter.${name}.process`, ""],
-      [`filter.${name}.required`, "false"],
-      [`diff.${name}.textconv`, "cat"],
-      [`diff.${name}.command`, ""],
-      [`merge.${name}.driver`, ""],
-      [`trailer.${name}.command`, ""],
-      [`trailer.${name}.cmd`, ""],
-      [`submodule.${name}.update`, "checkout"],
-      [`lfs.extension.${name}.clean`, ""],
-      [`lfs.extension.${name}.smudge`, ""],
-      [`lfs.customtransfer.${name}.path`, ""],
-      [`gpg.${name}.program`, "false"],
-    ];
-    for (const [key, want] of keys) {
-      const out = neutralisers([entry(key, "touch /x")], "strict");
-      assert.deepEqual(out, [{ key, value: want }], `${JSON.stringify(key.slice(0, 60))}`);
+    for (const v of VECTORS) {
+      const key = v.replace(".N.", `.${name}.`);
+      if (key === v) continue;
+      const g = generateConfig([row(key, "touch /x")], false);
+      assert.deepEqual(g.kept, [], JSON.stringify(key.slice(0, 60)));
+      assert.ok(!g.text.includes("touch /x"), JSON.stringify(key.slice(0, 60)));
     }
-    for (const trust of MODES) {
-      const credential = neutralisers([entry(`credential.${name}.helper`, "!touch /x")], trust);
-      assert.deepEqual(credential, [{ key: `credential.${name}.helper`, value: "" }]);
-    }
-    assert.deepEqual(remoteExecKeys([entry(`remote.${name}.uploadpack`, "x")], "strict"), [
-      `remote.${name}.uploadpack`,
-    ]);
-    assert.deepEqual(remoteExecKeys([entry(`remote.${name}.proxy`, "x")], "operator"), [`remote.${name}.proxy`]);
+  }
+  for (const v of VECTORS) {
+    if (v.includes(".N.")) continue;
+    assert.deepEqual(generateConfig([row(v, "touch /x")], false).kept, [], v);
   }
 });
 
-test('subsections are case-SENSITIVE: [filter "A"] and [filter "a"] are both neutralised; section and variable are not', () => {
-  const out = neutralisers(
-    [entry("filter.A.clean", "x"), entry("filter.a.clean", "y"), entry("FILTER.a.CLEAN", "z")],
-    "strict",
+test("keys nobody has named are dropped too: only the allow-list gets in", () => {
+  assert.deepEqual(keptKeys([row("filter.future.thing"), row("core.someNewExecKnob"), row("newsection.sub.var")]), []);
+  assert.deepEqual(keptKeys([row("core.filemode", "false"), row("user.name", "t"), row("filter.a.clean", "x")]), [
+    "core.filemode",
+    "user.name",
+  ]);
+});
+
+test("values are validated: an allowed key with a hostile or malformed value is dropped, not repaired", () => {
+  assert.deepEqual(
+    keptKeys([row("core.filemode", "touch /x"), row("core.eol", "$(x)"), row("core.compression", "9; x")]),
+    [],
   );
-  assert.deepEqual(out, [
-    { key: "filter.A.clean", value: "" },
-    { key: "filter.a.clean", value: "" },
-  ]);
-  assert.notEqual(keyId(parseKey("filter.A.clean") as never), keyId(parseKey("filter.a.clean") as never));
-  assert.equal(keyId(parseKey("FILTER.a.CLEAN") as never), keyId(parseKey("filter.a.clean") as never));
-});
-
-test("operator mode restores the operator's own value for the same key, and only for the same subsection spelling", () => {
-  const out = neutralisers(
-    [
-      entry("filter.lfs.clean", "git-lfs clean -- %f", "global"),
-      entry("filter.lfs.clean", "touch /x", "local"),
-      entry("filter.LFS.clean", "touch /y", "local"),
-    ],
-    "operator",
+  assert.deepEqual(keptKeys([row("user.name", "a\nb"), row("user.name", "a\u0001b")]), []);
+  assert.deepEqual(
+    keptKeys([row("lfs.http://h/x/info/lfs.access", "basic"), row("lfs.http://h/x/info/lfs.access", "x")]),
+    ["lfs.http://h/x/info/lfs.access"],
   );
-  assert.deepEqual(out, [
-    { key: "filter.lfs.clean", value: "git-lfs clean -- %f" },
-    { key: "filter.LFS.clean", value: "" },
-  ]);
+  assert.deepEqual(keptKeys([row("remote.o.url", ""), row("remote.o.url", null)]), []);
 });
 
-test("neutralFor knows only the execution vectors", () => {
-  assert.equal(neutralFor(parseKey("user.name") as never), null);
-  assert.equal(neutralFor(parseKey("filter.x.helper") as never), null);
-  assert.equal(neutralFor(parseKey("core.editor") as never), "true");
-  assert.equal(neutralFor(parseKey("lfs.url") as never), null);
+test("branch.<b>.remote, pushRemote and remote.pushDefault may only name a remote that exists (or `.`)", () => {
+  const rows = (v: string) => [
+    row("remote.origin.url", "https://h/x.git"),
+    row("branch.main.remote", v),
+    row("branch.main.pushRemote", v),
+    row("remote.pushDefault", v),
+  ];
+  for (const bad of ["https://evil/x.git", "ext::sh -c x", "/tmp/evil", "../evil", "nosuch", "git@evil:x", ""]) {
+    assert.deepEqual(keptKeys(rows(bad)), ["remote.origin.url"], JSON.stringify(bad));
+  }
+  assert.deepEqual(keptKeys(rows("origin")), [
+    "remote.origin.url",
+    "branch.main.remote",
+    "branch.main.pushRemote",
+    "remote.pushDefault",
+  ]);
+  assert.deepEqual(keptKeys(rows(".")).slice(1, 3), ["branch.main.remote", "branch.main.pushRemote"]);
 });
 
-test("attributeDriverNames reads filter/diff/merge names, quoted patterns and macros", () => {
-  const text = [
-    "# comment",
-    "*.bin filter=lfs diff=lfs merge=lfs -text",
-    '"my file.txt" filter=quoted',
-    "[attr]mine diff=viaMacro",
-    "*.x  filter=a=b\tdiff=tabbed",
-    "nofilter text",
-    "empty filter=",
-  ].join("\n");
-  assert.deepEqual(attributeDriverNames(text), [
-    ["filter", "lfs"],
-    ["diff", "lfs"],
-    ["merge", "lfs"],
-    ["filter", "quoted"],
-    ["diff", "viaMacro"],
-    ["filter", "a=b"],
-    ["diff", "tabbed"],
-  ]);
+test("the generated text round-trips through real git for every odd subsection name, and carries nothing else", () => {
+  const root = mkdtempSync(join(tmpdir(), "safe-git-gen-"));
+  try {
+    const rows: FileEntry[] = [row("core.filemode", "false"), row("user.name", 'Q "uote" \\ back\tslash')];
+    for (const n of ODD_NAMES) {
+      if (n === "") continue;
+      rows.push(row(`remote.${n}.url`, `https://h/${n.length}.git`), row(`branch.${n}.merge`, "refs/heads/x"));
+    }
+    const g = generateConfig(rows, true);
+    const file = join(root, "config");
+    writeFileSync(file, g.text);
+    const out = execFileSync("git", ["config", "--file", file, "--list", "-z"], {
+      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+    }).toString();
+    const back = parseFileConfig(out).filter((e) => e.key !== "core.repositoryformatversion" && e.key !== "core.bare");
+    assert.deepEqual(
+      back.map((e) => [e.key, e.value]),
+      g.kept.map((e) => [e.key, e.value]),
+    );
+    assert.equal(g.kept.length, rows.length - 0, "nothing the test offered was lost");
+    assert.match(g.text, /bare = "true"/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("configDelta compares as multisets: only what the command changed", () => {
+  const a = [row("remote.o.url", "u1"), row("remote.o.fetch", "f"), row("remote.o.fetch", "g")];
+  const b = [
+    row("remote.o.url", "u2"),
+    row("remote.o.fetch", "g"),
+    row("remote.o.fetch", "f"),
+    row("branch.x.merge", "m"),
+  ];
+  const d = configDelta(a, b);
+  assert.deepEqual(d.remove, [row("remote.o.url", "u1")]);
+  assert.deepEqual(d.add, [row("remote.o.url", "u2"), row("branch.x.merge", "m")]);
+  assert.deepEqual(configDelta(a, a), { remove: [], add: [] });
 });
 
 test("a listing record ends its key at the first newline, so a newline can never be part of a key", () => {
   const e = parseScopedConfig("local\0file:/r\0filter.a\nb.clean\nvalue\0");
   assert.equal(e[0]?.key, "filter.a");
   assert.equal(e[0]?.value, "b.clean\nvalue");
+  const f = parseFileConfig("filter.a\nb.clean\nvalue\0core.bare\0");
+  assert.deepEqual(f, [row("filter.a", "b.clean\nvalue"), { key: "core.bare", value: null }]);
 });
 
 // ─── against real git ──────────────────────────────────────────────────────────────────────────────────────────
@@ -230,7 +308,7 @@ test("filters, textconv and merge drivers with every odd name stay quiet - inclu
   }
 });
 
-test("a U+2028 / empty / CR subsection cannot dodge the network refusal or the trailer rule", async () => {
+test("a U+2028 / empty / CR subsection cannot dodge the allow-list: uploadpack and trailer commands never run", async () => {
   const l = lab();
   try {
     for (const name of ["r s", "", "r\rs"]) {
@@ -242,9 +320,7 @@ test("a U+2028 / empty / CR subsection cannot dodge the network refusal or the t
       for (const trust of MODES) {
         l.reset();
         const r = await safeGit(["ls-remote", name || "."], { cwd: l.repo, trust, timeoutMs: 20_000 });
-        assert.equal(r.code, 128, `${trust} ${JSON.stringify(name)}: ${r.stderr.slice(0, 80)}`);
-        assert.match(r.stderr, /refused/);
-        assert.deepEqual(l.seen(), []);
+        assert.deepEqual(l.seen(), [], `${trust} ${JSON.stringify(name)}: ${r.stderr.slice(0, 80)}`);
       }
     }
     const t = l.hook("trailer");
@@ -264,7 +340,7 @@ test("a U+2028 / empty / CR subsection cannot dodge the network refusal or the t
   }
 });
 
-test("submodule.<name>.update = !command does not run on `submodule update`", async () => {
+test("submodule.<name>.update = !command does not run, and `submodule update` itself is refused", async () => {
   const l = lab();
   try {
     const src = join(l.root, "sm-src");
@@ -293,8 +369,15 @@ test("submodule.<name>.update = !command does not run on `submodule update`", as
     for (const trust of MODES) {
       l.sh("git -C sm checkout -q HEAD~1 2>/dev/null || true", l.repo);
       l.reset();
-      await safeGit(["submodule", "update"], { cwd: l.repo, trust, timeoutMs: 30_000 });
+      const r = await safeGit(["submodule", "update"], { cwd: l.repo, trust, timeoutMs: 30_000 });
+      assert.equal(r.code, 128);
+      assert.match(r.stderr, /refused/);
       assert.deepEqual(l.seen(), [], `${trust}: submodule update ran the planted command`);
+      // and nothing else a caller may reasonably run reads that key either
+      for (const args of [["status"], ["diff"], ["checkout", "."], ["log", "-p", "-1"]]) {
+        await safeGit(args, { cwd: l.repo, trust, timeoutMs: 30_000 });
+      }
+      assert.deepEqual(l.seen(), [], `${trust}: a plain command ran the planted update command`);
     }
   } finally {
     rmSync(l.root, { recursive: true, force: true });

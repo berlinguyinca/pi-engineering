@@ -18,9 +18,9 @@
  * owner's (`onChange`): the watcher only knows fingerprints.
  */
 
-import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { safeGit, safeGitSync } from "../../git/safeGit.ts";
 import { type GitRunner, type SelfUpdateResult, checkForUpdate } from "../../update/selfUpdate.ts";
 
 export const DEFAULT_AUTO_RELOAD_INTERVAL_MS = 15_000;
@@ -180,19 +180,10 @@ const sshConfiguredByRoot = new Map<string, boolean>();
 export function sshCommandConfigured(root: string): boolean {
   const known = sshConfiguredByRoot.get(root);
   if (known !== undefined) return known;
-  let configured = false;
-  try {
-    const out = execFileSync("git", ["-C", root, "config", "--get", "core.sshCommand"], {
-      timeout: 5_000,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    });
-    configured = out.toString().trim().length > 0;
-  } catch {
-    // Exit 1 means "not set"; anything else is treated the same way.
-    configured = false;
-  }
+  // Through safeGit (operator trust): the operator's system/global `core.sshCommand` counts, a repository-local one
+  // (writable by whoever works in the checkout) does not reach git at all.
+  const r = safeGitSync(["config", "--get", "core.sshCommand"], { cwd: root, trust: "operator", timeoutMs: 5_000 });
+  const configured = r.code === 0 && r.stdout.trim().length > 0;
   sshConfiguredByRoot.set(root, configured);
   return configured;
 }
@@ -247,34 +238,22 @@ function resolveGitDir(root: string): string | null {
  * configuration is. stdin is closed for the same reason.
  */
 export function gitRunner(root: string, timeoutMs = 30_000): GitRunner {
-  return (args) =>
-    new Promise((resolve) => {
-      let child: ReturnType<typeof spawn>;
-      try {
-        child = spawn("git", ["-C", root, ...args], {
-          timeout: timeoutMs,
-          windowsHide: true,
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
-          env: unattendedGitEnv(process.env, sshCommandConfigured(root)),
-        });
-      } catch (error) {
-        return resolve({ code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) });
-      }
-      const out: Buffer[] = [];
-      const err: Buffer[] = [];
-      child.stdout?.on("data", (chunk: Buffer) => out.push(chunk));
-      child.stderr?.on("data", (chunk: Buffer) => err.push(chunk));
-      let settled = false;
-      const finish = (code: number, extra?: string) => {
-        if (settled) return;
-        settled = true;
-        const stderr = Buffer.concat(err).toString();
-        resolve({ code, stdout: Buffer.concat(out).toString(), stderr: stderr || extra || "" });
-      };
-      child.on("error", (error) => finish(1, error.message));
-      child.on("close", (code, signal) => finish(code ?? (signal ? 1 : 0), signal ? `git killed by ${signal}` : ""));
+  return async (args) => {
+    const env = unattendedGitEnv({}, sshCommandConfigured(root));
+    const r = await safeGit(args, {
+      cwd: root,
+      trust: "operator",
+      timeoutMs,
+      detached: true,
+      env: {
+        GIT_ASKPASS: env.GIT_ASKPASS ?? "true",
+        SSH_ASKPASS: env.SSH_ASKPASS ?? "",
+        GIT_OPTIONAL_LOCKS: "0",
+        ...(env.GIT_SSH_COMMAND ? { GIT_SSH_COMMAND: env.GIT_SSH_COMMAND } : {}),
+      },
     });
+    return { code: r.code, stdout: r.stdout, stderr: r.stderr };
+  };
 }
 
 /**
@@ -303,15 +282,12 @@ export function followRemote(root: string): Promise<SelfUpdateResult> {
 }
 
 /** `git rev-parse HEAD` of `root`, or null when it is not a readable checkout. */
-export function gitHead(root: string, timeoutMs = 5_000): Promise<string | null> {
-  return new Promise((resolve) => {
-    // A rebase, merge or bisect in flight (or a detached HEAD): no fingerprint,
-    // so the poll is skipped rather than loading an intermediate state.
-    if (gitOperationInProgress(root)) return resolve(null);
-    execFile("git", ["-C", root, "rev-parse", "HEAD"], { timeout: timeoutMs, windowsHide: true }, (error, stdout) => {
-      if (error) return resolve(null);
-      const sha = stdout.trim();
-      resolve(/^[0-9a-f]{40}$/.test(sha) ? sha : null);
-    });
-  });
+export async function gitHead(root: string, timeoutMs = 5_000): Promise<string | null> {
+  // A rebase, merge or bisect in flight (or a detached HEAD): no fingerprint,
+  // so the poll is skipped rather than loading an intermediate state.
+  if (gitOperationInProgress(root)) return null;
+  const r = await safeGit(["rev-parse", "HEAD"], { cwd: root, trust: "operator", timeoutMs });
+  if (r.code !== 0) return null;
+  const sha = r.stdout.trim();
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
 }

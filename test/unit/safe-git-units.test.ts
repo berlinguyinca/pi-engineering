@@ -10,67 +10,105 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  type RepoLayout,
+  applyPinDelta,
   configEnv,
+  contactsNetwork,
   diffing,
-  planFromListing,
-  remoteExecKeys,
+  discoverRepo,
+  excludePathspecs,
+  redirectsRepository,
+  remoteAllowed,
   safeGit,
+  safeGitEnv,
   safeGitSync,
+  setConfigListLimitForTests,
   subcommandIndex,
   withoutInjectedConfig,
 } from "../../src/git/safeGit.ts";
 import { MemorySteeringLedger, applySteering, parseSteeringItem } from "../../src/orchestration/steering.ts";
 import { loadHerdrConnection } from "../../src/runtime/herdr/herdrConnection.ts";
 
-const ok = (stdout: string) => ({ code: 0, stdout, stderr: "" });
-const rec = (scope: string, key: string, value = "v") => `${scope}\0file:/r/${scope}\0${key}\n${value}\0`;
-
-test("planFromListing: a failed or truncated listing is refused, not planned around", () => {
-  const bad = planFromListing({ code: 1, stdout: "", stderr: "x" }, "/r", "strict", {}, null);
-  assert.match(bad.unreadable ?? "", /unreadable/);
-  const cut = planFromListing({ code: 0, stdout: "", stderr: "", truncated: true }, "/r", "strict", {}, null);
-  assert.match(cut.unreadable ?? "", /too large/);
-  assert.equal(planFromListing(ok(rec("local", "user.name")), "/r", "strict", {}, null).unreadable, undefined);
-});
-
-test("planFromListing: GIT_PROXY_COMMAND is pinned unless the operator has one (env or trusted config)", () => {
-  const none = ok(rec("local", "core.gitProxy", "/evil"));
-  assert.equal(planFromListing(none, "/r", "strict", {}, null).extraEnv.GIT_PROXY_COMMAND, "false");
-  assert.equal(planFromListing(none, "/r", "operator", {}, null).extraEnv.GIT_PROXY_COMMAND, "false");
-  assert.deepEqual(planFromListing(none, "/r", "operator", { GIT_PROXY_COMMAND: "corp-proxy" }, null).extraEnv, {});
+test("applyPinDelta moves a pin by exactly what the command changed, never by what else is in the config", () => {
+  const row = (k: string, v: string) => `${k}\0${v}`;
+  const pin = [row("remote.o.url", "u1"), row("remote.o.pushurl", "p1")].sort().join("\u0001");
+  const out = applyPinDelta(pin, [{ key: "remote.o.url", value: "u1" }], [{ key: "remote.o.url", value: "u2" }]);
+  assert.equal(out, [row("remote.o.pushurl", "p1"), row("remote.o.url", "u2")].sort().join("\u0001"));
+  assert.equal(applyPinDelta("", [], [{ key: "remote.o.url", value: "u" }]), row("remote.o.url", "u"));
   assert.equal(
-    planFromListing(none, "/r", "strict", { GIT_PROXY_COMMAND: "corp-proxy" }, null).extraEnv.GIT_PROXY_COMMAND,
-    "false",
-    "strict mode never honours the operator's proxy",
+    applyPinDelta(
+      pin,
+      [],
+      [
+        { key: "core.filemode", value: "false" },
+        { key: "branch.x.merge", value: "m" },
+      ],
+    ),
+    pin,
   );
-  const trusted = ok(rec("global", "core.gitProxy", "corp") + rec("local", "core.gitProxy", "/evil"));
-  assert.deepEqual(planFromListing(trusted, "/r", "operator", {}, null).extraEnv, {});
-  assert.equal(planFromListing(trusted, "/r", "strict", {}, null).extraEnv.GIT_PROXY_COMMAND, "false");
+  assert.equal(applyPinDelta(row("remote.o.url", "u"), [{ key: "remote.o.url", value: "u" }], []), "");
 });
 
-test("planFromListing: oversized keys and driver floods are refused instead of overflowing the environment", () => {
-  const huge = ok(rec("local", `filter.${"a".repeat(40_000)}.clean`));
-  assert.match(planFromListing(huge, "/r", "strict", {}, null).unreadable ?? "", /too long/);
-  const many = ok(
-    Array.from({ length: 20_000 }, (_, i) => rec("local", `filter.${"n".repeat(40)}${i}.clean`)).join(""),
-  );
-  assert.match(planFromListing(many, "/r", "strict", {}, null).unreadable ?? "", /too many/);
+test("remoteAllowed: exact match, or a prefix when the entry ends in *", () => {
+  assert.equal(remoteAllowed("https://h/a.git", ["https://h/a.git"]), true);
+  assert.equal(remoteAllowed("https://h/a.git.evil", ["https://h/a.git"]), false);
+  assert.equal(remoteAllowed("https://h/org/x.git", ["https://h/org/*"]), true);
+  assert.equal(remoteAllowed("https://h/other/x.git", ["https://h/org/*"]), false);
+  assert.equal(remoteAllowed("https://h/org/x.git", []), false);
 });
 
-test("remoteExecKeys: the operator's own (trusted-scope) keys are not reported, the repository's are, in both modes' terms", () => {
-  const e = [
-    { scope: "global", origin: "f", key: "remote.o.uploadpack", value: "x" },
-    { scope: "local", origin: "f", key: "remote.o.uploadpack", value: "x" },
-    { scope: "worktree", origin: "f", key: "http.sslVerify", value: "false" },
-    { scope: "global", origin: "f", key: "http.proxy", value: "corp" },
-  ];
-  assert.deepEqual(remoteExecKeys(e, "operator"), ["remote.o.uploadpack", "http.sslVerify"]);
-  assert.deepEqual(remoteExecKeys(e, "strict"), [
-    "remote.o.uploadpack",
-    "remote.o.uploadpack",
-    "http.sslVerify",
-    "http.proxy",
-  ]);
+test("redirectsRepository sees --git-dir / --work-tree in either spelling, and only among git's own options", () => {
+  assert.equal(redirectsRepository(["--git-dir", "/g", "status"], 2), true);
+  assert.equal(redirectsRepository(["--git-dir=/g", "status"], 1), true);
+  assert.equal(redirectsRepository(["--work-tree=/w", "status"], 1), true);
+  assert.equal(
+    redirectsRepository(["-C", "/x", "status", "--git-dir=/g"], 2),
+    false,
+    "after the subcommand it is the subcommand's own argument",
+  );
+  assert.equal(redirectsRepository(["status"], 0), false);
+});
+
+test("contactsNetwork: remote edits are local (Pi repairs a pin with them), remote update/prune/show are not", () => {
+  const net = (args: string[]) => contactsNetwork(args, subcommandIndex(args));
+  for (const a of [
+    ["fetch"],
+    ["pull"],
+    ["push", "o"],
+    ["ls-remote"],
+    ["lfs", "locks"],
+    ["-C", "d", "fetch"],
+    ["remote", "update"],
+    ["remote", "show", "o"],
+    ["remote", "-v", "prune", "o"],
+    ["remote", "set-head", "o", "-a"],
+  ]) {
+    assert.equal(net(a), true, a.join(" "));
+  }
+  for (const a of [
+    ["remote"],
+    ["remote", "-v"],
+    ["remote", "add", "o", "u"],
+    ["remote", "set-url", "o", "u"],
+    ["remote", "rename", "a", "b"],
+    ["remote", "remove", "o"],
+    ["remote", "get-url", "o"],
+    ["status"],
+    ["config", "--get", "x"],
+  ]) {
+    assert.equal(net(a), false, a.join(" "));
+  }
+});
+
+test("excludePathspecs spells nested repositories as literal, top-anchored exclusions", () => {
+  assert.deepEqual(excludePathspecs(["sub", "a b/c"]), [":(exclude,top,literal)sub", ":(exclude,top,literal)a b/c"]);
+});
+
+test("safeGitEnv pins transports in both modes; operator keeps its own GIT_ALLOW_PROTOCOL, strict never does", () => {
+  assert.equal(safeGitEnv({}, "strict").GIT_ALLOW_PROTOCOL, "https:ssh:file");
+  assert.equal(safeGitEnv({ GIT_ALLOW_PROTOCOL: "ext" }, "strict").GIT_ALLOW_PROTOCOL, "https:ssh:file");
+  assert.equal(safeGitEnv({}, "operator").GIT_ALLOW_PROTOCOL, "https:http:ssh:file:git");
+  assert.equal(safeGitEnv({ GIT_ALLOW_PROTOCOL: "https" }, "operator").GIT_ALLOW_PROTOCOL, "https");
 });
 
 test("subcommandIndex skips git's own options, including --git-dir/--work-tree/--namespace with a separate value", () => {
@@ -167,68 +205,142 @@ test("-C relocates the config that is read: a planted repository named by -C (ab
   }
 });
 
-test("spawn failures (argument or environment too large) are results, never rejections, for async and sync", async () => {
+test("spawn failures (an argument too large for exec) are results, never rejections, for async and sync", async () => {
   const l = lab();
   try {
-    // 140 000 bytes in one subsection name exceeds the 128 KiB limit of a single environment string
-    const name = "z".repeat(140_000);
-    writeFileSync(
-      join(l.root, "dirty", ".git", "config"),
-      `${execFileSync("cat", [join(l.root, "dirty", ".git", "config")]).toString()}[filter "${name}"]\n\tclean = /bin/true\n`,
-    );
+    const big = "z".repeat(140_000); // above the 128 KiB limit of one argument
     for (const trust of ["strict", "operator"] as const) {
-      const r = await safeGit(["status", "--porcelain"], { cwd: join(l.root, "dirty"), trust, timeoutMs: 30_000 });
+      const r = await safeGit(["status", big], { cwd: join(l.root, "dirty"), trust, timeoutMs: 30_000 });
       assert.notEqual(r.code, 0);
-      assert.match(r.stderr, /refused/);
-      const s = safeGitSync(["status", "--porcelain"], { cwd: join(l.root, "dirty"), trust, timeoutMs: 30_000 });
+      assert.match(r.stderr, /E2BIG|refused/);
+      const s = safeGitSync(["status", big], { cwd: join(l.root, "dirty"), trust, timeoutMs: 30_000 });
       assert.notEqual(s.code, 0);
-      assert.match(s.stderr, /refused/);
+      assert.match(s.stderr, /E2BIG|refused/);
     }
     const missing = await safeGit(["status"], { cwd: join(l.root, "nope") });
     assert.notEqual(missing.code, 0, "an unusable cwd is a result");
+    // a 140 000-byte subsection name in the repository's config is simply not allow-listed: it costs nothing
+    writeFileSync(
+      join(l.root, "dirty", ".git", "config"),
+      `${execFileSync("cat", [join(l.root, "dirty", ".git", "config")]).toString()}[filter "${big}"]\n\tclean = /bin/true\n`,
+    );
+    const ok = await safeGit(["status", "--porcelain"], {
+      cwd: join(l.root, "dirty"),
+      trust: "strict",
+      timeoutMs: 30_000,
+    });
+    assert.equal(ok.code, 0, ok.stderr);
   } finally {
     rmSync(l.root, { recursive: true, force: true });
   }
 });
 
-test("safeGitSync refuses like the async variant: network keys, unreadable config, planted driver, planted proxy", () => {
+test("a repository config that git cannot read, or that is too large to list, is refused (async and sync), never passed through", async () => {
+  const l = lab();
+  try {
+    const d = join(l.root, "dirty");
+    const cfg = join(d, ".git", "config");
+    const good = execFileSync("cat", [cfg]).toString();
+    const hook = l.hook("clean");
+    // a syntax error AFTER a planted driver: raw git cannot even start, and the allow-list must not guess what it meant
+    writeFileSync(cfg, `${good}[filter "e"]\n\tclean = ${hook}\n[broken\n`);
+    for (const trust of ["strict", "operator"] as const) {
+      const r = await safeGit(["status", "--porcelain"], { cwd: d, trust });
+      assert.equal(r.code, 128);
+      assert.match(r.stderr, /refused: the repository config is unreadable/);
+      const s = safeGitSync(["status", "--porcelain"], { cwd: d, trust, timeoutMs: 20_000 });
+      assert.equal(s.code, 128);
+      assert.match(s.stderr, /unreadable/);
+    }
+    writeFileSync(cfg, `${good}[filter "e"]\n\tclean = ${hook}\n${"[x]\n\ty = ".concat("1\n").repeat(2000)}`);
+    setConfigListLimitForTests(1024);
+    try {
+      for (const trust of ["strict", "operator"] as const) {
+        const r = await safeGit(["status", "--porcelain"], { cwd: d, trust });
+        assert.equal(r.code, 128);
+        assert.match(r.stderr, /refused: the repository config is too large/);
+        assert.deepEqual(l.seen(), []);
+      }
+    } finally {
+      setConfigListLimitForTests(64 * 1024 * 1024);
+    }
+  } finally {
+    rmSync(l.root, { recursive: true, force: true });
+  }
+});
+
+test("safeGitSync: planted driver, proxy, uploadpack and fsmonitor never run; refusals match the async variant", () => {
   const l = lab();
   try {
     const d = join(l.root, "dirty");
     const up = l.hook("uploadpack");
     const clean = l.hook("clean");
     const proxy = l.hook("proxy");
+    const fsm = l.hook("fsm");
     l.sh(
-      `git config remote.o.url ${d} && git config remote.o.uploadpack '${up}' && git config filter.e.clean '${clean}' && git config core.gitProxy '${proxy}' && echo '* filter=e' > .git/info/attributes && echo changed > f.txt`,
+      `git config remote.o.url ${d} && git config remote.o.uploadpack '${up}' && git config filter.e.clean '${clean}' && git config core.gitProxy '${proxy}' && git config core.fsmonitor '${fsm}' && echo '* filter=e' > .git/info/attributes && echo changed > f.txt`,
       d,
     );
     for (const trust of ["strict", "operator"] as const) {
       l.reset();
-      const f = safeGitSync(["fetch", "o"], { cwd: d, trust, timeoutMs: 20_000 });
-      assert.equal(f.code, 128);
-      assert.match(f.stderr, /refused/);
+      safeGitSync(["fetch", "o"], { cwd: d, trust, timeoutMs: 20_000 });
       safeGitSync(["add", "-A"], { cwd: d, trust, timeoutMs: 20_000 });
-      assert.deepEqual(l.seen(), [], `${trust}: sync add ran ${l.seen().join(",")}`);
+      safeGitSync(["status", "--porcelain"], { cwd: d, trust, timeoutMs: 20_000 });
+      assert.deepEqual(l.seen(), [], `${trust}: sync ran ${l.seen().join(",")}`);
       l.sh("git -c filter.e.clean= -c filter.e.smudge= reset -q", d);
       l.reset();
-      safeGitSync(["ls-remote", "git://example.invalid/x.git"], {
-        cwd: join(l.root, "clean"),
-        trust,
-        timeoutMs: 20_000,
-      });
-      assert.deepEqual(l.seen(), [], `${trust}: sync ran ${l.seen().join(",")}`);
+      safeGitSync(["ls-remote", "git://example.invalid/x.git"], { cwd: d, trust, timeoutMs: 20_000 });
+      assert.deepEqual(l.seen(), [], `${trust}: sync ls-remote ran ${l.seen().join(",")}`);
     }
     const gone = safeGitSync(["status"], { cwd: join(l.root, "nope"), trust: "strict", timeoutMs: 5_000 });
-    assert.equal(gone.code, 128);
-    assert.match(gone.stderr, /refused/);
-    l.sh(`git config core.gitProxy '${proxy}'`, join(l.root, "clean"));
-    l.reset();
-    safeGitSync(["ls-remote", "git://example.invalid/x.git"], {
-      cwd: join(l.root, "clean"),
-      trust: "operator",
-      timeoutMs: 20_000,
+    assert.notEqual(gone.code, 0);
+    const redirected = safeGitSync(["--git-dir", `${d}/.git`, "status"], {
+      cwd: l.root,
+      trust: "strict",
+      timeoutMs: 5_000,
     });
-    assert.deepEqual(l.seen(), [], "planted gitProxy did not run in the sync variant");
+    assert.equal(redirected.code, 128);
+    assert.match(redirected.stderr, /refused/);
+  } finally {
+    rmSync(l.root, { recursive: true, force: true });
+  }
+});
+
+test("discoverRepo mirrors git: .git dir, gitdir: file, commondir, bare, skipped empty .git dir, fatal bad .git file, none", () => {
+  const l = lab();
+  try {
+    const found = (p: string): RepoLayout => {
+      const r = discoverRepo(p);
+      assert.ok(r !== null && r !== "invalid", `${p}: ${String(r)}`);
+      return r as RepoLayout;
+    };
+    const clean = join(l.root, "clean");
+    mkdirSync(join(clean, "sub", "deeper"), { recursive: true });
+    const main = found(join(clean, "sub", "deeper"));
+    assert.equal(main.workTree, clean);
+    assert.equal(main.gitDir, join(clean, ".git"));
+    assert.equal(main.commonDir, join(clean, ".git"));
+    l.sh(`git worktree add -q ${join(l.root, "wt")} -b wtb`, clean);
+    const wt = found(join(l.root, "wt"));
+    assert.equal(wt.workTree, join(l.root, "wt"));
+    assert.equal(wt.gitDir, join(clean, ".git", "worktrees", "wt"));
+    assert.equal(wt.commonDir, join(clean, ".git"));
+    l.sh(`git clone -q --bare ${clean} ${join(l.root, "bare.git")}`);
+    assert.equal(found(join(l.root, "bare.git")).workTree, null);
+    // planted core.worktree / core.bare cannot move the search: they are never read
+    l.sh(`git config core.worktree ${l.root} && git config core.bare true`, clean);
+    assert.equal(found(clean).workTree, clean);
+    mkdirSync(join(l.root, "plain", ".git"), { recursive: true });
+    // an empty .git directory is not a repository: git goes on upward (and finds none inside the lab)
+    const up = discoverRepo(join(l.root, "plain"));
+    assert.ok(up === null || (up !== "invalid" && !up.workTree?.startsWith(l.root)));
+    mkdirSync(join(l.root, "broken"));
+    writeFileSync(join(l.root, "broken", ".git"), "not a pointer");
+    assert.equal(discoverRepo(join(l.root, "broken")), "invalid");
+    writeFileSync(join(l.root, "gone"), "");
+    mkdirSync(join(l.root, "dangling"));
+    writeFileSync(join(l.root, "dangling", ".git"), `gitdir: ${join(l.root, "nowhere")}\n`);
+    assert.equal(discoverRepo(join(l.root, "dangling")), "invalid");
   } finally {
     rmSync(l.root, { recursive: true, force: true });
   }

@@ -9,7 +9,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { type GitTrust, configEnv, neutralisers, safeGit, safeGitPrefix } from "../../src/git/safeGit.ts";
+import { type GitTrust, configEnv, safeGit, safeGitPrefix } from "../../src/git/safeGit.ts";
 import { describeSource, originRemote } from "../../src/runtime/host/extension.ts";
 
 const MODES: GitTrust[] = ["strict", "operator"];
@@ -353,16 +353,16 @@ test("config injected through the environment (ambient or caller-supplied) is dr
   }
 });
 
-test("neutralisers: pairs keep the exact key, so names with = or newlines are addressable or refused", async () => {
-  const pairs = neutralisers(
-    [{ scope: "local", origin: "file:/x", key: "filter.a=b.clean", value: "touch /x" }],
-    "strict",
-  );
-  assert.deepEqual(pairs, [{ key: "filter.a=b.clean", value: "" }]);
+test("the argv prefix carries only forced settings, never a per-repository override; configEnv keeps exact keys", async () => {
   const l = lab();
   try {
-    const prefix = await safeGitPrefix(l.repo, "strict");
-    assert.ok(!prefix.some((a) => a.startsWith("filter.")), "no per-repository override travels as an argument");
+    l.cfg(`[filter "a=b"]\n\tclean = ${l.hook("x")}\n`);
+    for (const trust of MODES) {
+      const prefix = await safeGitPrefix(l.repo, trust);
+      assert.ok(!prefix.some((a) => a.startsWith("filter.")), "no per-repository override travels as an argument");
+      assert.ok(prefix.includes("core.hooksPath=/dev/null") && prefix.includes("core.fsmonitor=false"));
+      assert.ok(prefix.includes("diff.ignoreSubmodules=all") && prefix.includes("submodule.recurse=false"));
+    }
     assert.deepEqual(configEnv([{ key: "k=1", value: "v=2" }]), {
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "k=1",
