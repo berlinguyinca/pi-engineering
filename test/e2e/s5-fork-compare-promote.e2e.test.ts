@@ -30,12 +30,16 @@ import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { GitRepo } from "../../src/git/GitRepo.ts";
+import { emitLinkRecorded } from "../../src/github/lineage.ts";
+import { linkPullRequest } from "../../src/github/prLinks.ts";
+import { githubSync } from "../../src/github/sync.ts";
 import { forkIdFor } from "../../src/orchestration/forks.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import type { SteeringPorts } from "../../src/orchestration/steering.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "../../src/runtime/herdr/SteeringReceiver.ts";
-import { type ForkRuntime, createForkRuntime } from "../../src/runtime/herdr/forkWiring.ts";
+import { type ForkRuntime, createForkRuntime, downstreamPrNodes } from "../../src/runtime/herdr/forkWiring.ts";
+import { FakeGithubClient } from "../support/fakeGithubClient.ts";
 import { type PiHost, startPiHost } from "./support/piHost.ts";
 import { Plane, eventually } from "./support/plane.ts";
 
@@ -309,6 +313,23 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
       mission_generation: 0,
       fencing_token: 0,
     });
+    // a task that depends on task-a: its PR's merge gate is downstream of the forked attempt
+    store.createTask({
+      task_id: "task-down",
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "build on the retry loop",
+      depends_on: ["task-a"],
+      repo_id: "repo-1",
+      acceptance_ids: ["AC-2"],
+      deliverables: ["use-retry"],
+      execution_budget_ms: 60_000,
+      checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 1_000 },
+      candidate_generation: 0,
+      mission_generation: 0,
+      fencing_token: 0,
+    });
     const execution = store.createExecution({
       task_id: task.task_id,
       mission_id: mission.mission_id,
@@ -362,6 +383,7 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
       boundRoot: (_repoId: string) => repo,
       openRoot: async (path: string) => (await GitRepo.open(path))?.root ?? null,
       links: store,
+      downstreamPrs: (taskId: string) => downstreamPrNodes(store, taskId),
     };
     const rt = await createForkRuntime({
       agentDir: host.agentDir,
@@ -697,6 +719,42 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     rec.gateBEdgesBefore = JSON.stringify(await edgeKeys("pr:github.com/acme/widgets#12"));
   });
 
+  it("Pi's own merge gate for the downstream task's PR is validated at the current head (written by Pi's sync tick, not by the test)", async () => {
+    const client = new FakeGithubClient();
+    client.put("github.com/acme/widgets#21", {
+      title: "downstream",
+      state: "open",
+      pr: { state: "open", headSha: sha.C1, body: "builds on the retry loop" },
+    });
+    const prRef = { host: "github.com", owner: "acme", repo: "widgets", number: 21, kind: "pr" as const };
+    const links = await linkPullRequest(client, store, {
+      missionId: "MSN-s5",
+      prRef,
+      subjects: [{ kind: "task", id: "task-down" }],
+      headSha: sha.C1,
+      provenance: "pr_create_output",
+    });
+    for (const l of links) emitLinkRecorded(host.emitter, l);
+    assert.deepEqual(downstreamPrNodes(store, "task-a"), ["pr:github.com/acme/widgets#21"]);
+    assert.deepEqual(downstreamPrNodes(store, "task-down"), [], "control: nothing depends on the downstream task");
+    await githubSync({
+      client,
+      store,
+      cfg: {},
+      lineage: host.emitter,
+      quorum: async () => ({ status: "satisfied", head: sha.C1, counted: [], rereviewRequired: false }),
+    });
+    await host.drain();
+    const validated = await eventually(async () => {
+      const e = (await plane.edges("pr:github.com/acme/widgets#21")).filter(
+        ([t, from]) => t === "validated" && from === "gate:github.com/acme/widgets#21",
+      );
+      return e.length ? e : false;
+    }, "Pi's gate edge");
+    assert.equal(validated.length, 1);
+    rec.piGate = "gate:github.com/acme/widgets#21";
+  });
+
   it("a stale promotion is refused: evidence follows the head, and a confirmed promotion is fenced when the head moves", async () => {
     const steeringId = await requestFork("fk3", "third approach");
     await applyFork("fk3");
@@ -802,9 +860,17 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     for (const e of edgesBefore) assert.ok(edgesAfter.includes(e), `original edge preserved: ${e}`);
   });
 
-  it("GAP: promoting a fork invalidates no gate or review; the dependent gate stays validated at the old commit", async () => {
-    // Herdr's downstream check only REPORTS evidence left on another head; Pi only emits supersession edges. Nothing
-    // marks gate:A (task A, downstream of the forked attempt) stale, and nothing touches gate:B (independent task B).
+  it("promoting a fork withdraws Pi's OWN downstream gate (validated edge removed, gate pending); another writer's gate and the independent task's gate are untouched", async () => {
+    const piGate = rec.piGate as string;
+    await eventually(async () => {
+      const e = (await plane.edges("pr:github.com/acme/widgets#21")).filter(
+        ([t, from]) => t === "validated" && from === piGate,
+      );
+      return e.length === 0;
+    }, "Pi's downstream gate withdrawn");
+    assert.equal((await plane.node(piGate)).body.node.state, "pending");
+    // honest limit: gate:A was written by a different writer (the test's `ci` key). Herdr only REPORTS its evidence left on
+    // another head; Pi cannot, and does not, mark someone else's evidence stale.
     const gateA = (await plane.hood("gate:A")).body.edges as Array<{
       edge_type: string;
       stale?: boolean;
@@ -812,7 +878,7 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     }>;
     const validatedA = gateA.find((e) => e.edge_type === "validated");
     assert.ok(validatedA && !validatedA.removed);
-    assert.ok(!validatedA.stale, "gate A is NOT marked stale");
+    // the independent task B's gate is not touched
     const gateB = (await plane.hood("gate:B")).body.edges as Array<{
       edge_type: string;
       stale?: boolean;

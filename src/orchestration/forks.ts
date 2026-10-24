@@ -32,7 +32,7 @@ import {
   linkPullRequest,
   normaliseRepo,
 } from "../github/index.ts";
-import type { LineageEmitter } from "../runtime/herdr/lineage.ts";
+import { type LineageEmitter, lineageNodeId } from "../runtime/herdr/lineage.ts";
 import { atomicWriteFile, withFileLock } from "../runtime/herdr/portableLock.ts";
 import { type ForkParams, approachNodeId, clean, forkBranchFor, forkIdFor } from "./forkParams.ts";
 import type { SteeringAck, SteeringItem } from "./steering.ts";
@@ -219,6 +219,12 @@ export interface ForkManagerOptions {
   /** Present only when promotion is enabled in the global YAML. */
   promote?: PromoteDeps | null;
   verify?: ForkVerifier | null;
+  /**
+   * Canonical PR ids (`pr:host/owner/repo#n`) of the tasks that depend on `taskId`. When a fork of that task is
+   * promoted, the merge gates Pi wrote for those PRs were validated on the old line of work: Pi withdraws its own
+   * `validated` edge (with the reason) and sets the gate back to pending. Evidence another writer left stays theirs.
+   */
+  downstreamPrs?: (taskId: string) => string[];
   now?: () => number;
   log?: (message: string) => void;
 }
@@ -663,6 +669,7 @@ export class ForkManager {
           );
         }
       }
+      this.invalidateDownstreamGates(rec, winner);
       return ack(
         "applied",
         `pushed ${head.slice(0, 12)} to ${rec.branch}; draft PR ${prNode}; ${siblings.size} sibling(s) marked superseded in lineage only (branches and worktrees kept). Nothing was merged.`,
@@ -674,6 +681,22 @@ export class ForkManager {
         "refused",
         `promotion stopped: ${m}. Nothing was merged or deleted${this.o.registry.get(id)?.pushed ? "; the branch was pushed" : ""}`,
       );
+    }
+  }
+
+  /** Withdraw Pi's own `validated` gate edge on every PR downstream of the promoted fork's task. Best effort. */
+  private invalidateDownstreamGates(rec: ForkRecord, winner: string): void {
+    const lineage = this.o.lineage;
+    if (!lineage || !this.o.downstreamPrs) return;
+    try {
+      const reason = `upstream fork ${winner} was promoted; this gate was validated before the change`;
+      for (const pr of new Set(this.o.downstreamPrs(rec.taskId))) {
+        const gate = lineageNodeId("gate", pr.replace(/^pr:/, ""));
+        lineage.edgeRemove("validated", gate, pr, reason, `fork-stale:${rec.approachId}`, this.scope(rec));
+        lineage.nodeState(gate, "pending", `fork-stale:${rec.approachId}`, { reason }, this.scope(rec));
+      }
+    } catch {
+      /* observational */
     }
   }
 

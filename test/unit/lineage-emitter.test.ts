@@ -760,3 +760,15 @@ describe("lineage: tab and pane surfaces", () => {
     );
   });
 });
+
+describe("lineage: removing a bound edge", () => {
+  it("a validated edge can be withdrawn without restating its commit (a wildcard removal), but only with a reason", async () => {
+    const { store: envStore, emitter } = rig();
+    emitter.edgeRemove("validated", "gate:g1", `pr:github.com/a/b#1`, "upstream changed", "t1");
+    emitter.edgeRemove("validated", "gate:g1", `pr:github.com/a/b#1`, "  ", "t2");
+    const events = (await lineageEvents(envStore, emitter)).filter((e) => e.event_type === "edge.remove");
+    assert.equal(events.length, 1, "no reason, no removal");
+    assert.equal(events[0]?.payload.reason, "upstream changed");
+    assert.equal((events[0]?.payload as { attrs?: unknown }).attrs, undefined);
+  });
+});

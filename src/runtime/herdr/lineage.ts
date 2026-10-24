@@ -409,7 +409,7 @@ export class LineageEmitter {
     scope: LineageScope = {},
     at?: string | Date,
   ): void {
-    if (!this.validEdge(edgeType, from, to) || !nonEmpty(reason)) {
+    if (!this.validEdge(edgeType, from, to, undefined, true) || !nonEmpty(reason)) {
       this.drop();
       return;
     }
@@ -673,9 +673,12 @@ export class LineageEmitter {
     from: string | undefined,
     to: string | undefined,
     attrs?: Record<string, unknown>,
+    removing = false,
   ): boolean {
     if (!EDGE_SET.has(edgeType) || !from || !to || from === to) return false;
     if (!kindOf(from) || !kindOf(to)) return false;
+    // A removal without a binding withdraws the writer's edge at every revision, so it needs none of its own.
+    if (removing) return true;
     // reviewed / validated are bound to an exact revision; without one they are not edges.
     if (edgeType === "validated" && !nonEmpty(attrs?.commit)) return false;
     if (edgeType === "reviewed" && !nonEmpty(attrs?.commit) && !nonEmpty(attrs?.plan_digest)) return false;

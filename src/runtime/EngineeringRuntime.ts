@@ -94,7 +94,7 @@ import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
 import { type ExternalBridge, startExternalBridge } from "./herdr/externalAgent.ts";
-import { type ForkRuntime, createForkRuntime } from "./herdr/forkWiring.ts";
+import { type ForkRuntime, createForkRuntime, downstreamPrNodes } from "./herdr/forkWiring.ts";
 import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
@@ -1908,6 +1908,7 @@ export class EngineeringRuntime {
         boundRoot: (repoId) => rt.repositoryRegistry.get(repoId).root,
         openRoot: async (path) => (await GitRepo.open(path))?.root ?? null,
         links: store,
+        downstreamPrs: (taskId) => downstreamPrNodes(store, taskId),
       },
     });
     if (rt.forkRuntime) ports.forks = rt.forkRuntime.port;

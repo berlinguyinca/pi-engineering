@@ -28,6 +28,40 @@ export interface ForkRuntimeSources {
   /** Root of the git repository at `path`, or null. */
   openRoot(path: string): Promise<string | null>;
   links: GithubLinkStore;
+  /** Canonical PR ids of the tasks that depend (transitively) on `taskId`; absent = no downstream invalidation. */
+  downstreamPrs?: (taskId: string) => string[];
+}
+
+/** The active PR links of every task that depends, directly or not, on `taskId` (a pure read of the ledger). */
+export function downstreamPrNodes(
+  store: {
+    listTasks(): Array<{ task_id: string; mission_id: string; depends_on: string[] }>;
+    listGithubLinks(missionId?: string): Array<{
+      status: string;
+      targetKind: string;
+      target: string;
+      subject: { kind: string; id: string };
+    }>;
+  },
+  taskId: string,
+): string[] {
+  const tasks = store.listTasks();
+  const dependents = new Set<string>();
+  const frontier = [taskId];
+  while (frontier.length) {
+    const cur = frontier.pop() as string;
+    for (const t of tasks) {
+      if (t.depends_on.includes(cur) && !dependents.has(t.task_id)) {
+        dependents.add(t.task_id);
+        frontier.push(t.task_id);
+      }
+    }
+  }
+  const out = new Set<string>();
+  for (const l of store.listGithubLinks())
+    if (l.status === "active" && l.targetKind === "pr" && l.subject.kind === "task" && dependents.has(l.subject.id))
+      out.add(l.target);
+  return [...out];
 }
 
 const SAFE_BRANCH = /^[A-Za-z0-9][A-Za-z0-9._\-]*(?:\/[A-Za-z0-9][A-Za-z0-9._\-]*)*$/;
@@ -90,6 +124,7 @@ export async function createForkRuntime(input: {
     lineage: input.lineage,
     limits: settings.limits,
     promote,
+    ...(input.sources.downstreamPrs ? { downstreamPrs: input.sources.downstreamPrs } : {}),
     ...(input.log ? { log: input.log } : {}),
   });
   const s = input.sources;
