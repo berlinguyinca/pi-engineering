@@ -6,6 +6,8 @@ export { id, newRunId } from "./core/ids.ts";
 export { EventStore } from "./ledger/EventStore.ts";
 export { IncidentController } from "./incidents/IncidentController.ts";
 export { AutoSpecIncidentSink } from "./incidents/AutoSpecIncidentSink.ts";
+export { DeploymentController } from "./deploy/DeploymentController.ts";
+export type { DeploymentAdapter, DeploymentArtifact, DeploymentResult } from "./deploy/DeploymentController.ts";
 export type { AgentFailureIncident, IncidentClassification, IncidentRisk } from "./incidents/types.ts";
 export { Ledger } from "./ledger/Ledger.ts";
 export { ArtifactStore } from "./artifacts/ArtifactStore.ts";
