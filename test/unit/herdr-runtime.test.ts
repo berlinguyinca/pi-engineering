@@ -142,3 +142,35 @@ test("a helper worker reports the worker that started it as its parent session",
   assert.equal(started.find((e) => e.entity_id === lead)?.payload?.parent_session_id, undefined);
   assert.equal(started.find((e) => e.entity_id === helper)?.payload?.parent_session_id, lead);
 });
+
+test("worker identity is exported into the pane before the agent starts (launcher runtime selection)", async () => {
+  const order: string[] = [];
+  const exported: Array<Record<string, string>> = [];
+  class Spy extends FakeHerdrCli {
+    async exportEnv(_pane: string, vars: Record<string, string>): Promise<void> {
+      order.push("export");
+      exported.push(vars);
+    }
+    async startAgent(paneId: string, kind: string, name: string): Promise<void> {
+      order.push("start");
+      await super.startAgent(paneId, kind, name);
+    }
+  }
+  const rt = new HerdrAgentRuntime({ cli: new Spy(), maxContextTokens: 128_000 });
+  const id = await rt.create({ role: "reviewer", objective: "x", missionId: "mission-7" });
+  await rt.start(id);
+  assert.deepEqual(order, ["export", "start"]);
+  assert.deepEqual(exported[0], { PI_ENGINEERING_ROLE: "reviewer", PI_ENGINEERING_MISSION_ID: "mission-7" });
+});
+
+test("an env export failure never blocks the agent from starting", async () => {
+  class Failing extends FakeHerdrCli {
+    async exportEnv(): Promise<void> {
+      throw new Error("pane busy");
+    }
+  }
+  const rt = new HerdrAgentRuntime({ cli: new Failing(), maxContextTokens: 128_000 });
+  const id = await rt.create({ role: "planner", objective: "x" });
+  const w = await rt.start(id);
+  assert.equal(w.status, "READY");
+});
