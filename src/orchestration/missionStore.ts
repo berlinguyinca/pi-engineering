@@ -117,6 +117,9 @@ export type OrchestrationEventType =
   | "spec.approval"
   | "spec.invalidation"
   | "spec.materialized"
+  | "plan.revision"
+  | "plan.policy"
+  | "plan.decision"
   | "lane.acquired"
   | "lane.released"
   | "lane.wait"
@@ -190,6 +193,9 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "spec.approval",
   "spec.invalidation",
   "spec.materialized",
+  "plan.revision",
+  "plan.policy",
+  "plan.decision",
   "lane.acquired",
   "lane.released",
   "lane.wait",
@@ -433,6 +439,9 @@ export class MissionStore {
   private readonly specReviews = new Map<string, import("./specApproval.ts").SpecReviewEvidence>();
   private readonly specApprovals = new Map<string, import("./specApproval.ts").SpecApproval>();
   private readonly specStages: import("./specApproval.ts").SpecStageAttempt[] = [];
+  private readonly planRevisions: import("./planRecords.ts").PlanRevisionRecord[] = [];
+  private readonly planPolicies: import("./planRecords.ts").PlanPolicyRecord[] = [];
+  private readonly planDecisions: import("./planRecords.ts").PlanDecisionRecord[] = [];
   private readonly specInvalidations = new Map<string, { approvalId: string; reason: string; fencingToken: number }>();
   private readonly specMaterializations: Array<{
     missionId: string;
@@ -958,6 +967,21 @@ export class MissionStore {
       case "spec.stage": {
         const stage = e.payload.stage as import("./specApproval.ts").SpecStageAttempt;
         if (stage) this.specStages.push({ ...stage });
+        break;
+      }
+      case "plan.revision": {
+        const record = e.payload.record as import("./planRecords.ts").PlanRevisionRecord | undefined;
+        if (record) this.planRevisions.push(structuredClone(record));
+        break;
+      }
+      case "plan.policy": {
+        const record = e.payload.record as import("./planRecords.ts").PlanPolicyRecord | undefined;
+        if (record) this.planPolicies.push(structuredClone(record));
+        break;
+      }
+      case "plan.decision": {
+        const record = e.payload.record as import("./planRecords.ts").PlanDecisionRecord | undefined;
+        if (record) this.planDecisions.push(structuredClone(record));
         break;
       }
       case "spec.revision": {
@@ -3410,6 +3434,32 @@ export class MissionStore {
   }
 
   // ── Autonomous spec approval records ────────────────────────────────────
+
+  // ── Plan revisions, review policy and decisions (T03) ─────────────────
+
+  appendPlanRevision(record: import("./planRecords.ts").PlanRevisionRecord): void {
+    this.apply(this.emit("plan.revision", record.missionId, { actor: "system", record }));
+  }
+
+  appendPlanPolicy(record: import("./planRecords.ts").PlanPolicyRecord): void {
+    this.apply(this.emit("plan.policy", record.missionId, { actor: "system", record }));
+  }
+
+  appendPlanDecision(record: import("./planRecords.ts").PlanDecisionRecord): void {
+    this.apply(this.emit("plan.decision", record.missionId, { actor: "system", record }));
+  }
+
+  listPlanRevisions(missionId: string): import("./planRecords.ts").PlanRevisionRecord[] {
+    return this.planRevisions.filter((r) => r.missionId === missionId).map((r) => structuredClone(r));
+  }
+
+  listPlanPolicies(missionId: string): import("./planRecords.ts").PlanPolicyRecord[] {
+    return this.planPolicies.filter((r) => r.missionId === missionId).map((r) => structuredClone(r));
+  }
+
+  listPlanDecisions(missionId: string): import("./planRecords.ts").PlanDecisionRecord[] {
+    return this.planDecisions.filter((r) => r.missionId === missionId).map((r) => structuredClone(r));
+  }
 
   appendSpecStage(stage: import("./specApproval.ts").SpecStageAttempt): void {
     this.apply(this.emit("spec.stage", stage.missionId, { actor: "system", stage }));
