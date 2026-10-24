@@ -66,6 +66,7 @@ import {
   type GithubLinkPatch,
   type GithubLinkRecord,
   type GithubLinkSuggestion,
+  type GithubRereviewRequest,
   type GithubStaleSignal,
   linkIdFor,
 } from "../github/types.ts";
@@ -128,6 +129,7 @@ export type OrchestrationEventType =
   | "github.suggestion_resolved"
   | "github.link_corrected"
   | "github.evidence_stale"
+  | "github.rereview_requested"
   | "candidate.changed"
   | "evidence.validation_recorded"
   | "evidence.review_recorded"
@@ -209,6 +211,7 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "github.suggestion_resolved",
   "github.link_corrected",
   "github.evidence_stale",
+  "github.rereview_requested",
   "candidate.changed",
   "evidence.validation_recorded",
   "evidence.review_recorded",
@@ -453,6 +456,7 @@ export class MissionStore {
   private readonly githubLinks = new Map<string, GithubLinkRecord>();
   private readonly githubSuggestions = new Map<string, GithubLinkSuggestion>();
   private readonly githubStaleSignals = new Map<string, GithubStaleSignal>();
+  private readonly githubRereviews = new Map<string, GithubRereviewRequest>();
   private readonly candidates = new Map<string, CandidateRevision>();
   private readonly validationEvidence = new Map<string, ValidationEvidence>();
   private readonly reviewEvidence = new Map<string, ReviewEvidence>();
@@ -977,6 +981,11 @@ export class MissionStore {
       case "github.evidence_stale": {
         const signal = e.payload.signal as GithubStaleSignal | undefined;
         if (signal?.signalId) this.githubStaleSignals.set(signal.signalId, structuredClone(signal));
+        break;
+      }
+      case "github.rereview_requested": {
+        const request = e.payload.request as GithubRereviewRequest | undefined;
+        if (request?.signalId) this.githubRereviews.set(request.signalId, structuredClone(request));
         break;
       }
       case "candidate.changed": {
@@ -3255,6 +3264,25 @@ export class MissionStore {
   getGithubSuggestion(suggestionId: string): GithubLinkSuggestion | undefined {
     const s = this.githubSuggestions.get(suggestionId);
     return s ? structuredClone(s) : undefined;
+  }
+
+  /**
+   * The durable reaction to a stale-evidence signal: a re-review of the new head was requested. Idempotent on the
+   * signal id, so a repeated reconcile tick never requests twice. Returns false when already recorded.
+   */
+  recordGithubRereview(request: GithubRereviewRequest): boolean {
+    if (!this.missions.has(request.missionId)) throw new Error(`unknown mission ${request.missionId}`);
+    if (this.githubRereviews.has(request.signalId)) return false;
+    const copy = structuredClone(request);
+    this.githubRereviews.set(copy.signalId, copy);
+    this.emit("github.rereview_requested", copy.missionId, { actor: "system", request: copy });
+    return true;
+  }
+
+  listGithubRereviews(missionId?: string): GithubRereviewRequest[] {
+    return [...this.githubRereviews.values()]
+      .filter((r) => !missionId || r.missionId === missionId)
+      .map((r) => structuredClone(r));
   }
 
   listGithubStaleSignals(missionId?: string): GithubStaleSignal[] {

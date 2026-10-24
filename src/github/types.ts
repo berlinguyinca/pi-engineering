@@ -78,6 +78,20 @@ export interface GithubStaleSignal {
   recordedAt: string;
 }
 
+/** A re-review of a PR's new head was requested because evidence bound to the old head went stale. */
+export interface GithubRereviewRequest {
+  /** The stale signal this answers (idempotency key). */
+  signalId: string;
+  missionId: string;
+  /** Canonical PR id. */
+  target: string;
+  headSha: string;
+  previousHeadSha: string;
+  requestedAt: string;
+  /** What happened to the operator's dispatch command: not configured, ran, or failed. */
+  dispatch: "none" | "ok" | "failed";
+}
+
 export interface GithubLinkPatch {
   status?: LinkStatus;
   observed?: LinkObservation;

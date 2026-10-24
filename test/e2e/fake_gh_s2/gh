@@ -36,6 +36,10 @@ if (post && (m = path.match(/^repos\/([^/]+\/[^/]+)\/pulls$/))) {
   state.prs[n] = { title: fields.title ?? "pr", branch: fields.head };
   writeFileSync(statePath, JSON.stringify(state));
   process.stdout.write(JSON.stringify(prJson(n, state.prs[n])));
+} else if ((m = path.match(/^repos\/([^/]+\/[^/]+)\/commits\/([0-9a-f]+)\/check-runs$/))) {
+  const runs = m[1] === state.repo ? (state.checks?.[m[2]] ?? []) : [];
+  const page = { total_count: runs.length, check_runs: runs.map((r) => ({ head_sha: m[2], status: "completed", ...r })) };
+  process.stdout.write(JSON.stringify(argv.includes("--slurp") ? [page] : page));
 } else if ((m = path.match(/^repos\/([^/]+\/[^/]+)\/pulls\/(\d+)$/))) {
   const pr = m[1] === state.repo ? state.prs[m[2]] : undefined;
   if (!pr) fail("gh: Not Found (HTTP 404)");
