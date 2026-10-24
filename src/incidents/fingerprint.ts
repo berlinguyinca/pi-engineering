@@ -17,8 +17,10 @@ function stripWorktree(value: string, worktree: string): string {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   // Match complete path prefixes, including quoted arguments and --cwd= paths.
   // A sibling prefix, an unrelated absolute path, or a URL stays unchanged.
-  const pattern = new RegExp(`(^|[\\s"'=(])${escaped}(/|(?=$|[\\s"')]))`, "g");
-  return value.replace(pattern, (_match, before: string, slash: string) => `${before}${slash ? "" : "."}`);
+  const pattern = new RegExp(`(^|[\\s"'=(;|&])${escaped}(/|(?=$|[\\s"'();|&]))`, "g");
+  return value
+    .replace(pattern, (_match, before: string, slash: string) => `${before}${slash ? "" : "."}`)
+    .replace(new RegExp(`file://${escaped}/`, "g"), "file://");
 }
 
 /**
@@ -32,7 +34,9 @@ export function incidentFingerprint(
   // whitespace in commands/causes as the general APS canonicalizer would.
   return fnv1a64(
     JSON.stringify({
-      command: stripWorktree(incident.command, incident.worktree),
+      command: stripWorktree(incident.command, incident.worktree)
+        .replace(/\s*(?:&&|;)\s*/g, ";")
+        .replace(/;\s*/g, "; "),
       failure_class: incident.failure_class,
       repo: incident.repo.trim().toLowerCase(),
       root_cause: stripWorktree(incident.root_cause, incident.worktree),
@@ -44,6 +48,10 @@ function validateBoundedText(value: string, field: string, maxLength: number): v
   if (typeof value !== "string" || value.trim().length === 0 || value.length > maxLength) {
     throw new TypeError(`${field} must be nonblank text of at most ${maxLength} characters`);
   }
+}
+
+function validateRequiredText(value: string, field: string, maxLength = 2048): void {
+  validateBoundedText(value, field, maxLength);
 }
 
 /** Validate and project an incident into the versioned, JSON-safe adapter event. */
@@ -67,6 +75,23 @@ export function toIncidentEventPayload(incident: AgentFailureIncident) {
   };
   for (const [field, value] of Object.entries(fields)) {
     if (typeof value !== "string") throw new TypeError(`${field} must be a string`);
+  }
+  for (const [field, value] of Object.entries({
+    incident_id: incident.incident_id,
+    run_id: incident.run_id,
+    repo: incident.repo,
+    revision: incident.revision,
+    worktree: incident.worktree,
+    agent_role: incident.agent_role,
+    failure_class: incident.failure_class,
+    reproduction: incident.reproduction,
+    command: incident.command,
+    root_cause: incident.root_cause,
+    classification: incident.classification,
+    risk: incident.risk,
+    created_at: incident.created_at,
+  })) {
+    validateRequiredText(value, field);
   }
   validateBoundedText(incident.summary, "summary", 1024);
   if (!Array.isArray(incident.artifact_refs) || incident.artifact_refs.length > 32) {

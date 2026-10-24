@@ -92,6 +92,18 @@ test("incidents-fingerprint: treats the configured prefix literally in quoted pa
   );
 });
 
+test("incidents-fingerprint: normalizes shell delimiters and local file URLs", () => {
+  const first = incident({
+    command: "cd /work/tree-1; npm test",
+    root_cause: "file:///work/tree-1/src/session.ts:42:7",
+  });
+  const second = incident({
+    command: "cd .&& npm test",
+    root_cause: "file://src/session.ts:42:7",
+  });
+  assert.equal(incidentFingerprint(first), incidentFingerprint(second));
+});
+
 test("incidents-fingerprint: preserves timestamps and meaningful whitespace within causes", () => {
   for (const [first, second] of [
     ["Invalid date 2026-10-24T00:00:00Z", "Invalid date 2026-10-25T00:00:00Z"],
@@ -157,5 +169,14 @@ test("incidents-fingerprint: rejects non-primitive fields and invalid classifica
     { risk: "unrecognized" },
   ]) {
     assert.throws(() => toIncidentEventPayload({ ...incident(), ...change } as AgentFailureIncident));
+  }
+});
+
+test("incidents-fingerprint: rejects blank identity fields and oversized compact fields", () => {
+  for (const field of ["incident_id", "run_id", "repo", "failure_class", "command", "root_cause"]) {
+    assert.throws(() => toIncidentEventPayload({ ...incident(), [field]: " \t" } as AgentFailureIncident), /must be nonblank/i);
+  }
+  for (const field of ["reproduction", "command", "root_cause"]) {
+    assert.throws(() => toIncidentEventPayload({ ...incident(), [field]: "x".repeat(2049) } as AgentFailureIncident), /at most/i);
   }
 });
