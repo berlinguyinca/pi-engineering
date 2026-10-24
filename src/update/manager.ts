@@ -14,7 +14,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
-import { safeGitSyncOut } from "../git/safeGit.ts";
+import { safeGitOrThrow } from "../git/safeGit.ts";
 import type { HandoverResult, HandoverTask } from "../runtime/host/host.ts";
 import type { RuntimeTelemetry } from "../runtime/host/telemetry.ts";
 import { readStateSchema } from "../runtime/migrations/schema.ts";
@@ -98,11 +98,17 @@ export class UpdateManager {
   }
 
   /** Repository identity: recorded roots, else the installing checkout's root commit. */
-  private identityRoots(): string[] {
+  private async identityRoots(): Promise<string[]> {
     const recorded = this.prefs().identityRoots;
     if (recorded.length > 0) return recorded;
     try {
-      return safeGitSyncOut(["rev-list", "--max-parents=0", "HEAD"], { cwd: this.deps.packageRoot, timeoutMs: 5000 })
+      return (
+        await safeGitOrThrow(["rev-list", "--max-parents=0", "HEAD"], {
+          cwd: this.deps.packageRoot,
+          trust: "operator",
+          timeoutMs: 5000,
+        })
+      ).stdout
         .split("\n")
         .map((s) => s.trim())
         .filter((s) => /^[0-9a-f]{40}$/.test(s));
@@ -140,7 +146,7 @@ export class UpdateManager {
       const target = req.commit
         ? await this.deps.cache.resolveCommit(req.commit)
         : await this.deps.cache.resolveChannel(channel);
-      await this.deps.cache.verifyIdentity(target.sha, this.identityRoots());
+      await this.deps.cache.verifyIdentity(target.sha, await this.identityRoots());
       const metadata = parseCandidateMetadata(await this.deps.cache.readFile(target.sha, "package.json"), LEGACY_ENTRY);
       const pi = piCompatible(this.deps.piVersion, metadata.minimumPiVersion, metadata.maximumPiVersion);
       const stateDir = this.deps.stateDir();
@@ -185,11 +191,15 @@ export class UpdateManager {
   }
 
   /** Is the running runtime a git checkout with uncommitted changes? (§40) */
-  dirtyCheckout(): string | null {
+  async dirtyCheckout(): Promise<string | null> {
     const running = this.deps.running();
     if (!running?.checkout || !existsSync(join(running.root, ".git"))) return null;
     try {
-      const out = safeGitSyncOut(["status", "--porcelain"], { cwd: running.root, timeoutMs: 10_000 });
+      const { stdout: out } = await safeGitOrThrow(["status", "--porcelain"], {
+        cwd: running.root,
+        trust: "operator",
+        timeoutMs: 10_000,
+      });
       return out.trim() ? running.root : null;
     } catch {
       return null;
@@ -206,7 +216,7 @@ export class UpdateManager {
     }
     let handedOver = false;
     try {
-      const dirty = this.dirtyCheckout();
+      const dirty = await this.dirtyCheckout();
       if (dirty) {
         return {
           status: "refused",
@@ -232,7 +242,7 @@ export class UpdateManager {
               // Repository identity: recorded roots, else the installing
               // checkout's, else trust-on-first-use of the commit just
               // validated, so the check is never silently left off.
-              let roots = prefs.identityRoots.length > 0 ? prefs.identityRoots : this.identityRoots();
+              let roots = prefs.identityRoots.length > 0 ? prefs.identityRoots : await this.identityRoots();
               if (roots.length === 0 && outcome.check.target) {
                 roots = await this.deps.cache.rootsOf(outcome.check.target.sha).catch(() => []);
               }

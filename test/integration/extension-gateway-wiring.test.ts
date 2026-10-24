@@ -21,6 +21,7 @@ import { test } from "node:test";
 import extension from "../../extensions/index.ts";
 import { AdmissionController } from "../../src/gateway/AdmissionController.ts";
 import { setSharedAdmissionController } from "../../src/gateway/config.ts";
+import { testHooks as safeGitTestHooks } from "../../src/git/safeGit.ts";
 
 const PRODUCTION_429 =
   '429: {"active":4,"active_limit":4,"message":"inference admission: queue_timeout","queue_limit":100,"queued":30,' +
@@ -86,6 +87,14 @@ function ctxStub() {
     getContextUsage: () => undefined,
     isIdle: () => true,
   };
+}
+
+/**
+ * session_start now returns before the git-bound work it starts (panel, update check) has finished; a test that drives
+ * it ends the session, which waits for that work, so it cannot land in the middle of the next test.
+ */
+async function settle(handlers: Map<string, Handler[]>, ctx: unknown): Promise<void> {
+  for (const h of handlers.get("session_shutdown") ?? []) await Promise.resolve(h({}, ctx)).catch(() => {});
 }
 
 async function fireMessageEnd(handlers: Map<string, Handler[]>, errorMessage: string): Promise<void> {
@@ -462,6 +471,7 @@ test("wiring: update checking survives the gateway being disabled", async () => 
     // Driving them must not throw, and must not block on the network.
     const ctx = ctxStub();
     await Promise.all(starts.map((h) => Promise.resolve(h({}, ctx))));
+    await settle(handlers, ctx);
   } finally {
     if (prevGateway === undefined) delete process.env.PI_GATEWAY_ADMISSION_ENABLED;
     else process.env.PI_GATEWAY_ADMISSION_ENABLED = prevGateway;
@@ -488,7 +498,41 @@ test("wiring: session_start returns without waiting on the update check", async 
     // A real fetch against a remote takes far longer than this; anything under
     // a second proves the handler did not await one.
     assert.ok(elapsed < 1_000, `session_start took ${elapsed}ms — it is awaiting the check`);
+    await settle(handlers, ctx);
   } finally {
+    if (prev === undefined) delete process.env.PI_SELF_UPDATE;
+    else process.env.PI_SELF_UPDATE = prev;
+  }
+});
+
+test("wiring: session_start returns within the bound even when every git call takes 3 seconds", async () => {
+  // The first safeGit call of a process does one-time setup, and under load any git call can be slow. None of it may
+  // be on session_start's turn: the handler schedules the check and returns, and the check itself is async.
+  const prev = process.env.PI_SELF_UPDATE;
+  process.env.PI_SELF_UPDATE = "check";
+  let reached = false;
+  safeGitTestHooks.afterPlan = async () => {
+    reached = true;
+    await new Promise((r) => setTimeout(r, 3_000));
+  };
+  try {
+    const handlers = loadExtension();
+    const starts = handlers.get("session_start") ?? [];
+    const ctx = ctxStub();
+    const began = Date.now();
+    await Promise.all(starts.map((h) => Promise.resolve(h({}, ctx))));
+    const elapsed = Date.now() - began;
+    assert.ok(elapsed < 1_000, `session_start took ${elapsed}ms with a slow git — it is waiting on it`);
+    // the check does run (it was only moved off the handler's turn), and it is what is slow
+    const deadline = Date.now() + 5_000;
+    while (!reached && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+    assert.equal(reached, true, "the update check was never started");
+    // let the slow background work finish before the next test (a shutdown waits for the panel start); calls made
+    // from here on are not slow, so this costs at most the one 3 s sleep already in flight
+    safeGitTestHooks.afterPlan = undefined;
+    for (const h of handlers.get("session_shutdown") ?? []) await Promise.resolve(h({}, ctx));
+  } finally {
+    safeGitTestHooks.afterPlan = undefined;
     if (prev === undefined) delete process.env.PI_SELF_UPDATE;
     else process.env.PI_SELF_UPDATE = prev;
   }
@@ -505,8 +549,9 @@ test("wiring: the session_start check honours PI_SELF_UPDATE=0", async () => {
     const ctx = ctxStub();
     const began = Date.now();
     await Promise.all(starts.map((h) => Promise.resolve(h({}, ctx))));
-
-    assert.ok(Date.now() - began < 1_000, "disabled means no work at all, not work that is ignored");
+    const elapsed = Date.now() - began;
+    assert.ok(elapsed < 1_000, "disabled means no work at all, not work that is ignored");
+    await settle(handlers, ctx);
   } finally {
     if (prev === undefined) delete process.env.PI_SELF_UPDATE;
     else process.env.PI_SELF_UPDATE = prev;
@@ -556,6 +601,7 @@ test("wiring: an auto-opened panel never captures the keyboard", async () => {
     for (const h of handlers.get("session_start") ?? []) await Promise.resolve(h({}, ctx));
 
     assert.notEqual(capturing, true, "a session start must never seize the keyboard");
+    await settle(handlers, ctx);
   } finally {
     if (prev === undefined) delete process.env.PI_PANEL_AUTO_OPEN;
     else process.env.PI_PANEL_AUTO_OPEN = prev;

@@ -8,13 +8,13 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { safeGitSyncOut } from "../../git/safeGit.ts";
+import { safeGitOrThrow, safeGitSyncOut } from "../../git/safeGit.ts";
 import { SourceCache, type TrustedSource, type UpdateChannel } from "../../update/gitSource.ts";
 import { InstallLayout } from "../../update/installLayout.ts";
 import { UpdateJournal } from "../../update/journal.ts";
@@ -165,14 +165,51 @@ export function declaredEntry(dir: string): string | null {
   }
 }
 
-/** The `origin` remote of a checkout, if any. */
-export function originRemote(root: string): string | null {
+/**
+ * Answers of two synchronous git probes that sit on startup paths (`trustedSource`, `stateDir`), kept per path: the
+ * `origin` URL is keyed by the mtime of the repository's own config file (any edit shows at once), and the toplevel of a
+ * directory for a few seconds. `describeSource` is NOT cached: HEAD and cleanliness move whenever the checkout does,
+ * and a stale answer there would let a hot reload load the wrong commit. A failed probe is cached too (fail closed:
+ * null / the directory itself), so a missing git does not cost a spawn each time.
+ */
+const probeCache = new Map<string, { stamp: string; at: number; value: unknown }>();
+const TOPLEVEL_TTL_MS = 10_000;
+export function invalidateGitProbeCache(): void {
+  probeCache.clear();
+}
+function configStamp(root: string): string | null {
   try {
-    const url = safeGitSyncOut(["remote", "get-url", "origin"], { cwd: root, timeoutMs: 2000 }).trim();
-    return url || null;
+    const dotGit = join(root, ".git");
+    if (!statSync(dotGit).isDirectory()) return null; // a linked work tree: its config is elsewhere, do not cache
+    const st = statSync(join(dotGit, "config"));
+    return `${st.mtimeMs}:${st.size}`;
   } catch {
     return null;
   }
+}
+function probed<T>(kind: "origin" | "toplevel", path: string, stamp: string | null, compute: () => T): T {
+  if (stamp === null && kind === "origin") return compute();
+  const key = `${kind}\0${path}`;
+  const hit = probeCache.get(key);
+  const now = Date.now();
+  const fresh = hit && hit.stamp === (stamp ?? "") && (kind === "origin" || now - hit.at < TOPLEVEL_TTL_MS);
+  if (fresh) return hit.value as T;
+  const value = compute();
+  if (probeCache.size > 256) probeCache.clear();
+  probeCache.set(key, { stamp: stamp ?? "", at: now, value });
+  return value;
+}
+
+/** The `origin` remote of a checkout, if any. */
+export function originRemote(root: string): string | null {
+  return probed("origin", root, configStamp(root), () => {
+    try {
+      const url = safeGitSyncOut(["remote", "get-url", "origin"], { cwd: root, timeoutMs: 2000 }).trim();
+      return url || null;
+    } catch {
+      return null;
+    }
+  });
 }
 
 export type UpdateArgs = { ok: true; check: boolean; request: UpdateRequest } | { ok: false; error: string };
@@ -201,15 +238,9 @@ export function parseUpdateArgs(argv: string[]): UpdateArgs {
   return { ok: true, check, request };
 }
 
-/** Read version/commit for a runtime source directory. Never throws. */
+/** Read version/commit for a runtime source directory. Never throws. Not cached: HEAD and cleanliness move with the checkout. */
 export function describeSource(root: string): { version: string; commit: string | null } {
-  let version = "0.0.0";
-  try {
-    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version?: unknown };
-    if (typeof pkg.version === "string") version = pkg.version;
-  } catch {
-    // An unreadable manifest is reported as an unknown version, not a failure.
-  }
+  const version = readVersion(root);
   let commit: string | null = null;
   if (existsSync(join(root, ".git"))) {
     try {
@@ -219,6 +250,41 @@ export function describeSource(root: string): { version: string; commit: string 
         timeoutMs: 2000,
         env: { GIT_OPTIONAL_LOCKS: "0" },
       }).trim();
+      if (dirty || !/^[0-9a-f]{40}$/.test(commit)) commit = null;
+    } catch {
+      commit = null;
+    }
+  }
+  return { version, commit };
+}
+
+function readVersion(root: string): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version?: unknown };
+    if (typeof pkg.version === "string") return pkg.version;
+  } catch {
+    // An unreadable manifest is reported as an unknown version, not a failure.
+  }
+  return "0.0.0";
+}
+
+/** `describeSource` for async callers: the git probes run without blocking the event loop (same answers). */
+export async function describeSourceAsync(root: string): Promise<{ version: string; commit: string | null }> {
+  const version = readVersion(root);
+  let commit: string | null = null;
+  if (existsSync(join(root, ".git"))) {
+    try {
+      commit = (
+        await safeGitOrThrow(["rev-parse", "HEAD"], { cwd: root, trust: "operator", timeoutMs: 2000 })
+      ).stdout.trim();
+      const dirty = (
+        await safeGitOrThrow(["status", "--porcelain", "--untracked-files=no"], {
+          cwd: root,
+          trust: "operator",
+          timeoutMs: 2000,
+          env: { GIT_OPTIONAL_LOCKS: "0" },
+        })
+      ).stdout.trim();
       if (dirty || !/^[0-9a-f]{40}$/.test(commit)) commit = null;
     } catch {
       commit = null;
@@ -625,12 +691,13 @@ export class EngineeringHostExtension {
   stateDir(cwd?: string): string | null {
     const dir = cwd ?? (this.host?.latestContext() as Ctx | undefined)?.cwd;
     if (!dir) return null;
-    let root = dir;
-    try {
-      root = safeGitSyncOut(["rev-parse", "--show-toplevel"], { cwd: dir, timeoutMs: 2000 }).trim();
-    } catch {
-      root = dir;
-    }
+    const root = probed("toplevel", dir, null, () => {
+      try {
+        return safeGitSyncOut(["rev-parse", "--show-toplevel"], { cwd: dir, timeoutMs: 2000 }).trim();
+      } catch {
+        return dir;
+      }
+    });
     return join(root, ".pi-eng");
   }
 
@@ -657,7 +724,7 @@ export class EngineeringHostExtension {
 
   /** A mutable checkout, imported directly; a baseline copy is the rollback image. */
   protected async checkoutSource(root: string, label: string, baseline = true): Promise<RuntimeSource> {
-    const meta = describeSource(root);
+    const meta = await describeSourceAsync(root);
     let rollbackRoot: string | undefined;
     if (baseline && this.config.baseline !== false) {
       rollbackRoot = await snapshotRuntimeSource(root, this.generationsDir, "baseline").catch(() => undefined);

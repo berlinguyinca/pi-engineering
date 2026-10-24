@@ -2019,7 +2019,16 @@ function complete(p: Prepared, result: SafeGitResult): SafeGitResult {
   return out;
 }
 
+/**
+ * `prepare` does synchronous work (the repository scan, the config snapshot, the first call's one-time setup of the
+ * state directory, the git version and the operator's config), which under load takes tens to hundreds of
+ * milliseconds. The async API yields to the event loop first, so that work never runs inside the caller's own turn
+ * (a session_start handler, a render): the caller gets its promise back at once.
+ */
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
 export async function safeGit(args: readonly string[], opts: SafeGitOptions): Promise<SafeGitResult> {
+  await yieldToEventLoop();
   const p = prepare(args, opts);
   if (p.refused) return p.refused;
   try {

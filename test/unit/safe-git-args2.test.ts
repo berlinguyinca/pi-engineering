@@ -224,3 +224,19 @@ test("a sha256 repository works in both modes, and its own empty tree cuts attri
   assert.equal(evil.ran(), false, "the operator's filter was selected by the repository's .gitattributes");
   assert.match(sh("git rev-parse HEAD", dir).trim(), /^[0-9a-f]{64}$/);
 });
+
+test("safeGit does not run its synchronous preparation inside the caller's own turn", async () => {
+  const r = repo();
+  let planned = false;
+  testHooks.afterPlan = () => {
+    planned = true;
+  };
+  try {
+    const pending = safeGit(["status", "--short"], { cwd: r });
+    assert.equal(planned, false, "prepare ran before safeGit returned its promise");
+    assert.equal((await pending).code, 0);
+    assert.equal(planned, true);
+  } finally {
+    testHooks.afterPlan = undefined;
+  }
+});

@@ -188,6 +188,16 @@ export function sshCommandConfigured(root: string): boolean {
   return configured;
 }
 
+/** Async twin of `sshCommandConfigured` for the startup path: never blocks the event loop; same cache, same fail-closed answer (false). */
+export async function sshCommandConfiguredAsync(root: string): Promise<boolean> {
+  const known = sshConfiguredByRoot.get(root);
+  if (known !== undefined) return known;
+  const r = await safeGit(["config", "--get", "core.sshCommand"], { cwd: root, trust: "operator", timeoutMs: 5_000 });
+  const configured = r.code === 0 && r.stdout.trim().length > 0;
+  sshConfiguredByRoot.set(root, configured);
+  return configured;
+}
+
 /**
  * Is a git operation that moves HEAD on its own underway — a rebase, a merge
  * with conflicts, a bisect — or is HEAD detached? Each intermediate HEAD of
@@ -239,7 +249,7 @@ function resolveGitDir(root: string): string | null {
  */
 export function gitRunner(root: string, timeoutMs = 30_000): GitRunner {
   return async (args) => {
-    const env = unattendedGitEnv({}, sshCommandConfigured(root));
+    const env = unattendedGitEnv({}, await sshCommandConfiguredAsync(root));
     const r = await safeGit(args, {
       cwd: root,
       trust: "operator",
