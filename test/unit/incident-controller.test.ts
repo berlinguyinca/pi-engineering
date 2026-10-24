@@ -43,7 +43,7 @@ test("incident-controller: appends before publishing the first failure", async (
   assert.equal(decision.duplicate, false);
   assert.equal(decision.state, "persisted");
   assert.deepEqual(order, ["published-after-1"]);
-  assert.equal(backend.count(), 1);
+  assert.equal(backend.count(), 2);
   assert.equal(backend.all()[0]?.type, "incident.detected");
 });
 
@@ -67,24 +67,31 @@ test("incident-controller: suppresses duplicate fingerprints without republishin
   assert.equal(first.duplicate, false);
   assert.equal(second.duplicate, true);
   assert.equal(second.eventId, first.eventId);
-  assert.equal(backend.count(), 1);
+  assert.equal(backend.all().filter((event) => event.type === "incident.detected").length, 1);
   assert.equal(published, 1);
 });
 
 test("incident-controller: retains durable event when publishing fails", async () => {
   const backend = JsonlEventStore.inMemory();
+  let attempts = 0;
   const controller = new IncidentController({
     backend,
     publish: async () => {
-      throw new Error("AutoSpec unavailable");
+      attempts += 1;
+      if (attempts === 1) throw new Error("AutoSpec unavailable");
     },
   });
 
-  const decision = await controller.recordFailure(incident());
+  const failed = await controller.recordFailure(incident());
+  const retried = await new IncidentController({ backend, publish: async () => {} }).recordFailure(incident());
 
-  assert.equal(decision.state, "publish_failed");
-  assert.equal(decision.publishError, "AutoSpec unavailable");
-  assert.equal(backend.count(), 1);
+  assert.equal(failed.state, "publish_failed");
+  assert.equal(failed.publishError, "AutoSpec unavailable");
+  assert.equal(retried.state, "persisted");
+  assert.equal(retried.duplicate, false);
+  assert.equal(attempts, 1);
+  assert.equal(backend.all().filter((event) => event.type === "incident.detected").length, 1);
+  assert.equal(backend.all().filter((event) => event.type === "incident.delivery").length, 2);
 });
 
 test("incident-controller: room summary is bounded and excludes raw logs", async () => {

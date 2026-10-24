@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rmdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PublishedIncident } from "./IncidentController.ts";
@@ -12,7 +12,9 @@ export interface AutoSpecIncidentSinkOptions {
 
 interface AutoSpecResult {
   ok?: unknown;
-  issue?: unknown;
+  dry_run?: unknown;
+  fingerprint?: unknown;
+  debugger_dispatch?: { role?: unknown; dry_run?: unknown };
 }
 
 export class AutoSpecIncidentSink {
@@ -36,6 +38,7 @@ export class AutoSpecIncidentSink {
         event.repo,
         "--event-file",
         eventFile,
+        "--dry-run",
         "--json",
       ]);
       let result: AutoSpecResult;
@@ -44,9 +47,18 @@ export class AutoSpecIncidentSink {
       } catch (error) {
         throw new Error(`AutoSpec returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
       }
-      if (result.ok !== true) throw new Error("AutoSpec incident ingest did not acknowledge the event");
+      if (
+        result.ok !== true ||
+        result.dry_run !== true ||
+        result.fingerprint !== event.fingerprint ||
+        result.debugger_dispatch?.role !== "debugger" ||
+        result.debugger_dispatch.dry_run !== true
+      ) {
+        throw new Error("AutoSpec incident ingest acknowledgement was invalid");
+      }
     } finally {
-      await rm(directory, { recursive: true, force: true });
+      await unlink(eventFile).catch(() => undefined);
+      await rmdir(directory).catch(() => undefined);
     }
   }
 }

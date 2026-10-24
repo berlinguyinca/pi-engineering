@@ -33,11 +33,17 @@ test("autospec-incident-sink: sends an event file and removes it after success",
   const sink = new AutoSpecIncidentSink({
     root: tmpdir(),
     run: async (args) => {
+      assert.equal(args.includes("--dry-run"), true);
       observedPath = args[args.indexOf("--event-file") + 1] ?? "";
       const body = JSON.parse(await readFile(observedPath, "utf8")) as PublishedIncident;
       assert.equal(body.fingerprint, event.fingerprint);
       assert.equal((await stat(observedPath)).mode & 0o077, 0);
-      return JSON.stringify({ ok: true, issue: 921 });
+      return JSON.stringify({
+        ok: true,
+        dry_run: true,
+        fingerprint: event.fingerprint,
+        debugger_dispatch: { role: "debugger", dry_run: true },
+      });
     },
   });
 
@@ -64,4 +70,13 @@ test("autospec-incident-sink: rejects malformed command output", async () => {
   });
 
   await assert.rejects(sink.publish(event), /valid JSON|ok/);
+});
+
+test("autospec-incident-sink: rejects an acknowledgement for another event or mode", async () => {
+  const sink = new AutoSpecIncidentSink({
+    root: tmpdir(),
+    run: async () => JSON.stringify({ ok: true, dry_run: false, fingerprint: "other" }),
+  });
+
+  await assert.rejects(sink.publish(event), /acknowledgement|fingerprint|dry-run/i);
 });

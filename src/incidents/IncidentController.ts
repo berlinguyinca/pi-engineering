@@ -30,6 +30,12 @@ function existingByFingerprint(backend: EventStoreBackend, fingerprint: string):
   );
 }
 
+function latestDelivery(backend: EventStoreBackend, incidentEventId: string): StoredEvent | undefined {
+  return [...backend.all()]
+    .reverse()
+    .find((event) => event.type === "incident.delivery" && event.payload.incident_event_id === incidentEventId);
+}
+
 export class IncidentController {
   private readonly backend: EventStoreBackend;
   private readonly publish: IncidentPublish;
@@ -46,6 +52,21 @@ export class IncidentController {
   async recordFailure(incident: AgentFailureIncident): Promise<IncidentDecision> {
     const payload = toIncidentEventPayload(incident);
     const fingerprint = incidentFingerprint(incident);
+    const existing = existingByFingerprint(this.backend, fingerprint);
+    if (existing) {
+      const delivery = latestDelivery(this.backend, existing.event_id);
+      if (delivery?.payload.status === "acknowledged") {
+        return {
+          incidentId: String(existing.payload.incident_id),
+          fingerprint,
+          duplicate: true,
+          state: "duplicate",
+          eventId: existing.event_id,
+          publishAttempted: false,
+        };
+      }
+      return this.publishPersisted(existing, payload, fingerprint);
+    }
     const event: StoredEvent = {
       event_id: this.id(),
       timestamp: this.now().toISOString(),
@@ -60,35 +81,60 @@ export class IncidentController {
       () => existingByFingerprint(this.backend, fingerprint) === undefined,
     );
     if (committed === undefined) {
-      const existing = existingByFingerprint(this.backend, fingerprint);
-      if (!existing) throw new Error(`incident deduplication lost event ${fingerprint}`);
-      return {
-        incidentId: String(existing.payload.incident_id),
-        fingerprint,
-        duplicate: true,
-        state: "duplicate",
-        eventId: existing.event_id,
-        publishAttempted: false,
-      };
+      const raced = existingByFingerprint(this.backend, fingerprint);
+      if (!raced) throw new Error(`incident deduplication lost event ${fingerprint}`);
+      return this.publishPersisted(raced, payload, fingerprint);
     }
 
+    return this.publishPersisted(committed, payload, fingerprint, incident.incident_id);
+  }
+
+  private async publishPersisted(
+    event: StoredEvent,
+    payload: PublishedIncident,
+    fingerprint: string,
+    incidentId = String(event.payload.incident_id),
+  ): Promise<IncidentDecision> {
     try {
       await this.publish(payload);
+      await this.backend.append({
+        event_id: this.id(),
+        timestamp: this.now().toISOString(),
+        type: "incident.delivery",
+        project_id: event.project_id,
+        run_id: event.run_id,
+        worker_id: null,
+        payload: { incident_event_id: event.event_id, fingerprint, status: "acknowledged" },
+      });
       return {
-        incidentId: incident.incident_id,
+        incidentId,
         fingerprint,
         duplicate: false,
         state: "persisted",
-        eventId: committed.event_id,
+        eventId: event.event_id,
         publishAttempted: true,
       };
     } catch (error) {
+      await this.backend.append({
+        event_id: this.id(),
+        timestamp: this.now().toISOString(),
+        type: "incident.delivery",
+        project_id: event.project_id,
+        run_id: event.run_id,
+        worker_id: null,
+        payload: {
+          incident_event_id: event.event_id,
+          fingerprint,
+          status: "failed",
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
       return {
-        incidentId: incident.incident_id,
+        incidentId,
         fingerprint,
         duplicate: false,
         state: "publish_failed",
-        eventId: committed.event_id,
+        eventId: event.event_id,
         publishAttempted: true,
         publishError: error instanceof Error ? error.message : String(error),
       };
