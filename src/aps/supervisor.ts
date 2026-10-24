@@ -20,6 +20,7 @@
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import type { IncidentController } from "../incidents/IncidentController.ts";
 import { contextUtilization } from "./context.ts";
 import { ToolCallNormalizer } from "./fingerprint.ts";
 import { ProgressEvaluator } from "./progress.ts";
@@ -71,6 +72,10 @@ export interface AgentProgressSupervisorOptions {
    * construction because the abort handle (the session) is created later.
    */
   onPrevented?: (event: AgentLoopPreventedEvent) => void;
+  /** Optional durable incident bridge for prevented agent loops. */
+  incidentController?: IncidentController;
+  /** Repository identity required when the optional incident bridge is enabled. */
+  incidentContext?: { repo: string; revision: string; worktree: string };
 }
 
 /** Verdict plus whether a new event was emitted for this action. */
@@ -94,6 +99,8 @@ export class AgentProgressSupervisor {
   private readonly reportedLoops = new Map<string, string>();
   private readonly events: AgentLoopEvent[] = [];
   private readonly prevention: Required<LoopPreventionOptions>;
+  private readonly incidentController: IncidentController | undefined;
+  private readonly incidentContext: AgentProgressSupervisorOptions["incidentContext"];
   /** Enforcement callback (settable after construction; see options). */
   onPrevented: ((event: AgentLoopPreventedEvent) => void) | undefined;
   /** Fires prevention at most once per supervisor (the session is aborted). */
@@ -109,6 +116,8 @@ export class AgentProgressSupervisor {
     this.onEvent = options.onEvent;
     this.onPrevented = options.onPrevented;
     this.prevention = { ...DEFAULT_LOOP_PREVENTION, ...options.prevention };
+    this.incidentController = options.incidentController;
+    this.incidentContext = options.incidentContext;
     this.now = options.now ?? (() => new Date().toISOString());
     this.emitNotice =
       options.emitNotice ??
@@ -170,6 +179,31 @@ export class AgentProgressSupervisor {
           await this.eventStore.append(this.toStoredEvent(event));
         } catch {
           /* Persistence is best-effort. */
+        }
+      }
+      if (this.incidentController !== undefined && this.incidentContext !== undefined) {
+        try {
+          const preventionReason = stallExceeded ? "no_mutation_stall" : "no_progress_turns";
+          await this.incidentController.recordFailure({
+            incident_id: event.event_id,
+            run_id: action.runId,
+            repo: this.incidentContext.repo,
+            revision: this.incidentContext.revision,
+            worktree: this.incidentContext.worktree,
+            agent_role: action.role,
+            failure_class: "agent_loop_prevented",
+            exit_code: null,
+            summary: `Agent loop prevented: ${preventionReason}`,
+            artifact_refs: [],
+            reproduction: `${action.tool} ${action.toolResultSummary}`,
+            command: action.tool,
+            root_cause: `agent loop prevented: ${preventionReason}`,
+            classification: "runtime_tooling",
+            risk: "medium",
+            created_at: event.timestamp,
+          });
+        } catch {
+          /* Incident delivery must never break the observed run. */
         }
       }
       return {
