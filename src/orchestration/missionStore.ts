@@ -12,7 +12,7 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
-import type { LineageEmitter } from "../runtime/herdr/lineage.ts";
+import { type LineageEmitter, lineageNodeId } from "../runtime/herdr/lineage.ts";
 import {
   type CheckpointRefsInput,
   attachCheckpointRefs,
@@ -551,6 +551,58 @@ export class MissionStore {
           ended,
         );
       }
+    });
+  }
+
+  /**
+   * A worker review's verdict becomes a `review:` node, a `reviewed` edge bound to the exact candidate commit, and
+   * a `produced` edge from the reviewing attempt. The edge targets the commit, not a PR: only a trusted reviewer's
+   * edge on a PR counts toward Herdr's quorum, so Pi's own record never poses as a quorum vote. Reviews that were
+   * not valid or not accessible are never projected (no verdict was given).
+   */
+  private lineageReviewRecorded(ev: ReviewEvidence): void {
+    if (!ev.outputValid || !ev.accessible) return;
+    const sha = ev.identity.candidateSha;
+    this.lineageDo((l) => {
+      const review = lineageNodeId("review", ev.evidenceId);
+      const commit = lineageNodeId("commit", sha);
+      const scope = { mission_id: ev.missionId, task_id: ev.taskId };
+      l.nodeUpsert(
+        review,
+        {
+          label: `review ${ev.verdict}`,
+          state: "done",
+          attrs: {
+            verdict: ev.verdict,
+            independence: ev.independenceMode,
+            findings: ev.findings.length,
+            candidate_sha: sha,
+            commit: sha,
+          },
+        },
+        `review:${ev.evidenceId}`,
+        scope,
+        ev.recordedAt,
+      );
+      l.nodeUpsert(commit, { label: sha.slice(0, 12), attrs: { sha } }, `review-commit:${sha}`, scope, ev.recordedAt);
+      l.edgeAdd(
+        "reviewed",
+        review,
+        commit,
+        `review:${ev.evidenceId}`,
+        { commit: sha, verdict: ev.verdict, independence: ev.independenceMode },
+        scope,
+        ev.recordedAt,
+      );
+      l.edgeAdd(
+        "produced",
+        lineageNodeId("attempt", ev.executionId),
+        review,
+        `review-produced:${ev.evidenceId}`,
+        {},
+        scope,
+        ev.recordedAt,
+      );
     });
   }
 
@@ -2913,6 +2965,7 @@ export class MissionStore {
       actor: "system",
       evidence,
     });
+    this.lineageReviewRecorded(evidence);
     return copyReviewEvidence(evidence);
   }
 

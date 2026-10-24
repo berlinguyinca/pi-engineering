@@ -509,23 +509,31 @@ describe("scenario 1 / worker spawn, review evidence and the Herdr graph (real p
     assert.equal((await read(`agent:${taskIds.review}`, "alice")).body.node.state, "done");
   });
 
-  it("GAP: the review VERDICT does not reach Herdr (Pi emits `reviewed` edges only for plan reviews; no worker-review projection exists)", async () => {
-    const hood = await plane.c(
-      "GET",
-      `/graph/nodes/${encodeURIComponent(`agent:${taskIds.review}`)}/neighborhood?depth=3`,
-      { user: "alice" },
+  it("the worker-review VERDICT reaches Herdr: a review node, a `reviewed` edge bound to the exact candidate commit, and a produced edge from the reviewing attempt", async () => {
+    const rn = await eventually(async () => {
+      const r = await read("review:RE-s1", "alice");
+      return r.status === 200 ? r : false;
+    }, "the review node");
+    assert.equal(rn.body.node.attrs.verdict, "approve");
+    assert.equal(rn.body.node.attrs.candidate_sha, SHA);
+    const hood = await eventually(async () => {
+      const h = await plane.c("GET", `/graph/nodes/${encodeURIComponent("review:RE-s1")}/neighborhood?depth=1`, {
+        user: "alice",
+      });
+      const ed = (h.body.edges ?? []).filter((e: any) => e.edge_type === "reviewed");
+      return ed.length ? h : false;
+    }, "the reviewed edge");
+    const reviewed = (hood.body.edges ?? []).filter((e: any) => e.edge_type === "reviewed");
+    assert.deepEqual(
+      reviewed.map((e: any) => [e.from_id, e.to_id]),
+      [["review:RE-s1", `commit:${SHA}`]],
     );
-    const types = new Set((hood.body.edges ?? []).map((e: any) => e.edge_type));
-    assert.equal(
-      types.has("reviewed"),
-      false,
-      "if this fails the gap is closed: promote this test to a positive assertion",
-    );
-    assert.equal(types.has("validated"), false);
-    const keyed = await plane.call("GET", `/api/v1/graph/nodes/${encodeURIComponent("review:RE-s1")}`, {
-      key: "operator",
-    });
-    assert.equal(keyed.status, 404, "no review node exists for the stored review evidence");
+    assert.equal(reviewed[0].attrs.commit, SHA, "the edge is bound to the candidate commit");
+    const produced = (hood.body.edges ?? []).filter((e: any) => e.edge_type === "produced");
+    assert.equal(produced.length, 1, "the reviewing attempt produced the review");
+    // paired negative: a signed-in non-member sees nothing, and a request-changes style id that was never recorded is absent
+    assert.equal((await read("review:RE-s1", "bob")).status, 404);
+    assert.equal((await read("review:RE-never", "alice")).status, 404);
   });
 
   it("the plan revision, digest and Plannotator decision reach Herdr FROM THE CLI: mission and plan nodes bound to the digest, a produced edge, and an approval as a reviewed edge on the same digest", async () => {

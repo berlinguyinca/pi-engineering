@@ -679,3 +679,46 @@ class FakeCli implements HerdrCli {
     return { workspaceId: "w", path: repo };
   }
 }
+
+describe("lineage: worker-review verdicts", () => {
+  const evidence = (over: Record<string, unknown> = {}) =>
+    ({
+      evidenceId: "RE-lin",
+      missionId: "MSN-lin",
+      taskId: "task-a",
+      executionId: "EX-review",
+      identity: { candidateSha: SHA },
+      verdict: "request_changes",
+      independenceMode: "independent",
+      findings: [{ severity: "high", summary: "x", status: "open" }],
+      outputValid: true,
+      accessible: true,
+      recordedAt: "2026-09-26T10:00:00.000Z",
+      ...over,
+    }) as never;
+
+  it("a valid verdict becomes a review node, a reviewed edge bound to the candidate commit and a produced edge", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store } = missionRig(emitter);
+    (store as unknown as { lineageReviewRecorded(e: unknown): void }).lineageReviewRecorded(evidence());
+    const events = await lineageEvents(envStore, emitter);
+    const reviewed = edges(events, "reviewed");
+    assert.deepEqual(
+      reviewed.map((e) => [e.from_id, e.to_id]),
+      [["review:RE-lin", `commit:${SHA}`]],
+    );
+    assert.equal((reviewed[0] as { attrs?: { commit?: string } }).attrs?.commit, SHA);
+    assert.equal(edges(events, "produced").length, 1);
+    assertEndpointsUpserted(events);
+  });
+
+  it("an unreadable or invalid review projects nothing", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store } = missionRig(emitter);
+    const p = store as unknown as { lineageReviewRecorded(e: unknown): void };
+    p.lineageReviewRecorded(evidence({ outputValid: false }));
+    p.lineageReviewRecorded(evidence({ accessible: false }));
+    const events = await lineageEvents(envStore, emitter);
+    assert.equal(edges(events, "reviewed").length, 0);
+  });
+});
