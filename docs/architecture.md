@@ -166,6 +166,17 @@ root, including symlink escapes. Read tools may inspect external references.
 This file-tool guard does not sandbox arbitrary shell commands; shell isolation
 remains the responsibility of the runtime's execution environment.
 
+Git run by Pi itself against a repository a worker can write (every call in `GitRepo`, the worktree janitor, the
+change observer, post-merge reverts, `worker_result`, the result caches and review guards) goes through
+`src/git/safeGit.ts`. A worker can plant `core.fsmonitor`, hooks, `filter.*.clean/smudge/process`,
+`diff.*.textconv`, `merge.*.driver`, `commit.gpgsign` + `gpg.program`, `core.sshCommand`, credential helpers or
+`remote.*.uploadpack` in the shared `.git` (or `info/attributes`); `safeGit` rebuilds the environment, blanks every such
+key the repository defines on the command line (the operator's own global config is kept), adds
+`--no-ext-diff --no-textconv` to `diff`/`show`/`log`, and refuses fetch/push/ls-remote while a per-remote command is
+planted. `test/unit/safe-git-callers.test.ts` fails when a source file spawns `git` outside it unless the file is listed,
+with a reason, in `RAW_GIT_EXCEPTIONS`. The verifier and CAV runner intentionally run worker-authored commands (they are
+the point of a verification gate); they get a scrubbed environment (`src/lifecycle/workerEnv.ts`) but are not sandboxed.
+
 A mutating worker with a known base cannot report `completed` without a tracked
 file diff against that base. Empty or reverted commits do not count, and Git
 inspection failures require a blocked/partial report until evidence is available.
@@ -222,3 +233,17 @@ State persists under `<repoRoot>/.pi-eng/lifecycle/`. See
 - Tools: `ledger_read`, `ledger_claim`, `artifact_read`, `repo_search`, `symbol`,
   `tests_for` — resolved against the runtime for the calling cwd, so worker
   sessions and the interactive session share one durable ledger.
+
+### git hardening: classification, residual race, network pin
+
+`src/git/safeGit.ts` classifies config keys by their parts (section at the first dot, variable after the last dot,
+subsection = anything between, case-sensitive), never by a regular expression over the whole key, so names containing
+newlines, U+2028/2029, `=`, dots, quotes or nothing at all are neutralised like any other. Neutralisers travel in
+`GIT_CONFIG_COUNT/KEY_n/VALUE_n`. Driver names referenced by `info/attributes` and every `.gitattributes` are
+neutralised up front even when no config section exists yet, which closes the listing-to-command race for the
+attribute-driven vectors (0 hits in 200 strict and 200 operator flip-loop runs, against 7 in 40 before). The residual:
+a worker that writes both the attribute line and the config section inside the few milliseconds between listing and
+command can run one driver once; the config is listed again afterwards and a change discards the result and emits an
+error notice. A complete fix needs the worker unable to write the shared `.git`. Repository-defined `http.*`,
+`protocol.*`, `url.*`, `remote.*.proxy` and `lfs.url` refuse network commands, and a repository's remote URLs are pinned
+the first time Pi uses it. `safeGitSync` caps its own config probes at 5 s and blocks the event loop while git runs.

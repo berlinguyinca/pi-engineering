@@ -26,6 +26,7 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
@@ -52,6 +53,8 @@ import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
+import { gatePlanBeforeWorkers } from "../orchestration/planReview.ts";
+import { loadPlanReviewSettings } from "../orchestration/planReviewConfig.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import {
   DEFAULT_MISSION_RECOVERY_CEILING,
@@ -63,6 +66,7 @@ import {
 } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
+import { resolveSteeringTarget } from "../orchestration/steeringResolve.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
 import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
 import { type Mission, type MissionStop, PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
@@ -87,6 +91,9 @@ import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "
 import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
+import { type ForkRuntime, createForkRuntime } from "./herdr/forkWiring.ts";
+import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
 import { resolveWorktreeIdentity } from "./isolation/WorktreeIdentity.ts";
@@ -456,6 +463,12 @@ export interface RuntimeMissionActivityEvent {
 
 export interface EngineeringRuntimeOptions {
   cwd: string;
+  /**
+   * Optional lineage emitter (T02): mission executions, handoffs and verified
+   * checkpoints are reported as typed lineage events. Absent (the default) Pi
+   * emits nothing and behaves exactly as before.
+   */
+  lineage?: LineageEmitter;
   worker?: WorkerExecutor;
   /**
    * Optional distinct worker for the independent review + clean-room challenger
@@ -469,6 +482,8 @@ export interface EngineeringRuntimeOptions {
   verifier?: VerificationProvider;
   model?: Model<any>;
   agentDir?: string;
+  /** T12: inject a steering receiver (tests); undefined = decide from the global YAML and the configured control plane. */
+  steeringReceiver?: SteeringReceiver | null;
   /**
    * Route mission roles through this instead of a router built from the
    * agent dir's policy and discovered models. Hosts and tests that must not
@@ -552,6 +567,16 @@ export interface EngineeringRuntimeOptions {
     mission: import("../orchestration/types.ts").Mission,
     risk: import("../orchestration/types.ts").RiskProfile,
   ) => Promise<PlanTaskInput[]>;
+  /**
+   * Pre-implementation plan gate (T03). Off unless given. When set, the default
+   * planner's tasks pass through {@link gatePlanBeforeWorkers} before any worker
+   * starts: risk-based skip | offer | require review bound to the plan digest.
+   * A blocked plan yields no tasks (fail closed) and an open finding that says why.
+   */
+  planReview?: Pick<
+    import("../orchestration/planReview.ts").PlanGateInput,
+    "adapter" | "policy" | "emitter" | "replan" | "maxRevisions"
+  > & { configNotes?: string[] };
   /**
    * Optional autonomous spec approval hook (design 2026-09-28). When provided,
    * material mutations are reviewed/refined/approved and their tasks are
@@ -681,6 +706,9 @@ export class EngineeringRuntime {
   missionOwnership: MissionOwnership | null;
   /** Clock-driven owner of startup and periodic nonterminal-mission reconciliation. */
   missionSupervisor: MissionSupervisor | null;
+  /** T12: outbound-only steering poller; null unless enabled in the global YAML with a control plane configured. */
+  steeringReceiver: SteeringReceiver | null = null;
+  forkRuntime: ForkRuntime | null = null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /** The planner the orchestrator uses to turn a mission into tasks. */
@@ -1272,6 +1300,7 @@ export class EngineeringRuntime {
       rt.orchestrationPath = orchestrationPath;
       rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
       openedMissionStores.set(orchestrationPath, rt.missionStore);
+      if (opts.lineage) rt.missionStore.setLineage(opts.lineage);
       rt.ownershipId = `session-${session.sessionId}-${randomUUID()}`;
       liveOwnerIds().add(rt.ownershipId);
       rt.missionOwnership = new MissionOwnership(rt.missionStore, {
@@ -1478,6 +1507,10 @@ export class EngineeringRuntime {
       // derived from the workflow, never assumed. (Dogfood caught the planner
       // hardcoding mutates_repo:true, which let a read-only "why is this failing?"
       // request write to the repository.)
+      // Plan review is opt-in: an explicit option, else the `plan_review` block of
+      // the repo's engineering.yaml; absent means OFF and nothing below changes.
+      const planReviewSettings =
+        opts.planReview !== undefined ? opts.planReview : await loadPlanReviewSettings(repoRoot, opts.agentDir);
       const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
         const mutates = workflowMutatesRepo(mission.workflow_class);
         const acceptanceIds = mission.acceptance_criteria.flatMap((criterion) =>
@@ -1505,46 +1538,48 @@ export class EngineeringRuntime {
         // Non-trivial goals get ONE planner call (PLANNER_PROMPT) on the best
         // "planner"-routed model so independent work gets real write domains;
         // a malformed plan falls back to the single task and never blocks.
-        const planned = await planMission({
-          goal: mission.goal,
-          mutates,
-          mode: missionPlannerMode(),
-          acceptanceIds,
-          single,
-          ...plannerScope(rt.missionStore?.getWorkspaceManifest(mission.mission_id), repoRoot),
-          runPlanner: async (task) => {
-            const route = await routeModel?.("planner", { missionId: mission.mission_id }).catch(() => undefined);
-            // Bounded: a hard timeout aborts the one call; thinking is allowed
-            // for role "planner" (thinkingPolicy) and the role's token budget applies.
-            const abort = new AbortController();
-            const timer = setTimeout(() => abort.abort(), plannerTimeoutMs());
-            try {
-              const run = await rt.worker.run({
-                role: "planner",
-                task,
-                tools: READ_ONLY_TOOLS,
-                cwd: repoRoot,
-                signal: abort.signal,
-                maxContextTokens: ROLE_BUDGETS.planner.hardMaxTokens,
-                ...(route ? { modelOverride: { provider: route.provider, id: route.id } } : {}),
-              });
-              if (abort.signal.aborted) throw new Error(`planner timed out after ${plannerTimeoutMs()} ms`);
-              if (run.error) {
-                if (run.error.startsWith("transient:") || classifyError(run.error).retryable) {
-                  throw new PlannerTransientError(run.error);
+        const planWith = (planGoal: string, objective: string) =>
+          planMission({
+            goal: planGoal,
+            mutates,
+            mode: missionPlannerMode(),
+            acceptanceIds,
+            single: () => ({ ...single(), objective }),
+            ...plannerScope(rt.missionStore?.getWorkspaceManifest(mission.mission_id), repoRoot),
+            runPlanner: async (task) => {
+              const route = await routeModel?.("planner", { missionId: mission.mission_id }).catch(() => undefined);
+              // Bounded: a hard timeout aborts the one call; thinking is allowed
+              // for role "planner" (thinkingPolicy) and the role's token budget applies.
+              const abort = new AbortController();
+              const timer = setTimeout(() => abort.abort(), plannerTimeoutMs());
+              try {
+                const run = await rt.worker.run({
+                  role: "planner",
+                  task,
+                  tools: READ_ONLY_TOOLS,
+                  cwd: repoRoot,
+                  signal: abort.signal,
+                  maxContextTokens: ROLE_BUDGETS.planner.hardMaxTokens,
+                  ...(route ? { modelOverride: { provider: route.provider, id: route.id } } : {}),
+                });
+                if (abort.signal.aborted) throw new Error(`planner timed out after ${plannerTimeoutMs()} ms`);
+                if (run.error) {
+                  if (run.error.startsWith("transient:") || classifyError(run.error).retryable) {
+                    throw new PlannerTransientError(run.error);
+                  }
+                  throw new Error(run.error);
                 }
-                throw new Error(run.error);
+                return run.result;
+              } catch (error) {
+                if (error instanceof PlannerTransientError || abort.signal.aborted) throw error;
+                if (classifyError(error).retryable) throw new PlannerTransientError(String(error));
+                throw error;
+              } finally {
+                clearTimeout(timer);
               }
-              return run.result;
-            } catch (error) {
-              if (error instanceof PlannerTransientError || abort.signal.aborted) throw error;
-              if (classifyError(error).retryable) throw new PlannerTransientError(String(error));
-              throw error;
-            } finally {
-              clearTimeout(timer);
-            }
-          },
-        });
+            },
+          });
+        const planned = await planWith(mission.goal, mission.goal);
         if (planned.fallbackReason) {
           rt.missionStore?.addFinding({
             mission_id: mission.mission_id,
@@ -1584,12 +1619,90 @@ export class EngineeringRuntime {
             recommended_action: "Confirm or restate what this mission should do.",
           });
         }
+        if (planReviewSettings && rt.missionStore && !planned.clarification && planned.tasks.length > 0) {
+          const gated = await gatePlanBeforeWorkers({
+            // Changes requested: plan again with the reviewer's feedback as input.
+            // The single-task fallback carries the feedback too, so the revision
+            // always differs and needs its own decision.
+            replan: async ({ annotations, revision }) => {
+              const feedback = annotations.length
+                ? annotations.map((a) => `- ${a}`).join("\n")
+                : "- (the reviewer asked for changes without comments)";
+              const augmented = `${mission.goal}\n\nA plan reviewer requested changes to revision ${revision.revision}. Address this feedback:\n${feedback}`;
+              const replanned = await planWith(augmented, augmented);
+              return replanned.tasks.length > 0 ? replanned.tasks : revision.tasks;
+            },
+            ...planReviewSettings,
+            missionId: mission.mission_id,
+            goal: mission.goal,
+            plan: async () => planned.tasks,
+            ledger: rt.missionStore,
+          });
+          if (gated.status === "blocked") {
+            rt.missionStore.addFinding({
+              mission_id: mission.mission_id,
+              task_id: null,
+              severity: "major",
+              category: PLANNER_CLARIFICATION_CATEGORY,
+              file: null,
+              line: null,
+              summary: `Plan review blocked implementation (${gated.code}).`,
+              evidence: [gated.reason, ...(planReviewSettings.configNotes ?? [])].join("\n").slice(0, 1000),
+              recommended_action:
+                gated.code === "plannotator_unavailable"
+                  ? "Restore the plan review service or record an explicit operator override with a reason."
+                  : "Revise the plan and resubmit for review.",
+            });
+            return [];
+          }
+          if (planReviewSettings.configNotes?.length) {
+            rt.missionStore.addFinding({
+              mission_id: mission.mission_id,
+              task_id: null,
+              severity: "minor",
+              category: "plan_review_config",
+              file: null,
+              line: null,
+              summary: "Plan review configuration was only partly honoured.",
+              evidence: planReviewSettings.configNotes.join("\n").slice(0, 1000),
+              recommended_action: "Fix or remove the ignored plan_review settings.",
+            });
+          }
+          return gated.tasks;
+        }
         return planned.tasks;
       };
       rt.missionPlanner = opts.orchestrationPlanner ?? defaultPlanner;
       const limits = await loadMissionLimits(repoRoot, opts.agentDir);
       const recoveryBudget = missionRecoveryBudget(rt.resilience);
+      // Optional AutoSpec design gate for orchestrated missions (T04). Nothing from
+      // the integration is imported unless an `autospec` block exists or a layer is unparsable.
+      let completionEvidence: ConstructorParameters<typeof Orchestrator>[0]["completionEvidence"];
+      let autospecOn = false;
+      try {
+        if (await autospecConfigured(repoRoot, opts.agentDir ? { agentDir: opts.agentDir } : {})) {
+          autospecOn = true;
+          const provider = await import("../integrations/autospec/provider.ts");
+          const autospecConfig = await provider.loadAutoSpecConfig(
+            repoRoot,
+            opts.agentDir ? { agentDir: opts.agentDir } : {},
+          );
+          completionEvidence = (_mission, candidates) =>
+            provider.missionDesignGateReasons(autospecConfig, {
+              repoRoot,
+              candidates: candidates.map((c) => ({
+                baseSha: c.identity.baseSha,
+                candidateSha: c.identity.candidateSha,
+              })),
+            });
+        }
+      } catch (error) {
+        // Configured-but-unloadable must block, not silently disable.
+        const why = error instanceof Error ? error.message : String(error);
+        if (autospecOn) completionEvidence = () => [`autospec_config: integration failed to load: ${why}`];
+      }
       rt.orchestrator = new Orchestrator({
+        ...(completionEvidence ? { completionEvidence } : {}),
         recovery: recoveryBudget,
         store: rt.missionStore,
         backends,
@@ -1720,8 +1833,11 @@ export class EngineeringRuntime {
       });
       await rt.missionSupervisor.reconcileOnStartup();
       rt.missionSupervisor.start();
+      rt.steeringReceiver = await EngineeringRuntime.startSteering(rt, opts);
       return rt;
     } catch (error) {
+      rt.steeringReceiver?.stop();
+      rt.forkRuntime?.stop();
       rt.externalPumpStopped = true;
       rt.missionActivityTicker?.close();
       rt.missionActivityClock.clear();
@@ -1731,6 +1847,58 @@ export class EngineeringRuntime {
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
       throw error;
     }
+  }
+
+  /**
+   * T12. Start the steering poller only when the GLOBAL engineering YAML enables it and a Herdr control plane is
+   * configured; otherwise nothing is constructed and no network call is ever made. The poller can reach exactly two
+   * things: `MissionStore.steerTask` (labelled, untrusted text) and `Orchestrator.resume`.
+   */
+  private static async startSteering(
+    rt: EngineeringRuntime,
+    opts: EngineeringRuntimeOptions,
+  ): Promise<SteeringReceiver | null> {
+    const store = rt.missionStore;
+    if (!store) return null;
+    const orchestrator = (): NonNullable<EngineeringRuntime["orchestrator"]> => {
+      if (!rt.orchestrator) throw new Error("orchestrator is not running");
+      return rt.orchestrator;
+    };
+    const ports: import("../orchestration/steering.ts").SteeringPorts = {
+      now: () => Date.now() / 1000,
+      resolve: (nodeId) => resolveSteeringTarget(store, nodeId),
+      steerRunning: (taskId, text) => orchestrator().broker.steerRunningTask(taskId, text, "herdr-steering"),
+      resumeMission: async (missionId) => {
+        const mission = await orchestrator().resume(missionId);
+        return { changed: mission.status !== "PAUSED_INFRASTRUCTURE" };
+      },
+      log: (message) => console.error(message),
+    };
+    if (opts.steeringReceiver !== undefined) return opts.steeringReceiver;
+    // T13: forks and promotion. Constructed only when the global YAML enables `forks:`; otherwise the port is absent
+    // and a fork/promote request is acknowledged `unsupported`.
+    rt.forkRuntime = await createForkRuntime({
+      agentDir: opts.agentDir ?? getAgentDir(),
+      stateDir: resolveStateRoot(),
+      lineage: opts.lineage ?? null,
+      log: (message) => console.error(message),
+      sources: {
+        getTask: (id) => store.getTask(id),
+        getExecution: (id) => store.getExecution(id),
+        getMission: (id) => store.getMission(id),
+        boundRoot: (repoId) => rt.repositoryRegistry.get(repoId).root,
+        openRoot: async (path) => (await GitRepo.open(path))?.root ?? null,
+        links: store,
+      },
+    });
+    if (rt.forkRuntime) ports.forks = rt.forkRuntime.port;
+    const receiver = await createSteeringReceiver({
+      agentDir: opts.agentDir ?? getAgentDir(),
+      stateDir: resolveStateRoot(),
+      ports,
+    });
+    receiver?.start();
+    return receiver;
   }
 
   /**
@@ -1758,6 +1926,8 @@ export class EngineeringRuntime {
     }
     const path = this.orchestrationPath;
     try {
+      this.steeringReceiver?.stop();
+      this.forkRuntime?.stop();
       await this.missionSupervisor?.shutdown();
       await this.missionStore?.flush();
       await this.missionObservability?.flush();

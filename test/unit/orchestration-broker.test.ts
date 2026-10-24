@@ -2783,6 +2783,59 @@ describe("ExecutionBroker (spec 03)", () => {
     assert.equal(store.getTask(t.task_id)!.steer_requests[0], "do not touch schema");
   });
 
+  it("steerRunningTask reaches the backend's onSteer for a running task, and is truthful otherwise", async () => {
+    let steered = "";
+    const withChannel = setup({
+      agent: {
+        runAgent: async () => ({
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "d",
+          artifactRefs: [],
+          usage: {},
+        }),
+        onSteer: (s) => {
+          steered = s;
+        },
+      },
+    });
+    assert.equal(withChannel.broker.steerRunningTask(withChannel.t.task_id, "x"), "not_running");
+    await withChannel.broker.execute({
+      taskId: withChannel.t.task_id,
+      missionId: withChannel.m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+    });
+    assert.equal(
+      withChannel.broker.steerRunningTask(withChannel.t.task_id, "framed text", "herdr-steering"),
+      "delivered",
+    );
+    assert.equal(steered, "framed text");
+    assert.equal(withChannel.store.getTask(withChannel.t.task_id)!.steer_requests[0], "framed text");
+
+    const noChannel = setup({
+      agent: {
+        runAgent: async () => ({
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "d",
+          artifactRefs: [],
+          usage: {},
+        }),
+      },
+    });
+    await noChannel.broker.execute({
+      taskId: noChannel.t.task_id,
+      missionId: noChannel.m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+    });
+    assert.equal(noChannel.broker.steerRunningTask(noChannel.t.task_id, "x"), "no_channel");
+    assert.deepEqual(noChannel.store.getTask(noChannel.t.task_id)!.steer_requests, []);
+  });
+
   it("maps process/validation kinds to the right backend", async () => {
     const calls: string[] = [];
     const { m, broker } = setup({

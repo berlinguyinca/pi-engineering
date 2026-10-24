@@ -1,13 +1,10 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { safeGitOrThrow } from "../git/safeGit.ts";
 
 async function git(cwd: string, args: string[]): Promise<string> {
-  return (await execFileAsync("git", args, { cwd, maxBuffer: 64 * 1024 * 1024 })).stdout;
+  return (await safeGitOrThrow(args, { cwd, trust: "operator", maxBuffer: 64 * 1024 * 1024 })).stdout;
 }
 
 /** Ignored paths (`!! path` lines of `git status --ignored`), and the non-ignored remainder. */

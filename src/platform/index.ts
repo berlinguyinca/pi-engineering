@@ -15,6 +15,7 @@
 
 import type { EventStore } from "../ledger/EventStore.ts";
 import type { MissionStore } from "../orchestration/missionStore.ts";
+import type { LineageEmitter } from "../runtime/herdr/lineage.ts";
 import { ControlPlane } from "./ControlPlane.ts";
 import { McpRegistry } from "./McpRegistry.ts";
 import { PlannotatorAdapter } from "./Plannotator.ts";
@@ -46,6 +47,8 @@ export interface PlatformOptions {
   mcpPolicy?: (ctx: { projectId: string; role: string; tool: string }) => boolean;
   /** Optional orchestration MissionStore surfaced to the operator via PI WEB. */
   missionStore?: MissionStore | null;
+  /** Optional lineage emitter (T02): worker spawn/state is reported from the work graph. */
+  lineage?: LineageEmitter | null;
 }
 
 export class Platform {
@@ -71,6 +74,7 @@ export class Platform {
       ProjectRegistry.rebuild(this.store, history) ??
       ProjectRegistry.create(this.store, opts.workspaceName ?? "default");
     this.graph = WorkGraph.replay(this.store, history);
+    if (opts.lineage) this.graph.setLineage(opts.lineage);
     this.plannotator = new PlannotatorAdapter(opts.plannotator);
     this.mcp = new McpRegistry({ policy: opts.mcpPolicy });
     this.remote = new RemoteWorkerClient({ graph: this.graph });

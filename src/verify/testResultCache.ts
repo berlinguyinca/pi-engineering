@@ -4,6 +4,7 @@ import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, utimes, 
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
+import { safeGitOrThrow } from "../git/safeGit.ts";
 import type { StageRun } from "./Verifier.ts";
 
 const run = promisify(execFile);
@@ -98,8 +99,10 @@ export function fingerprint(input: FingerprintInput): string {
   return createHash("sha256").update(canonical).digest("hex");
 }
 
-async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
-  const { stdout } = await run("git", ["-C", cwd, ...args], {
+async function git(cwd: string, args: string[], env?: Record<string, string>): Promise<string> {
+  const { stdout } = await safeGitOrThrow(args, {
+    cwd,
+    trust: "operator",
     maxBuffer: 64 * 1024 * 1024,
     ...(env ? { env } : {}),
   });
@@ -120,7 +123,7 @@ export async function treeHash(cwd: string): Promise<string> {
     await copyFile(realIndex, index).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== "ENOENT") throw error;
     });
-    const env = { ...process.env, GIT_INDEX_FILE: index };
+    const env = { GIT_INDEX_FILE: index };
     await git(cwd, ["add", "-A"], env);
     return (await git(cwd, ["write-tree"], env)).trim();
   } finally {

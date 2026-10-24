@@ -3,11 +3,11 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
-import { createIngestFromEnv } from "../src/runtime/herdr/ingestFromEnv.ts";
+import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
 import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
@@ -88,6 +88,8 @@ import {
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
 import { attachInspectorWhenReady, createInspectorSlot } from "../src/runtime/herdr/attachInspector.ts";
+import type { LineageEmitter } from "../src/runtime/herdr/lineage.ts";
+import { loadLineageEmitter } from "../src/runtime/herdr/lineageConfig.ts";
 import { getHostMaintenance } from "../src/runtime/host/maintenance.ts";
 import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
@@ -322,6 +324,16 @@ export async function settleWorkspaceActivity(): Promise<void> {
  * `<repo>/src`) must share ONE runtime/ledger view, otherwise each holds a
  * stale in-memory ledger over the same shared `.pi-eng/ledger.jsonl` file.
  */
+/**
+ * The lineage emitter, built once per process from the central fleet config.
+ * Null (and free) unless `lineage.enabled` and `ingest.outbox` are both true there.
+ */
+let lineageEmitterOnce: Promise<LineageEmitter | null> | undefined;
+function lineageEmitter(): Promise<LineageEmitter | null> {
+  lineageEmitterOnce ??= loadLineageEmitter();
+  return lineageEmitterOnce;
+}
+
 async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<EngineeringRuntime> {
   if (runtimeShutdownFlight) await runtimeShutdownFlight;
   const openGeneration = runtimeShutdownGeneration;
@@ -348,13 +360,15 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
-  const attentionIngest = createIngestFromEnv(process.env);
+  const lineage = await lineageEmitter();
+  const attentionIngest = await resolveAttentionIngest(process.env, getAgentDir());
   const attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
   let attentionReady = false;
   const opening = EngineeringRuntime.open({
     cwd,
     verifier: new CommandVerifier(),
     model,
+    ...(lineage ? { lineage } : {}),
     // Autonomous stop (roadmap spec §13, §33): when this repository's Roadmap
     // 1.0 is complete, /engineer refuses to invent new work. The gate is derived
     // from the roadmap engine (completion is never declared). If the repo has no
@@ -2301,8 +2315,10 @@ ${RECOVERY_PROMPT}`;
   // never depends on it (the semantic tool + runtime gate enforce policy).
   // Planner/worker execution mode (docs/specs/planner-worker-hot-model-routing.md):
   // /engineering-* commands, and the mode `/mission` consults before orchestrating.
-  const plannerAttentionIngest = createIngestFromEnv(process.env);
-  const plannerAttention = plannerAttentionIngest ? new MissionAttentionReporter(plannerAttentionIngest) : null;
+  // the global engineering.yaml `herdr:` block only (no environment variables); resolved lazily because this site is synchronous
+  const plannerAttention = resolveAttentionIngest(process.env, getAgentDir()).then((i) =>
+    i ? new MissionAttentionReporter(i) : null,
+  );
   const plannerWorker = registerPlannerWorker(pi, {
     host: async (ctx) => {
       const rt = await getRuntime(ctx);
@@ -2310,7 +2326,7 @@ ${RECOVERY_PROMPT}`;
         repoRoot: rt.git?.root ?? rt.cwd,
         worker: rt.worker,
         reportAttention: (snapshot: Parameters<MissionAttentionReporter["update"]>[0]) => {
-          void plannerAttention?.update(snapshot).catch(() => {});
+          void plannerAttention.then((r) => r?.update(snapshot)).catch(() => {});
         },
         // Live missions an operator paused or pinned, for /engineering-status.
         missionControlLines: () =>

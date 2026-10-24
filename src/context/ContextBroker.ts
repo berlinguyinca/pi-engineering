@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { promisify } from "node:util";
 import { GitRepo } from "../git/GitRepo.ts";
-
-const exec = promisify(execFile);
+import { safeGitOrThrow } from "../git/safeGit.ts";
 
 /** A single retrievable context item with relevance metadata (spec §10.5). */
 export interface ContextItem {
@@ -85,7 +82,11 @@ export class ContextBroker {
 
   /** Compact repository map (paths + a one-line guess of kind). */
   async repoMap(limit = 200): Promise<string[]> {
-    const r = await exec("git", ["-C", this.repoRoot, "ls-files"], { maxBuffer: 64 * 1024 * 1024 });
+    const r = await safeGitOrThrow(["ls-files"], {
+      cwd: this.repoRoot,
+      trust: "operator",
+      maxBuffer: 64 * 1024 * 1024,
+    });
     const files = r.stdout
       .split("\n")
       // Match ignore tokens against whole path SEGMENTS, not substrings, so a
@@ -101,11 +102,12 @@ export class ContextBroker {
     if (!pattern.trim()) return []; // an empty pattern would match every line
     let out = "";
     try {
-      const r = await exec(
-        "git",
-        ["-C", this.repoRoot, "grep", "-n", "-E", "--no-color", "-I", "-e", pattern, "--", "."],
-        { maxBuffer: 4 * 1024 * 1024, timeout: 30_000 },
-      );
+      const r = await safeGitOrThrow(["grep", "-n", "-E", "--no-color", "-I", "-e", pattern, "--", "."], {
+        cwd: this.repoRoot,
+        trust: "operator",
+        maxBuffer: 4 * 1024 * 1024,
+        timeoutMs: 30_000,
+      });
       out = r.stdout;
     } catch (err) {
       // git grep exits 1 when there are no matches (normal -> empty). Any other

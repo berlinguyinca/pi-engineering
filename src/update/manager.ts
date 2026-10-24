@@ -10,11 +10,11 @@
  * state, the ledger and every worktree exactly as they were (§15, §47).
  */
 
-import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
+import { safeGitSyncOut } from "../git/safeGit.ts";
 import type { HandoverResult, HandoverTask } from "../runtime/host/host.ts";
 import type { RuntimeTelemetry } from "../runtime/host/telemetry.ts";
 import { readStateSchema } from "../runtime/migrations/schema.ts";
@@ -102,11 +102,7 @@ export class UpdateManager {
     const recorded = this.prefs().identityRoots;
     if (recorded.length > 0) return recorded;
     try {
-      return execFileSync("git", ["-C", this.deps.packageRoot, "rev-list", "--max-parents=0", "HEAD"], {
-        timeout: 5000,
-        stdio: ["ignore", "pipe", "ignore"],
-      })
-        .toString()
+      return safeGitSyncOut(["rev-list", "--max-parents=0", "HEAD"], { cwd: this.deps.packageRoot, timeoutMs: 5000 })
         .split("\n")
         .map((s) => s.trim())
         .filter((s) => /^[0-9a-f]{40}$/.test(s));
@@ -193,10 +189,7 @@ export class UpdateManager {
     const running = this.deps.running();
     if (!running?.checkout || !existsSync(join(running.root, ".git"))) return null;
     try {
-      const out = execFileSync("git", ["-C", running.root, "status", "--porcelain"], {
-        timeout: 10_000,
-        stdio: ["ignore", "pipe", "ignore"],
-      }).toString();
+      const out = safeGitSyncOut(["status", "--porcelain"], { cwd: running.root, timeoutMs: 10_000 });
       return out.trim() ? running.root : null;
     } catch {
       return null;

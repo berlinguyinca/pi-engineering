@@ -311,3 +311,126 @@ export function specialistRoles(categories: Set<WorkCategory> | WorkCategory[], 
   if (cats.has("ui_ux") || cats.has("accessibility")) out.push("ui_reviewer");
   return [...new Set(out)];
 }
+
+// ---------------------------------------------------------------------------------------------
+// Complexity assessment (T03)
+// ---------------------------------------------------------------------------------------------
+
+/** Plan-review risk class used by the Plannotator policy (matches platform RiskClass). */
+export type PlanRiskClass = "low" | "medium" | "high" | "critical";
+
+export const COMPLEXITY_BANDS = ["trivial", "small", "moderate", "large", "severe"] as const;
+export type ComplexityBand = (typeof COMPLEXITY_BANDS)[number];
+
+export interface ComplexityInput extends ClassificationInput {
+  /**
+   * The work will change the repository. A request that matches no rule is then
+   * `unknown`, never `chat`: a mutating goal is not a conversation.
+   */
+  mutates?: boolean;
+  /** Number of planned tasks, when a plan already exists. */
+  taskCount?: number;
+}
+
+export interface ComplexityAssessment {
+  /** Bounded integer in [0, 100]. */
+  score: number;
+  band: ComplexityBand;
+  riskClass: PlanRiskClass;
+  classification: Classification;
+  /** Every contribution to the score and the risk class, in order. */
+  reasons: string[];
+}
+
+const CATEGORY_WEIGHT: Partial<Record<WorkCategory, number>> = {
+  destructive: 30,
+  security: 20,
+  auth: 20,
+  database: 18,
+  migration: 18,
+  infra: 18,
+  deployment: 16,
+  remote_administration: 16,
+  service_management: 14,
+  server_lifecycle: 14,
+  api: 10,
+  dependency: 8,
+  runtime_system: 8,
+  build_system: 6,
+  config: 6,
+  backend: 5,
+  frontend: 4,
+  ui_ux: 4,
+  performance: 4,
+  unknown: 8,
+};
+
+const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, n));
+
+function bandOf(score: number): ComplexityBand {
+  if (score < 10) return "trivial";
+  if (score < 30) return "small";
+  if (score < 55) return "moderate";
+  if (score < 80) return "large";
+  return "severe";
+}
+
+const RISK_CLASS: Record<LifecycleRisk, PlanRiskClass> = {
+  LOW: "low",
+  NORMAL: "medium",
+  HIGH: "high",
+  CRITICAL: "critical",
+};
+
+/**
+ * Pure, deterministic complexity score (0-100) and plan risk class. The risk
+ * class is the classifier's risk; a very large change raises it one step so a
+ * big plan is never reviewed less than a risky small one.
+ */
+export function assessComplexity(input: ComplexityInput): ComplexityAssessment {
+  const classification = classifyWork(input);
+  const reasons: string[] = [];
+  let categories = classification.categories;
+  if (input.mutates && categories.includes("chat")) {
+    categories = categories.filter((c) => c !== "chat");
+    if (!categories.length) categories = ["unknown"];
+    reasons.push("mutating work is never classed as chat; treated as unknown");
+  }
+
+  let score = 0;
+  const add = (points: number, why: string): void => {
+    if (points <= 0) return;
+    score += points;
+    reasons.push(`+${points} ${why}`);
+  };
+  const weights = categories.map((c) => ({ c, w: CATEGORY_WEIGHT[c] ?? 0 })).sort((a, b) => b.w - a.w);
+  if (weights[0] && weights[0].w > 0) add(weights[0].w, `category ${weights[0].c}`);
+  for (const { c, w } of weights.slice(1, 3)) add(Math.ceil(w / 2), `category ${c}`);
+
+  const files = input.files.length;
+  add(Math.min(20, files * 2), `${files} file(s) in scope`);
+  add(Math.min(15, Math.floor((input.changedLines ?? 0) / 40)), `${input.changedLines ?? 0} changed line(s)`);
+  add(
+    Math.min(10, (input.taskCount ?? 0) > 1 ? (input.taskCount ?? 0) * 2 : 0),
+    `${input.taskCount ?? 0} planned task(s)`,
+  );
+  add(Math.min(15, classification.planTriggers.length * 3), `plan triggers: ${classification.planTriggers.join(", ")}`);
+  if (input.mutates) add(5, "mutates the repository");
+  const ranked = riskRank(classification.risk);
+  add(ranked * 5, `classifier risk ${classification.risk}`);
+
+  score = clamp(Math.round(score), 0, 100);
+  let risk = classification.risk;
+  if (score >= 80 && riskRank(risk) < riskRank("CRITICAL")) {
+    risk = LIFECYCLE_RISKS[riskRank(risk) + 1] as LifecycleRisk;
+    reasons.push(`score ${score} >= 80 raises risk to ${risk}`);
+  }
+  reasons.push(`complexity ${score}/100 (${bandOf(score)}), risk class ${RISK_CLASS[risk]}`);
+  return {
+    score,
+    band: bandOf(score),
+    riskClass: RISK_CLASS[risk],
+    classification: { ...classification, categories, risk },
+    reasons,
+  };
+}

@@ -33,7 +33,7 @@ import { appendFile, mkdir, readFile, rename, truncate, writeFile } from "node:f
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
 import type { EventStoreBackend, StoredEvent } from "./backend.ts";
-import { ExclusiveFileLock, lockHeldByLiveOwner, type FileLockRecoveryHooks } from "./fileLock.ts";
+import { ExclusiveFileLock, type FileLockRecoveryHooks, lockHeldByLiveOwner } from "./fileLock.ts";
 
 /** Files held by a live instance in this process, so two cannot diverge silently. */
 const openFiles = new Set<string>();

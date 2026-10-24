@@ -8,11 +8,8 @@
  * render. Git lookup failures degrade gracefully to `insideGit: false`.
  */
 
-import { execFile } from "node:child_process";
 import { basename, sep } from "node:path";
-import { promisify } from "node:util";
-
-const exec = promisify(execFile);
+import { safeGitOrThrow } from "../git/safeGit.ts";
 
 export interface GitContext {
   insideGit: boolean;
@@ -27,8 +24,10 @@ export type GitExecFn = (cwd: string, args: string[]) => Promise<string | null>;
 
 export const DEFAULT_GIT_EXEC: GitExecFn = async (cwd, args) => {
   try {
-    const { stdout } = await exec("git", ["-C", cwd, ...args], {
-      timeout: 10_000,
+    const { stdout } = await safeGitOrThrow(args, {
+      cwd,
+      trust: "operator",
+      timeoutMs: 10_000,
       maxBuffer: 4 * 1024 * 1024,
     });
     return stdout.trim() || null;

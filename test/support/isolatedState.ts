@@ -17,3 +17,6 @@ if (!process.env.PI_ENGINEERING_STATE_DIR) {
 if (!process.env.PI_ENGINEERING_HOME) {
   process.env.PI_ENGINEERING_HOME = mkdtempSync(join(tmpdir(), "pi-eng-test-install-"));
 }
+
+// The retired Herdr environment variables are never an input to a test (Herdr is configured by YAML only).
+for (const name of ["HERDR_INGEST_URL", "HERDR_INGEST_API_KEY", "HERDR_HOST_ID"]) delete process.env[name];
