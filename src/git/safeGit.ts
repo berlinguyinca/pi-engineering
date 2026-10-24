@@ -63,11 +63,14 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
+  constants as fsConstants,
+  fstatSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
   readlinkSync,
   realpathSync,
@@ -90,7 +93,7 @@ import {
   removeShadow,
   sweepOnce,
 } from "./safeGitState.ts";
-import { scanRepoTree } from "./safeGitTree.ts";
+import { UNBOUNDED_SCAN, scanRepoTreeDetailed } from "./safeGitTree.ts";
 
 /**
  * Trust model (T16 H5). The repository's LOCAL and WORKTREE config, `info/attributes`, `.gitattributes`, `.lfsconfig`
@@ -727,6 +730,12 @@ export const testHooks: {
   afterPlan?: () => void | Promise<void>;
   /** Tests only: treat local-path / file:// remotes as allow-listed (the test repositories use local bare remotes). */
   localTransports?: boolean;
+  /** Tests only: make the write-back after a command fail (the rollback path). */
+  failWriteBack?: boolean;
+  /** Tests only: fail AFTER the files were moved back (a partial write-back). */
+  failWriteBackAfter?: boolean;
+  /** Tests only: the text `git --version` is taken to print (null: ask git). */
+  gitVersion?: string;
   /** Tests only: runs right after the shadow exists, before Pi's own internal git calls (nested-repo check) use it. */
   afterShadow?: (shadowRoot: string) => void;
   /** Tests only: the user id the ownership check compares against (a repository cannot be chowned without privileges). */
@@ -957,17 +966,59 @@ export function urlClass(u: string): UrlClass {
 
 /** Positional arguments of a network command that name a repository by path or helper rather than by remote name. */
 const PATHISH = /^(\/|\.\.?\/|~|file:)|::|^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+/** `host:path` and `user@host:path` (scp-like): a URL in disguise. A refspec such as `main:main` looks the same, so only the repository argument is tested for it. */
+const SCP_LIKE = /^([A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+:(?!\/\/)/;
+const REPOSITORY_FIRST = new Set(["fetch", "pull", "push", "ls-remote", "clone"]);
 export function urlArguments(args: readonly string[], at: number, remoteNames: ReadonlySet<string>): string[] {
   let positional = args.slice(at + 1).filter((a) => !a.startsWith("-"));
   // `git clone <repository> [<directory>]`: the directory is where the clone goes, not a remote
   if (args[at] === "clone" && positional.length >= 2) positional = positional.slice(0, -1);
-  return positional.filter((a) => !remoteNames.has(a) && PATHISH.test(a));
+  const out = positional.filter((a) => !remoteNames.has(a) && PATHISH.test(a));
+  const first = positional[0];
+  if (REPOSITORY_FIRST.has(args[at] ?? "") && first !== undefined && !remoteNames.has(first)) {
+    if (SCP_LIKE.test(first) && !out.includes(first)) out.push(first);
+  }
+  return out;
+}
+
+// ─── git version and the empty tree ──────────────────────────────────────────────────────────────────────────────
+
+/** `GIT_ATTR_SOURCE` (what cuts attributes off at the source) exists from git 2.40; with an older git the cut-off would silently not happen. */
+const MIN_GIT = [2, 40] as const;
+let gitVersionCache: string | undefined;
+export function gitVersionProblem(): string | null {
+  if (gitVersionCache === undefined && testHooks.gitVersion === undefined) {
+    gitVersionCache = runSync(["--version"], { PATH: process.env.PATH ?? "" }, 5_000, 4096).stdout;
+  }
+  const text = testHooks.gitVersion ?? gitVersionCache ?? "";
+  const m = /git version (\d+)\.(\d+)/.exec(text);
+  if (!m) return "the git version could not be determined, and Pi needs git 2.40 or newer";
+  const major = Number(m[1]);
+  const minor = Number(m[2]);
+  if (major < MIN_GIT[0] || (major === MIN_GIT[0] && minor < MIN_GIT[1])) {
+    return `git ${major}.${minor} is older than ${MIN_GIT[0]}.${MIN_GIT[1]}: it has no GIT_ATTR_SOURCE, so Pi could not stop a repository's attributes from selecting a filter or diff driver. Upgrade git`;
+  }
+  return null;
+}
+
+const emptyTrees = new Map<string, string>();
+/** The empty tree's id in the repository's own hash format (sha1 or sha256), asked of git instead of assumed. */
+function emptyTreeFor(format: string, env: NodeJS.ProcessEnv): string | null {
+  const known = emptyTrees.get(format);
+  if (known) return known;
+  const r = runSync(["hash-object", "-t", "tree", "/dev/null"], env, 5_000, 4096);
+  const id = r.stdout.trim();
+  if (r.code !== 0 || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(id)) return null;
+  emptyTrees.set(format, id);
+  return id;
 }
 
 // ─── per-call preparation and completion ─────────────────────────────────────────────────────────────────────────
 
 interface Shadow {
   root: string;
+  /** Names in the shadow that are private COPIES of a real file (read-only commands only): never written back. */
+  copies: ReadonlySet<string>;
   common: string;
   /** The generated global attributes file (git-lfs lines only). */
   attributes: string;
@@ -1020,19 +1071,94 @@ const CONFIG_WRITERS = new Set([
   "rebase",
 ]);
 
+/**
+ * Commands that read `shallow` and `info/grafts` but never write them. For these the shadow holds private COPIES,
+ * read once with O_NOFOLLOW: git then never opens the shared path, so a link planted (or flipped in) after Pi's own
+ * look cannot make it quote a line of some other file in an error message. `packed-refs`, the refs themselves, the
+ * index and the per-worktree files are read from the real git directory (git takes them from GIT_DIR, which cannot
+ * be moved into the shadow without moving the index and refs with it), so for those only the last look, the
+ * withholding of quoted lines and a sandbox remain.
+ */
+const READS_ONLY_SHARED_FILES = new Set([
+  "log",
+  "show",
+  "diff",
+  "diff-tree",
+  "diff-files",
+  "diff-index",
+  "rev-parse",
+  "rev-list",
+  "ls-files",
+  "ls-tree",
+  "cat-file",
+  "for-each-ref",
+  "show-ref",
+  "describe",
+  "blame",
+  "merge-base",
+  "name-rev",
+  "grep",
+  "shortlog",
+  "status",
+  "add",
+  "commit",
+  "restore",
+  "reflog",
+]);
+const COPY_LIMIT = 256 * 1024 * 1024;
+
+/** Read a plain, single-name file without following a link; null when it does not exist. Throws when it is not plain. */
+export function readPlainFile(path: string): Buffer | null {
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    if (code === "ELOOP") throw new Error(`${path} is a symbolic link`);
+    throw e;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${path} is not a regular file`);
+    if (st.nlink > 1) throw new Error(`${path} has more than one hard link`);
+    if (st.size > COPY_LIMIT) throw new Error(`${path} is too large to copy`);
+    const buf = Buffer.alloc(st.size);
+    let got = 0;
+    while (got < st.size) {
+      const n = readSync(fd, buf, got, st.size - got, got);
+      if (n === 0) break;
+      got += n;
+    }
+    return buf.subarray(0, got);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function makeShadow(
   layout: RepoLayout,
   configText: string,
   writer: boolean,
   attributesFor: (common: string) => string,
+  readOnlyCommand = false,
 ): Shadow {
   sweepOnce();
   const root = makeShadowRoot();
   const common = join(root, ".git");
+  const copies = new Set<string>();
   try {
     mkdirSync(common, { mode: 0o700 });
     for (const name of readdirSync(layout.commonDir)) {
       if (SHADOW_SKIP.has(name)) continue;
+      if (readOnlyCommand && name === "shallow") {
+        const body = readPlainFile(join(layout.commonDir, name));
+        if (body !== null) {
+          writeFileSync(join(common, name), body, { mode: 0o400 });
+          copies.add(name);
+          continue;
+        }
+      }
       symlinkSync(join(layout.commonDir, name), join(common, name));
     }
     mkdirSync(join(common, "hooks"), { mode: 0o700 });
@@ -1047,6 +1173,14 @@ function makeShadow(
     }
     for (const name of infoNames) {
       if (name === "attributes") continue;
+      if (readOnlyCommand && name === "grafts") {
+        const body = readPlainFile(join(layout.commonDir, "info", name));
+        if (body !== null) {
+          writeFileSync(join(common, "info", name), body, { mode: 0o400 });
+          copies.add("info/grafts");
+          continue;
+        }
+      }
       symlinkSync(join(layout.commonDir, "info", name), join(common, "info", name));
     }
     writeFileSync(join(common, "config"), configText, { mode: 0o400 });
@@ -1058,7 +1192,7 @@ function makeShadow(
       chmodSync(join(common, "hooks"), 0o500);
       chmodSync(common, 0o500);
     }
-    return { root, common, attributes, attributesText, writer };
+    return { root, copies, common, attributes, attributesText, writer };
   } catch (e) {
     markShadowDone(root);
     removeShadow(root);
@@ -1214,6 +1348,74 @@ export function unsafeOwner(
   return null;
 }
 
+/**
+ * Symbolic links, hard links and special files in the shared git directories (see safeGitTree.ts). A repository with
+ * more loose refs/logs than the scan can verify is refused with the way out; `pack-refs` and `gc` are exactly that way
+ * out, so they alone are let through when the ONLY problem is the amount.
+ */
+function scanProblemFor(layout: RepoLayout, sub: string | undefined): string | null {
+  let scan: ReturnType<typeof scanRepoTreeDetailed>;
+  try {
+    scan = scanRepoTreeDetailed(layout);
+  } catch (e) {
+    return `the repository could not be inspected (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
+  }
+  if (!scan.reason) return null;
+  if (scan.overLimit) {
+    if (sub === "pack-refs" || sub === "gc") {
+      // the way out of a too-large tree: let through only when EVERY entry checks out (padding the tree so the budget
+      // runs out before a planted link is reached must not open the door)
+      try {
+        const full = scanRepoTreeDetailed(layout, UNBOUNDED_SCAN);
+        return full.reason ? `the repository's git directory contains ${full.reason}` : null;
+      } catch (e) {
+        return `the repository could not be inspected (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
+      }
+    }
+    return `the repository's git directory has more loose refs or log files than Pi can verify (${scan.reason}). Run \`git pack-refs --all\` (or \`git gc\`) through Pi, which is let through for exactly this reason, or from a shell in ${layout.commonDir}, and retry`;
+  }
+  return `the repository's git directory contains ${scan.reason}`;
+}
+
+/**
+ * Settings the caller may not override with its own leading `-c key=value` (it would come AFTER Pi's forced
+ * settings, and the last `-c` wins): everything that selects a program, a transport, a credential, an endpoint, an
+ * attribute file, a repository location or an include.
+ */
+const PROTECTED_KEY =
+  /^(core\.(hookspath|fsmonitor|attributesfile|sshcommand|worktree|bare|pager|editor|gitproxy|askpass|excludesfile|alternaterefscommand|untrackedcache)|protocol\.|credential|url\.|include|alias\.|filter\.|diff\.|merge\.|gpg\.|lfs\.|uploadpack\.|receive\.|safe\.|submodule\.|fetch\.|push\.|gc\.|maintenance\.|http\.|remote\.|sequence\.|tag\.gpgsign|commit\.gpgsign|log\.showsignature|status\.submodulesummary|difftool|mergetool|pager\.|man\.|web\.|browser\.|help\.|trailer\.|ssh\.|pi\.|extensions\.|init\.templatedir|transfer\.|fsck\.|pack\.|index\.|checkout\.|worktree\.|sparsecheckout|core\.sparsecheckout)/i;
+
+/** `<program>`-taking options of the network commands: they name a program that runs on the other side or locally. */
+const PROGRAM_OPTIONS = /^(--upload-pack|--receive-pack|--exec|--ssh-command|--config-env|--exec-path)(=|$)/;
+
+/** Why a caller-supplied option is refused, or null. */
+export function refusedOption(args: readonly string[], at: number): string | null {
+  for (let i = 0; i < at; i++) {
+    const a = args[i] ?? "";
+    if (a === "-c") {
+      const kv = args[i + 1] ?? "";
+      const key = kv.split("=")[0] ?? "";
+      if (PROTECTED_KEY.test(key))
+        return `-c ${key} would override a setting Pi forces (or selects a program, endpoint or include)`;
+      i++;
+    } else if (a.startsWith("-c") && a.length > 2 && !a.startsWith("--")) {
+      const key = a.slice(2).split("=")[0] ?? "";
+      if (PROTECTED_KEY.test(key))
+        return `-c ${key} would override a setting Pi forces (or selects a program, endpoint or include)`;
+    } else if (/^--(config-env|exec-path)(=|$)/.test(a)) {
+      return `${a.split("=")[0]} is not allowed`;
+    }
+  }
+  for (let i = at + 1; i < args.length; i++) {
+    const a = args[i] ?? "";
+    if (a === "--") break;
+    if (PROGRAM_OPTIONS.test(a)) return `${a.split("=")[0]} names a program git would run`;
+    if (args[at] === "clone" && (a === "-u" || /^-[A-Za-z]*u/.test(a)))
+      return "-u (--upload-pack) names a program git would run";
+  }
+  return null;
+}
+
 function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
   const trust = opts.trust ?? "strict";
   const cleanEnv = withoutInjectedConfig({ ...safeGitEnv(process.env, trust), ...(opts.env ?? {}) });
@@ -1226,6 +1428,10 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
   const refuse = (why: string): Prepared => ({ ...base, refused: failed(`refused: ${why}`) });
   if (redirectsRepository(args, at))
     return refuse("--git-dir / --work-tree would point git at a repository that was not inspected");
+  const badOption = refusedOption(args, at);
+  if (badOption) return refuse(badOption);
+  const oldGit = gitVersionProblem();
+  if (oldGit) return refuse(oldGit);
 
   // URLs that come from the work tree (.gitmodules) rather than from config cannot be allow-listed: no submodule fetching at all
   if (sub === "submodule" && args.slice(at + 1).some((a) => SUBMODULE_NETWORK_VERBS.has(a))) {
@@ -1294,16 +1500,9 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
   const unsafe = unsafeOwner(layout, opCfg, testHooks.uid);
   if (unsafe) return refuse(unsafe);
 
-  // 0c. symbolic links and special files where git expects plain files or directories
-  let scan: string | null;
-  try {
-    scan = scanRepoTree(layout);
-  } catch (e) {
-    return refuse(
-      `the repository could not be inspected (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`,
-    );
-  }
-  if (scan) return refuse(`the repository's git directory contains ${scan}`);
+  // 0c. symbolic links, hard links and special files where git expects plain files or directories
+  const scanProblem = scanProblemFor(layout, sub);
+  if (scanProblem) return refuse(scanProblem);
 
   // 1. snapshot the repository's own config (one file, no includes, runs nothing)
   const realConfig = join(layout.commonDir, "config");
@@ -1358,48 +1557,71 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
 
   // 3. the shadow (and, in operator mode with git-lfs, the generated attributes: read by Pi through the shadow itself)
   let shadow: Shadow;
-  let lfsPatterns = 0;
+  let lfsInfo: ReturnType<typeof generateLfsAttributes> | undefined;
+  // the repository's own LFS patterns, read by Pi through the shadow (the root file even while untracked, git applies it
+  // at once; nested ones once they are tracked)
+  const scanLfs = (common: string): ReturnType<typeof generateLfsAttributes> | undefined => {
+    if (!layout.workTree) return undefined;
+    const gitEnv: NodeJS.ProcessEnv = {
+      ...cleanEnv,
+      GIT_DIR: layout.gitDir,
+      GIT_COMMON_DIR: common,
+      GIT_WORK_TREE: layout.workTree,
+    };
+    const listed = runSync(
+      [...OPERATOR_FORCED, "ls-files", "-z", "--", ".gitattributes", "*/.gitattributes"],
+      gitEnv,
+      5_000,
+      16 * 1024 * 1024,
+      layout.workTree,
+    );
+    if (listed.code !== 0 || listed.truncated) {
+      return { text: "", patterns: 0, uncertain: ["the list of tracked .gitattributes files could not be read"] };
+    }
+    return generateLfsAttributes(layout.workTree, [".gitattributes", ...listed.stdout.split("\0").filter(Boolean)]);
+  };
   try {
     // git creates `logs/` in the common directory on the first branch update; the shadow may be read-only, so it exists first
     if (!exists(join(layout.commonDir, "logs"))) mkdirSync(join(layout.commonDir, "logs"), { recursive: true });
-    shadow = makeShadow(layout, generated.text, CONFIG_WRITERS.has(sub ?? ""), (common) => {
-      if (trust !== "operator" || !opCfg.hasLfsFilter || !layout.workTree) return "";
-      const gitEnv: NodeJS.ProcessEnv = {
-        ...cleanEnv,
-        GIT_DIR: layout.gitDir,
-        GIT_COMMON_DIR: common,
-        GIT_WORK_TREE: layout.workTree,
-      };
-      const listed = runSync(
-        [...OPERATOR_FORCED, "ls-files", "-z", "--", ".gitattributes", "*/.gitattributes"],
-        gitEnv,
-        5_000,
-        16 * 1024 * 1024,
-        layout.workTree,
-      );
-      if (listed.code !== 0 || listed.truncated) return "";
-      // the root file is read even while untracked (git applies it at once); nested ones once they are tracked
-      const gen = generateLfsAttributes(layout.workTree, [
-        ".gitattributes",
-        ...listed.stdout.split("\0").filter(Boolean),
-      ]);
-      lfsPatterns = gen.patterns;
-      return gen.text;
-    });
+    shadow = makeShadow(
+      layout,
+      generated.text,
+      CONFIG_WRITERS.has(sub ?? ""),
+      (common) => {
+        if (trust !== "operator" || !opCfg.hasLfsFilter || !layout.workTree) return "";
+        lfsInfo = scanLfs(common);
+        return lfsInfo?.text ?? "";
+      },
+      READS_ONLY_SHARED_FILES.has(sub ?? ""),
+    );
   } catch (e) {
     return refuse(
       `could not prepare an isolated git view (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`,
     );
   }
   testHooks.afterShadow?.(shadow.root);
-  // hooks are off, so `git lfs push` (the pre-push hook) never runs: pointers would reach the remote without their objects
-  if (network && sub === "push" && lfsPatterns > 0) {
-    dropShadow(shadow);
-    return refuse(
-      "this repository tracks files with git-lfs, and Pi runs git without hooks, so `git lfs push` would not run and the remote would receive pointer files without their objects. Push it yourself (git push) from a shell, or untrack the LFS patterns",
-    );
+  // hooks are off, so `git lfs push` (the pre-push hook) never runs: pointers would reach the remote without their
+  // objects. Checked in both modes: strict has no lfs filter, but a pointer file committed by hand is just as broken.
+  if (network && sub === "push") {
+    const info = lfsInfo ?? scanLfs(shadow.common);
+    if (info && (info.patterns > 0 || info.uncertain.length > 0)) {
+      dropShadow(shadow);
+      return refuse(
+        info.patterns > 0
+          ? "this repository tracks files with git-lfs, and Pi runs git without hooks, so `git lfs push` would not run and the remote would receive pointer files without their objects. Push it yourself (git push) from a shell, or untrack the LFS patterns"
+          : `Pi cannot tell whether this repository tracks files with git-lfs (${info.uncertain[0]}), and a push without hooks would send pointer files without their objects. Push it yourself (git push) from a shell`,
+      );
+    }
   }
   const env: NodeJS.ProcessEnv = { ...cleanEnv, GIT_DIR: layout.gitDir, GIT_COMMON_DIR: shadow.common };
+  // the empty tree of THIS repository's hash format (a sha256 repository has a different one)
+  const format = generated.kept.find((k) => k.key.toLowerCase() === "extensions.objectformat")?.value ?? "sha1";
+  const tree = emptyTreeFor(format.toLowerCase(), env);
+  if (!tree) {
+    dropShadow(shadow);
+    return refuse("the empty tree of this repository could not be determined");
+  }
+  env.GIT_ATTR_SOURCE = tree;
   if (layout.workTree) env.GIT_WORK_TREE = layout.workTree;
   if (layout.workTree && exists(join(layout.workTree, ".lfsconfig"))) env.GIT_LFS_SKIP_SMUDGE = "1";
   skipSmudge(env, sub);
@@ -1435,6 +1657,13 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
         }
       }
     }
+  }
+  // the last look before git starts: after the shadow and Pi's own internal git calls, so the window a planted link
+  // has to be flipped in is as short as Pi can make it (it is not closed: see docs/architecture.md, "what remains")
+  const lastLook = scanProblemFor(layout, sub);
+  if (lastLook) {
+    dropShadow(shadow);
+    return refuse(lastLook);
   }
   return {
     ...base,
@@ -1494,7 +1723,7 @@ function writeBack(p: Prepared): string | null {
   const layout = p.layout as RepoLayout;
   const shadow = p.shadow as Shadow;
   for (const name of readdirSync(shadow.common)) {
-    if (SHADOW_SKIP.has(name) || name.endsWith(".lock")) continue;
+    if (SHADOW_SKIP.has(name) || name.endsWith(".lock") || shadow.copies.has(name)) continue;
     const from = join(shadow.common, name);
     if (lstatSync(from).isSymbolicLink()) continue;
     moveBack(from, join(layout.commonDir, name));
@@ -1502,7 +1731,7 @@ function writeBack(p: Prepared): string | null {
   // files git created in `info/` (the symlinks and the generated empty `attributes` stay behind)
   const infoReal = join(layout.commonDir, "info");
   for (const name of readdirSync(join(shadow.common, "info"))) {
-    if (name === "attributes" || name.endsWith(".lock")) continue;
+    if (name === "attributes" || name.endsWith(".lock") || shadow.copies.has(`info/${name}`)) continue;
     const from = join(shadow.common, "info", name);
     if (lstatSync(from).isSymbolicLink()) continue;
     mkdirSync(infoReal, { recursive: true });
@@ -1539,6 +1768,48 @@ function fixWorktreeLinks(p: Prepared): void {
       /* a stale or foreign entry: leave it alone */
     }
   }
+}
+
+/**
+ * `git worktree add` ran inside the shadow, so the new work tree's `.git` file names the shadow's directory. When Pi
+ * could not move the result back and repair that link, the work tree would stay behind pointing at a directory that
+ * is about to be removed: it is rolled back (the work tree this very call created, and its admin directory) and the
+ * caller gets the failure. The branch the command may have created is left alone.
+ */
+function rollbackWorktrees(p: Prepared): number {
+  const layout = p.layout as RepoLayout;
+  const shadow = p.shadow as Shadow;
+  // the new admin directory is in the real repository (moved back) or still in the shadow (not moved yet)
+  const places = [join(layout.commonDir, "worktrees"), join(shadow.common, "worktrees")];
+  const done = new Set<string>();
+  let removed = 0;
+  for (const dir of places) {
+    let names: string[];
+    try {
+      if (lstatSync(dir).isSymbolicLink()) continue;
+      names = readdirSync(dir).slice(0, 4096);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      try {
+        const pointer = readFileSync(join(dir, name, "gitdir"), "utf8").trim();
+        if (!pointer.endsWith("/.git")) continue;
+        const st = lstatSync(pointer);
+        if (!st.isFile() || !readFileSync(pointer, "utf8").includes(shadow.root)) continue;
+        const tree = dirname(pointer);
+        if (!done.has(tree)) {
+          rmSync(tree, { recursive: true, force: true });
+          done.add(tree);
+          removed++;
+        }
+        for (const d of places) rmSync(join(d, name), { recursive: true, force: true });
+      } catch {
+        /* not one of ours */
+      }
+    }
+  }
+  return removed;
 }
 
 function mapOut(s: string, p: Prepared): string {
@@ -1627,8 +1898,29 @@ export function limitStderr(stderr: string): string {
   const joined = lines.join("\n");
   return joined.length > STDERR_TOTAL ? `${joined.slice(0, STDERR_TOTAL)}\n...[stderr truncated]` : joined;
 }
-const clamp = (r: SafeGitResult): SafeGitResult =>
-  r.stderr.length > STDERR_LINE ? { ...r, stderr: limitStderr(r.stderr) } : r;
+/**
+ * git quotes the offending LINE of a malformed shared file in its error (`unexpected line in .git/packed-refs: <line>`,
+ * `bad shallow line: <line>`, `bad graft data: <line>`). If the file is a link a worker planted, that line is a line of
+ * some other file. Pi never relays the quoted part; the name of the problem stays.
+ */
+const QUOTING_MESSAGES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/(unexpected line in [^:\n]*): (?!<)[^\n]*/g, "$1: <line withheld>"],
+  [/(bad shallow line): (?!<)[^\n]*/g, "$1: <line withheld>"],
+  [/(bad graft data): (?!<)[^\n]*/g, "$1: <line withheld>"],
+  [
+    /((?:bad|invalid|malformed|corrupt|broken|unknown|garbage|unexpected)[^\n:]{0,40}\b(?:line|data|entry|content|record)s?\b[^\n:]{0,60}): (?!<)[^\n]*/gi,
+    "$1: <content withheld>",
+  ],
+];
+export function withholdQuotedContent(stderr: string): string {
+  let out = stderr;
+  for (const [re, to] of QUOTING_MESSAGES) out = out.replace(re, to);
+  return out;
+}
+const clamp = (r: SafeGitResult): SafeGitResult => {
+  const text = withholdQuotedContent(r.stderr);
+  return text.length > STDERR_LINE || text !== r.stderr ? { ...r, stderr: limitStderr(text) } : r;
+};
 
 /**
  * After the command: is the shadow still what Pi made it? The directory is private (see safeGitState.ts), so this is
@@ -1679,10 +1971,15 @@ function complete(p: Prepared, result: SafeGitResult): SafeGitResult {
     }
     let problem: string | null = null;
     try {
+      if (testHooks.failWriteBack) throw Object.assign(new Error("injected"), { code: "EINJECTED" });
       problem = writeBack(p);
+      if (testHooks.failWriteBackAfter) throw Object.assign(new Error("injected"), { code: "EINJECTED" });
     } catch (e) {
       problem = `moving the command's files back into the repository failed (${(e as NodeJS.ErrnoException).code ?? (e as Error).message})`;
     }
+    // a work tree whose files could not be moved back is not repaired, it is rolled back (before the link fix below would hide it)
+    let rolledBack = 0;
+    if (problem && p.sub === "worktree" && result.code === 0) rolledBack = rollbackWorktrees(p);
     let changed: ReturnType<typeof replayConfig> = null;
     try {
       changed = replayConfig(p);
@@ -1700,6 +1997,8 @@ function complete(p: Prepared, result: SafeGitResult): SafeGitResult {
     } catch (e) {
       problem ??= `the remote pin could not be saved (${(e as Error).message})`;
     }
+    if (problem && p.sub === "worktree" && result.code === 0) rolledBack += rollbackWorktrees(p);
+    if (rolledBack > 0) problem = `${problem}; the ${rolledBack} work tree(s) this command created were rolled back`;
     notifyIgnored(layout, p.generated);
     out = clamp({
       ...result,

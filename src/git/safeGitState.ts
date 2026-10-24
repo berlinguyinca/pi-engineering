@@ -33,17 +33,32 @@ import { join } from "node:path";
 import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 
 /** Test seams: a unique root per test (so one test never counts another's directories) and an alternative state root. */
-export const stateHooks: { stateRoot?: string; shadowRoot?: string; legacyDir?: string | null } = {};
+export const stateHooks: {
+  stateRoot?: string;
+  shadowRoot?: string;
+  legacyDir?: string | null;
+  uid?: number;
+  sweepUid?: number;
+} = {};
 
-const uid = (): number | null => (typeof process.getuid === "function" ? process.getuid() : null);
+const uid = (): number | null => stateHooks.uid ?? (typeof process.getuid === "function" ? process.getuid() : null);
 
-/** Create (when missing) and verify a private directory. Throws when it is not safe to use. */
+const STATE_HELP =
+  "Pi keeps its git state in a private directory that only you may use: make it a plain directory you own with mode 0700 (chown / chmod it), or move Pi's state directory (see docs/architecture.md, git hardening)";
+
+/** Create (when missing) and verify a private directory. Throws, with the path and what to do, when it is not safe to use. */
 function privateDir(path: string): string {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
+  const bad = (why: string): Error =>
+    new Error(`Pi's git state directory ${path} cannot be used: ${why}. ${STATE_HELP}`);
+  try {
+    mkdirSync(path, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    throw bad((e as NodeJS.ErrnoException).code ?? (e as Error).message);
+  }
   const st = lstatSync(path);
-  if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${path} is not a plain directory`);
+  if (st.isSymbolicLink() || !st.isDirectory()) throw bad("it is not a plain directory");
   const me = uid();
-  if (me !== null && st.uid !== me) throw new Error(`${path} is not owned by this user`);
+  if (me !== null && st.uid !== me) throw bad("it is not owned by this user");
   if ((st.mode & 0o077) !== 0) chmodSync(path, 0o700);
   return path;
 }
@@ -63,10 +78,18 @@ const live = new Set<string>();
 export const markShadowLive = (root: string): void => void live.add(root);
 export const markShadowDone = (root: string): void => void live.delete(root);
 
-/** Make a directory removable again (the shadow is made read-only while git runs). */
+/**
+ * Make a directory removable again (the shadow is made read-only while git runs) and remove it. Nothing is followed:
+ * `chmod` follows links, so each step looks with `lstat` first and touches only a plain directory of ours; `rm` itself
+ * unlinks a symbolic link instead of descending into it (a link in place of the root itself is just unlinked).
+ */
 export function removeShadow(root: string): void {
+  const me = uid();
   for (const d of [join(root, ".git", "info"), join(root, ".git"), root]) {
     try {
+      const st = lstatSync(d);
+      if (st.isSymbolicLink() || !st.isDirectory()) continue;
+      if (me !== null && st.uid !== me) continue;
       chmodSync(d, 0o700);
     } catch {
       /* already gone */
@@ -106,7 +129,7 @@ let swept = false;
  */
 export function sweepStaleShadows(maxAgeMs: number = SWEEP_MAX_AGE_MS, now: number = Date.now()): number {
   let removed = 0;
-  const me = uid();
+  const me = stateHooks.sweepUid ?? uid();
   const sweep = (dir: string, prefix: string): void => {
     let names: string[];
     try {
@@ -212,6 +235,76 @@ function load(): PinFile {
   return data;
 }
 
+/**
+ * Advisory lock around the read-modify-write of pins.json (several Pi processes share it): a lock file created with
+ * O_EXCL, holding its owner's pid. A lock whose owner is gone, or that is older than a minute, is stale and removed.
+ * The caller re-reads the file once it holds the lock, so one process cannot overwrite another's entries.
+ */
+const LOCK_WAIT_MS = 15_000;
+const LOCK_STALE_MS = 60_000;
+export const lockHooks: { waitMs?: number } = {};
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+function ownerAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+function withPinLock<T>(fn: () => T): T {
+  const lock = `${pinPath()}.lock`;
+  const deadline = Date.now() + (lockHooks.waitMs ?? LOCK_WAIT_MS);
+  let fd = -1;
+  for (;;) {
+    try {
+      fd = openSync(lock, "wx", 0o600);
+      writeSync(fd, `${process.pid}\n`);
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    }
+    try {
+      const st = lstatSync(lock);
+      let pid = Number.NaN;
+      try {
+        pid = Number.parseInt(readFileSync(lock, "utf8"), 10);
+      } catch {
+        /* just removed */
+      }
+      const stale = Date.now() - st.mtimeMs > LOCK_STALE_MS || (Number.isInteger(pid) && !ownerAlive(pid));
+      if (stale) {
+        try {
+          unlinkSync(lock);
+        } catch {
+          /* another process removed it first */
+        }
+        continue;
+      }
+    } catch {
+      continue; // gone between the two calls: try to take it
+    }
+    if (Date.now() > deadline)
+      throw new Error(
+        `pi git pin file is locked by another process (${lock}); remove the lock file if no Pi is running`,
+      );
+    sleepMs(5 + Math.floor(Math.random() * 15));
+  }
+  try {
+    cache = undefined; // whatever we read before the lock may be stale
+    return fn();
+  } finally {
+    closeSync(fd);
+    try {
+      unlinkSync(lock);
+    } catch {
+      /* already removed as stale */
+    }
+  }
+}
+
 function save(data: PinFile): void {
   const file = pinPath();
   for (const k of ["pins", "repos"] as const) {
@@ -242,19 +335,25 @@ function save(data: PinFile): void {
 export const pinStore = {
   getPin: (commonDir: string): string | undefined => load().pins[commonDir],
   setPin(commonDir: string, value: string): void {
-    const d = load();
-    if (d.pins[commonDir] === value) return;
-    delete d.pins[commonDir];
-    d.pins[commonDir] = value;
-    save(d);
+    if (load().pins[commonDir] === value) return;
+    withPinLock(() => {
+      const d = load();
+      if (d.pins[commonDir] === value) return;
+      delete d.pins[commonDir];
+      d.pins[commonDir] = value;
+      save(d);
+    });
   },
   getRepo: (workTree: string): string | undefined => load().repos[workTree],
   setRepo(workTree: string, commonDir: string): void {
-    const d = load();
-    if (d.repos[workTree] === commonDir) return;
-    delete d.repos[workTree];
-    d.repos[workTree] = commonDir;
-    save(d);
+    if (load().repos[workTree] === commonDir) return;
+    withPinLock(() => {
+      const d = load();
+      if (d.repos[workTree] === commonDir) return;
+      delete d.repos[workTree];
+      d.repos[workTree] = commonDir;
+      save(d);
+    });
   },
 };
 
@@ -263,23 +362,25 @@ export const pinStore = {
  * directory or a work tree). Used after a deliberate remote change or a re-clone at the same path.
  */
 export function resetSafeGitPins(path?: string): { pins: number; repos: number } {
-  const d = load();
-  let pins = 0;
-  let repos = 0;
-  for (const k of Object.keys(d.pins)) {
-    if (path === undefined || k === path) {
-      delete d.pins[k];
-      pins++;
+  return withPinLock(() => {
+    const d = load();
+    let pins = 0;
+    let repos = 0;
+    for (const k of Object.keys(d.pins)) {
+      if (path === undefined || k === path) {
+        delete d.pins[k];
+        pins++;
+      }
     }
-  }
-  for (const k of Object.keys(d.repos)) {
-    if (path === undefined || k === path || d.repos[k] === path) {
-      delete d.repos[k];
-      repos++;
+    for (const k of Object.keys(d.repos)) {
+      if (path === undefined || k === path || d.repos[k] === path) {
+        delete d.repos[k];
+        repos++;
+      }
     }
-  }
-  if (pins + repos > 0) save(d);
-  return { pins, repos };
+    if (pins + repos > 0) save(d);
+    return { pins, repos };
+  });
 }
 
 /** What Pi remembers (for `pi-engineering git-pins list`). */

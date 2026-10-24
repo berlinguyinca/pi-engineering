@@ -10,7 +10,7 @@
  *
  * Only `readdir` entry types are used (no per-file stat), so the cost is one directory read per directory.
  */
-import { type Dirent, readdirSync } from "node:fs";
+import { type Dirent, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 /** Entries visited per call; a repository with more loose refs/log files than this is refused (fail closed). */
@@ -32,7 +32,32 @@ function list(dir: string): Dirent[] | null {
 }
 
 class Budget {
-  left = treeScanLimit;
+  left: number;
+  constructor(left: number) {
+    this.left = left;
+  }
+  /** Set when the entry budget ran out (as opposed to something being wrong with an entry). */
+  limit = false;
+}
+
+const OUT_OF_BUDGET = "too many entries to verify";
+
+/**
+ * A regular file in the scan set must have exactly one name: a hard link is another name for a file somewhere else
+ * (an `~/.ssh/authorized_keys` that git would append to, a log it would truncate), and unlike a symbolic link
+ * nothing in the directory entry gives it away. `objects/` is exempt (a local clone legitimately hard-links objects).
+ */
+function linked(path: string): boolean {
+  try {
+    return lstatSync(path).nlink > 1;
+  } catch {
+    return false;
+  }
+}
+
+function over(budget: Budget, where: string): string {
+  budget.limit = true;
+  return `${where || "the git directory"}: ${OUT_OF_BUDGET}`;
 }
 
 /** Everything below `dir` must be a regular file or a directory. Returns the first offender, or null. */
@@ -40,13 +65,15 @@ function walk(dir: string, rel: string, budget: Budget): string | null {
   const entries = list(dir);
   if (entries === null) return null;
   for (const e of entries) {
-    if (--budget.left < 0) return `${rel}: too many entries to verify`;
+    if (--budget.left < 0) return over(budget, rel);
     if (e.isSymbolicLink()) return `${rel}/${e.name} is a symbolic link`;
     if (e.isDirectory()) {
       const r = walk(join(dir, e.name), `${rel}/${e.name}`, budget);
       if (r) return r;
     } else if (!e.isFile()) {
       return `${rel}/${e.name} is not a regular file`;
+    } else if (linked(join(dir, e.name))) {
+      return `${rel}/${e.name} has more than one hard link`;
     }
   }
   return null;
@@ -57,10 +84,11 @@ function topLevel(dir: string, rel: string, budget: Budget): string | null {
   const entries = list(dir);
   if (entries === null) return null;
   for (const e of entries) {
-    if (--budget.left < 0) return `${rel}: too many entries to verify`;
+    if (--budget.left < 0) return over(budget, rel);
     if (e.name === "hooks") continue;
     if (e.isSymbolicLink()) return `${rel}${e.name} is a symbolic link`;
     if (!e.isFile() && !e.isDirectory()) return `${rel}${e.name} is not a regular file or directory`;
+    if (e.isFile() && linked(join(dir, e.name))) return `${rel}${e.name} has more than one hard link`;
   }
   return null;
 }
@@ -69,8 +97,27 @@ function topLevel(dir: string, rel: string, budget: Budget): string | null {
  * Verify the git directories of one repository. Returns a human-readable reason to refuse, or null when every
  * entry is a regular file or directory.
  */
+/** The entry budget `pack-refs` / `gc` get: the way out of a too-large tree must still look at every entry. */
+export const UNBOUNDED_SCAN = 50_000_000;
+
 export function scanRepoTree(layout: { gitDir: string; commonDir: string }): string | null {
-  const budget = new Budget();
+  return scanRepoTreeDetailed(layout).reason;
+}
+
+/** Like `scanRepoTree`, and says whether the reason is only that there is too much to look at (recoverable by packing refs). */
+export function scanRepoTreeDetailed(
+  layout: { gitDir: string; commonDir: string },
+  limit: number = treeScanLimit,
+): {
+  reason: string | null;
+  overLimit: boolean;
+} {
+  const budget = new Budget(limit);
+  const reason = scanInto(layout, budget);
+  return { reason, overLimit: reason !== null && budget.limit };
+}
+
+function scanInto(layout: { gitDir: string; commonDir: string }, budget: Budget): string | null {
   const dirs = layout.gitDir === layout.commonDir ? [layout.commonDir] : [layout.commonDir, layout.gitDir];
   for (const dir of dirs) {
     const shown = dir === layout.commonDir ? "" : "worktree admin dir: ";
@@ -87,7 +134,7 @@ export function scanRepoTree(layout: { gitDir: string; commonDir: string }): str
     const entries = list(join(layout.commonDir, sub));
     if (entries === null) continue;
     for (const e of entries) {
-      if (--budget.left < 0) return `${sub}: too many entries to verify`;
+      if (--budget.left < 0) return over(budget, sub);
       if (e.isSymbolicLink()) return `${sub}/${e.name} is a symbolic link`;
       if (!e.isFile() && !e.isDirectory()) return `${sub}/${e.name} is not a regular file or directory`;
     }
@@ -95,7 +142,7 @@ export function scanRepoTree(layout: { gitDir: string; commonDir: string }): str
   // administrative directories of the other linked worktrees (their index, HEAD, gitdir ...)
   const worktrees = list(join(layout.commonDir, "worktrees"));
   for (const w of worktrees ?? []) {
-    if (--budget.left < 0) return "worktrees: too many entries to verify";
+    if (--budget.left < 0) return over(budget, "worktrees");
     if (w.isSymbolicLink()) return `worktrees/${w.name} is a symbolic link`;
     if (!w.isDirectory()) continue;
     const top = topLevel(join(layout.commonDir, "worktrees", w.name), `worktrees/${w.name}/`, budget);

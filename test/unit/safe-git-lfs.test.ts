@@ -253,18 +253,36 @@ test("push of a repository that tracks LFS files is refused loudly in operator m
   }
 });
 
-test("push is not refused when there is nothing LFS about the repository, when the filter is not lfs, or in strict mode (which has no lfs filter)", async () => {
+test("push is not refused when there is nothing LFS about the repository (or only in a comment, or for another filter)", async () => {
   const cases: Array<[string, { root?: string }, "strict" | "operator"]> = [
     ["plain", {}, "operator"],
     ["other filter", { root: "*.bin filter=other\n" }, "operator"],
     ["lfs only in a comment", { root: "# *.bin filter=lfs\n" }, "operator"],
-    ["strict", { root: "*.bin filter=lfs\n" }, "strict"],
+    ["plain strict", {}, "strict"],
   ];
   for (const [name, attrs, trust] of cases) {
     const r = lfsRepo(`nopush-${name.replace(/\W+/g, "_")}`, attrs);
     const res = await safeGit(["push", "origin", "main"], { cwd: r, trust, timeoutMs: 8_000 });
     assert.doesNotMatch(res.stderr, /git-lfs/, name);
   }
+});
+
+test("strict mode refuses the push of a repository with LFS patterns too (a hand-committed pointer is just as broken)", async () => {
+  const r = lfsRepo("strict-push", { root: "*.bin filter=lfs\n" });
+  const res = await safeGit(["push", "origin", "main"], { cwd: r, trust: "strict", timeoutMs: 8_000 });
+  assert.equal(res.code, 128);
+  assert.match(res.stderr, /tracks files with git-lfs/);
+});
+
+test("an [attr] macro that sets a filter, or an attributes file over 1 MiB, makes the push refused (fail closed, with the reason)", async () => {
+  const macro = lfsRepo("macro-push", { root: "[attr]store filter=lfs\n*.bin store\n" });
+  const m = await safeGit(["push", "origin", "main"], { cwd: macro, trust: "strict", timeoutMs: 8_000 });
+  assert.equal(m.code, 128);
+  assert.match(m.stderr, /cannot tell whether .*\[attr\] macro/);
+  const big = lfsRepo("big-push", { root: `${"# pad\n".repeat(200_000)}*.bin filter=other\n` });
+  const b = await safeGit(["push", "origin", "main"], { cwd: big, trust: "operator", timeoutMs: 8_000 });
+  assert.equal(b.code, 128);
+  assert.match(b.stderr, /cannot tell whether .*larger than 1 MiB/);
 });
 
 // ─── each protection on its own (the server tests above are covered twice over by the two protections) ────────────

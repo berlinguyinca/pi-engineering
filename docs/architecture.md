@@ -334,7 +334,7 @@ none of it replaces the sandbox.
   line (they beat `.lfsconfig`, measured with git-lfs 3.4): the endpoint git-lfs derives from the repository's own https remote, the
   operator's own configured value when the operator's global config sets one, or empty (git-lfs then fails with "missing
   protocol" instead of contacting anything) for ssh and other remotes. Hooks are off, so the `pre-push` hook that runs
-  `git lfs push` never runs: a `push` of a repository that tracks LFS patterns (operator mode with `filter.lfs` configured) is
+  `git lfs push` never runs: a `push` of a repository that tracks LFS patterns (in either mode, see Round 5) is
   refused with a message that says why, instead of sending pointer files without their objects. Push such a repository from a
   shell, or untrack the patterns.
 - Repository identity and transports. Pi remembers, per work tree, which repository it belongs to (recorded when Pi creates a
@@ -357,6 +357,61 @@ before Pi ever looks wins); a same-user worker with access to Pi's private state
 Pi's code defeats all of this and needs the sandbox above; nested repositories are handled for the commands measured with git
 2.43 (the matrix in `test/unit/safe-git-nested.test.ts` is the regression guard for other git versions); the shadow is not a
 sandbox (a worker that can write `.git` can still run its own git); the symlink scan and the shadow verification are checks
-before and after a call, so a worker that swaps a path for a link during the few milliseconds of a call is not caught by the scan
-(the generated config and attributes do not depend on it); an LFS repository cannot be pushed through Pi, and untracked nested
-`.gitattributes` files are not applied.
+before and after a call, so a worker that swaps a path for a link while git runs is not stopped by the scan (the generated
+config and attributes do not depend on it; see Round 5 for what that race can and cannot do); an LFS repository cannot be
+pushed through Pi, and untracked nested `.gitattributes` files are not applied.
+
+#### Round 5: the race that remains, and what was done about it
+
+**The scan-to-spawn race is real and is not closed by anything in this module.** Pi looks at the shared git directories
+(symlinks, hard links, special files) and then starts git. A same-user worker that writes the shared `.git` can replace
+`worktrees/<n>/index`, `packed-refs`, `FETCH_HEAD`, `HEAD` or a ref with a link between that look and git opening the path.
+The window is not "a few milliseconds": measured, a worker polling the path wins within tens to hundreds of milliseconds of a
+call, and a long-running git (fetch, gc, a large add) hands it far more. What a won race gives the worker: git writes the
+index / FETCH_HEAD / a reflog through the link (a file write at the victim path, with git-chosen content that includes
+attacker-chosen path names), or reads the linked file as a ref file. The only things that close it are a separate uid for the
+worker or a mount namespace in which the worker cannot create links inside Pi's repositories' `.git`: **a worker sandbox is
+required**, and nothing below replaces it.
+
+What Pi does to make the race smaller and less useful (none of it is a lock):
+
+- The scan runs twice: before Pi's own internal git calls, and again as the very last step before the spawn (after the shadow
+  is built and the nested-repository check has run), so the window starts as late as Pi can make it.
+- For commands that only read them (`log show diff rev-parse rev-list ls-files ls-tree cat-file for-each-ref show-ref describe
+  blame merge-base name-rev grep shortlog status add commit restore reflog`), `shallow` and `info/grafts` are read once with
+  `O_NOFOLLOW` (a plain, single-name file only) into private copies in the 0700 shadow; git never opens the shared path. The
+  copy is never written back. NOT done: private copies of the index, `FETCH_HEAD`, `packed-refs`, `ORIG_HEAD`, the refs and the
+  reflogs. git takes those from `GIT_DIR` (the real per-worktree directory), which cannot be moved into the shadow without
+  moving the index and refs with it, and copying the index in and out of a private directory would break git's own lock
+  protocol (lost updates between concurrent Pi calls); that is too invasive for a hardening round, so those files remain
+  exposed to the race.
+- No quoted file content is relayed. git quotes the offending line of a malformed shared file in its error (`unexpected line in
+  .git/packed-refs: <line>`, `bad shallow line: <line>`, `bad graft data: <line>`); if the file is a link the worker planted,
+  that line belongs to some other file. Pi replaces the quoted part with `<line withheld>` (and `<content withheld>` for similar
+  messages) in every stderr it relays. This removes the read-a-line-of-another-file leak, not the write.
+- Hard links are refused on every regular file in the scan set (`config`, `HEAD`, `index`, `packed-refs`, `FETCH_HEAD`,
+  `ORIG_HEAD`, `refs/**`, `logs/**`, `info/**`, and the same in each `worktrees/<n>/`): a hard link has no marker in the
+  directory entry, so `nlink > 1` is the only sign. `objects/` is exempt (a local clone hard-links objects).
+- The scan limit refusal says how to recover (`git pack-refs --all` / `git gc`), and `pack-refs` and `gc` alone are let through
+  when the only problem is the amount; for them the scan is re-run with no entry limit, so padding the tree to exhaust the budget
+  before a planted link is reached does not open the door.
+- Removing a shadow never follows a link (`lstat` before every `chmod`, a link in place of a directory is unlinked, not entered).
+
+Other changes in this round: a caller's own leading `-c key=value` cannot override a setting Pi forces or select a program,
+endpoint, include or credential helper (both modes), and `--upload-pack`, `--receive-pack`, `--exec`, `clone -u`,
+`--config-env` and `--exec-path` are refused; scp-like arguments (`host:path`, `user@host:path`) are URLs subject to the
+operator's `pi.allowedRemote` (only the repository argument of fetch/pull/push/ls-remote/clone is tested for that form, so a
+refspec such as `main:main` is not mistaken for a URL); git older than 2.40 is refused (no `GIT_ATTR_SOURCE`: attributes
+could not be cut off), and the empty tree is asked of git per repository so sha256 repositories work; a `push` of a repository
+whose attributes select `filter=lfs` is refused in strict mode as well, and a `[attr]` macro that sets a filter or an
+attributes file over 1 MiB makes the push refused with the reason (Pi cannot tell, so it fails closed); the pin file is updated
+under an advisory lock file (O_EXCL, stale after a minute or when its owner is gone, re-read under the lock, atomic rename), so
+concurrent Pi processes cannot drop each other's pins; an unusable state directory is refused with its path and how to fix it
+(Pi's state directory has no YAML key: its location is the existing machine-state setting, and this module reads no new
+environment variable); a `git worktree add` whose results could not be moved back into the repository is rolled back (the work
+tree and admin directory that call created), and the caller gets the failure.
+
+Still not done, deliberately: private copies of the written files (above); a pre-push LFS upload step; a check that LFS pointer
+files are actually present before refusing an LFS push (it would mean a `git grep` over every tracked blob per push, so a
+repository that lists LFS patterns but has no LFS files is refused too); an in-memory pin store when the state directory is
+unusable (the shadow needs the same directory, so the call is refused either way).

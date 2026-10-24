@@ -94,20 +94,32 @@ export function lfsLines(text: string, dir: string): string[] {
 export function generateLfsAttributes(
   workTree: string,
   relPaths: readonly string[],
-): { text: string; patterns: number } {
+): { text: string; patterns: number; uncertain: string[] } {
   const lines: string[] = [];
+  const uncertain: string[] = [];
   for (const rel of relPaths) {
     if (rel !== ".gitattributes" && !rel.endsWith("/.gitattributes")) continue;
     const full = join(workTree, rel);
     try {
       const st = lstatSync(full);
-      if (!st.isFile() || st.size > MAX_FILE) continue;
+      if (!st.isFile()) continue;
+      if (st.size > MAX_FILE) {
+        uncertain.push(`${rel} is larger than 1 MiB, so it was not read`);
+        continue;
+      }
       const dir = rel === ".gitattributes" ? "" : rel.slice(0, -"/.gitattributes".length);
-      lines.push(...lfsLines(readFileSync(full, "utf8"), dir));
+      const body = readFileSync(full, "utf8");
+      // a macro that sets a filter can switch lfs on for any pattern that names it: not interpreted, so not trusted either
+      if (/^\s*\[attr\]\S+.*\bfilter\b/m.test(body))
+        uncertain.push(`${rel} defines an [attr] macro that sets a filter`);
+      lines.push(...lfsLines(body, dir));
     } catch {
       /* unreadable: contributes nothing */
     }
-    if (lines.length >= MAX_PATTERNS) break;
+    if (lines.length >= MAX_PATTERNS) {
+      uncertain.push("more than 5000 LFS patterns");
+      break;
+    }
   }
-  return { text: lines.length ? `${lines.join("\n")}\n` : "", patterns: lines.length };
+  return { text: lines.length ? `${lines.join("\n")}\n` : "", patterns: lines.length, uncertain };
 }
