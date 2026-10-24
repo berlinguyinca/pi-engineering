@@ -155,6 +155,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     this.mutate(rec, { status: "READY", currentOperation: "start" });
     this.emitSession(rec, "session.started", rec.worker.status);
     this.emitSpawn(rec);
+    this.emitSurface(rec, "open", "surface-open");
     return rec.worker;
   }
 
@@ -245,6 +246,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     } catch {
       /* best-effort */
     }
+    this.emitSurface(rec, "closed", "surface-closed", "pane closed by Pi terminate");
     this.mutate(rec, { status: "TERMINATED", currentOperation: "terminate" });
     this.emitSession(rec, "session.terminated", "TERMINATED");
     return true;
@@ -262,6 +264,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     } else {
       status = rec.worker.status === "COMPLETED" || rec.worker.status === "TERMINATED" ? rec.worker.status : "LOST";
     }
+    if (!live && status === "LOST") this.emitSurface(rec, "gone", "surface-gone", "agent no longer present in Herdr");
     this.mutate(rec, { status, currentOperation: "resumeOrReconcile" });
     this.emitSession(rec, "session.updated", status);
     return rec.worker;
@@ -352,6 +355,28 @@ export class HerdrAgentRuntime implements AgentRuntime {
         at: rec.worker.updated_at,
       });
       rec.lineageSpawned = true;
+    } catch {
+      /* observational */
+    }
+  }
+
+  /** The worker's tab (top-level) or pane (helper). A surface fact only: it never moves the agent or attempt. */
+  private emitSurface(rec: Rec, state: "open" | "closed" | "gone", transition: string, reason?: string): void {
+    const lineage = this.lineage;
+    if (!lineage || !rec.lineageSpawned) return;
+    try {
+      lineage.surfaceState(
+        {
+          surface: rec.request.parentRuntimeId ? "pane" : "tab",
+          id: rec.worker.id,
+          agent: rec.worker.id,
+          missionId: rec.worker.missionId,
+          at: rec.worker.updated_at,
+        },
+        state,
+        transition,
+        reason,
+      );
     } catch {
       /* observational */
     }

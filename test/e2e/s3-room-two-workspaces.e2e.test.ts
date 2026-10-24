@@ -23,6 +23,7 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
 import { WorkGraph } from "../../src/platform/WorkGraph.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { HerdrAgentRuntime } from "../../src/runtime/herdr/HerdrAgentRuntime.ts";
 import { type PiHost, startPiHost } from "./support/piHost.ts";
 import { Plane, eventually, loadAcceptance } from "./support/plane.ts";
 
@@ -370,16 +371,63 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
     assert.ok(!spawnTargets.has(`agent:${lead}`) && !spawnTargets.has(`agent:${agentB}`));
   });
 
-  it("GAP: no Pi code path emits tab/pane surface nodes, so a pane close cannot reach Herdr from Pi", async () => {
-    for (const type of ["pane", "tab"]) {
-      const r = await listing("alice", type);
-      assert.equal(r.status, 200);
-      assert.deepEqual(r.body.nodes, [], `Pi emitted a ${type} node: lineage.ts has no tab/pane primitive`);
-    }
-    // the only closePane call in Pi is Terminate (which cancels the attempt on purpose), never a "surface closed" report
-    const src = readFileSync(new URL("../../src/runtime/herdr/HerdrAgentRuntime.ts", import.meta.url), "utf8");
-    assert.equal((src.match(/closePane\(/g) ?? []).length, 1);
-    assert.match(src, /async terminate[\s\S]{0,1200}closePane\(/);
+  it("Pi's Herdr runtime emits the tab (top-level worker) and pane (helper) surface nodes, and a pane close reaches Herdr without touching the agent", async () => {
+    const cli = {
+      status: async () => ({ ok: true, serverVersion: "0.9.1", protocol: 22 }),
+      listAgents: async () => [],
+      getAgent: async () => null,
+      readAgent: async () => "",
+      prompt: async () => undefined,
+      wait: async () => ({
+        agent_status: "working",
+        cwd: "/tmp",
+        pane_id: "p",
+        workspace_id: "w",
+        revision: 1,
+        state_change_seq: 1,
+      }),
+      startAgent: async () => undefined,
+      sendKeys: async () => undefined,
+      closePane: async () => undefined,
+      createWorktree: async (repo: string) => ({ workspaceId: "w", path: repo }),
+    } as unknown as ConstructorParameters<typeof HerdrAgentRuntime>[0]["cli"];
+    const rt = new HerdrAgentRuntime({ cli, lineage: hostA.emitter });
+    const top = await rt.create({ role: "lead", objective: "o" });
+    await rt.start(top);
+    const helper = await rt.create({ role: "helper", objective: "o", parentRuntimeId: top });
+    await rt.start(helper);
+    await hostA.drain();
+    const tabNode = await eventually(async () => {
+      const r = await plane.c("GET", `/graph/nodes/${encodeURIComponent(`tab:${top}`)}`, { user: "alice" });
+      return r.status === 200 ? r : false;
+    }, "the tab node");
+    assert.equal(tabNode.body.node.state, "open");
+    assert.equal(tabNode.body.node.attrs.agent_id, `agent:${top}`);
+    const paneNode = await eventually(async () => {
+      const r = await plane.c("GET", `/graph/nodes/${encodeURIComponent(`pane:${helper}`)}`, { user: "alice" });
+      return r.status === 200 ? r : false;
+    }, "the pane node");
+    assert.equal(paneNode.body.node.attrs.agent_id, `agent:${helper}`);
+    // the pane is closed from Pi's side (the helper's surface goes away): the surface says closed, the agent is not touched
+    await rt.terminate(helper);
+    await hostA.drain();
+    await eventually(
+      async () =>
+        (await plane.c("GET", `/graph/nodes/${encodeURIComponent(`pane:${helper}`)}`, { user: "alice" })).body.node
+          ?.state === "closed",
+      "the pane closed",
+    );
+    const agent = await plane.c("GET", `/graph/nodes/${encodeURIComponent(`agent:${helper}`)}`, { user: "alice" });
+    assert.equal(agent.body.node.state, "running", "a surface close never changes the agent");
+    assert.equal(
+      (await plane.c("GET", `/graph/nodes/${encodeURIComponent(`tab:${top}`)}`, { user: "alice" })).body.node.state,
+      "open",
+    );
+    // negative control: a tab for a worker that was never started does not exist
+    assert.equal(
+      (await plane.c("GET", `/graph/nodes/${encodeURIComponent("tab:never-started")}`, { user: "alice" })).status,
+      404,
+    );
   });
 
   it("closing a pane never kills the worker (SERVER CONTRACT via raw ingest, not Pi-path evidence)", async () => {

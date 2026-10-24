@@ -90,7 +90,10 @@ export type LineageState =
   | "validated"
   | "acknowledged"
   | "committed"
-  | "aborted";
+  | "aborted"
+  | "open"
+  | "closed"
+  | "gone";
 
 /** The slice of EnvelopeStore / ControlPlaneIngest the emitter needs. */
 export interface LineageSink {
@@ -460,6 +463,41 @@ export class LineageEmitter {
       const parentAttempt = lineageNodeId("attempt", input.parentAttempt);
       if (parentAttempt && parentAttempt !== attempt) {
         this.edgeAdd("spawn", parentAttempt, attempt, t, undefined, scope, input.at);
+      }
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  /**
+   * A terminal surface (tab for a top-level worker, pane for a helper) showing an agent. The surface node carries
+   * `attrs.agent_id` so Herdr's tab reader can attach it to the agent. Closing the surface is its OWN fact: it
+   * never changes the agent or the attempt (the worker may still be running without a pane).
+   */
+  surfaceState(
+    input: { surface: "tab" | "pane"; id: string; agent: string; missionId?: string | null; at?: string | Date },
+    state: "open" | "closed" | "gone",
+    transition: string,
+    reason?: string,
+  ): void {
+    try {
+      const node = lineageNodeId(input.surface, input.id);
+      const agent = lineageNodeId("agent", input.agent);
+      if (!node || !agent) {
+        this.drop();
+        return;
+      }
+      const scope = scopeOf(input, input.agent);
+      if (state === "open") {
+        this.nodeUpsert(
+          node,
+          { label: input.surface, state: "open", attrs: { agent_id: agent } },
+          transition,
+          scope,
+          input.at,
+        );
+      } else {
+        this.nodeState(node, state, transition, reason ? { reason } : {}, scope, input.at);
       }
     } catch (error) {
       this.fail(error);

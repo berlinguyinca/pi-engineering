@@ -241,7 +241,9 @@ describe("lineage: no parent, no spawn edge", () => {
         [`attempt:${lead}`, `attempt:${child}`],
       ],
     );
-    const ended = events.filter((e) => e.event_type === "node.state");
+    const ended = events.filter(
+      (e) => e.event_type === "node.state" && !/^(tab|pane):/.test(String(e.payload.node_id)),
+    );
     assert.deepEqual(
       ended.map((e) => [e.payload.node_id, e.payload.state]),
       [[`attempt:${child}`, "cancelled"]],
@@ -420,7 +422,9 @@ describe("lineage: dedupe and ids", () => {
 
 describe("lineage: attempt state transitions", () => {
   const stateEvents = (events: EnvelopeV2[]) =>
-    events.filter((e) => e.event_type === "node.state").map((e) => [e.payload.node_id, e.payload.state]);
+    events
+      .filter((e) => e.event_type === "node.state" && !/^(tab|pane):/.test(String(e.payload.node_id)))
+      .map((e) => [e.payload.node_id, e.payload.state]);
 
   it("Herdr: terminate on a completed worker is a no-op; wait failures emit failed; resume emits running", async () => {
     const { store: envStore, emitter } = rig();
@@ -720,5 +724,39 @@ describe("lineage: worker-review verdicts", () => {
     p.lineageReviewRecorded(evidence({ accessible: false }));
     const events = await lineageEvents(envStore, emitter);
     assert.equal(edges(events, "reviewed").length, 0);
+  });
+});
+
+describe("lineage: tab and pane surfaces", () => {
+  it("a top-level worker is a tab and a helper a pane, open on start and closed on terminate, without touching the agent", async () => {
+    const { store: envStore, emitter } = rig();
+    const rt = new HerdrAgentRuntime({ cli: new FakeCli(), lineage: emitter });
+    const lead = await rt.create({ role: "lead", objective: "o" });
+    await rt.start(lead);
+    const child = await rt.create({ role: "helper", objective: "o", parentRuntimeId: lead });
+    await rt.start(child);
+    await rt.terminate(child);
+    const events = await lineageEvents(envStore, emitter);
+    const opened = events.filter(
+      (e) => e.event_type === "node.upsert" && /^(tab|pane):/.test(String(e.payload.node_id)),
+    );
+    assert.deepEqual(
+      opened.map((e) => [e.payload.node_id, e.payload.state, (e.payload.attrs as { agent_id: string }).agent_id]),
+      [
+        [`tab:${lead}`, "open", `agent:${lead}`],
+        [`pane:${child}`, "open", `agent:${child}`],
+      ],
+    );
+    const closed = events.filter(
+      (e) => e.event_type === "node.state" && /^(tab|pane):/.test(String(e.payload.node_id)),
+    );
+    assert.deepEqual(
+      closed.map((e) => [e.payload.node_id, e.payload.state]),
+      [[`pane:${child}`, "closed"]],
+    );
+    assert.ok(
+      !events.some((e) => e.event_type === "node.state" && e.payload.node_id === `agent:${child}`),
+      "a surface close never changes the agent",
+    );
   });
 });
