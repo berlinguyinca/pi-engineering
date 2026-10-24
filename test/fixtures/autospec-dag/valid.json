@@ -1,0 +1,58 @@
+{
+  "mission": {
+    "schema": "autospec.protocol.mission.v1",
+    "protocol_version": 1,
+    "idempotency_key": "idem-mission-1",
+    "mission_id": "m-fixture-1",
+    "sequence": 1,
+    "required_extensions": [],
+    "state": "RUNNING",
+    "authority": "pi-engineering",
+    "generation": 2,
+    "last_transition": {
+      "from": "READY",
+      "to": "RUNNING",
+      "reason": "worker leased the first task",
+      "at": "2026-10-15T12:00:00Z",
+      "owner": "pi-engineering",
+      "attempt": 1
+    }
+  },
+  "tasks": [
+    {
+      "schema": "autospec.protocol.task.v1",
+      "protocol_version": 1,
+      "idempotency_key": "idem-task-1",
+      "mission_id": "m-fixture-1",
+      "sequence": 1,
+      "required_extensions": [],
+      "task_id": "t-1",
+      "depends_on": [],
+      "state": "READY",
+      "executor": "pi-local",
+      "affected_surfaces": [
+        {
+          "path": "crates/autospec-core/src/protocol/mod.rs"
+        }
+      ]
+    },
+    {
+      "schema": "autospec.protocol.task.v1",
+      "protocol_version": 1,
+      "idempotency_key": "idem-task-2",
+      "mission_id": "m-fixture-1",
+      "sequence": 2,
+      "required_extensions": [],
+      "task_id": "t-2",
+      "depends_on": ["t-1"],
+      "state": "BLOCKED",
+      "executor": "autospec-managed",
+      "affected_surfaces": [
+        {
+          "path": "schemas/"
+        }
+      ],
+      "exclusivity": "schemas"
+    }
+  ]
+}

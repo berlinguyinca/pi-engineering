@@ -31,3 +31,6 @@ npm-debug.log*
 # oh-my-claudecode hook state (written by local agent hooks)
 .omc/
 rr*.ts
+
+# T16 acceptance: local overrides never enter git
+test/e2e/acceptance.local.yaml

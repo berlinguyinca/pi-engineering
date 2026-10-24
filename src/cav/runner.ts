@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 /**
  * CAV-02 Deterministic Test Execution: normalize build/unit/integration
  * execution with machine-readable evidence.
@@ -8,9 +11,7 @@
  * evidence ledger so a step's PASS/FAIL is explainable from evidence, not
  * model prose, and fails closed on a hard failure.
  */
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { withRustBuildEnv } from "../git/rustBuildCache.ts";
+import { workerCommandEnv } from "../lifecycle/workerEnv.ts";
 import type { CavEvidenceLedger } from "./evidence.ts";
 
 const exec = promisify(execFile);
@@ -53,7 +54,7 @@ export async function runDeterministicTest(
       cwd: opts.cwd,
       timeout: 300_000,
       maxBuffer: 16 * 1024 * 1024,
-      env: await withRustBuildEnv({ ...process.env, NODE_TEST_CONTEXT: "" }, opts.cwd),
+      env: await withRustBuildEnv({ ...workerCommandEnv(), NODE_TEST_CONTEXT: "" }, opts.cwd),
     });
     stdout = res.stdout;
     stderr = res.stderr;

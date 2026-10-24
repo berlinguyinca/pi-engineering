@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { promisify } from "node:util";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { safeGitOrThrow } from "../git/safeGit.ts";
 import type { VerificationProfile, VerificationProvider, VerifyOutcome, VerifyRunOptions } from "./Verifier.ts";
-
-const execFileAsync = promisify(execFile);
 
 /**
  * The verification failures that already exist at a base commit (spec §5
@@ -137,7 +134,7 @@ function stageOf(id: string): string {
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: 8 * 1024 * 1024 });
+  const { stdout } = await safeGitOrThrow(args, { cwd, trust: "operator", maxBuffer: 8 * 1024 * 1024 });
   return stdout.trim();
 }
 

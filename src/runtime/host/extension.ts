@@ -7,7 +7,6 @@
  * here is feature code; features live in the generation.
  */
 
-import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -15,6 +14,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { safeGitSyncOut } from "../../git/safeGit.ts";
 import { SourceCache, type TrustedSource, type UpdateChannel } from "../../update/gitSource.ts";
 import { InstallLayout } from "../../update/installLayout.ts";
 import { UpdateJournal } from "../../update/journal.ts";
@@ -168,12 +168,7 @@ export function declaredEntry(dir: string): string | null {
 /** The `origin` remote of a checkout, if any. */
 export function originRemote(root: string): string | null {
   try {
-    const url = execFileSync("git", ["-C", root, "remote", "get-url", "origin"], {
-      timeout: 2000,
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .toString()
-      .trim();
+    const url = safeGitSyncOut(["remote", "get-url", "origin"], { cwd: root, timeoutMs: 2000 }).trim();
     return url || null;
   } catch {
     return null;
@@ -218,19 +213,12 @@ export function describeSource(root: string): { version: string; commit: string 
   let commit: string | null = null;
   if (existsSync(join(root, ".git"))) {
     try {
-      commit = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      })
-        .toString()
-        .trim();
-      const dirty = execFileSync("git", ["-C", root, "status", "--porcelain", "--untracked-files=no"], {
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-      })
-        .toString()
-        .trim();
+      commit = safeGitSyncOut(["rev-parse", "HEAD"], { cwd: root, timeoutMs: 2000 }).trim();
+      const dirty = safeGitSyncOut(["status", "--porcelain", "--untracked-files=no"], {
+        cwd: root,
+        timeoutMs: 2000,
+        env: { GIT_OPTIONAL_LOCKS: "0" },
+      }).trim();
       if (dirty || !/^[0-9a-f]{40}$/.test(commit)) commit = null;
     } catch {
       commit = null;
@@ -639,12 +627,7 @@ export class EngineeringHostExtension {
     if (!dir) return null;
     let root = dir;
     try {
-      root = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      })
-        .toString()
-        .trim();
+      root = safeGitSyncOut(["rev-parse", "--show-toplevel"], { cwd: dir, timeoutMs: 2000 }).trim();
     } catch {
       root = dir;
     }

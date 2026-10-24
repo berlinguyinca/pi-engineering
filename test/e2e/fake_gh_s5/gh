@@ -1,0 +1,77 @@
+#!/usr/bin/env node
+// FAKE - test shim. Not GitHub. Used only by test/e2e/s5-fork-compare-promote.e2e.test.ts (copied next to a sidecar
+// gh.config.json that names the REAL bare repository standing in for the remote). It answers exactly the `gh api`
+// calls Pi's GhCliClient makes for a promotion: list open PRs by head, create a PR, read a PR. The head SHA it reports
+// is whatever the bare repository really holds for the branch, so a PR can never claim a commit that was not pushed.
+// Every call is appended to gh.calls.log (one JSON array per line); there is deliberately no merge endpoint.
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const { execFileSync } = require("node:child_process");
+
+const dir = __dirname;
+const cfg = JSON.parse(fs.readFileSync(path.join(dir, "gh.config.json"), "utf8"));
+const statePath = path.join(dir, "gh.state.json");
+const argv = process.argv.slice(2);
+fs.appendFileSync(path.join(dir, "gh.calls.log"), `${JSON.stringify(argv)}\n`);
+
+const fail = (msg, code = 1) => {
+  process.stderr.write(`${msg}\n`);
+  process.exit(code);
+};
+if (argv[0] !== "api") fail(`unsupported fake gh command: ${argv[0]}`);
+
+let method = "GET";
+const fields = {};
+let route = "";
+for (let i = 1; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--hostname") i++;
+  else if (a === "-X") method = argv[++i];
+  else if (a === "-f" || a === "-F") {
+    const kv = argv[++i];
+    const at = kv.indexOf("=");
+    fields[kv.slice(0, at)] = kv.slice(at + 1);
+  } else if (a.startsWith("--")) continue;
+  else route = a;
+}
+
+const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, "utf8")) : { next: cfg.firstNumber, prs: {} };
+const save = () => fs.writeFileSync(statePath, JSON.stringify(state));
+const headOf = (branch) => {
+  try {
+    return execFileSync("git", ["--git-dir", cfg.bare, "rev-parse", "--verify", `refs/heads/${branch}`], { encoding: "utf8" }).trim();
+  } catch {
+    return null;
+  }
+};
+const view = (pr) => ({
+  number: pr.number,
+  state: "open",
+  merged: false,
+  title: pr.title,
+  body: pr.body,
+  draft: pr.draft,
+  html_url: `https://github.com/${cfg.repo}/pull/${pr.number}`,
+  user: { login: "fake-user" },
+  head: { sha: headOf(pr.head), ref: pr.head, repo: { full_name: cfg.repo } },
+  base: { ref: pr.base },
+});
+
+const list = new RegExp(`^repos/${cfg.repo}/pulls$`);
+const one = new RegExp(`^repos/${cfg.repo}/pulls/(\\d+)$`);
+let m;
+if (list.test(route) && method === "GET") {
+  const want = String(fields.head ?? "").split(":").slice(1).join(":");
+  process.stdout.write(JSON.stringify(Object.values(state.prs).filter((p) => p.head === want).map(view)));
+} else if (list.test(route) && method === "POST") {
+  if (!headOf(fields.head)) fail("HTTP 422: head branch is not on the remote", 1);
+  const pr = { number: state.next++, title: fields.title, body: fields.body, head: fields.head, base: fields.base, draft: fields.draft === "true" };
+  state.prs[pr.number] = pr;
+  save();
+  process.stdout.write(JSON.stringify({ number: pr.number }));
+} else if ((m = one.exec(route)) && method === "GET") {
+  const pr = state.prs[m[1]];
+  if (!pr) fail("gh: Not Found (HTTP 404)");
+  process.stdout.write(JSON.stringify(view(pr)));
+} else fail(`unsupported fake gh route: ${method} ${route}`);

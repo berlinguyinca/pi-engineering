@@ -39,6 +39,11 @@ export interface GateInput {
   /** Test files present in the change set. */
   testFilesChanged: number;
   implementationComplete?: boolean;
+  /**
+   * Extra gate items from optional integrations (e.g. AutoSpec design-gate
+   * evidence). Absent = the evaluation is exactly what it was without them.
+   */
+  extraItems?: GateItem[];
 }
 
 const BLOCKING_SEVERITIES = new Set(["blocker", "critical", "high"]);
@@ -275,6 +280,8 @@ export function evaluateGate(input: GateInput): GateEvaluation {
       ),
     );
   }
+
+  if (input.extraItems?.length) items.push(...input.extraItems);
 
   const blockers = items
     .filter((i) => !satisfied(i))

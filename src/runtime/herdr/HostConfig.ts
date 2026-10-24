@@ -198,7 +198,10 @@ export async function loadHostConfig(opts: LoadHostConfigOptions = {}): Promise<
   }
   // Everything else (404/403 from a control plane that predates the feature or was rolled back,
   // 5xx, 3xx, network errors, malformed bodies) falls back to the cache; only 401 revokes.
-  const cached = readCache(cachePath, hostId); // 
-  if (!cached) throw new HostConfigUnavailable(`control plane at ${url} unreachable or refused the request and no cached configuration exists`);
+  const cached = readCache(cachePath, hostId); //
+  if (!cached)
+    throw new HostConfigUnavailable(
+      `control plane at ${url} unreachable or refused the request and no cached configuration exists`,
+    );
   return build(url, hostId, cached.revision, cached.values, "cache");
 }

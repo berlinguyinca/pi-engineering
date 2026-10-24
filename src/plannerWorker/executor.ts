@@ -19,13 +19,12 @@
  * model disappearing never loses the mission.
  */
 
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { promisify } from "node:util";
 import type { WorkerRole } from "../core/types.ts";
 import { GitRepo, type WorktreeInfo } from "../git/GitRepo.ts";
+import { safeGit } from "../git/safeGit.ts";
 import { workerInactivityMs, workerTimeoutMs } from "../orchestration/broker.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { DEFAULT_STAGE_INACTIVITY_MS, runWithInactivityGuard } from "../verify/Verifier.ts";
@@ -80,7 +79,6 @@ import {
   type VerificationRun,
 } from "./types.ts";
 
-const exec = promisify(execFile);
 const COMMITTER = ["-c", "user.name=pi-engineering", "-c", "user.email=pi-engineering@localhost"];
 
 const IMPLEMENT_TOOLS = ["read", "grep", "find", "ls", "write", "edit", "bash"];
@@ -147,13 +145,7 @@ interface Runtime {
 }
 
 async function git(cwd: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  try {
-    const r = await exec("git", ["-C", cwd, ...args], { maxBuffer: 64 * 1024 * 1024 });
-    return { code: 0, stdout: r.stdout, stderr: r.stderr };
-  } catch (err) {
-    const e = err as { code?: number; stdout?: string; stderr?: string };
-    return { code: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? String(err) };
-  }
+  return safeGit(args, { cwd, trust: "operator", maxBuffer: 64 * 1024 * 1024 });
 }
 
 /**

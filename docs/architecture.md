@@ -166,6 +166,17 @@ root, including symlink escapes. Read tools may inspect external references.
 This file-tool guard does not sandbox arbitrary shell commands; shell isolation
 remains the responsibility of the runtime's execution environment.
 
+Git run by Pi itself against a repository a worker can write (every call in `GitRepo`, the worktree janitor, the
+change observer, post-merge reverts, `worker_result`, the result caches and review guards) goes through
+`src/git/safeGit.ts`. A worker can plant `core.fsmonitor`, hooks, `filter.*.clean/smudge/process`,
+`diff.*.textconv`, `merge.*.driver`, `commit.gpgsign` + `gpg.program`, `core.sshCommand`, credential helpers or
+`remote.*.uploadpack` in the shared `.git` (or `info/attributes`); `safeGit` rebuilds the environment, blanks every such
+key the repository defines on the command line (the operator's own global config is kept), adds
+`--no-ext-diff --no-textconv` to `diff`/`show`/`log`, and refuses fetch/push/ls-remote while a per-remote command is
+planted. `test/unit/safe-git-callers.test.ts` fails when a source file spawns `git` outside it unless the file is listed,
+with a reason, in `RAW_GIT_EXCEPTIONS`. The verifier and CAV runner intentionally run worker-authored commands (they are
+the point of a verification gate); they get a scrubbed environment (`src/lifecycle/workerEnv.ts`) but are not sandboxed.
+
 A mutating worker with a known base cannot report `completed` without a tracked
 file diff against that base. Empty or reverted commits do not count, and Git
 inspection failures require a blocked/partial report until evidence is available.

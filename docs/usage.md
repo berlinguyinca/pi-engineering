@@ -704,6 +704,65 @@ pi-engineering mission submit --store <dir> < submit.json # {result:"created", m
 pi-engineering mission observe --store <dir> < observe.json # {result:"ok", mission:<snapshot>}
 ```
 
+## Optional AutoSpec DAG, design-gate evidence and quality law
+
+Everything here is OFF unless an `autospec:` block exists in `~/.pi/agent/engineering.yaml`
+(global) or `<repo>/.pi/engineering.yaml` (repo). There are no environment variables, and
+with no block nothing from `src/integrations/autospec/` is imported, read or executed. The
+`mission submit|observe|cancel` contract is unchanged.
+
+```yaml
+autospec:
+  dag: {enabled: true}                  # global only
+  design_gate:
+    report: .autospec/reports/design-gates.json   # global only, repo-relative
+    rules_file: /path/to/autospec-design/rules.yaml  # global only: Pi's own view of vlm/review rules
+    ui_paths: ["src/ui/**"]             # global sets; a repo layer may only add
+    require_for_ui: true                # a repo layer may only turn it ON
+  quality_law:                          # global only, informational
+    profile_file: /path/to/profile.json
+    profile_id: web
+    gate_files: [/path/to/quality-gate.json]
+```
+
+- **DAG ingestion**: `pi-engineering plan --store <dir> --from-autospec <file|dir>` (a file
+  `{mission, tasks}` or a directory with `mission.json` and `tasks.json`). Refused unless
+  `autospec.dag.enabled: true` is set in the global config; a repo layer cannot enable it. It maps
+  `autospec.protocol.mission/task.v1` records to plan tasks (`depends_on` = prerequisites), keeps
+  repo-qualified issue refs (`owner/repo#N`, from the `autospec.issue_refs` extension) in
+  `execution_requirements.autospec` so they are covered by the plan digest, and fails closed on cycles
+  (iterative, at most 2000 tasks), missing dependencies, unknown *required* extensions,
+  `autospec-managed` executors, started work, odd task ids, and surfaces that are wildcards, `~`,
+  control characters or under `.git/`, `.pi/`, `.autospec/`. The plan then goes through the same T03
+  plan-review gate and policy as any other plan. Like the standalone plan it stops before any worker
+  starts; Pi stays the execution authority.
+- **Design gate evidence**: Pi never runs the design gates. It reads the report AutoSpec's
+  `autospec-design-gates.sh` wrote, **from the commit under evaluation** (`git show <sha>:<report>`);
+  an untracked or edited worktree copy is ignored. It recomputes the verdict from `gates[]`
+  (a failed `severity: blocker` gate blocks whatever its `blocking` flag says) and requires every
+  `auto` rule in Pi's vendored table (or the operator's `rules_file`) to be present. The report must
+  name the commit it was produced for (`commit_sha`, or a `design-gates.commit` sidecar); that commit
+  must be the evaluated commit or an ancestor with no UI-path change since (the report cannot name its
+  own commit, so it is normally committed one commit later). SKIPPED, missing, stale, unbound,
+  malformed or incomplete reports are "not run" / unavailable, never a pass. `vlm` and `review`
+  rules are an advisory checklist.
+  With `require_for_ui: true` the interactive completion gate blocks a UI change without valid
+  evidence, **and so does the orchestrated-mission completion gate**: it evaluates the candidate commit
+  (`CandidateEvidenceIdentity.candidateSha`) against the changed UI paths, synchronously, from a
+  committed report. A mission with several repository candidates is blocked rather than skipped.
+  Without `require_for_ui` the item is shown but never blocks. A malformed `engineering.yaml` (either layer)
+  counts as configured and blocks; it never silently switches the gate off. `ui_paths` are case-insensitive
+  anchored globs (`*` within a segment, `**` across; `dir/**` also matches `dir` itself; `? [ ] { }` are
+  rejected; use a leading `**` segment to match a file name at any depth). `report` must end in `.json`.
+- **Attestation (recommended)**: set `design_gate.attestation_key_file` (global only) to an ABSOLUTE
+  path of an owner-only (mode 0600) regular file, not a symlink, outside the repository, its top level
+  and every linked worktree; anything else is rejected. The report must then be accompanied, in the same commit, by
+  `design-gates.sig` = hex HMAC-SHA256 over `<commit_sha>\n<sha256 hex of the report bytes>`,
+  produced by the operator's trusted runner. Without a key, provenance is only "committed": a worker
+  that can commit can still commit a forged report. That is a residual trust assumption, not a fix.
+- **Quality law**: the profile's Constitution `quality_gates` are listed in the finalization
+  output as "not verified".
+
 ## Mission worker tools
 
 Mission implementer and repair workers get `read`, `edit`, `write`, `bash`,
@@ -1236,8 +1295,7 @@ the inspector says `not recorded`. Model messages and private reasoning are neve
 previews. These previews appear in inspection, not compact bars or HerdR attention notifications.
 
 The mission refresh timer stops for completed, failed, canceled or operator-paused missions and
-on runtime shutdown. Local footer refreshes do not create repeated notices. With the existing
-`HERDR_INGEST_URL` integration configured, HerdR receives one attention event when a mission
+on runtime shutdown. Local footer refreshes do not create repeated notices. With the `herdr:` block of the global `engineering.yaml` configured (see "Herdr connection" below), HerdR receives one attention event when a mission
 finishes, fails/crashes, or becomes stalled. Routine progress and heartbeats do not notify HerdR;
 a recovered mission can alert again if it stalls again. Reconnecting seeds current state without
 re-alerting about historical terminal or stalled missions.
@@ -1251,6 +1309,45 @@ Planner-worker missions also update their persistent widget/status once per seco
 `/engineering-workers [task]` to inspect a task's bounded recent activity, changed files and
 recorded result/blocker, or `/engineering-status` for the current activity summary. Verified
 contract counts determine percentage; live timers do not advance it.
+
+### Herdr connection (global `engineering.yaml` only, no environment variables)
+
+One block configures every Pi-to-Herdr path (attention events, lineage, steering, forks). It is read from the
+GLOBAL `engineering.yaml` in Pi's agent directory only; a repository file cannot set it, and the old
+`HERDR_INGEST_URL`, `HERDR_INGEST_API_KEY` and `HERDR_HOST_ID` variables are no longer read. If one of them is set,
+Pi prints an error to stderr (once per process) saying so; there is no silent fallback.
+
+```yaml
+herdr:
+  url: https://herdr.example.org       # https, or http only for localhost / 127.0.0.1 / ::1
+  api_key_file: /home/me/.config/herdr/key   # absolute path, mode 0600, owned by you, one line
+  instance_id: pi-laptop-1             # optional: names this Pi when several share one key
+  lineage: true                        # optional (default false): emit typed lineage events
+  visibility: room                     # optional: private | mission | room | org (default private)
+  room_id: room-abc                    # optional: stamped on every lineage event (Herdr lineage_key_scopes)
+  workspace_id: ws-1                   # optional
+  mission_id: m-1                      # optional default mission for events that carry none
+```
+
+Absent block means Pi does not talk to Herdr at all. The key is read from the file, never logged, and is not placed
+in the environment of anything Pi starts. Commands whose text a worker can author (the verifier's check commands,
+CAV test runs) run with a scrubbed environment: every `HERDR_*` variable, GitHub tokens, `SSH_AUTH_SOCK` and
+anything named `*_API_KEY`, `*_SECRET` or `*_PASSWORD` are removed.
+
+Sequence recovery: Herdr orders each source by `source_sequence`. If Pi's sequence file is lost or restored from an
+older copy, Pi lifts the counter above its own outbox, and on a `409` naming a taken sequence it learns the server's
+high-water mark (`reason: "sequence_conflict"` and `last_sequence` in the 409 body when Herdr sends them, otherwise the message text and `GET /api/v1/ingest/sources`),
+resumes above it and re-numbers the pending events; nothing is dropped. When that cannot be done, the event is
+dead-lettered with an error notice and `conflictDeadLettered` in the ingest diagnostics.
+
+Steering requests are judged on Herdr's clock (the `Date` header of the poll response plus monotonic time since),
+not on Pi's wall clock. A request that names a digest (`expected_digest`) is applied (redirect, resume, fork, promote)
+only while the target's current plan digest equals it, and is answered `stale` when Pi cannot compute one. Today Herdr
+sends `expected_digest` only on `approve`/`reject`, which Pi answers `unsupported` (gate decisions are not taken from
+steering), so in practice the digest check guards nothing that is applied yet; it is there so a Herdr that starts
+sending it on the other actions cannot be trusted by accident. Herdr's `fence` is an opaque hash Pi cannot recompute:
+it is compared only where a runtime supplies a fence for the target (none does today) and is always recorded in the
+at-most-once ledger.
 
 External web consumers receive additive `waitingSince`, `lastOutputAt`,
 `currentActivityStartedAt` and worker timing fields in the mission snapshot. They should derive
