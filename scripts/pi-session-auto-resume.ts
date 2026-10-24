@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /** Installed by install-session-auto-resume.ts; delegates to the existing Pi CLI. */
-import { realpathSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { appendFileSync, mkdirSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -54,5 +56,45 @@ if (prepared.recovering) {
   );
   if (prepared.waitMs > 0) await setTimeout(prepared.waitMs);
 }
-process.argv = [process.argv[0]!, cli, ...prepared.argv];
-await import(pathToFileURL(cli).href);
+// Runtime selection (pi_runtime in engineering.yaml). Decided HERE, before Pi starts: any problem
+// leaves standard Pi in place. A runtime that has started is never replayed on another one.
+let decision: import("../src/runtime/piRuntime.ts").LaunchDecision | null = null;
+const agentDir = process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi/agent");
+try {
+  const { decideLaunchRuntime } = await import("../src/runtime/piRuntime.ts");
+  decision = await decideLaunchRuntime(process.cwd(), agentDir, process.env);
+  if (decision) {
+    mkdirSync(agentDir, { recursive: true });
+    appendFileSync(
+      resolve(agentDir, "runtime-selection.jsonl"),
+      `${JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...decision })}\n`,
+    );
+    if (decision.fallbackReason) {
+      // Seen by the agent that starts in this process, so it can report why it is on standard Pi.
+      process.env.PI_RUNTIME_FALLBACK_REASON = decision.fallbackReason;
+      process.stderr.write(
+        `[pi runtime] ${decision.requested} unavailable, using standard Pi: ${decision.fallbackReason}\n`,
+      );
+    }
+  }
+} catch (error) {
+  decision = null;
+  process.stderr.write(`[pi runtime] Selection skipped: ${error instanceof Error ? error.message : String(error)}\n`);
+}
+if (decision?.binary) {
+  const child = spawn(decision.binary, prepared.argv, {
+    stdio: "inherit",
+    env: { ...process.env, PI_RUNTIME_KIND: decision.runtime, PI_RUNTIME_SOURCE: decision.source },
+  });
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => child.kill(sig));
+  child.on("error", (error) => {
+    // Failed to start at all (nothing ran): the only case where standard Pi may still take over.
+    process.stderr.write(`[pi runtime] ${decision.runtime} did not start (${error.message}); using standard Pi\n`);
+    process.argv = [process.argv[0]!, cli, ...prepared.argv];
+    void import(pathToFileURL(cli).href);
+  });
+  child.on("exit", (code, signal) => process.exit(code ?? (signal ? 128 + (signal === "SIGINT" ? 2 : 15) : 1)));
+} else {
+  process.argv = [process.argv[0]!, cli, ...prepared.argv];
+  await import(pathToFileURL(cli).href);
+}

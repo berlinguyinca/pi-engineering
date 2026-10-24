@@ -394,6 +394,8 @@ export class ControlPlaneIngest {
       name?: string;
       /** Bare herdr pane id; the control plane stores this one today. */
       paneId?: string;
+      /** Which Pi binary this agent runs on, plus engine/CPU/RSS (see `runtimeFacts`). Runtime metrics only. */
+      runtime?: Record<string, unknown>;
     } = {},
   ): Promise<boolean> {
     const missionId = payload.missionId ?? this.defaultMissionId;
@@ -408,6 +410,7 @@ export class ControlPlaneIngest {
       ...(payload.parentSessionId ? { parent_session_id: payload.parentSessionId } : {}),
       ...(payload.name ? { name: payload.name } : {}),
       ...(payload.paneId ? { pane_id: payload.paneId } : {}),
+      ...(payload.runtime ? { runtime: payload.runtime } : {}),
     });
   }
 }

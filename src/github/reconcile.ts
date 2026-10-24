@@ -221,7 +221,12 @@ export async function reconcileGithubLinks(
       }
       apply(
         present({
-          observed: { state: observed.state, headSha: observed.headSha, observedAt: now() },
+          observed: {
+            state: observed.state,
+            headSha: observed.headSha,
+            ...(observed.author ? { author: observed.author } : {}),
+            observedAt: now(),
+          },
           ...(epoch !== undefined ? { epoch } : {}),
         }),
         recover && !changed

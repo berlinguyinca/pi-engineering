@@ -58,6 +58,8 @@ export interface GhPullRequest {
   bodyTruncated: boolean;
   state: "open" | "closed" | "merged";
   headSha: string;
+  /** PR author's login when GitHub reports a well-formed one (untrusted, bounded). */
+  author?: string;
   headRef: string;
   baseRef: string;
   url: string;
@@ -186,6 +188,12 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+/** A GitHub login (optionally a `[bot]` account); anything else is dropped rather than trusted. */
+function authorLogin(user: unknown): string | undefined {
+  const login = str(asRecord(user).login);
+  return /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?$/.test(login) ? login : undefined;
+}
+
 export class GhCliClient implements GithubClient {
   readonly id = "gh-cli";
   private readonly run: GhRunner;
@@ -277,6 +285,7 @@ export class GhCliClient implements GithubClient {
       bodyTruncated: parseableBody(raw.body).truncated,
       state,
       headSha: headSha.toLowerCase(),
+      ...(authorLogin(raw.user) ? { author: authorLogin(raw.user) as string } : {}),
       headRef: boundTitle(head.ref).slice(0, 255),
       baseRef: boundTitle(base.ref).slice(0, 255),
       url: str(raw.html_url).slice(0, 500),
