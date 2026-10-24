@@ -139,11 +139,16 @@ test("config enables the feed with NO env vars; URL and key come from the host c
   assert.ok(handle);
   pi.fire("session_start", { reason: "startup" });
   await drain(handle);
-  assert.equal(h.ingest[0]?.url, "http://cp.lan/api/v1/ingest");
-  assert.equal(h.ingest[0]?.headers["x-api-key"], "ing-key");
-  assert.equal(h.ingest[0]?.body.entity_type, "inspector");
-  assert.equal(h.ingest[0]?.body.entity_id, "pane-env");
-  assert.equal(h.ingest[0]?.body.event_type, "inspector.batch");
+  const posts = h.ingest.filter((i: any) => i.body.entity_type === "inspector");
+  assert.equal(posts[0]?.url, "http://cp.lan/api/v1/ingest");
+  assert.equal(posts[0]?.headers["x-api-key"], "ing-key");
+  assert.equal(posts[0]?.body.entity_type, "inspector");
+  assert.equal(posts[0]?.body.entity_id, "pane-env");
+  assert.equal(posts[0]?.body.event_type, "inspector.batch");
+  // the runtime report rides the same ingest as a session record, not as an inspector batch
+  const runtime = h.ingest.find((i: any) => i.body.entity_type === "session");
+  assert.equal(runtime?.body.entity_id, "pane-env");
+  assert.equal(runtime?.body.payload.runtime.runtime_kind, "standard-pi");
   handle.dispose();
 });
 
