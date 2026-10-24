@@ -297,8 +297,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
         // Fall back to the opaque target; provisioning is best-effort.
       }
     }
-    // Worker identity for the launcher's runtime selection (pi_runtime role/mission overrides). Best-effort:
-    // without it the launcher simply sees an agent with no role or mission and uses the default runtime.
+    // Worker identity for the runtime report (role/mission shown on the dashboard session row). Best-effort:
+    // without it the agent is simply reported with no role or mission.
     if (this.cli.exportEnv) {
       const vars: Record<string, string> = { PI_ENGINEERING_ROLE: rec.worker.role };
       if (rec.worker.missionId) vars.PI_ENGINEERING_MISSION_ID = rec.worker.missionId;

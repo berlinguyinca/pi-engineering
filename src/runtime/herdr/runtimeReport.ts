@@ -3,7 +3,7 @@
  * Best-effort and non-blocking like every other ingest call; runtime metrics only (inference metrics stay
  * in the inference telemetry). Sent once at start and then on a slow interval so CPU/RSS stay current.
  */
-import { runtimeFacts } from "../piRuntime.ts";
+import { runtimeFacts } from "../runtimeFacts.ts";
 import type { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 
 export interface RuntimeReporter {
@@ -23,7 +23,7 @@ export function reportRuntimeFacts(
       .session(sessionId, "session.updated", {
         ...(missionId ? { missionId } : {}),
         ...(role ? { agentRole: role } : {}),
-        runtime: runtimeFacts(env) as unknown as Record<string, unknown>,
+        runtime: runtimeFacts() as unknown as Record<string, unknown>,
       })
       .catch(() => {});
   send();
