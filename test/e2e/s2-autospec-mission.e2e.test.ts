@@ -271,14 +271,28 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     assert.deepEqual(store.listPlanRevisions(missionId), [], "unreviewed means no review revision was recorded");
   });
 
-  it("GAP: the plan CLI itself writes nothing to Herdr (planCli never builds a lineage emitter), so the mission is absent from the graph", async () => {
-    const sources = Object.keys(await plane.sources());
-    assert.deepEqual(
-      sources.filter((s) => s.includes("pi")),
-      [],
-      "no Pi source has registered after the CLI ran with a configured herdr: block",
+  it("the plan CLI itself writes the mission and the DAG to Herdr (planCli builds the YAML lineage emitter): a Pi source registered, the mission and its tasks are in the graph", async () => {
+    const sources = Object.keys(await plane.sources("operator"));
+    assert.ok(
+      sources.some((s) => s.includes("pi")),
+      `a Pi source registered: ${sources.join(",")}`,
     );
-    assert.equal((await plane.node(`mission:${missionId}`)).status, 404);
+    // org scope: readable by an ordinary (viewer) key, which is not the operator bypass
+    const mission = await plane.node(`mission:${missionId}`, "viewer");
+    assert.equal(mission.status, 200, JSON.stringify(mission.body));
+    assert.equal(mission.body.node.attrs.source, "autospec");
+    for (const t of ["t-1", "t-2", "t-3"]) {
+      const n = await plane.node(`task:${missionId}/${t}`, "viewer");
+      assert.equal(n.status, 200, t);
+      assert.equal(n.body.node.state, "pending");
+    }
+    const deps = (await plane.edges(`task:${missionId}/t-1`, "viewer")).filter(([t]) => t === "dependency");
+    assert.deepEqual(deps.map(([, from, to]) => [from, to]).sort(), [
+      [`task:${missionId}/t-2`, `task:${missionId}/t-1`],
+      [`task:${missionId}/t-3`, `task:${missionId}/t-1`],
+    ]);
+    // negative control: a task the DAG never had is absent
+    assert.equal((await plane.node(`task:${missionId}/t-99`, "viewer")).status, 404);
   });
 
   // ------------------------------------------------------------------------------------------ worktrees + spawn
@@ -402,11 +416,19 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     );
   });
 
-  it("GAP: the issue ids of the DAG (acme/widgets#12, acme/other#3) never become issue nodes or issue_link edges in Herdr", async () => {
-    // positive control above: the task->PR link exists. The DAG's own issue refs have no runtime emitter caller.
+  it("the DAG's own issue ids (acme/widgets#12, acme/other#3) are issue nodes and issue_link edges from their task, written by the plan CLI", async () => {
     for (const id of ["issue:github.com/acme/widgets#12", "issue:github.com/acme/other#3"]) {
-      assert.equal((await plane.node(id)).status, 404, id);
+      const n = await eventually(async () => {
+        const r = await plane.node(id, "viewer");
+        return r.status === 200 ? r : false;
+      }, id);
+      assert.ok(n.body.node.state == null, "no state was invented: Pi has not asked GitHub");
+      assert.ok(n.body.node.attrs.number);
+      const links = (await plane.edges(id, "viewer")).filter(([t]) => t === "issue_link");
+      assert.deepEqual(links, [["issue_link", `task:${missionId}/t-1`, id]]);
     }
+    // cross-repo issues stay two distinct nodes; a ref the DAG never carried is absent
+    assert.equal((await plane.node("issue:github.com/acme/widgets#99", "viewer")).status, 404);
   });
 
   it("GAP: no CI validation node, no 'validated' edge and no dependency edge is emitted for the PR by any runtime path", async () => {

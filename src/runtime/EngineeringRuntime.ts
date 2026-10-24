@@ -33,6 +33,7 @@ import { selectExternalMissionsToStart } from "../orchestration/externalStartSel
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { MAINTENANCE_STOP_REASON, OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
+import { emitMissionPlanned } from "../orchestration/missionLineage.ts";
 import { readAutospecFlags } from "../orchestration/missionMode.ts";
 import {
   PlannerTransientError,
@@ -53,7 +54,7 @@ import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
-import { gatePlanBeforeWorkers } from "../orchestration/planReview.ts";
+import { type PlanLineageEmitter, gatePlanBeforeWorkers } from "../orchestration/planReview.ts";
 import { loadPlanReviewSettings } from "../orchestration/planReviewConfig.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import {
@@ -1620,6 +1621,13 @@ export class EngineeringRuntime {
           });
         }
         if (planReviewSettings && rt.missionStore && !planned.clarification && planned.tasks.length > 0) {
+          // Herdr projection: the mission node first (the plan's `produced` edge needs it), then the gate's own
+          // revision / decision events through the same emitter. Null without a configured `herdr:` block.
+          emitMissionPlanned(opts.lineage, {
+            missionId: mission.mission_id,
+            title: mission.title || mission.goal.slice(0, 80),
+            source: "standalone",
+          });
           const gated = await gatePlanBeforeWorkers({
             // Changes requested: plan again with the reviewer's feedback as input.
             // The single-task fallback carries the feedback too, so the revision
@@ -1633,6 +1641,7 @@ export class EngineeringRuntime {
               return replanned.tasks.length > 0 ? replanned.tasks : revision.tasks;
             },
             ...planReviewSettings,
+            emitter: (planReviewSettings as { emitter?: PlanLineageEmitter | null }).emitter ?? opts.lineage ?? null,
             missionId: mission.mission_id,
             goal: mission.goal,
             plan: async () => planned.tasks,

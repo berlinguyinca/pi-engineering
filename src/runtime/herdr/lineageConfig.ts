@@ -100,6 +100,12 @@ export async function loadLineageEmitter(
     log?: (line: string) => void;
     /** Directory holding the global engineering.yaml; default Pi's agent dir. */
     agentDir?: string;
+    /**
+     * Only the global engineering.yaml `herdr:` block may turn lineage on; the fleet host-config path (which fetches
+     * from a control plane named by `host.json`) is not tried. The short-lived CLIs use this: no `herdr:` block
+     * means no emitter and no network, whatever else is installed on the machine.
+     */
+    yamlOnly?: boolean;
   } = {},
 ): Promise<LineageEmitter | null> {
   // The global YAML `herdr:` block wins when it turns lineage on; otherwise the host-config path below.
@@ -116,6 +122,7 @@ export async function loadLineageEmitter(
   } catch {
     // fall through to the host-config path
   }
+  if (opts.yamlOnly) return null;
   try {
     const host = await loadHostConfig({
       timeoutMs: 1500,

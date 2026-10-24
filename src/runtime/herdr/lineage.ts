@@ -143,6 +143,7 @@ function nonEmpty(value: unknown): value is string {
 }
 
 const KIND_SET: ReadonlySet<string> = new Set(LINEAGE_NODE_KINDS);
+const LINEAGE_EVENT_TYPES: ReadonlySet<string> = new Set(["node.upsert", "node.state", "edge.add", "edge.remove"]);
 const EDGE_SET: ReadonlySet<string> = new Set(LINEAGE_EDGE_TYPES);
 
 /** Longest id (after the `kind:` prefix) and label that are sent as-is. */
@@ -678,7 +679,8 @@ export class LineageEmitter {
     idParts: readonly unknown[],
     scope: LineageScope,
     at?: string | Date,
-  ): void {
+    extra: Pick<EnvelopeDraft, "evidence_refs"> = {},
+  ): Promise<void> {
     try {
       const draft: EnvelopeDraft = {
         // Deliberately NOT event_id_derived: the store must keep this id so a retry dedupes.
@@ -691,6 +693,7 @@ export class LineageEmitter {
         ...this.defaultScope,
         ...scope,
         ...(this.visibility ? { visibility_scope: this.visibility } : {}),
+        ...extra,
       };
       this.counters.emitted++;
       const pending = Promise.resolve(this.sink.stage(draft)).then(
@@ -699,8 +702,53 @@ export class LineageEmitter {
       );
       this.inflight.add(pending);
       void pending.then(() => this.inflight.delete(pending));
+      return pending;
     } catch (error) {
       this.fail(error);
+      return Promise.resolve();
+    }
+  }
+
+  /**
+   * Stage a lineage draft that a caller built itself (the plan-review gate does: see `PlanLineageEmitter`) THROUGH
+   * this emitter, so it gets the same room/workspace/mission default scope, visibility, `instance_id` stamp, host
+   * label and keyed event id as every other event. Never throws; resolves once the sink settled, so a short-lived
+   * CLI can wait for it. A malformed draft is dropped and counted, never repaired.
+   */
+  stage(draft: EnvelopeDraft): Promise<void> {
+    try {
+      const type = draft.event_type;
+      if (draft.entity_type !== LINEAGE_ENTITY_TYPE || !LINEAGE_EVENT_TYPES.has(type) || !draft.event_id) {
+        this.drop();
+        return Promise.resolve();
+      }
+      let payload = draft.payload;
+      if (type === "node.upsert") {
+        const given = (payload.attrs as Record<string, unknown> | undefined) ?? undefined;
+        const attrs = this.withHost(this.instanceId ? { ...given, instance_id: this.instanceId } : given);
+        payload = attrs ? { ...payload, attrs } : payload;
+      } else if (type === "edge.add") {
+        const attrs = this.withHost(payload.attrs as Record<string, unknown> | undefined);
+        payload = attrs ? { ...payload, attrs } : payload;
+      }
+      const scope: LineageScope = {
+        ...(draft.mission_id ? { mission_id: draft.mission_id } : {}),
+        ...(draft.task_id ? { task_id: draft.task_id } : {}),
+        ...(draft.agent_id ? { agent_id: draft.agent_id } : {}),
+        ...(draft.workspace_id ? { workspace_id: draft.workspace_id } : {}),
+      };
+      return this.send(
+        type,
+        draft.entity_id,
+        payload,
+        [draft.event_id],
+        scope,
+        draft.occurred_at,
+        draft.evidence_refs ? { evidence_refs: draft.evidence_refs } : {},
+      );
+    } catch (error) {
+      this.fail(error);
+      return Promise.resolve();
     }
   }
 }

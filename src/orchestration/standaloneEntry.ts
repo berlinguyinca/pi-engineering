@@ -23,6 +23,8 @@ import { join, resolve } from "node:path";
 import { createHerdrPlannotatorTransport } from "../platform/HerdrPlannotatorTransport.ts";
 import { PlannotatorAdapter } from "../platform/Plannotator.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
+import type { LineageEmitter } from "../runtime/herdr/lineage.ts";
+import { type PlanCliLineageDeps, emitMissionPlanned, loadPlanCliLineage } from "./missionLineage.ts";
 import { assertRootMissionAllowed } from "./missionMode.ts";
 import { MissionStore } from "./missionStore.ts";
 import type { PlanTaskInput } from "./orchestrator.ts";
@@ -43,7 +45,8 @@ export interface StandalonePlanIo {
 }
 
 export interface StandalonePlanDeps
-  extends Pick<PlanGateInput, "adapter" | "emitter" | "replan" | "now" | "maxRevisions"> {
+  extends Pick<PlanGateInput, "adapter" | "emitter" | "replan" | "now" | "maxRevisions">,
+    Omit<PlanCliLineageDeps, "emitter"> {
   /** Policy modes by risk class; the CLI flags add an override on top. */
   policy?: PlanReviewPolicyConfig;
   /** Directory whose `.pi/engineering.yaml` is the repo layer (default: the process cwd). */
@@ -217,6 +220,7 @@ export async function runStandalonePlan(
     err(`cannot open the store in ${dir}: ${error instanceof Error ? error.message : String(error)}\n`);
     return 3;
   }
+  let lineage: LineageEmitter | null = null;
   try {
     const store = MissionStore.open(backend);
     if (!store.getMission(missionId)) {
@@ -243,6 +247,14 @@ export async function runStandalonePlan(
     }
     let result: PlanGateResult;
     let notes: string[] = [];
+    // Herdr projection (T16 wiring): only when the GLOBAL engineering.yaml has an enabled `herdr:` block. Absent, this
+    // is null and nothing below sends anything anywhere.
+    lineage = await loadPlanCliLineage(env, deps);
+    emitMissionPlanned(lineage, {
+      missionId,
+      title: typeof body.title === "string" && body.title ? body.title : goal.slice(0, 80),
+      source: "standalone",
+    });
     try {
       const configured =
         deps.adapter === undefined && deps.policy === undefined && !pluggedAdapter
@@ -259,6 +271,7 @@ export async function runStandalonePlan(
         { missionId, goal, tasks },
         {
           ...deps,
+          ...(lineage ? { emitter: lineage } : {}),
           ...(mergedPolicy ? { policy: mergedPolicy } : {}),
           ...(pluggedAdapter
             ? { adapter: pluggedAdapter }
@@ -303,6 +316,8 @@ export async function runStandalonePlan(
     err(`${error instanceof Error ? error.message : String(error)}\n`);
     return 3;
   } finally {
+    // The CLI exits right after this: let the (bounded, best-effort) delivery settle. It never changes the exit code.
+    await lineage?.idle().catch(() => undefined);
     backend.close();
   }
 }

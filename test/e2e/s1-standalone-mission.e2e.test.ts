@@ -39,7 +39,7 @@ interface PlanRun {
 function runPlan(
   args: string[],
   body: unknown,
-  o: { agentDir: string; cwd: string; allowSpawnUnder?: string },
+  o: { agentDir: string; cwd: string; allowSpawnUnder?: string; guard?: boolean },
 ): Promise<PlanRun> {
   return new Promise((res, rej) => {
     const env: Record<string, string> = {
@@ -50,7 +50,10 @@ function runPlan(
       PI_ENGINEERING_HOME: join(o.cwd, "home"),
       ...(o.allowSpawnUnder ? { TEST_ALLOW_SPAWN_UNDER: o.allowSpawnUnder } : {}),
     };
-    const child = spawn(process.execPath, ["--import", GUARD, join(PI, "scripts/pi-engineering.ts"), "plan", ...args], {
+    // `guard: false` is for the runs that are CONFIGURED to talk to the real plane (a `herdr:` block): the guard would
+    // block exactly the loopback traffic under test. Every run without a `herdr:` block keeps the guard.
+    const preload = o.guard === false ? [] : ["--import", GUARD];
+    const child = spawn(process.execPath, [...preload, join(PI, "scripts/pi-engineering.ts"), "plan", ...args], {
       cwd: o.cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -309,7 +312,7 @@ describe("scenario 1 / worker spawn, review evidence and the Herdr graph (real p
     roomId = (await plane.makeRoom("alice", "s1", "s1-room")).roomId;
     ws = workdir("graph");
     writeAgentDir(ws.agentDir, { url: plane.url, key: plane.keys.pi as string, roomId, instance: "pi-s1" });
-    const r = await runPlan(["--store", ws.store], LOW, ws);
+    const r = await runPlan(["--store", ws.store], LOW, { ...ws, guard: false });
     assert.equal(r.code, 0, r.stderr);
     mission = r.json.missionId;
     planRun = r;
@@ -525,19 +528,49 @@ describe("scenario 1 / worker spawn, review evidence and the Herdr graph (real p
     assert.equal(keyed.status, 404, "no review node exists for the stored review evidence");
   });
 
-  it("GAP: the plan revision, digest and Plannotator decision do not reach Herdr from the CLI (planStandalone supports an emitter, runStandalonePlan wires none)", async () => {
+  it("the plan revision, digest and Plannotator decision reach Herdr FROM THE CLI: mission and plan nodes bound to the digest, a produced edge, and an approval as a reviewed edge on the same digest", async () => {
+    const hoodOf = (id: string) =>
+      plane.c("GET", `/graph/nodes/${encodeURIComponent(id)}/neighborhood?depth=1`, { user: "alice" });
+    // 1. the skipped-by-policy plan of the graph workdir (the CLI wrote it; no test code emitted anything)
     const planNode = `plan:${mission}/${planRun.json.revision}`;
-    const r = await plane.call("GET", `/api/v1/graph/nodes/${encodeURIComponent(planNode)}`, { key: "operator" });
-    assert.equal(r.status, 404, "if this fails the gap is closed: assert the digest on the node instead");
-    // the digest is nevertheless durable in Pi's own ledger (the evidence exists, it is just not projected)
-    const be = await JsonlEventStore.open(join(ws.store, "orchestration.jsonl"), { readOnly: true } as never).catch(
-      () => null,
+    const n = await eventually(async () => {
+      const r = await read(planNode, "alice");
+      return r.status === 200 ? r : false;
+    }, "the plan node written by the CLI");
+    assert.equal(n.body.node.attrs.plan_digest, planRun.json.planDigest, "the node carries the CLI's digest");
+    assert.equal(n.body.node.attrs.risk_class, planRun.json.riskClass);
+    assert.equal(n.body.node.state, "proceeding", "skipped by policy: allowed to proceed, not 'approved'");
+    const m = await read(`mission:${mission}`, "alice");
+    assert.equal(m.status, 200, "the CLI defined the mission node the produced edge needs");
+    assert.equal(m.body.node.label, "tidy the docs");
+    const produced = ((await hoodOf(planNode)).body.edges ?? []).filter((e: any) => e.edge_type === "produced");
+    assert.deepEqual(
+      produced.map((e: any) => [e.from_id, e.to_id]),
+      [[`mission:${mission}`, planNode]],
     );
-    if (be) {
-      const s = MissionStore.open(be);
-      assert.equal(s.listPlanRevisions(mission)[0]?.planDigest, planRun.json.planDigest);
-      be.close();
-    }
+    // paired negative: the same read by a signed-in non-member answers like an absent node
+    assert.equal((await read(planNode, "bob")).status, 404);
+
+    // 2. a Plannotator approval on the exact digest is a `reviewed` edge bound to that digest
+    const fake2 = makeFakePlannotator();
+    fake2.setMode("approve");
+    const w = workdir("graph-approved");
+    writeAgentDir(w.agentDir, { url: plane.url, key: plane.keys.pi as string, roomId, instance: "pi-s1-plan" });
+    const ok = await runPlan(["--store", w.store, "--plannotator-command", fake2.command], MEDIUM, {
+      ...w,
+      allowSpawnUnder: fake2.dir,
+      guard: false,
+    });
+    assert.equal(ok.code, 0, ok.stderr);
+    assert.equal(ok.json.outcome, "approved");
+    const approvedPlan = `plan:${ok.json.missionId}/${ok.json.revision}`;
+    const edges = ((await hoodOf(approvedPlan)).body.edges ?? []).filter((e: any) => e.edge_type === "reviewed");
+    assert.equal(edges.length, 1, JSON.stringify(edges));
+    assert.equal(edges[0].attrs.plan_digest, ok.json.planDigest);
+    assert.equal(edges[0].attrs.decision, "approved");
+    assert.equal((await read(approvedPlan, "alice")).body.node.state, "approved");
+    // the digest the bridge reviewed is the digest Herdr holds
+    assert.equal(fake2.calls().at(-1), (await read(approvedPlan, "alice")).body.node.attrs.plan_digest);
   });
 
   it("the whole outbox drained: nothing pending, nothing rejected, nothing dead-lettered", async () => {
