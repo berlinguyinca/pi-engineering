@@ -408,7 +408,10 @@ describe("gatePlanBeforeWorkers", () => {
     assert.equal(reviewed[1]?.attrs.plan_digest, revs[1]?.planDigest);
     assert.equal(reviewed[0]?.attrs.plan_digest, revs[0]?.planDigest);
     assert.ok(drafts.every((d) => d.entity_type === "lineage" && d.mission_id === "M14" && d.event_id));
-    assert.equal(new Set(drafts.map((d) => d.event_id)).size, drafts.length, "event ids are unique");
+    // the mission ensure is re-staged for every revision under ONE id on purpose: Herdr dedupes the replay
+    const ids = drafts.map((d) => d.event_id);
+    const repeated = ids.filter((id, i) => ids.indexOf(id) !== i);
+    assert.deepEqual(repeated, ["plan-M14-mission"], "the only repeated id is the idempotent mission ensure");
 
     const none = new MemoryPlanLedger();
     await gatePlanBeforeWorkers({ missionId: "M15", goal: "g", plan: async () => LOW(), ledger: none });
