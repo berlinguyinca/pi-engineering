@@ -52,6 +52,8 @@ import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
+import { gatePlanBeforeWorkers } from "../orchestration/planReview.ts";
+import { loadPlanReviewSettings } from "../orchestration/planReviewConfig.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import {
   DEFAULT_MISSION_RECOVERY_CEILING,
@@ -87,6 +89,7 @@ import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "
 import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
 import { resolveWorktreeIdentity } from "./isolation/WorktreeIdentity.ts";
@@ -456,6 +459,12 @@ export interface RuntimeMissionActivityEvent {
 
 export interface EngineeringRuntimeOptions {
   cwd: string;
+  /**
+   * Optional lineage emitter (T02): mission executions, handoffs and verified
+   * checkpoints are reported as typed lineage events. Absent (the default) Pi
+   * emits nothing and behaves exactly as before.
+   */
+  lineage?: LineageEmitter;
   worker?: WorkerExecutor;
   /**
    * Optional distinct worker for the independent review + clean-room challenger
@@ -552,6 +561,16 @@ export interface EngineeringRuntimeOptions {
     mission: import("../orchestration/types.ts").Mission,
     risk: import("../orchestration/types.ts").RiskProfile,
   ) => Promise<PlanTaskInput[]>;
+  /**
+   * Pre-implementation plan gate (T03). Off unless given. When set, the default
+   * planner's tasks pass through {@link gatePlanBeforeWorkers} before any worker
+   * starts: risk-based skip | offer | require review bound to the plan digest.
+   * A blocked plan yields no tasks (fail closed) and an open finding that says why.
+   */
+  planReview?: Pick<
+    import("../orchestration/planReview.ts").PlanGateInput,
+    "adapter" | "policy" | "emitter" | "replan" | "maxRevisions"
+  > & { configNotes?: string[] };
   /**
    * Optional autonomous spec approval hook (design 2026-09-28). When provided,
    * material mutations are reviewed/refined/approved and their tasks are
@@ -1272,6 +1291,7 @@ export class EngineeringRuntime {
       rt.orchestrationPath = orchestrationPath;
       rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
       openedMissionStores.set(orchestrationPath, rt.missionStore);
+      if (opts.lineage) rt.missionStore.setLineage(opts.lineage);
       rt.ownershipId = `session-${session.sessionId}-${randomUUID()}`;
       liveOwnerIds().add(rt.ownershipId);
       rt.missionOwnership = new MissionOwnership(rt.missionStore, {
@@ -1478,6 +1498,10 @@ export class EngineeringRuntime {
       // derived from the workflow, never assumed. (Dogfood caught the planner
       // hardcoding mutates_repo:true, which let a read-only "why is this failing?"
       // request write to the repository.)
+      // Plan review is opt-in: an explicit option, else the `plan_review` block of
+      // the repo's engineering.yaml; absent means OFF and nothing below changes.
+      const planReviewSettings =
+        opts.planReview !== undefined ? opts.planReview : await loadPlanReviewSettings(repoRoot, opts.agentDir);
       const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
         const mutates = workflowMutatesRepo(mission.workflow_class);
         const acceptanceIds = mission.acceptance_criteria.flatMap((criterion) =>
@@ -1505,46 +1529,48 @@ export class EngineeringRuntime {
         // Non-trivial goals get ONE planner call (PLANNER_PROMPT) on the best
         // "planner"-routed model so independent work gets real write domains;
         // a malformed plan falls back to the single task and never blocks.
-        const planned = await planMission({
-          goal: mission.goal,
-          mutates,
-          mode: missionPlannerMode(),
-          acceptanceIds,
-          single,
-          ...plannerScope(rt.missionStore?.getWorkspaceManifest(mission.mission_id), repoRoot),
-          runPlanner: async (task) => {
-            const route = await routeModel?.("planner", { missionId: mission.mission_id }).catch(() => undefined);
-            // Bounded: a hard timeout aborts the one call; thinking is allowed
-            // for role "planner" (thinkingPolicy) and the role's token budget applies.
-            const abort = new AbortController();
-            const timer = setTimeout(() => abort.abort(), plannerTimeoutMs());
-            try {
-              const run = await rt.worker.run({
-                role: "planner",
-                task,
-                tools: READ_ONLY_TOOLS,
-                cwd: repoRoot,
-                signal: abort.signal,
-                maxContextTokens: ROLE_BUDGETS.planner.hardMaxTokens,
-                ...(route ? { modelOverride: { provider: route.provider, id: route.id } } : {}),
-              });
-              if (abort.signal.aborted) throw new Error(`planner timed out after ${plannerTimeoutMs()} ms`);
-              if (run.error) {
-                if (run.error.startsWith("transient:") || classifyError(run.error).retryable) {
-                  throw new PlannerTransientError(run.error);
+        const planWith = (planGoal: string, objective: string) =>
+          planMission({
+            goal: planGoal,
+            mutates,
+            mode: missionPlannerMode(),
+            acceptanceIds,
+            single: () => ({ ...single(), objective }),
+            ...plannerScope(rt.missionStore?.getWorkspaceManifest(mission.mission_id), repoRoot),
+            runPlanner: async (task) => {
+              const route = await routeModel?.("planner", { missionId: mission.mission_id }).catch(() => undefined);
+              // Bounded: a hard timeout aborts the one call; thinking is allowed
+              // for role "planner" (thinkingPolicy) and the role's token budget applies.
+              const abort = new AbortController();
+              const timer = setTimeout(() => abort.abort(), plannerTimeoutMs());
+              try {
+                const run = await rt.worker.run({
+                  role: "planner",
+                  task,
+                  tools: READ_ONLY_TOOLS,
+                  cwd: repoRoot,
+                  signal: abort.signal,
+                  maxContextTokens: ROLE_BUDGETS.planner.hardMaxTokens,
+                  ...(route ? { modelOverride: { provider: route.provider, id: route.id } } : {}),
+                });
+                if (abort.signal.aborted) throw new Error(`planner timed out after ${plannerTimeoutMs()} ms`);
+                if (run.error) {
+                  if (run.error.startsWith("transient:") || classifyError(run.error).retryable) {
+                    throw new PlannerTransientError(run.error);
+                  }
+                  throw new Error(run.error);
                 }
-                throw new Error(run.error);
+                return run.result;
+              } catch (error) {
+                if (error instanceof PlannerTransientError || abort.signal.aborted) throw error;
+                if (classifyError(error).retryable) throw new PlannerTransientError(String(error));
+                throw error;
+              } finally {
+                clearTimeout(timer);
               }
-              return run.result;
-            } catch (error) {
-              if (error instanceof PlannerTransientError || abort.signal.aborted) throw error;
-              if (classifyError(error).retryable) throw new PlannerTransientError(String(error));
-              throw error;
-            } finally {
-              clearTimeout(timer);
-            }
-          },
-        });
+            },
+          });
+        const planned = await planWith(mission.goal, mission.goal);
         if (planned.fallbackReason) {
           rt.missionStore?.addFinding({
             mission_id: mission.mission_id,
@@ -1583,6 +1609,57 @@ export class EngineeringRuntime {
             evidence: planned.clarification.slice(0, 1000),
             recommended_action: "Confirm or restate what this mission should do.",
           });
+        }
+        if (planReviewSettings && rt.missionStore && !planned.clarification && planned.tasks.length > 0) {
+          const gated = await gatePlanBeforeWorkers({
+            // Changes requested: plan again with the reviewer's feedback as input.
+            // The single-task fallback carries the feedback too, so the revision
+            // always differs and needs its own decision.
+            replan: async ({ annotations, revision }) => {
+              const feedback = annotations.length
+                ? annotations.map((a) => `- ${a}`).join("\n")
+                : "- (the reviewer asked for changes without comments)";
+              const augmented = `${mission.goal}\n\nA plan reviewer requested changes to revision ${revision.revision}. Address this feedback:\n${feedback}`;
+              const replanned = await planWith(augmented, augmented);
+              return replanned.tasks.length > 0 ? replanned.tasks : revision.tasks;
+            },
+            ...planReviewSettings,
+            missionId: mission.mission_id,
+            goal: mission.goal,
+            plan: async () => planned.tasks,
+            ledger: rt.missionStore,
+          });
+          if (gated.status === "blocked") {
+            rt.missionStore.addFinding({
+              mission_id: mission.mission_id,
+              task_id: null,
+              severity: "major",
+              category: PLANNER_CLARIFICATION_CATEGORY,
+              file: null,
+              line: null,
+              summary: `Plan review blocked implementation (${gated.code}).`,
+              evidence: [gated.reason, ...(planReviewSettings.configNotes ?? [])].join("\n").slice(0, 1000),
+              recommended_action:
+                gated.code === "plannotator_unavailable"
+                  ? "Restore the plan review service or record an explicit operator override with a reason."
+                  : "Revise the plan and resubmit for review.",
+            });
+            return [];
+          }
+          if (planReviewSettings.configNotes?.length) {
+            rt.missionStore.addFinding({
+              mission_id: mission.mission_id,
+              task_id: null,
+              severity: "minor",
+              category: "plan_review_config",
+              file: null,
+              line: null,
+              summary: "Plan review configuration was only partly honoured.",
+              evidence: planReviewSettings.configNotes.join("\n").slice(0, 1000),
+              recommended_action: "Fix or remove the ignored plan_review settings.",
+            });
+          }
+          return gated.tasks;
         }
         return planned.tasks;
       };

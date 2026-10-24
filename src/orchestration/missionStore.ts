@@ -12,6 +12,7 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
+import type { LineageEmitter } from "../runtime/herdr/lineage.ts";
 import {
   type CheckpointRefsInput,
   attachCheckpointRefs,
@@ -101,6 +102,7 @@ export type OrchestrationEventType =
   | "finding.created"
   | "finding.resolved"
   | "handoff.created"
+  | "handoff.transitioned"
   | "workspace.authorized"
   | "workspace.rebound"
   | "workspace.rebind_failed"
@@ -138,6 +140,9 @@ export type OrchestrationEventType =
   | "spec.approval"
   | "spec.invalidation"
   | "spec.materialized"
+  | "plan.revision"
+  | "plan.policy"
+  | "plan.decision"
   | "lane.acquired"
   | "lane.released"
   | "lane.wait"
@@ -178,6 +183,7 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "finding.created",
   "finding.resolved",
   "handoff.created",
+  "handoff.transitioned",
   "workspace.authorized",
   "workspace.rebound",
   "workspace.rebind_failed",
@@ -215,6 +221,9 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "spec.approval",
   "spec.invalidation",
   "spec.materialized",
+  "plan.revision",
+  "plan.policy",
+  "plan.decision",
   "lane.acquired",
   "lane.released",
   "lane.wait",
@@ -462,6 +471,9 @@ export class MissionStore {
   private readonly specReviews = new Map<string, import("./specApproval.ts").SpecReviewEvidence>();
   private readonly specApprovals = new Map<string, import("./specApproval.ts").SpecApproval>();
   private readonly specStages: import("./specApproval.ts").SpecStageAttempt[] = [];
+  private readonly planRevisions: import("./planRecords.ts").PlanRevisionRecord[] = [];
+  private readonly planPolicies: import("./planRecords.ts").PlanPolicyRecord[] = [];
+  private readonly planDecisions: import("./planRecords.ts").PlanDecisionRecord[] = [];
   private readonly specInvalidations = new Map<string, { approvalId: string; reason: string; fencingToken: number }>();
   private readonly specMaterializations: Array<{
     missionId: string;
@@ -478,9 +490,95 @@ export class MissionStore {
     stored: StoredEvent;
   }> = [];
   private emitChain: Promise<void> = Promise.resolve();
+  /** Optional lineage emitter (T02). Null = no lineage; every hook below is then a no-op. */
+  private lineage: LineageEmitter | null = null;
+  /** Logical agents (one per task) whose node was upserted, and whether they are currently ended. */
+  private readonly lineageAgents = new Map<string, "live" | "ended">();
 
   private constructor(backend: EventStoreBackend) {
     this.backend = backend;
+  }
+
+  /**
+   * Attach (or detach with null) the lineage emitter. Hooks fire from the
+   * mutators only, never from `apply()`, so replaying history on open emits nothing.
+   */
+  setLineage(emitter: LineageEmitter | null): void {
+    this.lineage = emitter;
+  }
+
+  /** Run a lineage hook fire-and-forget: absent emitter = no-op, errors never reach the caller. */
+  private lineageDo(hook: (lineage: LineageEmitter) => void): void {
+    const lineage = this.lineage;
+    if (!lineage) return;
+    try {
+      hook(lineage);
+    } catch {
+      // lineage is observational; it must never disturb the mission path
+    }
+  }
+
+  /** Model-driven executions only: process/integration/validation runs are not agents. */
+  private lineageAgentExecution(ex: Execution): boolean {
+    return ex.backend === "agent" || ex.backend === "research" || ex.backend === "review";
+  }
+
+  private lineageAttemptEnded(ex: Execution, state: "done" | "failed" | "cancelled", reason?: string): void {
+    if (!this.lineageAgentExecution(ex)) return;
+    this.lineageDo((l) => {
+      const ended = ex.ended_at ?? undefined;
+      l.attemptState(
+        { attempt: ex.execution_id, agent: ex.task_id, missionId: ex.mission_id, taskId: ex.task_id },
+        state,
+        "end", // an attempt ends once: a retried end dedupes
+        reason ?? ex.exit_status ?? undefined,
+        ended,
+      );
+      // The agent's state is the aggregate of its attempts: it ends only when none is still live.
+      const stillLive = [...this.executions.values()].some(
+        (other) =>
+          other.task_id === ex.task_id &&
+          other.execution_id !== ex.execution_id &&
+          (other.status === "PENDING" || other.status === "RUNNING"),
+      );
+      if (!stillLive) {
+        this.lineageAgents.set(ex.task_id, "ended");
+        l.agentState(
+          { agent: ex.task_id, missionId: ex.mission_id, taskId: ex.task_id },
+          state,
+          `end:${ex.execution_id}`,
+          reason ?? ex.exit_status ?? undefined,
+          ended,
+        );
+      }
+    });
+  }
+
+  /** A model session attached to (or replacing the one on) an attempt. */
+  private lineageSessionChange(ex: Execution, previous: string | null, next: string | null, at: string): void {
+    if (!next || next === previous || !this.lineageAgentExecution(ex)) return;
+    this.lineageDo((l) =>
+      previous
+        ? l.sessionRolledOver({
+            agent: ex.task_id,
+            attempt: ex.execution_id,
+            fromSession: previous,
+            toSession: next,
+            missionId: ex.mission_id,
+            taskId: ex.task_id,
+            transition: `${previous}>${next}`,
+            at,
+          })
+        : l.sessionAttached({
+            agent: ex.task_id,
+            attempt: ex.execution_id,
+            session: next,
+            missionId: ex.mission_id,
+            taskId: ex.task_id,
+            transition: `attach:${next}`,
+            at,
+          }),
+    );
   }
 
   /** Open a store over a backend, replaying existing events. */
@@ -748,6 +846,12 @@ export class MissionStore {
         if (manifest) this.workspaceManifests.set(manifest.missionId, copyWorkspaceManifest(manifest));
         break;
       }
+      case "handoff.created":
+      case "handoff.transitioned": {
+        const handoff = e.payload.handoff as HandoffRecord | undefined;
+        if (handoff?.id) this.handoffRecords.set(handoff.id, { ...handoff });
+        break;
+      }
       case "task.checkpointed": {
         const checkpoint = e.payload.checkpoint as TaskCheckpoint;
         if (checkpoint) this.recordTaskCheckpoint(checkpoint);
@@ -924,6 +1028,21 @@ export class MissionStore {
       case "spec.stage": {
         const stage = e.payload.stage as import("./specApproval.ts").SpecStageAttempt;
         if (stage) this.specStages.push({ ...stage });
+        break;
+      }
+      case "plan.revision": {
+        const record = e.payload.record as import("./planRecords.ts").PlanRevisionRecord | undefined;
+        if (record) this.planRevisions.push(structuredClone(record));
+        break;
+      }
+      case "plan.policy": {
+        const record = e.payload.record as import("./planRecords.ts").PlanPolicyRecord | undefined;
+        if (record) this.planPolicies.push(structuredClone(record));
+        break;
+      }
+      case "plan.decision": {
+        const record = e.payload.record as import("./planRecords.ts").PlanDecisionRecord | undefined;
+        if (record) this.planDecisions.push(structuredClone(record));
         break;
       }
       case "spec.revision": {
@@ -1474,6 +1593,33 @@ export class MissionStore {
       actor: "system",
       execution: ex,
     });
+    // No parent attempt is recorded on an execution, so no spawn edge (nothing is guessed).
+    if (this.lineageAgentExecution(ex)) {
+      this.lineageDo((l) => {
+        // The logical agent is the task; its label (the task's role) and running state are set once.
+        // A later attempt only revives it if it had ended.
+        const known = this.lineageAgents.get(ex.task_id);
+        l.workerSpawned({
+          agent: ex.task_id,
+          attempt: ex.execution_id,
+          session: ex.session_id,
+          missionId: ex.mission_id,
+          taskId: ex.task_id,
+          role: task?.role ?? null,
+          model: ex.model,
+          upsertAgent: known === undefined,
+          transition: `created:${ex.execution_id}`,
+        });
+        if (known === "ended") {
+          l.agentState(
+            { agent: ex.task_id, missionId: ex.mission_id, taskId: ex.task_id },
+            "running",
+            `resume:${ex.execution_id}`,
+          );
+        }
+        this.lineageAgents.set(ex.task_id, "live");
+      });
+    }
     return copyExecution(ex);
   }
 
@@ -1499,6 +1645,22 @@ export class MissionStore {
             ? "execution.failed"
             : "execution.canceled";
     this.emit(type, ex.mission_id, { actor: "system", execution: next });
+    if (this.lineageAgentExecution(next)) {
+      this.lineageSessionChange(next, ex.session_id, next.session_id, now);
+      if (status === "RUNNING") {
+        this.lineageDo((l) =>
+          l.attemptState(
+            { attempt: next.execution_id, agent: next.task_id, missionId: next.mission_id, taskId: next.task_id },
+            "running",
+            "start",
+            undefined,
+            now,
+          ),
+        );
+      } else if (status === "SUCCEEDED") this.lineageAttemptEnded(next, "done");
+      else if (status === "FAILED") this.lineageAttemptEnded(next, "failed");
+      else if (status === "CANCELED") this.lineageAttemptEnded(next, "cancelled");
+    }
     return this.getExecution(executionId)!;
   }
 
@@ -1618,6 +1780,7 @@ export class MissionStore {
       }
       if (!appended) throw authorityError ?? new Error("gate evidence authority changed before publication");
       this.clearPersistenceFailure(event.event_id);
+      this.lineageAttemptEnded(execution, "done");
       return this.getExecution(input.executionId)!;
     });
     this.emitChain = publish.then(
@@ -1848,6 +2011,7 @@ export class MissionStore {
         execution: terminal,
         reason: "prior execution fenced before replacement dispatch",
       });
+      this.lineageAttemptEnded(terminal, "cancelled", "orphaned execution reconciled");
       const task = this.tasks.get(execution.task_id);
       if (task?.status === "RUNNING" && task.assigned_execution_id === execution.execution_id) {
         this.transitionTask(task.task_id, "RETRYING", "system", {
@@ -2047,6 +2211,7 @@ export class MissionStore {
       actor: "system",
       handoff: { ...result.record },
     });
+    this.lineageHandoff(result.record);
     return { ...result.record };
   }
 
@@ -2111,7 +2276,30 @@ export class MissionStore {
       next.ackAt = ackAt ?? current.ackAt ?? new Date().toISOString();
     }
     this.handoffRecords.set(id, { ...next });
+    // Persist the transition: a restart restores the state lineage reported, not `prepared`.
+    this.emit("handoff.transitioned", next.missionId, { actor: "system", handoff: { ...next } });
+    this.lineageHandoff(next);
     return { ...next };
+  }
+
+  private lineageHandoff(record: HandoffRecord): void {
+    this.lineageDo((l) =>
+      l.handoff({
+        id: record.id,
+        kind: record.kind,
+        missionId: record.missionId,
+        fromSession: record.predecessor.sessionId,
+        toSession: record.successor?.sessionId,
+        state: record.state,
+        checkpointSha: record.checkpointSha,
+        fromGeneration: record.predecessor.generation,
+        toGeneration: record.successor?.generation,
+        at:
+          record.ackAt && (record.state === "acknowledged" || record.state === "committed")
+            ? record.ackAt
+            : record.createdAt,
+      }),
+    );
   }
 
   /** Preserve a settled outcome while making failed lease cleanup durable and visible. */
@@ -2273,6 +2461,7 @@ export class MissionStore {
       this.assertCheckpointAuthoritative(checkpoint);
 
       const copy = copyTaskCheckpoint(checkpoint);
+      const priorSession = this.lineage ? this.priorCheckpointSession(checkpoint) : null;
       const payload = structuredClone({ actor: "system", checkpoint: copy });
       const event: OrchestrationEvent = {
         event_id: id("oevt"),
@@ -2312,6 +2501,7 @@ export class MissionStore {
         throw error;
       }
       this.clearPersistenceFailure(event.event_id);
+      this.lineageCheckpointVerified(copy, priorSession);
       return copyTaskCheckpoint(copy);
     });
     this.emitChain = publish.then(
@@ -2319,6 +2509,33 @@ export class MissionStore {
       () => undefined,
     );
     return publish;
+  }
+
+  /** Session of the latest earlier checkpoint of the same execution, if any. */
+  private priorCheckpointSession(checkpoint: TaskCheckpoint): string | null {
+    const earlier = this.listTaskCheckpoints(checkpoint.missionId, checkpoint.taskId).filter(
+      (candidate) => candidate.executionId === checkpoint.executionId && candidate.sessionId,
+    );
+    // No earlier checkpoint: the session the execution itself recorded is the one being replaced.
+    return earlier.at(-1)?.sessionId ?? this.executions.get(checkpoint.executionId)?.session_id ?? null;
+  }
+
+  /** Verified checkpoint: artifact produced by the attempt; a changed session id is a rollover of the same attempt. */
+  private lineageCheckpointVerified(checkpoint: TaskCheckpoint, priorSession: string | null): void {
+    const execution = this.executions.get(checkpoint.executionId);
+    if (!execution || !this.lineageAgentExecution(execution)) return;
+    this.lineageSessionChange(execution, priorSession, checkpoint.sessionId ?? null, checkpoint.createdAt);
+    this.lineageDo((l) =>
+      l.checkpointVerified({
+        checkpointId: checkpoint.checkpointId,
+        attempt: checkpoint.executionId,
+        missionId: checkpoint.missionId,
+        taskId: checkpoint.taskId,
+        sequence: checkpoint.sequence,
+        commit: checkpoint.candidateSha,
+        at: checkpoint.createdAt,
+      }),
+    );
   }
 
   private assertCheckpointAuthoritative(checkpoint: TaskCheckpoint): void {
@@ -3369,6 +3586,32 @@ export class MissionStore {
   }
 
   // ── Autonomous spec approval records ────────────────────────────────────
+
+  // ── Plan revisions, review policy and decisions (T03) ─────────────────
+
+  appendPlanRevision(record: import("./planRecords.ts").PlanRevisionRecord): void {
+    this.apply(this.emit("plan.revision", record.missionId, { actor: "system", record }));
+  }
+
+  appendPlanPolicy(record: import("./planRecords.ts").PlanPolicyRecord): void {
+    this.apply(this.emit("plan.policy", record.missionId, { actor: "system", record }));
+  }
+
+  appendPlanDecision(record: import("./planRecords.ts").PlanDecisionRecord): void {
+    this.apply(this.emit("plan.decision", record.missionId, { actor: "system", record }));
+  }
+
+  listPlanRevisions(missionId: string): import("./planRecords.ts").PlanRevisionRecord[] {
+    return this.planRevisions.filter((r) => r.missionId === missionId).map((r) => structuredClone(r));
+  }
+
+  listPlanPolicies(missionId: string): import("./planRecords.ts").PlanPolicyRecord[] {
+    return this.planPolicies.filter((r) => r.missionId === missionId).map((r) => structuredClone(r));
+  }
+
+  listPlanDecisions(missionId: string): import("./planRecords.ts").PlanDecisionRecord[] {
+    return this.planDecisions.filter((r) => r.missionId === missionId).map((r) => structuredClone(r));
+  }
 
   appendSpecStage(stage: import("./specApproval.ts").SpecStageAttempt): void {
     this.apply(this.emit("spec.stage", stage.missionId, { actor: "system", stage }));

@@ -15,7 +15,7 @@
  *    persisted envelope keeps its nonce'd id).
  */
 
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -83,6 +83,37 @@ export function defaultSource(dir: string): string {
 }
 
 /**
+ * Per-instance secret for derived event ids, persisted 0600 next to the instance id.
+ * Without it a derived id is a pure function of public data (the source string is listed
+ * by the ingest sources endpoint), so a third party could pre-register a victim's next
+ * event_id. Unusable state dir: a process-local secret (ids stay stable within the process).
+ */
+export function loadIdSecret(dir: string): string {
+  const file = join(dir, "id-secret");
+  const valid = (v: string) => /^[0-9a-f]{64}$/.test(v);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const existing = readFileSync(file, "utf8").trim();
+    if (valid(existing)) return existing;
+  } catch {
+    // first run, or unreadable
+  }
+  const fresh = randomBytes(32).toString("hex");
+  try {
+    writeFileSync(file, `${fresh}\n`, { flag: "wx", mode: 0o600 });
+    return fresh;
+  } catch {
+    try {
+      const other = readFileSync(file, "utf8").trim();
+      if (valid(other)) return other; // lost a creation race: adopt the winner
+    } catch {
+      // keep the process-local secret
+    }
+  }
+  return fresh;
+}
+
+/**
  * Redact the payload as JSON text first (that catches `"password": "..."`
  * key-shaped secrets, which a per-string walk cannot see), falling back to the
  * per-string walk if the redacted text no longer parses.
@@ -104,6 +135,7 @@ export class EnvelopeStore {
   readonly outbox: EnvelopeOutbox;
   readonly sequence: SourceSequence;
   private readonly maxEventBytes: number;
+  private readonly idSecret: string;
   private tail: Promise<unknown> = Promise.resolve();
 
   constructor(opts: EnvelopeStoreOptions = {}) {
@@ -111,8 +143,21 @@ export class EnvelopeStore {
     this.source = opts.source ?? defaultSource(dir);
     if (!SOURCE_PATTERN.test(this.source)) throw new TypeError(`invalid source "${this.source}"`);
     this.maxEventBytes = opts.maxEventBytes ?? 256 * 1024;
+    this.idSecret = loadIdSecret(dir);
     this.sequence = new SourceSequence({ dir, source: this.source, blockSize: opts.sequenceBlock ?? 1 });
     this.outbox = new EnvelopeOutbox({ file: join(dir, `outbox-${this.source}.jsonl`), maxPending: opts.maxPending });
+  }
+
+  /**
+   * Deterministic, unguessable event id: HMAC-SHA256 keyed with the per-instance secret over
+   * the parts. Same parts + same instance => same id (retry dedupe, stable across restart);
+   * another instance, or anyone without the secret, cannot compute it.
+   */
+  deriveEventId(prefix: string, parts: readonly unknown[]): string {
+    const mac = createHmac("sha256", this.idSecret)
+      .update(JSON.stringify([prefix, ...parts]))
+      .digest("hex");
+    return `${prefix}_${mac.slice(0, 32)}`;
   }
 
   /** Counters for the health / diagnostic path. */
@@ -133,7 +178,11 @@ export class EnvelopeStore {
   private async stageNow(input: EnvelopeDraft): Promise<StageResult> {
     const payload = redactPayload(input.payload);
     const draft: EnvelopeDraft = { ...input, payload };
-    if (draft.event_id && input.event_id_derived) draft.event_id = `${draft.event_id}-${randomUUID().slice(0, 8)}`;
+    if (draft.event_id && input.event_id_derived) {
+      // Adapter ids are content hashes of public-ish data: re-key them with the secret, then add the nonce.
+      const prefix = draft.event_id.split("_")[0] || "evt";
+      draft.event_id = `${this.deriveEventId(prefix, [draft.event_id])}-${randomUUID().slice(0, 8)}`;
+    }
 
     buildEnvelope(draft, { source: this.source, sourceSequence: 0 }); // validate BEFORE burning a sequence
 

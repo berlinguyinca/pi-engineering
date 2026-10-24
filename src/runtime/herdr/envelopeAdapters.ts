@@ -23,7 +23,11 @@ function str(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
-/** Deterministic id for events that carry none: same content => same id. */
+/**
+ * Deterministic id for events that carry none: same content => same id. This is a bare content
+ * hash; EnvelopeStore re-keys every `event_id_derived` id with the per-instance secret before it
+ * is staged, so the id that leaves the host is not computable from public data.
+ */
 export function deterministicEventId(prefix: string, parts: unknown): string {
   return `${prefix}_${createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 32)}`;
 }
