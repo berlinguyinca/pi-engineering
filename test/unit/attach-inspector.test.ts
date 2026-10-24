@@ -78,7 +78,7 @@ test("enabled: attaches, and a session_start fired BEFORE the attach completed i
   const handle = await p;
   assert.ok(handle);
   await new Promise((r) => setTimeout(r, 60));
-  const kinds = ingest.flatMap((b) => b.payload.events.map((e: any) => `${e.kind}:${e.phase ?? ""}`));
+  const kinds = ingest.filter((b) => b.payload?.events).flatMap((b) => b.payload.events.map((e: any) => `${e.kind}:${e.phase ?? ""}`));
   assert.equal(kinds.filter((k) => k === "lifecycle:started").length, 1, `got ${kinds.join(",")}`);
   handle.dispose();
 });
