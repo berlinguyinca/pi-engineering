@@ -21,7 +21,7 @@ import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
  * namespaces first; a writer some other caller keeps open across a reload
  * stays the old instance until it is closed.
  */
-import { runtimeFacts } from "../piRuntime.ts";
+import { runtimeFacts } from "../runtimeFacts.ts";
 import type { LeaseOwner } from "./LeaseManager.ts";
 import { type ReconciliationReport, RecoveryManager } from "./RecoveryManager.ts";
 import { RuntimeRegistry, type SessionBindingUpdate } from "./RuntimeRegistry.ts";
