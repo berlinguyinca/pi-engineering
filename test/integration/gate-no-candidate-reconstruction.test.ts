@@ -12,14 +12,14 @@
  *       and FINITELY (no repeated CREATE_REPAIR_TASKS refusal loop) with an
  *       operator-facing explanation.
  *
- * STATUS(#360): SKIPPED — this is the acceptance spec for the fix. The
- * Git-verified reconstruction primitive (`MissionStore.recordReconstructedCandidate`)
- * is implemented and unit-tested. What remains is the orchestrator wiring in the
- * gate-refusal branch: (1) select a Git-verifiable preserved checkpoint, (2) seed
- * the broker's candidate-TARGET worktree with that content (validation with
- * candidateScoped backends throws CANDIDATE_UNAVAILABLE otherwise), and (3) record
- * the reconstructed candidate and re-run the gate. See the handoff in
- * docs/specs/.../HANDOFF-gate-no-candidate.md.
+ * The Git-verified reconstruction primitive (`MissionStore.recordReconstructedCandidate`)
+ * plus the orchestrator wiring (`reconstructCandidateFromPreservedWork` +
+ * `Broker.reconstructCandidateFromRef`) are implemented; this file is the live
+ * acceptance gate for both paths. Reconstruction seeds the candidate target at
+ * the preserved commit, runs the deterministic integration over it (whose green
+ * execution supersedes the failed implementer whose preserved work landed),
+ * then re-runs the required gates; the reconstructed candidate keeps a
+ * `reconstructedFrom` origin marker tied to the source checkpoint.
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -28,7 +28,6 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
-import { taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { RepositoryRegistry } from "../../src/orchestration/repositoryRegistry.ts";
@@ -83,29 +82,32 @@ function backendsFor(calls: Calls): BrokerBackends {
     },
     review: {
       candidateScoped: true,
-      runReview: async ({ acceptanceCriteria }) => ({
-        executionId: "review",
-        exitStatus: "succeeded",
-        summary: "approved",
-        artifactRefs: [],
-        usage: {},
-        findings: [],
-        reviewEvidence: {
-          reviewerSessionId: "review-no-candidate",
-          model: "test",
-          provider: "test",
-          verdict: "approve",
-          independenceMode: "independent",
+      runReview: async ({ acceptanceCriteria }) => {
+        calls.review++;
+        return {
+          executionId: "review",
+          exitStatus: "succeeded",
+          summary: "approved",
+          artifactRefs: [],
+          usage: {},
           findings: [],
-          outputValid: true,
-          accessible: true,
-          acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
-            acceptanceId: criterion.acceptanceId,
-            status: "passed" as const,
-            detail: "checked",
-          })),
-        },
-      }),
+          reviewEvidence: {
+            reviewerSessionId: "review-no-candidate",
+            model: "test",
+            provider: "test",
+            verdict: "approve",
+            independenceMode: "independent",
+            findings: [],
+            outputValid: true,
+            accessible: true,
+            acceptanceResults: (acceptanceCriteria ?? []).map((criterion) => ({
+              acceptanceId: criterion.acceptanceId,
+              status: "passed" as const,
+              detail: "checked",
+            })),
+          },
+        };
+      },
     },
   };
 }
@@ -165,6 +167,8 @@ async function harnessFor(reconstructable: boolean) {
     risk_profile: "high",
     workflow_class: "engineering",
   });
+  // The classifier normally derives required gates; this state is hand-built.
+  store.updateMission(mission.mission_id, { required_gates: ["validation", "independent_review"] });
   const missionId = mission.mission_id;
   const manifest = {
     manifestId: `WM-${missionId}`,
@@ -213,34 +217,34 @@ async function harnessFor(reconstructable: boolean) {
   store.setExecutionStatus(execution.execution_id, "RUNNING");
   store.setExecutionStatus(execution.execution_id, "FAILED", { exit_status: "failed" });
   store.transitionTask("TSK-impl", "FAILED", "system", { failure_reason: "agent.loop_prevented" });
-  // The failed implementer was already superseded by an earlier recovery
-  // (as after leG4ua's repeated auto-recoveries), so there is no recoverable
-  // pre-candidate implementer left -> the gate-refusal branch is reachable.
+  // A validation gate then failed with NO candidate to judge — the exact
+  // leG4ua shape ("current validation evidence is unavailable because no
+  // candidate is recorded"). A failed gate task (not an agent) routes the
+  // planner to CREATE_REPAIR_TASKS over the gate-refusal branch.
   store.createTask({
-    task_id: "TSK-repl",
+    task_id: "TSK-validation",
     mission_id: missionId,
-    kind: "agent",
-    role: "implementer",
-    objective: "replacement",
+    kind: "validation",
+    role: "validator",
+    objective: "validate",
     repo_id: "repo-nc",
-    mutates_repo: true,
-    isolation: "worktree",
-    write_domains: ["src/**"],
-    deliverables: ["deliver"],
+    mutates_repo: false,
+    isolation: "none",
+    write_domains: [],
+    deliverables: ["validation"],
   });
-  store.transitionTask("TSK-repl", "READY");
-  store.transitionTask("TSK-repl", "CANCELED");
-  store.supersedeTask({
-    supersessionId: "SUP-earlier",
-    missionId,
-    failedTaskId: "TSK-impl",
-    replacementTaskIds: ["TSK-repl"],
-    repoId: "repo-nc",
-    acceptanceIds: [],
-    coverageFingerprint: taskCoverageFingerprint(store.getTask("TSK-impl")!),
-    reason: "earlier recovery",
-    createdAt: "2026-09-27T00:00:01.500Z",
+  store.transitionTask("TSK-validation", "READY");
+  const gateExecution = store.createExecution({
+    task_id: "TSK-validation",
+    mission_id: missionId,
+    backend: "validation",
+    repo_id: "repo-nc",
+    base_sha: baseSha,
   });
+  store.transitionTask("TSK-validation", "RUNNING", "system", { assigned_execution_id: gateExecution.execution_id });
+  store.setExecutionStatus(gateExecution.execution_id, "RUNNING");
+  store.setExecutionStatus(gateExecution.execution_id, "FAILED", { exit_status: "failed" });
+  store.transitionTask("TSK-validation", "FAILED", "system", { failure_reason: "no candidate to validate" });
 
   // Durable preserved work: a checkpoint naming the preserved commit/branch.
   if (reconstructable && preservedSha && preservedBranch) {
@@ -273,16 +277,16 @@ async function harnessFor(reconstructable: boolean) {
     });
   }
 
-  // Mission-level failure classification (no taskId) -> the refusal branch.
+  // Gate failure with no candidate -> CREATE_REPAIR_TASKS -> the refusal branch.
   store.classifyFailure({
     classificationId: "FC-nocand",
     missionId,
-    taskId: null,
-    executionId: null,
-    category: "IMPLEMENTATION_DEFECT",
+    taskId: "TSK-validation",
+    executionId: gateExecution.execution_id,
+    category: "VALIDATION_FAILED",
     evidenceRefs: [],
     fingerprint: `sha256:${"b".repeat(64)}`,
-    summary: "implementer stalled before publishing a candidate",
+    summary: "validation failed: current validation evidence is unavailable because no candidate is recorded",
     classifiedAt: "2026-09-27T00:00:02.000Z",
   });
   store.transitionMission(missionId, "BLOCKED");
@@ -299,7 +303,7 @@ async function harnessFor(reconstructable: boolean) {
   return { fixture, git, baseSha, preservedSha, preservedBranch, store, registry, calls, orchestrator, missionId };
 }
 
-describe.skip("recovery gate with no recorded candidate (#360) — acceptance spec, pending orchestrator wiring", () => {
+describe("recovery gate with no recorded candidate (#360)", () => {
   it("(a) reconstructs a Git-verified candidate from preserved work, re-runs the gate, and completes", async () => {
     const h = await harnessFor(true);
     try {
@@ -331,8 +335,10 @@ describe.skip("recovery gate with no recorded candidate (#360) — acceptance sp
   it("(b) with no preserved work, fails cleanly and FINITELY (no refusal loop)", async () => {
     const h = await harnessFor(false);
     try {
-      const recoveriesBefore = h.store.listRecoveryDecisions(h.missionId).length;
       const resumed = await h.orchestrator.repairBlockedMission(h.missionId);
+      // Baseline AFTER the first pass: finiteness means a second pass adds NO
+      // further recovery decisions, not that the first refusal consumed none.
+      const recoveriesBefore = h.store.listRecoveryDecisions(h.missionId).length;
       const stop = h.store.listMissionStops(h.missionId).at(-1);
       // Operator-facing explanation naming the missing candidate.
       assert.match(stop?.reason ?? "", /no candidate|candidate/i);
@@ -345,6 +351,7 @@ describe.skip("recovery gate with no recorded candidate (#360) — acceptance sp
       // Finite: a second repair pass does not re-enter the refusal loop.
       const resumedAgain = await h.orchestrator.repairBlockedMission(h.missionId);
       const recoveriesAfter = h.store.listRecoveryDecisions(h.missionId).length;
+      assert.ok(recoveriesBefore >= 1, "the refusal consumed exactly one recovery decision");
       assert.equal(recoveriesAfter, recoveriesBefore, "no further recovery decisions are created on re-entry (finite)");
       assert.equal(h.calls.validation, 0, "the gate is not re-run with no candidate");
       assert.equal(resumed.status, "BLOCKED");
