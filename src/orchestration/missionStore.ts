@@ -32,13 +32,16 @@ import {
   taskCoverageFingerprint,
   validateAcceptanceResults,
 } from "./evidence.ts";
+import { failureFingerprint } from "./recovery.ts";
 import { assertMissionTransition, assertTaskTransition } from "./state.ts";
 import type {
   CandidateEvidenceIdentity,
   CandidateRevision,
+  DiskSuspendEpisode,
   EvidenceInvalidation,
   Execution,
   ExecutionStatus,
+  FailureCategory,
   FailureClassification,
   LeaseTransition,
   Mission,
@@ -147,6 +150,8 @@ export type OrchestrationEventType =
   | "execution.gate_evidence_published"
   | "mission.resumed"
   | "mission.stopped"
+  | "mission.disk_suspend_marked"
+  | "mission.disk_suspend_resolved"
   | "spec.stage"
   | "spec.revision"
   | "spec.review"
@@ -231,6 +236,8 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "execution.gate_evidence_published",
   "mission.resumed",
   "mission.stopped",
+  "mission.disk_suspend_marked",
+  "mission.disk_suspend_resolved",
   "spec.stage",
   "spec.revision",
   "spec.review",
@@ -393,6 +400,22 @@ const TASK_TRANSITION_METADATA_FIELDS = new Set<keyof TaskTransitionMetadata>([
   "failure_reason",
 ]);
 const TERMINAL_TASK_STATUSES = new Set<TaskStatus>(["SUCCEEDED", "FAILED", "CANCELED", "SKIPPED"]);
+
+/**
+ * (#416) Transient/interruption categories that a concurrent disk-pressure
+ * suspend explains for a task that was RUNNING at suspend time. Genuine
+ * defects — validation, review, merge, authorization, scope, requirement,
+ * deadlock — are deliberately absent: a disk outage never excuses them.
+ */
+const DISK_SUSPENDED_EXCUSABLE: ReadonlySet<FailureCategory> = new Set([
+  "PROVIDER_TRANSIENT",
+  "PROVIDER_PERMANENT",
+  "TASK_BUDGET_EXHAUSTED",
+  "ORPHANED_EXECUTION",
+  "INVALID_WORKER_OUTPUT",
+  "PERSISTENCE_FAILURE",
+  "EVIDENCE_UNAVAILABLE",
+]);
 const RECOVERY_TRANSITIONS: Record<RecoveryStatus, ReadonlyArray<RecoveryStatus>> = {
   planned: ["started", "failed", "exhausted"],
   started: ["succeeded", "failed", "exhausted"],
@@ -486,6 +509,8 @@ export class MissionStore {
   private readonly repositoryLeaseEpochs = new Map<string, RepositoryLease>();
   private readonly missionResumptions: MissionResumption[] = [];
   private readonly missionStops: MissionStop[] = [];
+  /** (#416) disk-pressure suspend episodes, oldest first. */
+  private readonly diskSuspendEpisodes: DiskSuspendEpisode[] = [];
   private readonly specRevisions = new Map<string, import("./specApproval.ts").MissionSpecRevision>();
   private readonly specReviews = new Map<string, import("./specApproval.ts").SpecReviewEvidence>();
   private readonly specApprovals = new Map<string, import("./specApproval.ts").SpecApproval>();
@@ -1109,6 +1134,30 @@ export class MissionStore {
       case "mission.stopped": {
         const stop = e.payload.stop as MissionStop;
         if (stop) this.missionStops.push(copyMissionStop(stop));
+        break;
+      }
+      case "mission.disk_suspend_marked": {
+        const episode = e.payload.episode as DiskSuspendEpisode | undefined;
+        if (!episode) break;
+        // A merge re-emits the full episode under the same id: replay upserts,
+        // so the durable history is idempotent like the live projection.
+        const at = this.diskSuspendEpisodes.findIndex((entry) => entry.episodeId === episode.episodeId);
+        if (at >= 0) this.diskSuspendEpisodes[at] = structuredClone(episode);
+        else this.diskSuspendEpisodes.push(structuredClone(episode));
+        break;
+      }
+      case "mission.disk_suspend_resolved": {
+        const resolved = e.payload as { episodeId?: string; missionId?: string; resolvedAt?: string };
+        if (resolved.episodeId) {
+          const episode = this.diskSuspendEpisodes.find((entry) => entry.episodeId === resolved.episodeId);
+          if (episode) episode.resolvedAt = resolved.resolvedAt ?? new Date(0).toISOString();
+        } else if (resolved.missionId) {
+          // Resolve-any is a coarse operator fallback; newest open episode wins.
+          const episode = [...this.diskSuspendEpisodes]
+            .reverse()
+            .find((entry) => entry.missionId === resolved.missionId && entry.resolvedAt === null);
+          if (episode) episode.resolvedAt = resolved.resolvedAt ?? new Date(0).toISOString();
+        }
         break;
       }
       case "spec.stage": {
@@ -2670,15 +2719,116 @@ export class MissionStore {
     this.taskCheckpointLastEventOrdinals.set(copy.checkpointId, ++this.taskCheckpointEventOrdinal);
   }
 
+  /**
+   * (#416) Record that a disk-pressure suspend interrupted `taskIds`. One
+   * open episode per mission: a fresh-incident re-suspend (the controller's
+   * re-suspension path) merges additional RUNNING tasks into the open episode
+   * instead of stacking a second one. Deterministic: replay reproduces the
+   * same episode from the durable event.
+   */
+  markDiskSuspendEpisode(
+    missionId: string,
+    input: { episodeId?: string; taskIds: readonly string[]; incidentPath?: string; markedAt?: string },
+  ): DiskSuspendEpisode {
+    if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
+    const open = this.diskSuspendEpisodes.find((e) => e.missionId === missionId && e.resolvedAt === null);
+    if (open) {
+      const added = input.taskIds.filter((taskId) => !open.taskIds.includes(taskId));
+      if (added.length > 0) {
+        open.taskIds.push(...added);
+        if (input.incidentPath && !open.incidentPath) open.incidentPath = input.incidentPath;
+        this.emit("mission.disk_suspend_marked", missionId, {
+          actor: "system",
+          episode: structuredClone(open),
+        });
+      }
+      return structuredClone(open);
+    }
+    const episode: DiskSuspendEpisode = {
+      episodeId: input.episodeId ?? id("DSE"),
+      missionId,
+      ...(input.incidentPath ? { incidentPath: input.incidentPath } : {}),
+      taskIds: [...new Set(input.taskIds)],
+      markedAt: input.markedAt ?? new Date().toISOString(),
+      resolvedAt: null,
+    };
+    this.diskSuspendEpisodes.push(episode);
+    this.emit("mission.disk_suspend_marked", missionId, { actor: "system", episode: structuredClone(episode) });
+    return structuredClone(episode);
+  }
+
+  /** (#416) Close the open disk-suspend episode for the mission (incident recovered). */
+  resolveDiskSuspendEpisode(missionId: string, resolvedAt?: string): DiskSuspendEpisode | undefined {
+    const episode = [...this.diskSuspendEpisodes]
+      .reverse()
+      .find((entry) => entry.missionId === missionId && entry.resolvedAt === null);
+    if (!episode) return undefined;
+    episode.resolvedAt = resolvedAt ?? new Date().toISOString();
+    this.emit("mission.disk_suspend_resolved", missionId, {
+      actor: "system",
+      episodeId: episode.episodeId,
+      resolvedAt: episode.resolvedAt,
+    });
+    return structuredClone(episode);
+  }
+
+  /** (#416) The open disk-suspend episode for the mission, if any. */
+  getOpenDiskSuspendEpisode(missionId: string): DiskSuspendEpisode | undefined {
+    const episode = [...this.diskSuspendEpisodes]
+      .reverse()
+      .find((entry) => entry.missionId === missionId && entry.resolvedAt === null);
+    return episode ? structuredClone(episode) : undefined;
+  }
+
+  /** (#416) All disk-suspend episodes for the mission, oldest first (audit). */
+  listDiskSuspendEpisodes(missionId?: string): DiskSuspendEpisode[] {
+    return this.diskSuspendEpisodes
+      .filter((episode) => (missionId ? episode.missionId === missionId : true))
+      .map((episode) => structuredClone(episode));
+  }
+
   classifyFailure(classification: FailureClassification): FailureClassification {
     if (!this.missions.has(classification.missionId)) throw new Error(`unknown mission ${classification.missionId}`);
     const copy = copyFailureClassification(classification);
+    this.applyDiskSuspendOverride(copy);
     this.failureClassifications.set(copy.classificationId, copy);
     this.emit("failure.classified", classification.missionId, {
       actor: "system",
       classification: copy,
     });
     return copyFailureClassification(copy);
+  }
+
+  /**
+   * (#416) A task that was RUNNING when a disk-pressure suspend fired and then
+   * fails with a transient/interruption signature is diagnosed
+   * `DISK_SUSPENDED`: recovery resumes it from its last checkpoint (the fence/
+   * reconcile action) and the outage is waited out — never terminal by count.
+   * Genuine defects (validation, review, merge, authorization, scope,
+   * requirement, deadlock) are never excused by a concurrent disk outage, and
+   * failures of tasks that were NOT running at suspend are untouched. The
+   * classificationId stays the caller's: only the diagnosis and the budget
+   * fingerprint change, so caller identity checks keep working.
+   */
+  private applyDiskSuspendOverride(copy: FailureClassification): void {
+    if (copy.category === "DISK_SUSPENDED" || !copy.taskId) return;
+    if (!DISK_SUSPENDED_EXCUSABLE.has(copy.category)) return;
+    const episode = [...this.diskSuspendEpisodes]
+      .reverse()
+      .find((entry) => entry.missionId === copy.missionId && entry.resolvedAt === null);
+    if (!episode || !episode.taskIds.includes(copy.taskId)) return;
+    copy.category = "DISK_SUSPENDED";
+    copy.summary = `${copy.summary} [interrupted by disk suspend ${episode.episodeId}${
+      episode.incidentPath ? ` on ${episode.incidentPath}` : ""
+    }]`;
+    copy.fingerprint = failureFingerprint({
+      missionId: copy.missionId,
+      taskId: copy.taskId,
+      executionId: copy.executionId,
+      summary: copy.summary,
+      evidenceRefs: copy.evidenceRefs,
+      category: "DISK_SUSPENDED",
+    });
   }
 
   listFailureClassifications(missionId?: string): FailureClassification[] {

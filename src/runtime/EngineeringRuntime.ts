@@ -991,6 +991,43 @@ export class EngineeringRuntime {
             // Diagnostics are observers, never participants in execution.
           }
         },
+        // (#416) The suspend marks which tasks were RUNNING so their later
+        // failures classify as DISK_SUSPENDED (checkpoint-resume, capacity
+        // budget) instead of generic noise; the recovery event closes the
+        // episode so post-recovery failures are judged normally again. The
+        // override-supplied observer still runs — this hook chains, never
+        // replaces.
+        onEvent: (event) => {
+          try {
+            (this.snapshotPressureOverrides ?? {}).onEvent?.(event);
+          } catch {
+            // Observer failures never participate in execution.
+          }
+          const store = this.missionStore;
+          if (!store) return;
+          try {
+            if (event.kind === "incident") {
+              for (const mission of store.listMissions()) {
+                if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) continue;
+                const running = store
+                  .listTasks(mission.mission_id)
+                  .filter((task) => task.status === "RUNNING")
+                  .map((task) => task.task_id);
+                if (running.length === 0) continue;
+                store.markDiskSuspendEpisode(mission.mission_id, {
+                  taskIds: running,
+                  ...(event.incident.path ? { incidentPath: event.incident.path } : {}),
+                });
+              }
+            } else if (event.kind === "recovered") {
+              for (const mission of store.listMissions()) store.resolveDiskSuspendEpisode(mission.mission_id);
+            }
+          } catch {
+            // Episode bookkeeping is durable best-effort here: the store is the
+            // authority and never depends on this hook (a lost mark degrades
+            // to today's generic classification, never to corruption).
+          }
+        },
       });
     }
     return this.snapshotPressure;
