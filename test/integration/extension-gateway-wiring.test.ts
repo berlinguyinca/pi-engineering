@@ -625,9 +625,16 @@ test("wiring: refresh accepts a timeout before the provider and clears its visib
   writeFileSync(path, before);
   process.env.PI_AGENT_DIR = dir;
   let attempts = 0;
+  // Scope the stub to the refresh provider's URLs. Unrelated background
+  // traffic (e.g. the HerdR control-plane ingest on fleet hosts) must not
+  // land in the probe counter — it did on a fleet machine, where 3 ingest
+  // POSTs turned the expected 2 probe attempts into 5. Anything else gets an
+  // instant 204: no network, no hang, no count.
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    if (String(input).endsWith("/models"))
+    const url = String(input);
+    if (url.endsWith("/models"))
       return Response.json({ data: [{ id: "flash-next", ctx_per_request: 8192 }] });
+    if (!url.startsWith("https://refresh.example/")) return new Response("", { status: 204 });
     attempts += 1;
     return new Promise((_resolve, reject) =>
       init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true }),
