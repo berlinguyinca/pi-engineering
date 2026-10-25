@@ -93,12 +93,18 @@ routing:
       # metabolomics passes forced tool-calls (verified today: finish_reason
       # tool_calls) and is a family distinct from the 27b-vision reviewer.
       # deepseek stays on planning prose (MSN-nC658P: no worker_result, #428).
-      model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
+      # rev 8d (2026-10-25): deepseek no worker_result (#428); flint local
+      # upstream 400 crashes under dispatch; remote flash_next same 400
+      # upstream_error (MSN-RqGkem) though every probe passes. 27b-vision-q8
+      # is the placement this live engine demonstrably completes on (rev-7-era
+      # commits). deepseek keeps planning; review moves to vision-q4.
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
       fallback_model: "flint/flint-40b"
       timeout_ms: 3600000
       max_context_tokens: 128000
     reviewer:
-      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
+      # rev 8d: q8 is implementing now; review goes q4 (fallback q8).
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
       fallback_model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
       timeout_ms: 1800000
       max_context_tokens: 128000
