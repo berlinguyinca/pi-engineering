@@ -6,6 +6,7 @@ import { type Actor, isMachineEvidence } from "../core/types.ts";
 import type { Ledger } from "../ledger/Ledger.ts";
 import type { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { Mission } from "../orchestration/types.ts";
+import { lookupMissionDurable } from "../runtime/host/durableMissionLookup.ts";
 import { missionReportLines } from "./missionReport.ts";
 
 /** Shared services bound to the current repository's runtime. */
@@ -407,11 +408,40 @@ export function buildCoreTools(
           },
         );
 
+      // (#427) A miss in the live store is answered from the durable event
+      // log before saying `Unknown mission`: the replay projection proves
+      // whether the mission exists at all, and every mutation is reported
+      // against the replay view instead of being silently refused.
+      const durableMiss = async (verb: string, missionId: string) => {
+        const durable = await lookupMissionDurable(ctx.cwd, missionId).catch(() => undefined);
+        if (!durable) return text(`Unknown mission ${missionId}.`);
+        return text(
+          [
+            `Mission ${durable.mission.mission_id} [${durable.mission.status}] workflow=${durable.mission.workflow_class}`,
+            `Durable replay view (#427): the event log knows this mission but this session holds no live runtime for it — the ${verb} was NOT performed.`,
+            ...missionReportLines(durable.store, missionId),
+            durable.mission.status === "BLOCKED" || durable.mission.status === "REPAIRING"
+              ? `Next step: the session that owns it resumes; or start a fresh mission — the preserved work is on the branches listed above.`
+              : `Next step: none needed through this tool; the owning session reports status.`,
+          ].join("\n"),
+          {
+            missionId,
+            status: durable.mission.status,
+            diagnostics: [
+              {
+                code: "durable_replay_view",
+                cwd: ctx.cwd,
+                message: "mission found in durable events, not live in this session",
+              },
+            ],
+          },
+        );
+      };
       if (action === "clear_pin") {
         const missionId = String(params.missionId ?? "").trim();
         if (!missionId) return text("The clear_pin action needs missionId.");
         const current = store?.getMission(missionId);
-        if (!current) return text(`Unknown mission ${missionId}.`);
+        if (!current) return await durableMiss("pin release", missionId);
         if (!services.clearMissionModelPin) {
           return text(
             `Clearing a pin is not available through the tool in this session. Ask the operator to run /mission resume ${missionId} --model auto.`,
@@ -427,7 +457,7 @@ export function buildCoreTools(
         const missionId = String(params.missionId ?? "").trim();
         if (!missionId) return text("The cancel action needs missionId.");
         const current = store?.getMission(missionId);
-        if (!current) return text(`Unknown mission ${missionId}.`);
+        if (!current) return await durableMiss("cancellation", missionId);
         if (!services.cancelMission) {
           return text(
             `Cancel is not available through the tool in this session. Ask the operator to run /mission cancel ${missionId}.`,
@@ -444,7 +474,8 @@ export function buildCoreTools(
         const missionId = String(params.missionId ?? "").trim();
         if (!missionId) return text(`The ${action} action needs missionId.`);
         const current = store?.getMission(missionId);
-        if (!current) return text(`Unknown mission ${missionId}.`);
+        if (!current)
+          return await durableMiss(action === "status" ? "status read (no change attempted)" : "resume", missionId);
         if (action === "status") return describe(current);
         // Resuming a stop that waits for the user (a requirement question, a
         // credential the user must fix) is the user's call, not the model's:
