@@ -18,6 +18,17 @@ import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
 
+/**
+ * Make every `git commit` in the repository (and its linked worktrees) fail. Pi runs git through safeGit with hooks
+ * disabled, so a failing pre-commit hook no longer works. An identity that git rejects (blank after trimming) is a
+ * repository-local setting safeGit's allow-list honours, and it fails the commit itself, not the preceding `add`.
+ */
+async function breakCommitIdentity(root: string): Promise<void> {
+  await exec("git", ["-C", root, "config", "user.name", " "]);
+  // Operator-trust safeGit passes these through and they override config; an exporting host would mask the failure.
+  for (const key of ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"]) delete process.env[key];
+}
+
 class LateAppendFailureBackend implements EventStoreBackend {
   readonly inner = JsonlEventStore.inMemory();
   fail = false;
@@ -1011,18 +1022,6 @@ describe("ExecutionBroker (spec 03)", () => {
     try {
       const git = await GitRepo.open(fx.root);
       assert.ok(git);
-      await writeFile(
-        join(fx.root, ".git", "hooks", "pre-commit"),
-        [
-          "#!/bin/sh",
-          "if [ ! -f src/hook-added.ts ]; then",
-          "  printf 'export const hookAdded = true;\\n' > src/hook-added.ts",
-          "fi",
-          "exit 0",
-          "",
-        ].join("\n"),
-        { mode: 0o755 },
-      );
       const store = MissionStore.open(JsonlEventStore.inMemory());
       const mission = store.createMission({
         title: "cancel checkpoint",
@@ -1092,6 +1091,9 @@ describe("ExecutionBroker (spec 03)", () => {
             runAgent: async ({ worktree, signal }) => {
               assert.ok(worktree);
               await writeFile(join(worktree, "src", "cancelled.ts"), "export const cancelled = true;\n", "utf8");
+              // Pi runs git with hooks disabled (safeGit), so a pre-commit hook cannot add files; a second
+              // dirty file written by the worker stands in for "more than one file is checkpointed".
+              await writeFile(join(worktree, "src", "hook-added.ts"), "export const hookAdded = true;\n", "utf8");
               dirty();
               // addEventListener on an already-aborted signal never fires, which
               // would hang the writer forever; treat an already-aborted signal
@@ -1363,7 +1365,7 @@ describe("ExecutionBroker (spec 03)", () => {
     try {
       const git = await GitRepo.open(fx.root);
       assert.ok(git);
-      await writeFile(join(fx.root, ".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      await breakCommitIdentity(fx.root);
       const store = MissionStore.open(JsonlEventStore.inMemory());
       const mission = store.createMission({
         title: "retain failed preservation",
@@ -3114,13 +3116,9 @@ describe("ExecutionBroker (spec 03)", () => {
 
       // A worker that DID edit its worktree must never have that work lost
       // silently. Force the harvest commit to fail deterministically (worktrees
-      // share the main repo\u2019s hooks dir) and require the broker to surface a
+      // share the main repo\u2019s config) and require the broker to surface a
       // finding explaining why the work will not integrate.
-      const { mkdir, writeFile, chmod } = await import("node:fs/promises");
-      const hooksDir = join(fx.root, ".git", "hooks");
-      await mkdir(hooksDir, { recursive: true });
-      await writeFile(join(hooksDir, "pre-commit"), "#!/bin/sh\nexit 1\n");
-      await chmod(join(hooksDir, "pre-commit"), 0o755);
+      await breakCommitIdentity(fx.root);
 
       const broker = new ExecutionBroker({
         store,
