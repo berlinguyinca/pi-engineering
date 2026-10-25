@@ -1827,6 +1827,11 @@ export class Orchestrator {
     }
   }
 
+  /** True while this process's controller is driving the mission (orchestrate or resume has not returned). */
+  hasLiveRun(missionId: string): boolean {
+    return this.liveRuns.has(missionId);
+  }
+
   /** True while the planner is producing this mission's tasks. */
   isPlanning(missionId: string): boolean {
     return this.planning.has(missionId);
