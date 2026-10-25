@@ -66,6 +66,10 @@ const DEFAULT_ACTIONS: Record<FailureCategory, RecoveryAction> = {
   ORPHANED_EXECUTION: "FENCE_RECONCILE_AND_RESUME",
   DEADLOCKED_DAG: "REPAIR_BLOCKED_MISSION",
   PERSISTENCE_FAILURE: "PAUSE_FOR_PERSISTENCE",
+  // (#416) The disk suspend interrupts work exactly like a lost owner does:
+  // the fence/reconcile primitive resumes from the last checkpoint, so the
+  // in-flight task continues instead of being re-reasoned from scratch.
+  DISK_SUSPENDED: "FENCE_RECONCILE_AND_RESUME",
 };
 
 const EXPECTED_CHANGE: Record<RecoveryAction, string> = {
@@ -96,6 +100,10 @@ const CAPACITY_WAIT_ACTIONS: Partial<Record<FailureCategory, RecoveryAction>> = 
   ORPHANED_EXECUTION: "PROBE_AND_BACKOFF",
   EVIDENCE_UNAVAILABLE: "PROBE_AND_BACKOFF",
   PERSISTENCE_FAILURE: "PAUSE_FOR_PERSISTENCE",
+  // (#416) A disk outage is waited out, never counted against the strategy
+  // budget — the same principle as #112 for gateway capacity: the identical
+  // failure IS what "waiting for free space" looks like.
+  DISK_SUSPENDED: "PROBE_AND_BACKOFF",
 };
 
 /** Failures no automatic action can resolve: they must ask the operator. */
@@ -533,6 +541,14 @@ export class FailureClassifier {
     // The worker compacted once and the prompt still overflows the model's
     // window (issue #180): replaying it never helps; split the task instead.
     if (/context[_ ]overflow/.test(summary)) return "TASK_BUDGET_EXHAUSTED";
+    // (#416) Disk-pressure signatures: ENOSPC kills worker writes, checkpoints
+    // and durable appends with "no space left on device". Route to the
+    // disk-suspend capacity wait (resume from the last checkpoint; never
+    // terminal by count). Ahead of provider statuses on purpose: an ENOSPC
+    // surfaced through an HTTP 500 or a worker error is still a disk outage,
+    // not provider trouble.
+    if (/enospc|no space left on device|disk (?:full|pressure|space)|storage pressure|disk[- ]suspend/.test(summary))
+      return "DISK_SUSPENDED";
     if (evidence.providerStatus !== undefined) {
       if ([408, 425, 429, 500, 502, 503, 504].includes(evidence.providerStatus)) {
         return "PROVIDER_TRANSIENT";
