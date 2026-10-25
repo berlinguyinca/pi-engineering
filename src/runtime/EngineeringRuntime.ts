@@ -173,6 +173,8 @@ export interface EngineerReport {
 const SNAPSHOT_PUBLISH_MAX_RETRIES = 4;
 /** Base backoff (ms) between snapshot publish retries; grows linearly (~1s total). */
 const SNAPSHOT_PUBLISH_BACKOFF_MS = 100;
+/** Minimum interval between internal live-view snapshot publications. */
+const SNAPSHOT_PUBLISH_INTERVAL_MS = 750;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
@@ -761,6 +763,7 @@ export class EngineeringRuntime {
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
+  private snapshotPublishTimer: ReturnType<typeof setTimeout> | null = null;
   private snapshotPublishRetries = 0;
   /**
    * FR-03/04/05 — storage-pressure wiring: the controller the snapshot
@@ -963,6 +966,16 @@ export class EngineeringRuntime {
     return guard.publishPaused;
   }
 
+  /** Coalesce high-frequency observability updates before rebuilding the full snapshot. */
+  private scheduleMissionSnapshot(): void {
+    if (this.snapshotPublishTimer || this.closed) return;
+    this.snapshotPublishTimer = setTimeout(() => {
+      this.snapshotPublishTimer = null;
+      void this.publishMissionSnapshot();
+    }, SNAPSHOT_PUBLISH_INTERVAL_MS);
+    this.snapshotPublishTimer.unref?.();
+  }
+
   /** Best-effort measurement hints for storage classification (never throws). */
   private async storagePressureHints(): Promise<StorageHints> {
     const hints: StorageHints = { path: this.workDir };
@@ -999,7 +1012,7 @@ export class EngineeringRuntime {
         // replaces.
         onEvent: (event) => {
           try {
-            (this.snapshotPressureOverrides ?? {}).onEvent?.(event);
+            this.snapshotPressureOverrides?.onEvent?.(event);
           } catch {
             // Observer failures never participate in execution.
           }
@@ -1388,7 +1401,7 @@ export class EngineeringRuntime {
         },
       });
       rt.unsubscribeMissionActivity = rt.missionObservability.subscribe((missionId) => {
-        void rt.publishMissionSnapshot();
+        rt.scheduleMissionSnapshot();
         rt.emitMissionActivity(missionId);
       });
       for (const missionId of rt.missionObservability.listMissionIds()) rt.emitMissionActivity(missionId);
@@ -1822,7 +1835,7 @@ export class EngineeringRuntime {
             phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";
           rt.emitPhase({ workItemId: mission.mission_id, goal: mission.goal, phase: mapped });
           // Keep the PI WEB mission snapshot fresh as missions progress.
-          void rt.publishMissionSnapshot();
+          rt.scheduleMissionSnapshot();
         },
       });
       if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
@@ -1977,6 +1990,10 @@ export class EngineeringRuntime {
   async close(): Promise<void> {
     if (this.closed) return;
     this.externalPumpStopped = true;
+    if (this.snapshotPublishTimer) {
+      clearTimeout(this.snapshotPublishTimer);
+      this.snapshotPublishTimer = null;
+    }
     if (this.openReferences > 1) {
       this.openReferences--;
       if (this.orchestrationPath) EngineeringRuntime.releaseOrchestrationReference(this.orchestrationPath);
@@ -2374,7 +2391,7 @@ export class EngineeringRuntime {
         })
         .finally(() => {
           this.runningExternal.delete(missionId);
-          void this.publishMissionSnapshot();
+          this.scheduleMissionSnapshot();
         });
     }
   }

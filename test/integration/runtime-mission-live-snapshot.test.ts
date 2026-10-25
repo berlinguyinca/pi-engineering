@@ -79,6 +79,29 @@ test("runtime starts the supervisor, repairs blocked missions before open return
   }
 });
 
+test("coalesces rapid internal snapshot requests into one publication", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-snapshot-rate-"));
+  const originalPublish = EngineeringRuntime.prototype.publishMissionSnapshot;
+  let publications = 0;
+  try {
+    EngineeringRuntime.prototype.publishMissionSnapshot = async () => {
+      publications += 1;
+      return null;
+    };
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const schedule = (runtime as unknown as { scheduleMissionSnapshot(): void }).scheduleMissionSnapshot;
+    schedule.call(runtime);
+    schedule.call(runtime);
+    assert.equal(publications, 0);
+    await new Promise((resolve) => setTimeout(resolve, 850));
+    assert.equal(publications, 1);
+    await runtime.close();
+  } finally {
+    EngineeringRuntime.prototype.publishMissionSnapshot = originalPublish;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("snapshot preserves the complete actionable stop payload", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-actionable-stop-"));
   try {
@@ -1146,7 +1169,7 @@ test("runtime republishes a serialized live snapshot on worker activity and hear
 
     const path = join(workDir, "orchestration-snapshot.json");
     let snapshot: MissionSnapshotFile | undefined;
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < 200; i++) {
       try {
         snapshot = JSON.parse(await readFile(path, "utf8")) as MissionSnapshotFile;
         if (snapshot.missions[0]?.observability?.currentActivity?.summary === "Finished tool: typecheck") break;
@@ -1210,7 +1233,7 @@ test("runtime diagnoses a failed snapshot write and retries on the next activity
       summary: "Retry update",
     });
     let snapshot: MissionSnapshotFile | undefined;
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < 200; i++) {
       try {
         snapshot = JSON.parse(await readFile(path, "utf8")) as MissionSnapshotFile;
         if (snapshot.missions[0]?.observability?.currentActivity?.summary === "Retry update") break;
