@@ -15,7 +15,10 @@ test("real stack lifecycle: starts a real process, health-checks it, verifies, a
       args: ["--experimental-strip-types", "scripts/control-server.ts", String(port)],
       cwd: REPO,
       healthUrl: `http://127.0.0.1:${port}/health`,
-      startupTimeoutMs: 15000,
+      // 60s (was 15s): spawns the real control-server through --experimental-strip-types.
+      // On a loaded machine (full suite, --test-concurrency=4) TS strip + boot of the
+      // child regularly exceeded 15s; the assertion below still proves real health.
+      startupTimeoutMs: 60000,
     },
     async () => {
       const res = await fetch(`http://127.0.0.1:${port}/health`);
