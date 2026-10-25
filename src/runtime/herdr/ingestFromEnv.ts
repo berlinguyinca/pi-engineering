@@ -56,6 +56,8 @@ function hasControlChar(value: string): boolean {
  * or logs.
  */
 export function createIngestFromEnv(env: NodeJS.ProcessEnv): ControlPlaneIngest | null {
+  // Same process-level off switch as loadHerdrConnection (test harness default).
+  if (env.HERDR_DISABLED === "1") return null;
   const trimmedUrl = env.HERDR_INGEST_URL?.trim() ?? "";
   if (trimmedUrl === "") return null;
 

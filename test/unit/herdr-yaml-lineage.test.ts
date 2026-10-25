@@ -1,4 +1,7 @@
 /** T16 glue: the global engineering.yaml `herdr:` block drives lineage (room/mission/visibility) and the attention ingest. */
+// This file exercises the connection layer itself, so it opts back in from the
+// harness-wide HERDR_DISABLED default (test/support/isolatedState.ts).
+delete process.env.HERDR_DISABLED;
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
@@ -48,6 +51,24 @@ describe("herdr: YAML lineage keys", () => {
     assert.equal(connection?.roomId, "room-1");
     assert.equal(connection?.workspaceId, "ws.1");
     assert.equal(connection?.missionId, "m:1");
+  });
+
+  it("HERDR_DISABLED=1 is a hard off switch even for a valid config", async () => {
+    const { dir } = await setup("");
+    process.env.HERDR_DISABLED = "1";
+    try {
+      const { connection, notes } = await loadHerdrConnection(dir);
+      assert.equal(connection, null);
+      assert.match(notes[0] ?? "", /disabled by HERDR_DISABLED/);
+      // The env-URL path is gated too: a live HERDR_INGEST_URL must stay silent.
+      const attention = await resolveAttentionIngest(
+        { HERDR_DISABLED: "1", HERDR_INGEST_URL: "http://127.0.0.1:9" },
+        dir,
+      );
+      assert.equal(attention, null);
+    } finally {
+      delete process.env.HERDR_DISABLED;
+    }
   });
 
   it("rejects bad values and unknown keys (herdr off, with a note)", async () => {
