@@ -87,14 +87,14 @@ routing:
       timeout_ms: 3600000
       max_context_tokens: 128000
     implementer:
-      # rev 8b (2026-10-25, operator approved): deepseek_v4-flash answered the
-      # liveness probe but returned no worker_result on a real implementing task
-      # (MSN-nC658P; it does not reliably carry the worker protocol tool-call —
-      # #428, matching rev-7's read-thrash warning). Implementing moves to
-      # flint-40b (served, the Oct-23 working placement); planner/orchestrator
-      # keep deepseek, review stays 27b-vision — three distinct families.
-      model: "flint/flint-40b"
-      fallback_model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
+      # rev 8c (2026-10-25): flint is LOCAL (8290 on this box) and its upstream
+      # crashed twice under worker dispatch load (MSN-03avoS, MSN-1WShkr:
+      # 400 upstream_error at request_state unknown). flash_next on remote
+      # metabolomics passes forced tool-calls (verified today: finish_reason
+      # tool_calls) and is a family distinct from the 27b-vision reviewer.
+      # deepseek stays on planning prose (MSN-nC658P: no worker_result, #428).
+      model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
+      fallback_model: "flint/flint-40b"
       timeout_ms: 3600000
       max_context_tokens: 128000
     reviewer:
