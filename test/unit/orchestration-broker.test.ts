@@ -25,6 +25,8 @@ const exec = promisify(execFile);
  */
 async function breakCommitIdentity(root: string): Promise<void> {
   await exec("git", ["-C", root, "config", "user.name", " "]);
+  // Operator-trust safeGit passes these through and they override config; an exporting host would mask the failure.
+  for (const key of ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"]) delete process.env[key];
 }
 
 class LateAppendFailureBackend implements EventStoreBackend {
