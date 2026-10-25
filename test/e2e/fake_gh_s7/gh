@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+// FAKE - test shim. NOT the GitHub CLI. Used only by test/e2e/s7-cross-repo.e2e.test.ts.
+// Answers `gh api repos/<owner>/<repo>/issues/<n>` for two fixed issues; every other call is a 404.
+const argv = process.argv.slice(2);
+const path = argv[argv.length - 1];
+const ISSUES = {
+  "acme/api#31": { title: "Provide the API", body: "" },
+  "acme/web#32": { title: "Use the API", body: "## Dependencies\n\nBlocked by acme/api#31\n" },
+};
+const m = path.match(/^repos\/(acme\/[a-z]+)\/issues\/(\d+)$/);
+const hit = m ? ISSUES[`${m[1]}#${m[2]}`] : undefined;
+if (argv[0] !== "api" || !hit) {
+  process.stderr.write("gh: Not Found (HTTP 404)\n");
+  process.exit(1);
+}
+process.stdout.write(
+  JSON.stringify({ number: Number(m[2]), title: hit.title, state: "open", body: hit.body, labels: [], html_url: `https://github.com/${m[1]}/issues/${m[2]}` }),
+);

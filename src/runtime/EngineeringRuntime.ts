@@ -33,6 +33,7 @@ import { selectExternalMissionsToStart } from "../orchestration/externalStartSel
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { MAINTENANCE_STOP_REASON, OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
+import { emitMissionPlanned } from "../orchestration/missionLineage.ts";
 import { readAutospecFlags } from "../orchestration/missionMode.ts";
 import {
   PlannerTransientError,
@@ -53,7 +54,7 @@ import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
-import { gatePlanBeforeWorkers } from "../orchestration/planReview.ts";
+import { type PlanLineageEmitter, gatePlanBeforeWorkers } from "../orchestration/planReview.ts";
 import { loadPlanReviewSettings } from "../orchestration/planReviewConfig.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import {
@@ -92,7 +93,8 @@ import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
-import { type ForkRuntime, createForkRuntime } from "./herdr/forkWiring.ts";
+import { type ExternalBridge, startExternalBridge } from "./herdr/externalAgent.ts";
+import { type ForkRuntime, createForkRuntime, downstreamPrNodes } from "./herdr/forkWiring.ts";
 import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
@@ -709,6 +711,7 @@ export class EngineeringRuntime {
   /** T12: outbound-only steering poller; null unless enabled in the global YAML with a control plane configured. */
   steeringReceiver: SteeringReceiver | null = null;
   forkRuntime: ForkRuntime | null = null;
+  externalBridge: ExternalBridge | null = null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /** The planner the orchestrator uses to turn a mission into tasks. */
@@ -1620,6 +1623,13 @@ export class EngineeringRuntime {
           });
         }
         if (planReviewSettings && rt.missionStore && !planned.clarification && planned.tasks.length > 0) {
+          // Herdr projection: the mission node first (the plan's `produced` edge needs it), then the gate's own
+          // revision / decision events through the same emitter. Null without a configured `herdr:` block.
+          emitMissionPlanned(opts.lineage, {
+            missionId: mission.mission_id,
+            title: mission.title || mission.goal.slice(0, 80),
+            source: "standalone",
+          });
           const gated = await gatePlanBeforeWorkers({
             // Changes requested: plan again with the reviewer's feedback as input.
             // The single-task fallback carries the feedback too, so the revision
@@ -1633,6 +1643,7 @@ export class EngineeringRuntime {
               return replanned.tasks.length > 0 ? replanned.tasks : revision.tasks;
             },
             ...planReviewSettings,
+            emitter: (planReviewSettings as { emitter?: PlanLineageEmitter | null }).emitter ?? opts.lineage ?? null,
             missionId: mission.mission_id,
             goal: mission.goal,
             plan: async () => planned.tasks,
@@ -1835,10 +1846,18 @@ export class EngineeringRuntime {
       await rt.missionSupervisor.reconcileOnStartup();
       rt.missionSupervisor.start();
       rt.steeringReceiver = await EngineeringRuntime.startSteering(rt, opts);
+      // Pi as an external coworker agent: only when `pi-engineering herdr join` stored a credential AND the global YAML
+      // names a control plane. Otherwise null: no timer, no request.
+      rt.externalBridge = await startExternalBridge({
+        agentDir: opts.agentDir ?? getAgentDir(),
+        stateDir: resolveStateRoot(),
+        log: (message) => console.error(message),
+      }).catch(() => null);
       return rt;
     } catch (error) {
       rt.steeringReceiver?.stop();
       rt.forkRuntime?.stop();
+      rt.externalBridge?.stop();
       rt.externalPumpStopped = true;
       rt.missionActivityTicker?.close();
       rt.missionActivityClock.clear();
@@ -1890,6 +1909,7 @@ export class EngineeringRuntime {
         boundRoot: (repoId) => rt.repositoryRegistry.get(repoId).root,
         openRoot: async (path) => (await GitRepo.open(path))?.root ?? null,
         links: store,
+        downstreamPrs: (taskId) => downstreamPrNodes(store, taskId),
       },
     });
     if (rt.forkRuntime) ports.forks = rt.forkRuntime.port;
@@ -1929,6 +1949,7 @@ export class EngineeringRuntime {
     try {
       this.steeringReceiver?.stop();
       this.forkRuntime?.stop();
+      this.externalBridge?.stop();
       await this.missionSupervisor?.shutdown();
       await this.missionStore?.flush();
       await this.missionObservability?.flush();

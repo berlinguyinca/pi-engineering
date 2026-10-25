@@ -1,22 +1,3 @@
-import assert from "node:assert/strict";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { after, before, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
-import { GitRepo } from "../../src/git/GitRepo.ts";
-import { createGithubClient } from "../../src/github/client.ts";
-import { emitLinkRecorded } from "../../src/github/lineage.ts";
-import { linkPullRequest } from "../../src/github/prLinks.ts";
-import { reconcileGithubLinks } from "../../src/github/reconcile.ts";
-import { ingestAutoSpecDag } from "../../src/integrations/autospec/dagIngest.ts";
-import { decideMerge } from "../../src/merge/mergeGate.ts";
-import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
-import { callers, mentions, reachable } from "./support/codeGraph.ts";
-import { Plane, eventually, sha40 } from "./support/plane.ts";
 /**
  * ACCEPTANCE SCENARIO 2 - AutoSpec mission.
  * "existing GitHub issue DAG, Pi adapter, multiple worktrees, PR, independent AI reviewer, defect repair, head change
@@ -33,6 +14,23 @@ import { Plane, eventually, sha40 } from "./support/plane.ts";
  *
  * Gaps are named `GAP: ...` and assert today's behaviour; none is filled by calling emitter primitives from the test.
  */
+import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import { GitRepo } from "../../src/git/GitRepo.ts";
+import { createGithubClient } from "../../src/github/client.ts";
+import { emitLinkRecorded } from "../../src/github/lineage.ts";
+import { linkPullRequest } from "../../src/github/prLinks.ts";
+import { ingestAutoSpecDag } from "../../src/integrations/autospec/dagIngest.ts";
+import { decideMerge } from "../../src/merge/mergeGate.ts";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
+import { Plane, eventually, sha40 } from "./support/plane.ts";
 import { scratch } from "./support/scratch.ts";
 
 const PI = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -154,6 +152,58 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l) as string[]);
+  const setChecks = (sha: string, conclusion: "success" | "failure") => {
+    const f = join(tmp, "gh", "state.json");
+    const st = JSON.parse(readFileSync(f, "utf8"));
+    st.checks = { ...(st.checks ?? {}), [sha]: [{ name: "ci", conclusion }] };
+    writeFileSync(f, JSON.stringify(st));
+  };
+  /** One `pi-engineering github sync` tick as a child process. The store is single-writer, so the test closes its own. */
+  const syncCli = async (): Promise<any> => {
+    await store.flush();
+    await emitter.idle();
+    backend.close();
+    const r = await new Promise<CliRun>((res, rej) => {
+      const child = spawn(
+        process.execPath,
+        [join(PI, "scripts/pi-engineering.ts"), "github", "sync", "--store", storeDir],
+        {
+          cwd: tmp,
+          env: {
+            PATH: process.env.PATH ?? "",
+            HOME: tmp,
+            PI_CODING_AGENT_DIR: agentDir,
+            PI_ENGINEERING_STATE_DIR: join(tmp, "state"),
+            PI_ENGINEERING_HOME: join(tmp, "home"),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (d) => {
+        out += d;
+      });
+      child.stderr.on("data", (d) => {
+        err += d;
+      });
+      child.on("error", rej);
+      child.on("close", (code) => {
+        let json: any = null;
+        try {
+          json = JSON.parse(out.trim().split("\n").pop() as string);
+        } catch {
+          /* leave null */
+        }
+        res({ code: code ?? -1, json, stderr: err });
+      });
+    });
+    backend = await JsonlEventStore.open(join(storeDir, "orchestration.jsonl"));
+    store = MissionStore.open(backend);
+    store.setLineage(emitter);
+    assert.equal(r.code, 0, r.stderr);
+    return r.json;
+  };
   const quorum = async () => {
     const r = await plane.call("GET", `/api/v1/graph/nodes/${encodeURIComponent(PR_NODE(prNumber))}/review-quorum`, {
       key: "operator",
@@ -191,6 +241,12 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
         "  instance_id: pi-s2",
         "  lineage: true",
         "  visibility: org",
+        "github:",
+        "  enabled: true",
+        "  hosts: [github.com]",
+        `  gh_path: ${JSON.stringify(join(tmp, "gh", "gh"))}`,
+        "  required_checks: [ci]",
+        `  rereview_command: ${JSON.stringify([process.execPath, join(tmp, "request-rereview.mjs")])}`,
       ].join("\n")}\n`,
     );
     storeDir = join(tmp, "store");
@@ -219,6 +275,11 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
       }),
     );
     writeFileSync(join(tmp, "gh", "calls.jsonl"), "");
+    // the operator's re-review command: records its argv (a stand-in for whatever dispatches a re-review)
+    writeFileSync(
+      join(tmp, "request-rereview.mjs"),
+      `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(join(tmp, "rereview.log"))}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`,
+    );
   });
 
   after(async () => {
@@ -272,14 +333,28 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     assert.deepEqual(store.listPlanRevisions(missionId), [], "unreviewed means no review revision was recorded");
   });
 
-  it("GAP: the plan CLI itself writes nothing to Herdr (planCli never builds a lineage emitter), so the mission is absent from the graph", async () => {
-    const sources = Object.keys(await plane.sources());
-    assert.deepEqual(
-      sources.filter((s) => s.includes("pi")),
-      [],
-      "no Pi source has registered after the CLI ran with a configured herdr: block",
+  it("the plan CLI itself writes the mission and the DAG to Herdr (planCli builds the YAML lineage emitter): a Pi source registered, the mission and its tasks are in the graph", async () => {
+    const sources = Object.keys(await plane.sources("operator"));
+    assert.ok(
+      sources.some((s) => s.includes("pi")),
+      `a Pi source registered: ${sources.join(",")}`,
     );
-    assert.equal((await plane.node(`mission:${missionId}`)).status, 404);
+    // org scope: readable by an ordinary (viewer) key, which is not the operator bypass
+    const mission = await plane.node(`mission:${missionId}`, "viewer");
+    assert.equal(mission.status, 200, JSON.stringify(mission.body));
+    assert.equal(mission.body.node.attrs.source, "autospec");
+    for (const t of ["t-1", "t-2", "t-3"]) {
+      const n = await plane.node(`task:${missionId}/${t}`, "viewer");
+      assert.equal(n.status, 200, t);
+      assert.equal(n.body.node.state, "pending");
+    }
+    const deps = (await plane.edges(`task:${missionId}/t-1`, "viewer")).filter(([t]) => t === "dependency");
+    assert.deepEqual(deps.map(([, from, to]) => [from, to]).sort(), [
+      [`task:${missionId}/t-2`, `task:${missionId}/t-1`],
+      [`task:${missionId}/t-3`, `task:${missionId}/t-1`],
+    ]);
+    // negative control: a task the DAG never had is absent
+    assert.equal((await plane.node(`task:${missionId}/t-99`, "viewer")).status, 404);
   });
 
   // ------------------------------------------------------------------------------------------ worktrees + spawn
@@ -403,20 +478,45 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     );
   });
 
-  it("GAP: the issue ids of the DAG (acme/widgets#12, acme/other#3) never become issue nodes or issue_link edges in Herdr", async () => {
-    // positive control above: the task->PR link exists. The DAG's own issue refs have no runtime emitter caller.
+  it("the DAG's own issue ids (acme/widgets#12, acme/other#3) are issue nodes and issue_link edges from their task, written by the plan CLI", async () => {
     for (const id of ["issue:github.com/acme/widgets#12", "issue:github.com/acme/other#3"]) {
-      assert.equal((await plane.node(id)).status, 404, id);
+      const n = await eventually(async () => {
+        const r = await plane.node(id, "viewer");
+        return r.status === 200 ? r : false;
+      }, id);
+      assert.ok(n.body.node.state == null, "no state was invented: Pi has not asked GitHub");
+      assert.ok(n.body.node.attrs.number);
+      const links = (await plane.edges(id, "viewer")).filter(([t]) => t === "issue_link");
+      assert.deepEqual(links, [["issue_link", `task:${missionId}/t-1`, id]]);
     }
+    // cross-repo issues stay two distinct nodes; a ref the DAG never carried is absent
+    assert.equal((await plane.node("issue:github.com/acme/widgets#99", "viewer")).status, 404);
   });
 
-  it("GAP: no CI validation node, no 'validated' edge and no dependency edge is emitted for the PR by any runtime path", async () => {
-    const edges = await plane.edges(PR_NODE(prNumber));
-    assert.ok(edges.length >= 1, "control: the PR does have edges");
-    assert.deepEqual(
-      edges.filter(([t]) => t === "validated" || t === "dependency"),
-      [],
-    );
+  it("the sync CLI projects CI for the PR head: red CI validates nothing, green CI is a `validated` edge bound to that head", async () => {
+    const validatedOn = async () =>
+      (await plane.edges(PR_NODE(prNumber))).filter(([t, from]) => t === "validated" && String(from).startsWith("ci:"));
+    setChecks(head1, "failure");
+    const red = await syncCli();
+    assert.equal(red.result, "ok");
+    assert.equal(red.ciPrs, 1);
+    await eventually(async () => (await plane.node(PR_NODE(prNumber))).status === 200, "the PR node");
+    assert.deepEqual(await validatedOn(), [], "control: a failing check validates nothing");
+    setChecks(head1, "success");
+    const green = await syncCli();
+    assert.equal(green.ciPrs, 1);
+    const edge = await eventually(async () => {
+      const e = await validatedOn();
+      return e.length ? e : false;
+    }, "the validated edge");
+    assert.equal(edge.length, 1);
+    const ciNode = String(edge[0]?.[1]);
+    const n = await plane.node(ciNode);
+    assert.equal(n.body.node.state, "done");
+    assert.equal(n.body.node.attrs.commit, head1);
+    // no quorum yet: the gate waits (and Pi read Herdr's answer to know it)
+    assert.equal(green.gates[0].decision, "wait");
+    assert.equal(green.gates[0].quorum, "insufficient");
   });
 
   // ----------------------------------------------------------------------- independent reviewers and head change
@@ -463,7 +563,7 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
   it("Pi's decideMerge merges only when review and green CI are on the live head; no review waits, red CI rejects", async () => {
     const q = await quorum();
     assert.equal(q.status, "satisfied");
-    const verdictSha = q.head; // the test maps a satisfied quorum to a PASS verdict: no product code does (see GAP below)
+    const verdictSha = q.head; // the product mapping (githubSync) is exercised through the CLI below
     assert.equal(decision(head1, head1, verdictSha, "pass").decision, "merge");
     assert.equal(decision(head1, head1, null, "pass").decision, "wait");
     assert.equal(decision(head1, head1, verdictSha, "pending").decision, "wait");
@@ -487,14 +587,18 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
       provenance: "pr_create_output",
     });
     assert.equal(relink[0]?.observed.headSha, head1, "control: re-linking is idempotent and keeps the recorded head");
-    // the real head-move path is the reconciler: it asks GitHub (fake over the real remote), corrects the link,
-    // emits the new head to Herdr and records a stale signal for evidence bound to the old head
-    const result = await reconcileGithubLinks(client, store, { hosts: ["github.com"] }, { missionId, sink: emitter });
-    assert.equal(result.status, "ok");
-    assert.equal(result.corrections.length, 1, JSON.stringify(result));
-    assert.equal(result.staleSignals.length, 1);
+    // the real head-move path is the sync CLI: it asks GitHub (fake over the real remote), corrects the link, emits the
+    // new head to Herdr, records a stale signal for evidence bound to the old head, and requests a re-review of the new one
+    setChecks(head2, "success");
+    const tick = await syncCli();
+    assert.equal(tick.result, "ok");
+    assert.equal(tick.corrections, 1, JSON.stringify(tick));
+    assert.equal(tick.staleSignals, 1);
+    assert.equal(tick.rereviews.length, 1);
+    assert.equal(tick.rereviews[0].head, head2);
+    assert.equal(tick.rereviews[0].dispatch, "ok", "the operator's command ran");
     assert.equal(store.getGithubLink(relink[0]!.linkId)?.observed.headSha, head2);
-    await emitter.idle();
+    assert.equal(tick.gates[0].decision, "reject", "Pi's candidate was the old head: it is not merged");
     await eventually(
       async () => (await plane.node(PR_NODE(prNumber))).body.node?.attrs?.head_sha === head2,
       "new head in graph",
@@ -504,6 +608,11 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     assert.equal(q.status, "insufficient", "both verdicts were for the old head");
     assert.deepEqual(q.counted, []);
     assert.equal(q.rereview_required, true);
+    // Herdr's new request route: Pi asked Herdr to RECORD the re-review for the new head, with its own key (no env, no
+    // new config); the quorum read now shows the durable request, bound to head2
+    assert.equal(q.rereview_request?.head, head2, JSON.stringify(q));
+    assert.ok(q.rereview_request?.request_id, "Herdr stored a request id");
+    assert.equal(tick.rereviews[0].ask, "ok");
   });
 
   it("the old verdict no longer merges: decideMerge rejects a PASS pinned to the previous head, CI included", async () => {
@@ -542,26 +651,46 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     assert.equal(attrs.author, "pi-bot", "the head-bound quorum needs the login to exclude the author's own approval");
   });
 
-  it("GAP: nothing in Pi calls the reconciler or reacts to github.evidence_stale (no automatic re-review request)", async () => {
-    const reach = reachable();
-    assert.ok(existsSync(join(PI, "src/github/reconcile.ts")), "control: the reconciler exists");
-    // structural: the product entry points reach no call of the reconciler, and no module but the reconciler and the
-    // store's event table even names the stale signal (so nothing can react to it)
-    assert.deepEqual(callers(reach, ["reconcileGithubLinks"]), []);
-    assert.deepEqual(mentions(reach, /^github\.evidence_stale$/, ["src/github/reconcile.ts"]), [
-      "src/orchestration/missionStore.ts",
-    ]);
+  it("the stale head produced exactly ONE durable re-review request, one command run, and the PR node says which head wants it", async () => {
+    const again = await syncCli();
+    assert.equal(again.rereviews.length, 0, "a second tick does not request again");
+    assert.equal(again.staleSignals, 0);
+    const requests = store.listGithubRereviews(missionId);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0]?.headSha, head2);
+    assert.equal(requests[0]?.previousHeadSha, head1);
+    const log = readFileSync(join(tmp, "rereview.log"), "utf8").trim().split("\n");
+    assert.equal(log.length, 1, "the operator's command ran once");
+    assert.deepEqual(JSON.parse(log[0] as string).slice(0, 4), ["--pr", PR_NODE(prNumber), "--head", head2]);
+    const attrs = (await plane.node(PR_NODE(prNumber))).body.node.attrs;
+    assert.equal(attrs.rereview_head, head2);
+    // and exactly ONE ask reached Herdr: the answer is stored on the durable request, so a second tick does not ask again
+    assert.equal(requests[0]?.ask?.state, "ok");
+    assert.equal(requests[0]?.ask?.attempts, 1);
+    assert.equal(requests[0]?.ask?.requestId, (await quorum()).rereview_request?.request_id);
   });
 
-  it("GAP: nothing in Pi connects Herdr's review quorum to its merge gate (decideMerge has no runtime caller, no quorum reader)", async () => {
-    const reach = reachable();
-    assert.ok(existsSync(join(PI, "src/merge/mergeGate.ts")), "control: the gate exists");
-    assert.deepEqual(
-      callers(reach, ["decideMerge"]),
-      [],
-      "no module reachable from a product entry point calls the gate",
+  it("the sync CLI reads Herdr's review quorum for the merge gate: satisfied + green CI on the live head merges, and it is projected as a Pi-owned gate", async () => {
+    const q = await quorum();
+    assert.equal(q.status, "satisfied");
+    const tick = await syncCli();
+    assert.equal(tick.gates[0].quorum, "satisfied", "Pi read the quorum Herdr derived");
+    assert.equal(tick.gates[0].decision, "merge", JSON.stringify(tick.gates));
+    const gateId = `gate:github.com/${REPO}#${prNumber}`;
+    const gate = await eventually(async () => {
+      const g = await plane.node(gateId);
+      return g.status === 200 && g.body.node.attrs?.decision === "merge" ? g : false;
+    }, "the gate node");
+    assert.equal(gate.body.node.attrs.commit, head2);
+    const gateEdges = (await plane.edges(PR_NODE(prNumber))).filter(
+      ([t, from]) => t === "validated" && from === gateId,
     );
-    assert.deepEqual(mentions(reach, /review[-_]?quorum/i), [], "no reachable module reads Herdr's review quorum");
+    assert.equal(gateEdges.length, 1);
+    // negative control: the same tick with red CI on the head does not merge
+    setChecks(head2, "failure");
+    const red = await syncCli();
+    assert.equal(red.gates[0].decision, "reject");
+    setChecks(head2, "success");
   });
 
   it("the fake gh was only asked for the calls Pi's client makes (no merge, no review-write)", async () => {

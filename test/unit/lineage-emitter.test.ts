@@ -241,7 +241,9 @@ describe("lineage: no parent, no spawn edge", () => {
         [`attempt:${lead}`, `attempt:${child}`],
       ],
     );
-    const ended = events.filter((e) => e.event_type === "node.state");
+    const ended = events.filter(
+      (e) => e.event_type === "node.state" && !/^(tab|pane):/.test(String(e.payload.node_id)),
+    );
     assert.deepEqual(
       ended.map((e) => [e.payload.node_id, e.payload.state]),
       [[`attempt:${child}`, "cancelled"]],
@@ -420,7 +422,9 @@ describe("lineage: dedupe and ids", () => {
 
 describe("lineage: attempt state transitions", () => {
   const stateEvents = (events: EnvelopeV2[]) =>
-    events.filter((e) => e.event_type === "node.state").map((e) => [e.payload.node_id, e.payload.state]);
+    events
+      .filter((e) => e.event_type === "node.state" && !/^(tab|pane):/.test(String(e.payload.node_id)))
+      .map((e) => [e.payload.node_id, e.payload.state]);
 
   it("Herdr: terminate on a completed worker is a no-op; wait failures emit failed; resume emits running", async () => {
     const { store: envStore, emitter } = rig();
@@ -679,3 +683,92 @@ class FakeCli implements HerdrCli {
     return { workspaceId: "w", path: repo };
   }
 }
+
+describe("lineage: worker-review verdicts", () => {
+  const evidence = (over: Record<string, unknown> = {}) =>
+    ({
+      evidenceId: "RE-lin",
+      missionId: "MSN-lin",
+      taskId: "task-a",
+      executionId: "EX-review",
+      identity: { candidateSha: SHA },
+      verdict: "request_changes",
+      independenceMode: "independent",
+      findings: [{ severity: "high", summary: "x", status: "open" }],
+      outputValid: true,
+      accessible: true,
+      recordedAt: "2026-09-26T10:00:00.000Z",
+      ...over,
+    }) as never;
+
+  it("a valid verdict becomes a review node, a reviewed edge bound to the candidate commit and a produced edge", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store } = missionRig(emitter);
+    (store as unknown as { lineageReviewRecorded(e: unknown): void }).lineageReviewRecorded(evidence());
+    const events = await lineageEvents(envStore, emitter);
+    const reviewed = edges(events, "reviewed");
+    assert.deepEqual(
+      reviewed.map((e) => [e.from_id, e.to_id]),
+      [["review:RE-lin", `commit:${SHA}`]],
+    );
+    assert.equal((reviewed[0] as { attrs?: { commit?: string } }).attrs?.commit, SHA);
+    assert.equal(edges(events, "produced").length, 1);
+    assertEndpointsUpserted(events);
+  });
+
+  it("an unreadable or invalid review projects nothing", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store } = missionRig(emitter);
+    const p = store as unknown as { lineageReviewRecorded(e: unknown): void };
+    p.lineageReviewRecorded(evidence({ outputValid: false }));
+    p.lineageReviewRecorded(evidence({ accessible: false }));
+    const events = await lineageEvents(envStore, emitter);
+    assert.equal(edges(events, "reviewed").length, 0);
+  });
+});
+
+describe("lineage: tab and pane surfaces", () => {
+  it("a top-level worker is a tab and a helper a pane, open on start and closed on terminate, without touching the agent", async () => {
+    const { store: envStore, emitter } = rig();
+    const rt = new HerdrAgentRuntime({ cli: new FakeCli(), lineage: emitter });
+    const lead = await rt.create({ role: "lead", objective: "o" });
+    await rt.start(lead);
+    const child = await rt.create({ role: "helper", objective: "o", parentRuntimeId: lead });
+    await rt.start(child);
+    await rt.terminate(child);
+    const events = await lineageEvents(envStore, emitter);
+    const opened = events.filter(
+      (e) => e.event_type === "node.upsert" && /^(tab|pane):/.test(String(e.payload.node_id)),
+    );
+    assert.deepEqual(
+      opened.map((e) => [e.payload.node_id, e.payload.state, (e.payload.attrs as { agent_id: string }).agent_id]),
+      [
+        [`tab:${lead}`, "open", `agent:${lead}`],
+        [`pane:${child}`, "open", `agent:${child}`],
+      ],
+    );
+    const closed = events.filter(
+      (e) => e.event_type === "node.state" && /^(tab|pane):/.test(String(e.payload.node_id)),
+    );
+    assert.deepEqual(
+      closed.map((e) => [e.payload.node_id, e.payload.state]),
+      [[`pane:${child}`, "closed"]],
+    );
+    assert.ok(
+      !events.some((e) => e.event_type === "node.state" && e.payload.node_id === `agent:${child}`),
+      "a surface close never changes the agent",
+    );
+  });
+});
+
+describe("lineage: removing a bound edge", () => {
+  it("a validated edge can be withdrawn without restating its commit (a wildcard removal), but only with a reason", async () => {
+    const { store: envStore, emitter } = rig();
+    emitter.edgeRemove("validated", "gate:g1", `pr:github.com/a/b#1`, "upstream changed", "t1");
+    emitter.edgeRemove("validated", "gate:g1", `pr:github.com/a/b#1`, "  ", "t2");
+    const events = (await lineageEvents(envStore, emitter)).filter((e) => e.event_type === "edge.remove");
+    assert.equal(events.length, 1, "no reason, no removal");
+    assert.equal(events[0]?.payload.reason, "upstream changed");
+    assert.equal((events[0]?.payload as { attrs?: unknown }).attrs, undefined);
+  });
+});

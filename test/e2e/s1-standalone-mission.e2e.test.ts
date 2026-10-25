@@ -39,7 +39,7 @@ interface PlanRun {
 function runPlan(
   args: string[],
   body: unknown,
-  o: { agentDir: string; cwd: string; allowSpawnUnder?: string },
+  o: { agentDir: string; cwd: string; allowSpawnUnder?: string; guard?: boolean },
 ): Promise<PlanRun> {
   return new Promise((res, rej) => {
     const env: Record<string, string> = {
@@ -50,7 +50,10 @@ function runPlan(
       PI_ENGINEERING_HOME: join(o.cwd, "home"),
       ...(o.allowSpawnUnder ? { TEST_ALLOW_SPAWN_UNDER: o.allowSpawnUnder } : {}),
     };
-    const child = spawn(process.execPath, ["--import", GUARD, join(PI, "scripts/pi-engineering.ts"), "plan", ...args], {
+    // `guard: false` is for the runs that are CONFIGURED to talk to the real plane (a `herdr:` block): the guard would
+    // block exactly the loopback traffic under test. Every run without a `herdr:` block keeps the guard.
+    const preload = o.guard === false ? [] : ["--import", GUARD];
+    const child = spawn(process.execPath, [...preload, join(PI, "scripts/pi-engineering.ts"), "plan", ...args], {
       cwd: o.cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -309,7 +312,7 @@ describe("scenario 1 / worker spawn, review evidence and the Herdr graph (real p
     roomId = (await plane.makeRoom("alice", "s1", "s1-room")).roomId;
     ws = workdir("graph");
     writeAgentDir(ws.agentDir, { url: plane.url, key: plane.keys.pi as string, roomId, instance: "pi-s1" });
-    const r = await runPlan(["--store", ws.store], LOW, ws);
+    const r = await runPlan(["--store", ws.store], LOW, { ...ws, guard: false });
     assert.equal(r.code, 0, r.stderr);
     mission = r.json.missionId;
     planRun = r;
@@ -493,9 +496,45 @@ describe("scenario 1 / worker spawn, review evidence and the Herdr graph (real p
       acceptanceResults: [{ acceptanceId: "AC-1", status: "passed", detail: "reviewed against criterion" }],
       recordedAt: new Date().toISOString(),
     } as never);
+    // a review whose output was not valid gave no verdict: it must never be projected
+    task("TSK-s1-review-bad", "review", "independent-reviewer");
+    store.transitionTask("TSK-s1-review-bad", "READY");
+    const exInvalid = store.createExecution({
+      task_id: "TSK-s1-review-bad",
+      backend: "review",
+      mission_id: mission,
+      repo_id: "repo-1",
+      base_sha: "base-a",
+    });
+    store.transitionTask("TSK-s1-review-bad", "RUNNING", "system", { assigned_execution_id: exInvalid.execution_id });
+    store.setExecutionStatus(exInvalid.execution_id, "RUNNING");
+    store.setExecutionStatus(exInvalid.execution_id, "SUCCEEDED");
+    store.transitionTask("TSK-s1-review-bad", "SUCCEEDED");
+    store.recordCandidate(mission, identity, "integration", {
+      taskId: "TSK-s1-review-bad",
+      executionId: exInvalid.execution_id,
+    });
+    store.recordReviewEvidence({
+      evidenceId: "RE-s1-invalid",
+      missionId: mission,
+      taskId: "TSK-s1-review-bad",
+      executionId: exInvalid.execution_id,
+      identity,
+      identityHash: hashCandidateEvidenceIdentity(identity),
+      reviewerSessionId: "review-session-2",
+      model: "model-a",
+      provider: "provider-a",
+      verdict: "approve",
+      independenceMode: "independent",
+      findings: [],
+      outputValid: false,
+      accessible: true,
+      acceptanceResults: [],
+      recordedAt: new Date().toISOString(),
+    } as never);
     await store.flush();
     await emitterRef.idle();
-    const rec = store.listReviewEvidence(mission);
+    const rec = store.listReviewEvidence(mission).filter((r) => r.evidenceId === "RE-s1");
     assert.equal(rec.length, 1);
     assert.equal(rec[0]?.verdict, "approve");
     assert.equal(rec[0]?.identity.candidateSha, SHA);
@@ -506,38 +545,77 @@ describe("scenario 1 / worker spawn, review evidence and the Herdr graph (real p
     assert.equal((await read(`agent:${taskIds.review}`, "alice")).body.node.state, "done");
   });
 
-  it("GAP: the review VERDICT does not reach Herdr (Pi emits `reviewed` edges only for plan reviews; no worker-review projection exists)", async () => {
-    const hood = await plane.c(
-      "GET",
-      `/graph/nodes/${encodeURIComponent(`agent:${taskIds.review}`)}/neighborhood?depth=3`,
-      { user: "alice" },
+  it("the worker-review VERDICT reaches Herdr: a review node, a `reviewed` edge bound to the exact candidate commit, and a produced edge from the reviewing attempt", async () => {
+    const rn = await eventually(async () => {
+      const r = await read("review:RE-s1", "alice");
+      return r.status === 200 ? r : false;
+    }, "the review node");
+    assert.equal(rn.body.node.attrs.verdict, "approve");
+    assert.equal(rn.body.node.attrs.candidate_sha, SHA);
+    const hood = await eventually(async () => {
+      const h = await plane.c("GET", `/graph/nodes/${encodeURIComponent("review:RE-s1")}/neighborhood?depth=1`, {
+        user: "alice",
+      });
+      const ed = (h.body.edges ?? []).filter((e: any) => e.edge_type === "reviewed");
+      return ed.length ? h : false;
+    }, "the reviewed edge");
+    const reviewed = (hood.body.edges ?? []).filter((e: any) => e.edge_type === "reviewed");
+    assert.deepEqual(
+      reviewed.map((e: any) => [e.from_id, e.to_id]),
+      [["review:RE-s1", `commit:${SHA}`]],
     );
-    const types = new Set((hood.body.edges ?? []).map((e: any) => e.edge_type));
-    assert.equal(
-      types.has("reviewed"),
-      false,
-      "if this fails the gap is closed: promote this test to a positive assertion",
-    );
-    assert.equal(types.has("validated"), false);
-    const keyed = await plane.call("GET", `/api/v1/graph/nodes/${encodeURIComponent("review:RE-s1")}`, {
-      key: "operator",
-    });
-    assert.equal(keyed.status, 404, "no review node exists for the stored review evidence");
+    assert.equal(reviewed[0].attrs.commit, SHA, "the edge is bound to the candidate commit");
+    const produced = (hood.body.edges ?? []).filter((e: any) => e.edge_type === "produced");
+    assert.equal(produced.length, 1, "the reviewing attempt produced the review");
+    // paired negative: a signed-in non-member sees nothing, and a request-changes style id that was never recorded is absent
+    assert.equal((await read("review:RE-s1", "bob")).status, 404);
+    assert.equal((await read("review:RE-never", "alice")).status, 404);
+    assert.equal((await read("review:RE-s1-invalid", "alice")).status, 404, "an invalid review is not a verdict");
   });
 
-  it("GAP: the plan revision, digest and Plannotator decision do not reach Herdr from the CLI (planStandalone supports an emitter, runStandalonePlan wires none)", async () => {
+  it("the plan revision, digest and Plannotator decision reach Herdr FROM THE CLI: mission and plan nodes bound to the digest, a produced edge, and an approval as a reviewed edge on the same digest", async () => {
+    const hoodOf = (id: string) =>
+      plane.c("GET", `/graph/nodes/${encodeURIComponent(id)}/neighborhood?depth=1`, { user: "alice" });
+    // 1. the skipped-by-policy plan of the graph workdir (the CLI wrote it; no test code emitted anything)
     const planNode = `plan:${mission}/${planRun.json.revision}`;
-    const r = await plane.call("GET", `/api/v1/graph/nodes/${encodeURIComponent(planNode)}`, { key: "operator" });
-    assert.equal(r.status, 404, "if this fails the gap is closed: assert the digest on the node instead");
-    // the digest is nevertheless durable in Pi's own ledger (the evidence exists, it is just not projected)
-    const be = await JsonlEventStore.open(join(ws.store, "orchestration.jsonl"), { readOnly: true } as never).catch(
-      () => null,
+    const n = await eventually(async () => {
+      const r = await read(planNode, "alice");
+      return r.status === 200 ? r : false;
+    }, "the plan node written by the CLI");
+    assert.equal(n.body.node.attrs.plan_digest, planRun.json.planDigest, "the node carries the CLI's digest");
+    assert.equal(n.body.node.attrs.risk_class, planRun.json.riskClass);
+    assert.equal(n.body.node.state, "proceeding", "skipped by policy: allowed to proceed, not 'approved'");
+    const m = await read(`mission:${mission}`, "alice");
+    assert.equal(m.status, 200, "the CLI defined the mission node the produced edge needs");
+    assert.equal(m.body.node.label, "tidy the docs");
+    const produced = ((await hoodOf(planNode)).body.edges ?? []).filter((e: any) => e.edge_type === "produced");
+    assert.deepEqual(
+      produced.map((e: any) => [e.from_id, e.to_id]),
+      [[`mission:${mission}`, planNode]],
     );
-    if (be) {
-      const s = MissionStore.open(be);
-      assert.equal(s.listPlanRevisions(mission)[0]?.planDigest, planRun.json.planDigest);
-      be.close();
-    }
+    // paired negative: the same read by a signed-in non-member answers like an absent node
+    assert.equal((await read(planNode, "bob")).status, 404);
+
+    // 2. a Plannotator approval on the exact digest is a `reviewed` edge bound to that digest
+    const fake2 = makeFakePlannotator();
+    fake2.setMode("approve");
+    const w = workdir("graph-approved");
+    writeAgentDir(w.agentDir, { url: plane.url, key: plane.keys.pi as string, roomId, instance: "pi-s1-plan" });
+    const ok = await runPlan(["--store", w.store, "--plannotator-command", fake2.command], MEDIUM, {
+      ...w,
+      allowSpawnUnder: fake2.dir,
+      guard: false,
+    });
+    assert.equal(ok.code, 0, ok.stderr);
+    assert.equal(ok.json.outcome, "approved");
+    const approvedPlan = `plan:${ok.json.missionId}/${ok.json.revision}`;
+    const edges = ((await hoodOf(approvedPlan)).body.edges ?? []).filter((e: any) => e.edge_type === "reviewed");
+    assert.equal(edges.length, 1, JSON.stringify(edges));
+    assert.equal(edges[0].attrs.plan_digest, ok.json.planDigest);
+    assert.equal(edges[0].attrs.decision, "approved");
+    assert.equal((await read(approvedPlan, "alice")).body.node.state, "approved");
+    // the digest the bridge reviewed is the digest Herdr holds
+    assert.equal(fake2.calls().at(-1), (await read(approvedPlan, "alice")).body.node.attrs.plan_digest);
   });
 
   it("the whole outbox drained: nothing pending, nothing rejected, nothing dead-lettered", async () => {

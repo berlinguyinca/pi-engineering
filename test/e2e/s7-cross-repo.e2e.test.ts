@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { discoverGithubLinks } from "../../src/github/discovery.ts";
 import {
   type DependencyItem,
   buildDependencyGraph,
@@ -13,9 +15,11 @@ import {
   refKey,
 } from "../../src/github/index.ts";
 import type { GithubLinkRecord } from "../../src/github/types.ts";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EnvelopeStore } from "../../src/runtime/herdr/envelopeStore.ts";
 import { loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
-import { callers, reachable } from "./support/codeGraph.ts";
+import { FakeGithubClient } from "../support/fakeGithubClient.ts";
 import { Plane, eventually } from "./support/plane.ts";
 /**
  * ACCEPTANCE SCENARIO 7 (non-visual part) - cross-repo issue references.
@@ -155,7 +159,7 @@ describe("scenario 7 / cross-repo issues in the Herdr graph", () => {
     assert.equal((await read(`issue:${api7}`, "alice")).status, 200);
   });
 
-  it("GAP: emitDependencyEdges on endpoints that were never fully upserted is refused by the plane (403 lineage_forbidden, dead-lettered), so the caller must seed the issue nodes first", async () => {
+  it("negative control: the bare library call emitDependencyEdges on endpoints that were never fully upserted is refused by the plane (403 lineage_forbidden, dead-lettered), which is why the runtime caller seeds the issue nodes first", async () => {
     const items: DependencyItem[] = [
       { ref: ref("https://github.com/acme/api/issues/21"), state: "open" },
       {
@@ -181,11 +185,87 @@ describe("scenario 7 / cross-repo issues in the Herdr graph", () => {
     assert.deepEqual(h.body.edges ?? [], [], "no dependency edge reached the graph");
   });
 
-  it("GAP: nothing in Pi's runtime calls the dependency projection (emitDependencyEdges/buildDependencyGraph are library-only)", () => {
-    const reach = reachable();
-    assert.ok(existsSync(join(PI, "src/github/dependencies.ts")), "control: the projection exists");
-    // structural: no module reachable from a product entry point CALLS either function (definitions don't count)
-    assert.deepEqual(callers(reach, ["emitDependencyEdges", "buildDependencyGraph"]), []);
+  it("the runtime caller exists: `pi-engineering github sync` seeds the issue nodes with fields, then emits the cross-repo dependency edge, and the room member navigates it", async () => {
+    const root = scratch("t16-s7-sync-");
+    const agentDir = join(root, "agent");
+    mkdirSync(agentDir, { recursive: true });
+    const keyFile = join(root, "k");
+    writeFileSync(keyFile, `${plane.keys.pi}\n`);
+    chmodSync(keyFile, 0o600);
+    cpSync(join(PI, "test/e2e/fake_gh_s7"), join(root, "gh"), { recursive: true });
+    writeFileSync(
+      join(agentDir, "engineering.yaml"),
+      `${[
+        "herdr:",
+        `  url: ${plane.url}`,
+        `  api_key_file: ${keyFile}`,
+        "  lineage: true",
+        "  visibility: room",
+        `  room_id: ${roomId}`,
+        "github:",
+        "  enabled: true",
+        `  gh_path: ${JSON.stringify(join(root, "gh", "gh"))}`,
+      ].join("\n")}\n`,
+    );
+    // the links a mission would hold (recorded in-process through the real discovery), in a store the CLI then reads
+    const storeDir = join(root, "store");
+    mkdirSync(storeDir, { recursive: true });
+    const backend = await JsonlEventStore.open(join(storeDir, "orchestration.jsonl"));
+    const store = MissionStore.open(backend);
+    const mission = store.createMission({
+      title: "s7",
+      goal: "acme/api#31 and acme/web#32",
+      user_request: "g",
+      repository: ".",
+      base_ref: "b",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    const fake = new FakeGithubClient();
+    fake.put("github.com/acme/api#31", { title: "Provide the API", state: "open" });
+    fake.put("github.com/acme/web#32", { title: "Use the API", state: "open" });
+    await discoverGithubLinks(fake, store, {}, { missionId: mission.mission_id, goal: "acme/api#31 and acme/web#32" });
+    assert.equal(store.listGithubLinks().length, 2, "control: both issues are linked");
+    await store.flush();
+    backend.close();
+
+    const out = await new Promise<{ code: number; stdout: string; stderr: string }>((res, rej) => {
+      const child = spawn(
+        process.execPath,
+        [join(PI, "scripts/pi-engineering.ts"), "github", "sync", "--store", storeDir],
+        {
+          cwd: root,
+          env: {
+            PATH: process.env.PATH ?? "",
+            HOME: root,
+            PI_CODING_AGENT_DIR: agentDir,
+            PI_ENGINEERING_STATE_DIR: join(root, "state"),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => {
+        stdout += d;
+      });
+      child.stderr.on("data", (d) => {
+        stderr += d;
+      });
+      child.on("error", rej);
+      child.on("close", (code) => res({ code: code ?? -1, stdout, stderr }));
+    });
+    assert.equal(out.code, 0, out.stderr);
+    assert.equal(JSON.parse(out.stdout.trim().split("\n").pop() as string).dependencyEdges, 1);
+    const dep = await eventually(async () => {
+      const r = await hood("issue:github.com/acme/web#32", "alice");
+      const e = (r.body.edges ?? []).find((x: any) => x.edge_type === "dependency");
+      return e ?? false;
+    }, "the dependency edge written by the CLI");
+    assert.equal(dep.to_id, "issue:github.com/acme/api#31");
+    assert.equal(dep.attrs.cross_repo, true);
+    assert.equal((await read("issue:github.com/acme/api#31", "alice")).body.node.label, "acme/api#31");
+    assert.equal((await hood("issue:github.com/acme/web#32", "bob")).status, 404, "a non-member sees nothing");
   });
 
   it("canonical ids are repo-qualified and reject ambiguity (a bare #7 without a default repo is not a node)", () => {

@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
 import { WorkGraph } from "../../src/platform/WorkGraph.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { enclosingMethods } from "./support/codeGraph.ts";
+import { HerdrAgentRuntime } from "../../src/runtime/herdr/HerdrAgentRuntime.ts";
 import { type PiHost, startPiHost } from "./support/piHost.ts";
 import { Plane, eventually, loadAcceptance } from "./support/plane.ts";
 /**
@@ -299,9 +299,16 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
     const cid = ask.body.consultation.consult_id as string;
     const es = await edgesOf();
     const cons = es.filter((e) => e.edge_type === "consultation");
-    assert.equal(cons.length, 1);
-    assert.equal(cons[0]?.from_id, `thread:hcn-consult.${cid}`);
-    assert.equal(cons[0]?.to_id, `agent:${lead}`);
+    // Herdr now also records asker -> target as a reference edge (thread nodes, never agents): exactly two edges
+    assert.equal(cons.length, 2);
+    const subjectEdge = cons.filter((e) => e.from_id === `thread:hcn-consult.${cid}`);
+    assert.equal(subjectEdge.length, 1);
+    assert.equal(subjectEdge[0]?.to_id, `agent:${lead}`);
+    const reference = cons.filter((e) => e.from_id !== `thread:hcn-consult.${cid}`);
+    assert.deepEqual(
+      reference.map((e) => [e.from_id, e.to_id]),
+      [[`thread:hcn-consult-asker.${cid}`, `thread:hcn-consult-target.${cid}`]],
+    );
     // asker and answerer are attributes of the consultation thread, not endpoints and not agents
     const thread = await plane.c("GET", `/graph/nodes/${encodeURIComponent(`thread:hcn-consult.${cid}`)}`, {
       user: "alice",
@@ -326,7 +333,11 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
     const after = await edgesOf();
     assert.deepEqual(ofType(after, "spawn"), ofType(es, "spawn"));
     assert.deepEqual(ofType(after, "handoff"), ofType(es, "handoff"));
-    assert.equal(ofType(after, "consultation").length, 1);
+    assert.equal(
+      ofType(after, "consultation").length,
+      2,
+      "answering adds no edge (subject edge + asker->target reference)",
+    );
   });
 
   it("timeline: ordered, typed markers for spawn, handoff and consultation; ledger steps are contiguous", async () => {
@@ -371,20 +382,62 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
     assert.ok(!spawnTargets.has(`agent:${lead}`) && !spawnTargets.has(`agent:${agentB}`));
   });
 
-  it("GAP: no Pi code path emits tab/pane surface nodes, so a pane close cannot reach Herdr from Pi", async () => {
-    for (const type of ["pane", "tab"]) {
-      const r = await listing("alice", type);
-      assert.equal(r.status, 200);
-      assert.deepEqual(r.body.nodes, [], `Pi emitted a ${type} node: lineage.ts has no tab/pane primitive`);
-    }
-    // structural: the only closePane call in Pi's Herdr runtime is inside terminate() (which cancels the attempt on
-    // purpose), never a "surface closed" report
-    assert.deepEqual(
-      enclosingMethods(
-        fileURLToPath(new URL("../../src/runtime/herdr/HerdrAgentRuntime.ts", import.meta.url)),
-        "closePane",
-      ),
-      ["terminate"],
+  it("Pi's Herdr runtime emits the tab (top-level worker) and pane (helper) surface nodes, and a pane close reaches Herdr without touching the agent", async () => {
+    const cli = {
+      status: async () => ({ ok: true, serverVersion: "0.9.1", protocol: 22 }),
+      listAgents: async () => [],
+      getAgent: async () => null,
+      readAgent: async () => "",
+      prompt: async () => undefined,
+      wait: async () => ({
+        agent_status: "working",
+        cwd: "/tmp",
+        pane_id: "p",
+        workspace_id: "w",
+        revision: 1,
+        state_change_seq: 1,
+      }),
+      startAgent: async () => undefined,
+      sendKeys: async () => undefined,
+      closePane: async () => undefined,
+      createWorktree: async (repo: string) => ({ workspaceId: "w", path: repo }),
+    } as unknown as ConstructorParameters<typeof HerdrAgentRuntime>[0]["cli"];
+    const rt = new HerdrAgentRuntime({ cli, lineage: hostA.emitter });
+    const top = await rt.create({ role: "lead", objective: "o" });
+    await rt.start(top);
+    const helper = await rt.create({ role: "helper", objective: "o", parentRuntimeId: top });
+    await rt.start(helper);
+    await hostA.drain();
+    const tabNode = await eventually(async () => {
+      const r = await plane.c("GET", `/graph/nodes/${encodeURIComponent(`tab:${top}`)}`, { user: "alice" });
+      return r.status === 200 ? r : false;
+    }, "the tab node");
+    assert.equal(tabNode.body.node.state, "open");
+    assert.equal(tabNode.body.node.attrs.agent_id, `agent:${top}`);
+    const paneNode = await eventually(async () => {
+      const r = await plane.c("GET", `/graph/nodes/${encodeURIComponent(`pane:${helper}`)}`, { user: "alice" });
+      return r.status === 200 ? r : false;
+    }, "the pane node");
+    assert.equal(paneNode.body.node.attrs.agent_id, `agent:${helper}`);
+    // the pane is closed from Pi's side (the helper's surface goes away): the surface says closed, the agent is not touched
+    await rt.terminate(helper);
+    await hostA.drain();
+    await eventually(
+      async () =>
+        (await plane.c("GET", `/graph/nodes/${encodeURIComponent(`pane:${helper}`)}`, { user: "alice" })).body.node
+          ?.state === "closed",
+      "the pane closed",
+    );
+    const agent = await plane.c("GET", `/graph/nodes/${encodeURIComponent(`agent:${helper}`)}`, { user: "alice" });
+    assert.equal(agent.body.node.state, "running", "a surface close never changes the agent");
+    assert.equal(
+      (await plane.c("GET", `/graph/nodes/${encodeURIComponent(`tab:${top}`)}`, { user: "alice" })).body.node.state,
+      "open",
+    );
+    // negative control: a tab for a worker that was never started does not exist
+    assert.equal(
+      (await plane.c("GET", `/graph/nodes/${encodeURIComponent("tab:never-started")}`, { user: "alice" })).status,
+      404,
     );
   });
 
@@ -476,6 +529,25 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
       !ids((await listing("alice")).body.nodes).includes("agent:elsewhere"),
       "and it does not show up in this room",
     );
+  });
+
+  it("Pi's real path with a key scoped to ONE room: Pi stamps the YAML room_id, so a scoped key delivers for its room and is refused for another", async () => {
+    const mine = await startPiHost(plane, { key: "scoped", instanceId: "pi-scoped", roomId: "room-elsewhere" });
+    const g = WorkGraph.create(JsonlEventStore.inMemory());
+    g.setLineage(mine.emitter);
+    const ok = g.createWorker({ projectId: "P-scoped", role: "lead" }).id;
+    await mine.drain();
+    await eventually(
+      async () => (await plane.node(`agent:${ok}`)).status === 200,
+      "the scoped key's own room delivers",
+    );
+    // negative control: the SAME key, YAML pointed at a room the operator did not list, is refused by Herdr
+    const wrong = await startPiHost(plane, { key: "scoped", instanceId: "pi-scoped-2", roomId });
+    const g2 = WorkGraph.create(JsonlEventStore.inMemory());
+    g2.setLineage(wrong.emitter);
+    const bad = g2.createWorker({ projectId: "P-scoped", role: "lead" }).id;
+    await wrong.drain();
+    assert.equal((await plane.node(`agent:${bad}`)).status, 404, "a room the key may not address leaves no trace");
   });
 
   it("membership-scoped reads: members read; guests, outsiders and other rooms' members get one indistinguishable 404", async () => {

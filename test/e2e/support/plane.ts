@@ -24,6 +24,11 @@ import { readYaml } from "../../../src/lifecycle/policy.ts";
  */
 import { scratch } from "./scratch.ts";
 
+// Every e2e suite talks to a REAL local control plane through Pi's real YAML connection layer, so the harness-wide
+// HERDR_DISABLED default (test/support/isolatedState.ts, #414) is cleared for these processes, as the connection-layer
+// unit tests do. The plane is on loopback and generated per run; no live fleet config is reachable (HOME is a temp dir).
+delete process.env.HERDR_DISABLED;
+
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const PI_ROOT = resolve(HERE, "../../..");
 

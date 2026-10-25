@@ -12,7 +12,7 @@
 
 import { id } from "../core/ids.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
-import type { LineageEmitter } from "../runtime/herdr/lineage.ts";
+import { type LineageEmitter, lineageNodeId } from "../runtime/herdr/lineage.ts";
 import {
   type CheckpointRefsInput,
   attachCheckpointRefs,
@@ -62,10 +62,20 @@ import type {
   WorkspaceManifest,
 } from "./types.ts";
 
+export interface DagProjection {
+  missionId: string;
+  /** Task node ids, dependency edges `[from, to]` and issue links `[task, issue]` as last projected. */
+  tasks: string[];
+  dependencies: Array<[string, string]>;
+  issueLinks: Array<[string, string]>;
+}
+
 import {
+  type GithubGateDecision,
   type GithubLinkPatch,
   type GithubLinkRecord,
   type GithubLinkSuggestion,
+  type GithubRereviewRequest,
   type GithubStaleSignal,
   linkIdFor,
 } from "../github/types.ts";
@@ -128,6 +138,9 @@ export type OrchestrationEventType =
   | "github.suggestion_resolved"
   | "github.link_corrected"
   | "github.evidence_stale"
+  | "github.rereview_requested"
+  | "github.gate_decided"
+  | "dag.projected"
   | "candidate.changed"
   | "evidence.validation_recorded"
   | "evidence.review_recorded"
@@ -209,6 +222,9 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "github.suggestion_resolved",
   "github.link_corrected",
   "github.evidence_stale",
+  "github.rereview_requested",
+  "github.gate_decided",
+  "dag.projected",
   "candidate.changed",
   "evidence.validation_recorded",
   "evidence.review_recorded",
@@ -453,6 +469,9 @@ export class MissionStore {
   private readonly githubLinks = new Map<string, GithubLinkRecord>();
   private readonly githubSuggestions = new Map<string, GithubLinkSuggestion>();
   private readonly githubStaleSignals = new Map<string, GithubStaleSignal>();
+  private readonly githubRereviews = new Map<string, GithubRereviewRequest>();
+  private readonly githubGates = new Map<string, GithubGateDecision>();
+  private readonly dagProjections = new Map<string, DagProjection>();
   private readonly candidates = new Map<string, CandidateRevision>();
   private readonly validationEvidence = new Map<string, ValidationEvidence>();
   private readonly reviewEvidence = new Map<string, ReviewEvidence>();
@@ -551,6 +570,58 @@ export class MissionStore {
           ended,
         );
       }
+    });
+  }
+
+  /**
+   * A worker review's verdict becomes a `review:` node, a `reviewed` edge bound to the exact candidate commit, and
+   * a `produced` edge from the reviewing attempt. The edge targets the commit, not a PR: only a trusted reviewer's
+   * edge on a PR counts toward Herdr's quorum, so Pi's own record never poses as a quorum vote. Reviews that were
+   * not valid or not accessible are never projected (no verdict was given).
+   */
+  private lineageReviewRecorded(ev: ReviewEvidence): void {
+    if (!ev.outputValid || !ev.accessible) return;
+    const sha = ev.identity.candidateSha;
+    this.lineageDo((l) => {
+      const review = lineageNodeId("review", ev.evidenceId);
+      const commit = lineageNodeId("commit", sha);
+      const scope = { mission_id: ev.missionId, task_id: ev.taskId };
+      l.nodeUpsert(
+        review,
+        {
+          label: `review ${ev.verdict}`,
+          state: "done",
+          attrs: {
+            verdict: ev.verdict,
+            independence: ev.independenceMode,
+            findings: ev.findings.length,
+            candidate_sha: sha,
+            commit: sha,
+          },
+        },
+        `review:${ev.evidenceId}`,
+        scope,
+        ev.recordedAt,
+      );
+      l.nodeUpsert(commit, { label: sha.slice(0, 12), attrs: { sha } }, `review-commit:${sha}`, scope, ev.recordedAt);
+      l.edgeAdd(
+        "reviewed",
+        review,
+        commit,
+        `review:${ev.evidenceId}`,
+        { commit: sha, verdict: ev.verdict, independence: ev.independenceMode },
+        scope,
+        ev.recordedAt,
+      );
+      l.edgeAdd(
+        "produced",
+        lineageNodeId("attempt", ev.executionId),
+        review,
+        `review-produced:${ev.evidenceId}`,
+        {},
+        scope,
+        ev.recordedAt,
+      );
     });
   }
 
@@ -925,6 +996,21 @@ export class MissionStore {
       case "github.evidence_stale": {
         const signal = e.payload.signal as GithubStaleSignal | undefined;
         if (signal?.signalId) this.githubStaleSignals.set(signal.signalId, structuredClone(signal));
+        break;
+      }
+      case "github.gate_decided": {
+        const g = e.payload.gate as GithubGateDecision | undefined;
+        if (g?.target) this.githubGates.set(g.target, structuredClone(g));
+        break;
+      }
+      case "dag.projected": {
+        const d = e.payload.projection as DagProjection | undefined;
+        if (d?.missionId) this.dagProjections.set(d.missionId, structuredClone(d));
+        break;
+      }
+      case "github.rereview_requested": {
+        const request = e.payload.request as GithubRereviewRequest | undefined;
+        if (request?.signalId) this.githubRereviews.set(request.signalId, structuredClone(request));
         break;
       }
       case "candidate.changed": {
@@ -2927,6 +3013,7 @@ export class MissionStore {
       actor: "system",
       evidence,
     });
+    this.lineageReviewRecorded(evidence);
     return copyReviewEvidence(evidence);
   }
 
@@ -3216,6 +3303,74 @@ export class MissionStore {
   getGithubSuggestion(suggestionId: string): GithubLinkSuggestion | undefined {
     const s = this.githubSuggestions.get(suggestionId);
     return s ? structuredClone(s) : undefined;
+  }
+
+  /**
+   * The durable reaction to a stale-evidence signal: a re-review of the new head was requested. Idempotent on the
+   * signal id, so a repeated reconcile tick never requests twice. Returns false when already recorded.
+   */
+  recordGithubRereview(request: GithubRereviewRequest): boolean {
+    if (!this.missions.has(request.missionId)) throw new Error(`unknown mission ${request.missionId}`);
+    if (this.githubRereviews.has(request.signalId)) return false;
+    return this.writeGithubRereview(request);
+  }
+
+  /** Replace the record of a request (an in-flight marker, a retry outcome). Replay keeps the last write. */
+  updateGithubRereview(request: GithubRereviewRequest): boolean {
+    if (!this.githubRereviews.has(request.signalId)) return false;
+    return this.writeGithubRereview(request);
+  }
+
+  getGithubRereview(signalId: string): GithubRereviewRequest | undefined {
+    const r = this.githubRereviews.get(signalId);
+    return r ? structuredClone(r) : undefined;
+  }
+
+  private writeGithubRereview(request: GithubRereviewRequest): boolean {
+    const copy = structuredClone(request);
+    this.githubRereviews.set(copy.signalId, copy);
+    this.emit("github.rereview_requested", copy.missionId, { actor: "system", request: copy });
+    return true;
+  }
+
+  /**
+   * The merge-gate decision for a PR, with a revision that moves only when (head, decision) CHANGES. The revision
+   * goes into the lineage event ids: a replay of the same decision dedupes, a flip (merge -> wait -> merge) is a new
+   * event, so Herdr's final state follows Pi's. Returns the current record and what it replaced.
+   */
+  recordGithubGate(
+    missionId: string,
+    target: string,
+    head: string,
+    decision: string,
+  ): {
+    gate: GithubGateDecision;
+    previous: GithubGateDecision | undefined;
+  } {
+    const previous = this.githubGates.get(target);
+    if (previous && previous.head === head && previous.decision === decision)
+      return { gate: structuredClone(previous), previous: structuredClone(previous) };
+    const gate: GithubGateDecision = { missionId, target, head, decision, revision: (previous?.revision ?? 0) + 1 };
+    this.githubGates.set(target, gate);
+    this.emit("github.gate_decided", missionId, { actor: "system", gate: structuredClone(gate) });
+    return { gate: structuredClone(gate), previous: previous ? structuredClone(previous) : undefined };
+  }
+
+  /** What the plan CLI last projected for a mission (so a re-plan can withdraw what the new plan dropped). */
+  getDagProjection(missionId: string): DagProjection | undefined {
+    const d = this.dagProjections.get(missionId);
+    return d ? structuredClone(d) : undefined;
+  }
+
+  recordDagProjection(projection: DagProjection): void {
+    this.dagProjections.set(projection.missionId, structuredClone(projection));
+    this.emit("dag.projected", projection.missionId, { actor: "system", projection: structuredClone(projection) });
+  }
+
+  listGithubRereviews(missionId?: string): GithubRereviewRequest[] {
+    return [...this.githubRereviews.values()]
+      .filter((r) => !missionId || r.missionId === missionId)
+      .map((r) => structuredClone(r));
   }
 
   listGithubStaleSignals(missionId?: string): GithubStaleSignal[] {

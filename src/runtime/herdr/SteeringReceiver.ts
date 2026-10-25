@@ -15,8 +15,10 @@ import { join } from "node:path";
 import { readYaml } from "../../lifecycle/policy.ts";
 import {
   FileSteeringLedger,
+  type LiveTargetRead,
   type ServerClock,
   type SteeringAck,
+  type SteeringItem,
   type SteeringLedger,
   type SteeringPorts,
   applySteering,
@@ -79,6 +81,7 @@ export class SteeringReceiver {
   private readonly fetchImpl: typeof globalThis.fetch;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private polling = false;
   private failures = 0;
   private readonly intervalMs: number;
   private readonly opts: SteeringReceiverOptions;
@@ -135,8 +138,54 @@ export class SteeringReceiver {
     }
   }
 
+  /**
+   * Herdr's CURRENT fence and digest for the item's target, read with Pi's own key at apply time
+   * (`GET /api/v1/steering/targets/{node_id}`). Pi cannot recompute Herdr's fence, and a room-scoped node is not
+   * readable through the graph, so this is the one honest source. 404 is Herdr's only "no" (`gone`); everything
+   * else that is not a well-formed 200 is `unavailable` (the request is retried on the next poll, never applied).
+   */
+  private readonly liveTarget = async (item: SteeringItem): Promise<LiveTargetRead> => {
+    try {
+      const res = await this.fetchImpl(
+        `${this.base}/api/v1/steering/targets/${encodeURIComponent(item.nodeId)}${this.query()}`,
+        { redirect: "error", headers: this.headers(), signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000) },
+      );
+      if (res.status === 404) return { status: "gone" };
+      if (!res.ok) return { status: "unavailable" };
+      const body = (await this.readJson(res)) as Record<string, unknown> | null;
+      if (!body || typeof body !== "object" || typeof body.fence !== "string" || body.fence.length > 256) {
+        return { status: "unavailable" };
+      }
+      const digest = typeof body.digest === "string" && body.digest.length <= 256 ? body.digest : null;
+      const digests = Array.isArray(body.digests)
+        ? body.digests.filter((d): d is string => typeof d === "string" && d.length <= 256).slice(0, 8)
+        : undefined;
+      return {
+        status: "ok",
+        fence: body.fence,
+        digest,
+        ...(digests ? { digests } : {}),
+        superseded: body.superseded === true,
+      };
+    } catch {
+      return { status: "unavailable" };
+    }
+  };
+
   /** One round trip. Never throws; a failed ack is retried on the next poll because Herdr re-offers it. */
   async pollOnce(): Promise<PollResult> {
+    // One round trip at a time: the live read awaits the network between the ledger check and the ledger write, so an
+    // overlapping poll could otherwise apply the same request twice.
+    if (this.polling) return { received: 0, skipped: 0, acked: 0, dropped: 0, error: "a poll is already running" };
+    this.polling = true;
+    try {
+      return await this.pollOnceInner();
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private async pollOnceInner(): Promise<PollResult> {
     const out: PollResult = { received: 0, skipped: 0, acked: 0, dropped: 0, error: null };
     let body: unknown;
     let res: Response;
@@ -160,7 +209,7 @@ export class SteeringReceiver {
     out.received = items.length;
     out.dropped = dropped;
     for (const item of items) {
-      const result = await applySteering(item, this.opts.ports, this.opts.ledger, clock);
+      const result = await applySteering(item, this.opts.ports, this.opts.ledger, clock, this.liveTarget);
       if (!result) {
         out.skipped++;
         continue;

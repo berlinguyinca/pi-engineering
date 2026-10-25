@@ -78,6 +78,40 @@ export interface GithubStaleSignal {
   recordedAt: string;
 }
 
+/** A re-review of a PR's new head was requested because evidence bound to the old head went stale. */
+export interface GithubRereviewRequest {
+  /** The stale signal this answers (idempotency key). */
+  signalId: string;
+  missionId: string;
+  /** Canonical PR id. */
+  target: string;
+  headSha: string;
+  previousHeadSha: string;
+  requestedAt: string;
+  /**
+   * What happened to the operator's dispatch command: `none` (not configured), `inflight` (written BEFORE the command
+   * runs, so a crash is visible: delivery is at-least-once), `ok`, or `failed` (retried after `nextAttemptAt`).
+   */
+  dispatch: "none" | "inflight" | "ok" | "failed";
+  attempts?: number;
+  nextAttemptAt?: string;
+  inflightAt?: string;
+  /**
+   * Herdr's answer to Pi's request to RECORD this re-review (`review-quorum/rereview`). `refused` is final (Herdr
+   * said not permitted, hidden or not needed); `failed` is asked again with a bound. Absent = never asked.
+   */
+  ask?: { state: "ok" | "refused" | "failed"; attempts: number; nextAt?: string; requestId?: string; reason?: string };
+}
+
+/** The merge-gate decision last projected for a PR; `revision` moves only when head or decision changes. */
+export interface GithubGateDecision {
+  missionId: string;
+  target: string;
+  head: string;
+  decision: string;
+  revision: number;
+}
+
 export interface GithubLinkPatch {
   status?: LinkStatus;
   observed?: LinkObservation;

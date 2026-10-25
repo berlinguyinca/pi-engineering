@@ -420,6 +420,15 @@ async function emitRevision(
     },
     evidence_refs: evidence,
   });
+  // The `produced` edge needs both endpoints to exist in the graph: make sure the mission is there (a bare ensure:
+  // a richer upsert by whoever knows the title wins and is never overwritten by this one).
+  await safeStage(emitter, {
+    ...common,
+    event_id: `plan-${rev.missionId}-mission`,
+    entity_id: `mission:${rev.missionId}`,
+    event_type: "node.upsert",
+    payload: { node_type: "mission", node_id: `mission:${rev.missionId}` },
+  });
   await safeStage(emitter, {
     ...common,
     event_id: `plan-${key}-produced`,

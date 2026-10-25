@@ -60,10 +60,20 @@ export interface SteeringAck {
 }
 
 /**
+ * What Herdr says the target looks like NOW (`GET /api/v1/steering/targets/{node_id}`, read with Pi's own ingest key at
+ * apply time). `gone` is Herdr's single 404 (no live request for a node this key owns); `unavailable` is anything
+ * transient (network, throttle, 5xx, an unreadable body): the request is left for the next poll, never applied unchecked.
+ */
+export type LiveTargetRead =
+  | { status: "ok"; fence: string | null; digest: string | null; digests?: string[]; superseded: boolean }
+  | { status: "gone" }
+  | { status: "unavailable" };
+export type LiveTargetReader = (item: SteeringItem) => Promise<LiveTargetRead>;
+
+/**
  * `digest` is the current plan digest of the target's mission (what Herdr's gate digest `expected_digest` names);
- * `fence` is Pi's own current fence token for the node, when Pi has one that is comparable with Herdr's. Herdr's fence
- * is a hash of Herdr's view of the node (state, last event, attrs) that Pi cannot recompute, so today no Pi runtime
- * supplies `fence`; the comparison exists for the day one can.
+ * `fence` is a fence a port can vouch for itself; Herdr's own fence is a hash of Herdr's view of the node that Pi cannot
+ * recompute, so it is NOT supplied here: it is read live from Herdr at apply time (see {@link LiveTargetReader}).
  */
 export type ResolvedTarget =
   | {
@@ -412,6 +422,37 @@ export function expiredReason(item: SteeringItem, ports: SteeringPorts, clock?: 
 }
 
 /**
+ * The apply-time check against Herdr's CURRENT view of the target. Null = nothing to compare or all matches (go on),
+ * "retry" = Herdr could not be asked right now (leave the request unacknowledged), or the stale acknowledgement.
+ * Needs a reader AND a fence or digest on the request; fails closed when Herdr answers but cannot confirm.
+ */
+async function checkLive(item: SteeringItem, live?: LiveTargetReader): Promise<SteeringAck | "retry" | null> {
+  // Herdr fences every node-targeted request, so a request with neither a fence nor a digest has nothing to compare
+  // (and is not asked about); the check is for requests that name what the person saw.
+  if (!live || (!item.fence && !item.expectedDigest)) return null;
+  let r: LiveTargetRead;
+  try {
+    r = await live(item);
+  } catch {
+    r = { status: "unavailable" };
+  }
+  if (r.status === "unavailable") return "retry";
+  if (r.status === "gone") {
+    return { outcome: "stale", note: "Herdr no longer holds a live request for this target (re-propose it)" };
+  }
+  if (r.superseded) return { outcome: "stale", note: "the target was superseded since the request was made" };
+  if (item.fence && r.fence !== item.fence) {
+    return { outcome: "stale", note: "the target changed since the request was made (fence mismatch)" };
+  }
+  // Herdr accepts a request's digest if it names ANY of the node's digest-like attributes (plan_digest, digest, commit,
+  // head_sha); `digest` is only the first of them, so the whole list is what the live read is compared with.
+  if (item.expectedDigest && !(r.digests ?? (r.digest ? [r.digest] : [])).includes(item.expectedDigest)) {
+    return { outcome: "stale", note: "the target changed since the request was made (digest mismatch)" };
+  }
+  return null;
+}
+
+/**
  * T13: hand a fork or promote request to the fork port, with the same at-most-once ledger as every other action.
  * Without the port (forks not enabled in the global YAML) the honest answer is `unsupported`.
  */
@@ -420,6 +461,7 @@ async function applyFork(
   ports: SteeringPorts,
   ledger: SteeringLedger,
   clock?: ServerClock,
+  live?: LiveTargetReader,
 ): Promise<SteeringAck | null> {
   const finish = (a: SteeringAck): SteeringAck => {
     const bounded = { outcome: a.outcome, note: a.note.slice(0, 280) };
@@ -443,6 +485,9 @@ async function applyFork(
       return finish({ outcome: "stale", note: "the target changed since the request was made (digest mismatch)" });
     }
   }
+  const seen = await checkLive(item, live);
+  if (seen === "retry") return null;
+  if (seen) return finish(seen);
   ledger.begin(item.steeringId, item.fence);
   try {
     return finish(await port.apply(item));
@@ -461,6 +506,7 @@ export async function applySteering(
   ports: SteeringPorts,
   ledger: SteeringLedger,
   clock?: ServerClock,
+  live?: LiveTargetReader,
 ): Promise<SteeringAck | null> {
   const prior = ledger.get(item.steeringId);
   if (prior?.state === "done" && prior.outcome) return { outcome: prior.outcome, note: prior.note ?? "" };
@@ -475,7 +521,7 @@ export async function applySteering(
     ledger.finish(item.steeringId, ack);
     return ack;
   }
-  if (item.action === "fork" || item.action === "promote") return applyFork(item, ports, ledger, clock);
+  if (item.action === "fork" || item.action === "promote") return applyFork(item, ports, ledger, clock, live);
   const target = ports.resolve(item.nodeId);
   if (!target) return null;
   const finish = (ack: SteeringAck): SteeringAck => {
@@ -500,6 +546,9 @@ export async function applySteering(
   if (item.fence && target.fence && target.fence !== item.fence) {
     return finish({ outcome: "stale", note: "the target changed since the request was made (fence mismatch)" });
   }
+  const seen = await checkLive(item, live);
+  if (seen === "retry") return null;
+  if (seen) return finish(seen);
   ledger.begin(item.steeringId, item.fence);
   try {
     if (item.action === "redirect") {

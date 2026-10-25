@@ -11,6 +11,7 @@ import { EngineeringRuntime } from "../../src/index.ts";
 import { mergePlanReviewLayers } from "../../src/orchestration/planReviewConfig.ts";
 import { PLANNER_CLARIFICATION_CATEGORY } from "../../src/orchestration/types.ts";
 import { PlannotatorAdapter, type PlannotatorTransport } from "../../src/platform/Plannotator.ts";
+import { LineageEmitter } from "../../src/runtime/herdr/lineage.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const GOAL = "change login token handling in the auth module";
@@ -180,6 +181,43 @@ describe("plan review on the orchestrator path", () => {
       assert.deepEqual(await plan(), [], global);
       assert.match(store.listFindings(mission.mission_id)[0]?.evidence ?? "", expected);
     }
+  });
+
+  it("(f) with a lineage emitter, the runtime's plan gate projects the mission, plan digest and decision to Herdr", async () => {
+    const { t, digests } = transportOf(["approved"]);
+    const drafts: Array<{ event_type: string; payload: Record<string, any>; mission_id?: string; room_id?: string }> =
+      [];
+    const lineage = new LineageEmitter({
+      source: "pi-test",
+      visibility: "room",
+      defaultScope: { room_id: "room-rt" },
+      sink: { stage: async (d) => void drafts.push(d as never) },
+    });
+    const { plan, mission } = await open({
+      lineage,
+      planReview: { adapter: new PlannotatorAdapter({ transport: t }) },
+    });
+    await plan();
+    await lineage.idle();
+    const node = `plan:${mission.mission_id}/1`;
+    const planUpsert = drafts.find((d) => d.event_type === "node.upsert" && d.payload.node_id === node);
+    assert.equal(
+      planUpsert?.payload.attrs.plan_digest,
+      digests[0],
+      "the digest on the plan node is the reviewed digest",
+    );
+    assert.equal(planUpsert?.room_id, "room-rt", "the emitter's default scope applies to the gate's events");
+    assert.ok(
+      drafts.some((d) => d.event_type === "node.upsert" && d.payload.node_id === `mission:${mission.mission_id}`),
+    );
+    const reviewed = drafts.find((d) => d.event_type === "edge.add" && d.payload.edge_type === "reviewed");
+    assert.equal(reviewed?.payload.attrs.plan_digest, digests[0]);
+  });
+
+  it("(f2) without a lineage emitter nothing is projected and planning is unchanged", async () => {
+    const { t } = transportOf(["approved"]);
+    const { plan } = await open({ planReview: { adapter: new PlannotatorAdapter({ transport: t }) } });
+    assert.equal((await plan()).length, 1);
   });
 
   it("layer merge: absent/disabled is off; malformed fails closed; repo can only raise", () => {

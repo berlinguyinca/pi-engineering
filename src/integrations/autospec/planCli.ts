@@ -16,11 +16,13 @@
 import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { emitMissionPlanned, loadPlanCliLineage } from "../../orchestration/missionLineage.ts";
 import { MissionStore } from "../../orchestration/missionStore.ts";
 import { loadPlanReviewSettings } from "../../orchestration/planReviewConfig.ts";
 import type { StandalonePlanDeps, StandalonePlanIo } from "../../orchestration/standaloneEntry.ts";
 import { JsonlEventStore } from "../../platform/eventstore/jsonl.ts";
 import { ingestAutoSpecDag } from "./dagIngest.ts";
+import { emitDagLineage } from "./dagLineage.ts";
 import { bindAutoSpecPlan } from "./planBinding.ts";
 import { loadAutoSpecConfig } from "./provider.ts";
 
@@ -101,6 +103,8 @@ export async function runAutoSpecPlan(
     err(`cannot open the store in ${dir}: ${error instanceof Error ? error.message : String(error)}\n`);
     return 3;
   }
+  // Herdr projection: only when the GLOBAL engineering.yaml has an enabled `herdr:` block (else null, no network).
+  const lineage = await loadPlanCliLineage(env, deps);
   try {
     const store = MissionStore.open(backend);
     if (!store.getMission(ingest.missionId)) {
@@ -116,6 +120,7 @@ export async function runAutoSpecPlan(
         workflow_class: "engineering",
       });
     }
+    emitMissionPlanned(lineage, { missionId: ingest.missionId, title: ingest.goal.slice(0, 80), source: "autospec" });
     const settings =
       deps.adapter === undefined && deps.policy === undefined ? await loadPlanReviewSettings(cwd, { env }) : null;
     const outcome = await bindAutoSpecPlan(ingest, {
@@ -125,12 +130,18 @@ export async function runAutoSpecPlan(
       ...((deps.adapter ?? settings?.adapter) ? { adapter: deps.adapter ?? settings?.adapter ?? null } : {}),
       ...((deps.policy ?? settings?.policy) ? { policy: deps.policy ?? settings?.policy } : {}),
       ...(settings?.maxRevisions ? { maxRevisions: settings.maxRevisions } : {}),
+      ...(lineage ? { emitter: lineage } : {}),
       ...(deps.now ? { now: deps.now } : {}),
     });
     await store.flush();
     if (outcome.status === "rejected") {
       out(`${JSON.stringify({ result: "rejected", code: outcome.code, reason: outcome.message })}\n`);
       return 2;
+    }
+    const projected = emitDagLineage(lineage, ingest, undefined, store.getDagProjection(ingest.missionId));
+    if (lineage) {
+      store.recordDagProjection(projected.projection);
+      await store.flush();
     }
     const issueRefs = Object.fromEntries(ingest.issueRefs);
     const base = {
@@ -165,6 +176,8 @@ export async function runAutoSpecPlan(
     err(`${error instanceof Error ? error.message : String(error)}\n`);
     return 3;
   } finally {
+    // The CLI exits right after this: let the (bounded, best-effort) delivery settle. It never changes the exit code.
+    await lineage?.idle().catch(() => undefined);
     backend.close();
   }
 }
