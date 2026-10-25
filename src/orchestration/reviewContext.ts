@@ -1,8 +1,5 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { safeGit } from "../git/safeGit.ts";
 import { REVIEWER_CONTEXT_CHAR_CAP } from "../workers/prompts.ts";
-
-const execFileAsync = promisify(execFile);
 
 /** ~12k tokens of diff; a longer diff is replaced by the full `--stat` plus a notice. */
 export const REVIEW_DIFF_CHAR_CAP = REVIEWER_CONTEXT_CHAR_CAP;
@@ -52,16 +49,10 @@ function fenced(content: string, info = ""): string {
 
 /** The diff output up to the cap (read through a bounded buffer), and whether more existed. */
 async function boundedGit(cwd: string, args: string[]): Promise<{ text: string; more: boolean }> {
-  try {
-    const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: REVIEW_DIFF_CHAR_CAP * 4 });
-    return { text: stdout, more: false };
-  } catch (error) {
-    const partial = (error as { stdout?: unknown; code?: unknown }).stdout;
-    if ((error as { code?: unknown }).code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" && typeof partial === "string") {
-      return { text: partial, more: true };
-    }
-    throw error;
-  }
+  const r = await safeGit(args, { cwd, trust: "operator", maxBuffer: REVIEW_DIFF_CHAR_CAP * 4 });
+  if (r.truncated) return { text: r.stdout, more: true };
+  if (r.code !== 0) throw Object.assign(new Error(r.stderr.trim() || `git ${args[0]} failed`), { code: r.code });
+  return { text: r.stdout, more: false };
 }
 
 const DIFF_FLAGS = ["diff", "--no-color", "--no-ext-diff", "--no-textconv"];

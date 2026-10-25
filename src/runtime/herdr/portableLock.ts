@@ -92,6 +92,9 @@ process.on("exit", () => {
 });
 
 function pidAlive(pid: number): boolean {
+  // kill(0, 0) and kill(-1, 0) address a process GROUP / every process and always "succeed": a record naming them
+  // is corrupt, not a live holder, and must not make a lock permanently unstealable (T16 L10).
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;

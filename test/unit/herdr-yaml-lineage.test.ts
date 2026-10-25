@@ -8,8 +8,8 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { resetLegacyHerdrEnvWarning, resolveAttentionIngest } from "../../src/runtime/herdr/attentionIngest.ts";
 import { createIngestFromConnection, loadHerdrConnection } from "../../src/runtime/herdr/herdrConnection.ts";
-import { resolveAttentionIngest } from "../../src/runtime/herdr/ingestFromEnv.ts";
 import { LineageEmitter } from "../../src/runtime/herdr/lineage.ts";
 import { createLineageFromConnection, loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
 
@@ -68,6 +68,9 @@ describe("herdr: YAML lineage keys", () => {
       assert.equal(attention, null);
     } finally {
       delete process.env.HERDR_DISABLED;
+      // resolveAttentionIngest warns once per process about the legacy variable
+      // passed above; leave the warning armed for the tests that count it.
+      resetLegacyHerdrEnvWarning();
     }
   });
 
@@ -188,15 +191,18 @@ describe("loadLineageEmitter from engineering.yaml", () => {
 });
 
 describe("attention ingest resolution", () => {
-  it("env wins; YAML is the fallback; none = null", async () => {
+  it("YAML only; the environment is never consulted; none = null", async () => {
     const { dir } = await setup("");
-    const viaEnv = await resolveAttentionIngest({ HERDR_INGEST_URL: "http://127.0.0.1:1/" }, dir);
-    assert.equal(viaEnv?.url, "http://127.0.0.1:1");
     const { calls, fetch } = recorder();
-    const viaYaml = await resolveAttentionIngest({}, dir, { fetch });
+    const warnings: string[] = [];
+    const viaYaml = await resolveAttentionIngest({ HERDR_INGEST_URL: "http://127.0.0.1:1/" }, dir, {
+      fetch,
+      warn: (l) => warnings.push(l),
+    });
     assert.equal(viaYaml?.url, "http://127.0.0.1:9");
     await viaYaml?.emit("mission", "m1", "mission.started", {});
     assert.equal(calls[0]?.body.source, "pi");
+    assert.equal(warnings.length, 1);
     const empty = await mkdtemp(join(tmpdir(), "pi-yaml-none-"));
     assert.equal(await resolveAttentionIngest({}, empty), null);
   });

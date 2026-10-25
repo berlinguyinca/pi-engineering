@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { readYaml } from "../../lifecycle/policy.ts";
 import {
   FileSteeringLedger,
+  type ServerClock,
   type SteeringAck,
   type SteeringLedger,
   type SteeringPorts,
@@ -41,6 +42,27 @@ export interface SteeringReceiverOptions {
   timeoutMs?: number;
   /** Short, secret-free diagnostics only. */
   log?: (message: string) => void;
+}
+
+/**
+ * Herdr's clock from one response: the `Date` header (whole seconds, so the true time is up to a second later; the
+ * later bound is used, which can only make a request look expired sooner) or a numeric `server_epoch` in the body,
+ * advanced by monotonic time since the response was read. Undefined when the response carried neither.
+ */
+export function serverClockFrom(
+  res: Response,
+  body: unknown,
+  mono: () => number = () => performance.now(),
+): ServerClock {
+  const at = mono();
+  let epoch: number | undefined;
+  const fromBody = (body as { server_epoch?: unknown } | null)?.server_epoch;
+  if (typeof fromBody === "number" && Number.isFinite(fromBody)) epoch = fromBody;
+  else {
+    const date = Date.parse(res.headers?.get("date") ?? "");
+    if (Number.isFinite(date)) epoch = Math.floor(date / 1000) + 1;
+  }
+  return { now: () => (epoch === undefined ? undefined : epoch + (mono() - at) / 1000) };
 }
 
 export interface PollResult {
@@ -117,8 +139,9 @@ export class SteeringReceiver {
   async pollOnce(): Promise<PollResult> {
     const out: PollResult = { received: 0, skipped: 0, acked: 0, dropped: 0, error: null };
     let body: unknown;
+    let res: Response;
     try {
-      const res = await this.fetchImpl(`${this.base}/api/v1/steering/pending${this.query()}`, {
+      res = await this.fetchImpl(`${this.base}/api/v1/steering/pending${this.query()}`, {
         redirect: "error",
         headers: this.headers(),
         signal: AbortSignal.timeout(this.opts.timeoutMs ?? 10_000),
@@ -132,11 +155,12 @@ export class SteeringReceiver {
       out.error = (err as Error).name === "TimeoutError" ? "timed out" : "unreachable or unreadable";
       return out;
     }
+    const clock = serverClockFrom(res, body);
     const { items, dropped } = parseSteeringItems(body);
     out.received = items.length;
     out.dropped = dropped;
     for (const item of items) {
-      const result = await applySteering(item, this.opts.ports, this.opts.ledger);
+      const result = await applySteering(item, this.opts.ports, this.opts.ledger, clock);
       if (!result) {
         out.skipped++;
         continue;

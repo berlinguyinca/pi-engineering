@@ -900,7 +900,7 @@ describe("git hardening: repository-controlled state cannot run code or redirect
     assert.equal(s.registry.get(f.id)?.status, "active");
   });
 
-  it("insteadOf, pushInsteadOf and include files that could rewrite the URL are refused", async () => {
+  it("insteadOf, pushInsteadOf and include files that could rewrite the URL are ignored: the push still goes to the pinned remote only", async () => {
     for (const setKey of [
       (s: ReturnType<typeof setup>) => sh(s.root, "config", `url.${join(s.state, "evil.git")}.insteadOf`, s.bare),
       (s: ReturnType<typeof setup>) => sh(s.root, "config", `url.${join(s.state, "evil.git")}.pushInsteadOf`, s.bare),
@@ -916,10 +916,10 @@ describe("git hardening: repository-controlled state cannot run code or redirect
       const a = await s.mgr.promote(
         item({ action: "promote", steeringId: "pr-1", nodeId: f.node, params: { expectedHead: head } }),
       );
-      assert.equal(a.outcome, "refused", a.note);
-      assert.match(a.note, /can redirect URLs/);
+      // round 3: repository-local url.*/include are not on the allow-list, so they are dropped rather than refused
+      assert.equal(a.outcome, "applied", a.note);
       assert.equal(sh(join(s.state, "evil.git"), "for-each-ref"), "");
-      assert.throws(() => sh(s.bare, "rev-parse", "--verify", `refs/heads/${f.rec.branch}`));
+      assert.equal(sh(s.bare, "rev-parse", `refs/heads/${f.rec.branch}`), head);
     }
   });
 

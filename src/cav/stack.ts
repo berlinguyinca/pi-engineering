@@ -1,3 +1,5 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import { once } from "node:events";
 /**
  * CAV-03 Real Stack Lifecycle: start/stop/health-check a real deployed
  * development stack with deterministic, fail-closed evidence.
@@ -8,8 +10,7 @@
  * verification, then stops it. A real process, a real HTTP round-trip, and a
  * real health payload are the evidence — not a mock.
  */
-import { type ChildProcess, spawn } from "node:child_process";
-import { once } from "node:events";
+import { workerCommandEnv } from "../lifecycle/workerEnv.ts";
 
 export interface StackLifecycleOptions {
   command: string;
@@ -85,7 +86,7 @@ export async function runRealStackLifecycle(
     spawnError = e;
   };
   try {
-    const cleanEnv = { ...process.env, NODE_TEST_CONTEXT: "", ...(opts.env ?? {}) };
+    const cleanEnv = { ...workerCommandEnv(), NODE_TEST_CONTEXT: "", ...(opts.env ?? {}) };
     child = spawn(opts.command, opts.args, {
       cwd: opts.cwd,
       env: cleanEnv,
