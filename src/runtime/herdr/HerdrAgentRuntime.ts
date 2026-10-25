@@ -300,6 +300,13 @@ export class HerdrAgentRuntime implements AgentRuntime {
         // Fall back to the opaque target; provisioning is best-effort.
       }
     }
+    // Worker identity for the runtime report (role/mission shown on the dashboard session row). Best-effort:
+    // without it the agent is simply reported with no role or mission.
+    if (this.cli.exportEnv) {
+      const vars: Record<string, string> = { PI_ENGINEERING_ROLE: rec.worker.role };
+      if (rec.worker.missionId) vars.PI_ENGINEERING_MISSION_ID = rec.worker.missionId;
+      await this.cli.exportEnv(rec.target, vars).catch(() => {});
+    }
     try {
       await this.cli.startAgent(rec.target, this.agentKind, rec.worker.role);
     } catch (err) {

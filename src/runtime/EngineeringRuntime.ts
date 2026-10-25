@@ -1824,6 +1824,7 @@ export class EngineeringRuntime {
         recoveryPlanner: new RecoveryPlanner(recoveryBudget),
         onStatuses: (statuses) => rt.consumeSupervisorStatuses(statuses),
         planningInFlight: (missionId) => rt.orchestrator?.isPlanning(missionId) ?? false,
+        runInFlight: (missionId) => rt.orchestrator?.hasLiveRun(missionId) ?? false,
         // Other live sessions in this worktree see the same missions; each
         // mission is supervised only by its custodian, and a dead custodian's
         // missions are adopted automatically.

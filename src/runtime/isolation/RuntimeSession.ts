@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync, renameSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
 /**
  * The Pi Engineering session: one UUID per Pi process, registered in the
  * machine registry, heartbeating, and unregistered on graceful exit.
@@ -17,10 +21,7 @@
  * namespaces first; a writer some other caller keeps open across a reload
  * stays the old instance until it is closed.
  */
-import { randomUUID } from "node:crypto";
-import { mkdirSync, renameSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { ExclusiveFileLock } from "../../platform/eventstore/fileLock.ts";
+import { runtimeFacts } from "../runtimeFacts.ts";
 import type { LeaseOwner } from "./LeaseManager.ts";
 import { type ReconciliationReport, RecoveryManager } from "./RecoveryManager.ts";
 import { RuntimeRegistry, type SessionBindingUpdate } from "./RuntimeRegistry.ts";
@@ -320,7 +321,11 @@ export class RuntimeSession {
       }).reconcile();
       registry.setState(this.sessionId, record.generationId, "healthy");
       this.setHealth("healthy");
-      emitRuntimeEvent("runtime.started", { session_id: this.sessionId, generation_id: record.generationId });
+      emitRuntimeEvent("runtime.started", {
+        session_id: this.sessionId,
+        generation_id: record.generationId,
+        ...runtimeFacts(),
+      });
       this.state.driver = () => RuntimeSession.current();
       this.state.driverModule = import.meta.url;
       this.startHeartbeat();
@@ -416,7 +421,7 @@ export class RuntimeSession {
         if (this.state.health === "recovering" || this.state.health === "rebound" || transient) {
           this.setHealth("healthy");
         }
-        emitRuntimeEvent("session.heartbeat", { session_id: this.sessionId });
+        emitRuntimeEvent("session.heartbeat", { session_id: this.sessionId, ...runtimeFacts() });
         return true;
       }
       this.setHealth("recovering", "registry generation superseded; re-registering");

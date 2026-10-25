@@ -35,7 +35,7 @@ import {
 import { type LineageEmitter, lineageNodeId } from "../runtime/herdr/lineage.ts";
 import { atomicWriteFile, withFileLock } from "../runtime/herdr/portableLock.ts";
 import { type ForkParams, approachNodeId, clean, forkBranchFor, forkIdFor } from "./forkParams.ts";
-import type { SteeringAck, SteeringItem } from "./steering.ts";
+import { type SteeringAck, type SteeringItem, steeringText } from "./steering.ts";
 
 export { type ForkParams, approachNodeId, forkBranchFor, forkIdFor, parseForkParams } from "./forkParams.ts";
 
@@ -64,6 +64,12 @@ export interface ForkRecord {
   branch: string;
   worktreePath: string;
   label: string;
+  /**
+   * The changed requirement the room attached to the fork (Herdr delivers it, bounded and redacted, as untrusted text
+   * from the named person). Kept here, never written into the worktree or the graph; read it framed with
+   * {@link ForkManager.framedRequirement}.
+   */
+  requirement?: { text: string; proposedBy: string; confirmedBy: string };
   status: ForkStatus;
   steeringId: string;
   createdAt: string;
@@ -319,6 +325,9 @@ export class ForkManager {
       branch,
       worktreePath: path,
       label: item.params?.label ?? "",
+      ...(item.instruction
+        ? { requirement: { text: item.instruction, proposedBy: item.proposedBy, confirmedBy: item.confirmedBy } }
+        : {}),
       status: "creating",
       steeringId: item.steeringId,
       createdAt: new Date(this.now()).toISOString(),
@@ -382,8 +391,31 @@ export class ForkManager {
     if (warn) this.o.log?.(`forks: ${retired} retired forks kept on disk`);
     return ack(
       "applied",
-      `created ${approachNodeId(id)} on branch ${branch}; start work in its worktree. The original is untouched.${warn}`,
+      `created ${approachNodeId(id)} on branch ${branch}; start work in its worktree.${
+        rec.requirement ? " The changed requirement is recorded with the fork." : ""
+      } The original is untouched.${warn}`,
     );
+  }
+
+  /**
+   * The fork's changed requirement framed for a model: a fixed header naming who wrote it, the words quoted as one JSON
+   * string, and the statement that it cannot override a gate, a hold or the task's scope. Null when the fork carries none.
+   */
+  framedRequirement(approachId: string): string | null {
+    const rec = this.o.registry.get(approachId);
+    if (!rec?.requirement) return null;
+    return steeringText({
+      steeringId: rec.steeringId,
+      action: "fork",
+      nodeId: rec.originNodeId,
+      instruction: rec.requirement.text,
+      proposedBy: rec.requirement.proposedBy,
+      confirmedBy: rec.requirement.confirmedBy,
+      room: rec.room,
+      validUntilEpoch: 0,
+      fence: null,
+      expectedDigest: null,
+    });
   }
 
   // ── comparison data ───────────────────────────────────────────────────────────────────────────────────────

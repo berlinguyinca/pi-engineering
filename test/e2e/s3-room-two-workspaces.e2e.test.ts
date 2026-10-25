@@ -1,3 +1,16 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { pathToFileURL } from "node:url";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
+import { WorkGraph } from "../../src/platform/WorkGraph.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { HerdrAgentRuntime } from "../../src/runtime/herdr/HerdrAgentRuntime.ts";
+import { type PiHost, startPiHost } from "./support/piHost.ts";
+import { Plane, eventually, loadAcceptance } from "./support/plane.ts";
 /**
  * ACCEPTANCE SCENARIO 3 (Pi side). One HCN room spans two workspaces on two different hosts; a parent agent (tab)
  * spawns two child agents (panes); the graph and timeline keep spawn, handoff and peer consultation apart; closing a
@@ -12,23 +25,10 @@
  *
  * Gaps are named `GAP:` and assert the CURRENT behaviour. Nothing here calls an emitter primitive to fill a gap.
  */
-import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, before, describe, it } from "node:test";
-import { pathToFileURL } from "node:url";
-import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
-import { WorkGraph } from "../../src/platform/WorkGraph.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { HerdrAgentRuntime } from "../../src/runtime/herdr/HerdrAgentRuntime.ts";
-import { type PiHost, startPiHost } from "./support/piHost.ts";
-import { Plane, eventually, loadAcceptance } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 function gitRepo(): string {
-  const d = mkdtempSync(join(tmpdir(), "t16-s3-repo-"));
+  const d = scratch("t16-s3-repo-");
   const g = (...a: string[]) => execFileSync("git", ["-C", d, ...a], { stdio: "pipe" });
   g("init", "-q", "-b", "main");
   g("config", "user.email", "t16@example.invalid");
@@ -299,9 +299,16 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
     const cid = ask.body.consultation.consult_id as string;
     const es = await edgesOf();
     const cons = es.filter((e) => e.edge_type === "consultation");
-    assert.equal(cons.length, 1);
-    assert.equal(cons[0]?.from_id, `thread:hcn-consult.${cid}`);
-    assert.equal(cons[0]?.to_id, `agent:${lead}`);
+    // Herdr now also records asker -> target as a reference edge (thread nodes, never agents): exactly two edges
+    assert.equal(cons.length, 2);
+    const subjectEdge = cons.filter((e) => e.from_id === `thread:hcn-consult.${cid}`);
+    assert.equal(subjectEdge.length, 1);
+    assert.equal(subjectEdge[0]?.to_id, `agent:${lead}`);
+    const reference = cons.filter((e) => e.from_id !== `thread:hcn-consult.${cid}`);
+    assert.deepEqual(
+      reference.map((e) => [e.from_id, e.to_id]),
+      [[`thread:hcn-consult-asker.${cid}`, `thread:hcn-consult-target.${cid}`]],
+    );
     // asker and answerer are attributes of the consultation thread, not endpoints and not agents
     const thread = await plane.c("GET", `/graph/nodes/${encodeURIComponent(`thread:hcn-consult.${cid}`)}`, {
       user: "alice",
@@ -326,7 +333,11 @@ describe("scenario 3: one room, two workspaces, two hosts", () => {
     const after = await edgesOf();
     assert.deepEqual(ofType(after, "spawn"), ofType(es, "spawn"));
     assert.deepEqual(ofType(after, "handoff"), ofType(es, "handoff"));
-    assert.equal(ofType(after, "consultation").length, 1);
+    assert.equal(
+      ofType(after, "consultation").length,
+      2,
+      "answering adds no edge (subject edge + asker->target reference)",
+    );
   });
 
   it("timeline: ordered, typed markers for spawn, handoff and consultation; ledger steps are contiguous", async () => {

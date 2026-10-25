@@ -12,13 +12,19 @@ import { MissionStore } from "../orchestration/missionStore.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { loadHerdrConnection } from "../runtime/herdr/herdrConnection.ts";
 import { type GithubClient, createGithubClient, refConfigOf } from "./client.ts";
-import { type QuorumReader, createHerdrQuorumReader } from "./quorum.ts";
+import {
+  type QuorumReader,
+  type RereviewRequester,
+  createHerdrQuorumReader,
+  createHerdrRereviewRequester,
+} from "./quorum.ts";
 import { loadGithubSettings } from "./settings.ts";
 import { githubSync } from "./sync.ts";
 
 export interface GithubSyncCliDeps {
   client?: GithubClient | null;
   quorum?: QuorumReader | null;
+  rereview?: RereviewRequester | null;
   run?: (argv: string[]) => Promise<boolean>;
   fetch?: typeof globalThis.fetch;
   lineageDir?: string;
@@ -75,6 +81,12 @@ export async function runGithubSyncCli(
       : connection?.apiKey
         ? createHerdrQuorumReader(connection, deps.fetch ?? globalThis.fetch)
         : null;
+  const rereview =
+    deps.rereview !== undefined
+      ? deps.rereview
+      : connection?.apiKey
+        ? createHerdrRereviewRequester(connection, deps.fetch ?? globalThis.fetch)
+        : null;
   const client = deps.client !== undefined ? deps.client : createGithubClient(settings?.config);
   try {
     const report = await githubSync({
@@ -87,6 +99,7 @@ export async function runGithubSyncCli(
       ...(settings?.rereviewCommand.length ? { rereviewCommand: settings.rereviewCommand } : {}),
       ...(settings?.rereviewEnv.length ? { rereviewEnv: settings.rereviewEnv } : {}),
       quorum,
+      rereview,
       ...(deps.run ? { run: deps.run } : {}),
     });
     await missions.flush();
@@ -101,6 +114,7 @@ export async function runGithubSyncCli(
           target: r.target,
           head: r.headSha,
           dispatch: r.dispatch,
+          ...(r.ask ? { ask: r.ask.state } : {}),
         })),
         ciPrs: report.ciPrs,
         dependencyEdges: report.dependencyEdges,

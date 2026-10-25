@@ -31,12 +31,9 @@
  * parsing): an unrecognized mutating form is not a hole in the guard's
  * contract, it is a gap to close when it bites.
  */
-import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { safeGit } from "../git/safeGit.ts";
 
 export interface PrimaryWorktreeGuardConfig {
   enabled: boolean;
@@ -217,18 +214,17 @@ function canonical(path: string): string {
 }
 
 async function gitRevParse(dir: string): Promise<[string, string, string] | null> {
-  try {
-    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"], {
-      cwd: dir,
-      timeout: 10_000,
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-    });
-    const [top, gitDir, commonDir] = stdout.split("\n").map((l) => l.trim());
-    if (!top || !gitDir || !commonDir) return null;
-    return [top, gitDir, commonDir];
-  } catch {
-    return null;
-  }
+  // through safeGit (round 4): a worker-written `core.worktree` / `core.bare` in the shared config cannot change which
+  // work tree the guard believes `dir` is in
+  const r = await safeGit(["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"], {
+    cwd: dir,
+    timeoutMs: 10_000,
+    env: { GIT_OPTIONAL_LOCKS: "0" },
+  });
+  if (r.code !== 0) return null;
+  const [top, gitDir, commonDir] = r.stdout.split("\n").map((l) => l.trim());
+  if (!top || !gitDir || !commonDir) return null;
+  return [top, gitDir, commonDir];
 }
 
 async function worktreeCheck(dir: string): Promise<WorktreeCheck> {

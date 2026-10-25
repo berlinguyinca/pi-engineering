@@ -10,12 +10,12 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { EXTERNAL_STATE_FILE, startExternalBridge } from "../../src/runtime/herdr/externalAgent.ts";
 import { PI_ROOT, Plane, eventually } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 describe("scenario 4 - external coworker bridge (Pi side)", () => {
   let plane: Plane;
@@ -85,7 +85,7 @@ describe("scenario 4 - external coworker bridge (Pi side)", () => {
     });
 
   it("Pi's own client: `herdr join` redeems a one-time code from stdin (never argv), stores a 0600 credential, and the roster shows a Pi external", async () => {
-    const root = mkdtempSync(join(tmpdir(), "t16-s4-pi-"));
+    const root = scratch("t16-s4-pi-");
     const agentDir = join(root, "agent");
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(join(agentDir, "engineering.yaml"), `herdr:\n  url: ${plane.url}\n`);
@@ -157,7 +157,7 @@ describe("scenario 4 - external coworker bridge (Pi side)", () => {
     assert.equal(rv.status, 200);
     assert.equal((await cli(["heartbeat"], root, agentDir)).code, 1);
     // and with no credential at all the client does nothing
-    const empty = mkdtempSync(join(tmpdir(), "t16-s4-none-"));
+    const empty = scratch("t16-s4-none-");
     assert.equal(await startExternalBridge({ agentDir, stateDir: join(empty, "state") }), null);
   });
 });

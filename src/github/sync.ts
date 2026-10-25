@@ -21,7 +21,7 @@ import { type LineageEmitter, lineageNodeId } from "../runtime/herdr/lineage.ts"
 import type { GithubClient } from "./client.ts";
 import { type DependencyItem, buildDependencyGraph } from "./dependencies.ts";
 import { type GithubLineageSink, emitCiValidation, emitDependencyEdges, targetState } from "./lineage.ts";
-import type { QuorumReader } from "./quorum.ts";
+import type { QuorumReader, RereviewAnswer, RereviewRequester } from "./quorum.ts";
 import { type ReconcileResult, type ReconcileStore, reconcileGithubLinks } from "./reconcile.ts";
 import { type GithubRef, type RefConfig, canonicalId, parseCanonicalId, refKey } from "./refs.ts";
 import type { GithubGateDecision, GithubRereviewRequest, GithubStaleSignal } from "./types.ts";
@@ -51,6 +51,11 @@ export interface GithubSyncDeps {
   /** Names of environment variables the re-review command may see (YAML `github.rereview_env`); none by default. */
   rereviewEnv?: readonly string[];
   quorum?: QuorumReader | null;
+  /**
+   * Asks Herdr to RECORD a re-review request for the stale head (`review-quorum/rereview`), once per stale signal.
+   * Herdr dispatches nothing: the operator's `rereview_command` (and AutoSpec) still do the review.
+   */
+  rereview?: RereviewRequester | null;
   /** Runs the operator's re-review command; resolves true on exit 0. Test seam. */
   run?: (argv: string[]) => Promise<boolean>;
   now?: () => string;
@@ -136,40 +141,82 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
   // (a second PROCESS cannot open the same store: the journal's writer lock).
   const run = deps.run ?? ((argv: string[]) => runRereviewCommand(argv, deps.rereviewEnv ?? []));
   const hasCommand = Boolean(deps.rereviewCommand?.length);
+  const askHerdr = deps.rereview ?? null;
+  if (askHerdr) await lineage?.idle().catch(() => undefined); // Herdr must hold the new head before it is asked about it
   for (const signal of store.listGithubStaleSignals(deps.missionId)) {
     const existing = store.getGithubRereview(signal.signalId);
     const nowMs = Date.parse(now());
+    let commandDue = hasCommand;
     if (existing) {
-      if (existing.dispatch === "ok" || existing.dispatch === "none") continue;
-      if (!hasCommand) continue;
-      const attempts = existing.attempts ?? 1;
-      if (existing.dispatch === "failed") {
-        if (attempts >= REREVIEW_MAX_ATTEMPTS) continue;
-        if (existing.nextAttemptAt && Date.parse(existing.nextAttemptAt) > nowMs) continue;
+      commandDue = hasCommand && existing.dispatch !== "ok" && existing.dispatch !== "none";
+      if (commandDue) {
+        const attempts = existing.attempts ?? 1;
+        if (existing.dispatch === "failed") {
+          if (attempts >= REREVIEW_MAX_ATTEMPTS) commandDue = false;
+          else if (existing.nextAttemptAt && Date.parse(existing.nextAttemptAt) > nowMs) commandDue = false;
+        }
+        if (
+          existing.dispatch === "inflight" &&
+          Date.parse(existing.inflightAt ?? existing.requestedAt) + REREVIEW_INFLIGHT_LEASE_MS > nowMs
+        )
+          commandDue = false;
       }
-      if (
-        existing.dispatch === "inflight" &&
-        Date.parse(existing.inflightAt ?? existing.requestedAt) + REREVIEW_INFLIGHT_LEASE_MS > nowMs
-      )
-        continue;
     }
+    // Herdr's ledger is idempotent per PR head, so a crash before the answer was stored only repeats a harmless ask.
+    let askDue = Boolean(askHerdr);
+    if (askDue && existing?.ask) {
+      askDue =
+        existing.ask.state === "failed" &&
+        existing.ask.attempts < REREVIEW_MAX_ATTEMPTS &&
+        !(existing.ask.nextAt && Date.parse(existing.ask.nextAt) > nowMs);
+    }
+    if (!commandDue && !askDue) continue;
     if (inflightHere.has(signal.signalId)) continue;
-    const attempts = (existing?.attempts ?? 0) + (hasCommand ? 1 : 0);
+    const attempts = (existing?.attempts ?? 0) + (commandDue ? 1 : 0);
     const base: GithubRereviewRequest = {
+      ...(existing ?? {}),
       signalId: signal.signalId,
       missionId: signal.missionId,
       target: signal.target,
       headSha: signal.headSha,
       previousHeadSha: signal.previousHeadSha,
       requestedAt: existing?.requestedAt ?? now(),
-      dispatch: hasCommand ? "inflight" : "none",
+      dispatch: commandDue ? "inflight" : (existing?.dispatch ?? "none"),
       attempts,
-      ...(hasCommand ? { inflightAt: now() } : {}),
+      ...(commandDue ? { inflightAt: now() } : {}),
     };
-    if (existing) store.updateGithubRereview(base);
-    else if (!store.recordGithubRereview(base)) continue;
+    if (!existing) {
+      if (!store.recordGithubRereview(base)) continue;
+    } else if (commandDue) store.updateGithubRereview(base); // the in-flight marker; an ask-only retry has nothing to persist yet
     let final = base;
-    if (hasCommand) {
+    let changed = false;
+    if (askDue && askHerdr) {
+      inflightHere.add(signal.signalId);
+      let answer: RereviewAnswer;
+      try {
+        answer = await askHerdr(signal.target, signal.headSha);
+      } catch {
+        answer = { state: "failed", reason: "error" };
+      } finally {
+        inflightHere.delete(signal.signalId);
+      }
+      const tries = (existing?.ask?.attempts ?? 0) + 1;
+      final = {
+        ...final,
+        ask: {
+          state: answer.state,
+          attempts: tries,
+          ...(answer.state === "failed"
+            ? { nextAt: new Date(Date.parse(now()) + REREVIEW_BACKOFF_MS * 2 ** (tries - 1)).toISOString() }
+            : {}),
+          ...(answer.requestId ? { requestId: answer.requestId } : {}),
+          ...(answer.reason ? { reason: answer.reason } : {}),
+        },
+      };
+      store.updateGithubRereview(final);
+      changed = true;
+    }
+    if (commandDue) {
       inflightHere.add(signal.signalId);
       let ok = false;
       try {
@@ -187,7 +234,7 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
       } finally {
         inflightHere.delete(signal.signalId);
       }
-      const { inflightAt: _i, ...rest } = base;
+      const { inflightAt: _i, ...rest } = final;
       final = ok
         ? { ...rest, dispatch: "ok" }
         : {
@@ -196,9 +243,10 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
             nextAttemptAt: new Date(Date.parse(now()) + REREVIEW_BACKOFF_MS * 2 ** (attempts - 1)).toISOString(),
           };
       store.updateGithubRereview(final);
+      changed = true;
     }
     if (!existing) report.rereviews.push(final);
-    else if (final.dispatch === "ok") report.rereviews.push(final);
+    else if (changed && (final.dispatch === "ok" || final.ask?.state === "ok")) report.rereviews.push(final);
     lineage?.nodeUpsert(
       signal.target,
       { attrs: { rereview_head: signal.headSha, rereview_signal: signal.signalId } },

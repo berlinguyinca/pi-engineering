@@ -96,6 +96,11 @@ export interface GithubRereviewRequest {
   attempts?: number;
   nextAttemptAt?: string;
   inflightAt?: string;
+  /**
+   * Herdr's answer to Pi's request to RECORD this re-review (`review-quorum/rereview`). `refused` is final (Herdr
+   * said not permitted, hidden or not needed); `failed` is asked again with a bound. Absent = never asked.
+   */
+  ask?: { state: "ok" | "refused" | "failed"; attempts: number; nextAt?: string; requestId?: string; reason?: string };
 }
 
 /** The merge-gate decision last projected for a PR; `revision` moves only when head or decision changes. */

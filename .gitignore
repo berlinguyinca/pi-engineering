@@ -32,5 +32,5 @@ npm-debug.log*
 .omc/
 rr*.ts
 
-# T16 acceptance: local overrides never enter git
+# T16 e2e local acceptance override
 test/e2e/acceptance.local.yaml

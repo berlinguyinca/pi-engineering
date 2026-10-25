@@ -1221,6 +1221,7 @@ ${RECOVERY_PROMPT}`;
   const selfUpdateEnabled = selfUpdateMode !== "0" && selfUpdateMode !== "false" && selfUpdateMode !== "off";
   const extensionRoot = resolve(new URL("..", import.meta.url).pathname);
   let lastUpdateCheckAt: number | undefined;
+  let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
 
   // The same unattended, tty-less runner the auto-reload watcher uses.
   const runGit = gitRunner(extensionRoot);
@@ -1261,16 +1262,30 @@ ${RECOVERY_PROMPT}`;
       if (!selfUpdateEnabled || !shouldCheck(lastUpdateCheckAt, Date.now())) return;
       // Deliberately not awaited: a session must never wait on a network call
       // to start, and a failed check is silence rather than a notice.
-      void runSelfUpdate(selfUpdateMode !== "check")
-        .then((result) => {
-          if (result.unavailable) return;
-          // Only speak when there is something to act on. "You are up to date"
-          // every few hours is noise that trains the operator to ignore the one
-          // notice that matters.
-          if (result.decision.action === "current" || result.decision.action === "skip") return;
-          ctx.ui.notify(describeUpdate(result.decision, { applied: result.applied }), "info");
-        })
-        .catch(() => {});
+      // The check is also moved off this handler's turn (and unref'd): the first git call of a process does one-time
+      // setup (state directory, version probe, the operator's config) that must not delay the session's start.
+      lastUpdateCheckAt = Date.now();
+      if (updateCheckTimer) clearTimeout(updateCheckTimer);
+      const timer = setTimeout(() => {
+        updateCheckTimer = undefined;
+        void runSelfUpdate(selfUpdateMode !== "check")
+          .then((result) => {
+            if (result.unavailable) return;
+            // Only speak when there is something to act on. "You are up to date"
+            // every few hours is noise that trains the operator to ignore the one
+            // notice that matters.
+            if (result.decision.action === "current" || result.decision.action === "skip") return;
+            ctx.ui.notify(describeUpdate(result.decision, { applied: result.applied }), "info");
+          })
+          .catch(() => {});
+      }, 0);
+      timer.unref?.();
+      updateCheckTimer = timer;
+    });
+    // A session that ends before the deferred check started takes the check with it.
+    pi.on("session_shutdown", () => {
+      if (updateCheckTimer) clearTimeout(updateCheckTimer);
+      updateCheckTimer = undefined;
     });
   }
 
@@ -2277,6 +2292,8 @@ ${RECOVERY_PROMPT}`;
   // Session lifecycle: diagnostics sink, and the data behind the footer's
   // ambient row (files, findings, tokens). Needs a live Pi run (the smoke-test
   // stub has no pi.on).
+  let panelStartGeneration = 0;
+  let panelStarting: Promise<void> = Promise.resolve();
   if (typeof pi.on === "function") {
     pi.on("session_start", async (_event, ctx) => {
       // First, before anything can report: until a sink is installed every
@@ -2288,14 +2305,19 @@ ${RECOVERY_PROMPT}`;
       telemetryUninstall = installTelemetrySink(ctx.ui as { notify(text: string, level: string): void });
       // A new session inherits no timer from the last one.
       stopPanelRefresh();
-      const key = await repoCacheKey(ctx.cwd);
-      const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
-      if (!rt) return;
-      const plumbing = panelFor(key, rt);
-      plumbing.workspace.invalidate();
-      void plumbing.workspace.refresh();
-      plumbing.ledger.refresh();
-      startPanelRefresh(plumbing);
+      // Opening the repository's runtime runs git (several calls, under load seconds): the session does not wait for
+      // it. The panel starts when the runtime is ready, unless the session was shut down or restarted meanwhile.
+      const generation = ++panelStartGeneration;
+      panelStarting = (async () => {
+        const key = await repoCacheKey(ctx.cwd);
+        const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+        if (!rt || generation !== panelStartGeneration) return;
+        const plumbing = panelFor(key, rt);
+        plumbing.workspace.invalidate();
+        void plumbing.workspace.refresh();
+        plumbing.ledger.refresh();
+        startPanelRefresh(plumbing);
+      })().catch(() => {});
     });
 
     pi.on("session_shutdown", async () => {
@@ -2304,7 +2326,9 @@ ${RECOVERY_PROMPT}`;
       telemetryUninstall = undefined;
       // A timer that survives a session runs git against a repository nobody
       // is looking at and blocks the next session's refresh.
+      panelStartGeneration++;
       stopPanelRefresh();
+      await panelStarting;
       await shutdownCachedRuntimes();
     });
   }

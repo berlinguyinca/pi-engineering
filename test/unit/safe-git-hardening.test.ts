@@ -10,14 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { CliForkGit } from "../../src/git/forkGit.ts";
-import {
-  type GitTrust,
-  neutralisers,
-  parseScopedConfig,
-  safeGit,
-  safeGitEnv,
-  setConfigListLimitForTests,
-} from "../../src/git/safeGit.ts";
+import { type GitTrust, safeGit, safeGitEnv, setConfigListLimitForTests } from "../../src/git/safeGit.ts";
 
 const sh = (cmd: string, cwd: string, env: NodeJS.ProcessEnv = {}) =>
   execFileSync("bash", ["-c", cmd], { cwd, env: { ...process.env, ...env }, stdio: "pipe" }).toString();
@@ -141,7 +134,7 @@ for (const trust of MODES) {
         await run(args, cwd);
         assert.deepEqual(f.seen(), [], `${name} ran planted code: ${f.seen().join(",")}`);
       }
-      // a per-remote upload-pack command cannot be overridden by -c, so network operations are refused instead
+      // a per-remote upload-pack command is simply not part of the config git sees: the fetch works and runs nothing
       for (const sub of [
         ["fetch", "origin"],
         ["ls-remote", "origin"],
@@ -149,8 +142,7 @@ for (const trust of MODES) {
       ]) {
         f.reset();
         const r = await run(sub, f.primary);
-        assert.notEqual(r.code, 0, `${sub[0]} must refuse while remote.origin.uploadpack is planted`);
-        assert.match(r.stderr, /refused/);
+        assert.equal(r.code, 0, `${sub[0]} must work with the planted uploadpack ignored: ${r.stderr}`);
         assert.deepEqual(f.seen(), [], `${sub[0]} ran planted code`);
       }
       // commit with a dirty tree: hooks, gpg, editor must stay quiet and the commit must still be made
@@ -166,31 +158,42 @@ for (const trust of MODES) {
   });
 }
 
-test("operator mode keeps the operator's own global config and neutralises only the repository's", () => {
-  const entries = parseScopedConfig(
-    [
-      "global\0filter.lfs.clean\ngit-lfs clean -- %f",
-      "global\0credential.helper\nstore",
-      "global\0user.name\nOp",
-      "local\0filter.lfs.clean\ntouch /x",
-      "local\0filter.evil.smudge\ntouch /y",
-      "local\0credential.helper\n!touch /z",
-      "",
-    ].join("\0"),
-  );
-  assert.equal(entries.length, 6);
-  const op = neutralisers(entries, "operator");
-  const pairs = op.map((c) => `${c.key}=${c.value}`);
-  assert.ok(pairs.includes("filter.lfs.clean=git-lfs clean -- %f"), "operator's lfs filter is restored");
-  assert.ok(pairs.includes("filter.evil.smudge="), "repo-only filter is blanked");
-  assert.deepEqual(
-    pairs.filter((p) => p.startsWith("credential.helper=")),
-    ["credential.helper=", "credential.helper=store"],
-    "reset then the operator's own helper",
-  );
-  assert.ok(!pairs.some((p) => p.includes("touch")), "no repository command survives");
-  const strict = neutralisers(entries, "strict").map((c) => `${c.key}=${c.value}`);
-  assert.ok(strict.includes("filter.lfs.clean="), "strict mode trusts no scope");
+test("operator mode keeps the operator's own global config (alias, credential helper) but no repository attribute selects a driver; strict mode keeps nothing", async () => {
+  const f = fixture();
+  try {
+    const opMark = join(f.marks, "operator-clean");
+    const opScript = join(f.root, "op-clean.sh");
+    writeFileSync(opScript, `#!/bin/sh\ntouch ${opMark}\ncat\n`, { mode: 0o755 });
+    const gl = join(f.root, "operator.gitconfig");
+    writeFileSync(gl, `[filter "op"]\n\tclean = ${opScript}\n[alias]\n\tzz = status\n`);
+    // info/attributes (planted by the fixture: filter=x) outranks .gitattributes, so select the operator's driver there
+    writeFileSync(join(f.primary, ".git", "info", "attributes"), "* filter=op\n");
+    const prior = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = gl;
+    try {
+      writeFileSync(join(f.linked, "f.txt"), "changed\n");
+      f.reset();
+      await safeGit(["add", "-A"], { cwd: f.linked, trust: "operator" });
+      // round 4: attributes are cut off at the source, so a repository's attributes cannot select ANY driver, the
+      // operator's own included (only git-lfs lines that Pi itself generated apply: test/unit/safe-git-attrs.test.ts)
+      assert.deepEqual(f.seen(), [], "neither the operator's driver nor the repository's runs");
+      sh("git reset -q", f.linked, { GIT_CONFIG_GLOBAL: "/dev/null" });
+      writeFileSync(join(f.linked, "f.txt"), "changed again\n");
+      f.reset();
+      await safeGit(["add", "-A"], { cwd: f.linked, trust: "strict" });
+      assert.deepEqual(f.seen(), [], "strict mode ignores the operator's config as well");
+      // global-only settings are visible in operator mode and absent in strict mode
+      const alias = await safeGit(["config", "--get", "alias.zz"], { cwd: f.linked, trust: "operator" });
+      assert.equal(alias.stdout.trim(), "status");
+      const none = await safeGit(["config", "--get", "alias.zz"], { cwd: f.linked, trust: "strict" });
+      assert.equal(none.stdout.trim(), "");
+    } finally {
+      if (prior === undefined) Reflect.deleteProperty(process.env, "GIT_CONFIG_GLOBAL");
+      else process.env.GIT_CONFIG_GLOBAL = prior;
+    }
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
 });
 
 test("a repository can neither re-enable a driver through core.attributesFile nor tracked .gitattributes", async () => {
@@ -259,7 +262,7 @@ test("operator mode honours the operator's own git environment; strict mode does
   assert.equal(op.GIT_EDITOR, "true");
   const strict = safeGitEnv(source, "strict");
   assert.equal(strict.GIT_CONFIG_GLOBAL, "/dev/null");
-  assert.equal(strict.GIT_ALLOW_PROTOCOL, "https:ssh:file");
+  assert.equal(strict.GIT_ALLOW_PROTOCOL, "https:ssh");
   assert.equal(strict.GIT_SSL_CAINFO, undefined);
 });
 

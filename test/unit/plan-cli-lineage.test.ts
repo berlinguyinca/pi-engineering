@@ -1,3 +1,6 @@
+// Exercises the Herdr connection layer; opts back in from the harness-wide
+// HERDR_DISABLED default (test/support/isolatedState.ts).
+delete process.env.HERDR_DISABLED;
 /**
  * T16 wiring: the plan CLIs (standalone `plan` and `plan --from-autospec`) project the mission, the plan revision, its
  * digest, the review decision and the AutoSpec issue DAG into Herdr through the global-YAML emitter. The recorded

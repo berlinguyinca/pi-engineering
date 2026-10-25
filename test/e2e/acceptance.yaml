@@ -1,7 +1,8 @@
 # T16 acceptance configuration for the Pi-side suites (test/e2e). The ONLY configuration: no environment variables.
 # Relative paths resolve against the pi-engineering checkout root; an untracked acceptance.local.yaml wins when present.
 version: 1
-herdr_repo: ../herdr-t16                        # integrated Herdr release-candidate worktree (control plane under test)
+herdr_repo: auto                                # `auto` = the sibling checkout holding herdr_engineering/control_plane (same -tNN suffix wins);
+                                                # or an explicit path relative to this checkout, e.g. ../herdr-t16
 autospec_bin: ../autospec-t06/target/debug/autospec
 python: python3                                 # system python (needs PyYAML + asyncpg for the full control plane)
 startup_timeout_seconds: 30

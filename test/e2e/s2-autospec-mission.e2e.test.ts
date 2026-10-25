@@ -17,7 +17,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -32,6 +31,7 @@ import type { WorkspaceManifest } from "../../src/orchestration/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
 import { Plane, eventually, sha40 } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 const PI = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const FAKE_GH = join(PI, "test/e2e/fake_gh_s2");
@@ -223,7 +223,7 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
         reviewers: { "@r1": {}, "@r2": {} },
       },
     });
-    tmp = mkdtempSync(join(tmpdir(), "t16-s2-"));
+    tmp = scratch("t16-s2-");
     agentDir = join(tmp, "agent");
     mkdirSync(agentDir, { recursive: true });
     const keyFile = join(agentDir, "ingest.key");
@@ -541,14 +541,20 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
   });
 
   // ---------------------------------------------------------------------------------------- merge gate (before repair)
-  const decision = (candidate: string, prHead: string, reviewSha: string | null, ci: "pass" | "fail" | "pending") =>
+  const decision = (
+    candidate: string,
+    prHead: string,
+    reviewSha: string | null,
+    ci: "pass" | "fail" | "pending",
+    checkSha: string = prHead,
+  ) =>
     decideMerge({
       repo: REPO,
       prNumber,
       candidateSha: candidate,
       prHeadSha: prHead,
       baseSha: git(clone, "rev-parse", "main"),
-      checks: [{ name: "ci", status: ci, sha: prHead }],
+      checks: [{ name: "ci", status: ci, sha: checkSha }],
       requiredChecks: ["ci"],
       review: reviewSha === null ? null : { verdict: "PASS", sha: reviewSha },
       queue: [],
@@ -602,12 +608,25 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     assert.equal(q.status, "insufficient", "both verdicts were for the old head");
     assert.deepEqual(q.counted, []);
     assert.equal(q.rereview_required, true);
+    // Herdr's new request route: Pi asked Herdr to RECORD the re-review for the new head, with its own key (no env, no
+    // new config); the quorum read now shows the durable request, bound to head2
+    assert.equal(q.rereview_request?.head, head2, JSON.stringify(q));
+    assert.ok(q.rereview_request?.request_id, "Herdr stored a request id");
+    assert.equal(tick.rereviews[0].ask, "ok");
   });
 
   it("the old verdict no longer merges: decideMerge rejects a PASS pinned to the previous head, CI included", async () => {
     assert.equal(decision(head2, head2, head1, "pass").decision, "reject"); // stale review
     assert.equal(decision(head1, head2, head2, "pass").decision, "reject"); // candidate is the old commit
     assert.equal(decision(head2, head2, head2, "pass").decision, "merge"); // control: everything on the new head
+  });
+
+  it("a GREEN CI check pinned to the previous head cannot merge a PR whose review is on the current head", async () => {
+    // only the CHECK's sha differs from the live head: review, candidate and head all agree on head2
+    const stale = decision(head2, head2, head2, "pass", head1);
+    assert.equal(stale.decision, "reject");
+    assert.match(stale.reasons.join(";"), /check ci sha .* != head/);
+    assert.equal(decision(head2, head2, head2, "pass", head2).decision, "merge"); // control: same call, check on the live head
   });
 
   it("fresh independent verdicts at the new head satisfy the quorum again, and then the gate merges", async () => {
@@ -645,6 +664,10 @@ describe("scenario 2 / AutoSpec mission: DAG -> worktrees -> PR -> independent r
     assert.deepEqual(JSON.parse(log[0] as string).slice(0, 4), ["--pr", PR_NODE(prNumber), "--head", head2]);
     const attrs = (await plane.node(PR_NODE(prNumber))).body.node.attrs;
     assert.equal(attrs.rereview_head, head2);
+    // and exactly ONE ask reached Herdr: the answer is stored on the durable request, so a second tick does not ask again
+    assert.equal(requests[0]?.ask?.state, "ok");
+    assert.equal(requests[0]?.ask?.attempts, 1);
+    assert.equal(requests[0]?.ask?.requestId, (await quorum()).rereview_request?.request_id);
   });
 
   it("the sync CLI reads Herdr's review quorum for the merge gate: satisfied + green CI on the live head merges, and it is projected as a Pi-owned gate", async () => {

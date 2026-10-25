@@ -1,3 +1,5 @@
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 /**
  * FAKE - test shim. A stand-in for `herdr-plannotator` (the real one needs a browser UI and a human), written as a
  * shell script so Pi's REAL HerdrPlannotatorTransport spawns it exactly as it would the real bridge:
@@ -6,9 +8,7 @@
  *   approve | approve-wrong-digest | annotate | deny | dismiss | crash | garbage
  * Every invocation appends the plan-file sha256 to `calls.log`, so tests can prove what was reviewed.
  */
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { scratch } from "./scratch.ts";
 
 export interface FakePlannotator {
   dir: string;
@@ -18,7 +18,7 @@ export interface FakePlannotator {
 }
 
 export function makeFakePlannotator(): FakePlannotator {
-  const dir = mkdtempSync(join(tmpdir(), "t16-fake-plannotator-"));
+  const dir = scratch("t16-fake-plannotator-");
   const command = join(dir, "fake-plannotator");
   const script = `#!/bin/sh
 # FAKE - test shim (see fakePlannotator.ts)

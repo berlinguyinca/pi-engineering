@@ -1,11 +1,14 @@
 /** T16 glue: the global engineering.yaml `herdr:` block drives lineage (room/mission/visibility) and the attention ingest. */
+// This file exercises the connection layer itself, so it opts back in from the
+// harness-wide HERDR_DISABLED default (test/support/isolatedState.ts).
+delete process.env.HERDR_DISABLED;
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { resolveAttentionIngest } from "../../src/runtime/herdr/attentionIngest.ts";
+import { resetLegacyHerdrEnvWarning, resolveAttentionIngest } from "../../src/runtime/herdr/attentionIngest.ts";
 import { createIngestFromConnection, loadHerdrConnection } from "../../src/runtime/herdr/herdrConnection.ts";
 import { LineageEmitter } from "../../src/runtime/herdr/lineage.ts";
 import { createLineageFromConnection, loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
@@ -48,6 +51,27 @@ describe("herdr: YAML lineage keys", () => {
     assert.equal(connection?.roomId, "room-1");
     assert.equal(connection?.workspaceId, "ws.1");
     assert.equal(connection?.missionId, "m:1");
+  });
+
+  it("HERDR_DISABLED=1 is a hard off switch even for a valid config", async () => {
+    const { dir } = await setup("");
+    process.env.HERDR_DISABLED = "1";
+    try {
+      const { connection, notes } = await loadHerdrConnection(dir);
+      assert.equal(connection, null);
+      assert.match(notes[0] ?? "", /disabled by HERDR_DISABLED/);
+      // The env-URL path is gated too: a live HERDR_INGEST_URL must stay silent.
+      const attention = await resolveAttentionIngest(
+        { HERDR_DISABLED: "1", HERDR_INGEST_URL: "http://127.0.0.1:9" },
+        dir,
+      );
+      assert.equal(attention, null);
+    } finally {
+      delete process.env.HERDR_DISABLED;
+      // resolveAttentionIngest warns once per process about the legacy variable
+      // passed above; leave the warning armed for the tests that count it.
+      resetLegacyHerdrEnvWarning();
+    }
   });
 
   it("rejects bad values and unknown keys (herdr off, with a note)", async () => {
@@ -117,6 +141,22 @@ describe("loadLineageEmitter from engineering.yaml", () => {
       assert.equal(c.body.visibility_scope, "room");
       assert.equal(c.body.entity_type, "lineage");
     }
+  });
+
+  it("visibility defaults to PRIVATE when the YAML does not say otherwise (and a stated value is honoured)", async () => {
+    const run = async (block: string) => {
+      const { dir } = await setup(block);
+      const state = await mkdtemp(join(tmpdir(), "pi-yaml-lineage-state-"));
+      const { calls, fetch } = recorder();
+      const em = await loadLineageEmitter({ agentDir: dir, envelopeDir: state, fetch });
+      assert.ok(em instanceof LineageEmitter);
+      em.workerSpawned({ agent: "lead", attempt: "lead.1", transition: "t" });
+      await em.idle();
+      assert.ok(calls.length > 0);
+      return new Set(calls.map((c) => c.body.visibility_scope));
+    };
+    assert.deepEqual([...(await run("  lineage: true\n  room_id: room-9\n"))], ["private"]);
+    assert.deepEqual([...(await run("  lineage: true\n  visibility: org\n  room_id: room-9\n"))], ["org"]); // control
   });
 
   it("instance_id from the YAML is stamped on upserted nodes (Herdr pins steering to it); absent = unpinned", async () => {

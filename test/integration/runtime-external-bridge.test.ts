@@ -1,3 +1,6 @@
+// Exercises the Herdr connection layer; opts back in from the harness-wide
+// HERDR_DISABLED default (test/support/isolatedState.ts).
+delete process.env.HERDR_DISABLED;
 /**
  * T16 wiring through the REAL EngineeringRuntime: with a stored join credential AND `herdr.url` in the global YAML the
  * runtime heartbeats to Herdr by itself; with either missing it sends nothing. Removing `startExternalBridge` from the

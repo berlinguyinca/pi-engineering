@@ -1,3 +1,15 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import net from "node:net";
+import { join } from "node:path";
+import { after, before, describe, it } from "node:test";
+import { ControlPlaneIngest } from "../../src/runtime/herdr/ControlPlaneIngest.ts";
+import { EnvelopeStore } from "../../src/runtime/herdr/envelopeStore.ts";
+import { createLineageEmitter } from "../../src/runtime/herdr/lineage.ts";
+import { Plane, eventually, freePort } from "./support/plane.ts";
 /**
  * Acceptance scenario 6, Pi side: the durable outbox against a REAL control-plane process that crashes (SIGKILL),
  * restarts empty, sees duplicates, a dropped event, a revoked key and a lineage refusal.
@@ -12,18 +24,7 @@
  * A tiny TCP forwarder keeps the emitter's configured URL stable while the plane gets a new port on each restart
  * (the harness picks a fresh port per start; the emitter's URL is fixed at construction, as in production).
  */
-import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
-import net from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, before, describe, it } from "node:test";
-import { ControlPlaneIngest } from "../../src/runtime/herdr/ControlPlaneIngest.ts";
-import { EnvelopeStore } from "../../src/runtime/herdr/envelopeStore.ts";
-import { createLineageEmitter } from "../../src/runtime/herdr/lineage.ts";
-import { Plane, eventually, freePort } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 const FAST = { baseMs: 20, maxMs: 100, deadLetterAfter: 5 };
 const uniq = (p: string) => `${p}-${randomBytes(3).toString("hex")}`;
@@ -67,7 +68,7 @@ describe("scenario 6 (Pi): outbox under crash, duplicate, drop, revoked key, ref
   let root: string;
 
   before(async () => {
-    root = mkdtempSync(join(tmpdir(), "s6-pi-"));
+    root = scratch("s6-pi-");
     plane = await Plane.start({
       keys: { pi: "ingest", scoped: "ingest", rival: "ingest" },
       scopes: { scoped: { rooms: ["room-allowed"], missions: [] } },
@@ -109,7 +110,7 @@ describe("scenario 6 (Pi): outbox under crash, duplicate, drop, revoked key, ref
   });
   const post = (envelope: unknown, key = "pi") => plane.call("POST", "/api/v1/ingest", { key, body: envelope });
 
-  it("kill -9 mid-stream: Pi keeps what was not delivered, a restarted Pi replays it in order, and the loss on the server side is SHOWN as a gap, not hidden", async () => {
+  it("SERVER kill -9 mid-stream (Pi stays up): Pi keeps what was not delivered, a restarted Pi store replays it in order, and the loss on the server side is SHOWN as a gap, not hidden", async () => {
     const source = uniq("s6crash");
     const a = mk("crash", source, "pi");
     const em = createLineageEmitter({ ingest: a.ingest }, { visibility: "org" });
@@ -181,6 +182,46 @@ describe("scenario 6 (Pi): outbox under crash, duplicate, drop, revoked key, ref
       !edges.some((e) => e[0] === "spawn" && e[1] === "agent:lead"),
       "no spawn edge from a parent the server no longer knows",
     );
+  });
+
+  it("Pi PROCESS kill -9 (a separate OS process): its durable queue survives, a new Pi process replays it in order with no gap and no duplicate", async () => {
+    const source = uniq("s6pikill");
+    const dir = join(root, "pikill");
+    mkdirSync(dir, { recursive: true });
+    const keyFile = join(root, "pikill.key");
+    writeFileSync(keyFile, `${plane.keys.pi}\n`, { mode: 0o600 });
+    const cfgFile = join(root, "pikill.json");
+    writeFileSync(cfgFile, JSON.stringify({ dir, source, url, keyFile }));
+    const child = spawn(process.execPath, [join(import.meta.dirname, "support/piChild.ts"), cfgFile], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => {
+      out += d;
+    });
+    child.stderr.on("data", (d) => {
+      err += d;
+    });
+    await eventually(async () => out.includes("QUEUED"), `child to queue its events (stderr: ${err})`, 30_000);
+    assert.match(out, /DELIVERED true/, "control: the live child delivered its first event");
+    assert.match(out, /QUEUED 2/);
+    assert.equal((await plane.node("agent:pk1")).status, 200);
+    assert.equal((await plane.node("agent:pk2")).status, 404, "nothing past the first event reached the server");
+    const exited = new Promise<string>((res) => child.once("exit", (_c, sig) => res(String(sig))));
+    child.kill("SIGKILL");
+    assert.equal(await exited, "SIGKILL", "the Pi process really died by SIGKILL");
+    // a NEW Pi process (this one) reopens the same directory
+    const b = mk("pikill", source, "pi");
+    assert.equal((await b.store.outbox.peek()).length, 2, "the killed process's undelivered events are on disk");
+    await drain(b.ingest, 0);
+    assert.equal((await plane.node("agent:pk2")).status, 200);
+    assert.equal((await plane.node("agent:pk3")).status, 200);
+    const s = (await plane.sources())[source];
+    assert.deepEqual(s?.gaps, [], "contiguous: nothing lost, nothing skipped");
+    assert.equal(s?.last_sequence, 3, JSON.stringify(s));
+    const d = b.ingest.diagnostics();
+    assert.equal((d?.rejected ?? 0) + (d?.deadLettered ?? 0) + (d?.dropped ?? 0), 0, JSON.stringify(d));
   });
 
   it("duplicate events: a lost ack and a raw re-POST are both acknowledged as duplicates and apply nothing twice", async () => {

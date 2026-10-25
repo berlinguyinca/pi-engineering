@@ -12,6 +12,7 @@ import { GitRepo } from "../../src/git/GitRepo.ts";
 import { sweepWorktrees } from "../../src/git/worktreeJanitor.ts";
 import { captureChangeSnapshot } from "../../src/lifecycle/changeObserver.ts";
 import { gitPostMerge } from "../../src/merge/postMerge.ts";
+import { gitHead, gitRunner, sshCommandConfigured, trackedChanges } from "../../src/runtime/host/sourceWatch.ts";
 import { hasNoChangesVsBase } from "../../src/workers/workerResultTool.ts";
 
 const CLEAN_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
@@ -133,6 +134,19 @@ describe("migrated callers run none of the planted payloads", () => {
       report.reclaimed.some((r) => basename(r.path) === basename(janitorWt)),
       JSON.stringify(report),
     );
+    assert.deepEqual(seen(), []);
+  });
+
+  it("source watcher (gitHead, trackedChanges, gitRunner, sshCommandConfigured) on the watched checkout", async () => {
+    reset();
+    sh(`git config core.sshCommand 'sh -c "touch ${marks}/ssh"' --`, primary);
+    assert.match((await gitHead(linked)) ?? "", /^[0-9a-f]{40}$/);
+    assert.ok(Array.isArray(await trackedChanges(linked)));
+    const run = await gitRunner(linked)(["status", "--porcelain", "--untracked-files=no"]);
+    assert.equal(run.code, 0, run.stderr);
+    const fetch = await gitRunner(primary)(["fetch", "--dry-run"]);
+    assert.ok(fetch.code === 0 || fetch.code === 128, fetch.stderr);
+    assert.equal(sshCommandConfigured(linked), false, "a repository-local core.sshCommand is not the operator's");
     assert.deepEqual(seen(), []);
   });
 });

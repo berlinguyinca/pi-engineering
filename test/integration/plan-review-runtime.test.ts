@@ -201,9 +201,15 @@ describe("plan review on the orchestrator path", () => {
     await lineage.idle();
     const node = `plan:${mission.mission_id}/1`;
     const planUpsert = drafts.find((d) => d.event_type === "node.upsert" && d.payload.node_id === node);
-    assert.equal(planUpsert?.payload.attrs.plan_digest, digests[0], "the digest on the plan node is the reviewed digest");
+    assert.equal(
+      planUpsert?.payload.attrs.plan_digest,
+      digests[0],
+      "the digest on the plan node is the reviewed digest",
+    );
     assert.equal(planUpsert?.room_id, "room-rt", "the emitter's default scope applies to the gate's events");
-    assert.ok(drafts.some((d) => d.event_type === "node.upsert" && d.payload.node_id === `mission:${mission.mission_id}`));
+    assert.ok(
+      drafts.some((d) => d.event_type === "node.upsert" && d.payload.node_id === `mission:${mission.mission_id}`),
+    );
     const reviewed = drafts.find((d) => d.event_type === "edge.add" && d.payload.edge_type === "reviewed");
     assert.equal(reviewed?.payload.attrs.plan_digest, digests[0]);
   });

@@ -13,19 +13,10 @@
  *
  * Gaps are named `GAP:` and assert the CURRENT behaviour. Nothing here calls an emitter primitive to fill a gap.
  */
+
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import {
-  appendFileSync,
-  chmodSync,
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -42,6 +33,7 @@ import { type ForkRuntime, createForkRuntime, downstreamPrNodes } from "../../sr
 import { FakeGithubClient } from "../support/fakeGithubClient.ts";
 import { type PiHost, startPiHost } from "./support/piHost.ts";
 import { Plane, eventually } from "./support/plane.ts";
+import { scratch } from "./support/scratch.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const enc = encodeURIComponent;
@@ -67,6 +59,7 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
   let hostOther: PiHost;
   let hostSameKey: PiHost;
   let runtime: ForkRuntime;
+  let ports: SteeringPorts;
   let receiver: SteeringReceiver;
   let rxOtherKey: SteeringReceiver;
   let rxOtherInstance: SteeringReceiver;
@@ -147,6 +140,8 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     doc.sections.control_plane.values.collab.steering = {
       enabled: true,
       self_confirm: false,
+      propose_per_10min: 200, // this suite proposes far more than the production default of a real room
+      confirm_per_10min: 200,
       actions: ["pause", "redirect", "fork", "promote"],
       forks: {
         enabled: true,
@@ -218,7 +213,7 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     setSteering({});
 
     // a real repository: C0 base, C1 the attempt's (reviewed, failed) result, C2 main moved on since
-    const parent = mkdtempSync(join(tmpdir(), "t16-s5-"));
+    const parent = scratch("t16-s5-");
     repo = join(parent, "repo");
     bare = join(parent, "origin.git");
     execFileSync("git", ["init", "-q", "--bare", "-b", "main", bare]);
@@ -240,7 +235,7 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     mainAtStart = sha.C2;
 
     // the fake gh and its sidecar config (the bare repository is the "remote")
-    ghDir = mkdtempSync(join(tmpdir(), "t16-s5-gh-"));
+    ghDir = scratch("t16-s5-gh-");
     copyFileSync(join(HERE, "fake_gh_s5", "gh"), join(ghDir, "gh"));
     const script = readFileSync(join(ghDir, "gh"), "utf8").replace("#!/usr/bin/env node", `#!${process.execPath}`);
     writeFileSync(join(ghDir, "gh"), script);
@@ -394,7 +389,7 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     });
     assert.ok(rt, "forks.enabled in the global YAML builds the fork runtime");
     runtime = rt;
-    const ports: SteeringPorts = {
+    ports = {
       forks: runtime.port,
       resolve: () => null,
       steerRunning: () => "no_channel",
@@ -597,31 +592,26 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     assert.equal(reviewed.stale ?? false, false);
   });
 
-  it("GAP: the changed requirement can only travel as the fork's 80-character label", async () => {
-    // Herdr refuses `instruction` on a fork (it is for redirect only) and a `reason` is stored but never delivered, and
-    // Pi's ForkManager.create reads only base_sha and label. So the new requirement reaches the worktree's agent as
-    // a label and nothing more; the rest has to be restated to that agent.
-    const withInstruction = await propose("bob", "fork", attemptNode, {
-      base_sha: sha.C1,
-      label: "second approach",
-      instruction: "Use a bounded queue instead of recursion; cap retries at 3.",
-    });
-    assert.equal(withInstruction.status, 400);
-    assert.match(JSON.stringify(withInstruction.body), /instruction is only for redirect/);
+  it("the changed requirement travels with the fork: Herdr delivers the bounded instruction, Pi records it framed as untrusted text and never writes it into the worktree or the graph", async () => {
     const requirement = "Use a bounded queue instead of recursion; cap retries at 3.";
     const p = await propose("bob", "fork", attemptNode, {
       base_sha: sha.C1,
       label: "bounded queue, retries capped at 3",
-      reason: requirement,
+      instruction: requirement,
     });
     assert.ok([200, 201].includes(p.status), JSON.stringify(p.body));
+    // negative control: an instruction on an action that has no use for one is still refused
+    const bad = await propose("bob", "pause", attemptNode, { instruction: "x" });
+    assert.equal(bad.status, 400);
+    assert.match(JSON.stringify(bad.body), /instruction is only for redirect and fork/);
     assert.equal((await confirm("alice", p.body.steering, attemptNode)).status, 200);
     const offered = await plane.call("GET", "/api/v1/steering/pending?instance_id=inst-a", { key: "pi" });
     const item = offered.body.steering.find(
       (i: { steering_id: string }) => i.steering_id === p.body.steering.steering_id,
     );
     assert.ok(item, "offered to the reporting key and instance");
-    assert.ok(!JSON.stringify(item).includes("bounded queue instead"), "the reason text is not part of the delivery");
+    assert.equal(item.instruction, requirement, "Herdr delivers the instruction");
+    assert.equal(item.instruction_trust, "untrusted_text_from_proposed_by");
     const id = forkIdFor(p.body.steering.steering_id);
     forks.fk2 = {
       steeringId: p.body.steering.steering_id,
@@ -634,8 +624,22 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     const f2 = forks.fk2 as (typeof forks)[string];
     const node = (await plane.node(f2.node)).body.node;
     assert.equal(node.label, "bounded queue, retries capped at 3");
-    assert.ok(!JSON.stringify(node.attrs).includes("instead of recursion"));
+    assert.ok(!JSON.stringify(node.attrs).includes("instead of recursion"), "the requirement is not graph data");
     assert.equal(git(f2.worktree, "rev-parse", "HEAD"), sha.C1);
+    assert.equal(git(f2.worktree, "status", "--porcelain"), "", "nothing was written into the worktree");
+    const framed = runtime.manager.framedRequirement(f2.id);
+    assert.ok(framed, "the fork carries its requirement");
+    assert.match(framed as string, /untrusted/);
+    assert.match(framed as string, /proposed_by: "bob"/);
+    assert.ok((framed as string).includes(JSON.stringify(requirement)), "the words are quoted as one JSON string");
+    assert.equal(
+      runtime.manager.framedRequirement(forks.fk1?.id as string),
+      null,
+      "a fork proposed without an instruction carries none",
+    );
+    const ack = (await statusOf(f2.steeringId))?.ack;
+    assert.equal(ack?.outcome, "applied");
+    assert.match(ack?.note ?? "", /requirement is recorded/);
   });
 
   it("two alternatives are worked, reported and compared; only trusted head-bound evidence counts", async () => {
@@ -895,6 +899,104 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     assert.equal(JSON.stringify(await edgeKeys("pr:github.com/acme/widgets#12")), rec.gateBEdgesBefore);
   });
 
+  // ------------------------------------------------------------------------------------------------ fences, one stage at a time
+  // The target moves ONLY in a fenced attribute (fencing_token) through the REAL Pi emitter: it stays `running`, `pause`
+  // stays eligible, the instance pin is unchanged, so nothing but the fence can notice (the fork tests above move
+  // head_sha, which other guards also see).
+  const liveNode = async (id: string, token: string) => {
+    const before = (await target(id)).body.fence as string | undefined; // undefined: the node does not exist yet
+    host.emitter.nodeUpsert(id, { label: id, state: "running", attrs: { fencing_token: token } }, `t16.fence.${token}`);
+    await host.drain();
+    // (fencing_token itself is a secret-named key and is redacted on read, so wait on the fence it feeds)
+    await eventually(async () => (await target(id)).body.fence !== before, `${id} at ${token}`);
+  };
+  const confirmWith = (st: { steering_id: string; digest: string }, fence: string) =>
+    plane.c("POST", `/rooms/${roomId}/steering/${st.steering_id}/confirm`, {
+      user: "alice",
+      body: { digest: st.digest, expected_fence: fence },
+    });
+
+  it("fence at PROPOSE: a target that moved only in a fenced attribute is refused, the fresh fence is accepted", async () => {
+    await liveNode("attempt:fence-p", "t1");
+    const old = (await target("attempt:fence-p")).body.fence as string;
+    await liveNode("attempt:fence-p", "t2");
+    const fresh = await target("attempt:fence-p");
+    assert.notEqual(fresh.body.fence, old);
+    assert.ok((fresh.body.actions as string[]).includes("pause"), "still eligible: only the fence differs");
+    const late = await plane.c("POST", `/rooms/${roomId}/steering`, {
+      user: "bob",
+      body: { action: "pause", node_id: "attempt:fence-p", expected_fence: old, idempotency_key: "fp-1" },
+    });
+    assert.equal(late.status, 409);
+    assert.equal(late.body.code, "stale_fence");
+    assert.ok([200, 201].includes((await propose("bob", "pause", "attempt:fence-p")).status), "control: fresh fence");
+  });
+
+  it("fence at CONFIRM: a wrong expected_fence on an unchanged target, and a target that moved after the proposal, are both refused", async () => {
+    await liveNode("attempt:fence-c", "t1");
+    const a = await propose("bob", "pause", "attempt:fence-c");
+    assert.ok([200, 201].includes(a.status), JSON.stringify(a.body));
+    const stored = (await target("attempt:fence-c")).body.fence as string;
+    const bogus = await confirmWith(a.body.steering, "0".repeat(stored.length));
+    assert.equal(bogus.status, 409);
+    assert.equal(bogus.body.code, "stale_fence", "target unchanged: only expected_fence is wrong");
+    const b = await propose("bob", "pause", "attempt:fence-c");
+    assert.equal((await confirmWith(b.body.steering, stored)).status, 200, "control: the right fence confirms");
+    const c = await propose("bob", "pause", "attempt:fence-c");
+    await liveNode("attempt:fence-c", "t2");
+    const moved = await confirmWith(c.body.steering, stored); // the proposal's own fence, but the target has moved on
+    assert.equal(moved.status, 409);
+    assert.equal(moved.body.code, "stale_fence");
+    assert.equal((await statusOf(c.body.steering.steering_id))?.status, "fenced");
+    await receiver.pollOnce(); // drain the one confirmed request (b) so later tests see a clean queue
+  });
+
+  it("fence at DELIVERY: a confirmed request is not handed to the Pi receiver once the target moved", async () => {
+    await liveNode("attempt:fence-d1", "t1");
+    const keep = await propose("bob", "pause", "attempt:fence-d1");
+    assert.ok([200, 201].includes(keep.status), JSON.stringify(keep.body));
+    assert.equal((await confirm("alice", keep.body.steering, "attempt:fence-d1")).status, 200);
+    const pending = async () =>
+      (
+        (await plane.call("GET", "/api/v1/steering/pending?instance_id=inst-a", { key: "pi" })).body.steering as Array<{
+          steering_id: string;
+        }>
+      ).map((x) => x.steering_id);
+    assert.ok(
+      (await pending()).includes(keep.body.steering.steering_id),
+      "control: an untouched confirmed request is offered",
+    );
+    await liveNode("attempt:fence-d2", "u1");
+    const st = await propose("bob", "pause", "attempt:fence-d2");
+    assert.equal((await confirm("alice", st.body.steering, "attempt:fence-d2")).status, 200);
+    await liveNode("attempt:fence-d2", "u2"); // moved between confirmation and the emitter's poll
+    const got = await pending();
+    assert.ok(!got.includes(st.body.steering.steering_id), "withheld");
+    assert.equal((await statusOf(st.body.steering.steering_id))?.status, "fenced");
+    const r = await receiver.pollOnce(); // the real Pi receiver agrees: it is never handed the fenced request
+    assert.ok(r.received <= 1, "at most the untouched, unacked pause is re-offered");
+  });
+
+  it("self-confirmation: an owner cannot confirm their own proposal; the operator's hot self_confirm switch is the control", async () => {
+    await liveNode("attempt:fence-s", "t1");
+    const mine = await propose("alice", "pause", "attempt:fence-s"); // the owner may PROPOSE
+    const refused = await confirm("alice", mine.body.steering, "attempt:fence-s");
+    assert.equal(refused.status, 403);
+    assert.equal(refused.body.code, "self_confirm");
+    assert.equal((await statusOf(mine.body.steering.steering_id))?.status, "pending");
+    setSteering({ self_confirm: true });
+    try {
+      assert.equal(
+        (await confirm("alice", mine.body.steering, "attempt:fence-s")).status,
+        200,
+        "control: allowed when on",
+      );
+    } finally {
+      setSteering({});
+    }
+    await receiver.pollOnce();
+  });
+
   it("GAP: AutoSpec's review publisher writes org-scoped nodes that room members cannot comment on", async () => {
     // `autospec review-quorum publish` stamps visibility_scope "org". A node nobody in the room can read is not a
     // comment anchor, so a human cannot comment on an AutoSpec-published review from the room; it can only be done
@@ -928,15 +1030,79 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     assert.equal(missing.status, c.status, "the refusal does not reveal that the org node exists");
     assert.deepEqual(missing.body, c.body);
   });
-  it("GAP: no Pi runtime supplies a steering fence, so the receiver's own fence comparison never fires (PI-WIRING-HERDR-NEEDS item 11)", async () => {
-    // Herdr's fence cannot be recomputed by Pi and no ingest-key read returns it. EngineeringRuntime therefore resolves
-    // targets WITHOUT a fence. When Herdr adds the read and the runtime starts filling `fence`, this test must be
-    // replaced by one that asserts the comparison; until then it records the current behaviour.
-    const { readFileSync } = await import("node:fs");
-    const src = readFileSync(new URL("../../src/runtime/EngineeringRuntime.ts", import.meta.url), "utf8");
-    const at = src.indexOf("private static async startSteering");
-    assert.ok(at > 0);
-    const body = src.slice(at, src.indexOf("\n  }\n", at));
-    assert.equal(/\bfence\s*:/.test(body), false, "startSteering supplies no fence today");
+  it("a request is applied only against Herdr's CURRENT fence: a target that changed after delivery is acknowledged stale and nothing is created (item 11)", async () => {
+    const p = await propose("bob", "fork", attemptNode, { base_sha: sha.C1, label: "raced fork" });
+    assert.ok([200, 201].includes(p.status), JSON.stringify(p.body));
+    assert.equal((await confirm("alice", p.body.steering, attemptNode)).status, 200);
+    const steeringId = p.body.steering.steering_id as string;
+    const approach = `approach:${forkIdFor(steeringId)}`;
+    const calls: string[] = [];
+    let moved = false;
+    // the target moves between Herdr's delivery (fence already checked there) and Pi's apply: injected on the wire,
+    // after the real /pending answer, through the real emitter and the real control plane
+    const racing: typeof globalThis.fetch = async (input, init) => {
+      const url = String(input);
+      calls.push(new URL(url).pathname);
+      const res = await fetch(input, init);
+      if (!moved && url.includes("/steering/pending")) {
+        moved = true;
+        host.emitter.nodeUpsert(attemptNode, { attrs: { note: "changed after delivery" } }, `race:${steeringId}`);
+        await host.drain();
+      }
+      return res;
+    };
+    const rx = await createSteeringReceiver({
+      agentDir: host.agentDir,
+      stateDir: scratch("t16-s5-race-"),
+      ports,
+      fetch: racing,
+    });
+    assert.ok(rx);
+    const r = await rx.pollOnce();
+    assert.equal(r.error, null);
+    assert.ok(
+      calls.some((c) => c.includes("/steering/targets/")),
+      "Pi read the live fence before applying",
+    );
+    const st = await eventually(async () => {
+      const x = await statusOf(steeringId);
+      return x?.ack ? x : false;
+    }, "the stale ack");
+    assert.equal(st.ack?.outcome, "stale");
+    assert.match(st.ack?.note ?? "", /fence mismatch/);
+    assert.equal((await plane.node(approach)).status, 404, "no fork was created from a request that no longer holds");
+    assert.equal(worktreeOf(`pi-fork/${forkIdFor(steeringId)}`), "", "and no worktree");
+  });
+
+  it("the live read is Herdr's own: 404 when the key does not own the node, and no request is applied on a transient failure", async () => {
+    // the other key owns nothing here: the same single 404 for 'not yours', 'no live request' and 'absent'
+    const theirs = await plane.call("GET", `/api/v1/steering/targets/${enc(attemptNode)}`, { key: "other" });
+    assert.equal(theirs.status, 404);
+    const p = await propose("bob", "fork", attemptNode, { base_sha: sha.C1, label: "transient" });
+    assert.ok([200, 201].includes(p.status), JSON.stringify(p.body));
+    assert.equal((await confirm("alice", p.body.steering, attemptNode)).status, 200);
+    const steeringId = p.body.steering.steering_id as string;
+    const down: typeof globalThis.fetch = async (input, init) =>
+      String(input).includes("/steering/targets/") ? new Response("busy", { status: 503 }) : fetch(input, init);
+    const rx = await createSteeringReceiver({
+      agentDir: host.agentDir,
+      stateDir: scratch("t16-s5-down-"),
+      ports,
+      fetch: down,
+    });
+    assert.ok(rx);
+    const r = await rx.pollOnce();
+    assert.equal(r.skipped >= 1, true, "left for the next poll");
+    assert.equal(r.acked, 0);
+    assert.ok(!(await statusOf(steeringId))?.ack, "no acknowledgement was sent");
+    assert.equal(worktreeOf(`pi-fork/${forkIdFor(steeringId)}`), "", "nothing was applied unchecked");
+    // and the request is still live: the healthy receiver applies it on its next poll
+    const again = await receiver.pollOnce();
+    assert.equal(again.error, null);
+    await eventually(
+      async () => (await statusOf(steeringId))?.ack?.outcome === "applied",
+      "applied once Herdr answers",
+    );
+    assert.ok(worktreeOf(`pi-fork/${forkIdFor(steeringId)}`));
   });
 });
