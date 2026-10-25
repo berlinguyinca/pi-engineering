@@ -516,6 +516,34 @@ export function isLongWaitTransient(signal: GatewayWaitSignal): boolean {
 }
 
 /**
+ * (#428) Route-availability refusals: `retryable: false` in an InferWeave
+ * envelope is a statement about THAT REQUEST's replay-safety, not about the
+ * route's availability. Two field-verified families are availability states in
+ * replay-safe clothing:
+ *
+ *   * `upstream_error` with `request_state: "unknown"` — the upstream died
+ *     mid-request (observed 2026-10-25: a local server crashing under load);
+ *     nothing was produced, so there is nothing to replay unsafely.
+ *   * `model_not_found` (with `x_availability: MODEL_UNAVAILABLE`) — a cold or
+ *     just-moved route alias; the same alias answered chat probes minutes
+ *     later (#417: the advertised list is not the served-set).
+ *
+ * Both are capacity waits the mission scheduler owns (hours, probes, capped
+ * backoff). Quota, billing and malformed-request refusals are NOT availability
+ * states and keep failing the task.
+ */
+export function isRouteAvailabilitySignal(signal: GatewayWaitSignal): boolean {
+  if (signal.retryable) return false; // The ordinary transient path owns these.
+  const reason = signal.reason?.toLowerCase();
+  if (reason !== "upstream_error" && reason !== "model_not_found") return false;
+  // Restrict to the gateway's structured envelopes — a bare prose mention of
+  // an upstream error must not park a mission.
+  return (
+    signal.type === "inferweave_backpressure" || signal.actionCode === "IW-ACT-FIX-REQUEST" || signal.flattened === true
+  );
+}
+
+/**
  * The worker failure marker for a gateway wait budget that ran out: a
  * `transient:*` marker for a long-wait transient (the scheduler's resilience
  * window takes over), else `gateway:<reason>`, which fails the task.
@@ -529,7 +557,7 @@ export function gatewayFailureMarker(signal: GatewayWaitSignal): string {
   // a malformed or replay-unsafe envelope) keeps its gateway marker and fails.
   // A bare 5xx is not evidence of a transient outage (isLongWaitTransient):
   // it keeps its gateway marker and fails instead of waiting for hours.
-  if (isLongWaitTransient(signal)) {
+  if (isLongWaitTransient(signal) || isRouteAvailabilitySignal(signal)) {
     return isAccountWideRefusal(signal) ? "transient:rate_limit" : "transient:server_unavailable";
   }
   return `gateway:${signal.reason ?? signal.type ?? signal.status ?? "rate-limited"}`;
