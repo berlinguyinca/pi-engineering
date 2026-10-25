@@ -87,7 +87,13 @@ routing:
       timeout_ms: 3600000
       max_context_tokens: 128000
     implementer:
-      model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
+      # rev 8b (2026-10-25, operator approved): deepseek_v4-flash answered the
+      # liveness probe but returned no worker_result on a real implementing task
+      # (MSN-nC658P; it does not reliably carry the worker protocol tool-call —
+      # #428, matching rev-7's read-thrash warning). Implementing moves to
+      # flint-40b (served, the Oct-23 working placement); planner/orchestrator
+      # keep deepseek, review stays 27b-vision — three distinct families.
+      model: "flint/flint-40b"
       fallback_model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
       timeout_ms: 3600000
       max_context_tokens: 128000
