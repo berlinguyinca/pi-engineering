@@ -362,6 +362,22 @@ function repairContractObjective(
 /** Content hash of an empty diff: a candidate identical to its base. */
 const EMPTY_DIFF_HASH = `sha256:${createHash("sha256").update("").digest("hex")}`;
 
+/**
+ * Bounded replacement-task id (#420): recovery id + short hash of the failed
+ * task (uniqueness across siblings) + deliverable index. The failed task's
+ * FULL id must NOT be embedded — recovery chains re-feed their own
+ * replacements, and an embedded lineage grew every id (and the git branch /
+ * worktree names derived from it) by ~22 chars per generation until
+ * `git worktree add` failed on name length and a transient first failure
+ * became a permanent mission kill. Parentage lives in the durable supersession
+ * lineage, never in the name. Deterministic for a given (recoveryId,
+ * failedTaskId, index) so replay reproduces the same id.
+ */
+export function replacementTaskId(recoveryId: string, failedTaskId: string, index: number): string {
+  const failedTaskDigest = createHash("sha256").update(failedTaskId).digest("hex").slice(0, 8);
+  return `${recoveryId}-TSK${failedTaskDigest}-${index}`;
+}
+
 /** Tell a replacement worker what the failed attempt's branch already holds, so it finishes only what is missing. */
 function committedNote(checkpoint: { committedChanges: readonly string[] } | undefined): string {
   const paths = checkpoint?.committedChanges ?? [];
@@ -1320,8 +1336,9 @@ export class Orchestrator {
             : [failed.objective];
         const supersessionId = `${repairDecision.recoveryId}-SUP-${failed.task_id}`;
         const replacementFingerprints: Record<string, string> = {};
-        const replacementTaskIds = remaining.map(
-          (_deliverable, index) => `${repairDecision.recoveryId}-TSK-${failed.task_id}-${index + 1}`,
+        // (#420) Bounded replacement ids via the shared helper — see its doc.
+        const replacementTaskIds = remaining.map((_deliverable, index) =>
+          replacementTaskId(repairDecision.recoveryId, failed.task_id, index + 1),
         );
         const lineageFingerprintSpec = {
           supersessionId,
