@@ -2,6 +2,9 @@
  * T16: the attention emitter is configured by the global engineering.yaml `herdr:` block ONLY (operator rule: no
  * environment variables). The retired variables are reported loudly and never used.
  */
+// Exercises the connection layer, so it opts back in from the harness-wide
+// HERDR_DISABLED default (test/support/isolatedState.ts).
+delete process.env.HERDR_DISABLED;
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

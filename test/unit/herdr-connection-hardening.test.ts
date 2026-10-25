@@ -3,6 +3,9 @@
  * test: URL scheme/host/userinfo/query/fragment, key-file mode/owner/size, and "redirects are refused" on every path
  * that carries the API key.
  */
+// Exercises the connection layer, so it opts back in from the harness-wide
+// HERDR_DISABLED default (test/support/isolatedState.ts).
+delete process.env.HERDR_DISABLED;
 import assert from "node:assert/strict";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

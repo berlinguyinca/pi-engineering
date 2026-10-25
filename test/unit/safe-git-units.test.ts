@@ -3,6 +3,9 @@
  * (listing failure, proxy pin, relocation by -C, option skipping, injected-config strip, diff flags, the synchronous
  * variant's refusals, spawn failures), plus the Herdr connection wiring and the fork-port digest catch.
  */
+// Exercises the connection layer, so it opts back in from the harness-wide
+// HERDR_DISABLED default (test/support/isolatedState.ts).
+delete process.env.HERDR_DISABLED;
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";

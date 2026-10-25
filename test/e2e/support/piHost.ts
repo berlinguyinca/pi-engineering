@@ -1,13 +1,13 @@
-/**
- * A Pi "host" for acceptance tests: its own global engineering.yaml (the `herdr:` block), key file (0600), state dir,
- * and a lineage emitter built by the REAL loader (loadLineageEmitter). Two hosts = two keys + two sources.
- */
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LineageEmitter } from "../../../src/runtime/herdr/lineage.ts";
 import { loadLineageEmitter } from "../../../src/runtime/herdr/lineageConfig.ts";
 import type { Plane } from "./plane.ts";
+/**
+ * A Pi "host" for acceptance tests: its own global engineering.yaml (the `herdr:` block), key file (0600), state dir,
+ * and a lineage emitter built by the REAL loader (loadLineageEmitter). Two hosts = two keys + two sources.
+ */
+import { scratch } from "./scratch.ts";
 
 export interface PiHostOptions {
   /** label of the plane key this host uses */
@@ -28,7 +28,7 @@ export interface PiHost {
 }
 
 export async function startPiHost(plane: Plane, o: PiHostOptions): Promise<PiHost> {
-  const root = mkdtempSync(join(tmpdir(), `t16-pihost-${o.instanceId}-`));
+  const root = scratch(`t16-pihost-${o.instanceId}-`);
   const agentDir = join(root, "agent");
   const stateDir = join(root, "state");
   mkdirSync(agentDir, { recursive: true });

@@ -1909,6 +1909,67 @@ export class ExecutionBroker {
     };
   }
 
+  /**
+   * Reconstruct the candidate TARGET from a preserved worker commit (#360).
+   *
+   * When a mission holds committed worker work that never became a candidate
+   * (the producing execution failed before publishing), recovery seeds a
+   * candidate lifecycle directly at the preserved commit (the checkpoint-split
+   * `seedSha` mechanism) so the gates can run over Git-verified content
+   * instead of refusing forever. The ref must resolve to `preservedSha`, be a
+   * descendant of base, and carry commits ahead of it; the seeded head must
+   * equal `preservedSha` for the store to tie the candidate to its source
+   * checkpoint. Anything unverifiable returns null and the caller keeps the
+   * existing terminal refusal.
+   *
+   * Returns the Git-verified candidate sha + diff hash, or null when nothing
+   * could be reconstructed (unverifiable ref, seed mismatch, no repository).
+   */
+  async reconstructCandidateFromRef(input: {
+    missionId: string;
+    repoId: string;
+    baseSha: string;
+    preservedRef: string;
+    preservedSha: string;
+    missionGeneration: number;
+    candidateGeneration: number;
+  }): Promise<{ candidateSha: string; diffHash: string } | null> {
+    if (!this.resolveRepository) return null;
+    const repository = await this.resolveRepository(input.repoId, [], input.missionId);
+    const refSha = await repository.git.resolveCommit(input.preservedRef);
+    if (!refSha || refSha !== input.preservedSha) return null;
+    if (!(await repository.git.isAncestor(input.baseSha, refSha))) return null;
+    const ahead = await repository.git.revListCount(`${input.baseSha}..${refSha}`);
+    if (ahead === null || ahead <= 0) return null;
+    let lifecycle: CandidateLifecycle;
+    try {
+      // Seed the candidate target directly at the preserved commit (the same
+      // seedSha mechanism checkpoint-split replacement uses). The base stays
+      // the mission's base, so the candidate diff is exactly the preserved
+      // work's diff — no merge commit, no content drift.
+      lifecycle = await repository.git.createCandidateWorktree(input.baseSha, {
+        missionId: input.missionId,
+        repoId: input.repoId,
+        missionGeneration: input.missionGeneration,
+        candidateGeneration: input.candidateGeneration,
+        repositoryGeneration: 0,
+        attempt: `reconstruct-${input.preservedSha.slice(0, 12)}`,
+        seedSha: input.preservedSha,
+      });
+    } catch {
+      // An existing attempt record that cannot be reconciled: refuse to seed.
+      return null;
+    }
+    const head = await repository.git.headCommitIn(lifecycle.path);
+    if (head !== input.preservedSha) return null;
+    lifecycle.candidateSha = head;
+    lifecycle.updatedAt = new Date().toISOString();
+    await repository.git.persistCandidateLifecycle(lifecycle);
+    this.missionCandidates.set(input.missionId, { lifecycle, git: repository.git });
+    const diff = await repository.git.captureDiff(input.baseSha, head);
+    return { candidateSha: head, diffHash: artifactHash(diff) };
+  }
+
   /** Read-only fail-closed preflight for Git journals consumed by recovery. */
   async durableRepositoryDiagnostics(missionId: string): Promise<DurableRepositoryDiagnostic[]> {
     const repoIds = [

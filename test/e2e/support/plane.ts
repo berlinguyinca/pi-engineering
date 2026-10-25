@@ -1,3 +1,20 @@
+import { type ChildProcess, spawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
+import net from "node:net";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readYaml } from "../../../src/lifecycle/policy.ts";
 /**
  * Real Herdr control-plane process for Pi-side acceptance tests (T16).
  *
@@ -5,14 +22,7 @@
  * through a generated 0600 fleet-config YAML (JSON is valid YAML) and a generated collaboration users file. Keys and
  * tokens are generated at run time. Suite paths come from test/e2e/acceptance.yaml, never from environment variables.
  */
-import { type ChildProcess, spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import net from "node:net";
-import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { readYaml } from "../../../src/lifecycle/policy.ts";
+import { scratch } from "./scratch.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const PI_ROOT = resolve(HERE, "../../..");
@@ -31,9 +41,29 @@ export async function loadAcceptance(): Promise<Acceptance> {
   raw ??= (await readYaml(join(dir, "acceptance.yaml"))).raw as Record<string, unknown>;
   if (!raw || raw.version !== 1) throw new Error("acceptance config must have version: 1");
   const abs = (v: unknown) => (isAbsolute(String(v)) ? String(v) : resolve(PI_ROOT, String(v)));
+  // `auto` = discover the sibling checkout by what it contains (same -tNN worktree suffix wins), as the Herdr side does
+  const suffix = PI_ROOT.includes("-") ? (PI_ROOT.split("-").pop() as string) : "";
+  const discover = (marker: string): string => {
+    const found = readdirSync(dirname(PI_ROOT))
+      .map((n) => join(dirname(PI_ROOT), n))
+      .filter((d) => d !== PI_ROOT && existsSync(join(d, marker)))
+      .sort();
+    const same = found.filter((d) => suffix !== "" && d.endsWith(`-${suffix}`));
+    const built = found.filter((d) => existsSync(join(d, "target/debug/autospec"))); // AutoSpec: only a built checkout is usable
+    const pick = same.length === 1 ? same : marker.startsWith("crates/") && built.length === 1 ? built : found;
+    if (pick.length !== 1)
+      throw new Error(
+        `cannot discover a sibling checkout containing ${marker}: ${found.join(", ")}; set it in acceptance.local.yaml`,
+      );
+    return pick[0] as string;
+  };
+  const herdrRepo = raw.herdr_repo === "auto" ? discover("herdr_engineering/control_plane") : abs(raw.herdr_repo);
   return {
-    herdrRepo: abs(raw.herdr_repo),
-    autospecBin: abs(raw.autospec_bin),
+    herdrRepo,
+    autospecBin:
+      raw.autospec_bin === "auto"
+        ? join(discover("crates/autospec-cli"), "target/debug/autospec")
+        : abs(raw.autospec_bin),
     python: String(raw.python ?? "python3"),
     startupSeconds: Number(raw.startup_timeout_seconds ?? 30),
   };
@@ -108,7 +138,7 @@ export class Plane {
   private constructor(acc: Acceptance, opts: PlaneOptions) {
     this.acc = acc;
     this.opts = opts;
-    this.workdir = opts.workdir ?? mkdtempSync(join(tmpdir(), "t16-plane-"));
+    this.workdir = opts.workdir ?? scratch("t16-plane-");
     mkdirSync(this.workdir, { recursive: true });
     this.roles = { viewer: "viewer", operator: "operator", ...(opts.keys ?? {}) };
     for (const label of Object.keys(this.roles)) this.keys[label] = newSecret(label);
@@ -192,7 +222,7 @@ export class Plane {
     for (;;) {
       if (!this.alive()) throw new Error(`control plane exited during startup:\n${this.tail()}`);
       try {
-        if ((await this.call("GET", "/api/v1/ingest/sources", { key: "viewer" })).status === 200) break;
+        if ((await this.call("GET", "/api/v1/ingest/sources", { key: "operator" })).status === 200) break;
       } catch {
         /* not up yet */
       }
@@ -325,7 +355,7 @@ export class Plane {
   }
 
   async sources(
-    key = "viewer",
+    key = "operator",
   ): Promise<Record<string, { source?: string; actor?: string; last_sequence?: number; gaps?: unknown[] }>> {
     const r = await this.call("GET", "/api/v1/ingest/sources", { key });
     return Object.fromEntries((r.body.sources ?? []).map((s: { source: string }) => [s.source, s]));

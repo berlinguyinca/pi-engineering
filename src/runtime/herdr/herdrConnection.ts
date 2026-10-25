@@ -93,6 +93,15 @@ function readKeyFile(path: string): { key: string } | { error: string } {
 export async function loadHerdrConnection(
   agentDir: string,
 ): Promise<{ connection: HerdrConnection | null; notes: string[] }> {
+  // Process-level off switch, set by the test harness (test/support/isolatedState.ts).
+  // A developer/fleet machine's live connection config must never activate inside a
+  // test process: tests would POST fake lifecycle events to the real control plane
+  // AND those background POSTs corrupt global-fetch stubs in unrelated tests (a
+  // fleet host turned an expected 2 probe attempts into 5 via 3 stray ingests).
+  // Tests that exercise the connection layer clear this explicitly.
+  if (process.env.HERDR_DISABLED === "1") {
+    return { connection: null, notes: ["herdr off: disabled by HERDR_DISABLED"] };
+  }
   let raw: unknown;
   try {
     raw = (await readYaml(join(agentDir, "engineering.yaml"))).raw;

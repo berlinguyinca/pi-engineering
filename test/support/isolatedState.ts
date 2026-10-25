@@ -15,6 +15,14 @@ import { stateHooks as safeGitStateHooks, testHooks as safeGitTestHooks } from "
 if (!process.env.PI_ENGINEERING_STATE_DIR) {
   process.env.PI_ENGINEERING_STATE_DIR = mkdtempSync(join(tmpdir(), "pi-eng-test-state-"));
 }
+// Fleet connectivity is OFF for tests by default: a machine's live herdr
+// connection config (engineering.yaml `herdr:` block, HERDR_INGEST_URL) must
+// not activate inside a test process — no telemetry to a live control plane,
+// and no background fetches polluting global-fetch stubs. Connection-layer
+// tests opt back in explicitly by clearing HERDR_DISABLED.
+if (!process.env.HERDR_DISABLED) {
+  process.env.HERDR_DISABLED = "1";
+}
 if (!process.env.PI_ENGINEERING_HOME) {
   process.env.PI_ENGINEERING_HOME = mkdtempSync(join(tmpdir(), "pi-eng-test-install-"));
 }

@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
+import { allSources, mentions } from "./support/codeGraph.ts";
 import { PI_ROOT, Plane } from "./support/plane.ts";
 
 function sources(dir: string, out: string[] = []): string[] {
@@ -66,11 +67,13 @@ describe("scenario 4 - external coworker bridge (Pi side)", () => {
 
   it("GAP: Pi has no bridge client - nothing under src/, extensions/ or scripts/ speaks the join/heartbeat protocol", () => {
     const needles = ["agents/join", "agents/external", "externals/invites", "hcj_"];
-    const hits: string[] = [];
+    const re = new RegExp(needles.map((n) => n.replace(/[/.]/g, "\\$&")).join("|"));
+    // structural: no TypeScript module under src/, extensions/ or scripts/ has a string literal or identifier naming
+    // the bridge endpoints; non-TS files (shell, js) are scanned as text because there is no parser for them
+    const hits = mentions(allSources(["src", "extensions", "scripts"]), re);
     for (const dir of ["src", "extensions", "scripts"]) {
-      for (const file of sources(join(PI_ROOT, dir))) {
-        const text = readFileSync(file, "utf8");
-        for (const n of needles) if (text.includes(n)) hits.push(`${file}: ${n}`);
+      for (const file of sources(join(PI_ROOT, dir)).filter((f) => !f.endsWith(".ts"))) {
+        if (needles.some((n) => readFileSync(file, "utf8").includes(n))) hits.push(file);
       }
     }
     // CURRENT behaviour: no client exists. When one lands this fails; replace it with a real-client test against Plane.

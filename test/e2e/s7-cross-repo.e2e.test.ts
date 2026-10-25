@@ -1,12 +1,5 @@
-/**
- * ACCEPTANCE SCENARIO 7 (non-visual part) - cross-repo issue references.
- * "Test cross-repo issues ..." Pi's REAL github layer (refs, dependency graph, link records, lineage projection) feeds a
- * REAL YAML-configured lineage emitter into a REAL Herdr control plane; the room member navigates the graph across repos.
- * (Plannotator digest echo and PR-head validity are in herdr tests/e2e/test_s7_integrity.py.)
- */
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -22,7 +15,15 @@ import {
 import type { GithubLinkRecord } from "../../src/github/types.ts";
 import { EnvelopeStore } from "../../src/runtime/herdr/envelopeStore.ts";
 import { loadLineageEmitter } from "../../src/runtime/herdr/lineageConfig.ts";
+import { callers, reachable } from "./support/codeGraph.ts";
 import { Plane, eventually } from "./support/plane.ts";
+/**
+ * ACCEPTANCE SCENARIO 7 (non-visual part) - cross-repo issue references.
+ * "Test cross-repo issues ..." Pi's REAL github layer (refs, dependency graph, link records, lineage projection) feeds a
+ * REAL YAML-configured lineage emitter into a REAL Herdr control plane; the room member navigates the graph across repos.
+ * (Plannotator digest echo and PR-head validity are in herdr tests/e2e/test_s7_integrity.py.)
+ */
+import { scratch } from "./support/scratch.ts";
 
 const PI = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ref = (s: string) => {
@@ -45,7 +46,7 @@ describe("scenario 7 / cross-repo issues in the Herdr graph", () => {
     });
     await plane.verifyFeatures("alice");
     roomId = (await plane.makeRoom("alice", "s7", "s7-room")).roomId;
-    const root = mkdtempSync(join(tmpdir(), "t16-s7-"));
+    const root = scratch("t16-s7-");
     const agentDir = join(root, "agent");
     envDir = join(root, "env");
     mkdirSync(agentDir, { recursive: true });
@@ -181,25 +182,10 @@ describe("scenario 7 / cross-repo issues in the Herdr graph", () => {
   });
 
   it("GAP: nothing in Pi's runtime calls the dependency projection (emitDependencyEdges/buildDependencyGraph are library-only)", () => {
-    const callers: string[] = [];
-    const walk = (d: string) => {
-      for (const f of readdirSync(d)) {
-        const p = join(d, f);
-        if (statSync(p).isDirectory()) walk(p);
-        else if (p.endsWith(".ts") && /\b(emitDependencyEdges|buildDependencyGraph)\(/.test(readFileSync(p, "utf8")))
-          callers.push(p.replace(`${PI}/`, ""));
-      }
-    };
-    walk(join(PI, "src"));
-    walk(join(PI, "extensions"));
-    assert.deepEqual(
-      callers.sort(),
-      ["src/github/dependencies.ts", "src/github/lineage.ts"].filter((f) => callers.includes(f)).sort(),
-    );
-    assert.ok(
-      !callers.some((c) => !c.startsWith("src/github/")),
-      `if this fails a runtime caller exists: ${callers.join(",")}`,
-    );
+    const reach = reachable();
+    assert.ok(existsSync(join(PI, "src/github/dependencies.ts")), "control: the projection exists");
+    // structural: no module reachable from a product entry point CALLS either function (definitions don't count)
+    assert.deepEqual(callers(reach, ["emitDependencyEdges", "buildDependencyGraph"]), []);
   });
 
   it("canonical ids are repo-qualified and reject ambiguity (a bare #7 without a default repo is not a node)", () => {

@@ -473,7 +473,13 @@ async function blockedCheckpointHarness(
 describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
   it(
     "runs MSN-qSLaeM through the public runtime, times out after 2/3, and repairs only the remainder",
-    { timeout: 30_000 },
+    // 60s: the scenario drives a REAL Pi worker session (spawn + model round-trips +
+    // git commits). Under full-suite parallel load these turns take several times
+    // longer than on an idle machine; 30s was exhausted by wall time, not by the
+    // scenario. The timeout scenario itself is load-independent: the scripted
+    // probe stalls forever on deliverable three, so the worker can never complete
+    // early regardless of the budget size.
+    { timeout: 60_000 },
     async () => {
       const metaRoot = await mkdtemp(join(tmpdir(), "pi-eng-meta-root-"));
       const first = await greenFixture();
@@ -655,8 +661,15 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
                 criterion.acceptance_id ? [criterion.acceptance_id] : [],
               ),
               deliverables: ["one", "two", "three"],
-              execution_budget_ms: 1_000,
-              checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 200 },
+              // 5s (was 1s): the 2/3 watchdog leaves ~3.3s for two commit+claim
+              // turns through a real worker session. 1s fit only an idle host;
+              // on loaded hosts the claims lost the race and completedDeliverables
+              // arrived empty. The scripted probe never serves deliverable three
+              // (it stalls past any deadline), so a larger budget cannot flip the
+              // scenario to success — it only stops wall-clock from deciding the
+              // outcome.
+              execution_budget_ms: 5_000,
+              checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 1_000 },
               max_attempts: 1,
               failure_policy: "block",
             },
