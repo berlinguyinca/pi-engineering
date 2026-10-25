@@ -82,23 +82,37 @@ routing:
     # strong enough to actually write code. Revert to distinct text pins once G1
     # routes land or a strong text model is served.
     planner:
-      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
-      fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
+      model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
+      fallback_model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
       timeout_ms: 3600000
       max_context_tokens: 128000
     implementer:
-      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
-      fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
+      model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
+      fallback_model: "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl"
       timeout_ms: 3600000
       max_context_tokens: 128000
     reviewer:
-      model: "metabolomics/coding-review"
-      fallback_model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
+      model: "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl"
+      fallback_model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
       timeout_ms: 1800000
       max_context_tokens: 128000
     verifier:
       model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
+      fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
     spec_verifier:
       model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
+      fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
     test_reviewer:
       model: "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"
+      fallback_model: "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4"
+    # rev 8 (2026-10-25, operator directive): text roles -> deepseek_v4-flash.
+    # Live probe today: development-gateway qwen3.8-27b family ALL 404
+    # (dispatch-killed MSN-D1xaBT and MSN-J9sycT); metabolomics
+    # deepseek_v4-flash 200, 27b-vision-q8 200, flash_next-q4_k_xl 200,
+    # 27b-vision-q4 429 (served, backpressured), coding-review 404. Review
+    # moves to the served 27b-vision-q8 — a family DISTINCT from the deepseek
+    # implementer, so the cross-family independent-review separation of duties
+    # holds. The rev-7 warning stands: on one P0 deepseek read-thrashed to
+    # loop_prevented (no_mutation_stall); if the implementer stalls the same
+    # way, the operator flips the pin (or /model) to flint/flint-40b — also
+    # served — and resumes. Backup: engineering.yaml.bak-20261025-point-at-deepseek.
