@@ -36,6 +36,7 @@ import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
 import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
+import { preflightEnabled, preflightWorkerShape } from "../gateway/preflight.ts";
 import {
   type GatewayRetryDecision,
   type GatewayWaitSignal,
@@ -582,6 +583,35 @@ export class PiWorkerExecutor implements WorkerExecutor {
     if (model && !model.baseUrl) {
       const providerBaseUrl = (modelRuntime.getProvider(model.provider) as { baseUrl?: string } | undefined)?.baseUrl;
       if (providerBaseUrl) model = { ...model, baseUrl: providerBaseUrl };
+    }
+
+    // (#425) Worker-shaped preflight: the gateway served prose probes for
+    // hours while every worker-shaped dispatch died with an instant 400
+    // upstream_error. Probe the production completion path — same auth, URL,
+    // compatibility, tool schema present — BEFORE paying a full worker
+    // startup, and map the outcome through the same gateway-signal vocabulary
+    // as an in-run failure (#428/#435): availability failures become capacity
+    // waits, deterministic refusals still fail, and an unrecognized error
+    // behaves exactly like the worker's first real request.
+    if (this.allowModelNetwork && preflightEnabled()) {
+      const pre = await preflightWorkerShape({ runtime: modelRuntime, model });
+      if (!pre.ok) {
+        const summary = `Preflight before worker start failed (${pre.marker}): ${pre.detail}`;
+        return {
+          result: {
+            status: "failed",
+            summary,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: { preflight: pre.marker },
+            error: pre.marker,
+          },
+          usage: null,
+          error: pre.marker,
+        };
+      }
     }
 
     // Build the base system prompt with the Tool Transition Rule (spec §15).
