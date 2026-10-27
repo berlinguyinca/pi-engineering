@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { testHooks as safeGitHooks } from "../../src/git/safeGit.ts";
 import { PlannerWorkerExecutor } from "../../src/plannerWorker/executor.ts";
+import { RoleResolver } from "../../src/plannerWorker/resolver.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
@@ -220,7 +221,7 @@ test("replanning durably fences retired artifacts before cleanup or resume can r
   const opts: any = {
     repoRoot: fixture.root,
     stateDir,
-    resolver: { resolve: async () => null, refresh: async () => {} },
+    resolver: new RoleResolver({ provider: "default" }),
   };
   const executor: any = new PlannerWorkerExecutor(opts);
   const contract = {
@@ -280,7 +281,9 @@ test("replanning durably fences retired artifacts before cleanup or resume can r
     assert.deepEqual(saved.retired_worktrees, [{ ...worktree, base_commit: base }]);
     // Older checkpoints may lack the retired inventory. The existing branch
     // itself must still stop a replacement from force-removing its workspace.
-    const legacy: any = new PlannerWorkerExecutor(opts);
+    const legacyStateDir = join(stateDir, "legacy-checkpoint");
+    await mkdir(legacyStateDir, { recursive: true });
+    const legacy: any = new PlannerWorkerExecutor({ ...opts, stateDir: legacyStateDir });
     legacy.repo = repo;
     legacy.brief = executor.brief;
     legacy.integration = integration;
@@ -297,6 +300,7 @@ test("replanning durably fences retired artifacts before cleanup or resume can r
     assert.equal(replacement.state.status, "failed");
     assert.match(replacement.state.blocked_reason ?? replacement.state.history.at(-1)?.note ?? "", /preserv|recover/i);
     assert.equal(await readFile(output, "utf8"), "recover after restart\n");
+    await executor.persist();
     await assert.rejects(() => new PlannerWorkerExecutor(opts).resume(), /preserv.*recover/i);
     assert.equal(await readFile(output, "utf8"), "recover after restart\n");
     // A missing directory cannot silently clear the durable fence and allow a
