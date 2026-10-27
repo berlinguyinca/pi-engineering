@@ -50,15 +50,18 @@ class FakeHerdrCli {
   async wait(t: string) {
     return this.agents.get(t) ?? { agent_status: "done" };
   }
-  async startAgent(p: string) {
-    if (!this.agents.has(p)) this.agents.set(p, { agent_status: "idle" });
+  async startAgent(_name: string, _kind: string, pane: string) {
+    if (!this.agents.has(pane)) this.agents.set(pane, { agent_status: "idle" });
   }
   async sendKeys() {}
   async closePane(t: string) {
     this.agents.delete(t);
   }
+  async createWorkspace() {
+    return { workspaceId: "w1", paneId: "fake-pane" };
+  }
   async createWorktree() {
-    return { workspaceId: "wt1", path: "/tmp/wt" };
+    return { workspaceId: "wt1", paneId: "fake-pane", path: "/tmp/wt" };
   }
 }
 
