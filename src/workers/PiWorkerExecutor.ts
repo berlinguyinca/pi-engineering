@@ -192,7 +192,7 @@ function roleResourceLoader(systemPrompt: string): ResourceLoader {
 export interface PiWorkerExecutorOptions {
   agentDir?: string;
   model?: Model<any>;
-  /** Core tools (ledger, artifact, context) exposed to worker sessions. */
+  /** Available core tools; each worker receives only names in its request allowlist. */
   customTools?: ToolDefinition[];
   allowModelNetwork?: boolean;
   /** Generation guard configuration (loop mitigation). Defaults to spec values. */
@@ -712,8 +712,12 @@ export class PiWorkerExecutor implements WorkerExecutor {
         ? [budgetNotice(createClaimDeliverableTool(req.deliverables ?? []) as unknown as ToolDefinition)]
         : []),
       ...(offersCheckpointProgress(req) ? [createCheckpointProgressTool(req.deliverables ?? [])] : []),
-      terminating,
-    ];
+    ].filter(
+      // Injected tools and file-tool replacements obey the same explicit
+      // permissions as built-ins. Result tools are always executor-owned.
+      (tool) => req.tools.includes(tool.name) && tool.name !== "worker_result" && tool.name !== "review_result",
+    );
+    customTools.push(terminating);
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
     let model: Model<any> = initialModel;
     let systemPrompt: string = initialPrompt;
