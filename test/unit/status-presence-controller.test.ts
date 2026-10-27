@@ -1,0 +1,260 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
+import {
+  MissionPresenceController,
+  type PresenceOptions,
+  type PresenceSink,
+} from "../../src/status/MissionPresenceController.ts";
+
+const T0 = Date.parse("2026-10-27T10:10:00.000Z");
+let clock = T0;
+const now = () => clock;
+
+function mission(overrides: Partial<RuntimeMissionActivityEvent> = {}): RuntimeMissionActivityEvent {
+  return {
+    missionId: "MSN-1",
+    title: "presence strip",
+    phase: "EXECUTING",
+    state: "EXECUTING",
+    health: "active",
+    approximatePercent: 40,
+    acceptanceCoverage: { completed: 2, total: 5, approximatePercent: 40 },
+    workflowProgress: { completed: 2, total: 5, approximatePercent: 40 },
+    summary: "editing src/status/presence.ts",
+    activeWorkers: 1,
+    waitingWorkers: 0,
+    failedWorkers: 0,
+    lastMeaningfulProgressAt: "2026-10-27T10:09:40.000Z",
+    lastHeartbeatAt: "2026-10-27T10:09:50.000Z",
+    action: "CONTINUE",
+    reason: "active",
+    recovery: { attempt: 0, maxAttempts: 0 },
+    nextAction: "monitor",
+    nextActionAt: null,
+    owner: "owner",
+    repository: "/repo",
+    task: "t1",
+    preservedWork: [],
+    ...overrides,
+  };
+}
+
+/** Tests drive the clock by hand; a 1-hour timer can never fire mid-test. */
+function opts(extra: PresenceOptions = {}): PresenceOptions {
+  return { now, intervalMs: 3_600_000, ...extra };
+}
+
+const running = mission();
+const needsYou = mission({ state: "NEEDS_ATTENTION", health: "blocked", reason: "approval required" });
+
+interface RecordedSink extends PresenceSink {
+  working: (string | undefined)[];
+  widget: (string[] | undefined)[];
+  widgetKeys: string[];
+  titles: (string | undefined)[];
+  notices: { text: string; level: string }[];
+}
+
+function recordingSink(): RecordedSink {
+  return {
+    working: [],
+    widget: [],
+    widgetKeys: [],
+    titles: [],
+    notices: [],
+    setWorkingMessage(text) {
+      this.working.push(text);
+    },
+    setWidget(key, lines) {
+      this.widgetKeys.push(key);
+      this.widget.push(lines);
+    },
+    setTitle(title) {
+      this.titles.push(title);
+    },
+    notify(text, level) {
+      this.notices.push({ text, level });
+    },
+  };
+}
+
+test("survives a UI without setWidget or setWorkingMessage", () => {
+  const controller = new MissionPresenceController({ notify: () => {} }, opts());
+  controller.update(needsYou);
+  controller.tick();
+  controller.dispose();
+});
+
+test("survives a sink whose surface throws", () => {
+  const controller = new MissionPresenceController(
+    {
+      setWorkingMessage() {
+        throw new Error("terminal torn down");
+      },
+      setWidget() {
+        throw new Error("terminal torn down");
+      },
+    },
+    opts(),
+  );
+  controller.update(running);
+  controller.tick();
+  controller.dispose();
+});
+
+test("writes the working line while the agent is idle and clears it on agent start", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running);
+  controller.tick();
+  assert.match(sink.working.at(-1) ?? "", /^Mission · MSN-1 · presence strip/);
+  controller.onAgentStart();
+  assert.equal(sink.working.at(-1), undefined);
+  controller.dispose();
+});
+
+test("does not write the working line while the agent is running", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.onAgentStart();
+  controller.update(running);
+  controller.tick();
+  assert.deepEqual(sink.working, []);
+  controller.dispose();
+});
+
+test("restores the working line when the agent settles", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running);
+  controller.onAgentStart();
+  controller.onAgentEnd();
+  controller.tick();
+  assert.match(sink.working.at(-1) ?? "", /^Mission · MSN-1/);
+  controller.dispose();
+});
+
+test("publishes the widget at most once per tick and not when nothing changed", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running);
+  controller.tick();
+  controller.tick();
+  assert.equal(sink.widget.length, 1);
+  clock = T0 + 60_000;
+  controller.tick();
+  assert.equal(sink.widget.length, 2, "an elapsed age is a change worth republishing");
+  controller.dispose();
+  clock = T0;
+});
+
+test("uses only the engineering-missions widget key", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running);
+  controller.tick();
+  controller.update(needsYou);
+  controller.tick();
+  assert.deepEqual([...new Set(sink.widgetKeys)], ["engineering-missions"]);
+  controller.dispose();
+});
+
+test("notifies once per attention change and not again while unchanged", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(needsYou);
+  controller.tick();
+  controller.update(needsYou);
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  assert.match(sink.notices[0]!.text, /MSN-1/);
+  assert.match(sink.notices[0]!.text, /needs you/);
+  assert.equal(sink.notices[0]!.level, "warning");
+
+  controller.update(running);
+  controller.tick();
+  controller.update(needsYou);
+  controller.tick();
+  assert.equal(sink.notices.length, 2);
+  controller.dispose();
+});
+
+test("does not notify for ordinary running or waiting missions", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running);
+  controller.tick();
+  controller.update(mission({ state: "WAITING_FOR_LLM", health: "waiting" }));
+  controller.tick();
+  assert.deepEqual(sink.notices, []);
+  controller.dispose();
+});
+
+test("calls the quiet hook for every tracked mission on tick", () => {
+  const quietIds: string[] = [];
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts({ quiet: (missionId) => quietIds.push(missionId) }));
+  controller.update(running);
+  controller.tick();
+  assert.deepEqual(quietIds, ["MSN-1"]);
+  controller.dispose();
+});
+
+test("noteSentence replaces the working-line text for that mission", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running);
+  controller.noteSentence("MSN-1", "Tests: 34 passed, 1 failing");
+  controller.tick();
+  assert.match(sink.working.at(-1) ?? "", /Tests: 34 passed, 1 failing/);
+  controller.dispose();
+});
+
+test("noteSentence redacts secrets before they reach the title bar", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running);
+  controller.noteSentence("MSN-1", "using sk-abc123def456abc123def456");
+  controller.tick();
+  assert.doesNotMatch(sink.working.at(-1) ?? "", /sk-abc123/);
+  controller.dispose();
+});
+
+test("dispose clears the widget, the working line and the title", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts({ title: true }));
+  controller.update(running);
+  controller.tick();
+  controller.dispose();
+  assert.equal(sink.widget.at(-1), undefined);
+  assert.equal(sink.working.at(-1), undefined);
+  assert.equal(sink.titles.at(-1), undefined);
+});
+
+test("title stays off unless enabled", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running);
+  controller.tick();
+  assert.deepEqual(sink.titles, []);
+});
+
+test("an enabled title carries the attention counts", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts({ title: true }));
+  controller.update(running);
+  controller.update({ ...needsYou, missionId: "MSN-2" });
+  controller.tick();
+  assert.match(sink.titles.at(-1) ?? "", /1 running · 1 needs you/);
+  controller.dispose();
+});
+
+test("visible counts the missions the controller is tracking", () => {
+  const controller = new MissionPresenceController({}, opts({ rows: 1 }));
+  controller.update(running);
+  controller.update({ ...needsYou, missionId: "MSN-2" });
+  assert.equal(controller.visible(), 2);
+  controller.dispose();
+});

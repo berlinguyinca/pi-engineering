@@ -22,7 +22,10 @@ export interface PresenceView {
   header: string;
   rows: PresenceRow[];
   overflow: string | null;
+  /** The one-line story for the mission that owns the working line. */
   workingLine: string | null;
+  /** Which mission that line belongs to, so a caller can substitute its own text. */
+  workingMissionId: string | null;
 }
 
 /** States that mean the operator is the next actor, not the runtime. */
@@ -124,12 +127,15 @@ function headerOf(events: readonly RuntimeMissionActivityEvent[]): string {
   );
 }
 
-function workingLineOf(rows: readonly PresenceRow[], events: readonly RuntimeMissionActivityEvent[]): string | null {
+function workingLineOf(
+  rows: readonly PresenceRow[],
+  events: readonly RuntimeMissionActivityEvent[],
+): { line: string | null; missionId: string | null } {
   const live = events.find((event) => !TERMINAL.has(event.state));
   const row = rows.find((candidate) => candidate.missionId === live?.missionId);
-  if (!live || !row) return null;
+  if (!live || !row) return { line: null, missionId: null };
   const line = `Mission · ${row.missionId} · ${row.title} · ${row.age} · ${safe(live.phase, 20)} ${row.percent}`;
-  return line.length > 240 ? `${line.slice(0, 239)}…` : line;
+  return { line: line.length > 240 ? `${line.slice(0, 239)}…` : line, missionId: row.missionId };
 }
 
 /** Project live missions into the strip. Pure: no clock, no I/O, no runtime imports. */
@@ -148,7 +154,8 @@ export function projectPresence(
     hidden.length === 0
       ? null
       : `${hidden.length} more · worst ${hidden[0]!.missionId} (${safe(hidden[0]!.title, 30)})`;
-  return { header: headerOf(events), rows, overflow, workingLine: workingLineOf(rows, shown) };
+  const working = workingLineOf(rows, shown);
+  return { header: headerOf(events), rows, overflow, workingLine: working.line, workingMissionId: working.missionId };
 }
 
 /** Render the strip: header, one line per mission, then the overflow line. */

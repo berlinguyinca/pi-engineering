@@ -1,15 +1,17 @@
 /**
  * A one-line, always-visible summary of what the run is doing.
  *
- * The panel cannot do this job. `ctx.ui.custom()` is documented as "Show a
- * custom component with keyboard focus" and pi offers no non-focusing variant,
- * so a panel that is always on screen is a session that accepts no typing —
- * which is exactly what shipped once and had to be reverted.
+ * `ctx.ui.custom()` is documented as "Show a custom component with keyboard
+ * focus", so a panel that is always on screen is a session that accepts no
+ * typing — which is exactly what shipped once and had to be reverted. Persistent
+ * text does not need that component: `ctx.ui.setWidget()` renders a block of
+ * lines above or below the editor and takes no focus (pi's own surface table
+ * lists it under "Persistent content near the editor"), which is why mission
+ * presence lives there — see `src/status/MissionPresenceController.ts`.
  *
- * `setFooter` carries no such contract: a footer component renders and never
- * takes focus. So persistent awareness lives here instead, and pays for it by
- * being a line rather than a pane — counts and the worst finding, not a tree
- * you can open.
+ * `setFooter` carries no focus contract either, and it remains the footer's
+ * owner. So this line keeps its narrower job: counts and the worst finding,
+ * not a tree you can open.
  *
  * Pure. Renders from state the feeders already computed, so this runs on the
  * draw path without touching git or the network.

@@ -164,10 +164,13 @@ test("a mission with no observability state still renders, without a percentage"
 test("the working line names the mission, its title and its phase", () => {
   const view = projectPresence([mission({ lastMeaningfulProgressAt: "2026-10-27T10:09:40.000Z" })], 4, T);
   assert.match(view.workingLine ?? "", /^Mission · MSN-1 · presence strip · 20s ago · EXECUTING ~40%$/);
+  assert.equal(view.workingMissionId, "MSN-1");
 });
 
 test("the working line is absent when only terminal missions remain", () => {
-  assert.equal(projectPresence([complete], 4, T).workingLine, null);
+  const view = projectPresence([complete], 4, T);
+  assert.equal(view.workingLine, null);
+  assert.equal(view.workingMissionId, null);
 });
 
 test("widget lines are header, rows and overflow in that order", () => {
