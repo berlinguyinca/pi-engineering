@@ -118,6 +118,7 @@ import { WorkingStatusController } from "../src/status/working.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
+import { describeSkippedTools, registerToolsTolerant } from "../src/tools/registration.ts";
 import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
@@ -905,10 +906,24 @@ export default function (pi: ExtensionAPI) {
     });
   }
   // Semantic tools resolved against the runtime for the calling cwd.
-  for (const tool of buildCoreTools(resolveServices, {
-    unavailableReason: (cwd) => runtimeOpenFailures.get(cwd) ?? null,
-  })) {
-    pi.registerTool(tool);
+  // Registration is collision-tolerant: tool names are global, and the ordinary
+  // development setup (installed package + a worktree checkout) declares them
+  // twice. The first copy wins; the operator is told which names were skipped
+  // instead of watching the second copy fail to load (src/tools/registration.ts).
+  const registration = registerToolsTolerant(
+    pi as Parameters<typeof registerToolsTolerant>[0],
+    buildCoreTools(resolveServices, {
+      unavailableReason: (cwd) => runtimeOpenFailures.get(cwd) ?? null,
+    }),
+  );
+  const skippedNotice = describeSkippedTools(registration.skipped);
+  if (skippedNotice && typeof pi.on === "function") {
+    let announced = false;
+    pi.on("session_start", (_event: unknown, ctx: { ui: { notify(text: string, level?: string): void } }) => {
+      if (announced) return;
+      announced = true;
+      ctx.ui.notify(skippedNotice, "warning");
+    });
   }
 
   // ─── Operator model pin: missions follow an explicit /model switch ───────

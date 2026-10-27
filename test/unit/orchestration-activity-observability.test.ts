@@ -131,6 +131,59 @@ test("an identical tool call is still recorded as a tool signal", () => {
   assert.ok((worker?.repeatedToolCalls ?? 0) >= 9);
 });
 
+test("an identical completed call with no artifact counts as a repeated cycle", () => {
+  const h = harness();
+  for (let i = 0; i < 6; i++) {
+    h.feed({
+      kind: "tool",
+      phase: "completed",
+      toolName: "bash",
+      toolCommand: "npm_test",
+      invocationSignature: "sig-bash-npm-test",
+      summary: "bash npm_test done",
+    });
+  }
+  const signals = h.obs.loopSignals(h.id, WORKER);
+  assert.deepEqual(
+    signals.map((signal) => signal.kind),
+    ["repeated_cycle"],
+    "a cycle that produced nothing new is its own signal family",
+  );
+  assert.equal(signals[0]?.detail, "sig-bash-npm-test", "the signal names the cycle that repeated");
+});
+
+test("a completed call that changed a file is progress, not a cycle", () => {
+  const h = harness();
+  for (let i = 0; i < 8; i++) {
+    h.feed({
+      kind: "tool",
+      phase: "completed",
+      toolName: "write",
+      toolTarget: "src/status/presence.ts",
+      invocationSignature: "sig-write-presence",
+      summary: "wrote src/status/presence.ts",
+    });
+  }
+  assert.deepEqual(h.obs.loopSignals(h.id, WORKER), [], "an artifact-producing cycle is not a loop");
+});
+
+test("loop thresholds are read by signal family, not by activity type", () => {
+  const h = harness();
+  // loopThresholds.error is 4 and tool_invocation is 6; default is 8. Before the
+  // lookup was keyed by signal family, every family silently used 8, so an
+  // operator saw nothing for four identical failures.
+  for (let i = 0; i < 4; i++) {
+    h.feed({
+      kind: "tool",
+      phase: "failed",
+      toolName: "bash",
+      toolCommand: "npm_test",
+      summary: "bash npm_test failed",
+    });
+  }
+  assert.equal(h.obs.hasLoop(h.id, WORKER), true, "four identical failures is the configured threshold");
+});
+
 test("a read whose target the event does not carry is not invented", () => {
   const h = harness();
   for (let i = 0; i < 12; i++) {

@@ -4,15 +4,24 @@ import { redactSecrets as redactPlatform } from "../../src/platform/redact.ts";
 import { redactSecrets as redactSecurityPolicy } from "../../src/security/SecurityPolicy.ts";
 
 /**
- * Regression gap matrix between the two redaction implementations.
+ * Regression gap matrix across the two public redaction entry points.
  *
- * Two implementations exist with different pattern sets:
+ * Both entry points now read ONE canonical table (`SECRET_RULES` in
+ * `src/platform/redact.ts`); `SecurityPolicy.redactSecrets` delegates to it:
  *   * `src/platform/redact.ts`            → `redactSecrets(text)`
- *   * `src/security/SecurityPolicy.ts`    → `redactSecrets(text, patterns?)`
+ *   * `src/security/SecurityPolicy.ts`    → `redactSecrets(text, extraPatterns?)`
  *
- * This file documents, per secret shape, which module redacts it and which
- * misses it. A miss is recorded as `test.todo` so CI stays green while the gap
- * is visible in the test report.
+ * The matrix deliberately runs every shape through BOTH entry points anyway.
+ * The failure mode it guards against is a re-fork: the moment someone maintains
+ * a second pattern set again, the two columns diverge here. Nine shapes were
+ * gaps in `SecurityPolicy.ts` — some leaked fragments (`sk-live-…`, `ghp_…`, a
+ * basic-auth URL), some passed only by destroying the context that had to
+ * survive (`API_KEY=`, `"apiKey":`, `token=`). One of the nine, `google-api-key`,
+ * was a gap in both entry points.
+ *
+ * A miss is recorded as `test.todo` so CI stays green while the gap is visible
+ * in the test report, and `EXPECTED_GAPS` below pins the exact set of known
+ * misses so any NEW gap — or any silently closed one — fails this file.
  *
  * ── Strictness ─────────────────────────────────────────────────────────────
  * A case is only counted as redacted when NONE of its `leakFragments` appear in
@@ -179,20 +188,10 @@ for (const c of CASES) {
 }
 
 // ── Final non-todo summary: every miss must equal the explicit expectation. ──
-const EXPECTED_GAPS: Array<[string, string]> = [
-  // { module, case } tuples of every observed miss, kept explicit so any new gap
-  // or any silently closed gap changes this test.
-  ["SecurityPolicy.ts", "openai-sk"],
-  ["SecurityPolicy.ts", "github-ghp"],
-  ["SecurityPolicy.ts", "basic-auth-url"],
-  ["SecurityPolicy.ts", "env-api-key"],
-  ["SecurityPolicy.ts", "json-apikey"],
-  ["SecurityPolicy.ts", "slack-xoxb"],
-  ["SecurityPolicy.ts", "jwt"],
-  ["platform/redact.ts", "google-api-key"],
-  ["SecurityPolicy.ts", "google-api-key"],
-  ["SecurityPolicy.ts", "plain-40hex-token"],
-];
+// { module, case } tuples of every observed miss, kept explicit so any new gap
+// or any silently closed gap changes this test. Empty = both entry points close
+// every shape in CASES; adding a shape that only one of them catches fails here.
+const EXPECTED_GAPS: Array<[string, string]> = [];
 
 test("redact-regression: redaction gap summary matches EXPECTED_GAPS", () => {
   const misses: Array<{ module: string; case: string; reason: string }> = [];

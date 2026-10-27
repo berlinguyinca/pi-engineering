@@ -29,25 +29,51 @@
 
 const PLACEHOLDER = "[REDACTED]";
 
-const RULES: Array<{ pattern: RegExp; replacement: string }> = [
+/** What a rule recognises, for callers that report *why* text was sanitized. */
+export type SecretKind = "api_key" | "bearer" | "aws" | "private_key" | "generic";
+
+/**
+ * The one canonical redaction table. Every redactor in the runtime reads this
+ * list — `src/security/SecurityPolicy.ts` delegates here rather than keeping a
+ * second pattern set, because a hand-maintained duplicate drifts silently: the
+ * gap matrix in `test/unit/security-redaction-regression.test.ts` recorded ten
+ * shapes one implementation caught and the other leaked.
+ */
+export const SECRET_RULES: Array<{ kind: SecretKind; pattern: RegExp; replacement: string }> = [
   // ── Value-shaped: recognisable without any key ───────────────────────────
   // A PEM private key block, header to footer, however long.
-  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: PLACEHOLDER },
+  {
+    kind: "private_key",
+    pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    replacement: PLACEHOLDER,
+  },
   // Credentials inside a URL: scheme://user:secret@host
-  { pattern: /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi, replacement: `$1${PLACEHOLDER}@` },
+  {
+    kind: "generic",
+    pattern: /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi,
+    replacement: `$1${PLACEHOLDER}@`,
+  },
   // Provider-issued tokens with distinctive prefixes.
-  { pattern: /\b(gh[pousr]_[A-Za-z0-9]{16,})/g, replacement: PLACEHOLDER },
-  { pattern: /\bsk-[A-Za-z0-9-]{12,}/g, replacement: PLACEHOLDER },
-  { pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: PLACEHOLDER },
-  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: PLACEHOLDER },
+  { kind: "api_key", pattern: /\b(gh[pousr]_[A-Za-z0-9]{16,})/g, replacement: PLACEHOLDER },
+  // `sk-` keys carry hyphenated tiers (`sk-live-`, `sk-proj-`), so the class
+  // must include the hyphen; `[A-Za-z0-9]{16,}` alone leaks `sk-live-…`.
+  { kind: "api_key", pattern: /\bsk-[A-Za-z0-9-]{12,}/g, replacement: PLACEHOLDER },
+  { kind: "api_key", pattern: /\bAIza[0-9A-Za-z_-]{32,}/g, replacement: PLACEHOLDER },
+  { kind: "api_key", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: PLACEHOLDER },
+  { kind: "aws", pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: PLACEHOLDER },
   // A JWT: three base64url segments separated by dots.
-  { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, replacement: PLACEHOLDER },
+  {
+    kind: "generic",
+    pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+    replacement: PLACEHOLDER,
+  },
 
   // ── Key-shaped: a name meaning "secret", then a value ────────────────────
   // Bearer auth first, so its token is consumed before the generic rules run.
-  { pattern: /\b(Bearer\s+)\S+/gi, replacement: `$1${PLACEHOLDER}` },
+  { kind: "bearer", pattern: /\b(Bearer\s+)\S+/gi, replacement: `$1${PLACEHOLDER}` },
   // JSON / YAML: "api_key": "value"  — quoted key, quoted value.
   {
+    kind: "generic",
     pattern: /("[A-Za-z0-9_.-]*(?:key|secret|password|passwd|token|credential)"\s*:\s*)"[^"]*"/gi,
     replacement: `$1"${PLACEHOLDER}"`,
   },
@@ -57,11 +83,13 @@ const RULES: Array<{ pattern: RegExp; replacement: string }> = [
   // `TOKEN=x` stays `TOKEN=`. Rewriting it would make redacted text differ
   // from its original in a way that has nothing to do with the secret.
   {
+    kind: "generic",
     pattern:
       /([A-Za-z0-9_.-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization))(\s*[:=]\s*)"[^"]*"/gi,
     replacement: `$1$2"${PLACEHOLDER}"`,
   },
   {
+    kind: "generic",
     pattern: /([A-Za-z0-9_.-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization))(\s*[:=]\s*)\S+/gi,
     replacement: `$1$2${PLACEHOLDER}`,
   },
@@ -72,7 +100,7 @@ export function redactSecrets(text: string): string {
   if (!text) return text;
   try {
     let out = text;
-    for (const { pattern, replacement } of RULES) out = out.replace(pattern, replacement);
+    for (const { pattern, replacement } of SECRET_RULES) out = out.replace(pattern, replacement);
     return out;
   } catch {
     return text;

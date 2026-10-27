@@ -6,8 +6,9 @@ import type { MissionObservability } from "./observability/MissionObservability.
  *
  * Before this, observability was told only about tool *signatures*: a worker
  * that read the same file nine times in a row — the classic picture of going in
- * circles — left no repeated_file_read signal, and a worker whose every tool
- * call failed left no repeated_error signal. The tracker had the thresholds and
+ * circles — left no repeated_file_read signal, a worker whose every tool call
+ * failed left no repeated_error signal, and a call that completed and produced
+ * nothing new left no repeated_cycle signal. The tracker had the thresholds and
  * nobody fed it.
  *
  * Meaningful progress is deliberately NOT re-emitted here. A WORKER_ACTIVITY
@@ -36,6 +37,13 @@ export function recordWorkerActivity(
   }
   if (event.phase === "failed") {
     observability.noteWorkerError(missionId, workerId, `${event.toolName ?? "tool"}:${event.phase}`);
+  }
+  // A cycle = one round of work that produced nothing new. Only a COMPLETED call
+  // qualifies (a failure is already counted as an error), and only one the event
+  // can name (no signature, no identity to repeat). A write/edit produced an
+  // artifact, so its completion is progress and clears the read family instead.
+  if (event.phase === "completed" && event.invocationSignature && !WRITE_TOOLS.has(event.toolName ?? "")) {
+    observability.noteWorkerCycle(missionId, workerId, event.invocationSignature);
   }
   // Only paths the event itself carries: a read with no target is not evidence
   // of anything, and inventing one would blame the worker for the event's gap.
