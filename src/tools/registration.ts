@@ -33,7 +33,14 @@ export interface RegistrationOutcome {
  */
 export function registerToolsTolerant(host: ToolRegistrar, tools: Array<{ name: string }>): RegistrationOutcome {
   const taken = new Set<string>();
-  for (const tool of host.getAllTools?.() ?? []) taken.add(tool.name);
+  // Pi forbids action methods while extensions are still loading, so the
+  // pre-flight view is best-effort. When it is unavailable the try/catch below
+  // still catches a real collision — the view only makes the reason clearer.
+  try {
+    for (const tool of host.getAllTools?.() ?? []) taken.add(tool.name);
+  } catch {
+    // No visibility yet; registration will report conflicts instead.
+  }
 
   const registered: string[] = [];
   const skipped: RegistrationOutcome["skipped"] = [];

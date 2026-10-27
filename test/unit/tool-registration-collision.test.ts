@@ -62,6 +62,24 @@ test("a host without getAllTools still registers everything it accepts", () => {
   assert.deepEqual(outcome.skipped, []);
 });
 
+test("a host that refuses to answer getAllTools still registers what it accepts", () => {
+  // Pi forbids action methods during extension loading, which is exactly when
+  // this runs. A refused pre-flight view must degrade to the try/catch path.
+  const registered: string[] = [];
+  const outcome = registerToolsTolerant(
+    {
+      getAllTools: () => {
+        throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
+      },
+      registerTool: (t) => void registered.push(t.name),
+    },
+    [{ name: "ledger_read" }, { name: "mission" }],
+  );
+
+  assert.deepEqual(registered, ["ledger_read", "mission"], "a load-time view refusal is not fatal");
+  assert.deepEqual(outcome.skipped, []);
+});
+
 test("the operator line names the tools and the fix", () => {
   assert.equal(describeSkippedTools([]), null, "nothing skipped, nothing said");
 

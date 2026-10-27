@@ -31,6 +31,12 @@ interface GenerationTable {
   commands: Map<string, CommandOptions>;
   tools: Map<string, ToolDef>;
   fencedCalls: number;
+  /**
+   * Tool names this generation claimed that Pi refused because another
+   * extension already owns them (two runtime copies loaded at once). The first
+   * registration wins in Pi; losing a name is not a reason to fail the load.
+   */
+  shadowedTools: Map<string, string>;
 }
 
 /** How the bridge learns where to send things. Implemented by the RuntimeHost. */
@@ -158,6 +164,12 @@ export class PiBridge {
     return this.tables.get(generation)?.fencedCalls ?? 0;
   }
 
+  /** Tool names a generation could not register because another extension owns them. */
+  shadowedTools(generation: number): Array<{ name: string; reason: string }> {
+    const table = this.tables.get(generation);
+    return table ? [...table.shadowedTools].map(([name, reason]) => ({ name, reason })) : [];
+  }
+
   /** Forget a retired generation's tables so nothing can route to it again. */
   dropGeneration(generation: number): void {
     this.tables.delete(generation);
@@ -181,7 +193,13 @@ export class PiBridge {
    * table and, where Pi needs one, a forwarder; actions are fenced.
    */
   createGenerationApi(generation: number, onEventBusSubscription?: (off: () => void) => void): ExtensionAPI {
-    const table: GenerationTable = { handlers: new Map(), commands: new Map(), tools: new Map(), fencedCalls: 0 };
+    const table: GenerationTable = {
+      handlers: new Map(),
+      commands: new Map(),
+      tools: new Map(),
+      fencedCalls: 0,
+      shadowedTools: new Map(),
+    };
     this.tables.set(generation, table);
     const live = () => this.target.isLive(generation) && this.tables.get(generation) === table;
 
@@ -230,13 +248,22 @@ export class PiBridge {
         return;
       }
       table.tools.set(tool.name, tool);
-      this.toolForwarders.add(tool.name);
       // Re-registered per generation (Pi overwrites by name), so a changed
       // schema or description reaches Pi; execution always forwards.
-      this.pi.registerTool({
-        ...tool,
-        execute: (...args: unknown[]) => this.runTool(tool.name, args),
-      } as never);
+      try {
+        this.pi.registerTool({
+          ...tool,
+          execute: (...args: unknown[]) => this.runTool(tool.name, args),
+        } as never);
+        this.toolForwarders.add(tool.name);
+      } catch (error) {
+        // Pi refuses a tool name another extension already registered. Losing
+        // the name must not take the runtime down: the copy that registered
+        // first serves it, and this one keeps every other tool it owns. It is
+        // not added to toolForwarders, because this generation does not own it.
+        table.tools.delete(tool.name);
+        table.shadowedTools.set(tool.name, error instanceof Error ? error.message : String(error));
+      }
     };
 
     const realEvents = (this.pi as { events?: { on?: unknown; emit?: unknown } }).events;
