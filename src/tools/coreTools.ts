@@ -36,12 +36,24 @@ export interface CoreServices {
 }
 
 /** Resolve a machine reference rather than trusting an agent-supplied prefix. */
-export function hasRecordedEvidence(
+export async function hasRecordedEvidence(
   ref: string | undefined,
   services: Pick<CoreServices, "ledger" | "artifacts">,
-): boolean {
+): Promise<boolean> {
   if (!ref || !isMachineEvidence(ref)) return false;
-  if (ref.startsWith("artifact://")) return Boolean(services.artifacts.getByUri(ref));
+  if (ref.startsWith("artifact://")) {
+    try {
+      // Metadata discovery is deliberately cheap and does not authenticate
+      // content. A bounded page validates the full digest on first access and
+      // reuses it only while the pinned file's identity remains unchanged.
+      return (
+        services.artifacts.getByUri(ref) !== undefined &&
+        (await services.artifacts.readSliceByUri(ref, 0, 1)) !== undefined
+      );
+    } catch {
+      return false;
+    }
+  }
   const id = ref.startsWith("test-run://") ? ref.slice("test-run://".length) : ref;
   const evidence = services.ledger.getEvidence(id);
   return evidence !== undefined && evidence.trust !== "unverified";
@@ -195,7 +207,7 @@ export function buildCoreTools(
         };
       const ref = params.evidence ? String(params.evidence) : undefined;
       // Prefixes classify references; they cannot authenticate evidence (INV-006).
-      const machine = hasRecordedEvidence(ref, services);
+      const machine = await hasRecordedEvidence(ref, services);
       const status = params.kind === "finding" || params.kind === "hypothesis" ? "open" : machine ? "verified" : "open";
       const entity = await services.ledger.recordEntity(
         params.kind as "fact" | "hypothesis" | "finding" | "decision",
