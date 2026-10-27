@@ -44,6 +44,12 @@ export interface HerdrStatus {
   protocol: number;
 }
 
+export interface HerdrWorkspace {
+  workspaceId: string;
+  paneId: string;
+  path: string;
+}
+
 /** Thin contract over the Herdr CLI. */
 export interface HerdrCli {
   status(): Promise<HerdrStatus>;
@@ -59,8 +65,10 @@ export interface HerdrCli {
   exportEnv?(paneId: string, vars: Record<string, string>): Promise<void>;
   sendKeys(target: string, keys: string): Promise<void>;
   closePane(target: string): Promise<void>;
-  /** Create a Git worktree-backed workspace; returns its id/path. */
-  createWorktree(repo: string): Promise<{ workspaceId: string; path: string }>;
+  /** Create a workspace with a new shell pane in the requested directory. */
+  createWorkspace(cwd: string): Promise<HerdrWorkspace>;
+  /** Create a Git worktree-backed workspace with its root shell pane. */
+  createWorktree(repo: string): Promise<HerdrWorkspace>;
 }
 
 export interface RealHerdrCliOptions {
@@ -120,9 +128,9 @@ export class RealHerdrCli implements HerdrCli {
 
   async getAgent(target: string): Promise<HerdrAgent | null> {
     const out = await this.run(["agent", "get", target]);
-    const parsed = JSON.parse(out) as { result?: HerdrAgent; error?: { code?: string } };
+    const parsed = JSON.parse(out) as { result?: { agent?: HerdrAgent }; error?: { code?: string } };
     if (parsed.error) return null;
-    return parsed.result ?? null;
+    return parsed.result?.agent ?? null;
   }
 
   async readAgent(target: string, lines?: number): Promise<string> {
@@ -140,9 +148,9 @@ export class RealHerdrCli implements HerdrCli {
     const args = ["agent", "wait", target, ...until.flatMap((u) => ["--until", u])];
     if (timeoutMs && timeoutMs > 0) args.push("--timeout", String(timeoutMs));
     const out = await this.run(args);
-    const parsed = JSON.parse(out) as { result?: HerdrAgent };
-    if (!parsed.result) throw new HerdrError("agent_wait_no_result", "agent.wait returned no agent");
-    return parsed.result;
+    const parsed = JSON.parse(out) as { result?: { agent?: HerdrAgent } };
+    if (!parsed.result?.agent) throw new HerdrError("agent_wait_no_result", "agent.wait returned no agent");
+    return parsed.result.agent;
   }
 
   async exportEnv(paneId: string, vars: Record<string, string>): Promise<void> {
@@ -167,12 +175,31 @@ export class RealHerdrCli implements HerdrCli {
     await this.run(["pane", "close", target]);
   }
 
-  async createWorktree(repo: string): Promise<{ workspaceId: string; path: string }> {
-    const out = await this.run(["worktree", "create", repo]);
-    const parsed = JSON.parse(out) as { result?: { workspace_id?: string; path?: string } };
-    return {
-      workspaceId: parsed.result?.workspace_id ?? "unknown",
-      path: parsed.result?.path ?? repo,
+  async createWorkspace(cwd: string): Promise<HerdrWorkspace> {
+    return this.parseWorkspace(await this.run(["workspace", "create", "--cwd", cwd, "--no-focus"]), false);
+  }
+
+  async createWorktree(repo: string): Promise<HerdrWorkspace> {
+    return this.parseWorkspace(await this.run(["worktree", "create", "--cwd", repo, "--no-focus"]), true);
+  }
+
+  private parseWorkspace(out: string, worktree: boolean): HerdrWorkspace {
+    const parsed = JSON.parse(out) as {
+      result?: {
+        workspace?: { workspace_id?: string };
+        root_pane?: { pane_id?: string; cwd?: string };
+        worktree?: { path?: string };
+      };
     };
+    const workspaceId = parsed.result?.workspace?.workspace_id;
+    const paneId = parsed.result?.root_pane?.pane_id;
+    const path = worktree ? parsed.result?.worktree?.path : parsed.result?.root_pane?.cwd;
+    if (![workspaceId, paneId, path].every((value) => typeof value === "string" && value.length > 0)) {
+      throw new HerdrError(
+        "herdr_provisioning_invalid",
+        "Herdr creation response is missing workspace, root pane or path",
+      );
+    }
+    return { workspaceId: workspaceId!, paneId: paneId!, path: path! };
   }
 }

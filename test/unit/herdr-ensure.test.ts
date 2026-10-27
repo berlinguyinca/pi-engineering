@@ -42,8 +42,11 @@ class StubCli implements HerdrCli {
   async startAgent() {}
   async sendKeys() {}
   async closePane() {}
+  async createWorkspace(repo: string) {
+    return { workspaceId: "w", paneId: "w:p1", path: repo };
+  }
   async createWorktree(repo: string) {
-    return { workspaceId: "w", path: repo };
+    return { workspaceId: "w", paneId: "w:p1", path: repo };
   }
 }
 

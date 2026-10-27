@@ -197,7 +197,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
   async waitFor(rid: RuntimeId, timeoutMs?: number, signal?: AbortSignal): Promise<AgentWorker> {
     const rec = this.require(rid);
     if (signal?.aborted) throw new Error("waitFor aborted");
-    const until = ["done", "blocked", "working", "idle"];
+    const until = ["done", "blocked", "idle"];
     let agent: HerdrAgent;
     try {
       agent = await this.cli.wait(rec.target, until, timeoutMs ?? 300_000);
@@ -291,14 +291,12 @@ export class HerdrAgentRuntime implements AgentRuntime {
 
   private async provision(rec: Rec): Promise<void> {
     if (rec.provisioned) return;
-    if (rec.request.isolation === "worktree") {
-      try {
-        const wt = await this.cli.createWorktree(rec.request.cwd ?? process.cwd());
-        rec.target = wt.workspaceId;
-        rec.worker.worktree = wt.path;
-      } catch {
-        // Fall back to the opaque target; provisioning is best-effort.
-      }
+    if (rec.target === rec.worker.id) {
+      const cwd = rec.request.cwd ?? process.cwd();
+      const workspace =
+        rec.request.isolation === "worktree" ? await this.cli.createWorktree(cwd) : await this.cli.createWorkspace(cwd);
+      rec.target = workspace.paneId;
+      if (rec.request.isolation === "worktree") rec.worker.worktree = workspace.path;
     }
     // Worker identity for the runtime report (role/mission shown on the dashboard session row). Best-effort:
     // without it the agent is simply reported with no role or mission.
@@ -308,7 +306,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
       await this.cli.exportEnv(rec.target, vars).catch(() => {});
     }
     try {
-      await this.cli.startAgent(rec.target, this.agentKind, rec.worker.role);
+      const name = tidyAgentName(`pi-${rec.worker.id}-${rec.worker.role}`)!;
+      await this.cli.startAgent(rec.target, this.agentKind, name);
     } catch (err) {
       if (err instanceof HerdrError && err.code === "agent_start_failed") throw err;
       throw new HerdrError(

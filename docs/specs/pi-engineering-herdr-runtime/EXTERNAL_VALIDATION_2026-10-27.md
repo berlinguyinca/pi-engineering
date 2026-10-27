@@ -26,48 +26,82 @@ reopening the connection pool. Other tests verify the HTTP/provider contract
 using the memory backend; this run does not claim a PostgreSQL-backed HTTP test.
 After exit, no owned cluster process or temporary cluster directory remained.
 
-## Herdr: live health passed; live canary remains blocked
+## Herdr: real provisioning, lifecycle and bounded model canary passed
 
-Read-only local commands:
+Read-only checks of `herdr --version`, `herdr --help`, `herdr status server`
+and `HerdrAgentRuntime.health()` show client/server **0.9.1**, protocol **22**,
+compatible endpoints and healthy availability.
 
-```sh
-~/.local/bin/herdr --version
-~/.local/bin/herdr --help
-~/.local/bin/herdr status server
-~/.local/bin/herdr --skill
-test "${HERDR_ENV:-}" = 1
-```
+The outer validation process has no `HERDR_ENV`. The installed `herdr --skill`
+requires control commands to originate inside a genuine Herdr-managed pane.
+An owned named server resolves this without assigning a fake environment flag:
 
-Observed: client/server **0.9.1**, protocol **22**, endpoint and private protocol
-compatible. `HerdrAgentRuntime.health()` through `RealHerdrCli` also returns
-`ok: true`, `activeWorkers: 0`, server `0.9.1`, protocol `22`.
-This checks availability, not provisioning or model execution.
+1. Create a private temporary directory containing a configuration whose documented
+   `[terminal].default_shell` points to an owned bootstrap script, and set
+   `[worktrees].directory` to an owned temporary worktree directory.
+2. Start `HERDR_CONFIG_PATH=<owned-config> herdr --session <unique-name> server`.
+   Headless startup has no initial pane, so attach a PTY client to that same named
+   session solely to create its initial workspace. Send no keyboard input.
+3. The bootstrap verifies Herdr's injected `HERDR_ENV=1` and checks that
+   `herdr --session <unique-name> status server` reports exactly the named socket.
+   After its readiness marker, terminate only the owned client process. Keep the
+   bootstrap pane alive, including after command errors. CLI group-help commands
+   can return nonzero and must not cause the last pane to exit.
+4. Run every validation command from that genuine managed bootstrap pane,
+   explicitly selecting the unique session and checking its socket before each
+   mutation. An owned job-file loop permits this without further TUI input.
+   Use an empty private Pi profile, a disposable Git repository and no model prompt.
 
-The environment check exits 1. The installed skill (`herdr --skill`) explicitly
-requires: "Before issuing any control command, verify that this agent is running
-inside a Herdr-managed pane" and "If the check fails, say that you are not running
-inside Herdr and stop. Do not inspect or control the focused Herdr session from
-outside Herdr." Therefore this agent issued no pane, workspace, agent, session,
-or handoff control commands. No existing agents or leases were stopped.
+Actual session: `pi-herdr-validation-xu2jbd3c`; its data and fixture repository
+are under `/tmp/pi-herdr-validation-xu2jbd3c`. The genuine bootstrap reported
+`managed=1 pane=w1:p1 workspace=w1`. No default-session API controls were issued;
+no pre-existing agents, leases or servers were stopped.
 
-Independent code blocker: `HerdrAgentRuntime.provision()` still uses its opaque
-runtime ID as the start target without worktree isolation. With worktree isolation
-it uses `createWorktree().workspaceId` as that target. `RealHerdrCli.startAgent()`
-passes the target to `agent start --pane`, which needs an actual pane ID.
-`createWorktree()` reads top-level `workspace_id`/`path`; the actual response
-topology also needs validation before treating it as pane provisioning.
-These paths do not yet prove real pane provisioning. This validation scope
-does not change runtime code.
+The installed CLI/schema and real responses identified and verified these fixes:
 
-To unblock a real canary, coordinate a dedicated, owned Herdr test session/pane
-under the installed control requirements, repair and validate the real pane
-mapping, and obtain from the session owner the intended InferWeave endpoint,
-discovered model ID and authentication mechanism. Credentials stay outside
-evidence files. Before sending any model prompt, coordinate the ephemeral
-worker profile and session with the leader; never reuse the user's conversation.
-The canary must prove planner → two engineers → tester → reviewer, artifacts,
-isolation, routing and restart reconciliation from spec 15. None of those live
-claims follows from a healthy server or a fake CLI test.
+- `workspace create --cwd <path> --no-focus` returns
+  `result.workspace.workspace_id` and `result.root_pane.pane_id`.
+- `worktree create --cwd <repo> --no-focus` returns those fields plus
+  `result.worktree.path`. The old positional-repository invocation was invalid.
+- Agent startup must target the returned root pane, never a workspace ID or
+  a generated runtime ID. Creation now fails closed, and startup retries reuse
+  their allocated pane. Parallel same-role workers get distinct legal names.
+- `agent get` and `agent wait` return `result.agent`; treating the outer result
+  as an agent reproduced a false `LOST` status for a real idle Pi process.
+  Both operations now unwrap the actual response. `agent read` returns plain
+  terminal text. Runtime waits no longer include `working` as a settled state.
+
+Real probes through `RealHerdrCli` and `HerdrAgentRuntime` passed workspace
+creation (`w4:p1`), worktree creation (`w5:p1`), real Pi startup (`w6:p1`), and
+worktree-backed startup/get/wait/read (`w8:p1`). Startup returned `READY`, a
+subsequent live get remained `READY`, and explicit owned-pane termination
+completed. These initial probes sent no model prompt. A separately authorized bounded
+model canary then used only a disposable profile and the session owner's selected
+InferWeave model configuration, as recorded below.
+
+The live arithmetic micro-canary ran planner → two parallel engineers → tester
+→ reviewer, each in a distinct real Herdr/Pi worktree and fresh session. Tools,
+extensions, MCP, skills and context-file discovery were disabled via documented
+Pi CLI flags. The ephemeral profile selected provider `metabolomics`, model
+`deepseek_v4-flash-modality-text-quant-mxfp4`, thinking off and at most 256 output
+tokens per response. Only `models.json` and `auth.json` were copied from the
+owner-approved private profile; credentials are excluded from repository evidence.
+
+All five workers produced exactly one persisted assistant response, matched by
+session-header checkout path. Every response ended with `stopReason: stop` and
+runtime status `COMPLETED`. Output token counts were **99 / 115 / 84 / 146 / 150**.
+The harness validated the actual JSON responses, materialized small artifacts,
+passed both engineers' outputs to the tester, and passed all three artifacts to
+an independent reviewer that approved them. It terminated each owned agent in a
+`finally` block. Selected response and usage evidence is in
+[`evidence/2026-10-27-herdr-canary.json`](evidence/2026-10-27-herdr-canary.json).
+
+This proves bounded real model execution across the actual runtime seam, not
+full spec-15 completion: the model workers had no tools and did not mutate Git;
+artifacts were materialized by the harness. Restart reconciliation, final Git
+integration and structured terminating worker-result extraction remain unproved.
+The adapter still synthesizes its completion summary; response verification used
+persisted assistant messages, never that summary as model-output evidence.
 
 ## Deterministic contracts and rollback readiness
 
@@ -75,18 +109,25 @@ claims follows from a healthy server or a fake CLI test.
 node --test --import ./test/support/isolatedState.ts \
   test/integration/runtime-canary.test.ts \
   test/unit/agentruntime.test.ts test/unit/herdr-runtime.test.ts \
-  test/unit/herdr-cli-argv.test.ts
+  test/unit/herdr-cli-argv.test.ts test/unit/herdr-ensure.test.ts \
+  test/unit/lineage-emitter.test.ts
 ```
 
-Observed: **20 passed, 0 failed, 0 skipped**. This includes the deterministic
+Observed after the provisioning fixes: **60 passed, 0 failed, 0 skipped**. This includes the deterministic
 canary, both runtime contracts, selector negotiation, and CLI argument checks.
 The canary uses `FakeWorkerExecutor`; the Herdr contract uses a fake client.
 
-`createAgentRuntime` retains legacy as the default and accepts Herdr explicitly.
-These selector tests establish availability of the legacy selection path, not
-a live rollback drill. Spec 14's migration state machine, live canary gate,
-rollback drill and telemetry window remain unproved. Keep the migration/default
-decision unchanged until those gates have independent live evidence.
+A bounded selector rollback check deliberately required protocol 999 against
+the real owned protocol-22 server, verified negotiation rejection, selected the
+legacy default, and completed an owned deterministic `FakeWorkerExecutor` task.
+Result: `selectedRuntime: legacy`, `status: COMPLETED`; no production default
+changed. This proves rejection followed by explicit legacy selection, not a
+live server-outage recovery or model-backed legacy rollback drill.
+
+Spec 14's migration state machine, full rollback drill and telemetry window
+remain open. Keep the migration/default decision unchanged until those gates
+have independent live evidence. All owned clients were detached before pane
+cleanup; all owned test servers and temporary resources were then cleaned up.
 
 ## Static verification
 
