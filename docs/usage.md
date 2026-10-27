@@ -1239,6 +1239,46 @@ the SQLite registry is kept on a machine-local runtime directory automatically.
 - `/ledger hypothesis` — claims not yet promoted to facts.
 - `/verify` — run verification yourself and see the captured log artifact.
 
+## Risk-aware legacy verification and review
+
+For legacy `/engineer` and tournament candidates, a low risk label enables cheap
+verification only after the runtime reads the candidate's actual Git diff. A
+change consisting entirely of `.md`, `.rst`, or `.adoc` files gets a required
+patch-whitespace check plus any trusted `verify:docs` and `test:docs` scripts.
+Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and `SKILL.md`)
+retain the normal gates. Configuration files such as `requirements.txt` also
+retain normal verification.
+
+For other low-risk changes, the owner may declare `verify:quick` or `test:quick`
+in the trusted checkout's package scripts (`verify:quick` takes precedence).
+Without an owner-declared quick script, the normal profile remains in force.
+Requests that explicitly mention verification, tests, checks, build, or lint keep
+the normal gates; explicit full-suite requests select the full profile. Commands
+are chosen from the trusted owner checkout and run in the candidate worktree.
+Manual `/verify full` continues to request the broader suite.
+
+Legacy independent reviews must return `details.findings` explicitly, including
+an empty array for a clean review. Each finding must have a valid severity, a
+nonempty claim, and an evidence string. A missing or malformed payload is an
+incomplete review, so it cannot authorize promotion. Artifact-backed claims are
+accepted as machine evidence only after content validation, including after
+reopening a store.
+
+## Artifact startup and paged reads
+
+Reopening an artifact store validates metadata, file types, transaction recovery,
+and content sizes without reading every historical blob. Content digests are
+verified on first content access; same-size digest corruption is reported at that
+point rather than at startup. Missing files, size mismatches, invalid paths, and
+unsafe links still fail closed.
+
+The first paged read streams the artifact once to verify its digest and build a
+bounded sparse character index. Subsequent pages read the requested range near a
+checkpoint. The cache retains indexes for at most 16 files, with at most 1,025
+checkpoints each; it does not retain whole decoded blobs. File replacement,
+modification, or metadata digest changes invalidate reuse. Pagination offsets
+remain JavaScript string offsets (UTF-16 code units).
+
 ## Worker permissions and recovery isolation
 
 A worker receives the builtin and semantic tools explicitly named in its request
