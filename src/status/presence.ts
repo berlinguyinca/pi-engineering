@@ -16,6 +16,8 @@ export interface PresenceRow {
   unit: string;
   age: string;
   attention: boolean;
+  /** Why this mission deserves attention, when there is a fact that says so. */
+  attentionReason?: string;
 }
 
 export interface PresenceView {
@@ -51,7 +53,23 @@ const HEALTH_TIE = 6;
  * health the observability service already computed — presence never re-derives
  * health, it only orders by it.
  */
+/**
+ * Attention severity → rank. Attention can only raise a mission, never demote
+ * one: a mission the operator must act on is already rank 0, and a mission that
+ * is merely looping should not be pushed below one that has genuinely stopped.
+ */
+const ATTENTION_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 5 };
+
 export function presenceRank(event: RuntimeMissionActivityEvent): number {
+  const stateRank = statePresenceRank(event);
+  const severity = event.attention?.severity;
+  if (!severity) return stateRank;
+  // The strongest fact wins. A mission that looks active but whose counters say
+  // it has repeated the same tool call seven times outranks one merely waiting.
+  return Math.min(stateRank, ATTENTION_RANK[severity] ?? 5);
+}
+
+function statePresenceRank(event: RuntimeMissionActivityEvent): number {
   if (NEEDS_YOU.has(event.state)) return 0;
   if (PARKED.has(event.state)) return 1;
   if (event.health === "stalled") return 2;
@@ -115,6 +133,7 @@ function ageOf(event: RuntimeMissionActivityEvent, now: number): string {
 }
 
 function rowOf(event: RuntimeMissionActivityEvent, now: number, basis?: PresenceBasis): PresenceRow {
+  const attention = event.attention;
   return {
     missionId: event.missionId,
     title: safe(event.title, 40),
@@ -124,6 +143,8 @@ function rowOf(event: RuntimeMissionActivityEvent, now: number, basis?: Presence
     unit: unitOf(event),
     age: ageOf(event, now),
     attention: presenceRank(event) <= 1,
+    // Carried so a surface can say *why* without re-deriving it from narration.
+    ...(attention && attention.severity !== "info" ? { attentionReason: safe(attention.reason, 80) } : {}),
   };
 }
 
@@ -141,7 +162,10 @@ function workingLineOf(
   const live = events.find((event) => !TERMINAL.has(event.state));
   const row = rows.find((candidate) => candidate.missionId === live?.missionId);
   if (!live || !row) return { line: null, missionId: null };
-  const line = `Mission · ${row.missionId} · ${row.title} · ${row.age} · ${safe(live.phase, 20)} ${row.percent}`;
+  // Lead with the evidence when there is any: "why look now" beats "what it is
+  // called" for the one line the operator actually reads.
+  const head = row.attentionReason ?? row.title;
+  const line = `Mission · ${row.missionId} · ${head} · ${row.age} · ${safe(live.phase, 20)} ${row.percent}`;
   return { line: line.length > 240 ? `${line.slice(0, 239)}…` : line, missionId: row.missionId };
 }
 

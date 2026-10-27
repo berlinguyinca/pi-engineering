@@ -48,6 +48,7 @@ import { MissionStore } from "../orchestration/missionStore.ts";
 import { buildVerifierStages } from "../orchestration/missionWhy.ts";
 import { MissionActivityTicker } from "../orchestration/observability/MissionActivityTicker.ts";
 import { MissionObservability, boundedToolOutputPreview } from "../orchestration/observability/MissionObservability.ts";
+import { type MissionAttention, attentionFromSummary } from "../orchestration/observability/attention.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
@@ -451,6 +452,12 @@ export interface RuntimeMissionActivityEvent {
   operatorPausedAt?: string | null;
   /** The mission's operator model pin ("provider/id"), when it has one. */
   operatorModelPin?: string | null;
+  /**
+   * Why this mission deserves attention, with the fact that says so. Derived
+   * from observability facts, never from model narration; absent when there is
+   * nothing to say, so a surface can fall back to plain state ordering.
+   */
+  attention?: MissionAttention | null;
 }
 
 export interface EngineeringRuntimeOptions {
@@ -1075,6 +1082,17 @@ export class EngineeringRuntime {
         task: summary.task,
         preservedWork: summary.preservedWork.map((value) => redactSecrets(value).slice(0, 240)).slice(0, 8),
         operatorPausedAt: mission?.operator_paused_at ?? null,
+        attention: attentionFromSummary(summary, {
+          now: Date.parse(observedAt) || Date.now(),
+          // The counters live per worker; the strongest one across live workers
+          // is what an operator would act on.
+          loopSignals: projection.workers
+            .filter((worker) => worker.state === "running" || worker.state === "waiting")
+            .flatMap((worker) => this.missionObservability?.loopSignals(missionId, worker.workerId) ?? []),
+          operatorPausedAt: mission?.operator_paused_at ?? null,
+          review: { blockingOpen: projection.review.blockingOpen },
+          tests: { failed: projection.tests.failed },
+        }),
         operatorModelPin: mission?.operator_model_pin
           ? `${mission.operator_model_pin.provider}/${mission.operator_model_pin.id}`
           : null,

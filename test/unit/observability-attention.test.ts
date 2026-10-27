@@ -1,0 +1,190 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { deriveAttention } from "../../src/orchestration/observability/attention.ts";
+import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
+import { presenceRank, projectPresence } from "../../src/status/presence.ts";
+
+/**
+ * Health says whether a mission is moving; it does not say why the operator
+ * should look now. These tests pin attention as a separate, deterministic
+ * judgement: the same facts always produce the same severity and the same
+ * evidence, and the evidence is a fact (a count, an age, a deadline), never a
+ * sentence the model wrote about itself.
+ */
+
+const T0 = Date.parse("2026-10-27T12:00:00.000Z");
+
+/** A complete event: presence renders every field, so a partial one is not a fixture. */
+function event(overrides: Partial<RuntimeMissionActivityEvent> = {}): RuntimeMissionActivityEvent {
+  return {
+    observedAt: new Date(T0).toISOString(),
+    missionId: "MSN-1",
+    title: "Work",
+    phase: "implement",
+    state: "EXECUTING",
+    health: "active",
+    approximatePercent: 40,
+    acceptanceCoverage: { completed: 4, total: 10, approximatePercent: 40 },
+    workflowProgress: { completed: 4, total: 10, approximatePercent: 40 },
+    summary: "reading src/a.ts",
+    activeWorkers: 1,
+    waitingWorkers: 0,
+    failedWorkers: 0,
+    lastMeaningfulProgressAt: new Date(T0 - 10_000).toISOString(),
+    lastHeartbeatAt: new Date(T0 - 5_000).toISOString(),
+    action: "reading src/a.ts",
+    reason: "",
+    recovery: { attempt: 0, maxAttempts: 3 },
+    nextAction: "",
+    nextActionAt: null,
+    owner: null,
+    repository: null,
+    task: null,
+    preservedWork: [],
+    ...overrides,
+  };
+}
+
+function base(overrides: Partial<Parameters<typeof deriveAttention>[0]> = {}) {
+  return {
+    state: "EXECUTING",
+    health: "active" as const,
+    lastMeaningfulProgressAt: new Date(T0 - 10_000).toISOString(),
+    lastHeartbeatAt: new Date(T0 - 5_000).toISOString(),
+    recovery: { attempt: 0, maxAttempts: 3 },
+    now: T0,
+    ...overrides,
+  };
+}
+
+test("the operator being the next actor outranks everything else", () => {
+  const attention = deriveAttention(
+    base({
+      state: "NEEDS_ATTENTION",
+      reason: "resume is unauthorized for this runtime",
+      // A loop is present too, and still loses.
+      loopSignals: [{ kind: "repeated_tool_call", detail: "read src/a.ts", count: 9 }],
+    }),
+  );
+
+  assert.equal(attention?.severity, "critical");
+  assert.equal(attention?.evidence[0]?.kind, "operator_action_required");
+  assert.match(attention!.reason, /resume is unauthorized/);
+});
+
+/** The case health cannot express: an active mission that is going nowhere. */
+test("a loop is high attention even while health stays active", () => {
+  const attention = deriveAttention(
+    base({
+      loopSignals: [
+        { kind: "repeated_file_read", detail: "src/a.ts", count: 6 },
+        { kind: "repeated_tool_call", detail: "bash npm test", count: 9 },
+      ],
+    }),
+  );
+
+  assert.equal(attention?.severity, "high");
+  assert.equal(attention?.evidence[0]?.kind, "loop");
+  assert.match(attention!.reason, /repeated tool call ×9/, "the strongest counter is the one surfaced");
+});
+
+test("a pause the operator made is reported as theirs, not as a fault", () => {
+  const attention = deriveAttention(base({ operatorPausedAt: new Date(T0 - 90_000).toISOString() }));
+
+  assert.equal(attention?.severity, "medium");
+  assert.equal(attention?.evidence[0]?.kind, "operator_paused");
+  assert.match(attention!.reason, /paused by you 1m ago/);
+});
+
+test("exhausted recovery and failing tests are listed together, strongest first", () => {
+  const attention = deriveAttention(
+    base({ state: "RECOVERING", recovery: { attempt: 3, maxAttempts: 3 }, tests: { failed: 4 } }),
+  );
+
+  assert.equal(attention?.severity, "high");
+  assert.deepEqual(
+    attention?.evidence.map((entry) => entry.kind),
+    ["recovery_exhausted", "tests_failing"],
+  );
+});
+
+test("a wait the runtime is handling itself informs without interrupting", () => {
+  const attention = deriveAttention(base({ health: "waiting", waitingReason: "inferweave_admission" }));
+
+  assert.equal(attention?.severity, "info");
+  assert.match(attention!.reason, /waiting on inferweave admission/);
+});
+
+test("a wait past its deadline is worth interrupting for", () => {
+  const attention = deriveAttention(
+    base({
+      health: "waiting",
+      waitingReason: "human_approval",
+      waitingSince: new Date(T0 - 40 * 60_000).toISOString(),
+      waitingDeadlineMs: 30 * 60_000,
+    }),
+  );
+
+  assert.equal(attention?.severity, "medium");
+  assert.equal(attention?.evidence[0]?.kind, "waiting_deadline");
+  assert.match(attention!.reason, /past its deadline/);
+});
+
+/** A running mission with neither heartbeat nor progress is not "healthy". */
+test("no proof of life is stated, not hidden behind an active label", () => {
+  const attention = deriveAttention(base({ lastMeaningfulProgressAt: null, lastHeartbeatAt: undefined }));
+
+  assert.equal(attention?.severity, "medium");
+  assert.equal(attention?.evidence[0]?.kind, "no_proof_of_life");
+});
+
+test("a mission with nothing to say produces no attention", () => {
+  assert.equal(deriveAttention(base()), null);
+  assert.equal(deriveAttention(base({ state: "COMPLETE", health: "complete" })), null);
+});
+
+test("attention raises a mission's presence rank but never demotes one", () => {
+  const running = event();
+  const looped = event({
+    missionId: "MSN-loop",
+    attention: {
+      severity: "high",
+      reason: "repeated tool call ×9 — bash npm test",
+      evidence: [{ kind: "loop", detail: "repeated tool call ×9" }],
+    },
+  });
+  const needsYou = event({
+    missionId: "MSN-you",
+    state: "NEEDS_ATTENTION",
+    attention: {
+      severity: "critical",
+      reason: "waiting for you",
+      evidence: [{ kind: "operator_action_required", detail: "waiting for you" }],
+    },
+  });
+
+  assert.ok(presenceRank(looped) < presenceRank(running), "a looping mission outranks one merely running");
+  assert.equal(presenceRank(needsYou), 0, "the operator still comes first");
+  assert.equal(presenceRank(event({ state: "NEEDS_ATTENTION" })), 0, "no attention, same rank as before");
+});
+
+test("the working line leads with the evidence when there is any", () => {
+  const looped = event({
+    missionId: "MSN-loop",
+    title: "Payment retries",
+    action: "working on it",
+    summary: "working on it",
+    reason: "working on it",
+    attention: {
+      severity: "high",
+      reason: "repeated tool call ×9 — bash npm test",
+      evidence: [{ kind: "loop", detail: "repeated tool call ×9" }],
+    },
+  });
+
+  const view = projectPresence([looped], 4, T0);
+  assert.match(view.workingLine ?? "", /repeated tool call ×9/, "the line says why to look");
+  assert.doesNotMatch(view.workingLine ?? "", /working on it/, "self-narration is not evidence");
+  assert.equal(view.rows[0]?.attentionReason, "repeated tool call ×9 — bash npm test");
+});

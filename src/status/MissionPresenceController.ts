@@ -246,7 +246,10 @@ export class MissionPresenceController {
       }
       const what =
         rank === 0 ? "needs you" : rank === 1 ? "has stopped" : event.state === "COMPLETE" ? "is complete" : "failed";
-      const reason = flat(event.reason, 120);
+      // Cite the evidence, not the mission's own narration: a counter the
+      // operator can act on beats a sentence the model wrote about itself.
+      const why = event.attention ? `${event.attention.reason} (${event.attention.evidence[0]!.kind})` : event.reason;
+      const reason = flat(why, 120);
       const next = rank <= 1 ? ` — /mission-status ${event.missionId}` : "";
       this.bus.notify(
         event.missionId,

@@ -525,7 +525,10 @@ test("the default quiet interval is a minute: an operator watching wants a minut
   h.clock.advance(2_000);
   h.obs.maybeEmitQuietUpdate(id);
   await h.obs.flush();
-  assert.ok(h.updates.some((m) => m.includes("Still running")), "61s of silence proves liveness");
+  assert.ok(
+    h.updates.some((m) => m.includes("Still running")),
+    "61s of silence proves liveness",
+  );
 });
 
 test("a recent transition update suppresses the quiet-period summary", async () => {
