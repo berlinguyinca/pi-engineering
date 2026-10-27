@@ -29,9 +29,6 @@ function recordingFetch(calls: CapturedCall[]): typeof globalThis.fetch {
 /** Fake Herdr CLI (minimal, mirrors herdr-runtime.test.ts). */
 class FakeHerdrCli {
   agents = new Map<string, { agent_status: string }>();
-  constructor() {
-    this.agents.set("fake-pane", { agent_status: "idle" });
-  }
   async status() {
     return { ok: true, serverVersion: "0.9.1", protocol: 22 };
   }
@@ -50,15 +47,16 @@ class FakeHerdrCli {
   async wait(t: string) {
     return this.agents.get(t) ?? { agent_status: "done" };
   }
-  async startAgent(_name: string, _kind: string, pane: string) {
-    if (!this.agents.has(pane)) this.agents.set(pane, { agent_status: "idle" });
+  async startAgent(pane: string, _kind: string, _name: string) {
+    assert.equal(pane, "fake-pane", "the created pane must be used as the start target");
+    this.agents.set(pane, { agent_status: "idle" });
   }
   async sendKeys() {}
   async closePane(t: string) {
     this.agents.delete(t);
   }
-  async createWorkspace() {
-    return { workspaceId: "w1", paneId: "fake-pane" };
+  async createWorkspace(cwd: string) {
+    return { workspaceId: "w1", paneId: "fake-pane", path: cwd };
   }
   async createWorktree() {
     return { workspaceId: "wt1", paneId: "fake-pane", path: "/tmp/wt" };
