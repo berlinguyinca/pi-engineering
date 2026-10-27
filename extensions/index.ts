@@ -113,6 +113,8 @@ import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
 import { WorkingStatusController } from "../src/status/working.ts";
+import { MissionPresenceController, presenceOptionsFromEnv } from "../src/status/MissionPresenceController.ts";
+import { seedPresence } from "../src/status/presenceSeed.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
@@ -368,7 +370,15 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     },
     onMissionActivity: (event) => {
       publishMissionActivity(key, event);
+      presence?.update(event);
       if (attentionReady) void attention?.update(event).catch(() => {});
+    },
+    // The quiet heartbeat: observability composes a human-readable sentence when
+    // nothing has changed for a while, and presence is the only surface that can
+    // carry it. Without this wiring a mission that goes silent looks identical to
+    // a mission that has stopped.
+    onMissionObservabilityUpdate: (missionId, message) => {
+      presence?.noteSentence(missionId, message);
     },
     // Pipeline progress -> status footer. Best-effort and read-only: the
     // runtime swallows anything thrown here, and the footer is the only
@@ -398,6 +408,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       const summary = runtime.missionObservability?.summary(mission.mission_id);
       if (summary) attention?.seed({ ...summary, operatorPausedAt: mission.operator_paused_at });
     }
+    seedPresenceFrom(runtime);
     attentionReady = true;
     return { runtime, memoryIdentity };
   });
@@ -421,6 +432,39 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
 
 // The activity vocabulary is shared with mission presence and the panel; it lives in src/status.
 export { formatMissionActivity };
+
+/**
+ * The session's mission strip and working line. One controller per session (a
+ * process hosts one interactive session); missions from every repository this
+ * session touches share the strip, which is the point — dozens of legs running
+ * at once should read as one queue, not as one hidden surface each.
+ */
+let presence: MissionPresenceController | undefined;
+let presencePoll: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Draw rows for missions this process never saw emit anything — started
+ * earlier, or by another process. Only ever runs against a runtime that is
+ * already open: drawing a strip must never be the reason a runtime opens.
+ */
+function seedPresenceFrom(runtime: EngineeringRuntime): void {
+  if (!presence) return;
+  seedPresence(presence, {
+    missions: runtime.missionStore?.listMissions() ?? [],
+    summary: (missionId) => runtime.missionObservability?.summary(missionId) ?? null,
+  });
+  // Draw now. Waiting for the next clock tick would leave a session that opens
+  // a runtime and immediately sits idle showing nothing at all.
+  presence.tick();
+}
+
+async function refreshPresence(cwd: string): Promise<void> {
+  if (!presence) return;
+  const key = await repoCacheKey(cwd).catch(() => "");
+  const open = key ? runtimes.get(key) : undefined;
+  if (!open) return;
+  seedPresenceFrom(open.runtime);
+}
 
 /** Feed live mission detail into persistent surfaces without creating notices. */
 function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent): void {
@@ -1934,10 +1978,33 @@ ${RECOVERY_PROMPT}`;
       working?.dispose();
       working = ctx.hasUI ? new WorkingStatusController(ctx.ui) : undefined;
       working?.onModelSelect(ctx.model);
+      // Presence yields the working line to the agent but never yields the
+      // strip: an operator who cannot see the queue cannot steer it.
+      if (presencePoll) clearInterval(presencePoll);
+      presencePoll = undefined;
+      presence?.dispose();
+      const presenceEnv = presenceOptionsFromEnv(process.env);
+      presence =
+        ctx.hasUI && presenceEnv.enabled
+          ? new MissionPresenceController(ctx.ui, {
+              rows: presenceEnv.rows,
+              title: presenceEnv.title,
+              quiet: (missionId) => {
+                void getRuntimeByCwd(ctx.cwd)
+                  .then((runtime) => runtime.missionObservability?.maybeEmitQuietUpdate(missionId))
+                  .catch(() => {});
+              },
+            })
+          : undefined;
+      if (presence && presenceEnv.pollMs > 0) {
+        presencePoll = setInterval(() => void refreshPresence(ctx.cwd).catch(() => {}), presenceEnv.pollMs);
+        presencePoll.unref?.();
+      }
     });
     pi.on("agent_start", (_event, ctx) => {
       workingSignal = ctx.signal;
       working?.onAgentStart();
+      presence?.onAgentStart();
     });
     pi.on("message_update", (event) => working?.onMessageUpdate(event));
     pi.on("tool_execution_start", (event) => working?.onToolEvent(event));
@@ -1947,11 +2014,16 @@ ${RECOVERY_PROMPT}`;
     pi.on("agent_settled", () => {
       workingSignal = undefined;
       working?.onAgentEnd();
+      presence?.onAgentEnd();
     });
     pi.on("session_shutdown", () => {
       workingSignal = undefined;
       working?.dispose();
       working = undefined;
+      if (presencePoll) clearInterval(presencePoll);
+      presencePoll = undefined;
+      presence?.dispose();
+      presence = undefined;
     });
   }
 

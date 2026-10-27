@@ -38,12 +38,43 @@ export interface PresenceOptions {
   now?: () => number;
   /** Refresh cadence; 0 lets the caller drive every tick by hand. */
   intervalMs?: number;
+  /** How often to ask observability for a quiet-period summary (default 60s). */
+  quietMs?: number;
+}
+
+export interface PresenceEnvOptions extends PresenceOptions {
+  /** Whether the strip exists at all this session. */
+  enabled: boolean;
+  /** How often the strip is refreshed from durable state (rows from other processes). */
+  pollMs: number;
+}
+
+function boundedNumber(raw: string | undefined, fallback: number, min: number, max: number): number {
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.round(parsed))) : fallback;
+}
+
+/**
+ * Presence is observational and cheap, so it ships on: the operator's escape
+ * hatch is `PI_MISSION_PRESENCE=0`. The row budget is capped because a strip
+ * that pushes the editor off screen is worse than no strip.
+ */
+export function presenceOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): PresenceEnvOptions {
+  return {
+    enabled: env.PI_MISSION_PRESENCE !== "0",
+    rows: boundedNumber(env.PI_MISSION_PRESENCE_ROWS, 4, 1, 10),
+    title: env.PI_MISSION_TITLE === "1",
+    intervalMs: 1_000,
+    pollMs: boundedNumber(env.PI_MISSION_PRESENCE_POLL_MS, 5_000, 1_000, 600_000),
+  };
 }
 
 interface Tracked {
   event: RuntimeMissionActivityEvent;
   basis?: PresenceBasis;
   sentence?: string;
+  /** True once the runtime itself reported this mission; durable seeds may not demote it. */
+  authoritative: boolean;
 }
 
 function flat(text: string, max: number): string {
@@ -60,6 +91,8 @@ export class MissionPresenceController {
   private readonly titleEnabled: boolean;
   private readonly quiet: ((missionId: string) => void) | undefined;
   private readonly now: () => number;
+  private readonly quietMs: number;
+  private lastQuietAt = 0;
   private readonly live = new Map<string, Tracked>();
   private readonly attention = new Map<string, string>();
   private agentActive = false;
@@ -75,6 +108,7 @@ export class MissionPresenceController {
     this.titleEnabled = options.title ?? false;
     this.quiet = options.quiet;
     this.now = options.now ?? Date.now;
+    this.quietMs = options.quietMs ?? 60_000;
     const intervalMs = options.intervalMs ?? 1_000;
     if (intervalMs > 0) {
       this.timer = setInterval(() => this.tick(), intervalMs);
@@ -82,11 +116,23 @@ export class MissionPresenceController {
     }
   }
 
-  /** The mission's latest activity event; the strip's row for it. */
-  update(event: RuntimeMissionActivityEvent, progressBasis?: PresenceBasis): void {
+  /**
+   * The mission's latest activity event; the strip's row for it.
+   *
+   * `source: "store"` is the durable backstop (a mission this session never saw
+   * emit anything). It may open a row but never rewrite one the runtime already
+   * reported — a seeded row would make a live mission look quieter than it is.
+   */
+  update(event: RuntimeMissionActivityEvent, basis?: PresenceBasis, source: "activity" | "store" = "activity"): void {
     if (this.disposed) return;
     const previous = this.live.get(event.missionId);
-    this.live.set(event.missionId, { event, basis: progressBasis ?? previous?.basis, sentence: previous?.sentence });
+    if (source === "store" && previous?.authoritative) return;
+    this.live.set(event.missionId, {
+      event,
+      basis: basis ?? previous?.basis,
+      sentence: previous?.sentence,
+      authoritative: source === "activity" ? true : (previous?.authoritative ?? false),
+    });
   }
 
   /**
@@ -116,13 +162,19 @@ export class MissionPresenceController {
 
   tick(): void {
     if (this.disposed) return;
+    const now = this.now();
     const events = [...this.live.values()].map((tracked) => tracked.event);
     const basis = new Map<string, PresenceBasis>();
     for (const [missionId, tracked] of this.live) {
       if (tracked.basis) basis.set(missionId, tracked.basis);
-      this.quiet?.(missionId);
     }
-    const view = projectPresence(events, this.rows, this.now(), basis);
+    // Silence is only evidence when someone asks for it, and asking every
+    // second is a summary generator running on the render path.
+    if (this.quiet && events.length > 0 && now - this.lastQuietAt >= this.quietMs) {
+      this.lastQuietAt = now;
+      for (const missionId of this.live.keys()) this.quiet(missionId);
+    }
+    const view = projectPresence(events, this.rows, now, basis);
     this.publishWidget(view);
     this.publishWorkingLine(view);
     this.publishTitle(view);

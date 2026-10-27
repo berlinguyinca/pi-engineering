@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import {
   MissionPresenceController,
+  presenceOptionsFromEnv,
   type PresenceOptions,
   type PresenceSink,
 } from "../../src/status/MissionPresenceController.ts";
@@ -256,5 +257,41 @@ test("visible counts the missions the controller is tracking", () => {
   controller.update(running);
   controller.update({ ...needsYou, missionId: "MSN-2" });
   assert.equal(controller.visible(), 2);
+  controller.dispose();
+});
+
+test("presence is on by default and off only when told", () => {
+  assert.equal(presenceOptionsFromEnv({}).enabled, true);
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE: "0" }).enabled, false);
+});
+
+test("the row budget is bounded so a wide strip cannot eat the terminal", () => {
+  assert.equal(presenceOptionsFromEnv({}).rows, 4);
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "7" }).rows, 7);
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "400" }).rows, 10);
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "nonsense" }).rows, 4);
+});
+
+test("the title bar is opt-in and the poll has a floor", () => {
+  assert.equal(presenceOptionsFromEnv({}).title, false);
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_TITLE: "1" }).title, true);
+  assert.equal(presenceOptionsFromEnv({}).pollMs, 5_000);
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_POLL_MS: "10" }).pollMs, 1_000, "a 10ms poll would hammer the runtime");
+});
+
+test("the quiet heartbeat has its own slower cadence than the strip", () => {
+  let quietCalls = 0;
+  const controller = new MissionPresenceController(
+    {},
+    opts({ quiet: () => quietCalls++, quietMs: 60_000 }),
+  );
+  controller.update(running);
+  controller.tick();
+  controller.tick();
+  assert.equal(quietCalls, 1, "a one-second strip refresh must not ask for a summary every second");
+  clock = T0 + 61_000;
+  controller.tick();
+  assert.equal(quietCalls, 2);
+  clock = T0;
   controller.dispose();
 });
