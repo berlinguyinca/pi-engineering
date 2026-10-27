@@ -18,7 +18,8 @@ import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { type SessionEntry, buildSessionContext } from "@earendil-works/pi-coding-agent";
+import { type SessionEntry, buildSessionProjection } from "@earendil-works/pi-coding-agent";
+import { isBareContinuation } from "../orchestration/autoInvoke.ts";
 import { planTransition } from "./compatibility.ts";
 import { plannerWorkerDir } from "./config.ts";
 import { type HandoffCommandResult, runHandoff } from "./handoffCommand.ts";
@@ -113,7 +114,7 @@ export type SessionHandoffResult =
 
 /**
  * Build a bounded `HandoffArtifact` for a live session (Unit C1). Reuses B2's
- * `runHandoff`: the latest user message as the mission
+ * `runHandoff`: the latest substantive user request as the mission
  * summary/objective, the latest assistant text as architectural context.
  * Returns `{ok:false}` when there is nothing to hand off (no user message)
  * or the artifact cannot reach `committed`.
@@ -124,7 +125,10 @@ export function buildSessionHandoff(input: {
 }): SessionHandoffResult {
   const last = (role: string): SessionHandoffMessage | undefined =>
     [...input.messages].reverse().find((m) => m.role === role && m.text.trim() !== "");
-  const lastUser = last("user");
+  const lastUser =
+    [...input.messages]
+      .reverse()
+      .find((m) => m.role === "user" && m.text.trim() && !isBareContinuation(m.text.trim())) ?? last("user");
   if (!lastUser) return { ok: false, error: "no user message to hand off" };
   const lastAssistant = last("assistant");
   // Bound the session text that enters the artifact. `summary` is already
@@ -234,7 +238,13 @@ export function projectSessionHandoff(messages: AgentMessage[], branch: SessionE
   if (typeof data?.rendered !== "string" || !data.rendered) return;
   const fingerprint = (message: unknown) => createHash("sha256").update(JSON.stringify(message)).digest("hex");
   const oldMessages = new Map<string, number>();
-  for (const message of buildSessionContext(branch.slice(0, boundary)).messages) {
+  // Resolve edits against the complete branch before selecting hidden entries:
+  // an edit appended after the marker may replace a pre-marker message.
+  const hiddenIds = new Set(branch.slice(0, boundary).map((entry) => entry.id));
+  const hiddenMessages = buildSessionProjection(branch)
+    .entries.filter((entry) => hiddenIds.has(entry.sourceEntry.id))
+    .flatMap((entry) => entry.messages);
+  for (const message of hiddenMessages) {
     const key = fingerprint(message);
     oldMessages.set(key, (oldMessages.get(key) ?? 0) + 1);
   }

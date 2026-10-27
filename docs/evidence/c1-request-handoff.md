@@ -77,3 +77,21 @@ Later native/tuned manual, threshold, and overflow compaction are additionally
 covered by six actual-SDK/loopback HTTP cases, including the full extension entry.
 This combines a real provider round trip with deterministic lifecycle boundaries;
 it does not claim every provider/model combination has been exercised.
+
+
+## Merge review follow-ups
+
+Independent review reproduced two additional boundaries: a native context edit
+appended after a handoff could replace a hidden earlier message, and a bare
+continuation prompt could displace the substantive objective. The projection now
+selects hidden messages by source-entry provenance from Pi's complete current
+projection, including edits. The artifact builder reuses the existing continuation
+classifier to retain the most recent substantive user request. Both regressions
+failed before the repairs and pass afterward.
+
+This PR repairs interactive model-switch transfer already present in main. It does
+not complete the original B1 phase-boundary migration: that path remains opt-in,
+and the recorded live provider evidence above exercises model selection rather
+than a full mission phase boundary and fresh worker session. That separate
+migration proof remains outstanding; no phase-handoff or Herdr default is enabled
+by this repair.

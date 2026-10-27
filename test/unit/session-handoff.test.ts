@@ -341,6 +341,34 @@ describe("buildSessionHandoff bounds session text", () => {
 });
 
 describe("branch-local handoff projection", () => {
+  it("keeps post-handoff edits to hidden entries outside the request", () => {
+    const manager = SessionManager.inMemory("/tmp");
+    const old = manager.appendMessage({ role: "user", content: "original old context", timestamp: 1 });
+    manager.appendCustomEntry(SESSION_HANDOFF_ENTRY, { rendered: "bounded handoff" });
+    const successor = manager.appendMessage({ role: "user", content: "successor", timestamp: 2 });
+    manager.appendContextEdit(old, { content: "EDITED_OLD_CONTEXT".repeat(5000) });
+    manager.appendContextEdit(successor, { content: "edited successor" });
+    const projected = projectSessionHandoff(manager.buildSessionContext().messages, manager.getBranch());
+    assert.equal(projected?.length, 2);
+    assert.ok(!JSON.stringify(projected).includes("EDITED_OLD_CONTEXT"));
+    assert.match(JSON.stringify(projected), /edited successor/);
+  });
+
+  it("preserves the substantive task when the latest user only says continue", () => {
+    const task = "Implement /ready with HTTP 503 while startup is incomplete.";
+    const built = buildSessionHandoff({
+      sessionId: "s",
+      messages: [
+        { role: "user", text: task },
+        { role: "assistant", text: "I will inspect the source files." },
+        { role: "user", text: "continue" },
+      ],
+    });
+    assert.ok(built.ok);
+    assert.equal(built.artifact.objective, task);
+    assert.equal(built.artifact.mission_summary, task);
+  });
+
   it("keeps identical later user messages, fresh extension context, and the current branch only", () => {
     const manager = SessionManager.inMemory("/tmp");
     const message = { role: "user" as const, content: "repeat this request", timestamp: 1 };
