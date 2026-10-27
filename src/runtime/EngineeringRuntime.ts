@@ -1913,6 +1913,18 @@ export class EngineeringRuntime {
     return flight;
   }
 
+  /**
+   * Pause one named mission — the case Esc cannot express, because Esc pauses
+   * the turn the operator is watching and dozens of missions run at once.
+   * Works with no live turn: the store records the pause, then whatever is live
+   * is stopped or parked. Only resume un-parks it; no scheduler or supervisor
+   * will run it again on its own.
+   */
+  async pauseMission(missionId: string): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
+    return this.orchestrator.pauseMission(missionId);
+  }
+
   private async performBlockedMissionResume(
     missionId: string,
     signal?: AbortSignal,

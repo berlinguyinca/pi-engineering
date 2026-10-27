@@ -630,6 +630,7 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
     actor: () => ({ type: "user" }),
     resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
     cancelMission: (id) => rt.cancelMission(id),
+    pauseMission: (id) => rt.pauseMission(id),
     clearMissionModelPin: (id) => rt.clearMissionModelPin(id),
     // A rebound parent launch targets the bound worktree by default.
     ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
@@ -2293,7 +2294,7 @@ ${RECOVERY_PROMPT}`;
 
   pi.registerCommand("mission", {
     description:
-      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission inspect <missionId> [workerId] shows recent activity; /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
+      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission inspect <missionId> [workerId] shows recent activity; /mission why <missionId> explains what blocks one; /mission pause <missionId> stops one named mission (Esc pauses the turn on screen; this pauses the one you name); /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
@@ -2320,6 +2321,24 @@ ${RECOVERY_PROMPT}`;
         try {
           const canceled = await rt.cancelMission(cancel[1]);
           ctx.ui.notify(`Mission ${canceled.mission_id} — ${canceled.title} [${canceled.status}]`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
+      // Pause one named mission. Esc cannot express this: it pauses the turn the
+      // operator is watching, and with dozens of missions the one worth stopping
+      // is rarely the one on screen.
+      const pause = /^pause\s+(MSN-\S+)\s*$/i.exec(request);
+      if (pause?.[1]) {
+        const rt = await openRuntime();
+        if (!rt) return;
+        try {
+          const paused = await rt.pauseMission(pause[1]);
+          ctx.ui.notify(
+            `Mission ${paused.mission_id} — ${paused.title} [${paused.status}] · resume with /mission resume ${paused.mission_id}`,
+            "info",
+          );
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         }

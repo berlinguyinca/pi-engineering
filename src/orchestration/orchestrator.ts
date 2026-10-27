@@ -50,6 +50,7 @@ import {
   MAINTENANCE_STOP_REASON,
   MISSION_CANCEL_REASON,
   MISSION_MAINTENANCE_REASON,
+  MISSION_PAUSE_REASON,
   OPERATOR_PAUSE_STOP_REASON,
   interruptibleRun,
   isMaintenanceAbort,
@@ -4544,6 +4545,41 @@ export class Orchestrator {
     return isPauseAbort(signal)
       ? this.pauseInterruptedMission(missionId, isMaintenanceAbort(signal))
       : this.cancelMission(missionId);
+  }
+
+  /**
+   * Pause a mission the operator names, from outside any live turn.
+   *
+   * Esc pauses the turn the operator is watching. This pauses the mission they
+   * pointed at, which is the case Esc cannot express: dozens of missions run at
+   * once, and the one worth stopping is rarely the one on screen. The mission is
+   * marked paused first, so automatic recovery is off immediately, and then
+   * whatever is live is stopped: a running pipeline takes the pause signal and
+   * parks itself with its work, and a mission the scheduler owns — or one merely
+   * waiting — is parked here with its claims released.
+   */
+  async pauseMission(missionId: string): Promise<Mission> {
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (["COMPLETE", "FAILED", "CANCELED", "CANCELING"].includes(mission.status)) return mission;
+    this.store.markOperatorPause(missionId);
+    const live = this.liveRuns.get(missionId);
+    if (live) {
+      // The pipeline's own pause path parks it and reports the activity. Its
+      // status is still in flight here, so report what is already durable.
+      live.abort(MISSION_PAUSE_REASON);
+      return this.store.getMission(missionId) ?? mission;
+    }
+    if (["NEW", "CLASSIFYING", "PLANNING"].includes(mission.status)) {
+      // Nothing has been dispatched, so there is no in-flight work to park. The
+      // interrupted-run path cancels this state because an Esc during planning
+      // preserves nothing; a *named* pause must not destroy a mission the
+      // operator only asked to stop. The pause is durable and the supervisor
+      // honours it, so nothing starts this mission until the operator resumes.
+      await this.store.flush();
+      return this.store.getMission(missionId)!;
+    }
+    return this.pauseInterruptedMission(missionId);
   }
 
   /**
