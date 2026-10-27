@@ -174,6 +174,37 @@ tmux send-keys -t bf2 -l "/mission cancel MSN-pDiOqd"; tmux send-keys -t bf2 Ent
 tmux capture-pane -t bf2
 ```
 
+## Tool namespace: two runtime copies, verified
+
+Loading the installed runtime and a checkout at once fails the second load with
+`Tool "ledger_read" conflicts with <the other path>`. Whether anything inside the
+extension can survive that was tested with a minimal pair (pi 1.4.0):
+
+```ts
+// /tmp/ext-probe/a.ts and b.ts — identical tool name, registration wrapped
+try { pi.registerTool({ name: "dup_tool", … }); } catch (e) { /* … */ }
+```
+
+```
+$ pi --no-extensions --extension /tmp/ext-probe/a.ts --extension /tmp/ext-probe/b.ts -p "say OK"
+probe A registered
+probe B registered
+Error: Failed to load extension "/tmp/ext-probe/b.ts": Tool "dup_tool" conflicts with /tmp/ext-probe/a.ts
+```
+
+Both `registerTool()` calls returned normally; Pi rejected the name **after** the
+extension finished loading. So no try/catch in an extension can prevent it, and
+the remedy is operator-level: one runtime per session
+(`pi --no-extensions --extension <path>/extensions/index.ts`), now written down in
+`docs/usage.md`.
+
+The tolerance code is still worth having, for the case the runtime *can* handle —
+a host that rejects a name synchronously, which is what a mid-session generation
+handover can hit (`src/runtime/host/piBridge.ts` records it as
+`shadowedTools(generation)` instead of losing the generation's whole tool
+surface). That path is unit-tested (`test/unit/runtime-host-tool-collision.test.ts`);
+the Pi post-load check is not something the package can influence.
+
 ## Verdict
 
 The strip renders in a real terminal, updates without keypresses, survives a process restart through the durable store, marks terminal state, and disappears completely under `PI_MISSION_PRESENCE=0` while `origin/main`'s own surfaces keep working. Typing is not blocked.

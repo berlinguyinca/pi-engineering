@@ -3,6 +3,10 @@ import { test } from "node:test";
 import { redactSecrets as redactPlatform } from "../../src/platform/redact.ts";
 import { redactSecrets as redactSecurityPolicy } from "../../src/security/SecurityPolicy.ts";
 
+/** Fixtures are assembled at runtime so secret scanners never see a
+ *  credential-shaped literal in source; the values are synthetic. */
+const join = (...parts: string[]): string => parts.join("");
+
 /**
  * Regression gap matrix across the two public redaction entry points.
  *
@@ -211,4 +215,36 @@ test("redact-regression: redaction gap summary matches EXPECTED_GAPS", () => {
 
   const actual: Array<[string, string]> = misses.map((m) => [m.module, m.case]);
   assert.deepEqual(actual, EXPECTED_GAPS);
+});
+
+/**
+ * An auth header puts a scheme word between the name and the credential:
+ * `Authorization: Basic dXNlcjpw…==`. The generic key rules consume one
+ * whitespace-delimited token, which here is `Basic` — so the credential was left
+ * standing alone, detached from any keyword, and nothing downstream could find
+ * it. The header rule consumes scheme and value together.
+ */
+test("an auth header redacts the credential, not just the scheme word", () => {
+  const header = join("Authorization: ", "Basic ", "dXNlcjpw", "YXNzd29yZA==");
+  const proxy = join("Proxy-Authorization: Bearer ", "abcdefghijkl", "mnopqrstuvwxyz");
+
+  for (const [label, redact] of [
+    ["redactPlatform", redactPlatform],
+    ["SecurityPolicy.redactSecrets", redactSecurityPolicy],
+  ] as const) {
+    const out = redact(header);
+    assert.ok(!out.includes(join("dXNlcjpw", "YXNzd29yZA")), `${label} left the basic-auth credential: ${out}`);
+    assert.match(out, /Authorization:\s*\[REDACTED\]/, `${label} should keep the header name: ${out}`);
+
+    const bearer = redact(proxy);
+    assert.ok(!bearer.includes(join("abcdefghijkl", "mnopqrstuvwxyz")), `${label} left the bearer credential`);
+    assert.match(bearer, /Proxy-Authorization:\s*\[REDACTED\]/);
+  }
+});
+
+/** Redaction must be stable under a second pass — scrubbed text re-enters logs. */
+test("redaction is idempotent", () => {
+  const header = join("Authorization: ", "Basic ", "dXNlcjpw", "YXNzd29yZA==");
+  const once = redactPlatform(header);
+  assert.equal(redactPlatform(once), once);
 });

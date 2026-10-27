@@ -71,6 +71,18 @@ export const SECRET_RULES: Array<{ kind: SecretKind; pattern: RegExp; replacemen
   // ── Key-shaped: a name meaning "secret", then a value ────────────────────
   // Bearer auth first, so its token is consumed before the generic rules run.
   { kind: "bearer", pattern: /\b(Bearer\s+)\S+/gi, replacement: `$1${PLACEHOLDER}` },
+  // An auth header carries a scheme before the credential:
+  //   Authorization: Basic dXNlcjpwYXNzd29yZA==
+  // The generic key rules below consume one whitespace-delimited token, which
+  // here is the word "Basic" — that would leave the credential standing on its
+  // own, unattached to any keyword, and no later rule could find it. So the
+  // whole header value is consumed here, scheme included.
+  {
+    kind: "bearer",
+    pattern:
+      /\b(proxy-authorization|authorization)(\s*[:=]\s*)(?:Basic|Bearer|Token|Digest|NTLM|Negotiate|AWS4-HMAC-SHA256)[^\n"']*/gi,
+    replacement: `$1$2${PLACEHOLDER}`,
+  },
   // JSON / YAML: "api_key": "value"  — quoted key, quoted value.
   {
     kind: "generic",

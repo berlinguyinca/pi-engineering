@@ -11,6 +11,28 @@ engineering runtime is available **on demand**.
 pi install /absolute/path/to/pi-engineering-runtime
 ```
 
+### Loading one runtime per session
+
+Pi's tool namespace is global, and it checks name uniqueness **after** an
+extension finishes loading. A second copy of this runtime — the installed
+package plus a checkout passed with `--extension`, or two checkouts — therefore
+cannot be caught from inside the extension: `pi.registerTool()` accepts the
+registration, and the load fails afterwards with
+`Tool "ledger_read" conflicts with <the other path>`.
+
+Load exactly one runtime per session. When developing against a checkout:
+
+```bash
+pi --no-extensions --extension /absolute/path/to/checkout/extensions/index.ts
+```
+
+The error names the copy that lost the race, not a broken install. The copy that
+registered first serves the tools; the other keeps its commands that do not
+collide. Nothing in this package can change that outcome — the tolerance in
+`src/tools/registration.ts` and `src/runtime/host/piBridge.ts` covers hosts that
+reject a name synchronously (a generation handover mid-session), which is the
+case the runtime can actually handle.
+
 ## Running the full workflow
 
 ```bash

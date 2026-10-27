@@ -906,10 +906,10 @@ export default function (pi: ExtensionAPI) {
     });
   }
   // Semantic tools resolved against the runtime for the calling cwd.
-  // Registration is collision-tolerant: tool names are global, and the ordinary
-  // development setup (installed package + a worktree checkout) declares them
-  // twice. The first copy wins; the operator is told which names were skipped
-  // instead of watching the second copy fail to load (src/tools/registration.ts).
+  // Registration is tolerant of a host that rejects a name synchronously (the
+  // generation-handover case). It cannot prevent Pi's own post-load uniqueness
+  // check, which fails the second copy of this runtime from outside the
+  // extension — load one runtime per session (docs/usage.md).
   const registration = registerToolsTolerant(
     pi as Parameters<typeof registerToolsTolerant>[0],
     buildCoreTools(resolveServices, {
