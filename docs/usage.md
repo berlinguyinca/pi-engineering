@@ -584,10 +584,16 @@ The Git hard-link and symlink safety checks remain enabled.
 
 A failed or unverified harvest retains its worker output and reports the worktree
 path and branch. Failed mission workspaces are kept in full, including ignored
-files. Resume refuses dirty, unharvested, or unmerged prior work instead of
-resetting or deleting it. Inspect the named worktree and preserve its changes on
-a recovery branch or integrate them deliberately; only then remove the recovered
-worktree/branch and retry resume. Do not delete the state file or force-remove a
+files. Replanning retains superseded workspaces even if a later plan succeeds,
+and durably records their path, branch, and base before replacing contracts.
+Reissuing a task ID refuses to overwrite an existing branch and instead names
+its recovery location. Generic idle housekeeping leaves planner-worker workspaces
+to their executor or explicit recovery; retained output consumes disk until then.
+Resume refuses dirty, unharvested, or unmerged prior work instead of resetting or
+deleting it. Inspect the named worktree and preserve its changes on a recovery
+branch or integrate them deliberately. Save ignored artifacts separately or
+explicitly commit them to the recovery branch. Then remove both the original
+worktree directory and its branch and retry resume. Do not delete the state file or force-remove a
 worktree merely to clear the recovery fence. Successful completion additionally
 reruns the contract verification commands in the integrated tree before applying
 the result to the checkout. Verification and review must leave that tree at the
@@ -1288,6 +1294,10 @@ role. Custom callers must explicitly name safe retrieval tools they need, such a
 `ledger_read`, `artifact_read`, `repo_search`, `symbol`, and `tests_for`. Nested
 `mission` execution and `ledger_claim` are not implicitly granted to reviewers
 or scouts.
+
+An explicit model-routing refusal stops planner-worker dispatch for every role;
+it cannot silently select the worker's default model. Standalone hosts with no
+routing information can still use their configured worker default.
 
 A named mission wait protects its own condition. It cannot hide a separately
 running worker that has exceeded its meaningful-progress stall threshold.
