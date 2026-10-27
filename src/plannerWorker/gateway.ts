@@ -62,11 +62,24 @@ function bool(v: unknown): boolean | undefined {
   return typeof v === "boolean" ? v : undefined;
 }
 
+/** Refusal metadata is a partial update: omitted fields retain known values. */
+export type CatalogModelUpdate = Pick<CatalogModel, "id"> & Partial<Omit<CatalogModel, "id">>;
+
 /** Parse a `/models` listing, keeping every extended field the gateway offers. */
 export function parseCatalog(payload: unknown): CatalogModel[] {
+  return parseCatalogUpdates(payload).map((model) => ({
+    alias: false,
+    aliases: [],
+    capabilities: [],
+    modalities: [],
+    ...model,
+  }));
+}
+
+function parseCatalogUpdates(payload: unknown): CatalogModelUpdate[] {
   const data = (payload as { data?: unknown } | null)?.data;
   if (!Array.isArray(data)) return [];
-  const out: CatalogModel[] = [];
+  const out: CatalogModelUpdate[] = [];
   for (const raw of data) {
     if (!raw || typeof raw !== "object") continue;
     const row = raw as Record<string, unknown>;
@@ -74,14 +87,16 @@ export function parseCatalog(payload: unknown): CatalogModel[] {
     if (!id) continue;
     const backing = str(row.x_backing_model);
     const contextWindow = num(row.ctx_per_request) ?? num(row.x_context_window) ?? num(row.context_length);
-    const model: CatalogModel = {
-      id,
-      alias: row.x_alias === true || backing !== undefined,
-      aliases: strs(row.x_aliases),
-      capabilities: strs(row.x_capabilities ?? row.capabilities),
-      modalities: strs(row.x_modalities),
-    };
-    if (backing) model.backing = backing;
+    const model: CatalogModelUpdate = { id };
+    if (typeof row.x_alias === "boolean" || backing !== undefined) {
+      model.alias = row.x_alias === true || backing !== undefined;
+    }
+    if ("x_aliases" in row) model.aliases = strs(row.x_aliases);
+    if ("x_capabilities" in row || "capabilities" in row) {
+      model.capabilities = strs(row.x_capabilities ?? row.capabilities);
+    }
+    if ("x_modalities" in row) model.modalities = strs(row.x_modalities);
+    if ("x_backing_model" in row || model.alias === false) model.backing = backing;
     const family = str(row.x_family);
     if (family) model.family = family;
     const sizeClass = str(row.x_size_class);
@@ -393,7 +408,7 @@ export interface AvailabilityError {
   message: string;
   retryAfterMs?: number;
   /** Comparable models the gateway suggests (same shape as `/models` rows). */
-  candidates: CatalogModel[];
+  candidates: CatalogModelUpdate[];
   /** Route or canonical capability query the refusal concerns, when any. */
   route?: string;
   routeGeneration?: number;
@@ -471,7 +486,7 @@ export function parseAvailabilityError(
     status,
     message,
     ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
-    candidates: parseCatalog({ data: rawCandidates }),
+    candidates: parseCatalogUpdates({ data: rawCandidates }),
     ...(route ? { route } : {}),
     ...(routeGeneration !== undefined ? { routeGeneration } : {}),
   };

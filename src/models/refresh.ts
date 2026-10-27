@@ -411,6 +411,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
   const listing = () =>
     fetchGatewayModels({
       baseUrl,
+      providerId: opts.providerId,
       ...(opts.dryRun ? { observeRuntime: false } : {}),
       ...(opts.apiKey ? { apiKey: opts.apiKey } : {}),
       ...(opts.headers ? { headers: opts.headers } : {}),

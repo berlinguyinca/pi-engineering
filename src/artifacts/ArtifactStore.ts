@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, closeSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { constants, type BigIntStats, closeSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { type FileHandle, link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ArtifactMeta } from "../core/types.ts";
@@ -39,6 +39,43 @@ const CANONICAL_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const IMMUTABLE_ID = /^.+-([a-f0-9]{64})-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DIGEST = /^[a-f0-9]{64}$/;
 const LOCK_WAIT_MS = 10_000;
+const PAGE_BUFFER_BYTES = 64 * 1024;
+const MAX_PAGE_INDEXES = 16;
+const MAX_PAGE_CHECKPOINTS = 1024;
+
+interface PageCheckpoint {
+  byteOffset: number;
+  charOffset: number;
+}
+
+interface VerifiedPageIndex {
+  signature: string;
+  sha256: string;
+  checkpoints: PageCheckpoint[];
+}
+
+function fileSignature(stat: BigIntStats): string {
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
+function assertContentFile(stat: BigIntStats, size: number, key: string): void {
+  if (!stat.isFile() || stat.nlink !== 1n)
+    throw integrityError(`artifact content ${key} is not a private regular file`);
+  if (stat.size !== BigInt(size)) throw integrityError(`artifact content size mismatch for ${key}`);
+}
+
+// Do not split a potentially incomplete UTF-8 sequence between independently
+// decoded chunks. Deferring malformed prefixes also preserves Buffer.toString's
+// replacement-character behavior once their following bytes are available.
+function completeUtf8Prefix(bytes: Buffer): number {
+  let lead = bytes.length - 1;
+  while (lead >= Math.max(0, bytes.length - 4) && (bytes[lead]! & 0xc0) === 0x80) lead--;
+  if (lead < 0) return bytes.length;
+  const byte = bytes[lead]!;
+  const length =
+    byte >= 0xc2 && byte <= 0xdf ? 2 : byte >= 0xe0 && byte <= 0xef ? 3 : byte >= 0xf0 && byte <= 0xf4 ? 4 : 1;
+  return bytes.length - lead < length ? lead : bytes.length;
+}
 const LOCK_BOOTSTRAP_BIND_WAIT_MS = 1_000;
 const LOCK_DOMAIN_RECORD = ".artifact-lock-domain.json";
 const LOCK_BOOTSTRAP_RECORD = ".artifact-lock-bootstrap.json";
@@ -165,7 +202,11 @@ function sameLockBootstrapRecord(left: LockBootstrapRecord, right: LockBootstrap
   );
 }
 
-/** Filesystem-backed lazy artifact store (spec §25, AC-010). */
+/**
+ * Filesystem-backed lazy artifact store (spec §25, AC-010).
+ * Startup validates metadata, file sizes, and transaction recovery; content
+ * digests are verified on content access, rather than reading historical blobs.
+ */
 export class ArtifactStore {
   private readonly root: string;
   private readonly rootReal: string;
@@ -173,6 +214,7 @@ export class ArtifactStore {
   private readonly index = new Map<string, Readonly<ArtifactMeta>>();
   private readonly immutableKeys = new Set<string>();
   private lockDomain?: LockDomainRecord;
+  private readonly pageIndexes = new Map<string, VerifiedPageIndex>();
 
   private constructor(root: string, rootReal: string, hooks: ArtifactStoreHooks) {
     this.root = root;
@@ -929,11 +971,11 @@ export class ArtifactStore {
     }
   }
 
-  private async readDurableFromCategory(
+  private async readMetaFromCategory(
     opened: OpenCategory,
     category: string,
     id: string,
-  ): Promise<{ meta: StoredArtifactMeta; content: Buffer } | undefined> {
+  ): Promise<StoredArtifactMeta | undefined> {
     const transactionPath = this.filePath(opened, id, "txn.json");
     if ((await this.regularState(transactionPath, `artifact transaction ${category}/${id}`)) === "regular") {
       throw integrityError(`artifact transaction is incomplete for ${category}/${id}`);
@@ -956,10 +998,111 @@ export class ArtifactStore {
       if (String(error).includes("ARTIFACT INTEGRITY")) throw error;
       throw integrityError(`artifact metadata is corrupt for ${category}/${id}`);
     }
-    const meta = this.validateStoredMeta(parsed, category, id);
-    const content = await this.readFileNoFollow(contentPath, `artifact content ${category}/${id}`);
+    return this.validateStoredMeta(parsed, category, id);
+  }
+
+  private async readDurableFromCategory(
+    opened: OpenCategory,
+    category: string,
+    id: string,
+  ): Promise<{ meta: StoredArtifactMeta; content: Buffer } | undefined> {
+    const meta = await this.readMetaFromCategory(opened, category, id);
+    if (!meta) return undefined;
+    const content = await this.readFileNoFollow(this.filePath(opened, id, "txt"), `artifact content ${category}/${id}`);
     this.validateContent(meta, content, category, id);
     return { meta, content };
+  }
+
+  private async assertUnchangedContent(
+    handle: FileHandle,
+    path: string,
+    signature: string,
+    key: string,
+  ): Promise<void> {
+    const current = await handle.stat({ bigint: true });
+    const named = await lstat(path, { bigint: true });
+    if (
+      !current.isFile() ||
+      current.nlink !== 1n ||
+      fileSignature(current) !== signature ||
+      !named.isFile() ||
+      named.nlink !== 1n ||
+      fileSignature(named) !== signature
+    ) {
+      this.pageIndexes.delete(key);
+      throw integrityError(`artifact content changed during read for ${key}`);
+    }
+  }
+
+  private async pageIndex(
+    handle: FileHandle,
+    meta: StoredArtifactMeta,
+    signature: string,
+    key: string,
+  ): Promise<VerifiedPageIndex> {
+    const cached = this.pageIndexes.get(key);
+    if (cached?.signature === signature && cached.sha256 === meta.sha256) {
+      this.pageIndexes.delete(key);
+      this.pageIndexes.set(key, cached);
+      return cached;
+    }
+    this.pageIndexes.delete(key);
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(PAGE_BUFFER_BYTES);
+    const checkpoints: PageCheckpoint[] = [{ byteOffset: 0, charOffset: 0 }];
+    const stride = Math.max(PAGE_BUFFER_BYTES, Math.ceil(meta.size / MAX_PAGE_CHECKPOINTS));
+    let byteOffset = 0;
+    let charOffset = 0;
+    let pending = Buffer.alloc(0);
+    while (byteOffset < meta.size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, meta.size - byteOffset), byteOffset);
+      if (!bytesRead) throw integrityError(`artifact content size mismatch for ${key}`);
+      const chunk = buffer.subarray(0, bytesRead);
+      hash.update(chunk);
+      byteOffset += bytesRead;
+      const bytes = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      const complete = completeUtf8Prefix(bytes);
+      charOffset += bytes.subarray(0, complete).toString("utf8").length;
+      pending = Buffer.from(bytes.subarray(complete));
+      const decodedBytes = byteOffset - pending.length;
+      if (decodedBytes - checkpoints[checkpoints.length - 1]!.byteOffset >= stride) {
+        checkpoints.push({ byteOffset: decodedBytes, charOffset });
+      }
+    }
+    if (hash.digest("hex") !== meta.sha256) throw integrityError(`artifact content digest mismatch for ${key}`);
+    return { signature, sha256: meta.sha256, checkpoints };
+  }
+
+  private async readIndexedSlice(
+    handle: FileHandle,
+    index: VerifiedPageIndex,
+    size: number,
+    start: number,
+    limit: number,
+  ): Promise<string> {
+    let checkpoint = index.checkpoints[0]!;
+    for (const candidate of index.checkpoints) {
+      if (candidate.charOffset > start) break;
+      checkpoint = candidate;
+    }
+    let byteOffset = checkpoint.byteOffset;
+    let charOffset = checkpoint.charOffset;
+    let pending = Buffer.alloc(0);
+    const buffer = Buffer.allocUnsafe(PAGE_BUFFER_BYTES);
+    let result = "";
+    while (byteOffset < size && charOffset < start + limit) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - byteOffset), byteOffset);
+      if (!bytesRead) throw integrityError("artifact content size changed during ranged read");
+      byteOffset += bytesRead;
+      const chunk = buffer.subarray(0, bytesRead);
+      const bytes = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+      const complete = byteOffset === size ? bytes.length : completeUtf8Prefix(bytes);
+      const decoded = bytes.subarray(0, complete).toString("utf8");
+      pending = Buffer.from(bytes.subarray(complete));
+      result += decoded.slice(Math.max(0, start - charOffset), Math.max(0, start + limit - charOffset));
+      charOffset += decoded.length;
+    }
+    return result;
   }
 
   private async writeAtomic(opened: OpenCategory, name: string, content: string, exclusive = false): Promise<void> {
@@ -1136,12 +1279,18 @@ export class ArtifactStore {
           this.key(entry.name, id);
           if (file.isSymbolicLink()) throw integrityError(`artifact metadata ${entry.name}/${id} is a symlink`);
           await this.backfillLegacyMeta(rescanned, entry.name, id);
-          const durable = await this.readDurableFromCategory(rescanned, entry.name, id);
-          if (!durable) throw integrityError(`artifact metadata disappeared during replay for ${entry.name}/${id}`);
+          const meta = await this.readMetaFromCategory(rescanned, entry.name, id);
+          if (!meta) throw integrityError(`artifact metadata disappeared during replay for ${entry.name}/${id}`);
+          const content = await open(this.filePath(rescanned, id, "txt"), constants.O_RDONLY | constants.O_NOFOLLOW);
+          try {
+            assertContentFile(await content.stat({ bigint: true }), meta.size, this.key(entry.name, id));
+          } finally {
+            await content.close();
+          }
           metadataIds.add(id);
           const key = this.key(entry.name, id);
-          this.index.set(key, publicMeta(durable.meta));
-          if (durable.meta.immutable === true) this.immutableKeys.add(key);
+          this.index.set(key, publicMeta(meta));
+          if (meta.immutable === true) this.immutableKeys.add(key);
         }
         for (const file of current) {
           if (!file.name.endsWith(".txt")) continue;
@@ -1269,11 +1418,39 @@ export class ArtifactStore {
     offset = 0,
     maxChars = 12000,
   ): Promise<{ content: string; nextOffset: number } | undefined> {
-    const content = await this.readContent(category, id);
-    if (content === undefined) return undefined;
-    const start = Math.max(0, offset);
-    const slice = content.slice(start, start + Math.max(1, maxChars));
-    return { content: slice, nextOffset: start + slice.length };
+    const key = this.key(category, id);
+    const opened = await this.openCategory(category, false, "read");
+    if (!opened) return undefined;
+    try {
+      const meta = await this.readMetaFromCategory(opened, category, id);
+      if (!meta) return undefined;
+      const path = this.filePath(opened, id, "txt");
+      const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const stat = await handle.stat({ bigint: true });
+        assertContentFile(stat, meta.size, key);
+        const signature = fileSignature(stat);
+        const index = await this.pageIndex(handle, meta, signature, key);
+        await this.assertUnchangedContent(handle, path, signature, key);
+        const start = Math.max(0, Math.trunc(offset) || 0);
+        const slice = await this.readIndexedSlice(
+          handle,
+          index,
+          meta.size,
+          start,
+          Math.max(1, Math.trunc(maxChars) || 1),
+        );
+        await this.assertUnchangedContent(handle, path, signature, key);
+        this.pageIndexes.delete(key);
+        this.pageIndexes.set(key, index);
+        while (this.pageIndexes.size > MAX_PAGE_INDEXES) this.pageIndexes.delete(this.pageIndexes.keys().next().value!);
+        return { content: slice, nextOffset: start + slice.length };
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      await this.closeCategory(opened);
+    }
   }
 
   async readSliceByUri(

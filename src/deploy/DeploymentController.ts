@@ -69,7 +69,11 @@ export class DeploymentController {
     }
   }
 
-  private async append(type: string, artifact: DeploymentArtifact, detail: Record<string, unknown>): Promise<StoredEvent> {
+  private async append(
+    type: string,
+    artifact: DeploymentArtifact,
+    detail: Record<string, unknown>,
+  ): Promise<StoredEvent> {
     return this.events.append({
       event_id: this.id(),
       timestamp: this.now(),

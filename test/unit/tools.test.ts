@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -79,6 +79,58 @@ test("ledger_claim does not verify a claim citing a fabricated artifact URI (rev
       { cwd: "/tmp" },
     );
     assert.equal(agentClaim.details.status, "open");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ledger_claim validates reopened artifact bytes before promoting recorded evidence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-claim-corrupt-artifact-"));
+  try {
+    const ledger = await Ledger.create(join(dir, "ledger.jsonl"));
+    const root = join(dir, "artifacts");
+    const writer = await ArtifactStore.create(root);
+    const corrupt = await writer.put("verify", "corrupt", "trusted output", "corrupt sample");
+    const valid = await writer.put("verify", "valid", "valid output", "valid sample");
+    // Same-size corruption remains discoverable as metadata after lazy reopen,
+    // but metadata presence must never authenticate its machine evidence.
+    await writeFile(join(root, "verify", "corrupt.txt"), "changed output");
+    const artifacts = await ArtifactStore.create(root);
+    assert.ok(artifacts.getByUri(corrupt.uri));
+    const tools = buildCoreTools(() => ({
+      ledger,
+      artifacts,
+      broker: null,
+      currentWorkItemId: () => null,
+      actor: () => ({ type: "agent" }),
+    }));
+    const execute = tools.find((tool) => tool.name === "ledger_claim")!.execute as unknown as (
+      id: string,
+      params: Record<string, unknown>,
+      signal: undefined,
+      update: undefined,
+      ctx: { cwd: string },
+    ) => Promise<{ details: { id: string; status: string; evidenceResolved: boolean } }>;
+    const rejected = await execute(
+      "corrupt",
+      { kind: "fact", claim: "the output is verified", evidence: corrupt.uri },
+      undefined,
+      undefined,
+      { cwd: dir },
+    );
+    assert.equal(rejected.details.status, "open");
+    assert.equal(rejected.details.evidenceResolved, false);
+    assert.deepEqual(ledger.getEntity(rejected.details.id)?.evidence, []);
+    const accepted = await execute(
+      "valid",
+      { kind: "fact", claim: "valid output captured", evidence: valid.uri },
+      undefined,
+      undefined,
+      { cwd: dir },
+    );
+    assert.equal(accepted.details.status, "verified");
+    assert.equal(accepted.details.evidenceResolved, true);
+    assert.deepEqual(ledger.getEntity(accepted.details.id)?.evidence, [valid.uri]);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

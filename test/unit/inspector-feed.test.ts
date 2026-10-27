@@ -12,8 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { loadHostConfig } from "../../src/runtime/herdr/HostConfig.ts";
 import { ControlPlaneIngest } from "../../src/runtime/herdr/ControlPlaneIngest.ts";
+import { loadHostConfig } from "../../src/runtime/herdr/HostConfig.ts";
 import {
   INSPECTOR_LIMITS,
   type InspectorEvent,
@@ -111,7 +111,11 @@ function toolRun(pi: FakePi, id: string, tool: string, args: any, result: string
 
 // ── central host config wiring ──
 
-function hostHome(values: object | null): { home: string; fetch: typeof fetch; ingest: Array<{ url: string; headers: any; body: any }> } {
+function hostHome(values: object | null): {
+  home: string;
+  fetch: typeof fetch;
+  ingest: Array<{ url: string; headers: any; body: any }>;
+} {
   const home = mkdtempSync(join(tmpdir(), "inspcfg-"));
   mkdirSync(join(home, ".config", "herdr-engineering"), { recursive: true });
   writeFileSync(
@@ -120,7 +124,8 @@ function hostHome(values: object | null): { home: string; fetch: typeof fetch; i
   );
   const ingest: Array<{ url: string; headers: any; body: any }> = [];
   const f = (async (url: string, init: RequestInit) => {
-    if (url.endsWith("/api/v1/fleet/config")) return new Response(JSON.stringify({ revision: "r1", values: values ?? {} }));
+    if (url.endsWith("/api/v1/fleet/config"))
+      return new Response(JSON.stringify({ revision: "r1", values: values ?? {} }));
     if (url.endsWith("/applied")) return new Response("{}");
     ingest.push({ url, headers: init.headers, body: JSON.parse(String(init.body)) });
     return new Response("{}");
@@ -152,11 +157,72 @@ test("config enables the feed with NO env vars; URL and key come from the host c
   handle.dispose();
 });
 
+test("disposing a host-configured inspector stops its periodic runtime reporter", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = hostHome({ inspector: { enabled: true } });
+  const pi = new FakePi();
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+    env: { HERDR_PANE_ID: "disposed-runtime-reporter" },
+  });
+  assert.ok(handle);
+  const reports = () => h.ingest.filter((row) => row.body.entity_type === "session").length;
+  await tick();
+  assert.equal(reports(), 1);
+  t.mock.timers.tick(60_000);
+  await tick();
+  assert.equal(reports(), 2, "periodic reporting is active before disposal");
+  handle.dispose();
+  t.mock.timers.tick(120_000);
+  await tick();
+  assert.equal(reports(), 2, "the returned handle must own and stop its reporter");
+});
+
+test("normal shutdown still emits ended and stops an attached runtime reporter", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = hostHome({ inspector: { enabled: true } });
+  const pi = new FakePi();
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+    env: { HERDR_PANE_ID: "normal-shutdown-runtime-reporter" },
+  });
+  assert.ok(handle);
+  try {
+    pi.fire("session_start", { reason: "startup" });
+    await drain(handle);
+    pi.fire("session_shutdown");
+    await drain(handle);
+    const phases = h.ingest
+      .flatMap((row) => row.body.payload?.events ?? [])
+      .filter((event) => event.kind === "lifecycle")
+      .map((event) => event.phase);
+    assert.deepEqual(phases, ["started", "ended"]);
+    const reports = () => h.ingest.filter((row) => row.body.entity_type === "session").length;
+    const before = reports();
+    t.mock.timers.tick(120_000);
+    await tick();
+    assert.equal(reports(), before);
+  } finally {
+    handle.dispose();
+  }
+});
+
 test("stays off when inspector.enabled is false, absent, or not boolean true", async () => {
-  for (const values of [{ inspector: { enabled: false } }, {}, { inspector: { reasoning: "full" } }, { inspector: { enabled: "true" } }, { inspector: { enabled: 1 } }]) {
+  for (const values of [
+    { inspector: { enabled: false } },
+    {},
+    { inspector: { reasoning: "full" } },
+    { inspector: { enabled: "true" } },
+    { inspector: { enabled: 1 } },
+  ]) {
     const h = hostHome(values);
     const pi = new FakePi();
-    const handle = await attachInspectorFeedFromHost(pi as never, { hostConfig: { home: h.home, fetch: h.fetch }, fetch: h.fetch });
+    const handle = await attachInspectorFeedFromHost(pi as never, {
+      hostConfig: { home: h.home, fetch: h.fetch },
+      fetch: h.fetch,
+    });
     assert.equal(handle, null);
     assert.equal(pi.handlers.size, 0, "no handlers subscribed");
     assert.equal(pi.bus.size, 0);
@@ -183,7 +249,10 @@ test("reasoning comes from inspector.reasoning (off|summary|full, default off)",
 test("agent.api_key is preferred over ingest.api_key for the feed", async () => {
   const h = hostHome({ inspector: { enabled: true }, agent: { api_key: "agent-key" }, ingest: { api_key: "ing-key" } });
   const pi = new FakePi();
-  const handle = await attachInspectorFeedFromHost(pi as never, { hostConfig: { home: h.home, fetch: h.fetch }, fetch: h.fetch });
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+  });
   assert.ok(handle);
   pi.fire("session_start", { reason: "startup" });
   await drain(handle);
@@ -194,7 +263,10 @@ test("agent.api_key is preferred over ingest.api_key for the feed", async () => 
 test("an empty api key in the host config sends NO x-api-key header to ingest", async () => {
   const h = hostHome({ inspector: { enabled: true }, agent: { api_key: "" }, ingest: { api_key: "" } });
   const pi = new FakePi();
-  const handle = await attachInspectorFeedFromHost(pi as never, { hostConfig: { home: h.home, fetch: h.fetch }, fetch: h.fetch });
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+  });
   assert.ok(handle);
   pi.fire("session_start", { reason: "startup" });
   await drain(handle);
@@ -213,12 +285,21 @@ test("legacy env vars have NO effect: PI_INSPECTOR_FEED / HERDR_CP_URL / PI_INSP
     // config disabled -> off despite env
     const off = hostHome({ inspector: { enabled: false } });
     const pi = new FakePi();
-    assert.equal(await attachInspectorFeedFromHost(pi as never, { hostConfig: { home: off.home, fetch: off.fetch }, fetch: off.fetch }), null);
+    assert.equal(
+      await attachInspectorFeedFromHost(pi as never, {
+        hostConfig: { home: off.home, fetch: off.fetch },
+        fetch: off.fetch,
+      }),
+      null,
+    );
     assert.equal(pi.handlers.size, 0);
     // config enabled -> host URL/key/reasoning, never the env ones
     const on = hostHome({ inspector: { enabled: true }, ingest: { api_key: "ing-key" } });
     const pi2 = new FakePi();
-    const handle = await attachInspectorFeedFromHost(pi2 as never, { hostConfig: { home: on.home, fetch: on.fetch }, fetch: on.fetch });
+    const handle = await attachInspectorFeedFromHost(pi2 as never, {
+      hostConfig: { home: on.home, fetch: on.fetch },
+      fetch: on.fetch,
+    });
     assert.ok(handle);
     pi2.fire("session_start", { reason: "startup" });
     await drain(handle);
@@ -270,10 +351,11 @@ test("lifecycle + capabilities + association on start; resumed session is restor
 
   // Same process starting the same id again without resume is a restart, not a fresh start.
   const c = setup({ sessionId: undefined });
-  c.pi.fire("session_start", { reason: "startup" }, CTX);
-  c.pi.fire("session_start", { reason: "reload" }, CTX);
+  const ctx = { ...CTX, sessionManager: { getSessionId: () => "lifecycle-pi-session" } };
+  c.pi.fire("session_start", { reason: "startup" }, ctx);
+  c.pi.fire("session_start", { reason: "reload" }, ctx);
   await drain(c.handle);
-  assert.equal(c.sink.batches[0]?.id, "pi-session-1", "falls back to Pi's session id without HERDR_PANE_ID");
+  assert.equal(c.sink.batches[0]?.id, "lifecycle-pi-session", "falls back to Pi's session id without HERDR_PANE_ID");
   assert.deepEqual(
     c.sink.kind("lifecycle").map((e) => e.phase),
     ["started", "restarted"],

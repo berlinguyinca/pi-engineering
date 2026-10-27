@@ -228,12 +228,21 @@ test("housekeeping is deferred past session_start and a shutdown cancels it befo
     process.getActiveResourcesInfo().filter((r) => r === "Timeout" || r === "PipeWrap" || r === "ChildProcess");
   try {
     extension(pi as never);
-    const before = handles().length;
+    const before = handles();
     for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
     for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     // Past both the first-run delay and several intervals: nothing may fire.
     await new Promise((r) => setTimeout(r, 500));
-    assert.equal(handles().length, before, "no housekeeping timer or git child pipe remains after shutdown");
+    const after = handles();
+    // Unrelated child pipes may finish during shutdown. Compare each resource
+    // kind separately so their disappearance neither fails the check nor hides
+    // a leaked housekeeping timer or child process.
+    for (const kind of ["Timeout", "PipeWrap", "ChildProcess"]) {
+      assert.ok(
+        after.filter((resource) => resource === kind).length <= before.filter((resource) => resource === kind).length,
+        `no housekeeping ${kind} remains after shutdown`,
+      );
+    }
     assert.equal(
       (existsSync(spawnLog) ? readFileSync(spawnLog, "utf8") : "").includes("sweep "),
       false,

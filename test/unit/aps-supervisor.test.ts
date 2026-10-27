@@ -9,8 +9,8 @@ import { test } from "node:test";
 import { ToolCallNormalizer, semanticFingerprint } from "../../src/aps/fingerprint.ts";
 import { AGENT_LOOP_CANDIDATE_EVENT, AgentProgressSupervisor } from "../../src/aps/supervisor.ts";
 import type { AgentAction } from "../../src/aps/types.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { IncidentController } from "../../src/incidents/IncidentController.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { TelemetryNotice } from "../../src/telemetry/sink.ts";
 import { setTelemetrySink } from "../../src/telemetry/sink.ts";
 

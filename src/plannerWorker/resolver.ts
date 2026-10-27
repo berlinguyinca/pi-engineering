@@ -4,12 +4,13 @@
  */
 
 import type { ModelProfile } from "./compatibility.ts";
-import type { CatalogModel } from "./gateway.ts";
+import type { CatalogModel, CatalogModelUpdate } from "./gateway.ts";
 import type { ModelRef } from "./planner.ts";
 import {
   DEFAULT_ROLE_CONFIG,
   type ResolvedRole,
   type RoleConfig,
+  dispatchResolution,
   resolveRole,
   servedIdentity,
   usable,
@@ -21,7 +22,11 @@ export interface RoleResolverOptions {
   config?: Readonly<Record<PlannerWorkerRole, RoleConfig>>;
   catalog?: CatalogModel[];
   loadCatalog?: () => Promise<CatalogModel[]>;
-  fallback?: (role: PlannerWorkerRole, exclude: readonly string[]) => Promise<ModelRef | undefined>;
+  fallback?: (
+    role: PlannerWorkerRole,
+    exclude: readonly string[],
+    requirements: RoleConfig,
+  ) => Promise<ModelRef | undefined>;
   /**
    * The operator's explicit model choice (Pi `/model`), read at every
    * resolution so a switch lands at the next dispatch, replan or review.
@@ -66,16 +71,41 @@ export class RoleResolver {
   }
 
   /** Merge gateway-suggested candidates (availability error metadata). */
-  mergeCandidates(candidates: CatalogModel[]): void {
-    for (const c of candidates) if (!this.models.some((m) => m.id === c.id)) this.models.push(c);
+  mergeCandidates(candidates: CatalogModelUpdate[]): void {
+    for (const candidate of candidates) {
+      const index = this.models.findIndex((m) => m.id === candidate.id);
+      const existing = this.models[index];
+      if (!existing) {
+        this.models.push({ alias: false, aliases: [], capabilities: [], modalities: [], ...candidate });
+      } else this.models[index] = { ...existing, ...candidate };
+    }
   }
 
   async resolve(role: PlannerWorkerRole, avoid: readonly string[] = []): Promise<ResolvedRole | null> {
+    return this.resolveWithPin(role, avoid, this.opts.operatorPin?.());
+  }
+
+  /** Dispatch never falls through a known refusal to the worker's default model. */
+  async resolveForDispatch(role: PlannerWorkerRole, avoid: readonly string[] = []): Promise<ResolvedRole | null> {
     const pin = this.opts.operatorPin?.();
+    const resolved = await this.resolveWithPin(role, avoid, pin);
+    return dispatchResolution(
+      role,
+      resolved,
+      this.models.length === 0 && !this.opts.fallback && this.excluded.size === 0 && !pin,
+    );
+  }
+
+  private async resolveWithPin(
+    role: PlannerWorkerRole,
+    avoid: readonly string[],
+    pin: ModelRef | null | undefined,
+  ): Promise<ResolvedRole | null> {
     if (!pin || this.excluded.has(pin.id)) return this.resolveUnpinned(role, avoid);
     const pinName = `${pin.provider}/${pin.id}`;
     const cfg = this.config[role];
-    const entry = this.models.find((m) => m.id === pin.id);
+    const entry = pin.provider === this.opts.provider ? this.models.find((m) => m.id === pin.id) : undefined;
+    if (entry?.backing && this.excluded.has(entry.backing)) return this.resolveUnpinned(role, avoid);
     // Hard checks only: what the catalogue says the pinned model cannot do.
     const refusal = !entry
       ? null

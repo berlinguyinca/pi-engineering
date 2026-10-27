@@ -18,9 +18,9 @@
  */
 
 import { id } from "../core/ids.ts";
+import type { IncidentController } from "../incidents/IncidentController.ts";
 import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
-import type { IncidentController } from "../incidents/IncidentController.ts";
 import { contextUtilization } from "./context.ts";
 import { ToolCallNormalizer } from "./fingerprint.ts";
 import { ProgressEvaluator } from "./progress.ts";

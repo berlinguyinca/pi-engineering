@@ -120,12 +120,19 @@ for (const mode of ["single", "batch"] as const) {
     try {
       baseline.release();
       await fetchGatewayModels({ baseUrl: baseline.baseUrl });
-      const capacity = observedGatewayCapacity("new");
+      const identity = { baseUrl: baseline.baseUrl, modelId: "new" };
+      const capacity = observedGatewayCapacity(identity);
+      assert.equal(capacity, 7);
       writeFileSync(path, JSON.stringify({ providers: { test: { baseUrl: host.baseUrl, models: [] } } }));
       host.release();
       if (mode === "single") await refreshProviderModels({ modelsPath: path, providerId: "test", dryRun: true });
       else await refreshConfiguredProviders({ modelsPath: path, providerIds: ["test"], dryRun: true });
-      assert.equal(observedGatewayCapacity("new"), capacity);
+      assert.equal(observedGatewayCapacity(identity), capacity);
+      assert.equal(
+        observedGatewayCapacity({ provider: "test", baseUrl: host.baseUrl, modelId: "new" }),
+        undefined,
+        "a preview must not publish its own provider/endpoint capacity",
+      );
       assert.equal(advertisedRequestLimit(host.baseUrl), undefined);
       assert.equal(advertisedRequestLimit(host.baseUrl, "new"), undefined);
     } finally {

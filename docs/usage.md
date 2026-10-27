@@ -432,7 +432,7 @@ A mission whose goal implies more than one deliverable, names several paths, or 
 
 ## Concurrency caps, cooldown scope and stall detection
 
-- Caps follow the gateway: when the `/models` catalogue advertises `active_limit` (or `x_active_limit`, else `slots`), the scheduler's per-role and agent caps and the admission controller's concurrency (less `PI_GATEWAY_RESERVED_SLOTS`) use that capacity. The fixed defaults (2 per role, 4 minus 1 reserved) apply only when the catalogue says nothing. `PI_ENGINEERING_MAX_PER_ROLE`, `PI_ENGINEERING_MAX_AGENTS` and `PI_GATEWAY_MAX_CONCURRENCY` always override.
+- Scheduler caps use catalogue `active_limit` (or `x_active_limit`, else `slots`) only when the backend supplies an authoritative provider/endpoint and model route. Requested model hints and pins are not proof of the eventual route. Unknown routes, including the default production path where routing happens after dispatch, use configured limits; provider-only observations become unknown if that name has described multiple endpoints. Zero capacity blocks automatically limited model tasks, but does not block local process/validation/integration tasks. Explicit `PI_ENGINEERING_MAX_PER_ROLE` and `PI_ENGINEERING_MAX_AGENTS` settings remain authoritative. The separate process-wide admission controller retains its configured concurrency and reserved slot policy, with `PI_GATEWAY_MAX_CONCURRENCY` taking precedence over catalogue-derived capacity.
 - A 429 cools down only the model (or route) it named. It parks the whole process only when the gateway says `scope: "global"` or `"caller"`, or when the refusal names no model.
 - A model turn that streams no first token for `PI_GATEWAY_FIRST_TOKEN_STALL_MS` (default 15 minutes), or then goes `PI_GATEWAY_STREAM_STALL_MS` (default 5 minutes; `0` disables) between tokens, ends as a transient stream failure, so resume and retry accounting apply. A slow turn that keeps streaming never stalls. The 60 minute worker-inactivity watchdog remains for long-running tool commands.
 - The scheduler pass loop is event-driven: it wakes when a task settles and otherwise ticks once a second.
@@ -571,6 +571,35 @@ are kept and are not run again. Missions are bounded by attempts and
 convergence (stall detection), not by wall-clock budgets. Route swaps on
 InferWeave (`/iw/v1/routes/events`) are followed between requests, without a
 restart.
+
+### Git locks and recovery of planner-worker output
+
+Worktree and promotion locks now live in the shared Git common directory's
+`pi-engineering-locks/` metadata directory, outside Git's top-level safety scan.
+Before upgrading mutating runtimes, drain their work and restart **all** older
+processes that can mutate that repository. Mixed old/new mutation is unsupported:
+new runtimes conservatively refuse an already-present legacy lock, but that
+absence check cannot serialize an older process that acquires its old lock later.
+The Git hard-link and symlink safety checks remain enabled.
+
+A failed or unverified harvest retains its worker output and reports the worktree
+path and branch. Failed mission workspaces are kept in full, including ignored
+files. Replanning retains superseded workspaces even if a later plan succeeds,
+and durably records their path, branch, and base before replacing contracts.
+Reissuing a task ID refuses to overwrite an existing branch and instead names
+its recovery location. Generic idle housekeeping leaves planner-worker workspaces
+to their executor or explicit recovery; retained output consumes disk until then.
+Resume refuses dirty, unharvested, or unmerged prior work instead of resetting or
+deleting it. Inspect the named worktree and preserve its changes on a recovery
+branch or integrate them deliberately. Save ignored artifacts separately or
+explicitly commit them to the recovery branch. Then remove both the original
+worktree directory and its branch and retry resume. Do not delete the state file or force-remove a
+worktree merely to clear the recovery fence. Successful completion additionally
+reruns the contract verification commands in the integrated tree before applying
+the result to the checkout. Verification and review must leave that tree at the
+same clean commit; source edits, new untracked files, or a changed HEAD fail
+completion and retain the workspace. Application uses the verified commit ID
+rather than a branch name that could move after verification.
 
 ## Individual commands
 
@@ -1215,6 +1244,69 @@ the SQLite registry is kept on a machine-local runtime directory automatically.
 - `/ledger finding` — open reviewer findings.
 - `/ledger hypothesis` — claims not yet promoted to facts.
 - `/verify` — run verification yourself and see the captured log artifact.
+
+## Risk-aware legacy verification and review
+
+For legacy `/engineer` and tournament candidates, a low risk label enables cheap
+verification only after the runtime reads the candidate's actual Git diff. A
+change consisting entirely of `.md`, `.rst`, or `.adoc` files gets a required
+patch-whitespace check plus any trusted `verify:docs` and `test:docs` scripts.
+Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and `SKILL.md`)
+retain the normal gates. Configuration files such as `requirements.txt` also
+retain normal verification.
+
+For other low-risk changes, the owner may declare `verify:quick` or `test:quick`
+in the trusted checkout's package scripts (`verify:quick` takes precedence).
+Without an owner-declared quick script, the normal profile remains in force.
+Requests that explicitly mention verification, tests, checks, build, or lint keep
+the normal gates; explicit full-suite requests select the full profile. Commands
+are chosen from the trusted owner checkout and run in the candidate worktree.
+Manual `/verify full` continues to request the broader suite.
+
+Legacy independent reviews must return `details.findings` explicitly, including
+an empty array for a clean review. Each finding must have a valid severity, a
+nonempty claim, and an evidence string. A missing or malformed payload is an
+incomplete review, so it cannot authorize promotion. Artifact-backed claims are
+accepted as machine evidence only after content validation, including after
+reopening a store.
+
+## Artifact startup and paged reads
+
+Reopening an artifact store validates metadata, file types, transaction recovery,
+and content sizes without reading every historical blob. Content digests are
+verified on first content access; same-size digest corruption is reported at that
+point rather than at startup. Missing files, size mismatches, invalid paths, and
+unsafe links still fail closed.
+
+The first paged read streams the artifact once to verify its digest and build a
+bounded sparse character index. Subsequent pages read the requested range near a
+checkpoint. The cache retains indexes for at most 16 files, with at most 1,025
+checkpoints each; it does not retain whole decoded blobs. File replacement,
+modification, or metadata digest changes invalidate reuse. Pagination offsets
+remain JavaScript string offsets (UTF-16 code units).
+
+## Worker permissions and recovery isolation
+
+A worker receives the builtin and semantic tools explicitly named in its request
+allowlist, plus its executor-owned terminal result tool. Supplying tools to the
+executor makes them available for selection; it does not grant them to every
+role. Custom callers must explicitly name safe retrieval tools they need, such as
+`ledger_read`, `artifact_read`, `repo_search`, `symbol`, and `tests_for`. Nested
+`mission` execution and `ledger_claim` are not implicitly granted to reviewers
+or scouts.
+
+An explicit model-routing refusal stops planner-worker dispatch for every role;
+it cannot silently select the worker's default model. Standalone hosts with no
+routing information can still use their configured worker default.
+
+A named mission wait protects its own condition. It cannot hide a separately
+running worker that has exceeded its meaningful-progress stall threshold.
+Worker-specific queue/model waits must be recorded on that worker, rather than
+represented only as a mission-level wait. The supervisor still debounces stall
+recovery and preserves existing opt-in deadline policy: this change adds no
+mission wall-clock limit. The observability spec's universal wait-deadline wording
+remains a policy discrepancy; default recovery waits currently end when their
+condition changes or the operator cancels.
 
 ## Real-model smoke tests
 

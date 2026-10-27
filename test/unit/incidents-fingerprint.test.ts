@@ -174,9 +174,15 @@ test("incidents-fingerprint: rejects non-primitive fields and invalid classifica
 
 test("incidents-fingerprint: rejects blank identity fields and oversized compact fields", () => {
   for (const field of ["incident_id", "run_id", "repo", "failure_class", "command", "root_cause"]) {
-    assert.throws(() => toIncidentEventPayload({ ...incident(), [field]: " \t" } as AgentFailureIncident), /must be nonblank/i);
+    assert.throws(
+      () => toIncidentEventPayload({ ...incident(), [field]: " \t" } as AgentFailureIncident),
+      /must be nonblank/i,
+    );
   }
   for (const field of ["reproduction", "command", "root_cause"]) {
-    assert.throws(() => toIncidentEventPayload({ ...incident(), [field]: "x".repeat(2049) } as AgentFailureIncident), /at most/i);
+    assert.throws(
+      () => toIncidentEventPayload({ ...incident(), [field]: "x".repeat(2049) } as AgentFailureIncident),
+      /at most/i,
+    );
   }
 });

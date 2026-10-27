@@ -405,3 +405,50 @@ test("runHousekeeping aborts: a pre-aborted run rejects before touching git, an 
     await fixture.cleanup();
   }
 });
+
+for (const metadata of ["registered", "pruned"] as const) {
+  test(`aged ${metadata} planner-worker recovery output survives housekeeping while ordinary orphans are reclaimed`, async () => {
+    const fixture = await makeFixtureRepo();
+    try {
+      const repo = (await GitRepo.open(fixture.root))!;
+      await writeFile(join(fixture.root, ".gitignore"), "recover.txt\n");
+      await exec("git", ["-C", fixture.root, "add", ".gitignore"]);
+      await exec("git", ["-C", fixture.root, "commit", "-qm", "ignore recovery output"]);
+      const base = await repo.headCommit();
+      const worker = await repo.createWorktree(base, "pi-eng-pw-recovery-blocked");
+      const ordinary = await repo.createWorktree(base, "pi-eng-scratch-orphan");
+      const output = join(worker.path, "recover.txt");
+      await writeFile(output, "ignored worker output remains recoverable\n");
+      const stateDir = join(fixture.root, ".pi-eng", "planner-worker", "recovery");
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(
+        join(stateDir, "state.json"),
+        JSON.stringify({
+          status: "failed",
+          unharvested_worktrees: [worker.path],
+          retired_worktrees: [{ ...worker, base_commit: base }],
+        }),
+      );
+      if (metadata === "pruned") {
+        const admin = (await readFile(join(worker.path, ".git"), "utf8")).trim().replace(/^gitdir:\s*/, "");
+        await rm(admin, { recursive: true });
+        assert.equal(
+          (await repo.listLinkedWorktrees()).some((wt) => wt.path === worker.path),
+          false,
+        );
+      }
+      const report = await sweepWorktrees({ repo, now: () => Date.now() + 48 * HOUR });
+      assert.equal(await readFile(output, "utf8"), "ignored worker output remains recoverable\n");
+      assert.ok(report.kept.some((wt) => wt.path === worker.path && /planner-worker.*recovery/i.test(wt.reason)));
+      assert.deepEqual(
+        report.reclaimed.map((wt) => wt.path),
+        [ordinary.path],
+      );
+      assert.equal(await exists(ordinary.path), false);
+      assert.equal(await repo.resolveCommit(worker.branch), base, "housekeeping leaves the recovery branch untouched");
+      assert.equal(report.failed.length, 0);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+}

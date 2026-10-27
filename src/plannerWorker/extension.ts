@@ -269,11 +269,13 @@ export function registerPlannerWorker(
       operatorPin: currentOperatorPin,
       // A short deadline: the mode decision must not stall /mission.
       loadCatalog: conn ? () => fetchCatalog({ ...conn, timeoutMs: 5_000 }) : async () => [],
-      fallback: async (role, exclude) => {
+      fallback: async (role, exclude, requirements) => {
         router ??= createRoleRouter({ cwd: repoRoot });
         const adapter = await router.catch(() => null);
         return adapter?.route(STATIC_ROUTER_ROLE[role] as RoleName, {
           exclude: exclude.map((id) => ({ provider, id })),
+          minContext: requirements.min_context,
+          extraRequires: requirements.tools === true ? ["tool_calling"] : [],
         });
       },
     });

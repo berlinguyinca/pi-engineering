@@ -10,6 +10,8 @@
  *
  * This module sweeps the runtime's own worktree namespace (and nothing else):
  *
+ *  - Planner-worker worktrees are retained for their executor/recovery owner,
+ *    including unregistered directories whose Git metadata was pruned.
  *  - A worktree whose owning mission is still live (any non-terminal status)
  *    is kept untouched.
  *  - A worktree whose mission is terminal, or whose owner cannot be found and
@@ -242,6 +244,20 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
   const referenced = await repo.durablyReferencedWorktreePaths([...registered.keys()]);
 
   for (const wt of registered.values()) {
+    // Planner-worker retirement/recovery fences live outside candidate records.
+    // Only that executor (on success) or explicit recovery may remove its trees.
+    // The path check also protects output after Git admin metadata is pruned.
+    if (
+      wt.branch?.startsWith("pi-eng-pw-") ||
+      basename(wt.path).startsWith(`${repo.worktreeNamespacePrefix()}pi-eng-pw-`)
+    ) {
+      report.kept.push({
+        path: wt.path,
+        branch: wt.branch,
+        reason: "planner-worker executor or recovery owns removal",
+      });
+      continue;
+    }
     // A durable candidate/cleanup record still names this checkout: the
     // mission's recovery path owns its removal, never the janitor.
     if (referenced.has(wt.path)) {

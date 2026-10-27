@@ -58,6 +58,12 @@ function num(value: unknown): number | undefined {
   return undefined;
 }
 
+function capacityNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" && (typeof value !== "string" || !value.trim())) return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
 function str(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -105,8 +111,8 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
     if (contextWindow === undefined) continue;
     const contextTotal = num(row.ctx_total);
     const state = str(row.x_state) ?? str(row.state);
-    const slots = typeof row.slots === "number" && Number.isFinite(row.slots) ? row.slots : undefined;
-    const activeLimit = num(row.x_active_limit) ?? num(row.active_limit);
+    const slots = capacityNumber(row.slots);
+    const activeLimit = capacityNumber(row.x_active_limit) ?? capacityNumber(row.active_limit);
     const maxRequestBytes = num(row.x_max_request_bytes) ?? num(row.max_request_bytes);
     // Routing facts are kept exactly as advertised: absent stays undefined, never a guess.
     const capabilities = strs(row.x_capabilities ?? row.capabilities);
@@ -139,32 +145,60 @@ export function gatewayCapacity(entries: readonly GatewayModelEntry[]): number |
   let best: number | undefined;
   for (const entry of entries) {
     const n = entry.activeLimit ?? entry.slots;
-    if (n !== undefined && n > 0 && (best === undefined || n > best)) best = n;
+    if (n !== undefined && n >= 0 && (best === undefined || n > best)) best = n;
   }
   return best;
 }
 
-let observedCapacity: number | undefined;
-let observedByModel = new Map<string, number>();
+/** A routed model, never an ambient catalogue maximum. */
+export interface GatewayCapacityIdentity {
+  modelId: string;
+  provider?: string;
+  baseUrl?: string;
+}
+
+const observedCatalogs = new Map<string, Map<string, number>>();
+// null means the provider name has described multiple endpoints in this process.
+// A caller must then supply its actual endpoint instead of selecting the last one.
+const observedProviders = new Map<string, string | null>();
+
+function capacityKey(provider: string | undefined, baseUrl: string): string {
+  return JSON.stringify([provider ?? "", baseUrl.replace(/\/+$/, "")]);
+}
 
 /**
- * Capacity from the most recent catalogue this process fetched (scheduler
- * default): the routed model's own limit when known, else the catalogue maximum.
+ * Capacity for an identified provider/endpoint and model. Unknown routes stay
+ * unknown: another provider's catalogue is not evidence for this model.
  */
-export function observedGatewayCapacity(modelId?: string): number | undefined {
-  return (modelId ? observedByModel.get(modelId) : undefined) ?? observedCapacity;
+export function observedGatewayCapacity(identity?: GatewayCapacityIdentity): number | undefined {
+  if (!identity?.modelId) return undefined;
+  const key = identity.baseUrl
+    ? capacityKey(identity.provider, identity.baseUrl)
+    : identity.provider
+      ? observedProviders.get(identity.provider)
+      : undefined;
+  return key == null ? undefined : observedCatalogs.get(key)?.get(identity.modelId);
 }
 
 /** Total concurrency across the catalogue's concrete (non-alias) models. */
 export function gatewayCapacityTotal(entries: readonly GatewayModelEntry[]): number | undefined {
   let total = 0;
-  for (const entry of entries) if (!entry.alias) total += entry.activeLimit ?? entry.slots ?? 0;
-  return total > 0 ? total : undefined;
+  let known = false;
+  for (const entry of entries) {
+    if (entry.alias) continue;
+    const capacity = entry.activeLimit ?? entry.slots;
+    if (capacity === undefined || capacity < 0) continue;
+    known = true;
+    total += capacity;
+  }
+  return known ? total : undefined;
 }
 
 export interface FetchCatalogOptions {
   /** Provider base URL, e.g. `https://llm.example.com/v1`. */
   baseUrl: string;
+  /** Registry provider identity, when known by the caller. */
+  providerId?: string;
   apiKey?: string;
   headers?: Record<string, string | null>;
   signal?: AbortSignal;
@@ -228,13 +262,20 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
       throw new CatalogFetchError(`gateway returned no usable models from ${base}/models`, res.status);
     }
     if (opts.observeRuntime !== false) {
-      observedCapacity = gatewayCapacity(models);
-      observedByModel = new Map(
-        models.flatMap((m) => {
-          const n = m.activeLimit ?? m.slots;
-          return n !== undefined && n > 0 ? [[m.id, n] as [string, number]] : [];
-        }),
+      const key = capacityKey(opts.providerId, base);
+      observedCatalogs.set(
+        key,
+        new Map(
+          models.flatMap((m) => {
+            const n = m.activeLimit ?? m.slots;
+            return n !== undefined && n >= 0 ? [[m.id, n] as [string, number]] : [];
+          }),
+        ),
       );
+      if (opts.providerId) {
+        const previous = observedProviders.get(opts.providerId);
+        observedProviders.set(opts.providerId, previous === undefined || previous === key ? key : null);
+      }
     }
     return models;
   } catch (err) {

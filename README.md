@@ -87,6 +87,9 @@ the cache. Transient failures pause automatic requests for 60 seconds; rejected
 or forbidden keys pause them for five minutes. `/memory` and `/memory setup`
 remain available during that pause, and changing the host or key retries
 immediately. Explicit commands retain their longer, bounded verification wait.
+Starting another turn does not cancel a pending explicit memory command. A
+completed save/check/search invalidates older automatic lookups; replacing the
+session or connection still fences results from the retired context.
 
 Saving requires a read/write device key. Read-only keys can recall but cannot
 save. Treat saved notes as user-provided reference information, not proof that
@@ -247,6 +250,13 @@ a 30s ask), so the runtime reads the refusal itself:
 Waiting out backpressure is deliberately **separate** from the degeneration
 recovery ladder: a queue timeout is not a degeneration, and must not burn
 attempts lowering reasoning effort or swapping models.
+
+Mission scheduling uses advertised capacity only for an unambiguous selected
+provider/model route. Refreshing another provider cannot change that route's
+limit. If routing has not selected a concrete model yet, or a provider name
+identifies multiple endpoints, scheduling uses configured limits instead of an
+unrelated catalogue maximum. Explicit scheduler limits remain authoritative;
+model-capacity signals do not block local process or validation tasks.
 
 ### Long transient outages: wait for hours, fail only on permanent errors
 

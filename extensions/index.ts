@@ -1336,7 +1336,7 @@ ${RECOVERY_PROMPT}`;
       } catch {
         // Unauthenticated probe; the gateway decides whether that is allowed.
       }
-      provider = new ModelHealthProvider({ baseUrl, ...(apiKey ? { apiKey } : {}) });
+      provider = new ModelHealthProvider({ providerId: model.provider, baseUrl, ...(apiKey ? { apiKey } : {}) });
       healthProviders.set(model.provider, provider);
     }
     await provider.refresh();

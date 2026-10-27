@@ -373,7 +373,11 @@ test("durable metadata binds every record to exact size and digest", async () =>
 
     await store.put("logs", "mutable", "new content", "new");
     await writeFile(mutableMetadataPath, JSON.stringify(mutableMetadata), "utf8");
-    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*(digest|size)/i);
+    // Reopen validates metadata and sizes without loading historical content.
+    // Digest corruption is rejected before the lazy content can be consumed.
+    const reopened = await ArtifactStore.create(root);
+    await assert.rejects(() => reopened.readContentByUri(mutable.uri), /artifact integrity.*digest/i);
+    await assert.rejects(() => reopened.readSliceByUri(mutable.uri), /artifact integrity.*digest/i);
 
     await writeFile(join(root, "logs", "mutable.txt"), "old", "utf8");
     await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*(digest|size)/i);

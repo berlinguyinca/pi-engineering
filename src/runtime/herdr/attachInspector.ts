@@ -36,10 +36,19 @@ export async function attachInspectorWhenReady(
   let seenStart: { event: unknown; ctx: unknown } | undefined;
   const feedStartHandlers: Array<(event: unknown, ctx: unknown) => unknown> = [];
   let attaching = true;
+  const lifetime = new AbortController();
+  const probes: Array<() => void> = [];
   try {
-    pi.on("session_start", ((event: unknown, ctx: unknown) => {
-      if (attaching) seenStart = { event, ctx };
-    }) as never);
+    const on = (pi.on as (name: string, handler: (event: unknown, ctx: unknown) => void) => unknown).bind(pi);
+    const remember = on("session_start", (event, ctx) => {
+      if (attaching && !lifetime.signal.aborted) seenStart = { event, ctx };
+    });
+    if (typeof remember === "function") probes.push(remember as () => void);
+    const shutdown = on("session_shutdown", () => {
+      seenStart = undefined;
+      lifetime.abort();
+    });
+    if (typeof shutdown === "function") probes.push(shutdown as () => void);
     const proxy = new Proxy(pi, {
       get(target, prop, receiver) {
         if (prop === "on") {
@@ -53,9 +62,22 @@ export async function attachInspectorWhenReady(
     });
     const handle = await attachInspectorFeedFromHost(proxy as ExtensionAPI, {
       ...rest,
-      hostConfig: { timeoutMs: 3000, ...hostConfig },
+      signal: lifetime.signal,
+      hostConfig: {
+        timeoutMs: 3000,
+        ...hostConfig,
+        fetch: (input, init) =>
+          (hostConfig?.fetch ?? globalThis.fetch)(input, {
+            ...init,
+            signal: AbortSignal.any([lifetime.signal, ...(init?.signal ? [init.signal] : [])]),
+          }),
+      },
     });
     attaching = false;
+    if (lifetime.signal.aborted) {
+      handle?.dispose();
+      return null;
+    }
     if (handle && seenStart) {
       for (const h of feedStartHandlers) {
         try {
@@ -68,6 +90,7 @@ export async function attachInspectorWhenReady(
     return handle;
   } catch (err) {
     attaching = false;
+    if (lifetime.signal.aborted) return null;
     if (err instanceof HostConfigUnavailable) {
       // HostConfigUnavailable messages never contain the token or values.
       log?.(`[inspector] off: ${err.message}`);
@@ -75,6 +98,15 @@ export async function attachInspectorWhenReady(
       log?.("[inspector] off: could not attach the feed");
     }
     return null;
+  } finally {
+    seenStart = undefined;
+    for (const off of probes) {
+      try {
+        off();
+      } catch {
+        // Unsubscription is optional on Pi hosts, but late work is still fenced.
+      }
+    }
   }
 }
 

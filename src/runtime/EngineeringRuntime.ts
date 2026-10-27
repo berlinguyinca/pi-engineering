@@ -187,9 +187,19 @@ function maxExternalMissions(env: NodeJS.ProcessEnv = process.env): number {
 }
 
 /** Read-only tool allowlist (scout/reviewer/challenger). */
-const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
+const READ_ONLY_TOOLS = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "ledger_read",
+  "artifact_read",
+  "repo_search",
+  "symbol",
+  "tests_for",
+];
 /** Implementation tool allowlist. */
-const IMPLEMENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const IMPLEMENT_TOOLS = [...READ_ONLY_TOOLS, "bash", "edit", "write"];
 /**
  * Roles that may hydrate from SHARED durable memory. Independent reviewer and
  * clean-room challenger are deliberately excluded (INV-007): they must not
@@ -2739,7 +2749,7 @@ export class EngineeringRuntime {
     // A captured observation can support a hypothesis without proving its
     // interpretation. Worker prose never auto-verifies a hypothesis (INV-006).
     for (const claim of run.result.claims) {
-      const machine = hasRecordedEvidence(claim.evidence, this);
+      const machine = await hasRecordedEvidence(claim.evidence, this);
       await this.ledger.recordEntity("hypothesis", claim.claim, "open", this.actor(runId, role), opts.wi.id, {
         evidence: machine ? [claim.evidence!] : [],
       });
@@ -3010,7 +3020,25 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     // set "test": "true") and neutralize the very gate that is supposed to
     // certify it (INV-003/005 integrity). Stages still RUN in the candidate
     // worktree so they exercise the candidate's actual code.
-    const profile = await this.verifier.detect(this.cwd);
+    // Risk labels alone are insufficient: confirm the actual changed paths
+    // before selecting cheap checks. Code/config changes retain normal gates
+    // unless the trusted project explicitly declares a quick profile.
+    const explicitChecks = /\b(?:tests?|testing|verify|verification|checks?|suite|build|lint|typecheck)\b/i.test(
+      wi.goal,
+    );
+    const explicitFull =
+      explicitChecks &&
+      /\b(?:full|all|complete|entire|whole)\b[\s\S]*\b(?:tests?|verification|checks?|suite)\b|\b(?:tests?|verification|checks?|suite)\b[\s\S]*\b(?:full|all|complete|entire|whole)\b|\b(?:test:(?:full|all)|verify\s+full)\b/i.test(
+        wi.goal,
+      );
+    const changedFiles =
+      wi.risk === "low" && !explicitChecks && this.git && worktreePath
+        ? await this.git.changedFiles(candidate.base_commit, await this.git.headCommitIn(runCwd))
+        : undefined;
+    const profile = await this.verifier.detect(this.cwd, {
+      ...(explicitFull ? { full: true } : {}),
+      ...(changedFiles ? { risk: wi.risk, changedFiles, baseCommit: candidate.base_commit } : {}),
+    });
     const outcome = await this.verifier.run(runCwd, profile, this.artifacts, { quarantine: this.testQuarantine });
     const actor = this.actor(newRunId(), "reviewer");
     this.telemetry.verifyStages += outcome.stages.length;
@@ -3091,34 +3119,55 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
       // review (distinct from the implementer's, and per-candidate).
       sessionScope: candidate.id,
     });
-    // Findings come from the explicit details.findings contract; anything else
-    // is recorded as a (non-blocking) hypothesis so a malformed review never
-    // both invents blocking findings and silently promotes.
-    const completed = run.result.status === "completed";
+    // A completed worker is not necessarily a completed review. Validate the
+    // entire role-specific payload before recording anything: dropping one
+    // malformed finding could turn a reported defect into a clean approval.
+    const details = run.result.details;
+    const findings =
+      details !== null && typeof details === "object" && !Array.isArray(details)
+        ? (details as { findings?: unknown }).findings
+        : undefined;
+    const validFindings =
+      Array.isArray(findings) &&
+      findings.every(
+        (f): f is { severity: "info" | "low" | "medium" | "high" | "critical"; claim: string; evidence: string } =>
+          f !== null &&
+          typeof f === "object" &&
+          !Array.isArray(f) &&
+          ["info", "low", "medium", "high", "critical"].includes(f.severity) &&
+          typeof f.claim === "string" &&
+          f.claim.trim().length > 0 &&
+          typeof f.evidence === "string",
+      );
+    const completed = run.result.status === "completed" && validFindings;
     const findingIds: string[] = [];
-    // Only a COMPLETED review contributes findings. A review that timed out or
-    // hit the context budget returns a fallback failed result with empty
-    // details; treating that as a clean review would silently promote a
-    // candidate that was never independently reviewed (INV-007), so we surface
-    // `completed: false` and let the caller gate promotion on it.
-    const details = completed
-      ? (run.result.details as { findings?: Array<{ severity?: string; claim?: string; evidence?: string }> })
-      : {};
-    for (const f of details?.findings ?? []) {
-      if (!f.claim) continue;
-      const entity = await this.ledger.recordEntity("finding", f.claim, "open", this.actor(runId, "reviewer"), wi.id, {
-        severity: (f.severity as never) ?? "medium",
-        evidence: f.evidence ? [f.evidence] : [],
-        candidateId: candidate.id,
-      });
-      findingIds.push(entity.id);
+    if (completed) {
+      for (const f of findings) {
+        const entity = await this.ledger.recordEntity(
+          "finding",
+          f.claim,
+          "open",
+          this.actor(runId, "reviewer"),
+          wi.id,
+          {
+            severity: f.severity,
+            evidence: f.evidence ? [f.evidence] : [],
+            candidateId: candidate.id,
+          },
+        );
+        findingIds.push(entity.id);
+      }
     }
     for (const c of run.result.claims) {
       await this.ledger.recordEntity("hypothesis", c.claim, "open", this.actor(runId, "reviewer"), wi.id, {
-        evidence: hasRecordedEvidence(c.evidence, this) ? [c.evidence] : [],
+        evidence: (await hasRecordedEvidence(c.evidence, this)) ? [c.evidence] : [],
       });
     }
-    return { summary: run.result.summary, findingIds, completed };
+    const summary =
+      run.result.status === "completed" && !validFindings
+        ? `Invalid review findings: expected details.findings with severity, nonempty claim, and evidence strings. ${run.result.summary}`
+        : run.result.summary;
+    return { summary, findingIds, completed };
   }
 
   /**
