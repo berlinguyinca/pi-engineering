@@ -1,6 +1,6 @@
 /**
  * Actual LLM handoff proof against an operator-provisioned EPHEMERAL agentDir.
- * Usage: node --import ./test/support/isolatedState.ts scripts/evidence/c1-request-handoff-evidence.ts <agentDir> <provider> <big-id> <small-id>
+ * Usage: node --import ./test/support/isolatedState.ts scripts/evidence/c1-request-handoff-evidence.ts <agentDir> <provider> <big-id> <small-id> [small-provider]
  * Never point this at a live user's agentDir. All session/project state is temporary.
  * The supplied models/auth files are read by Pi; this script does not copy or log credentials.
  */
@@ -17,13 +17,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { registerPlannerWorker } from "../../src/plannerWorker/extension.ts";
 
-const [suppliedDir, provider, bigId, smallId] = process.argv.slice(2);
+const [suppliedDir, provider, bigId, smallId, suppliedSmallProvider] = process.argv.slice(2);
 if (!suppliedDir || !provider || !bigId || !smallId) {
   throw new Error("Expected ephemeral agentDir, provider, big model id and small model id");
 }
+const smallProvider = suppliedSmallProvider ?? provider;
 const agentDir = resolve(suppliedDir);
 const root = await mkdtemp(join(tmpdir(), "c1-request-proof-"));
 let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+let deadline: ReturnType<typeof setTimeout> | undefined;
 try {
   const runtime = await ModelRuntime.create({
     authPath: join(agentDir, "auth.json"),
@@ -32,7 +34,7 @@ try {
     refreshOnCreate: false,
   });
   const big = runtime.getModel(provider, bigId);
-  const small = runtime.getModel(provider, smallId);
+  const small = runtime.getModel(smallProvider, smallId);
   assert.ok(big && small, "both supplied models must exist in the ephemeral registry");
   assert.ok(big.contextWindow > small.contextWindow, "proof requires a smaller successor window");
   const settingsManager = SettingsManager.inMemory({ retry: { enabled: false } });
@@ -85,13 +87,21 @@ try {
     settingsManager,
     sessionManager: manager,
     tools: ["read"],
+    thinkingLevel: "off",
   }));
   const errors: string[] = [];
   await session.bindExtensions({ onError: (error) => errors.push(error.error) });
   const before = session.getContextUsage()?.tokens ?? 0;
   assert.ok(before > small.contextWindow, "seeded context must exceed the successor window");
-  await session.setModel(small);
+  // Pi's supported Model.maxTokens controls the default stream output ceiling.
+  // Keep the catalogue entry unchanged; only this proof session gets the cap.
+  await session.setModel({ ...small, maxTokens: 64 });
+  session.setThinkingLevel("off");
+  deadline = setTimeout(() => {
+    void session?.abort();
+  }, 60_000);
   await session.prompt("Continue the handed-off task. Reply briefly without using tools.");
+  clearTimeout(deadline);
   assert.deepEqual(errors, []);
   const last = session.agent.state.messages.at(-1);
   assert.equal(last?.role, "assistant");
@@ -103,6 +113,9 @@ try {
     JSON.stringify({
       provider,
       big: bigId,
+      smallProvider,
+      outputLimit: 64,
+      thinking: "off",
       small: smallId,
       beforeTokens: before,
       contextWindow: small.contextWindow,
@@ -113,6 +126,7 @@ try {
     }),
   );
 } finally {
+  clearTimeout(deadline);
   session?.dispose();
   await rm(root, { recursive: true, force: true });
 }

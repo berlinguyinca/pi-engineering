@@ -36,8 +36,11 @@ For an actual LLM proof, provision an isolated temporary agent directory with
 models.json/auth.json and run:
 
 ```sh
-node --import ./test/support/isolatedState.ts scripts/evidence/c1-request-handoff-evidence.ts <ephemeral-agentDir> <provider> <big-model-id> <small-model-id>
+node --import ./test/support/isolatedState.ts scripts/evidence/c1-request-handoff-evidence.ts <ephemeral-agentDir> <provider> <big-model-id> <small-model-id> [small-provider]
 ```
+
+The optional successor provider defaults to the first provider. The request uses
+a 64-token output ceiling, thinking disabled, and a 60-second abort deadline.
 
 This creates temporary project/session state, checks the serialized provider
 payload and actual successful response, prints only bounded evidence, and removes
