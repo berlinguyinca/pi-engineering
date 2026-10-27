@@ -3028,7 +3028,7 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     );
     const explicitFull =
       explicitChecks &&
-      /\b(?:full|all|complete|entire|whole)\b[\s\S]*\b(?:tests?|verification|checks?|suite)\b|\b(?:test:(?:full|all)|verify\s+full)\b/i.test(
+      /\b(?:full|all|complete|entire|whole)\b[\s\S]*\b(?:tests?|verification|checks?|suite)\b|\b(?:tests?|verification|checks?|suite)\b[\s\S]*\b(?:full|all|complete|entire|whole)\b|\b(?:test:(?:full|all)|verify\s+full)\b/i.test(
         wi.goal,
       );
     const changedFiles =

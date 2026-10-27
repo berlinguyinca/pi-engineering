@@ -107,3 +107,39 @@ test("documentation checks declared by the trusted project remain required", asy
     await fixture.cleanup();
   }
 });
+
+for (const request of ["run tests in full", "run the test suite in full"]) {
+  test(`explicit ${request} retains the trusted full-suite gate`, async () => {
+    const fixture = await makeFixtureRepo();
+    try {
+      await writeFile(
+        join(fixture.root, "package.json"),
+        JSON.stringify({
+          type: "module",
+          scripts: {
+            test: 'node -e "process.exit(0)"',
+            lint: 'node -e "process.exit(0)"',
+            "test:full": 'node -e "process.exit(1)"',
+          },
+        }),
+      );
+      const worker = new FakeWorkerExecutor({
+        implementer: async (req) => {
+          await writeFile(join(req.cwd, "README.md"), "Corrected spelling\n");
+          return { status: "completed", summary: "edited docs" };
+        },
+        reviewer: () => ({ status: "completed", summary: "reviewed", details: { findings: [] } }),
+      });
+      const rt = await EngineeringRuntime.open({ cwd: fixture.root, worker });
+      const report = await rt.engineer(`Fix README typo and ${request}`);
+      assert.equal(report.outcome, "failed", "a passing default test must not bypass a failing requested full suite");
+      assert.equal(report.verification?.failedStage, "test:full");
+      assert.deepEqual(
+        report.verification?.stages.map((s) => s.stage.name),
+        ["test", "lint", "test:full"],
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+}
