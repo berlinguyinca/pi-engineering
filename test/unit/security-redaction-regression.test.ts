@@ -212,6 +212,19 @@ for (const m of MODULES) {
     );
   });
 
+  test(`redact-regression[${m.name}] consumes punctuation inside unquoted secrets`, () => {
+    for (const input of [
+      "password=alpha{bravo}charlie",
+      "password=alpha,bravo",
+      "password=alpha;bravo",
+      "password=alpha[bravo]charlie",
+      'password=alpha"bravo"charlie',
+    ])
+      assert.equal(m.redact(input), "password=[REDACTED]");
+    assert.equal(m.redact("password=alpha,bravo; status=ok"), "password=[REDACTED]; status=ok");
+    assert.equal(m.redact("password=alpha{bravo}charlie,status=ok"), "password=[REDACTED],status=ok");
+  });
+
   test(`redact-regression[${m.name}] handles case, quotes, multiline and repeated secrets`, () => {
     const input =
       "start\nExPoRt OPENAI_API_KEY='first secret value'\n" +

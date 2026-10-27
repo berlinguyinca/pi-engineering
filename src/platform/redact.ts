@@ -51,11 +51,12 @@ const RULES: Array<{ pattern: RegExp; replacement: string }> = [
 ];
 
 // A quoted assignment is consumed in one pass, including escaped quotes.
-// The unquoted alternative stops at delimiters instead of eating JSON syntax
-// or adjacent prose. Cross a newline only for an explicitly quoted value.
+// Bare values may contain punctuation. Only treat a comma or semicolon as a
+// separator before whitespace, the end of input, or another field assignment.
+// Quoted values preserve JSON syntax. Cross a newline only for a quoted value.
 const SECRET_NAME = String.raw`(?:key|[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|private[_-]?key|[_-]key|secret|password|passwd|token|credential|authorization))`;
 const ASSIGNMENT = new RegExp(
-  String.raw`(?<![A-Za-z0-9_.-])(["']${SECRET_NAME}["']|${SECRET_NAME})([ \t]*[:=][ \t]*(?:\r?\n[ \t]*(?=["']))?)((?:Bearer|Basic)[ \t]+(?:[A-Za-z0-9._~+/=-]+|\[REDACTED\])|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;{}\[\]]+)`,
+  String.raw`(?<![A-Za-z0-9_.-])(["']${SECRET_NAME}["']|${SECRET_NAME})([ \t]*[:=][ \t]*(?:\r?\n[ \t]*(?=["']))?)((?:Bearer|Basic)[ \t]+(?:[A-Za-z0-9._~+/=-]+|\[REDACTED\])|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?![,;](?:\s|$|["']?[A-Za-z0-9_.-]+["']?[ \t]*[:=]))\S)+)`,
   "gi",
 );
 
