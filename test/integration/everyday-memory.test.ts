@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionCommandContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import extension from "../../extensions/index.ts";
 
 function load(cwd: string) {
@@ -21,6 +21,7 @@ function load(cwd: string) {
   } as unknown as ExtensionAPI);
   const ctx = {
     cwd,
+    sessionManager: SessionManager.inMemory(cwd),
     hasUI: true,
     mode: "rpc",
     ui: {

@@ -14,8 +14,12 @@
  * compact).
  */
 
+import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { type SessionEntry, buildSessionProjection } from "@earendil-works/pi-coding-agent";
+import { isBareContinuation } from "../orchestration/autoInvoke.ts";
 import { planTransition } from "./compatibility.ts";
 import { plannerWorkerDir } from "./config.ts";
 import { type HandoffCommandResult, runHandoff } from "./handoffCommand.ts";
@@ -110,7 +114,7 @@ export type SessionHandoffResult =
 
 /**
  * Build a bounded `HandoffArtifact` for a live session (Unit C1). Reuses B2's
- * `runHandoff`: the latest user message as the mission
+ * `runHandoff`: the latest substantive user request as the mission
  * summary/objective, the latest assistant text as architectural context.
  * Returns `{ok:false}` when there is nothing to hand off (no user message)
  * or the artifact cannot reach `committed`.
@@ -121,7 +125,10 @@ export function buildSessionHandoff(input: {
 }): SessionHandoffResult {
   const last = (role: string): SessionHandoffMessage | undefined =>
     [...input.messages].reverse().find((m) => m.role === role && m.text.trim() !== "");
-  const lastUser = last("user");
+  const lastUser =
+    [...input.messages]
+      .reverse()
+      .find((m) => m.role === "user" && m.text.trim() && !isBareContinuation(m.text.trim())) ?? last("user");
   if (!lastUser) return { ok: false, error: "no user message to hand off" };
   const lastAssistant = last("assistant");
   // Bound the session text that enters the artifact. `summary` is already
@@ -210,6 +217,95 @@ export function messageText(content: unknown): string {
   return "";
 }
 
+/** Durable branch-local projection boundary; custom entries never enter model context. */
+export const SESSION_HANDOFF_ENTRY = "engineering-session-handoff";
+
+/**
+ * Project a bounded handoff into Pi's native per-request context hook. Read the
+ * current branch on every call so reload, fork and session replacement never
+ * reuse a captured context. The transcript stays available for inspection.
+ * Later native compaction supersedes the projection with its own summary.
+ */
+export function projectSessionHandoff(messages: AgentMessage[], branch: SessionEntry[]): AgentMessage[] | undefined {
+  let boundary = -1;
+  for (let i = 0; i < branch.length; i++) {
+    const entry = branch[i];
+    if (entry?.type === "custom" && entry.customType === SESSION_HANDOFF_ENTRY) boundary = i;
+  }
+  if (boundary < 0 || branch.slice(boundary + 1).some((entry) => entry.type === "compaction")) return;
+  const marker = branch[boundary];
+  const data = marker?.type === "custom" ? (marker.data as { rendered?: unknown } | undefined) : undefined;
+  if (typeof data?.rendered !== "string" || !data.rendered) return;
+  const fingerprint = (message: unknown) => createHash("sha256").update(JSON.stringify(message)).digest("hex");
+  const oldMessages = new Map<string, number>();
+  // Resolve edits against the complete branch before selecting hidden entries:
+  // an edit appended after the marker may replace a pre-marker message.
+  const hiddenIds = new Set(branch.slice(0, boundary).map((entry) => entry.id));
+  const hiddenMessages = buildSessionProjection(branch)
+    .entries.filter((entry) => hiddenIds.has(entry.sourceEntry.id))
+    .flatMap((entry) => entry.messages);
+  for (const message of hiddenMessages) {
+    const key = fingerprint(message);
+    oldMessages.set(key, (oldMessages.get(key) ?? 0) + 1);
+  }
+  const remaining = messages.filter((message) => {
+    const key = fingerprint(message);
+    const count = oldMessages.get(key) ?? 0;
+    if (count === 0) return true;
+    oldMessages.set(key, count - 1);
+    return false;
+  });
+  return [
+    { role: "user", content: `Session handoff (earlier transcript retained on disk):\n${data.rendered}`, timestamp: 0 },
+    ...remaining,
+  ];
+}
+
+/** Pre-switch usage cannot justify threshold compaction of the new projection. */
+export function staleHandoffThreshold(reason: string | undefined, branch: SessionEntry[]): boolean {
+  if (reason !== "threshold") return false;
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry?.type === "compaction" || (entry?.type === "message" && entry.message.role === "assistant")) return false;
+    if (entry?.type === "custom" && entry.customType === SESSION_HANDOFF_ENTRY) return true;
+  }
+  return false;
+}
+
+/** Canonical native-compaction input containing no hidden transcript prefix. */
+export function sessionHandoffCompactionBranch(
+  branch: SessionEntry[],
+): { entries: SessionEntry[]; markerId: string; summary: string } | undefined {
+  let boundary = -1;
+  for (let i = 0; i < branch.length; i++) {
+    const entry = branch[i];
+    if (entry?.type === "custom" && entry.customType === SESSION_HANDOFF_ENTRY) boundary = i;
+  }
+  const marker = branch[boundary];
+  if (marker?.type !== "custom" || branch.slice(boundary + 1).some((entry) => entry.type === "compaction")) return;
+  const rendered = (marker.data as { rendered?: unknown } | undefined)?.rendered;
+  if (typeof rendered !== "string" || !rendered) return;
+  // Native preparation recognizes previousSummary and chooses cuts only in the
+  // successor suffix. Reuse the REAL marker id so every returned cutoff is a
+  // valid persisted boundary, never an invented session entry.
+  return {
+    markerId: marker.id,
+    summary: rendered,
+    entries: [
+      {
+        type: "compaction",
+        id: marker.id,
+        parentId: null,
+        timestamp: marker.timestamp,
+        summary: rendered,
+        firstKeptEntryId: marker.id,
+        tokensBefore: 0,
+      },
+      ...branch.slice(boundary + 1),
+    ],
+  };
+}
+
 /**
  * The side-effect surface a model-switch decision needs. `extension.ts`
  * satisfies it with the pi event context; tests satisfy it with counters.
@@ -219,6 +315,8 @@ export interface SessionSwitchEffects {
   recordContext(context: "handoff" | "compact" | "direct", reason: string): void;
   /** Persist the committed handoff artifact (handoff path only). */
   persist(decision: Extract<SessionSwitchDecision, { action: "handoff" }>): Promise<void>;
+  /** Install the durable context boundary before reporting a handoff. */
+  transfer(decision: Extract<SessionSwitchDecision, { action: "handoff" }>): void;
   notify(message: string, level: "info" | "error"): void;
   /** Native compaction — the fallback only; NEVER on the handoff path. */
   compact(options: { customInstructions: string }): void;
@@ -236,6 +334,7 @@ export async function applySessionSwitchDecision(
   effects: SessionSwitchEffects,
 ): Promise<void> {
   if (decision.action === "handoff") {
+    effects.transfer(decision);
     effects.recordContext("handoff", decision.reason);
     await effects.persist(decision);
     effects.notify(`switching to ${nextId} via handoff (${decision.tokenEstimate} tokens); no compaction`, "info");

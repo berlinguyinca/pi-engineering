@@ -16,6 +16,10 @@
  *      switch crossed the boundary via the handoff with no
  *      `ctx.compact()` (selective_compaction never fired).
  *
+ * This historical artifact-only check does not prove request transfer. Use
+ * test/integration/session-handoff-request.test.ts for the deterministic real
+ * transport proof, and c1-request-handoff-evidence.ts for an actual LLM proof.
+ *
  * No LLM calls are made: the provider is a local stub that is never
  * requested; the context pressure comes from real session content, and the
  * context estimate is pi's own `getContextUsage()` over that content.

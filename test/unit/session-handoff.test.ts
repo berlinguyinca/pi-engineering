@@ -13,8 +13,10 @@ import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import {
+  SESSION_HANDOFF_ENTRY,
   type SessionSwitchDecision,
   type SessionSwitchEffects,
   applySessionSwitchDecision,
@@ -22,7 +24,9 @@ import {
   decideSessionSwitch,
   messageText,
   persistSessionHandoff,
+  projectSessionHandoff,
   sessionBranchMessages,
+  sessionHandoffCompactionBranch,
 } from "../../src/plannerWorker/sessionHandoff.ts";
 
 // ── buildSessionHandoff ─────────────────────────────────────────────────────
@@ -172,6 +176,7 @@ function countingEffects(): SessionSwitchEffects & {
     persists: 0,
     compacts: 0,
     notifications: [],
+    transfer: () => {},
     recordContext: (context) => {
       e.contexts.push(context);
     },
@@ -333,4 +338,95 @@ describe("buildSessionHandoff bounds session text", () => {
       assert.ok(ctx.length <= 1_540, `architectural context must be bounded, got ${ctx.length}`);
     }
   });
+});
+
+describe("branch-local handoff projection", () => {
+  it("keeps post-handoff edits to hidden entries outside the request", () => {
+    const manager = SessionManager.inMemory("/tmp");
+    const old = manager.appendMessage({ role: "user", content: "original old context", timestamp: 1 });
+    manager.appendCustomEntry(SESSION_HANDOFF_ENTRY, { rendered: "bounded handoff" });
+    const successor = manager.appendMessage({ role: "user", content: "successor", timestamp: 2 });
+    manager.appendContextEdit(old, { content: "EDITED_OLD_CONTEXT".repeat(5000) });
+    manager.appendContextEdit(successor, { content: "edited successor" });
+    const projected = projectSessionHandoff(manager.buildSessionContext().messages, manager.getBranch());
+    assert.equal(projected?.length, 2);
+    assert.ok(!JSON.stringify(projected).includes("EDITED_OLD_CONTEXT"));
+    assert.match(JSON.stringify(projected), /edited successor/);
+  });
+
+  it("preserves the substantive task when the latest user only says continue", () => {
+    const task = "Implement /ready with HTTP 503 while startup is incomplete.";
+    const built = buildSessionHandoff({
+      sessionId: "s",
+      messages: [
+        { role: "user", text: task },
+        { role: "assistant", text: "I will inspect the source files." },
+        { role: "user", text: "continue" },
+      ],
+    });
+    assert.ok(built.ok);
+    assert.equal(built.artifact.objective, task);
+    assert.equal(built.artifact.mission_summary, task);
+  });
+
+  it("keeps identical later user messages, fresh extension context, and the current branch only", () => {
+    const manager = SessionManager.inMemory("/tmp");
+    const message = { role: "user" as const, content: "repeat this request", timestamp: 1 };
+    const original = manager.appendMessage(message);
+    manager.appendCustomEntry(SESSION_HANDOFF_ENTRY, { rendered: "bounded handoff" });
+    manager.appendMessage(message);
+    const projected = projectSessionHandoff(manager.buildSessionContext().messages, manager.getBranch());
+    assert.equal(projected?.length, 2, "handoff plus the repeated successor request");
+    assert.deepEqual(projected?.[1], message);
+    manager.branch(original);
+    assert.equal(projectSessionHandoff(manager.buildSessionContext().messages, manager.getBranch()), undefined);
+  });
+
+  it("uses native projection to remove earlier summaries and yields to later compaction", () => {
+    const manager = SessionManager.inMemory("/tmp");
+    manager.appendMessage({ role: "user", content: "old", timestamp: 1 });
+    manager.appendCompaction("large old summary", null, 100000);
+    manager.appendCustomEntry(SESSION_HANDOFF_ENTRY, { rendered: "bounded handoff" });
+    manager.appendMessage({ role: "user", content: "new", timestamp: 2 });
+    const projected = projectSessionHandoff(manager.buildSessionContext().messages, manager.getBranch());
+    assert.equal(projected?.length, 2);
+    assert.ok(!JSON.stringify(projected).includes("large old summary"));
+    manager.appendCompaction("successor summary", null, 10000);
+    assert.equal(
+      projectSessionHandoff(manager.buildSessionContext().messages, manager.getBranch()),
+      undefined,
+      "later native compaction supersedes the handoff",
+    );
+  });
+
+  it("does not report a successful transfer if installing the boundary fails", async () => {
+    const built = buildSessionHandoff({ sessionId: "s", messages: sessionMessages });
+    assert.ok(built.ok);
+    const effects = countingEffects();
+    effects.transfer = () => {
+      throw new Error("append failed");
+    };
+    await assert.rejects(
+      applySessionSwitchDecision({ action: "handoff", ...built, reason: "fits" }, "small", effects),
+      /append failed/,
+    );
+    assert.deepEqual(effects.contexts, []);
+    assert.equal(effects.notifications.length, 0);
+  });
+});
+
+it("canonical compaction input and cutoff prune hidden history durably", () => {
+  const manager = SessionManager.inMemory("/tmp");
+  manager.appendMessage({ role: "user", content: "HIDDEN_OLD_CONTEXT", timestamp: 1 });
+  const marker = manager.appendCustomEntry(SESSION_HANDOFF_ENTRY, { rendered: "bounded handoff" });
+  manager.appendMessage({ role: "user", content: "successor user turn", timestamp: 2 });
+  const projected = sessionHandoffCompactionBranch(manager.getBranch());
+  assert.ok(projected);
+  assert.equal(projected.markerId, marker);
+  assert.equal(projected.entries[0]?.type, "compaction");
+  assert.ok(!JSON.stringify(projected.entries).includes("HIDDEN_OLD_CONTEXT"));
+  manager.appendCompaction(projected.summary, projected.markerId, 10000);
+  assert.ok(!JSON.stringify(manager.buildSessionContext().messages).includes("HIDDEN_OLD_CONTEXT"));
+  assert.match(JSON.stringify(manager.buildSessionContext().messages), /successor user turn/);
+  assert.equal(sessionHandoffCompactionBranch(manager.getBranch()), undefined);
 });

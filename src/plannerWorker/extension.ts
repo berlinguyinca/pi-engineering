@@ -19,6 +19,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createRoleRouter } from "../capability/adapter.ts";
 import type { RoleName } from "../capability/roles.ts";
+import { compactSessionHandoff } from "../compaction/autoTune.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workerInactivityMs } from "../orchestration/broker.ts";
 import type { MissionAttentionSnapshot } from "../runtime/herdr/MissionAttentionReporter.ts";
@@ -40,10 +41,13 @@ import { chooseExecutionMode } from "./mode.ts";
 import { RoleResolver } from "./resolver.ts";
 import { STATIC_ROUTER_ROLE } from "./roles.ts";
 import {
+  SESSION_HANDOFF_ENTRY,
   applySessionSwitchDecision,
   decideSessionSwitch,
   persistSessionHandoff,
+  projectSessionHandoff,
   sessionBranchMessages,
+  staleHandoffThreshold,
 } from "./sessionHandoff.ts";
 import { latestState, renderPlan, renderStatus, renderWorkers } from "./status.ts";
 import { TransitionLog } from "./transitions.ts";
@@ -205,6 +209,23 @@ export function registerPlannerWorker(
 
   // Interactive session switches: same transition log, same context-fit check.
   if (typeof pi.on === "function") {
+    pi.on("context", (event, ctx) => {
+      const messages = projectSessionHandoff(event.messages, ctx.sessionManager.getBranch());
+      return messages ? { messages } : undefined;
+    });
+    pi.on("session_before_compact", async (event, ctx) => {
+      if (staleHandoffThreshold(event.reason, event.branchEntries)) return { cancel: true };
+      try {
+        const compaction = await compactSessionHandoff(event, ctx);
+        return compaction ? { compaction } : undefined;
+      } catch (error) {
+        ctx.ui.notify(
+          `Session handoff compaction failed: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+        return { cancel: true };
+      }
+    });
     pi.on("model_select", async (event, ctx) => {
       const next = event.model;
       if (!next) return;
@@ -248,6 +269,7 @@ export function registerPlannerWorker(
             context,
           });
         },
+        transfer: (d) => pi.appendEntry(SESSION_HANDOFF_ENTRY, { rendered: d.rendered }),
         persist: (d) => persistSessionHandoff(repoRoot, d),
         notify: (message, level) => ctx.ui.notify(message, level),
         compact: (options) => ctx.compact(options),

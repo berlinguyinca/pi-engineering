@@ -32,7 +32,9 @@
  *   `prepareCompaction` with the tuned keepRecent/reserve and return Pi's own
  *   `compact()` result, summarized through the session's model registry — the
  *   composed provider, so the gateway wrapper and the thinking-off policy
- *   apply. Any failure falls back to Pi's default compaction (never cancels).
+ *   apply. Ordinary failures fall back to Pi's default compaction. An active
+ *   session handoff uses only its projected branch and cancels on failure,
+ *   because the raw fallback would restore hidden pre-handoff history.
  *
  *   `prepareCompaction` is not exported from the package entry (0.87.1) and
  *   depends on unexported projection helpers, so it is loaded from Pi's own
@@ -47,12 +49,16 @@
 import { pathToFileURL } from "node:url";
 import {
   type CompactionResult,
+  type ExtensionContext,
+  type SessionBeforeCompactEvent,
+  type SessionEntry,
   SettingsManager,
   VERSION,
   compact,
   estimateTokens,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
+import { sessionHandoffCompactionBranch, staleHandoffThreshold } from "../plannerWorker/sessionHandoff.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { summaryInstructions } from "./summaryInstructions.ts";
 
@@ -325,6 +331,7 @@ export interface AutoCompactionContext {
 }
 
 interface BeforeCompactEvent {
+  reason?: string;
   preparation: PreparationLike;
   branchEntries: unknown[];
   customInstructions?: string;
@@ -349,6 +356,53 @@ export interface AutoCompactionOptions {
   enabled?: boolean;
   /** Source of Pi's prepareCompaction; default loadPiPrepareCompaction. */
   loadPrepare?: () => Promise<PrepareCompaction | undefined>;
+}
+
+/**
+ * Compact the active handoff projection, never the hidden raw transcript. The
+ * event cache lets the earlier auto-tuner and later planner handler share one
+ * summary request. Entries and cached results are scoped to this event only.
+ */
+const handoffCompactions = new WeakMap<object, Promise<CompactionResult | undefined>>();
+export function compactSessionHandoff(
+  event: Pick<SessionBeforeCompactEvent, "branchEntries" | "preparation" | "customInstructions" | "signal">,
+  ctx: Pick<ExtensionContext, "model" | "modelRegistry" | "thinkingLevel">,
+  settings = event.preparation.settings,
+  loadPrepare = loadPiPrepareCompaction,
+): Promise<CompactionResult | undefined> {
+  const cached = handoffCompactions.get(event);
+  if (cached) return cached;
+  const active = sessionHandoffCompactionBranch(event.branchEntries);
+  if (!active || !ctx.model) return Promise.resolve(undefined);
+  const run = (async () => {
+    event.signal.throwIfAborted();
+    const prepare = await loadPrepare();
+    event.signal.throwIfAborted();
+    if (!prepare) throw new Error("Cannot safely compact the active session handoff: native preparation unavailable");
+    const preparation = prepare(active.entries, settings);
+    if (!preparation || preparation.firstKeptEntryId === active.markerId) {
+      return {
+        summary: active.summary,
+        firstKeptEntryId: active.markerId,
+        tokensBefore: event.preparation.tokensBefore,
+        details: { sessionHandoff: true },
+      };
+    }
+    const streamFn = ((model: never, context: never, options?: never) =>
+      ctx.modelRegistry.streamSimple(model, context, options)) as never;
+    return compact(
+      preparation as never,
+      ctx.model!,
+      undefined,
+      undefined,
+      event.customInstructions,
+      event.signal,
+      ctx.thinkingLevel,
+      streamFn,
+    );
+  })();
+  handoffCompactions.set(event, run);
+  return run;
 }
 
 /** Turns after a failed tuned compaction before the trigger re-arms. */
@@ -430,6 +484,25 @@ export function registerAutoCompaction(pi: AutoCompactionHost, options: AutoComp
       reserveTokens: effective.reserveTokens,
       keepRecentTokens: effective.keepRecentTokens,
     };
+    const activeHandoff = sessionHandoffCompactionBranch(branchEntries as SessionEntry[]);
+    if (activeHandoff) {
+      const placeholder = fallbackPreparation ?? {
+        firstKeptEntryId: activeHandoff.markerId,
+        settings,
+        tokensBefore: ctx.getContextUsage()?.tokens ?? 0,
+      };
+      return compactSessionHandoff(
+        {
+          branchEntries: branchEntries as SessionEntry[],
+          preparation: placeholder as never,
+          customInstructions,
+          signal: signal ?? new AbortController().signal,
+        },
+        ctx as never,
+        settings,
+        options.loadPrepare ?? loadPiPrepareCompaction,
+      );
+    }
     const prepare = await (options.loadPrepare ?? loadPiPrepareCompaction)();
     let preparation: PreparationLike | undefined;
     if (prepare) {
@@ -573,6 +646,25 @@ export function registerAutoCompaction(pi: AutoCompactionHost, options: AutoComp
     // Every compaction runs here, tuned or not, so each summary is anchored on
     // the latest user request (summaryInstructions). Untuned models keep Pi's
     // own values, so only the instructions differ from Pi's compaction.
+    if (staleHandoffThreshold(event.reason, event.branchEntries as SessionEntry[])) return { cancel: true };
+    if (sessionHandoffCompactionBranch(event.branchEntries as SessionEntry[])) {
+      try {
+        const compaction = await compactSessionHandoff(
+          event as never,
+          ctx as never,
+          { enabled: true, reserveTokens: effective.reserveTokens, keepRecentTokens: effective.keepRecentTokens },
+          options.loadPrepare ?? loadPiPrepareCompaction,
+        );
+        return compaction ? { compaction } : undefined;
+      } catch (error) {
+        emitTelemetry({
+          level: "warning",
+          key: "compaction-handoff:failed",
+          text: `Handoff compaction failed safely: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        return { cancel: true };
+      }
+    }
     try {
       const instructions = summaryInstructions(event.branchEntries, event.customInstructions);
       const tuned =
