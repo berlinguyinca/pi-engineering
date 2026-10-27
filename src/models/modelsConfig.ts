@@ -49,14 +49,24 @@ export function defaultModelsPath(agentDir: string = process.env.PI_AGENT_DIR ??
 
 /** Read the config, or an empty one when absent. Throws only on malformed JSON. */
 export function readModelsConfig(path: string): ModelsConfig {
-  if (!existsSync(path)) return {};
-  const raw = readFileSync(path, "utf8");
-  if (!raw.trim()) return {};
+  return readModelsConfigSnapshot(path).config;
+}
+
+/** Keep the exact source used to plan an asynchronous refresh, including absence. */
+export function readModelsConfigSnapshot(path: string): { config: ModelsConfig; contents: string | null } {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { config: {}, contents: null };
+    throw error;
+  }
+  if (!raw.trim()) return { config: {}, contents: raw };
   const parsed: unknown = JSON.parse(raw);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error(`${path} does not contain a JSON object`);
   }
-  return parsed as ModelsConfig;
+  return { config: parsed as ModelsConfig, contents: raw };
 }
 
 /** The configured model list for a provider, or an empty list. */
@@ -129,7 +139,24 @@ export function writeModelsConfig(
   config: ModelsConfig,
   now: Date = new Date(),
   writer = "unlabelled",
+  expectedContents?: string | null,
 ): WriteResult {
+  const checkSource = () => {
+    if (expectedContents === undefined) return;
+    let contents: string | null;
+    try {
+      contents = readFileSync(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      contents = null;
+    }
+    if (contents !== expectedContents) {
+      throw new Error(
+        `${path} changed while refreshing models; run refresh again. Your configuration was not changed.`,
+      );
+    }
+  };
+  checkSource();
   const existed = existsSync(path);
   const mode = existed ? statSync(path).mode & 0o777 : 0o600;
   const result: WriteResult = {};
@@ -143,6 +170,7 @@ export function writeModelsConfig(
   try {
     writeFileSync(tmp, `${JSON.stringify(config, null, 1)}\n`, { mode: 0o600 });
     chmodSync(tmp, mode);
+    checkSource();
     renameSync(tmp, path);
   } catch (err) {
     // The temporary file holds the API key. Leaving one behind after a failed

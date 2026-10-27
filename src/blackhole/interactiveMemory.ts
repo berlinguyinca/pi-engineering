@@ -11,6 +11,11 @@ import { type OpenVikingEnvConfig, resolveOpenVikingFromEnv } from "./envConfig.
 
 const MEMORY_CONTEXT = "pi-engineering-memory";
 const MAX_CONTEXT = 6000;
+const AUTOMATIC_LOOKUP_MS = 250;
+const RECALL_TTL_MS = 60_000;
+const MAX_CACHED_QUERIES = 32;
+const FAILURE_BACKOFF_MS = 60_000;
+const AUTH_BACKOFF_MS = 5 * 60_000;
 const STOPWORDS = new Set(
   "the and that this what with from can could should please how are was will have has for you your our about into using want need help know remember memory tell some there these those".split(
     " ",
@@ -21,6 +26,7 @@ export interface InteractiveMemoryOptions {
   env?: () => NodeJS.ProcessEnv;
   provider?: (config: OpenVikingEnvConfig) => DurableMemoryProvider;
   setup?: (ctx: ExtensionContext, force?: boolean) => Promise<void>;
+  now?: () => number;
   /**
    * Where headless failure notices are stamped (once per host per day).
    * Default: `<state root>/memory-notices` (PI_ENGINEERING_STATE_DIR,
@@ -108,10 +114,35 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     ((config) =>
       new OpenVikingProvider({ ...config, strict: true, timeoutMs: Math.min(config.providerTimeoutMs, 5000) }));
   const setup = options.setup ?? ((ctx, force) => ensureMemorySetup(ctx, { force }));
+  const now = options.now ?? Date.now;
   let generation = 0;
+  // Explicit refreshes retire automatic work without retiring their command context.
+  let automaticLookupEpoch = 0;
   let recalled = "";
   let activeFingerprint = "";
   let lastFailure = "";
+  let retryAfter = 0;
+  const recalls = new Map<string, { block: { text: string; count: number }; expiresAt: number }>();
+  const clearRecall = () => {
+    automaticLookupEpoch++;
+    recalled = "";
+    recalls.clear();
+  };
+  // Keep automatic hooks bounded even for an injected provider. A late result
+  // has no callback into ctx and cannot inject notes after this turn starts.
+  const automatic = async <T>(work: Promise<T>): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new OpenVikingRequestError("timeout")), AUTOMATIC_LOOKUP_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const fingerprint = (config: OpenVikingEnvConfig) =>
     createHash("sha256").update(`${config.baseUrl}\0${config.token}`).digest("hex");
   const setStatus = (ctx: ExtensionContext, text: string) => {
@@ -143,6 +174,8 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
   const handleError = (ctx: ExtensionContext, error: unknown, explicit = false) => {
     const code = error instanceof OpenVikingRequestError ? error.code : "unreachable";
+    clearRecall();
+    retryAfter = now() + (code === "auth" || code === "forbidden" ? AUTH_BACKOFF_MS : FAILURE_BACKOFF_MS);
     const messages = {
       auth: "key invalid or revoked",
       forbidden: "access denied",
@@ -155,16 +188,18 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
   const reset = () => {
     generation++;
-    recalled = "";
+    clearRecall();
     activeFingerprint = "";
     lastFailure = "";
+    retryAfter = 0;
   };
-  const connection = (ctx: ExtensionContext, explicit = false) => {
+  const connection = (ctx: ExtensionContext, explicit = false, auto = false) => {
     const env = environment();
     const config = resolveOpenVikingFromEnv(env);
     if (!config) {
-      recalled = "";
+      clearRecall();
       activeFingerprint = "";
+      retryAfter = 0;
       setStatus(ctx, "off");
       if (explicit)
         reply(
@@ -183,12 +218,20 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     }
     const identity = fingerprint(config);
     if (identity !== activeFingerprint) {
-      recalled = "";
+      clearRecall();
       activeFingerprint = identity;
+      retryAfter = 0;
+      lastFailure = "";
       generation++;
     }
+    if (auto && now() < retryAfter) return;
     try {
-      return { client: makeProvider(config), identity };
+      return {
+        client: makeProvider(
+          auto ? { ...config, providerTimeoutMs: Math.min(config.providerTimeoutMs, AUTOMATIC_LOOKUP_MS) } : config,
+        ),
+        identity,
+      };
     } catch (error) {
       handleError(ctx, error, explicit);
       return;
@@ -200,14 +243,18 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     return !!config?.token && fingerprint(config) === identity;
   };
   const check = async (ctx: ExtensionContext, explicit: boolean) => {
-    const conn = connection(ctx, explicit);
+    const conn = connection(ctx, explicit, !explicit);
     if (!conn) return;
     const id = generation;
+    const epoch = automaticLookupEpoch;
     setStatus(ctx, "checking");
     try {
-      const records = await conn.client.recallAll();
-      if (!current(id, conn.identity)) return;
+      const request = conn.client.recallAll();
+      const records = await (explicit ? request : automatic(request));
+      if (!current(id, conn.identity) || (!explicit && epoch !== automaticLookupEpoch)) return;
       lastFailure = "";
+      retryAfter = 0;
+      if (explicit) clearRecall();
       setStatus(ctx, `ready · ${records.length} saved`);
       if (explicit)
         reply(
@@ -215,7 +262,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           `Memory connection verified: ${records.length} saved note(s). /remember <text> saves an explicit note; /memory <query> searches.`,
         );
     } catch (error) {
-      if (current(id, conn.identity)) handleError(ctx, error, explicit);
+      if (current(id, conn.identity) && (explicit || epoch === automaticLookupEpoch)) handleError(ctx, error, explicit);
     }
   };
 
@@ -244,7 +291,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       try {
         await conn.client.store(record);
         if (!current(id, conn.identity)) return;
+        clearRecall();
         lastFailure = "";
+        retryAfter = 0;
         setStatus(ctx, "ready · note saved");
         reply(ctx, `Saved private memory ${recordId}.`);
       } catch (error) {
@@ -272,7 +321,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         try {
           await setup(ctx, true);
         } catch (error) {
-          handleError(ctx, error, true);
+          if (id === generation) handleError(ctx, error, true);
         }
         if (id === generation) await check(ctx, true);
         return;
@@ -299,7 +348,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
             .split(/\s+/)
             .filter((term) => term.length >= 2),
         );
+        clearRecall();
         lastFailure = "";
+        retryAfter = 0;
         setStatus(ctx, `ready · ${block.count} matches`);
         reply(ctx, block.text || "Memory connection verified; no matching notes.");
       } catch (error) {
@@ -314,7 +365,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     try {
       await setup(ctx);
     } catch (error) {
-      handleError(ctx, error);
+      if (id === generation) handleError(ctx, error);
     }
     if (id === generation) await check(ctx, false);
   });
@@ -325,24 +376,36 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   pi.on("before_agent_start", async (event, ctx) => {
     generation++;
     recalled = "";
-    const conn = connection(ctx);
+    const conn = connection(ctx, false, true);
     if (!conn) return;
     const id = generation;
+    const epoch = automaticLookupEpoch;
     const terms = queryTokens(event.prompt);
     if (!terms.length) {
       setStatus(ctx, "idle");
       return;
     }
+    const query = terms.join(" ").slice(0, 512);
+    const cached = recalls.get(query);
+    if (cached && cached.expiresAt > now()) {
+      recalled = cached.block.text;
+      setStatus(ctx, `ready · ${cached.block.count} recalled`);
+      return;
+    }
+    recalls.delete(query);
     setStatus(ctx, "checking");
     try {
-      const records = await conn.client.search(terms.join(" ").slice(0, 512));
-      if (!current(id, conn.identity)) return;
+      const records = await automatic(conn.client.search(query));
+      if (!current(id, conn.identity) || epoch !== automaticLookupEpoch) return;
       const block = memoryBlock(records, terms);
+      recalls.set(query, { block, expiresAt: now() + RECALL_TTL_MS });
+      while (recalls.size > MAX_CACHED_QUERIES) recalls.delete(recalls.keys().next().value!);
       recalled = block.text;
       lastFailure = "";
+      retryAfter = 0;
       setStatus(ctx, `ready · ${block.count} recalled`);
     } catch (error) {
-      if (current(id, conn.identity)) handleError(ctx, error);
+      if (current(id, conn.identity) && epoch === automaticLookupEpoch) handleError(ctx, error);
     }
   });
   pi.on("context", (event, ctx) => {

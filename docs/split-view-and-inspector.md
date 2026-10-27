@@ -4,7 +4,7 @@ Two independent, optional, off-by-default features. Core Pi Engineering requires
 
 ## 1. split-view (vendored)
 
-Upstream: https://github.com/Hugo-W/pi-split-view (MIT), vendored unmodified at commit `6b6b98a`
+Upstream: https://github.com/Hugo-W/pi-split-view (MIT), vendored at commit `6b6b98a` with local reliability fixes
 in `extensions/split-view/` (see `extensions/split-view/VENDORED.md` for provenance, audit, update procedure).
 
 **Install**: nothing to do. `package.json` `pi.extensions` lists it after the main entry:
@@ -29,6 +29,11 @@ registers no shortcuts).
 
 `pi --no-split` starts bare even if `ui-panels.json` enables panels. The thinking panel displays
 reasoning text in your local terminal only; it is not sent anywhere.
+
+Response-only mode (`/split-trim-response on`) keeps the newest 200 visible messages;
+the native transcript retains the complete history. Its duplicate response components
+are created only while that mode is active and released when it is disabled. The files
+panel tracks explicit tool paths; it does not guess file paths from shell-command words.
 
 **Conflicts**: none with pi-engineering commands; no shortcuts; no `setFooter`/`setStatus`; widget key `split-view`
 (only used once enabled). Checked by `test/unit/split-view-vendor.test.ts`.

@@ -21,7 +21,7 @@ import {
   type ModelsConfig,
   providerBaseUrl,
   providerModels,
-  readModelsConfig,
+  readModelsConfigSnapshot,
   withProviderModels,
   writeModelsConfig,
 } from "./modelsConfig.ts";
@@ -411,6 +411,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
   const listing = () =>
     fetchGatewayModels({
       baseUrl,
+      ...(opts.dryRun ? { observeRuntime: false } : {}),
       ...(opts.apiKey ? { apiKey: opts.apiKey } : {}),
       ...(opts.headers ? { headers: opts.headers } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
@@ -419,7 +420,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
   opts.onProgress?.({ providerId: opts.providerId, phase: "listing", completed: 0, total: 0, elapsedMs: 0 });
   const advertised = await listing();
   const capacity = gatewayCapacityTotal(advertised);
-  if (capacity !== undefined) sharedAdmissionController().applyGatewayCapacity(capacity);
+  if (capacity !== undefined && !opts.dryRun) sharedAdmissionController().applyGatewayCapacity(capacity);
   const reasoningIds = new Set(existing.filter((model) => model.reasoning === true).map((model) => model.id));
 
   const canProbe = opts.probeModels && api === "openai-completions";
@@ -472,7 +473,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
  * that rewrites an identical file still churns a backup and a mtime for nothing.
  */
 export async function refreshProviderModels(opts: RefreshOptions): Promise<RefreshResult> {
-  const config: ModelsConfig = readModelsConfig(opts.modelsPath);
+  const { config, contents } = readModelsConfigSnapshot(opts.modelsPath);
   const result = await planProviderRefresh(config, opts);
 
   if (!result.plan.dirty || opts.dryRun) {
@@ -486,6 +487,7 @@ export async function refreshProviderModels(opts: RefreshOptions): Promise<Refre
     withProviderModels(config, opts.providerId, result.plan.next),
     (opts.now ?? (() => new Date()))(),
     "model-refresh",
+    contents,
   );
   result.lines.push(`Wrote ${opts.modelsPath}`);
   if (write.backupPath) result.lines.push(`Previous version kept at ${write.backupPath}`);
@@ -504,7 +506,8 @@ export async function refreshConfiguredProviders(
 ): Promise<ConfiguredProviderRefreshResult> {
   // Parse once before entering the per-provider recovery loop. A malformed
   // source file is not a provider failure and must never be replaced.
-  let nextConfig = readModelsConfig(opts.modelsPath);
+  const snapshot = readModelsConfigSnapshot(opts.modelsPath);
+  let nextConfig = snapshot.config;
   const results: ConfiguredProviderRefreshResult["results"] = [];
   const failures: ConfiguredProviderRefreshResult["failures"] = [];
   const lines: string[] = [];
@@ -548,7 +551,13 @@ export async function refreshConfiguredProviders(
   if (!dirty || opts.dryRun) return { results, failures, written: false, lines };
 
   opts.signal?.throwIfAborted();
-  const write = writeModelsConfig(opts.modelsPath, nextConfig, (opts.now ?? (() => new Date()))(), "model-refresh");
+  const write = writeModelsConfig(
+    opts.modelsPath,
+    nextConfig,
+    (opts.now ?? (() => new Date()))(),
+    "model-refresh",
+    snapshot.contents,
+  );
   const commonLines = [`Wrote ${opts.modelsPath}`];
   if (write.backupPath) commonLines.push(`Previous version kept at ${write.backupPath}`);
   commonLines.push("Restart Pi or run /reload for the new models to take effect.");

@@ -260,6 +260,7 @@ function notifyingCtx() {
     notices,
     ctx: {
       ...ctxStub(),
+      reload: async () => {},
       ui: { ...ctxStub().ui, notify: (text: string, level: string) => notices.push({ text, level }) },
     },
   };
@@ -1069,7 +1070,7 @@ test("wiring: /model-refresh reloads after a real write, and not on a dry run", 
 
     await commands.get("model-refresh")?.handler("", withReload);
     assert.equal(reloads, 1);
-    assert.match(notices.at(-1)?.text ?? "", /Reloaded\./);
+    assert.match(notices.at(-1)?.text ?? "", /Configuration saved\. Reloading Pi/);
 
     await commands.get("refresh-models")?.handler("", withReload);
     assert.match(notices.at(-1)?.text ?? "", /now \/model-refresh/);

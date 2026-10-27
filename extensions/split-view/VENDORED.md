@@ -6,10 +6,18 @@
 | Pinned commit | `6b6b98a3166d1d58b26e81c1f31109e829d336e8` (`6b6b98a`) |
 | License | MIT (see `LICENSE`, copied verbatim) |
 | Files | `split-view.ts` (extension), `layout-manager.ts`, `ui-panels-config.ts` (shared modules) |
-| Modifications | **None.** The only difference from upstream is a 2-line provenance comment at the top of each `.ts` file. |
+| Modifications | `split-view.ts` has local reliability/performance patches described below; shared modules retain their upstream implementation. |
 
 `ui-panels-config.ts` is a shared module (it has a no-op default export) and is
 deliberately NOT listed in `package.json` `pi.extensions`; only `split-view.ts` is.
+
+## Local reliability patches (2026-10-26)
+
+- Persisted tool-result content arrays are restored through the same text parser as live results.
+- The response-only document is maintained only while trim mode is enabled. Enabling it lazily rebuilds the newest 200 visible user/assistant messages; disabling it releases those components. The native transcript retains the complete history.
+- Response-only mode retains a maximum of 200 message components during streaming and reconstruction, bounding duplicate redraw work.
+- Shell command words are no longer synchronously probed as filesystem paths: quoting, `cd`, and redirection make that attribution unreliable. Explicit tool path fields remain tracked.
+- Regression coverage is in `test/unit/split-view-reliability.test.ts`; retain these patches when updating the upstream snapshot.
 
 ## Integration
 
@@ -60,8 +68,8 @@ deliberately NOT listed in `package.json` `pi.extensions`; only `split-view.ts` 
    `diff <(tail -n +3 extensions/split-view/split-view.ts) /tmp/sv/split-view.ts`.
 3. Re-audit the diff for: network/exec imports, new `registerShortcut`/input handlers,
    new filesystem writes, new `setFooter`/`setStatus` use.
-4. Copy the files, re-add the header with the new commit hash, update the table above.
-5. Run `npm run typecheck && npm run lint && node --test --test-concurrency=1 test/unit/split-view-vendor.test.ts`.
+4. Copy the files, reapply the local reliability patches, re-add the header with the new commit hash, and update the table above.
+5. Run `npm run typecheck && npm run lint && node --test --test-concurrency=1 test/unit/split-view-vendor.test.ts test/unit/split-view-reliability.test.ts`.
 
 ## Rollback
 

@@ -56,9 +56,9 @@ pi install /absolute/path/to/pi-engineering-runtime
 
 ### Everyday memory
 
-On the first interactive Pi start after installing or updating this extension,
-the setup dialog asks you to confirm or change the Viking connection. Existing
-environment/token-file settings can be kept. Changed credentials are entered
+When no Viking connection is configured, interactive Pi offers a setup dialog.
+An existing connection is preserved across updates; use `/memory setup` to
+change it. Existing environment/token-file settings can be kept. Changed credentials are entered
 in a masked field and verified before they are saved. Settings and private key
 files live under `~/.pi/agent/engineering-memory/` (or the active
 `PI_CODING_AGENT_DIR`), outside the extension checkout. Updates preserve them.
@@ -77,6 +77,16 @@ failure. `/memory` distinguishes a healthy empty store from a rejected key.
 Automatic recall is ephemeral model context, inserted before the current user
 request; it is not copied into the saved transcript. Only `/remember` writes
 notes—normal conversations are not automatically uploaded or promoted.
+
+Automatic startup recall and per-prompt searches wait at most 250 ms, so a slow
+memory service does not hold up the model turn for seconds. A timed-out lookup
+adds no notes to that turn. Successful searches, including empty results, are
+cached for 60 seconds with at most 32 query entries. Saving a note, a successful
+explicit memory check/search, session replacement, or a changed host/key clears
+the cache. Transient failures pause automatic requests for 60 seconds; rejected
+or forbidden keys pause them for five minutes. `/memory` and `/memory setup`
+remain available during that pause, and changing the host or key retries
+immediately. Explicit commands retain their longer, bounded verification wait.
 
 Saving requires a read/write device key. Read-only keys can recall but cannot
 save. Treat saved notes as user-provided reference information, not proof that

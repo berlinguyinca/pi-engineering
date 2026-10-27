@@ -1437,16 +1437,6 @@ ${RECOVERY_PROMPT}`;
     return { written: result.written, lines: result.lines, failed: result.failures.length > 0 };
   }
 
-  /** Pi caches models.json; without a reload a successful write changes nothing in the open session. */
-  async function reloadAfterWrite(ctx: ExtensionCommandContext): Promise<string> {
-    try {
-      await ctx.reload();
-      return "Reloaded.";
-    } catch (err) {
-      return `Reload failed (${err instanceof Error ? err.message : String(err)}); run /reload.`;
-    }
-  }
-
   // ─── /model-refresh: make the configured catalogue match the gateway ─────
   // Model configuration drifts silently and expensively. Measured against a
   // live gateway, a working models.json had one model configured at 1,048,576
@@ -1460,6 +1450,7 @@ ${RECOVERY_PROMPT}`;
     const dryRun = argv.includes("--dry-run");
     let explicitProvider: string | undefined;
     let probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS;
+    let reload = false;
     try {
       for (let i = 0; i < argv.length; i += 1) {
         const arg = argv[i]!;
@@ -1484,7 +1475,8 @@ ${RECOVERY_PROMPT}`;
       });
       const lines = [...out.lines];
       if (name === "refresh-models") lines.push("(/refresh-models is now /model-refresh; the old name still works.)");
-      if (out.written && !dryRun) lines.push(await reloadAfterWrite(ctx));
+      reload = out.written && !dryRun;
+      if (reload) lines.push("Configuration saved. Reloading Pi…");
       ctx.ui.notify(lines.join("\n"), out.failed ? "warning" : "info");
     } catch (err) {
       ctx.ui.notify(
@@ -1495,6 +1487,9 @@ ${RECOVERY_PROMPT}`;
       ctx.ui.setStatus?.("model-refresh", undefined);
       ctx.ui.setWidget?.("model-refresh", undefined);
     }
+    // Reload invalidates ctx even if it fails. All UI work and cleanup must
+    // finish first; let Pi report a reload failure without claiming the save failed.
+    if (reload) await ctx.reload();
   };
   pi.registerCommand("model-refresh", {
     description:
@@ -1517,6 +1512,7 @@ ${RECOVERY_PROMPT}`;
       const check = argv.includes("--check");
       const dryRun = check || argv.includes("--dry-run");
       const skipRefresh = argv.includes("--no-refresh");
+      let written = false;
       try {
         const source = parseSyncSource(readSyncSourceSetting());
         const canonical = parseCanonicalProviders(await fetchCanonicalText(source, ctx.signal));
@@ -1527,7 +1523,6 @@ ${RECOVERY_PROMPT}`;
           (id) => ctx.modelRegistry?.getProviderAuthStatus(id).configured === true,
         );
         const lines = describeProviderSync(plan, dryRun);
-        let written = false;
         if (plan.dirty && !dryRun) {
           const w = writeModelsConfig(defaultModelsPath(), plan.config, new Date(), "model-sync");
           written = true;
@@ -1560,17 +1555,18 @@ ${RECOVERY_PROMPT}`;
             lines.push(`Model refresh failed: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
-        if (written) lines.push(await reloadAfterWrite(ctx));
+        if (written) lines.push("Configuration saved. Reloading Pi…");
         ctx.ui.notify(lines.join("\n"), failed ? "warning" : "info");
       } catch (err) {
         ctx.ui.notify(
-          `model-sync failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
+          `model-sync failed: ${err instanceof Error ? err.message : String(err)}. ${written ? "Provider settings were saved; run /reload to load them." : "Your configuration was not changed."}`,
           "error",
         );
       } finally {
         ctx.ui.setStatus?.("model-refresh", undefined);
         ctx.ui.setWidget?.("model-refresh", undefined);
       }
+      if (written) await ctx.reload();
     },
   });
 

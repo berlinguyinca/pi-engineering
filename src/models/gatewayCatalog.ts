@@ -170,6 +170,8 @@ export interface FetchCatalogOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** False for previews: do not publish scheduling capacity or request-body limits. */
+  observeRuntime?: boolean;
 }
 
 /** The gateway this extension is built around, when nothing else is configured. */
@@ -212,24 +214,28 @@ export async function fetchGatewayModels(opts: FetchCatalogOptions): Promise<Gat
     // The request-body cap, however the gateway chose to advertise it: a
     // response header, a listing-level field, or per model. Recorded for the
     // live-path body guard (src/request/bodyBudget.ts).
-    noteRequestLimitHeader(base, res.headers);
-    // `x_max_request_bytes` is the gateway's extension-field convention (like
-    // `x_context_window`); `max_request_bytes` is accepted as well.
-    const listing = body as { x_max_request_bytes?: unknown; max_request_bytes?: unknown } | null;
-    noteAdvertisedRequestLimit(base, listing?.x_max_request_bytes ?? listing?.max_request_bytes);
-    for (const model of models) {
-      if (model.maxRequestBytes !== undefined) noteAdvertisedRequestLimit(base, model.maxRequestBytes, model.id);
+    if (opts.observeRuntime !== false) {
+      noteRequestLimitHeader(base, res.headers);
+      // `x_max_request_bytes` is the gateway's extension-field convention (like
+      // `x_context_window`); `max_request_bytes` is accepted as well.
+      const listing = body as { x_max_request_bytes?: unknown; max_request_bytes?: unknown } | null;
+      noteAdvertisedRequestLimit(base, listing?.x_max_request_bytes ?? listing?.max_request_bytes);
+      for (const model of models) {
+        if (model.maxRequestBytes !== undefined) noteAdvertisedRequestLimit(base, model.maxRequestBytes, model.id);
+      }
     }
     if (models.length === 0) {
       throw new CatalogFetchError(`gateway returned no usable models from ${base}/models`, res.status);
     }
-    observedCapacity = gatewayCapacity(models);
-    observedByModel = new Map(
-      models.flatMap((m) => {
-        const n = m.activeLimit ?? m.slots;
-        return n !== undefined && n > 0 ? [[m.id, n] as [string, number]] : [];
-      }),
-    );
+    if (opts.observeRuntime !== false) {
+      observedCapacity = gatewayCapacity(models);
+      observedByModel = new Map(
+        models.flatMap((m) => {
+          const n = m.activeLimit ?? m.slots;
+          return n !== undefined && n > 0 ? [[m.id, n] as [string, number]] : [];
+        }),
+      );
+    }
     return models;
   } catch (err) {
     opts.signal?.throwIfAborted();
