@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { test } from "node:test";
 import { AutoSpecIncidentSink } from "../../src/incidents/AutoSpecIncidentSink.ts";
 import type { PublishedIncident } from "../../src/incidents/IncidentController.ts";
 

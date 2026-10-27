@@ -1,6 +1,6 @@
 /** Central fleet config client (src/runtime/herdr/HostConfig.ts). No network: injected fetch, temp home. */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, existsSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -22,7 +22,10 @@ const cachePath = (home: string) => join(home, ".cache", "herdr-engineering", "f
 const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
 const VALUES = { inspector: { enabled: true, reasoning: "summary" }, ingest: { api_key: "ing" } };
 
-interface Call { url: string; init: RequestInit }
+interface Call {
+  url: string;
+  init: RequestInit;
+}
 function fakeFetch(handler: (c: Call) => Response | Promise<Response>, calls: Call[] = []) {
   return {
     calls,
@@ -36,7 +39,9 @@ function fakeFetch(handler: (c: Call) => Response | Promise<Response>, calls: Ca
 
 test("fetch: sends X-Host-Token, never follows redirects, writes 0600 cache in 0700 dir, posts applied", async () => {
   const home = homeWith();
-  const f = fakeFetch((c) => (c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r1", values: VALUES })));
+  const f = fakeFetch((c) =>
+    c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r1", values: VALUES }),
+  );
   const cfg = await loadHostConfig({ home, fetch: f.fetch });
   assert.equal(cfg.source, "fetch");
   assert.equal(cfg.revision, "r1");
@@ -66,13 +71,23 @@ test("a failing applied POST does not fail the load", async () => {
 
 for (const [name, handler] of [
   ["5xx", () => new Response("x", { status: 503 })],
-  ["network error", () => { throw new Error("ECONNREFUSED"); }],
+  [
+    "network error",
+    () => {
+      throw new Error("ECONNREFUSED");
+    },
+  ],
   ["3xx (not followed)", () => new Response(null, { status: 302, headers: { location: "http://evil/" } })],
   ["malformed body", () => new Response("not json", { status: 200 })],
 ] as const) {
   test(`cache fallback on ${name}, source is cache`, async () => {
     const home = homeWith();
-    await loadHostConfig({ home, fetch: fakeFetch((c) => (c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r1", values: VALUES }))).fetch });
+    await loadHostConfig({
+      home,
+      fetch: fakeFetch((c) =>
+        c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r1", values: VALUES }),
+      ).fetch,
+    });
     const cfg = await loadHostConfig({ home, fetch: fakeFetch(handler as any).fetch });
     assert.equal(cfg.source, "cache");
     assert.equal(cfg.revision, "r1");
@@ -84,7 +99,12 @@ for (const [name, handler] of [
 test("unreachable with no cache is unavailable (not revoked) and leaks nothing", async () => {
   const home = homeWith();
   await assert.rejects(
-    loadHostConfig({ home, fetch: fakeFetch(() => { throw new Error(`down ${TOKEN}`); }).fetch }),
+    loadHostConfig({
+      home,
+      fetch: fakeFetch(() => {
+        throw new Error(`down ${TOKEN}`);
+      }).fetch,
+    }),
     (e: any) => e instanceof HostConfigUnavailable && e.revoked === false && !e.message.includes(TOKEN),
   );
 });
@@ -93,22 +113,40 @@ test("a cache for another host_id is ignored", async () => {
   const home = homeWith();
   mkdirSync(join(home, ".cache", "herdr-engineering"), { recursive: true });
   writeFileSync(cachePath(home), JSON.stringify({ host_id: "other", revision: "r", values: VALUES }));
-  await assert.rejects(loadHostConfig({ home, fetch: fakeFetch(() => new Response("", { status: 500 })).fetch }), HostConfigUnavailable);
+  await assert.rejects(
+    loadHostConfig({ home, fetch: fakeFetch(() => new Response("", { status: 500 })).fetch }),
+    HostConfigUnavailable,
+  );
 });
 
 test("401 deletes the cache and fails revoked=true without leaking the token or values", async () => {
   const home = homeWith();
-  await loadHostConfig({ home, fetch: fakeFetch((c) => (c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r1", values: { ingest: { api_key: SECRET_VALUE } } }))).fetch });
+  await loadHostConfig({
+    home,
+    fetch: fakeFetch((c) =>
+      c.url.endsWith("/applied")
+        ? new Response("{}")
+        : ok({ revision: "r1", values: { ingest: { api_key: SECRET_VALUE } } }),
+    ).fetch,
+  });
   assert.ok(existsSync(cachePath(home)));
   await assert.rejects(
     loadHostConfig({ home, fetch: fakeFetch(() => new Response("nope", { status: 401 })).fetch }),
-    (e: any) => e instanceof HostConfigUnavailable && e.revoked === true && !e.message.includes(TOKEN) && !e.message.includes(SECRET_VALUE),
+    (e: any) =>
+      e instanceof HostConfigUnavailable &&
+      e.revoked === true &&
+      !e.message.includes(TOKEN) &&
+      !e.message.includes(SECRET_VALUE),
   );
   assert.equal(existsSync(cachePath(home)), false);
 });
 
 const primeCache = (home: string) =>
-  loadHostConfig({ home, fetch: fakeFetch((c) => (c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r1", values: VALUES }))).fetch });
+  loadHostConfig({
+    home,
+    fetch: fakeFetch((c) => (c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r1", values: VALUES })))
+      .fetch,
+  });
 
 for (const status of [404, 403]) {
   test(`HTTP ${status} with a cache falls back to the cache (source cache) and keeps it`, async () => {
@@ -125,13 +163,21 @@ test("HTTP 404 without a cache is a clear, non-revoked failure", async () => {
   const home = homeWith();
   await assert.rejects(
     loadHostConfig({ home, fetch: fakeFetch(() => new Response("", { status: 404 })).fetch }),
-    (e: any) => e instanceof HostConfigUnavailable && e.revoked === false && /no cached configuration/.test(e.message) && !e.message.includes(TOKEN),
+    (e: any) =>
+      e instanceof HostConfigUnavailable &&
+      e.revoked === false &&
+      /no cached configuration/.test(e.message) &&
+      !e.message.includes(TOKEN),
   );
 });
 
 test("empty apiKey values send no X-API-Key header downstream", async () => {
   const home = homeWith();
-  const f = fakeFetch((c) => (c.url.endsWith("/applied") ? new Response("{}") : ok({ revision: "r", values: { agent: { api_key: "" }, ingest: { api_key: "" } } })));
+  const f = fakeFetch((c) =>
+    c.url.endsWith("/applied")
+      ? new Response("{}")
+      : ok({ revision: "r", values: { agent: { api_key: "" }, ingest: { api_key: "" } } }),
+  );
   const cfg = await loadHostConfig({ home, fetch: f.fetch });
   assert.equal(cfg.apiKey, null);
   for (const c of f.calls) {
@@ -152,18 +198,28 @@ test("array / non-object values are rejected (falls back to cache or unavailable
   const home = homeWith();
   mkdirSync(join(home, ".cache", "herdr-engineering"), { recursive: true });
   writeFileSync(cachePath(home), JSON.stringify({ host_id: "h1", revision: "r", values: [1] }));
-  await assert.rejects(loadHostConfig({ home, fetch: fakeFetch(() => new Response("", { status: 500 })).fetch }), HostConfigUnavailable);
+  await assert.rejects(
+    loadHostConfig({ home, fetch: fakeFetch(() => new Response("", { status: 500 })).fetch }),
+    HostConfigUnavailable,
+  );
 });
 
 test("missing or incomplete host.json is unavailable and names no secret", async () => {
-  await assert.rejects(loadHostConfig({ home: homeWith(null), fetch: fakeFetch(() => ok({})).fetch }), HostConfigUnavailable);
+  await assert.rejects(
+    loadHostConfig({ home: homeWith(null), fetch: fakeFetch(() => ok({})).fetch }),
+    HostConfigUnavailable,
+  );
   const home = homeWith({ control_plane_url: "http://cp", host_id: "h", token: "" });
   await assert.rejects(loadHostConfig({ home, fetch: fakeFetch(() => ok({})).fetch }), /incomplete/);
 });
 
 test("get() returns fallbacks for missing section, key, null and undotted keys", async () => {
   const home = homeWith();
-  const cfg = await loadHostConfig({ home, fetch: fakeFetch(() => ok({ revision: "r", values: { inspector: { enabled: false, nul: null }, ci: { n: 0 } } })).fetch });
+  const cfg = await loadHostConfig({
+    home,
+    fetch: fakeFetch(() => ok({ revision: "r", values: { inspector: { enabled: false, nul: null }, ci: { n: 0 } } }))
+      .fetch,
+  });
   assert.equal(cfg.get("inspector.enabled", true), false, "false is a value, not missing");
   assert.equal(cfg.get("ci.n", 9), 0);
   assert.equal(cfg.get("inspector.nul", "fb"), "fb");
@@ -174,7 +230,8 @@ test("get() returns fallbacks for missing section, key, null and undotted keys",
 });
 
 test("apiKey: agent.api_key wins, then ingest.api_key, else null", async () => {
-  const mk = async (values: object) => (await loadHostConfig({ home: homeWith(), fetch: fakeFetch(() => ok({ revision: "r", values })).fetch })).apiKey;
+  const mk = async (values: object) =>
+    (await loadHostConfig({ home: homeWith(), fetch: fakeFetch(() => ok({ revision: "r", values })).fetch })).apiKey;
   assert.equal(await mk({ agent: { api_key: "a" }, ingest: { api_key: "i" } }), "a");
   assert.equal(await mk({ ingest: { api_key: "i" } }), "i");
   assert.equal(await mk({ agent: { api_key: "" }, ingest: { api_key: "i" } }), "i");
@@ -184,7 +241,9 @@ test("apiKey: agent.api_key wins, then ingest.api_key, else null", async () => {
 test("timeout: a hung control plane falls back instead of hanging", async () => {
   const home = homeWith();
   const hang = (async (_u: string, init: RequestInit) =>
-    new Promise<Response>((_, rej) => init.signal!.addEventListener("abort", () => rej(new Error("aborted"))))) as unknown as typeof fetch;
+    new Promise<Response>((_, rej) =>
+      init.signal!.addEventListener("abort", () => rej(new Error("aborted"))),
+    )) as unknown as typeof fetch;
   const keepAlive = setTimeout(() => {}, 2000); // AbortSignal.timeout is unref'd
   try {
     await assert.rejects(loadHostConfig({ home, fetch: hang, timeoutMs: 30 }), HostConfigUnavailable);

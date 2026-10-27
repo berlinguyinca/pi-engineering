@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { StoredEvent, EventStoreBackend } from "../platform/eventstore/backend.ts";
+import type { EventStoreBackend, StoredEvent } from "../platform/eventstore/backend.ts";
 import { incidentFingerprint, toIncidentEventPayload } from "./fingerprint.ts";
 import type { AgentFailureIncident } from "./types.ts";
 
@@ -25,9 +25,7 @@ export interface IncidentControllerOptions {
 }
 
 function existingByFingerprint(backend: EventStoreBackend, fingerprint: string): StoredEvent | undefined {
-  return backend.all().find(
-    (event) => event.type === "incident.detected" && event.payload.fingerprint === fingerprint,
-  );
+  return backend.all().find((event) => event.type === "incident.detected" && event.payload.fingerprint === fingerprint);
 }
 
 function latestDelivery(backend: EventStoreBackend, incidentEventId: string): StoredEvent | undefined {

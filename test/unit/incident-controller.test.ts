@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { IncidentController } from "../../src/incidents/IncidentController.ts";
 import type { AgentFailureIncident } from "../../src/incidents/types.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 function incident(overrides: Partial<AgentFailureIncident> = {}): AgentFailureIncident {
   return {
