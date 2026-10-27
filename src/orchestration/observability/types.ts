@@ -322,7 +322,7 @@ export interface MissionObservabilityConfig {
 export const DEFAULT_OBSERVABILITY_CONFIG: MissionObservabilityConfig = {
   slowAfterMs: 120_000, // 2m
   stallAfterMs: 300_000, // 5m
-  quietUpdateIntervalMs: 300_000, // 5m
+  quietUpdateIntervalMs: 60_000, // 1m — an operator watching wants a minute; emitUpdate performs no durable write
   activityRetention: 200,
   historyRetention: 500,
   heartbeatSampleMs: 15_000,
