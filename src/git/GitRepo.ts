@@ -1918,14 +1918,7 @@ export class GitRepo {
       };
     }
     guard?.assertAuthoritative();
-    const args = [
-      "-C",
-      worktree.path,
-      "rebase",
-      "--quiet",
-      ...(await this.fallbackIdentityArgs()),
-      ontoSha,
-    ];
+    const args = ["-C", worktree.path, "rebase", "--quiet", ...(await this.fallbackIdentityArgs()), ontoSha];
     const r = await this.git(args);
     if (r.code !== 0) {
       const text = `${r.stderr}\n${r.stdout}`;

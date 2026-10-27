@@ -33,4 +33,8 @@ mkdir "$cluster_dir/socket"
 # Replace, never inherit, TEST_DATABASE_URL. This can only name the owned cluster.
 TEST_DATABASE_URL="postgresql://$(id -un)@localhost:5432/pi_openviking_test?host=$cluster_dir/socket"
 export TEST_DATABASE_URL
-node --test --import ./test/support/isolatedState.ts test/integration/openviking.test.ts
+if test "$#" -gt 0; then
+  "$@"
+else
+  node --test --import ./test/support/isolatedState.ts test/integration/openviking.test.ts
+fi

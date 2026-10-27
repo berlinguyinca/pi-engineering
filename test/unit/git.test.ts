@@ -513,7 +513,11 @@ test("rebaseWorktreeOnto rebases a clean candidate onto a new base and refuses a
       assert.ok(ok.headSha && ok.headSha !== candidate.candidateSha, "a real rebase moves the candidate head");
       // The rebased candidate descends from the new base and keeps its own change.
       assert.equal(await repo.headCommitIn(candidate.path), ok.headSha);
-      assert.equal(await repo.isAncestor(newBase, ok.headSha), true, "rebased candidate descends from the incumbent head");
+      assert.equal(
+        await repo.isAncestor(newBase, ok.headSha),
+        true,
+        "rebased candidate descends from the incumbent head",
+      );
       assert.equal(
         await (await import("node:fs/promises")).readFile(join(candidate.path, "src", "rebased.js"), "utf8"),
         "export const rebased = true;\n",

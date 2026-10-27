@@ -127,7 +127,8 @@ describe("FailureClassifier", () => {
     assert.equal(
       classifier.inferRecognizedCategory({
         missionId: "M",
-        summary: "model development/qwen3.8 has no capacity right now — switched implementer to metabolomics/qwen3.8-27b",
+        summary:
+          "model development/qwen3.8 has no capacity right now — switched implementer to metabolomics/qwen3.8-27b",
       }),
       "PROVIDER_TRANSIENT",
     );
@@ -141,8 +142,10 @@ describe("FailureClassifier", () => {
     // A genuine bad request with no capacity signature is still permanent:
     // the 400 status decides when no backpressure wording is present.
     assert.equal(
-      classifier.classify({ ...baseEvidence("Model gateway refused the request: 400: bad request"), providerStatus: 400 })
-        .category,
+      classifier.classify({
+        ...baseEvidence("Model gateway refused the request: 400: bad request"),
+        providerStatus: 400,
+      }).category,
       "PROVIDER_PERMANENT",
     );
   });
