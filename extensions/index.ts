@@ -4,8 +4,8 @@ import { resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
 import { createIngestFromEnv } from "../src/runtime/herdr/ingestFromEnv.ts";
-import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 import { formatMissionActivity } from "../src/status/missionActivity.ts";
+import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -109,12 +109,12 @@ import {
   startSessionControl,
 } from "../src/sessionControl/SessionControl.ts";
 import { maintenanceHandler } from "../src/sessionControl/runtimeMaintenance.ts";
+import { MissionPresenceController, presenceOptionsFromEnv } from "../src/status/MissionPresenceController.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
-import { WorkingStatusController } from "../src/status/working.ts";
-import { MissionPresenceController, presenceOptionsFromEnv } from "../src/status/MissionPresenceController.ts";
 import { seedPresence } from "../src/status/presenceSeed.ts";
+import { WorkingStatusController } from "../src/status/working.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";

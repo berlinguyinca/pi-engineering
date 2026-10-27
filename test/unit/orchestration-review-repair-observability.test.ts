@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import {
+  recordGateVerdict,
+  recordRepairRound,
+  recordReviewSettlement,
+} from "../../src/orchestration/reviewRepairNotice.ts";
 import type { ReviewEvidence } from "../../src/orchestration/types.ts";
-import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "../../src/orchestration/reviewRepairNotice.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 /**
  * Review, repair and gate failure already happen in the orchestrator; what was
@@ -33,10 +37,7 @@ function harness() {
   return { obs, store, id: mission.mission_id, updates };
 }
 
-function reviewEvidence(
-  missionId: string,
-  over: Partial<ReviewEvidence> = {},
-): ReviewEvidence {
+function reviewEvidence(missionId: string, over: Partial<ReviewEvidence> = {}): ReviewEvidence {
   return {
     evidenceId: "RE-1",
     missionId,
@@ -120,7 +121,10 @@ test("a repair round that produced nothing stays open", () => {
 
 test("a gate that does not pass records its own reasons and is not verified complete", () => {
   const h = harness();
-  recordGateVerdict(h.obs, h.id, { can_complete: false, reasons: ["no current validation evidence", "2 task(s) failed"] });
+  recordGateVerdict(h.obs, h.id, {
+    can_complete: false,
+    reasons: ["no current validation evidence", "2 task(s) failed"],
+  });
 
   const summary = h.obs.summary(h.id);
   assert.notEqual(summary?.progress.verifiedComplete, true);
@@ -131,6 +135,10 @@ test("a gate that does not pass records its own reasons and is not verified comp
 test("a gate that passes is not reported as failed", () => {
   const h = harness();
   recordGateVerdict(h.obs, h.id, { can_complete: true, reasons: [] });
-  assert.notEqual(h.obs.summary(h.id)?.completionStatus, "verified_complete", "passing the gate is the caller's job to record");
+  assert.notEqual(
+    h.obs.summary(h.id)?.completionStatus,
+    "verified_complete",
+    "passing the gate is the caller's job to record",
+  );
   assert.equal(h.updates.filter((m) => m.includes("Completion not yet verified")).length, 0);
 });

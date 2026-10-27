@@ -1,8 +1,8 @@
+import type { MissionStatus } from "../orchestration/types.ts";
 import { redactSecrets } from "../platform/redact.ts";
+import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
 import { missionActivityAge } from "../tools/missionReport.ts";
 import { formatMissionActivity } from "./missionActivity.ts";
-import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
-import type { MissionStatus } from "../orchestration/types.ts";
 
 /** How a mission's percentage was obtained; "inferred" must never read as measured. */
 export type PresenceBasis = "weighted_dag" | "inferred";
@@ -35,7 +35,15 @@ const PARKED = new Set(["BLOCKED", "PAUSED_INFRASTRUCTURE"]);
 const TERMINAL = new Set(["COMPLETE", "CANCELED", "FAILED"]);
 const QUEUED = new Set(["NEW", "CLASSIFYING", "PLANNING", "READY", "QUEUED"]);
 
-const HEALTH_RANK: Record<string, number> = { blocked: 0, failed: 0, stalled: 1, slow: 2, waiting: 3, active: 4, complete: 5 };
+const HEALTH_RANK: Record<string, number> = {
+  blocked: 0,
+  failed: 0,
+  stalled: 1,
+  slow: 2,
+  waiting: 3,
+  active: 4,
+  complete: 5,
+};
 const HEALTH_TIE = 6;
 
 /**
@@ -47,7 +55,8 @@ export function presenceRank(event: RuntimeMissionActivityEvent): number {
   if (NEEDS_YOU.has(event.state)) return 0;
   if (PARKED.has(event.state)) return 1;
   if (event.health === "stalled") return 2;
-  if (event.state.startsWith("WAITING_") || event.state.startsWith("RECOVERING_") || event.health === "waiting") return 3;
+  if (event.state.startsWith("WAITING_") || event.state.startsWith("RECOVERING_") || event.health === "waiting")
+    return 3;
   if (TERMINAL.has(event.state)) return 4;
   return 5;
 }
@@ -122,9 +131,7 @@ function headerOf(events: readonly RuntimeMissionActivityEvent[]): string {
   const running = events.filter((event) => presenceRank(event) === 5).length;
   const needsYou = events.filter((event) => presenceRank(event) === 0).length;
   const queued = events.filter((event) => QUEUED.has(event.state)).length;
-  return (
-    `Missions · ${running} running · ${needsYou} needs you` + (queued > 0 ? ` · ${queued} queued` : "")
-  );
+  return `Missions · ${running} running · ${needsYou} needs you${queued > 0 ? ` · ${queued} queued` : ""}`;
 }
 
 function workingLineOf(

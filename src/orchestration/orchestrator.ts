@@ -32,6 +32,7 @@ import {
   WAITING_FOR_INFERENCE_SUMMARY,
 } from "../workers/activity.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
+import { recordWorkerActivity } from "./activityNotice.ts";
 import {
   type BrokerBackends,
   ExecutionBroker,
@@ -80,16 +81,15 @@ import {
   replacementRecoveryFingerprint,
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
+import { recordSchedulerStatus } from "./recoveryNotice.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { buildReviewContext } from "./reviewContext.ts";
+import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler } from "./scheduler.ts";
 import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } from "./specApproval.ts";
 import { canTransitionMission, canTransitionTask } from "./state.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
-import { recordSchedulerStatus } from "./recoveryNotice.ts";
-import { recordWorkerActivity } from "./activityNotice.ts";
-import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
 import type {
   AcceptanceCriterion,
   CompletionVerdict,
@@ -478,7 +478,8 @@ export class Orchestrator {
       rand: opts.rand,
       acquireAuthority: this.ownership ? (task, signal) => this.acquireTaskAuthorityWaiting(task, signal) : undefined,
       recovery: opts.recovery,
-      onStatus: (notice) => recordSchedulerStatus(notice, this.observability, (missionId, line) => this.report(missionId, line)),
+      onStatus: (notice) =>
+        recordSchedulerStatus(notice, this.observability, (missionId, line) => this.report(missionId, line)),
       // Surface every task settlement as live progress so a running mission is
       // never silent: the operator sees each worker/gate settle instead of a
       // black screen for the whole worker budget (default 30 min).

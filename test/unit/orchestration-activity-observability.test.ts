@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { recordWorkerActivity } from "../../src/orchestration/activityNotice.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { WorkerActivity } from "../../src/workers/WorkerExecutor.ts";
-import { recordWorkerActivity } from "../../src/orchestration/activityNotice.ts";
 
 /**
  * A worker's activity stream already reaches observability as sentences, but the

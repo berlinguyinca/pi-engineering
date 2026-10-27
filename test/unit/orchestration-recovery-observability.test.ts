@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
-import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import type { MissionSchedulerStatusNotice } from "../../src/orchestration/scheduler.ts";
 import { recordSchedulerStatus } from "../../src/orchestration/recoveryNotice.ts";
+import type { MissionSchedulerStatusNotice } from "../../src/orchestration/scheduler.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 /**
  * The scheduler already tells the orchestrator, per notice, whether a mission

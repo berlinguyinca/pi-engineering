@@ -1,13 +1,13 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
+import type { MissionObservabilitySummary } from "../../src/orchestration/observability/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import { MissionPresenceController } from "../../src/status/MissionPresenceController.ts";
 import { seedPresence } from "../../src/status/presenceSeed.ts";
-import type { MissionObservabilitySummary } from "../../src/orchestration/observability/types.ts";
-import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 
 const T0 = Date.parse("2026-10-27T10:10:00.000Z");
 

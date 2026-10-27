@@ -1,12 +1,12 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import {
   MissionPresenceController,
-  presenceOptionsFromEnv,
   type PresenceOptions,
   type PresenceSink,
+  presenceOptionsFromEnv,
 } from "../../src/status/MissionPresenceController.ts";
 
 const T0 = Date.parse("2026-10-27T10:10:00.000Z");
@@ -276,15 +276,16 @@ test("the title bar is opt-in and the poll has a floor", () => {
   assert.equal(presenceOptionsFromEnv({}).title, false);
   assert.equal(presenceOptionsFromEnv({ PI_MISSION_TITLE: "1" }).title, true);
   assert.equal(presenceOptionsFromEnv({}).pollMs, 5_000);
-  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_POLL_MS: "10" }).pollMs, 1_000, "a 10ms poll would hammer the runtime");
+  assert.equal(
+    presenceOptionsFromEnv({ PI_MISSION_PRESENCE_POLL_MS: "10" }).pollMs,
+    1_000,
+    "a 10ms poll would hammer the runtime",
+  );
 });
 
 test("the quiet heartbeat has its own slower cadence than the strip", () => {
   let quietCalls = 0;
-  const controller = new MissionPresenceController(
-    {},
-    opts({ quiet: () => quietCalls++, quietMs: 60_000 }),
-  );
+  const controller = new MissionPresenceController({}, opts({ quiet: () => quietCalls++, quietMs: 60_000 }));
   controller.update(running);
   controller.tick();
   controller.tick();

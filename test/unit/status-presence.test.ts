@@ -1,15 +1,15 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import {
+  type PresenceRow,
+  type PresenceView,
   presenceMarker,
   presenceRank,
   projectPresence,
   renderWidgetLines,
   storeOnlyEvent,
-  type PresenceRow,
-  type PresenceView,
 } from "../../src/status/presence.ts";
 
 const T = Date.parse("2026-10-27T10:10:00.000Z");
@@ -104,15 +104,24 @@ test("heartbeat-only change does not reorder rows", () => {
 test("breaks ties on health, then oldest progress, then mission id", () => {
   const slow = mission({ missionId: "MSN-slow", health: "slow" });
   const active = mission({ missionId: "MSN-active", health: "active" });
-  assert.deepEqual(projectPresence([active, slow], 4, T).rows.map((r) => r.missionId), ["MSN-slow", "MSN-active"]);
+  assert.deepEqual(
+    projectPresence([active, slow], 4, T).rows.map((r) => r.missionId),
+    ["MSN-slow", "MSN-active"],
+  );
 
   const older = mission({ missionId: "MSN-zzz", lastMeaningfulProgressAt: "2026-10-27T09:00:00.000Z" });
   const newer = mission({ missionId: "MSN-aaa", lastMeaningfulProgressAt: "2026-10-27T10:05:00.000Z" });
-  assert.deepEqual(projectPresence([newer, older], 4, T).rows.map((r) => r.missionId), ["MSN-zzz", "MSN-aaa"]);
+  assert.deepEqual(
+    projectPresence([newer, older], 4, T).rows.map((r) => r.missionId),
+    ["MSN-zzz", "MSN-aaa"],
+  );
 
   const twinA = mission({ missionId: "MSN-twin-a" });
   const twinB = mission({ missionId: "MSN-twin-b" });
-  assert.deepEqual(projectPresence([twinB, twinA], 4, T).rows.map((r) => r.missionId), ["MSN-twin-a", "MSN-twin-b"]);
+  assert.deepEqual(
+    projectPresence([twinB, twinA], 4, T).rows.map((r) => r.missionId),
+    ["MSN-twin-a", "MSN-twin-b"],
+  );
 });
 
 test("marks inferred progress as inferred", () => {
@@ -122,7 +131,13 @@ test("marks inferred progress as inferred", () => {
 
 test("shows no percentage when nothing is measured", () => {
   const view = projectPresence(
-    [mission({ approximatePercent: 0, acceptanceCoverage: { completed: 0, total: 0, approximatePercent: 0 }, workflowProgress: { completed: 0, total: 0, approximatePercent: 0 } })],
+    [
+      mission({
+        approximatePercent: 0,
+        acceptanceCoverage: { completed: 0, total: 0, approximatePercent: 0 },
+        workflowProgress: { completed: 0, total: 0, approximatePercent: 0 },
+      }),
+    ],
     4,
     T,
   );
@@ -138,7 +153,10 @@ test("shows no proof of life yet instead of a fabricated age", () => {
 test("caps rows at the budget and names the worst unshown mission in the overflow line", () => {
   const view = projectPresence([needsYou, stalled, waiting, blocked, complete], 2, T);
   assert.equal(view.rows.length, 2);
-  assert.deepEqual(view.rows.map((row) => row.missionId), ["MSN-needs", "MSN-blocked"]);
+  assert.deepEqual(
+    view.rows.map((row) => row.missionId),
+    ["MSN-needs", "MSN-blocked"],
+  );
   assert.match(view.overflow ?? "", /^3 more/);
   assert.match(view.overflow ?? "", /MSN-stalled/);
 });
@@ -155,7 +173,9 @@ test("header counts running, needs-you and queued missions", () => {
 });
 
 test("a mission with no observability state still renders, without a percentage", () => {
-  const row = row0(projectPresence([storeOnlyEvent({ mission_id: "MSN-9", title: "queued leg", status: "QUEUED" })], 4, T));
+  const row = row0(
+    projectPresence([storeOnlyEvent({ mission_id: "MSN-9", title: "queued leg", status: "QUEUED" })], 4, T),
+  );
   assert.equal(row.marker, "~");
   assert.equal(row.percent, "—");
   assert.equal(row.age, "no proof of life yet");

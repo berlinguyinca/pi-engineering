@@ -1,3 +1,7 @@
+import type { MissionObservabilitySummary } from "../orchestration/observability/types.ts";
+import type { Mission } from "../orchestration/types.ts";
+import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
+import type { MissionPresenceController } from "./MissionPresenceController.ts";
 /**
  * Fill the presence strip from durable state instead of waiting for a live
  * event: missions started earlier, or by another process, would otherwise be
@@ -9,10 +13,6 @@
  * a backstop must never make a live mission look quieter than it is.
  */
 import { storeOnlyEvent } from "./presence.ts";
-import type { MissionPresenceController } from "./MissionPresenceController.ts";
-import type { Mission } from "../orchestration/types.ts";
-import type { MissionObservabilitySummary } from "../orchestration/observability/types.ts";
-import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
 
 export interface PresenceSource {
   /** The durable rows: `runtime.missionStore.listMissions()`. */

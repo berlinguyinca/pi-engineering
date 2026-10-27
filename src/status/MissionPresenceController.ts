@@ -7,14 +7,8 @@
  * is guarded and a torn-down terminal is treated as a no-op sink.
  */
 import { redactSecrets } from "../platform/redact.ts";
-import {
-  projectPresence,
-  renderWidgetLines,
-  presenceRank,
-  type PresenceBasis,
-  type PresenceView,
-} from "./presence.ts";
 import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
+import { type PresenceBasis, type PresenceView, presenceRank, projectPresence, renderWidgetLines } from "./presence.ts";
 
 const WIDGET_KEY = "engineering-missions";
 const HEADER_PREFIX = "Missions · ";
@@ -242,16 +236,15 @@ export class MissionPresenceController {
       const urgent = rank <= 1 || NOTIFY_STATES.has(event.state);
       if (!urgent) continue;
       const what =
-        rank === 0
-          ? "needs you"
-          : rank === 1
-            ? "has stopped"
-            : event.state === "COMPLETE"
-              ? "is complete"
-              : "failed";
+        rank === 0 ? "needs you" : rank === 1 ? "has stopped" : event.state === "COMPLETE" ? "is complete" : "failed";
       const reason = flat(event.reason, 120);
       const next = rank <= 1 ? ` — /mission-status ${event.missionId}` : "";
-      this.guard(() => this.sink.notify?.(`Mission ${event.missionId} ${what}${reason ? `: ${reason}` : ""}${next}`, rank <= 1 || event.state === "FAILED" ? "warning" : "info"));
+      this.guard(() =>
+        this.sink.notify?.(
+          `Mission ${event.missionId} ${what}${reason ? `: ${reason}` : ""}${next}`,
+          rank <= 1 || event.state === "FAILED" ? "warning" : "info",
+        ),
+      );
     }
   }
 

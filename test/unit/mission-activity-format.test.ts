@@ -1,5 +1,5 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import { formatMissionActivity } from "../../src/status/missionActivity.ts";
