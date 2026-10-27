@@ -130,6 +130,7 @@ export interface CatalogProbeTarget {
  * — the same request the model catalogue uses — followed by InferWeave's
  * read-only `/iw/v1/admission` report. Catalogue `slots` is a configured
  * ceiling, not remaining capacity. Recovery needs a matching model report.
+ * Both the Go model-keyed report and Rust model-array report are supported.
  * Immediate model-level headroom permits a retry; caller/global admission can
  * still refuse it. Plain OpenAI catalogues retain their availability check.
  *
@@ -220,6 +221,9 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
         return unknownCapacity;
       }
       const report = (await admission.json().catch(() => null)) as { models?: unknown } | null;
+      if (report && !Array.isArray(report.models) && typeof report.models === "object") {
+        return goAdmissionReadiness(report as Record<string, unknown>, target.modelId, row, rows);
+      }
       const models = Array.isArray(report?.models) ? (report.models as Array<Record<string, unknown>>) : [];
       const measured = models.find(
         (m) =>
@@ -264,6 +268,89 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
       clearTimeout(timer);
     }
   }
+}
+
+/** Read the deployed Go gateway's model-keyed admission snapshot. */
+function goAdmissionReadiness(
+  report: Record<string, unknown>,
+  modelId: string,
+  catalogRow: Record<string, unknown>,
+  catalog: Array<Record<string, unknown>>,
+): ProbeResult {
+  const unknown: ProbeResult = {
+    healthy: false,
+    authoritative: false,
+    reason: `model ${modelId} capacity unknown: no fresh known model-level admission report`,
+  };
+  const object = (value: unknown): Record<string, unknown> | undefined =>
+    value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+  const count = (value: unknown): value is number =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  if (report.enabled !== true || typeof report.closed !== "boolean") return unknown;
+  if (report.closed) return { healthy: false, authoritative: true, reason: "gateway admission is closed" };
+  const models = object(report.models);
+  if (!models) return unknown;
+  const candidates = new Set([modelId]);
+  if (typeof catalogRow.x_backing_model === "string") candidates.add(catalogRow.x_backing_model);
+  for (const row of catalog) {
+    if (row && typeof row.id === "string" && Array.isArray(row.x_aliases) && row.x_aliases.includes(modelId)) {
+      candidates.add(row.id);
+    }
+  }
+  const matching = [...candidates].filter((id) => Object.hasOwn(models, id));
+  if (matching.length !== 1) return unknown;
+  const canonical = matching[0]!;
+  const measured = object(models[canonical]);
+  if (!measured || measured.capacity_known !== true) return unknown;
+  // The Go gateway itself rejects observations aged 90 seconds or in the future.
+  // `capacity_updated_at` is the oldest constituent sample, not report generation.
+  const updated =
+    typeof measured.capacity_updated_at === "string" ? Date.parse(measured.capacity_updated_at) : Number.NaN;
+  const age = Date.now() - updated;
+  if (!Number.isFinite(age) || age < 0 || age >= 90_000) return unknown;
+  if (
+    !count(measured.capacity) ||
+    !count(measured.available) ||
+    measured.available > measured.capacity ||
+    !count(measured.active) ||
+    !count(measured.queued) ||
+    !count(measured.active_limit) ||
+    !count(measured.queue_limit)
+  ) {
+    return unknown;
+  }
+  // Idle model rows can carry zero placeholder policy limits. Diagnostics,
+  // when present, supplies the effective policy independently of live entries.
+  const diagnostics = object(report.diagnostics);
+  const policy = object(diagnostics?.policy);
+  const overrides = object(policy?.model_overrides);
+  const modelPolicy = object(overrides?.[canonical]) ?? object(policy?.model_default);
+  const activeLimit = count(modelPolicy?.active) && modelPolicy.active > 0 ? modelPolicy.active : measured.active_limit;
+  if (activeLimit === 0 && measured.active > 0) return unknown;
+  const global = object(object(policy?.scope_limits)?.global);
+  if (
+    count(global?.active) &&
+    global.active > 0 &&
+    count(report.active) &&
+    report.active + (count(report.selecting) ? report.selecting : 0) >= global.active
+  ) {
+    return { healthy: false, authoritative: true, reason: "gateway global active admission limit is occupied" };
+  }
+  if (measured.queued > 0 || measured.available === 0 || (activeLimit > 0 && measured.active >= activeLimit)) {
+    return {
+      healthy: false,
+      authoritative: true,
+      reason:
+        measured.queue_limit > 0 && measured.queued >= measured.queue_limit
+          ? `model ${modelId} queue full (${measured.queued}/${measured.queue_limit})`
+          : `model ${modelId} has no immediate model-level capacity (${measured.available} available, ${measured.queued} queued)`,
+    };
+  }
+  return {
+    healthy: true,
+    authoritative: true,
+    reason: `model ${modelId} has model-level active headroom; caller admission is not reported`,
+  };
 }
 
 /** The slice of Pi's ModelRuntime the probe target needs. */
