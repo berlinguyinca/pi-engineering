@@ -12,6 +12,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stateHooks as safeGitStateHooks, testHooks as safeGitTestHooks } from "../../src/git/safeGit.ts";
 
+// Memory setup can write a revision marker, and model commands write models.json.
+// Neither profile convention may fall through to the developer's real ~/.pi/agent.
+const profileDir =
+  process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR || mkdtempSync(join(tmpdir(), "pi-eng-test-profile-"));
+if (!process.env.PI_CODING_AGENT_DIR) process.env.PI_CODING_AGENT_DIR = profileDir;
+if (!process.env.PI_AGENT_DIR) process.env.PI_AGENT_DIR = profileDir;
+
 if (!process.env.PI_ENGINEERING_STATE_DIR) {
   process.env.PI_ENGINEERING_STATE_DIR = mkdtempSync(join(tmpdir(), "pi-eng-test-state-"));
 }

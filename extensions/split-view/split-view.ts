@@ -1,5 +1,5 @@
 // Vendored from https://github.com/Hugo-W/pi-split-view @ commit 6b6b98a (MIT, see ./LICENSE).
-// Vendored unmodified (apart from this header). See ./VENDORED.md for provenance, audit and update procedure.
+// Locally patched for lifecycle and performance fixes. See ./VENDORED.md for provenance and update procedure.
 /**
  * split-view.ts — unified panel TUI extension
  *
@@ -55,10 +55,9 @@
  * Response-only is native-parity BY DESIGN (SV-09/SV-10/SV-18, USER DECISION
  * 2026-10-07, decisions/E-policy.md): it shows TEXT content only — pi's own
  * transcript renders user messages as text and drops non-text blocks, so
- * image-only user turns render nothing there either; it keeps FULL scrollback
- * (unbounded — pi's own transcript is unbounded and offers no virtualization
- * primitive, so this matches the platform's cost model, a constant factor
- * only); and it preserves the NUMERIC scroll offset across branch switches —
+ * image-only user turns render nothing there either. Full scrollback remains
+ * in the native transcript; response-only keeps the newest 200 messages to
+ * bound redraw cost. It preserves the NUMERIC scroll offset across branch switches —
  * the ScrollView clamps the old offset into the new content, exactly like
  * the native transcript on the same /tree switch. Toggling trim itself does
  * not move the response doc's scroll position.
@@ -117,6 +116,7 @@ import * as path from "node:path";
 
 const WIDGET_KEY = "split-view";
 const MAX_TOOLS = 60;
+const MAX_RESPONSE_MESSAGES = 200;
 // Display window (logical lines) for the thinking panel. The full transcript
 // keeps everything; the band is a recent-history view. Must stay small: the
 // per-flush render cost is dominated by wrapping the visible window.
@@ -136,7 +136,7 @@ const MAX_BODY_ROWS = 96;
 const MAX_LINE_CHARS = 600;
 
 /** Legend shown at the bottom of the files list. */
-const LEGEND = "r read · w write · s seen(bash) · a subagent";
+const LEGEND = "r read · w write · a subagent";
 
 // ─── module-lifetime state ───────────────────────────────────────────────────
 
@@ -388,6 +388,9 @@ function thinkingLines(theme: Theme, width: number): string[] {
  */
 const responseDoc = new Container();
 let streamingResponseComponent: AssistantMessageComponent | null = null;
+// One borrowed reference to the active native message is sufficient for a mid-turn
+// toggle. No duplicate components or historical messages are retained while off.
+let activeResponseMessage: any = null;
 
 function messageText(msg: any): string {
 	const c = msg?.content;
@@ -407,30 +410,43 @@ function responseContent(msg: any): any[] {
 	);
 }
 
+/** Keep only the recent response window; the native transcript retains full history. */
+function appendResponseComponent(component: Component): void {
+	if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
+	responseDoc.addChild(component);
+	while (responseDoc.children.length > MAX_RESPONSE_MESSAGES * 2 - 1) {
+		responseDoc.removeChild(responseDoc.children[0]);
+	}
+}
+
+function hasResponseContent(msg: any): boolean {
+	if (msg?.role === "user") return !!messageText(msg).trim();
+	if (msg?.role !== "assistant") return false;
+	return (
+		msg.stopReason === "error" ||
+		msg.stopReason === "aborted" ||
+		responseContent(msg).some(
+			(c: any) => c?.type === "text" && typeof c.text === "string" && c.text.trim(),
+		)
+	);
+}
+
 /** Append a message to the response doc (user or assistant). */
 function addResponseMessage(msg: any): void {
+	if (!trimResponse || !hasResponseContent(msg)) return;
 	try {
 		if (msg.role === "user") {
 			const text = messageText(msg);
 			if (!text.trim()) return;
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
-			responseDoc.addChild(new UserMessageComponent(text, getMarkdownTheme()));
+			appendResponseComponent(new UserMessageComponent(text, getMarkdownTheme()));
 			return;
 		}
 		if (msg.role === "assistant") {
 			const content = responseContent(msg);
-			const hasText = content.some(
-				(c: any) =>
-					c?.type === "text" && typeof c.text === "string" && c.text.trim(),
-			);
-			// Keep empty-text messages whose stopReason shows an error marker.
-			if (!hasText && msg.stopReason !== "error" && msg.stopReason !== "aborted")
-				return;
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
 			// toolCalls are stripped too so the component's error/abort markers
 			// render (it suppresses them when toolCalls exist — in the full
 			// transcript the tool components show errors instead).
-			responseDoc.addChild(
+			appendResponseComponent(
 				new AssistantMessageComponent(
 					{ ...msg, content },
 					true,
@@ -446,21 +462,38 @@ function addResponseMessage(msg: any): void {
 	}
 }
 
-/** Rebuild the whole response doc from the current branch. */
+/** Rebuild the recent response window only when trim mode is actually in use. */
 function rebuildResponseDoc(ctx: ExtensionContext): void {
 	responseDoc.clear();
 	streamingResponseComponent = null;
+	if (!trimResponse) return;
 	const branch = ctx.sessionManager.getBranch();
-	for (const entry of branch) {
+	const messages: any[] = [];
+	for (
+		let i = branch.length - 1;
+		i >= 0 && messages.length < MAX_RESPONSE_MESSAGES;
+		i--
+	) {
+		const entry = branch[i];
 		if (entry.type !== "message") continue;
 		const msg = (entry as any).message;
-		if (msg) addResponseMessage(msg);
+		if (hasResponseContent(msg)) messages.push(msg);
 	}
+	for (const msg of messages.reverse()) {
+		const isActive =
+			activeResponseMessage && msg.role === "assistant" &&
+			(msg === activeResponseMessage ||
+				(msg.timestamp !== undefined && msg.timestamp === activeResponseMessage.timestamp));
+		if (!isActive) addResponseMessage(msg);
+	}
+	if (activeResponseMessage) responseMessageUpdate(activeResponseMessage);
 }
 
 /** Live-stream an assistant message into the doc (lazy: created on first visible text). */
 function responseMessageUpdate(msg: any): void {
 	if (msg?.role !== "assistant") return;
+	activeResponseMessage = msg;
+	if (!trimResponse) return;
 	const stripped = { ...msg, content: responseContent(msg) };
 	const hasVisible = stripped.content.some(
 		(c: any) => c?.type === "text" && typeof c.text === "string" && c.text.trim(),
@@ -470,7 +503,6 @@ function responseMessageUpdate(msg: any): void {
 		// spacers accumulate in the doc.
 		if (!hasVisible) return;
 		try {
-			if (responseDoc.children.length > 0) responseDoc.addChild(new Spacer(1));
 			streamingResponseComponent = new AssistantMessageComponent(
 				undefined as any,
 				true,
@@ -479,7 +511,7 @@ function responseMessageUpdate(msg: any): void {
 				1,
 				[],
 			);
-			responseDoc.addChild(streamingResponseComponent);
+			appendResponseComponent(streamingResponseComponent);
 		} catch {
 			/* theme not ready */
 			return;
@@ -494,6 +526,8 @@ function responseMessageUpdate(msg: any): void {
 
 function responseMessageEnd(msg: any): void {
 	if (msg?.role !== "assistant") return;
+	activeResponseMessage = null;
+	if (!trimResponse) return;
 	if (streamingResponseComponent) {
 		try {
 			streamingResponseComponent.updateContent(
@@ -576,7 +610,7 @@ function resultText(r: any): string {
 	let text: string;
 	if (typeof r === "string") text = r;
 	else {
-		const content = r?.content;
+		const content = Array.isArray(r) ? r : r?.content;
 		if (typeof content === "string") text = content;
 		else if (Array.isArray(content)) {
 			text = content
@@ -704,20 +738,9 @@ function pathsFrom(
 	input: any,
 ): { abs: string; op: string }[] {
 	const out: { abs: string; op: string }[] = [];
-	if (toolName === "bash") {
-		const cmd = typeof input?.command === "string" ? input.command : "";
-		for (const raw of cmd.split(/\s+/)) {
-			const tok = raw.replace(/^[("'`]+/, "").replace(/[)"'`;:,]+$/, "");
-			if (!tok || tok.startsWith("-") || /[|&><`$*?]/.test(tok)) continue;
-			try {
-				const abs = path.resolve(tok);
-				if (existsSync(abs) && statSync(abs).isFile()) out.push({ abs, op: "s" });
-			} catch {
-				/* skip */
-			}
-		}
-		return out;
-	}
+	// Shell words are not reliable file paths (cd, quoting, redirections). Do not
+	// synchronously stat them on the input/render path or invent file attribution.
+	if (toolName === "bash") return out;
 	const add = (v: unknown, op: string, unconditional: boolean) => {
 		if (typeof v !== "string" || !v) return;
 		try {
@@ -1513,6 +1536,7 @@ export default function (pi: ExtensionAPI) {
 
 	/** Rebuild all buffers from the current branch (start / reload / tree). */
 	const reconstruct = (ctx: ExtensionContext) => {
+		activeResponseMessage = null;
 		thinking.reset();
 		toolsBy.clear();
 		toolOrder.length = 0;
@@ -1646,7 +1670,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Response stream (panel C trim mode): mirror user/assistant messages into
-	// the response doc. Always maintained so toggling trim mid-turn is seamless.
+	// the response doc only while trim is active; enabling rebuilds from the branch.
 	// Assistant components are created lazily on first visible text (update),
 	// so tool-only / thinking-only rounds add nothing to the doc.
 	pi.on("message_start", (event) => {
@@ -1816,6 +1840,9 @@ export default function (pi: ExtensionAPI) {
 		if (isLayoutLayerActive("ui")) setLayoutLayer("ui", null);
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		widgetSet = false;
+		activeResponseMessage = null;
+		responseDoc.clear();
+		streamingResponseComponent = null;
 	});
 
 	// ── panel toggles ──
@@ -1923,6 +1950,7 @@ export default function (pi: ExtensionAPI) {
 				toolsOn = false;
 				filesOn = false;
 				trimResponse = false;
+				rebuildResponseDoc(ctx);
 				reconcileLayout(ctx.ui.theme);
 				ctx.ui.notify("Split view off (all panels)", "info");
 			} else {
@@ -1936,6 +1964,7 @@ export default function (pi: ExtensionAPI) {
 					filesOn = cfg.files;
 					trimResponse = cfg.trimResponse;
 				}
+				rebuildResponseDoc(ctx);
 				reconcileLayout(ctx.ui.theme);
 				ctx.ui.notify("Split view on (saved layout)", "info");
 			}
@@ -2028,7 +2057,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("split-trim-response", {
 		description:
-			"Panel C: full transcript ↔ response-only (on|off) — response-only: text-only (native parity), full scrollback, scroll offset preserved on branch switch",
+			"Panel C: full transcript ↔ response-only (on|off) — response-only: text-only, newest 200 messages; full history remains in the native transcript",
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
 				ctx.ui.notify("/split-trim-response requires interactive mode", "error");
@@ -2061,9 +2090,10 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			trimResponse = next;
+			rebuildResponseDoc(ctx);
 			reconcileLayout(ctx.ui.theme);
 			ctx.ui.notify(
-				`Panel C: ${trimResponse ? "response only" : "full transcript"}`,
+				`Panel C: ${trimResponse ? "response only · newest 200 messages" : "full transcript"}`,
 				"info",
 			);
 		},

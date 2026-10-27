@@ -3,8 +3,8 @@
  *
  * Loaded through Pi's REAL extension loader (jiti), so this also proves the vendored
  * code loads, registers only what VENDORED.md documents, claims no shortcuts and is
- * inert until the operator runs `/split`. Provenance is checked byte-for-byte against
- * the recorded header so an accidental local edit is caught.
+ * inert until the operator runs `/split`. Provenance headers and the documented
+ * local reliability patches remain explicit when the upstream snapshot changes.
  */
 
 import assert from "node:assert/strict";
@@ -58,11 +58,11 @@ test("package.json pi.extensions lists the main entry and split-view, but not th
   assert.ok(!pkg.pi.extensions.some((e) => e.includes("ui-panels-config") || e.includes("layout-manager")));
 });
 
-test("vendored files carry the provenance header and are otherwise unmodified upstream", () => {
+test("vendored files preserve provenance and document local reliability patches", () => {
   for (const f of ["split-view.ts", "layout-manager.ts", "ui-panels-config.ts"]) {
     const head = readFileSync(join(vendorDir, f), "utf8").split("\n", 2).join("\n");
     assert.match(head, /github\.com\/Hugo-W\/pi-split-view @ commit 6b6b98a \(MIT/);
-    assert.match(head, /Vendored unmodified/);
+    assert.match(head, f === "split-view.ts" ? /Locally patched/ : /Vendored unmodified/);
   }
   assert.match(readFileSync(join(vendorDir, "LICENSE"), "utf8"), /MIT License/);
   assert.match(readFileSync(join(vendorDir, "VENDORED.md"), "utf8"), /6b6b98a/);
