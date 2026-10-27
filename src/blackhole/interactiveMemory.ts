@@ -116,12 +116,15 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const setup = options.setup ?? ((ctx, force) => ensureMemorySetup(ctx, { force }));
   const now = options.now ?? Date.now;
   let generation = 0;
+  // Explicit refreshes retire automatic work without retiring their command context.
+  let automaticLookupEpoch = 0;
   let recalled = "";
   let activeFingerprint = "";
   let lastFailure = "";
   let retryAfter = 0;
   const recalls = new Map<string, { block: { text: string; count: number }; expiresAt: number }>();
   const clearRecall = () => {
+    automaticLookupEpoch++;
     recalled = "";
     recalls.clear();
   };
@@ -171,7 +174,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
   const handleError = (ctx: ExtensionContext, error: unknown, explicit = false) => {
     const code = error instanceof OpenVikingRequestError ? error.code : "unreachable";
-    recalls.clear();
+    clearRecall();
     retryAfter = now() + (code === "auth" || code === "forbidden" ? AUTH_BACKOFF_MS : FAILURE_BACKOFF_MS);
     const messages = {
       auth: "key invalid or revoked",
@@ -243,11 +246,12 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     const conn = connection(ctx, explicit, !explicit);
     if (!conn) return;
     const id = generation;
+    const epoch = automaticLookupEpoch;
     setStatus(ctx, "checking");
     try {
       const request = conn.client.recallAll();
       const records = await (explicit ? request : automatic(request));
-      if (!current(id, conn.identity)) return;
+      if (!current(id, conn.identity) || (!explicit && epoch !== automaticLookupEpoch)) return;
       lastFailure = "";
       retryAfter = 0;
       if (explicit) clearRecall();
@@ -258,7 +262,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           `Memory connection verified: ${records.length} saved note(s). /remember <text> saves an explicit note; /memory <query> searches.`,
         );
     } catch (error) {
-      if (current(id, conn.identity)) handleError(ctx, error, explicit);
+      if (current(id, conn.identity) && (explicit || epoch === automaticLookupEpoch)) handleError(ctx, error, explicit);
     }
   };
 
@@ -375,6 +379,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     const conn = connection(ctx, false, true);
     if (!conn) return;
     const id = generation;
+    const epoch = automaticLookupEpoch;
     const terms = queryTokens(event.prompt);
     if (!terms.length) {
       setStatus(ctx, "idle");
@@ -391,7 +396,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     setStatus(ctx, "checking");
     try {
       const records = await automatic(conn.client.search(query));
-      if (!current(id, conn.identity)) return;
+      if (!current(id, conn.identity) || epoch !== automaticLookupEpoch) return;
       const block = memoryBlock(records, terms);
       recalls.set(query, { block, expiresAt: now() + RECALL_TTL_MS });
       while (recalls.size > MAX_CACHED_QUERIES) recalls.delete(recalls.keys().next().value!);
@@ -400,7 +405,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       retryAfter = 0;
       setStatus(ctx, `ready · ${block.count} recalled`);
     } catch (error) {
-      if (current(id, conn.identity)) handleError(ctx, error);
+      if (current(id, conn.identity) && epoch === automaticLookupEpoch) handleError(ctx, error);
     }
   });
   pi.on("context", (event, ctx) => {

@@ -388,6 +388,45 @@ test("explicit memory search invalidates an earlier automatic recall", async () 
   assert.match((await f.emit("context", { messages: [] })).messages[0].content, /externally updated/);
 });
 
+for (const action of ["save", "check", "search"] as const) {
+  for (const outcome of ["success", "failure"] as const) {
+    test(`explicit ${action} fences a pending automatic lookup ${outcome}`, async () => {
+      const f = fixture();
+      const prompt = { prompt: "calibration", systemPrompt: "" };
+      let resolve!: (rows: DurableMemoryRecord[]) => void;
+      let reject!: (error: Error) => void;
+      f.override(
+        () =>
+          new Promise((resolveSearch, rejectSearch) => {
+            resolve = resolveSearch;
+            reject = rejectSearch;
+          }),
+      );
+      const pending = f.emit("before_agent_start", prompt);
+      f.override(undefined);
+      if (action === "save") await f.command("remember", "calibration newly saved");
+      else {
+        await f.store.store(record("calibration newly saved"));
+        await f.command("memory", action === "check" ? "status" : "calibration");
+      }
+      const statuses = f.statuses.length;
+      const notices = f.notices.length;
+      if (outcome === "success") resolve([record("calibration obsolete snapshot")]);
+      else reject(new OpenVikingRequestError("auth", 401));
+      await pending;
+      assert.equal(f.statuses.length, statuses, "stale work must preserve explicit command status");
+      assert.equal(f.notices.length, notices, "stale failure must not publish a notice");
+      assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
+      const queries = f.queries.length;
+      await f.emit("before_agent_start", prompt);
+      assert.equal(f.queries.length, queries + 1, "stale work must not populate cache or impose backoff");
+      const content = (await f.emit("context", { messages: [] })).messages[0].content;
+      assert.match(content, /newly saved/);
+      assert.doesNotMatch(content, /obsolete snapshot/);
+    });
+  }
+}
+
 test("late setup errors do not touch a session closed while setup was pending", async () => {
   for (const manual of [false, true]) {
     let reject!: (error: Error) => void;

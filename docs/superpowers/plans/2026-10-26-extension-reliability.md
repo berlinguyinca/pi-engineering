@@ -32,3 +32,9 @@ Use temporary directories and local HTTP servers for network/write races. Lifecy
 - Full Node 22 suite: 6,105 pass, 25 fail, 1 skip, 10 todo (6,141 tests). Twenty failures were a missing Playwright browser; after installing the browser, all 24 browser tests pass.
 - Remaining full-suite failures outside this change: DAG parallel execution (worktree hard-link lock refusal), long task-id planner execution (same refusal/missing output), inspector lifecycle (started vs restarted), real Host reload resource-count equality, and housekeeping resource-count equality. The first four reproduce on pristine main; housekeeping passes in isolation on both main and this branch. No unrelated assertions were weakened.
 - Node 26's changed Undici dispatcher internals break two existing timeout tests; these pass under Node 22.23.2, used for the final full-suite run.
+
+## Merge review follow-up
+
+- Independent review found that an automatic memory lookup could repopulate stale cache or failure backoff after a successful explicit save/check/search. A dedicated automatic lookup epoch now retires those pending producers without invalidating command contexts.
+- Six overlap regressions failed before the fix and pass afterward. Current-head focused verification passes 99/99 tests, full core/scripts typecheck and loading smoke checks. The memory lane additionally passes 115/115 tests. Both independent re-reviews approve, with architectural status CLEAR.
+- The 6,141-test full-suite results above apply to the initial PR head; the small merge-review follow-up was verified with the targeted suites rather than repeating that baseline run.
