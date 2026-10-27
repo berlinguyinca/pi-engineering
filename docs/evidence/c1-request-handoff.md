@@ -60,3 +60,20 @@ This creates temporary project/session state, checks the serialized provider
 payload and actual successful response, prints only bounded evidence, and removes
 its project directory. The supplied directory must be an ephemeral proof profile.
 The script does not establish that proof until it has actually run successfully.
+
+## Actual bounded provider proof — 2026-10-27
+
+The request evidence script ran against the configured provider using an isolated
+copy of model/auth configuration (private temporary files, subsequently removed).
+The selected predecessor had a 262,144-token configured window; the actual
+successor `qwen3.8-flash_next-modality-text-quant-w3a8` advertises 131,072 tokens.
+A synthetic 163,863-token conversation was transferred before the request. The
+complete serialized request was 3,415 characters, made one actual provider call,
+returned `HANDOFF_OK`, and recorded zero compaction entries during the switch.
+Output was capped at 64 tokens with thinking off. No live user transcript,
+credentials, settings, or session was changed.
+
+Later native/tuned manual, threshold, and overflow compaction are additionally
+covered by six actual-SDK/loopback HTTP cases, including the full extension entry.
+This combines a real provider round trip with deterministic lifecycle boundaries;
+it does not claim every provider/model combination has been exercised.
