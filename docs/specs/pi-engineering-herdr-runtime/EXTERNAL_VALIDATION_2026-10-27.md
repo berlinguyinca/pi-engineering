@@ -103,6 +103,64 @@ integration and structured terminating worker-result extraction remain unproved.
 The adapter still synthesizes its completion summary; response verification used
 persisted assistant messages, never that summary as model-output evidence.
 
+## Real engineering follow-up: passed with committed code and actual tests
+
+The follow-up ran the same real planner → parallel engineers → tester → reviewer
+shape with built-in `read`, `write` and `bash` tools enabled. The harness seeded
+acceptance tests before dispatch; it never authored the implementation files.
+The engineers used actual model-issued Bash calls to create and commit
+`add.mjs` and `subtract.mjs` in separate worktrees. The tester cherry-picked both
+commits into its own checkout and ran the real Node test command. The harness
+independently reran that command and verified **2 passed, 0 failed, exit 0**,
+exact changed-file sets, clean engineer worktrees and the actual integrated diff.
+The reviewer inspected the real Git diff through its own Bash tool and approved.
+
+| Worker | Assistant responses | Output tokens | Actual proof |
+| --- | --- | --- | --- |
+| Planner | 1 | 81 | Plan for the two engineer tasks, integration tests and review |
+| Engineer A | 2 | 126, 14 | `add.mjs`, commit `283e06718d8a83dea93230776af70dae2a5b3acf` |
+| Engineer B | 2 | 94, 14 | `subtract.mjs`, commit `f6dfd664405c60900d61688c55a8bc517d730506` |
+| Tester | 2 | 154, 11 | Integrated commit `b8564ed80d99eb8a2fc9123c0b3516491d74b9b2`; real test exit 0 |
+| Reviewer | 2 | 109, 64 | Actual diff inspection and `approve` verdict |
+
+Total: **9 assistant responses**, all below the configured 256-token output cap;
+combined with the preceding micro-canary this used **14** authorized responses.
+Selected actual tool calls/results, source files, Git diff, test output and model
+responses are preserved in
+[`evidence/2026-10-27-herdr-engineering-canary.json`](evidence/2026-10-27-herdr-engineering-canary.json).
+Temporary fixture commit objects were reclaimed with their owned repository;
+the evidence preserves their observed hashes and source diff.
+
+The reusable opt-in harness is `scripts/validate-herdr-engineering-canary.mjs`:
+
+```sh
+node scripts/validate-herdr-engineering-canary.mjs \
+  --profile /private/approved-profile \
+  --provider SELECTED_PROVIDER --model SELECTED_MODEL \
+  --evidence /path/to/nonsecret-evidence.json
+```
+
+The source profile must supply `models.json` and `auth.json`, with the selected
+model's output limit at most 256. No dependencies are added. The harness owns
+its disposable Git fixture, profile, state directories, named server, client and
+worktrees. It exclusively claims the unique session directory, verifies the
+real managed environment and exact socket, detaches its no-input client before
+work begins, and stops the owned server from the managed pane after terminating
+workers. Failed startup retains only private diagnostic logs, never copied
+credentials. Use `--bootstrap-only` to validate isolation/shutdown with zero
+inference calls. That check also passed after tightening the startup and cleanup
+guards. The ordinary test suite never starts this live harness.
+
+The harness limits each worker to 180 seconds and at most three assistant
+responses, with a combined follow-up cap of 15. It keeps extensions, MCP,
+skills and context-file discovery disabled. Zero agents remained before owned
+shutdown; temporary profiles, credential copies, fixture worktrees and named
+session directories were cleaned. No existing server or user profile changed.
+
+This follow-up proves real worker code mutations, commit integration, tests and
+review. Durable server-restart reconciliation, structured terminating result-tool
+extraction and full migration rollback remain unproved.
+
 ## Deterministic contracts and rollback readiness
 
 ```sh
@@ -113,7 +171,7 @@ node --test --import ./test/support/isolatedState.ts \
   test/unit/lineage-emitter.test.ts
 ```
 
-Observed after the provisioning fixes: **60 passed, 0 failed, 0 skipped**. This includes the deterministic
+Observed after provisioning, concurrency and deadline fixes: **65 passed, 0 failed, 0 skipped**. This includes the deterministic
 canary, both runtime contracts, selector negotiation, and CLI argument checks.
 The canary uses `FakeWorkerExecutor`; the Herdr contract uses a fake client.
 
@@ -133,4 +191,4 @@ cleanup; all owned test servers and temporary resources were then cleaned up.
 
 `npm run build` (both core and scripts typechecks), `shellcheck
 scripts/test-openviking-postgres.sh`, Biome on the changed TypeScript test, and
-`git diff --check` pass. The leader owns the full-suite and integration review.
+`git diff --check` pass. The live harness also passes `node --check` and Biome. The leader owns the full-suite and integration review.
