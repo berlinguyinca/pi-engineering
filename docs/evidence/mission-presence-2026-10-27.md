@@ -210,3 +210,51 @@ the Pi post-load check is not something the package can influence.
 The strip renders in a real terminal, updates without keypresses, survives a process restart through the durable store, marks terminal state, and disappears completely under `PI_MISSION_PRESENCE=0` while `origin/main`'s own surfaces keep working. Typing is not blocked.
 
 Two of the plan's Step 1/Step 2 expectations are **not** satisfied by this run: the working-line handoff never became observable, and Esc did not pause the mission. Neither is disproven as a mechanism — both need a run where the mission's foreground turn returns to idle (and where a mission actually reaches stalled/blocked), which the local model did not produce here.
+
+## Follow-up: the two expectations that were not observable, and the surfaces that now prove them
+
+The unresolved items above were both about *who owns a surface* and *who may act
+on a mission*. They are closed as mechanisms, with tests, rather than left as
+things to notice in a terminal.
+
+**One arbiter for the status surfaces** (`src/status/surfaceBus.ts`). The working
+line was written directly by two producers, each guarding the other with a private
+flag (`agentActive`). A third claimant would have needed to know both flags, and
+the per-pair yield rules disagreed, so the last writer won. Producers now claim a
+surface with a priority and an optional expiry; the arbiter resolves the winner,
+deduplicates writes once, and hands the surface to the next claimant when the
+winner releases. `test/unit/status-surface-bus.test.ts` pins arbitration,
+handback, expiry, deduplication, keyed widgets, notify-once-per-change, and a sink
+that throws. Two presence tests that encoded the old clear-on-agent-start
+behaviour were rewritten to assert arbitration instead — "the line goes blank
+during a turn" was never the requirement; "the operator sees the most relevant
+line" is.
+
+**Attention as evidence** (`src/orchestration/observability/attention.ts`). Health
+says whether work is moving; it does not say why to look now, and surfaces had
+been ranking by health and then appending the mission's own narration. Attention
+is derived from observability facts in a fixed order and carries the strongest
+fact with it; no model text is read. Presence ranks by it (it can raise a mission,
+never demote one), the working line leads with it, and notifications cite the
+evidence kind. `test/unit/observability-attention.test.ts` pins the ordering, the
+loop-while-healthy case, a pause reported as the operator's own, exhausted
+recovery with failing tests listed together, self-serving waits informing without
+interrupting, a wait past its deadline, and "no proof of life" being stated rather
+than hidden behind an `active` label.
+
+**Mission-scoped control** (`Orchestrator.pauseMission`, `/mission pause <id>`,
+`mission` tool `pause`). Esc pauses the turn on screen; a named pause stops the
+mission the operator points at, with no live turn. Recording the pause first makes
+automatic recovery stop immediately, and the supervisor reads it from the store, so
+it survives a restart. One decision is worth recording: the interrupted-run path
+`cancel`s a mission paused before anything dispatched, because an Esc during
+planning preserves nothing. Reusing that for a named pause would have destroyed
+missions whose operators only asked to stop them — a cancel cannot be resumed — so
+`pauseMission` handles the pre-dispatch states itself and leaves them paused.
+`test/unit/mission-scoped-pause.test.ts` pins parking with a resume condition, the
+no-cancel rule, the supervisor leaving a paused mission alone across a tick, the
+live-run abort, and terminal/unknown handling.
+
+Verification for this follow-up: `4290` unit tests and `968` integration tests
+(967 pass, 1 skipped) with `--test-concurrency=1`, `npm run typecheck` clean, and
+`biome check` clean.

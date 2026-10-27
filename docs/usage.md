@@ -346,6 +346,46 @@ the tool reports "interrupt noted". This covers a mission that is
 `NEEDS_ATTENTION`, `BLOCKED` or `WAITING_FOR_USER`. An interrupt that arrives
 before any work was planned still cancels, because there is nothing to keep.
 
+#### Pausing a mission you name: `/mission pause <id>`
+
+Esc pauses the turn you are watching. Dozens of missions can run at once, and the
+one worth stopping is rarely the one on screen, so a mission can also be paused
+by name: `/mission pause <id>`, or the `mission` tool's `pause` action. No live
+turn is needed. The pause is written to the mission first, so automatic recovery
+is off from that instant and the supervisor leaves the mission alone even after a
+restart; then whatever is live is stopped — a dispatched pipeline parks itself
+with its work, a queued or waiting mission is parked with its resume recorded.
+`/mission resume <id>` continues it.
+
+A mission that has not dispatched yet is paused rather than cancelled. The Esc
+path cancels that state because an interrupt during planning preserves nothing;
+reusing it for a named pause would destroy missions whose operators only asked to
+stop them, and a cancel cannot be resumed.
+
+### What you see while missions run
+
+Two surfaces show mission activity, and they share one arbiter
+(`src/status/surfaceBus.ts`) instead of guarding each other out:
+
+- the native working line, which the foreground agent owns while it runs, and
+  which the mission strip takes back the moment the turn ends;
+- the `engineering-missions` strip, ranked by who needs you first, plus the
+  terminal title and one notification per state change.
+
+Each producer claims a surface with a priority, so a third claimant — a recovery
+notice, a gateway wait — needs to know nothing about the others, and a claim that
+expires cannot keep a surface after its reason has ended.
+
+The strip and the working line lead with **evidence**, not with a mission's
+narration about itself. Attention is derived from observability facts in a fixed
+order — you being the next actor, exhausted recovery, failure, blocking review
+findings, failing tests, a loop counter, your own pause, a parked state, a stall,
+a wait past its deadline, progress age, and the one case where neither heartbeat
+nor progress proves the work is alive — and the strongest fact is what you read.
+"repeated tool call ×9" is something you can act on; "working on it" is not. The
+derivation is pure and reads no model text, so two operators looking at the same
+mission see the same reason.
+
 When a mission worker's model runs out of capacity (`queue_deadline_exceeded`,
 `queue_timeout`, `CAPACITY_EXHAUSTED`), the worker first waits out the gateway's
 advertised holds. If the hold is for one model (not the whole account) and the
@@ -600,6 +640,7 @@ restart.
 | -------------- | ------------------------------------------------------------- |
 | `/mission inspect <id> [workerId]` | Inspect current worker/model routing, recent activity (last 20 summaries), changed files, tests, retries, recovery and blockers. Supply a worker ID to filter its activity. |
 | `/mission why <id>` | Explains why a mission is not finishing: blocking task, failure category and reason, who holds the repository lease or custody (session and pid), cooldown scope and `nextActionAt`, retry counters, inherited failures, stranded branches, per-task typed usage (tokens, wall-time split, attempts, stream resumes, thinking), per-model error rollups (429, 404, connect-refused, stream stall, takeover, grammar 400) and the exact remedy command. Offline equivalent: `pi-engineering missions why --store <dir> <id> [--json]`. |
+| `/mission pause <id>` | Pause one named mission (no live turn needed). Esc pauses the turn on screen; this pauses the mission you name. Its work is kept and only `/mission resume <id>` continues it. |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
 | `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
