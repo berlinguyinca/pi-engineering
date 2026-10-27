@@ -325,10 +325,40 @@ export class GitRepo {
     return dir;
   }
 
-  private async assertPromotionUnlocked(): Promise<void> {
-    const lock = `${join(await this.commonDir(), "pi-engineering-promotion")}.lock`;
+  /**
+   * Lock publication briefly hard-links its owner record. Keep that private
+   * metadata out of Git's top-level file namespace, which safeGit scans for
+   * hostile hard links. All linked worktrees still share this directory.
+   * Drain old runtime processes before upgrading: they use the legacy names.
+   */
+  private async administrationLockFile(kind: "worktree" | "promotion"): Promise<string> {
+    const dir = join(await this.commonDir(), "pi-engineering-locks");
     try {
-      await access(lock);
+      await mkdir(dir, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    if (!(await lstat(dir)).isDirectory()) throw new Error("unsafe git administration lock directory");
+    return join(dir, `pi-engineering-${kind}`);
+  }
+
+  private async assertLegacyLockAbsent(kind: "worktree" | "promotion"): Promise<void> {
+    const path = join(await this.commonDir(), `pi-engineering-${kind}.lock`);
+    try {
+      await lstat(path);
+      throw new Error(
+        `legacy repository ${kind} critical section is held; drain old runtime processes before upgrading`,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  private async assertPromotionUnlocked(): Promise<void> {
+    await this.assertLegacyLockAbsent("promotion");
+    const lock = `${await this.administrationLockFile("promotion")}.lock`;
+    try {
+      await lstat(lock);
       throw new Error("repository promotion critical section is held");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -356,13 +386,14 @@ export class GitRepo {
   private async withWorktreeSection<T>(guard: GitMutationGuard | undefined, fn: () => Promise<T>): Promise<T> {
     const { ceilingMs, pollMs, now, sleep } = this.promotionWait;
     const deadline = now() + ceilingMs;
-    const lockFile = join(await this.commonDir(), "pi-engineering-worktree");
+    const lockFile = await this.administrationLockFile("worktree");
     let backoff = pollMs;
     for (let polls = 0; ; polls++) {
       guard?.assertAuthoritative();
       let lock: ExclusiveFileLock | undefined;
       let failure: unknown;
       try {
+        await this.assertLegacyLockAbsent("worktree");
         await this.assertPromotionUnlocked();
         lock = await ExclusiveFileLock.acquire(lockFile);
       } catch (error) {
@@ -2073,10 +2104,11 @@ export class GitRepo {
     hooks: PromotionHooks = {},
   ): Promise<PromotionResult> {
     guard?.assertAuthoritative();
-    const lockFile = join(await this.commonDir(), "pi-engineering-promotion");
+    const lockFile = await this.administrationLockFile("promotion");
     let lock: ExclusiveFileLock;
     let promotionIntent: PromotionLifecycle | undefined;
     try {
+      await this.assertLegacyLockAbsent("promotion");
       lock = await ExclusiveFileLock.acquire(lockFile);
     } catch (error) {
       return {
@@ -2220,9 +2252,10 @@ export class GitRepo {
 
   async reconcilePromotion(identity: PromotionIdentity, guard?: GitMutationGuard): Promise<PromotionResult> {
     guard?.assertAuthoritative();
-    const lockFile = join(await this.commonDir(), "pi-engineering-promotion");
+    const lockFile = await this.administrationLockFile("promotion");
     let lock: ExclusiveFileLock;
     try {
+      await this.assertLegacyLockAbsent("promotion");
       lock = await ExclusiveFileLock.acquire(lockFile);
     } catch (error) {
       return {

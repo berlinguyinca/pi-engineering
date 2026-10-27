@@ -20,8 +20,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { lstat, readFile, rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import type { WorkerRole } from "../core/types.ts";
 import { GitRepo, type WorktreeInfo } from "../git/GitRepo.ts";
 import { safeGit } from "../git/safeGit.ts";
@@ -148,6 +148,15 @@ async function git(cwd: string, args: string[]): Promise<{ code: number; stdout:
   return safeGit(args, { cwd, trust: "operator", maxBuffer: 64 * 1024 * 1024 });
 }
 
+/** A refused/failed query is never an empty successful result. */
+async function checkedGit(cwd: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  const result = await git(cwd, args);
+  if (result.code !== 0) {
+    throw new Error(`git ${args[0]} failed: ${(result.stderr || result.stdout).trim().slice(0, 300)}`);
+  }
+  return result;
+}
+
 /**
  * Run one verification command in a worktree (real child process, own process
  * group). There is no total-duration limit — missions are bounded by attempts
@@ -232,8 +241,12 @@ export class PlannerWorkerExecutor {
   private finalFixUsed = false;
   private baseCommit = "";
   private applied = false;
+  /** Only this exact clean, verified commit may be applied to the checkout. */
+  private verifiedIntegrationHead: string | null = null;
   /** Worktrees of contracts superseded by a replan, removed at cleanup. */
   private readonly retired: WorktreeInfo[] = [];
+  /** A failed harvest must retain the exact workspace for recovery. */
+  private readonly unharvested = new Set<string>();
   private status: PlannerWorkerReport["status"] | "running" = "running";
   private failureReason: string | null = null;
   private started = 0;
@@ -288,7 +301,7 @@ export class PlannerWorkerExecutor {
     if (this.status === "running") await this.finalReview();
     if (this.status === "running") {
       await this.apply(this.baseCommit);
-      return await this.finish("completed");
+      return await this.finish(this.status === "running" ? "completed" : this.status);
     }
     return await this.finish(this.status);
   }
@@ -321,6 +334,7 @@ export class PlannerWorkerExecutor {
     const repo = await GitRepo.open(this.opts.repoRoot);
     if (!repo) throw new Error(`${this.opts.repoRoot} is not a git repository`);
     this.repo = repo;
+    await this.assertResumePreservesWork(saved);
     await this.opts.resolver.refresh();
     this.baseCommit = saved.base_commit;
     this.integration = await this.reattachIntegration(saved.integration_branch, saved.integration_path);
@@ -331,7 +345,7 @@ export class PlannerWorkerExecutor {
       this.finalFixUsed = saved.contracts.some((c) => c.contract.task_id === "final-fix");
       this.telemetry.seed(saved.metrics ?? []);
       this.transitions.seed(saved.transitions ?? []);
-      const integrated = (await git(this.integration.path, ["log", "--format=%s"])).stdout;
+      const integrated = (await checkedGit(this.integration.path, ["log", "--format=%s"])).stdout;
       let kept = 0;
       for (const prior of saved.contracts) {
         const id = prior.contract.task_id;
@@ -368,6 +382,51 @@ export class PlannerWorkerExecutor {
     }
   }
 
+  /** Refuse destructive restart when previous work has not been harvested. */
+  private async assertResumePreservesWork(saved: ResumableState): Promise<void> {
+    const integrationBranch = saved.integration_branch!;
+    await checkedGit(this.opts.repoRoot, ["rev-parse", "--verify", `refs/heads/${integrationBranch}`]);
+    const unharvested = new Set(saved.unharvested_worktrees ?? []);
+    const exists = async (path: string): Promise<boolean> => {
+      try {
+        await lstat(path);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    };
+    const requireClean = async (path: string, branch: string) => {
+      try {
+        const state = await checkedGit(path, ["status", "--porcelain", "--untracked-files=all"]);
+        const current = await checkedGit(path, ["rev-parse", "--abbrev-ref", "HEAD"]);
+        if (state.stdout.trim() || current.stdout.trim() !== branch || unharvested.has(path)) {
+          throw new Error("dirty, unharvested or unexpected worktree");
+        }
+      } catch (error) {
+        throw new Error(
+          `resume preserved ${path} on ${branch}; recover its work before retrying: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+    if (saved.integration_path && (await exists(saved.integration_path))) {
+      await requireClean(saved.integration_path, integrationBranch);
+    }
+    for (const prior of saved.contracts) {
+      const branch = this.branchFor(prior.contract.task_id);
+      if (prior.worktree && (await exists(prior.worktree))) await requireClean(prior.worktree, branch);
+      const ref = await git(this.opts.repoRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+      if (ref.code === 1) continue;
+      if (ref.code !== 0) throw new Error(`cannot verify preserved branch ${branch}: ${ref.stderr}`);
+      const integrated = await git(this.opts.repoRoot, ["merge-base", "--is-ancestor", branch, integrationBranch]);
+      if (integrated.code !== 0 || (prior.worktree && unharvested.has(prior.worktree))) {
+        throw new Error(
+          `resume preserved ${prior.worktree ?? branch} on ${branch}; recover unharvested commits before retrying`,
+        );
+      }
+    }
+  }
+
   /** Re-open the mission's integration branch in a worktree (reusing a live one). */
   private async reattachIntegration(branch: string, path: string | undefined): Promise<WorktreeInfo> {
     if ((await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code !== 0) {
@@ -376,13 +435,10 @@ export class PlannerWorkerExecutor {
     const target = path ?? join(dirname(this.repo.root), `pi-eng-resume-${branch}`);
     const live = (await git(target, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim() === branch;
     if (live) {
-      // A crash may have left a half-finished merge: drop it, keep the commits.
-      await git(target, ["merge", "--abort"]);
-      await git(target, ["reset", "-q", "--hard", "HEAD"]);
+      // Preflight verified cleanliness. Never reset a crashed merge or edits.
       return { path: target, branch };
     }
-    await git(this.opts.repoRoot, ["worktree", "remove", "--force", target]);
-    if (basename(target).startsWith("pi-eng-")) await rm(target, { recursive: true, force: true });
+    await git(this.opts.repoRoot, ["worktree", "remove", target]);
     // -f: a crashed worktree whose directory vanished may still register the branch.
     const add = await git(this.opts.repoRoot, ["worktree", "add", "-f", target, branch]);
     if (add.code !== 0) throw new Error(`cannot reattach ${branch}: ${add.stderr.trim()}`);
@@ -578,7 +634,7 @@ export class PlannerWorkerExecutor {
       }
     }
     if (!rt.worktree) {
-      const head = (await git(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
+      const head = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
       rt.worktree = await this.repo.createWorktree(head, this.branchFor(c.task_id));
       rt.baseCommit = head;
       rt.lastHead = head;
@@ -1146,7 +1202,7 @@ export class PlannerWorkerExecutor {
     // The reviewer reads a worktree holding the integrated work plus every batch candidate.
     let reviewTree: WorktreeInfo | null = null;
     try {
-      const head = (await git(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
+      const head = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
       reviewTree = await this.repo.createWorktree(head, this.branchFor(`batch-review-${ids.join("-")}`));
       for (const rt of batch) {
         const merged = await git(reviewTree.path, [
@@ -1293,41 +1349,50 @@ export class PlannerWorkerExecutor {
 
   private async commitAttempt(rt: Runtime): Promise<string[]> {
     const path = rt.worktree!.path;
-    await git(path, ["add", "-A"]);
-    const dirty = (await git(path, ["status", "--porcelain"])).stdout.trim() !== "";
-    if (dirty) {
-      // Repository hooks must not silently drop an attempt: a lost commit would
-      // integrate nothing while verification passed on the working tree.
-      const r = await git(path, [
-        ...COMMITTER,
-        "commit",
-        "-q",
-        "--no-verify",
-        "-m",
-        `pw: ${rt.state.contract.task_id} attempt ${rt.state.attempt}`,
-      ]);
-      if (r.code !== 0 || (await git(path, ["status", "--porcelain"])).stdout.trim() !== "") {
-        throw new Error(`could not commit attempt ${rt.state.attempt}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`);
+    try {
+      await checkedGit(path, ["add", "-A"]);
+      const dirty = (await checkedGit(path, ["status", "--porcelain"])).stdout.trim() !== "";
+      if (dirty) {
+        // Repository hooks must not silently drop an attempt: a lost commit would
+        // integrate nothing while verification passed on the working tree.
+        const r = await git(path, [
+          ...COMMITTER,
+          "commit",
+          "-q",
+          "--no-verify",
+          "-m",
+          `pw: ${rt.state.contract.task_id} attempt ${rt.state.attempt}`,
+        ]);
+        if (r.code !== 0 || (await checkedGit(path, ["status", "--porcelain"])).stdout.trim() !== "") {
+          throw new Error(
+            `could not commit attempt ${rt.state.attempt}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`,
+          );
+        }
       }
+      const head = (await checkedGit(path, ["rev-parse", "HEAD"])).stdout.trim();
+      rt.diff = (await checkedGit(path, ["diff", rt.baseCommit, head, "--", ".", ":!package-lock.json"])).stdout;
+      rt.lastHead = head;
+      const names = (await checkedGit(path, ["diff", "--name-only", rt.baseCommit, head])).stdout;
+      rt.state.changed_files = names.split("\n").filter(Boolean);
+      return rt.state.changed_files;
+    } catch (error) {
+      this.unharvested.add(path);
+      await this.persist();
+      throw error;
     }
-    const head = (await git(path, ["rev-parse", "HEAD"])).stdout.trim();
-    rt.diff = (await git(path, ["diff", rt.baseCommit, head, "--", ".", ":!package-lock.json"])).stdout;
-    rt.lastHead = head;
-    const names = (await git(path, ["diff", "--name-only", rt.baseCommit, head])).stdout;
-    rt.state.changed_files = names.split("\n").filter(Boolean);
-    return rt.state.changed_files;
   }
 
   /** The change a contract's integration merge brought in ("" when it changed nothing). */
   private async integratedDiff(id: string): Promise<string> {
     const subject = `pw: integrate ${id}`;
-    const log = await git(this.integration.path, ["log", "--merges", "--format=%H%x00%s"]);
+    const log = await checkedGit(this.integration.path, ["log", "--merges", "--format=%H%x00%s"]);
     const merge = log.stdout
       .split("\n")
       .map((line) => line.split("\0"))
       .find(([, s]) => s === subject)?.[0];
     if (!merge) return "";
-    return (await git(this.integration.path, ["diff", `${merge}^1`, merge, "--", ".", ":!package-lock.json"])).stdout;
+    return (await checkedGit(this.integration.path, ["diff", `${merge}^1`, merge, "--", ".", ":!package-lock.json"]))
+      .stdout;
   }
 
   private integrate(rt: Runtime): Promise<{ ok: boolean; reason: string }> {
@@ -1352,8 +1417,8 @@ export class PlannerWorkerExecutor {
   }
 
   private async resetWorktree(rt: Runtime): Promise<void> {
-    const head = (await git(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
-    await git(rt.worktree!.path, ["reset", "-q", "--hard", head]);
+    const head = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
+    await checkedGit(rt.worktree!.path, ["reset", "-q", "--hard", head]);
     rt.baseCommit = head;
     rt.lastHead = head;
   }
@@ -1362,7 +1427,25 @@ export class PlannerWorkerExecutor {
 
   private async finalReview(): Promise<void> {
     this.emit({ type: "phase", text: "final review" });
+    this.verifiedIntegrationHead = null;
+    const verifiedHead = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
+    if (!(await this.checkIntegrationSnapshot(verifiedHead, "before integrated verification"))) return;
     const all = [...this.contracts.values()];
+    const integratedVerification: VerificationRun[] = [];
+    for (const command of new Set(all.flatMap((rt) => rt.state.contract.verification))) {
+      const result = await runVerification(command, this.integration.path, {
+        inactivityMs: this.opts.verificationInactivityMs,
+        signal: this.opts.signal,
+      });
+      integratedVerification.push(result);
+      if (!result.passed) {
+        this.status = "failed";
+        this.failureReason = `integrated verification failed: ${command}`;
+        this.emit({ type: "phase", text: this.failureReason });
+        return;
+      }
+    }
+    if (!(await this.checkIntegrationSnapshot(verifiedHead, "after integrated verification"))) return;
     const diff = all.map((rt) => rt.diff).join("\n");
     const implementers = [...new Set(all.map((rt) => rt.state.last_model).filter((m): m is string => m !== null))];
     const reviewer = await this.opts.resolver.resolve("reviewer", implementers);
@@ -1376,7 +1459,7 @@ export class PlannerWorkerExecutor {
         this.brief.acceptance_criteria.length > 0
           ? this.brief.acceptance_criteria
           : all.flatMap((rt) => rt.state.contract.acceptance),
-      verification: [],
+      verification: integratedVerification.map((run) => run.command),
       constraints: this.brief.constraints,
       risk: "medium",
       relevant_files: all.flatMap((rt) => rt.state.changed_files),
@@ -1396,12 +1479,17 @@ export class PlannerWorkerExecutor {
           summary: [...this.results.values()].map((d) => `${d.task_id}: ${d.summary}`).join("\n"),
           changed_files: finalContract.relevant_files,
           diff,
-          verification: all.flatMap((rt) => rt.verification),
+          verification: integratedVerification,
         },
       }),
       cwd: this.integration.path,
     });
-    if (r.verdict.status === "pass") return;
+    if (r.verdict.status === "pass") {
+      if (await this.checkIntegrationSnapshot(verifiedHead, "after final review")) {
+        this.verifiedIntegrationHead = verifiedHead;
+      }
+      return;
+    }
     if (this.finalFixUsed || r.verdict.status === "escalate" || r.verdict.status === "replan") {
       this.status = "failed";
       this.failureReason = `final review: ${r.verdict.status}: ${r.verdict.issues.map((i) => i.summary).join("; ")}`;
@@ -1422,16 +1510,36 @@ export class PlannerWorkerExecutor {
     if (this.status === "running") await this.finalReview();
   }
 
+  /** Shell verification and review must not change the result they certify. */
+  private async checkIntegrationSnapshot(expectedHead: string | null, phase: string): Promise<boolean> {
+    try {
+      if (!expectedHead) throw new Error("no verified integration commit");
+      const head = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
+      const state = await checkedGit(this.integration.path, ["status", "--porcelain", "--untracked-files=all"]);
+      if (head !== expectedHead || state.stdout.trim()) throw new Error("integration commit or clean state changed");
+      return true;
+    } catch (error) {
+      this.status = "failed";
+      this.failureReason = `integration state changed ${phase}: ${error instanceof Error ? error.message : String(error)}`;
+      this.unharvested.add(this.integration.path);
+      this.emit({ type: "phase", text: this.failureReason });
+      await this.persist();
+      return false;
+    }
+  }
+
   private async apply(base: string): Promise<void> {
+    if (!(await this.checkIntegrationSnapshot(this.verifiedIntegrationHead, "before apply"))) return;
     if (this.opts.applyToCheckout === false) return;
-    const head = (await git(this.opts.repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
+    const head = (await checkedGit(this.opts.repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
     const clean =
-      (await git(this.opts.repoRoot, ["status", "--porcelain", "--untracked-files=no"])).stdout.trim() === "";
+      (await checkedGit(this.opts.repoRoot, ["status", "--porcelain", "--untracked-files=no"])).stdout.trim() === "";
     if (head !== base || !clean) {
       this.emit({ type: "phase", text: `checkout moved or dirty; result left on branch ${this.integration.branch}` });
       return;
     }
-    const r = await git(this.opts.repoRoot, ["merge", "--ff-only", "-q", this.integration.branch]);
+    // Pin the verified object rather than a branch that can move after the check.
+    const r = await git(this.opts.repoRoot, ["merge", "--ff-only", "-q", this.verifiedIntegrationHead!]);
     this.applied = r.code === 0;
     this.emit({
       type: "phase",
@@ -1444,15 +1552,37 @@ export class PlannerWorkerExecutor {
   }
 
   private async dropWorktree(info: WorktreeInfo, keepBranch = false): Promise<void> {
-    await git(this.opts.repoRoot, ["worktree", "remove", "--force", info.path]);
-    if (!keepBranch) await git(this.opts.repoRoot, ["branch", "-D", info.branch]);
+    const state = await git(info.path, ["status", "--porcelain", "--untracked-files=all"]);
+    if (this.unharvested.has(info.path) || state.code !== 0 || state.stdout.trim()) {
+      this.emit({ type: "phase", text: `preserved worker output at ${info.path} on ${info.branch}` });
+      return;
+    }
+    // Git itself rechecks cleanliness at removal: a write after status must not
+    // turn cleanup into deletion of new uncommitted output.
+    const removed = await git(this.opts.repoRoot, ["worktree", "remove", info.path]);
+    if (removed.code !== 0) {
+      this.emit({ type: "phase", text: `preserved worktree at ${info.path}: cleanup could not confirm removal` });
+      return;
+    }
+    if (!keepBranch) await checkedGit(this.opts.repoRoot, ["branch", "-D", info.branch]);
   }
 
   private async cleanup(): Promise<void> {
-    for (const rt of this.contracts.values()) if (rt.worktree) await this.dropWorktree(rt.worktree);
-    for (const info of this.retired) await this.dropWorktree(info);
+    for (const rt of this.contracts.values()) {
+      if (rt.worktree) {
+        // Preserve failed workspaces in full, including ignored files that a
+        // clean git status cannot prove disposable.
+        if (this.status !== "completed" || rt.state.status !== "passed") this.unharvested.add(rt.worktree.path);
+        await this.dropWorktree(rt.worktree);
+      }
+    }
+    for (const info of this.retired) await this.dropWorktree(info, true);
     // The integration branch is the result when it was not applied to the checkout.
-    if (this.integration) await this.dropWorktree(this.integration, !this.applied);
+    if (this.integration) {
+      if (this.status !== "completed") this.unharvested.add(this.integration.path);
+      await this.dropWorktree(this.integration, !this.applied);
+    }
+    if (this.unharvested.size > 0) await this.persist();
     await this.transitions.flush();
   }
 
@@ -1488,6 +1618,7 @@ export class PlannerWorkerExecutor {
       base_commit: this.baseCommit,
       integration_branch: this.integration?.branch ?? null,
       integration_path: this.integration?.path ?? null,
+      unharvested_worktrees: [...this.unharvested],
       planner_model: this.plannerModel,
       plan: this.plan,
       live_activity: this.activity.snapshot(),
@@ -1531,6 +1662,7 @@ interface ResumableState {
   base_commit?: string;
   integration_branch?: string;
   integration_path?: string;
+  unharvested_worktrees?: string[];
   plan: PlannerOutput;
   contracts: ContractState[];
   transitions?: PlannerWorkerReport["transitions"];

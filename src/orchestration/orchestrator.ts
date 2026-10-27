@@ -88,7 +88,7 @@ import {
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { buildReviewContext } from "./reviewContext.ts";
 import { brokerKind } from "./scheduler.ts";
-import { MissionScheduler } from "./scheduler.ts";
+import { MissionScheduler, type SchedulerOptions } from "./scheduler.ts";
 import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } from "./specApproval.ts";
 import { canTransitionMission, canTransitionTask } from "./state.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
@@ -195,6 +195,8 @@ export interface OrchestratorOptions {
     maxSubprocesses?: number;
     maxPerRole?: number;
   };
+  /** Authoritative pre-dispatch route, when the backend can resolve one. Requested model hints are insufficient. */
+  modelForTask?: SchedulerOptions["modelForTask"];
   router?: IntentRouter;
   /**
    * Maximum gate-driven repair rounds (spec 07). Each round repairs the open
@@ -493,6 +495,7 @@ export class Orchestrator {
       store: this.store,
       broker: this.broker,
       limits: this.limits,
+      modelForTask: opts.modelForTask,
       // Time-based gateway resilience: a worker transient-infra failure retries
       // within the (env-resolved) window, parking the mission in a WAITING state,
       // and pauses (not fails) on exhaustion. Operator may override config/probe.

@@ -433,6 +433,80 @@ test("long task ids never share a branch, and a rejecting pre-commit hook cannot
   assert.equal(branches.stdout.trim(), "");
 });
 
+test("completion reruns contract verification against the integrated tree", async () => {
+  const { executor } = await setup((req) => {
+    if (roleOf(req) === "planner") {
+      return {
+        content: JSON.stringify({
+          contracts: [
+            contract("solo", {
+              verification: [
+                'test -f src/solo/done.txt && test "$(git branch --show-current)" != pi-eng-pw-M-integrated',
+              ],
+            }),
+          ],
+        }),
+      };
+    }
+    if (roleOf(req) === "implementer") {
+      return {
+        content: JSON.stringify({
+          status: "completed",
+          summary: "created output",
+          files: [{ path: "src/solo/done.txt", content: "done" }],
+        }),
+      };
+    }
+    return pass;
+  });
+  const report = await executor.run(brief("M-integrated"));
+  assert.equal(report.status, "failed", "worker-tree success alone cannot prove the integrated result");
+  assert.match(report.failure_reason ?? "", /integrated verification/i);
+});
+
+for (const mutation of ["verification", "reviewer edit", "reviewer commit", "reviewer edit without apply"] as const) {
+  test(`completion requires a sealed integration tree after ${mutation}`, async () => {
+    const configured = await setup(async (req) => {
+      const integration = (configured.executor as any).integration;
+      if (roleOf(req) === "planner") {
+        const verification =
+          mutation === "verification"
+            ? `if test "$(git branch --show-current)" = "${integration.branch}"; then printf tampered > src/solo/done.txt; fi; test -f src/solo/done.txt`
+            : 'test "$(cat src/solo/done.txt)" = verified';
+        return { content: JSON.stringify({ contracts: [contract("solo", { verification: [verification] })] }) };
+      }
+      if (roleOf(req) === "implementer") {
+        return {
+          content: JSON.stringify({
+            status: "completed",
+            summary: "created output",
+            files: [{ path: "src/solo/done.txt", content: "verified" }],
+          }),
+        };
+      }
+      if (roleOf(req) === "reviewer" && taskOf(req) === "final-review" && mutation !== "verification") {
+        await writeFile(join(integration.path, "src", "solo", "done.txt"), "tampered");
+        if (mutation === "reviewer commit") {
+          await exec("git", ["-C", integration.path, "add", "src/solo/done.txt"]);
+          await exec("git", ["-C", integration.path, "commit", "-qm", "unverified review mutation"]);
+        }
+      }
+      return pass;
+    });
+    if (mutation === "reviewer edit without apply") (configured.executor as any).opts.applyToCheckout = false;
+    const report = await configured.executor.run(brief(`M-integrity-${mutation.replaceAll(" ", "-")}`));
+    assert.equal(report.status, "failed", "an exit-zero command or passing review cannot change the verified result");
+    assert.match(report.failure_reason ?? "", /integration.*(changed|clean|state)/i);
+    await assert.rejects(readFile(join(configured.fixture.root, "src", "solo", "done.txt")));
+    const integration = (configured.executor as any).integration;
+    assert.equal(
+      await readFile(join(integration.path, "src", "solo", "done.txt"), "utf8"),
+      "tampered",
+      "unverified output is retained for recovery",
+    );
+  });
+}
+
 test("verification commands come from model output and never see credentials", async () => {
   process.env.PW_TEST_API_TOKEN = "secret";
   try {

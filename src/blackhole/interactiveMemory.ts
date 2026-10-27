@@ -374,7 +374,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   pi.on("session_before_tree", () => reset());
   pi.on("session_shutdown", () => reset());
   pi.on("before_agent_start", async (event, ctx) => {
-    generation++;
+    // A new turn retires older automatic work, not commands still completing
+    // in this session. Session/connection replacement owns generation changes.
+    automaticLookupEpoch++;
     recalled = "";
     const conn = connection(ctx, false, true);
     if (!conn) return;

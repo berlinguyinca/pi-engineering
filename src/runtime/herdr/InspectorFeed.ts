@@ -950,10 +950,17 @@ export function inspectorConfigFromHost(cfg: Pick<HostConfig, "url" | "apiKey" |
  */
 export async function attachInspectorFeedFromHost(
   pi: ExtensionAPI,
-  extra: Partial<InspectorFeedOptions> & { fetch?: typeof globalThis.fetch; hostConfig?: LoadHostConfigOptions } = {},
+  extra: Partial<InspectorFeedOptions> & {
+    fetch?: typeof globalThis.fetch;
+    hostConfig?: LoadHostConfigOptions;
+    /** Do not construct a feed or reporter if the owning attachment was retired. */
+    signal?: AbortSignal;
+  } = {},
 ): Promise<InspectorFeedHandle | null> {
-  const { fetch, hostConfig, ...rest } = extra;
+  const { fetch, hostConfig, signal, ...rest } = extra;
+  if (signal?.aborted) return null;
   const host = await loadHostConfig(hostConfig);
+  if (signal?.aborted) return null;
   const cfg = inspectorConfigFromHost(host);
   if (!cfg.enabled) return null;
   const ingest = new ControlPlaneIngest({
@@ -966,7 +973,32 @@ export async function attachInspectorFeedFromHost(
   const paneId = rest.sessionId ?? env.HERDR_PANE_ID?.trim();
   if (handle && paneId) {
     const reporter = reportRuntimeFacts(ingest, paneId, env);
-    pi.on?.("session_shutdown" as never, (() => reporter.stop()) as never);
+    let off: unknown;
+    const stop = () => {
+      reporter.stop();
+      if (typeof off === "function") {
+        try {
+          off();
+        } catch {
+          // A retired host may no longer support unsubscription.
+        }
+        off = undefined;
+      }
+    };
+    try {
+      off = pi.on?.("session_shutdown" as never, stop as never);
+    } catch (error) {
+      stop();
+      handle.dispose();
+      throw error;
+    }
+    return {
+      ...handle,
+      dispose: () => {
+        stop();
+        handle.dispose();
+      },
+    };
   }
   return handle;
 }

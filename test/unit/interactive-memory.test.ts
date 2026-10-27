@@ -427,6 +427,93 @@ for (const action of ["save", "check", "search"] as const) {
   }
 }
 
+for (const action of ["save", "check", "search"] as const) {
+  for (const outcome of ["success", "failure"] as const) {
+    test(`explicit ${action} spanning a new turn retires that turn's older lookup ${outcome}`, async () => {
+      const f = fixture();
+      const prompt = { prompt: "calibration", systemPrompt: "" };
+      const store = f.store.store.bind(f.store);
+      const recallAll = f.store.recallAll.bind(f.store);
+      await store(record("calibration obsolete snapshot"));
+      let completeCommand!: () => void;
+      const commandGate = new Promise<void>((resolve) => {
+        completeCommand = resolve;
+      });
+      if (action === "save")
+        f.store.store = async (row) => {
+          await commandGate;
+          await store(row);
+        };
+      else if (action === "check")
+        f.store.recallAll = async () => {
+          await commandGate;
+          return recallAll();
+        };
+      else
+        f.override(async () => {
+          await commandGate;
+          return f.store.search("calibration");
+        });
+      const command = f.command(
+        action === "save" ? "remember" : "memory",
+        action === "check" ? "status" : "calibration newly saved",
+      );
+      let resolve!: (rows: DurableMemoryRecord[]) => void;
+      let reject!: (error: Error) => void;
+      f.override(
+        () =>
+          new Promise((resolveSearch, rejectSearch) => {
+            resolve = resolveSearch;
+            reject = rejectSearch;
+          }),
+      );
+      const lookup = f.emit("before_agent_start", prompt);
+      if (action !== "save") await store(record("calibration newly saved"));
+      completeCommand();
+      await command;
+      assert.ok(f.notices.length > 0, "ordinary turn changes must not invalidate explicit command acknowledgments");
+      const statuses = f.statuses.length;
+      const notices = f.notices.length;
+      if (outcome === "success") resolve([record("calibration obsolete snapshot")]);
+      else reject(new OpenVikingRequestError("auth", 401));
+      await lookup;
+      assert.equal(f.statuses.length, statuses);
+      assert.equal(f.notices.length, notices);
+      f.override(undefined);
+      f.store.recallAll = recallAll;
+      const searches = f.queries.length;
+      await f.emit("before_agent_start", prompt);
+      assert.equal(f.queries.length, searches + 1, "an obsolete lookup cannot seed cache or failure backoff");
+      assert.match((await f.emit("context", { messages: [] })).messages[0].content, /newly saved/);
+    });
+  }
+}
+
+for (const replacement of ["session", "credential"] as const) {
+  test(`an explicit save remains fenced after real ${replacement} replacement`, async () => {
+    const f = fixture();
+    const store = f.store.store.bind(f.store);
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    f.store.store = async (row) => {
+      await gate;
+      await store(row);
+    };
+    const save = f.command("remember", "calibration from the retired connection");
+    if (replacement === "session") await f.emit("session_before_switch");
+    else f.env.PI_OPENVIKING_TOKEN = "rotated-key";
+    await f.emit("before_agent_start", { prompt: "calibration" });
+    const statuses = f.statuses.length;
+    const notices = f.notices.length;
+    finish();
+    await save;
+    assert.equal(f.statuses.length, statuses);
+    assert.equal(f.notices.length, notices);
+  });
+}
+
 test("late setup errors do not touch a session closed while setup was pending", async () => {
   for (const manual of [false, true]) {
     let reject!: (error: Error) => void;
