@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { HerdrAgentRuntime } from "../src/runtime/herdr/HerdrAgentRuntime.ts";
 import { RealHerdrCli } from "../src/runtime/herdr/HerdrCli.ts";
+import { cleanupOwnedCanary, stopOwnedCanaryProcess, trackOwnedCanaryProcess } from "./support/ownedCanaryProcess.ts";
 
 const exec = promisify(execFile);
 const self = fileURLToPath(import.meta.url);
@@ -74,18 +75,7 @@ async function host() {
   };
   let server;
   let client;
-  let serverExited = false;
-  let clientExited = false;
   let ownsSessionDirectory = false;
-  const killGroup = (child, exited, signal = "SIGTERM") => {
-    if (child && !exited) {
-      try {
-        process.kill(-child.pid, signal);
-      } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
-    }
-  };
   try {
     await mkdir(dirname(sessionDirectory), { recursive: true, mode: 0o700 });
     // Exclusive creation prevents a rare name collision from attaching to or deleting an existing session.
@@ -183,46 +173,46 @@ exec /bin/bash --noprofile --norc
       config,
       `onboarding = false\n[terminal]\ndefault_shell = ${JSON.stringify(join(root, "bootstrap.sh"))}\nshell_mode = "non_login"\nnew_cwd = ${JSON.stringify(root)}\n[worktrees]\ndirectory = ${JSON.stringify(join(root, "worktrees"))}\n`,
     );
-    server = spawn(bin, ["--session", session, "server"], {
-      env,
-      cwd: root,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    server = trackOwnedCanaryProcess(
+      spawn(bin, ["--session", session, "server"], {
+        env,
+        cwd: root,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
     const serverLog = createWriteStream(join(root, "server.log"));
-    server.stdout.pipe(serverLog);
-    server.stderr.pipe(serverLog);
-    server.once("exit", () => {
-      serverExited = true;
-    });
+    server.child.stdout.pipe(serverLog);
+    server.child.stderr.pipe(serverLog);
     for (let i = 0; i < 100 && !(await exists(socket)); i++) {
-      assert.ok(!serverExited, "Owned headless server exited before creating its socket");
+      assert.ok(!server.closed && !server.error, "Owned headless server failed before creating its socket");
       await pause(100);
     }
     assert.ok(await exists(socket), "Owned server did not create its named socket");
     // Socket ownership is checked again from inside the genuine managed pane.
-    client = spawn(
-      "script",
-      [
-        "-qefc",
-        `stty rows 40 cols 120\nexec ${[bin, "--session", session].map(quote).join(" ")}`,
-        join(root, "client.log"),
-      ],
-      {
-        env,
-        cwd: root,
-        detached: true,
-        stdio: "ignore",
-      },
+    client = trackOwnedCanaryProcess(
+      spawn(
+        "script",
+        [
+          "-qefc",
+          `stty rows 40 cols 120\nexec ${[bin, "--session", session].map(quote).join(" ")}`,
+          join(root, "client.log"),
+        ],
+        {
+          env,
+          cwd: root,
+          detached: true,
+          stdio: "ignore",
+        },
+      ),
     );
-    client.once("exit", () => {
-      clientExited = true;
-    });
-    for (let i = 0; i < 200 && !(await exists(join(root, "ready"))); i++) await pause(100);
+    for (let i = 0; i < 200 && !(await exists(join(root, "ready"))); i++) {
+      assert.ok(!client.closed && !client.error, "Owned TUI client failed before managed bootstrap readiness");
+      await pause(100);
+    }
     assert.ok(await exists(join(root, "ready")), "Genuine managed bootstrap did not become ready");
-    killGroup(client, clientExited);
-    for (let i = 0; i < 50 && !clientExited; i++) await pause(100);
-    assert.ok(clientExited, "Owned TUI client must detach before test work or pane cleanup");
+    await stopOwnedCanaryProcess(client);
+    assert.ok(client.closed, "Owned TUI client must detach before test work or pane cleanup");
     await writeFile(join(root, "client-detached"), "ready");
     let printed = 0;
     for (let i = 0; i < 2000 && !(await exists(join(root, "result.json"))); i++) {
@@ -242,8 +232,8 @@ exec /bin/bash --noprofile --norc
       `Engineering canary failed at ${result.stage}; error type ${result.errorType}`,
     );
     assert.equal(result.ownedAgentsRemaining, 0, "Every owned worker must terminate before server cleanup");
-    for (let i = 0; i < 100 && !serverExited; i++) await pause(100);
-    assert.ok(serverExited, "Owned server did not shut down from its managed pane");
+    for (let i = 0; i < 100 && !server.closed; i++) await pause(100);
+    assert.ok(server.closed, "Owned server did not shut down from its managed pane");
     console.log(
       `${opts.bootstrapOnly ? "Bootstrap check" : "Engineering canary"} passed: ${result.assistantRequests} assistant responses; owned server stopped.`,
     );
@@ -257,18 +247,7 @@ exec /bin/bash --noprofile --norc
     }
     throw error;
   } finally {
-    killGroup(client, clientExited);
-    for (let i = 0; i < 50 && client && !clientExited; i++) await pause(100);
-    if (client && !clientExited) {
-      killGroup(client, clientExited, "SIGKILL");
-      for (let i = 0; i < 50 && !clientExited; i++) await pause(100);
-    }
-    assert.ok(!client || clientExited, "Detach the owned client before shutting down its server");
-    // Only the dedicated process group spawned above is eligible for emergency cleanup.
-    killGroup(server, serverExited);
-    for (let i = 0; i < 50 && server && !serverExited; i++) await pause(100);
-    await rm(root, { recursive: true, force: true });
-    if (ownsSessionDirectory) await rm(sessionDirectory, { recursive: true, force: true });
+    await cleanupOwnedCanary({ client, server, root, sessionDirectory, ownsSessionDirectory });
   }
 }
 
