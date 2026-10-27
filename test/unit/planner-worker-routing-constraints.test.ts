@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { CatalogModel } from "../../src/plannerWorker/gateway.ts";
+import { type CatalogModel, parseAvailabilityError } from "../../src/plannerWorker/gateway.ts";
 import { RoleResolver } from "../../src/plannerWorker/resolver.ts";
 import { DEFAULT_ROLE_CONFIG, resolveRole } from "../../src/plannerWorker/roles.ts";
 
@@ -100,4 +100,66 @@ test("failover refreshes known candidate readiness, context and tool support", a
   assert.equal(ready?.via, "capability");
   assert.equal(ready?.contextWindow, 131_072);
   assert.equal(resolver.catalog().length, 1);
+});
+
+test("sparse refusal candidates preserve known capabilities and recover role dispatch", async () => {
+  const resolver = new RoleResolver({
+    provider: "gw",
+    config,
+    catalog: [
+      model({ capabilities: ["coding.implementation"], aliases: ["coding-implementation"], state: "draining" }),
+    ],
+  });
+  const refusal = parseAvailabilityError(503, {
+    error: {
+      code: "model_not_found",
+      x_fallback_candidates: [{ id: "candidate", x_state: "hot", x_context_window: 131_072 }],
+    },
+  });
+  assert.ok(refusal);
+  resolver.mergeCandidates(refusal.candidates);
+  const resolved = await resolver.resolve("implementer");
+  assert.equal(resolved?.model.id, "candidate");
+  assert.equal(resolved?.via, "capability");
+  assert.deepEqual(resolved?.entry?.capabilities, ["coding.implementation"]);
+  assert.deepEqual(resolved?.entry?.aliases, ["coding-implementation"]);
+  assert.deepEqual(resolved?.entry?.modalities, ["text"]);
+});
+
+test("sparse refusal candidates preserve logical alias identity", async () => {
+  const resolver = new RoleResolver({
+    provider: "gw",
+    config,
+    catalog: [model({ id: "coding-implementation", alias: true, backing: "underlying", state: "draining" })],
+  });
+  const refusal = parseAvailabilityError(503, {
+    error: { code: "model_not_found", x_fallback_candidates: [{ id: "coding-implementation", x_state: "hot" }] },
+  });
+  assert.ok(refusal);
+  resolver.mergeCandidates(refusal.candidates);
+  const resolved = await resolver.resolve("implementer");
+  assert.equal(resolved?.via, "alias");
+  assert.equal(resolved?.backing, "underlying");
+  assert.equal(resolved?.entry?.alias, true);
+});
+
+test("explicit empty refusal capability metadata replaces previous declarations", async () => {
+  const resolver = new RoleResolver({
+    provider: "gw",
+    config,
+    catalog: [model({ capabilities: ["coding.implementation"], alias: true, backing: "old-backing" })],
+  });
+  const refusal = parseAvailabilityError(503, {
+    error: {
+      code: "model_not_found",
+      x_fallback_candidates: [{ id: "candidate", x_alias: false, x_capabilities: [], x_aliases: [], x_modalities: [] }],
+    },
+  });
+  assert.ok(refusal);
+  resolver.mergeCandidates(refusal.candidates);
+  assert.equal(await resolver.resolve("implementer"), null);
+  assert.deepEqual(resolver.catalog()[0]?.capabilities, []);
+  assert.deepEqual(resolver.catalog()[0]?.modalities, []);
+  assert.equal(resolver.catalog()[0]?.alias, false);
+  assert.equal(resolver.catalog()[0]?.backing, undefined);
 });

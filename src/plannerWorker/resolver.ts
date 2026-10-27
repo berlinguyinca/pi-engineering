@@ -4,7 +4,7 @@
  */
 
 import type { ModelProfile } from "./compatibility.ts";
-import type { CatalogModel } from "./gateway.ts";
+import type { CatalogModel, CatalogModelUpdate } from "./gateway.ts";
 import type { ModelRef } from "./planner.ts";
 import {
   DEFAULT_ROLE_CONFIG,
@@ -70,11 +70,13 @@ export class RoleResolver {
   }
 
   /** Merge gateway-suggested candidates (availability error metadata). */
-  mergeCandidates(candidates: CatalogModel[]): void {
+  mergeCandidates(candidates: CatalogModelUpdate[]): void {
     for (const candidate of candidates) {
       const index = this.models.findIndex((m) => m.id === candidate.id);
-      if (index < 0) this.models.push(candidate);
-      else this.models[index] = { ...this.models[index], ...candidate };
+      const existing = this.models[index];
+      if (!existing) {
+        this.models.push({ alias: false, aliases: [], capabilities: [], modalities: [], ...candidate });
+      } else this.models[index] = { ...existing, ...candidate };
     }
   }
 
