@@ -98,7 +98,11 @@ export interface ResolveContext {
   /** Model ids known unavailable right now (failure-aware switching). */
   exclude?: readonly string[];
   /** Static routing (engineering.yaml pins via the capability router). */
-  fallback?: (role: PlannerWorkerRole, exclude: readonly string[]) => Promise<ModelRef | undefined>;
+  fallback?: (
+    role: PlannerWorkerRole,
+    exclude: readonly string[],
+    requirements: RoleConfig,
+  ) => Promise<ModelRef | undefined>;
 }
 
 function score(m: CatalogModel, cfg: RoleConfig): number {
@@ -187,9 +191,12 @@ export async function resolveRole(role: PlannerWorkerRole, ctx: ResolveContext):
   }
 
   // 3. Static role routing.
-  const fallback = await ctx.fallback?.(role, [...exclude]).catch(() => undefined);
+  const fallback = await ctx.fallback?.(role, [...exclude], cfg).catch(() => undefined);
   if (fallback) {
-    const entry = ctx.catalog.find((m) => m.id === fallback.id);
+    // Catalogue ids belong to the gateway provider; another provider may use
+    // the same id for a different model. Its router owns the hard checks.
+    const entry = fallback.provider === ctx.provider ? ctx.catalog.find((m) => m.id === fallback.id) : undefined;
+    if (exclude.has(fallback.id) || (entry && !fits(entry))) return null;
     return {
       role,
       model: fallback,

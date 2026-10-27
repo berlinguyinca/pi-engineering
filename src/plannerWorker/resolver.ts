@@ -21,7 +21,11 @@ export interface RoleResolverOptions {
   config?: Readonly<Record<PlannerWorkerRole, RoleConfig>>;
   catalog?: CatalogModel[];
   loadCatalog?: () => Promise<CatalogModel[]>;
-  fallback?: (role: PlannerWorkerRole, exclude: readonly string[]) => Promise<ModelRef | undefined>;
+  fallback?: (
+    role: PlannerWorkerRole,
+    exclude: readonly string[],
+    requirements: RoleConfig,
+  ) => Promise<ModelRef | undefined>;
   /**
    * The operator's explicit model choice (Pi `/model`), read at every
    * resolution so a switch lands at the next dispatch, replan or review.
@@ -67,7 +71,11 @@ export class RoleResolver {
 
   /** Merge gateway-suggested candidates (availability error metadata). */
   mergeCandidates(candidates: CatalogModel[]): void {
-    for (const c of candidates) if (!this.models.some((m) => m.id === c.id)) this.models.push(c);
+    for (const candidate of candidates) {
+      const index = this.models.findIndex((m) => m.id === candidate.id);
+      if (index < 0) this.models.push(candidate);
+      else this.models[index] = { ...this.models[index], ...candidate };
+    }
   }
 
   async resolve(role: PlannerWorkerRole, avoid: readonly string[] = []): Promise<ResolvedRole | null> {

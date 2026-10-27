@@ -302,10 +302,12 @@ export function mergeRecords(sources: ModelRecord[][]): ModelRecord[] {
         merged.set(key, rec);
         continue;
       }
-      // Union health/availability signals; keep the richer capability declaration.
+      // The first source owns availability (Pi runtime precedes configured files).
+      // Supplementary configuration must not make an unselectable model routable.
+      // Health remains conservative; keep the richer capability declaration.
       merged.set(key, {
         ...existing,
-        available: existing.available || rec.available,
+        available: existing.available,
         healthy: existing.healthy && rec.healthy,
         contextWindow: existing.contextWindow ?? rec.contextWindow,
         maxOutput: existing.maxOutput ?? rec.maxOutput,
