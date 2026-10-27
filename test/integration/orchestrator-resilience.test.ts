@@ -250,6 +250,30 @@ describe("resilience e2e — a gateway outage pauses (not fails) a live mission"
     assert.equal(h.orchestrator.gate.evaluate(resumed).can_complete, true);
   });
 
+  it("explicit forced resume can attempt work when capacity telemetry is unknown", async () => {
+    let down = true;
+    const h = harness({
+      failWhileDown: () => down,
+      probe: async () => ({ healthy: false, authoritative: false }),
+    });
+    const initial = await h.orchestrator.orchestrate("Add a health endpoint", {
+      repository: ".",
+      baseRef: "abc",
+      mutationRequested: true,
+    });
+    assert.equal(initial.mission.status, "PAUSED_INFRASTRUCTURE");
+    down = false;
+    assert.equal(
+      (await h.orchestrator.resume(initial.mission.mission_id)).status,
+      "PAUSED_INFRASTRUCTURE",
+      "unknown capacity does not automatically prove recovery",
+    );
+    const before = h.calls.agent;
+    const resumed = await h.orchestrator.resume(initial.mission.mission_id, { force: true });
+    assert.equal(resumed.status, "COMPLETE");
+    assert.ok(h.calls.agent > before, "explicit force attempts work despite unknown telemetry");
+  });
+
   it("resume attempts bounded repair and blocks when validation remains red", async () => {
     let down = true;
     const h = harness({ failWhileDown: () => down, validationFailTimes: 99 });

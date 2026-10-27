@@ -679,8 +679,11 @@ class FakeCli implements HerdrCli {
   async startAgent(): Promise<void> {}
   async sendKeys(): Promise<void> {}
   async closePane(): Promise<void> {}
-  async createWorktree(repo: string): Promise<{ workspaceId: string; path: string }> {
-    return { workspaceId: "w", path: repo };
+  async createWorkspace(repo: string) {
+    return { workspaceId: "w", paneId: "w:p1", path: repo };
+  }
+  async createWorktree(repo: string) {
+    return { workspaceId: "w", paneId: "w:p1", path: repo };
   }
 }
 

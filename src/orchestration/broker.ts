@@ -2646,7 +2646,9 @@ export class ExecutionBroker {
         ok: false,
         rebased: false,
         conflict: result.conflict,
-        reason: result.conflict ? `rebase onto ${currentBase} conflicted: ${result.reason}` : result.reason ?? "rebase failed",
+        reason: result.conflict
+          ? `rebase onto ${currentBase} conflicted: ${result.reason}`
+          : (result.reason ?? "rebase failed"),
       };
     }
     const lifecycle: CandidateLifecycle = {
@@ -2679,7 +2681,14 @@ export class ExecutionBroker {
       hash,
       createdAt: manifest.createdAt,
     };
-    return { ok: true, rebased: true, conflict: false, baseSha: currentBase, candidateSha: result.headSha, manifest: updated };
+    return {
+      ok: true,
+      rebased: true,
+      conflict: false,
+      baseSha: currentBase,
+      candidateSha: result.headSha,
+      manifest: updated,
+    };
   }
 
   /** Sole incumbent mutation: called only after current candidate gates pass. */

@@ -667,6 +667,9 @@ export class PlannerWorkerExecutor {
       rt.baseCommit = head;
       rt.lastHead = head;
       rt.state.worktree = rt.worktree.path;
+      // A worker can die as soon as dispatch starts. Its identity must already
+      // be durable so resume never mistakes this workspace for unknown output.
+      await this.persist(true);
     }
     for (;;) {
       const outcome = await this.attempt(rt);

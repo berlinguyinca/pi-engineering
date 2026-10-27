@@ -2051,7 +2051,10 @@ describe("ExecutionBroker (spec 03)", () => {
       assert.equal(result.rebased, true, "a stale candidate must be rebased, not re-enqueued");
       assert.equal(result.conflict, false);
       assert.equal(result.baseSha, newBase, "the manifest base is re-pointed at the incumbent head");
-      assert.ok(result.candidateSha && result.candidateSha !== candidate.candidateSha, "a real rebase moves the candidate head");
+      assert.ok(
+        result.candidateSha && result.candidateSha !== candidate.candidateSha,
+        "a real rebase moves the candidate head",
+      );
       assert.ok(result.manifest, "an updated workspace manifest is returned");
       const binding = result.manifest!.repositories.find((r) => r.repoId === "repo-stale-base-rebase");
       assert.equal(binding?.baseSha, newBase);

@@ -1,0 +1,286 @@
+{
+  "status": "passed",
+  "serverVersion": "0.9.1",
+  "protocol": 22,
+  "session": "pi-herdr-engineering-6duvcy",
+  "baseline": "8f681a6a9e9d97d55f88a9eac0b7f1f08766e55a",
+  "workers": [
+    {
+      "name": "planner",
+      "role": "planner",
+      "runtimeId": "HERD-W73GGd",
+      "messages": [
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "stop",
+          "inputTokens": 793,
+          "outputTokens": 81,
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"kind\":\"plan\",\"steps\":[\"engineer-a\",\"engineer-b\",\"tester\",\"reviewer\"],\"detail\":\"engineer-a implements add.mjs, engineer-b implements subtract.mjs, tester integrates commits and runs seeded acceptance tests, reviewer inspects the actual diff\"}"
+            }
+          ]
+        }
+      ],
+      "worktree": "/tmp/pi-herdr-engineering-6dUVCy/worktrees/repo/worktree-brave-harbor-2560",
+      "response": {
+        "kind": "plan",
+        "steps": ["engineer-a", "engineer-b", "tester", "reviewer"],
+        "detail": "engineer-a implements add.mjs, engineer-b implements subtract.mjs, tester integrates commits and runs seeded acceptance tests, reviewer inspects the actual diff"
+      },
+      "toolResults": [],
+      "status": "COMPLETED",
+      "head": "8f681a6a9e9d97d55f88a9eac0b7f1f08766e55a"
+    },
+    {
+      "name": "engineer-a",
+      "role": "implementer",
+      "runtimeId": "HERD-oKwq6w",
+      "messages": [
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "toolUse",
+          "inputTokens": 821,
+          "outputTokens": 126,
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "BJZ7Xawrr96YCOAp8nxrB5LNFRX5NBX6",
+              "name": "bash",
+              "arguments": {
+                "command": "printf 'export function add(a, b) {\\n  return a + b;\\n}\\n' > add.mjs && git add add.mjs && git commit -m \"Add add function\n\nExports named add(a,b) returning numeric sum.\n\nConfidence: high\nTested: inspection\" && git log --oneline -1"
+              }
+            }
+          ]
+        },
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "stop",
+          "inputTokens": 56,
+          "outputTokens": 14,
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"kind\":\"engineer-a\",\"status\":\"committed\"}"
+            }
+          ]
+        }
+      ],
+      "worktree": "/tmp/pi-herdr-engineering-6dUVCy/worktrees/repo/worktree-green-field-dcd3",
+      "response": {
+        "kind": "engineer-a",
+        "status": "committed"
+      },
+      "toolResults": [
+        {
+          "toolName": "bash",
+          "isError": false,
+          "content": [
+            {
+              "type": "text",
+              "text": "[worktree/green-field-dcd3 283e067] Add add function\n 1 file changed, 3 insertions(+)\n create mode 100644 add.mjs\n283e067 Add add function\n"
+            }
+          ]
+        }
+      ],
+      "status": "COMPLETED",
+      "head": "283e06718d8a83dea93230776af70dae2a5b3acf"
+    },
+    {
+      "name": "engineer-b",
+      "role": "implementer",
+      "runtimeId": "HERD-oOlp7B",
+      "messages": [
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "toolUse",
+          "inputTokens": 823,
+          "outputTokens": 94,
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "uEWLIOM1a55gogt45YSxqVqwalIxsKS0",
+              "name": "bash",
+              "arguments": {
+                "command": "cat > subtract.mjs <<'EOF'\nexport function subtract(a, b) {\n  return a - b;\n}\nEOF\ngit add subtract.mjs\ngit commit -m \"Add subtract function\n\nConfidence: high\nTested: inspection\""
+              }
+            }
+          ]
+        },
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "stop",
+          "inputTokens": 51,
+          "outputTokens": 14,
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"kind\":\"engineer-b\",\"status\":\"committed\"}"
+            }
+          ]
+        }
+      ],
+      "worktree": "/tmp/pi-herdr-engineering-6dUVCy/worktrees/repo/worktree-quiet-harbor-e625",
+      "response": {
+        "kind": "engineer-b",
+        "status": "committed"
+      },
+      "toolResults": [
+        {
+          "toolName": "bash",
+          "isError": false,
+          "content": [
+            {
+              "type": "text",
+              "text": "[worktree/quiet-harbor-e625 f6dfd66] Add subtract function\n 1 file changed, 3 insertions(+)\n create mode 100644 subtract.mjs\n"
+            }
+          ]
+        }
+      ],
+      "status": "COMPLETED",
+      "head": "f6dfd664405c60900d61688c55a8bc517d730506"
+    },
+    {
+      "name": "tester",
+      "role": "test-generator",
+      "runtimeId": "HERD-DW00iK",
+      "messages": [
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "toolUse",
+          "inputTokens": 885,
+          "outputTokens": 154,
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "rT0eyIPgdvyoWudQhPmUO1AKOj9KO7oe",
+              "name": "bash",
+              "arguments": {
+                "command": "git cherry-pick 283e06718d8a83dea93230776af70dae2a5b3acf f6dfd664405c60900d61688c55a8bc517d730506 && '/home/wohlgemuth/.nvm/versions/node/v22.23.2/bin/node' '--test' '--import' '/home/wohlgemuth/IdeaProjects/pi-next-integration/test/support/isolatedState.ts' 'test/arithmetic.test.mjs'"
+              }
+            }
+          ]
+        },
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "stop",
+          "inputTokens": 280,
+          "outputTokens": 11,
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"kind\":\"test\",\"status\":\"passed\"}"
+            }
+          ]
+        }
+      ],
+      "worktree": "/tmp/pi-herdr-engineering-6dUVCy/worktrees/repo/worktree-green-stone-1773",
+      "response": {
+        "kind": "test",
+        "status": "passed"
+      },
+      "toolResults": [
+        {
+          "toolName": "bash",
+          "isError": false,
+          "content": [
+            {
+              "type": "text",
+              "text": "[worktree/green-stone-1773 7405f25] Add add function\n Date: Tue Oct 27 12:21:27 2026 -0700\n 1 file changed, 3 insertions(+)\n create mode 100644 add.mjs\n[worktree/green-stone-1773 b8564ed] Add subtract function\n Date: Tue Oct 27 12:21:31 2026 -0700\n 1 file changed, 3 insertions(+)\n create mode 100644 subtract.mjs\nTAP version 13\n# Subtest: add handles positive, negative and zero operands\nok 1 - add handles positive, negative and zero operands\n  ---\n  duration_ms: 0.642114\n  type: 'test'\n  ...\n# Subtest: subtract handles positive, negative and zero operands\nok 2 - subtract handles positive, negative and zero operands\n  ---\n  duration_ms: 0.137279\n  type: 'test'\n  ...\n1..2\n# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 126.084605\n"
+            }
+          ]
+        }
+      ],
+      "status": "COMPLETED",
+      "head": "b8564ed80d99eb8a2fc9123c0b3516491d74b9b2"
+    },
+    {
+      "name": "reviewer",
+      "role": "reviewer",
+      "runtimeId": "HERD-plNmd2",
+      "messages": [
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "toolUse",
+          "inputTokens": 863,
+          "outputTokens": 109,
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "KJeqW0cWWLs7VbLzkT0d3HaLRJUomv02",
+              "name": "bash",
+              "arguments": {
+                "command": "git diff 8f681a6a9e9d97d55f88a9eac0b7f1f08766e55a b8564ed80d99eb8a2fc9123c0b3516491d74b9b2 -- add.mjs subtract.mjs"
+              }
+            }
+          ]
+        },
+        {
+          "provider": "metabolomics",
+          "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+          "stopReason": "stop",
+          "inputTokens": 161,
+          "outputTokens": 64,
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"kind\":\"review\",\"verdict\":\"approve\",\"reason\":\"add(a,b) returns a+b and subtract(a,b) returns a-b; both implementations are arithmetically correct.\"}"
+            }
+          ]
+        }
+      ],
+      "worktree": "/tmp/pi-herdr-engineering-6dUVCy/worktrees/repo/worktree-silver-cloud-93cf",
+      "response": {
+        "kind": "review",
+        "verdict": "approve",
+        "reason": "add(a,b) returns a+b and subtract(a,b) returns a-b; both implementations are arithmetically correct."
+      },
+      "toolResults": [
+        {
+          "toolName": "bash",
+          "isError": false,
+          "content": [
+            {
+              "type": "text",
+              "text": "diff --git a/add.mjs b/add.mjs\nnew file mode 100644\nindex 0000000..7d65831\n--- /dev/null\n+++ b/add.mjs\n@@ -0,0 +1,3 @@\n+export function add(a, b) {\n+  return a + b;\n+}\ndiff --git a/subtract.mjs b/subtract.mjs\nnew file mode 100644\nindex 0000000..b3d35bc\n--- /dev/null\n+++ b/subtract.mjs\n@@ -0,0 +1,3 @@\n+export function subtract(a, b) {\n+  return a - b;\n+}\n"
+            }
+          ]
+        }
+      ],
+      "status": "COMPLETED",
+      "head": "8f681a6a9e9d97d55f88a9eac0b7f1f08766e55a"
+    }
+  ],
+  "verification": {
+    "command": [
+      "/home/wohlgemuth/.nvm/versions/node/v22.23.2/bin/node",
+      "--test",
+      "--import",
+      "/home/wohlgemuth/IdeaProjects/pi-next-integration/test/support/isolatedState.ts",
+      "test/arithmetic.test.mjs"
+    ],
+    "exitCode": 0,
+    "stdout": "TAP version 13\n# Subtest: add handles positive, negative and zero operands\nok 1 - add handles positive, negative and zero operands\n  ---\n  duration_ms: 0.637516\n  type: 'test'\n  ...\n# Subtest: subtract handles positive, negative and zero operands\nok 2 - subtract handles positive, negative and zero operands\n  ---\n  duration_ms: 0.127832\n  type: 'test'\n  ...\n1..2\n# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 126.345178\n",
+    "stderr": ""
+  },
+  "diff": "diff --git a/add.mjs b/add.mjs\nnew file mode 100644\nindex 0000000..7d65831\n--- /dev/null\n+++ b/add.mjs\n@@ -0,0 +1,3 @@\n+export function add(a, b) {\n+  return a + b;\n+}\ndiff --git a/subtract.mjs b/subtract.mjs\nnew file mode 100644\nindex 0000000..b3d35bc\n--- /dev/null\n+++ b/subtract.mjs\n@@ -0,0 +1,3 @@\n+export function subtract(a, b) {\n+  return a - b;\n+}",
+  "files": {
+    "add.mjs": "export function add(a, b) {\n  return a + b;\n}\n",
+    "subtract.mjs": "export function subtract(a, b) {\n  return a - b;\n}\n"
+  },
+  "limitations": [
+    "No durable server-restart recovery or full migration rollback was exercised.",
+    "Structured result-tool extraction remains unproved; model evidence is read from owned persisted session messages."
+  ],
+  "assistantRequests": 9,
+  "ownedAgentsRemaining": 0
+}

@@ -252,6 +252,33 @@ waiting in `WAITING_FOR_LLM` and relaunches only on an authoritative healthy
 probe; it is never `BLOCKED` for this. Executions that ran tools count as
 attempts as before.
 
+### Gateway recovery capacity checks
+
+For InferWeave, the recovery probe authenticates to the model catalogue and
+reads `/iw/v1/admission` for the selected model. Catalogue `slots` is a capacity
+ceiling. Automatic recovery requires measured immediate model headroom and an
+empty model queue; spare queue room alone does not release a paused mission.
+The probe supports both the Go model-keyed report and the Rust model-array
+report. Go capacity must be known and less than 90 seconds old. Logical aliases
+are matched using the catalogue or admission report's explicit model mapping.
+
+This is a model-level readiness check. Caller, session, priority and downstream
+limits can still refuse a request; another caller's aggregate queue or priority
+statistics do not establish availability for this mission. When Go diagnostics
+report an effective model or global active limit, the probe also checks it.
+
+Missing, stale or unsupported admission telemetry is **unknown capacity**, not
+proof of either free capacity or a model outage. An idle Go model may have no
+tracked admission row. Such answers do not establish automatic recovery and can
+leave a mission waiting until telemetry appears. Plain OpenAI-compatible
+providers retain their model-availability check without requiring InferWeave.
+
+For a legacy gateway without suitable admission telemetry, an operator can set
+`PI_GATEWAY_HEALTH_URL` to an explicitly chosen gateway base URL to use the
+existing HTTP readiness probe instead. This override proves only that the
+selected health endpoint responds; it does **not** measure queue headroom.
+Ordinary `/mission resume` is not a guaranteed bypass of the capacity probe.
+
 ### Reviewer tools and the candidate guard
 
 The reviewer gets `read`, `bash`, `repo_search` and `symbol` next to the evidence

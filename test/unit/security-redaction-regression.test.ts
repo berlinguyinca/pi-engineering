@@ -6,13 +6,12 @@ import { redactSecrets as redactSecurityPolicy } from "../../src/security/Securi
 /**
  * Regression gap matrix between the two redaction implementations.
  *
- * Two implementations exist with different pattern sets:
+ * Both entry points must implement the same default redaction policy:
  *   * `src/platform/redact.ts`            → `redactSecrets(text)`
  *   * `src/security/SecurityPolicy.ts`    → `redactSecrets(text, patterns?)`
  *
- * This file documents, per secret shape, which module redacts it and which
- * misses it. A miss is recorded as `test.todo` so CI stays green while the gap
- * is visible in the test report.
+ * Every case is a required regression. New gaps must fail CI rather than
+ * silently becoming TODOs based on the current implementation output.
  *
  * ── Strictness ─────────────────────────────────────────────────────────────
  * A case is only counted as redacted when NONE of its `leakFragments` appear in
@@ -164,12 +163,11 @@ test("redact-regression: both modules leave a non-secret control string unchange
   assert.equal(redactSecurityPolicy(CONTROL), CONTROL);
 });
 
-// ── Gap matrix: per module, per case. Misses are recorded with test.todo. ────
+// Every matrix entry is mandatory, including any newly added cases.
 for (const c of CASES) {
   for (const m of MODULES) {
-    const redacts = isRedacted(m.redact, c);
     const leak = leaked(m.redact, c);
-    test(`redact-regression[${m.name}] redacts ${c.name}`, { todo: !redacts }, () => {
+    test(`redact-regression[${m.name}] redacts ${c.name}`, () => {
       if (leak) {
         assert.ok(false, `${m.name} leaked leakFragment ${JSON.stringify(leak)} for ${c.name}`);
       }
@@ -179,20 +177,7 @@ for (const c of CASES) {
 }
 
 // ── Final non-todo summary: every miss must equal the explicit expectation. ──
-const EXPECTED_GAPS: Array<[string, string]> = [
-  // { module, case } tuples of every observed miss, kept explicit so any new gap
-  // or any silently closed gap changes this test.
-  ["SecurityPolicy.ts", "openai-sk"],
-  ["SecurityPolicy.ts", "github-ghp"],
-  ["SecurityPolicy.ts", "basic-auth-url"],
-  ["SecurityPolicy.ts", "env-api-key"],
-  ["SecurityPolicy.ts", "json-apikey"],
-  ["SecurityPolicy.ts", "slack-xoxb"],
-  ["SecurityPolicy.ts", "jwt"],
-  ["platform/redact.ts", "google-api-key"],
-  ["SecurityPolicy.ts", "google-api-key"],
-  ["SecurityPolicy.ts", "plain-40hex-token"],
-];
+const EXPECTED_GAPS: Array<[string, string]> = [];
 
 test("redact-regression: redaction gap summary matches EXPECTED_GAPS", () => {
   const misses: Array<{ module: string; case: string; reason: string }> = [];
@@ -212,4 +197,86 @@ test("redact-regression: redaction gap summary matches EXPECTED_GAPS", () => {
 
   const actual: Array<[string, string]> = misses.map((m) => [m.module, m.case]);
   assert.deepEqual(actual, EXPECTED_GAPS);
+});
+
+for (const m of MODULES) {
+  test(`redact-regression[${m.name}] preserves punctuation and adjacent fields`, () => {
+    const input = `before token=${hex40}, status=ok; after`;
+    assert.equal(m.redact(input), "before token=[REDACTED], status=ok; after");
+    const json = `{"apiKey":"${hex40}","service":"ordinary"}`;
+    assert.equal(m.redact(json), '{"apiKey":"[REDACTED]","service":"ordinary"}');
+    assert.doesNotThrow(() => JSON.parse(m.redact(json)));
+    assert.equal(
+      m.redact('{"key":"sensitive-value","OPENAI_KEY":"other-value"}'),
+      '{"key":"[REDACTED]","OPENAI_KEY":"[REDACTED]"}',
+    );
+  });
+
+  test(`redact-regression[${m.name}] consumes punctuation inside unquoted secrets`, () => {
+    for (const input of [
+      "password=alpha{bravo}charlie",
+      "password=alpha,bravo",
+      "password=alpha;bravo",
+      "password=alpha[bravo]charlie",
+      'password=alpha"bravo"charlie',
+    ])
+      assert.equal(m.redact(input), "password=[REDACTED]");
+    assert.equal(m.redact("password=alpha,bravo; status=ok"), "password=[REDACTED]; status=ok");
+    assert.equal(m.redact("password=alpha{bravo}charlie,status=ok"), "password=[REDACTED],status=ok");
+  });
+
+  test(`redact-regression[${m.name}] handles case, quotes, multiline and repeated secrets`, () => {
+    const input =
+      "start\nExPoRt OPENAI_API_KEY='first secret value'\n" +
+      'config: {"ApiKey": "escaped\\"secret value", "service": "safe"}\n' +
+      "password=second-secret; finish";
+    const out = m.redact(input);
+    for (const fragment of ["first secret value", "escaped", "secret value", "second-secret"]) {
+      assert.ok(!out.includes(fragment), `${m.name} leaked quoted or multiline value`);
+    }
+    for (const context of ["start\nExPoRt OPENAI_API_KEY=", '"service": "safe"', "; finish"]) {
+      assert.ok(out.includes(context), `${m.name} lost surrounding context`);
+    }
+    assert.equal(m.redact(out), out, "redaction must be idempotent");
+    assert.equal(m.redact("Authorization: bEaReR short123, next=ok"), "Authorization: bEaReR [REDACTED], next=ok");
+  });
+
+  test(`redact-regression[${m.name}] handles provider token boundaries and opaque authorization`, () => {
+    for (const token of [`sk-${"proj-"}${"ab_CD".repeat(8)}`, `AIza${"x".repeat(34)}-`]) {
+      assert.equal(m.redact(`before (${token}), after`), "before ([REDACTED]), after");
+    }
+    assert.equal(m.redact("Authorization=opaque-credential; done"), "Authorization=[REDACTED]; done");
+    assert.equal(m.redact("Authorization: Basic dXNlcjpwYXNz; done"), "Authorization: Basic [REDACTED]; done");
+    assert.equal(
+      m.redact(`{
+  "apiKey":
+  "${hex40}",
+  "service": "safe"
+}`),
+      '{\n  "apiKey":\n  "[REDACTED]",\n  "service": "safe"\n}',
+    );
+  });
+
+  test(`redact-regression[${m.name}] preserves ordinary lookalikes and empty lines`, () => {
+    for (const text of [
+      CONTROL,
+      '{"monkey":"banana","keyboard":"qwerty","tokenCount":42}',
+      "passwordLength=12; tokenizer=fast; secretariat=meeting",
+      "monkey=banana; keyboard=qwerty; donkey=ordinary",
+      "token=\nordinary prose follows",
+      "Bearer\nordinary prose follows",
+      `commit=${hex40}`,
+      `token ${hex40}`,
+      "https://example.com/resource",
+    ])
+      assert.equal(m.redact(text), text);
+  });
+}
+
+test("redact-regression: SecurityPolicy keeps explicit custom patterns", () => {
+  assert.equal(
+    redactSecurityPolicy("custom value; password=hunter2", [{ kind: "generic", re: /custom value/g }]),
+    "[REDACTED]; password=hunter2",
+  );
+  assert.equal(redactSecurityPolicy("ordinary text", []), "ordinary text");
 });

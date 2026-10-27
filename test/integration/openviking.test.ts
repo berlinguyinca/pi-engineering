@@ -102,13 +102,27 @@ test("openviking service: Postgres store round-trips (requires TEST_DATABASE_URL
       search(q: string): Promise<Array<Record<string, unknown>>>;
     };
   };
-  const store = new PostgresStore(url);
+  let store = new PostgresStore(url);
   await store.init();
   try {
     await store.store(record);
     const all = await store.recallAll();
-    assert.ok(all.some((r) => r.id === "dur-1"));
+    assert.deepEqual(
+      all.find((r) => r.id === record.id),
+      record,
+    );
     assert.ok((await store.search("negatives")).length >= 1);
+
+    // Updates preserve the primary-key identity and survive a new connection pool.
+    const updated = { ...record, text: "persisted postgres roundtrip update" };
+    await store.store(updated);
+    await store.close();
+    store = new PostgresStore(url);
+    await store.init();
+    const restored = (await store.recallAll()).filter((r) => r.id === record.id);
+    assert.deepEqual(restored, [updated]);
+    assert.ok((await store.search("roundtrip")).some((r) => r.id === record.id));
+    assert.ok(!(await store.search("negatives")).some((r) => r.id === record.id));
   } finally {
     await store.close();
   }
