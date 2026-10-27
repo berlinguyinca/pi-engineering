@@ -9,11 +9,19 @@
 import { redactSecrets } from "../platform/redact.ts";
 import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
 import { type PresenceBasis, type PresenceView, presenceRank, projectPresence, renderWidgetLines } from "./presence.ts";
+import { StatusSurfaceBus, type SurfaceProducer } from "./surfaceBus.ts";
 
 const WIDGET_KEY = "engineering-missions";
 const HEADER_PREFIX = "Missions · ";
 /** States worth interrupting the operator for, on top of the attention ranks. */
 const NOTIFY_STATES = new Set(["FAILED", "COMPLETE"]);
+/**
+ * Below the foreground agent (100): while a turn is running the agent's own
+ * line is what the operator is watching, and the strip keeps its claim queued
+ * at lower priority rather than clearing it. Above nothing but an operator
+ * notice, which claims 90.
+ */
+const PRESENCE_PRIORITY = 50;
 
 export interface PresenceSink {
   setWorkingMessage?(text?: string): void;
@@ -34,6 +42,11 @@ export interface PresenceOptions {
   intervalMs?: number;
   /** How often to ask observability for a quiet-period summary (default 60s). */
   quietMs?: number;
+  /**
+   * The session's status-surface arbiter. Shared with the working-line
+   * controller, so neither one has to guard the other out by hand.
+   */
+  bus?: StatusSurfaceBus;
 }
 
 export interface PresenceEnvOptions extends PresenceOptions {
@@ -81,6 +94,11 @@ function flat(text: string, max: number): string {
 
 export class MissionPresenceController {
   private readonly sink: PresenceSink;
+  private readonly bus: StatusSurfaceBus;
+  private readonly ownsBus: boolean;
+  private readonly strip: SurfaceProducer;
+  private readonly workingLine: SurfaceProducer;
+  private readonly title: SurfaceProducer;
   private readonly rows: number;
   private readonly titleEnabled: boolean;
   private readonly quiet: ((missionId: string) => void) | undefined;
@@ -88,16 +106,17 @@ export class MissionPresenceController {
   private readonly quietMs: number;
   private lastQuietAt = 0;
   private readonly live = new Map<string, Tracked>();
-  private readonly attention = new Map<string, string>();
   private agentActive = false;
   private disposed = false;
   private timer: ReturnType<typeof setInterval> | undefined;
-  private lastPanel: string | undefined;
-  private lastMessage: string | undefined;
-  private lastTitle: string | undefined;
 
   constructor(sink: PresenceSink, options: PresenceOptions = {}) {
     this.sink = sink;
+    this.bus = options.bus ?? new StatusSurfaceBus(sink, options.now);
+    this.ownsBus = options.bus === undefined;
+    this.strip = this.bus.producer("widget", "mission-strip", { key: WIDGET_KEY });
+    this.workingLine = this.bus.producer("working", "presence-working");
+    this.title = this.bus.producer("title", "presence-title");
     this.rows = options.rows ?? 4;
     this.titleEnabled = options.title ?? false;
     this.quiet = options.quiet;
@@ -141,11 +160,14 @@ export class MissionPresenceController {
     tracked.sentence = flat(sentence, 200);
   }
 
-  /** The agent owns the working line while it runs; presence yields it. */
+  /**
+   * The agent owns the working line while it runs. Presence does not clear its
+   * claim — it holds it at lower priority and the arbiter hands the line back
+   * when the turn ends, so a strip that was mid-sentence does not restart blank.
+   */
   onAgentStart(): void {
     if (this.disposed) return;
     this.agentActive = true;
-    this.publishWorking(undefined);
   }
 
   onAgentEnd(): void {
@@ -185,75 +207,58 @@ export class MissionPresenceController {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
     this.agentActive = false;
-    this.publishWorking(undefined);
-    if (this.lastPanel !== undefined) {
-      this.guard(() => this.sink.setWidget?.(WIDGET_KEY, undefined));
-      this.lastPanel = undefined;
-    }
-    if (this.lastTitle !== undefined) {
-      this.guard(() => this.sink.setTitle?.(undefined));
-      this.lastTitle = undefined;
-    }
+    for (const missionId of this.live.keys()) this.bus.forget(missionId);
+    this.strip.release();
+    this.workingLine.release();
+    this.title.release();
+    // A bus nobody else holds must clear what it wrote, or the strip outlives
+    // the session that drew it.
+    if (this.ownsBus) this.bus.dispose();
   }
 
   private publishWidget(view: PresenceView): void {
     const lines = this.live.size > 0 ? renderWidgetLines(view) : undefined;
-    const serialized = lines ? lines.join("\n") : undefined;
-    if (serialized === this.lastPanel) return;
-    this.lastPanel = serialized;
-    this.guard(() => this.sink.setWidget?.(WIDGET_KEY, lines));
+    this.strip.publish({ lines, priority: PRESENCE_PRIORITY });
   }
 
   private publishWorkingLine(view: PresenceView): void {
-    if (this.agentActive) return;
     const sentence = view.workingMissionId ? this.live.get(view.workingMissionId)?.sentence : undefined;
     const line = sentence ? `Mission · ${view.workingMissionId} · ${sentence}` : view.workingLine;
-    this.publishWorking(line ?? undefined);
-  }
-
-  private publishWorking(text: string | undefined): void {
-    if (this.lastMessage === text) return;
-    this.lastMessage = text;
-    this.guard(() => this.sink.setWorkingMessage?.(text));
+    this.workingLine.publish({ text: line ?? undefined, priority: PRESENCE_PRIORITY });
   }
 
   private publishTitle(view: PresenceView): void {
     if (!this.titleEnabled) return;
     const title = this.live.size > 0 ? view.header.slice(HEADER_PREFIX.length) : undefined;
-    if (title === this.lastTitle) return;
-    this.lastTitle = title;
-    this.guard(() => this.sink.setTitle?.(title));
+    this.title.publish({ text: title ?? undefined, priority: PRESENCE_PRIORITY });
   }
 
   /** One notification per state change; a mission cannot spam the terminal. */
   private notifyAttention(events: readonly RuntimeMissionActivityEvent[]): void {
     for (const event of events) {
-      const key = `${event.state}|${event.health}`;
-      const previous = this.attention.get(event.missionId);
-      this.attention.set(event.missionId, key);
-      if (previous === key) continue;
       const rank = presenceRank(event);
       const urgent = rank <= 1 || NOTIFY_STATES.has(event.state);
-      if (!urgent) continue;
+      // A quiet sighting is still a change worth remembering: the next one
+      // notifies even though nothing in between interrupted the operator.
+      if (!urgent) {
+        this.bus.observe(event.missionId, `${event.state}|${event.health}`);
+        continue;
+      }
       const what =
         rank === 0 ? "needs you" : rank === 1 ? "has stopped" : event.state === "COMPLETE" ? "is complete" : "failed";
       const reason = flat(event.reason, 120);
       const next = rank <= 1 ? ` — /mission-status ${event.missionId}` : "";
-      this.guard(() =>
-        this.sink.notify?.(
-          `Mission ${event.missionId} ${what}${reason ? `: ${reason}` : ""}${next}`,
-          rank <= 1 || event.state === "FAILED" ? "warning" : "info",
-        ),
+      this.bus.notify(
+        event.missionId,
+        `${event.state}|${event.health}`,
+        `Mission ${event.missionId} ${what}${reason ? `: ${reason}` : ""}${next}`,
+        rank <= 1 || event.state === "FAILED" ? "warning" : "info",
       );
     }
   }
 
-  /** A status surface is observational; a torn-down UI must never fail a mission. */
-  private guard(action: () => void): void {
-    try {
-      action();
-    } catch {
-      // The surface is gone; the mission keeps running.
-    }
+  /** Whether a turn is running; kept for surfaces that ask rather than observe. */
+  isAgentActive(): boolean {
+    return this.agentActive;
   }
 }

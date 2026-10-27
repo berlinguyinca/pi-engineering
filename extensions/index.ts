@@ -114,6 +114,7 @@ import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
 import { seedPresence } from "../src/status/presenceSeed.ts";
+import { StatusSurfaceBus } from "../src/status/surfaceBus.ts";
 import { WorkingStatusController } from "../src/status/working.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
@@ -1991,7 +1992,11 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", (_event, ctx) => {
       workingSignal = undefined;
       working?.dispose();
-      working = ctx.hasUI ? new WorkingStatusController(ctx.ui) : undefined;
+      // One arbiter for both surfaces (src/status/surfaceBus.ts). The agent's
+      // line and the mission strip used to guard each other out with private
+      // flags; now each holds a priority claim and the arbiter decides.
+      const surfaces = new StatusSurfaceBus(ctx.ui);
+      working = ctx.hasUI ? new WorkingStatusController(ctx.ui, Date.now, { bus: surfaces }) : undefined;
       working?.onModelSelect(ctx.model);
       // Presence yields the working line to the agent but never yields the
       // strip: an operator who cannot see the queue cannot steer it.
@@ -2002,6 +2007,7 @@ ${RECOVERY_PROMPT}`;
       presence =
         ctx.hasUI && presenceEnv.enabled
           ? new MissionPresenceController(ctx.ui, {
+              bus: surfaces,
               rows: presenceEnv.rows,
               title: presenceEnv.title,
               quiet: (missionId) => {

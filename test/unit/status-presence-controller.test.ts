@@ -8,6 +8,7 @@ import {
   type PresenceSink,
   presenceOptionsFromEnv,
 } from "../../src/status/MissionPresenceController.ts";
+import { StatusSurfaceBus } from "../../src/status/surfaceBus.ts";
 
 const T0 = Date.parse("2026-10-27T10:10:00.000Z");
 let clock = T0;
@@ -105,24 +106,42 @@ test("survives a sink whose surface throws", () => {
   controller.dispose();
 });
 
-test("writes the working line while the agent is idle and clears it on agent start", () => {
+/**
+ * The working line is arbitrated, not cleared. Presence keeps its claim at
+ * priority 50; the foreground agent claims 100. While a turn runs the operator
+ * sees the agent's line, and the strip's line returns the moment the turn ends —
+ * neither controller knows the other exists, which is what the old `agentActive`
+ * flag got wrong whenever a third producer wanted the line.
+ */
+test("holds its working-line claim while the agent runs on a shared bus", () => {
   const sink = recordingSink();
-  const controller = new MissionPresenceController(sink, opts());
+  const bus = new StatusSurfaceBus(sink);
+  const controller = new MissionPresenceController(sink, opts({ bus }));
+  const agent = bus.producer("working", "working-agent");
+
   controller.update(running);
   controller.tick();
   assert.match(sink.working.at(-1) ?? "", /^Mission · MSN-1 · presence strip/);
+
   controller.onAgentStart();
-  assert.equal(sink.working.at(-1), undefined);
+  agent.publish({ text: "Working · reading src/a.ts", priority: 100 });
+  assert.equal(sink.working.at(-1), "Working · reading src/a.ts", "the agent owns the line during its turn");
+
+  agent.release();
+  controller.tick();
+  assert.match(sink.working.at(-1) ?? "", /^Mission · MSN-1/, "the strip's line comes back on its own");
   controller.dispose();
 });
 
-test("does not write the working line while the agent is running", () => {
+test("keeps claiming the working line during a turn instead of going blank", () => {
   const sink = recordingSink();
   const controller = new MissionPresenceController(sink, opts());
   controller.onAgentStart();
   controller.update(running);
   controller.tick();
-  assert.deepEqual(sink.working, []);
+
+  assert.match(sink.working.at(-1) ?? "", /^Mission · MSN-1/, "a lone strip has nothing to yield to");
+  assert.equal(controller.isAgentActive(), true, "the controller still tracks the turn it is sharing with");
   controller.dispose();
 });
 

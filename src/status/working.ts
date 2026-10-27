@@ -3,6 +3,7 @@ import type { AdmissionEvent } from "../gateway/AdmissionController.ts";
 import { formatWaitingFor, gatewayWaitLabel } from "../gateway/admissionNotice.ts";
 import type { GatewayWaitSignal } from "../gateway/signals.ts";
 import { activityFromSessionEvent, safeWorkerOutputPreview } from "../workers/activity.ts";
+import { StatusSurfaceBus, type SurfaceProducer } from "./surfaceBus.ts";
 
 interface WorkingSink {
   setWorkingMessage?(text?: string): void;
@@ -19,9 +20,17 @@ interface ToolActivity {
   lastOutputAt?: number;
 }
 const WIDGET_KEY = "engineering-working";
+/**
+ * The foreground agent owns the working line while it runs. It outranks the
+ * mission strip (50) but not an operator attention notice (90), which is meant
+ * to interrupt whatever is on screen.
+ */
+const WORKING_PRIORITY = 100;
 
 export class WorkingStatusController {
-  private readonly sink: WorkingSink;
+  private readonly bus: StatusSurfaceBus;
+  private readonly working: SurfaceProducer;
+  private readonly widget: SurfaceProducer;
   private readonly now: () => number;
   private model: ModelRoute = {};
   private active = false;
@@ -32,12 +41,14 @@ export class WorkingStatusController {
   private readonly tools = new Map<string, ToolActivity>();
   private wait: { signal: GatewayWaitSignal; until: number; since: number } | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
-  private lastMessage: string | undefined;
-  private lastPanel: string | undefined;
 
-  constructor(sink: WorkingSink, now: () => number = Date.now) {
-    this.sink = sink;
+  constructor(sink: WorkingSink, now: () => number = Date.now, options: { bus?: StatusSurfaceBus } = {}) {
     this.now = now;
+    // One arbiter per session, shared with the mission strip. Without one the
+    // controller owns a bus over its own sink, which keeps the old behaviour.
+    this.bus = options.bus ?? new StatusSurfaceBus(sink, now);
+    this.working = this.bus.producer("working", "working-agent");
+    this.widget = this.bus.producer("widget", "working-widget", { key: WIDGET_KEY });
   }
 
   onModelSelect(model: ModelRoute | undefined): void {
@@ -67,7 +78,10 @@ export class WorkingStatusController {
     this.tools.clear();
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
-    this.publish(undefined, undefined);
+    // Release, not blank: whatever else is claiming the line (the mission strip)
+    // takes it back without either controller knowing about the other.
+    this.working.release();
+    this.widget.release();
   }
 
   onGatewayEvent(event: AdmissionEvent): void {
@@ -173,24 +187,11 @@ export class WorkingStatusController {
   }
 
   private publish(message: string | undefined, lines: string[] | undefined): void {
-    const label = message !== undefined ? `Working · ${message}` : undefined;
-    if (label !== this.lastMessage) {
-      try {
-        this.sink.setWorkingMessage?.(label);
-        this.lastMessage = label;
-      } catch {
-        // A UI being torn down must never fail a provider call or timer.
-      }
-    }
-    const panel = lines?.join("\n");
-    if (panel !== this.lastPanel) {
-      try {
-        this.sink.setWidget?.(WIDGET_KEY, lines);
-        this.lastPanel = panel;
-      } catch {
-        // The status is observational; inference retains its own lifecycle.
-      }
-    }
+    this.working.publish({
+      text: message !== undefined ? `Working · ${message}` : undefined,
+      priority: WORKING_PRIORITY,
+    });
+    this.widget.publish({ lines, priority: WORKING_PRIORITY });
   }
 
   dispose(): void {
