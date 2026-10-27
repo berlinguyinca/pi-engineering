@@ -37,35 +37,27 @@ const RULES: Array<{ pattern: RegExp; replacement: string }> = [
   { pattern: /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi, replacement: `$1${PLACEHOLDER}@` },
   // Provider-issued tokens with distinctive prefixes.
   { pattern: /\b(gh[pousr]_[A-Za-z0-9]{16,})/g, replacement: PLACEHOLDER },
-  { pattern: /\bsk-[A-Za-z0-9-]{12,}/g, replacement: PLACEHOLDER },
+  { pattern: /\bsk-[A-Za-z0-9_-]{12,}/g, replacement: PLACEHOLDER },
   { pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: PLACEHOLDER },
   { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: PLACEHOLDER },
   // A JWT: three base64url segments separated by dots.
   { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, replacement: PLACEHOLDER },
 
-  // ── Key-shaped: a name meaning "secret", then a value ────────────────────
-  // Bearer auth first, so its token is consumed before the generic rules run.
-  { pattern: /\b(Bearer\s+)\S+/gi, replacement: `$1${PLACEHOLDER}` },
-  // JSON / YAML: "api_key": "value"  — quoted key, quoted value.
-  {
-    pattern: /("[A-Za-z0-9_.-]*(?:key|secret|password|passwd|token|credential)"\s*:\s*)"[^"]*"/gi,
-    replacement: `$1"${PLACEHOLDER}"`,
-  },
-  // Bare key = value / key: value, with NO \b before the name, so an
-  // underscore-prefixed environment variable is still matched.
-  // The separator is CAPTURED and replayed, so `token: x` stays `token: ` and
-  // `TOKEN=x` stays `TOKEN=`. Rewriting it would make redacted text differ
-  // from its original in a way that has nothing to do with the secret.
-  {
-    pattern:
-      /([A-Za-z0-9_.-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization))(\s*[:=]\s*)"[^"]*"/gi,
-    replacement: `$1$2"${PLACEHOLDER}"`,
-  },
-  {
-    pattern: /([A-Za-z0-9_.-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization))(\s*[:=]\s*)\S+/gi,
-    replacement: `$1$2${PLACEHOLDER}`,
-  },
+  { pattern: /\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g, replacement: PLACEHOLDER },
+
+  // Authentication schemes are retained as context. Horizontal whitespace and
+  // token characters prevent consuming the following line or field delimiter.
+  { pattern: /\b((?:Bearer|Basic)[ \t]+)[A-Za-z0-9._~+/=-]+/gi, replacement: `$1${PLACEHOLDER}` },
 ];
+
+// A quoted assignment is consumed in one pass, including escaped quotes.
+// The unquoted alternative stops at delimiters instead of eating JSON syntax
+// or adjacent prose. Cross a newline only for an explicitly quoted value.
+const SECRET_NAME = String.raw`(?:key|[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|private[_-]?key|[_-]key|secret|password|passwd|token|credential|authorization))`;
+const ASSIGNMENT = new RegExp(
+  String.raw`(?<![A-Za-z0-9_.-])(["']${SECRET_NAME}["']|${SECRET_NAME})([ \t]*[:=][ \t]*(?:\r?\n[ \t]*(?=["']))?)((?:Bearer|Basic)[ \t]+(?:[A-Za-z0-9._~+/=-]+|\[REDACTED\])|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s"',;{}\[\]]+)`,
+  "gi",
+);
 
 /** Redact secrets from free text. Never throws; returns the input on failure. */
 export function redactSecrets(text: string): string {
@@ -73,6 +65,11 @@ export function redactSecrets(text: string): string {
   try {
     let out = text;
     for (const { pattern, replacement } of RULES) out = out.replace(pattern, replacement);
+    out = out.replace(ASSIGNMENT, (_match, key: string, separator: string, value: string) => {
+      const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : "";
+      const scheme = /^(?:Bearer|Basic)[ \t]+/i.exec(value)?.[0] ?? "";
+      return `${key}${separator}${quote}${scheme}${PLACEHOLDER}${quote}`;
+    });
     return out;
   } catch {
     return text;

@@ -1,3 +1,5 @@
+import { redactSecrets as redactDefaultSecrets } from "../platform/redact.ts";
+
 /**
  * Security hardening (spec §29, backlog B-111).
  *
@@ -14,6 +16,8 @@
  */
 export type SecretKind = "api_key" | "bearer" | "aws" | "private_key" | "generic";
 
+// Legacy pattern set remains available for callers that explicitly supply it.
+// Default redaction shares the platform policy so the two entry points cannot drift.
 export const SECRET_PATTERNS: Array<{ kind: SecretKind; re: RegExp }> = [
   { kind: "api_key", re: /(sk-[A-Za-z0-9]{16,}|[A-Za-z0-9_-]{24,}\.eyJ[A-Za-z0-9_-]{10,})/g },
   { kind: "bearer", re: /(Bearer\s+[A-Za-z0-9._~+/=-]{16,})/gi },
@@ -28,10 +32,8 @@ export const SECRET_PATTERNS: Array<{ kind: SecretKind; re: RegExp }> = [
 export const SECRET_REDACTION = "[REDACTED]";
 
 /** Redact known secrets from a string. Returns the sanitized text. */
-export function redactSecrets(
-  text: string,
-  patterns: Array<{ kind: SecretKind; re: RegExp }> = SECRET_PATTERNS,
-): string {
+export function redactSecrets(text: string, patterns?: Array<{ kind: SecretKind; re: RegExp }>): string {
+  if (patterns === undefined) return redactDefaultSecrets(text);
   let out = text;
   for (const { re } of patterns) out = out.replace(re, SECRET_REDACTION);
   return out;
