@@ -59,7 +59,7 @@ import { HandoffRecordError, type MissionStore } from "./missionStore.ts";
 import { MissionActivityTicker } from "./observability/MissionActivityTicker.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
-import type { ActivityType, WaitingReason } from "./observability/types.ts";
+import type { ActivityType } from "./observability/types.ts";
 import { type DispatchAuthority, type MissionOwnership, RepositoryLeasedError } from "./ownership.ts";
 import {
   type ContextWindowResolver,
@@ -87,6 +87,7 @@ import { MissionScheduler } from "./scheduler.ts";
 import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } from "./specApproval.ts";
 import { canTransitionMission, canTransitionTask } from "./state.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
+import { recordSchedulerStatus } from "./recoveryNotice.ts";
 import type {
   AcceptanceCriterion,
   CompletionVerdict,
@@ -475,30 +476,7 @@ export class Orchestrator {
       rand: opts.rand,
       acquireAuthority: this.ownership ? (task, signal) => this.acquireTaskAuthorityWaiting(task, signal) : undefined,
       recovery: opts.recovery,
-      onStatus: (notice) => {
-        const obs = this.observability;
-        if (notice.action === "resumed") {
-          obs?.clearWaiting(notice.missionId);
-          this.report(
-            notice.missionId,
-            `[mission ${notice.missionId}] recovery succeeded; worker execution resumed (attempt ${notice.attempt})`,
-          );
-          return;
-        }
-        const waitingReason: WaitingReason =
-          notice.status === "WAITING_FOR_CAPACITY"
-            ? "rate_limit"
-            : notice.status === "RECOVERING_CONTEXT"
-              ? "model_request"
-              : "external_resource";
-        const next = notice.nextActionAt ? `; next recovery check ${new Date(notice.nextActionAt).toISOString()}` : "";
-        const detail =
-          notice.action === "paused"
-            ? `Recovery stopped with no active worker: ${notice.reason}. Mission is paused and resumable.`
-            : `No active worker while recovery runs: ${notice.reason}; attempt ${notice.attempt}${next}`;
-        obs?.setWaiting(notice.missionId, waitingReason, detail);
-        this.report(notice.missionId, `[mission ${notice.missionId}] ${detail}`);
-      },
+      onStatus: (notice) => recordSchedulerStatus(notice, this.observability, (missionId, line) => this.report(missionId, line)),
       // Surface every task settlement as live progress so a running mission is
       // never silent: the operator sees each worker/gate settle instead of a
       // black screen for the whole worker budget (default 30 min).
