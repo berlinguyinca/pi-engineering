@@ -345,3 +345,57 @@ test("cleanup still removes clean fully harvested passed workspaces", async () =
     await fixture.cleanup();
   }
 });
+
+for (const storageFailure of [false, true]) {
+  test(`worker creation checkpoint ${storageFailure ? "refuses dispatch on storage failure" : "is durable before dispatch"}`, async () => {
+    const fixture = await makeFixtureRepo();
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const integration = await repo.createWorktree(base, "pi-eng-pw-Checkpoint");
+    const stateDir = join(fixture.root, ".pi-eng", "checkpoint");
+    await mkdir(stateDir, { recursive: true });
+    if (storageFailure) await mkdir(join(stateDir, "state.json"));
+    const contract = {
+      task_id: "task",
+      objective: "preserve the worker identity",
+      depends_on: [],
+      scope: { allowed: ["src/**"] },
+      acceptance: ["checkpoint exists"],
+      verification: ["true"],
+      risk: "low",
+    };
+    const executor: any = new PlannerWorkerExecutor({
+      repoRoot: fixture.root,
+      stateDir,
+      resolver: new RoleResolver({ provider: "default" }),
+    } as any);
+    executor.repo = repo;
+    executor.brief = { mission_id: "Checkpoint", summary: "checkpoint before worker execution" };
+    executor.integration = integration;
+    executor.baseCommit = base;
+    executor.plan = { contracts: [contract], decisions: [], architectural_context: [] };
+    executor.addContract(contract);
+    const runtime = executor.contracts.get("task");
+    executor.setStatus(runtime, "ready", "dependencies satisfied");
+    let dispatched = 0;
+    executor.attempt = async () => {
+      dispatched++;
+      const saved = JSON.parse(await readFile(join(stateDir, "state.json"), "utf8"));
+      assert.equal(saved.contracts[0].worktree, runtime.worktree.path);
+      assert.equal(saved.base_commit, base);
+      return "done";
+    };
+    try {
+      if (storageFailure) {
+        await assert.rejects(() => executor.executeContract(runtime), /EISDIR|ENOTEMPTY/);
+        assert.equal(dispatched, 0, "no worker runs without a durable worktree identity");
+      } else {
+        await executor.executeContract(runtime);
+        assert.equal(dispatched, 1);
+      }
+    } finally {
+      await executor.persistQueue;
+      await fixture.cleanup();
+    }
+  });
+}
