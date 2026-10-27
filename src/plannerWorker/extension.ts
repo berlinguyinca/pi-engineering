@@ -40,9 +40,11 @@ import { chooseExecutionMode } from "./mode.ts";
 import { RoleResolver } from "./resolver.ts";
 import { STATIC_ROUTER_ROLE } from "./roles.ts";
 import {
+  SESSION_HANDOFF_ENTRY,
   applySessionSwitchDecision,
   decideSessionSwitch,
   persistSessionHandoff,
+  projectSessionHandoff,
   sessionBranchMessages,
 } from "./sessionHandoff.ts";
 import { latestState, renderPlan, renderStatus, renderWorkers } from "./status.ts";
@@ -205,6 +207,23 @@ export function registerPlannerWorker(
 
   // Interactive session switches: same transition log, same context-fit check.
   if (typeof pi.on === "function") {
+    pi.on("context", (event, ctx) => {
+      const messages = projectSessionHandoff(event.messages, ctx.sessionManager.getBranch());
+      return messages ? { messages } : undefined;
+    });
+    // Pi checks the previous assistant's usage before the next request. Its
+    // pre-handoff usage describes the old transcript, not the projected request.
+    // Suppress only that stale threshold check; manual/overflow recovery and
+    // thresholds after the first successor response remain native.
+    pi.on("session_before_compact", (event, ctx) => {
+      if (event.reason !== "threshold") return;
+      const branch = ctx.sessionManager.getBranch();
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i];
+        if (entry?.type === "compaction" || (entry?.type === "message" && entry.message.role === "assistant")) return;
+        if (entry?.type === "custom" && entry.customType === SESSION_HANDOFF_ENTRY) return { cancel: true };
+      }
+    });
     pi.on("model_select", async (event, ctx) => {
       const next = event.model;
       if (!next) return;
@@ -248,6 +267,7 @@ export function registerPlannerWorker(
             context,
           });
         },
+        transfer: (d) => pi.appendEntry(SESSION_HANDOFF_ENTRY, { rendered: d.rendered }),
         persist: (d) => persistSessionHandoff(repoRoot, d),
         notify: (message, level) => ctx.ui.notify(message, level),
         compact: (options) => ctx.compact(options),

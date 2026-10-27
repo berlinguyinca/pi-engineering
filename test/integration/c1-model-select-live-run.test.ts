@@ -78,6 +78,7 @@ test("C1 live run: a model switch under context pressure transfers via handoff w
     const extension = (await import("../../extensions/index.ts")).default;
     (extension as unknown as (api: unknown) => void)({
       on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
+      appendEntry: () => {},
       registerCommand: () => {},
       registerTool: () => {},
       registerShortcut: () => {},
