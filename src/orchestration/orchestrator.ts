@@ -88,6 +88,7 @@ import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } f
 import { canTransitionMission, canTransitionTask } from "./state.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
 import { recordSchedulerStatus } from "./recoveryNotice.ts";
+import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
 import type {
   AcceptanceCriterion,
   CompletionVerdict,
@@ -1739,6 +1740,16 @@ export class Orchestrator {
     const task = this.store.getTask(taskId);
     const label = task?.objective ?? taskId;
     const workerId = this.taskExecutions.get(`${missionId}:${taskId}`) ?? taskId;
+    // A settled review carries its verdict inside its evidence: without feeding
+    // it, a reviewer that asked for changes looked like a review still running.
+    if (task?.kind === "review") {
+      recordReviewSettlement(
+        obs,
+        missionId,
+        status,
+        this.store.listReviewEvidence(missionId).find((evidence) => evidence.taskId === taskId),
+      );
+    }
     if (obs && status === "SUCCEEDED") {
       obs.taskStarted(missionId, taskId, label);
       obs.taskCompleted(missionId, taskId, label);
@@ -3315,6 +3326,15 @@ export class Orchestrator {
         const repaired = await this.runSingleTask(missionId, repair.task_id, {
           signal,
         });
+        recordRepairRound(
+          this.observability,
+          missionId,
+          repair.task_id,
+          obj.findingIds ?? [],
+          // The replacement settling is not proof the finding is gone; only a
+          // resolved finding counts.
+          repaired && (obj.findingIds ?? []).length > 0,
+        );
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         if (repaired) pendingResolution.push(...(obj.findingIds ?? []));
         // The replacement carries the dead workers' work (re-adopted, or redone
@@ -3479,6 +3499,9 @@ export class Orchestrator {
     const unresolvedBlocking = this.store
       .listFindings(missionId)
       .filter((f) => f.severity === "blocking" && f.status !== "resolved").length;
+    // The gate said no, with its own reasons. Before this the only trace of a
+    // failed completion gate was the mission's terminal status.
+    recordGateVerdict(this.observability, missionId, verdict);
     const hasBlocking =
       unresolvedBlocking > 0 || (finalMission.required_gates.length > 0 && verdict.reasons.length > 0);
     if (hasBlocking) {
