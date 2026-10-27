@@ -88,6 +88,7 @@ import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } f
 import { canTransitionMission, canTransitionTask } from "./state.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
 import { recordSchedulerStatus } from "./recoveryNotice.ts";
+import { recordWorkerActivity } from "./activityNotice.ts";
 import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
 import type {
   AcceptanceCriterion,
@@ -1660,8 +1661,7 @@ export class Orchestrator {
           (event.kind === "tool" && (event.phase === "completed" || event.phase === "failed")) ||
           ["Model streaming", "Model response received", TOOL_PROGRESS_SUMMARY].includes(event.summary),
       });
-      if (event.kind === "tool" && event.phase === "started" && event.invocationSignature)
-        obs?.noteWorkerTool(event.missionId, event.executionId, event.invocationSignature);
+      recordWorkerActivity(obs, event.missionId, event.executionId, event);
       if (event.kind === "tool" && event.buildTool) this.noteBuildCommand(event);
       if ((event.kind === "state" || event.kind === "execution") && event.phase === "completed") {
         obs?.workerCompleted(event.missionId, event.executionId);
