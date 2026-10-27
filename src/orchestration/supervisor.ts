@@ -269,17 +269,16 @@ export class MissionSupervisor {
       return this.statusForStop(mission, currentStop.reason, currentStop.resumeCondition, expectedResumptionGeneration);
     }
 
-    const scheduledWait = this.currentWait(mission.mission_id);
-    if (
-      scheduledWait &&
-      scheduledWait.action !== "WAIT_FOR_REQUIREMENT" &&
-      this.now() >= Date.parse(scheduledWait.nextActionAt)
-    ) {
-      return this.status(mission, "HEALTHY", scheduledWait.expectedMaterialChange, undefined, scheduledWait);
-    }
-
     const diagnosis = this.diagnose(mission);
     if (!diagnosis) {
+      const scheduledWait = this.currentWait(mission.mission_id);
+      if (
+        scheduledWait &&
+        scheduledWait.action !== "WAIT_FOR_REQUIREMENT" &&
+        this.now() >= Date.parse(scheduledWait.nextActionAt)
+      ) {
+        return this.status(mission, "HEALTHY", scheduledWait.expectedMaterialChange, undefined, scheduledWait);
+      }
       this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
       const wait = this.currentWait(mission.mission_id);
       const healthy = this.status(mission, "HEALTHY", "Mission has current ownership or a named future wait");
@@ -450,9 +449,11 @@ export class MissionSupervisor {
         reason: `Named wait ${wait.action} expired at ${wait.deadline}`,
       };
     }
-    if (wait) return null;
-    const projectedHealth = this.observability?.summary(mission.mission_id)?.health;
-    if (projectedHealth === "stalled") {
+    const projection = this.observability?.projection(mission.mission_id);
+    const stalledWorker = projection?.workers.find(
+      (worker) => worker.state === "running" && worker.health === "stalled",
+    );
+    if (stalledWorker || projection?.summary.health === "stalled") {
       // Debounce: only classify after the STALLED projection persists across
       // consecutive supervisor evaluations. A single stale tick (e.g. a worker
       // between tool calls) must not fence a live worker. A genuinely dead
@@ -464,11 +465,14 @@ export class MissionSupervisor {
           health: "STALLED",
           category: "ORPHANED_EXECUTION",
           reason: "Worker heartbeat is live but meaningful progress exceeded the stall threshold",
+          task: stalledWorker?.taskId ? this.store.getTask(stalledWorker.taskId) : undefined,
         };
       }
       return null;
     }
     this.stalledProjections.delete(mission.mission_id);
+    // A wait protects its own condition, not independently running workers.
+    if (wait) return null;
     const tasks = this.store.listTasks(mission.mission_id);
     const activeExecution = this.store
       .listExecutions(mission.mission_id)

@@ -1439,7 +1439,9 @@ export class MissionObservability {
       now,
       alive,
     });
-    if (["complete", "failed", "blocked"].includes(result.health) || s.waitingReason) return result;
+    if (["complete", "failed", "blocked"].includes(result.health)) return result;
+    // A mission wait can belong to a queued sibling task. Only a worker's own
+    // explicit waiting state exempts that worker from its stall threshold.
     if (workers.some((worker) => this.workerHealth(s, worker) === "stalled")) return { health: "stalled" };
     return result;
   }
