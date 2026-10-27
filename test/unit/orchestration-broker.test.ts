@@ -1963,6 +1963,113 @@ describe("ExecutionBroker (spec 03)", () => {
     }
   });
 
+  it("rebaseCandidateOntoCurrentBase rebases onto the incumbent head and re-points the manifest base without consuming repair budget", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "stale base rebase",
+        goal: "stale base rebase",
+        user_request: "stale base rebase",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-stale-base-rebase",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-stale-base-rebase",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-stale-base-rebase",
+        createdAt: new Date().toISOString(),
+      });
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "integrate",
+        repo_id: "repo-stale-base-rebase",
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.transitionTask(integrationTask.task_id, "READY");
+      store.transitionTask(integrationTask.task_id, "RUNNING");
+      const execution = store.createExecution({
+        task_id: integrationTask.task_id,
+        mission_id: mission.mission_id,
+        backend: "integration",
+        repo_id: "repo-stale-base-rebase",
+        base_sha: base,
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.assignTaskExecution(integrationTask.task_id, execution.execution_id);
+      store.setExecutionStatus(execution.execution_id, "RUNNING");
+      store.setExecutionStatus(execution.execution_id, "SUCCEEDED");
+      store.transitionTask(integrationTask.task_id, "SUCCEEDED");
+      const candidate = await git.createCandidateWorktree(base, {
+        missionId: mission.mission_id,
+        repoId: "repo-stale-base-rebase",
+        missionGeneration: 0,
+        candidateGeneration: 0,
+        repositoryGeneration: 1,
+        attempt: execution.execution_id,
+      });
+      await writeFile(join(candidate.path, "src", "stale-base-rebase.ts"), "export const rebased = true;\n");
+      await git.commitAll(candidate.path, "stale-base candidate");
+      candidate.candidateSha = await git.headCommitIn(candidate.path);
+      await git.persistCandidateLifecycle(candidate);
+
+      // The incumbent advances: the candidate's base is now stale (the exact
+      // condition behind MSN-SZ3bfz's merge-queue rejection).
+      await writeFile(join(fx.root, "src", "incumbent-advance.ts"), "export const advanced = true;\n");
+      await git.commitAll(fx.root, "incumbent advanced past the candidate base");
+      const newBase = await git.headCommit();
+      assert.notEqual(newBase, base);
+
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-stale-base-rebase", root: fx.root, git }),
+        backends: {},
+      });
+      const result = await broker.rebaseCandidateOntoCurrentBase(mission.mission_id);
+
+      assert.equal(result.ok, true);
+      assert.equal(result.rebased, true, "a stale candidate must be rebased, not re-enqueued");
+      assert.equal(result.conflict, false);
+      assert.equal(result.baseSha, newBase, "the manifest base is re-pointed at the incumbent head");
+      assert.ok(result.candidateSha && result.candidateSha !== candidate.candidateSha, "a real rebase moves the candidate head");
+      assert.ok(result.manifest, "an updated workspace manifest is returned");
+      const binding = result.manifest!.repositories.find((r) => r.repoId === "repo-stale-base-rebase");
+      assert.equal(binding?.baseSha, newBase);
+      // The candidate's branch now contains the incumbent advance on top of its own work.
+      assert.equal(await git.headCommitIn(candidate.path), result.candidateSha);
+
+      // The durable lifecycle record reflects the rebase for a later restart.
+      const [persisted] = (await git.loadCandidateLifecycles(mission.mission_id, "repo-stale-base-rebase")).filter(
+        (r) => r.state === "integrating" || r.state === "promotion_intent",
+      );
+      assert.ok(persisted);
+      assert.equal(persisted.baseSha, newBase);
+      assert.equal(persisted.candidateSha, result.candidateSha);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
   it("fresh current gates reauthorize a base-only stale intent and promote under current authority", async () => {
     const fx = await makeFixtureRepo();
     try {

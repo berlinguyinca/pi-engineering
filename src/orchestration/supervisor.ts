@@ -539,14 +539,28 @@ export class MissionSupervisor {
       // Requeue through the existing supersession/repair machinery: naming the
       // failed task makes the repair plan create one bounded replacement for it
       // instead of declaring an ownerless mission and stopping.
+      const reason = `Task ${failed.task_id} (${failed.kind}:${failed.role}) failed and no task is runnable: ${taskFailureReason(
+        failed,
+        this.store.listExecutions(mission.mission_id, failed.task_id),
+        this.store.listFailureClassifications(mission.mission_id),
+      )}`;
+      // A failed worker task is an implementation defect only when its failure
+      // matches NO known provider/infrastructure signature. A blanket
+      // IMPLEMENTATION_DEFECT used to swallow a gateway capacity 400 (the
+      // `inferweave_backpressure` envelope) and turn it into a CREATE_REPAIR_TASKS
+      // loop that burned the repair budget re-issuing the same doomed request;
+      // capacity, network and credential failures route to their own recoveries
+      // (wait, stop) instead. Only an unrecognised failure stays a defect.
+      const inferred = this.classifier.inferRecognizedCategory({
+        missionId: mission.mission_id,
+        taskId: failed.task_id,
+        executionId: null,
+        summary: reason,
+      });
       return {
         health: "REPAIR_REQUIRED",
-        category: "IMPLEMENTATION_DEFECT",
-        reason: `Task ${failed.task_id} (${failed.kind}:${failed.role}) failed and no task is runnable: ${taskFailureReason(
-          failed,
-          this.store.listExecutions(mission.mission_id, failed.task_id),
-          this.store.listFailureClassifications(mission.mission_id),
-        )}`,
+        category: inferred ?? "IMPLEMENTATION_DEFECT",
+        reason,
         task: failed,
       };
     }

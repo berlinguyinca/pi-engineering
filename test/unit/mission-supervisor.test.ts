@@ -812,10 +812,63 @@ describe("MissionSupervisor", () => {
 
     assert.equal(status?.health, "REPAIR_REQUIRED");
     assert.equal(status?.task, failed.task_id, "the repair names the task to replace, not the mission");
-    assert.equal(status?.decision?.action, "CREATE_REPAIR_TASKS");
+    // A connection drop is a gateway saturation signature (issue #112): the
+    // supervisor waits it out and re-dispatches — it does NOT hire another
+    // implementer to hit the same saturated gateway.
+    assert.equal(status?.decision?.action, "PROBE_AND_BACKOFF");
     assert.match(status?.reason ?? "", /Connection error/);
     assert.equal(h.store.listMissionStops(h.mission.mission_id).length, 0, "a requeue is not a stop");
+    assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "PROVIDER_TRANSIENT");
+  });
+
+  it("classifies a 400 backpressure failure as a capacity wait, never an implementation defect (MSN-MypLoa)", async () => {
+    const h = harness();
+    const failed = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the change",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(failed.task_id, "READY");
+    h.store.transitionTask(failed.task_id, "RUNNING");
+    h.store.transitionTask(failed.task_id, "FAILED", "system", {
+      failure_reason:
+        'backend reported failed: Model gateway refused the request after 0 honoured wait(s): 400: {"action":"fix_request","action_code":"IW-ACT-FIX-REQUEST","code":"upstream_error","message":"Correct the request syntax, parameters, endpoint, or model identity.","reason":"upstream_error","replay_safe":false,"request_state":"unknown","retryable":false,"scope":"request","type":"inferweave_backpressure"}',
+    });
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "REPAIR_REQUIRED");
+    assert.equal(status?.task, failed.task_id);
+    // The exact regression: the envelope was blanket-labeled IMPLEMENTATION_DEFECT,
+    // which burned the CREATE_REPAIR_TASKS budget re-issuing the same doomed
+    // request until the mission stalled. It must park as a capacity wait.
+    assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "PROVIDER_TRANSIENT");
+    assert.equal(status?.decision?.action, "PROBE_AND_BACKOFF");
+    assert.equal(h.store.listMissionStops(h.mission.mission_id).length, 0, "a capacity wait is not a stop");
+  });
+
+  it("keeps a genuine code failure an implementation defect", async () => {
+    const h = harness();
+    const failed = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the change",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(failed.task_id, "READY");
+    h.store.transitionTask(failed.task_id, "RUNNING");
+    h.store.transitionTask(failed.task_id, "FAILED", "system", {
+      failure_reason: "backend reported failed: worker exited with code 1 without a result",
+    });
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "REPAIR_REQUIRED");
     assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "IMPLEMENTATION_DEFECT");
+    assert.equal(status?.decision?.action, "CREATE_REPAIR_TASKS");
   });
 
   it("falls back to the execution outcome when a failed task recorded no reason", async () => {

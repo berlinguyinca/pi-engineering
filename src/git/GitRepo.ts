@@ -1896,6 +1896,56 @@ export class GitRepo {
   }
 
   /**
+   * Rebase the candidate worktree's branch onto `ontoSha` (the incumbent head
+   * after the target moved) so a stale-base queue rejection is repaired by a
+   * real rebase + revalidation instead of re-enqueueing the same SHA.
+   * The worktree is only touched when clean; on conflict the rebase is
+   * aborted and the worktree left untouched, so the caller can escalate.
+   * `headSha` is the new branch head on success.
+   */
+  async rebaseWorktreeOnto(
+    worktree: WorktreeInfo,
+    ontoSha: string,
+    guard?: GitMutationGuard,
+  ): Promise<{ ok: boolean; conflict: boolean; reason: string | null; headSha: string | null }> {
+    const dirty = (await this.statusIn(worktree.path)).trim();
+    if (dirty !== "") {
+      return {
+        ok: false,
+        conflict: false,
+        reason: `candidate worktree ${worktree.path} is not clean; refusing to rebase an unknown state`,
+        headSha: null,
+      };
+    }
+    guard?.assertAuthoritative();
+    const args = [
+      "-C",
+      worktree.path,
+      "rebase",
+      "--quiet",
+      ...(await this.fallbackIdentityArgs()),
+      ontoSha,
+    ];
+    const r = await this.git(args);
+    if (r.code !== 0) {
+      const text = `${r.stderr}\n${r.stdout}`;
+      const conflicted = /CONFLICT|could not apply|failed to apply/.test(text);
+      if (conflicted) {
+        guard?.assertAuthoritative();
+        await this.git(["-C", worktree.path, "rebase", "--abort"]).catch(() => {});
+      }
+      const reason =
+        text
+          .split("\n")
+          .map((line) => line.trim())
+          .find((line) => line.length > 0) ?? "rebase failed";
+      return { ok: false, conflict: conflicted, reason: reason.slice(0, 200), headSha: null };
+    }
+    const headSha = await this.headCommitIn(worktree.path);
+    return { ok: true, conflict: false, reason: null, headSha };
+  }
+
+  /**
    * Push the local `branch` to origin, guarded against a concurrent advance.
    * `expectedSha` is the remote head we observed (string) or null to rely on the
    * freshly-updated remote-tracking ref (retry after a re-merge). A lost race is
