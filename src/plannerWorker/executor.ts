@@ -129,6 +129,10 @@ export interface PlannerWorkerOptions {
   signal?: AbortSignal;
 }
 
+interface RetiredWorktree extends WorktreeInfo {
+  base_commit?: string;
+}
+
 interface Runtime {
   state: ContractState;
   worktree: WorktreeInfo | null;
@@ -243,8 +247,8 @@ export class PlannerWorkerExecutor {
   private applied = false;
   /** Only this exact clean, verified commit may be applied to the checkout. */
   private verifiedIntegrationHead: string | null = null;
-  /** Worktrees of contracts superseded by a replan, removed at cleanup. */
-  private readonly retired: WorktreeInfo[] = [];
+  /** Superseded nonpassed workspaces remain recoverable across replans/restarts. */
+  private readonly retired: RetiredWorktree[] = [];
   /** A failed harvest must retain the exact workspace for recovery. */
   private readonly unharvested = new Set<string>();
   private status: PlannerWorkerReport["status"] | "running" = "running";
@@ -396,6 +400,18 @@ export class PlannerWorkerExecutor {
         throw error;
       }
     };
+    for (const retired of saved.retired_worktrees ?? []) {
+      const ref = await git(this.opts.repoRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${retired.branch}`]);
+      if (ref.code !== 0 && ref.code !== 1) {
+        throw new Error(`cannot verify preserved branch ${retired.branch}: ${ref.stderr}`);
+      }
+      // Follow the existing explicit recovery flow: preserve output elsewhere,
+      // then remove both original identities. Either one alone stays fenced.
+      if (!(await exists(retired.path)) && ref.code === 1) continue;
+      throw new Error(
+        `resume preserved ${retired.path} on ${retired.branch} (base ${retired.base_commit ?? saved.base_commit}); recover retired worker output before retrying`,
+      );
+    }
     const requireClean = async (path: string, branch: string) => {
       try {
         const state = await checkedGit(path, ["status", "--porcelain", "--untracked-files=all"]);
@@ -634,8 +650,20 @@ export class PlannerWorkerExecutor {
       }
     }
     if (!rt.worktree) {
+      const branch = this.branchFor(c.task_id);
+      if (this.retired.some((info) => info.branch === branch)) {
+        this.forceFail(rt, `preserved retired output on ${branch}; recover its work before retrying this task id`);
+        return;
+      }
+      // Older checkpoints can lack retirement metadata. Never let the GitRepo
+      // stale-worktree cleanup overwrite a branch whose output is unknown.
+      const existing = await git(this.opts.repoRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+      if (existing.code !== 1) {
+        this.forceFail(rt, `preserved existing or unverifiable output on ${branch}; recover its work before retrying`);
+        return;
+      }
       const head = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
-      rt.worktree = await this.repo.createWorktree(head, this.branchFor(c.task_id));
+      rt.worktree = await this.repo.createWorktree(head, branch);
       rt.baseCommit = head;
       rt.lastHead = head;
       rt.state.worktree = rt.worktree.path;
@@ -1329,9 +1357,15 @@ export class PlannerWorkerExecutor {
       return true;
     }
     for (const old of remaining) {
-      if (old.worktree) this.retired.push(old.worktree);
-      this.contracts.delete(old.state.contract.task_id);
+      if (old.worktree) {
+        this.retired.push({ ...old.worktree, base_commit: old.baseCommit });
+        this.unharvested.add(old.worktree.path);
+      }
     }
+    // Keep the original contracts reachable until their retirement inventory
+    // and recovery fence have reached disk. A failed write must stop replanning.
+    await this.persist(true);
+    for (const old of remaining) this.contracts.delete(old.state.contract.task_id);
     this.plan = {
       contracts: [
         ...passed.map((id) => this.plan.contracts.find((c) => c.task_id === id)!).filter(Boolean),
@@ -1576,7 +1610,11 @@ export class PlannerWorkerExecutor {
         await this.dropWorktree(rt.worktree);
       }
     }
-    for (const info of this.retired) await this.dropWorktree(info, true);
+    for (const info of this.retired) {
+      // A later successful plan cannot harvest superseded failed workspaces.
+      this.unharvested.add(info.path);
+      await this.dropWorktree(info, true);
+    }
     // The integration branch is the result when it was not applied to the checkout.
     if (this.integration) {
       if (this.status !== "completed") this.unharvested.add(this.integration.path);
@@ -1610,7 +1648,7 @@ export class PlannerWorkerExecutor {
 
   private persistQueue: Promise<void> = Promise.resolve();
 
-  private persist(): Promise<void> {
+  private persist(requireDurable = false): Promise<void> {
     const snapshot = () => ({
       ...this.report(),
       status: this.status,
@@ -1619,24 +1657,26 @@ export class PlannerWorkerExecutor {
       integration_branch: this.integration?.branch ?? null,
       integration_path: this.integration?.path ?? null,
       unharvested_worktrees: [...this.unharvested],
+      retired_worktrees: this.retired,
       planner_model: this.plannerModel,
       plan: this.plan,
       live_activity: this.activity.snapshot(),
       updated_at: new Date().toISOString(),
     });
-    this.persistQueue = this.persistQueue
-      .then(async () => {
-        // Write to a sibling temp file then rename so a crash (e.g. SIGKILL)
-        // mid-persist can never leave state.json truncated: `rename` is atomic,
-        // so resume always reads either the complete previous state or the
-        // complete new one.
-        const target = join(this.opts.stateDir, "state.json");
-        const temporary = plannerStateTempPath(this.opts.stateDir);
-        await writeFile(temporary, `${JSON.stringify(snapshot(), null, 2)}\n`);
-        await rename(temporary, target);
-      })
-      .catch(() => undefined);
-    return this.persistQueue;
+    const pending = this.persistQueue.then(async () => {
+      // Write to a sibling temp file then rename so a crash (e.g. SIGKILL)
+      // mid-persist can never leave state.json truncated: `rename` is atomic,
+      // so resume always reads either the complete previous state or the
+      // complete new one.
+      const target = join(this.opts.stateDir, "state.json");
+      const temporary = plannerStateTempPath(this.opts.stateDir);
+      await writeFile(temporary, `${JSON.stringify(snapshot(), null, 2)}\n`);
+      await rename(temporary, target);
+    });
+    // Leave the serialization queue usable after a failed write, while callers
+    // at destructive boundaries must observe the failure rather than proceed.
+    this.persistQueue = pending.catch(() => undefined);
+    return requireDurable ? pending : this.persistQueue;
   }
 }
 
@@ -1663,6 +1703,7 @@ interface ResumableState {
   integration_branch?: string;
   integration_path?: string;
   unharvested_worktrees?: string[];
+  retired_worktrees?: RetiredWorktree[];
   plan: PlannerOutput;
   contracts: ContractState[];
   transitions?: PlannerWorkerReport["transitions"];

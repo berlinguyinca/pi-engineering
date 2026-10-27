@@ -180,3 +180,164 @@ for (const kind of ["dirty worker", "committed failed harvest", "dirty integrati
     }
   });
 }
+
+for (const status of ["failed", "completed", "aborted"]) {
+  test(`cleanup preserves ignored output in retired ${status} workspaces`, async () => {
+    const fixture = await makeFixtureRepo();
+    const repo = (await GitRepo.open(fixture.root))!;
+    const worktree = await repo.createWorktree(await repo.headCommit(), "retired-ignored-output");
+    await writeFile(join(worktree.path, ".gitignore"), "recover.txt\n");
+    await exec("git", ["-C", worktree.path, "add", ".gitignore"]);
+    await exec("git", ["-C", worktree.path, "commit", "-qm", "ignore recovery artifact"]);
+    const output = join(worktree.path, "recover.txt");
+    await writeFile(output, "retired output\n");
+    const executor: any = new PlannerWorkerExecutor({
+      repoRoot: fixture.root,
+      stateDir: join(fixture.root, ".pi-eng", "retired"),
+    } as any);
+    executor.repo = repo;
+    executor.status = status;
+    executor.retired.push(worktree);
+    try {
+      assert.equal((await exec("git", ["-C", worktree.path, "status", "--porcelain"])).stdout, "");
+      await executor.cleanup();
+      assert.equal(await readFile(output, "utf8"), "retired output\n");
+      await exec("git", ["-C", fixture.root, "rev-parse", "--verify", `refs/heads/${worktree.branch}`]);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+}
+
+test("replanning durably fences retired artifacts before cleanup or resume can replace them", async () => {
+  const fixture = await makeFixtureRepo();
+  const repo = (await GitRepo.open(fixture.root))!;
+  const base = await repo.headCommit();
+  const integration = await repo.createWorktree(base, "pi-eng-pw-Retired");
+  const worktree = await repo.createWorktree(base, "pi-eng-pw-Retired-task");
+  const stateDir = join(fixture.root, ".pi-eng", "retired-recovery");
+  await mkdir(stateDir, { recursive: true });
+  const opts: any = {
+    repoRoot: fixture.root,
+    stateDir,
+    resolver: { resolve: async () => null, refresh: async () => {} },
+  };
+  const executor: any = new PlannerWorkerExecutor(opts);
+  const contract = {
+    task_id: "task",
+    objective: "replace blocked work",
+    depends_on: [],
+    scope: { allowed: ["src/**"] },
+    acceptance: ["done"],
+    verification: ["true"],
+    risk: "medium",
+  };
+  executor.repo = repo;
+  executor.brief = { mission_id: "Retired", summary: "recover retired work" };
+  executor.integration = integration;
+  executor.baseCommit = base;
+  executor.roleWorker = () => ({
+    run: async () => ({
+      result: {
+        status: "completed",
+        summary: JSON.stringify({ contracts: [contract], decisions: [], architectural_context: [] }),
+      },
+    }),
+  });
+  const runtime = {
+    worktree,
+    baseCommit: base,
+    state: {
+      contract: { ...contract, task_id: "task" },
+      status: "blocked",
+      attempt: 1,
+      blocked_reason: "evidence: blocked",
+      changed_files: [],
+      history: [],
+      worktree: worktree.path,
+    },
+  };
+  executor.contracts.set("task", runtime);
+  await writeFile(join(worktree.path, ".gitignore"), "recover.txt\n");
+  await exec("git", ["-C", worktree.path, "add", ".gitignore"]);
+  await exec("git", ["-C", worktree.path, "commit", "-qm", "ignore recovery artifact"]);
+  const output = join(worktree.path, "recover.txt");
+  await writeFile(output, "recover after restart\n");
+  try {
+    // A failed durable write must stop retirement before dropping the only
+    // contract record or launching a replacement with a colliding identity.
+    await mkdir(join(stateDir, "state.json"));
+    await assert.rejects(() => executor.replan(runtime), /EISDIR|ENOTEMPTY/);
+    assert.equal(executor.contracts.get("task"), runtime);
+    assert.equal(await readFile(output, "utf8"), "recover after restart\n");
+    // Retry from the original persisted/in-memory contract after storage returns.
+    executor.retired.length = 0;
+    executor.replans = 0;
+    await rm(join(stateDir, "state.json"), { recursive: true });
+    assert.equal(await executor.replan(runtime), true);
+    const saved = JSON.parse(await readFile(join(stateDir, "state.json"), "utf8"));
+    assert.ok(saved.unharvested_worktrees?.includes(worktree.path), "retirement persists a recovery fence immediately");
+    assert.deepEqual(saved.retired_worktrees, [{ ...worktree, base_commit: base }]);
+    // Older checkpoints may lack the retired inventory. The existing branch
+    // itself must still stop a replacement from force-removing its workspace.
+    const legacy: any = new PlannerWorkerExecutor(opts);
+    legacy.repo = repo;
+    legacy.brief = executor.brief;
+    legacy.integration = integration;
+    legacy.attempt = async () => "done";
+    legacy.addContract(contract);
+    const legacyReplacement = legacy.contracts.get("task");
+    legacy.setStatus(legacyReplacement, "ready", "dependencies satisfied");
+    await legacy.executeContract(legacyReplacement);
+    assert.equal(legacyReplacement.state.status, "failed");
+    assert.equal(await readFile(output, "utf8"), "recover after restart\n");
+    const replacement = executor.contracts.get("task");
+    executor.setStatus(replacement, "ready", "dependencies satisfied");
+    await executor.executeContract(replacement);
+    assert.equal(replacement.state.status, "failed");
+    assert.match(replacement.state.blocked_reason ?? replacement.state.history.at(-1)?.note ?? "", /preserv|recover/i);
+    assert.equal(await readFile(output, "utf8"), "recover after restart\n");
+    await assert.rejects(() => new PlannerWorkerExecutor(opts).resume(), /preserv.*recover/i);
+    assert.equal(await readFile(output, "utf8"), "recover after restart\n");
+    // A missing directory cannot silently clear the durable fence and allow a
+    // same-id replacement branch to overwrite the preserved commit history.
+    await exec("git", ["-C", fixture.root, "worktree", "remove", "--force", worktree.path]);
+    await assert.rejects(() => new PlannerWorkerExecutor(opts).resume(), /preserv.*recover/i);
+    // Deliberate recovery keeps the commits elsewhere, then removes both
+    // original identities as documented; no state-file surgery is needed.
+    await exec("git", ["-C", fixture.root, "branch", "recovered-output", worktree.branch]);
+    await exec("git", ["-C", fixture.root, "branch", "-D", worktree.branch]);
+    const recovered: any = new PlannerWorkerExecutor(opts);
+    let resumed = false;
+    recovered.proceed = async () => {
+      resumed = true;
+      return recovered.report();
+    };
+    await recovered.resume();
+    assert.equal(resumed, true, "explicit recovery allows resume to reach execution again");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("cleanup still removes clean fully harvested passed workspaces", async () => {
+  const fixture = await makeFixtureRepo();
+  const repo = (await GitRepo.open(fixture.root))!;
+  const worktree = await repo.createWorktree(await repo.headCommit(), "harvested-passed");
+  const executor: any = new PlannerWorkerExecutor({
+    repoRoot: fixture.root,
+    stateDir: join(fixture.root, ".pi-eng", "passed"),
+  } as any);
+  executor.repo = repo;
+  executor.status = "completed";
+  executor.contracts.set("task", { worktree, state: { status: "passed" } });
+  try {
+    await executor.cleanup();
+    await assert.rejects(() => access(worktree.path), { code: "ENOENT" });
+    await assert.rejects(() =>
+      exec("git", ["-C", fixture.root, "rev-parse", "--verify", `refs/heads/${worktree.branch}`]),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
