@@ -465,7 +465,7 @@ export class PlannerWorkerExecutor {
 
   private async planMission(): Promise<boolean> {
     this.emit({ type: "phase", text: "planning" });
-    const planner = await this.opts.resolver.resolve("planner");
+    const planner = await this.opts.resolver.resolveForDispatch("planner");
     this.plannerModel = planner ? servedIdentity(planner) : null;
     this.recordTransition("planner", "planner", planner, "planning", "plan");
     const result = await runPlanner({
@@ -915,7 +915,7 @@ export class PlannerWorkerExecutor {
     avoid: string[],
     handoffTokens: number,
   ): Promise<ResolvedRole | null | "reject"> {
-    const resolved = await this.opts.resolver.resolve(role, avoid);
+    const resolved = await this.opts.resolver.resolveForDispatch(role, avoid);
     if (!resolved) return null; // executor default model (single-model hosts)
     const plan = planTransition(
       this.opts.resolver.profileOf(resolved),
@@ -1018,7 +1018,7 @@ export class PlannerWorkerExecutor {
       this.opts.resolver.exclude(servedIdentity(resolved));
       this.opts.resolver.exclude(resolved.model.id);
       this.opts.resolver.mergeCandidates(availability.candidates);
-      const next = await this.opts.resolver.resolve(role, avoid);
+      const next = await this.opts.resolver.resolveForDispatch(role, avoid);
       if (!next) return run;
       this.recordTransition(task, role, next, `failover:${availability.code}`, task);
       resolved = next;
@@ -1175,7 +1175,7 @@ export class PlannerWorkerExecutor {
 
   private async review(rt: Runtime): Promise<ReviewVerdict> {
     const c = rt.state.contract;
-    const reviewer = await this.opts.resolver.resolve("reviewer", this.avoidFor("reviewer", rt));
+    const reviewer = await this.opts.resolver.resolveForDispatch("reviewer", this.avoidFor("reviewer", rt));
     this.recordTransition(c.task_id, "reviewer", reviewer, "review", c.task_id);
     const r = await runReview({
       worker: this.roleWorker("reviewer", reviewer, c.task_id),
@@ -1204,7 +1204,7 @@ export class PlannerWorkerExecutor {
 
   private async preReview(rt: Runtime): Promise<ReviewVerdict | null> {
     const c = rt.state.contract;
-    const reviewer = await this.opts.resolver.resolve("reviewer", []);
+    const reviewer = await this.opts.resolver.resolveForDispatch("reviewer", []);
     this.recordTransition(c.task_id, "reviewer", reviewer, "pre-review", c.task_id);
     const r = await runReview({
       worker: this.roleWorker("reviewer", reviewer, c.task_id),
@@ -1244,7 +1244,7 @@ export class PlannerWorkerExecutor {
         ]);
         if (merged.code !== 0) await git(reviewTree.path, ["merge", "--abort"]);
       }
-      const reviewer = await this.opts.resolver.resolve("reviewer", implementers);
+      const reviewer = await this.opts.resolver.resolveForDispatch("reviewer", implementers);
       this.recordTransition("batch-review", "reviewer", reviewer, "batch review", ids.join(","));
       ({ verdicts } = await runBatchReview({
         worker: this.roleWorker("reviewer", reviewer, "batch-review", implementers),
@@ -1287,7 +1287,7 @@ export class PlannerWorkerExecutor {
     failed: VerificationRun[],
   ): Promise<{ diagnosis: string; required_changes: string[] } | null> {
     const c = rt.state.contract;
-    const debuggerModel = await this.opts.resolver.resolve("debugger", []);
+    const debuggerModel = await this.opts.resolver.resolveForDispatch("debugger", []);
     this.recordTransition(c.task_id, "debugger", debuggerModel, "diagnosis", c.task_id);
     const evidence = {
       contract: c,
@@ -1335,7 +1335,7 @@ export class PlannerWorkerExecutor {
       .filter((x) => x.state.status === "passed")
       .map((x) => x.state.contract.task_id);
     const remaining = [...this.contracts.values()].filter((x) => x.state.status !== "passed");
-    const planner = await this.opts.resolver.resolve("planner");
+    const planner = await this.opts.resolver.resolveForDispatch("planner");
     // Implementers must stay separated from whichever model plans next.
     if (planner) this.plannerModel = servedIdentity(planner);
     this.recordTransition("planner", "planner", planner, "replanning", rt.state.contract.task_id);
@@ -1482,7 +1482,7 @@ export class PlannerWorkerExecutor {
     if (!(await this.checkIntegrationSnapshot(verifiedHead, "after integrated verification"))) return;
     const diff = all.map((rt) => rt.diff).join("\n");
     const implementers = [...new Set(all.map((rt) => rt.state.last_model).filter((m): m is string => m !== null))];
-    const reviewer = await this.opts.resolver.resolve("reviewer", implementers);
+    const reviewer = await this.opts.resolver.resolveForDispatch("reviewer", implementers);
     this.recordTransition("final", "reviewer", reviewer, "final review", "final");
     const finalContract: TaskContract = {
       task_id: "final-review",

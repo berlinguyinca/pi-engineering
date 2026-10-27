@@ -10,6 +10,7 @@ import {
   DEFAULT_ROLE_CONFIG,
   type ResolvedRole,
   type RoleConfig,
+  dispatchResolution,
   resolveRole,
   servedIdentity,
   usable,
@@ -81,11 +82,30 @@ export class RoleResolver {
   }
 
   async resolve(role: PlannerWorkerRole, avoid: readonly string[] = []): Promise<ResolvedRole | null> {
+    return this.resolveWithPin(role, avoid, this.opts.operatorPin?.());
+  }
+
+  /** Dispatch never falls through a known refusal to the worker's default model. */
+  async resolveForDispatch(role: PlannerWorkerRole, avoid: readonly string[] = []): Promise<ResolvedRole | null> {
     const pin = this.opts.operatorPin?.();
+    const resolved = await this.resolveWithPin(role, avoid, pin);
+    return dispatchResolution(
+      role,
+      resolved,
+      this.models.length === 0 && !this.opts.fallback && this.excluded.size === 0 && !pin,
+    );
+  }
+
+  private async resolveWithPin(
+    role: PlannerWorkerRole,
+    avoid: readonly string[],
+    pin: ModelRef | null | undefined,
+  ): Promise<ResolvedRole | null> {
     if (!pin || this.excluded.has(pin.id)) return this.resolveUnpinned(role, avoid);
     const pinName = `${pin.provider}/${pin.id}`;
     const cfg = this.config[role];
-    const entry = this.models.find((m) => m.id === pin.id);
+    const entry = pin.provider === this.opts.provider ? this.models.find((m) => m.id === pin.id) : undefined;
+    if (entry?.backing && this.excluded.has(entry.backing)) return this.resolveUnpinned(role, avoid);
     // Hard checks only: what the catalogue says the pinned model cannot do.
     const refusal = !entry
       ? null
