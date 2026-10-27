@@ -19,6 +19,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createRoleRouter } from "../capability/adapter.ts";
 import type { RoleName } from "../capability/roles.ts";
+import { compactSessionHandoff } from "../compaction/autoTune.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workerInactivityMs } from "../orchestration/broker.ts";
 import type { MissionAttentionSnapshot } from "../runtime/herdr/MissionAttentionReporter.ts";
@@ -46,6 +47,7 @@ import {
   persistSessionHandoff,
   projectSessionHandoff,
   sessionBranchMessages,
+  staleHandoffThreshold,
 } from "./sessionHandoff.ts";
 import { latestState, renderPlan, renderStatus, renderWorkers } from "./status.ts";
 import { TransitionLog } from "./transitions.ts";
@@ -211,17 +213,17 @@ export function registerPlannerWorker(
       const messages = projectSessionHandoff(event.messages, ctx.sessionManager.getBranch());
       return messages ? { messages } : undefined;
     });
-    // Pi checks the previous assistant's usage before the next request. Its
-    // pre-handoff usage describes the old transcript, not the projected request.
-    // Suppress only that stale threshold check; manual/overflow recovery and
-    // thresholds after the first successor response remain native.
-    pi.on("session_before_compact", (event, ctx) => {
-      if (event.reason !== "threshold") return;
-      const branch = ctx.sessionManager.getBranch();
-      for (let i = branch.length - 1; i >= 0; i--) {
-        const entry = branch[i];
-        if (entry?.type === "compaction" || (entry?.type === "message" && entry.message.role === "assistant")) return;
-        if (entry?.type === "custom" && entry.customType === SESSION_HANDOFF_ENTRY) return { cancel: true };
+    pi.on("session_before_compact", async (event, ctx) => {
+      if (staleHandoffThreshold(event.reason, event.branchEntries)) return { cancel: true };
+      try {
+        const compaction = await compactSessionHandoff(event, ctx);
+        return compaction ? { compaction } : undefined;
+      } catch (error) {
+        ctx.ui.notify(
+          `Session handoff compaction failed: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+        return { cancel: true };
       }
     });
     pi.on("model_select", async (event, ctx) => {

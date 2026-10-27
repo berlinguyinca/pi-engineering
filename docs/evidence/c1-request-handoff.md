@@ -21,6 +21,16 @@ that threshold is cancelled only until the first successor assistant response.
 Manual and overflow compaction remain native, as does selective compaction when
 no handoff can be built.
 
+Native compaction bypasses request-time context hooks. All engineering
+compaction consumers therefore prepare from a synthetic native compaction at the
+real handoff marker ID, followed only by successor entries. With a short suffix,
+a canonical native compaction commits the handoff summary at that marker; under
+successor pressure, Pi summarizes the successor prefix and retains a native cut
+from the successor suffix. This covers manual, threshold, overflow, and the
+auto-tuner's turn boundary. Earlier and later before-compaction hooks share a
+single event result. A failed handoff summary cancels visibly rather than
+falling back to the raw hidden branch.
+
 `test/integration/session-handoff-request.test.ts` exercises the real SDK and
 OpenAI-compatible HTTP transport against a loopback server. It seeds oversized
 history and a 70k-token prior assistant response, leaves automatic compaction
@@ -29,7 +39,11 @@ including Pi's system prompt, a real read-tool schema, the latest task, and the
 new user prompt. The fixture enforces a deterministic payload estimate plus
 output reserve; it is not an external model tokenizer. The request excludes old
 history, completes successfully, and continues after SDK reload with zero native
-compactions. Unit tests also cover branch isolation, repeated successor messages,
+compactions during the initial handoff in the standalone configuration. Six
+HTTP scenarios cover later manual, threshold, and overflow compaction both
+standalone and with the complete production extension loaded, including larger
+successor history requiring a real summary request. Every captured summary,
+retry, and follow-up excludes old history. Unit tests also cover branch isolation, repeated successor messages,
 prior summaries, and later compaction.
 
 For an actual LLM proof, provision an isolated temporary agent directory with

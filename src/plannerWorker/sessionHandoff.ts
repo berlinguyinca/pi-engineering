@@ -251,6 +251,51 @@ export function projectSessionHandoff(messages: AgentMessage[], branch: SessionE
   ];
 }
 
+/** Pre-switch usage cannot justify threshold compaction of the new projection. */
+export function staleHandoffThreshold(reason: string | undefined, branch: SessionEntry[]): boolean {
+  if (reason !== "threshold") return false;
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry?.type === "compaction" || (entry?.type === "message" && entry.message.role === "assistant")) return false;
+    if (entry?.type === "custom" && entry.customType === SESSION_HANDOFF_ENTRY) return true;
+  }
+  return false;
+}
+
+/** Canonical native-compaction input containing no hidden transcript prefix. */
+export function sessionHandoffCompactionBranch(
+  branch: SessionEntry[],
+): { entries: SessionEntry[]; markerId: string; summary: string } | undefined {
+  let boundary = -1;
+  for (let i = 0; i < branch.length; i++) {
+    const entry = branch[i];
+    if (entry?.type === "custom" && entry.customType === SESSION_HANDOFF_ENTRY) boundary = i;
+  }
+  const marker = branch[boundary];
+  if (marker?.type !== "custom" || branch.slice(boundary + 1).some((entry) => entry.type === "compaction")) return;
+  const rendered = (marker.data as { rendered?: unknown } | undefined)?.rendered;
+  if (typeof rendered !== "string" || !rendered) return;
+  // Native preparation recognizes previousSummary and chooses cuts only in the
+  // successor suffix. Reuse the REAL marker id so every returned cutoff is a
+  // valid persisted boundary, never an invented session entry.
+  return {
+    markerId: marker.id,
+    summary: rendered,
+    entries: [
+      {
+        type: "compaction",
+        id: marker.id,
+        parentId: null,
+        timestamp: marker.timestamp,
+        summary: rendered,
+        firstKeptEntryId: marker.id,
+        tokensBefore: 0,
+      },
+      ...branch.slice(boundary + 1),
+    ],
+  };
+}
+
 /**
  * The side-effect surface a model-switch decision needs. `extension.ts`
  * satisfies it with the pi event context; tests satisfy it with counters.

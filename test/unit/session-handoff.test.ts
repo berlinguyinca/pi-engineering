@@ -26,6 +26,7 @@ import {
   persistSessionHandoff,
   projectSessionHandoff,
   sessionBranchMessages,
+  sessionHandoffCompactionBranch,
 } from "../../src/plannerWorker/sessionHandoff.ts";
 
 // ── buildSessionHandoff ─────────────────────────────────────────────────────
@@ -384,4 +385,20 @@ describe("branch-local handoff projection", () => {
     assert.deepEqual(effects.contexts, []);
     assert.equal(effects.notifications.length, 0);
   });
+});
+
+it("canonical compaction input and cutoff prune hidden history durably", () => {
+  const manager = SessionManager.inMemory("/tmp");
+  manager.appendMessage({ role: "user", content: "HIDDEN_OLD_CONTEXT", timestamp: 1 });
+  const marker = manager.appendCustomEntry(SESSION_HANDOFF_ENTRY, { rendered: "bounded handoff" });
+  manager.appendMessage({ role: "user", content: "successor user turn", timestamp: 2 });
+  const projected = sessionHandoffCompactionBranch(manager.getBranch());
+  assert.ok(projected);
+  assert.equal(projected.markerId, marker);
+  assert.equal(projected.entries[0]?.type, "compaction");
+  assert.ok(!JSON.stringify(projected.entries).includes("HIDDEN_OLD_CONTEXT"));
+  manager.appendCompaction(projected.summary, projected.markerId, 10000);
+  assert.ok(!JSON.stringify(manager.buildSessionContext().messages).includes("HIDDEN_OLD_CONTEXT"));
+  assert.match(JSON.stringify(manager.buildSessionContext().messages), /successor user turn/);
+  assert.equal(sessionHandoffCompactionBranch(manager.getBranch()), undefined);
 });
