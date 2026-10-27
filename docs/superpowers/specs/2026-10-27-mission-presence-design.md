@@ -52,6 +52,18 @@ takes keyboard focus, so it cannot be the always-on surface. `ctx.ui.setWidget` 
 "offers no non-focusing variant", which is factually wrong and is the reason presence was pushed into the
 footer. That comment is corrected as part of this change.
 
+Two sharper facts on main, both verified:
+
+- Mission progress lines already reach the extension (`orchestrate({ onProgress })` at
+  `extensions/index.ts:2416`) and their only consumer is `SessionControl.missionProgress`
+  (`src/sessionControl/SessionControl.ts:303`), which regexes the mission id out of the line, keeps it in a
+  five-entry `recentMissionIds` list, and **discards the text**. Every settlement, heartbeat and recovery
+  sentence `OrchestrationOrchestrator.report` produces is thrown away.
+- Nothing notifies the operator when a mission needs them. There is no `needs_action` concept anywhere in
+  `src/` or `extensions/` on main; `summary.action` is a free string. Mission `ctx.ui.notify` calls are all
+  command responses to explicit operator input (`extensions/index.ts:2290`, `:2396`, `:2404`). A mission that
+  is blocked, paused, or waiting on the operator is silent by construction.
+
 ## 3. Goals
 
 - G1. At a glance, in every pane: is anything running, what is it doing, when did it last prove it was
@@ -121,9 +133,14 @@ Wired in dependency order, each with its own test, each additive:
    severity and file:line already available on the finding record.
 5. **Repair.** `repairStarted` / `repairCompleted` where the repair loop runs.
 6. **Gate failure.** `gateFailed` beside the existing `gatePassed` path.
-7. **Loop evidence.** Feed the existing `LoopTracker` signals into `loopSignals` / `hasLoop` so
-   `stall.ts`'s `loop_detected` trigger has input, and `progress.ts` can report
-   `no_progress_reason: "looping"`.
+7. **Loop evidence producers.** `WorkerLoopTracker` is already created lazily by
+   `MissionObservability.tracker()` and already fed by `noteWorkerTool` from
+   `OrchestrationOrchestrator.observeWorkerActivity`, and `health.ts:78` already maps `hasLoop` to
+   `stalled` — so repeated-tool loops already affect health. What is missing is the rest of the signal set:
+   `noteWorkerRead`, `noteWorkerError`, `noteWorkerCycle`, `workerFileChanged` have no callers, so a worker
+   that re-reads the same file or repeats an edit cycle without repeating a tool signature is invisible to
+   the tracker. `stall.ts` on main contains only `WorkerLoopTracker`; there is no separate stall engine to
+   wire.
 8. **Meaningful progress.** `meaningfulProgress` on the events that already carry
    `meaningfulProgress: true`, so `lastMeaningfulProgressAt` stops depending on the activity fallback.
 
@@ -178,19 +195,30 @@ hide behind 11 others.
 
 Row vocabulary is ASCII-first, matching pi's own footer, which already spells paused as `|` — glyph
 coverage across terminals and fonts is not guaranteed, and a strip whose markers render as boxes is worse
-than no strip: `>` running, `~` waiting, `!` stalled, `x` failed, `v` verified complete, `|` paused.
+than no strip: `>` running, `~` waiting, `!` stalled, `x` failed, `v` verified complete, `|` paused. The
+state token itself is not invented: it is `formatMissionActivity(event).missionStatus.token`, which already
+renders `R<attempt>/<max> <ACTION>→<nextVerb>` and `PAUSED (operator)`, is already covered by
+`test/integration/extension-mission-commands.test.ts:695-722`, and is what the footer and panel show today.
+Sharing it requires moving `formatMissionActivity` out of `extensions/index.ts:422` into
+`src/status/missionActivity.ts`, with the extension re-exporting it so the existing test keeps passing.
 Each row carries mission id, title (redacted, truncated), phase, approximate percent, the
 best available unit (tests `34/81`, gate `2/3`, review findings, worker count), and the age of the last
 proof of life. `lastHeartbeatAt` and `lastMeaningfulProgressAt` are distinct columns in meaning and must
 never be collapsed into one "last seen".
 
-### 5.5 Notification demotion
+### 5.5 Give progress lines a surface, and add the missing attention signal
 
-`onProgress` currently calls `ctx.ui.notify` for every progress line, and `onMissionActivity` already
-notifies only for `needs_action` / `blocked` / `paused`. Progress lines move to the working line and the
-strip. `notify` keeps exactly: needs-you, blocked, paused, failed, verified-complete, and the interactive
-Esc path. With presence disabled, `onProgress` returns to its current behaviour so turning the feature off
-never leaves the operator with less than they have today.
+Progress text currently dies in `SessionControl.missionProgress` (§2). It gains two consumers: the working
+line while the agent is idle, and the strip's per-mission activity column. `SessionControl` keeps recording
+mission ids exactly as today — its behaviour is not changed.
+
+Attention notification is new, not a demotion, because none exists: `notify` fires when a mission's derived
+state says the operator is required — `action` indicating operator intervention, `health` `blocked`, or the
+mission `PAUSED` by operator/recovery exhaustion — plus verified-complete and failed. One notification per
+mission per state change, deduplicated by state so a mission cannot spam the terminal, and never for routine
+phase transitions or task settlements. With presence disabled there is no strip, so progress lines keep
+their current fate (discarded) rather than becoming toasts: disabling the feature restores today's
+behaviour exactly, and never makes visibility worse.
 
 ### 5.6 Terminal title
 
@@ -222,8 +250,8 @@ observability state, and §7 covers what it shows for a mission with no state.
    into the runtime.
 4. Presence never takes keyboard focus and never writes a surface another controller owns.
 5. Redaction is applied at the surface boundary (`redactSecrets`), as `emitMissionActivity` already does.
-6. A quiet mission is reported as quiet, never as stalled; only the stall policy engine escalates
-   (`stall.ts`), and presence renders its verdict rather than making one.
+6. A quiet mission is reported as quiet, never as stalled. Health is derived by `health.ts` and presence
+   renders its verdict rather than making one.
 7. Disabling presence restores today's behaviour exactly.
 
 ## 7. Failure and degradation
