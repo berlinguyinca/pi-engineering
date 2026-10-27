@@ -127,8 +127,11 @@ export interface CatalogProbeTarget {
 
 /**
  * The default mission recovery probe: an authenticated `GET {baseUrl}/models`
- * — the same request the model catalogue uses — healthy iff the gateway
- * answers AND lists the mission's model with capacity (`slots` absent or > 0).
+ * — the same request the model catalogue uses — followed by InferWeave's
+ * read-only `/iw/v1/admission` report. Catalogue `slots` is a configured
+ * ceiling, not remaining capacity. Recovery needs a matching model report.
+ * Immediate model-level headroom permits a retry; caller/global admission can
+ * still refuse it. Plain OpenAI catalogues retain their availability check.
  *
  * Unlike a bare health endpoint it answers the question a paused mission has:
  * "can MY model be served again?". An InferWeave `/healthz` reports degraded
@@ -165,11 +168,12 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
+      const headers = {
+        ...(target.apiKey ? { Authorization: `Bearer ${target.apiKey}` } : {}),
+        ...(target.headers ?? {}),
+      };
       const res = await this.fetchImpl(`${target.baseUrl.replace(/\/+$/, "")}/models`, {
-        headers: {
-          ...(target.apiKey ? { Authorization: `Bearer ${target.apiKey}` } : {}),
-          ...(target.headers ?? {}),
-        },
+        headers,
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -193,7 +197,63 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
       if (typeof row.slots === "number" && row.slots <= 0) {
         return { healthy: false, reason: `model ${target.modelId} has no capacity (0 slots)`, authoritative: true };
       }
-      return { healthy: true, authoritative: true };
+      // InferWeave concrete rows identify their owner and advertise slots;
+      // route rows can omit slots. Keep ordinary OpenAI providers independent
+      // of this optional adapter, while never interpreting an IW ceiling as free.
+      const hasAdmissionReport =
+        target.provider === "inferweave" ||
+        row.owned_by === "inferweave" ||
+        "slots" in row ||
+        "x_state" in row ||
+        "x_alias" in row;
+      if (!hasAdmissionReport) return { healthy: true, authoritative: true };
+      const unknownCapacity: ProbeResult = {
+        healthy: false,
+        authoritative: false,
+        reason: `model ${target.modelId} capacity unknown: no valid model-level admission report`,
+      };
+      // /iw is a sibling of /v1, including for gateways mounted under a prefix.
+      const admissionUrl = `${target.baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "")}/iw/v1/admission`;
+      const admission = await this.fetchImpl(admissionUrl, { headers, signal: controller.signal });
+      if (!admission.ok) {
+        await admission.body?.cancel().catch(() => {});
+        return unknownCapacity;
+      }
+      const report = (await admission.json().catch(() => null)) as { models?: unknown } | null;
+      const models = Array.isArray(report?.models) ? (report.models as Array<Record<string, unknown>>) : [];
+      const measured = models.find(
+        (m) =>
+          m &&
+          typeof m === "object" &&
+          (m.model === target.modelId || (Array.isArray(m.aliases) && m.aliases.includes(target.modelId))),
+      );
+      const count = (value: unknown): value is number =>
+        typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+      if (
+        !measured ||
+        !count(measured.ceiling) ||
+        !count(measured.active) ||
+        !count(measured.queued) ||
+        !count(measured.queueCapacity)
+      ) {
+        return unknownCapacity;
+      }
+      const directHeadroom = measured.queued === 0 && measured.active < measured.ceiling;
+      if (!directHeadroom) {
+        return {
+          healthy: false,
+          authoritative: true,
+          reason:
+            measured.queueCapacity > 0 && measured.queued >= measured.queueCapacity
+              ? `model ${target.modelId} queue full (${measured.queued}/${measured.queueCapacity})`
+              : `model ${target.modelId} has no immediate model-level capacity (${measured.active}/${measured.ceiling} active, ${measured.queued} queued)`,
+        };
+      }
+      return {
+        healthy: true,
+        authoritative: true,
+        reason: `model ${target.modelId} has model-level active headroom; caller admission is not reported`,
+      };
     } catch (err) {
       return {
         healthy: false,
