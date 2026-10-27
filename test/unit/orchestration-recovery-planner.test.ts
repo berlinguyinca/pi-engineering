@@ -112,6 +112,41 @@ describe("FailureClassifier", () => {
     }
   });
 
+  it("classifies a 400 backpressure/capacity envelope as transient, never a defect (MSN-MypLoa)", () => {
+    const classifier = new FailureClassifier();
+    // The exact shape the InferWeave edge emitted when saturated: HTTP 400 with a
+    // `fix_request`/`upstream_error` envelope typed `inferweave_backpressure`.
+    const liveEnvelope =
+      'backend reported failed: Model gateway refused the request after 0 honoured wait(s): 400: {"action":"fix_request","action_code":"IW-ACT-FIX-REQUEST","code":"upstream_error","message":"Correct the request syntax, parameters, endpoint, or model identity.","reason":"upstream_error","replay_safe":false,"request_state":"unknown","retryable":false,"scope":"request","type":"inferweave_backpressure"}';
+    assert.equal(
+      classifier.inferRecognizedCategory({ missionId: "M", summary: liveEnvelope }),
+      "PROVIDER_TRANSIENT",
+      "the backpressure type tag wins over the 400 status",
+    );
+    // The model-switch announcement wording (MSN-U1iY7E) is the same class.
+    assert.equal(
+      classifier.inferRecognizedCategory({
+        missionId: "M",
+        summary: "model development/qwen3.8 has no capacity right now — switched implementer to metabolomics/qwen3.8-27b",
+      }),
+      "PROVIDER_TRANSIENT",
+    );
+    for (const summary of [
+      "gateway capacity hold: waiting for a free worker",
+      "model is overloaded; try again later",
+      "inference backpressure: queue full",
+    ]) {
+      assert.equal(classifier.inferRecognizedCategory({ missionId: "M", summary }), "PROVIDER_TRANSIENT", summary);
+    }
+    // A genuine bad request with no capacity signature is still permanent:
+    // the 400 status decides when no backpressure wording is present.
+    assert.equal(
+      classifier.classify({ ...baseEvidence("Model gateway refused the request: 400: bad request"), providerStatus: 400 })
+        .category,
+      "PROVIDER_PERMANENT",
+    );
+  });
+
   it("never lets a caller-supplied category mask a lost execution lease", () => {
     const classifier = new FailureClassifier();
     for (const category of ["AUTHORIZATION_OR_CREDENTIAL", "PROVIDER_PERMANENT", "VALIDATION_FAILED"] as const) {

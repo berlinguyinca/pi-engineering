@@ -549,6 +549,20 @@ export class FailureClassifier {
     // not provider trouble.
     if (/enospc|no space left on device|disk (?:full|pressure|space)|storage pressure|disk[- ]suspend/.test(summary))
       return "DISK_SUSPENDED";
+    // A gateway capacity hold or backpressure is the serving side being
+    // saturated, whatever the HTTP status: a saturated edge answers 400 with a
+    // `fix_request`/`upstream_error` envelope (type `inferweave_backpressure`,
+    // `request_state: unknown`) that LOOKS like a request defect but clears
+    // when capacity returns. It must be waited out (PROBE_AND_BACKOFF) and
+    // re-dispatched — ideally to a fallback model — never routed to
+    // CREATE_REPAIR_TASKS, which burns the repair budget re-issuing the same
+    // doomed request (observed: MSN-MypLoa, MSN-U1iY7E).
+    if (
+      /inferweave_backpressure|backpressure|no capacity right now|has no capacity|capacity (?:hold|unavailable)|gateway capacity|overloaded/.test(
+        summary,
+      )
+    )
+      return "PROVIDER_TRANSIENT";
     if (evidence.providerStatus !== undefined) {
       if ([408, 425, 429, 500, 502, 503, 504].includes(evidence.providerStatus)) {
         return "PROVIDER_TRANSIENT";

@@ -57,6 +57,7 @@ import type {
   RecoveredMerge,
   ReviewEvidence,
   ValidationEvidence,
+  WorkspaceManifest,
 } from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
 
@@ -2541,8 +2542,15 @@ export class ExecutionBroker {
     await candidate.git.persistCandidateLifecycle(candidate.lifecycle, authority);
   }
 
-  /** Sole incumbent mutation: called only after current candidate gates pass. */
-  async promoteCandidate(missionId: string, authority?: DispatchAuthority): Promise<boolean> {
+  /**
+   * Resolve the mission's current integration candidate: in-memory first, then
+   * (after a restart) from the durable lifecycle record. The resolved candidate
+   * is cached so promotion, stale-base repair and cleanup share one identity.
+   */
+  private async resolvePromotionCandidate(
+    missionId: string,
+    authority?: DispatchAuthority,
+  ): Promise<{ lifecycle: CandidateLifecycle; git: GitRepo } | undefined> {
     let candidate = this.missionCandidates.get(missionId);
     if (!candidate && this.resolveRepository) {
       authority?.assertAuthoritative();
@@ -2586,6 +2594,97 @@ export class ExecutionBroker {
         }
       }
     }
+    return candidate;
+  }
+
+  /**
+   * Repair a stale-base merge-queue rejection by rebasing the candidate branch
+   * onto the incumbent's CURRENT head and re-pointing the workspace manifest's
+   * base at that head. The re-run validation/review gates (called by the
+   * orchestrator after this returns) then publish candidate evidence for the
+   * new (base, candidate) pair.
+   *
+   * This does not consume the mission's repair-round budget: the rejection that
+   * triggers it is a base-fence miss, not a candidate defect. A real rebase
+   * conflict is returned (conflict:true) so the caller escalates instead of
+   * re-enqueueing the same SHA.
+   *
+   * The manifest is returned, not bound: the caller owns the repository
+   * registry (stage/activate) and the durable bind.
+   */
+  async rebaseCandidateOntoCurrentBase(
+    missionId: string,
+    authority?: DispatchAuthority,
+  ): Promise<{
+    ok: boolean;
+    rebased: boolean;
+    conflict: boolean;
+    reason?: string;
+    baseSha?: string;
+    candidateSha?: string;
+    manifest?: WorkspaceManifest;
+  }> {
+    const candidate = await this.resolvePromotionCandidate(missionId, authority);
+    if (!candidate) {
+      return { ok: false, rebased: false, conflict: false, reason: "no integration candidate is available to rebase" };
+    }
+    authority?.assertAuthoritative();
+    const currentBase = await candidate.git.headCommit();
+    if (candidate.lifecycle.baseSha === currentBase) {
+      return {
+        ok: true,
+        rebased: false,
+        conflict: false,
+        baseSha: currentBase,
+        candidateSha: candidate.lifecycle.candidateSha,
+      };
+    }
+    const worktree = { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch };
+    const result = await candidate.git.rebaseWorktreeOnto(worktree, currentBase, authority);
+    if (!result.ok || !result.headSha) {
+      return {
+        ok: false,
+        rebased: false,
+        conflict: result.conflict,
+        reason: result.conflict ? `rebase onto ${currentBase} conflicted: ${result.reason}` : result.reason ?? "rebase failed",
+      };
+    }
+    const lifecycle: CandidateLifecycle = {
+      ...candidate.lifecycle,
+      baseSha: currentBase,
+      seedSha: currentBase, // rebased candidate now descends from the incumbent head, not the old seed
+      candidateSha: result.headSha,
+      updatedAt: new Date().toISOString(),
+    };
+    await candidate.git.persistCandidateLifecycle(lifecycle, authority);
+    candidate.lifecycle = lifecycle;
+
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    if (!manifest || !manifest.repositories.some((binding) => binding.repoId === lifecycle.repoId)) {
+      return { ok: true, rebased: true, conflict: false, baseSha: currentBase, candidateSha: result.headSha };
+    }
+    const body = {
+      missionId: manifest.missionId,
+      generation: manifest.generation + 1,
+      authorizedRoots: manifest.authorizedRoots,
+      repositories: manifest.repositories.map((binding) =>
+        binding.repoId === lifecycle.repoId ? { ...binding, baseSha: currentBase } : binding,
+      ),
+      dependencyEdges: manifest.dependencyEdges,
+    };
+    const hash = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    const updated: WorkspaceManifest = {
+      manifestId: `WM-${hash.slice(0, 16)}`,
+      ...body,
+      hash,
+      createdAt: manifest.createdAt,
+    };
+    return { ok: true, rebased: true, conflict: false, baseSha: currentBase, candidateSha: result.headSha, manifest: updated };
+  }
+
+  /** Sole incumbent mutation: called only after current candidate gates pass. */
+  async promoteCandidate(missionId: string, authority?: DispatchAuthority): Promise<boolean> {
+    const candidate = await this.resolvePromotionCandidate(missionId, authority);
     if (!candidate) return false;
     authority?.assertAuthoritative();
     const worktree = {
