@@ -1452,7 +1452,13 @@ test("quiet mission activity refreshes locally each second without persisted hea
     const before = updates.at(-1)!;
     const count = runtime.orchestrationEvents().length;
     const initialUpdates = updates.length;
-    await new Promise((resolve) => setTimeout(resolve, 1100));
+    // The ticker starts before workerStarted. Its first tick can precede the
+    // first displayed whole-second age change, so wait for the observable redraw
+    // rather than assuming the phase of the interval.
+    const redrawDeadline = Date.now() + 3500;
+    while (updates.length === initialUpdates && Date.now() < redrawDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.ok(updates.length > initialUpdates, "a silent worker still gets clock-only redraws");
     const after = updates.at(-1)!;
     assert.notEqual(after.observedAt, before.observedAt);

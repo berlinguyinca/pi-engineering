@@ -9,7 +9,16 @@ The authoritative product specification is
 document disagrees with the spec, the implementation is the thing that is behind,
 and the gap is called out here.
 
-## Status snapshot (validated)
+## Evidence scope
+
+The capability table and milestone counts below describe historical implementation
+milestones, not a release certification for the current tree. The October 2026
+spec audit found additional local correctness and performance gaps despite those
+milestones. See `docs/superpowers/plans/2026-10-27-spec-gaps.md` for the bounded
+follow-up and its regression requirements. Fresh test results belong to the
+commit being reviewed; old counts and manual evidence must not be reused as proof.
+
+## Historical capability snapshot
 
 | Capability | Status | Evidence |
 | --- | --- | --- |
@@ -37,10 +46,10 @@ and the gap is called out here.
 | `/commands` + semantic tools in pi | **Works** | `scripts/smoke-commands.ts`, `scripts/smoke-installed.ts` |
 | Real-model end-to-end dogfood | **Works** | `scripts/dogfood.ts`; see below |
 
-**Verification evidence (last full run):**
+**Historical verification evidence (original milestone snapshot):**
 - `npx tsc --noEmit` — passes.
-- `npm test` — 194/194 passing (unit + integration).
-- `npm run lint` (biome check) — clean.
+- `npm test` — 194/194 passing at that milestone (the suite has since grown substantially).
+- `npm run lint` (biome check) — clean at that milestone; this is not a current-tree claim.
 - Standalone install: pi's `ResourceLoader` discovers and loads the package
   extension with zero errors (`scripts/smoke-installed.ts`).
 - Real dogfood (`qwen3.8-27b`): `titleCase()` added to `src/transform.js`,
@@ -90,18 +99,20 @@ review is never treated as a clean review. Covered by two regression tests.
 
 ## What is deliberately NOT built yet
 
-**Roadmap 1.0 is complete** (23/23 required milestones VERIFIED; `roadmap check`
-exits 0). The previously-deferred M13 Parallel Task DAG execution is now
+**Roadmap 1.0 was recorded complete** (23/23 required milestones VERIFIED
+at the recorded evidence commits). Re-run the evidence gate for a current-tree
+completion claim; this document does not establish its present exit status.
+The previously-deferred M13 Parallel Task DAG execution is now
 IMPLEMENTED and required (parallel waves + a runtime git lock that serializes
 promotion merges, eliminating the `index.lock` race). All backlog items
 B-101..B-104 and B-107..B-113 are also implemented as milestones M13-M22, and
 M23 adds the optional Blackhole session-memory integration.
 
-The only spec provisions still out of scope are those excluded by the project
+The deliberate external scope boundaries include provisions excluded by the project
 constraint or requiring external infrastructure: AutoSpec/InferWeave adapters
 (optional seams exist, empty by default), a hosted control plane (core provides a
-telemtry export seam), and a Go control plane. These are deliberate boundaries,
-not accidental gaps.
+telemetry export seam), and a Go control plane. These are deliberate boundaries.
+They do not imply that all local spec requirements have been exhaustively verified.
 
 ## Roadmap 1.0: verifiable completion (implemented)
 
@@ -122,7 +133,7 @@ node scripts/pi-engineering.ts roadmap check   # exit 0 = complete
 node scripts/pi-engineering.ts roadmap status
 ```
 
-Machine evidence: `roadmap check` exits **0** with `complete: true`, release gate
+Historical machine evidence recorded `roadmap check` exiting **0** with `complete: true`, release gate
 **PASS**, 23/23 VERIFIED; 226 tests pass incl. schema/evaluate/invalidate/CLI/
 autonomous-stop/dogfood, routing, scheduling, budget, security, merge-queue, repo
 intel, verification-farm, benchmark, parallel-DAG, and blackhole integration tests. See
@@ -338,9 +349,11 @@ add zero subprocesses). See `docs/evidence/milestone-harness-status-bar.md`.
 
 ## Next slice
 
-Roadmap 1.0 (23/23) is complete. Remaining backlog is genuinely external
-infrastructure: a hosted control plane / dashboard (B-105) and a Go control
-plane (B-106). Candidate parallel execution is available via `parallel: true`
+Roadmap 1.0 recorded 23/23 completed milestones. The October 2026 audit also
+identified local follow-up work in permissions, structured review validation,
+routing, independent stall recovery, artifact IO, and risk-aware verification.
+External backlog includes a hosted control plane / dashboard (B-105) and a Go
+control plane (B-106). Candidate parallel execution is available via `parallel: true`
 but not default (a single serial worker gains nothing; concurrency assumes a
 multi-worker/multi-model backend).
 

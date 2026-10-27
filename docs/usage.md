@@ -1239,6 +1239,25 @@ the SQLite registry is kept on a machine-local runtime directory automatically.
 - `/ledger hypothesis` — claims not yet promoted to facts.
 - `/verify` — run verification yourself and see the captured log artifact.
 
+## Worker permissions and recovery isolation
+
+A worker receives the builtin and semantic tools explicitly named in its request
+allowlist, plus its executor-owned terminal result tool. Supplying tools to the
+executor makes them available for selection; it does not grant them to every
+role. Custom callers must explicitly name safe retrieval tools they need, such as
+`ledger_read`, `artifact_read`, `repo_search`, `symbol`, and `tests_for`. Nested
+`mission` execution and `ledger_claim` are not implicitly granted to reviewers
+or scouts.
+
+A named mission wait protects its own condition. It cannot hide a separately
+running worker that has exceeded its meaningful-progress stall threshold.
+Worker-specific queue/model waits must be recorded on that worker, rather than
+represented only as a mission-level wait. The supervisor still debounces stall
+recovery and preserves existing opt-in deadline policy: this change adds no
+mission wall-clock limit. The observability spec's universal wait-deadline wording
+remains a policy discrepancy; default recovery waits currently end when their
+condition changes or the operator cancels.
+
 ## Real-model smoke tests
 
 After installing the package, from the repo directory:
