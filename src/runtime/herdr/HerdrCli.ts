@@ -57,7 +57,7 @@ export interface HerdrCli {
   getAgent(target: string): Promise<HerdrAgent | null>;
   readAgent(target: string, lines?: number): Promise<string>;
   /** Submit a prompt to a persistent agent (sendTask). */
-  prompt(target: string, text: string): Promise<void>;
+  prompt(target: string, text: string, timeoutMs?: number): Promise<void>;
   /** Wait until the agent reaches one of `until` states or times out. */
   wait(target: string, until: string[], timeoutMs?: number): Promise<HerdrAgent>;
   startAgent(paneId: string, kind: string, name: string): Promise<void>;
@@ -88,10 +88,10 @@ export class RealHerdrCli implements HerdrCli {
     this.timeoutMs = opts.timeoutMs ?? 120_000;
   }
 
-  private async run(args: string[]): Promise<string> {
+  private async run(args: string[], timeoutMs = this.timeoutMs): Promise<string> {
     try {
       const { stdout } = await exec(this.bin, args, {
-        timeout: this.timeoutMs,
+        timeout: timeoutMs,
         maxBuffer: 32 * 1024 * 1024,
         env: { ...process.env },
       });
@@ -139,15 +139,17 @@ export class RealHerdrCli implements HerdrCli {
     return this.run(args);
   }
 
-  async prompt(target: string, text: string): Promise<void> {
-    await this.run(["agent", "prompt", target, text]);
+  async prompt(target: string, text: string, timeoutMs?: number): Promise<void> {
+    const deadline = timeoutMs === undefined ? this.timeoutMs : timeoutMs > 0 ? timeoutMs + 1000 : 0;
+    await this.run(["agent", "prompt", target, text], deadline);
   }
 
   async wait(target: string, until: string[], timeoutMs?: number): Promise<HerdrAgent> {
     // herdr 0.9.1: --until repeats per state, and the timeout flag is --timeout (milliseconds)
     const args = ["agent", "wait", target, ...until.flatMap((u) => ["--until", u])];
     if (timeoutMs && timeoutMs > 0) args.push("--timeout", String(timeoutMs));
-    const out = await this.run(args);
+    // The child must outlive the requested server wait; omitted/zero means an indefinite wait.
+    const out = await this.run(args, timeoutMs && timeoutMs > 0 ? timeoutMs + 1000 : 0);
     const parsed = JSON.parse(out) as { result?: { agent?: HerdrAgent } };
     if (!parsed.result?.agent) throw new HerdrError("agent_wait_no_result", "agent.wait returned no agent");
     return parsed.result.agent;

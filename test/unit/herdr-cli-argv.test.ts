@@ -89,6 +89,30 @@ test("get and wait unwrap the live agent_info response", async () => {
   }
 });
 
+test("wait and prompt honor requested deadlines beyond the default subprocess timeout", async () => {
+  const f = fake();
+  try {
+    writeFileSync(f.bin, readFileSync(f.bin, "utf8").replace("cat ", "sleep 0.2\ncat "));
+    const cli = new RealHerdrCli({ bin: f.bin, timeoutMs: 10 });
+    assert.equal((await cli.wait("w1:p2", ["done"], 100)).agent_status, "idle");
+    await cli.prompt("w1:p2", "bounded task", 100);
+  } finally {
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("an indefinite server wait has no subprocess deadline", async () => {
+  const f = fake();
+  try {
+    writeFileSync(f.bin, readFileSync(f.bin, "utf8").replace("cat ", "sleep 0.2\ncat "));
+    const cli = new RealHerdrCli({ bin: f.bin, timeoutMs: 10 });
+    assert.equal((await cli.wait("w1:p2", ["done"])).agent_status, "idle");
+    assert.equal((await cli.wait("w1:p2", ["done"], 0)).agent_status, "idle");
+  } finally {
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
 test("exportEnv runs one export line in the pane and refuses unsafe values", async () => {
   const f = fake();
   try {

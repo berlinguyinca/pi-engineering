@@ -35,6 +35,7 @@ interface Rec {
   request: AgentWorkerRequest;
   target: string;
   provisioned: boolean;
+  provisioning?: Promise<void>;
   /** True once the lineage spawn was emitted; attempt states are only sent for a known attempt. */
   lineageSpawned?: boolean;
 }
@@ -164,7 +165,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     if (req) rec.request = { ...rec.request, ...req };
     rec.worker.objective = task;
     await this.provision(rec);
-    await this.cli.prompt(rec.target, task);
+    await this.cli.prompt(rec.target, task, rec.request.timeoutMs);
     this.mutate(rec, { status: "WORKING", objective: task, currentOperation: "sendTask", result: null });
     this.emitSession(rec, "session.updated", "WORKING");
     return rec.worker;
@@ -291,6 +292,17 @@ export class HerdrAgentRuntime implements AgentRuntime {
 
   private async provision(rec: Rec): Promise<void> {
     if (rec.provisioned) return;
+    if (rec.provisioning) return rec.provisioning;
+    const pending = this.provisionWorker(rec);
+    rec.provisioning = pending;
+    try {
+      await pending;
+    } finally {
+      rec.provisioning = undefined;
+    }
+  }
+
+  private async provisionWorker(rec: Rec): Promise<void> {
     if (rec.target === rec.worker.id) {
       const cwd = rec.request.cwd ?? process.cwd();
       const workspace =

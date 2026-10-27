@@ -46,7 +46,7 @@ class FakeHerdrCli implements HerdrCli {
   async readAgent(): Promise<string> {
     return "implemented add a health endpoint";
   }
-  async prompt(target: string, _text: string): Promise<void> {
+  async prompt(target: string, _text: string, _timeoutMs?: number): Promise<void> {
     this.promptCalls++;
     this.agents.set(target, { ...this.agents.get(target)!, agent_status: "done", revision: 2, state_change_seq: 2 });
   }
@@ -133,6 +133,39 @@ test("retrying agent startup reuses the already allocated pane", async () => {
   await rt.start(rid);
   assert.equal(cli.workspaceCalls, 1);
   assert.equal(cli.startCalls[0]!.paneId, "w1:p1");
+});
+
+test("concurrent starts share one allocation and one agent startup", async () => {
+  const cli = new FakeHerdrCli();
+  const rt = new HerdrAgentRuntime({ cli });
+  const rid = await rt.create({ role: "planner", objective: "A", isolation: "none" });
+  await Promise.all([rt.start(rid), rt.start(rid)]);
+  assert.equal(cli.workspaceCalls, 1);
+  assert.equal(cli.startCalls.length, 1);
+  assert.equal(cli.startCalls[0]!.paneId, "w1:p1");
+});
+
+test("concurrent start and sendTask share the provisioned pane", async () => {
+  const cli = new FakeHerdrCli();
+  const rt = new HerdrAgentRuntime({ cli });
+  const rid = await rt.create({ role: "planner", objective: "A", isolation: "none" });
+  await Promise.all([rt.start(rid), rt.sendTask(rid, "A")]);
+  assert.equal(cli.workspaceCalls, 1);
+  assert.equal(cli.startCalls.length, 1);
+  assert.equal(cli.promptCalls, 1);
+  assert.equal(cli.startCalls[0]!.paneId, "w1:p1");
+});
+
+test("sendTask forwards the declared worker deadline to prompt submission", async () => {
+  const cli = new FakeHerdrCli();
+  let submittedTimeout: number | undefined;
+  cli.prompt = async (_target, _text, timeoutMs) => {
+    submittedTimeout = timeoutMs;
+  };
+  const rt = new HerdrAgentRuntime({ cli });
+  const rid = await rt.create({ role: "planner", objective: "A", isolation: "none", timeoutMs: 180_000 });
+  await rt.sendTask(rid, "A");
+  assert.equal(submittedTimeout, 180_000);
 });
 
 test("parallel same-role workers receive distinct legal Herdr names", async () => {
