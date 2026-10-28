@@ -3582,6 +3582,27 @@ export class MissionStore {
     return fresh.length;
   }
 
+  /**
+   * Resolve a mission for a MUTATION, applying what other sessions appended to
+   * this namespace first (#427).
+   *
+   * The live projection is not the authority — the appended events are. Observed
+   * on a shared dev box: `mission status/resume MSN-J9sycT` answered "Unknown
+   * mission" from the session that had just run it, while the per-session streams
+   * replayed that mission perfectly. A mutation path that declares a mission
+   * unknown without this re-read strands work the durable log still describes.
+   *
+   * Deliberately not used by ordinary reads: `refresh()` re-scans stream files,
+   * so hot read paths keep the projection and the tool layer's cached durable
+   * lookup instead.
+   */
+  resolveMission(missionId: string): Mission | undefined {
+    const known = this.getMission(missionId);
+    if (known) return known;
+    this.syncExternal();
+    return this.getMission(missionId);
+  }
+
   /** Local takeover is permitted only while this process owns the JSONL writer boundary. */
   hasExclusiveWriterAuthority(): boolean {
     const backend = this.backend as EventStoreBackend & {

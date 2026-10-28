@@ -11,6 +11,8 @@
  * the plugin.
  */
 
+import { readFile } from "node:fs/promises";
+
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import type { CanonicalLifecycle } from "./missionStore.ts";
 import {
@@ -176,6 +178,14 @@ export interface MissionSnapshotMission {
   verifierStages?: VerifierStageTiming[];
   /** Additive autonomous-spec-approval projection; absent when no spec work exists. */
   specApproval?: MissionSpecApprovalSnapshot;
+  /**
+   * Additive (#427): which process published this entry and when. Several live
+   * `pi` sessions share one `.pi-eng` directory; the stamp is what lets a
+   * publisher merge instead of clobber — it knows which entries are its own and
+   * which belong to another session.
+   */
+  ownerPid?: number;
+  publishedAtMs?: number;
 }
 
 export interface MissionSnapshotTask {
@@ -443,4 +453,115 @@ export function buildMissionSnapshotFile(
     ),
     ...(storagePressure ? { storagePressure } : {}),
   };
+}
+
+/**
+ * ── Multi-publisher discipline (#427) ──────────────────────────────────────
+ *
+ * Several live `pi` sessions share one `.pi-eng` directory per project. Each
+ * publishes the snapshot, and each one only knows the missions IT holds live.
+ * The write was atomic but last-writer-wins, so the published file was a
+ * lottery: a mission that had blocked could read back as absent minutes later,
+ * and the PI WEB plugin rendered whichever session happened to write last.
+ *
+ * Merging on publish makes the file a union. A publisher replaces the entries it
+ * owns and leaves every other publisher's alone, so no session can erase
+ * another's missions, and the durable `revision` ordinal decides who is right
+ * about a mission two sessions both hold.
+ */
+
+/** Which process wrote an entry, and when. */
+export interface SnapshotPublisherTag {
+  ownerPid: number;
+  publishedAtMs: number;
+}
+
+/** Stamp every entry in a freshly built snapshot with its publisher. */
+export function tagSnapshotPublisher(snapshot: MissionSnapshotFile, tag: SnapshotPublisherTag): MissionSnapshotFile {
+  return {
+    ...snapshot,
+    missions: snapshot.missions.map((mission) => ({ ...mission, ...tag })),
+  };
+}
+
+function newer(existing: MissionSnapshotMission, incoming: MissionSnapshotMission): boolean {
+  if (typeof existing.revision === "number" && typeof incoming.revision === "number") {
+    if (existing.revision !== incoming.revision) return existing.revision > incoming.revision;
+  }
+  const existingAt = existing.publishedAtMs ?? 0;
+  const incomingAt = incoming.publishedAtMs ?? 0;
+  return existingAt > incomingAt;
+}
+
+/**
+ * Merge this publisher's view into the file already on disk.
+ *
+ * Rules, in order of authority:
+ *   1. Entries this publisher owns and no longer reports are dropped — it is the
+ *      authority for its own missions, so a finished one must not linger.
+ *   2. For a mission both report, the higher durable `revision` wins. The event
+ *      ordinal is replay-stable, so it beats wall-clock recency; a tie goes to
+ *      the publisher currently holding the mission.
+ *   3. Entries owned by another publisher survive untouched.
+ *
+ * `storagePressure` always comes from the publisher doing the write: it is that
+ * runtime's own write health, and presenting another session's suspended state
+ * as this one's would be a lie about the file being read.
+ */
+export function mergeSnapshotFiles(
+  existing: MissionSnapshotFile | null,
+  incoming: MissionSnapshotFile,
+  tag: SnapshotPublisherTag,
+): MissionSnapshotFile {
+  const byId = new Map<string, MissionSnapshotMission>();
+  for (const mission of existing?.missions ?? []) byId.set(mission.id, mission);
+
+  const merged: MissionSnapshotMission[] = [];
+  const incomingIds = new Set<string>();
+  for (const mission of incoming.missions) {
+    incomingIds.add(mission.id);
+    const prior = byId.get(mission.id);
+    // Our own previous entry never outranks our current view of it.
+    merged.push(prior && prior.ownerPid !== tag.ownerPid && newer(prior, mission) ? prior : mission);
+  }
+  for (const mission of existing?.missions ?? []) {
+    if (incomingIds.has(mission.id)) continue;
+    if (mission.ownerPid === tag.ownerPid) continue; // ours, and we no longer hold it
+    merged.push(mission);
+  }
+
+  const { storagePressure: _existingPressure, ...rest } = incoming as MissionSnapshotFile & {
+    storagePressure?: StoragePressureSnapshot;
+  };
+  return { ...rest, missions: merged };
+}
+
+export {
+  acquireSnapshotPublisherLock,
+  SNAPSHOT_LOCK_FILENAME,
+  type SnapshotLockHandle,
+  type SnapshotLockOptions,
+} from "./snapshotLock.ts";
+
+/**
+ * Read a published snapshot, tolerating absence and a torn file (#427).
+ *
+ * A merge must not be blocked by a file it cannot use: a missing or corrupt
+ * snapshot degrades to "nothing to merge", which publishes this publisher's view
+ * rather than publishing nothing at all.
+ */
+export async function readMissionSnapshotFile(path: string): Promise<MissionSnapshotFile | null> {
+  let contents: string;
+  try {
+    contents = await readFile(path, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(contents) as MissionSnapshotFile;
+    if (typeof parsed !== "object" || parsed === null || !Array.isArray(parsed.missions)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
