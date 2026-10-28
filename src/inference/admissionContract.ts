@@ -13,12 +13,47 @@ export interface InferWeaveAdmissionPayload {
   reason: string;
   message?: string;
   scope?: string;
+  /**
+   * Additive (#419): which kind of request the caller was making — an interactive
+   * session or a mission/batch worker. `scope` names the RESOURCE the gate applies
+   * to (request / model / caller / global); it says nothing about who asked, so it
+   * could not answer "does admission treat batch workers differently?". Unknown
+   * tokens are preserved so a producer this repo does not know stays visible.
+   */
+  request_origin?: string;
   request_id?: string;
   retry_after_ms?: number;
   active?: number;
   active_limit?: number;
   queued?: number;
   queue_limit?: number;
+}
+
+/**
+ * Who made the request. Open like `scope`: the known producers are named, and an
+ * unfamiliar token is carried through unchanged rather than dropped.
+ */
+export type RequestOrigin = "interactive" | "mission-worker" | (string & {});
+
+/** Requests that say nothing about their origin are interactive traffic. */
+export const DEFAULT_REQUEST_ORIGIN: RequestOrigin = "interactive";
+
+/** Header the client sets so the relay can carry origin to the provider. */
+export const REQUEST_ORIGIN_RELAY_HEADER = "x-inferweave-request-origin";
+
+/** Trim + lowercase, or nothing. An unfamiliar producer stays identifiable. */
+export function normalizeRequestOrigin(value: unknown): RequestOrigin | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim().toLowerCase();
+  return text.length > 0 ? text : undefined;
+}
+
+/**
+ * The outbound header carrying origin (#419). An absent origin emits the default,
+ * so existing traffic is unambiguous on the wire without every caller naming it.
+ */
+export function requestOriginHeaders(origin?: RequestOrigin): Record<string, string> {
+  return { [REQUEST_ORIGIN_RELAY_HEADER]: origin ?? DEFAULT_REQUEST_ORIGIN };
 }
 
 /** Shared normalized guidance consumed by both retry paths. */
@@ -34,6 +69,8 @@ export interface InferenceGuidance {
   replaySafe?: boolean;
   requestState?: "not_started" | "queued" | "dispatched" | "streaming" | "unknown";
   scope?: "request" | "model" | "caller" | "global" | string;
+  /** Additive (#419): interactive session vs mission/batch worker. */
+  requestOrigin?: RequestOrigin;
   retryAfterMs?: number;
 }
 
@@ -230,6 +267,10 @@ export function parseAdmissionPayload(value: unknown): AdmissionInfo | undefined
   if (queued !== undefined) info.queued = queued;
   const queueLimit = nonNegativeInt(candidate.queue_limit ?? candidate.queueLimit);
   if (queueLimit !== undefined) info.queueLimit = queueLimit;
+  // #419: who asked, as distinct from which resource the gate applies to (`scope`).
+  // Read only when the envelope carried it — parsing never fabricates an origin.
+  const requestOrigin = normalizeRequestOrigin(candidate.request_origin ?? candidate.requestOrigin);
+  if (requestOrigin !== undefined) info.requestOrigin = requestOrigin;
   return info;
 }
 
