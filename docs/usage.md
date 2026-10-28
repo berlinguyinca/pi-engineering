@@ -411,6 +411,15 @@ Each producer claims a surface with a priority, so a third claimant — a recove
 notice, a gateway wait — needs to know nothing about the others, and a claim that
 expires cannot keep a surface after its reason has ended.
 
+The strip shows the missions **this window runs**. Durable mission state is shared
+by every pi window on the machine, so backfilling the strip from it is scoped to
+the session that started each mission (`mission.parent_session_id`): a fresh window
+opens with an empty strip instead of mirroring queues it is not driving, and
+mission output stays in the window the mission runs at. Live activity still arrives,
+because a runtime emits it only for missions it is running here. Set
+`PI_MISSION_PRESENCE_SCOPE=all` for one machine-wide dashboard, or
+`PI_MISSION_PRESENCE=0` to drop the strip entirely.
+
 The strip and the working line lead with **evidence**, not with a mission's
 narration about itself. Attention is derived from observability facts in a fixed
 order — you being the next actor, exhausted recovery, failure, blocking review

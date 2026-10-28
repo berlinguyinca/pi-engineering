@@ -13,6 +13,11 @@ function loopEvent(
   target: string,
   noProgressTurns: number,
   contextUtilization: number | null,
+  options: {
+    reason?: string;
+    noMutationStall?: number;
+    noMutationStallDistinct?: number;
+  } = {},
 ): AgentLoopPreventedEvent {
   return {
     type: "agent.loop_prevented",
@@ -25,14 +30,20 @@ function loopEvent(
     role: "implementer",
     iteration: 9,
     phase: "execute",
-    reason: "no_progress_turns",
+    reason: options.reason ?? "no_progress_turns",
     fingerprint: "fp-x",
     tool: "read_file",
     model: { provider: "metabolomics", id: "qwen3.8-27b" },
     contextUtilization,
     family,
     target,
-    metrics: { noProgressTurns, repeatedCalls: noProgressTurns, staleToolResults: 0, noMutationStall: 0 },
+    metrics: {
+      noProgressTurns,
+      repeatedCalls: noProgressTurns,
+      staleToolResults: 0,
+      noMutationStall: options.noMutationStall ?? 0,
+      noMutationStallDistinct: options.noMutationStallDistinct ?? 0,
+    },
   };
 }
 
@@ -92,4 +103,35 @@ test("isRecoverable is true for replan and compact, false for none", () => {
   assert.equal(isRecoverable({ action: "replan", rationale: "r" }), true);
   assert.equal(isRecoverable({ action: "compact", rationale: "r" }), true);
   assert.equal(isRecoverable({ action: "none", rationale: "r" }), false);
+});
+
+test("a no-mutation stall recovers even when its last family is not read-like", () => {
+  const ev = loopEvent("RUN_COMMAND", "grep -rin case|when src/columns.py", 0, 0.3, {
+    reason: "no_mutation_stall",
+    noMutationStall: 40,
+    noMutationStallDistinct: 3,
+  });
+  const d = decideRecovery(ev);
+  assert.equal(d.action, "replan", "the stall has a deterministic fix regardless of family");
+  assert.equal(isRecoverable(d), true);
+  assert.match(d.rationale, /40 non-mutating actions over 3 distinct target/);
+});
+
+test("the stall recovery prompt sends the worker to the artifact, not another read", () => {
+  const ev = loopEvent("READ_FILE", "src/columns.py", 0, 0.3, {
+    reason: "no_mutation_stall",
+    noMutationStall: 40,
+    noMutationStallDistinct: 3,
+  });
+  const p = buildRecoveryPrompt(decideRecovery(ev), ev);
+  assert.match(p, /40 actions over 3 distinct target/);
+  assert.match(p, /without writing anything/);
+  assert.match(p, /return worker_result naming exactly what blocks you/);
+});
+
+test("an ordinary read loop's recovery prompt carries no stall directive", () => {
+  const ev = loopEvent("READ_FILE", "src/x.ts", 4, 0.3);
+  const p = buildRecoveryPrompt(decideRecovery(ev), ev);
+  assert.match(p, /STOP using READ_FILE/);
+  assert.doesNotMatch(p, /without writing anything/);
 });

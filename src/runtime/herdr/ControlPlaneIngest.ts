@@ -511,6 +511,10 @@ export class ControlPlaneIngest {
       paneId?: string;
       /** Which Pi binary this agent runs on, plus engine/CPU/RSS (see `runtimeFacts`). Runtime metrics only. */
       runtime?: Record<string, unknown>;
+      /** Git facts of the directory the agent works in (see `sessionGitFacts`): what the control plane correlates by. */
+      worktreeId?: string;
+      commitSha?: string;
+      repoUrl?: string;
     } = {},
   ): Promise<boolean> {
     const missionId = payload.missionId ?? this.defaultMissionId;
@@ -526,6 +530,9 @@ export class ControlPlaneIngest {
       ...(payload.name ? { name: payload.name } : {}),
       ...(payload.paneId ? { pane_id: payload.paneId } : {}),
       ...(payload.runtime ? { runtime: payload.runtime } : {}),
+      ...(payload.worktreeId ? { worktree_id: payload.worktreeId } : {}),
+      ...(payload.commitSha ? { commit_sha: payload.commitSha } : {}),
+      ...(payload.repoUrl ? { repo_url: payload.repoUrl } : {}),
     });
   }
 }

@@ -6,12 +6,12 @@ import { MissionObservability } from "../../src/orchestration/observability/Miss
 import type { MissionObservabilitySummary } from "../../src/orchestration/observability/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
-import { MissionPresenceController } from "../../src/status/MissionPresenceController.ts";
-import { seedPresence } from "../../src/status/presenceSeed.ts";
+import { MissionPresenceController, presenceOptionsFromEnv } from "../../src/status/MissionPresenceController.ts";
+import { missionBelongsToSession, seedPresence } from "../../src/status/presenceSeed.ts";
 
 const T0 = Date.parse("2026-10-27T10:10:00.000Z");
 
-function harness(withObservability: boolean) {
+function harness(withObservability: boolean, parentSessionId?: string) {
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
   const mission = store.createMission({
@@ -22,6 +22,7 @@ function harness(withObservability: boolean) {
     base_ref: "main",
     risk_profile: "low",
     workflow_class: "engineering",
+    ...(parentSessionId ? { parent_session_id: parentSessionId } : {}),
   });
   const obs = withObservability ? new MissionObservability({ store, backend }) : null;
   obs?.missionCreated(mission.mission_id, mission.title);
@@ -48,7 +49,7 @@ function controller() {
 test("a mission with no observability state still renders a row", () => {
   const { store, missionId } = harness(false);
   const { presence, widget } = controller();
-  seedPresence(presence, { missions: store.listMissions(), summary: () => null });
+  seedPresence(presence, { missions: store.listMissions(), summary: () => null, scope: "all" });
   presence.tick();
   assert.equal(widget.length, 1);
   assert.match(widget[0]!.join("\n"), new RegExp(missionId));
@@ -84,7 +85,7 @@ test("a mission with observability state renders its real state, not its store r
     task: "t1",
     preservedWork: [],
   };
-  seedPresence(presence, { missions: store.listMissions(), summary: () => summary });
+  seedPresence(presence, { missions: store.listMissions(), summary: () => summary, scope: "all" });
   presence.tick();
   const lines = widget[0]!.join("\n");
   assert.match(lines, /MSN-seeded/);
@@ -124,8 +125,80 @@ test("a seeded row never overwrites activity the runtime already reported", () =
     preservedWork: [],
   };
   presence.update(event);
-  seedPresence(presence, { missions: store.listMissions(), summary: () => null });
+  seedPresence(presence, { missions: store.listMissions(), summary: () => null, scope: "all" });
   presence.tick();
   assert.match(working.at(-1) ?? "", /EXECUTING ~40%/, "the store row is a backstop, not a downgrade");
   presence.dispose();
+});
+
+test("durable seeding draws this session's missions and leaves other windows' alone", () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const base = {
+    goal: "goal",
+    user_request: "request",
+    repository: "repo",
+    base_ref: "main",
+    risk_profile: "low" as const,
+    workflow_class: "engineering" as const,
+  };
+  const mine = store.createMission({ ...base, title: "mine", parent_session_id: "SES-mine" });
+  const theirs = store.createMission({ ...base, title: "theirs", parent_session_id: "SES-other" });
+  const orphan = store.createMission({ ...base, title: "no owner" });
+
+  const { presence, widget } = controller();
+  seedPresence(presence, { missions: store.listMissions(), summary: () => null, sessionId: "SES-mine" });
+  presence.tick();
+
+  assert.equal(widget.length, 1, "the strip is drawn");
+  const lines = widget[0]!.join("\n");
+  assert.match(lines, new RegExp(mine.mission_id), "a mission this session started belongs on this strip");
+  assert.doesNotMatch(lines, new RegExp(theirs.mission_id), "another window's mission is not this window's queue");
+  assert.doesNotMatch(lines, new RegExp(orphan.mission_id), "an unowned row belongs to no session");
+  presence.dispose();
+});
+
+test("a strip that cannot name its own session draws no durable rows", () => {
+  const { store, missionId } = harness(false);
+  const { presence, widget } = controller();
+  seedPresence(presence, { missions: store.listMissions(), summary: () => null });
+  presence.tick();
+  assert.equal(widget.length, 0, "without a session id, ownership is unknowable, so nothing is claimed");
+  presence.dispose();
+});
+
+test("scope: all restores the machine-wide strip", () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const base = {
+    goal: "goal",
+    user_request: "request",
+    repository: "repo",
+    base_ref: "main",
+    risk_profile: "low" as const,
+    workflow_class: "engineering" as const,
+  };
+  const mine = store.createMission({ ...base, title: "mine", parent_session_id: "SES-mine" });
+  const theirs = store.createMission({ ...base, title: "theirs", parent_session_id: "SES-other" });
+
+  const { presence, widget } = controller();
+  seedPresence(presence, { missions: store.listMissions(), summary: () => null, scope: "all" });
+  presence.tick();
+  const lines = widget[0]!.join("\n");
+  assert.match(lines, new RegExp(mine.mission_id));
+  assert.match(lines, new RegExp(theirs.mission_id), "the opt-in draws every window's mission");
+  presence.dispose();
+});
+
+test("ownership is the starting session, and only the starting session", () => {
+  assert.equal(missionBelongsToSession({ parent_session_id: "SES-a" }, "SES-a"), true);
+  assert.equal(missionBelongsToSession({ parent_session_id: "SES-b" }, "SES-a"), false);
+  assert.equal(missionBelongsToSession({ parent_session_id: null }, "SES-a"), false);
+  assert.equal(missionBelongsToSession({ parent_session_id: "SES-a" }, null), false);
+});
+
+test("presence is session-scoped unless the operator asks for the machine-wide strip", () => {
+  assert.equal(presenceOptionsFromEnv({}).scope, "session");
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_SCOPE: "all" }).scope, "all");
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_SCOPE: "anything-else" }).scope, "session");
 });

@@ -114,6 +114,20 @@ export function decideRecovery(loop: AgentLoopEvent, options: ApsRecoveryOptions
     };
   }
 
+  // A no-mutation stall has one deterministic fix, whatever family the last
+  // action belonged to: the role is defined by the artifact it produces and it
+  // has gone a long run without one. Steering it to "a different read family"
+  // cannot help - the missing thing is the artifact, not the search strategy.
+  if (loop.reason === "no_mutation_stall") {
+    return {
+      action: "replan",
+      rationale: `${loop.metrics.noMutationStall} non-mutating actions over ${loop.metrics.noMutationStallDistinct} distinct target(s) with no artifact; produce the artifact or report the blocker`,
+      fromFamily: family,
+      toFamily: REPLAN_MAP[family],
+      contextUtilization: utilization,
+    };
+  }
+
   // A read-like strategy stuck on one target -> replan to a different family.
   if (READ_LIKE.has(family)) {
     return {
@@ -147,9 +161,13 @@ Do NOT repeat them. Discard only those identical repeats and proceed from the la
     const to = decision.toFamily ?? "a different approach";
     const from = decision.fromFamily ?? loop.family;
     const target = loop.target ? ` on "${loop.target}"` : "";
+    const stall =
+      loop.reason === "no_mutation_stall"
+        ? `\nYou have taken ${loop.metrics.noMutationStall} actions over ${loop.metrics.noMutationStallDistinct} distinct target(s) without writing anything. Stop investigating: make the edit you already have enough information to make, or return worker_result naming exactly what blocks you.`
+        : "";
     return `[APS recovery] Prior attempts repeated ${from}${target} without progress (loop prevented).
 Change strategy: STOP using ${from}; instead take a genuinely different approach (e.g. ${to}).
-Re-read the task and pick a different next step.`;
+Re-read the task and pick a different next step.${stall}`;
   }
   return "";
 }
