@@ -1210,9 +1210,23 @@ export class PiWorkerExecutor implements WorkerExecutor {
           }
         }
         const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
+        // Attribute the failure to the signal that actually fired. The stall
+        // signal used to be reported as "identical no-progress turns", which
+        // sent operators hunting for a repeat loop that never existed - the run
+        // had simply gone 40 actions without a write.
+        const preventionReason = loopPreventedEvent?.reason ?? "no_progress_turns";
+        const stallActions = loopPreventedEvent?.metrics.noMutationStall ?? 0;
+        const stallTargets = loopPreventedEvent?.metrics.noMutationStallDistinct ?? 0;
+        const trigger =
+          preventionReason === "no_mutation_stall"
+            ? `${stallActions} consecutive non-mutating actions over ${stallTargets} distinct target(s)`
+            : `${noProgressTurns} identical no-progress turns`;
         const detail = {
           loop_prevented: true,
           loop_prevented_no_change_vs_base: loopPreventedNoChange,
+          prevention_reason: preventionReason,
+          no_mutation_stall: stallActions,
+          no_mutation_stall_distinct: stallTargets,
           no_progress_turns: noProgressTurns,
           recovery: loopPreventedEvent !== undefined ? decideApsRecovery(loopPreventedEvent).action : "none",
           escalated_to_human: escalatedToHuman,
@@ -1223,7 +1237,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         return {
           result: {
             status: "failed",
-            summary: `Agent loop prevented after ${noProgressTurns} identical no-progress turns (${AGENT_LOOP_PREVENTED_EVENT}).${noChangeSuffix}`,
+            summary: `Agent loop prevented by ${preventionReason} (${trigger}) (${AGENT_LOOP_PREVENTED_EVENT}).${noChangeSuffix}`,
             claims: [],
             evidence_refs: [],
             new_hypotheses: [],

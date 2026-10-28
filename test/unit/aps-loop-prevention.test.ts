@@ -156,15 +156,35 @@ function makeRoleAction(role: string, tool: string, args: Record<string, unknown
   };
 }
 
-test("an artifact role thrashing on many DISTINCT reads with no write is prevented (no_mutation_stall)", async () => {
-  const h = harness(); // default noMutationStall = 40
-  for (const a of makeDistinctReads(40)) await h.observe(a);
+/**
+ * Thrashing: the same FEW targets, cycled, with no write. The output differs
+ * each pass so the identical-fingerprint signal stays silent - only the stall,
+ * read together with target diversity, can see it.
+ */
+function makeCycledReads(n: number, targets = 3): AgentAction[] {
+  const out: AgentAction[] = [];
+  for (let i = 0; i < n; i++) {
+    out.push(makeAction("read", { path: `src/cycle-${i % targets}.ts` }, `pass ${i}`));
+  }
+  return out;
+}
+
+test("an artifact role cycling FEW targets with no write is prevented (no_mutation_stall)", async () => {
+  const h = harness(); // default noMutationStall = 40, diversity ceiling 6
+  for (const a of makeCycledReads(45)) await h.observe(a);
   assert.equal(h.prevented.length, 1, "prevention fires exactly once");
   const ev = h.prevented[0]!;
   assert.equal(ev.type, "agent.loop_prevented");
   assert.equal(ev.reason, "no_mutation_stall");
   assert.equal(ev.metrics.noMutationStall, 40);
+  assert.equal(ev.metrics.noMutationStallDistinct, 3, "the cycle kept returning to 3 targets");
   assert.equal(ev.role, "implementer");
+});
+
+test("an artifact role reading MANY distinct files is investigating, not thrashing", async () => {
+  const h = harness(); // default noMutationStall = 40
+  for (const a of makeDistinctReads(60)) await h.observe(a);
+  assert.equal(h.prevented.length, 0, "the stall requires LOW target diversity, not merely a long read-only run");
 });
 
 test("an analysis role (reviewer) never triggers the stall signal, even with many reads", async () => {
@@ -177,20 +197,20 @@ test("an analysis role (reviewer) never triggers the stall signal, even with man
 
 test("a write resets the no-mutation stall run (progress)", async () => {
   const h = harness();
-  for (const a of makeDistinctReads(39)) await h.observe(a);
+  for (const a of makeCycledReads(39)) await h.observe(a);
   await h.observe(WRITE_ACTION()); // progress: resets the stall run
-  for (const a of makeDistinctReads(39)) await h.observe(a);
+  for (const a of makeCycledReads(39)) await h.observe(a);
   assert.equal(h.prevented.length, 0, "the write broke the stall run twice");
 });
 
 test("below the stall threshold, an artifact role is never prevented", async () => {
   const h = harness(); // default noMutationStall = 40
-  for (const a of makeDistinctReads(39)) await h.observe(a);
+  for (const a of makeCycledReads(39)) await h.observe(a);
   assert.equal(h.prevented.length, 0, "39 < 40: legitimate exploration is not prevented");
 });
 
 test("the stall signal can be disabled (0) while tight-loop prevention stays on", async () => {
   const h = harness({ noMutationStall: 0 });
-  for (const a of makeDistinctReads(60)) await h.observe(a);
+  for (const a of makeCycledReads(60)) await h.observe(a);
   assert.equal(h.prevented.length, 0, "noMutationStall=0 disables the stall signal");
 });

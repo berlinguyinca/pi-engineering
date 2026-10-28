@@ -37,6 +37,24 @@ import {
 
 /** Persistent event type for loop candidates (additive to the store's type space). */
 export const AGENT_LOOP_CANDIDATE_EVENT = "agent.loop_candidate";
+/**
+ * Why a loop notice fired, in the operator's terms, with the knob that changes
+ * it. A bare "loop prevented" gives an operator nothing to act on; these numbers
+ * say which signal fired, how far past it the run is, and what to tune - and
+ * they are the only way to tell thrashing (few targets, cycled) from an agent
+ * reading its way through a codebase (many targets) from the outside.
+ */
+export function describeLoopTrigger(event: AgentLoopEvent, prevention: Required<LoopPreventionOptions>): string {
+  const m = event.metrics;
+  if (event.reason === "no_mutation_stall") {
+    return ` · ${m.noMutationStall}/${prevention.noMutationStall} non-mutating actions over ${m.noMutationStallDistinct} distinct target(s) (prevents at <= ${prevention.noMutationStallDiversity} targets; tune prevention.noMutationStall / prevention.noMutationStallDiversity)`;
+  }
+  if (event.reason === "no_progress_turns") {
+    return ` · ${m.noProgressTurns}/${prevention.noProgressTurns} identical turns (tune prevention.noProgressTurns)`;
+  }
+  return ` · ${m.noProgressTurns} identical turns`;
+}
+
 /** Persistent event type for loop prevention (Phase 3 enforcement). */
 export const AGENT_LOOP_PREVENTED_EVENT = "agent.loop_prevented";
 
@@ -125,7 +143,7 @@ export class AgentProgressSupervisor {
         emitTelemetry({
           level: "warning",
           key: "agent.loop_candidate",
-          text: `APS: loop candidate in session ${event.sessionId}: ${event.family} ${event.target || "(no target)"} (${event.reason})`,
+          text: `APS: loop candidate in session ${event.sessionId}: ${event.family} ${event.target || "(no target)"} (${event.reason})${this.describeTrigger(event)}`,
           detail: event,
         }));
   }
@@ -150,12 +168,14 @@ export class AgentProgressSupervisor {
     // aborts the run. Conservative: only identical-fingerprint no-progress
     // triggers it; changed inputs/results change the fingerprint and keep
     // noProgressTurns low, so legitimate repeats are never prevented.
-    // Phase 3 enforcement: two independent signals fire the same once-per-run
-    // prevention. (a) noProgressTurns - a tight loop (identical fingerprint);
-    // (b) noMutationStall - an artifact role thrashing on non-mutating actions
-    // (many distinct reads/bash, no write/edit) for a long run.
+    // (b) noMutationStall - an artifact role stuck on non-mutating actions
+    // (many reads/bash, no write/edit) for a long run. Because reads leave no
+    // trace on disk, the count alone cannot tell thrashing from investigation,
+    // so the signal also requires the run to be LOW-DIVERSITY in its targets.
     const stallThreshold = this.prevention.noMutationStall ?? 0;
-    const stallExceeded = stallThreshold > 0 && vector.noMutationStall >= stallThreshold;
+    const diversityThreshold = this.prevention.noMutationStallDiversity ?? 0;
+    const lowDiversity = diversityThreshold <= 0 || vector.noMutationStallDistinct <= diversityThreshold;
+    const stallExceeded = stallThreshold > 0 && vector.noMutationStall >= stallThreshold && lowDiversity;
     if (
       this.prevention.enabled &&
       !this.preventionFired &&
@@ -289,8 +309,18 @@ export class AgentProgressSupervisor {
         repeatedCalls: vector.repeatedCalls[action.contentFingerprint] ?? 0,
         staleToolResults: vector.staleToolResults,
         noMutationStall: vector.noMutationStall,
+        noMutationStallDistinct: vector.noMutationStallDistinct,
       },
     };
+  }
+
+  /**
+   * Why a notice fired, in the operator's terms, with the knob that changes it.
+   * A bare "loop prevented" gives an operator nothing to act on; these numbers
+   * say which signal fired, how far past it the run is, and what to tune.
+   */
+  private describeTrigger(event: AgentLoopEvent): string {
+    return describeLoopTrigger(event, this.prevention);
   }
 
   /** Map an APS event onto the shared persistent event model. */

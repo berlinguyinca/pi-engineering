@@ -27,16 +27,19 @@ function contextWithRegistry(tools: string[]): RuntimeContext {
     operations: { active: () => [] } as unknown as RuntimeContext["operations"],
     isActive: () => true,
     log: () => {},
-    info: { version: "0.2.0", commit: "c".repeat(40), label: "installed:test", root: "/tmp" } as unknown as RuntimeContext["info"],
+    info: {
+      version: "0.2.0",
+      commit: "c".repeat(40),
+      label: "installed:test",
+      root: "/tmp",
+    } as unknown as RuntimeContext["info"],
     latestContext: () => ({ cwd: "/tmp" }),
     session: { active: () => false, replay: async () => [] },
   };
 }
 
 function toolsCheck(runtime: ExtensionGenerationRuntime) {
-  return runtime
-    .health()
-    .then((health) => health.checks.find((check) => check.name === "tools registered")!);
+  return runtime.health().then((health) => health.checks.find((check) => check.name === "tools registered")!);
 }
 
 /** A factory that registers `ledger_read` through the generation's own API. */

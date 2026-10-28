@@ -14,6 +14,7 @@ function prevented(
   turns: number,
   utilization: number,
   family: SemanticStrategyFamily = "SEARCH_SYMBOL",
+  options: { reason?: string; noMutationStall?: number; noMutationStallDistinct?: number } = {},
 ): AgentLoopPreventedEvent {
   return {
     type: "agent.loop_prevented",
@@ -26,14 +27,20 @@ function prevented(
     role: "implementer",
     iteration: 9,
     phase: "execute",
-    reason: "no_progress_turns",
+    reason: options.reason ?? "no_progress_turns",
     fingerprint: "fp",
     tool,
     model: { provider: "metabolomics", id: model },
     contextUtilization: utilization,
     family,
     target: "x.ts",
-    metrics: { noProgressTurns: turns, repeatedCalls: turns, staleToolResults: 0, noMutationStall: 0 },
+    metrics: {
+      noProgressTurns: turns,
+      repeatedCalls: turns,
+      staleToolResults: 0,
+      noMutationStall: options.noMutationStall ?? 0,
+      noMutationStallDistinct: options.noMutationStallDistinct ?? 0,
+    },
   };
 }
 
@@ -184,4 +191,22 @@ test("rollout progressively enables enforcement by phase", () => {
   assert.equal(resolveRollout(4).escalation, false);
   assert.equal(resolveRollout(5).escalation, true);
   assert.equal(resolveRollout(6).observability, true);
+});
+
+test("a stall prevention notice says stall, not identical turns", () => {
+  const line = apsNotice(
+    prevented("m1", "bash", 0, 0.4, "RUN_COMMAND", {
+      reason: "no_mutation_stall",
+      noMutationStall: 40,
+      noMutationStallDistinct: 3,
+    }),
+  );
+  assert.match(line, /40 non-mutating actions over 3 distinct target/);
+  assert.doesNotMatch(line, /identical turns/);
+});
+
+test("an identical-turn prevention notice still reads as turns", () => {
+  const line = apsNotice(prevented("m1", "read_file", 4, 0.4));
+  assert.match(line, /4 identical turns/);
+  assert.doesNotMatch(line, /non-mutating/);
 });

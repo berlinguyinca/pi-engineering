@@ -127,10 +127,17 @@ export class ProgressEvaluator {
     }
 
     // No-mutation stall: trailing run of non-mutating actions by an
-    // artifact-producing role. Catches "thrashing" (many distinct reads/bash,
-    // no write/edit) that the identical-fingerprint signal misses. Only for the
-    // last-observed role, and only for artifact roles.
+    // artifact-producing role. Catches "thrashing" (no write/edit) that the
+    // identical-fingerprint signal misses — but the run's DISTINCT TARGET count
+    // is what makes it interpretable: a long run over many targets is an agent
+    // reading through a codebase (progress the counter cannot see, because reads
+    // change nothing on disk), a long run over few targets is an agent cycling
+    // the same command. Targets are counted by the CALL (tool + normalized
+    // arguments), not the fingerprint, because a cycling agent often gets
+    // slightly different output each pass. Both counts are reported; the caller
+    // decides. Only for the last-observed role, and only for artifact roles.
     let noMutationStall = 0;
+    const stallTargets = new Set<string>();
     const lastRole = this.history[n - 1]?.role;
     if (lastRole !== undefined && isArtifactRole(lastRole)) {
       for (let i = n - 1; i >= 0; i--) {
@@ -139,6 +146,7 @@ export class ProgressEvaluator {
         if (!isArtifactRole(action.role)) break; // role boundary: stop counting
         if (isMutatingTool(action.tool)) break; // progress: stop counting
         noMutationStall += 1;
+        stallTargets.add(`${action.tool} ${canonicalJson(action.normalizedArguments)}`);
       }
     }
 
@@ -148,6 +156,7 @@ export class ProgressEvaluator {
       repeatedCalls,
       staleToolResults,
       noMutationStall,
+      noMutationStallDistinct: stallTargets.size,
       lastFingerprint: n > 0 ? (this.history[n - 1]?.contentFingerprint ?? null) : null,
     };
   }
