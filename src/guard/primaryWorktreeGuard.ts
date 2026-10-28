@@ -112,14 +112,35 @@ function tokenize(segment: string): string[] {
  * it was mutating, and block a command that never touched the repository —
  * including the `git worktree add ... -b <branch>` the block message itself
  * tells the model to run.
+ *
+ * A trailing `:` is kept on purpose: `echo "--- git: what is X ---` is prose.
  */
 function isGitCommand(word: string): boolean {
   return word === "git" || /(^|\/)git$/.test(word);
 }
 
-function gitVerbs(segment: string): string[] {
+/** Words that may precede a command name without being the command itself. */
+const COMMAND_PREFIXES = new Set(["sudo", "env", "command", "time", "do", "then", "else", "!", "(", "{"]);
+
+/** True when `tokens[i]` is where a command name may sit (after `FOO=bar sudo …`). */
+function atCommandPosition(tokens: string[], i: number): boolean {
+  for (let j = i - 1; j >= 0; j--) {
+    const prev = tokens[j];
+    if (prev === undefined || COMMAND_PREFIXES.has(prev) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev)) continue;
+    return false;
+  }
+  return true;
+}
+
+interface GitInvocation {
+  verb: string;
+  /** The `git` word sits where a command name sits, not inside an argument. */
+  invoked: boolean;
+}
+
+function gitInvocations(segment: string): GitInvocation[] {
   const tokens = tokenize(segment);
-  const verbs: string[] = [];
+  const invocations: GitInvocation[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const word = tokens[i];
     if (word === undefined || !isGitCommand(word)) continue;
@@ -130,9 +151,9 @@ function gitVerbs(segment: string): string[] {
       j += GIT_FLAGS_WITH_ARG.has(flag) ? 2 : 1;
     }
     const verb = tokens[j];
-    if (verb !== undefined) verbs.push(verb);
+    if (verb !== undefined) invocations.push({ verb, invoked: atCommandPosition(tokens, i) });
   }
-  return verbs;
+  return invocations;
 }
 
 const READ_ONLY_VERBS = new Set([
@@ -158,25 +179,74 @@ const READ_ONLY_VERBS = new Set([
 ]);
 
 /**
+ * Verbs that change repository state (worktree, index, HEAD, refs). Kept
+ * explicit so that a word which merely follows the letters `git` in prose is
+ * not mistaken for a command; `git checkout`-style aliases are not verbs, and
+ * git refuses an unknown one with "is not a git command".
+ */
+const MUTATING_VERBS = new Set([
+  "commit",
+  "checkout",
+  "switch",
+  "reset",
+  "merge",
+  "rebase",
+  "cherry-pick",
+  "am",
+  "apply",
+  "add",
+  "rm",
+  "restore",
+  "update-ref",
+  "push",
+  "pull",
+  "clone",
+  "init",
+  "clean",
+  "mv",
+  "rename",
+  "revert",
+  "bisect",
+  "filter-branch",
+  "symbolic-ref",
+  "hash-object",
+  "write-tree",
+  "update-index",
+  "commit-tree",
+  "replace",
+  "notes",
+]);
+
+/**
  * True when the command contains a `git` invocation that changes
  * repository state (worktree, index, HEAD, refs). Read-only verbs and
  * worktree management are false — that is how a session inspects the repo
  * and leaves the primary checkout.
  *
- * Conservative by design: a git verb inside a quoted argument (`grep 'git push'
- * README.md`) still counts, because `sh -c 'git commit'` must not slip past.
- * What gets fixed here is the false positive that costs an operator time — a
- * command that touches nothing in the repository; the remaining ones only ask
- * the model to move to its own worktree.
+ * Two things make a word count as an invocation: it must BE `git` (or a path
+ * to the binary), and the verb after it must be a verb git knows. Anything
+ * else is prose — `echo "--- git: what is 524176f18392 ---"` and
+ * `git/refs/tags/v1` are not commands, and blocking them (both happened in a
+ * live session) only stops a session from doing the thing the block message
+ * tells it to do.
+ *
+ * Conservative where it matters: quoting is stripped rather than skipped, so
+ * `sh -c 'git commit -m x'` is still caught, and an unknown verb at a real
+ * command position stays blocked in case git grows a mutating verb this list
+ * predates.
  */
 export function isMutatingGitCommand(command: string): boolean {
   return segments(command).some((segment) => {
-    for (const verb of gitVerbs(segment)) {
+    for (const { verb, invoked } of gitInvocations(segment)) {
       if (verb === "worktree") continue; // escape hatch: add/remove/list/prune
-      if (!READ_ONLY_VERBS.has(verb)) return true; // commit, checkout, add, rm, …
-      if (verb === "branch" || verb === "tag") return branchOrTagMutates(segment, verb);
-      if (verb === "stash") return stashMutates(segment);
-      if (verb === "config") return configMutates(segment);
+      if (READ_ONLY_VERBS.has(verb)) {
+        if (verb === "branch" || verb === "tag") return branchOrTagMutates(segment, verb);
+        if (verb === "stash") return stashMutates(segment);
+        if (verb === "config") return configMutates(segment);
+        continue;
+      }
+      if (MUTATING_VERBS.has(verb)) return true;
+      if (invoked) return true; // `git <verb git does not know>`: fail closed
     }
     return false;
   });

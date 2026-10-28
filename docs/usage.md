@@ -888,13 +888,15 @@ The block reason tells the model the escape hatch: `git worktree add
 <sibling-dir> -b <branch> origin/<base>`.
 
 A `git` command is recognised by the word itself (`git`, `/usr/bin/git`,
-`./git`), not by the letters appearing inside a larger word: a path segment
-(`gh api repos/<owner>/<repo>/git/refs/…`), a filename (`rm /tmp/x.git`) and a
-branch name (`-b fix/…-git-…`) are not invocations — matching them as ones
-blocked the very `git worktree add` the message above recommends. Quoting is
-stripped rather than skipped, so `sh -c 'git commit'` is still caught, and a
-verb inside a quoted argument (`grep 'git push' README.md`) is still treated
-conservatively.
+`./git`) and by a verb git actually knows: a path segment
+(`gh api repos/<owner>/<repo>/git/refs/…`), a filename (`rm /tmp/x.git`), a
+branch name (`-b fix/…-git-…`) and prose (`echo "--- git: what is X ---"`) are
+not commands — matching them as ones blocked the very `git worktree add` the
+message above recommends, and blocked ordinary `echo` separators. Quoting is
+stripped rather than skipped, so `sh -c 'git commit'` is still caught, a verb
+inside a quoted argument (`grep "git push" README.md`) is still treated
+conservatively, and an unknown verb at a real command position (`git what`)
+stays blocked in case git grows a mutating verb this list predates.
 
 Knobs (set before starting the session):
 

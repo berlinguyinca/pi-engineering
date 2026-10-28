@@ -110,6 +110,12 @@ test("isMutatingGitCommand: blocks commands that change checkout state", () => {
     "git branch -dv feat/x",
     "git branch -f feat/x origin/main",
     "cd repo && git commit -m x",
+    // Unknown verb at a real command position: fail closed in case git grows a
+    // mutating verb this list predates.
+    "git what",
+    // A mutating verb inside a quoted argument stays conservative — skipping
+    // quoted spans would let `sh -c 'git commit'` through.
+    'grep -n "git push" README.md',
   ]) {
     assert.equal(isMutatingGitCommand(command), true, command);
   }
@@ -158,6 +164,11 @@ test("isMutatingGitCommand: a word that merely contains `git` is not an invocati
     "ls .github/workflows",
     "grep -r github README.md",
     "cp /tmp/a.git /tmp/b.git",
+    // The word `git` in prose, with a following word that is not a git verb:
+    // this separator line was blocked in a live session (verb "what").
+    'echo "--- git: what is 524176f18392 ---"',
+    'echo "the git command failed"',
+    "echo git status was clean",
   ]) {
     assert.equal(isMutatingGitCommand(command), false, command);
   }
@@ -235,6 +246,7 @@ test("guard: commands that merely mention `git` run in the primary checkout", as
     "gh api repos/o/r/git/refs/tags/v0.2.0 --jq .object.sha",
     "rm -f /tmp/stable-verify.git",
     "git worktree add /repo-wt -b fix/primary-guard-git-token-matching origin/main",
+    'echo "--- git: what is 524176f18392 ---"',
   ]) {
     assert.equal(await guard.onToolCall("bash", { command }), undefined, command);
   }
