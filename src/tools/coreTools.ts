@@ -31,6 +31,11 @@ export interface CoreServices {
   resumeMission?: (missionId: string, signal?: AbortSignal) => Promise<Mission>;
   /** Explicitly cancel a mission (the only thing that terminates a healthy one). */
   cancelMission?: (missionId: string) => Promise<Mission>;
+  /**
+   * Pause one named mission (what `/mission pause` runs). Optional: without it
+   * the mission tool's `pause` action points at the slash command.
+   */
+  pauseMission?: (missionId: string) => Promise<Mission>;
   /** Release a mission from its operator model pin (back to automatic routing). */
   clearMissionModelPin?: (missionId: string) => Promise<Mission>;
 }
@@ -372,12 +377,13 @@ export function buildCoreTools(
             Type.Literal("run"),
             Type.Literal("status"),
             Type.Literal("resume"),
+            Type.Literal("pause"),
             Type.Literal("cancel"),
             Type.Literal("clear_pin"),
           ],
           {
             description:
-              "run (default) starts a mission from `request`; status/resume/cancel/clear_pin act on `missionId`. clear_pin releases the mission from the operator's /model pin (automatic routing).",
+              "run (default) starts a mission from `request`; status/resume/pause/cancel/clear_pin act on `missionId`. pause stops one named mission and keeps its work (resume continues it); cancel ends one. clear_pin releases the mission from the operator's /model pin (automatic routing).",
           },
         ),
       ),
@@ -464,6 +470,25 @@ export function buildCoreTools(
         return describe(released, [
           "Operator pin released: the mission uses role pins and the router from its next dispatch.",
         ]);
+      }
+      if (action === "pause") {
+        const missionId = String(params.missionId ?? "").trim();
+        if (!missionId) return text("The pause action needs missionId.");
+        const current = store?.getMission(missionId);
+        if (!current) return text(`Unknown mission ${missionId}.`);
+        // Pause is mission-scoped and needs no live turn: the store records it,
+        // then whatever is live is stopped or parked. Only resume un-parks it.
+        if (!services.pauseMission) {
+          return text(
+            `Pausing is not available through the tool in this session. Ask the operator to run /mission pause ${missionId}.`,
+            {
+              missionId,
+              status: current.status,
+            },
+          );
+        }
+        const paused = await services.pauseMission(missionId);
+        return describe(paused, [`Operator pause recorded — resume with /mission resume ${missionId}.`]);
       }
       if (action === "cancel") {
         const missionId = String(params.missionId ?? "").trim();

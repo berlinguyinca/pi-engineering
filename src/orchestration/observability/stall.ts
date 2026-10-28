@@ -17,6 +17,23 @@ import type { LoopSignal, MissionObservabilityConfig } from "./types.ts";
 
 type LoopKind = LoopSignal["kind"];
 
+/**
+ * Signal family → the configured threshold that governs it.
+ *
+ * `loopThresholds` is keyed by ACTIVITY TYPE (`reading_file`, `error`, …) while
+ * the lookup happens per SIGNAL FAMILY (`repeated_file_read`, `repeated_error`,
+ * …). Without this map every family silently fell through to `default` (8), so
+ * the tuned values — errors at 4, reads at 6 — never applied and an operator
+ * watched four identical failures before anything was flagged.
+ */
+const THRESHOLD_KEY: Partial<Record<LoopKind, string>> = {
+  repeated_file_read: "reading_file",
+  repeated_tool_call: "tool_invocation",
+  repeated_error: "error",
+  repeated_cycle: "tool_invocation",
+  unchanged_test_position: "running_test",
+};
+
 interface Counter {
   kind: LoopKind;
   detail: string;
@@ -63,7 +80,7 @@ export class WorkerLoopTracker {
   }
 
   private thresholdFor(kind: LoopKind): number {
-    return this.config.loopThresholds[kind] ?? this.config.loopThresholds.default ?? 8;
+    return this.config.loopThresholds[THRESHOLD_KEY[kind] ?? "default"] ?? this.config.loopThresholds.default ?? 8;
   }
 
   /** Remove a family of counters (e.g. reads when a file actually changed). */

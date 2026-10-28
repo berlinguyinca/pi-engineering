@@ -273,10 +273,24 @@ for (const m of MODULES) {
   });
 }
 
-test("redact-regression: SecurityPolicy keeps explicit custom patterns", () => {
+/**
+ * `patterns` ADDS caller-specific shapes; it cannot replace the canonical table.
+ * The old contract (`patterns === undefined` → default, otherwise patterns only)
+ * meant a caller passing a short list silently narrowed coverage — the same drift
+ * class this consolidation exists to prevent. No caller in this repository passes
+ * one; the contract is pinned here so it cannot quietly revert.
+ */
+test("redact-regression: SecurityPolicy adds explicit custom patterns to the canonical table", () => {
   assert.equal(
     redactSecurityPolicy("custom value; password=hunter2", [{ kind: "generic", re: /custom value/g }]),
-    "[REDACTED]; password=hunter2",
+    "[REDACTED]; password=[REDACTED]",
+    "the caller's shape AND the canonical shape are both redacted",
   );
   assert.equal(redactSecurityPolicy("ordinary text", []), "ordinary text");
+  // An empty list is not an opt-out: the canonical table still runs.
+  assert.equal(
+    redactSecurityPolicy("password=hunter2", []),
+    "password=[REDACTED]",
+    "passing [] cannot disable canonical redaction",
+  );
 });

@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
 import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
+import { formatMissionActivity } from "../src/status/missionActivity.ts";
 import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
@@ -113,13 +114,17 @@ import {
   startSessionControl,
 } from "../src/sessionControl/SessionControl.ts";
 import { maintenanceHandler } from "../src/sessionControl/runtimeMaintenance.ts";
+import { MissionPresenceController, presenceOptionsFromEnv } from "../src/status/MissionPresenceController.ts";
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
+import { seedPresence } from "../src/status/presenceSeed.ts";
+import { StatusSurfaceBus } from "../src/status/surfaceBus.ts";
 import { WorkingStatusController } from "../src/status/working.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
+import { describeSkippedTools, registerToolsTolerant } from "../src/tools/registration.ts";
 import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
@@ -384,7 +389,15 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     },
     onMissionActivity: (event) => {
       publishMissionActivity(key, event);
+      presence?.update(event);
       if (attentionReady) void attention?.update(event).catch(() => {});
+    },
+    // The quiet heartbeat: observability composes a human-readable sentence when
+    // nothing has changed for a while, and presence is the only surface that can
+    // carry it. Without this wiring a mission that goes silent looks identical to
+    // a mission that has stopped.
+    onMissionObservabilityUpdate: (missionId, message) => {
+      presence?.noteSentence(missionId, message);
     },
     // Pipeline progress -> status footer. Best-effort and read-only: the
     // runtime swallows anything thrown here, and the footer is the only
@@ -414,6 +427,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       const summary = runtime.missionObservability?.summary(mission.mission_id);
       if (summary) attention?.seed({ ...summary, operatorPausedAt: mission.operator_paused_at });
     }
+    seedPresenceFrom(runtime);
     attentionReady = true;
     return { runtime, memoryIdentity };
   });
@@ -435,69 +449,40 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   }
 }
 
-/** Feed live mission detail into persistent surfaces without creating notices. */
-export function formatMissionActivity(event: RuntimeMissionActivityEvent): {
-  phase: string;
-  detail: string;
-  missionStatus: { token: string; reason: string; next: string; live?: string };
-} {
-  const now = event.observedAt ? Date.parse(event.observedAt) : Date.now();
-  const age = (at?: string | null) => missionActivityAge(at, now);
-  const liveWorkers = event.workersDetail?.filter((entry) => entry.status === "running" || entry.status === "waiting");
-  const worker =
-    liveWorkers?.find((entry) => entry.health === "stalled") ??
-    liveWorkers?.[0] ??
-    event.workersDetail?.find((entry) => entry.status === "failed" || entry.status === "completed");
-  const activity = (worker?.currentActivity ?? event.summary).replace(/\s+/g, " ").slice(0, 100);
-  const duration = worker?.currentActivityStartedAt ? ` for ${age(worker.currentActivityStartedAt)}` : "";
-  const lastHeartbeat = worker ? worker.lastHeartbeatAt : event.lastHeartbeatAt;
-  const lastProgress = worker ? worker.lastMeaningfulProgressAt : event.lastMeaningfulProgressAt;
-  const heartbeat = ` · heartbeat ${age(lastHeartbeat)}${lastHeartbeat ? " ago" : ""}`;
-  const lastOutput = worker ? worker.lastOutputAt : event.lastOutputAt;
-  const output = `output ${age(lastOutput)}${lastOutput ? " ago" : ""}`;
-  const progress = `progress ${age(lastProgress)}${lastProgress ? " ago" : ""}`;
-  const model = worker?.model ? ` · ${worker.route ? `${worker.route} → ` : ""}${worker.model}` : "";
-  const waiting = event.waitingReason
-    ? ` · wait ${event.waitingReason.replaceAll("_", " ")}${event.waitingSince ? ` for ${age(event.waitingSince)}` : ""}`
-    : "";
-  const live = `${event.health.toUpperCase()} · ${activity.slice(0, 36)}${duration} · ${output}`;
-  const workers = ` · workers ${event.activeWorkers} active/${event.waitingWorkers} waiting/${event.failedWorkers} failed`;
+// The activity vocabulary is shared with mission presence and the panel; it lives in src/status.
+export { formatMissionActivity };
 
-  const compact = (value: string | null, fallback: string, length = 80) => (value ?? fallback).slice(0, length);
-  const scope =
-    `repo ${compact(event.repository, "unknown")} · task ${compact(worker?.taskId ?? event.task, "none")} · ` +
-    `owner ${compact(event.owner, "unowned")}`;
-  const recovery = `recovery ${event.recovery.attempt}/${event.recovery.maxAttempts}`;
-  const next = `next ${event.nextAction.slice(0, 120)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`;
-  const preserved =
-    event.preservedWork.length > 0 ? ` · preserved ${event.preservedWork.join(", ").slice(0, 120)}` : "";
-  const nextVerb = event.nextAction.trim().split(/\s+/)[0]?.slice(0, 12) || "monitor";
-  const recoveryToken =
-    event.recovery.maxAttempts > 0 ? `R${event.recovery.attempt}/${event.recovery.maxAttempts}` : "R–";
-  const pausedByOperator = event.operatorPausedAt
-    ? `PAUSED by operator at ${event.operatorPausedAt} — automatic repair is off; resume with /mission resume ${event.missionId} (add --model auto to release a model pin)`
-    : null;
-  const pin = event.operatorModelPin ? ` · model: ${event.operatorModelPin} (operator pin)` : "";
-  const token = pausedByOperator
-    ? `${recoveryToken} PAUSED (operator)`
-    : `${recoveryToken} ${event.action.slice(0, 12).toUpperCase()}→${nextVerb}`;
-  return {
-    phase:
-      `acceptance ${event.acceptanceCoverage.completed}/${event.acceptanceCoverage.total} ` +
-      `(${event.acceptanceCoverage.approximatePercent}%) · workflow ${event.workflowProgress.completed}/` +
-      `${event.workflowProgress.total} (${event.workflowProgress.approximatePercent}%) · ${event.health}`,
-    detail:
-      `Now: ${activity}${duration} · ${output}${heartbeat} · ${progress}${model}${waiting}${workers} · ${scope} · ` +
-      `${recovery}${preserved} · ${event.action}: ${event.reason.slice(0, 120)} · ${next}${pin}`,
-    missionStatus: pausedByOperator
-      ? { token, reason: "paused by the operator (Esc); automatic repair is off", next: pausedByOperator }
-      : {
-          token,
-          live,
-          reason: event.reason.slice(0, 160),
-          next: `${event.nextAction.slice(0, 160)}${event.nextActionAt ? ` at ${event.nextActionAt}` : ""}`,
-        },
-  };
+/**
+ * The session's mission strip and working line. One controller per session (a
+ * process hosts one interactive session); missions from every repository this
+ * session touches share the strip, which is the point — dozens of legs running
+ * at once should read as one queue, not as one hidden surface each.
+ */
+let presence: MissionPresenceController | undefined;
+let presencePoll: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * Draw rows for missions this process never saw emit anything — started
+ * earlier, or by another process. Only ever runs against a runtime that is
+ * already open: drawing a strip must never be the reason a runtime opens.
+ */
+function seedPresenceFrom(runtime: EngineeringRuntime): void {
+  if (!presence) return;
+  seedPresence(presence, {
+    missions: runtime.missionStore?.listMissions() ?? [],
+    summary: (missionId) => runtime.missionObservability?.summary(missionId) ?? null,
+  });
+  // Draw now. Waiting for the next clock tick would leave a session that opens
+  // a runtime and immediately sits idle showing nothing at all.
+  presence.tick();
+}
+
+async function refreshPresence(cwd: string): Promise<void> {
+  if (!presence) return;
+  const key = await repoCacheKey(cwd).catch(() => "");
+  const open = key ? runtimes.get(key) : undefined;
+  if (!open) return;
+  seedPresenceFrom(open.runtime);
 }
 
 /** Feed live mission detail into persistent surfaces without creating notices. */
@@ -681,6 +666,7 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
     actor: () => ({ type: "user" }),
     resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
     cancelMission: (id) => rt.cancelMission(id),
+    pauseMission: (id) => rt.pauseMission(id),
     clearMissionModelPin: (id) => rt.clearMissionModelPin(id),
     // A rebound parent launch targets the bound worktree by default.
     ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
@@ -980,10 +966,24 @@ export default function (pi: ExtensionAPI) {
     });
   }
   // Semantic tools resolved against the runtime for the calling cwd.
-  for (const tool of buildCoreTools(resolveServices, {
-    unavailableReason: (cwd) => runtimeOpenFailures.get(cwd) ?? null,
-  })) {
-    pi.registerTool(tool);
+  // Registration is tolerant of a host that rejects a name synchronously (the
+  // generation-handover case). It cannot prevent Pi's own post-load uniqueness
+  // check, which fails the second copy of this runtime from outside the
+  // extension — load one runtime per session (docs/usage.md).
+  const registration = registerToolsTolerant(
+    pi as Parameters<typeof registerToolsTolerant>[0],
+    buildCoreTools(resolveServices, {
+      unavailableReason: (cwd) => runtimeOpenFailures.get(cwd) ?? null,
+    }),
+  );
+  const skippedNotice = describeSkippedTools(registration.skipped);
+  if (skippedNotice && typeof pi.on === "function") {
+    let announced = false;
+    pi.on("session_start", (_event: unknown, ctx: { ui: { notify(text: string, level?: string): void } }) => {
+      if (announced) return;
+      announced = true;
+      ctx.ui.notify(skippedNotice, "warning");
+    });
   }
 
   // ─── Operator model pin: missions follow an explicit /model switch ───────
@@ -2089,12 +2089,40 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_start", (_event, ctx) => {
       workingSignal = undefined;
       working?.dispose();
-      working = ctx.hasUI ? new WorkingStatusController(ctx.ui) : undefined;
+      // One arbiter for both surfaces (src/status/surfaceBus.ts). The agent's
+      // line and the mission strip used to guard each other out with private
+      // flags; now each holds a priority claim and the arbiter decides.
+      const surfaces = new StatusSurfaceBus(ctx.ui);
+      working = ctx.hasUI ? new WorkingStatusController(ctx.ui, Date.now, { bus: surfaces }) : undefined;
       working?.onModelSelect(ctx.model);
+      // Presence yields the working line to the agent but never yields the
+      // strip: an operator who cannot see the queue cannot steer it.
+      if (presencePoll) clearInterval(presencePoll);
+      presencePoll = undefined;
+      presence?.dispose();
+      const presenceEnv = presenceOptionsFromEnv(process.env);
+      presence =
+        ctx.hasUI && presenceEnv.enabled
+          ? new MissionPresenceController(ctx.ui, {
+              bus: surfaces,
+              rows: presenceEnv.rows,
+              title: presenceEnv.title,
+              quiet: (missionId) => {
+                void getRuntimeByCwd(ctx.cwd)
+                  .then((runtime) => runtime.missionObservability?.maybeEmitQuietUpdate(missionId))
+                  .catch(() => {});
+              },
+            })
+          : undefined;
+      if (presence && presenceEnv.pollMs > 0) {
+        presencePoll = setInterval(() => void refreshPresence(ctx.cwd).catch(() => {}), presenceEnv.pollMs);
+        presencePoll.unref?.();
+      }
     });
     pi.on("agent_start", (_event, ctx) => {
       workingSignal = ctx.signal;
       working?.onAgentStart();
+      presence?.onAgentStart();
     });
     pi.on("message_update", (event) => working?.onMessageUpdate(event));
     pi.on("tool_execution_start", (event) => working?.onToolEvent(event));
@@ -2104,11 +2132,16 @@ ${RECOVERY_PROMPT}`;
     pi.on("agent_settled", () => {
       workingSignal = undefined;
       working?.onAgentEnd();
+      presence?.onAgentEnd();
     });
     pi.on("session_shutdown", () => {
       workingSignal = undefined;
       working?.dispose();
       working = undefined;
+      if (presencePoll) clearInterval(presencePoll);
+      presencePoll = undefined;
+      presence?.dispose();
+      presence = undefined;
     });
   }
 
@@ -2368,7 +2401,7 @@ ${RECOVERY_PROMPT}`;
 
   pi.registerCommand("mission", {
     description:
-      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission inspect <missionId> [workerId] shows recent activity; /mission why <missionId> explains what blocks one; /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
+      "Run an orchestration mission (optional leading --mode/--backend/--budget/--max-workers); /mission inspect <missionId> [workerId] shows recent activity; /mission why <missionId> explains what blocks one; /mission pause <missionId> stops one named mission (Esc pauses the turn on screen; this pauses the one you name); /mission resume <missionId> [--model auto] continues a stopped or paused one (optionally releasing its operator model pin), /mission cancel <missionId> ends one.",
     handler: async (args, ctx) => {
       const request = args.trim();
       if (!request) {
@@ -2395,6 +2428,24 @@ ${RECOVERY_PROMPT}`;
         try {
           const canceled = await rt.cancelMission(cancel[1]);
           ctx.ui.notify(`Mission ${canceled.mission_id} — ${canceled.title} [${canceled.status}]`, "info");
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
+      // Pause one named mission. Esc cannot express this: it pauses the turn the
+      // operator is watching, and with dozens of missions the one worth stopping
+      // is rarely the one on screen.
+      const pause = /^pause\s+(MSN-\S+)\s*$/i.exec(request);
+      if (pause?.[1]) {
+        const rt = await openRuntime();
+        if (!rt) return;
+        try {
+          const paused = await rt.pauseMission(pause[1]);
+          ctx.ui.notify(
+            `Mission ${paused.mission_id} — ${paused.title} [${paused.status}] · resume with /mission resume ${paused.mission_id}`,
+            "info",
+          );
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         }

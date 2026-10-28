@@ -510,6 +510,27 @@ test("quiet-period update surfaces health when no transition fires", async () =>
   );
 });
 
+test("the default quiet interval is a minute: an operator watching wants a minute", async () => {
+  // Presence asks for a quiet update every minute. If the service's own window
+  // were still five minutes, every ask inside it would be silently dropped and
+  // a silent mission would be indistinguishable from a stopped one.
+  const h = harness();
+  const id = makeMission(h);
+  h.obs.missionCreated(id, "M");
+  h.obs.workerStarted(id, "wk-1");
+  h.clock.advance(59_000);
+  h.obs.maybeEmitQuietUpdate(id);
+  await h.obs.flush();
+  assert.equal(h.updates.filter((m) => m.includes("Still running")).length, 0, "59s is not yet quiet");
+  h.clock.advance(2_000);
+  h.obs.maybeEmitQuietUpdate(id);
+  await h.obs.flush();
+  assert.ok(
+    h.updates.some((m) => m.includes("Still running")),
+    "61s of silence proves liveness",
+  );
+});
+
 test("a recent transition update suppresses the quiet-period summary", async () => {
   const h = harness({ quietUpdateIntervalMs: 60_000 });
   const id = makeMission(h);

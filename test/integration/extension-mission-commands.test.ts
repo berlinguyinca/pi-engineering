@@ -55,7 +55,11 @@ function loadCommands(): Map<string, Command> {
   return loadHarness().commands;
 }
 
-function commandContext(cwd: string) {
+function commandContext(
+  cwd: string,
+  uiOverrides: Record<string, unknown> = {},
+  ctxOverrides: Record<string, unknown> = {},
+) {
   const notices: Array<{ text: string; level: string }> = [];
   return {
     notices,
@@ -72,7 +76,9 @@ function commandContext(cwd: string) {
         custom: () => ({ close: () => {} }),
         setFooter: () => {},
         onTerminalInput: () => () => {},
+        ...uiOverrides,
       },
+      ...ctxOverrides,
     },
   };
 }
@@ -761,4 +767,76 @@ test("/mission inspect rejects malformed syntax before opening a runtime or crea
   for (const input of ["inspect", "inspect MSN-1 w1 extra"]) await command.handler(input, ctx);
   assert.equal(notices.length, 2);
   assert.ok(notices.every((notice) => notice.text === "/mission inspect <missionId> [workerId]"));
+});
+
+test("mission presence survives a UI without setWidget or setWorkingMessage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-presence-thin-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const { commands, handlers } = loadHarness();
+    // A UI that offers every surface except the two presence needs: the strip
+    // is observational and must not break what the operator types next.
+    const { ctx, notices } = commandContext(root, { setStatus: () => {} }, { hasUI: true });
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+    await commands.get("mission-status")!.handler("", ctx);
+    assert.match(notices.at(-1)?.text ?? "", /No missions yet/i);
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a mission this session never saw emitting still gets a strip row and a working line", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-presence-seed-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const mission = runtime.missionStore!.createMission({
+      title: "quiet leg",
+      goal: "a mission started elsewhere",
+      user_request: "a mission started elsewhere",
+      repository: root,
+      base_ref: await runtime.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    await runtime.close();
+
+    const widget: (string[] | undefined)[] = [];
+    const working: (string | undefined)[] = [];
+    const { commands, handlers } = loadHarness();
+    const { ctx } = commandContext(
+      root,
+      {
+        setWidget: (_key: string, lines: string[] | undefined) => widget.push(lines),
+        setWorkingMessage: (text: string | undefined) => working.push(text),
+        setStatus: () => {},
+      },
+      // A TUI session has a strip to draw; the harness ctx is otherwise headless.
+      { hasUI: true },
+    );
+    for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+    await commands.get("mission-status")!.handler("", ctx);
+
+    const strip = widget.at(-1);
+    assert.ok(strip, "opening the runtime must draw the missions it found");
+    assert.match(strip!.join("\n"), new RegExp(mission.mission_id));
+    assert.match(strip!.join("\n"), /no proof of life yet/, "a store row carries no proof of life and says so");
+    assert.match(working.at(-1) ?? "", new RegExp(`Mission · ${mission.mission_id}`));
+
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    assert.equal(widget.at(-1), undefined, "shutdown clears the strip");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

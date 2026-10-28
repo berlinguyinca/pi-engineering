@@ -29,25 +29,61 @@
 
 const PLACEHOLDER = "[REDACTED]";
 
-const RULES: Array<{ pattern: RegExp; replacement: string }> = [
+/** What a rule recognises, for callers that report *why* text was sanitized. */
+export type SecretKind = "api_key" | "bearer" | "aws" | "private_key" | "generic";
+
+/**
+ * The one canonical redaction table. Every redactor in the runtime reads this
+ * list — `src/security/SecurityPolicy.ts` delegates here rather than keeping a
+ * second pattern set, because a hand-maintained duplicate drifts silently: the
+ * gap matrix in `test/unit/security-redaction-regression.test.ts` recorded ten
+ * shapes one implementation caught and the other leaked.
+ */
+export const SECRET_RULES: Array<{ kind: SecretKind; pattern: RegExp; replacement: string }> = [
   // ── Value-shaped: recognisable without any key ───────────────────────────
   // A PEM private key block, header to footer, however long.
-  { pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, replacement: PLACEHOLDER },
+  {
+    kind: "private_key",
+    pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    replacement: PLACEHOLDER,
+  },
   // Credentials inside a URL: scheme://user:secret@host
-  { pattern: /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi, replacement: `$1${PLACEHOLDER}@` },
+  {
+    kind: "generic",
+    pattern: /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi,
+    replacement: `$1${PLACEHOLDER}@`,
+  },
   // Provider-issued tokens with distinctive prefixes.
-  { pattern: /\b(gh[pousr]_[A-Za-z0-9]{16,})/g, replacement: PLACEHOLDER },
-  { pattern: /\bsk-[A-Za-z0-9_-]{12,}/g, replacement: PLACEHOLDER },
-  { pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: PLACEHOLDER },
-  { pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: PLACEHOLDER },
+  // Provider-issued tokens with distinctive prefixes.
+  { kind: "api_key", pattern: /\b(gh[pousr]_[A-Za-z0-9]{16,})/g, replacement: PLACEHOLDER },
+  // `sk-` keys carry hyphenated tiers (`sk-live-`, `sk-proj-`) and underscored
+  // segments, so the class needs both.
+  { kind: "api_key", pattern: /\bsk-[A-Za-z0-9_-]{12,}/g, replacement: PLACEHOLDER },
+  { kind: "api_key", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: PLACEHOLDER },
+  { kind: "aws", pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: PLACEHOLDER },
   // A JWT: three base64url segments separated by dots.
-  { pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, replacement: PLACEHOLDER },
+  {
+    kind: "generic",
+    pattern: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+    replacement: PLACEHOLDER,
+  },
 
-  { pattern: /\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g, replacement: PLACEHOLDER },
+  { kind: "api_key", pattern: /\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g, replacement: PLACEHOLDER },
 
   // Authentication schemes are retained as context. Horizontal whitespace and
   // token characters prevent consuming the following line or field delimiter.
-  { pattern: /\b((?:Bearer|Basic)[ \t]+)[A-Za-z0-9._~+/=-]+/gi, replacement: `$1${PLACEHOLDER}` },
+  //
+  // The KEY-shaped family lives in ASSIGNMENT below, not here: a rule that
+  // consumes an `Authorization:` header value to end of line swallows whatever
+  // else sat on that line, and a rule that consumes one whitespace token leaves
+  // the scheme's credential standing unattached to any keyword. The assignment
+  // pass keeps the name, the separator and the scheme, and replaces only the
+  // credential.
+  {
+    kind: "bearer",
+    pattern: /\b((?:Bearer|Basic)[ \t]+)[A-Za-z0-9._~+/=-]+/gi,
+    replacement: `$1${PLACEHOLDER}`,
+  },
 ];
 
 // A quoted assignment is consumed in one pass, including escaped quotes.
@@ -65,7 +101,7 @@ export function redactSecrets(text: string): string {
   if (!text) return text;
   try {
     let out = text;
-    for (const { pattern, replacement } of RULES) out = out.replace(pattern, replacement);
+    for (const { pattern, replacement } of SECRET_RULES) out = out.replace(pattern, replacement);
     out = out.replace(ASSIGNMENT, (_match, key: string, separator: string, value: string) => {
       const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : "";
       const scheme = /^(?:Bearer|Basic)[ \t]+/i.exec(value)?.[0] ?? "";

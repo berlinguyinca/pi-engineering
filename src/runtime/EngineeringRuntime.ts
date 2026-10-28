@@ -50,6 +50,7 @@ import { MissionStore } from "../orchestration/missionStore.ts";
 import { buildVerifierStages } from "../orchestration/missionWhy.ts";
 import { ClockOnlyGate, MissionActivityTicker } from "../orchestration/observability/MissionActivityTicker.ts";
 import { MissionObservability, boundedToolOutputPreview } from "../orchestration/observability/MissionObservability.ts";
+import { type MissionAttention, attentionFromSummary } from "../orchestration/observability/attention.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
@@ -473,6 +474,12 @@ export interface RuntimeMissionActivityEvent {
   operatorPausedAt?: string | null;
   /** The mission's operator model pin ("provider/id"), when it has one. */
   operatorModelPin?: string | null;
+  /**
+   * Why this mission deserves attention, with the fact that says so. Derived
+   * from observability facts, never from model narration; absent when there is
+   * nothing to say, so a surface can fall back to plain state ordering.
+   */
+  attention?: MissionAttention | null;
 }
 
 export interface EngineeringRuntimeOptions {
@@ -1203,6 +1210,17 @@ export class EngineeringRuntime {
         task: summary.task,
         preservedWork: summary.preservedWork.map((value) => redactSecrets(value).slice(0, 240)).slice(0, 8),
         operatorPausedAt: mission?.operator_paused_at ?? null,
+        attention: attentionFromSummary(summary, {
+          now: Date.parse(observedAt) || Date.now(),
+          // The counters live per worker; the strongest one across live workers
+          // is what an operator would act on.
+          loopSignals: projection.workers
+            .filter((worker) => worker.state === "running" || worker.state === "waiting")
+            .flatMap((worker) => this.missionObservability?.loopSignals(missionId, worker.workerId) ?? []),
+          operatorPausedAt: mission?.operator_paused_at ?? null,
+          review: { blockingOpen: projection.review.blockingOpen },
+          tests: { failed: projection.tests.failed },
+        }),
         operatorModelPin: mission?.operator_model_pin
           ? `${mission.operator_model_pin.provider}/${mission.operator_model_pin.id}`
           : null,
@@ -2251,6 +2269,18 @@ export class EngineeringRuntime {
     });
     this.missionResumeFlights.set(missionId, flight);
     return flight;
+  }
+
+  /**
+   * Pause one named mission — the case Esc cannot express, because Esc pauses
+   * the turn the operator is watching and dozens of missions run at once.
+   * Works with no live turn: the store records the pause, then whatever is live
+   * is stopped or parked. Only resume un-parks it; no scheduler or supervisor
+   * will run it again on its own.
+   */
+  async pauseMission(missionId: string): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
+    return this.orchestrator.pauseMission(missionId);
   }
 
   private async performBlockedMissionResume(

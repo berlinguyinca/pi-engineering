@@ -586,7 +586,7 @@ export class MissionObservability {
       case "REVIEW_FINDING": {
         const severity = (meta.severity as "blocking" | "major" | "minor") ?? "major";
         s.review.findings.push({
-          findingId: ev.taskId ?? id("F"),
+          findingId: (meta.findingId as string | undefined) ?? ev.taskId ?? id("F"),
           severity,
           summary: ev.summary,
           file: meta.file as string | null | undefined,
@@ -1016,12 +1016,15 @@ export class MissionObservability {
     severity: "blocking" | "major" | "minor",
     summary: string,
     file?: string | null,
+    /** Stable identity (the completion gate's own `<evidenceId>:<index>`) so a
+     * later repair that resolves this finding closes the same record. */
+    findingId?: string,
   ): void {
     this.record({
       missionId,
       type: "REVIEW_FINDING",
       summary,
-      metadata: { severity, file, activityType: "review_finding" },
+      metadata: { severity, file, findingId, activityType: "review_finding" },
       meaningfulProgress: true,
     });
     if (severity === "blocking") this.emitUpdate(missionId, `Blocking review finding: ${summary}`);

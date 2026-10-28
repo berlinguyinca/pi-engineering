@@ -1,5 +1,3 @@
-import { redactSecrets as redactDefaultSecrets } from "../platform/redact.ts";
-
 /**
  * Security hardening (spec §29, backlog B-111).
  *
@@ -14,28 +12,37 @@ import { redactSecrets as redactDefaultSecrets } from "../platform/redact.ts";
  *      that says "ignore your instructions") and flag them so the runtime can
  *      refuse to follow them.
  */
-export type SecretKind = "api_key" | "bearer" | "aws" | "private_key" | "generic";
+import { SECRET_RULES, type SecretKind, redactSecrets as redactCanonical } from "../platform/redact.ts";
 
-// Legacy pattern set remains available for callers that explicitly supply it.
-// Default redaction shares the platform policy so the two entry points cannot drift.
-export const SECRET_PATTERNS: Array<{ kind: SecretKind; re: RegExp }> = [
-  { kind: "api_key", re: /(sk-[A-Za-z0-9]{16,}|[A-Za-z0-9_-]{24,}\.eyJ[A-Za-z0-9_-]{10,})/g },
-  { kind: "bearer", re: /(Bearer\s+[A-Za-z0-9._~+/=-]{16,})/gi },
-  { kind: "aws", re: /(AKIA[0-9A-Z]{16})/g },
-  {
-    kind: "private_key",
-    re: /(-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/g,
-  },
-  { kind: "generic", re: /(password|passwd|secret|token|api[_-]?key)\s*[:=]\s*["']?([^"'\s,;]{6,})/gi },
-];
+/** Vocabulary for what a rule recognised; it lives with the canonical rules. */
+export type { SecretKind };
+
+/**
+ * Kind-labelled view of the canonical rule table in `src/platform/redact.ts`.
+ * Kept for callers that report *why* text was sanitized. It used to be a second,
+ * narrower pattern set maintained by hand here, which is how nine secret shapes
+ * leaked through this module while the platform redactor already caught them;
+ * the gap matrix in `test/unit/security-redaction-regression.test.ts` is the
+ * proof. There is now exactly one table.
+ */
+export const SECRET_PATTERNS: Array<{ kind: SecretKind; re: RegExp }> = SECRET_RULES.map((rule) => ({
+  kind: rule.kind,
+  re: rule.pattern,
+}));
 
 export const SECRET_REDACTION = "[REDACTED]";
 
-/** Redact known secrets from a string. Returns the sanitized text. */
+/**
+ * Redact known secrets from a string. Returns the sanitized text.
+ *
+ * The canonical table always runs. `patterns` ADDS caller-specific shapes on
+ * top of it — it can no longer replace the default, so passing a short list can
+ * never shrink coverage the way the old default-parameter contract allowed.
+ * No caller in this repository passes one.
+ */
 export function redactSecrets(text: string, patterns?: Array<{ kind: SecretKind; re: RegExp }>): string {
-  if (patterns === undefined) return redactDefaultSecrets(text);
-  let out = text;
-  for (const { re } of patterns) out = out.replace(re, SECRET_REDACTION);
+  let out = redactCanonical(text);
+  for (const { re } of patterns ?? []) out = out.replace(re, SECRET_REDACTION);
   return out;
 }
 

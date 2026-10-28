@@ -32,6 +32,7 @@ import {
   WAITING_FOR_INFERENCE_SUMMARY,
 } from "../workers/activity.ts";
 import { budgetExhaustedBuildHint } from "../workers/buildActivity.ts";
+import { recordWorkerActivity } from "./activityNotice.ts";
 import {
   type BrokerBackends,
   ExecutionBroker,
@@ -54,6 +55,7 @@ import {
   MAINTENANCE_STOP_REASON,
   MISSION_CANCEL_REASON,
   MISSION_MAINTENANCE_REASON,
+  MISSION_PAUSE_REASON,
   OPERATOR_PAUSE_STOP_REASON,
   interruptibleRun,
   isMaintenanceAbort,
@@ -64,7 +66,7 @@ import { HandoffRecordError, type MissionStore } from "./missionStore.ts";
 import { MissionActivityTicker } from "./observability/MissionActivityTicker.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
 import { computeProgress } from "./observability/progress.ts";
-import type { ActivityType, WaitingReason } from "./observability/types.ts";
+import type { ActivityType } from "./observability/types.ts";
 import { type DispatchAuthority, type MissionOwnership, RepositoryLeasedError } from "./ownership.ts";
 import {
   type ContextWindowResolver,
@@ -85,8 +87,10 @@ import {
   replacementRecoveryFingerprint,
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
+import { recordSchedulerStatus } from "./recoveryNotice.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { buildReviewContext } from "./reviewContext.ts";
+import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
 import { brokerKind } from "./scheduler.ts";
 import { MissionScheduler, type SchedulerOptions } from "./scheduler.ts";
 import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } from "./specApproval.ts";
@@ -506,30 +510,8 @@ export class Orchestrator {
       rand: opts.rand,
       acquireAuthority: this.ownership ? (task, signal) => this.acquireTaskAuthorityWaiting(task, signal) : undefined,
       recovery: opts.recovery,
-      onStatus: (notice) => {
-        const obs = this.observability;
-        if (notice.action === "resumed") {
-          obs?.clearWaiting(notice.missionId);
-          this.report(
-            notice.missionId,
-            `[mission ${notice.missionId}] recovery succeeded; worker execution resumed (attempt ${notice.attempt})`,
-          );
-          return;
-        }
-        const waitingReason: WaitingReason =
-          notice.status === "WAITING_FOR_CAPACITY"
-            ? "rate_limit"
-            : notice.status === "RECOVERING_CONTEXT"
-              ? "model_request"
-              : "external_resource";
-        const next = notice.nextActionAt ? `; next recovery check ${new Date(notice.nextActionAt).toISOString()}` : "";
-        const detail =
-          notice.action === "paused"
-            ? `Recovery stopped with no active worker: ${notice.reason}. Mission is paused and resumable.`
-            : `No active worker while recovery runs: ${notice.reason}; attempt ${notice.attempt}${next}`;
-        obs?.setWaiting(notice.missionId, waitingReason, detail);
-        this.report(notice.missionId, `[mission ${notice.missionId}] ${detail}`);
-      },
+      onStatus: (notice) =>
+        recordSchedulerStatus(notice, this.observability, (missionId, line) => this.report(missionId, line)),
       // Surface every task settlement as live progress so a running mission is
       // never silent: the operator sees each worker/gate settle instead of a
       // black screen for the whole worker budget (default 30 min).
@@ -1899,8 +1881,7 @@ export class Orchestrator {
           (event.kind === "tool" && (event.phase === "completed" || event.phase === "failed")) ||
           ["Model streaming", "Model response received", TOOL_PROGRESS_SUMMARY].includes(event.summary),
       });
-      if (event.kind === "tool" && event.phase === "started" && event.invocationSignature)
-        obs?.noteWorkerTool(event.missionId, event.executionId, event.invocationSignature);
+      recordWorkerActivity(obs, event.missionId, event.executionId, event);
       if (event.kind === "tool" && event.buildTool) this.noteBuildCommand(event);
       if ((event.kind === "state" || event.kind === "execution") && event.phase === "completed") {
         obs?.workerCompleted(event.missionId, event.executionId);
@@ -1979,6 +1960,16 @@ export class Orchestrator {
     const task = this.store.getTask(taskId);
     const label = task?.objective ?? taskId;
     const workerId = this.taskExecutions.get(`${missionId}:${taskId}`) ?? taskId;
+    // A settled review carries its verdict inside its evidence: without feeding
+    // it, a reviewer that asked for changes looked like a review still running.
+    if (task?.kind === "review") {
+      recordReviewSettlement(
+        obs,
+        missionId,
+        status,
+        this.store.listReviewEvidence(missionId).find((evidence) => evidence.taskId === taskId),
+      );
+    }
     if (obs && status === "SUCCEEDED") {
       obs.taskStarted(missionId, taskId, label);
       obs.taskCompleted(missionId, taskId, label);
@@ -3560,6 +3551,15 @@ export class Orchestrator {
         const repaired = await this.runSingleTask(missionId, repair.task_id, {
           signal,
         });
+        recordRepairRound(
+          this.observability,
+          missionId,
+          repair.task_id,
+          obj.findingIds ?? [],
+          // The replacement settling is not proof the finding is gone; only a
+          // resolved finding counts.
+          repaired && (obj.findingIds ?? []).length > 0,
+        );
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         if (repaired) pendingResolution.push(...(obj.findingIds ?? []));
         // The replacement carries the dead workers' work (re-adopted, or redone
@@ -3724,6 +3724,9 @@ export class Orchestrator {
     const unresolvedBlocking = this.store
       .listFindings(missionId)
       .filter((f) => f.severity === "blocking" && f.status !== "resolved").length;
+    // The gate said no, with its own reasons. Before this the only trace of a
+    // failed completion gate was the mission's terminal status.
+    recordGateVerdict(this.observability, missionId, verdict);
     const hasBlocking =
       unresolvedBlocking > 0 || (finalMission.required_gates.length > 0 && verdict.reasons.length > 0);
     if (hasBlocking) {
@@ -4765,6 +4768,41 @@ export class Orchestrator {
     return isPauseAbort(signal)
       ? this.pauseInterruptedMission(missionId, isMaintenanceAbort(signal))
       : this.cancelMission(missionId);
+  }
+
+  /**
+   * Pause a mission the operator names, from outside any live turn.
+   *
+   * Esc pauses the turn the operator is watching. This pauses the mission they
+   * pointed at, which is the case Esc cannot express: dozens of missions run at
+   * once, and the one worth stopping is rarely the one on screen. The mission is
+   * marked paused first, so automatic recovery is off immediately, and then
+   * whatever is live is stopped: a running pipeline takes the pause signal and
+   * parks itself with its work, and a mission the scheduler owns — or one merely
+   * waiting — is parked here with its claims released.
+   */
+  async pauseMission(missionId: string): Promise<Mission> {
+    const mission = this.store.getMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    if (["COMPLETE", "FAILED", "CANCELED", "CANCELING"].includes(mission.status)) return mission;
+    this.store.markOperatorPause(missionId);
+    const live = this.liveRuns.get(missionId);
+    if (live) {
+      // The pipeline's own pause path parks it and reports the activity. Its
+      // status is still in flight here, so report what is already durable.
+      live.abort(MISSION_PAUSE_REASON);
+      return this.store.getMission(missionId) ?? mission;
+    }
+    if (["NEW", "CLASSIFYING", "PLANNING"].includes(mission.status)) {
+      // Nothing has been dispatched, so there is no in-flight work to park. The
+      // interrupted-run path cancels this state because an Esc during planning
+      // preserves nothing; a *named* pause must not destroy a mission the
+      // operator only asked to stop. The pause is durable and the supervisor
+      // honours it, so nothing starts this mission until the operator resumes.
+      await this.store.flush();
+      return this.store.getMission(missionId)!;
+    }
+    return this.pauseInterruptedMission(missionId);
   }
 
   /**
