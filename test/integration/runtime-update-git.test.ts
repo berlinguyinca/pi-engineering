@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { EngineeringHostExtension, parseUpdateArgs } from "../../src/runtime/host/extension.ts";
-import { readPreferences } from "../../src/update/preferences.ts";
+import { readPreferences, writePreferences } from "../../src/update/preferences.ts";
 import { createUpdateRepo, escapingSymlink, git, publishUnrelatedHistory } from "../support/gitRemote.ts";
 import { type PiTestSession, startPiSession } from "../support/piSession.ts";
 import { bag } from "../support/runtimeFixtures.ts";
@@ -31,15 +31,35 @@ afterEach(async () => {
 });
 
 let seq = 0;
-async function world(opts: { updateRemote?: string; trusted?: string[] } = {}) {
+async function world(
+  opts: { updateRemote?: string; trusted?: string[]; shallow?: boolean; localCommit?: boolean } = {},
+) {
   const key = `__rt_git_${process.pid}_${++seq}`;
   const b = bag(key);
   const root = mkdtempSync(join(tmpdir(), "rt-git-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const repo = createUpdateRepo(join(root, "src"), key, { version: "0.2.0", value: "A" });
+  let packageRoot = repo.checkout;
+  if (opts.shallow) {
+    // A depth-1 install, which is how a release gets staged: the installed
+    // checkout's oldest commit is the shallow boundary, not the root commit.
+    repo.publish({ version: "0.2.0", value: "A" });
+    packageRoot = join(root, "shallow");
+    // file:// (not a plain path): git ignores --depth when it can hardlink a local clone.
+    git(root, "clone", "--quiet", "--depth", "1", "--branch", "main", `file://${repo.remote}`, packageRoot);
+    if (opts.localCommit) {
+      // The installed commit exists only on this machine: nothing on the
+      // source can vouch for it, so no history can establish its identity.
+      git(packageRoot, "config", "user.email", "local@example.invalid");
+      git(packageRoot, "config", "user.name", "local");
+      writeFileSync(join(packageRoot, "local-only.ts"), "export const LOCAL = 1;\n");
+      git(packageRoot, "add", "-A");
+      git(packageRoot, "commit", "--quiet", "-m", "local only");
+    }
+  }
   const ext = new EngineeringHostExtension({
     installRoot: join(root, "install"),
-    packageRoot: repo.checkout,
+    packageRoot,
     entry: "runtime.ts",
     baseline: true,
     autoUpdateCheck: false,
@@ -54,7 +74,7 @@ async function world(opts: { updateRemote?: string; trusted?: string[] } = {}) {
     await pi.emit({ type: "agent_settled" });
     return b.values.at(-1);
   };
-  return { key, b, root, repo, ext, pi, host, settle };
+  return { key, b, root, repo, packageRoot, ext, pi, host, settle };
 }
 
 /** A fingerprint of everything an update must not touch before activation. */
@@ -265,4 +285,60 @@ test("security: untrusted source, argument-injection remote, malformed metadata,
   const foreign = await w4.ext.updates.check({});
   assert.match(foreign.failure ?? "", /does not belong to the trusted repository/);
   assert.equal(await w4.settle(), "A");
+});
+
+test("depth-1 install: identity comes from the running commit, so updates still work", async () => {
+  const w = await world({ shallow: true });
+  // The fixture really is shallow: what it can call its root is the boundary.
+  assert.equal(git(w.packageRoot, "rev-parse", "--is-shallow-repository"), "true");
+  const boundary = git(w.packageRoot, "rev-list", "--max-parents=0", "HEAD");
+  const root = git(w.repo.upstream, "rev-list", "--max-parents=0", "HEAD");
+  assert.notEqual(boundary, root);
+
+  w.repo.publish({ version: "0.3.0", value: "B" });
+  const check = await w.ext.updates.check({});
+  assert.equal(check.failure, undefined);
+  assert.equal(check.target?.metadata.version, "0.3.0");
+  assert.equal(check.upToDate, false);
+
+  const outcome = await update(w, "");
+  assert.equal(outcome?.status, "handover");
+  assert.equal(await w.settle(), "B");
+});
+
+test("depth-1 install still rejects a candidate from an unrelated history", async () => {
+  const w = await world({ shallow: true });
+  w.repo.publish({ version: "0.3.0", value: "B" });
+  // Identity resolves while the source still carries the installed commit.
+  assert.equal((await w.ext.updates.check({})).failure, undefined);
+
+  // Then the remote is taken over by an unrelated history.
+  publishUnrelatedHistory(w.repo, w.key, { version: "9.9.9", value: "EVIL" });
+  const foreign = await w.ext.updates.check({});
+  assert.match(foreign.failure ?? "", /does not belong to the trusted repository/);
+  const forced = await update(w, "");
+  assert.equal(forced?.status, "failed");
+  assert.equal(w.host.activeGeneration()?.generation, 1);
+  assert.equal(await w.settle(), "A");
+});
+
+test("depth-1 install of a commit the source does not have fails loudly, with the fix", async () => {
+  const w = await world({ shallow: true, localCommit: true });
+
+  const check = await w.ext.updates.check({});
+  assert.match(check.failure ?? "", /history is shallow/);
+  assert.match(check.failure ?? "", /identityRoots/);
+
+  // The refusal is reported, not swallowed: an update attempt says why.
+  const outcome = await update(w, "");
+  assert.equal(outcome?.status, "failed");
+  assert.match(outcome?.status === "failed" ? outcome.reason : "", /history is shallow/);
+  assert.equal(await w.settle(), "A");
+
+  // Recording the true root is the documented fix, and it works.
+  const root = git(w.repo.upstream, "rev-list", "--max-parents=0", "HEAD");
+  const prefs = readPreferences(w.ext.layout.preferencesFile);
+  await writePreferences(w.ext.layout.preferencesFile, { ...prefs, identityRoots: [root] });
+  w.repo.publish({ version: "0.3.0", value: "B" });
+  assert.equal((await w.ext.updates.check({})).failure, undefined);
 });

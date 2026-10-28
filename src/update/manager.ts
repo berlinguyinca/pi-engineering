@@ -97,10 +97,47 @@ export class UpdateManager {
     return readPreferences(this.deps.layout.preferencesFile);
   }
 
-  /** Repository identity: recorded roots, else the installing checkout's root commit. */
-  private async identityRoots(): Promise<string[]> {
+  /**
+   * Repository identity for the candidate check: recorded roots, else the
+   * installing checkout's root commit.
+   *
+   * A depth-1 install (how a release gets staged) has no root commit locally:
+   * `rev-list --max-parents=0` returns the shallow boundary, which is not the
+   * repository's identity, so every candidate is rejected forever and the check
+   * looks like "no updates". When the installed history is incomplete, the
+   * running commit's real roots are read from the trusted update source. If
+   * even that is impossible the reason is reported with its fix - never
+   * swallowed into an empty root list that silently disables the check.
+   */
+  private async identity(): Promise<{ roots: string[]; failure: string | null }> {
     const recorded = this.prefs().identityRoots;
-    if (recorded.length > 0) return recorded;
+    if (recorded.length > 0) return { roots: recorded, failure: null };
+    const local = await this.localRoots();
+    if (!(await this.shallowInstall())) return { roots: local, failure: null };
+    const running = this.deps.running()?.commit;
+    if (running) {
+      try {
+        const roots = await this.deps.cache.rootsOf(running);
+        if (roots.length > 0) return { roots, failure: null };
+      } catch {
+        // The running commit is not on the update source: reported below.
+      }
+    }
+    const boundary = local[0] ?? "unknown";
+    return {
+      roots: [],
+      failure: [
+        `installed runtime history is shallow (its oldest commit is ${boundary.slice(0, 12)}, not the repository root)`,
+        `and commit ${running ? running.slice(0, 12) : "unknown"} is not on the update source, so repository`,
+        `identity cannot be established. Fetch the full history of ${this.deps.packageRoot}, or record the`,
+        `repository root commit as identityRoots in ${this.deps.layout.preferencesFile}.`,
+      ].join(" "),
+    };
+  }
+
+  /** Root commits of the installing checkout, as far as its own history knows. */
+  private async localRoots(): Promise<string[]> {
+    if (!existsSync(join(this.deps.packageRoot, ".git"))) return [];
     try {
       return (
         await safeGitOrThrow(["rev-list", "--max-parents=0", "HEAD"], {
@@ -114,6 +151,21 @@ export class UpdateManager {
         .filter((s) => /^[0-9a-f]{40}$/.test(s));
     } catch {
       return [];
+    }
+  }
+
+  /** True when the installing checkout was fetched with incomplete history. */
+  private async shallowInstall(): Promise<boolean> {
+    if (!existsSync(join(this.deps.packageRoot, ".git"))) return false;
+    try {
+      const { stdout } = await safeGitOrThrow(["rev-parse", "--is-shallow-repository"], {
+        cwd: this.deps.packageRoot,
+        trust: "operator",
+        timeoutMs: 5000,
+      });
+      return stdout.trim() === "true";
+    } catch {
+      return false;
     }
   }
 
@@ -146,7 +198,9 @@ export class UpdateManager {
       const target = req.commit
         ? await this.deps.cache.resolveCommit(req.commit)
         : await this.deps.cache.resolveChannel(channel);
-      await this.deps.cache.verifyIdentity(target.sha, await this.identityRoots());
+      const identity = await this.identity();
+      if (identity.failure) throw new UpdateSourceError(identity.failure);
+      await this.deps.cache.verifyIdentity(target.sha, identity.roots);
       const metadata = parseCandidateMetadata(await this.deps.cache.readFile(target.sha, "package.json"), LEGACY_ENTRY);
       const pi = piCompatible(this.deps.piVersion, metadata.minimumPiVersion, metadata.maximumPiVersion);
       const stateDir = this.deps.stateDir();
@@ -242,7 +296,7 @@ export class UpdateManager {
               // Repository identity: recorded roots, else the installing
               // checkout's, else trust-on-first-use of the commit just
               // validated, so the check is never silently left off.
-              let roots = prefs.identityRoots.length > 0 ? prefs.identityRoots : await this.identityRoots();
+              let roots = prefs.identityRoots.length > 0 ? prefs.identityRoots : (await this.identity()).roots;
               if (roots.length === 0 && outcome.check.target) {
                 roots = await this.deps.cache.rootsOf(outcome.check.target.sha).catch(() => []);
               }
@@ -282,6 +336,11 @@ export class UpdateManager {
       runtime_api: target.metadata.runtimeApi,
     };
     telemetry.emit("runtime.update.started", fields);
+    const startedAt = Date.now();
+    const step = (line: string) => progress(`${line} (${((Date.now() - startedAt) / 1000).toFixed(1)}s)`);
+    progress(
+      `updating ${running?.version ?? "?"} → ${target.metadata.version} on ${fields.channel} (${target.sha.slice(0, 12)})`,
+    );
     let record = journal.begin({
       transaction,
       kind: "update",
@@ -296,7 +355,7 @@ export class UpdateManager {
       phase: "fetching",
     });
     telemetry.emit("runtime.update.fetched", fields);
-    progress("✓ downloaded");
+    step("✓ fetched");
 
     const staged = join(layout.stagingDir, `${transaction}`);
     record = journal.advance(record, "staging", { candidateRuntime: staged });
@@ -321,7 +380,7 @@ export class UpdateManager {
       stateSchema: target.metadata.stateSchema,
     });
     telemetry.emit("runtime.update.staged", fields);
-    progress("✓ staged");
+    step("✓ staged");
 
     if (!check.pi.ok) {
       const reason = `Pi Engineering ${target.metadata.version} requires a newer Pi runtime (${check.pi.reason}).\n\nCandidate downloaded but not activated.\nPi update/restart required.`;
@@ -355,10 +414,11 @@ export class UpdateManager {
       return { status: "failed", stage: "validate", reason, steps };
     }
     telemetry.emit("runtime.update.validated", fields);
-    progress("✓ validated");
-    progress("✓ compatible");
+    step("✓ validated");
+    step("✓ compatible");
 
     const versionDir = await layout.install(staged, id);
+    step("✓ installed; waiting for a safe point to activate");
     record = journal.advance(record, "validating", { candidateRuntime: versionDir });
     const { task, done } = await runActivation({
       host: this.deps.activation,

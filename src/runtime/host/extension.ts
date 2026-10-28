@@ -587,24 +587,55 @@ export class EngineeringHostExtension {
               ? { version: check.target.metadata.version, commit: check.target.sha, channel: check.channel }
               : null,
         }).catch(() => {});
+        const target = (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined;
+        if (check.failure) {
+          // A check that cannot run has to be seen: silently leaving automatic
+          // updates off is how a runtime goes stale without anyone noticing.
+          notify(target, `Pi Engineering update check failed: ${check.failure}`, "warning");
+        }
         if (check.target && !check.upToDate && !check.failure) {
-          const target = (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined;
           try {
             target?.ui?.setStatus?.(
-              "pi-engineering-update",
+              UPDATE_STATUS_KEY,
               `Pi Engineering ${check.current?.version ?? ""} · ${check.target.metadata.version} available`,
             );
           } catch {
             // A stale ctx cannot show a status; the panel still does.
           }
           if (prefs.autoInstall && check.pi.ok) {
-            const outcome = await this.updates.update({});
+            const to = check.target.metadata.version;
+            notify(
+              target,
+              `Pi Engineering ${check.current?.version ?? "?"} → ${to}: updating automatically (progress in the status line).`,
+            );
+            const outcome = await this.updates.update({}, updateProgressReporter(target?.ui));
             this.lastUpdateOutcome = outcome;
-            if (outcome.status === "handover") await outcome.done;
+            if (outcome.status === "handover") {
+              void outcome.done.then(({ result }) => {
+                clearUpdateStatus(target);
+                notify(
+                  target,
+                  result.ok
+                    ? `Pi Engineering ${to} activated.`
+                    : `Pi Engineering ${to} did not activate (${result.failure ?? result.phase}): the running runtime was not touched.`,
+                  result.ok ? "info" : "warning",
+                );
+              });
+              await outcome.done;
+            } else {
+              clearUpdateStatus(target);
+              notify(target, formatOutcome(outcome), "warning");
+            }
           }
         }
         return check;
-      } catch {
+      } catch (error) {
+        // Unexpected here means the operator gets no check at all: say so.
+        notify(
+          (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined,
+          `Pi Engineering update check failed: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
         return undefined;
       } finally {
         this.checking = undefined;
@@ -1101,15 +1132,31 @@ export class EngineeringHostExtension {
       return;
     }
     const progress: string[] = [];
-    const outcome = await this.updates.update(parsed.request, (line) => progress.push(line));
+    const report = updateProgressReporter(ctx.ui);
+    const outcome = await this.updates.update(parsed.request, (line) => {
+      progress.push(line);
+      report(line);
+    });
     this.lastUpdateOutcome = outcome;
-    if (outcome.status !== "handover") return notify(ctx, formatOutcome(outcome), "warning");
+    const steps = progress.length > 0 ? ["", ...progress] : [];
+    if (outcome.status !== "handover") {
+      clearUpdateStatus(ctx);
+      return notify(
+        ctx,
+        [...(movedLine ? [movedLine, ""] : []), ...steps, formatOutcome(outcome)].join("\n"),
+        "warning",
+      );
+    }
     const from = outcome.check.current?.version;
     const to = outcome.check.target?.metadata.version;
     const header = [`Pi Engineering ${from ?? "?"} → ${to ?? "?"}`, "", ...progress];
     const format = (r: HandoverResult) =>
       [...header, formatHandover(r, { from, to, action: "Updated" }).replace(/^Pi Engineering\n\n/, "")].join("\n");
-    void outcome.done.then(({ result: r }) => (r.ok ? this.retain().catch(() => {}) : undefined));
+    // The status line keeps saying what it is waiting for until activation ends.
+    void outcome.done.then(({ result: r }) => {
+      clearUpdateStatus(ctx);
+      if (r.ok) void this.retain().catch(() => {});
+    });
     const result = await this.awaitOrBackground(outcome.task, ctx, `Pi Engineering ${to} ready.`, format);
     if (result) {
       await outcome.done;
@@ -1415,6 +1462,34 @@ export function formatOutcome(o: Exclude<UpdateOutcome, { status: "handover" }>)
 
 function level(result: HandoverResult): string {
   return result.ok ? "info" : result.rolledBack || result.untouched ? "warning" : "error";
+}
+
+/** Status line key for live update progress (automatic check included). */
+const UPDATE_STATUS_KEY = "pi-engineering-update";
+
+/**
+ * Live update progress: every step the updater reports goes on the status line
+ * as it happens, so a fetch -> stage -> validate -> activate run that takes
+ * tens of seconds is visible while it runs instead of arriving only in the
+ * final message (or, for the automatic run, not at all).
+ */
+export function updateProgressReporter(ui: Ctx["ui"]): (line: string) => void {
+  return (line: string) => {
+    try {
+      ui?.setStatus?.(UPDATE_STATUS_KEY, `Pi Engineering update · ${line}`);
+    } catch {
+      // A stale ctx cannot show a status; the final notification still says it.
+    }
+  };
+}
+
+/** Take the update status line back once a run is over. */
+export function clearUpdateStatus(ctx: Ctx | undefined): void {
+  try {
+    ctx?.ui?.setStatus?.(UPDATE_STATUS_KEY, undefined);
+  } catch {
+    // A stale ctx cannot clear a status.
+  }
 }
 
 export function notify(ctx: Ctx | undefined, text: string, lvl = "info"): void {
