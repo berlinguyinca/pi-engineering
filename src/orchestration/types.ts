@@ -520,7 +520,16 @@ export type FailureCategory =
   | "REQUIREMENT_AMBIGUITY"
   | "ORPHANED_EXECUTION"
   | "DEADLOCKED_DAG"
-  | "PERSISTENCE_FAILURE";
+  | "PERSISTENCE_FAILURE"
+  /**
+   * (#416) Work interrupted by the disk-pressure suspend: the task was running
+   * when `StoragePressureController` parked the runtime in
+   * `WAITING_FOR_DISK_SPACE`. Recovery reasons deterministically about it
+   * (resume from the last checkpoint) instead of generically, and it is a
+   * capacity wait — never terminal by count, so a disk outage cannot burn the
+   * strategy budget the way an ordinary failure does.
+   */
+  | "DISK_SUSPENDED";
 
 /** Stable, machine-readable diagnosis of one failure. */
 export interface FailureClassification {
@@ -535,6 +544,23 @@ export interface FailureClassification {
   classifiedAt: string;
   /** Durable BLOCKED episode this failure belongs to when one already exists. */
   blockerEpisodeId?: EntityId;
+}
+
+/**
+ * (#416) One disk-pressure suspend episode: which tasks were RUNNING when the
+ * storage guard parked the runtime, so their later failures classify as
+ * `DISK_SUSPENDED` (checkpoint-resume, capacity-wait budget) instead of
+ * generic noise, and the resolution of the episode is durable across restarts.
+ */
+export interface DiskSuspendEpisode {
+  episodeId: EntityId;
+  missionId: EntityId;
+  /** Mount/path the incident was reported against, when known. */
+  incidentPath?: string;
+  /** Tasks RUNNING at suspend time. */
+  taskIds: string[];
+  markedAt: string;
+  resolvedAt: string | null;
 }
 
 export type RecoveryAction =

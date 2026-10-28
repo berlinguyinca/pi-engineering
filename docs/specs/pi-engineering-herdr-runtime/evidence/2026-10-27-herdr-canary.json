@@ -1,0 +1,108 @@
+{
+  "date": "2026-10-27",
+  "serverVersion": "0.9.1",
+  "protocol": 22,
+  "session": "pi-herdr-validation-xu2jbd3c",
+  "profile": "private disposable profile; credentials excluded",
+  "toolsEnabled": false,
+  "extensionsEnabled": false,
+  "inferenceCalls": 5,
+  "workers": [
+    {
+      "name": "planner",
+      "role": "planner",
+      "runtimeId": "HERD-Qsd8gw",
+      "worktree": "/tmp/pi-herdr-validation-xu2jbd3c/worktrees/repo/worktree-quiet-meadow-82ad",
+      "status": "COMPLETED",
+      "provider": "metabolomics",
+      "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+      "stopReason": "stop",
+      "inputTokens": 562,
+      "outputTokens": 99,
+      "cacheReadTokens": 1,
+      "response": {
+        "kind": "plan",
+        "steps": ["engineerA", "engineerB", "tester", "reviewer"],
+        "checksum": 28
+      }
+    },
+    {
+      "name": "engineer-a",
+      "role": "implementer",
+      "runtimeId": "HERD-PfcWs0",
+      "worktree": "/tmp/pi-herdr-validation-xu2jbd3c/worktrees/repo/worktree-rapid-harbor-3f26",
+      "status": "COMPLETED",
+      "provider": "metabolomics",
+      "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+      "stopReason": "stop",
+      "inputTokens": 516,
+      "outputTokens": 115,
+      "cacheReadTokens": 47,
+      "response": {
+        "kind": "engineer-a",
+        "code": "function add(a,b){return a+b;}",
+        "checksum": 42
+      }
+    },
+    {
+      "name": "engineer-b",
+      "role": "implementer",
+      "runtimeId": "HERD-CbU7uA",
+      "worktree": "/tmp/pi-herdr-validation-xu2jbd3c/worktrees/repo/worktree-lucky-field-4854",
+      "status": "COMPLETED",
+      "provider": "metabolomics",
+      "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+      "stopReason": "stop",
+      "inputTokens": 513,
+      "outputTokens": 84,
+      "cacheReadTokens": 47,
+      "response": {
+        "kind": "engineer-b",
+        "code": "function subtract(a,b){return a-b;}",
+        "checksum": 48
+      }
+    },
+    {
+      "name": "tester",
+      "role": "test-generator",
+      "runtimeId": "HERD-vRNnQC",
+      "worktree": "/tmp/pi-herdr-validation-xu2jbd3c/worktrees/repo/worktree-green-forest-215b",
+      "status": "COMPLETED",
+      "provider": "metabolomics",
+      "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+      "stopReason": "stop",
+      "inputTokens": 563,
+      "outputTokens": 146,
+      "cacheReadTokens": 47,
+      "response": {
+        "kind": "test",
+        "sum": 5,
+        "difference": 5,
+        "pass": true
+      }
+    },
+    {
+      "name": "reviewer",
+      "role": "reviewer",
+      "runtimeId": "HERD-CIdJZE",
+      "worktree": "/tmp/pi-herdr-validation-xu2jbd3c/worktrees/repo/worktree-lucky-forest-c09c",
+      "status": "COMPLETED",
+      "provider": "metabolomics",
+      "model": "deepseek_v4-flash-modality-text-quant-mxfp4",
+      "stopReason": "stop",
+      "inputTokens": 531,
+      "outputTokens": 150,
+      "cacheReadTokens": 94,
+      "response": {
+        "kind": "review",
+        "verdict": "approve",
+        "reviewed": ["engineer-a.json", "engineer-b.json", "tester.json"]
+      }
+    }
+  ],
+  "limitations": [
+    "Arithmetic micro-canary with tools disabled; model-produced artifacts materialized by the harness, not worker Git edits.",
+    "Adapter completion summaries are synthesized; response proof comes from persisted assistant messages matched to each owned worktree.",
+    "No server-restart reconciliation or production migration/default changes were exercised."
+  ]
+}

@@ -178,3 +178,74 @@ test("mission tool resume reaches EngineeringRuntime.resumeBlockedMission instea
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("#427 mission tool answers from durable replay instead of Unknown mission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-mission-tool-durable-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const { tools } = loadHarness();
+    const mission = tools.get("mission");
+    assert.ok(mission, "the mission tool is registered");
+
+    // A mission written to the durable namespace but unknown to this live
+    // session's in-memory registry — the #427 amnesia shape.
+    const { MissionStore } = await import("../../src/orchestration/missionStore.ts");
+    const { SessionEventStore } = await import("../../src/runtime/isolation/SessionEventStore.ts");
+    const { resolveWorktreeIdentity } = await import("../../src/runtime/isolation/WorktreeIdentity.ts");
+    const { resolveStateRoot, worktreeRuntimeDir } = await import("../../src/runtime/isolation/stateDir.ts");
+    const identity = await resolveWorktreeIdentity(root);
+    const eventsDir = join(worktreeRuntimeDir(resolveStateRoot(process.env), identity.worktreeId), "events");
+    const other = SessionEventStore.open({
+      eventsDir,
+      sessionId: "other-session-427",
+      worktreeId: identity.worktreeId,
+    });
+    const otherStore = MissionStore.open(other);
+    otherStore.createMission({
+      mission_id: "MSN-427durable",
+      title: "written by another session",
+      goal: "durable only",
+      user_request: "durable only",
+      repository: root,
+      base_ref: "main",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    await otherStore.flush();
+    other.close();
+
+    const status = await mission.execute(
+      "call-9",
+      { action: "status", missionId: "MSN-427durable" },
+      undefined,
+      undefined,
+      context(root),
+    );
+    const statusText = status.content.map((part) => part.text).join("\n");
+    assert.doesNotMatch(statusText, /Unknown mission/, "a durable-known mission is never reported Unknown");
+    assert.match(statusText, /MSN-427durable/);
+
+    const unknown = await mission.execute(
+      "call-10",
+      { action: "status", missionId: "MSN-never-existed" },
+      undefined,
+      undefined,
+      context(root),
+    );
+    assert.match(
+      unknown.content.map((part) => part.text).join("\n"),
+      /Unknown mission MSN-never-existed/,
+      "the truly unknown stays Unknown",
+    );
+
+    await runtime.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

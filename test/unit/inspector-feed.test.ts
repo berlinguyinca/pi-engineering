@@ -7,18 +7,22 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { ControlPlaneIngest } from "../../src/runtime/herdr/ControlPlaneIngest.ts";
+import { loadHostConfig } from "../../src/runtime/herdr/HostConfig.ts";
 import {
   INSPECTOR_LIMITS,
   type InspectorEvent,
   type InspectorFeedHandle,
   type InspectorFeedOptions,
   attachInspectorFeed,
-  attachInspectorFeedFromEnv,
+  attachInspectorFeedFromHost,
   headTail,
-  inspectorConfigFromEnv,
+  inspectorConfigFromHost,
   isSensitivePath,
   parseTestOutput,
 } from "../../src/runtime/herdr/InspectorFeed.ts";
@@ -105,53 +109,215 @@ function toolRun(pi: FakePi, id: string, tool: string, args: any, result: string
   });
 }
 
-test("off by default: env without both HERDR_CP_URL and PI_INSPECTOR_FEED=1 attaches nothing and sends nothing", async () => {
-  for (const env of [
+// ── central host config wiring ──
+
+function hostHome(values: object | null): {
+  home: string;
+  fetch: typeof fetch;
+  ingest: Array<{ url: string; headers: any; body: any }>;
+} {
+  const home = mkdtempSync(join(tmpdir(), "inspcfg-"));
+  mkdirSync(join(home, ".config", "herdr-engineering"), { recursive: true });
+  writeFileSync(
+    join(home, ".config", "herdr-engineering", "host.json"),
+    JSON.stringify({ control_plane_url: "http://cp.lan/", host_id: "h1", token: "tok" }),
+  );
+  const ingest: Array<{ url: string; headers: any; body: any }> = [];
+  const f = (async (url: string, init: RequestInit) => {
+    if (url.endsWith("/api/v1/fleet/config"))
+      return new Response(JSON.stringify({ revision: "r1", values: values ?? {} }));
+    if (url.endsWith("/applied")) return new Response("{}");
+    ingest.push({ url, headers: init.headers, body: JSON.parse(String(init.body)) });
+    return new Response("{}");
+  }) as unknown as typeof fetch;
+  return { home, fetch: f, ingest };
+}
+
+test("config enables the feed with NO env vars; URL and key come from the host config; posts inspector.batch", async () => {
+  const h = hostHome({ inspector: { enabled: true }, ingest: { api_key: "ing-key" } });
+  const pi = new FakePi();
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+    env: { HERDR_PANE_ID: "pane-env" },
+  });
+  assert.ok(handle);
+  pi.fire("session_start", { reason: "startup" });
+  await drain(handle);
+  const posts = h.ingest.filter((i: any) => i.body.entity_type === "inspector");
+  assert.equal(posts[0]?.url, "http://cp.lan/api/v1/ingest");
+  assert.equal(posts[0]?.headers["x-api-key"], "ing-key");
+  assert.equal(posts[0]?.body.entity_type, "inspector");
+  assert.equal(posts[0]?.body.entity_id, "pane-env");
+  assert.equal(posts[0]?.body.event_type, "inspector.batch");
+  // the runtime report rides the same ingest as a session record, not as an inspector batch
+  const runtime = h.ingest.find((i: any) => i.body.entity_type === "session");
+  assert.equal(runtime?.body.entity_id, "pane-env");
+  assert.equal(runtime?.body.payload.runtime.runtime_kind, "standard-pi");
+  handle.dispose();
+});
+
+test("disposing a host-configured inspector stops its periodic runtime reporter", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = hostHome({ inspector: { enabled: true } });
+  const pi = new FakePi();
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+    env: { HERDR_PANE_ID: "disposed-runtime-reporter" },
+  });
+  assert.ok(handle);
+  const reports = () => h.ingest.filter((row) => row.body.entity_type === "session").length;
+  await tick();
+  assert.equal(reports(), 1);
+  t.mock.timers.tick(60_000);
+  await tick();
+  assert.equal(reports(), 2, "periodic reporting is active before disposal");
+  handle.dispose();
+  t.mock.timers.tick(120_000);
+  await tick();
+  assert.equal(reports(), 2, "the returned handle must own and stop its reporter");
+});
+
+test("normal shutdown still emits ended and stops an attached runtime reporter", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const h = hostHome({ inspector: { enabled: true } });
+  const pi = new FakePi();
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+    env: { HERDR_PANE_ID: "normal-shutdown-runtime-reporter" },
+  });
+  assert.ok(handle);
+  try {
+    pi.fire("session_start", { reason: "startup" });
+    await drain(handle);
+    pi.fire("session_shutdown");
+    await drain(handle);
+    const phases = h.ingest
+      .flatMap((row) => row.body.payload?.events ?? [])
+      .filter((event) => event.kind === "lifecycle")
+      .map((event) => event.phase);
+    assert.deepEqual(phases, ["started", "ended"]);
+    const reports = () => h.ingest.filter((row) => row.body.entity_type === "session").length;
+    const before = reports();
+    t.mock.timers.tick(120_000);
+    await tick();
+    assert.equal(reports(), before);
+  } finally {
+    handle.dispose();
+  }
+});
+
+test("stays off when inspector.enabled is false, absent, or not boolean true", async () => {
+  for (const values of [
+    { inspector: { enabled: false } },
     {},
-    { HERDR_CP_URL: "http://cp" },
-    { PI_INSPECTOR_FEED: "1" },
-    { HERDR_CP_URL: "http://cp", PI_INSPECTOR_FEED: "0" },
+    { inspector: { reasoning: "full" } },
+    { inspector: { enabled: "true" } },
+    { inspector: { enabled: 1 } },
   ]) {
+    const h = hostHome(values);
     const pi = new FakePi();
-    let fetched = 0;
-    const handle = attachInspectorFeedFromEnv(pi as never, env, {
-      fetch: (async () => {
-        fetched++;
-        return new Response("{}");
-      }) as typeof fetch,
+    const handle = await attachInspectorFeedFromHost(pi as never, {
+      hostConfig: { home: h.home, fetch: h.fetch },
+      fetch: h.fetch,
     });
     assert.equal(handle, null);
     assert.equal(pi.handlers.size, 0, "no handlers subscribed");
     assert.equal(pi.bus.size, 0);
     await tick();
-    assert.equal(fetched, 0);
+    assert.equal(h.ingest.length, 0);
   }
-  assert.equal(inspectorConfigFromEnv({ HERDR_CP_URL: "http://cp", PI_INSPECTOR_FEED: "1" }).enabled, true);
-  assert.equal(inspectorConfigFromEnv({}).reasoning, "off");
 });
 
-test("env wiring posts inspector.batch through the existing ControlPlaneIngest envelope", async () => {
+test("reasoning comes from inspector.reasoning (off|summary|full, default off)", async () => {
+  const cfgFor = async (inspector: object) => {
+    const h = hostHome({ inspector });
+    return inspectorConfigFromHost(await loadHostConfig({ home: h.home, fetch: h.fetch }));
+  };
+  assert.equal((await cfgFor({ enabled: true })).reasoning, "off");
+  assert.equal((await cfgFor({ enabled: true, reasoning: "summary" })).reasoning, "summary");
+  assert.equal((await cfgFor({ enabled: true, reasoning: "full" })).reasoning, "full");
+  assert.equal((await cfgFor({ enabled: true, reasoning: "bogus" })).reasoning, "off");
+  const on = await cfgFor({ enabled: true });
+  assert.equal(on.enabled, true);
+  assert.equal(on.url, "http://cp.lan");
+  assert.equal((await cfgFor({ enabled: false })).enabled, false);
+});
+
+test("agent.api_key is preferred over ingest.api_key for the feed", async () => {
+  const h = hostHome({ inspector: { enabled: true }, agent: { api_key: "agent-key" }, ingest: { api_key: "ing-key" } });
   const pi = new FakePi();
-  const calls: Array<{ url: string; body: any }> = [];
-  const handle = attachInspectorFeedFromEnv(
-    pi as never,
-    { HERDR_CP_URL: "http://cp.lan/", PI_INSPECTOR_FEED: "1", HERDR_PANE_ID: "pane-env" },
-    {
-      fetch: (async (url: string, init: RequestInit) => {
-        calls.push({ url, body: JSON.parse(String(init.body)) });
-        return new Response("{}");
-      }) as typeof fetch,
-    },
-  );
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+  });
   assert.ok(handle);
   pi.fire("session_start", { reason: "startup" });
   await drain(handle);
-  assert.equal(calls[0]?.url, "http://cp.lan/api/v1/ingest");
-  assert.equal(calls[0]?.body.entity_type, "inspector");
-  assert.equal(calls[0]?.body.entity_id, "pane-env", "HERDR_PANE_ID is the session entity id");
-  assert.equal(calls[0]?.body.event_type, "inspector.batch");
-  assert.ok(Array.isArray(calls[0]?.body.payload.events));
+  assert.equal(h.ingest[0]?.headers["x-api-key"], "agent-key");
   handle.dispose();
+});
+
+test("an empty api key in the host config sends NO x-api-key header to ingest", async () => {
+  const h = hostHome({ inspector: { enabled: true }, agent: { api_key: "" }, ingest: { api_key: "" } });
+  const pi = new FakePi();
+  const handle = await attachInspectorFeedFromHost(pi as never, {
+    hostConfig: { home: h.home, fetch: h.fetch },
+    fetch: h.fetch,
+  });
+  assert.ok(handle);
+  pi.fire("session_start", { reason: "startup" });
+  await drain(handle);
+  assert.ok(h.ingest.length > 0);
+  assert.ok(!Object.keys(h.ingest[0]!.headers).some((k) => k.toLowerCase() === "x-api-key"));
+  handle.dispose();
+});
+
+test("legacy env vars have NO effect: PI_INSPECTOR_FEED / HERDR_CP_URL / PI_INSPECTOR_REASONING / HERDR_CP_API_KEY", async () => {
+  const saved = { ...process.env };
+  process.env.PI_INSPECTOR_FEED = "1";
+  process.env.HERDR_CP_URL = "http://legacy.example";
+  process.env.PI_INSPECTOR_REASONING = "full";
+  process.env.HERDR_CP_API_KEY = "legacy-key";
+  try {
+    // config disabled -> off despite env
+    const off = hostHome({ inspector: { enabled: false } });
+    const pi = new FakePi();
+    assert.equal(
+      await attachInspectorFeedFromHost(pi as never, {
+        hostConfig: { home: off.home, fetch: off.fetch },
+        fetch: off.fetch,
+      }),
+      null,
+    );
+    assert.equal(pi.handlers.size, 0);
+    // config enabled -> host URL/key/reasoning, never the env ones
+    const on = hostHome({ inspector: { enabled: true }, ingest: { api_key: "ing-key" } });
+    const pi2 = new FakePi();
+    const handle = await attachInspectorFeedFromHost(pi2 as never, {
+      hostConfig: { home: on.home, fetch: on.fetch },
+      fetch: on.fetch,
+    });
+    assert.ok(handle);
+    pi2.fire("session_start", { reason: "startup" });
+    await drain(handle);
+    assert.equal(on.ingest[0]?.url, "http://cp.lan/api/v1/ingest");
+    assert.equal(on.ingest[0]?.headers["x-api-key"], "ing-key");
+    handle.dispose();
+    // no host.json at all -> unavailable despite env
+    const empty = mkdtempSync(join(tmpdir(), "inspcfg-"));
+    await assert.rejects(
+      attachInspectorFeedFromHost(new FakePi() as never, { hostConfig: { home: empty, fetch: on.fetch } }),
+      /host config unavailable/,
+    );
+  } finally {
+    for (const k of ["PI_INSPECTOR_FEED", "HERDR_CP_URL", "PI_INSPECTOR_REASONING", "HERDR_CP_API_KEY"]) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
 });
 
 test("ControlPlaneIngest.emitBatch is best-effort: fetch failure resolves false, never throws", async () => {
@@ -185,10 +351,11 @@ test("lifecycle + capabilities + association on start; resumed session is restor
 
   // Same process starting the same id again without resume is a restart, not a fresh start.
   const c = setup({ sessionId: undefined });
-  c.pi.fire("session_start", { reason: "startup" }, CTX);
-  c.pi.fire("session_start", { reason: "reload" }, CTX);
+  const ctx = { ...CTX, sessionManager: { getSessionId: () => "lifecycle-pi-session" } };
+  c.pi.fire("session_start", { reason: "startup" }, ctx);
+  c.pi.fire("session_start", { reason: "reload" }, ctx);
   await drain(c.handle);
-  assert.equal(c.sink.batches[0]?.id, "pi-session-1", "falls back to Pi's session id without HERDR_PANE_ID");
+  assert.equal(c.sink.batches[0]?.id, "lifecycle-pi-session", "falls back to Pi's session id without HERDR_PANE_ID");
   assert.deepEqual(
     c.sink.kind("lifecycle").map((e) => e.phase),
     ["started", "restarted"],
@@ -586,7 +753,7 @@ test("micro-benchmark: 10k tool updates are processed well under a second", () =
   handle.dispose();
 });
 
-test("HERDR_CP_API_KEY is sent as X-API-Key and never otherwise", async () => {
+test("an ingest apiKey is sent as X-API-Key and never otherwise", async () => {
   const seen: Array<Record<string, string>> = [];
   const fetchStub = (async (_url: unknown, init: { headers: Record<string, string> }) => {
     seen.push(init.headers);

@@ -15,6 +15,7 @@ const TERMINAL = new Set(["COMPLETE", "FAILED", "CANCELED"]);
 /** Task statuses that occupy no worker and can never become runnable again. */
 const TERMINAL_TASK_STATUSES = new Set(["SUCCEEDED", "FAILED", "SKIPPED", "CANCELED"]);
 const WAIT_ACTIONS = new Set(["WAIT_FOR_REQUIREMENT", "PROBE_AND_BACKOFF", "PAUSE_FOR_PERSISTENCE"]);
+const FINISHING_PHASES: ReadonlySet<string> = new Set(["VALIDATING", "REVIEWING", "INTEGRATING", "FINAL_VALIDATION"]);
 
 /**
  * `PLANNING_EMPTY`: the planner produced no executable work, so only the
@@ -74,6 +75,8 @@ export interface MissionSupervisorOptions {
   admit?: (mission: Mission) => boolean | Promise<boolean>;
   /** Whether the planner is running for a mission right now (no tasks yet is then expected). */
   planningInFlight?: (missionId: string) => boolean;
+  /** Whether a controller in this process is driving the mission right now (it is then not orphaned). */
+  runInFlight?: (missionId: string) => boolean;
 }
 
 export interface SupervisorDiagnostic {
@@ -118,6 +121,7 @@ export class MissionSupervisor {
   private readonly beforeTick?: () => void | Promise<void>;
   private readonly admit?: (mission: Mission) => boolean | Promise<boolean>;
   private readonly planningInFlight?: (missionId: string) => boolean;
+  private readonly runInFlight?: (missionId: string) => boolean;
   private readonly supervisorDiagnostics: SupervisorDiagnostic[] = [];
   private timer?: ReturnType<typeof setInterval>;
   private readonly missionTicks = new Map<string, Promise<SupervisorStatus>>();
@@ -137,6 +141,7 @@ export class MissionSupervisor {
     this.beforeTick = options.beforeTick;
     this.admit = options.admit;
     this.planningInFlight = options.planningInFlight;
+    this.runInFlight = options.runInFlight;
     if (!Number.isFinite(this.intervalMs) || this.intervalMs <= 0) {
       throw new Error("MissionSupervisor intervalMs must be positive");
     }
@@ -264,17 +269,16 @@ export class MissionSupervisor {
       return this.statusForStop(mission, currentStop.reason, currentStop.resumeCondition, expectedResumptionGeneration);
     }
 
-    const scheduledWait = this.currentWait(mission.mission_id);
-    if (
-      scheduledWait &&
-      scheduledWait.action !== "WAIT_FOR_REQUIREMENT" &&
-      this.now() >= Date.parse(scheduledWait.nextActionAt)
-    ) {
-      return this.status(mission, "HEALTHY", scheduledWait.expectedMaterialChange, undefined, scheduledWait);
-    }
-
     const diagnosis = this.diagnose(mission);
     if (!diagnosis) {
+      const scheduledWait = this.currentWait(mission.mission_id);
+      if (
+        scheduledWait &&
+        scheduledWait.action !== "WAIT_FOR_REQUIREMENT" &&
+        this.now() >= Date.parse(scheduledWait.nextActionAt)
+      ) {
+        return this.status(mission, "HEALTHY", scheduledWait.expectedMaterialChange, undefined, scheduledWait);
+      }
       this.assertResumptionGeneration(mission.mission_id, expectedResumptionGeneration);
       const wait = this.currentWait(mission.mission_id);
       const healthy = this.status(mission, "HEALTHY", "Mission has current ownership or a named future wait");
@@ -445,9 +449,11 @@ export class MissionSupervisor {
         reason: `Named wait ${wait.action} expired at ${wait.deadline}`,
       };
     }
-    if (wait) return null;
-    const projectedHealth = this.observability?.summary(mission.mission_id)?.health;
-    if (projectedHealth === "stalled") {
+    const projection = this.observability?.projection(mission.mission_id);
+    const stalledWorker = projection?.workers.find(
+      (worker) => worker.state === "running" && worker.health === "stalled",
+    );
+    if (stalledWorker || projection?.summary.health === "stalled") {
       // Debounce: only classify after the STALLED projection persists across
       // consecutive supervisor evaluations. A single stale tick (e.g. a worker
       // between tool calls) must not fence a live worker. A genuinely dead
@@ -459,11 +465,14 @@ export class MissionSupervisor {
           health: "STALLED",
           category: "ORPHANED_EXECUTION",
           reason: "Worker heartbeat is live but meaningful progress exceeded the stall threshold",
+          task: stalledWorker?.taskId ? this.store.getTask(stalledWorker.taskId) : undefined,
         };
       }
       return null;
     }
     this.stalledProjections.delete(mission.mission_id);
+    // A wait protects its own condition, not independently running workers.
+    if (wait) return null;
     const tasks = this.store.listTasks(mission.mission_id);
     const activeExecution = this.store
       .listExecutions(mission.mission_id)
@@ -488,6 +497,12 @@ export class MissionSupervisor {
         ["PENDING", "READY", "WAITING", "BLOCKED", "RETRYING"].includes(task.status) &&
         task.depends_on.some((dependency) => !dependencySatisfied(dependency)),
     );
+    // A dependency that is RUNNING is in flight, not stuck: its execution row settles before its task row does (result
+    // capture and the change observer run git in between), so a tick landing there sees no live execution. Judging
+    // that a deadlock BLOCKED healthy missions; a dead controller is still caught by its lease.
+    const waitsOnRunning =
+      unresolved?.depends_on.some((dependency) => this.store.getTask(dependency)?.status === "RUNNING") ?? false;
+    if (!activeExecution && unresolved && !runnable && waitsOnRunning) return null;
     if (!activeExecution && unresolved && !runnable) {
       return {
         health: "DEADLOCKED",
@@ -524,17 +539,35 @@ export class MissionSupervisor {
       // Requeue through the existing supersession/repair machinery: naming the
       // failed task makes the repair plan create one bounded replacement for it
       // instead of declaring an ownerless mission and stopping.
+      const reason = `Task ${failed.task_id} (${failed.kind}:${failed.role}) failed and no task is runnable: ${taskFailureReason(
+        failed,
+        this.store.listExecutions(mission.mission_id, failed.task_id),
+        this.store.listFailureClassifications(mission.mission_id),
+      )}`;
+      // A failed worker task is an implementation defect only when its failure
+      // matches NO known provider/infrastructure signature. A blanket
+      // IMPLEMENTATION_DEFECT used to swallow a gateway capacity 400 (the
+      // `inferweave_backpressure` envelope) and turn it into a CREATE_REPAIR_TASKS
+      // loop that burned the repair budget re-issuing the same doomed request;
+      // capacity, network and credential failures route to their own recoveries
+      // (wait, stop) instead. Only an unrecognised failure stays a defect.
+      const inferred = this.classifier.inferRecognizedCategory({
+        missionId: mission.mission_id,
+        taskId: failed.task_id,
+        executionId: null,
+        summary: reason,
+      });
       return {
         health: "REPAIR_REQUIRED",
-        category: "IMPLEMENTATION_DEFECT",
-        reason: `Task ${failed.task_id} (${failed.kind}:${failed.role}) failed and no task is runnable: ${taskFailureReason(
-          failed,
-          this.store.listExecutions(mission.mission_id, failed.task_id),
-          this.store.listFailureClassifications(mission.mission_id),
-        )}`,
+        category: inferred ?? "IMPLEMENTATION_DEFECT",
+        reason,
         task: failed,
       };
     }
+    // Every task is finished and the live controller is between the worker and the next gate (integration, validation,
+    // review): git and verification run there with no execution row, and the slower they are the longer a tick can land
+    // in that window. A controller that is running this mission is not an orphan.
+    if (FINISHING_PHASES.has(mission.status) && this.runInFlight?.(mission.mission_id)) return null;
     return {
       health: "ORPHANED",
       category: "ORPHANED_EXECUTION",

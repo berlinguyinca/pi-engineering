@@ -7,6 +7,7 @@ import {
   DEFAULT_STRATEGY_MAX_ATTEMPTS,
   FailureClassifier,
   type FailureEvidence,
+  NO_CHANGE_LOOP_PREVENTED_MARKER,
   RecoveryPlanner,
   failureFingerprint,
   replacementRecoveryFingerprint,
@@ -44,6 +45,12 @@ describe("FailureClassifier", () => {
     ["merge conflict in candidate", {}, "MERGE_CONFLICT", "REBUILD_INTEGRATION_CANDIDATE"],
     ["authorization or credential required", {}, "AUTHORIZATION_OR_CREDENTIAL", "STOP"],
     ["requirement is ambiguous", {}, "REQUIREMENT_AMBIGUITY", "WAIT_FOR_REQUIREMENT"],
+    [
+      `Agent loop prevented after 0 identical no-progress turns (agent.loop_prevented). — ${NO_CHANGE_LOOP_PREVENTED_MARKER}: a mutating implementer was prevented from making progress and produced no changes vs base; an operator must decide whether the objective is already met or needs a different approach.`,
+      {},
+      "REQUIREMENT_AMBIGUITY",
+      "WAIT_FOR_REQUIREMENT",
+    ],
     ["orphaned execution has no owner", {}, "ORPHANED_EXECUTION", "FENCE_RECONCILE_AND_RESUME"],
     ["dependency graph is deadlocked", {}, "DEADLOCKED_DAG", "REPAIR_BLOCKED_MISSION"],
     ["durable persistence write failed", {}, "PERSISTENCE_FAILURE", "PAUSE_FOR_PERSISTENCE"],
@@ -103,6 +110,44 @@ describe("FailureClassifier", () => {
       assert.equal(classifier.classify(baseEvidence(summary)).category, "PROVIDER_TRANSIENT", summary);
       assert.equal(RecoveryPlanner.defaultAction("PROVIDER_TRANSIENT"), "PROBE_AND_BACKOFF");
     }
+  });
+
+  it("classifies a 400 backpressure/capacity envelope as transient, never a defect (MSN-MypLoa)", () => {
+    const classifier = new FailureClassifier();
+    // The exact shape the InferWeave edge emitted when saturated: HTTP 400 with a
+    // `fix_request`/`upstream_error` envelope typed `inferweave_backpressure`.
+    const liveEnvelope =
+      'backend reported failed: Model gateway refused the request after 0 honoured wait(s): 400: {"action":"fix_request","action_code":"IW-ACT-FIX-REQUEST","code":"upstream_error","message":"Correct the request syntax, parameters, endpoint, or model identity.","reason":"upstream_error","replay_safe":false,"request_state":"unknown","retryable":false,"scope":"request","type":"inferweave_backpressure"}';
+    assert.equal(
+      classifier.inferRecognizedCategory({ missionId: "M", summary: liveEnvelope }),
+      "PROVIDER_TRANSIENT",
+      "the backpressure type tag wins over the 400 status",
+    );
+    // The model-switch announcement wording (MSN-U1iY7E) is the same class.
+    assert.equal(
+      classifier.inferRecognizedCategory({
+        missionId: "M",
+        summary:
+          "model development/qwen3.8 has no capacity right now — switched implementer to metabolomics/qwen3.8-27b",
+      }),
+      "PROVIDER_TRANSIENT",
+    );
+    for (const summary of [
+      "gateway capacity hold: waiting for a free worker",
+      "model is overloaded; try again later",
+      "inference backpressure: queue full",
+    ]) {
+      assert.equal(classifier.inferRecognizedCategory({ missionId: "M", summary }), "PROVIDER_TRANSIENT", summary);
+    }
+    // A genuine bad request with no capacity signature is still permanent:
+    // the 400 status decides when no backpressure wording is present.
+    assert.equal(
+      classifier.classify({
+        ...baseEvidence("Model gateway refused the request: 400: bad request"),
+        providerStatus: 400,
+      }).category,
+      "PROVIDER_PERMANENT",
+    );
   });
 
   it("never lets a caller-supplied category mask a lost execution lease", () => {

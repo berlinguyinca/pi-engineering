@@ -4,7 +4,7 @@ Two independent, optional, off-by-default features. Core Pi Engineering requires
 
 ## 1. split-view (vendored)
 
-Upstream: https://github.com/Hugo-W/pi-split-view (MIT), vendored unmodified at commit `6b6b98a`
+Upstream: https://github.com/Hugo-W/pi-split-view (MIT), vendored at commit `6b6b98a` with local reliability fixes
 in `extensions/split-view/` (see `extensions/split-view/VENDORED.md` for provenance, audit, update procedure).
 
 **Install**: nothing to do. `package.json` `pi.extensions` lists it after the main entry:
@@ -30,6 +30,11 @@ registers no shortcuts).
 `pi --no-split` starts bare even if `ui-panels.json` enables panels. The thinking panel displays
 reasoning text in your local terminal only; it is not sent anywhere.
 
+Response-only mode (`/split-trim-response on`) keeps the newest 200 visible messages;
+the native transcript retains the complete history. Its duplicate response components
+are created only while that mode is active and released when it is disabled. The files
+panel tracks explicit tool paths; it does not guess file paths from shell-command words.
+
 **Conflicts**: none with pi-engineering commands; no shortcuts; no `setFooter`/`setStatus`; widget key `split-view`
 (only used once enabled). Checked by `test/unit/split-view-vendor.test.ts`.
 
@@ -44,22 +49,33 @@ view can show what an agent is doing. Wire contract (authoritative, owned by the
 
 It reuses `src/runtime/herdr/ControlPlaneIngest.ts` (one added method, `emitBatch`, which is
 `emit("inspector", sessionId, "inspector.batch", {events})`); there is no second HTTP client. Implementation:
-`src/runtime/herdr/InspectorFeed.ts`; wired in `extensions/index.ts` via `attachInspectorFeedFromEnv`.
+`src/runtime/herdr/InspectorFeed.ts`; wired in `extensions/index.ts` via `attachInspectorWhenReady` (`src/runtime/herdr/attachInspector.ts`).
 (`ControlPlaneIngest` is not constructed anywhere else in production today, so the feed builds its own
-instance from the URL.)
+instance from the central config's URL.)
 
-**Enable** (both are required; otherwise no handler is registered and nothing is sent):
+**Enable**: centrally, per host. The feed is configured by the fleet's central configuration, not by
+environment variables. `herdr-eng fleet join` writes `~/.config/herdr-engineering/host.json`
+(`control_plane_url`, `host_id`, `token`); Pi fetches `GET {control_plane_url}/api/v1/fleet/config` once at
+startup (3 s timeout, in the background, never blocking the session; the last good copy is cached in
+`~/.cache/herdr-engineering/fleet-config.json`). Nothing is subscribed or sent unless that config loads **and**
+`inspector.enabled` is exactly `true`. A machine without `host.json` simply has no inspector.
 
-| Variable | Meaning |
+| Central config key | Meaning |
 |---|---|
-| `HERDR_CP_URL` | control-plane base URL (same variable the Herdr feed plugin uses), e.g. `http://dev.lan` |
-| `PI_INSPECTOR_FEED=1` | opt in to the inspector feed |
-| `HERDR_PANE_ID` | (set by Herdr) used as the entity id, so it equals the `session` entity; falls back to Pi's session id |
-| `PI_INSPECTOR_REASONING` | `off` (default), `summary` or `full` - see privacy |
+| `inspector.enabled` | `true` to opt this host in to the inspector feed |
+| `inspector.reasoning` | `off` (default), `summary` or `full` - see privacy |
+| `agent.api_key` (else `ingest.api_key`) | ingest key sent as `X-API-Key` |
 
-Settings-file keys are not used: there is no existing settings mechanism for the control plane, only env.
+The control-plane URL comes from `host.json`. `HERDR_PANE_ID` (set by Herdr) is still used as the entity id, so it
+equals the `session` entity; it falls back to Pi's session id. The old `HERDR_CP_URL`, `PI_INSPECTOR_FEED`,
+`PI_INSPECTOR_REASONING` and `HERDR_CP_API_KEY` variables are no longer read.
 
-**Disable**: unset `HERDR_CP_URL` or `PI_INSPECTOR_FEED` and restart Pi. Nothing persists.
+**Disable**: set `inspector.enabled` to `false` centrally and restart Pi (config applies at process start only).
+A revoked host token (HTTP 401) discards the cache and disables the feed. Nothing persists.
+
+**Attach window**: the config is loaded in the background, so events emitted before the attach completes (up to
+~6 s worst case on a slow control plane; none when the config is cached or the control plane answers quickly) are
+not captured. Only the last `session_start` and the latest mission association made in that window are replayed.
 
 **Bounds and overhead**
 
@@ -93,7 +109,7 @@ pytest, cargo); otherwise only start/end and the exit code are sent. Counts are 
 - Reasoning is **off by default** and **capability-dependent**. `capabilities.reasoning` is `none` until Pi
   actually delivers `thinking_*` stream events for the current model, then `full` (raw thinking) or `summary`
   (Responses-style APIs, which deliver provider summaries). `reasoning` events are sent only if thinking text
-  was really received **and** `PI_INSPECTOR_REASONING` is `summary` or `full`. Nothing is synthesised.
+  was really received **and** the central `inspector.reasoning` is `summary` or `full`. Nothing is synthesised.
   With `off`, thinking text is never even buffered.
 - The client does not redact content beyond truncation: Herdr redacts at its ingest boundary and gates access
   by role. The client adds `sensitive: true` for paths such as `.env*`, `*.pem`, `*.key`, `id_rsa`, `.ssh/`,

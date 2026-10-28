@@ -12,6 +12,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { Type } from "typebox";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import type { WorkerRequest } from "../../src/workers/WorkerExecutor.ts";
@@ -575,3 +576,107 @@ for (const scenario of [
     );
   });
 }
+
+for (const role of ["reviewer", "scout", "implementer"] as const) {
+  test(`${role}: injected tools obey the request allowlist and cannot execute an unrequested mutation`, async () => {
+    await withProbe(
+      [
+        toolCalls([{ name: "mission", args: {} }]),
+        toolCalls([{ name: "ledger_read", args: {} }]),
+        toolCalls([{ name: "worker_result", args: result() }]),
+      ],
+      async ({ executor, req, cwd, bodies }) => {
+        const mutation = join(cwd, "unrequested-mutation.txt");
+        executor.setCustomTools([
+          {
+            name: "mission",
+            label: "Mission",
+            description: "Mutate the repository",
+            parameters: Type.Object({}),
+            async execute() {
+              writeFileSync(mutation, "mutated");
+              return { content: [{ type: "text", text: "changed repository" }], details: {} };
+            },
+          },
+          {
+            name: "ledger_read",
+            label: "Ledger Read",
+            description: "Read verified evidence",
+            parameters: Type.Object({}),
+            async execute() {
+              return { content: [{ type: "text", text: "verified evidence fixture" }], details: {} };
+            },
+          },
+        ]);
+        const run = await executor.run(
+          req({ role, tools: ["read", "ledger_read"], baseRef: undefined, isolatedWorktree: false }),
+        );
+        assert.equal(run.result.status, "completed", run.result.summary);
+        assert.equal(existsSync(mutation), false, "an unrequested mutating tool cannot execute");
+        const offered = JSON.parse(bodies[0]!).tools.map((tool: { function: { name: string } }) => tool.function.name);
+        assert.deepEqual(offered.sort(), ["ledger_read", "read", "worker_result"]);
+        assert.match(bodies[1]!, /Tool mission not found/);
+        assert.match(bodies[2]!, /verified evidence fixture/, "explicitly allowed semantic tools remain executable");
+      },
+    );
+  });
+}
+
+for (const isolatedWorktree of [false, true]) {
+  test(`tolerant file adapters do not add unrequested read or edit permissions (isolated=${isolatedWorktree})`, async () => {
+    await withProbe([toolCalls([{ name: "worker_result", args: result() }])], async ({ executor, req, bodies }) => {
+      const run = await executor.run(
+        req({ role: "reviewer", tools: [], tolerantFileTools: true, isolatedWorktree, baseRef: undefined }),
+      );
+      assert.equal(run.result.status, "completed", run.result.summary);
+      const offered = JSON.parse(bodies[0]!).tools.map((tool: { function: { name: string } }) => tool.function.name);
+      assert.deepEqual(offered, ["worker_result"]);
+    });
+  });
+}
+
+test("the executor owns terminal tools even when injected tools reuse their names", async () => {
+  await withProbe([toolCalls([{ name: "worker_result", args: result() }])], async ({ executor, req, bodies }) => {
+    const injectedTerminal = {
+      label: "Injected terminal",
+      description: "Must not replace the executor terminal protocol",
+      parameters: Type.Object({}),
+      async execute() {
+        throw new Error("injected terminal must not execute");
+      },
+    };
+    executor.setCustomTools([
+      { ...injectedTerminal, name: "worker_result" },
+      { ...injectedTerminal, name: "review_result" },
+    ]);
+    const run = await executor.run(req({ role: "reviewer", tools: ["worker_result", "review_result"] }));
+    assert.equal(run.result.status, "completed", run.result.summary);
+    const offered = JSON.parse(bodies[0]!).tools.map((tool: { function: { name: string } }) => tool.function.name);
+    assert.deepEqual(offered, ["worker_result"]);
+  });
+});
+
+test("an explicitly requested custom mutation remains executable for an implementer", async () => {
+  await withProbe(
+    [toolCalls([{ name: "mission", args: {} }]), toolCalls([{ name: "worker_result", args: result() }])],
+    async ({ executor, req, cwd, bodies }) => {
+      const changed = join(cwd, "requested-mutation.txt");
+      executor.setCustomTools([
+        {
+          name: "mission",
+          label: "Mission",
+          description: "Perform the requested mutation",
+          parameters: Type.Object({}),
+          async execute() {
+            writeFileSync(changed, "requested mutation");
+            return { content: [{ type: "text", text: "mutation finished" }], details: {} };
+          },
+        },
+      ]);
+      const run = await executor.run(req({ role: "implementer", tools: ["mission"], baseRef: undefined }));
+      assert.equal(run.result.status, "completed", run.result.summary);
+      assert.equal(readFileSync(changed, "utf8"), "requested mutation");
+      assert.match(bodies[1]!, /mutation finished/);
+    },
+  );
+});

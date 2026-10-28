@@ -126,21 +126,26 @@ that ran LLM inference:
 - Runtime `7565cf10`, mission `MSN-6erqDr`: the implementer task shows
   `usage.model = "qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m"` — recorded
   **even though the task settled FAILED**, confirming model provenance is captured
-  independent of task outcome. (That mission's failure is a separate
-  routing/verification issue in the newer runtime under print-mode invocation,
-  not a regression from the provenance fix, which only records the model.)
+  independent of task outcome. (That mission's failure was LLM gateway capacity
+  exhaustion — the pinned implementer model `text-ctx-c128k` on the `development`
+  provider returned repeated 429 `queue_deadline_exceeded` backpressure — not a
+  runtime regression; the runtime correctly retried and entered recovery while
+  waiting for capacity.)
 
-Remaining provenance gap (out of scope for the P4 worker/broker fix): the
-reviewer / fresh-review task consumes real LLM tokens (`MSN-3lsyJt` `TSK-7qcSIT`:
-26651 prompt / 2908 completion) yet its `usage.model` is `null`
-(`wall.inferenceMs` 0). The reviewer runs in a separate fresh-review session whose
-serving model is not propagated onto the parent execution record, unlike the worker
-path closed above.
+Reviewer / gate provenance gap (observed live, since fixed): the reviewer /
+fresh-review task consumes real LLM tokens (`MSN-3lsyJt` `TSK-7qcSIT`: 26651 prompt
+/ 2908 completion) yet its `usage.model` was `null` (`wall.inferenceMs` 0). Root
+cause: gate backends (review/integration/validation) settle a successful run through
+`buildGateEvidencePublication → publishGateEvidenceIfAuthoritative`, a different
+path than the agent backend's `setExecutionStatus`, so the P4 Gap-2 model copy never
+applied to them. Fixed by carrying the serving model (`outcome.usage.model`) through
+the `GateEvidencePublication` and settling the execution record's `model` field to
+it (see `test/unit/orchestration-broker-model-provenance.test.ts`, gate-path test).
 
 ## Tests covering this flow
 
 - `test/integration/worker-model-provenance.test.ts` — executor attaches the serving model to `details.model` (Gap 1).
-- `test/unit/orchestration-broker-model-provenance.test.ts` — broker settlement records the serving model on the execution record (Gap 2).
+- `test/unit/orchestration-broker-model-provenance.test.ts` — broker settlement records the serving model on the execution record (Gap 2, non-gate path + the gate/review publication path).
 - `test/integration/orchestrator-e2e.test.ts:851-880` — asserts `workersDetail` carries per-task routing provenance (model/route) in the summary.
 - `test/integration/extension-mission-commands.test.ts` — `/mission-status` rendering incl. `execution_mode` (lines 540, 616).
 - `test/integration/mission-observability-e2e.test.ts` — end-to-end observability summary assertions.

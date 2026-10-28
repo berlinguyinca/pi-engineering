@@ -149,6 +149,13 @@ export interface InstallDeps<M, O, C = unknown> {
    * "aborted" ends the call as aborted without sending anything.
    */
   beforeSend?: (model: M, signal: AbortSignal | undefined, context: C) => Promise<"go" | "aborted">;
+  /**
+   * Extra request headers for every attempt of a call, merged over the caller's
+   * own `options.headers`. This is where the gateway learns who is asking: it
+   * buckets admission by user+client+session+agent, so without an identity every
+   * session of a key shares one default bucket.
+   */
+  requestHeaders?: (model: M, options: O | undefined) => Record<string, string>;
   maxAttempts?: number;
   maxElapsedMs?: number;
   now?: () => number;
@@ -287,9 +294,16 @@ export function installGatewayStreamRetry<M, C, O>(
       const classifyAttempt = deps.buildClassifyAttempt?.(model);
       await pumpWithGatewayRetry(
         () => {
-          responseCapture = captureGatewayAttemptResponse(
-            (options ?? {}) as ProviderResponseOptions<ProviderResponseLike, unknown>,
-          );
+          const identity = deps.requestHeaders?.(model, options);
+          const attemptOptions = (
+            identity && Object.keys(identity).length > 0
+              ? {
+                  ...(options ?? {}),
+                  headers: { ...((options as { headers?: object } | undefined)?.headers ?? {}), ...identity },
+                }
+              : (options ?? {})
+          ) as ProviderResponseOptions<ProviderResponseLike, unknown>;
+          responseCapture = captureGatewayAttemptResponse(attemptOptions);
           return baseStream(model, context, responseCapture.options as O);
         },
         out,

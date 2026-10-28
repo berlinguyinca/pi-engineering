@@ -32,6 +32,7 @@ import type { AdmissionSaturation } from "../inference/admissionTransport.ts";
 import type { AdmissionBudgetLedger } from "../inference/admissionTransport.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
+import { autospecConfigured } from "./autospecProbe.ts";
 import { LifecycleController } from "./controller.ts";
 import type { ApprovalRequest } from "./controller.ts";
 import { loadPolicy } from "./policy.ts";
@@ -361,7 +362,35 @@ export class LifecycleHarness {
       }
     }
 
+    // Optional AutoSpec integration (T04): nothing from it is imported, read or
+    // executed unless an `autospec` block exists, or a layer is unparsable (fail closed).
+    let extraGateEvidence: ConstructorParameters<typeof LifecycleController>[0]["extraGateEvidence"];
+    if (await autospecConfigured(ctx.cwd)) {
+      try {
+        const provider = await import("../integrations/autospec/provider.ts");
+        const autospecConfig = await provider.loadAutoSpecConfig(ctx.cwd);
+        extraGateEvidence = (gateCtx) => provider.collectAutoSpecGateEvidence(autospecConfig, gateCtx);
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err);
+        this.say(ctx, `AutoSpec integration failed to load: ${why}`, "warning");
+        // Configured but unusable: fail closed rather than silently dropping the gate.
+        extraGateEvidence = async () => ({
+          items: [
+            {
+              key: "autospec_config",
+              status: "unavailable",
+              required: true,
+              reason: `AutoSpec integration failed to load: ${why}`,
+              blockers: ["autospec_config: integration failed to load"],
+            },
+          ],
+          checklist: [`AutoSpec integration failed to load: ${why}`],
+        });
+      }
+    }
+
     this.controller = new LifecycleController({
+      ...(extraGateEvidence ? { extraGateEvidence } : {}),
       cwd: ctx.cwd,
       sessionKey,
       policy,

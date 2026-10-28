@@ -16,7 +16,7 @@ import { GitRepo } from "../../src/git/GitRepo.ts";
 import type { BrokerBackends, IntegrationHandoff } from "../../src/orchestration/broker.ts";
 import { buildCandidateEvidenceIdentity, taskCoverageFingerprint } from "../../src/orchestration/evidence.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
-import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
+import { Orchestrator, replacementTaskId } from "../../src/orchestration/orchestrator.ts";
 import { MissionOwnership, type OwnershipIdentity } from "../../src/orchestration/ownership.ts";
 import { replacementRecoveryFingerprint } from "../../src/orchestration/recovery.ts";
 import { RepositoryRegistry } from "../../src/orchestration/repositoryRegistry.ts";
@@ -1008,7 +1008,8 @@ describe("orchestrator: durable blocked-mission repair", () => {
         failureFingerprint: "sha256:budget-fingerprint",
       });
       const supersessionId = `${recoveryId}-SUP-${h.failed.task_id}`;
-      const replacementTaskIds = [1, 2].map((index) => `${recoveryId}-TSK-${h.failed.task_id}-${index}`);
+      // Must mirror the orchestrator's bounded #420 id scheme.
+      const replacementTaskIds = [1, 2].map((index) => replacementTaskId(recoveryId, h.failed.task_id, index));
       const lineageFingerprintSpec = {
         supersessionId,
         failedTaskId: h.failed.task_id,
@@ -1282,7 +1283,8 @@ describe("orchestrator: durable blocked-mission repair", () => {
       status: "planned",
       decidedAt: "2026-09-27T00:00:10.000Z",
     });
-    const taskId = `${recoveryId}-TSK-${h.failed.task_id}-1`;
+    // Must mirror the orchestrator's bounded #420 id scheme.
+    const taskId = replacementTaskId(recoveryId, h.failed.task_id, 1);
     const supersessionId = `${recoveryId}-SUP-${h.failed.task_id}`;
     h.store.createTask({
       task_id: taskId,

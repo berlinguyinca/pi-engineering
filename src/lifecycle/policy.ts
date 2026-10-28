@@ -209,6 +209,16 @@ export interface EngineeringPolicy {
       admission?: AdmissionRetrySettings;
     };
   };
+  /**
+   * Pre-implementation plan review (T03). Absent means OFF; see
+   * orchestration/planReviewConfig.ts for the accepted shape.
+   */
+  plan_review?: unknown;
+  /**
+   * Optional AutoSpec integration (T04). Absent means the integration is never
+   * loaded; see integrations/autospec/config.ts for the accepted shape.
+   */
+  autospec?: unknown;
 }
 
 export const DEFAULT_POLICY: EngineeringPolicy = {
@@ -526,7 +536,7 @@ function stripComments(text: string): string {
   return text;
 }
 
-async function readYaml(path: string): Promise<{ raw: unknown; text?: string }> {
+export async function readYaml(path: string): Promise<{ raw: unknown; text?: string }> {
   try {
     const text = await readFile(path, "utf-8");
     return { raw: parseYaml(stripComments(text)), text };

@@ -571,6 +571,7 @@ test("known wait deadline expires while an unbounded legitimate wait stays waiti
   h.clock.advance(10_000);
   assert.equal(h.obs.summary(id)!.health, "stalled");
   h.obs.clearWaiting(id);
+  h.obs.activity(id, { type: "waiting_for_queue", summary: "Queued for capacity", workerId: "worker" });
   h.obs.setWaiting(id, "inferweave_admission", "Queued for capacity");
   h.clock.advance(24 * 60 * 60_000);
   assert.equal(h.obs.summary(id)!.health, "waiting");
@@ -625,6 +626,30 @@ test("one worker waiting for capacity does not hide another stalled worker", () 
   h.obs.heartbeat(id, "waiting", { lastActivityMs: 10_000 });
   h.obs.heartbeat(id, "silent", { lastActivityMs: 10_000 });
   assert.equal(h.obs.summary(id)!.health, "stalled");
+});
+
+test("a task waiting for a repository does not hide a stalled running worker", () => {
+  const h = harness({ stallAfterMs: 1000, slowAfterMs: 500 });
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "silent", { taskId: "running-task" });
+  h.obs.setWaiting(id, "repository_lease", "Another task is waiting for its repository");
+  h.clock.advance(2000);
+
+  assert.equal(h.obs.projection(id)!.workers[0]!.health, "stalled");
+  assert.equal(h.obs.summary(id)!.health, "stalled");
+  assert.equal(h.obs.summary(id)!.waitingReason, "repository_lease", "the unrelated wait remains visible");
+});
+
+test("an explicit worker wait remains waiting alongside a mission wait", () => {
+  const h = harness({ stallAfterMs: 1000, slowAfterMs: 500 });
+  const id = makeMission(h);
+  h.obs.workerStarted(id, "waiting");
+  h.obs.activity(id, { type: "waiting_for_queue", summary: "Queued for capacity", workerId: "waiting" });
+  h.obs.setWaiting(id, "repository_lease", "Another task is waiting for its repository");
+  h.clock.advance(2000);
+
+  assert.equal(h.obs.projection(id)!.workers[0]!.health, "waiting");
+  assert.equal(h.obs.summary(id)!.health, "waiting");
 });
 
 test("a busy worker cannot hide a different silent worker in the same mission", () => {

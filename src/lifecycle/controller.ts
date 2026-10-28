@@ -31,6 +31,7 @@ import type {
   ChangeSnapshot,
   CheckSpec,
   Classification,
+  GateItem,
   LifecycleRisk,
   LifecycleRun,
   LifecycleState,
@@ -67,6 +68,16 @@ export interface ControllerOptions {
   notify?: (message: string, level?: "info" | "warning" | "error") => void;
   /** Mirror findings/decisions into the Engineering Ledger. */
   record?: (entry: { kind: "finding" | "decision" | "requirement"; text: string; severity?: string }) => Promise<void>;
+  /**
+   * Optional integration evidence (T04, AutoSpec design gate / quality law).
+   * Absent for every standalone run; when present its items join the completion
+   * gate and its checklist joins the finalization output.
+   */
+  extraGateEvidence?: (ctx: {
+    cwd: string;
+    headCommit: string;
+    files: ChangeSnapshot["files"];
+  }) => Promise<{ items: GateItem[]; checklist: string[] }>;
 }
 
 export type SettleAction = "none" | "complete" | "remediate" | "escalate" | "blocked";
@@ -471,6 +482,30 @@ export class LifecycleController {
     // ---------------------------------------------------------------- gate
     const unresolved = this.unresolvedFindings(run, reports);
     run.openFingerprints = unresolved;
+    let extra: { items: GateItem[]; checklist: string[] } = { items: [], checklist: [] };
+    if (this.opts.extraGateEvidence) {
+      try {
+        extra = await this.opts.extraGateEvidence({
+          cwd: this.opts.cwd,
+          headCommit: snapshot.headCommit,
+          files: snapshot.files,
+        });
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err);
+        extra = {
+          items: [
+            {
+              key: "autospec_evidence",
+              status: "unavailable",
+              required: true,
+              reason: `integration evidence failed: ${why}`,
+              blockers: ["autospec_evidence: unavailable"],
+            },
+          ],
+          checklist: [`AutoSpec evidence unavailable: ${why}`],
+        };
+      }
+    }
     const gate = evaluateGate({
       run,
       policy: this.opts.policy,
@@ -484,6 +519,7 @@ export class LifecycleController {
       unresolvedFingerprints: unresolved,
       implementerModel: this.authorModelKey(run),
       testFilesChanged: snapshot.files.filter((f) => TEST_PATH.test(f.path)).length,
+      ...(extra.items.length ? { extraItems: extra.items } : {}),
     });
     run.gate = gate;
     await this.opts.store.save(run);
@@ -505,6 +541,7 @@ export class LifecycleController {
         reports,
         verification: finalVerification,
         models: reports.map((r) => `${r.model.provider}/${r.model.id}`),
+        ...(extra.checklist.length ? { extraLines: extra.checklist } : {}),
       });
       this.opts.notify?.(message, "info");
       this.resetObservation();
@@ -523,6 +560,7 @@ export class LifecycleController {
         reports,
         verification: finalVerification,
         models: reports.map((r) => `${r.model.provider}/${r.model.id}`),
+        ...(extra.checklist.length ? { extraLines: extra.checklist } : {}),
       });
       this.opts.notify?.(message, "error");
       return { action: "escalate", run, message };

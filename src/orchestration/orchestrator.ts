@@ -43,7 +43,12 @@ import {
 } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
-import { hashCandidateEvidenceIdentity, normalizeReviewSeverity, taskCoverageFingerprint } from "./evidence.ts";
+import {
+  buildCandidateEvidenceIdentity,
+  hashCandidateEvidenceIdentity,
+  normalizeReviewSeverity,
+  taskCoverageFingerprint,
+} from "./evidence.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import {
   type InterruptMode,
@@ -87,12 +92,13 @@ import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { buildReviewContext } from "./reviewContext.ts";
 import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
 import { brokerKind } from "./scheduler.ts";
-import { MissionScheduler } from "./scheduler.ts";
+import { MissionScheduler, type SchedulerOptions } from "./scheduler.ts";
 import type { ProtectedUserCriteria, SpecControllerResult, SpecScopeEnvelope } from "./specApproval.ts";
 import { canTransitionMission, canTransitionTask } from "./state.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
 import type {
   AcceptanceCriterion,
+  CandidateRevision,
   CompletionVerdict,
   FailureClassification,
   Mission,
@@ -156,6 +162,12 @@ export interface OrchestratorOptions {
   observability?: MissionObservability | null;
   /** Planner: decomposes a goal into tasks. Injected for determinism. */
   planner: (mission: Mission, risk: RiskProfile) => Promise<PlanTaskInput[]>;
+  /**
+   * Optional synchronous integration check evaluated by the completion gate
+   * (e.g. the AutoSpec design gate against the candidate commit). Returned
+   * reasons block completion. Absent = unchanged.
+   */
+  completionEvidence?: (mission: Mission, candidates: CandidateRevision[]) => string[];
   /** Acceptance criterion deriver. */
   deriveAcceptance?: (mission: Mission) => Promise<string[]>;
   /** Called on each mission phase transition. */
@@ -187,6 +199,8 @@ export interface OrchestratorOptions {
     maxSubprocesses?: number;
     maxPerRole?: number;
   };
+  /** Authoritative pre-dispatch route, when the backend can resolve one. Requested model hints are insufficient. */
+  modelForTask?: SchedulerOptions["modelForTask"];
   router?: IntentRouter;
   /**
    * Maximum gate-driven repair rounds (spec 07). Each round repairs the open
@@ -354,6 +368,22 @@ function repairContractObjective(
 /** Content hash of an empty diff: a candidate identical to its base. */
 const EMPTY_DIFF_HASH = `sha256:${createHash("sha256").update("").digest("hex")}`;
 
+/**
+ * Bounded replacement-task id (#420): recovery id + short hash of the failed
+ * task (uniqueness across siblings) + deliverable index. The failed task's
+ * FULL id must NOT be embedded — recovery chains re-feed their own
+ * replacements, and an embedded lineage grew every id (and the git branch /
+ * worktree names derived from it) by ~22 chars per generation until
+ * `git worktree add` failed on name length and a transient first failure
+ * became a permanent mission kill. Parentage lives in the durable supersession
+ * lineage, never in the name. Deterministic for a given (recoveryId,
+ * failedTaskId, index) so replay reproduces the same id.
+ */
+export function replacementTaskId(recoveryId: string, failedTaskId: string, index: number): string {
+  const failedTaskDigest = createHash("sha256").update(failedTaskId).digest("hex").slice(0, 8);
+  return `${recoveryId}-TSK${failedTaskDigest}-${index}`;
+}
+
 /** Tell a replacement worker what the failed attempt's branch already holds, so it finishes only what is missing. */
 function committedNote(checkpoint: { committedChanges: readonly string[] } | undefined): string {
   const paths = checkpoint?.committedChanges ?? [];
@@ -469,6 +499,7 @@ export class Orchestrator {
       store: this.store,
       broker: this.broker,
       limits: this.limits,
+      modelForTask: opts.modelForTask,
       // Time-based gateway resilience: a worker transient-infra failure retries
       // within the (env-resolved) window, parking the mission in a WAITING state,
       // and pauses (not fails) on exhaustion. Operator may override config/probe.
@@ -492,7 +523,7 @@ export class Orchestrator {
         this.observeTaskSettled(missionId, taskId, status);
       },
     });
-    this.gate = new CompletionGate(this.store);
+    this.gate = new CompletionGate(this.store, undefined, opts.completionEvidence);
     this.planner = opts.planner;
     this.deriveAcceptance = opts.deriveAcceptance;
     this.onPhase = opts.onPhase;
@@ -820,6 +851,120 @@ export class Orchestrator {
         (!classification.taskId || this.store.getTask(classification.taskId)?.kind !== "agent") &&
         preCandidateImplementers.length === 0
       ) {
+        // #360: "no candidate recorded" is not always a dead end. When the
+        // mission preserves committed worker work that Git can verify ahead of
+        // base, reconstruct the candidate baseline from it (seed the candidate
+        // target, record a checkpoint-traceable candidate) and re-run the
+        // gates over that content. Only when nothing is reconstructable does
+        // the terminal refusal below apply.
+        if (!recoveryStartRecord && (await this.reconstructCandidateFromPreservedWork(missionId, classification))) {
+          // BLOCKED -> REPAIRING consumes the planned decision (the transition
+          // marks it started); for a mission already REPAIRING, start it here.
+          if (this.store.getMission(missionId)!.status === "BLOCKED") {
+            this.store.transitionMission(missionId, "REPAIRING", "system", {
+              recoveryDecisionId: repairDecision.recoveryId,
+            });
+          } else if (repairDecision.status === "planned") {
+            this.store.transitionRecovery(repairDecision.recoveryId, "started");
+          }
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          // Deterministic integration over the reconstructed candidate: it
+          // publishes the integration evidence (first member of the completion
+          // gate's evidence triple) on a SUCCEEDED authoritative execution,
+          // and it is the supersession replacement that accounts for the
+          // failed implementer whose preserved work became the candidate.
+          const integrationTaskId = `${repairDecision.recoveryId}-reconstruct-integration`;
+          let integrationTask = this.store.getTask(integrationTaskId);
+          if (!integrationTask) {
+            integrationTask = this.store.createTask({
+              task_id: integrationTaskId,
+              mission_id: missionId,
+              kind: "integration",
+              role: "integrator",
+              objective: `Integrate the reconstructed candidate for ${repairDecision.recoveryId}.`,
+              mutates_repo: true,
+              write_domains: this.writableDomainsForMission(missionId),
+              isolation: "none",
+              repo_id: this.repoIdForMission(missionId),
+              ...this.boundedTaskFields(missionId, ["integrated reconstructed candidate"], []),
+            });
+          }
+          this.recoveryTaskGenerations.set(integrationTask.task_id, expectedResumptionGeneration);
+          if (integrationTask.status === "PENDING") this.store.transitionTask(integrationTask.task_id, "READY");
+          const integratingFrom = this.store.getMission(missionId)?.status;
+          if (
+            integratingFrom &&
+            integratingFrom !== "INTEGRATING" &&
+            canTransitionMission(integratingFrom, "INTEGRATING")
+          ) {
+            this.store.transitionMission(missionId, "INTEGRATING");
+          }
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          const integrated = await this.runSingleTask(missionId, integrationTask.task_id, { signal });
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          if (!integrated) {
+            // The reconstructed content failed integration checks: settle the
+            // decision and stop durably (finite; no blind re-loop).
+            if (this.store.getRecoveryDecision(repairDecision.recoveryId)?.status === "started") {
+              this.store.transitionRecovery(repairDecision.recoveryId, "failed");
+            }
+            this.store.stopMission(missionId, {
+              reason:
+                "reconstruction: the preserved worker work failed integration checks; the mission must not complete on it",
+              preservedWork: await this.preservedMissionWork(missionId),
+              attemptedRecoveries: this.store.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId),
+              resumeCondition: `reconcile the preserved work with the integration failure, or cancel the mission with /mission cancel ${missionId}`,
+            });
+            await this.store.flush();
+            this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+            return this.store.getMission(missionId)!;
+          }
+          // Account for each failed implementer whose preserved commit became
+          // the candidate: its work landed through reconstruction, and the
+          // green integration task is its successful replacement.
+          const reconstructedCandidate = this.store.getCandidate(missionId);
+          for (const failed of this.store.listTasks(missionId)) {
+            if (failed.kind !== "agent" || failed.status !== "FAILED") continue;
+            if (this.store.listTaskSupersessions(missionId).some((lineage) => lineage.failedTaskId === failed.task_id))
+              continue;
+            const failedCheckpoint = this.store.listTaskCheckpoints(missionId, failed.task_id).at(-1);
+            if (
+              !failedCheckpoint?.candidateSha ||
+              failedCheckpoint.candidateSha !== reconstructedCandidate?.identity.candidateSha
+            )
+              continue;
+            this.store.supersedeTask({
+              supersessionId: id("SUP"),
+              missionId,
+              failedTaskId: failed.task_id,
+              replacementTaskIds: [integrationTask.task_id],
+              repoId: failed.repo_id ?? "",
+              acceptanceIds: [...(failed.acceptance_ids ?? [])],
+              coverageFingerprint: taskCoverageFingerprint(failed),
+              reason: `preserved worker work reconstructed into the candidate (${failedCheckpoint.checkpointId})`,
+              createdAt: new Date(this.scheduler.now()).toISOString(),
+            });
+          }
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          // Fresh validation + review over the integrated reconstruction (the
+          // REQUIRED gates: failed gate attempts suppress the missing signal,
+          // so missing_gates alone would not re-run them).
+          await this.runMissingGates(missionId, this.store.getMission(missionId)!.required_gates, signal);
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          const reran = await this.finalizeMission(missionId, expectedResumptionGeneration, signal, undefined, {
+            gateOnly: true,
+          });
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          if (this.store.getRecoveryDecision(repairDecision.recoveryId)?.status === "started") {
+            this.store.transitionRecovery(repairDecision.recoveryId, reran.completed ? "succeeded" : "failed");
+          }
+          await this.store.flush();
+          this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
+          return reran.mission;
+        }
         // Gate repair without an independently Git-verified candidate baseline
         // is refused (materiality could not be proven). The refusal is terminal
         // for this resumption: settle the decision whether it was planned or
@@ -1176,8 +1321,9 @@ export class Orchestrator {
             : [failed.objective];
         const supersessionId = `${repairDecision.recoveryId}-SUP-${failed.task_id}`;
         const replacementFingerprints: Record<string, string> = {};
-        const replacementTaskIds = remaining.map(
-          (_deliverable, index) => `${repairDecision.recoveryId}-TSK-${failed.task_id}-${index + 1}`,
+        // (#420) Bounded replacement ids via the shared helper — see its doc.
+        const replacementTaskIds = remaining.map((_deliverable, index) =>
+          replacementTaskId(repairDecision.recoveryId, failed.task_id, index + 1),
         );
         const lineageFingerprintSpec = {
           supersessionId,
@@ -1464,6 +1610,78 @@ export class Orchestrator {
 
   private repoIdForMission(missionId: string): string | undefined {
     return this.missionRepoIds.get(missionId) ?? this.store.getWorkspaceManifest(missionId)?.repositories[0]?.repoId;
+  }
+
+  /**
+   * #360: reconstruct the candidate baseline from a preserved worker
+   * checkpoint whose commit Git verifies as ahead of the mission's base. On
+   * success the broker's candidate target carries the content and a
+   * checkpoint-traceable candidate is recorded; the caller then re-runs the
+   * gates. Fail-closed: any unverifiable shape leaves the store untouched and
+   * returns false (the existing terminal refusal applies).
+   */
+  private async reconstructCandidateFromPreservedWork(
+    missionId: string,
+    classification: FailureClassification,
+  ): Promise<boolean> {
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    // Multi-repository missions complete on head-vector evidence; reconstruction
+    // is scoped to the single-repository shape of #360.
+    if (!manifest || manifest.repositories.length !== 1) return false;
+    const binding = manifest.repositories[0]!;
+    const checkpoints = this.store
+      .listTaskCheckpoints(missionId)
+      .filter((checkpoint) => !!checkpoint.candidateSha?.trim() && checkpoint.repoId === binding.repoId);
+    const mission = this.store.getMission(missionId);
+    const gateAcceptanceIds = mission?.acceptance_criteria.flatMap((criterion) =>
+      criterion.acceptance_id ? [criterion.acceptance_id] : [],
+    );
+    // Newest checkpoint first: the most recent preserved commit is the best
+    // candidate baseline; older ones are fallbacks for an unverifiable tip.
+    for (const checkpoint of [...checkpoints].reverse()) {
+      const outcome = await this.broker.reconstructCandidateFromRef({
+        missionId,
+        repoId: binding.repoId,
+        baseSha: binding.baseSha,
+        preservedRef: checkpoint.branch?.trim() || checkpoint.candidateSha!,
+        preservedSha: checkpoint.candidateSha!,
+        missionGeneration: checkpoint.missionGeneration,
+        candidateGeneration: checkpoint.candidateGeneration,
+      });
+      if (!outcome) continue;
+      try {
+        this.store.recordReconstructedCandidate(
+          missionId,
+          buildCandidateEvidenceIdentity({
+            workspaceManifestHash: manifest.hash,
+            missionGeneration: checkpoint.missionGeneration,
+            repoId: binding.repoId,
+            baseSha: binding.baseSha,
+            candidateSha: outcome.candidateSha,
+            diffHash: outcome.diffHash,
+            acceptanceIds: gateAcceptanceIds ?? [],
+            artifactHashes: checkpoint.artifactHashes,
+          }),
+          { checkpointId: checkpoint.checkpointId, branch: checkpoint.branch ?? null },
+          `candidate reconstructed from preserved worker work (${checkpoint.checkpointId})`,
+        );
+      } catch {
+        continue;
+      }
+      this.store.addFinding({
+        mission_id: missionId,
+        task_id: classification.taskId,
+        severity: "minor",
+        category: "recovery_candidate_reconstruction",
+        file: null,
+        line: null,
+        summary: `Reconstructed the candidate baseline from preserved worker work ${checkpoint.candidateSha} (${checkpoint.checkpointId}); gates re-run against it.`,
+        evidence: checkpoint.checkpointId,
+        recommended_action: "None; documents why a candidate exists without a publishing execution.",
+      });
+      return true;
+    }
+    return false;
   }
 
   private async preservedMissionWork(missionId: string): Promise<string[]> {
@@ -1809,6 +2027,11 @@ export class Orchestrator {
     } catch {
       // A progress listener is an observer, never a participant.
     }
+  }
+
+  /** True while this process's controller is driving the mission (orchestrate or resume has not returned). */
+  hasLiveRun(missionId: string): boolean {
+    return this.liveRuns.has(missionId);
   }
 
   /** True while the planner is producing this mission's tasks. */

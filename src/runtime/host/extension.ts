@@ -7,14 +7,14 @@
  * here is feature code; features live in the generation.
  */
 
-import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { safeGitOrThrow, safeGitSyncOut } from "../../git/safeGit.ts";
 import { SourceCache, type TrustedSource, type UpdateChannel } from "../../update/gitSource.ts";
 import { InstallLayout } from "../../update/installLayout.ts";
 import { UpdateJournal } from "../../update/journal.ts";
@@ -165,19 +165,51 @@ export function declaredEntry(dir: string): string | null {
   }
 }
 
-/** The `origin` remote of a checkout, if any. */
-export function originRemote(root: string): string | null {
+/**
+ * Answers of two synchronous git probes that sit on startup paths (`trustedSource`, `stateDir`), kept per path: the
+ * `origin` URL is keyed by the mtime of the repository's own config file (any edit shows at once), and the toplevel of a
+ * directory for a few seconds. `describeSource` is NOT cached: HEAD and cleanliness move whenever the checkout does,
+ * and a stale answer there would let a hot reload load the wrong commit. A failed probe is cached too (fail closed:
+ * null / the directory itself), so a missing git does not cost a spawn each time.
+ */
+const probeCache = new Map<string, { stamp: string; at: number; value: unknown }>();
+const TOPLEVEL_TTL_MS = 10_000;
+export function invalidateGitProbeCache(): void {
+  probeCache.clear();
+}
+function configStamp(root: string): string | null {
   try {
-    const url = execFileSync("git", ["-C", root, "remote", "get-url", "origin"], {
-      timeout: 2000,
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .toString()
-      .trim();
-    return url || null;
+    const dotGit = join(root, ".git");
+    if (!statSync(dotGit).isDirectory()) return null; // a linked work tree: its config is elsewhere, do not cache
+    const st = statSync(join(dotGit, "config"));
+    return `${st.mtimeMs}:${st.size}`;
   } catch {
     return null;
   }
+}
+function probed<T>(kind: "origin" | "toplevel", path: string, stamp: string | null, compute: () => T): T {
+  if (stamp === null && kind === "origin") return compute();
+  const key = `${kind}\0${path}`;
+  const hit = probeCache.get(key);
+  const now = Date.now();
+  const fresh = hit && hit.stamp === (stamp ?? "") && (kind === "origin" || now - hit.at < TOPLEVEL_TTL_MS);
+  if (fresh) return hit.value as T;
+  const value = compute();
+  if (probeCache.size > 256) probeCache.clear();
+  probeCache.set(key, { stamp: stamp ?? "", at: now, value });
+  return value;
+}
+
+/** The `origin` remote of a checkout, if any. */
+export function originRemote(root: string): string | null {
+  return probed("origin", root, configStamp(root), () => {
+    try {
+      const url = safeGitSyncOut(["remote", "get-url", "origin"], { cwd: root, timeoutMs: 2000 }).trim();
+      return url || null;
+    } catch {
+      return null;
+    }
+  });
 }
 
 export type UpdateArgs = { ok: true; check: boolean; request: UpdateRequest } | { ok: false; error: string };
@@ -206,31 +238,53 @@ export function parseUpdateArgs(argv: string[]): UpdateArgs {
   return { ok: true, check, request };
 }
 
-/** Read version/commit for a runtime source directory. Never throws. */
+/** Read version/commit for a runtime source directory. Never throws. Not cached: HEAD and cleanliness move with the checkout. */
 export function describeSource(root: string): { version: string; commit: string | null } {
-  let version = "0.0.0";
-  try {
-    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version?: unknown };
-    if (typeof pkg.version === "string") version = pkg.version;
-  } catch {
-    // An unreadable manifest is reported as an unknown version, not a failure.
-  }
+  const version = readVersion(root);
   let commit: string | null = null;
   if (existsSync(join(root, ".git"))) {
     try {
-      commit = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      })
-        .toString()
-        .trim();
-      const dirty = execFileSync("git", ["-C", root, "status", "--porcelain", "--untracked-files=no"], {
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-      })
-        .toString()
-        .trim();
+      commit = safeGitSyncOut(["rev-parse", "HEAD"], { cwd: root, timeoutMs: 2000 }).trim();
+      const dirty = safeGitSyncOut(["status", "--porcelain", "--untracked-files=no"], {
+        cwd: root,
+        timeoutMs: 2000,
+        env: { GIT_OPTIONAL_LOCKS: "0" },
+      }).trim();
+      if (dirty || !/^[0-9a-f]{40}$/.test(commit)) commit = null;
+    } catch {
+      commit = null;
+    }
+  }
+  return { version, commit };
+}
+
+function readVersion(root: string): string {
+  try {
+    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version?: unknown };
+    if (typeof pkg.version === "string") return pkg.version;
+  } catch {
+    // An unreadable manifest is reported as an unknown version, not a failure.
+  }
+  return "0.0.0";
+}
+
+/** `describeSource` for async callers: the git probes run without blocking the event loop (same answers). */
+export async function describeSourceAsync(root: string): Promise<{ version: string; commit: string | null }> {
+  const version = readVersion(root);
+  let commit: string | null = null;
+  if (existsSync(join(root, ".git"))) {
+    try {
+      commit = (
+        await safeGitOrThrow(["rev-parse", "HEAD"], { cwd: root, trust: "operator", timeoutMs: 2000 })
+      ).stdout.trim();
+      const dirty = (
+        await safeGitOrThrow(["status", "--porcelain", "--untracked-files=no"], {
+          cwd: root,
+          trust: "operator",
+          timeoutMs: 2000,
+          env: { GIT_OPTIONAL_LOCKS: "0" },
+        })
+      ).stdout.trim();
       if (dirty || !/^[0-9a-f]{40}$/.test(commit)) commit = null;
     } catch {
       commit = null;
@@ -533,24 +587,55 @@ export class EngineeringHostExtension {
               ? { version: check.target.metadata.version, commit: check.target.sha, channel: check.channel }
               : null,
         }).catch(() => {});
+        const target = (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined;
+        if (check.failure) {
+          // A check that cannot run has to be seen: silently leaving automatic
+          // updates off is how a runtime goes stale without anyone noticing.
+          notify(target, `Pi Engineering update check failed: ${check.failure}`, "warning");
+        }
         if (check.target && !check.upToDate && !check.failure) {
-          const target = (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined;
           try {
             target?.ui?.setStatus?.(
-              "pi-engineering-update",
+              UPDATE_STATUS_KEY,
               `Pi Engineering ${check.current?.version ?? ""} · ${check.target.metadata.version} available`,
             );
           } catch {
             // A stale ctx cannot show a status; the panel still does.
           }
           if (prefs.autoInstall && check.pi.ok) {
-            const outcome = await this.updates.update({});
+            const to = check.target.metadata.version;
+            notify(
+              target,
+              `Pi Engineering ${check.current?.version ?? "?"} → ${to}: updating automatically (progress in the status line).`,
+            );
+            const outcome = await this.updates.update({}, updateProgressReporter(target?.ui));
             this.lastUpdateOutcome = outcome;
-            if (outcome.status === "handover") await outcome.done;
+            if (outcome.status === "handover") {
+              void outcome.done.then(({ result }) => {
+                clearUpdateStatus(target);
+                notify(
+                  target,
+                  result.ok
+                    ? `Pi Engineering ${to} activated.`
+                    : `Pi Engineering ${to} did not activate (${result.failure ?? result.phase}): the running runtime was not touched.`,
+                  result.ok ? "info" : "warning",
+                );
+              });
+              await outcome.done;
+            } else {
+              clearUpdateStatus(target);
+              notify(target, formatOutcome(outcome), "warning");
+            }
           }
         }
         return check;
-      } catch {
+      } catch (error) {
+        // Unexpected here means the operator gets no check at all: say so.
+        notify(
+          (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined,
+          `Pi Engineering update check failed: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
         return undefined;
       } finally {
         this.checking = undefined;
@@ -637,17 +722,13 @@ export class EngineeringHostExtension {
   stateDir(cwd?: string): string | null {
     const dir = cwd ?? (this.host?.latestContext() as Ctx | undefined)?.cwd;
     if (!dir) return null;
-    let root = dir;
-    try {
-      root = execFileSync("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
-        timeout: 2000,
-        stdio: ["ignore", "pipe", "ignore"],
-      })
-        .toString()
-        .trim();
-    } catch {
-      root = dir;
-    }
+    const root = probed("toplevel", dir, null, () => {
+      try {
+        return safeGitSyncOut(["rev-parse", "--show-toplevel"], { cwd: dir, timeoutMs: 2000 }).trim();
+      } catch {
+        return dir;
+      }
+    });
     return join(root, ".pi-eng");
   }
 
@@ -674,7 +755,7 @@ export class EngineeringHostExtension {
 
   /** A mutable checkout, imported directly; a baseline copy is the rollback image. */
   protected async checkoutSource(root: string, label: string, baseline = true): Promise<RuntimeSource> {
-    const meta = describeSource(root);
+    const meta = await describeSourceAsync(root);
     let rollbackRoot: string | undefined;
     if (baseline && this.config.baseline !== false) {
       rollbackRoot = await snapshotRuntimeSource(root, this.generationsDir, "baseline").catch(() => undefined);
@@ -1051,15 +1132,31 @@ export class EngineeringHostExtension {
       return;
     }
     const progress: string[] = [];
-    const outcome = await this.updates.update(parsed.request, (line) => progress.push(line));
+    const report = updateProgressReporter(ctx.ui);
+    const outcome = await this.updates.update(parsed.request, (line) => {
+      progress.push(line);
+      report(line);
+    });
     this.lastUpdateOutcome = outcome;
-    if (outcome.status !== "handover") return notify(ctx, formatOutcome(outcome), "warning");
+    const steps = progress.length > 0 ? ["", ...progress] : [];
+    if (outcome.status !== "handover") {
+      clearUpdateStatus(ctx);
+      return notify(
+        ctx,
+        [...(movedLine ? [movedLine, ""] : []), ...steps, formatOutcome(outcome)].join("\n"),
+        "warning",
+      );
+    }
     const from = outcome.check.current?.version;
     const to = outcome.check.target?.metadata.version;
     const header = [`Pi Engineering ${from ?? "?"} → ${to ?? "?"}`, "", ...progress];
     const format = (r: HandoverResult) =>
       [...header, formatHandover(r, { from, to, action: "Updated" }).replace(/^Pi Engineering\n\n/, "")].join("\n");
-    void outcome.done.then(({ result: r }) => (r.ok ? this.retain().catch(() => {}) : undefined));
+    // The status line keeps saying what it is waiting for until activation ends.
+    void outcome.done.then(({ result: r }) => {
+      clearUpdateStatus(ctx);
+      if (r.ok) void this.retain().catch(() => {});
+    });
     const result = await this.awaitOrBackground(outcome.task, ctx, `Pi Engineering ${to} ready.`, format);
     if (result) {
       await outcome.done;
@@ -1365,6 +1462,34 @@ export function formatOutcome(o: Exclude<UpdateOutcome, { status: "handover" }>)
 
 function level(result: HandoverResult): string {
   return result.ok ? "info" : result.rolledBack || result.untouched ? "warning" : "error";
+}
+
+/** Status line key for live update progress (automatic check included). */
+const UPDATE_STATUS_KEY = "pi-engineering-update";
+
+/**
+ * Live update progress: every step the updater reports goes on the status line
+ * as it happens, so a fetch -> stage -> validate -> activate run that takes
+ * tens of seconds is visible while it runs instead of arriving only in the
+ * final message (or, for the automatic run, not at all).
+ */
+export function updateProgressReporter(ui: Ctx["ui"]): (line: string) => void {
+  return (line: string) => {
+    try {
+      ui?.setStatus?.(UPDATE_STATUS_KEY, `Pi Engineering update · ${line}`);
+    } catch {
+      // A stale ctx cannot show a status; the final notification still says it.
+    }
+  };
+}
+
+/** Take the update status line back once a run is over. */
+export function clearUpdateStatus(ctx: Ctx | undefined): void {
+  try {
+    ctx?.ui?.setStatus?.(UPDATE_STATUS_KEY, undefined);
+  } catch {
+    // A stale ctx cannot clear a status.
+  }
 }
 
 export function notify(ctx: Ctx | undefined, text: string, lvl = "info"): void {

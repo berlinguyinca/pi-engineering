@@ -10,6 +10,8 @@
  *
  * This module sweeps the runtime's own worktree namespace (and nothing else):
  *
+ *  - Planner-worker worktrees are retained for their executor/recovery owner,
+ *    including unregistered directories whose Git metadata was pruned.
  *  - A worktree whose owning mission is still live (any non-terminal status)
  *    is kept untouched.
  *  - A worktree whose mission is terminal, or whose owner cannot be found and
@@ -30,6 +32,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitRepo } from "./GitRepo.ts";
 import { rustTargetDir } from "./rustBuildCache.ts";
+import { safeGitOrThrow } from "./safeGit.ts";
 
 const exec = promisify(execFile);
 
@@ -164,33 +167,32 @@ async function assertNamespacePath(repo: GitRepo, path: string): Promise<void> {
  * checkout loses nothing. Returns the commit sha, or null when clean.
  */
 async function preserveUncommittedWork(path: string, branch: string | null): Promise<string | null> {
-  const status = await exec("git", ["-C", path, "status", "--porcelain"], {
-    timeout: 60_000,
+  const status = await safeGitOrThrow(["status", "--porcelain"], {
+    cwd: path,
+    trust: "operator",
+    timeoutMs: 60_000,
     maxBuffer: 16 * 1024 * 1024,
   });
   if (!status.stdout.trim()) return null;
   const env = {
-    ...process.env,
     GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "pi-engineering janitor",
     GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "pi-engineering@localhost",
     GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "pi-engineering janitor",
     GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "pi-engineering@localhost",
   };
-  await exec("git", ["-C", path, "add", "-A"], { timeout: 120_000, env });
-  await exec(
-    "git",
+  const base = { cwd: path, trust: "operator", env } as const;
+  await safeGitOrThrow(["add", "-A"], { ...base, timeoutMs: 120_000 });
+  await safeGitOrThrow(
     [
-      "-C",
-      path,
       "commit",
       "-q",
       "--no-verify",
       "-m",
       `pi-engineering: preserve uncommitted work from reclaimed worktree${branch ? ` ${branch}` : ""}`,
     ],
-    { timeout: 120_000, env },
+    { ...base, timeoutMs: 120_000 },
   );
-  const { stdout } = await exec("git", ["-C", path, "rev-parse", "HEAD"], { timeout: 30_000 });
+  const { stdout } = await safeGitOrThrow(["rev-parse", "HEAD"], { ...base, timeoutMs: 30_000 });
   return stdout.trim();
 }
 
@@ -228,7 +230,11 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
     }
     // Re-register so the preserve-then-remove path applies; failure means the
     // directory is handled as an unrecoverable stray below.
-    const repaired = await exec("git", ["-C", repo.root, "worktree", "repair", path], { timeout: 60_000 })
+    const repaired = await safeGitOrThrow(["worktree", "repair", path], {
+      cwd: repo.root,
+      trust: "operator",
+      timeoutMs: 60_000,
+    })
       .then(() => true)
       .catch(() => false);
     const after = repaired ? (await repo.listLinkedWorktrees()).find((wt) => wt.path === path) : undefined;
@@ -238,6 +244,20 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
   const referenced = await repo.durablyReferencedWorktreePaths([...registered.keys()]);
 
   for (const wt of registered.values()) {
+    // Planner-worker retirement/recovery fences live outside candidate records.
+    // Only that executor (on success) or explicit recovery may remove its trees.
+    // The path check also protects output after Git admin metadata is pruned.
+    if (
+      wt.branch?.startsWith("pi-eng-pw-") ||
+      basename(wt.path).startsWith(`${repo.worktreeNamespacePrefix()}pi-eng-pw-`)
+    ) {
+      report.kept.push({
+        path: wt.path,
+        branch: wt.branch,
+        reason: "planner-worker executor or recovery owns removal",
+      });
+      continue;
+    }
     // A durable candidate/cleanup record still names this checkout: the
     // mission's recovery path owns its removal, never the janitor.
     if (referenced.has(wt.path)) {
@@ -310,7 +330,11 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         // Resolved while the worktree is still registered: it needs git.
         const target = await rustTargetDir(wt.path).catch(() => null);
         preservedCommit = await preserveUncommittedWork(wt.path, wt.branch);
-        await exec("git", ["-C", repo.root, "worktree", "remove", "--force", wt.path], { timeout: 300_000 });
+        await safeGitOrThrow(["worktree", "remove", "--force", wt.path], {
+          cwd: repo.root,
+          trust: "operator",
+          timeoutMs: 300_000,
+        });
         // The worktree's own cargo target dir is derived output; it goes with it.
         if (target) await rm(target, { recursive: true, force: true }).catch(() => {});
       } else {

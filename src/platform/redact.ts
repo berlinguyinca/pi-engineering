@@ -54,11 +54,11 @@ export const SECRET_RULES: Array<{ kind: SecretKind; pattern: RegExp; replacemen
     replacement: `$1${PLACEHOLDER}@`,
   },
   // Provider-issued tokens with distinctive prefixes.
+  // Provider-issued tokens with distinctive prefixes.
   { kind: "api_key", pattern: /\b(gh[pousr]_[A-Za-z0-9]{16,})/g, replacement: PLACEHOLDER },
-  // `sk-` keys carry hyphenated tiers (`sk-live-`, `sk-proj-`), so the class
-  // must include the hyphen; `[A-Za-z0-9]{16,}` alone leaks `sk-live-…`.
-  { kind: "api_key", pattern: /\bsk-[A-Za-z0-9-]{12,}/g, replacement: PLACEHOLDER },
-  { kind: "api_key", pattern: /\bAIza[0-9A-Za-z_-]{32,}/g, replacement: PLACEHOLDER },
+  // `sk-` keys carry hyphenated tiers (`sk-live-`, `sk-proj-`) and underscored
+  // segments, so the class needs both.
+  { kind: "api_key", pattern: /\bsk-[A-Za-z0-9_-]{12,}/g, replacement: PLACEHOLDER },
   { kind: "api_key", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: PLACEHOLDER },
   { kind: "aws", pattern: /\bAKIA[0-9A-Z]{16}\b/g, replacement: PLACEHOLDER },
   // A JWT: three base64url segments separated by dots.
@@ -68,44 +68,33 @@ export const SECRET_RULES: Array<{ kind: SecretKind; pattern: RegExp; replacemen
     replacement: PLACEHOLDER,
   },
 
-  // ── Key-shaped: a name meaning "secret", then a value ────────────────────
-  // Bearer auth first, so its token is consumed before the generic rules run.
-  { kind: "bearer", pattern: /\b(Bearer\s+)\S+/gi, replacement: `$1${PLACEHOLDER}` },
-  // An auth header carries a scheme before the credential:
-  //   Authorization: Basic dXNlcjpwYXNzd29yZA==
-  // The generic key rules below consume one whitespace-delimited token, which
-  // here is the word "Basic" — that would leave the credential standing on its
-  // own, unattached to any keyword, and no later rule could find it. So the
-  // whole header value is consumed here, scheme included.
+  { kind: "api_key", pattern: /\bAIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])/g, replacement: PLACEHOLDER },
+
+  // Authentication schemes are retained as context. Horizontal whitespace and
+  // token characters prevent consuming the following line or field delimiter.
+  //
+  // The KEY-shaped family lives in ASSIGNMENT below, not here: a rule that
+  // consumes an `Authorization:` header value to end of line swallows whatever
+  // else sat on that line, and a rule that consumes one whitespace token leaves
+  // the scheme's credential standing unattached to any keyword. The assignment
+  // pass keeps the name, the separator and the scheme, and replaces only the
+  // credential.
   {
     kind: "bearer",
-    pattern:
-      /\b(proxy-authorization|authorization)(\s*[:=]\s*)(?:Basic|Bearer|Token|Digest|NTLM|Negotiate|AWS4-HMAC-SHA256)[^\n"']*/gi,
-    replacement: `$1$2${PLACEHOLDER}`,
-  },
-  // JSON / YAML: "api_key": "value"  — quoted key, quoted value.
-  {
-    kind: "generic",
-    pattern: /("[A-Za-z0-9_.-]*(?:key|secret|password|passwd|token|credential)"\s*:\s*)"[^"]*"/gi,
-    replacement: `$1"${PLACEHOLDER}"`,
-  },
-  // Bare key = value / key: value, with NO \b before the name, so an
-  // underscore-prefixed environment variable is still matched.
-  // The separator is CAPTURED and replayed, so `token: x` stays `token: ` and
-  // `TOKEN=x` stays `TOKEN=`. Rewriting it would make redacted text differ
-  // from its original in a way that has nothing to do with the secret.
-  {
-    kind: "generic",
-    pattern:
-      /([A-Za-z0-9_.-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization))(\s*[:=]\s*)"[^"]*"/gi,
-    replacement: `$1$2"${PLACEHOLDER}"`,
-  },
-  {
-    kind: "generic",
-    pattern: /([A-Za-z0-9_.-]*(?:api[_-]?key|secret|password|passwd|token|credential|authorization))(\s*[:=]\s*)\S+/gi,
-    replacement: `$1$2${PLACEHOLDER}`,
+    pattern: /\b((?:Bearer|Basic)[ \t]+)[A-Za-z0-9._~+/=-]+/gi,
+    replacement: `$1${PLACEHOLDER}`,
   },
 ];
+
+// A quoted assignment is consumed in one pass, including escaped quotes.
+// Bare values may contain punctuation. Only treat a comma or semicolon as a
+// separator before whitespace, the end of input, or another field assignment.
+// Quoted values preserve JSON syntax. Cross a newline only for a quoted value.
+const SECRET_NAME = String.raw`(?:key|[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|private[_-]?key|[_-]key|secret|password|passwd|token|credential|authorization))`;
+const ASSIGNMENT = new RegExp(
+  String.raw`(?<![A-Za-z0-9_.-])(["']${SECRET_NAME}["']|${SECRET_NAME})([ \t]*[:=][ \t]*(?:\r?\n[ \t]*(?=["']))?)((?:Bearer|Basic)[ \t]+(?:[A-Za-z0-9._~+/=-]+|\[REDACTED\])|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:(?![,;](?:\s|$|["']?[A-Za-z0-9_.-]+["']?[ \t]*[:=]))\S)+)`,
+  "gi",
+);
 
 /** Redact secrets from free text. Never throws; returns the input on failure. */
 export function redactSecrets(text: string): string {
@@ -113,6 +102,11 @@ export function redactSecrets(text: string): string {
   try {
     let out = text;
     for (const { pattern, replacement } of SECRET_RULES) out = out.replace(pattern, replacement);
+    out = out.replace(ASSIGNMENT, (_match, key: string, separator: string, value: string) => {
+      const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : "";
+      const scheme = /^(?:Bearer|Basic)[ \t]+/i.exec(value)?.[0] ?? "";
+      return `${key}${separator}${quote}${scheme}${PLACEHOLDER}${quote}`;
+    });
     return out;
   } catch {
     return text;

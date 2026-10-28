@@ -19,6 +19,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createRoleRouter } from "../capability/adapter.ts";
 import type { RoleName } from "../capability/roles.ts";
+import { compactSessionHandoff } from "../compaction/autoTune.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import { workerInactivityMs } from "../orchestration/broker.ts";
 import type { MissionAttentionSnapshot } from "../runtime/herdr/MissionAttentionReporter.ts";
@@ -39,7 +40,15 @@ import { runHandoff } from "./handoffCommand.ts";
 import { chooseExecutionMode } from "./mode.ts";
 import { RoleResolver } from "./resolver.ts";
 import { STATIC_ROUTER_ROLE } from "./roles.ts";
-import { assessSessionSwitch } from "./sessionSwitch.ts";
+import {
+  SESSION_HANDOFF_ENTRY,
+  applySessionSwitchDecision,
+  decideSessionSwitch,
+  persistSessionHandoff,
+  projectSessionHandoff,
+  sessionBranchMessages,
+  staleHandoffThreshold,
+} from "./sessionHandoff.ts";
 import { latestState, renderPlan, renderStatus, renderWorkers } from "./status.ts";
 import { TransitionLog } from "./transitions.ts";
 import { ENGINEERING_MODES, type EngineeringMode, type MissionBrief, type PlannerWorkerReport } from "./types.ts";
@@ -200,33 +209,72 @@ export function registerPlannerWorker(
 
   // Interactive session switches: same transition log, same context-fit check.
   if (typeof pi.on === "function") {
+    pi.on("context", (event, ctx) => {
+      const messages = projectSessionHandoff(event.messages, ctx.sessionManager.getBranch());
+      return messages ? { messages } : undefined;
+    });
+    pi.on("session_before_compact", async (event, ctx) => {
+      if (staleHandoffThreshold(event.reason, event.branchEntries)) return { cancel: true };
+      try {
+        const compaction = await compactSessionHandoff(event, ctx);
+        return compaction ? { compaction } : undefined;
+      } catch (error) {
+        ctx.ui.notify(
+          `Session handoff compaction failed: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+        return { cancel: true };
+      }
+    });
     pi.on("model_select", async (event, ctx) => {
       const next = event.model;
       if (!next) return;
       const repoRoot = ctx.cwd;
       const log = new TransitionLog({ path: join(plannerWorkerDir(repoRoot), "session-transitions.jsonl") });
-      log.record({
-        lane: "session",
-        from: event.previousModel ? `${event.previousModel.provider}/${event.previousModel.id}` : null,
-        to: `${next.provider}/${next.id}`,
-        reason: `session:${event.source}`,
-        task: "session",
-        role: "implementer",
-        context: "direct",
-      });
-      await log.flush();
-      if (deps.sessionGuardActive) return;
       const usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
-      const plan = assessSessionSwitch({
+      // Unit C1: prefer a bounded session handoff over native compaction;
+      // selective_compaction stays the last-resort fallback.
+      const decision = decideSessionSwitch({
         next: { id: next.id, provider: next.provider, contextWindow: next.contextWindow, input: next.input },
         contextTokens: usage?.tokens ?? null,
+        sessionId: ctx.sessionManager.getSessionId(),
+        messages: sessionBranchMessages(ctx.sessionManager),
       });
-      if (plan.outcome === "compact") {
-        ctx.ui.notify(`${next.id} holds ${next.contextWindow} tokens; compacting before the next request`, "info");
-        ctx.compact({ customInstructions: "Preserve task state, decisions, and open files; compress the rest." });
-      } else if (plan.outcome === "reject") {
-        ctx.ui.notify(`switch to ${next.id} cannot hold this session: ${plan.reasons.join("; ")}`, "error");
+      const nextId = `${next.provider}/${next.id}`;
+      const from = event.previousModel ? `${event.previousModel.provider}/${event.previousModel.id}` : null;
+      if (deps.sessionGuardActive) {
+        // Another guard owns the compact-on-switch decision; record the plain
+        // transition as before.
+        log.record({
+          lane: "session",
+          from,
+          to: nextId,
+          reason: `session:${event.source}`,
+          task: "session",
+          role: "implementer",
+          context: "direct",
+        });
+        await log.flush();
+        return;
       }
+      await applySessionSwitchDecision(decision, nextId, {
+        recordContext: (context, reason) => {
+          log.record({
+            lane: "session",
+            from,
+            to: nextId,
+            reason: `session:${event.source}:${context}`,
+            task: "session",
+            role: "implementer",
+            context,
+          });
+        },
+        transfer: (d) => pi.appendEntry(SESSION_HANDOFF_ENTRY, { rendered: d.rendered }),
+        persist: (d) => persistSessionHandoff(repoRoot, d),
+        notify: (message, level) => ctx.ui.notify(message, level),
+        compact: (options) => ctx.compact(options),
+      });
+      await log.flush();
     });
   }
 
@@ -243,11 +291,13 @@ export function registerPlannerWorker(
       operatorPin: currentOperatorPin,
       // A short deadline: the mode decision must not stall /mission.
       loadCatalog: conn ? () => fetchCatalog({ ...conn, timeoutMs: 5_000 }) : async () => [],
-      fallback: async (role, exclude) => {
+      fallback: async (role, exclude, requirements) => {
         router ??= createRoleRouter({ cwd: repoRoot });
         const adapter = await router.catch(() => null);
         return adapter?.route(STATIC_ROUTER_ROLE[role] as RoleName, {
           exclude: exclude.map((id) => ({ provider, id })),
+          minContext: requirements.min_context,
+          extraRequires: requirements.tools === true ? ["tool_calling"] : [],
         });
       },
     });

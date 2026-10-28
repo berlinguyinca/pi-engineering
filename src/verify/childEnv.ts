@@ -8,7 +8,7 @@
  * and contend for its session registry.
  *
  * `sanitizeVerifierEnv` returns a *copy* of the given environment with the
- * internal pi-engineering variables stripped and `PI_ENGINEERING_VERIFIER_CHILD`
+ * internal pi-engineering variables (and every HERDR_* variable) stripped and `PI_ENGINEERING_VERIFIER_CHILD`
  * set to `'1'` so the child knows it is running under a verifier. Keys listed in
  * `opts.keep` are retained even if they would otherwise be stripped. The input
  * object is never mutated.
@@ -44,8 +44,8 @@ export function sanitizeVerifierEnv(env: NodeJS.ProcessEnv, opts: SanitizeVerifi
   const result: NodeJS.ProcessEnv = {};
 
   for (const key of Object.keys(env)) {
-    if (STRIPPED.has(key) && !keep.has(key)) {
-      continue;
+    if ((STRIPPED.has(key) || key.startsWith("HERDR_")) && !keep.has(key)) {
+      continue; // HERDR_*: Pi's own control-plane settings never reach commands a repository can author (T16)
     }
     result[key] = env[key];
   }

@@ -23,8 +23,10 @@ import type {
   RuntimeId,
 } from "../AgentRuntime.ts";
 import type { AgentRuntime } from "../AgentRuntime.ts";
+import { paneLink, tidyAgentName } from "./CollabLayout.ts";
 import type { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 import { type HerdrAgent, type HerdrCli, HerdrError } from "./HerdrCli.ts";
+import { AttemptTransitions, type LineageEmitter, type LineageState } from "./lineage.ts";
 
 const VERSION = "herdr-0.9.1";
 
@@ -33,7 +35,21 @@ interface Rec {
   request: AgentWorkerRequest;
   target: string;
   provisioned: boolean;
+  provisioning?: Promise<void>;
+  /** True once the lineage spawn was emitted; attempt states are only sent for a known attempt. */
+  lineageSpawned?: boolean;
 }
+
+/** Runtime status -> lineage attempt state. Unlisted statuses (READY, CREATED, INTERRUPTED...) are not transitions. */
+const LINEAGE_STATE: Partial<Record<AgentStatus, LineageState>> = {
+  WORKING: "running",
+  RECOVERING: "running",
+  BLOCKED: "blocked",
+  COMPLETED: "done",
+  FAILED: "failed",
+  LOST: "failed",
+  TERMINATED: "cancelled",
+};
 
 /** Map a Herdr agent status to the normalized AgentStatus. */
 function normalizeStatus(s: HerdrAgent["agent_status"]): AgentStatus {
@@ -63,6 +79,11 @@ export interface HerdrAgentRuntimeOptions {
    * by default (no emitter = no network).
    */
   ingest?: ControlPlaneIngest;
+  /**
+   * Optional lineage emitter (T02). Off by default: without it no lineage is
+   * built and behaviour is unchanged.
+   */
+  lineage?: LineageEmitter;
 }
 
 export class HerdrAgentRuntime implements AgentRuntime {
@@ -71,11 +92,14 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private readonly agentKind: string;
   private readonly records = new Map<RuntimeId, Rec>();
   private readonly ingest?: ControlPlaneIngest;
+  private readonly lineage?: LineageEmitter;
+  private readonly lineageTransitions = new AttemptTransitions();
 
   constructor(opts: HerdrAgentRuntimeOptions) {
     this.cli = opts.cli;
     this.agentKind = opts.agentKind ?? "pi";
     this.ingest = opts.ingest;
+    this.lineage = opts.lineage;
     if (this.ingest) void this.ingest.hostRegistered().catch(() => {});
     this.capabilities = {
       name: "herdr",
@@ -131,6 +155,8 @@ export class HerdrAgentRuntime implements AgentRuntime {
     await this.provision(rec);
     this.mutate(rec, { status: "READY", currentOperation: "start" });
     this.emitSession(rec, "session.started", rec.worker.status);
+    this.emitSpawn(rec);
+    this.emitSurface(rec, "open", "surface-open");
     return rec.worker;
   }
 
@@ -139,7 +165,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     if (req) rec.request = { ...rec.request, ...req };
     rec.worker.objective = task;
     await this.provision(rec);
-    await this.cli.prompt(rec.target, task);
+    await this.cli.prompt(rec.target, task, rec.request.timeoutMs);
     this.mutate(rec, { status: "WORKING", objective: task, currentOperation: "sendTask", result: null });
     this.emitSession(rec, "session.updated", "WORKING");
     return rec.worker;
@@ -172,8 +198,19 @@ export class HerdrAgentRuntime implements AgentRuntime {
   async waitFor(rid: RuntimeId, timeoutMs?: number, signal?: AbortSignal): Promise<AgentWorker> {
     const rec = this.require(rid);
     if (signal?.aborted) throw new Error("waitFor aborted");
-    const until = ["done", "blocked", "working", "idle"];
-    const agent = await this.cli.wait(rec.target, until, timeoutMs ?? 300_000);
+    const until = ["done", "blocked", "idle"];
+    let agent: HerdrAgent;
+    try {
+      agent = await this.cli.wait(rec.target, until, timeoutMs ?? 300_000);
+    } catch (err) {
+      // A wait that times out or fails leaves the attempt neither running nor done: say so.
+      this.emitAttemptState(
+        rec,
+        "failed",
+        `wait failed: ${err instanceof Error ? err.message : "error"}`.slice(0, 200),
+      );
+      throw err;
+    }
     const status = normalizeStatus(agent.agent_status);
     const result: AgentWorkerResult =
       status === "COMPLETED"
@@ -210,6 +247,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     } catch {
       /* best-effort */
     }
+    this.emitSurface(rec, "closed", "surface-closed", "pane closed by Pi terminate");
     this.mutate(rec, { status: "TERMINATED", currentOperation: "terminate" });
     this.emitSession(rec, "session.terminated", "TERMINATED");
     return true;
@@ -227,6 +265,7 @@ export class HerdrAgentRuntime implements AgentRuntime {
     } else {
       status = rec.worker.status === "COMPLETED" || rec.worker.status === "TERMINATED" ? rec.worker.status : "LOST";
     }
+    if (!live && status === "LOST") this.emitSurface(rec, "gone", "surface-gone", "agent no longer present in Herdr");
     this.mutate(rec, { status, currentOperation: "resumeOrReconcile" });
     this.emitSession(rec, "session.updated", status);
     return rec.worker;
@@ -253,17 +292,34 @@ export class HerdrAgentRuntime implements AgentRuntime {
 
   private async provision(rec: Rec): Promise<void> {
     if (rec.provisioned) return;
-    if (rec.request.isolation === "worktree") {
-      try {
-        const wt = await this.cli.createWorktree(rec.request.cwd ?? process.cwd());
-        rec.target = wt.workspaceId;
-        rec.worker.worktree = wt.path;
-      } catch {
-        // Fall back to the opaque target; provisioning is best-effort.
-      }
+    if (rec.provisioning) return rec.provisioning;
+    const pending = this.provisionWorker(rec);
+    rec.provisioning = pending;
+    try {
+      await pending;
+    } finally {
+      rec.provisioning = undefined;
+    }
+  }
+
+  private async provisionWorker(rec: Rec): Promise<void> {
+    if (rec.target === rec.worker.id) {
+      const cwd = rec.request.cwd ?? process.cwd();
+      const workspace =
+        rec.request.isolation === "worktree" ? await this.cli.createWorktree(cwd) : await this.cli.createWorkspace(cwd);
+      rec.target = workspace.paneId;
+      if (rec.request.isolation === "worktree") rec.worker.worktree = workspace.path;
+    }
+    // Worker identity for the runtime report (role/mission shown on the dashboard session row). Best-effort:
+    // without it the agent is simply reported with no role or mission.
+    if (this.cli.exportEnv) {
+      const vars: Record<string, string> = { PI_ENGINEERING_ROLE: rec.worker.role };
+      if (rec.worker.missionId) vars.PI_ENGINEERING_MISSION_ID = rec.worker.missionId;
+      await this.cli.exportEnv(rec.target, vars).catch(() => {});
     }
     try {
-      await this.cli.startAgent(rec.target, this.agentKind, rec.worker.role);
+      const name = tidyAgentName(`pi-${rec.worker.id}-${rec.worker.role}`)!;
+      await this.cli.startAgent(rec.target, this.agentKind, name);
     } catch (err) {
       if (err instanceof HerdrError && err.code === "agent_start_failed") throw err;
       throw new HerdrError(
@@ -290,6 +346,77 @@ export class HerdrAgentRuntime implements AgentRuntime {
   private mutate(rec: Rec, patch: Partial<AgentWorker>): void {
     rec.worker = { ...rec.worker, ...patch, updated_at: new Date().toISOString() };
     this.records.set(rec.worker.id, rec);
+    // The attempt state follows the runtime status through this one choke point, so polling
+    // (sync), waiting, resuming and terminating all share the same dedupe and finality rules.
+    const state = patch.status ? LINEAGE_STATE[patch.status] : undefined;
+    if (state) this.emitAttemptState(rec, state);
+  }
+
+  /** Lineage: this runtime worker is one agent, one attempt, one session. start() is idempotent per id. */
+  private emitSpawn(rec: Rec): void {
+    const lineage = this.lineage;
+    if (!lineage) return;
+    try {
+      const wid = rec.worker.id;
+      const parent = rec.request.parentRuntimeId;
+      lineage.workerSpawned({
+        agent: wid,
+        attempt: wid,
+        session: wid,
+        // parentRuntimeId is the one real parent datum; absent => no spawn edge.
+        parentAgent: parent,
+        parentAttempt: parent,
+        missionId: rec.worker.missionId,
+        role: rec.worker.role,
+        model: rec.worker.model,
+        transition: "start",
+        at: rec.worker.updated_at,
+      });
+      rec.lineageSpawned = true;
+    } catch {
+      /* observational */
+    }
+  }
+
+  /** The worker's tab (top-level) or pane (helper). A surface fact only: it never moves the agent or attempt. */
+  private emitSurface(rec: Rec, state: "open" | "closed" | "gone", transition: string, reason?: string): void {
+    const lineage = this.lineage;
+    if (!lineage || !rec.lineageSpawned) return;
+    try {
+      lineage.surfaceState(
+        {
+          surface: rec.request.parentRuntimeId ? "pane" : "tab",
+          id: rec.worker.id,
+          agent: rec.worker.id,
+          missionId: rec.worker.missionId,
+          at: rec.worker.updated_at,
+        },
+        state,
+        transition,
+        reason,
+      );
+    } catch {
+      /* observational */
+    }
+  }
+
+  private emitAttemptState(rec: Rec, state: LineageState, reason?: string): void {
+    const lineage = this.lineage;
+    if (!lineage || !rec.lineageSpawned) return;
+    try {
+      // Unchanged state => null; done/cancelled are final, so terminate() on a completed worker is a no-op.
+      const transition = this.lineageTransitions.advance(rec.worker.id, state);
+      if (transition === null) return;
+      lineage.attemptState(
+        { attempt: rec.worker.id, agent: rec.worker.id, missionId: rec.worker.missionId },
+        state,
+        transition,
+        reason,
+        rec.worker.updated_at,
+      );
+    } catch {
+      /* observational */
+    }
   }
 
   /** Fire-and-forget control-plane session event (best-effort, never blocks). */
@@ -304,6 +431,15 @@ export class HerdrAgentRuntime implements AgentRuntime {
         agentRole: rec.worker.role,
         model: rec.worker.model ?? undefined,
         status,
+        parentSessionId: rec.request.parentRuntimeId,
+        // rec.target is a workspace id after worktree provisioning; only a pane id (`w2B:p1`) is a pane
+        paneId: rec.target.includes(":") ? rec.target : undefined,
+        // rec.target is a workspace id after worktree provisioning; only a pane id (`w2B:p1`) makes a pane link
+        instanceId:
+          this.ingest && rec.target.includes(":")
+            ? (paneLink(this.ingest.host.hostId, rec.target) ?? undefined)
+            : undefined,
+        name: tidyAgentName(`${rec.worker.role}-${rec.worker.id.slice(-6)}`) ?? undefined,
       })
       .catch(() => {});
   }

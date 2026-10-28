@@ -204,8 +204,8 @@ describe("follow-ups", () => {
       store,
       broker,
       limits: { maxActive: 10, maxAgents: 10 },
-      gatewayCapacity: (model) => (model === "small" ? 2 : 5),
-      modelForTask: () => "small",
+      gatewayCapacity: (model) => (model?.modelId === "small" ? 2 : 5),
+      modelForTask: () => ({ provider: "test", modelId: "small" }),
     });
     await scheduler.runMission(m.mission_id);
     assert.equal(peak, 2);

@@ -14,7 +14,7 @@
  */
 
 import { formatWaitingFor } from "../gateway/admissionNotice.ts";
-import { observedGatewayCapacity } from "../models/gatewayCatalog.ts";
+import { type GatewayCapacityIdentity, observedGatewayCapacity } from "../models/gatewayCatalog.ts";
 import { CircuitBreaker } from "../resilience/circuitBreaker.ts";
 import type { InfraErrorCategory } from "../resilience/classify.ts";
 import { CATEGORY_TO_STATE } from "../resilience/classify.ts";
@@ -149,7 +149,7 @@ export function resolveSchedulerLimits(
   const limits: SchedulerLimits = { ...DEFAULT_LIMITS };
   // The gateway's advertised per-model concurrency replaces the fixed
   // per-role default; an env override below still wins.
-  if (capacity !== undefined && capacity > 0) limits.maxPerRole = Math.floor(capacity);
+  if (capacity !== undefined && Number.isFinite(capacity) && capacity >= 0) limits.maxPerRole = Math.floor(capacity);
   const num = (key: string): number | undefined => {
     const v = env[key];
     if (!v) return undefined;
@@ -182,9 +182,9 @@ export interface SchedulerOptions {
    * slots), read on every capacity check. Replaces the default per-role cap;
    * explicit limits and env overrides still win.
    */
-  gatewayCapacity?: (modelId?: string) => number | undefined;
+  gatewayCapacity?: (identity?: GatewayCapacityIdentity) => number | undefined;
   /** The model a task is routed to, to key its cap by that model's limit. */
-  modelForTask?: (task: OrchestrationTask) => string | undefined;
+  modelForTask?: (task: OrchestrationTask) => GatewayCapacityIdentity | undefined;
   /** Fallback wake interval of the pass loop (default 1000 ms); events wake it sooner. */
   passTickMs?: number;
   /** Called when a task reaches a terminal state. */
@@ -278,8 +278,8 @@ export class MissionScheduler {
   private readonly wakers = new Set<() => void>();
   private wakePending = false;
   private readonly passTickMs: number;
-  private readonly gatewayCapacity: ((modelId?: string) => number | undefined) | undefined;
-  private readonly modelForTask: ((task: OrchestrationTask) => string | undefined) | undefined;
+  private readonly gatewayCapacity: SchedulerOptions["gatewayCapacity"];
+  private readonly modelForTask: SchedulerOptions["modelForTask"];
   private readonly perRoleExplicit: boolean;
   private readonly agentsExplicit: boolean;
   /** Mission-level gateway resilience config (time-based window, probes). */
@@ -414,10 +414,14 @@ export class MissionScheduler {
   private hasCapacity(t: OrchestrationTask): boolean {
     const kind = t.kind;
     if (this.activeTasks.size >= this.limits.maxActive) return false;
-    const capacity = this.gatewayCapacity?.(this.modelForTask?.(t));
+    const modelTask = kind === "agent" || kind === "review" || kind === "research";
+    const observed = modelTask ? this.gatewayCapacity?.(this.modelForTask?.(t)) : undefined;
+    const capacity = observed !== undefined && Number.isFinite(observed) && observed >= 0 ? observed : undefined;
     const maxAgents =
-      !this.agentsExplicit && capacity ? Math.max(this.limits.maxAgents, capacity) : this.limits.maxAgents;
-    const maxPerRole = !this.perRoleExplicit && capacity ? capacity : this.limits.maxPerRole;
+      !this.agentsExplicit && capacity !== undefined
+        ? Math.max(this.limits.maxAgents, capacity)
+        : this.limits.maxAgents;
+    const maxPerRole = !this.perRoleExplicit && capacity !== undefined ? capacity : this.limits.maxPerRole;
     if (kind === "agent" && this.counters.agents >= maxAgents) return false;
     if ((kind === "process" || kind === "validation") && this.counters.subprocesses >= this.limits.maxSubprocesses) {
       return false;

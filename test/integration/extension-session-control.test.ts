@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import extension from "../../extensions/index.ts";
+import { publishHostMaintenance } from "../../src/runtime/host/maintenance.ts";
 import { discoverSessions, requestSession } from "../../src/sessionControl/SessionControl.ts";
 
 type Handler = (event: Record<string, unknown>, context: Record<string, unknown>) => unknown;
@@ -25,6 +26,16 @@ test("extension publishes one live session, tool progress, UI-only note and life
   process.env.PI_PANEL_NARRATOR = "0";
   const handlers = new Map<string, Handler[]>();
   const notices: string[] = [];
+  const removeHost = publishHostMaintenance({
+    describe: async () => ({
+      hostCommit: "a".repeat(40),
+      commit: "a".repeat(40),
+      generation: 1,
+      capabilities: ["runtime.describe"],
+      pending: false,
+    }),
+    reload: async () => ({ ok: false, commit: "a".repeat(40), generation: 1 }),
+  });
   const pi = {
     on: (name: string, handler: Handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
     registerCommand: () => {},
@@ -77,9 +88,19 @@ test("extension publishes one live session, tool progress, UI-only note and life
     const status = await requestSession(sessions[0]!, { version: 1, op: "status" });
     assert.equal(status.ok, true);
     if (status.ok) {
+      assert.ok(status.data.runtime?.capabilities.includes("mission.resume.selected-model.v1"));
+      assert.equal(status.data.runtime?.interactiveIdle, true);
       assert.equal(status.data.currentTool, "mission");
       assert.equal(status.data.lastToolProgress, "repairing task TSK-1");
     }
+    for (const handler of handlers.get("session_before_compact") ?? []) await handler({}, ctx);
+    const compacting = await requestSession(sessions[0]!, { version: 1, op: "status" });
+    assert.ok(compacting.ok);
+    assert.equal(compacting.data.runtime?.interactiveIdle, false);
+    for (const handler of handlers.get("session_compact_failed") ?? []) await handler({}, ctx);
+    const settled = await requestSession(sessions[0]!, { version: 1, op: "status" });
+    assert.ok(settled.ok);
+    assert.equal(settled.data.runtime?.interactiveIdle, true);
     const note = await requestSession(sessions[0]!, {
       version: 1,
       op: "note",
@@ -129,6 +150,7 @@ test("extension publishes one live session, tool progress, UI-only note and life
     for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, headlessCtx);
     assert.equal((await discoverSessions(control)).length, 0);
   } finally {
+    removeHost();
     for (const [key, value] of Object.entries({
       PI_ENGINEERING_CONTROL_DIR: old.directory,
       PI_SELF_UPDATE: old.update,
@@ -206,12 +228,21 @@ test("housekeeping is deferred past session_start and a shutdown cancels it befo
     process.getActiveResourcesInfo().filter((r) => r === "Timeout" || r === "PipeWrap" || r === "ChildProcess");
   try {
     extension(pi as never);
-    const before = handles().length;
+    const before = handles();
     for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
     for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     // Past both the first-run delay and several intervals: nothing may fire.
     await new Promise((r) => setTimeout(r, 500));
-    assert.equal(handles().length, before, "no housekeeping timer or git child pipe remains after shutdown");
+    const after = handles();
+    // Unrelated child pipes may finish during shutdown. Compare each resource
+    // kind separately so their disappearance neither fails the check nor hides
+    // a leaked housekeeping timer or child process.
+    for (const kind of ["Timeout", "PipeWrap", "ChildProcess"]) {
+      assert.ok(
+        after.filter((resource) => resource === kind).length <= before.filter((resource) => resource === kind).length,
+        `no housekeeping ${kind} remains after shutdown`,
+      );
+    }
     assert.equal(
       (existsSync(spawnLog) ? readFileSync(spawnLog, "utf8") : "").includes("sweep "),
       false,

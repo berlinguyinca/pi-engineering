@@ -74,6 +74,11 @@ function tracking(pi: ExtensionAPI): { api: ExtensionAPI; undo: () => void } {
 }
 
 export async function installPiEngineering(pi: ExtensionAPI, modules: EntryModules = DEFAULT_MODULES): Promise<void> {
+  const startedAt = Date.now();
+  // The TUI renders its first frame only after extensions finish loading, so
+  // for a second or more the user sees a blank terminal. stderr is the one
+  // place that is visible in that window; keep it to two short lines.
+  process.stderr.write(`[pi-engineering] loading runtime…\n`);
   let stage = "import";
   const { api, undo } = tracking(pi);
   try {
@@ -81,6 +86,7 @@ export async function installPiEngineering(pi: ExtensionAPI, modules: EntryModul
     stage = "initialization";
     await host.default(api);
     setFallbackReason(null);
+    process.stderr.write(`[pi-engineering] runtime ready in ${Date.now() - startedAt}ms\n`);
     return;
   } catch (error) {
     setFallbackReason(`runtime host ${stage} failed: ${describe(error)}`);

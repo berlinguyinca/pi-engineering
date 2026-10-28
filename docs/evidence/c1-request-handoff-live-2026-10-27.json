@@ -1,0 +1,14 @@
+{
+  "provider": "metabolomics",
+  "big": "deepseek_v4-flash-modality-text-quant-mxfp4",
+  "smallProvider": "metabolomics",
+  "outputLimit": 64,
+  "thinking": "off",
+  "small": "qwen3.8-flash_next-modality-text-quant-w3a8",
+  "beforeTokens": 163863,
+  "contextWindow": 131072,
+  "requestChars": 3415,
+  "requests": 1,
+  "response": "HANDOFF_OK",
+  "compactions": 0
+}

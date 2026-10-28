@@ -33,6 +33,7 @@ export interface ModelHealth {
 
 export interface HealthProviderOptions {
   baseUrl: string;
+  providerId?: string;
   apiKey?: string;
   headers?: Record<string, string>;
   /** How long a reading stays good. Short: this is a liveness signal. */
@@ -98,6 +99,7 @@ export class ModelHealthProvider {
     try {
       const entries = await fetchGatewayModels({
         baseUrl: this.opts.baseUrl,
+        ...(this.opts.providerId ? { providerId: this.opts.providerId } : {}),
         ...(this.opts.apiKey ? { apiKey: this.opts.apiKey } : {}),
         ...(this.opts.headers ? { headers: this.opts.headers } : {}),
         ...(this.opts.fetchImpl ? { fetchImpl: this.opts.fetchImpl } : {}),

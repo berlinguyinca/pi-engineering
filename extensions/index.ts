@@ -3,12 +3,12 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
-import { createIngestFromEnv } from "../src/runtime/herdr/ingestFromEnv.ts";
+import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
 import { formatMissionActivity } from "../src/status/missionActivity.ts";
 import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
@@ -32,6 +32,7 @@ import {
   installedGatewayStreamRetries,
   isGatewayStreamRetryLive,
 } from "../src/gateway/installStreamRetry.ts";
+import { SettleRecovery, describeDecision, settleRecoveryEnabled } from "../src/gateway/settleRecovery.ts";
 import {
   advisesAlternateModel,
   describeGatewayWait,
@@ -45,8 +46,10 @@ import { GitRepo } from "../src/git/GitRepo.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
+import { registerPrimaryWorktreeGuard } from "../src/guard/primaryWorktreeGuard.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
 import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
+import { admissionIdentityHeaders } from "../src/inference/admissionTransport.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig } from "../src/models/modelsConfig.ts";
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
@@ -85,7 +88,9 @@ import {
 } from "../src/request/thinkingPolicy.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
-import { type InspectorFeedHandle, attachInspectorFeedFromEnv } from "../src/runtime/herdr/InspectorFeed.ts";
+import { attachInspectorWhenReady, createInspectorSlot } from "../src/runtime/herdr/attachInspector.ts";
+import type { LineageEmitter } from "../src/runtime/herdr/lineage.ts";
+import { loadLineageEmitter } from "../src/runtime/herdr/lineageConfig.ts";
 import { getHostMaintenance } from "../src/runtime/host/maintenance.ts";
 import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
@@ -324,6 +329,16 @@ export async function settleWorkspaceActivity(): Promise<void> {
  * `<repo>/src`) must share ONE runtime/ledger view, otherwise each holds a
  * stale in-memory ledger over the same shared `.pi-eng/ledger.jsonl` file.
  */
+/**
+ * The lineage emitter, built once per process from the central fleet config.
+ * Null (and free) unless `lineage.enabled` and `ingest.outbox` are both true there.
+ */
+let lineageEmitterOnce: Promise<LineageEmitter | null> | undefined;
+function lineageEmitter(): Promise<LineageEmitter | null> {
+  lineageEmitterOnce ??= loadLineageEmitter();
+  return lineageEmitterOnce;
+}
+
 async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<EngineeringRuntime> {
   if (runtimeShutdownFlight) await runtimeShutdownFlight;
   const openGeneration = runtimeShutdownGeneration;
@@ -350,13 +365,15 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
-  const attentionIngest = createIngestFromEnv(process.env);
+  const lineage = await lineageEmitter();
+  const attentionIngest = await resolveAttentionIngest(process.env, getAgentDir());
   const attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
   let attentionReady = false;
   const opening = EngineeringRuntime.open({
     cwd,
     verifier: new CommandVerifier(),
     model,
+    ...(lineage ? { lineage } : {}),
     // Autonomous stop (roadmap spec §13, §33): when this repository's Roadmap
     // 1.0 is complete, /engineer refuses to invent new work. The gate is derived
     // from the roadmap engine (completion is never declared). If the repo has no
@@ -476,6 +493,16 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
   if (plumbing) {
     const previous = plumbing.state.snapshot.run;
     const sameMission = previous?.workItemId === event.missionId;
+    // Skip a redraw for output identical to what the panel already shows.
+    if (
+      sameMission &&
+      previous.goal === detail &&
+      previous.phase === rendered.phase &&
+      JSON.stringify(previous.missionStatus) === JSON.stringify(rendered.missionStatus)
+    ) {
+      publishMissionActivityFooter(key, event, rendered, detail);
+      return;
+    }
     plumbing.state.set({
       run: {
         workItemId: event.missionId,
@@ -490,6 +517,15 @@ function publishMissionActivity(key: string, event: RuntimeMissionActivityEvent)
       updatedAt: Date.now(),
     });
   }
+  publishMissionActivityFooter(key, event, rendered, detail);
+}
+
+function publishMissionActivityFooter(
+  key: string,
+  event: RuntimeMissionActivityEvent,
+  rendered: ReturnType<typeof formatMissionActivity>,
+  detail: string,
+): void {
   if (ambientPanel?.key !== key) return;
   activeFooter?.setTask({
     workItemId: event.missionId,
@@ -665,16 +701,19 @@ export default function (pi: ExtensionAPI) {
   registerInteractiveMemory(pi);
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
-  // Agent-inspector feed to Herdr: OFF unless HERDR_CP_URL is set AND PI_INSPECTOR_FEED=1.
+  // Agent-inspector feed to Herdr: OFF unless this host's central fleet config
+  // (~/.config/herdr-engineering/host.json) sets inspector.enabled. Loaded in the
+  // background with a short timeout so session start never waits on the network;
+  // a missing config or unreachable control plane simply means no inspector.
   // Best-effort and bounded; see docs/split-view-and-inspector.md.
-  let inspector: InspectorFeedHandle | null = null;
-  try {
-    inspector = attachInspectorFeedFromEnv(pi, process.env, {
-      modelReason: () => (automaticModelSwitch ? "fallback" : undefined),
-    });
-  } catch {
-    inspector = null;
-  }
+  const inspector = createInspectorSlot();
+  void attachInspectorWhenReady(pi, {
+    modelReason: () => (automaticModelSwitch ? "fallback" : undefined),
+  })
+    .then((handle) => {
+      inspector.set(handle);
+    })
+    .catch(() => {});
   // Housekeeping: reclaim worktrees abandoned by crashed or killed runs and
   // expire unused Rust target caches. Live missions keep their worktrees, and
   // uncommitted work is committed to its branch before a checkout goes away,
@@ -748,10 +787,21 @@ export default function (pi: ExtensionAPI) {
   // a mission tool is awaiting a worker; another PI process never opens this
   // session's transcript or writes its event store to ask for status.
   let activeControl: SessionControlServer | null = null;
+  let maintenanceCompacting = false;
   if (typeof pi.on === "function") {
+    pi.on("session_before_compact", () => {
+      maintenanceCompacting = true;
+    });
+    pi.on("session_compact", () => {
+      maintenanceCompacting = false;
+    });
+    pi.on("session_compact_failed", () => {
+      maintenanceCompacting = false;
+    });
     pi.on("session_start", async (_event, ctx) => {
       await activeControl?.close();
       activeControl = null;
+      maintenanceCompacting = false;
       const sessionId = ctx.sessionManager?.getSessionId?.();
       if (!sessionId) return;
       try {
@@ -815,6 +865,7 @@ export default function (pi: ExtensionAPI) {
             )
           ).flat();
         };
+        const isInteractiveIdle = () => !maintenanceCompacting && ctx.isIdle() && !ctx.hasPendingMessages?.();
         activeControl = await startSessionControl({
           cwd: ctx.cwd,
           sessionId,
@@ -825,12 +876,19 @@ export default function (pi: ExtensionAPI) {
             const description = await host.describe();
             return {
               ...description,
+              interactiveIdle: isInteractiveIdle(),
               capabilities: [
-                ...new Set([...description.capabilities, "runtime.prepare", "mission.resumeAfterMaintenance"]),
+                ...new Set([
+                  ...description.capabilities,
+                  "runtime.prepare",
+                  "mission.resumeAfterMaintenance",
+                  "mission.resume.selected-model.v1",
+                ]),
               ],
             };
           },
           onMaintenance: maintenanceHandler({
+            isInteractiveIdle,
             getHost: getHostMaintenance,
             getRuntime: async (missionId) => {
               const active = await getRuntimeByCwd(runtimeCwd(ctx.cwd)).catch(() => null);
@@ -1005,6 +1063,12 @@ export default function (pi: ExtensionAPI) {
     // Identical-tool-call loops and unbounded bash test/build runs
     // (src/guard/toolCallGuard.ts; knobs in docs/usage.md, "Tool-call guard").
     registerToolCallGuard(pi as never);
+    // One agent, one worktree (AGENTS.md), enforced: block this session's own
+    // mutating calls against a repository's PRIMARY checkout so concurrent
+    // sessions cannot destroy each other's uncommitted work there. Production
+    // ops sessions set PI_ENG_PRIMARY=1; PI_ENG_WORKTREE_GUARD=0 disables
+    // (src/guard/primaryWorktreeGuard.ts; docs/usage.md, "Primary worktree guard").
+    registerPrimaryWorktreeGuard(pi as never, () => process.cwd());
     pi.on("tool_result", async (event) => {
       if (event.toolName !== "mission") return;
       const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
@@ -1157,6 +1221,7 @@ ${RECOVERY_PROMPT}`;
   const selfUpdateEnabled = selfUpdateMode !== "0" && selfUpdateMode !== "false" && selfUpdateMode !== "off";
   const extensionRoot = resolve(new URL("..", import.meta.url).pathname);
   let lastUpdateCheckAt: number | undefined;
+  let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
 
   // The same unattended, tty-less runner the auto-reload watcher uses.
   const runGit = gitRunner(extensionRoot);
@@ -1197,16 +1262,30 @@ ${RECOVERY_PROMPT}`;
       if (!selfUpdateEnabled || !shouldCheck(lastUpdateCheckAt, Date.now())) return;
       // Deliberately not awaited: a session must never wait on a network call
       // to start, and a failed check is silence rather than a notice.
-      void runSelfUpdate(selfUpdateMode !== "check")
-        .then((result) => {
-          if (result.unavailable) return;
-          // Only speak when there is something to act on. "You are up to date"
-          // every few hours is noise that trains the operator to ignore the one
-          // notice that matters.
-          if (result.decision.action === "current" || result.decision.action === "skip") return;
-          ctx.ui.notify(describeUpdate(result.decision, { applied: result.applied }), "info");
-        })
-        .catch(() => {});
+      // The check is also moved off this handler's turn (and unref'd): the first git call of a process does one-time
+      // setup (state directory, version probe, the operator's config) that must not delay the session's start.
+      lastUpdateCheckAt = Date.now();
+      if (updateCheckTimer) clearTimeout(updateCheckTimer);
+      const timer = setTimeout(() => {
+        updateCheckTimer = undefined;
+        void runSelfUpdate(selfUpdateMode !== "check")
+          .then((result) => {
+            if (result.unavailable) return;
+            // Only speak when there is something to act on. "You are up to date"
+            // every few hours is noise that trains the operator to ignore the one
+            // notice that matters.
+            if (result.decision.action === "current" || result.decision.action === "skip") return;
+            ctx.ui.notify(describeUpdate(result.decision, { applied: result.applied }), "info");
+          })
+          .catch(() => {});
+      }, 0);
+      timer.unref?.();
+      updateCheckTimer = timer;
+    });
+    // A session that ends before the deferred check started takes the check with it.
+    pi.on("session_shutdown", () => {
+      if (updateCheckTimer) clearTimeout(updateCheckTimer);
+      updateCheckTimer = undefined;
     });
   }
 
@@ -1257,7 +1336,7 @@ ${RECOVERY_PROMPT}`;
       } catch {
         // Unauthenticated probe; the gateway decides whether that is allowed.
       }
-      provider = new ModelHealthProvider({ baseUrl, ...(apiKey ? { apiKey } : {}) });
+      provider = new ModelHealthProvider({ providerId: model.provider, baseUrl, ...(apiKey ? { apiKey } : {}) });
       healthProviders.set(model.provider, provider);
     }
     await provider.refresh();
@@ -1358,16 +1437,6 @@ ${RECOVERY_PROMPT}`;
     return { written: result.written, lines: result.lines, failed: result.failures.length > 0 };
   }
 
-  /** Pi caches models.json; without a reload a successful write changes nothing in the open session. */
-  async function reloadAfterWrite(ctx: ExtensionCommandContext): Promise<string> {
-    try {
-      await ctx.reload();
-      return "Reloaded.";
-    } catch (err) {
-      return `Reload failed (${err instanceof Error ? err.message : String(err)}); run /reload.`;
-    }
-  }
-
   // ─── /model-refresh: make the configured catalogue match the gateway ─────
   // Model configuration drifts silently and expensively. Measured against a
   // live gateway, a working models.json had one model configured at 1,048,576
@@ -1381,6 +1450,7 @@ ${RECOVERY_PROMPT}`;
     const dryRun = argv.includes("--dry-run");
     let explicitProvider: string | undefined;
     let probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS;
+    let reload = false;
     try {
       for (let i = 0; i < argv.length; i += 1) {
         const arg = argv[i]!;
@@ -1405,7 +1475,8 @@ ${RECOVERY_PROMPT}`;
       });
       const lines = [...out.lines];
       if (name === "refresh-models") lines.push("(/refresh-models is now /model-refresh; the old name still works.)");
-      if (out.written && !dryRun) lines.push(await reloadAfterWrite(ctx));
+      reload = out.written && !dryRun;
+      if (reload) lines.push("Configuration saved. Reloading Pi…");
       ctx.ui.notify(lines.join("\n"), out.failed ? "warning" : "info");
     } catch (err) {
       ctx.ui.notify(
@@ -1416,6 +1487,9 @@ ${RECOVERY_PROMPT}`;
       ctx.ui.setStatus?.("model-refresh", undefined);
       ctx.ui.setWidget?.("model-refresh", undefined);
     }
+    // Reload invalidates ctx even if it fails. All UI work and cleanup must
+    // finish first; let Pi report a reload failure without claiming the save failed.
+    if (reload) await ctx.reload();
   };
   pi.registerCommand("model-refresh", {
     description:
@@ -1438,6 +1512,7 @@ ${RECOVERY_PROMPT}`;
       const check = argv.includes("--check");
       const dryRun = check || argv.includes("--dry-run");
       const skipRefresh = argv.includes("--no-refresh");
+      let written = false;
       try {
         const source = parseSyncSource(readSyncSourceSetting());
         const canonical = parseCanonicalProviders(await fetchCanonicalText(source, ctx.signal));
@@ -1448,7 +1523,6 @@ ${RECOVERY_PROMPT}`;
           (id) => ctx.modelRegistry?.getProviderAuthStatus(id).configured === true,
         );
         const lines = describeProviderSync(plan, dryRun);
-        let written = false;
         if (plan.dirty && !dryRun) {
           const w = writeModelsConfig(defaultModelsPath(), plan.config, new Date(), "model-sync");
           written = true;
@@ -1481,17 +1555,18 @@ ${RECOVERY_PROMPT}`;
             lines.push(`Model refresh failed: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
-        if (written) lines.push(await reloadAfterWrite(ctx));
+        if (written) lines.push("Configuration saved. Reloading Pi…");
         ctx.ui.notify(lines.join("\n"), failed ? "warning" : "info");
       } catch (err) {
         ctx.ui.notify(
-          `model-sync failed: ${err instanceof Error ? err.message : String(err)}. Your configuration was not changed.`,
+          `model-sync failed: ${err instanceof Error ? err.message : String(err)}. ${written ? "Provider settings were saved; run /reload to load them." : "Your configuration was not changed."}`,
           "error",
         );
       } finally {
         ctx.ui.setStatus?.("model-refresh", undefined);
         ctx.ui.setWidget?.("model-refresh", undefined);
       }
+      if (written) await ctx.reload();
     },
   });
 
@@ -1692,6 +1767,10 @@ ${RECOVERY_PROMPT}`;
         { provider: model.provider, api: model.api },
         {
           createStream: () => createAssistantMessageEventStream() as never,
+          // Tell the gateway who is asking (client, and this Pi session), so its
+          // per-session admission buckets are not one shared "default" bucket.
+          requestHeaders: (_model, options) =>
+            admissionIdentityHeaders(undefined, (options as { sessionId?: string } | undefined)?.sessionId),
           // Scope decides which gate, keyed on what the refusal is ABOUT. A
           // 429 or an admission envelope speaks for the account — a shared
           // queue, a concurrency ceiling — so it parks every caller behind one
@@ -1911,6 +1990,23 @@ ${RECOVERY_PROMPT}`;
             `${m.id} is out of capacity and no other model fits this session`,
           );
         },
+      }).register(pi as never);
+    }
+
+    // Last resort for a turn that failed before any output once the pump's
+    // bounded budget and the advised switch are spent: wait on an escalating
+    // schedule and continue, instead of leaving the session for the operator to
+    // type "retry". Registered AFTER the other settle handlers on purpose.
+    if (settleRecoveryEnabled()) {
+      new SettleRecovery({
+        onDecision: (decision) => inspector.note(describeDecision(decision)),
+        owe: (ctx, delayMs, attempt, label) => {
+          const m = ctx.model;
+          if (!m) return;
+          afterOutputRetry.owe({ provider: m.provider, id: m.id }, delayMs, attempt, "gateway failure", label);
+        },
+        isPaced: (ctx) => afterOutputRetry.isPaced({ provider: ctx.model?.provider, id: ctx.model?.id }),
+        hasPendingWait: (ctx) => afterOutputRetry.hasPendingWait({ provider: ctx.model?.provider, id: ctx.model?.id }),
       }).register(pi as never);
     }
 
@@ -2225,6 +2321,8 @@ ${RECOVERY_PROMPT}`;
   // Session lifecycle: diagnostics sink, and the data behind the footer's
   // ambient row (files, findings, tokens). Needs a live Pi run (the smoke-test
   // stub has no pi.on).
+  let panelStartGeneration = 0;
+  let panelStarting: Promise<void> = Promise.resolve();
   if (typeof pi.on === "function") {
     pi.on("session_start", async (_event, ctx) => {
       // First, before anything can report: until a sink is installed every
@@ -2236,14 +2334,19 @@ ${RECOVERY_PROMPT}`;
       telemetryUninstall = installTelemetrySink(ctx.ui as { notify(text: string, level: string): void });
       // A new session inherits no timer from the last one.
       stopPanelRefresh();
-      const key = await repoCacheKey(ctx.cwd);
-      const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
-      if (!rt) return;
-      const plumbing = panelFor(key, rt);
-      plumbing.workspace.invalidate();
-      void plumbing.workspace.refresh();
-      plumbing.ledger.refresh();
-      startPanelRefresh(plumbing);
+      // Opening the repository's runtime runs git (several calls, under load seconds): the session does not wait for
+      // it. The panel starts when the runtime is ready, unless the session was shut down or restarted meanwhile.
+      const generation = ++panelStartGeneration;
+      panelStarting = (async () => {
+        const key = await repoCacheKey(ctx.cwd);
+        const rt = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+        if (!rt || generation !== panelStartGeneration) return;
+        const plumbing = panelFor(key, rt);
+        plumbing.workspace.invalidate();
+        void plumbing.workspace.refresh();
+        plumbing.ledger.refresh();
+        startPanelRefresh(plumbing);
+      })().catch(() => {});
     });
 
     pi.on("session_shutdown", async () => {
@@ -2252,7 +2355,9 @@ ${RECOVERY_PROMPT}`;
       telemetryUninstall = undefined;
       // A timer that survives a session runs git against a repository nobody
       // is looking at and blocks the next session's refresh.
+      panelStartGeneration++;
       stopPanelRefresh();
+      await panelStarting;
       await shutdownCachedRuntimes();
     });
   }
@@ -2263,8 +2368,10 @@ ${RECOVERY_PROMPT}`;
   // never depends on it (the semantic tool + runtime gate enforce policy).
   // Planner/worker execution mode (docs/specs/planner-worker-hot-model-routing.md):
   // /engineering-* commands, and the mode `/mission` consults before orchestrating.
-  const plannerAttentionIngest = createIngestFromEnv(process.env);
-  const plannerAttention = plannerAttentionIngest ? new MissionAttentionReporter(plannerAttentionIngest) : null;
+  // the global engineering.yaml `herdr:` block only (no environment variables); resolved lazily because this site is synchronous
+  const plannerAttention = resolveAttentionIngest(process.env, getAgentDir()).then((i) =>
+    i ? new MissionAttentionReporter(i) : null,
+  );
   const plannerWorker = registerPlannerWorker(pi, {
     host: async (ctx) => {
       const rt = await getRuntime(ctx);
@@ -2272,7 +2379,7 @@ ${RECOVERY_PROMPT}`;
         repoRoot: rt.git?.root ?? rt.cwd,
         worker: rt.worker,
         reportAttention: (snapshot: Parameters<MissionAttentionReporter["update"]>[0]) => {
-          void plannerAttention?.update(snapshot).catch(() => {});
+          void plannerAttention.then((r) => r?.update(snapshot)).catch(() => {});
         },
         // Live missions an operator paused or pinned, for /engineering-status.
         missionControlLines: () =>
@@ -2443,7 +2550,7 @@ ${RECOVERY_PROMPT}`;
           await rt.resumeBlockedMission(missionId, ctx.signal);
           const mission = rt.missionStore?.getMission(missionId);
           if (!mission) throw new Error(`unknown mission ${missionId}`);
-          inspector?.associate({ mission_id: mission.mission_id });
+          inspector.associate({ mission_id: mission.mission_id });
           ctx.ui.notify(`Recovery ${mission.mission_id} — ${mission.title} [${mission.status}]`, "info");
         } catch (error) {
           ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -2473,7 +2580,7 @@ ${RECOVERY_PROMPT}`;
         },
       });
       const m = result.mission;
-      inspector?.associate({ mission_id: m.mission_id });
+      inspector.associate({ mission_id: m.mission_id });
       const completion =
         result.pausedBy === "operator" && result.mission.status !== "PAUSED_INFRASTRUCTURE"
           ? `interrupt noted — mission left ${result.mission.status} (not canceled); /mission resume ${result.mission.mission_id} continues it`

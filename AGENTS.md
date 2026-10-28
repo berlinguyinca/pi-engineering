@@ -123,7 +123,14 @@ candidate MUST execute in an isolated git worktree, branch, container overlay,
 or equivalent sandbox", and the runtime enforces it for the candidates it
 creates (`GitRepo.createWorktree`; `docs/architecture.md`, "Candidate
 isolation"). Agents editing the repository directly were the exception, and the
-exception is what broke.
+exception is what broke. Since the 2026-10-20 augur incident the exception is
+also ENFORCED for agents: the primary worktree guard
+(`src/guard/primaryWorktreeGuard.ts`, docs/usage.md "Primary worktree guard")
+blocks a session's own mutating tool calls against a repository's primary
+checkout — `write`/`edit` into it, state-changing `git` commands in it, bash
+writes into it — and points the model at its own worktree. Read-only inspection
+and `git worktree` management stay allowed; production-ops sessions set
+`PI_ENG_PRIMARY=1` before starting.
 
     git worktree add ../pi-engineering-runtime-<topic> -b <branch> origin/main
 

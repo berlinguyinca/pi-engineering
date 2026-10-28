@@ -482,6 +482,84 @@ test("candidate lifecycle preserves an earlier attempt and remounts its exact pe
   }
 });
 
+test("rebaseWorktreeOnto rebases a clean candidate onto a new base and refuses a dirty worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-rebase",
+      repoId: "repo-rebase",
+      missionGeneration: 0,
+      candidateGeneration: 0,
+      repositoryGeneration: 1,
+      attempt: "attempt-1",
+    });
+    const worktree = { path: candidate.path, branch: candidate.branch };
+    try {
+      await writeFile(join(candidate.path, "src", "rebased.js"), "export const rebased = true;\n");
+      await repo.commitAll(candidate.path, "stale-base candidate");
+      candidate.candidateSha = await repo.headCommitIn(candidate.path);
+
+      // Incumbent advances; the candidate's base is now stale.
+      await writeFile(join(fixture.root, "src", "advanced.js"), "export const advanced = true;\n");
+      await repo.commitAll(fixture.root, "incumbent advanced");
+      const newBase = await repo.headCommit();
+      assert.notEqual(newBase, base);
+
+      const ok = await repo.rebaseWorktreeOnto(worktree, newBase);
+      assert.equal(ok.ok, true);
+      assert.equal(ok.conflict, false);
+      assert.ok(ok.headSha && ok.headSha !== candidate.candidateSha, "a real rebase moves the candidate head");
+      // The rebased candidate descends from the new base and keeps its own change.
+      assert.equal(await repo.headCommitIn(candidate.path), ok.headSha);
+      assert.equal(
+        await repo.isAncestor(newBase, ok.headSha),
+        true,
+        "rebased candidate descends from the incumbent head",
+      );
+      assert.equal(
+        await (await import("node:fs/promises")).readFile(join(candidate.path, "src", "rebased.js"), "utf8"),
+        "export const rebased = true;\n",
+        "the candidate's change survives the rebase",
+      );
+    } finally {
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("rebaseWorktreeOnto refuses to rebase a dirty candidate worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const base = await repo.headCommit();
+    const candidate = await repo.createCandidateWorktree(base, {
+      missionId: "MSN-rebase-dirty",
+      repoId: "repo-rebase-dirty",
+      missionGeneration: 0,
+      candidateGeneration: 0,
+      repositoryGeneration: 1,
+      attempt: "attempt-1",
+    });
+    const worktree = { path: candidate.path, branch: candidate.branch };
+    try {
+      // Uncommitted change in the candidate worktree: must refuse rather than
+      // rebase an unknown state.
+      await writeFile(join(candidate.path, "src", "uncommitted.js"), "export const uncommitted = true;\n");
+      const result = await repo.rebaseWorktreeOnto(worktree, base);
+      assert.equal(result.ok, false);
+      assert.match(result.reason ?? "", /not clean|uncommitted/i);
+    } finally {
+      await repo.removeWorktree(candidate, { keepBranch: true }).catch(() => {});
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 test("promotion crash boundaries reconcile only from the exact durable intent", async () => {
   for (const crashAt of ["afterCas", "afterReset", "afterCandidateState", "afterCompletion"] as const) {
     const fixture = await makeFixtureRepo();

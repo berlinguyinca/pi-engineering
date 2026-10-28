@@ -12,7 +12,7 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { cp, mkdir, readdir, readlink, rm, stat, symlink } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { SourceCache } from "../../update/gitSource.ts";
 import { type EngineeringRuntimeModule, HOST_SUPPORTED_RUNTIME_APIS, isEngineeringRuntimeModule } from "./contract.ts";
@@ -64,6 +64,7 @@ export async function snapshotRuntimeSource(
   const dir = join(generationsDir, `${safeLabel}-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`);
   await mkdir(generationsDir, { recursive: true });
   const root = resolve(sourceRoot);
+  const dependencyParents = new Set([""]);
   try {
     if (commit) {
       const gitDir = execFileSync("git", ["-C", root, "rev-parse", "--absolute-git-dir"], {
@@ -77,16 +78,20 @@ export async function snapshotRuntimeSource(
         recursive: true,
         // Symlinks are copied as links; one escaping the source is rejected below.
         verbatimSymlinks: true,
-        filter: (src) => {
+        filter: async (src) => {
           const rel = relative(root, src);
           if (rel === "") return true;
           const top = rel.split(sep)[0] as string;
           if (SNAPSHOT_EXCLUDE.has(top)) return false;
+          if (basename(src) === "node_modules" && (await stat(src)).isDirectory()) {
+            dependencyParents.add(dirname(rel));
+            return false;
+          }
           return !rel.endsWith(".zip");
         },
       });
-    await rejectEscapingLinks(dir, dir, root);
-    await linkDependencies(root, dir);
+    await rejectEscapingLinks(dir, dir, root, commit ? dependencyParents : undefined);
+    for (const parent of dependencyParents) await linkDependencies(join(root, parent), join(dir, parent));
   } catch (error) {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     throw new RuntimeLoadError("snapshot", `could not snapshot ${root}: ${message(error)}`);
@@ -99,7 +104,15 @@ export async function snapshotRuntimeSource(
  * (judged from where the link sits in the source): the snapshot would import
  * code that is neither the source nor immutable.
  */
-async function rejectEscapingLinks(dir: string, snapshotRoot: string, sourceRoot: string): Promise<void> {
+async function rejectEscapingLinks(
+  dir: string,
+  snapshotRoot: string,
+  sourceRoot: string,
+  dependencyParents?: Set<string>,
+): Promise<void> {
+  // Git exports omit ignored dependency trees. Discover their parents only in
+  // the exported code, so services absent from that commit stay absent.
+  dependencyParents?.add(relative(snapshotRoot, dir));
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
     if (entry.isSymbolicLink()) {
@@ -110,15 +123,16 @@ async function rejectEscapingLinks(dir: string, snapshotRoot: string, sourceRoot
         throw new Error(`symlink ${relative(snapshotRoot, path)} -> ${target} escapes the source tree`);
       }
     } else if (entry.isDirectory()) {
-      await rejectEscapingLinks(path, snapshotRoot, sourceRoot);
+      await rejectEscapingLinks(path, snapshotRoot, sourceRoot, dependencyParents);
     }
   }
 }
 
-/** Point the snapshot's node_modules at the real dependency tree of the source. */
+/** Share installed dependency directories only after snapshot code links pass validation. */
 async function linkDependencies(sourceRoot: string, snapshotDir: string): Promise<void> {
   const nm = join(sourceRoot, "node_modules");
-  if (!existsSync(nm)) return;
+  // Preserve any tracked/copied entry (including ordinary files named node_modules).
+  if (existsSync(join(snapshotDir, "node_modules")) || !existsSync(nm) || !(await stat(nm)).isDirectory()) return;
   await symlink(realpathSync(nm), join(snapshotDir, "node_modules"), "dir");
 }
 

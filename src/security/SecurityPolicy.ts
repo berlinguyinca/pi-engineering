@@ -38,6 +38,7 @@ export const SECRET_REDACTION = "[REDACTED]";
  * The canonical table always runs. `patterns` ADDS caller-specific shapes on
  * top of it — it can no longer replace the default, so passing a short list can
  * never shrink coverage the way the old default-parameter contract allowed.
+ * No caller in this repository passes one.
  */
 export function redactSecrets(text: string, patterns?: Array<{ kind: SecretKind; re: RegExp }>): string {
   let out = redactCanonical(text);

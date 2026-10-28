@@ -8,8 +8,10 @@
  * herdr-engineering `docs/contracts/agent-inspector-event.md`.
  *
  * Hard invariants:
- *  - OFF BY DEFAULT: nothing is subscribed or sent unless HERDR_CP_URL is set
- *    AND PI_INSPECTOR_FEED=1 (see {@link attachInspectorFeedFromEnv}).
+ *  - OFF BY DEFAULT: nothing is subscribed or sent unless this host has a
+ *    central fleet config (host.json) whose values set `inspector.enabled` to
+ *    true (see {@link attachInspectorFeedFromHost}). No environment variable
+ *    enables it.
  *  - NEVER THROWS INTO PI and never awaits the network in a handler: every
  *    handler is wrapped, sends are fire-and-forget on an unref'd timer.
  *  - BOUNDED: hard queue cap (default 500), droppable `update` events are
@@ -21,14 +23,16 @@
  *    batch is dropped (no retry storms) and counted, and the count is reported
  *    as `dropped` on the next lifecycle event.
  *  - REASONING IS CAPABILITY-DEPENDENT, never synthesised: `reasoning` events
- *    are sent only if thinking text was really received AND the operator set
- *    PI_INSPECTOR_REASONING to `summary`/`full` (default `off`).
+ *    are sent only if thinking text was really received AND the central
+ *    config sets `inspector.reasoning` to `summary`/`full` (default `off`).
  *  - The server redacts; the client only truncates and adds a `sensitive` hint.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { contextReading } from "../../context/usage.ts";
 import { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
+import { type HostConfig, type LoadHostConfigOptions, loadHostConfig } from "./HostConfig.ts";
+import { reportRuntimeFacts } from "./runtimeReport.ts";
 
 // ── limits ───────────────────────────────────────────────────────────────────
 
@@ -919,41 +923,82 @@ async function defaultResolveGit(cwd: string): Promise<{ branch?: string } | und
   return branch ? { branch } : undefined;
 }
 
-// ── env entry point ──────────────────────────────────────────────────────────
+// ── central host config entry point ─────────────────────────────────────────
 
-function truthy(v: string | undefined): boolean {
-  return /^(1|true|on|yes)$/i.test((v ?? "").trim());
-}
-
-/** Resolved inspector configuration; `enabled` only when BOTH HERDR_CP_URL and PI_INSPECTOR_FEED=1. */
-export function inspectorConfigFromEnv(env: NodeJS.ProcessEnv = process.env): {
+/** Resolved inspector configuration; `enabled` only when the central config sets `inspector.enabled` to boolean true. */
+export function inspectorConfigFromHost(cfg: Pick<HostConfig, "url" | "apiKey" | "get">): {
   enabled: boolean;
-  url?: string;
+  url: string;
+  apiKey?: string;
   reasoning: ReasoningMode;
 } {
-  const url = env.HERDR_CP_URL?.trim() || undefined;
-  const r = (env.PI_INSPECTOR_REASONING ?? "off").trim().toLowerCase();
+  const r = String(cfg.get<unknown>("inspector.reasoning", "off")).trim().toLowerCase();
   return {
-    enabled: Boolean(url) && truthy(env.PI_INSPECTOR_FEED),
-    ...(url ? { url } : {}),
+    enabled: cfg.get<unknown>("inspector.enabled", false) === true,
+    url: cfg.url,
+    ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
     reasoning: r === "summary" || r === "full" ? r : "off",
   };
 }
 
 /**
- * Attach the feed when explicitly enabled by environment; returns null (and
- * registers nothing) otherwise. Builds its own {@link ControlPlaneIngest}
- * because no production code constructs one today.
+ * Load the central host config and attach the feed when it enables the
+ * inspector; resolves null (and registers nothing) otherwise. Rejects with
+ * {@link HostConfigUnavailable} when no config can be loaded (callers decide
+ * whether that matters). Builds its own {@link ControlPlaneIngest} because no
+ * production code constructs one today.
  */
-export function attachInspectorFeedFromEnv(
+export async function attachInspectorFeedFromHost(
   pi: ExtensionAPI,
-  env: NodeJS.ProcessEnv = process.env,
-  extra: Partial<InspectorFeedOptions> & { fetch?: typeof globalThis.fetch } = {},
-): InspectorFeedHandle | null {
-  const cfg = inspectorConfigFromEnv(env);
-  if (!cfg.enabled || !cfg.url) return null;
-  const { fetch, ...rest } = extra;
-  const apiKey = env.HERDR_CP_API_KEY?.trim() || undefined;
-  const ingest = new ControlPlaneIngest({ url: cfg.url, ...(apiKey ? { apiKey } : {}), ...(fetch ? { fetch } : {}) });
-  return attachInspectorFeed(pi, { env, reasoning: cfg.reasoning, ingest, ...rest });
+  extra: Partial<InspectorFeedOptions> & {
+    fetch?: typeof globalThis.fetch;
+    hostConfig?: LoadHostConfigOptions;
+    /** Do not construct a feed or reporter if the owning attachment was retired. */
+    signal?: AbortSignal;
+  } = {},
+): Promise<InspectorFeedHandle | null> {
+  const { fetch, hostConfig, signal, ...rest } = extra;
+  if (signal?.aborted) return null;
+  const host = await loadHostConfig(hostConfig);
+  if (signal?.aborted) return null;
+  const cfg = inspectorConfigFromHost(host);
+  if (!cfg.enabled) return null;
+  const ingest = new ControlPlaneIngest({
+    url: cfg.url,
+    ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
+    ...(fetch ? { fetch } : {}),
+  });
+  const handle = attachInspectorFeed(pi, { reasoning: cfg.reasoning, ingest, ...rest });
+  const env = rest.env ?? process.env;
+  const paneId = rest.sessionId ?? env.HERDR_PANE_ID?.trim();
+  if (handle && paneId) {
+    const reporter = reportRuntimeFacts(ingest, paneId, env);
+    let off: unknown;
+    const stop = () => {
+      reporter.stop();
+      if (typeof off === "function") {
+        try {
+          off();
+        } catch {
+          // A retired host may no longer support unsubscription.
+        }
+        off = undefined;
+      }
+    };
+    try {
+      off = pi.on?.("session_shutdown" as never, stop as never);
+    } catch (error) {
+      stop();
+      handle.dispose();
+      throw error;
+    }
+    return {
+      ...handle,
+      dispose: () => {
+        stop();
+        handle.dispose();
+      },
+    };
+  }
+  return handle;
 }

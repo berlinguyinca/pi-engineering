@@ -73,10 +73,13 @@ test("Pi loads the Host entry; the real extension reloads 5x with no duplicated 
     assert.ok((handlerCounts.before_agent_start ?? 0) > 0);
 
     await pi.run("/engineering reload");
-    await new Promise((r) => setTimeout(r, 50));
+    // session_start deliberately opens the repository runtime in the background.
+    // Wait for a real runtime consumer before sampling: a fixed delay can catch
+    // different generations midway through their startup git probes.
+    await pi.run("/ledger");
     const baseline = resources();
     for (let i = 0; i < 4; i++) await pi.run("/engineering reload");
-    await new Promise((r) => setTimeout(r, 50));
+    await pi.run("/ledger");
 
     for (const e of watched) assert.equal(pi.piHandlerCount(e), handlerCounts[e], `Pi handlers for ${e} unchanged`);
     const after = pi.piCommands();

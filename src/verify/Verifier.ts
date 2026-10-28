@@ -1,8 +1,9 @@
 import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
-import type { Evidence, EvidenceTrust } from "../core/types.ts";
+import type { Evidence, EvidenceTrust, RiskLevel } from "../core/types.ts";
 import { withRustBuildEnv } from "../git/rustBuildCache.ts";
 import { type MissionBuildOptions, admitMissionBuild } from "../resources/buildBudget.ts";
 import { sanitizeVerifierEnv } from "./childEnv.ts";
@@ -432,6 +433,16 @@ export interface VerifyRunOptions {
   continueThrough?: ReadonlySet<string>;
 }
 
+/** Trusted inputs for choosing a risk-proportional verification profile. */
+export interface VerificationDetectionOptions {
+  full?: boolean;
+  risk?: RiskLevel;
+  /** Actual paths changed in the candidate, never the worker's claimed scope. */
+  changedFiles?: readonly string[];
+  /** Validated base commit for a documentation-only patch check. */
+  baseCommit?: string;
+}
+
 /**
  * Verification provider abstraction (spec §15).
  *
@@ -442,7 +453,7 @@ export interface VerifyRunOptions {
  */
 export interface VerificationProvider {
   /** Detect the repo's verification profile. `full` adds a broader suite (lint + test:full). */
-  detect(cwd: string, opts?: { full?: boolean }): Promise<VerificationProfile>;
+  detect(cwd: string, opts?: VerificationDetectionOptions): Promise<VerificationProfile>;
   run(
     cwd: string,
     profile: VerificationProfile,
@@ -813,12 +824,27 @@ export class CommandVerifier implements VerificationProvider {
    * declared `lint` and `test:full` stages (a broader verification suite) so
    * `/verify full` records more evidence than the default gate.
    */
-  async detect(cwd: string, opts?: { full?: boolean }): Promise<VerificationProfile> {
+  async detect(cwd: string, opts?: VerificationDetectionOptions): Promise<VerificationProfile> {
     const full = opts?.full ?? false;
-    const { key, pkg } = await this.cacheKey(cwd, full);
+    const documentationBase =
+      !full &&
+      opts?.risk === "low" &&
+      opts.changedFiles?.length &&
+      opts.changedFiles.every(
+        (file) => /\.(?:md|rst|adoc)$/i.test(file) && !/^(?:AGENTS|CLAUDE|GEMINI|SKILL)\.md$/i.test(basename(file)),
+      ) &&
+      /^[a-f0-9]{40,64}$/i.test(opts.baseCommit ?? "")
+        ? opts.baseCommit
+        : undefined;
+    const cachedInputs = await this.cacheKey(cwd, full);
+    const { pkg } = cachedInputs;
+    // The base SHA changes per candidate; do not retain one cached profile per
+    // documentation commit in a long-lived interactive runtime.
+    if (documentationBase) return this.buildProfile(pkg, full, cwd, documentationBase);
+    const key = `${cachedInputs.key}\u0000risk:${opts?.risk ?? ""}`;
     const cached = this.profileCache.get(key);
     if (cached) return cached;
-    const profile = await this.buildProfile(pkg, full, cwd);
+    const profile = await this.buildProfile(pkg, full, cwd, documentationBase, !full && opts?.risk === "low");
     this.profileCache.set(key, profile);
     return profile;
   }
@@ -827,6 +853,8 @@ export class CommandVerifier implements VerificationProvider {
     pkg: { scripts?: Record<string, string>; main?: string; exports?: unknown; bin?: unknown },
     full: boolean,
     cwd: string,
+    documentationBase?: string,
+    lowRisk = false,
   ): Promise<VerificationProfile> {
     const scripts = pkg.scripts ?? {};
     const stages: VerifyStage[] = [];
@@ -842,6 +870,25 @@ export class CommandVerifier implements VerificationProvider {
         timeoutMs: DEFAULT_STAGE_INACTIVITY_MS,
       });
     };
+    if (documentationBase) {
+      // A real patch check still produces deterministic evidence. Preserve the
+      // owner's documentation-specific gates instead of substituting a no-op
+      // for verification or running an unrelated repository-wide suite.
+      stages.push({
+        name: "patch-whitespace",
+        command: "git",
+        args: ["diff", "--check", documentationBase, "HEAD", "--"],
+        required: true,
+      });
+      push("verify:docs", scripts["verify:docs"]);
+      push("test:docs", scripts["test:docs"]);
+      return { name: "detected-low-risk-docs", stages };
+    }
+    if (lowRisk && (scripts["verify:quick"] || scripts["test:quick"])) {
+      const name = scripts["verify:quick"] ? "verify:quick" : "test:quick";
+      push(name, scripts[name]);
+      return { name: "detected-low-risk-quick", stages };
+    }
     push("typecheck", scripts.typecheck ?? scripts.check);
     push("test", NPM_PLACEHOLDER_TEST.test(scripts.test ?? "") ? undefined : scripts.test);
     push("build", scripts.build);
@@ -920,7 +967,7 @@ export class CommandVerifier implements VerificationProvider {
       const artifactUri = (
         await store.put(
           "verify",
-          `${profile.name}-${stage.name}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          `verify-${`${profile.name}-${stage.name}`.replace(/[^A-Za-z0-9._-]/g, "-")}-${randomUUID()}`,
           log,
           truncate(log, 500),
         )

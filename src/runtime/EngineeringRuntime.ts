@@ -26,12 +26,14 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
 import { loadMissionLimits } from "../lifecycle/policy.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
 import { workflowMutatesRepo } from "../orchestration/intentRouter.ts";
 import { MAINTENANCE_STOP_REASON, OPERATOR_PAUSE_STOP_REASON, interruptibleRun } from "../orchestration/interrupt.ts";
+import { emitMissionPlanned } from "../orchestration/missionLineage.ts";
 import { readAutospecFlags } from "../orchestration/missionMode.ts";
 import {
   PlannerTransientError,
@@ -46,13 +48,15 @@ import {
 } from "../orchestration/missionSnapshot.ts";
 import { MissionStore } from "../orchestration/missionStore.ts";
 import { buildVerifierStages } from "../orchestration/missionWhy.ts";
-import { MissionActivityTicker } from "../orchestration/observability/MissionActivityTicker.ts";
+import { ClockOnlyGate, MissionActivityTicker } from "../orchestration/observability/MissionActivityTicker.ts";
 import { MissionObservability, boundedToolOutputPreview } from "../orchestration/observability/MissionObservability.ts";
 import { type MissionAttention, attentionFromSummary } from "../orchestration/observability/attention.ts";
 import { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { OrchestratorOptions, PlanTaskInput } from "../orchestration/orchestrator.ts";
 import { MissionOwnership } from "../orchestration/ownership.ts";
 import { missionCustodyKey } from "../orchestration/ownership.ts";
+import { type PlanLineageEmitter, gatePlanBeforeWorkers } from "../orchestration/planReview.ts";
+import { loadPlanReviewSettings } from "../orchestration/planReviewConfig.ts";
 import { type RouteModel, realBackends } from "../orchestration/realBackends.ts";
 import {
   DEFAULT_MISSION_RECOVERY_CEILING,
@@ -64,6 +68,7 @@ import {
 } from "../orchestration/recovery.ts";
 import { RepositoryRegistry } from "../orchestration/repositoryRegistry.ts";
 import { canTransitionMission } from "../orchestration/state.ts";
+import { resolveSteeringTarget } from "../orchestration/steeringResolve.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
 import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
 import { type Mission, type MissionStop, PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
@@ -88,6 +93,10 @@ import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "
 import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
+import { type ExternalBridge, startExternalBridge } from "./herdr/externalAgent.ts";
+import { type ForkRuntime, createForkRuntime, downstreamPrNodes } from "./herdr/forkWiring.ts";
+import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
 import { resolveWorktreeIdentity } from "./isolation/WorktreeIdentity.ts";
@@ -99,6 +108,7 @@ import {
 import { assessProcess } from "./isolation/processIdentity.ts";
 import { isReloadShutdown } from "./isolation/reloadCustody.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "./isolation/stateDir.ts";
+import { validateMaintenanceModel } from "./maintenanceModel.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 import {
   type PinTransition,
@@ -164,6 +174,8 @@ export interface EngineerReport {
 const SNAPSHOT_PUBLISH_MAX_RETRIES = 4;
 /** Base backoff (ms) between snapshot publish retries; grows linearly (~1s total). */
 const SNAPSHOT_PUBLISH_BACKOFF_MS = 100;
+/** Minimum interval between internal live-view snapshot publications. */
+const SNAPSHOT_PUBLISH_INTERVAL_MS = 750;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
@@ -176,9 +188,19 @@ function maxExternalMissions(env: NodeJS.ProcessEnv = process.env): number {
 }
 
 /** Read-only tool allowlist (scout/reviewer/challenger). */
-const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
+const READ_ONLY_TOOLS = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "ledger_read",
+  "artifact_read",
+  "repo_search",
+  "symbol",
+  "tests_for",
+];
 /** Implementation tool allowlist. */
-const IMPLEMENT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const IMPLEMENT_TOOLS = [...READ_ONLY_TOOLS, "bash", "edit", "write"];
 /**
  * Roles that may hydrate from SHARED durable memory. Independent reviewer and
  * clean-room challenger are deliberately excluded (INV-007): they must not
@@ -462,6 +484,12 @@ export interface RuntimeMissionActivityEvent {
 
 export interface EngineeringRuntimeOptions {
   cwd: string;
+  /**
+   * Optional lineage emitter (T02): mission executions, handoffs and verified
+   * checkpoints are reported as typed lineage events. Absent (the default) Pi
+   * emits nothing and behaves exactly as before.
+   */
+  lineage?: LineageEmitter;
   worker?: WorkerExecutor;
   /**
    * Optional distinct worker for the independent review + clean-room challenger
@@ -475,6 +503,8 @@ export interface EngineeringRuntimeOptions {
   verifier?: VerificationProvider;
   model?: Model<any>;
   agentDir?: string;
+  /** T12: inject a steering receiver (tests); undefined = decide from the global YAML and the configured control plane. */
+  steeringReceiver?: SteeringReceiver | null;
   /**
    * Route mission roles through this instead of a router built from the
    * agent dir's policy and discovered models. Hosts and tests that must not
@@ -533,6 +563,24 @@ export interface EngineeringRuntimeOptions {
   /** Bounded diagnostic when the live mission snapshot cannot be written. */
   onMissionSnapshotError?: (message: string) => void;
   /**
+   * Overrides for the snapshot storage-pressure guard (sampler, sentinel,
+   * probe scheduling, controller config, typed event hook). Production omits
+   * this; the runtime owns `republish`, `workDir`, and `log`. House style of
+   * `FileLockRecoveryHooks`: deterministic fault-injection seam, never used
+   * in production paths.
+   */
+  snapshotPressureOverrides?: Partial<
+    import("../resilience/snapshotPressureGuard.ts").SnapshotPressureGuardOptions & {
+      config?: Partial<import("../resilience/storagePressure.ts").StoragePressureConfig>;
+    }
+  >;
+  /**
+   * TEST-ONLY fault injection: when set, each snapshot publish calls this and
+   * throws the returned error (return null to allow the write). Models an
+   * ENOSPC-class write failure without filling a real disk.
+   */
+  snapshotWriteFault?: () => unknown | null;
+  /**
    * Optional orchestrator planner (spec 06). Defaults to a single implementer
    * task. Injected so deterministic tests and the extension can supply one.
    */
@@ -540,6 +588,16 @@ export interface EngineeringRuntimeOptions {
     mission: import("../orchestration/types.ts").Mission,
     risk: import("../orchestration/types.ts").RiskProfile,
   ) => Promise<PlanTaskInput[]>;
+  /**
+   * Pre-implementation plan gate (T03). Off unless given. When set, the default
+   * planner's tasks pass through {@link gatePlanBeforeWorkers} before any worker
+   * starts: risk-based skip | offer | require review bound to the plan digest.
+   * A blocked plan yields no tasks (fail closed) and an open finding that says why.
+   */
+  planReview?: Pick<
+    import("../orchestration/planReview.ts").PlanGateInput,
+    "adapter" | "policy" | "emitter" | "replan" | "maxRevisions"
+  > & { configNotes?: string[] };
   /**
    * Optional autonomous spec approval hook (design 2026-09-28). When provided,
    * material mutations are reviewed/refined/approved and their tasks are
@@ -669,6 +727,10 @@ export class EngineeringRuntime {
   missionOwnership: MissionOwnership | null;
   /** Clock-driven owner of startup and periodic nonterminal-mission reconciliation. */
   missionSupervisor: MissionSupervisor | null;
+  /** T12: outbound-only steering poller; null unless enabled in the global YAML with a control plane configured. */
+  steeringReceiver: SteeringReceiver | null = null;
+  forkRuntime: ForkRuntime | null = null;
+  externalBridge: ExternalBridge | null = null;
   /** Orchestrator facade (spec 06) — auto-invokes workflows from intent. */
   orchestrator: Orchestrator | null;
   /** The planner the orchestrator uses to turn a mission into tasks. */
@@ -696,16 +758,29 @@ export class EngineeringRuntime {
    * takes over; the interactive session model is not affected.
    */
   readonly unavailableModels = new UnavailableModels();
+  readonly supportsMaintenanceModelSelection = true;
+  private maintenanceModelRouter?: Pick<RoleRouterAdapter, "registry" | "select">;
+  private maintenanceModelBaseline?: { contextWindow?: number; input?: readonly string[]; reasoning?: boolean };
   private readonly onPhase: ((event: RuntimePhaseEvent) => void) | null;
   private readonly onMissionSnapshotError: ((message: string) => void) | null;
+  /** TEST-ONLY write-fault injector (see EngineeringRuntimeOptions). */
+  private readonly snapshotWriteFault: (() => unknown | null) | null;
+  /** Guard construction overrides (sampler/sentinel/schedule/config/events). */
+  private readonly snapshotPressureOverrides: Partial<
+    import("../resilience/snapshotPressureGuard.ts").SnapshotPressureGuardOptions & {
+      config?: Partial<import("../resilience/storagePressure.ts").StoragePressureConfig>;
+    }
+  > | null;
   private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private missionActivityTicker: MissionActivityTicker | null = null;
+  private readonly missionActivityClock = new ClockOnlyGate();
   private unsubscribeMissionActivity: (() => void) | null = null;
   private currentWorkItemId = "";
   private currentPhaseGoal = "";
   private snapshotPublishPending: Promise<MissionSnapshotFile | null> | null = null;
   private snapshotPublishDirty = false;
+  private snapshotPublishTimer: ReturnType<typeof setTimeout> | null = null;
   private snapshotPublishRetries = 0;
   /**
    * FR-03/04/05 — storage-pressure wiring: the controller the snapshot
@@ -825,6 +900,11 @@ export class EngineeringRuntime {
           // while suspended the guard is a no-op and the tag survives.
           this.snapshotPressure?.notePublishSuccess();
           latest = buildMissionSnapshotFile(missions, this.snapshotPressure?.state() ?? null);
+          // TEST-ONLY fault seam (see EngineeringRuntimeOptions.snapshotWriteFault):
+          // throws at the exact point an fs write would fail, so tests can
+          // model ENOSPC without filling a disk.
+          const writeFault = this.snapshotWriteFault?.();
+          if (writeFault) throw writeFault;
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
           const temporary = join(this.workDir, `.${MISSION_SNAPSHOT_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
           try {
@@ -903,6 +983,16 @@ export class EngineeringRuntime {
     return guard.publishPaused;
   }
 
+  /** Coalesce high-frequency observability updates before rebuilding the full snapshot. */
+  private scheduleMissionSnapshot(): void {
+    if (this.snapshotPublishTimer || this.closed) return;
+    this.snapshotPublishTimer = setTimeout(() => {
+      this.snapshotPublishTimer = null;
+      void this.publishMissionSnapshot();
+    }, SNAPSHOT_PUBLISH_INTERVAL_MS);
+    this.snapshotPublishTimer.unref?.();
+  }
+
   /** Best-effort measurement hints for storage classification (never throws). */
   private async storagePressureHints(): Promise<StorageHints> {
     const hints: StorageHints = { path: this.workDir };
@@ -920,6 +1010,7 @@ export class EngineeringRuntime {
   private get snapshotPressureGuard(): SnapshotPressureGuard {
     if (!this.snapshotPressure) {
       this.snapshotPressure = new SnapshotPressureGuard({
+        ...(this.snapshotPressureOverrides ?? {}),
         workDir: this.workDir,
         // The recovery republish pipeline (bypasses the pause gate).
         republish: () => this.publishMissionSnapshot({ force: true }),
@@ -928,6 +1019,43 @@ export class EngineeringRuntime {
             this.onMissionSnapshotError?.(message);
           } catch {
             // Diagnostics are observers, never participants in execution.
+          }
+        },
+        // (#416) The suspend marks which tasks were RUNNING so their later
+        // failures classify as DISK_SUSPENDED (checkpoint-resume, capacity
+        // budget) instead of generic noise; the recovery event closes the
+        // episode so post-recovery failures are judged normally again. The
+        // override-supplied observer still runs — this hook chains, never
+        // replaces.
+        onEvent: (event) => {
+          try {
+            this.snapshotPressureOverrides?.onEvent?.(event);
+          } catch {
+            // Observer failures never participate in execution.
+          }
+          const store = this.missionStore;
+          if (!store) return;
+          try {
+            if (event.kind === "incident") {
+              for (const mission of store.listMissions()) {
+                if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) continue;
+                const running = store
+                  .listTasks(mission.mission_id)
+                  .filter((task) => task.status === "RUNNING")
+                  .map((task) => task.task_id);
+                if (running.length === 0) continue;
+                store.markDiskSuspendEpisode(mission.mission_id, {
+                  taskIds: running,
+                  ...(event.incident.path ? { incidentPath: event.incident.path } : {}),
+                });
+              }
+            } else if (event.kind === "recovered") {
+              for (const mission of store.listMissions()) store.resolveDiskSuspendEpisode(mission.mission_id);
+            }
+          } catch {
+            // Episode bookkeeping is durable best-effort here: the store is the
+            // authority and never depends on this hook (a lost mark degrades
+            // to today's generic classification, never to corruption).
           }
         },
       });
@@ -1010,7 +1138,7 @@ export class EngineeringRuntime {
       .trim()
       .slice(0, 240);
     try {
-      this.onMissionActivity({
+      const event: RuntimeMissionActivityEvent = {
         observedAt,
         waitingReason: summary.waitingReason,
         waitingSince: summary.waitingSince,
@@ -1096,7 +1224,24 @@ export class EngineeringRuntime {
         operatorModelPin: mission?.operator_model_pin
           ? `${mission.operator_model_pin.provider}/${mission.operator_model_pin.id}`
           : null,
-      });
+      };
+      this.missionActivityClock.remember(
+        missionId,
+        [
+          event.waitingSince,
+          event.lastOutputAt,
+          event.lastHeartbeatAt,
+          event.lastMeaningfulProgressAt,
+          ...(event.workersDetail ?? []).flatMap((worker) => [
+            worker.currentActivityStartedAt,
+            worker.lastHeartbeatAt,
+            worker.lastMeaningfulProgressAt,
+            worker.lastOutputAt,
+          ]),
+        ],
+        Date.parse(observedAt),
+      );
+      this.onMissionActivity(event);
     } catch {
       // UI listeners are observers, never participants in mission execution.
     }
@@ -1104,6 +1249,9 @@ export class EngineeringRuntime {
 
   private constructor(opts: EngineeringRuntimeOptions) {
     this.cwd = opts.cwd;
+    this.maintenanceModelBaseline = opts.model
+      ? { contextWindow: opts.model.contextWindow, input: opts.model.input, reasoning: opts.model.reasoning }
+      : undefined;
     this.workDir = opts.workDir ?? "";
     this.worker = opts.worker ?? new PiWorkerExecutor({ model: opts.model, agentDir: opts.agentDir });
     this.reviewerWorker = opts.reviewerWorker ?? null;
@@ -1111,6 +1259,8 @@ export class EngineeringRuntime {
     this.roadmapComplete = opts.roadmapComplete ?? null;
     this.onPhase = opts.onPhase ?? null;
     this.onMissionSnapshotError = opts.onMissionSnapshotError ?? null;
+    this.snapshotWriteFault = opts.snapshotWriteFault ?? null;
+    this.snapshotPressureOverrides = opts.snapshotPressureOverrides ?? null;
     this.onMissionActivity = opts.onMissionActivity ?? null;
     this.blackhole = null;
     this.telemetry = {
@@ -1231,6 +1381,7 @@ export class EngineeringRuntime {
       rt.orchestrationPath = orchestrationPath;
       rt.missionStore = openedMissionStores.get(orchestrationPath) ?? MissionStore.open(orchestrationBackend);
       openedMissionStores.set(orchestrationPath, rt.missionStore);
+      if (opts.lineage) rt.missionStore.setLineage(opts.lineage);
       rt.ownershipId = `session-${session.sessionId}-${randomUUID()}`;
       liveOwnerIds().add(rt.ownershipId);
       rt.missionOwnership = new MissionOwnership(rt.missionStore, {
@@ -1271,10 +1422,14 @@ export class EngineeringRuntime {
       }
       rt.missionActivityTicker = new MissionActivityTicker({
         state: (missionId) => rt.missionStore?.getMission(missionId)?.status,
-        emit: (missionId, observedAt) => rt.emitMissionActivity(missionId, observedAt),
+        emit: (missionId, observedAt) => {
+          // Clock-only tick: skip the rebuild and redraw while no displayed age has changed.
+          if (!rt.missionActivityClock.due(missionId, Date.parse(observedAt))) return;
+          rt.emitMissionActivity(missionId, observedAt);
+        },
       });
       rt.unsubscribeMissionActivity = rt.missionObservability.subscribe((missionId) => {
-        void rt.publishMissionSnapshot();
+        rt.scheduleMissionSnapshot();
         rt.emitMissionActivity(missionId);
       });
       for (const missionId of rt.missionObservability.listMissionIds()) rt.emitMissionActivity(missionId);
@@ -1336,6 +1491,9 @@ export class EngineeringRuntime {
           operatorPin: currentOperatorPin,
         });
       }
+      const maintenanceRouter = routerAdapter as RoleRouterAdapter | undefined;
+      if (maintenanceRouter?.registry && typeof maintenanceRouter.select === "function")
+        rt.maintenanceModelRouter = maintenanceRouter;
       // Production arming (fault-tolerance spec §23): the capability pool
       // (registry + router) now exists, so arm the worker's resilient runtime
       // with capability-based fallback (RoleRouter + RequiredModelEnvelope),
@@ -1430,6 +1588,10 @@ export class EngineeringRuntime {
       // derived from the workflow, never assumed. (Dogfood caught the planner
       // hardcoding mutates_repo:true, which let a read-only "why is this failing?"
       // request write to the repository.)
+      // Plan review is opt-in: an explicit option, else the `plan_review` block of
+      // the repo's engineering.yaml; absent means OFF and nothing below changes.
+      const planReviewSettings =
+        opts.planReview !== undefined ? opts.planReview : await loadPlanReviewSettings(repoRoot, opts.agentDir);
       const defaultPlanner: NonNullable<typeof opts.orchestrationPlanner> = async (mission) => {
         const mutates = workflowMutatesRepo(mission.workflow_class);
         const acceptanceIds = mission.acceptance_criteria.flatMap((criterion) =>
@@ -1457,46 +1619,48 @@ export class EngineeringRuntime {
         // Non-trivial goals get ONE planner call (PLANNER_PROMPT) on the best
         // "planner"-routed model so independent work gets real write domains;
         // a malformed plan falls back to the single task and never blocks.
-        const planned = await planMission({
-          goal: mission.goal,
-          mutates,
-          mode: missionPlannerMode(),
-          acceptanceIds,
-          single,
-          ...plannerScope(rt.missionStore?.getWorkspaceManifest(mission.mission_id), repoRoot),
-          runPlanner: async (task) => {
-            const route = await routeModel?.("planner", { missionId: mission.mission_id }).catch(() => undefined);
-            // Bounded: a hard timeout aborts the one call; thinking is allowed
-            // for role "planner" (thinkingPolicy) and the role's token budget applies.
-            const abort = new AbortController();
-            const timer = setTimeout(() => abort.abort(), plannerTimeoutMs());
-            try {
-              const run = await rt.worker.run({
-                role: "planner",
-                task,
-                tools: READ_ONLY_TOOLS,
-                cwd: repoRoot,
-                signal: abort.signal,
-                maxContextTokens: ROLE_BUDGETS.planner.hardMaxTokens,
-                ...(route ? { modelOverride: { provider: route.provider, id: route.id } } : {}),
-              });
-              if (abort.signal.aborted) throw new Error(`planner timed out after ${plannerTimeoutMs()} ms`);
-              if (run.error) {
-                if (run.error.startsWith("transient:") || classifyError(run.error).retryable) {
-                  throw new PlannerTransientError(run.error);
+        const planWith = (planGoal: string, objective: string) =>
+          planMission({
+            goal: planGoal,
+            mutates,
+            mode: missionPlannerMode(),
+            acceptanceIds,
+            single: () => ({ ...single(), objective }),
+            ...plannerScope(rt.missionStore?.getWorkspaceManifest(mission.mission_id), repoRoot),
+            runPlanner: async (task) => {
+              const route = await routeModel?.("planner", { missionId: mission.mission_id }).catch(() => undefined);
+              // Bounded: a hard timeout aborts the one call; thinking is allowed
+              // for role "planner" (thinkingPolicy) and the role's token budget applies.
+              const abort = new AbortController();
+              const timer = setTimeout(() => abort.abort(), plannerTimeoutMs());
+              try {
+                const run = await rt.worker.run({
+                  role: "planner",
+                  task,
+                  tools: READ_ONLY_TOOLS,
+                  cwd: repoRoot,
+                  signal: abort.signal,
+                  maxContextTokens: ROLE_BUDGETS.planner.hardMaxTokens,
+                  ...(route ? { modelOverride: { provider: route.provider, id: route.id } } : {}),
+                });
+                if (abort.signal.aborted) throw new Error(`planner timed out after ${plannerTimeoutMs()} ms`);
+                if (run.error) {
+                  if (run.error.startsWith("transient:") || classifyError(run.error).retryable) {
+                    throw new PlannerTransientError(run.error);
+                  }
+                  throw new Error(run.error);
                 }
-                throw new Error(run.error);
+                return run.result;
+              } catch (error) {
+                if (error instanceof PlannerTransientError || abort.signal.aborted) throw error;
+                if (classifyError(error).retryable) throw new PlannerTransientError(String(error));
+                throw error;
+              } finally {
+                clearTimeout(timer);
               }
-              return run.result;
-            } catch (error) {
-              if (error instanceof PlannerTransientError || abort.signal.aborted) throw error;
-              if (classifyError(error).retryable) throw new PlannerTransientError(String(error));
-              throw error;
-            } finally {
-              clearTimeout(timer);
-            }
-          },
-        });
+            },
+          });
+        const planned = await planWith(mission.goal, mission.goal);
         if (planned.fallbackReason) {
           rt.missionStore?.addFinding({
             mission_id: mission.mission_id,
@@ -1536,12 +1700,98 @@ export class EngineeringRuntime {
             recommended_action: "Confirm or restate what this mission should do.",
           });
         }
+        if (planReviewSettings && rt.missionStore && !planned.clarification && planned.tasks.length > 0) {
+          // Herdr projection: the mission node first (the plan's `produced` edge needs it), then the gate's own
+          // revision / decision events through the same emitter. Null without a configured `herdr:` block.
+          emitMissionPlanned(opts.lineage, {
+            missionId: mission.mission_id,
+            title: mission.title || mission.goal.slice(0, 80),
+            source: "standalone",
+          });
+          const gated = await gatePlanBeforeWorkers({
+            // Changes requested: plan again with the reviewer's feedback as input.
+            // The single-task fallback carries the feedback too, so the revision
+            // always differs and needs its own decision.
+            replan: async ({ annotations, revision }) => {
+              const feedback = annotations.length
+                ? annotations.map((a) => `- ${a}`).join("\n")
+                : "- (the reviewer asked for changes without comments)";
+              const augmented = `${mission.goal}\n\nA plan reviewer requested changes to revision ${revision.revision}. Address this feedback:\n${feedback}`;
+              const replanned = await planWith(augmented, augmented);
+              return replanned.tasks.length > 0 ? replanned.tasks : revision.tasks;
+            },
+            ...planReviewSettings,
+            emitter: (planReviewSettings as { emitter?: PlanLineageEmitter | null }).emitter ?? opts.lineage ?? null,
+            missionId: mission.mission_id,
+            goal: mission.goal,
+            plan: async () => planned.tasks,
+            ledger: rt.missionStore,
+          });
+          if (gated.status === "blocked") {
+            rt.missionStore.addFinding({
+              mission_id: mission.mission_id,
+              task_id: null,
+              severity: "major",
+              category: PLANNER_CLARIFICATION_CATEGORY,
+              file: null,
+              line: null,
+              summary: `Plan review blocked implementation (${gated.code}).`,
+              evidence: [gated.reason, ...(planReviewSettings.configNotes ?? [])].join("\n").slice(0, 1000),
+              recommended_action:
+                gated.code === "plannotator_unavailable"
+                  ? "Restore the plan review service or record an explicit operator override with a reason."
+                  : "Revise the plan and resubmit for review.",
+            });
+            return [];
+          }
+          if (planReviewSettings.configNotes?.length) {
+            rt.missionStore.addFinding({
+              mission_id: mission.mission_id,
+              task_id: null,
+              severity: "minor",
+              category: "plan_review_config",
+              file: null,
+              line: null,
+              summary: "Plan review configuration was only partly honoured.",
+              evidence: planReviewSettings.configNotes.join("\n").slice(0, 1000),
+              recommended_action: "Fix or remove the ignored plan_review settings.",
+            });
+          }
+          return gated.tasks;
+        }
         return planned.tasks;
       };
       rt.missionPlanner = opts.orchestrationPlanner ?? defaultPlanner;
       const limits = await loadMissionLimits(repoRoot, opts.agentDir);
       const recoveryBudget = missionRecoveryBudget(rt.resilience);
+      // Optional AutoSpec design gate for orchestrated missions (T04). Nothing from
+      // the integration is imported unless an `autospec` block exists or a layer is unparsable.
+      let completionEvidence: ConstructorParameters<typeof Orchestrator>[0]["completionEvidence"];
+      let autospecOn = false;
+      try {
+        if (await autospecConfigured(repoRoot, opts.agentDir ? { agentDir: opts.agentDir } : {})) {
+          autospecOn = true;
+          const provider = await import("../integrations/autospec/provider.ts");
+          const autospecConfig = await provider.loadAutoSpecConfig(
+            repoRoot,
+            opts.agentDir ? { agentDir: opts.agentDir } : {},
+          );
+          completionEvidence = (_mission, candidates) =>
+            provider.missionDesignGateReasons(autospecConfig, {
+              repoRoot,
+              candidates: candidates.map((c) => ({
+                baseSha: c.identity.baseSha,
+                candidateSha: c.identity.candidateSha,
+              })),
+            });
+        }
+      } catch (error) {
+        // Configured-but-unloadable must block, not silently disable.
+        const why = error instanceof Error ? error.message : String(error);
+        if (autospecOn) completionEvidence = () => [`autospec_config: integration failed to load: ${why}`];
+      }
       rt.orchestrator = new Orchestrator({
+        ...(completionEvidence ? { completionEvidence } : {}),
         recovery: recoveryBudget,
         store: rt.missionStore,
         backends,
@@ -1613,7 +1863,7 @@ export class EngineeringRuntime {
             phase === "complete" ? "settled" : phase === "classified" ? "scout" : "implement";
           rt.emitPhase({ workItemId: mission.mission_id, goal: mission.goal, phase: mapped });
           // Keep the PI WEB mission snapshot fresh as missions progress.
-          void rt.publishMissionSnapshot();
+          rt.scheduleMissionSnapshot();
         },
       });
       if (opts.blackhole) rt.blackhole = await BlackholeManager.open({ ...opts.blackhole, ledger: rt.ledger });
@@ -1652,6 +1902,7 @@ export class EngineeringRuntime {
         recoveryPlanner: new RecoveryPlanner(recoveryBudget),
         onStatuses: (statuses) => rt.consumeSupervisorStatuses(statuses),
         planningInFlight: (missionId) => rt.orchestrator?.isPlanning(missionId) ?? false,
+        runInFlight: (missionId) => rt.orchestrator?.hasLiveRun(missionId) ?? false,
         // Other live sessions in this worktree see the same missions; each
         // mission is supervised only by its custodian, and a dead custodian's
         // missions are adopted automatically.
@@ -1672,16 +1923,81 @@ export class EngineeringRuntime {
       });
       await rt.missionSupervisor.reconcileOnStartup();
       rt.missionSupervisor.start();
+      rt.steeringReceiver = await EngineeringRuntime.startSteering(rt, opts);
+      // Pi as an external coworker agent: only when `pi-engineering herdr join` stored a credential AND the global YAML
+      // names a control plane. Otherwise null: no timer, no request.
+      rt.externalBridge = await startExternalBridge({
+        agentDir: opts.agentDir ?? getAgentDir(),
+        stateDir: resolveStateRoot(),
+        log: (message) => console.error(message),
+      }).catch(() => null);
       return rt;
     } catch (error) {
+      rt.steeringReceiver?.stop();
+      rt.forkRuntime?.stop();
+      rt.externalBridge?.stop();
       rt.externalPumpStopped = true;
       rt.missionActivityTicker?.close();
+      rt.missionActivityClock.clear();
       rt.unsubscribeMissionActivity?.();
       await rt.missionSupervisor?.shutdown();
       if (rt.ownershipId) liveOwnerIds().delete(rt.ownershipId);
       EngineeringRuntime.releaseOrchestrationReference(orchestrationPath);
       throw error;
     }
+  }
+
+  /**
+   * T12. Start the steering poller only when the GLOBAL engineering YAML enables it and a Herdr control plane is
+   * configured; otherwise nothing is constructed and no network call is ever made. The poller can reach exactly two
+   * things: `MissionStore.steerTask` (labelled, untrusted text) and `Orchestrator.resume`.
+   */
+  private static async startSteering(
+    rt: EngineeringRuntime,
+    opts: EngineeringRuntimeOptions,
+  ): Promise<SteeringReceiver | null> {
+    const store = rt.missionStore;
+    if (!store) return null;
+    const orchestrator = (): NonNullable<EngineeringRuntime["orchestrator"]> => {
+      if (!rt.orchestrator) throw new Error("orchestrator is not running");
+      return rt.orchestrator;
+    };
+    const ports: import("../orchestration/steering.ts").SteeringPorts = {
+      now: () => Date.now() / 1000,
+      resolve: (nodeId) => resolveSteeringTarget(store, nodeId),
+      steerRunning: (taskId, text) => orchestrator().broker.steerRunningTask(taskId, text, "herdr-steering"),
+      resumeMission: async (missionId) => {
+        const mission = await orchestrator().resume(missionId);
+        return { changed: mission.status !== "PAUSED_INFRASTRUCTURE" };
+      },
+      log: (message) => console.error(message),
+    };
+    if (opts.steeringReceiver !== undefined) return opts.steeringReceiver;
+    // T13: forks and promotion. Constructed only when the global YAML enables `forks:`; otherwise the port is absent
+    // and a fork/promote request is acknowledged `unsupported`.
+    rt.forkRuntime = await createForkRuntime({
+      agentDir: opts.agentDir ?? getAgentDir(),
+      stateDir: resolveStateRoot(),
+      lineage: opts.lineage ?? null,
+      log: (message) => console.error(message),
+      sources: {
+        getTask: (id) => store.getTask(id),
+        getExecution: (id) => store.getExecution(id),
+        getMission: (id) => store.getMission(id),
+        boundRoot: (repoId) => rt.repositoryRegistry.get(repoId).root,
+        openRoot: async (path) => (await GitRepo.open(path))?.root ?? null,
+        links: store,
+        downstreamPrs: (taskId) => downstreamPrNodes(store, taskId),
+      },
+    });
+    if (rt.forkRuntime) ports.forks = rt.forkRuntime.port;
+    const receiver = await createSteeringReceiver({
+      agentDir: opts.agentDir ?? getAgentDir(),
+      stateDir: resolveStateRoot(),
+      ports,
+    });
+    receiver?.start();
+    return receiver;
   }
 
   /**
@@ -1702,6 +2018,10 @@ export class EngineeringRuntime {
   async close(): Promise<void> {
     if (this.closed) return;
     this.externalPumpStopped = true;
+    if (this.snapshotPublishTimer) {
+      clearTimeout(this.snapshotPublishTimer);
+      this.snapshotPublishTimer = null;
+    }
     if (this.openReferences > 1) {
       this.openReferences--;
       if (this.orchestrationPath) EngineeringRuntime.releaseOrchestrationReference(this.orchestrationPath);
@@ -1709,6 +2029,9 @@ export class EngineeringRuntime {
     }
     const path = this.orchestrationPath;
     try {
+      this.steeringReceiver?.stop();
+      this.forkRuntime?.stop();
+      this.externalBridge?.stop();
       await this.missionSupervisor?.shutdown();
       await this.missionStore?.flush();
       await this.missionObservability?.flush();
@@ -1722,6 +2045,7 @@ export class EngineeringRuntime {
     if (path) EngineeringRuntime.releaseOrchestrationReference(path);
     this.closed = true;
     this.missionActivityTicker?.close();
+    this.missionActivityClock.clear();
     this.unsubscribeMissionActivity?.();
     if (this.ownershipId) liveOwnerIds().delete(this.ownershipId);
     this.snapshotPressure?.dispose();
@@ -1829,9 +2153,17 @@ export class EngineeringRuntime {
   /** Automatic maintenance never clears operator pause or creates a replacement mission. */
   async resumeMissionAfterMaintenance(
     missionId: string,
-    expected: { expectedRevision: number; expectedResumptionGeneration: number },
+    expected: {
+      expectedRevision: number;
+      expectedResumptionGeneration: number;
+      selectedModel?: { provider: string; id: string };
+      isInteractiveIdle?: () => boolean;
+    },
     signal?: AbortSignal,
-  ): Promise<{ status: "resumed"; mission: Mission } | { status: "skipped"; reason: string; code?: string }> {
+  ): Promise<
+    | { status: "resumed"; mission: Mission; selectedModel?: { provider: string; id: string } }
+    | { status: "skipped"; reason: string; code?: string }
+  > {
     const store = this.missionStore;
     const orchestrator = this.orchestrator;
     if (!store || !orchestrator)
@@ -1871,6 +2203,24 @@ export class EngineeringRuntime {
         code: "LEGACY_REPAIR_REQUIRED",
         reason: `Canceled implementation tasks lack exact ownership-loss evidence: ${legacy.ambiguousTaskIds.join(", ")}. Explicit repair must reconcile preserved work and operator intent.`,
       };
+    if (expected.selectedModel) {
+      const refusal = await validateMaintenanceModel({
+        router: this.maintenanceModelRouter,
+        selectedModel: expected.selectedModel,
+        previousModel: mission.operator_model_pin,
+        baseline: this.maintenanceModelBaseline,
+        tasks: store.listTasks(missionId),
+        unavailable: this.unavailableModels,
+      });
+      if (refusal) return { status: "skipped", code: "MODEL_INCOMPATIBLE", reason: refusal };
+      if (!(await this.maintenanceOwnedMissionIds()).includes(missionId))
+        return {
+          status: "skipped",
+          code: "CUSTODY_CHANGED",
+          reason: "mission custody changed during model validation",
+        };
+      if (signal?.aborted) return { status: "skipped", code: "OPERATOR_INTENT", reason: "recovery interrupted" };
+    }
     const resumed = await store.resumeMissionIfCurrent(
       missionId,
       "verified runtime maintenance resumed preserved work",
@@ -1880,6 +2230,8 @@ export class EngineeringRuntime {
         status: mission.status,
         blockedEpisodeId: mission.blocked_episode_id ?? null,
       },
+      expected.selectedModel ? { ...expected.selectedModel, set_at: new Date().toISOString() } : undefined,
+      expected.isInteractiveIdle,
     );
     if (!resumed)
       return {
@@ -1898,7 +2250,13 @@ export class EngineeringRuntime {
       await this.normalizeMissionForRepair(missionId);
       result = await orchestrator.repairBlockedMission(missionId, signal);
     }
-    return { status: "resumed", mission: result };
+    return {
+      status: "resumed",
+      mission: result,
+      ...(expected.selectedModel && result.operator_model_pin
+        ? { selectedModel: { provider: result.operator_model_pin.provider, id: result.operator_model_pin.id } }
+        : {}),
+    };
   }
 
   /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
@@ -2073,7 +2431,7 @@ export class EngineeringRuntime {
         })
         .finally(() => {
           this.runningExternal.delete(missionId);
-          void this.publishMissionSnapshot();
+          this.scheduleMissionSnapshot();
         });
     }
   }
@@ -2421,7 +2779,7 @@ export class EngineeringRuntime {
     // A captured observation can support a hypothesis without proving its
     // interpretation. Worker prose never auto-verifies a hypothesis (INV-006).
     for (const claim of run.result.claims) {
-      const machine = hasRecordedEvidence(claim.evidence, this);
+      const machine = await hasRecordedEvidence(claim.evidence, this);
       await this.ledger.recordEntity("hypothesis", claim.claim, "open", this.actor(runId, role), opts.wi.id, {
         evidence: machine ? [claim.evidence!] : [],
       });
@@ -2692,7 +3050,25 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     // set "test": "true") and neutralize the very gate that is supposed to
     // certify it (INV-003/005 integrity). Stages still RUN in the candidate
     // worktree so they exercise the candidate's actual code.
-    const profile = await this.verifier.detect(this.cwd);
+    // Risk labels alone are insufficient: confirm the actual changed paths
+    // before selecting cheap checks. Code/config changes retain normal gates
+    // unless the trusted project explicitly declares a quick profile.
+    const explicitChecks = /\b(?:tests?|testing|verify|verification|checks?|suite|build|lint|typecheck)\b/i.test(
+      wi.goal,
+    );
+    const explicitFull =
+      explicitChecks &&
+      /\b(?:full|all|complete|entire|whole)\b[\s\S]*\b(?:tests?|verification|checks?|suite)\b|\b(?:tests?|verification|checks?|suite)\b[\s\S]*\b(?:full|all|complete|entire|whole)\b|\b(?:test:(?:full|all)|verify\s+full)\b/i.test(
+        wi.goal,
+      );
+    const changedFiles =
+      wi.risk === "low" && !explicitChecks && this.git && worktreePath
+        ? await this.git.changedFiles(candidate.base_commit, await this.git.headCommitIn(runCwd))
+        : undefined;
+    const profile = await this.verifier.detect(this.cwd, {
+      ...(explicitFull ? { full: true } : {}),
+      ...(changedFiles ? { risk: wi.risk, changedFiles, baseCommit: candidate.base_commit } : {}),
+    });
     const outcome = await this.verifier.run(runCwd, profile, this.artifacts, { quarantine: this.testQuarantine });
     const actor = this.actor(newRunId(), "reviewer");
     this.telemetry.verifyStages += outcome.stages.length;
@@ -2773,34 +3149,55 @@ Report concrete findings. Return your findings EXACTLY as details.findings, an a
       // review (distinct from the implementer's, and per-candidate).
       sessionScope: candidate.id,
     });
-    // Findings come from the explicit details.findings contract; anything else
-    // is recorded as a (non-blocking) hypothesis so a malformed review never
-    // both invents blocking findings and silently promotes.
-    const completed = run.result.status === "completed";
+    // A completed worker is not necessarily a completed review. Validate the
+    // entire role-specific payload before recording anything: dropping one
+    // malformed finding could turn a reported defect into a clean approval.
+    const details = run.result.details;
+    const findings =
+      details !== null && typeof details === "object" && !Array.isArray(details)
+        ? (details as { findings?: unknown }).findings
+        : undefined;
+    const validFindings =
+      Array.isArray(findings) &&
+      findings.every(
+        (f): f is { severity: "info" | "low" | "medium" | "high" | "critical"; claim: string; evidence: string } =>
+          f !== null &&
+          typeof f === "object" &&
+          !Array.isArray(f) &&
+          ["info", "low", "medium", "high", "critical"].includes(f.severity) &&
+          typeof f.claim === "string" &&
+          f.claim.trim().length > 0 &&
+          typeof f.evidence === "string",
+      );
+    const completed = run.result.status === "completed" && validFindings;
     const findingIds: string[] = [];
-    // Only a COMPLETED review contributes findings. A review that timed out or
-    // hit the context budget returns a fallback failed result with empty
-    // details; treating that as a clean review would silently promote a
-    // candidate that was never independently reviewed (INV-007), so we surface
-    // `completed: false` and let the caller gate promotion on it.
-    const details = completed
-      ? (run.result.details as { findings?: Array<{ severity?: string; claim?: string; evidence?: string }> })
-      : {};
-    for (const f of details?.findings ?? []) {
-      if (!f.claim) continue;
-      const entity = await this.ledger.recordEntity("finding", f.claim, "open", this.actor(runId, "reviewer"), wi.id, {
-        severity: (f.severity as never) ?? "medium",
-        evidence: f.evidence ? [f.evidence] : [],
-        candidateId: candidate.id,
-      });
-      findingIds.push(entity.id);
+    if (completed) {
+      for (const f of findings) {
+        const entity = await this.ledger.recordEntity(
+          "finding",
+          f.claim,
+          "open",
+          this.actor(runId, "reviewer"),
+          wi.id,
+          {
+            severity: f.severity,
+            evidence: f.evidence ? [f.evidence] : [],
+            candidateId: candidate.id,
+          },
+        );
+        findingIds.push(entity.id);
+      }
     }
     for (const c of run.result.claims) {
       await this.ledger.recordEntity("hypothesis", c.claim, "open", this.actor(runId, "reviewer"), wi.id, {
-        evidence: hasRecordedEvidence(c.evidence, this) ? [c.evidence] : [],
+        evidence: (await hasRecordedEvidence(c.evidence, this)) ? [c.evidence] : [],
       });
     }
-    return { summary: run.result.summary, findingIds, completed };
+    const summary =
+      run.result.status === "completed" && !validFindings
+        ? `Invalid review findings: expected details.findings with severity, nonempty claim, and evidence strings. ${run.result.summary}`
+        : run.result.summary;
+    return { summary, findingIds, completed };
   }
 
   /**

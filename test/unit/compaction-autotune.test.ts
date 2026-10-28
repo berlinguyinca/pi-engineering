@@ -12,12 +12,15 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
+  compactSessionHandoff,
   effectiveCompaction,
   readUserCompactionValues,
   shouldAutoCompact,
   tunedCompactionTokens,
 } from "../../src/compaction/autoTune.ts";
+import { SESSION_HANDOFF_ENTRY } from "../../src/plannerWorker/sessionHandoff.ts";
 
 test("policy table: reserve follows the output allowance and the window; keep follows the window", () => {
   const rows: Array<[number, number | undefined, number, number]> = [
@@ -156,4 +159,33 @@ test("an older Pi (no agent_settled, no per-model compaction) gets a one-time no
   } finally {
     uninstall();
   }
+});
+
+test("handoff compaction shares one safe event result and never falls back to raw input on preparation failure", async () => {
+  const manager = SessionManager.inMemory("/tmp");
+  manager.appendMessage({ role: "user", content: "HIDDEN_OLD_CONTEXT", timestamp: 1 });
+  const marker = manager.appendCustomEntry(SESSION_HANDOFF_ENTRY, { rendered: "bounded handoff" });
+  manager.appendMessage({ role: "user", content: "successor", timestamp: 2 });
+  const settings = { enabled: true, reserveTokens: 4096, keepRecentTokens: 2048 };
+  const event = {
+    branchEntries: manager.getBranch(),
+    preparation: { settings, firstKeptEntryId: marker, tokensBefore: 10000 } as never,
+    signal: new AbortController().signal,
+  };
+  const ctx = { model: { id: "small" } } as never;
+  let preparations = 0;
+  const loader = async () => (entries: unknown[]) => {
+    preparations++;
+    assert.ok(!JSON.stringify(entries).includes("HIDDEN_OLD_CONTEXT"));
+    return undefined;
+  };
+  const first = compactSessionHandoff(event, ctx, settings, loader);
+  const second = compactSessionHandoff(event, ctx, settings, loader);
+  assert.equal(first, second);
+  assert.equal((await first)?.firstKeptEntryId, marker);
+  assert.equal(preparations, 1);
+  await assert.rejects(
+    compactSessionHandoff({ ...event }, ctx, settings, async () => undefined),
+    /native preparation unavailable/,
+  );
 });

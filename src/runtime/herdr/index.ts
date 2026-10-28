@@ -2,6 +2,8 @@
 export { HerdrAgentRuntime } from "./HerdrAgentRuntime.ts";
 export type { HerdrAgentRuntimeOptions } from "./HerdrAgentRuntime.ts";
 export { RealHerdrCli, HerdrError } from "./HerdrCli.ts";
+export { HostConfigUnavailable, loadHostConfig } from "./HostConfig.ts";
+export type { HostConfig, LoadHostConfigOptions } from "./HostConfig.ts";
 export { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 export type { ControlPlaneIngestOptions } from "./ControlPlaneIngest.ts";
 export type { HerdrCli, HerdrAgent, HerdrStatus, RealHerdrCliOptions } from "./HerdrCli.ts";
@@ -30,8 +32,8 @@ export {
   InspectorFeed,
   INSPECTOR_LIMITS,
   attachInspectorFeed,
-  attachInspectorFeedFromEnv,
-  inspectorConfigFromEnv,
+  attachInspectorFeedFromHost,
+  inspectorConfigFromHost,
   isSensitivePath,
   isTestCommand,
   parseTestOutput,
@@ -44,3 +46,11 @@ export type {
   InspectorSink,
   ReasoningMode,
 } from "./InspectorFeed.ts";
+export { LineageEmitter, createLineageEmitter, lineageNodeId } from "./lineage.ts";
+export {
+  createLineageFromConnection,
+  createLineageFromHostConfig,
+  lineageEnabledByConfig,
+  loadLineageEmitter,
+} from "./lineageConfig.ts";
+export type { LineageSink, LineageEmitterOptions } from "./lineage.ts";

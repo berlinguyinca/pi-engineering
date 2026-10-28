@@ -7,13 +7,10 @@
  * stable fingerprint so a gate is not re-run for identical content.
  */
 
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { promisify } from "node:util";
+import { safeGit } from "../git/safeGit.ts";
 import type { ChangeFile, ChangeSnapshot } from "./types.ts";
 import { EMPTY_CHANGE_SNAPSHOT } from "./types.ts";
-
-const exec = promisify(execFile);
 
 export interface ObserveOptions {
   cwd: string;
@@ -26,14 +23,10 @@ export interface ObserveOptions {
   diffExcerptChars?: number;
 }
 
+/** The observed worktree is worker-writable: every git call is hardened (see src/git/safeGit.ts). */
 async function git(cwd: string, args: string[]): Promise<{ stdout: string; code: number }> {
-  try {
-    const { stdout } = await exec("git", ["-C", cwd, ...args], { timeout: 120_000, maxBuffer: 32 * 1024 * 1024 });
-    return { stdout: stdout, code: 0 };
-  } catch (err) {
-    const e = err as { stdout?: string; code?: number };
-    return { stdout: typeof e.stdout === "string" ? e.stdout : "", code: typeof e.code === "number" ? e.code : 1 };
-  }
+  const r = await safeGit(args, { cwd, trust: "operator", timeoutMs: 120_000, maxBuffer: 32 * 1024 * 1024 });
+  return { stdout: r.stdout, code: r.code };
 }
 
 function parseStatusLine(line: string): { index: string; worktree: string; path: string; orig?: string } | undefined {

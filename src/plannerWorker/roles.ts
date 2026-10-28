@@ -66,6 +66,27 @@ export interface ResolvedRole {
   notes: string[];
 }
 
+/** A routing refusal must never become an implicit executor-default dispatch. */
+export class RoleRoutingRefusalError extends Error {
+  readonly role: PlannerWorkerRole;
+
+  constructor(role: PlannerWorkerRole) {
+    super(`no eligible model can serve ${role}; refusing executor default after routing rejection`);
+    this.name = "RoleRoutingRefusalError";
+    this.role = role;
+  }
+}
+
+/** Only an unconfigured standalone host may dispatch without a model selection. */
+export function dispatchResolution(
+  role: PlannerWorkerRole,
+  resolved: ResolvedRole | null,
+  defaultAllowed: boolean,
+): ResolvedRole | null {
+  if (!resolved && !defaultAllowed) throw new RoleRoutingRefusalError(role);
+  return resolved;
+}
+
 const UNUSABLE_STATES = new Set(["unavailable", "draining", "lost", "failed", "offline"]);
 
 export function usable(m: CatalogModel): boolean {
@@ -98,7 +119,11 @@ export interface ResolveContext {
   /** Model ids known unavailable right now (failure-aware switching). */
   exclude?: readonly string[];
   /** Static routing (engineering.yaml pins via the capability router). */
-  fallback?: (role: PlannerWorkerRole, exclude: readonly string[]) => Promise<ModelRef | undefined>;
+  fallback?: (
+    role: PlannerWorkerRole,
+    exclude: readonly string[],
+    requirements: RoleConfig,
+  ) => Promise<ModelRef | undefined>;
 }
 
 function score(m: CatalogModel, cfg: RoleConfig): number {
@@ -187,9 +212,12 @@ export async function resolveRole(role: PlannerWorkerRole, ctx: ResolveContext):
   }
 
   // 3. Static role routing.
-  const fallback = await ctx.fallback?.(role, [...exclude]).catch(() => undefined);
+  const fallback = await ctx.fallback?.(role, [...exclude], cfg).catch(() => undefined);
   if (fallback) {
-    const entry = ctx.catalog.find((m) => m.id === fallback.id);
+    // Catalogue ids belong to the gateway provider; another provider may use
+    // the same id for a different model. Its router owns the hard checks.
+    const entry = fallback.provider === ctx.provider ? ctx.catalog.find((m) => m.id === fallback.id) : undefined;
+    if (exclude.has(fallback.id) || (entry && !fits(entry))) return null;
     return {
       role,
       model: fallback,
@@ -200,6 +228,15 @@ export async function resolveRole(role: PlannerWorkerRole, ctx: ResolveContext):
     };
   }
   return null;
+}
+
+/** Resolve for dispatch; null is reserved for a host with no routing information. */
+export async function resolveRoleForDispatch(
+  role: PlannerWorkerRole,
+  ctx: ResolveContext,
+): Promise<ResolvedRole | null> {
+  const resolved = await resolveRole(role, ctx);
+  return dispatchResolution(role, resolved, ctx.catalog.length === 0 && !ctx.fallback && !ctx.exclude?.length);
 }
 
 /** Concrete identity of a resolution (backing model when an alias). */

@@ -201,7 +201,7 @@ function resumer(
   stateDir: string,
   go: string,
   mode: "link" | "no-link-slow-writer" = "link",
-): { done: Promise<string>; ready: Promise<void> } {
+): { child: ReturnType<typeof spawn>; done: Promise<string>; ready: Promise<void> } {
   const child = spawn(
     process.execPath,
     [
@@ -245,9 +245,43 @@ console.log(lock.pid === process.pid ? "won intact" : "won stolen");`,
     out += b.toString();
     if (out.includes("ready")) markReady();
   });
-  const done = new Promise<string>((r) => child.on("exit", () => r(out.replace("ready", "").trim())));
-  return { done, ready };
+  const done = new Promise<string>((resolveDone, rejectDone) => {
+    child.once("error", rejectDone);
+    // Process exit can precede the last stdout data event. Classify only once
+    // the pipe is drained, and preserve abnormal exits as diagnostic failures.
+    child.once("close", (code, signal) => {
+      const result = out.replace("ready", "").trim();
+      if (code !== 0 || signal) {
+        rejectDone(new Error(`resumer exited (${code}, ${signal}): ${result}`));
+      } else {
+        resolveDone(result);
+      }
+    });
+  });
+  return { child, done, ready };
 }
+
+test("resumer results include output still buffered when the child exits", async () => {
+  const fixture = await makeFixtureRepo();
+  cleanups.push(fixture.cleanup);
+  const dir = join(fixture.root, ".pi-eng", "planner-worker", "PW-buffered-output");
+  const lock = await acquireMissionLock(dir);
+  try {
+    const go = join(dir, "go");
+    const racer = resumer(dir, go);
+    await racer.ready;
+    // Hold the pipe's data events until process exit. Exit does not guarantee
+    // drained stdio: the helper must wait for close before classifying results.
+    racer.child.stdout!.pause();
+    const exited = new Promise((resolveExit) => racer.child.once("exit", resolveExit));
+    await writeFile(go, "");
+    await exited;
+    racer.child.stdout!.resume();
+    assert.equal(await racer.done, "refused");
+  } finally {
+    await lock.release();
+  }
+});
 
 const ROUNDS = Number(process.env.PW_LOCK_ROUNDS ?? 6);
 const RACERS = 6;

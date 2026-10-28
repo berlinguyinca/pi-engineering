@@ -495,3 +495,44 @@ test("install: abandonForAlternate sees the request context, so a summary call c
   assert.equal(seen[0]?.context, context, "the very context Pi sent, for isSummarizationRequest");
   assert.equal(h.baseCalls, 2, "declined: the hold was waited out and the call retried");
 });
+
+test("install: requestHeaders are merged into every attempt's options and keep existing headers", async () => {
+  resetGatewayStreamRetry();
+  const fail = { type: "error", error: { stopReason: "error", errorMessage: SATURATED } } as Ev;
+  const ok = { type: "done", message: { stopReason: "stop" } } as Ev;
+  const scripts = [[fail], [ok]];
+  const seen: Array<Record<string, string> | undefined> = [];
+  let calls = 0;
+  const registered: Array<Record<string, unknown>> = [];
+  const host: ProviderHost<unknown, unknown, unknown> = {
+    getProvider: () => ({
+      streamSimple: ((registered.at(-1)?.streamSimple as never) ??
+        ((_m: unknown, _c: unknown, o?: { headers?: Record<string, string> }) => {
+          seen.push(o?.headers);
+          return attempt(scripts[Math.min(calls++, scripts.length - 1)] ?? []);
+        })) as never,
+    }),
+    registerProvider: (_id: unknown, config?: Record<string, unknown>) => {
+      registered.push(config ?? {});
+    },
+  };
+  const stream = fakeStream();
+  installGatewayStreamRetry(
+    host,
+    { provider: "acme", api: "a" },
+    deps(stream, {
+      now: () => 0,
+      requestHeaders: (_m: unknown, o?: { sessionId?: string }) => ({
+        "X-InferWeave-Session-ID": o?.sessionId ?? "none",
+      }),
+    }),
+  );
+  const handler = registered[0]?.streamSimple as (m: unknown, c: unknown, o?: unknown) => unknown;
+  handler({}, {}, { sessionId: "sess-1", headers: { "x-keep": "1" } });
+  await stream.settled;
+  assert.equal(calls, 2);
+  assert.deepEqual(seen, [
+    { "x-keep": "1", "X-InferWeave-Session-ID": "sess-1" },
+    { "x-keep": "1", "X-InferWeave-Session-ID": "sess-1" },
+  ]);
+});

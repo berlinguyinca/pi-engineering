@@ -274,6 +274,33 @@ waiting in `WAITING_FOR_LLM` and relaunches only on an authoritative healthy
 probe; it is never `BLOCKED` for this. Executions that ran tools count as
 attempts as before.
 
+### Gateway recovery capacity checks
+
+For InferWeave, the recovery probe authenticates to the model catalogue and
+reads `/iw/v1/admission` for the selected model. Catalogue `slots` is a capacity
+ceiling. Automatic recovery requires measured immediate model headroom and an
+empty model queue; spare queue room alone does not release a paused mission.
+The probe supports both the Go model-keyed report and the Rust model-array
+report. Go capacity must be known and less than 90 seconds old. Logical aliases
+are matched using the catalogue or admission report's explicit model mapping.
+
+This is a model-level readiness check. Caller, session, priority and downstream
+limits can still refuse a request; another caller's aggregate queue or priority
+statistics do not establish availability for this mission. When Go diagnostics
+report an effective model or global active limit, the probe also checks it.
+
+Missing, stale or unsupported admission telemetry is **unknown capacity**, not
+proof of either free capacity or a model outage. An idle Go model may have no
+tracked admission row. Such answers do not establish automatic recovery and can
+leave a mission waiting until telemetry appears. Plain OpenAI-compatible
+providers retain their model-availability check without requiring InferWeave.
+
+For a legacy gateway without suitable admission telemetry, an operator can set
+`PI_GATEWAY_HEALTH_URL` to an explicitly chosen gateway base URL to use the
+existing HTTP readiness probe instead. This override proves only that the
+selected health endpoint responds; it does **not** measure queue headroom.
+Ordinary `/mission resume` is not a guaranteed bypass of the capacity probe.
+
 ### Reviewer tools and the candidate guard
 
 The reviewer gets `read`, `bash`, `repo_search` and `symbol` next to the evidence
@@ -511,7 +538,7 @@ A mission whose goal implies more than one deliverable, names several paths, or 
 
 ## Concurrency caps, cooldown scope and stall detection
 
-- Caps follow the gateway: when the `/models` catalogue advertises `active_limit` (or `x_active_limit`, else `slots`), the scheduler's per-role and agent caps and the admission controller's concurrency (less `PI_GATEWAY_RESERVED_SLOTS`) use that capacity. The fixed defaults (2 per role, 4 minus 1 reserved) apply only when the catalogue says nothing. `PI_ENGINEERING_MAX_PER_ROLE`, `PI_ENGINEERING_MAX_AGENTS` and `PI_GATEWAY_MAX_CONCURRENCY` always override.
+- Scheduler caps use catalogue `active_limit` (or `x_active_limit`, else `slots`) only when the backend supplies an authoritative provider/endpoint and model route. Requested model hints and pins are not proof of the eventual route. Unknown routes, including the default production path where routing happens after dispatch, use configured limits; provider-only observations become unknown if that name has described multiple endpoints. Zero capacity blocks automatically limited model tasks, but does not block local process/validation/integration tasks. Explicit `PI_ENGINEERING_MAX_PER_ROLE` and `PI_ENGINEERING_MAX_AGENTS` settings remain authoritative. The separate process-wide admission controller retains its configured concurrency and reserved slot policy, with `PI_GATEWAY_MAX_CONCURRENCY` taking precedence over catalogue-derived capacity.
 - A 429 cools down only the model (or route) it named. It parks the whole process only when the gateway says `scope: "global"` or `"caller"`, or when the refusal names no model.
 - A model turn that streams no first token for `PI_GATEWAY_FIRST_TOKEN_STALL_MS` (default 15 minutes), or then goes `PI_GATEWAY_STREAM_STALL_MS` (default 5 minutes; `0` disables) between tokens, ends as a transient stream failure, so resume and retry accounting apply. A slow turn that keeps streaming never stalls. The 60 minute worker-inactivity watchdog remains for long-running tool commands.
 - The scheduler pass loop is event-driven: it wakes when a task settles and otherwise ticks once a second.
@@ -651,6 +678,35 @@ convergence (stall detection), not by wall-clock budgets. Route swaps on
 InferWeave (`/iw/v1/routes/events`) are followed between requests, without a
 restart.
 
+### Git locks and recovery of planner-worker output
+
+Worktree and promotion locks now live in the shared Git common directory's
+`pi-engineering-locks/` metadata directory, outside Git's top-level safety scan.
+Before upgrading mutating runtimes, drain their work and restart **all** older
+processes that can mutate that repository. Mixed old/new mutation is unsupported:
+new runtimes conservatively refuse an already-present legacy lock, but that
+absence check cannot serialize an older process that acquires its old lock later.
+The Git hard-link and symlink safety checks remain enabled.
+
+A failed or unverified harvest retains its worker output and reports the worktree
+path and branch. Failed mission workspaces are kept in full, including ignored
+files. Replanning retains superseded workspaces even if a later plan succeeds,
+and durably records their path, branch, and base before replacing contracts.
+Reissuing a task ID refuses to overwrite an existing branch and instead names
+its recovery location. Generic idle housekeeping leaves planner-worker workspaces
+to their executor or explicit recovery; retained output consumes disk until then.
+Resume refuses dirty, unharvested, or unmerged prior work instead of resetting or
+deleting it. Inspect the named worktree and preserve its changes on a recovery
+branch or integrate them deliberately. Save ignored artifacts separately or
+explicitly commit them to the recovery branch. Then remove both the original
+worktree directory and its branch and retry resume. Do not delete the state file or force-remove a
+worktree merely to clear the recovery fence. Successful completion additionally
+reruns the contract verification commands in the integrated tree before applying
+the result to the checkout. Verification and review must leave that tree at the
+same clean commit; source edits, new untracked files, or a changed HEAD fail
+completion and retain the workspace. Application uses the verified commit ID
+rather than a branch name that could move after verification.
+
 ## Individual commands
 
 | Command        | Effect                                                        |
@@ -784,6 +840,65 @@ pi-engineering mission submit --store <dir> < submit.json # {result:"created", m
 pi-engineering mission observe --store <dir> < observe.json # {result:"ok", mission:<snapshot>}
 ```
 
+## Optional AutoSpec DAG, design-gate evidence and quality law
+
+Everything here is OFF unless an `autospec:` block exists in `~/.pi/agent/engineering.yaml`
+(global) or `<repo>/.pi/engineering.yaml` (repo). There are no environment variables, and
+with no block nothing from `src/integrations/autospec/` is imported, read or executed. The
+`mission submit|observe|cancel` contract is unchanged.
+
+```yaml
+autospec:
+  dag: {enabled: true}                  # global only
+  design_gate:
+    report: .autospec/reports/design-gates.json   # global only, repo-relative
+    rules_file: /path/to/autospec-design/rules.yaml  # global only: Pi's own view of vlm/review rules
+    ui_paths: ["src/ui/**"]             # global sets; a repo layer may only add
+    require_for_ui: true                # a repo layer may only turn it ON
+  quality_law:                          # global only, informational
+    profile_file: /path/to/profile.json
+    profile_id: web
+    gate_files: [/path/to/quality-gate.json]
+```
+
+- **DAG ingestion**: `pi-engineering plan --store <dir> --from-autospec <file|dir>` (a file
+  `{mission, tasks}` or a directory with `mission.json` and `tasks.json`). Refused unless
+  `autospec.dag.enabled: true` is set in the global config; a repo layer cannot enable it. It maps
+  `autospec.protocol.mission/task.v1` records to plan tasks (`depends_on` = prerequisites), keeps
+  repo-qualified issue refs (`owner/repo#N`, from the `autospec.issue_refs` extension) in
+  `execution_requirements.autospec` so they are covered by the plan digest, and fails closed on cycles
+  (iterative, at most 2000 tasks), missing dependencies, unknown *required* extensions,
+  `autospec-managed` executors, started work, odd task ids, and surfaces that are wildcards, `~`,
+  control characters or under `.git/`, `.pi/`, `.autospec/`. The plan then goes through the same T03
+  plan-review gate and policy as any other plan. Like the standalone plan it stops before any worker
+  starts; Pi stays the execution authority.
+- **Design gate evidence**: Pi never runs the design gates. It reads the report AutoSpec's
+  `autospec-design-gates.sh` wrote, **from the commit under evaluation** (`git show <sha>:<report>`);
+  an untracked or edited worktree copy is ignored. It recomputes the verdict from `gates[]`
+  (a failed `severity: blocker` gate blocks whatever its `blocking` flag says) and requires every
+  `auto` rule in Pi's vendored table (or the operator's `rules_file`) to be present. The report must
+  name the commit it was produced for (`commit_sha`, or a `design-gates.commit` sidecar); that commit
+  must be the evaluated commit or an ancestor with no UI-path change since (the report cannot name its
+  own commit, so it is normally committed one commit later). SKIPPED, missing, stale, unbound,
+  malformed or incomplete reports are "not run" / unavailable, never a pass. `vlm` and `review`
+  rules are an advisory checklist.
+  With `require_for_ui: true` the interactive completion gate blocks a UI change without valid
+  evidence, **and so does the orchestrated-mission completion gate**: it evaluates the candidate commit
+  (`CandidateEvidenceIdentity.candidateSha`) against the changed UI paths, synchronously, from a
+  committed report. A mission with several repository candidates is blocked rather than skipped.
+  Without `require_for_ui` the item is shown but never blocks. A malformed `engineering.yaml` (either layer)
+  counts as configured and blocks; it never silently switches the gate off. `ui_paths` are case-insensitive
+  anchored globs (`*` within a segment, `**` across; `dir/**` also matches `dir` itself; `? [ ] { }` are
+  rejected; use a leading `**` segment to match a file name at any depth). `report` must end in `.json`.
+- **Attestation (recommended)**: set `design_gate.attestation_key_file` (global only) to an ABSOLUTE
+  path of an owner-only (mode 0600) regular file, not a symlink, outside the repository, its top level
+  and every linked worktree; anything else is rejected. The report must then be accompanied, in the same commit, by
+  `design-gates.sig` = hex HMAC-SHA256 over `<commit_sha>\n<sha256 hex of the report bytes>`,
+  produced by the operator's trusted runner. Without a key, provenance is only "committed": a worker
+  that can commit can still commit a forged report. That is a residual trust assumption, not a fix.
+- **Quality law**: the profile's Constitution `quality_gates` are listed in the finalization
+  output as "not verified".
+
 ## Mission worker tools
 
 Mission implementer and repair workers get `read`, `edit`, `write`, `bash`,
@@ -823,6 +938,62 @@ on by default):
   calls. A user abort (Esc) never blocks a re-run.
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
+
+## Primary worktree guard
+
+The extension enforces the one-agent-one-worktree rule (AGENTS.md: each agent
+works in its own git worktree and never runs `git checkout` / `git switch` /
+`git reset` in a directory it does not own). Until this guard existed the rule
+was prose: a long-running session worked directly in a repository's PRIMARY
+checkout (the main / production worktree) while another session carried
+uncommitted work there; a force-switch destroyed the work, and a mission in
+the same checkout planned against a base that kept moving.
+
+`src/guard/primaryWorktreeGuard.ts` (on the `tool_call` hook, on by default)
+blocks the session's own **mutating** calls against any git repository's
+primary checkout:
+
+- `write` / `edit` to a path in the primary checkout;
+- bash `git` commands that change its state (`commit`, `checkout`, `switch`,
+  `reset`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `stash` (except
+  `list`/`show`), `add`, `rm`, `restore`, `update-ref`, `tag <name>`,
+  `branch <name>`/`-d`/`-D`/`-f`, `config` settings);
+- bash writes into it (`> f`, `>> f`, `tee f`, `sed -i … f`, `mv`/`cp` into
+  it).
+
+Read-only inspection (`git status`, `log`, `diff`, `show`, `fetch`, …) and
+worktree management (`git worktree add|remove|list|prune`) stay allowed —
+that is how a session observes the repo and **leaves** for its own worktree.
+The block reason tells the model the escape hatch: `git worktree add
+<sibling-dir> -b <branch> origin/<base>`.
+
+Knobs (set before starting the session):
+
+- `PI_ENG_PRIMARY=1` — this session is authorized to work in primary
+  checkouts (production ops: deploys, docker, branch inspection that must
+  happen in the production tree).
+- `PI_ENG_WORKTREE_GUARD=0` — disable the guard entirely.
+
+The bash checks are best-effort (no full shell parsing); an unrecognized
+mutating form is a gap to close when it bites, not a contract hole.
+The runtime's own in-process git operations (mission workers run in candidate
+worktrees; integration, janitor) do not go through the tool-call hook and are
+unaffected.
+
+## Recovering an interactive turn after the gateway wait is spent
+
+Pi retries a failed turn three times, and the gateway wrapper waits a short transient out for about five minutes (fifteen with alternate-model advice). Before this, a turn that failed before any output after that ended and sat until the operator typed "retry".
+
+`SettleRecovery` (`src/gateway/settleRecovery.ts`) is the last settle-boundary handler. When a turn failed with a retryable error and nothing was written, and no earlier handler continued it, it continues the turn after a paced wait: 30 s doubling to a 5 min cap with jitter, or the gateway's own advertised wait (up to 10 min) when that is longer. The wait is taken by the gateway wrapper, so Esc stops it.
+
+It never retries a final refusal (`do_not_retry`, `fix_request`, unknown model, context overflow, oversize body, exhausted quota or spend limits) or an abort, and it does nothing for a model whose requests bypass the wrapper. A successful assistant message, a model switch, or the end of the run starts a fresh budget. It gives up after 150 attempts or the shared retry window (12 h), whichever comes first, and says so in the telemetry line. A turn cut after output has begun stays with `AfterOutputRetry`.
+
+| Variable | Effect |
+|---|---|
+| `PI_SETTLE_RECOVERY=0` | Turn the handler off. |
+| `PI_SETTLE_RECOVERY_HORIZON_MS` | Give up this long after the first failure. Defaults to `PI_GATEWAY_MAX_ELAPSED_MS`. |
+| `PI_SETTLE_RECOVERY_BASE_MS`, `_CAP_MS` | First wait and the longest wait. |
+| `PI_SETTLE_RECOVERY_MAX_ATTEMPTS` | Continues per episode. |
 
 ## Resuming a worker after a cut stream
 
@@ -1181,6 +1352,69 @@ the SQLite registry is kept on a machine-local runtime directory automatically.
 - `/ledger hypothesis` — claims not yet promoted to facts.
 - `/verify` — run verification yourself and see the captured log artifact.
 
+## Risk-aware legacy verification and review
+
+For legacy `/engineer` and tournament candidates, a low risk label enables cheap
+verification only after the runtime reads the candidate's actual Git diff. A
+change consisting entirely of `.md`, `.rst`, or `.adoc` files gets a required
+patch-whitespace check plus any trusted `verify:docs` and `test:docs` scripts.
+Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and `SKILL.md`)
+retain the normal gates. Configuration files such as `requirements.txt` also
+retain normal verification.
+
+For other low-risk changes, the owner may declare `verify:quick` or `test:quick`
+in the trusted checkout's package scripts (`verify:quick` takes precedence).
+Without an owner-declared quick script, the normal profile remains in force.
+Requests that explicitly mention verification, tests, checks, build, or lint keep
+the normal gates; explicit full-suite requests select the full profile. Commands
+are chosen from the trusted owner checkout and run in the candidate worktree.
+Manual `/verify full` continues to request the broader suite.
+
+Legacy independent reviews must return `details.findings` explicitly, including
+an empty array for a clean review. Each finding must have a valid severity, a
+nonempty claim, and an evidence string. A missing or malformed payload is an
+incomplete review, so it cannot authorize promotion. Artifact-backed claims are
+accepted as machine evidence only after content validation, including after
+reopening a store.
+
+## Artifact startup and paged reads
+
+Reopening an artifact store validates metadata, file types, transaction recovery,
+and content sizes without reading every historical blob. Content digests are
+verified on first content access; same-size digest corruption is reported at that
+point rather than at startup. Missing files, size mismatches, invalid paths, and
+unsafe links still fail closed.
+
+The first paged read streams the artifact once to verify its digest and build a
+bounded sparse character index. Subsequent pages read the requested range near a
+checkpoint. The cache retains indexes for at most 16 files, with at most 1,025
+checkpoints each; it does not retain whole decoded blobs. File replacement,
+modification, or metadata digest changes invalidate reuse. Pagination offsets
+remain JavaScript string offsets (UTF-16 code units).
+
+## Worker permissions and recovery isolation
+
+A worker receives the builtin and semantic tools explicitly named in its request
+allowlist, plus its executor-owned terminal result tool. Supplying tools to the
+executor makes them available for selection; it does not grant them to every
+role. Custom callers must explicitly name safe retrieval tools they need, such as
+`ledger_read`, `artifact_read`, `repo_search`, `symbol`, and `tests_for`. Nested
+`mission` execution and `ledger_claim` are not implicitly granted to reviewers
+or scouts.
+
+An explicit model-routing refusal stops planner-worker dispatch for every role;
+it cannot silently select the worker's default model. Standalone hosts with no
+routing information can still use their configured worker default.
+
+A named mission wait protects its own condition. It cannot hide a separately
+running worker that has exceeded its meaningful-progress stall threshold.
+Worker-specific queue/model waits must be recorded on that worker, rather than
+represented only as a mission-level wait. The supervisor still debounces stall
+recovery and preserves existing opt-in deadline policy: this change adds no
+mission wall-clock limit. The observability spec's universal wait-deadline wording
+remains a policy discrepancy; default recovery waits currently end when their
+condition changes or the operator cancels.
+
 ## Real-model smoke tests
 
 After installing the package, from the repo directory:
@@ -1260,8 +1494,7 @@ the inspector says `not recorded`. Model messages and private reasoning are neve
 previews. These previews appear in inspection, not compact bars or HerdR attention notifications.
 
 The mission refresh timer stops for completed, failed, canceled or operator-paused missions and
-on runtime shutdown. Local footer refreshes do not create repeated notices. With the existing
-`HERDR_INGEST_URL` integration configured, HerdR receives one attention event when a mission
+on runtime shutdown. Local footer refreshes do not create repeated notices. With the `herdr:` block of the global `engineering.yaml` configured (see "Herdr connection" below), HerdR receives one attention event when a mission
 finishes, fails/crashes, or becomes stalled. Routine progress and heartbeats do not notify HerdR;
 a recovered mission can alert again if it stalls again. Reconnecting seeds current state without
 re-alerting about historical terminal or stalled missions.
@@ -1275,6 +1508,45 @@ Planner-worker missions also update their persistent widget/status once per seco
 `/engineering-workers [task]` to inspect a task's bounded recent activity, changed files and
 recorded result/blocker, or `/engineering-status` for the current activity summary. Verified
 contract counts determine percentage; live timers do not advance it.
+
+### Herdr connection (global `engineering.yaml` only, no environment variables)
+
+One block configures every Pi-to-Herdr path (attention events, lineage, steering, forks). It is read from the
+GLOBAL `engineering.yaml` in Pi's agent directory only; a repository file cannot set it, and the old
+`HERDR_INGEST_URL`, `HERDR_INGEST_API_KEY` and `HERDR_HOST_ID` variables are no longer read. If one of them is set,
+Pi prints an error to stderr (once per process) saying so; there is no silent fallback.
+
+```yaml
+herdr:
+  url: https://herdr.example.org       # https, or http only for localhost / 127.0.0.1 / ::1
+  api_key_file: /home/me/.config/herdr/key   # absolute path, mode 0600, owned by you, one line
+  instance_id: pi-laptop-1             # optional: names this Pi when several share one key
+  lineage: true                        # optional (default false): emit typed lineage events
+  visibility: room                     # optional: private | mission | room | org (default private)
+  room_id: room-abc                    # optional: stamped on every lineage event (Herdr lineage_key_scopes)
+  workspace_id: ws-1                   # optional
+  mission_id: m-1                      # optional default mission for events that carry none
+```
+
+Absent block means Pi does not talk to Herdr at all. The key is read from the file, never logged, and is not placed
+in the environment of anything Pi starts. Commands whose text a worker can author (the verifier's check commands,
+CAV test runs) run with a scrubbed environment: every `HERDR_*` variable, GitHub tokens, `SSH_AUTH_SOCK` and
+anything named `*_API_KEY`, `*_SECRET` or `*_PASSWORD` are removed.
+
+Sequence recovery: Herdr orders each source by `source_sequence`. If Pi's sequence file is lost or restored from an
+older copy, Pi lifts the counter above its own outbox, and on a `409` naming a taken sequence it learns the server's
+high-water mark (`reason: "sequence_conflict"` and `last_sequence` in the 409 body when Herdr sends them, otherwise the message text and `GET /api/v1/ingest/sources`),
+resumes above it and re-numbers the pending events; nothing is dropped. When that cannot be done, the event is
+dead-lettered with an error notice and `conflictDeadLettered` in the ingest diagnostics.
+
+Steering requests are judged on Herdr's clock (the `Date` header of the poll response plus monotonic time since),
+not on Pi's wall clock. A request that names a digest (`expected_digest`) is applied (redirect, resume, fork, promote)
+only while the target's current plan digest equals it, and is answered `stale` when Pi cannot compute one. Today Herdr
+sends `expected_digest` only on `approve`/`reject`, which Pi answers `unsupported` (gate decisions are not taken from
+steering), so in practice the digest check guards nothing that is applied yet; it is there so a Herdr that starts
+sending it on the other actions cannot be trusted by accident. Herdr's `fence` is an opaque hash Pi cannot recompute:
+it is compared only where a runtime supplies a fence for the target (none does today) and is always recorded in the
+at-most-once ledger.
 
 External web consumers receive additive `waitingSince`, `lastOutputAt`,
 `currentActivityStartedAt` and worker timing fields in the mission snapshot. They should derive

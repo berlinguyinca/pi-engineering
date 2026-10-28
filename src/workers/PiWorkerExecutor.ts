@@ -36,6 +36,7 @@ import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { AdmissionController } from "../gateway/AdmissionController.ts";
 import { type GatewayAdmissionConfig, sharedAdmissionController, sharedGatewayConfig } from "../gateway/config.ts";
+import { preflightEnabled, preflightWorkerShape } from "../gateway/preflight.ts";
 import {
   type GatewayRetryDecision,
   type GatewayWaitSignal,
@@ -90,6 +91,7 @@ import {
 } from "../inference/streamResume.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { missionDepthSpawnHook } from "../orchestration/missionMode.ts";
+import { NO_CHANGE_LOOP_PREVENTED_MARKER } from "../orchestration/recovery.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
 import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
@@ -137,7 +139,7 @@ import {
   realClock,
   withBudgetNotice,
 } from "./wallClockBudget.ts";
-import { createWorkerResultTool } from "./workerResultTool.ts";
+import { createWorkerResultTool, hasNoChangesVsBase } from "./workerResultTool.ts";
 import { createWorktreeFileTools } from "./worktreeFileTools.ts";
 
 /**
@@ -190,7 +192,7 @@ function roleResourceLoader(systemPrompt: string): ResourceLoader {
 export interface PiWorkerExecutorOptions {
   agentDir?: string;
   model?: Model<any>;
-  /** Core tools (ledger, artifact, context) exposed to worker sessions. */
+  /** Available core tools; each worker receives only names in its request allowlist. */
   customTools?: ToolDefinition[];
   allowModelNetwork?: boolean;
   /** Generation guard configuration (loop mitigation). Defaults to spec values. */
@@ -583,6 +585,35 @@ export class PiWorkerExecutor implements WorkerExecutor {
       if (providerBaseUrl) model = { ...model, baseUrl: providerBaseUrl };
     }
 
+    // (#425) Worker-shaped preflight: the gateway served prose probes for
+    // hours while every worker-shaped dispatch died with an instant 400
+    // upstream_error. Probe the production completion path — same auth, URL,
+    // compatibility, tool schema present — BEFORE paying a full worker
+    // startup, and map the outcome through the same gateway-signal vocabulary
+    // as an in-run failure (#428/#435): availability failures become capacity
+    // waits, deterministic refusals still fail, and an unrecognized error
+    // behaves exactly like the worker's first real request.
+    if (this.allowModelNetwork && preflightEnabled()) {
+      const pre = await preflightWorkerShape({ runtime: modelRuntime, model });
+      if (!pre.ok) {
+        const summary = `Preflight before worker start failed (${pre.marker}): ${pre.detail}`;
+        return {
+          result: {
+            status: "failed",
+            summary,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: { preflight: pre.marker },
+            error: pre.marker,
+          },
+          usage: null,
+          error: pre.marker,
+        };
+      }
+    }
+
     // Build the base system prompt with the Tool Transition Rule (spec §15).
     // Specialist roles may supply their own prompt wholesale. Prose roles
     // (reviewers) deliver written findings, so a rule that says "act instead of
@@ -681,8 +712,12 @@ export class PiWorkerExecutor implements WorkerExecutor {
         ? [budgetNotice(createClaimDeliverableTool(req.deliverables ?? []) as unknown as ToolDefinition)]
         : []),
       ...(offersCheckpointProgress(req) ? [createCheckpointProgressTool(req.deliverables ?? [])] : []),
-      terminating,
-    ];
+    ].filter(
+      // Injected tools and file-tool replacements obey the same explicit
+      // permissions as built-ins. Result tools are always executor-owned.
+      (tool) => req.tools.includes(tool.name) && tool.name !== "worker_result" && tool.name !== "review_result",
+    );
+    customTools.push(terminating);
     const tools = [...new Set([...req.tools, ...customTools.map((t) => t.name)])];
     let model: Model<any> = initialModel;
     let systemPrompt: string = initialPrompt;
@@ -1159,17 +1194,36 @@ export class PiWorkerExecutor implements WorkerExecutor {
           if (this.rollout.observability) this.observability.recordRecoveryOutcome(false);
           recoveryPending = false;
         }
+        // A MUTATING worker prevented from making progress, with nothing
+        // committed vs base, is the "nothing to do" signature — but the worker
+        // never reached the success-only `already_satisfied` assertion, so the
+        // bare loop_prevented failure would otherwise be auto-retried or
+        // auto-repaired forever. Mark it so recovery parks the mission for the
+        // operator (REQUIREMENT_AMBIGUITY -> WAIT_FOR_REQUIREMENT) instead.
+        let loopPreventedNoChange = false;
+        if (req.baseRef && MUTATING_ROLES.has(req.role)) {
+          try {
+            loopPreventedNoChange = await hasNoChangesVsBase(req.cwd, req.baseRef);
+          } catch {
+            // Git unknown is not proof of a no-op; leave the flag false.
+            loopPreventedNoChange = false;
+          }
+        }
         const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
         const detail = {
           loop_prevented: true,
+          loop_prevented_no_change_vs_base: loopPreventedNoChange,
           no_progress_turns: noProgressTurns,
           recovery: loopPreventedEvent !== undefined ? decideApsRecovery(loopPreventedEvent).action : "none",
           escalated_to_human: escalatedToHuman,
         };
+        const noChangeSuffix = loopPreventedNoChange
+          ? ` — ${NO_CHANGE_LOOP_PREVENTED_MARKER}: a mutating ${req.role} worker was prevented from making progress and produced no changes vs base; an operator must decide whether the objective is already met or needs a different approach.`
+          : "";
         return {
           result: {
             status: "failed",
-            summary: `Agent loop prevented after ${noProgressTurns} identical no-progress turns (${AGENT_LOOP_PREVENTED_EVENT}).`,
+            summary: `Agent loop prevented after ${noProgressTurns} identical no-progress turns (${AGENT_LOOP_PREVENTED_EVENT}).${noChangeSuffix}`,
             claims: [],
             evidence_refs: [],
             new_hypotheses: [],

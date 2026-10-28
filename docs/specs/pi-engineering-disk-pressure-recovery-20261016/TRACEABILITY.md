@@ -58,7 +58,13 @@ new mission or repeating completed work.*
   the last safe checkpoint" remains — mission-level work resumption is a
   separate integration (the snapshot/state layer is durable; no work is
   re-run because checkpointed state is the resume source).
-- [ ] FR-05 persistence integrity: integrate torn-tail JSONL repair in
-  `src/platform/eventstore/jsonl.ts` (ownership-verified only).
-- [ ] End-to-end acceptance scenarios (spec §6 tests 1–13) via isolated temp
-  filesystems / mocked fs.
+- [x] FR-05 persistence integrity: integrate torn-tail JSONL repair in
+  `src/platform/eventstore/jsonl.ts` (ownership-verified only) —
+  `repairTornTail(file, { owner? })` truncates only when the caller proves it
+  holds the writer lock or no live owner exists
+  (`lockHeldByLiveOwner`); stale/no owners still repair.
+- [x] End-to-end acceptance scenarios (spec §6) via isolated temp filesystems:
+  `test/integration/disk-pressure-snapshot-e2e.test.ts` drives the full
+  suspend → stale-tag → pause → probe (sentinel-gated) → recover → clean
+  republish → fresh-incident re-suspend lifecycle through the real runtime +
+  guard + controller + files (fault injection only).

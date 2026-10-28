@@ -251,6 +251,100 @@ describe("MissionSupervisor", () => {
     }
   });
 
+  for (const action of ["WAIT_FOR_REQUIREMENT", "PROBE_AND_BACKOFF"] as const) {
+    for (const probeDue of [false, true]) {
+      it(`recovers a stalled worker despite another task's ${action} wait (probe due: ${probeDue})`, async () => {
+        const start = Date.parse("2026-09-27T12:00:00.000Z");
+        const h = harness(start);
+        const active = h.store.createTask({
+          mission_id: h.mission.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: "active work",
+        });
+        h.store.transitionTask(active.task_id, "READY");
+        h.store.transitionTask(active.task_id, "RUNNING");
+        const waiting = h.store.createTask({
+          mission_id: h.mission.mission_id,
+          kind: "agent",
+          role: "implementer",
+          objective: "wait for a dependency",
+        });
+        h.observability.workerStarted(h.mission.mission_id, "silent", { taskId: active.task_id });
+        h.observability.setWaiting(h.mission.mission_id, "repository_lease", "Sibling task waiting for repository");
+        const classification = h.store.classifyFailure({
+          classificationId: "FC-sibling-wait",
+          missionId: h.mission.mission_id,
+          taskId: waiting.task_id,
+          executionId: null,
+          category: "REQUIREMENT_AMBIGUITY",
+          evidenceRefs: [],
+          fingerprint: "sha256:sibling-wait",
+          summary: "waiting for sibling dependency",
+          classifiedAt: new Date(start).toISOString(),
+        });
+        const wait = h.store.planRecovery({
+          recoveryId: "RCV-sibling-wait",
+          missionId: h.mission.mission_id,
+          classificationId: classification.classificationId,
+          action,
+          expectedMaterialChange: "dependency becomes available",
+          attempt: 1,
+          maxAttempts: 2,
+          deadline: null,
+          nextActionAt: new Date(start + (probeDue ? 0 : 60 * 60_000)).toISOString(),
+          status: "planned",
+          decidedAt: new Date(start).toISOString(),
+          failureFingerprint: classification.fingerprint,
+        });
+        h.setNow(start + 6 * 60_000);
+
+        const [first] = await h.supervisor.tick();
+        assert.notEqual(first?.health, "STALLED", "the first stale projection is debounced");
+        const [second] = await h.supervisor.tick();
+
+        assert.equal(second?.health, "STALLED");
+        assert.ok(second?.decision, "the stalled worker needs a durable recovery decision");
+        assert.equal(h.store.getFailureClassification(second.decision.classificationId)?.taskId, active.task_id);
+        assert.equal(h.store.getRecoveryDecision(wait.recoveryId)?.status, "planned", "the sibling wait is preserved");
+      });
+    }
+  }
+
+  it("does not recover a worker that is explicitly waiting for capacity", async () => {
+    const start = Date.parse("2026-09-27T12:00:00.000Z");
+    const h = harness(start);
+    const task = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "await inference capacity",
+    });
+    h.store.transitionTask(task.task_id, "READY");
+    h.store.transitionTask(task.task_id, "RUNNING");
+    const execution = h.store.createExecution({
+      task_id: task.task_id,
+      backend: "agent",
+      mission_id: h.mission.mission_id,
+    });
+    h.store.setExecutionStatus(execution.execution_id, "RUNNING");
+    h.observability.workerStarted(h.mission.mission_id, "waiting", { taskId: task.task_id });
+    h.observability.activity(h.mission.mission_id, {
+      type: "waiting_for_queue",
+      summary: "Queued for inference capacity",
+      workerId: "waiting",
+    });
+    h.observability.setWaiting(h.mission.mission_id, "repository_lease", "Sibling repository wait");
+    h.setNow(start + 24 * 60 * 60_000);
+
+    await h.supervisor.tick();
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "HEALTHY");
+    assert.equal(h.store.listRecoveryDecisions(h.mission.mission_id).length, 0);
+    assert.equal(h.observability.summary(h.mission.mission_id)?.health, "waiting");
+  });
+
   it("turns a named wait past its deadline into an actionable stop", async () => {
     const now = Date.parse("2026-09-27T12:00:00.000Z");
     const h = harness(now);
@@ -718,10 +812,63 @@ describe("MissionSupervisor", () => {
 
     assert.equal(status?.health, "REPAIR_REQUIRED");
     assert.equal(status?.task, failed.task_id, "the repair names the task to replace, not the mission");
-    assert.equal(status?.decision?.action, "CREATE_REPAIR_TASKS");
+    // A connection drop is a gateway saturation signature (issue #112): the
+    // supervisor waits it out and re-dispatches — it does NOT hire another
+    // implementer to hit the same saturated gateway.
+    assert.equal(status?.decision?.action, "PROBE_AND_BACKOFF");
     assert.match(status?.reason ?? "", /Connection error/);
     assert.equal(h.store.listMissionStops(h.mission.mission_id).length, 0, "a requeue is not a stop");
+    assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "PROVIDER_TRANSIENT");
+  });
+
+  it("classifies a 400 backpressure failure as a capacity wait, never an implementation defect (MSN-MypLoa)", async () => {
+    const h = harness();
+    const failed = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the change",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(failed.task_id, "READY");
+    h.store.transitionTask(failed.task_id, "RUNNING");
+    h.store.transitionTask(failed.task_id, "FAILED", "system", {
+      failure_reason:
+        'backend reported failed: Model gateway refused the request after 0 honoured wait(s): 400: {"action":"fix_request","action_code":"IW-ACT-FIX-REQUEST","code":"upstream_error","message":"Correct the request syntax, parameters, endpoint, or model identity.","reason":"upstream_error","replay_safe":false,"request_state":"unknown","retryable":false,"scope":"request","type":"inferweave_backpressure"}',
+    });
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "REPAIR_REQUIRED");
+    assert.equal(status?.task, failed.task_id);
+    // The exact regression: the envelope was blanket-labeled IMPLEMENTATION_DEFECT,
+    // which burned the CREATE_REPAIR_TASKS budget re-issuing the same doomed
+    // request until the mission stalled. It must park as a capacity wait.
+    assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "PROVIDER_TRANSIENT");
+    assert.equal(status?.decision?.action, "PROBE_AND_BACKOFF");
+    assert.equal(h.store.listMissionStops(h.mission.mission_id).length, 0, "a capacity wait is not a stop");
+  });
+
+  it("keeps a genuine code failure an implementation defect", async () => {
+    const h = harness();
+    const failed = h.store.createTask({
+      mission_id: h.mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "implement the change",
+      repo_id: "repo-1",
+    });
+    h.store.transitionTask(failed.task_id, "READY");
+    h.store.transitionTask(failed.task_id, "RUNNING");
+    h.store.transitionTask(failed.task_id, "FAILED", "system", {
+      failure_reason: "backend reported failed: worker exited with code 1 without a result",
+    });
+
+    const [status] = await h.supervisor.tick();
+
+    assert.equal(status?.health, "REPAIR_REQUIRED");
     assert.equal(h.store.listFailureClassifications(h.mission.mission_id).at(-1)?.category, "IMPLEMENTATION_DEFECT");
+    assert.equal(status?.decision?.action, "CREATE_REPAIR_TASKS");
   });
 
   it("falls back to the execution outcome when a failed task recorded no reason", async () => {

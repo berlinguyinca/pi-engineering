@@ -56,9 +56,9 @@ pi install /absolute/path/to/pi-engineering-runtime
 
 ### Everyday memory
 
-On the first interactive Pi start after installing or updating this extension,
-the setup dialog asks you to confirm or change the Viking connection. Existing
-environment/token-file settings can be kept. Changed credentials are entered
+When no Viking connection is configured, interactive Pi offers a setup dialog.
+An existing connection is preserved across updates; use `/memory setup` to
+change it. Existing environment/token-file settings can be kept. Changed credentials are entered
 in a masked field and verified before they are saved. Settings and private key
 files live under `~/.pi/agent/engineering-memory/` (or the active
 `PI_CODING_AGENT_DIR`), outside the extension checkout. Updates preserve them.
@@ -77,6 +77,19 @@ failure. `/memory` distinguishes a healthy empty store from a rejected key.
 Automatic recall is ephemeral model context, inserted before the current user
 request; it is not copied into the saved transcript. Only `/remember` writes
 notes—normal conversations are not automatically uploaded or promoted.
+
+Automatic startup recall and per-prompt searches wait at most 250 ms, so a slow
+memory service does not hold up the model turn for seconds. A timed-out lookup
+adds no notes to that turn. Successful searches, including empty results, are
+cached for 60 seconds with at most 32 query entries. Saving a note, a successful
+explicit memory check/search, session replacement, or a changed host/key clears
+the cache. Transient failures pause automatic requests for 60 seconds; rejected
+or forbidden keys pause them for five minutes. `/memory` and `/memory setup`
+remain available during that pause, and changing the host or key retries
+immediately. Explicit commands retain their longer, bounded verification wait.
+Starting another turn does not cancel a pending explicit memory command. A
+completed save/check/search invalidates older automatic lookups; replacing the
+session or connection still fences results from the retired context.
 
 Saving requires a read/write device key. Read-only keys can recall but cannot
 save. Treat saved notes as user-provided reference information, not proof that
@@ -237,6 +250,13 @@ a 30s ask), so the runtime reads the refusal itself:
 Waiting out backpressure is deliberately **separate** from the degeneration
 recovery ladder: a queue timeout is not a degeneration, and must not burn
 attempts lowering reasoning effort or swapping models.
+
+Mission scheduling uses advertised capacity only for an unambiguous selected
+provider/model route. Refreshing another provider cannot change that route's
+limit. If routing has not selected a concrete model yet, or a provider name
+identifies multiple endpoints, scheduling uses configured limits instead of an
+unrelated catalogue maximum. Explicit scheduler limits remain authoritative;
+model-capacity signals do not block local process or validation tasks.
 
 ### Long transient outages: wait for hours, fail only on permanent errors
 
@@ -603,15 +623,36 @@ MIT
 
 Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`.
 It preserves the original Pi CLI and saves a backup at `~/.local/bin/pi.before-session-auto-resume`.
-On interactive `pi --session <id-or-file>` it supplies a continuation through Pi's
-normal initial-prompt path when the last assistant turn failed without output and the gateway
-explicitly marked replay safe. Pi finishes startup and restores/selects its model before work starts.
-Existing tool results and mission IDs remain in context. The server's remaining retry delay is honored.
 
-Recovery happens once per user turn. Completed, cancelled, partial-output, and ambiguous failures
-stay idle. Explicit CLI prompts or attachments, piped input, print/RPC modes, forks, and interactive
-session selection and `pi -c` are left to Pi. Local session IDs and file paths are supported; cross-project ID
-lookup is left to Pi. Set `PI_SESSION_AUTO_RESUME=0` to disable recovery for a launch.
+On a host whose Pi is a *managed install* (`~/.pi/agent/bin/pi` with `install/current-version`), run
+`node scripts/install-session-auto-resume.ts --managed` instead. It leaves the managed wrapper in place
+and adds one marked block before its final `exec`, so the managed install can still switch releases:
+the Pi to run is resolved from `current-version` at every start, and the launcher's package links
+follow it. The block starts the launcher only after `node <launcher> --check` loads it, and otherwise
+falls through to the plain `exec`, so a missing or broken launcher never stops Pi starting.
+`PI_SESSION_AUTO_RESUME_BYPASS=1` skips it. The original wrapper is saved once as
+`~/.pi/agent/bin/pi.before-session-auto-resume`. Re-running the installer refreshes the files and
+the block; if Pi's own updater regenerates the wrapper, run it again to restore the hook.
+On interactive `pi --session <id-or-file>` or `pi -c` it supplies a continuation through Pi's
+normal initial-prompt path when the session stopped in one of three ways. Pi finishes startup and
+restores/selects its model before work starts. Existing tool results and mission IDs remain in context.
+
+- **Refused with a replay contract:** the last turn failed without output and the gateway explicitly
+  marked replay safe. The server's remaining retry delay is honored.
+- **Failed turn:** any other retryable inference failure (dropped stream, timeout, lost capacity),
+  with or without a partial answer. The in-session retry layers do not survive a restart.
+- **Interrupted:** the session ends on a tool call or result, so Pi was closed or died mid-turn. The
+  prompt says the last call may have run fully, partly or not at all, and to check state first.
+
+Safeguards: the last event must be at least 10 minutes old (`PI_SESSION_AUTO_RESUME_MIN_AGE_MS`), and
+no other Pi may be running in the session's directory (Linux, via `/proc`), because Pi takes no lock on
+a session file and two processes must never share one. Set `PI_SESSION_AUTO_RESUME_IGNORE_LIVE=1` to
+override. At most three recoveries follow one operator message. Completed, cancelled, final-refusal
+(`do_not_retry`, bad request, unknown model, exhausted quota), and operator-aborted tails stay idle.
+Explicit CLI prompts or attachments, piped input, print/RPC modes, forks, `--resume` and interactive
+session selection are left to Pi. `pi -c` is resolved to the file Pi itself would open (newest by
+mtime) and pinned. Local session IDs and file paths are supported; cross-project ID lookup is left
+to Pi. Set `PI_SESSION_AUTO_RESUME=0` to disable recovery for a launch.
 
 To uninstall, restore the saved launcher:
 `mv ~/.local/bin/pi.before-session-auto-resume ~/.local/bin/pi`.

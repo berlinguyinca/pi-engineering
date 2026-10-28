@@ -18,6 +18,17 @@ import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const exec = promisify(execFile);
 
+/**
+ * Make every `git commit` in the repository (and its linked worktrees) fail. Pi runs git through safeGit with hooks
+ * disabled, so a failing pre-commit hook no longer works. An identity that git rejects (blank after trimming) is a
+ * repository-local setting safeGit's allow-list honours, and it fails the commit itself, not the preceding `add`.
+ */
+async function breakCommitIdentity(root: string): Promise<void> {
+  await exec("git", ["-C", root, "config", "user.name", " "]);
+  // Operator-trust safeGit passes these through and they override config; an exporting host would mask the failure.
+  for (const key of ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"]) delete process.env[key];
+}
+
 class LateAppendFailureBackend implements EventStoreBackend {
   readonly inner = JsonlEventStore.inMemory();
   fail = false;
@@ -1011,18 +1022,6 @@ describe("ExecutionBroker (spec 03)", () => {
     try {
       const git = await GitRepo.open(fx.root);
       assert.ok(git);
-      await writeFile(
-        join(fx.root, ".git", "hooks", "pre-commit"),
-        [
-          "#!/bin/sh",
-          "if [ ! -f src/hook-added.ts ]; then",
-          "  printf 'export const hookAdded = true;\\n' > src/hook-added.ts",
-          "fi",
-          "exit 0",
-          "",
-        ].join("\n"),
-        { mode: 0o755 },
-      );
       const store = MissionStore.open(JsonlEventStore.inMemory());
       const mission = store.createMission({
         title: "cancel checkpoint",
@@ -1092,6 +1091,9 @@ describe("ExecutionBroker (spec 03)", () => {
             runAgent: async ({ worktree, signal }) => {
               assert.ok(worktree);
               await writeFile(join(worktree, "src", "cancelled.ts"), "export const cancelled = true;\n", "utf8");
+              // Pi runs git with hooks disabled (safeGit), so a pre-commit hook cannot add files; a second
+              // dirty file written by the worker stands in for "more than one file is checkpointed".
+              await writeFile(join(worktree, "src", "hook-added.ts"), "export const hookAdded = true;\n", "utf8");
               dirty();
               // addEventListener on an already-aborted signal never fires, which
               // would hang the writer forever; treat an already-aborted signal
@@ -1363,7 +1365,7 @@ describe("ExecutionBroker (spec 03)", () => {
     try {
       const git = await GitRepo.open(fx.root);
       assert.ok(git);
-      await writeFile(join(fx.root, ".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+      await breakCommitIdentity(fx.root);
       const store = MissionStore.open(JsonlEventStore.inMemory());
       const mission = store.createMission({
         title: "retain failed preservation",
@@ -1956,6 +1958,116 @@ describe("ExecutionBroker (spec 03)", () => {
         ).result(),
         /CANDIDATE_UNAVAILABLE/,
       );
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("rebaseCandidateOntoCurrentBase rebases onto the incumbent head and re-points the manifest base without consuming repair budget", async () => {
+    const fx = await makeFixtureRepo();
+    try {
+      const git = (await GitRepo.open(fx.root))!;
+      const store = MissionStore.open(JsonlEventStore.inMemory());
+      const base = await git.headCommit();
+      const mission = store.createMission({
+        title: "stale base rebase",
+        goal: "stale base rebase",
+        user_request: "stale base rebase",
+        repository: fx.root,
+        base_ref: base,
+        risk_profile: "medium",
+        workflow_class: "engineering_review",
+      });
+      store.bindWorkspaceManifest({
+        manifestId: "WM-stale-base-rebase",
+        missionId: mission.mission_id,
+        generation: 1,
+        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        repositories: [
+          {
+            repoId: "repo-stale-base-rebase",
+            canonicalRoot: fx.root,
+            baseRef: "main",
+            baseSha: base,
+            writableDomains: ["**"],
+          },
+        ],
+        dependencyEdges: [],
+        hash: "manifest-stale-base-rebase",
+        createdAt: new Date().toISOString(),
+      });
+      const integrationTask = store.createTask({
+        mission_id: mission.mission_id,
+        kind: "integration",
+        role: "integrator",
+        objective: "integrate",
+        repo_id: "repo-stale-base-rebase",
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.transitionTask(integrationTask.task_id, "READY");
+      store.transitionTask(integrationTask.task_id, "RUNNING");
+      const execution = store.createExecution({
+        task_id: integrationTask.task_id,
+        mission_id: mission.mission_id,
+        backend: "integration",
+        repo_id: "repo-stale-base-rebase",
+        base_sha: base,
+        mission_generation: 0,
+        candidate_generation: 0,
+      });
+      store.assignTaskExecution(integrationTask.task_id, execution.execution_id);
+      store.setExecutionStatus(execution.execution_id, "RUNNING");
+      store.setExecutionStatus(execution.execution_id, "SUCCEEDED");
+      store.transitionTask(integrationTask.task_id, "SUCCEEDED");
+      const candidate = await git.createCandidateWorktree(base, {
+        missionId: mission.mission_id,
+        repoId: "repo-stale-base-rebase",
+        missionGeneration: 0,
+        candidateGeneration: 0,
+        repositoryGeneration: 1,
+        attempt: execution.execution_id,
+      });
+      await writeFile(join(candidate.path, "src", "stale-base-rebase.ts"), "export const rebased = true;\n");
+      await git.commitAll(candidate.path, "stale-base candidate");
+      candidate.candidateSha = await git.headCommitIn(candidate.path);
+      await git.persistCandidateLifecycle(candidate);
+
+      // The incumbent advances: the candidate's base is now stale (the exact
+      // condition behind MSN-SZ3bfz's merge-queue rejection).
+      await writeFile(join(fx.root, "src", "incumbent-advance.ts"), "export const advanced = true;\n");
+      await git.commitAll(fx.root, "incumbent advanced past the candidate base");
+      const newBase = await git.headCommit();
+      assert.notEqual(newBase, base);
+
+      const broker = new ExecutionBroker({
+        store,
+        resolveRepository: async () => ({ repoId: "repo-stale-base-rebase", root: fx.root, git }),
+        backends: {},
+      });
+      const result = await broker.rebaseCandidateOntoCurrentBase(mission.mission_id);
+
+      assert.equal(result.ok, true);
+      assert.equal(result.rebased, true, "a stale candidate must be rebased, not re-enqueued");
+      assert.equal(result.conflict, false);
+      assert.equal(result.baseSha, newBase, "the manifest base is re-pointed at the incumbent head");
+      assert.ok(
+        result.candidateSha && result.candidateSha !== candidate.candidateSha,
+        "a real rebase moves the candidate head",
+      );
+      assert.ok(result.manifest, "an updated workspace manifest is returned");
+      const binding = result.manifest!.repositories.find((r) => r.repoId === "repo-stale-base-rebase");
+      assert.equal(binding?.baseSha, newBase);
+      // The candidate's branch now contains the incumbent advance on top of its own work.
+      assert.equal(await git.headCommitIn(candidate.path), result.candidateSha);
+
+      // The durable lifecycle record reflects the rebase for a later restart.
+      const [persisted] = (await git.loadCandidateLifecycles(mission.mission_id, "repo-stale-base-rebase")).filter(
+        (r) => r.state === "integrating" || r.state === "promotion_intent",
+      );
+      assert.ok(persisted);
+      assert.equal(persisted.baseSha, newBase);
+      assert.equal(persisted.candidateSha, result.candidateSha);
     } finally {
       await fx.cleanup();
     }
@@ -2783,6 +2895,59 @@ describe("ExecutionBroker (spec 03)", () => {
     assert.equal(store.getTask(t.task_id)!.steer_requests[0], "do not touch schema");
   });
 
+  it("steerRunningTask reaches the backend's onSteer for a running task, and is truthful otherwise", async () => {
+    let steered = "";
+    const withChannel = setup({
+      agent: {
+        runAgent: async () => ({
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "d",
+          artifactRefs: [],
+          usage: {},
+        }),
+        onSteer: (s) => {
+          steered = s;
+        },
+      },
+    });
+    assert.equal(withChannel.broker.steerRunningTask(withChannel.t.task_id, "x"), "not_running");
+    await withChannel.broker.execute({
+      taskId: withChannel.t.task_id,
+      missionId: withChannel.m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+    });
+    assert.equal(
+      withChannel.broker.steerRunningTask(withChannel.t.task_id, "framed text", "herdr-steering"),
+      "delivered",
+    );
+    assert.equal(steered, "framed text");
+    assert.equal(withChannel.store.getTask(withChannel.t.task_id)!.steer_requests[0], "framed text");
+
+    const noChannel = setup({
+      agent: {
+        runAgent: async () => ({
+          executionId: "e",
+          exitStatus: "succeeded",
+          summary: "d",
+          artifactRefs: [],
+          usage: {},
+        }),
+      },
+    });
+    await noChannel.broker.execute({
+      taskId: noChannel.t.task_id,
+      missionId: noChannel.m.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "x",
+    });
+    assert.equal(noChannel.broker.steerRunningTask(noChannel.t.task_id, "x"), "no_channel");
+    assert.deepEqual(noChannel.store.getTask(noChannel.t.task_id)!.steer_requests, []);
+  });
+
   it("maps process/validation kinds to the right backend", async () => {
     const calls: string[] = [];
     const { m, broker } = setup({
@@ -3061,13 +3226,9 @@ describe("ExecutionBroker (spec 03)", () => {
 
       // A worker that DID edit its worktree must never have that work lost
       // silently. Force the harvest commit to fail deterministically (worktrees
-      // share the main repo\u2019s hooks dir) and require the broker to surface a
+      // share the main repo\u2019s config) and require the broker to surface a
       // finding explaining why the work will not integrate.
-      const { mkdir, writeFile, chmod } = await import("node:fs/promises");
-      const hooksDir = join(fx.root, ".git", "hooks");
-      await mkdir(hooksDir, { recursive: true });
-      await writeFile(join(hooksDir, "pre-commit"), "#!/bin/sh\nexit 1\n");
-      await chmod(join(hooksDir, "pre-commit"), 0o755);
+      await breakCommitIdentity(fx.root);
 
       const broker = new ExecutionBroker({
         store,

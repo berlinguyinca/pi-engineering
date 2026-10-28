@@ -8,6 +8,7 @@ import { mkdir, writeFile } from "node:fs/promises";
  *   node scripts/pi-engineering.ts missions list|why|cancel --store <dir> ...  (legacy orchestration.jsonl only; see docs/orchestration.md)
  *   node scripts/pi-engineering.ts mission submit|observe|cancel --store <dir>  (JSON on stdin; needs PI_AUTOSPEC_ENABLED; see src/orchestration/externalEntry.ts)
  *   node scripts/pi-engineering.ts doctor [--repair] [--json] [--cwd <dir>]
+ *   node scripts/pi-engineering.ts git-pins list | reset [<path>]   (what safeGit remembers about repositories)
  *
  * `roadmap check` exit codes:
  *   0  roadmap 1.0 complete (release gate passes)
@@ -22,10 +23,14 @@ import { formatSummary } from "../src/benchmark/Metrics.ts";
 import { generatePlots } from "../src/benchmark/Plots.ts";
 import { BlackholeManager } from "../src/blackhole/BlackholeManager.ts";
 import { blackholeTelemetry, formatBlackholeTelemetry } from "../src/blackhole/telemetry.ts";
+import { listSafeGitPins, resetSafeGitPins } from "../src/git/safeGit.ts";
+import { runGithubSyncCli } from "../src/github/syncCli.ts";
 import { Ledger } from "../src/ledger/Ledger.ts";
 import { runExternalEntry } from "../src/orchestration/externalEntry.ts";
 import { runMissionsCommand } from "../src/orchestration/missionCancelCli.ts";
+import { runStandalonePlan } from "../src/orchestration/standaloneEntry.ts";
 import { defaultCliPaths, runRoadmapCheck, runRoadmapStatus, runRoadmapStructural } from "../src/roadmap/cli.ts";
+import { runHerdrExternalCli } from "../src/runtime/herdr/externalCli.ts";
 import { doctorExitCode, formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { runSessionsCommand } from "../src/sessionControl/cli.ts";
 
@@ -38,6 +43,27 @@ async function readStdin(): Promise<string> {
   return text;
 }
 
+/**
+ * `git-pins list` shows what Pi remembers about repositories (remote URLs per repository, the repository each work tree
+ * belongs to); `git-pins reset [path]` forgets all of it or the entries for one repository / work tree. The way to
+ * accept a deliberate remote change or a re-clone at the same path.
+ */
+function gitPinsCommand(args: string[]): number {
+  const sub = args[0];
+  if (sub === "list") {
+    console.log(JSON.stringify(listSafeGitPins(), null, 2));
+    return 0;
+  }
+  if (sub === "reset") {
+    const path = args[1] ? resolve(args[1]) : undefined;
+    const r = resetSafeGitPins(path);
+    console.log(`forgot ${r.pins} remote pin(s) and ${r.repos} work tree record(s)${path ? ` for ${path}` : ""}`);
+    return 0;
+  }
+  console.error("usage: pi-engineering git-pins list | git-pins reset [<path>]");
+  return 2;
+}
+
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const cmd = args[0];
@@ -45,7 +71,11 @@ async function main(): Promise<number> {
   if (cmd === "sessions") return runSessionsCommand(rest);
   if (cmd === "missions") return runMissionsCommand(rest);
   if (cmd === "mission") return runExternalEntry(rest, await readStdin(), process.env);
+  if (cmd === "plan") return runStandalonePlan(rest, await readStdin(), process.env);
+  if (cmd === "herdr") return runHerdrExternalCli(rest, process.env, readStdin);
+  if (cmd === "github") return runGithubSyncCli(rest, process.env);
   if (cmd === "doctor") return doctorCommand(rest);
+  if (cmd === "git-pins") return gitPinsCommand(rest);
   if (cmd === "blackhole") {
     const sub = rest.find((a) => !a.startsWith("--"));
     return blackholeCommand(sub ?? "status", rest);
@@ -61,7 +91,7 @@ async function main(): Promise<number> {
   }
   if (cmd !== "roadmap") {
     console.error(
-      "usage: pi-engineering <doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions why|missions cancel|blackhole ...|benchmark|cav status|...> [flags]",
+      "usage: pi-engineering <plan --store <dir>|github sync --store <dir>|doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions why|missions cancel|blackhole ...|benchmark|cav status|...> [flags]",
     );
     return 2;
   }

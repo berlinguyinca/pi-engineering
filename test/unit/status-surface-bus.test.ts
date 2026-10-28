@@ -20,7 +20,14 @@ function harness() {
     notify: (text: string, level: string) => calls.push(`notify:${level}:${text}`),
   };
   const bus = new StatusSurfaceBus(sink, () => clock);
-  return { bus, calls, advance: (ms: number) => (clock += ms) };
+  return {
+    bus,
+    calls,
+    advance: (ms: number) => {
+      clock += ms;
+      return clock;
+    },
+  };
 }
 
 test("the higher-priority claim owns the working line", () => {

@@ -57,6 +57,7 @@ import type {
   RecoveredMerge,
   ReviewEvidence,
   ValidationEvidence,
+  WorkspaceManifest,
 } from "./types.ts";
 import { canonicalizeWriteDomain } from "./workset.ts";
 
@@ -660,11 +661,32 @@ export class ExecutionBroker {
       worktree: string | null;
       taskId: string;
       missionId: string;
+      backend?: string;
       cancelCheckpoint?: () => Promise<void>;
       terminalPromise?: Promise<ExecutionOutcome>;
       authority?: DispatchAuthority;
     }
   >();
+  /**
+   * Deliver a steering request to the RUNNING execution of `taskId` through the same path as `handle.steer`:
+   * recorded on the task and handed to the backend's `onSteer`. Answers truthfully: "not_running" when the task has
+   * no running execution in this process, "no_channel" when its backend cannot take steering (nothing is recorded,
+   * since no model would ever read it), otherwise "delivered".
+   */
+  steerRunningTask(taskId: string, request: string, actor = "system"): "delivered" | "not_running" | "no_channel" {
+    for (const entry of this.active.values()) {
+      if (entry.taskId !== taskId || entry.status !== "RUNNING") continue;
+      const runner = entry.backend
+        ? (this.backends[entry.backend as keyof BrokerBackends] as { onSteer?: (s: string) => void } | undefined)
+        : undefined;
+      if (typeof runner?.onSteer !== "function") return "no_channel";
+      this.store.steerTask(taskId, request, actor);
+      runner.onSteer(request);
+      return "delivered";
+    }
+    return "not_running";
+  }
+
   /** Allocated worktrees, cleaned up when their execution settles. */
   readonly allocatedWorktrees = new Map<
     string,
@@ -1888,6 +1910,67 @@ export class ExecutionBroker {
     };
   }
 
+  /**
+   * Reconstruct the candidate TARGET from a preserved worker commit (#360).
+   *
+   * When a mission holds committed worker work that never became a candidate
+   * (the producing execution failed before publishing), recovery seeds a
+   * candidate lifecycle directly at the preserved commit (the checkpoint-split
+   * `seedSha` mechanism) so the gates can run over Git-verified content
+   * instead of refusing forever. The ref must resolve to `preservedSha`, be a
+   * descendant of base, and carry commits ahead of it; the seeded head must
+   * equal `preservedSha` for the store to tie the candidate to its source
+   * checkpoint. Anything unverifiable returns null and the caller keeps the
+   * existing terminal refusal.
+   *
+   * Returns the Git-verified candidate sha + diff hash, or null when nothing
+   * could be reconstructed (unverifiable ref, seed mismatch, no repository).
+   */
+  async reconstructCandidateFromRef(input: {
+    missionId: string;
+    repoId: string;
+    baseSha: string;
+    preservedRef: string;
+    preservedSha: string;
+    missionGeneration: number;
+    candidateGeneration: number;
+  }): Promise<{ candidateSha: string; diffHash: string } | null> {
+    if (!this.resolveRepository) return null;
+    const repository = await this.resolveRepository(input.repoId, [], input.missionId);
+    const refSha = await repository.git.resolveCommit(input.preservedRef);
+    if (!refSha || refSha !== input.preservedSha) return null;
+    if (!(await repository.git.isAncestor(input.baseSha, refSha))) return null;
+    const ahead = await repository.git.revListCount(`${input.baseSha}..${refSha}`);
+    if (ahead === null || ahead <= 0) return null;
+    let lifecycle: CandidateLifecycle;
+    try {
+      // Seed the candidate target directly at the preserved commit (the same
+      // seedSha mechanism checkpoint-split replacement uses). The base stays
+      // the mission's base, so the candidate diff is exactly the preserved
+      // work's diff — no merge commit, no content drift.
+      lifecycle = await repository.git.createCandidateWorktree(input.baseSha, {
+        missionId: input.missionId,
+        repoId: input.repoId,
+        missionGeneration: input.missionGeneration,
+        candidateGeneration: input.candidateGeneration,
+        repositoryGeneration: 0,
+        attempt: `reconstruct-${input.preservedSha.slice(0, 12)}`,
+        seedSha: input.preservedSha,
+      });
+    } catch {
+      // An existing attempt record that cannot be reconciled: refuse to seed.
+      return null;
+    }
+    const head = await repository.git.headCommitIn(lifecycle.path);
+    if (head !== input.preservedSha) return null;
+    lifecycle.candidateSha = head;
+    lifecycle.updatedAt = new Date().toISOString();
+    await repository.git.persistCandidateLifecycle(lifecycle);
+    this.missionCandidates.set(input.missionId, { lifecycle, git: repository.git });
+    const diff = await repository.git.captureDiff(input.baseSha, head);
+    return { candidateSha: head, diffHash: artifactHash(diff) };
+  }
+
   /** Read-only fail-closed preflight for Git journals consumed by recovery. */
   async durableRepositoryDiagnostics(missionId: string): Promise<DurableRepositoryDiagnostic[]> {
     const repoIds = [
@@ -2459,8 +2542,15 @@ export class ExecutionBroker {
     await candidate.git.persistCandidateLifecycle(candidate.lifecycle, authority);
   }
 
-  /** Sole incumbent mutation: called only after current candidate gates pass. */
-  async promoteCandidate(missionId: string, authority?: DispatchAuthority): Promise<boolean> {
+  /**
+   * Resolve the mission's current integration candidate: in-memory first, then
+   * (after a restart) from the durable lifecycle record. The resolved candidate
+   * is cached so promotion, stale-base repair and cleanup share one identity.
+   */
+  private async resolvePromotionCandidate(
+    missionId: string,
+    authority?: DispatchAuthority,
+  ): Promise<{ lifecycle: CandidateLifecycle; git: GitRepo } | undefined> {
     let candidate = this.missionCandidates.get(missionId);
     if (!candidate && this.resolveRepository) {
       authority?.assertAuthoritative();
@@ -2504,6 +2594,106 @@ export class ExecutionBroker {
         }
       }
     }
+    return candidate;
+  }
+
+  /**
+   * Repair a stale-base merge-queue rejection by rebasing the candidate branch
+   * onto the incumbent's CURRENT head and re-pointing the workspace manifest's
+   * base at that head. The re-run validation/review gates (called by the
+   * orchestrator after this returns) then publish candidate evidence for the
+   * new (base, candidate) pair.
+   *
+   * This does not consume the mission's repair-round budget: the rejection that
+   * triggers it is a base-fence miss, not a candidate defect. A real rebase
+   * conflict is returned (conflict:true) so the caller escalates instead of
+   * re-enqueueing the same SHA.
+   *
+   * The manifest is returned, not bound: the caller owns the repository
+   * registry (stage/activate) and the durable bind.
+   */
+  async rebaseCandidateOntoCurrentBase(
+    missionId: string,
+    authority?: DispatchAuthority,
+  ): Promise<{
+    ok: boolean;
+    rebased: boolean;
+    conflict: boolean;
+    reason?: string;
+    baseSha?: string;
+    candidateSha?: string;
+    manifest?: WorkspaceManifest;
+  }> {
+    const candidate = await this.resolvePromotionCandidate(missionId, authority);
+    if (!candidate) {
+      return { ok: false, rebased: false, conflict: false, reason: "no integration candidate is available to rebase" };
+    }
+    authority?.assertAuthoritative();
+    const currentBase = await candidate.git.headCommit();
+    if (candidate.lifecycle.baseSha === currentBase) {
+      return {
+        ok: true,
+        rebased: false,
+        conflict: false,
+        baseSha: currentBase,
+        candidateSha: candidate.lifecycle.candidateSha,
+      };
+    }
+    const worktree = { path: candidate.lifecycle.path, branch: candidate.lifecycle.branch };
+    const result = await candidate.git.rebaseWorktreeOnto(worktree, currentBase, authority);
+    if (!result.ok || !result.headSha) {
+      return {
+        ok: false,
+        rebased: false,
+        conflict: result.conflict,
+        reason: result.conflict
+          ? `rebase onto ${currentBase} conflicted: ${result.reason}`
+          : (result.reason ?? "rebase failed"),
+      };
+    }
+    const lifecycle: CandidateLifecycle = {
+      ...candidate.lifecycle,
+      baseSha: currentBase,
+      seedSha: currentBase, // rebased candidate now descends from the incumbent head, not the old seed
+      candidateSha: result.headSha,
+      updatedAt: new Date().toISOString(),
+    };
+    await candidate.git.persistCandidateLifecycle(lifecycle, authority);
+    candidate.lifecycle = lifecycle;
+
+    const manifest = this.store.getWorkspaceManifest(missionId);
+    if (!manifest || !manifest.repositories.some((binding) => binding.repoId === lifecycle.repoId)) {
+      return { ok: true, rebased: true, conflict: false, baseSha: currentBase, candidateSha: result.headSha };
+    }
+    const body = {
+      missionId: manifest.missionId,
+      generation: manifest.generation + 1,
+      authorizedRoots: manifest.authorizedRoots,
+      repositories: manifest.repositories.map((binding) =>
+        binding.repoId === lifecycle.repoId ? { ...binding, baseSha: currentBase } : binding,
+      ),
+      dependencyEdges: manifest.dependencyEdges,
+    };
+    const hash = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    const updated: WorkspaceManifest = {
+      manifestId: `WM-${hash.slice(0, 16)}`,
+      ...body,
+      hash,
+      createdAt: manifest.createdAt,
+    };
+    return {
+      ok: true,
+      rebased: true,
+      conflict: false,
+      baseSha: currentBase,
+      candidateSha: result.headSha,
+      manifest: updated,
+    };
+  }
+
+  /** Sole incumbent mutation: called only after current candidate gates pass. */
+  async promoteCandidate(missionId: string, authority?: DispatchAuthority): Promise<boolean> {
+    const candidate = await this.resolvePromotionCandidate(missionId, authority);
     if (!candidate) return false;
     authority?.assertAuthoritative();
     const worktree = {
@@ -3706,6 +3896,7 @@ export class ExecutionBroker {
       worktree: null,
       taskId: input.taskId,
       missionId: input.missionId,
+      backend,
       authority: input.authority,
     });
     input.authority?.assertAuthoritative();

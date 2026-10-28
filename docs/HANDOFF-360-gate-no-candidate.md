@@ -1,6 +1,19 @@
 # Handoff — #360: recovery-gate no-candidate dead loop
 
-**Status:** foundation landed, orchestrator wiring remaining.
+**Status:** RESOLVED — the orchestrator wiring landed on top of this foundation.
+The reconstruction path is `Orchestrator.reconstructCandidateFromPreservedWork`
+→ `Broker.reconstructCandidateFromRef` (candidate target SEEDED at the preserved
+commit via `seedSha`, not merged — `mergeRefInWorktree` always produces a merge
+commit, which broke the `head === preservedSha` invariant), then a deterministic
+integration task over the reconstruction (first member of the completion gate's
+evidence triple and the supersession replacement for the failed implementers),
+then the required gates, then `finalizeMission(gateOnly)`. Acceptance spec:
+`test/integration/gate-no-candidate-reconstruction.test.ts` (both scenarios,
+enabled). Notes below are kept as written during the foundation PR.
+
+> Superseded detail: “What remains” predicted a base-anchored + merge candidate;
+> the shipped design seeds directly at the preserved commit and runs an
+> integration task, which the supersession lineage requires anyway.
 **Issue:** [#360](https://github.com/berlinguyinca/pi-engineering/issues/360)
 
 ## What the bug is
