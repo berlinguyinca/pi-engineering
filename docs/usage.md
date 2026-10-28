@@ -33,6 +33,14 @@ collide. Nothing in this package can change that outcome — the tolerance in
 reject a name synchronously (a generation handover mid-session), which is the
 case the runtime can actually handle.
 
+A generation handover is not a second copy. The previous generation's tools stay
+in Pi's registry, the first registration wins, and the incoming generation
+inherits the names rather than re-registering them. Health checks therefore read
+Pi's registry, not the generation's own registrations: an inherited `ledger_read`
+satisfies "tools registered" (the check says so in its detail), so a live update
+is not rolled back for a name its predecessor legitimately holds. A required tool
+nobody holds still fails the check and rolls the candidate back.
+
 ## Running the full workflow
 
 ```bash

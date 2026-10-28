@@ -142,11 +142,23 @@ export class ExtensionGenerationRuntime implements EngineeringRuntime {
       ok: missingCommands.length === 0,
       ...(missingCommands.length ? { detail: `missing ${missingCommands.join(", ")}` } : {}),
     });
-    const missingTools = REQUIRED_TOOLS.filter((t) => !this.tools.has(t));
+    // Pi's tool registry is global and the first registration wins, so a
+    // generation that starts mid-session finds the previous generation still
+    // holding these names and registers nothing (src/tools/registration.ts).
+    // The capability is present either way: health asks the registry, not the
+    // generation. Asking the generation alone makes every in-session update fail
+    // its own health check and roll back a candidate that is working.
+    const held = this.registryToolNames();
+    const missingTools = REQUIRED_TOOLS.filter((t) => !held.has(t));
+    const inherited = REQUIRED_TOOLS.filter((t) => held.has(t) && !this.tools.has(t));
     checks.push({
       name: "tools registered",
       ok: missingTools.length === 0,
-      ...(missingTools.length ? { detail: `missing ${missingTools.join(", ")}` } : {}),
+      ...(missingTools.length
+        ? { detail: `missing ${missingTools.join(", ")}` }
+        : inherited.length > 0
+          ? { detail: `${inherited.join(", ")} held by the previous generation (first registration wins)` }
+          : {}),
     });
     checks.push({
       name: "no initialization exception",
@@ -194,6 +206,23 @@ export class ExtensionGenerationRuntime implements EngineeringRuntime {
   private cwd(): string {
     const ctx = this.context.latestContext() as { cwd?: string } | undefined;
     return ctx?.cwd ?? process.cwd();
+  }
+
+  /**
+   * Tool names this session can actually use: what this generation registered,
+   * plus what Pi's registry reports (the previous generation's names during a
+   * mid-session handover). Best-effort: a host with no registry view leaves this
+   * generation's own registrations as the only evidence.
+   */
+  private registryToolNames(): Set<string> {
+    const names = new Set<string>(this.tools);
+    try {
+      const view = this.context.pi as unknown as { getAllTools?: () => Array<{ name: string }> };
+      for (const tool of view.getAllTools?.() ?? []) names.add(tool.name);
+    } catch {
+      // Still loading, or the host does not expose the registry.
+    }
+    return names;
   }
 
   /** Observe what the factory registers, for the health check. */
