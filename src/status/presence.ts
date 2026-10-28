@@ -86,7 +86,14 @@ export function presenceMarker(event: RuntimeMissionActivityEvent): string {
   if (event.state === "COMPLETE") return "v";
   if (event.state === "FAILED" || event.state === "CANCELED") return "x";
   if (event.health === "stalled") return "*";
-  if (presenceRank(event) === 3) return "~";
+  // A mission whose counters say it is looping or blocked on a finding looks
+  // like any other running mission from its state alone. The marker is what an
+  // operator scans, so the evidence has to reach it: rank 0 is theirs to act on,
+  // rank 1 is worth a look.
+  const rank = presenceRank(event);
+  if (rank === 0) return "!";
+  if (rank === 1) return "*";
+  if (rank === 3) return "~";
   return ">";
 }
 
@@ -148,11 +155,27 @@ function rowOf(event: RuntimeMissionActivityEvent, now: number, basis?: Presence
   };
 }
 
+/**
+ * The header counts what the rows show, by the same markers, so a strip can
+ * never say "0 needs you" above two rows marked `!`.
+ */
 function headerOf(events: readonly RuntimeMissionActivityEvent[]): string {
-  const running = events.filter((event) => presenceRank(event) === 5).length;
-  const needsYou = events.filter((event) => presenceRank(event) === 0).length;
+  const live = events.filter((event) => !TERMINAL.has(event.state));
+  const counted = (marker: string) => live.filter((event) => presenceMarker(event) === marker).length;
+  const running = counted(">");
+  const waiting = counted("~");
+  const watch = counted("*");
+  const parked = counted("#");
   const queued = events.filter((event) => QUEUED.has(event.state)).length;
-  return `Missions · ${running} running · ${needsYou} needs you${queued > 0 ? ` · ${queued} queued` : ""}`;
+  const parts = [
+    `Missions · ${running} running`,
+    `${counted("!")} needs you`,
+    ...(watch > 0 ? [`${watch} to watch`] : []),
+    ...(waiting > 0 ? [`${waiting} waiting`] : []),
+    ...(parked > 0 ? [`${parked} parked`] : []),
+    ...(queued > 0 ? [`${queued} queued`] : []),
+  ];
+  return parts.join(" · ");
 }
 
 function workingLineOf(
@@ -191,16 +214,20 @@ export function projectPresence(
 
 /** Render the strip: header, one line per mission, then the overflow line. */
 export function renderWidgetLines(view: PresenceView): string[] {
-  const columns = view.rows.map((row) =>
-    [
+  const columns = view.rows.map((row) => {
+    const line = [
       `${row.marker} ${row.missionId}`,
       row.title.padEnd(28).slice(0, 28),
       row.token.padEnd(20).slice(0, 20),
       row.percent.padEnd(12),
       row.unit.padEnd(14),
       row.age,
-    ].join("  "),
-  );
+    ].join("  ");
+    // The columns say *what state it is in*; when a fact says why to look, it
+    // goes at the end of the row, where it reads as a sentence and the columns
+    // above still line up. The full reason stays on the working line.
+    return row.attentionReason ? `${line} · ${safe(row.attentionReason, 44)}` : line;
+  });
   return [view.header, ...columns, ...(view.overflow ? [view.overflow] : [])];
 }
 

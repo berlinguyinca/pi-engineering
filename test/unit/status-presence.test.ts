@@ -169,7 +169,56 @@ test("redacts secrets in titles", () => {
 test("header counts running, needs-you and queued missions", () => {
   const queued = mission({ missionId: "MSN-queued", state: "QUEUED", health: "waiting" });
   const view = projectPresence([mission({}), needsYou, queued], 8, T);
-  assert.match(view.header, /^Missions · 1 running · 1 needs you · 1 queued$/);
+  assert.match(view.header, /^Missions · 1 running · 1 needs you · 1 waiting · 1 queued$/);
+});
+
+/**
+ * The header and the rows are read together, so they may not disagree: a strip
+ * that says "0 needs you" above two `!` rows teaches the operator to ignore it.
+ */
+test("the header counts the markers the rows actually show", () => {
+  const looping = mission({
+    missionId: "MSN-loop",
+    attention: {
+      severity: "high",
+      reason: "repeated tool call ×9 — read src/x.ts",
+      evidence: [{ kind: "loop", detail: "×9 read src/x.ts" }],
+    },
+  });
+  const blocked = mission({
+    missionId: "MSN-block",
+    attention: {
+      severity: "high",
+      reason: "1 blocking review finding(s) open",
+      evidence: [{ kind: "review_blocked", detail: "1 open" }],
+    },
+  });
+  const view = projectPresence([mission({}), looping, blocked], 8, T);
+
+  assert.equal(view.header, "Missions · 1 running · 0 needs you · 2 to watch");
+  const lines = renderWidgetLines(view);
+  assert.match(lineAt(lines, 1), /^\* MSN-block\b/);
+  assert.match(lineAt(lines, 2), /^\* MSN-loop\b/);
+  assert.match(lineAt(lines, 3), /^> MSN-1\b/);
+});
+
+/** Evidence has to reach the row an operator scans, not only the working line. */
+test("a row whose evidence says why carries the reason", () => {
+  const looping = mission({
+    missionId: "MSN-loop",
+    attention: {
+      severity: "high",
+      reason: "repeated tool call ×9 — read src/x.ts",
+      evidence: [{ kind: "loop", detail: "×9 read src/x.ts" }],
+    },
+  });
+  const line = renderWidgetLines(projectPresence([looping], 4, T))[1]!;
+
+  assert.match(line, /\* MSN-loop/);
+  assert.match(line, /· repeated tool call ×9/);
+  // A mission with nothing to say about itself keeps the plain columns.
+  const quiet = renderWidgetLines(projectPresence([mission({})], 4, T))[1]!;
+  assert.ok(!quiet.includes("· " + "repeated"), quiet);
 });
 
 test("a mission with no observability state still renders, without a percentage", () => {
