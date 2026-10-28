@@ -9,6 +9,7 @@
 import { redactSecrets } from "../platform/redact.ts";
 import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
 import { type PresenceBasis, type PresenceView, presenceRank, projectPresence, renderWidgetLines } from "./presence.ts";
+import type { PresenceSeedScope } from "./presenceSeed.ts";
 import { StatusSurfaceBus, type SurfaceProducer } from "./surfaceBus.ts";
 
 const WIDGET_KEY = "engineering-missions";
@@ -54,6 +55,12 @@ export interface PresenceEnvOptions extends PresenceOptions {
   enabled: boolean;
   /** How often the strip is refreshed from durable state (rows from other processes). */
   pollMs: number;
+  /**
+   * Whose missions the strip may draw from durable state. `session` (the
+   * default) shows missions this session started; `all` mirrors every window on
+   * the machine into this one.
+   */
+  scope: PresenceSeedScope;
 }
 
 function boundedNumber(raw: string | undefined, fallback: number, min: number, max: number): number {
@@ -64,7 +71,10 @@ function boundedNumber(raw: string | undefined, fallback: number, min: number, m
 /**
  * Presence is observational and cheap, so it ships on: the operator's escape
  * hatch is `PI_MISSION_PRESENCE=0`. The row budget is capped because a strip
- * that pushes the editor off screen is worse than no strip.
+ * that pushes the editor off screen is worse than no strip. The scope is
+ * session-local by default because mission output belongs in the window the
+ * mission runs at; `PI_MISSION_PRESENCE_SCOPE=all` opts back in to the
+ * machine-wide strip.
  */
 export function presenceOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): PresenceEnvOptions {
   return {
@@ -73,6 +83,7 @@ export function presenceOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): Pr
     title: env.PI_MISSION_TITLE === "1",
     intervalMs: 1_000,
     pollMs: boundedNumber(env.PI_MISSION_PRESENCE_POLL_MS, 5_000, 1_000, 600_000),
+    scope: env.PI_MISSION_PRESENCE_SCOPE === "all" ? "all" : "session",
   };
 }
 

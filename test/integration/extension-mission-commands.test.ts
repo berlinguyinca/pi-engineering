@@ -9,6 +9,7 @@ import extension, * as extensionModule from "../../extensions/index.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
+import { RuntimeSession } from "../../src/runtime/isolation/RuntimeSession.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 
 const execFileAsync = promisify(execFile);
@@ -791,7 +792,7 @@ test("mission presence survives a UI without setWidget or setWorkingMessage", as
   }
 });
 
-test("a mission this session never saw emitting still gets a strip row and a working line", async () => {
+test("the strip backfills missions this session started, and says a store row proves nothing", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-presence-seed-"));
   try {
     await execFileAsync("git", ["init", "-q"], { cwd: root });
@@ -803,12 +804,13 @@ test("a mission this session never saw emitting still gets a strip row and a wor
     const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
     const mission = runtime.missionStore!.createMission({
       title: "quiet leg",
-      goal: "a mission started elsewhere",
-      user_request: "a mission started elsewhere",
+      goal: "a mission this session started earlier",
+      user_request: "a mission this session started earlier",
       repository: root,
       base_ref: await runtime.git!.headCommit(),
       risk_profile: "low",
       workflow_class: "engineering",
+      parent_session_id: RuntimeSession.current().sessionId,
     });
     await runtime.close();
 
@@ -829,7 +831,7 @@ test("a mission this session never saw emitting still gets a strip row and a wor
     await commands.get("mission-status")!.handler("", ctx);
 
     const strip = widget.at(-1);
-    assert.ok(strip, "opening the runtime must draw the missions it found");
+    assert.ok(strip, "a mission this session started is drawn even when this process never saw it emit");
     assert.match(strip!.join("\n"), new RegExp(mission.mission_id));
     assert.match(strip!.join("\n"), /no proof of life yet/, "a store row carries no proof of life and says so");
     assert.match(working.at(-1) ?? "", new RegExp(`Mission · ${mission.mission_id}`));
@@ -837,6 +839,95 @@ test("a mission this session never saw emitting still gets a strip row and a wor
     for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
     assert.equal(widget.at(-1), undefined, "shutdown clears the strip");
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Durable mission state is shared by every pi window on the machine, so the
+ * strip may backfill from it only what this window owns: mission output belongs
+ * in the window the mission runs at, not in all of them.
+ */
+async function seededStoreHarness(root: string, ownerSessionIds: string[]) {
+  await execFileAsync("git", ["init", "-q"], { cwd: root });
+  await execFileAsync(
+    "git",
+    ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+    { cwd: root },
+  );
+  const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+  const baseRef = await runtime.git!.headCommit();
+  const missions = ownerSessionIds.map((parentSessionId, index) =>
+    runtime.missionStore!.createMission({
+      title: `quiet leg ${index}`,
+      goal: "a mission sitting in the shared durable store",
+      user_request: "a mission sitting in the shared durable store",
+      repository: root,
+      base_ref: baseRef,
+      risk_profile: "low",
+      workflow_class: "engineering",
+      parent_session_id: parentSessionId,
+    }),
+  );
+  await runtime.close();
+
+  const widget: (string[] | undefined)[] = [];
+  const { commands, handlers } = loadHarness();
+  const { ctx } = commandContext(
+    root,
+    {
+      setWidget: (_key: string, lines: string[] | undefined) => widget.push(lines),
+      setWorkingMessage: () => {},
+      setStatus: () => {},
+    },
+    // A TUI session has a strip to draw; the harness ctx is otherwise headless.
+    { hasUI: true },
+  );
+  for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
+  // Opening the runtime is what backfills the strip; asking for status opens it.
+  await commands.get("mission-status")!.handler("", ctx);
+  return { missions, widget, handlers, ctx };
+}
+
+test("another window's mission stays off this window's strip", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-presence-scope-"));
+  try {
+    const { missions, widget, handlers, ctx } = await seededStoreHarness(root, [
+      RuntimeSession.current().sessionId,
+      "S-another-window",
+    ]);
+    const mine = missions[0]!;
+    const theirs = missions[1]!;
+
+    const strip = widget.at(-1);
+    assert.ok(strip, "the strip still draws this window's own mission");
+    const lines = strip!.join("\n");
+    assert.match(lines, new RegExp(mine.mission_id), "a mission this session started belongs on this strip");
+    assert.doesNotMatch(
+      lines,
+      new RegExp(theirs.mission_id),
+      "a mission another window drives must not occupy this window's status line",
+    );
+
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PI_MISSION_PRESENCE_SCOPE=all restores the machine-wide strip", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-presence-all-"));
+  const previous = process.env.PI_MISSION_PRESENCE_SCOPE;
+  try {
+    process.env.PI_MISSION_PRESENCE_SCOPE = "all";
+    const { missions, widget, handlers, ctx } = await seededStoreHarness(root, ["S-another-window"]);
+    const strip = widget.at(-1);
+    assert.ok(strip, "the opt-in draws missions from the shared store");
+    assert.match(strip!.join("\n"), new RegExp(missions[0]!.mission_id));
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+  } finally {
+    if (previous === undefined) delete process.env.PI_MISSION_PRESENCE_SCOPE;
+    else process.env.PI_MISSION_PRESENCE_SCOPE = previous;
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -118,7 +118,7 @@ import { MissionPresenceController, presenceOptionsFromEnv } from "../src/status
 import { resolveStatusBarConfig } from "../src/status/config.ts";
 import { FooterController } from "../src/status/footer.ts";
 import { renderStatus } from "../src/status/layout.ts";
-import { seedPresence } from "../src/status/presenceSeed.ts";
+import { type PresenceSeedScope, seedPresence } from "../src/status/presenceSeed.ts";
 import { StatusSurfaceBus } from "../src/status/surfaceBus.ts";
 import { WorkingStatusController } from "../src/status/working.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
@@ -457,20 +457,31 @@ export { formatMissionActivity };
  * process hosts one interactive session); missions from every repository this
  * session touches share the strip, which is the point — dozens of legs running
  * at once should read as one queue, not as one hidden surface each.
+ *
+ * What shares the strip is bounded by the same window boundary: durable rows are
+ * seeded only for missions this session started (`presenceScope`/`presenceSessionId`
+ * below), so a fresh window opens empty instead of mirroring the missions other
+ * windows are running. Live activity still reaches the strip, because a runtime
+ * only emits for missions it is actually running here.
  */
 let presence: MissionPresenceController | undefined;
 let presencePoll: ReturnType<typeof setInterval> | undefined;
+let presenceScope: PresenceSeedScope = "session";
+let presenceSessionId: string | null = null;
 
 /**
- * Draw rows for missions this process never saw emit anything — started
- * earlier, or by another process. Only ever runs against a runtime that is
- * already open: drawing a strip must never be the reason a runtime opens.
+ * Draw rows for missions this process never saw emit anything — started earlier
+ * in this session, or (under `scope: "all"`) by another process. Only ever runs
+ * against a runtime that is already open: drawing a strip must never be the
+ * reason a runtime opens.
  */
 function seedPresenceFrom(runtime: EngineeringRuntime): void {
   if (!presence) return;
   seedPresence(presence, {
     missions: runtime.missionStore?.listMissions() ?? [],
     summary: (missionId) => runtime.missionObservability?.summary(missionId) ?? null,
+    scope: presenceScope,
+    sessionId: presenceSessionId,
   });
   // Draw now. Waiting for the next clock tick would leave a session that opens
   // a runtime and immediately sits idle showing nothing at all.
@@ -2101,6 +2112,10 @@ ${RECOVERY_PROMPT}`;
       presencePoll = undefined;
       presence?.dispose();
       const presenceEnv = presenceOptionsFromEnv(process.env);
+      // The strip is scoped to the session that owns the missions, and ownership
+      // is stamped with the runtime session id, so that is the id to compare.
+      presenceScope = presenceEnv.scope;
+      presenceSessionId = RuntimeSession.current().sessionId;
       presence =
         ctx.hasUI && presenceEnv.enabled
           ? new MissionPresenceController(ctx.ui, {
