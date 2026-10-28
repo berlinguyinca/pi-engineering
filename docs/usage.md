@@ -386,6 +386,23 @@ nor progress proves the work is alive — and the strongest fact is what you rea
 derivation is pure and reads no model text, so two operators looking at the same
 mission see the same reason.
 
+The evidence reaches the row you scan, not just the notification. Markers mean:
+
+| Marker | Meaning                                                            |
+| ------ | ------------------------------------------------------------------ |
+| `!`    | you are the next actor — nothing else ranks above it                |
+| `*`    | worth a look: looping, blocked on a finding, failing tests, stalled |
+| `#`    | parked — its work is kept and it waits for `/mission resume`        |
+| `~`    | waiting (cooldown, gateway, lease)                                  |
+| `>`    | running                                                            |
+| `v` `x`| complete / failed or cancelled                                      |
+
+A row with evidence appends the reason at the end (`· repeated tool call ×12 —
+read src/status/presence.ts`); the full sentence stays on the working line and the
+notification. The header counts the markers the rows show, by the same function, so
+it cannot claim "0 needs you" above two `!` rows, and `running` counts only rows
+that are actually running.
+
 When a mission worker's model runs out of capacity (`queue_deadline_exceeded`,
 `queue_timeout`, `CAPACITY_EXHAUSTED`), the worker first waits out the gateway's
 advertised holds. If the hold is for one model (not the whole account) and the

@@ -258,3 +258,43 @@ live-run abort, and terminal/unknown handling.
 Verification for this follow-up: `4290` unit tests and `968` integration tests
 (967 pass, 1 skipped) with `--test-concurrency=1`, `npm run typecheck` clean, and
 `biome check` clean.
+
+### The evidence did not reach the row an operator scans
+
+Driving the production wiring end to end — store + observability + `seedPresence` +
+attention + `MissionPresenceController` with a recording sink — showed a strip the
+unit fixtures would have passed:
+
+```
+Missions · 1 running · 0 needs you
+# MSN-HELD   waiting on me      R– OBSERVE→monitor    —   workers 0a/0w/0f  no proof of life yet
+> MSN-BLOCK  MSN-BLOCK          R– EXECUTING→No       —   workers 1a/0w/0f  0s ago
+> MSN-LOOP   MSN-LOOP           R– EXECUTING→No       —   workers 1a/0w/0f  0s ago
+> MSN-OK     MSN-OK             R– WROTE THE AR→No    —   workers 1a/0w/0f  0s ago
+```
+
+Two defects, both invisible to a single-module test:
+
+1. `presenceMarker` derived the glyph from state alone, so a mission looping on its
+   twelfth identical tool call rendered `>` — the same glyph as steady progress —
+   and `renderWidgetLines` dropped the `attentionReason` the row already carried.
+   The evidence reached the working line and the notification, but not the surface
+   the operator scans.
+2. `headerOf` counted rank 0 while the rows could be rank 1, so the header said
+   `0 needs you` above rows that needed looking at.
+
+Fixed by making the marker reflect the derived rank (`!` rank 0, `*` rank 1),
+appending the reason to the row where it reads as a sentence without breaking
+column alignment, and computing the header from `presenceMarker` over the same rows
+so header and rows cannot disagree. `waiting` and `parked` became their own counts,
+so `running` means running.
+
+Also visible in that run and left as-is: a mission observability never announced
+(`missionCreated` not called) shows its mission id as its title, and progress shows
+`—` when no task weight is registered. Both are "show what is known, nothing that
+is not", which is the strip's rule.
+
+Full-suite note: `test/integration/runtime-isolation-stress.test.ts` failed once in
+a full 968-test integration run and passed in the two runs after (alone, and in the
+full run). It spawns a dozen concurrent sessions and is load-sensitive; nothing in
+the failure pointed at the presence or pause paths.
