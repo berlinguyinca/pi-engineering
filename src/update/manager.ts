@@ -336,6 +336,11 @@ export class UpdateManager {
       runtime_api: target.metadata.runtimeApi,
     };
     telemetry.emit("runtime.update.started", fields);
+    const startedAt = Date.now();
+    const step = (line: string) => progress(`${line} (${((Date.now() - startedAt) / 1000).toFixed(1)}s)`);
+    progress(
+      `updating ${running?.version ?? "?"} → ${target.metadata.version} on ${fields.channel} (${target.sha.slice(0, 12)})`,
+    );
     let record = journal.begin({
       transaction,
       kind: "update",
@@ -350,7 +355,7 @@ export class UpdateManager {
       phase: "fetching",
     });
     telemetry.emit("runtime.update.fetched", fields);
-    progress("✓ downloaded");
+    step("✓ fetched");
 
     const staged = join(layout.stagingDir, `${transaction}`);
     record = journal.advance(record, "staging", { candidateRuntime: staged });
@@ -375,7 +380,7 @@ export class UpdateManager {
       stateSchema: target.metadata.stateSchema,
     });
     telemetry.emit("runtime.update.staged", fields);
-    progress("✓ staged");
+    step("✓ staged");
 
     if (!check.pi.ok) {
       const reason = `Pi Engineering ${target.metadata.version} requires a newer Pi runtime (${check.pi.reason}).\n\nCandidate downloaded but not activated.\nPi update/restart required.`;
@@ -409,10 +414,11 @@ export class UpdateManager {
       return { status: "failed", stage: "validate", reason, steps };
     }
     telemetry.emit("runtime.update.validated", fields);
-    progress("✓ validated");
-    progress("✓ compatible");
+    step("✓ validated");
+    step("✓ compatible");
 
     const versionDir = await layout.install(staged, id);
+    step("✓ installed; waiting for a safe point to activate");
     record = journal.advance(record, "validating", { candidateRuntime: versionDir });
     const { task, done } = await runActivation({
       host: this.deps.activation,
