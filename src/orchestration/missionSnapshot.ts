@@ -530,10 +530,11 @@ export function mergeSnapshotFiles(
     merged.push(mission);
   }
 
-  const { storagePressure: _existingPressure, ...rest } = incoming as MissionSnapshotFile & {
-    storagePressure?: StoragePressureSnapshot;
-  };
-  return { ...rest, missions: merged };
+  // The write health is THIS publisher's own — never the existing file's. Presenting
+  // another session's suspended state as this one's would be a lie about the file
+  // being read, so `existing`'s copy is discarded and the incoming one is carried
+  // through untouched.
+  return { ...incoming, missions: merged };
 }
 
 export {

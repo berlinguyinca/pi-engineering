@@ -192,3 +192,35 @@ test("two publishers writing one file leave both views published", async () => {
   assert.equal(published.missions.find((m) => m.id === "MSN-shared")?.status, "BLOCKED");
   assert.equal(published.missions.find((m) => m.id === "MSN-alpha")?.revision, 3, "the holder updates its own");
 });
+
+/**
+ * Regression: the merge must carry the WRITER's own write health. It previously
+ * stripped `storagePressure` from the incoming file, so a disk-pressure publish lost
+ * its stale tag the moment the merge ran — the file read as healthy while the
+ * publisher was suspended, and the recovery probe had nothing to find.
+ */
+test("the merge keeps the writer's own storage-pressure tag", () => {
+  const existing = file([mission("MSN-a", { ownerPid: PID, publishedAtMs: 1000 })], {
+    storagePressure: { dirty: true, stale: true, republished: false, suspended: true },
+  });
+  const incoming = file([mission("MSN-a", { revision: 2 })], {
+    storagePressure: { dirty: false, stale: false, republished: true, suspended: false },
+  });
+
+  const merged = mergeSnapshotFiles(existing, incoming, { ownerPid: PID, publishedAtMs: 2000 });
+
+  assert.equal(merged.storagePressure?.stale, false, "the writer's health is what the file says");
+  assert.equal(merged.storagePressure?.republished, true);
+});
+
+/** The previous publisher's pressure state is never presented as this one's. */
+test("the merge never inherits the previous file's storage-pressure state", () => {
+  const existing = file([mission("MSN-a", { ownerPid: 200, publishedAtMs: 1000 })], {
+    storagePressure: { dirty: true, stale: true, republished: false, suspended: true },
+  });
+  const incoming = file([mission("MSN-a", { revision: 2 })]);
+
+  const merged = mergeSnapshotFiles(existing, incoming, { ownerPid: PID, publishedAtMs: 2000 });
+
+  assert.equal(merged.storagePressure, undefined, "no pressure reported by this write, so the file carries none");
+});

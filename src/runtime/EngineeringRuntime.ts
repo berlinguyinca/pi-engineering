@@ -1029,7 +1029,14 @@ export class EngineeringRuntime {
         await unlink(temporary).catch(() => undefined);
         throw error;
       }
-      return merged;
+      // The tags describe the FILE this process wrote, not the logical snapshot the
+      // runtime reasons about. Returning them would make the value differ by code path
+      // — a disk-backed read carries tags, an in-memory retry does not — and callers
+      // that compare consecutive publishes would see a change that is only bookkeeping.
+      return {
+        ...merged,
+        missions: merged.missions.map(({ ownerPid: _owner, publishedAtMs: _at, ...rest }) => rest),
+      };
     } finally {
       await lock.release().catch(() => undefined);
     }

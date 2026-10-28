@@ -116,7 +116,10 @@ test("E2E: ENOSPC suspends, tags the snapshot stale, probes, recovers, and repub
     const writesBefore = faultFireCount;
     for (let i = 0; i < 5; i++) {
       const paused = await runtime.publishMissionSnapshot();
-      assert.equal(paused, duringIncident, "paused publish returns the last good snapshot");
+      // Structural, not identity: a publish returns the merged view of the snapshot
+      // file (#427), so it is no longer the same object reference the caller passed.
+      // The contract is "the last good content, unchanged", which is what is asserted.
+      assert.deepEqual(paused, duringIncident, "paused publish returns the last good snapshot");
     }
     assert.equal(faultFireCount, writesBefore, "no write attempts while suspended (no retry storm)");
 
