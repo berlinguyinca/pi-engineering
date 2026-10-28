@@ -3791,6 +3791,9 @@ export class MissionStore {
       preservedWork: [...input.preservedWork],
       attemptedRecoveries: [...input.attemptedRecoveries],
       resumeCondition: input.resumeCondition,
+      // #418: the queue state observed at park time rides with the stop, so a
+      // mission parked hours ago can still tell the operator what the gateway said.
+      ...(input.queue ? { queue: { ...input.queue } } : {}),
       stoppedAt: new Date().toISOString(),
       generation: (this.listMissionStops(missionId).at(-1)?.generation ?? 0) + 1,
       resumptionGeneration,
@@ -3841,6 +3844,7 @@ export class MissionStore {
         preservedWork: [...input.preservedWork],
         attemptedRecoveries: [...input.attemptedRecoveries],
         resumeCondition: input.resumeCondition,
+        ...(input.queue ? { queue: { ...input.queue } } : {}),
         stoppedAt: new Date().toISOString(),
         generation: (durableBefore.listMissionStops(missionId).at(-1)?.generation ?? 0) + 1,
         resumptionGeneration: expected.resumptionGeneration,
@@ -4199,6 +4203,7 @@ function copyMissionStop(stop: MissionStop): MissionStop {
     ...stop,
     preservedWork: [...stop.preservedWork],
     attemptedRecoveries: [...stop.attemptedRecoveries],
+    ...(stop.queue ? { queue: { ...stop.queue } } : {}),
     ...(stop.settlementIdentity ? { settlementIdentity: { ...stop.settlementIdentity } } : {}),
   };
 }

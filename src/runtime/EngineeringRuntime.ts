@@ -22,6 +22,7 @@ import type {
   WorkerRole,
 } from "../core/types.ts";
 import { ROLE_BUDGETS } from "../core/types.ts";
+import { sharedAdmissionController } from "../gateway/config.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
@@ -75,7 +76,12 @@ import { canTransitionMission } from "../orchestration/state.ts";
 import { resolveSteeringTarget } from "../orchestration/steeringResolve.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
 import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
-import { type Mission, type MissionStop, PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
+import {
+  type Mission,
+  type MissionStop,
+  type MissionStopQueue,
+  PLANNER_CLARIFICATION_CATEGORY,
+} from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { redactSecrets } from "../platform/redact.ts";
@@ -2655,6 +2661,7 @@ export class EngineeringRuntime {
     const currentGeneration = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     if (expectedResumptionGeneration !== undefined && currentGeneration !== expectedResumptionGeneration) return;
     const decisions = this.missionStore.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId);
+    const queueState = this.queueStateForStop() ?? undefined;
     const fence = expectedMission ?? mission;
     await this.missionStore.stopMissionIfCurrent(
       missionId,
@@ -2663,6 +2670,10 @@ export class EngineeringRuntime {
         attemptedRecoveries: [...new Set([...source.attemptedRecoveries, ...decisions])],
         preservedWork: [...source.preservedWork],
         resumeCondition: source.resumeCondition,
+        // #418: a mission parked on capacity keeps the queue state the gateway
+        // last reported, so hours later the operator still sees the load and the
+        // hold-off instead of an open-ended "waits for capacity".
+        ...(queueState ? { queue: queueState } : {}),
       },
       {
         revision: fence.revision,
@@ -2672,6 +2683,36 @@ export class EngineeringRuntime {
       },
     );
     await this.missionStore.flush();
+  }
+
+  /**
+   * The queue state to persist with a park (#418), read from the admission
+   * controller that actually honoured the wait. Test seam so a unit test can
+   * present a queue without a gateway. Returns null when nothing was reported or
+   * the observation has aged out — the report then says nothing about the queue.
+   */
+  queueStateForStop(): MissionStopQueue | null {
+    if (this.queueStateOverride !== undefined) return this.queueStateOverride;
+    const observed = sharedAdmissionController().queueState();
+    if (!observed) return null;
+    return {
+      observedAtMs: observed.observedAtMs,
+      ...(observed.queued !== undefined ? { queued: observed.queued } : {}),
+      ...(observed.queueLimit !== undefined ? { queueLimit: observed.queueLimit } : {}),
+      ...(observed.activeLimit !== undefined ? { activeLimit: observed.activeLimit } : {}),
+      ...(observed.retryAfterMs !== undefined ? { retryAfterMs: observed.retryAfterMs } : {}),
+      ...(observed.waitingSinceMs !== undefined ? { waitingSinceMs: observed.waitingSinceMs } : {}),
+      ...(observed.reason ? { reason: observed.reason } : {}),
+      ...(observed.scope ? { scope: observed.scope } : {}),
+      ...(observed.provider ? { provider: observed.provider } : {}),
+      ...(observed.model ? { model: observed.model } : {}),
+    };
+  }
+
+  /** Test seam: present a fixed queue state as the state a park would persist. */
+  private queueStateOverride?: MissionStopQueue | null;
+  setQueueStateForTesting(state: MissionStopQueue | null): void {
+    this.queueStateOverride = state;
   }
 
   private retainOpenReference(): void {

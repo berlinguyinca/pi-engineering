@@ -661,6 +661,13 @@ export interface MissionStop {
   resumptionGeneration: number;
   blockedEpisodeId: EntityId | null;
   recoveryDeadline: string | null;
+  /**
+   * Additive (#418): the gateway queue state observed when the mission parked on
+   * capacity. Without it a capacity park reads as an open-ended "waits for
+   * capacity" even though the gateway reported how deep the queue is and how
+   * long to hold off. Absent means nothing was reported — never invented.
+   */
+  queue?: MissionStopQueue;
   /** Exact durable mission snapshot consumed by an atomic settlement. */
   settlementIdentity?: {
     revision: number;
@@ -668,6 +675,29 @@ export interface MissionStop {
     resumptionGeneration: number;
     blockedEpisodeId: EntityId | null;
   };
+}
+
+/**
+ * The gateway queue state carried on a stop (#418). Flat and durable: it is
+ * written once, at park time, and read by the operator report. Every field is
+ * something the gateway reported — nothing here is derived locally.
+ */
+export interface MissionStopQueue {
+  /** When this was observed (epoch ms). An ETA without an age is a guess. */
+  observedAtMs: number;
+  queued?: number;
+  queueLimit?: number;
+  /** Concurrent requests the gateway admits. */
+  activeLimit?: number;
+  /** The gateway's own hold-off in ms — the ETA is derived from this. */
+  retryAfterMs?: number;
+  /** Epoch ms the current run of waits began, when reported. */
+  waitingSinceMs?: number;
+  /** Gateway-reported machine reason, e.g. "queue_timeout". */
+  reason?: string;
+  scope?: string;
+  provider?: string;
+  model?: string;
 }
 
 /** A recovered worker commit merged by integration. */
