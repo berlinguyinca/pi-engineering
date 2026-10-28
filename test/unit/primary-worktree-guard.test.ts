@@ -110,6 +110,12 @@ test("isMutatingGitCommand: blocks commands that change checkout state", () => {
     "git branch -dv feat/x",
     "git branch -f feat/x origin/main",
     "cd repo && git commit -m x",
+    // Unknown verb at a real command position: fail closed in case git grows a
+    // mutating verb this list predates.
+    "git what",
+    // A mutating verb inside a quoted argument stays conservative — skipping
+    // quoted spans would let `sh -c 'git commit'` through.
+    'grep -n "git push" README.md',
   ]) {
     assert.equal(isMutatingGitCommand(command), true, command);
   }
@@ -140,6 +146,43 @@ test("isMutatingGitCommand: allows read-only inspection and worktree management"
     "gh pr checks 168",
   ]) {
     assert.equal(isMutatingGitCommand(command), false, command);
+  }
+});
+
+// ── the word `git` inside a larger word is not an invocation ────────────────
+
+test("isMutatingGitCommand: a word that merely contains `git` is not an invocation", () => {
+  // All three were blocked in a live session, where the guard read the NEXT
+  // word as the git verb (`--jq`, `/tmp/shaltest2`, `origin/main`) and called
+  // the command mutating. The third is the worktree command the block message
+  // itself tells the model to run, rejected because its branch name contained
+  // `-git-`.
+  for (const command of [
+    "gh api repos/o/r/git/refs/tags/v0.2.0 --jq .object.sha",
+    "rm -f /tmp/dbg.mjs /tmp/stable-verify.git /tmp/shaltest2",
+    "git worktree add /repo-wt -b fix/primary-guard-git-token-matching origin/main",
+    "ls .github/workflows",
+    "grep -r github README.md",
+    "cp /tmp/a.git /tmp/b.git",
+    // The word `git` in prose, with a following word that is not a git verb:
+    // this separator line was blocked in a live session (verb "what").
+    'echo "--- git: what is 524176f18392 ---"',
+    'echo "the git command failed"',
+    "echo git status was clean",
+  ]) {
+    assert.equal(isMutatingGitCommand(command), false, command);
+  }
+});
+
+test("isMutatingGitCommand: quoted and pathed git invocations stay detected", () => {
+  for (const command of [
+    "/usr/bin/git commit -m x",
+    "./git commit -m x",
+    "sh -c 'git commit -m x'",
+    "echo $(git push origin main)",
+    "for f in a b; do git add $f; done",
+  ]) {
+    assert.equal(isMutatingGitCommand(command), true, command);
   }
 });
 
@@ -195,6 +238,18 @@ test("guard: mutating git commands are blocked only when run in the primary chec
     await guard.onToolCall("bash", { command: "git worktree add /repo-wt -b feat/x origin/main" }),
     undefined,
   );
+});
+
+test("guard: commands that merely mention `git` run in the primary checkout", async () => {
+  const guard = guardFor(async (root) => root === "/repo", {}, "/repo");
+  for (const command of [
+    "gh api repos/o/r/git/refs/tags/v0.2.0 --jq .object.sha",
+    "rm -f /tmp/stable-verify.git",
+    "git worktree add /repo-wt -b fix/primary-guard-git-token-matching origin/main",
+    'echo "--- git: what is 524176f18392 ---"',
+  ]) {
+    assert.equal(await guard.onToolCall("bash", { command }), undefined, command);
+  }
 });
 
 test("guard: redirects into the primary checkout are blocked, redirects elsewhere allowed", async () => {
