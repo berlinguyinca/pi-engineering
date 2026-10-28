@@ -14,7 +14,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { verifyAccessibility } from "./a11y.ts";
 import { instrumentBrowserRun } from "./browser.ts";
 import { exploreUi } from "./explore.ts";
-import { compareToGolden, captureScreenshot } from "./visual.ts";
+import { captureScreenshot, compareToGolden } from "./visual.ts";
 
 export interface PilotConfig {
   /** Pilot name, e.g. "aims" | "inferweave" | "weaveforge". */

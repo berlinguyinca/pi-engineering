@@ -125,7 +125,10 @@ test("pilot calibration survives a host that cannot screenshot", async (t) => {
         JSON.stringify(result.blockers),
       );
       // The other gates keep reporting: the run is not lost to a capture error.
-      assert.ok(result.gates.some((g) => g.gate === "ui"), JSON.stringify(result.gates));
+      assert.ok(
+        result.gates.some((g) => g.gate === "ui"),
+        JSON.stringify(result.gates),
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

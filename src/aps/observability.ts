@@ -133,7 +133,15 @@ export function apsNotice(event: AgentLoopEvent | AgentLoopPreventedEvent | Esca
     return `APS escalation · ${event.role} · ${event.toModel ? `→ ${event.toModel}` : "→ human"}`;
   }
   if (event.type === "agent.loop_prevented") {
-    return `APS loop prevented · ${event.role} · ${event.family} · ${event.metrics.noProgressTurns} identical turns`;
+    const m = event.metrics;
+    // Say which signal fired. "N identical turns" used to be printed for every
+    // prevention, including the ones caused by a long non-mutating run, which
+    // pointed operators at a repeat loop that was never there.
+    const trigger =
+      event.reason === "no_mutation_stall"
+        ? `${m.noMutationStall} non-mutating actions over ${m.noMutationStallDistinct} distinct target(s)`
+        : `${m.noProgressTurns} identical turns`;
+    return `APS loop prevented · ${event.role} · ${event.family} · ${trigger}`;
   }
   const fam = (event.family as SemanticStrategyFamily | undefined) ?? "unknown";
   return `APS loop candidate · ${event.role} · ${fam} · ${event.metrics.noProgressTurns} turns`;

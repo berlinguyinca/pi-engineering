@@ -140,6 +140,16 @@ export interface ProgressVector {
    * is 0 for them.
    */
   noMutationStall: number;
+  /**
+   * How many DISTINCT targets appear in that trailing non-mutating run, counted
+   * by the CALL (tool + normalized arguments) rather than the fingerprint, since
+   * a cycling agent usually gets slightly different output each pass. This is
+   * what separates thrashing from investigating: an agent repeating one command
+   * has 1, an agent cycling a handful of files has a handful, an agent reading
+   * its way through a codebase has as many targets as actions. 0 when there is
+   * no trailing non-mutating run.
+   */
+  noMutationStallDistinct: number;
   /** Fingerprint of the most recent action, or null for an empty history. */
   lastFingerprint: string | null;
 }
@@ -238,6 +248,7 @@ export interface AgentLoopCandidateEvent {
     repeatedCalls: number;
     staleToolResults: number;
     noMutationStall: number;
+    noMutationStallDistinct: number;
   };
 }
 
@@ -266,6 +277,16 @@ export interface LoopPreventionOptions {
    * 0 disables the stall signal.
    */
   noMutationStall?: number;
+  /**
+   * How few distinct targets the trailing non-mutating run must involve before
+   * the stall signal is allowed to prevent. A long run over MANY targets is an
+   * agent reading its way through a codebase — progress the counter cannot see,
+   * because reads change nothing on disk — while a long run over FEW targets is
+   * an agent cycling the same command or file pair. Prevention fires on the
+   * stall only when the run is low-diversity. Default: 6. 0 removes the
+   * diversity requirement and lets any long non-mutating run prevent.
+   */
+  noMutationStallDiversity?: number;
 }
 
 /** Default loop-prevention configuration (enforcement ON, conservative). */
@@ -273,6 +294,7 @@ export const DEFAULT_LOOP_PREVENTION: Required<LoopPreventionOptions> = {
   enabled: true,
   noProgressTurns: 4,
   noMutationStall: 40,
+  noMutationStallDiversity: 6,
 };
 
 /**
