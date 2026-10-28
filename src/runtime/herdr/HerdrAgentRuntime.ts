@@ -27,6 +27,7 @@ import { paneLink, tidyAgentName } from "./CollabLayout.ts";
 import type { ControlPlaneIngest } from "./ControlPlaneIngest.ts";
 import { type HerdrAgent, type HerdrCli, HerdrError } from "./HerdrCli.ts";
 import { AttemptTransitions, type LineageEmitter, type LineageState } from "./lineage.ts";
+import { sessionGitFacts } from "./sessionGitFacts.ts";
 
 const VERSION = "herdr-0.9.1";
 
@@ -38,6 +39,8 @@ interface Rec {
   provisioning?: Promise<void>;
   /** True once the lineage spawn was emitted; attempt states are only sent for a known attempt. */
   lineageSpawned?: boolean;
+  /** Serializes this worker's session events behind their git probe, so `started` can never overtake `updated`. */
+  sessionChain?: Promise<void>;
 }
 
 /** Runtime status -> lineage attempt state. Unlisted statuses (READY, CREATED, INTERRUPTED...) are not transitions. */
@@ -425,8 +428,12 @@ export class HerdrAgentRuntime implements AgentRuntime {
     eventType: "session.started" | "session.updated" | "session.terminated",
     status: string,
   ): void {
-    this.ingest
-      ?.session(rec.worker.id, eventType, {
+    const ingest = this.ingest;
+    if (!ingest) return;
+    const dir = rec.worker.worktree ?? rec.request.cwd ?? undefined;
+    const send = async (): Promise<void> => {
+      const git = await sessionGitFacts(dir).catch(() => null);
+      await ingest.session(rec.worker.id, eventType, {
         missionId: rec.worker.missionId,
         agentRole: rec.worker.role,
         model: rec.worker.model ?? undefined,
@@ -435,12 +442,11 @@ export class HerdrAgentRuntime implements AgentRuntime {
         // rec.target is a workspace id after worktree provisioning; only a pane id (`w2B:p1`) is a pane
         paneId: rec.target.includes(":") ? rec.target : undefined,
         // rec.target is a workspace id after worktree provisioning; only a pane id (`w2B:p1`) makes a pane link
-        instanceId:
-          this.ingest && rec.target.includes(":")
-            ? (paneLink(this.ingest.host.hostId, rec.target) ?? undefined)
-            : undefined,
+        instanceId: rec.target.includes(":") ? (paneLink(ingest.host.hostId, rec.target) ?? undefined) : undefined,
         name: tidyAgentName(`${rec.worker.role}-${rec.worker.id.slice(-6)}`) ?? undefined,
-      })
-      .catch(() => {});
+        ...(git ? { worktreeId: git.worktreeId, commitSha: git.commitSha, repoUrl: git.repoUrl } : {}),
+      });
+    };
+    rec.sessionChain = (rec.sessionChain ?? Promise.resolve()).then(send).catch(() => {});
   }
 }
