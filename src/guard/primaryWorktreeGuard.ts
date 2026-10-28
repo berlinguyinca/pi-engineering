@@ -34,6 +34,7 @@
 import { realpathSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { safeGit } from "../git/safeGit.ts";
+import { resolveWriteTarget, extractWriteTargets as shellWriteTargets } from "./shellTargets.ts";
 
 export interface PrimaryWorktreeGuardConfig {
   enabled: boolean;
@@ -67,22 +68,16 @@ function segments(command: string): string[] {
 
 /**
  * File targets a bash command WRITES: `>` / `>>` redirects, `tee` targets,
- * `sed -i` files, `mv` / `cp` destinations. Best-effort (no quote
- * evaluation): a target starting with `$` is still returned (the checker
- * resolves what it can and skips the rest).
+ * `sed -i` files, `mv` / `cp` destinations.
+ *
+ * This used to be four regexes over the raw string, which read quoting and
+ * redirection syntax as data — `grep -rn "x > y" src/` produced a write target,
+ * and `echo x > "$OUT"/log.txt` produced none. It delegates to a shell-aware
+ * tokenizer (`shellTargets.ts`); see #456 for the corpus of real commands that
+ * each behaviour was chosen against.
  */
-export function extractWriteTargets(command: string): string[] {
-  const targets: string[] = [];
-  const add = (m: RegExpMatchArray) => {
-    const t = m[1];
-    if (t !== undefined) targets.push(t);
-  };
-  // Redirects: `> f`, `>> f`, `2> f` — but not `->`, `=>`, `>=`, or `>&1`.
-  for (const m of command.matchAll(/(?<![A-Za-z0-9_=+&])>{1,2}\s*([A-Za-z0-9_./~$@-]+)/g)) add(m);
-  for (const m of command.matchAll(/\btee\s+(?:-a\s+)?([A-Za-z0-9_./~$@-]+)/g)) add(m);
-  for (const m of command.matchAll(/\bsed\s+-\w*i\w*\s+'[^']*'\s+([^\s|&;()]+)/g)) add(m);
-  for (const m of command.matchAll(/\b(?:cp|mv)\s+(?:-\w+\s+)*[^\s|&;()]+\s+([^\s|&;()]+)/g)) add(m);
-  return targets;
+export function extractWriteTargets(command: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  return shellWriteTargets(command, env);
 }
 
 /** Flags that consume the following word as their argument. */
@@ -451,7 +446,7 @@ export class PrimaryWorktreeGuard {
       if (command === undefined) return undefined;
       const effectiveCwd = effectiveGitCwd(command, this.cwd());
       for (const target of extractWriteTargets(command)) {
-        const abs = isAbsolute(target) ? target : resolve(effectiveCwd, target);
+        const abs = resolveWriteTarget(target, effectiveCwd);
         const root = await this.primaryAt(dirname(abs));
         if (root) return { block: true, reason: blockReason(`the write target \`${target}\``, root) };
       }
@@ -467,7 +462,7 @@ export class PrimaryWorktreeGuard {
     if (toolName !== "write" && toolName !== "edit") return undefined;
     const path = typeof args.path === "string" ? args.path : undefined;
     if (path === undefined) return undefined;
-    const abs = isAbsolute(path) ? path : resolve(this.cwd(), path);
+    const abs = resolveWriteTarget(path, this.cwd());
     const root = await this.primaryAt(dirname(abs));
     if (root) return { block: true, reason: blockReason(`the write to \`${path}\``, root) };
     return undefined;
