@@ -85,16 +85,44 @@ export function extractWriteTargets(command: string): string[] {
   return targets;
 }
 
-const GIT = /\bgit\b/;
 /** Flags that consume the following word as their argument. */
 const GIT_FLAGS_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--git-common-dir"]);
 
+/**
+ * Split a segment into words and drop the shell punctuation that clings to
+ * them (`'git`, `$(git`, `commit"`), so quoting does not hide an invocation
+ * and a quoted verb still reads as a verb.
+ */
+function tokenize(segment: string): string[] {
+  return segment
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((token) => token.replace(/^[$('"`!]+/, "").replace(/['"`),;:]+$/, ""))
+    .filter(Boolean);
+}
+
+/**
+ * True when the word IS a git invocation: the bare `git` command or a path to
+ * the binary (`/usr/bin/git`, `./git`). A substring is not enough — matching
+ * `\bgit\b` against every word also matched the path segment of
+ * `gh api repos/<owner>/<repo>/git/refs/tags/v1`, the suffix of
+ * `rm -f /tmp/stable-verify.git`, and the middle of a branch name like
+ * `fix/primary-guard-git-token-matching`. Each of those made the guard read
+ * the NEXT word as a git verb (`--jq`, `/tmp/shaltest`, `origin/main`), decide
+ * it was mutating, and block a command that never touched the repository —
+ * including the `git worktree add ... -b <branch>` the block message itself
+ * tells the model to run.
+ */
+function isGitCommand(word: string): boolean {
+  return word === "git" || /(^|\/)git$/.test(word);
+}
+
 function gitVerbs(segment: string): string[] {
-  const tokens = segment.split(/\s+/).filter(Boolean);
+  const tokens = tokenize(segment);
   const verbs: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const word = tokens[i];
-    if (word === undefined || !GIT.test(word)) continue;
+    if (word === undefined || !isGitCommand(word)) continue;
     let j = i + 1;
     while (j < tokens.length) {
       const flag = tokens[j];
@@ -134,6 +162,12 @@ const READ_ONLY_VERBS = new Set([
  * repository state (worktree, index, HEAD, refs). Read-only verbs and
  * worktree management are false — that is how a session inspects the repo
  * and leaves the primary checkout.
+ *
+ * Conservative by design: a git verb inside a quoted argument (`grep 'git push'
+ * README.md`) still counts, because `sh -c 'git commit'` must not slip past.
+ * What gets fixed here is the false positive that costs an operator time — a
+ * command that touches nothing in the repository; the remaining ones only ask
+ * the model to move to its own worktree.
  */
 export function isMutatingGitCommand(command: string): boolean {
   return segments(command).some((segment) => {
@@ -150,7 +184,7 @@ export function isMutatingGitCommand(command: string): boolean {
 
 /** `git branch` lists; anything with a name or flag creates/renames/deletes. */
 function branchOrTagMutates(segment: string, verb: "branch" | "tag"): boolean {
-  const tokens = segment.split(/\s+/).filter(Boolean);
+  const tokens = tokenize(segment);
   const i = tokens.findIndex((t) => t === verb);
   if (i === -1) return false;
   const rest = tokens.slice(i + 1);
@@ -169,7 +203,7 @@ function branchOrTagMutates(segment: string, verb: "branch" | "tag"): boolean {
 
 /** `git stash list|show` read; `apply|pop|drop|clear|branch|save|push|store` mutate. */
 function stashMutates(segment: string): boolean {
-  const tokens = segment.split(/\s+/).filter(Boolean);
+  const tokens = tokenize(segment);
   const i = tokens.findIndex((t) => t === "stash");
   if (i === -1) return false;
   const sub = tokens[i + 1];
@@ -178,7 +212,7 @@ function stashMutates(segment: string): boolean {
 
 /** `git config --get/--list/--show-origin` read; setting/removing mutates. */
 function configMutates(segment: string): boolean {
-  const tokens = segment.split(/\s+/).filter(Boolean);
+  const tokens = tokenize(segment);
   const i = tokens.findIndex((t) => t === "config");
   if (i === -1) return false;
   return !tokens

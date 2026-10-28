@@ -887,6 +887,15 @@ that is how a session observes the repo and **leaves** for its own worktree.
 The block reason tells the model the escape hatch: `git worktree add
 <sibling-dir> -b <branch> origin/<base>`.
 
+A `git` command is recognised by the word itself (`git`, `/usr/bin/git`,
+`./git`), not by the letters appearing inside a larger word: a path segment
+(`gh api repos/<owner>/<repo>/git/refs/…`), a filename (`rm /tmp/x.git`) and a
+branch name (`-b fix/…-git-…`) are not invocations — matching them as ones
+blocked the very `git worktree add` the message above recommends. Quoting is
+stripped rather than skipped, so `sh -c 'git commit'` is still caught, and a
+verb inside a quoted argument (`grep 'git push' README.md`) is still treated
+conservatively.
+
 Knobs (set before starting the session):
 
 - `PI_ENG_PRIMARY=1` — this session is authorized to work in primary
