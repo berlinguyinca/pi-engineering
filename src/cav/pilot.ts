@@ -14,7 +14,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { verifyAccessibility } from "./a11y.ts";
 import { instrumentBrowserRun } from "./browser.ts";
 import { exploreUi } from "./explore.ts";
-import { compareToGolden } from "./visual.ts";
+import { compareToGolden, captureScreenshot } from "./visual.ts";
 
 export interface PilotConfig {
   /** Pilot name, e.g. "aims" | "inferweave" | "weaveforge". */
@@ -124,6 +124,7 @@ export async function calibratePilot(cfg: PilotConfig): Promise<PilotCalibration
   await mkdir(`${cfg.artifactsDir}/visual`, { recursive: true });
   const golden = `${cfg.artifactsDir}/visual/golden.png`;
   let goldenExists = true;
+  let visualBlockers: string[] = [];
   try {
     await readFile(golden);
   } catch {
@@ -135,19 +136,28 @@ export async function calibratePilot(cfg: PilotConfig): Promise<PilotCalibration
     try {
       const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
       await page.goto(cfg.url, { waitUntil: "load", timeout: 30000 });
-      await page.screenshot({ path: golden });
+      await captureScreenshot(page, golden);
+      await page.close().catch(() => {});
+    } catch (err) {
+      // A host that cannot screenshot must still get a verdict: the visual
+      // gate fails closed with the capture reason instead of throwing away the
+      // whole calibration (and the other gates' findings with it).
+      visualBlockers = [`golden capture failed: ${err instanceof Error ? err.message : String(err)}`];
     } finally {
       await browser.close();
     }
   }
   const visualThreshold = cfg.visualThresholdPct ?? 0.5;
-  const second = await compareToGolden({
-    goldenPath: golden,
-    artifactsDir: `${cfg.artifactsDir}/visual`,
-    url: cfg.url,
-    thresholdPct: visualThreshold,
-  });
-  const visualBlockers = second.matched ? [] : [`visual diff ${second.diffPct}% > ${visualThreshold}%`];
+  if (visualBlockers.length === 0) {
+    const second = await compareToGolden({
+      goldenPath: golden,
+      artifactsDir: `${cfg.artifactsDir}/visual`,
+      url: cfg.url,
+      thresholdPct: visualThreshold,
+    });
+    if (second.captureError) visualBlockers = [`capture failed: ${second.captureError}`];
+    else if (!second.matched) visualBlockers = [`visual diff ${second.diffPct}% > ${visualThreshold}%`];
+  }
   gates.push({ gate: "visual", passed: visualBlockers.length === 0, blockers: visualBlockers });
   if (visualBlockers.length) blockers.push(...visualBlockers.map((b) => `visual: ${b}`));
 

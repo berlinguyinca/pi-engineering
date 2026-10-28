@@ -31,6 +31,12 @@ export interface GoldenCompareResult {
   goldenPath: string;
   capturePath: string;
   diffPath: string;
+  /**
+   * Set when the capture never succeeded (every retry failed). The comparison
+   * fails closed with `matched: false` instead of throwing, so a host that
+   * cannot screenshot still reports a gate verdict instead of losing the run.
+   */
+  captureError?: string;
 }
 
 /** Decode a PNG buffer into raw RGBA pixels using pngjs. */
@@ -53,8 +59,11 @@ function pixelDiff(a: Buffer, b: Buffer, w: number, h: number): { diff: number; 
  * Capture a screenshot with retry to handle intermittent Playwright protocol
  * errors (e.g. "Protocol error (Page.captureScreenshot): Unable to capture
  * screenshot") that can occur under concurrent resource pressure.
+ *
+ * Exported so every capture site shares the same retry: a caller that seeds a
+ * golden must not be less resilient than a caller that compares to one.
  */
-async function captureScreenshot(page: Page, path: string, maxRetries = 3): Promise<void> {
+export async function captureScreenshot(page: Page, path: string, maxRetries = 3): Promise<void> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
@@ -115,7 +124,24 @@ export async function compareToGolden(opts: GoldenCompareOptions): Promise<Golde
     context = await browser.newContext({ viewport: opts.viewport ?? { width: 1280, height: 800 } });
     page = await context.newPage();
     await page.goto(opts.url, { waitUntil: "load", timeout: 30000 });
-    await captureScreenshot(page, capturePath);
+    try {
+      await captureScreenshot(page, capturePath);
+    } catch (err) {
+      // Capture is evidence, not a verdict: report it as a failed comparison
+      // (fail closed) rather than letting a protocol error escape.
+      const captureError = err instanceof Error ? err.message : String(err);
+      await writeFile(diffPath, `CAPTURE FAILED after retries: ${captureError}\n`);
+      return {
+        matched: false,
+        diffPct: 100,
+        thresholdPct,
+        goldenExists: true,
+        goldenPath: opts.goldenPath,
+        capturePath,
+        diffPath,
+        captureError,
+      };
+    }
     const fresh = await readFile(capturePath);
     const gd = decodePng(golden);
     const fd = decodePng(fresh);
