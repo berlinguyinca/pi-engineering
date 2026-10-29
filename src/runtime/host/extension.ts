@@ -16,6 +16,7 @@ import { type ExtensionAPI, VERSION as PI_VERSION } from "@earendil-works/pi-cod
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { safeGitOrThrow, safeGitSyncOut } from "../../git/safeGit.ts";
 import { SourceCache, type TrustedSource, type UpdateChannel } from "../../update/gitSource.ts";
+import { type RuntimeUpdateBridge, runtimeUpdateBridge, setRuntimeUpdateBridge } from "../../update/hostBridge.ts";
 import { InstallLayout } from "../../update/installLayout.ts";
 import { UpdateJournal } from "../../update/journal.ts";
 import { type UpdateCheckResult, UpdateManager, type UpdateOutcome, type UpdateRequest } from "../../update/manager.ts";
@@ -308,6 +309,7 @@ export class EngineeringHostExtension {
   readonly lock: RuntimeMutationLock;
   recovery: RecoveryOutcome | undefined;
   readonly updates: UpdateManager;
+  private bridgeRef: RuntimeUpdateBridge | undefined;
   private pi: ExtensionAPI | undefined;
   private readonly hostCommit: string | null;
   private unpublishMaintenance: () => void = () => {};
@@ -355,6 +357,9 @@ export class EngineeringHostExtension {
     try {
       await this.installSteps(pi);
     } catch (error) {
+      // A Host that failed to install must not leave `/update` pointed at an
+      // UpdateManager whose generation never started.
+      this.withdrawBridge();
       // The entry shim falls back to the legacy extension after this throws.
       // A generation this Host already started must not keep running beside
       // it (two runtimes, two custody owners): stop it first, and say so if
@@ -382,8 +387,66 @@ export class EngineeringHostExtension {
     }
   }
 
+  /**
+   * The seam the legacy `/update` command drives when Pi loaded the extension
+   * from an installed version directory (no version-control metadata, so the
+   * checkout fast-forward cannot apply).
+   *
+   * Activation stays here: the bridge only forwards to this Host's UpdateManager,
+   * which is the single owner of the pointer switch and the handover.
+   */
+  private updateBridge(): RuntimeUpdateBridge {
+    return {
+      owns: (dir: string) => this.layout.isVersionDir(dir),
+      check: async () => {
+        const check = await this.updates.check({});
+        return {
+          lines: [formatCheck(check)],
+          pending: !check.upToDate && check.target !== null,
+          ...(check.failure ? { failure: check.failure } : {}),
+        };
+      },
+      apply: async (report) => {
+        const lines: string[] = [];
+        const outcome = await this.updates.update({}, (line) => {
+          lines.push(line);
+          report?.(line);
+        });
+        this.lastUpdateOutcome = outcome;
+        if (outcome.status === "handover") {
+          const from = outcome.check.current?.version;
+          const to = outcome.check.target?.metadata.version;
+          // An explicit `/update` waits for activation to settle: the operator
+          // asked for it now, and the phases (fetch, stage, validate, activate)
+          // are the slow part the status line already narrates.
+          const settled = await outcome.done;
+          if (settled.result.ok) void this.retain().catch(() => {});
+          return {
+            lines,
+            outcome: formatHandover(settled.result, { from, to, action: "Updated" }).replace(/^Pi Engineering\n\n/, ""),
+            ok: settled.result.ok,
+          };
+        }
+        return { lines, outcome: formatOutcome(outcome), ok: outcome.status === "up_to_date" };
+      },
+    };
+  }
+
+  /** Publish the update seam for the legacy `/update` command. */
+  private publishBridge(): void {
+    this.bridgeRef = this.updateBridge();
+    setRuntimeUpdateBridge(this.bridgeRef);
+  }
+
+  /** Withdraw it, but never a bridge a newer Host already published. */
+  private withdrawBridge(): void {
+    if (this.bridgeRef !== undefined && runtimeUpdateBridge() === this.bridgeRef) setRuntimeUpdateBridge(undefined);
+    this.bridgeRef = undefined;
+  }
+
   private async installSteps(pi: ExtensionAPI): Promise<void> {
     this.pi = pi;
+    this.publishBridge();
     const host = new RuntimeHost({ pi, generationsDir: this.generationsDir, telemetry: this.telemetry });
     this.host = host;
     host.bridge.registerHostCommand("engineering", {
@@ -433,6 +496,7 @@ export class EngineeringHostExtension {
 
   /** Host shutdown: stop the update checker, let a running check finish, stop publishing panel status. */
   async dispose(): Promise<void> {
+    this.withdrawBridge();
     if (this.checkTimer) clearTimeout(this.checkTimer);
     this.checkTimer = undefined;
     this.host?.pendingTask()?.cancel();

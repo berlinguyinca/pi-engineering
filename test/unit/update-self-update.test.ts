@@ -193,3 +193,20 @@ test("self-update: a diverged AND dirty tree reports both facts", async () => {
   assert.match(result.decision.reason, /uncommitted changes present/);
   assert.equal(g.ran("merge"), false);
 });
+
+test("self-update: 'not a git checkout' names the recovery instead of dead-ending", async () => {
+  // The installed runtime's tree is exactly this to git: no repository at all.
+  const g = fakeGit({ inside: { code: 128, stdout: "", stderr: "fatal: not a git repository" } });
+  const result = await checkForUpdate({ cwd: "/runtime/versions/0.2.0-aaaa11112222", git: g.git, apply: true });
+
+  // The reason stays verbatim: it is true, and other callers key off it.
+  assert.equal(result.unavailable, "not a git checkout");
+  assert.equal(result.decision.action, "skip");
+  assert.equal(result.applied, false);
+  // What was missing was the way out. An installed runtime updates
+  // transactionally; the message has to point at the command that does it.
+  assert.ok(result.fix && result.fix.length > 0, "an unavailable answer must carry an operator fix");
+  assert.match(result.fix ?? "", /\/engineering update/);
+  assert.equal(g.ran("fetch"), false, "a tree that is not a checkout is never fetched");
+  assert.equal(g.ran("merge"), false, "nothing is merged into a tree git does not know");
+});
