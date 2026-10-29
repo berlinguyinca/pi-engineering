@@ -858,6 +858,7 @@ export function realBackends(opts: RealBackendsOptions) {
         wallClock?: { startedAt: number; budgetMs: number };
         missionId?: string;
         taskId?: string;
+        sessionId?: string;
         signal: AbortSignal;
         onActivity?: (event: WorkerActivity) => void;
       }): Promise<ExecutionOutcome> {
@@ -889,7 +890,7 @@ export function realBackends(opts: RealBackendsOptions) {
           // Every delegated implementation/recovery run is a fresh session;
           // carrying the identity through the public worker request makes its
           // separation from the later reviewer independently auditable.
-          sessionId: id("WKS"),
+          sessionId: input.sessionId ?? id("WKS"),
         };
         // Place the worker on the model the capability router chose for this
         // role (honours `policy.routing.roles`); fall back to the executor

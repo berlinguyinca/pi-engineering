@@ -25,7 +25,8 @@ export interface ContextHandoffDeps {
   /** Newest durable checkpoint SHA for the task, when one exists. */
   latestCheckpointSha(missionId: string, taskId: string): string | undefined;
   addHandoff(record: Record<string, unknown>): HandoffRecord;
-  endpoint(missionId: string): HandoffEndpoint | null;
+  /** The predecessor: the session that wrote the execution's checkpoints, else the configured endpoint. */
+  endpoint(missionId: string, executionId?: string): HandoffEndpoint | null;
   report(missionId: string, line: string): void;
   /** Catalogue for quota switching; empty = no alternate known. */
   catalogue?(): readonly QuotaResumeModel[];
@@ -171,7 +172,7 @@ export class ContextHandoffTrigger {
   ): Promise<boolean> {
     const { missionId } = obs;
     try {
-      const endpoint = this.deps.endpoint(missionId);
+      const endpoint = this.deps.endpoint(missionId, obs.executionId);
       if (!endpoint) {
         this.deps.report(missionId, `[mission ${missionId}] ${cause} handoff skipped: no session endpoint available`);
         return false;

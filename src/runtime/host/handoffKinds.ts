@@ -54,6 +54,10 @@ export interface HandoffRecord {
   ackAt?: string;
   /** ISO timestamp of creation. */
   createdAt: string;
+  /** ISO timestamp at which the checkpoint passed verification (hashes, commit, required fields). */
+  verifiedAt?: string;
+  /** ISO timestamp at which the source's lease/process was fenced; only ever set after `verifiedAt`. */
+  sourceFencedAt?: string;
   /** Why the handoff was triggered, when it was an automatic continuity handoff. */
   cause?: HandoffCause;
 }
@@ -147,6 +151,15 @@ export function validateHandoffRecord(
   }
 
   if (!isIsoTimestamp(obj.createdAt)) errors.push("createdAt must be an ISO-8601 timestamp");
+  if (obj.verifiedAt !== undefined && !isIsoTimestamp(obj.verifiedAt)) {
+    errors.push("verifiedAt must be an ISO-8601 timestamp when present");
+  }
+  if (obj.sourceFencedAt !== undefined && !isIsoTimestamp(obj.sourceFencedAt)) {
+    errors.push("sourceFencedAt must be an ISO-8601 timestamp when present");
+  }
+  if (obj.sourceFencedAt !== undefined && obj.verifiedAt === undefined) {
+    errors.push("sourceFencedAt requires verifiedAt (verify before revoke)");
+  }
 
   if (obj.cause !== undefined && !(HANDOFF_CAUSES as readonly unknown[]).includes(obj.cause)) {
     errors.push(`cause must be one of ${HANDOFF_CAUSES.join(", ")} when present`);
@@ -173,6 +186,8 @@ export function validateHandoffRecord(
   if (obj.successor !== undefined) record.successor = obj.successor as HandoffEndpoint;
   if (obj.checkpointSha !== undefined) record.checkpointSha = obj.checkpointSha as string;
   if (obj.ackAt !== undefined) record.ackAt = obj.ackAt as string;
+  if (obj.verifiedAt !== undefined) record.verifiedAt = obj.verifiedAt as string;
+  if (obj.sourceFencedAt !== undefined) record.sourceFencedAt = obj.sourceFencedAt as string;
   if (obj.cause !== undefined) record.cause = obj.cause as HandoffCause;
   return { ok: true, record };
 }

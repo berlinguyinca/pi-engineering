@@ -119,6 +119,7 @@ import {
   workerCompactionSettings,
 } from "./contextBudget.ts";
 import { registerLocalProviders } from "./localProviders.ts";
+import { type ProcessQuarantine, sharedProcessQuarantine } from "./processQuarantine.ts";
 import {
   MUTATING_ROLES,
   REVIEWER_CONTEXT_CHAR_CAP,
@@ -126,6 +127,7 @@ import {
   buildSystemPrompt,
   wantsCommitDiscipline,
 } from "./prompts.ts";
+import { createQuarantinedBashOperations } from "./quarantinedBash.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
@@ -193,6 +195,8 @@ function roleResourceLoader(systemPrompt: string): ResourceLoader {
 }
 
 export interface PiWorkerExecutorOptions {
+  /** Registry of the OS process groups worker bash commands start; fencing an execution terminates them. */
+  processQuarantine?: ProcessQuarantine;
   agentDir?: string;
   model?: Model<any>;
   /** Available core tools; each worker receives only names in its request allowlist. */
@@ -290,6 +294,7 @@ export interface PiWorkerExecutorOptions {
 const OPERATOR_SWITCH_POLL_MS = 250;
 
 export class PiWorkerExecutor implements WorkerExecutor {
+  private readonly processQuarantine: ProcessQuarantine;
   private readonly agentDir: string;
   private readonly customTools: ToolDefinition[];
   private readonly model: Model<any> | undefined;
@@ -338,6 +343,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.agentDir = normalizeAgentDir(
       opts.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? process.env.PI_AGENT_DIR ?? "~/.pi/agent",
     );
+    this.processQuarantine = opts.processQuarantine ?? sharedProcessQuarantine;
     this.customTools = opts.customTools ?? [];
     this.model = opts.model;
     this.allowModelNetwork = opts.allowModelNetwork ?? false;
@@ -707,7 +713,14 @@ export class PiWorkerExecutor implements WorkerExecutor {
       ...(req.tools.includes("bash")
         ? [
             budgetNotice(
-              createBashToolDefinition(req.cwd, { spawnHook: missionDepthSpawnHook }) as unknown as ToolDefinition,
+              createBashToolDefinition(req.cwd, {
+                spawnHook: missionDepthSpawnHook,
+                // Commands of an owned execution register their process groups under its abort signal, so the
+                // broker can quarantine them when the execution is fenced or goes stale.
+                ...(req.signal
+                  ? { operations: createQuarantinedBashOperations(this.processQuarantine, req.signal) }
+                  : {}),
+              }) as unknown as ToolDefinition,
             ),
           ]
         : []),

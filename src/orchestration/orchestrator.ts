@@ -52,6 +52,7 @@ import {
   normalizeReviewSeverity,
   taskCoverageFingerprint,
 } from "./evidence.ts";
+import { HandoffDriver } from "./handoffDriver.ts";
 import { IntentRouter, workflowMutatesRepo } from "./intentRouter.ts";
 import {
   type InterruptMode,
@@ -464,6 +465,8 @@ export class Orchestrator {
   private readonly phaseHandoffCfg: OrchestratorOptions["phaseHandoff"] | null;
   /** Live context-threshold and quota handoff trigger; null unless `phaseHandoff` is configured. */
   private readonly continuityTrigger: ContextHandoffTrigger | null = null;
+  /** Runs verify -> fence -> acknowledge for every handoff record the trigger creates; null with the trigger. */
+  private readonly handoffDriver: HandoffDriver | null = null;
   /** Last phase observed per mission, so the boundary handoff fires once per transition. */
   private readonly missionPhase = new Map<string, string>();
   private readonly failureClassifier = new FailureClassifier();
@@ -550,15 +553,41 @@ export class Orchestrator {
     this.parentSessionId = opts.parentSessionId ?? null;
     const handoffCfg = this.phaseHandoffCfg;
     if (handoffCfg) {
+      this.handoffDriver = new HandoffDriver({
+        store: this.store,
+        quarantineExecution: (executionId) => this.broker.quarantineExecution(executionId),
+        report: (missionId, line) => this.report(missionId, line),
+        ...(opts.artifacts ? { artifacts: opts.artifacts } : {}),
+        utilization: (missionId) =>
+          missionContextUtilization(
+            this.store.listExecutions(missionId),
+            handoffCfg.contextWindowForModel ?? (() => null),
+          ),
+        pressureThreshold: () => handoffCfg.threshold,
+      });
       this.continuityTrigger = new ContextHandoffTrigger({
         thresholdsFor: (model) => handoffCfg.thresholdsForModel?.(model) ?? DEFAULT_CONTEXT_THRESHOLDS,
         requestCheckpoint: (executionId) => this.broker.requestCheckpoint(executionId),
         latestCheckpointSha: (missionId, taskId) =>
           this.store.listTaskCheckpoints(missionId, taskId).at(-1)?.candidateSha ?? undefined,
-        addHandoff: (record) => this.store.addHandoffRecord(record),
-        endpoint: (missionId) => {
+        addHandoff: (record) => {
+          const created = this.store.addHandoffRecord(record);
+          // The production caller: a trigger-created record is driven through the verified protocol right away.
+          void this.handoffDriver?.drive(created.id);
+          return created;
+        },
+        endpoint: (missionId, executionId) => {
           const mission = this.store.getMission(missionId);
           if (!mission) return null;
+          // The predecessor is the worker session that wrote the checkpoints being handed over: that is the identity
+          // verification compares them with. The configured/parent endpoint is only the fallback.
+          const session = executionId ? this.store.getExecution(executionId)?.session_id : null;
+          if (session) {
+            const done = this.store
+              .listHandoffRecords(missionId)
+              .filter((r) => r.state === "acknowledged" || r.state === "committed").length;
+            return { sessionId: session, generation: done };
+          }
           return (
             handoffCfg.endpoint?.(mission) ??
             (this.parentSessionId ? { sessionId: this.parentSessionId, generation: 0 } : null)
@@ -1786,6 +1815,8 @@ export class Orchestrator {
   }
 
   private async activateMissionRepository(missionId: string): Promise<void> {
+    // Every (re)drive of a mission (run, resume, repair after a restart) first re-drives its open handoffs.
+    void this.handoffDriver?.resumeOpen(missionId);
     const repoId = this.repoIdForMission(missionId);
     const manifest = this.store.getWorkspaceManifest(missionId);
     if (repoId && manifest && this.repositoryRegistry) {
@@ -1800,6 +1831,8 @@ export class Orchestrator {
       this.missionPhase.set(mission.mission_id, phase);
       this.emitPhaseBoundaryHandoff(mission, previous, phase);
     }
+    // Crash recovery and retry: any open trigger-created handoff of this mission is driven again (idempotent).
+    void this.handoffDriver?.resumeOpen(mission.mission_id);
     this.onPhase?.(mission, phase);
     this.report(mission.mission_id, `[mission ${mission.mission_id}] phase ${phase}`);
     this.observability?.phaseChanged(mission.mission_id, phase);
@@ -1833,7 +1866,7 @@ export class Orchestrator {
       cfg.endpoint?.(mission) ?? (this.parentSessionId ? { sessionId: this.parentSessionId, generation: 0 } : null);
     if (!endpoint) {
       const errors = ["no session endpoint available"];
-      const fallback = phaseHandoffFallback(errors, utilization);
+      const fallback = phaseHandoffFallback(errors, utilization, cfg.threshold);
       this.report(
         mission.mission_id,
         `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff failed (${errors.join("; ")}); fallback ${fallback.fallback} (${fallback.reason})`,
@@ -1861,12 +1894,17 @@ export class Orchestrator {
     } catch (error) {
       const errors =
         error instanceof HandoffRecordError ? error.errors : [error instanceof Error ? error.message : String(error)];
-      const fallback = phaseHandoffFallback(errors, utilization);
+      const fallback = phaseHandoffFallback(errors, utilization, cfg.threshold);
       this.report(
         mission.mission_id,
         `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff failed (${errors.join("; ")}); fallback ${fallback.fallback} (${fallback.reason})`,
       );
     }
+  }
+
+  /** Resolves when no handoff drive is in flight (tests, shutdown). */
+  async settleHandoffs(): Promise<void> {
+    await this.handoffDriver?.idle();
   }
 
   /** Feed the live context/quota signals of a worker to the continuity trigger (never throws, never blocks). */
@@ -1918,6 +1956,8 @@ export class Orchestrator {
     const obs = this.observability;
     if (!this.observedExecutions.has(event.executionId)) {
       this.observedExecutions.add(event.executionId);
+      // A new execution may be the successor an open handoff is waiting for.
+      void this.handoffDriver?.resumeOpen(event.missionId);
       this.taskExecutions.set(`${event.missionId}:${event.taskId}`, event.executionId);
       const task = this.store.getTask(event.taskId);
       // P4: surface routing provenance per worker. The execution record

@@ -6,6 +6,7 @@
  * recovery decides what to do when it cannot.
  */
 
+import { DEFAULT_CONTEXT_THRESHOLDS } from "../../context/thresholds.ts";
 import type { HandoffResumeDecision, HandoffSideEffect } from "./handoffResume.ts";
 
 /** Whether an external side effect was observed after the failed handoff. */
@@ -82,6 +83,11 @@ export interface HandoffFallbackInput {
   resumeDecision: HandoffResumeDecision;
   resumeReasons: readonly string[];
   contextUtilization: number | null;
+  /**
+   * Utilization at/above which a failed handoff counts as "under context pressure". Defaults to the `soft` level of the
+   * one configured threshold triple (context/thresholds.ts); callers with per-model configuration pass theirs.
+   */
+  pressureThreshold?: number;
 }
 
 /** Decide the fallback strategy. First match wins. */
@@ -99,7 +105,7 @@ export function decideHandoffFallback(input: HandoffFallbackInput): { fallback: 
   if (
     (input.resumeDecision === "restart_fresh" || input.resumeDecision === "refuse") &&
     input.contextUtilization !== null &&
-    input.contextUtilization >= 0.75
+    input.contextUtilization >= (input.pressureThreshold ?? DEFAULT_CONTEXT_THRESHOLDS.soft)
   ) {
     return { fallback: "selective_compaction", reason: "context pressure after failed handoff" };
   }

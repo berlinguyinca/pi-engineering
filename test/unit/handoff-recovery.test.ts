@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { DEFAULT_CONTEXT_THRESHOLDS } from "../../src/context/thresholds.ts";
 import {
   type EffectObservation,
   type HandoffFallbackInput,
@@ -83,22 +84,22 @@ test("handoff recovery: reasons containing 'uncommitted side effect push-1' with
   assert.deepEqual(result, { fallback: "fresh_restart", reason: "unreconciled side effects" });
 });
 
-test("handoff recovery: 'restart_fresh' at 0.75 -> selective_compaction (boundary)", () => {
+test("handoff recovery: 'restart_fresh' at the soft level (0.70) -> selective_compaction (boundary)", () => {
   const result = decideHandoffFallback({
     resumeDecision: "restart_fresh",
     resumeReasons: ["no checkpoint"],
-    contextUtilization: 0.75,
+    contextUtilization: 0.7,
   });
   assert.deepEqual(result, { fallback: "selective_compaction", reason: "context pressure after failed handoff" });
 });
 
-test("handoff recovery: 'refuse' at 0.74 and at null -> fresh_restart", () => {
-  const at74 = decideHandoffFallback({
+test("handoff recovery: 'refuse' just under the soft level and at null -> fresh_restart", () => {
+  const below = decideHandoffFallback({
     resumeDecision: "refuse",
     resumeReasons: ["handoff record missing"],
-    contextUtilization: 0.74,
+    contextUtilization: 0.69,
   });
-  assert.deepEqual(at74, { fallback: "fresh_restart", reason: "handoff failed without context pressure" });
+  assert.deepEqual(below, { fallback: "fresh_restart", reason: "handoff failed without context pressure" });
 
   const atNull = decideHandoffFallback({
     resumeDecision: "refuse",
@@ -130,4 +131,15 @@ test("handoff recovery: inputs not mutated (Object.freeze inputs + deep-equal sn
 
   decideHandoffFallback(fallbackInput);
   assert.equal(JSON.stringify(fallbackInput), fallbackSnapshot);
+});
+
+test("handoff recovery: the pressure level comes from the configured threshold, not a literal", () => {
+  const input = { resumeDecision: "refuse" as const, resumeReasons: ["no checkpoint"], contextUtilization: 0.6 };
+  assert.equal(decideHandoffFallback(input).fallback, "fresh_restart");
+  assert.equal(decideHandoffFallback({ ...input, pressureThreshold: 0.5 }).fallback, "selective_compaction");
+  assert.equal(
+    decideHandoffFallback({ ...input, contextUtilization: DEFAULT_CONTEXT_THRESHOLDS.soft }).fallback,
+    "selective_compaction",
+    "the default is the soft level of the one threshold triple",
+  );
 });

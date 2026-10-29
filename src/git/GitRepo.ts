@@ -2538,6 +2538,20 @@ export class GitRepo {
     return paths;
   }
 
+  /** Untracked, non-ignored files in the worktree at `path` (repo-relative, sorted). */
+  async untrackedPathsIn(path: string): Promise<string[]> {
+    const args = ["-C", path, "ls-files", "--others", "--exclude-standard", "-z"];
+    const r = this.requireQuery(
+      await this.git(args, { preserveStdout: true }),
+      `untracked path query in ${path}`,
+      args,
+    );
+    return r.stdout
+      .split("\0")
+      .filter((entry) => entry.length > 0)
+      .sort();
+  }
+
   /**
    * Files under `paths` that changed since `commit` (committed AND uncommitted).
    * Used for impact-based roadmap-evidence invalidation (spec §10): conservative,

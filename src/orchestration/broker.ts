@@ -20,7 +20,8 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { lstat, readFile } from "node:fs/promises";
+import { isAbsolute, resolve as resolvePath } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { id } from "../core/ids.ts";
 import { sharedAdmissionController } from "../gateway/config.ts";
@@ -43,6 +44,7 @@ import {
 import type { WorkerActivity, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { TURN_SUMMARY, WAITING_FOR_INFERENCE_SUMMARY, sanitizeWorkerActivity } from "../workers/activity.ts";
 import type { CheckpointProgressClaim } from "../workers/checkpointProgressTool.ts";
+import { type ProcessQuarantine, sharedProcessQuarantine } from "../workers/processQuarantine.ts";
 import type { CheckpointManager, CheckpointSnapshot } from "./checkpoints.ts";
 import { EvidenceUnavailableError, buildCandidateEvidenceIdentity, hashCandidateEvidenceIdentity } from "./evidence.ts";
 import type { GateEvidencePublication, LateExecutionEvidence, MissionStore } from "./missionStore.ts";
@@ -313,6 +315,11 @@ export interface AgentRunner {
     /** Owning mission and task, for model bookkeeping and operator logs. */
     missionId?: string;
     taskId?: string;
+    /**
+     * The worker session identity the broker assigned to this execution. The worker must run under exactly this id:
+     * it is what checkpoints and handoff records name as the predecessor (verify-before-revoke compares them).
+     */
+    sessionId?: string;
     signal: AbortSignal;
     onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome>;
@@ -439,6 +446,8 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
  * The worker's machine-readable failure marker for a wall-clock timeout. Only
  * an explicitly configured (opt-in) wall-clock limit produces it.
  */
+const UNTRACKED_SNAPSHOT_MAX_FILES = 50;
+const UNTRACKED_SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024;
 const WALL_CLOCK_TIMEOUT_MARKER = "timeout";
 /** Stored execution summary of a deliberate `partial` worker report (the orchestrator words its recovery on it). */
 export const PARTIAL_PROGRESS_SUMMARY = "worker reported partial progress";
@@ -627,6 +636,8 @@ export interface BrokerOptions {
   cancellationAckTimeoutMs?: number;
   /** Merge-queue policy and hooks for mission promotion; see {@link MissionMergeQueueOptions}. */
   mergeQueue?: MissionMergeQueueOptions;
+  /** Process groups started by an execution's tools; terminated when the execution is fenced or stale. */
+  processQuarantine?: ProcessQuarantine;
 }
 
 export class ExecutionBroker {
@@ -644,6 +655,7 @@ export class ExecutionBroker {
   private readonly artifacts?: BrokerOptions["artifacts"];
   private readonly cancellationAckTimeoutMs: number;
   private readonly mergeQueueOptions: MissionMergeQueueOptions;
+  private readonly processQuarantine: ProcessQuarantine;
   /** One queue per repository and target branch, so promotions to one branch serialize. */
   private readonly mergeQueues = new Map<string, { queue: MergeQueue; primitives: GitPrimitives }>();
   /** Candidates currently in a queue, by branch: the primitives resolve their fence through this. */
@@ -779,6 +791,7 @@ export class ExecutionBroker {
     this.artifacts = opts.artifacts;
     this.cancellationAckTimeoutMs = opts.cancellationAckTimeoutMs ?? 5_000;
     this.mergeQueueOptions = opts.mergeQueue ?? {};
+    this.processQuarantine = opts.processQuarantine ?? sharedProcessQuarantine;
   }
 
   private durableRecoveryContext(input: ExecutionRequestInput): CheckpointRecoveryContext | undefined {
@@ -1000,18 +1013,81 @@ export class ExecutionBroker {
     if (candidateSha !== verifiedCandidateSha) {
       throw new Error("checkpoint snapshot HEAD changed while cancellation state was being collected");
     }
+    const committedChanges = baseSha
+      ? await repository.git.changedFiles(baseSha, verifiedCandidateSha).then((paths) => {
+          assertOrigin();
+          return paths;
+        })
+      : [];
+    const untracked = await this.untrackedSnapshot(repository.git, info.path);
+    assertOrigin();
     return {
       candidateSha: verifiedCandidateSha,
       branch: info.branch,
       worktree: info.path,
-      committedChanges: baseSha
-        ? await repository.git.changedFiles(baseSha, verifiedCandidateSha).then((paths) => {
-            assertOrigin();
-            return paths;
-          })
-        : [],
+      committedChanges,
       preservedUncommittedChanges,
+      ...(untracked ? { untracked } : {}),
     };
+  }
+
+  /**
+   * Untracked files with content hashes, or undefined when they cannot all be listed and hashed within bounds
+   * (too many, too large, unreadable, not a regular file). Undefined means unknown; it is never reported as empty.
+   */
+  private async untrackedSnapshot(
+    git: GitRepo,
+    worktree: string,
+  ): Promise<Array<{ path: string; sha256: string }> | undefined> {
+    try {
+      const paths = await git.untrackedPathsIn(worktree);
+      if (paths.length > UNTRACKED_SNAPSHOT_MAX_FILES) return undefined;
+      const out: Array<{ path: string; sha256: string }> = [];
+      for (const path of paths) {
+        const full = resolvePath(worktree, path);
+        const info = await lstat(full);
+        if (!info.isFile() || info.size > UNTRACKED_SNAPSHOT_MAX_BYTES || path.length > 1024) return undefined;
+        out.push({
+          path,
+          sha256: createHash("sha256")
+            .update(await readFile(full))
+            .digest("hex"),
+        });
+      }
+      return out;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Latest outcome per validation command, taken only from recorded validation evidence for exactly the candidate
+   * (repository and commit) being checkpointed. Validation runs as its own gate task, so evidence is matched on the
+   * candidate identity, not on the implementing task. Nothing is inferred from worker text.
+   */
+  private validationTestOutcomes(
+    missionId: string,
+    repoId: string,
+    candidateSha: string | null,
+  ): Array<{ ref: string; outcome: "passed" | "failed" | "skipped" }> {
+    if (!candidateSha) return [];
+    const latest = new Map<string, { ref: string; outcome: "passed" | "failed" | "skipped" }>();
+    for (const evidence of [...this.store.listValidationEvidence(missionId)].sort((a, b) =>
+      a.recordedAt.localeCompare(b.recordedAt),
+    )) {
+      if (
+        !evidence.accessible ||
+        evidence.identity.repoId !== repoId ||
+        evidence.identity.candidateSha !== candidateSha
+      )
+        continue;
+      const ref = `${evidence.profile}: ${evidence.command}`.slice(0, 256);
+      latest.set(ref, {
+        ref,
+        outcome: evidence.noTargets ? "skipped" : evidence.exitCode === 0 ? "passed" : "failed",
+      });
+    }
+    return [...latest.values()].slice(-50);
   }
 
   /** Commit cancellation state until hooks leave a clean, immutable branch tip. */
@@ -1353,6 +1429,19 @@ export class ExecutionBroker {
     return entry.terminalPromise;
   }
 
+  /** Forget an execution and terminate the OS processes its tools started (best effort, never part of the outcome). */
+  private releaseExecution(executionId: string): void {
+    const signal = this.active.get(executionId)?.abort.signal;
+    if (signal) void this.processQuarantine.quarantine(signal).catch(() => undefined);
+    this.active.delete(executionId);
+  }
+
+  /** Fence hook for handoffs: terminate an active execution's process groups without settling it. */
+  async quarantineExecution(executionId: string): Promise<void> {
+    const signal = this.active.get(executionId)?.abort.signal;
+    if (signal) await this.processQuarantine.quarantine(signal);
+  }
+
   private terminalizeExecution(
     executionId: string,
     reason: "canceled" | "timeout" | "inactivity",
@@ -1397,7 +1486,9 @@ export class ExecutionBroker {
       }
     }
     this.resumableCancels.delete(executionId);
-    this.active.delete(executionId);
+    // The execution no longer owns anything: terminate the OS processes its tools started. The logical fence
+    // (execution status) stops it publishing; this stops it running. Best effort, never part of the outcome.
+    this.releaseExecution(executionId);
     return outcome;
   }
 
@@ -3092,10 +3183,13 @@ export class ExecutionBroker {
     const binding = this.store
       .getWorkspaceManifest(input.missionId)
       ?.repositories.find((repository) => repository.repoId === input.repoId);
+    // An agent execution is one worker session; the broker names it so checkpoints and handoffs can cite it.
+    const workerSessionId = backend === "agent" ? id("WKS") : undefined;
     const execution = this.store.createExecution({
       task_id: input.taskId,
       mission_id: input.missionId,
       backend,
+      ...(workerSessionId ? { session_id: workerSessionId } : {}),
       model: (input.modelRequirements as { model?: string } | undefined)?.model ?? null,
       thinking_level: (input.modelRequirements as { thinking?: string } | undefined)?.thinking ?? null,
       mission_generation: input.authority?.missionIdentity.generation,
@@ -3357,11 +3451,15 @@ export class ExecutionBroker {
             await this.checkpoints.persist({
               taskId: input.taskId,
               executionId: execution.execution_id,
+              ...(workerSessionId ? { sessionId: workerSessionId } : {}),
               completedDeliverables: [...new Set([...completedDeliverables, ...declaredCompleted])],
               artifactRefs,
               artifactHashes,
               model: execution.model,
               snapshot,
+              handoff: {
+                tests: this.validationTestOutcomes(input.missionId, input.repoId, snapshot.candidateSha),
+              },
             });
             assertOrigin();
             return snapshot;
@@ -3819,7 +3917,7 @@ export class ExecutionBroker {
                   : {}),
               });
             }
-            this.active.delete(execution.execution_id);
+            this.releaseExecution(execution.execution_id);
             emitActivity({
               kind: "execution",
               phase: outcome.exitStatus === "succeeded" ? "completed" : "failed",
@@ -3866,7 +3964,7 @@ export class ExecutionBroker {
                 });
               }
             }
-            this.active.delete(execution.execution_id);
+            this.releaseExecution(execution.execution_id);
             emitActivity({
               kind: "execution",
               phase: "failed",
@@ -3942,7 +4040,7 @@ export class ExecutionBroker {
         await this.store.flush();
       } catch (error) {
         abort.abort(error);
-        this.active.delete(execution.execution_id);
+        this.releaseExecution(execution.execution_id);
         this.store.rejectLateExecution(execution.execution_id, "gate invalidation durability barrier failed");
         throw error;
       }
@@ -4076,6 +4174,9 @@ export class ExecutionBroker {
             wallClock,
             missionId: input.missionId,
             taskId: input.taskId,
+            ...(this.store.getExecution(executionId)?.session_id
+              ? { sessionId: this.store.getExecution(executionId)?.session_id as string }
+              : {}),
             signal,
             onActivity: base.onActivity,
           }),

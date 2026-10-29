@@ -125,6 +125,37 @@ function missionRig(emitter: LineageEmitter | null, backend = JsonlEventStore.in
   return { store, backend, mission, task, execution };
 }
 
+/** Run verify -> fence for a record the way the handoff driver does; the observed rollover only supplies the successor. */
+async function verifyAndFence(
+  store: MissionStore,
+  mgr: CheckpointManager,
+  taskId: string,
+  executionId: string,
+  handoffId: string,
+  sha: string,
+  session: string,
+): Promise<void> {
+  const cp = await mgr.persist({
+    taskId,
+    executionId,
+    sessionId: session,
+    snapshot: {
+      candidateSha: sha,
+      branch: "b",
+      worktree: "/wt",
+      committedChanges: [],
+      preservedUncommittedChanges: [],
+    },
+    handoff: {},
+  });
+  const verdict = await store.verifyHandoff(handoffId, cp, {
+    hashArtifact: async () => null,
+    commitExists: async () => true,
+  });
+  assert.equal(verdict.ok, true, JSON.stringify(verdict));
+  await store.fenceHandoffSource(handoffId, async () => {});
+}
+
 const SHA = "a".repeat(40);
 
 describe("lineage: spawn vs handoff", () => {
@@ -382,7 +413,7 @@ describe("lineage: session rollover and migration", () => {
       record("hf-other-session", { checkpointSha: sha, predecessor: { sessionId: "sess-9", generation: 0 } }),
     );
     const mgr = new CheckpointManager({ store });
-    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    await verifyAndFence(store, mgr, task.task_id, execution.execution_id, "hf-ok", sha, "sess-1");
     await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
 
     const done = store.getHandoffRecord("hf-ok");
@@ -872,9 +903,43 @@ describe("lineage: observed handoff acknowledgement edge cases", () => {
     const { store, task, execution } = missionRig(null);
     store.addHandoffRecord(open(execution.mission_id));
     const mgr = new CheckpointManager({ store });
-    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    await verifyAndFence(store, mgr, task.task_id, execution.execution_id, "hf-1", sha, "sess-1");
     await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
     assert.equal(store.getHandoffRecord("hf-1")?.state, "acknowledged");
+  });
+
+  it("an observed rollover never stands in for verification: an unverified checkpoint-bearing record stays prepared", async () => {
+    const { store, task, execution } = missionRig(null);
+    store.addHandoffRecord(open(execution.mission_id));
+    const mgr = new CheckpointManager({ store });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
+    const rec = store.getHandoffRecord("hf-1");
+    assert.equal(rec?.state, "prepared");
+    assert.equal(rec?.verifiedAt, undefined);
+    assert.equal(rec?.successor, undefined);
+  });
+
+  it("a verified but unfenced record is not acknowledged by observation either", async () => {
+    const { store, task, execution } = missionRig(null);
+    store.addHandoffRecord(open(execution.mission_id));
+    const mgr = new CheckpointManager({ store });
+    const cp = await mgr.persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      sessionId: "sess-1",
+      snapshot: {
+        candidateSha: sha,
+        branch: "b",
+        worktree: "/wt",
+        committedChanges: [],
+        preservedUncommittedChanges: [],
+      },
+      handoff: {},
+    });
+    await store.verifyHandoff("hf-1", cp, { hashArtifact: async () => null, commitExists: async () => true });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
+    assert.equal(store.getHandoffRecord("hf-1")?.state, "validated");
   });
 
   it("does not acknowledge when another execution of the mission still holds the replaced session", () => {

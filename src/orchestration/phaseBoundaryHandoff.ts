@@ -152,16 +152,18 @@ export function buildPhaseTransitionRecord(input: PhaseTransitionRecordInput): R
 /**
  * Fallback decision when a boundary handoff cannot be emitted: the failed
  * record is treated as a refused resume, so the standard handoff-fallback
- * rules apply — `selective_compaction` under context pressure (>= 0.75),
+ * rules apply — `selective_compaction` under context pressure (>= the configured soft level, default 0.70),
  * `fresh_restart` otherwise. This keeps native compaction as fallback only.
  */
 export function phaseHandoffFallback(
   errors: readonly string[],
   contextUtilization: number | null,
+  pressureThreshold?: number,
 ): { fallback: HandoffFallback; reason: string } {
   return decideHandoffFallback({
     resumeDecision: "refuse",
     resumeReasons: errors,
     contextUtilization,
+    ...(pressureThreshold !== undefined ? { pressureThreshold } : {}),
   });
 }

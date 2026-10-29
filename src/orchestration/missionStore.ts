@@ -32,6 +32,7 @@ import {
   taskCoverageFingerprint,
   validateAcceptanceResults,
 } from "./evidence.ts";
+import { type HandoffVerification, type HandoffVerifyDeps, verifyHandoffCheckpoint } from "./handoffProtocol.ts";
 import { failureFingerprint } from "./recovery.ts";
 import { assertMissionTransition, assertTaskTransition } from "./state.ts";
 import type {
@@ -652,11 +653,15 @@ export class MissionStore {
 
   /**
    * A rollover is the successor session taking over. Open handoff records of the mission that named the replaced
-   * session as predecessor advance to `acknowledged` with the observed successor, but only when they carry a
-   * checkpoint (that is what `validated` means); a record without one is left for its owner. Records carry no
-   * execution id, so when another live execution of the mission still holds the replaced session the owner is
-   * ambiguous and nothing is advanced. Bookkeeping only: any failure is swallowed, because the checkpoint or status
-   * update that observed the rollover is already durable and must not be reported as failed.
+   * session as predecessor are acknowledged with the observed successor, but only when they carry a checkpoint AND the
+   * verify-before-revoke protocol already ran for them (`verifiedAt` and `sourceFencedAt`, stamped only by
+   * `verifyHandoff` / `fenceHandoffSource`). Observation supplies the successor's identity and nothing else: it never
+   * stands in for verification, so a checkpoint-bearing record that was not verified and fenced is left for the handoff
+   * driver (`HandoffDriver`), which runs `executeHandoff`. Records without a checkpoint are untouched, as before (they
+   * keep the direct `acknowledgeHandoff` path). Records carry no execution id, so when another live execution of the
+   * mission still holds the replaced session the owner is ambiguous and nothing is advanced. Bookkeeping only: any
+   * failure is swallowed, because the checkpoint or status update that observed the rollover is already durable and
+   * must not be reported as failed.
    */
   private acknowledgeObservedHandoffs(ex: Execution, previous: string | null, next: string | null): void {
     if (!previous || !next || previous === next || !this.lineageAgentExecution(ex)) return;
@@ -676,14 +681,16 @@ export class MissionStore {
           r.missionId === ex.mission_id &&
           r.predecessor.sessionId === previous &&
           r.checkpointSha &&
-          (r.state === "prepared" || r.state === "validated"),
+          r.state === "validated" &&
+          r.verifiedAt &&
+          r.sourceFencedAt,
       );
       for (const record of open) {
-        if (record.state === "prepared") this.transitionHandoffRecord(record.id, "validated");
-        this.transitionHandoffRecord(record.id, "acknowledged", {
-          sessionId: next,
-          generation: record.predecessor.generation + 1,
-        });
+        try {
+          this.acknowledgeHandoff(record.id, { sessionId: next, generation: record.predecessor.generation + 1 });
+        } catch {
+          // one record's failure must not strand the others
+        }
       }
     } catch {
       // see above: never surface handoff bookkeeping failures to the caller
@@ -2444,6 +2451,9 @@ export class MissionStore {
     if (!result.ok) {
       throw new HandoffRecordError(result.errors);
     }
+    // A new record starts unverified and unfenced: only verifyHandoff / fenceHandoffSource may stamp these.
+    delete result.record.verifiedAt;
+    delete result.record.sourceFencedAt;
     this.handoffRecords.set(result.record.id, { ...result.record });
     this.emit("handoff.created", result.record.missionId, {
       actor: "system",
@@ -2495,12 +2505,29 @@ export class MissionStore {
    * id, an illegal transition, or a missing successor.
    */
   transitionHandoffRecord(id: string, to: HandoffState, successor?: HandoffEndpoint, ackAt?: string): HandoffRecord {
+    return this.transitionHandoff(id, to, successor, ackAt);
+  }
+
+  private transitionHandoff(
+    id: string,
+    to: HandoffState,
+    successor: HandoffEndpoint | undefined,
+    ackAt: string | undefined,
+  ): HandoffRecord {
     const current = this.handoffRecords.get(id);
     if (!current) {
       throw new HandoffRecordError([`unknown handoff record ${id}`]);
     }
     if (!nextStates(current.state).includes(to)) {
       throw new HandoffRecordError([`illegal handoff transition ${current.state} -> ${to}`]);
+    }
+    // Verify-before-revoke: a record that names a checkpoint (one without has nothing to verify; executeHandoff
+    // rejects it) may be acknowledged only after that checkpoint was verified and the source fenced, in that order.
+    // There is no exception for an observed rollover: observation only supplies the successor identity.
+    if (to === "acknowledged" && current.checkpointSha && !(current.verifiedAt && current.sourceFencedAt)) {
+      throw new HandoffRecordError([
+        `handoff ${id} cannot be acknowledged before its checkpoint is verified and its source fenced`,
+      ]);
     }
     const next: HandoffRecord = { ...current, state: to };
     if (to === "acknowledged" || to === "committed") {
@@ -2518,6 +2545,68 @@ export class MissionStore {
     this.emit("handoff.transitioned", next.missionId, { actor: "system", handoff: { ...next } });
     this.lineageHandoff(next);
     return { ...next };
+  }
+
+  /** Persist a field stamp on a handoff record without changing its state. */
+  private stampHandoff(id: string, patch: Pick<HandoffRecord, "verifiedAt" | "sourceFencedAt">): HandoffRecord {
+    const current = this.handoffRecords.get(id);
+    if (!current) throw new HandoffRecordError([`unknown handoff record ${id}`]);
+    const next: HandoffRecord = { ...current, ...patch };
+    this.handoffRecords.set(id, { ...next });
+    this.emit("handoff.transitioned", next.missionId, { actor: "system", handoff: { ...next } });
+    return { ...next };
+  }
+
+  /**
+   * Step 1 of verify-before-revoke. Verifies `checkpoint` against the record; on success stamps `verifiedAt` and
+   * advances prepared -> validated. On failure nothing is persisted and nothing advances, so the source lease and the
+   * record stay exactly as they were. Repeating it on an already verified record is a no-op.
+   */
+  async verifyHandoff(id: string, checkpoint: TaskCheckpoint, deps: HandoffVerifyDeps): Promise<HandoffVerification> {
+    const record = this.handoffRecords.get(id);
+    if (!record) throw new HandoffRecordError([`unknown handoff record ${id}`]);
+    if (record.state !== "prepared" && record.state !== "validated") {
+      throw new HandoffRecordError([`handoff ${id} is ${record.state}; only prepared or validated can be verified`]);
+    }
+    const verdict = await verifyHandoffCheckpoint(record, checkpoint, deps);
+    if (!verdict.ok) return verdict;
+    if (!record.verifiedAt) {
+      this.stampHandoff(id, { verifiedAt: new Date().toISOString() });
+    }
+    if (this.handoffRecords.get(id)?.state === "prepared") this.transitionHandoffRecord(id, "validated");
+    return verdict;
+  }
+
+  /**
+   * Step 2: run `fence` (lease fence, process quarantine) and stamp `sourceFencedAt`. Refuses unless the record is
+   * verified. `fence` must be idempotent: when it throws nothing is stamped and the call can be retried. A record
+   * already stamped is not fenced again.
+   */
+  async fenceHandoffSource(id: string, fence: () => Promise<void>): Promise<HandoffRecord> {
+    const record = this.handoffRecords.get(id);
+    if (!record) throw new HandoffRecordError([`unknown handoff record ${id}`]);
+    if (!record.verifiedAt || record.state !== "validated") {
+      throw new HandoffRecordError([`handoff ${id} must be verified before its source is fenced`]);
+    }
+    if (record.sourceFencedAt) return { ...record };
+    await fence();
+    return this.stampHandoff(id, { sourceFencedAt: new Date().toISOString() });
+  }
+
+  /**
+   * Step 3: the successor takes over. Requires steps 1 and 2. Idempotent for the same successor (no second event, no
+   * second lineage edge); a different successor for an acknowledged record is an error.
+   */
+  acknowledgeHandoff(id: string, successor: HandoffEndpoint): HandoffRecord {
+    const record = this.handoffRecords.get(id);
+    if (!record) throw new HandoffRecordError([`unknown handoff record ${id}`]);
+    if (record.state === "acknowledged" || record.state === "committed") {
+      if (record.successor?.sessionId !== successor.sessionId) {
+        throw new HandoffRecordError([`handoff ${id} was already acknowledged by ${record.successor?.sessionId}`]);
+      }
+      return { ...record };
+    }
+    return this.transitionHandoff(id, "acknowledged", successor, undefined);
   }
 
   private lineageHandoff(record: HandoffRecord): void {
