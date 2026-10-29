@@ -121,6 +121,7 @@ export type OrchestrationEventType =
   | "workspace.rebound"
   | "workspace.rebind_failed"
   | "task.checkpointed"
+  | "task.model_switched"
   | "task.split"
   | "task.superseded"
   | "failure.classified"
@@ -207,6 +208,7 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "workspace.rebound",
   "workspace.rebind_failed",
   "task.checkpointed",
+  "task.model_switched",
   "task.split",
   "task.superseded",
   "failure.classified",
@@ -1044,6 +1046,14 @@ export class MissionStore {
       case "task.checkpointed": {
         const checkpoint = e.payload.checkpoint as TaskCheckpoint;
         if (checkpoint) this.recordTaskCheckpoint(checkpoint);
+        break;
+      }
+      case "task.model_switched": {
+        this.applyTaskModelSwitch(
+          e.payload.task_id as string,
+          e.payload.model as string,
+          e.payload.resume_from_sha as string | undefined,
+        );
         break;
       }
       case "failure.classified": {
@@ -2621,6 +2631,9 @@ export class MissionStore {
         checkpointSha: record.checkpointSha,
         fromGeneration: record.predecessor.generation,
         toGeneration: record.successor?.generation,
+        cause: record.cause ?? null,
+        fromModel: record.fromModel ?? null,
+        toModel: record.toModel ?? null,
         at:
           record.ackAt && (record.state === "acknowledged" || record.state === "committed")
             ? record.ackAt
@@ -2758,6 +2771,39 @@ export class MissionStore {
   getWorkspaceManifest(missionId: string): WorkspaceManifest | undefined {
     const manifest = this.workspaceManifests.get(missionId);
     return manifest ? copyWorkspaceManifest(manifest) : undefined;
+  }
+
+  private applyTaskModelSwitch(taskId: string, model: string, resumeFromSha: string | undefined): void {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    task.execution_requirements = { ...task.execution_requirements, model };
+    if (resumeFromSha) task.repair_base_candidate_sha = resumeFromSha;
+  }
+
+  /**
+   * Durable model override for a task: every LATER execution of it (the scheduler's retry, a recovery dispatch) asks for
+   * `model` through the ordinary `execution_requirements.model` seam, and starts from `resumeFromSha` (a Git-verified
+   * checkpoint) when given. Idempotent: switching to the model the task already carries writes nothing, so a crash
+   * between the switch and the rest of a handoff can simply replay it. Terminal tasks are immutable.
+   */
+  switchTaskModel(taskId: string, model: string, resumeFromSha?: string, handoffId?: string): OrchestrationTask {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`unknown task ${taskId}`);
+    if (TERMINAL_TASK_STATUSES.has(task.status)) throw new Error(`terminal task ${taskId} is immutable`);
+    const alreadyThere =
+      task.execution_requirements.model === model &&
+      (resumeFromSha === undefined || task.repair_base_candidate_sha === resumeFromSha);
+    if (!alreadyThere) {
+      this.applyTaskModelSwitch(taskId, model, resumeFromSha);
+      this.emit("task.model_switched", task.mission_id, {
+        actor: "system",
+        task_id: taskId,
+        model,
+        ...(resumeFromSha ? { resume_from_sha: resumeFromSha } : {}),
+        ...(handoffId ? { handoff_id: handoffId } : {}),
+      });
+    }
+    return this.getTask(taskId)!;
   }
 
   getTaskCheckpoint(checkpointId: string): TaskCheckpoint | undefined {

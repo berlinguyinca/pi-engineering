@@ -382,7 +382,7 @@ describe("buildContinuityConfig (EngineeringRuntime wiring)", () => {
     try {
       writeFileSync(
         join(dir, "engineering.yaml"),
-        "context_thresholds:\n  runtimes:\n    gw: { preferred: 0.75 }\n  models:\n    special: { soft: 0.5, preferred: 0.6, emergency: 0.7 }\n",
+        "context_thresholds:\n  runtimes:\n    gw: { preferred: 0.75 }\n  models:\n    special: { soft: 0.5, preferred: 0.6, emergency: 0.7 }\nquota_fallbacks:\n  roles:\n    implementer: [special, nowindow, gw/test, unlisted]\n",
       );
       const cfg = await buildContinuityConfig({
         agentDir: dir,
@@ -401,13 +401,16 @@ describe("buildContinuityConfig (EngineeringRuntime wiring)", () => {
       assert.deepEqual(cfg.thresholdsForModel?.(null), DEFAULT_CONTEXT_THRESHOLDS);
       assert.equal(cfg.threshold, 0.7);
       assert.deepEqual(
-        cfg.quotaCatalogue?.().map((m) => [m.id, m.eligible]),
+        cfg.quotaCatalogue?.("implementer").map((m) => [m.id, m.eligible]),
         [
-          ["test", true],
           ["special", true],
           ["nowindow", false],
+          ["gw/test", true],
+          ["unlisted", false],
         ],
+        "only the operator's ordered list, never the whole registry; unavailable/unknown models are ineligible",
       );
+      assert.deepEqual(cfg.quotaCatalogue?.("reviewer"), [], "no list for the role and no default: none configured");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

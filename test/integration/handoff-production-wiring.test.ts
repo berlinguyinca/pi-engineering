@@ -435,8 +435,8 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
   });
 });
 
-describe("quota exhaustion takes the same verified path with its own cause", () => {
-  it("a quota failure observed through the Orchestrator hands off as a recovery record, verified and fenced", async () => {
+describe("quota exhaustion is a distinct cause that never picks a model on its own", () => {
+  it("with no quota fallback configured the recovery record says so and stays blocked: nothing is fenced", async () => {
     const r = await rig();
     r.emitRaw({
       kind: "state",
@@ -444,14 +444,19 @@ describe("quota exhaustion takes the same verified path with its own cause", () 
       meaningfulProgress: false,
       inferenceFailure: "quota",
     });
-    await until(() => r.store.listHandoffRecords(r.missionId).some((h) => h.sourceFencedAt));
+    await until(() => r.store.listHandoffRecords(r.missionId).length === 1);
     await settleTrigger(r);
+    await redrive(r.orchestrator, r.missionId);
     const [record] = r.store.listHandoffRecords(r.missionId);
     assert.equal(record?.kind, "recovery");
     assert.equal(record?.cause, "quota_exhausted");
-    assert.equal(record?.state, "validated");
-    assert.ok(record?.verifiedAt && record.sourceFencedAt);
-    await until(() => !alive(r.childPid));
-    assert.equal(events(r.backend, "execution.late_result_rejected").length, 1);
+    assert.equal(record?.state, "prepared");
+    assert.match(record?.blockedReason ?? "", /no quota_fallbacks configured for role implementer/);
+    assert.equal(record?.toModel, undefined);
+    assert.equal(record?.verifiedAt, undefined);
+    assert.equal(record?.sourceFencedAt, undefined);
+    assert.equal(r.store.getExecution(r.executionId())?.status, "RUNNING", "the source is untouched");
+    assert.equal(r.quarantineCalls.length, 0);
+    assert.ok(r.reports.some((l) => l.includes("quota handoff BLOCKED")));
   });
 });

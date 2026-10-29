@@ -220,6 +220,10 @@ export interface HandoffLineageInput {
   checkpointSha?: string | null;
   fromGeneration?: number;
   toGeneration?: number;
+  /** Why the handoff happened (e.g. quota_exhausted), and the model change a quota switch made. */
+  cause?: string | null;
+  fromModel?: string | null;
+  toModel?: string | null;
   at?: string | Date;
 }
 
@@ -627,6 +631,9 @@ export class LineageEmitter {
         ...(input.checkpointSha ? { checkpoint_sha: input.checkpointSha } : {}),
         ...(input.fromGeneration !== undefined ? { from_generation: input.fromGeneration } : {}),
         ...(input.toGeneration !== undefined ? { to_generation: input.toGeneration } : {}),
+        ...(input.cause ? { cause: input.cause } : {}),
+        ...(input.fromModel ? { from_model: input.fromModel } : {}),
+        ...(input.toModel ? { to_model: input.toModel } : {}),
       };
       const to = lineageNodeId("session", input.toSession);
       if (to) attrs.to_session_id = to;
@@ -636,7 +643,21 @@ export class LineageEmitter {
         const endpointAttrs = { handoff_id: node, ...(input.missionId ? { mission_id: input.missionId } : {}) };
         this.nodeUpsert(from, { attrs: endpointAttrs }, input.id, scope, input.at);
         this.nodeUpsert(to, { attrs: endpointAttrs }, input.id, scope, input.at);
-        this.edgeAdd("handoff", from, to, input.id, { handoff_id: node, handoff_kind: input.kind }, scope, input.at);
+        this.edgeAdd(
+          "handoff",
+          from,
+          to,
+          input.id,
+          {
+            handoff_id: node,
+            handoff_kind: input.kind,
+            ...(input.cause ? { cause: input.cause } : {}),
+            ...(input.fromModel ? { from_model: input.fromModel } : {}),
+            ...(input.toModel ? { to_model: input.toModel } : {}),
+          },
+          scope,
+          input.at,
+        );
       }
     } catch (error) {
       this.fail(error);

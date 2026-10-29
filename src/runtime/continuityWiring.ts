@@ -8,6 +8,7 @@
 import type { ContextThresholds } from "../context/thresholds.ts";
 import { loadContextThresholdConfig, resolveContextThresholds } from "../context/thresholds.ts";
 import type { OrchestratorOptions } from "../orchestration/orchestrator.ts";
+import { loadQuotaFallbackConfig, quotaFallbacksFor } from "./quotaFallbackConfig.ts";
 
 export interface RegistryModel {
   provider: string;
@@ -36,6 +37,8 @@ export async function buildContinuityConfig(input: {
   } catch (error) {
     input.log?.(`[context-thresholds] model registry unreadable (${error instanceof Error ? error.message : error})`);
   }
+  const quota = await loadQuotaFallbackConfig(input.agentDir);
+  for (const note of quota.notes) input.log?.(`[quota-fallbacks] ${note}`);
   const windows = new Map<string, number>();
   const providers = new Map<string, string>();
   for (const m of registry) {
@@ -53,10 +56,15 @@ export async function buildContinuityConfig(input: {
     // The phase boundary hands off at the global `soft` level.
     threshold: thresholdsForModel(null).soft,
     thresholdsForModel,
-    quotaCatalogue: () =>
-      registry.map((m) => ({
-        id: m.id,
-        eligible: input.isModelUnavailable?.({ provider: m.provider, id: m.id }) !== true,
-      })),
+    // ONLY the models the operator listed for the role, in their order. A listed model is eligible unless the registry
+    // is known and lacks it, or the runtime marked it unavailable. Never the whole registry: no silent pick.
+    quotaCatalogue: (role) =>
+      quotaFallbacksFor(quota.config, role).map((id) => {
+        const known = registry.find((m) => m.id === id || `${m.provider}/${m.id}` === id);
+        const absent = registry.length > 0 && !known;
+        const unavailable =
+          known !== undefined && input.isModelUnavailable?.({ provider: known.provider, id: known.id }) === true;
+        return { id, eligible: !absent && !unavailable };
+      }),
   };
 }

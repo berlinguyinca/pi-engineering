@@ -21,6 +21,12 @@
  * `sourceFencedAt` and is acknowledged either by a later drive or by the observed rollover, which is gated on those
  * stamps (MissionStore.acknowledgeObservedHandoffs). Never inferred, never invented.
  *
+ * Quota switch: a `quota_exhausted` record that carries `toModel` (a model the operator listed under engineering.yaml
+ * `quota_fallbacks`) switches the TASK's model durably after verification and before the source is fenced
+ * (MissionStore.switchTaskModel, idempotent); the scheduler's ordinary retry of the fenced task then asks for that model
+ * through `execution_requirements.model` and starts from the verified checkpoint. Only an execution on `toModel`
+ * acknowledges. A record with `blockedReason` (no fallback configured/eligible) is never driven: the source is untouched.
+ *
  * Records without a checkpoint SHA have nothing to verify and are not driven: they keep the legacy direct
  * `acknowledgeHandoff` path. `phase_transition` records are not driven either: their predecessor is the orchestrating
  * session, which wrote no checkpoint, so the protocol would reject every one of them.
@@ -102,6 +108,7 @@ export class HandoffDriver {
   private drivable(record: HandoffRecord): boolean {
     return (
       record.checkpointSha !== undefined &&
+      record.blockedReason === undefined &&
       record.kind !== "phase_transition" &&
       (record.state === "prepared" || record.state === "validated")
     );
@@ -123,6 +130,9 @@ export class HandoffDriver {
       .filter(
         (e) =>
           e.task_id === checkpoint.taskId &&
+          // A quota switch is only taken over by an execution on the configured fallback: a same-model retry racing in
+          // from the scheduler's resilience path is not the successor.
+          (record.toModel === undefined || e.model === record.toModel) &&
           e.execution_id !== checkpoint.executionId &&
           e.session_id &&
           e.session_id !== record.predecessor.sessionId &&
@@ -163,6 +173,13 @@ export class HandoffDriver {
       ...(successor ? { successor } : {}),
       deps: this.deps.verifyDeps ?? createHandoffVerifyDeps(this.deps.artifacts),
       fenceSource: composeFences(
+        // Quota switch: the task's model is switched (durably, idempotently) AFTER verification and BEFORE the writer
+        // is fenced, so the retry the fence unblocks already asks for the fallback model and starts from the checkpoint.
+        async () => {
+          if (record.cause === "quota_exhausted" && record.toModel) {
+            store.switchTaskModel(checkpoint.taskId, record.toModel, checkpoint.candidateSha ?? undefined, record.id);
+          }
+        },
         fenceExecutionWriter(store, checkpoint.executionId, () =>
           this.deps.quarantineExecution(checkpoint.executionId),
         ),
@@ -180,7 +197,7 @@ export class HandoffDriver {
       case "acknowledged":
         return `[mission ${m}] handoff ${id} verified, source fenced, acknowledged by ${outcome.record.successor?.sessionId}`;
       case "fenced":
-        return `[mission ${m}] handoff ${id} verified, source fenced; awaiting the successor session`;
+        return `[mission ${m}] handoff ${id} verified, source fenced${outcome.record.toModel ? ` (task switched ${outcome.record.fromModel ?? "?"} -> ${outcome.record.toModel})` : ""}; awaiting the successor session`;
       case "already_acknowledged":
         return `[mission ${m}] handoff ${id} already acknowledged (${outcome.resume.decision})`;
       case "rejected":

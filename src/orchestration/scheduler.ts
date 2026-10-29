@@ -881,12 +881,14 @@ export class MissionScheduler {
           mutatesRepo: task.mutates_repo,
           writeDomains: task.write_domains,
           isolation: task.isolation,
-          modelRequirements: task.execution_requirements,
+          // Re-read per attempt: a quota handoff may have switched the task's model (and its resume point) since the
+          // closure's snapshot was taken, and the retry must honour it.
+          modelRequirements: (this.store.getTask(task.task_id) ?? task).execution_requirements,
           deliverables: task.deliverables,
           executionBudgetMs: task.execution_budget_ms,
           checkpointPolicy: task.checkpoint_policy,
           requiredOutputArtifacts: task.required_output_artifacts,
-          candidateBaseSha: resumeFromSha ?? task.repair_base_candidate_sha,
+          candidateBaseSha: resumeFromSha ?? (this.store.getTask(task.task_id) ?? task).repair_base_candidate_sha,
           authority,
         });
         authority?.onInvalidated(() => {

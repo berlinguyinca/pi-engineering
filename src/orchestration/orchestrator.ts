@@ -200,8 +200,11 @@ export interface OrchestratorOptions {
      * requests a checkpoint and a `context` handoff at the next safe point, `emergency` at once. Default triple when absent.
      */
     thresholdsForModel?: (model: string | null) => import("../context/thresholds.ts").ContextThresholds;
-    /** Models a quota-exhausted run may switch to (runtime/host/quotaResume.ts). Empty = none known. */
-    quotaCatalogue?: () => readonly import("../runtime/host/quotaResume.ts").QuotaResumeModel[];
+    /**
+     * The ordered fallback models configured (engineering.yaml `quota_fallbacks`) for a role; a quota-exhausted run may
+     * switch only to one of these (runtime/host/quotaResume.ts). Empty = none configured: the handoff stays blocked.
+     */
+    quotaCatalogue?: (role: string | null) => readonly import("../runtime/host/quotaResume.ts").QuotaResumeModel[];
   } | null;
   parentSessionId?: string | null;
   limits?: {
@@ -1935,6 +1938,7 @@ export class Orchestrator {
           executionId: event.executionId,
           model: this.store.getExecution(event.executionId)?.model ?? "unknown",
           failureClass: "quota",
+          role: this.store.getTask(event.taskId)?.role ?? null,
         })
         .catch(swallow);
     } else if (

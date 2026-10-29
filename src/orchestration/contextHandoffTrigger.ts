@@ -28,8 +28,8 @@ export interface ContextHandoffDeps {
   /** The predecessor: the session that wrote the execution's checkpoints, else the configured endpoint. */
   endpoint(missionId: string, executionId?: string): HandoffEndpoint | null;
   report(missionId: string, line: string): void;
-  /** Catalogue for quota switching; empty = no alternate known. */
-  catalogue?(): readonly QuotaResumeModel[];
+  /** The operator-configured, ordered fallback models for a role; empty = none configured (the handoff stays blocked). */
+  catalogue?(role: string | null): readonly QuotaResumeModel[];
   now?(): Date;
 }
 
@@ -109,6 +109,7 @@ export class ContextHandoffTrigger {
     executionId: string;
     model: string;
     failureClass: InferenceFailureClass;
+    role?: string | null;
     retryAfterMs?: number;
   }): Promise<"pause" | "switch_model" | "wait" | "fail" | "already_handled"> {
     if (this.quotaDone.has(input.executionId)) return "already_handled";
@@ -130,16 +131,18 @@ export class ContextHandoffTrigger {
     executionId: string;
     model: string;
     failureClass: InferenceFailureClass;
+    role?: string | null;
     retryAfterMs?: number;
   }): Promise<"pause" | "switch_model" | "wait" | "fail"> {
     // Best effort: a quota failure usually ends the run, so the newest EARLIER durable checkpoint is what exists.
     await this.deps.requestCheckpoint(input.executionId);
     const sha = this.deps.latestCheckpointSha(input.missionId, input.taskId);
     const nowMs = (this.deps.now?.() ?? new Date()).getTime();
+    const catalogue = this.deps.catalogue?.(input.role ?? null) ?? [];
     const decision = decideQuotaResume({
       failureClass: input.failureClass,
       currentModelId: input.model,
-      catalogue: this.deps.catalogue?.() ?? [],
+      catalogue,
       ...(input.retryAfterMs !== undefined ? { retryAfterMs: input.retryAfterMs } : {}),
       nowMs,
       pausedAtMs: null,
@@ -150,10 +153,28 @@ export class ContextHandoffTrigger {
     });
     if (decision.action === "pause" || decision.action === "switch_model") {
       this.quotaDone.add(input.executionId);
+      const switching = decision.action === "switch_model" && decision.alternateModelId !== null;
+      const role = input.role ?? "(no role)";
+      // Never a silent pick: without a configured, eligible fallback the record says why it is not driven.
+      const blockedReason = switching
+        ? undefined
+        : `${decision.reasons.join("; ")}; ${
+            catalogue.length === 0
+              ? `no quota_fallbacks configured for role ${role} (engineering.yaml quota_fallbacks.roles.${input.role ?? "<role>"} or quota_fallbacks.default)`
+              : `none of the configured quota_fallbacks for role ${role} is eligible (${catalogue.map((m) => m.id).join(", ")})`
+          }; handoff stays blocked`;
       const done = await this.handoff(input, decision.handoffKind ?? "recovery", "quota_exhausted", {
         skipRequest: true,
         note: `${decision.action}: ${decision.reasons.join("; ")}${decision.alternateModelId ? ` -> ${decision.alternateModelId}` : ""}`,
+        extra: {
+          fromModel: input.model,
+          ...(switching ? { toModel: decision.alternateModelId } : {}),
+          ...(blockedReason ? { blockedReason } : {}),
+        },
       });
+      if (done && blockedReason) {
+        this.deps.report(input.missionId, `[mission ${input.missionId}] quota handoff BLOCKED: ${blockedReason}`);
+      }
       if (!done) this.quotaDone.delete(input.executionId);
     } else {
       this.deps.report(
@@ -168,7 +189,7 @@ export class ContextHandoffTrigger {
     obs: Pick<ContextObservation, "missionId" | "taskId" | "executionId">,
     kind: HandoffKind,
     cause: HandoffCause,
-    detail: { note: string; skipRequest?: boolean },
+    detail: { note: string; skipRequest?: boolean; extra?: Record<string, unknown> },
   ): Promise<boolean> {
     const { missionId } = obs;
     try {
@@ -202,7 +223,7 @@ export class ContextHandoffTrigger {
     obs: Pick<ContextObservation, "missionId" | "taskId" | "executionId">,
     kind: HandoffKind,
     cause: HandoffCause,
-    detail: { note: string },
+    detail: { note: string; extra?: Record<string, unknown> },
     endpoint: HandoffEndpoint,
   ): Promise<boolean> {
     const { missionId } = obs;
@@ -231,6 +252,7 @@ export class ContextHandoffTrigger {
         checkpointSha,
         createdAt,
         cause,
+        ...(detail.extra ?? {}),
       });
       this.deps.report(
         missionId,
