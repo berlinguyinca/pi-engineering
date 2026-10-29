@@ -663,6 +663,8 @@ export class ExecutionBroker {
       missionId: string;
       backend?: string;
       cancelCheckpoint?: () => Promise<void>;
+      /** Persist a checkpoint of the live execution now (context-threshold handoff); resolves when it is durable. */
+      requestCheckpoint?: () => Promise<void>;
       terminalPromise?: Promise<ExecutionOutcome>;
       authority?: DispatchAuthority;
     }
@@ -1254,6 +1256,21 @@ export class ExecutionBroker {
   }
 
   /** Revoke every active backend from an older explicit resumption before new dispatch. */
+  /**
+   * Ask a RUNNING execution to persist a checkpoint now (the context-threshold handoff trigger). Resolves true once the
+   * checkpoint is durable; false when the execution is not running here, has no checkpoint channel, or the write failed.
+   */
+  async requestCheckpoint(executionId: string): Promise<boolean> {
+    const request = this.active.get(executionId)?.requestCheckpoint;
+    if (!request) return false;
+    try {
+      await request();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async cancelStaleResumptionExecutions(missionId: string, currentGeneration: number): Promise<void> {
     const stale = [...this.active.entries()].filter(
       ([, entry]) =>
@@ -3515,6 +3532,7 @@ export class ExecutionBroker {
             }
             const activeForCheckpoint = this.active.get(execution.execution_id);
             if (activeForCheckpoint && this.checkpoints && checkpointId) {
+              activeForCheckpoint.requestCheckpoint = () => persistCheckpoint([...completedDeliverables]);
               activeForCheckpoint.cancelCheckpoint = () => {
                 checkpointScheduling = false;
                 if (checkpointTimer) clearTimeout(checkpointTimer);

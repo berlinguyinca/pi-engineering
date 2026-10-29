@@ -103,6 +103,7 @@ import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "
 import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { buildContinuityConfig } from "./continuityWiring.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
 import { type ExternalBridge, startExternalBridge } from "./herdr/externalAgent.ts";
 import { type ForkRuntime, createForkRuntime, downstreamPrNodes } from "./herdr/forkWiring.ts";
@@ -1860,7 +1861,23 @@ export class EngineeringRuntime {
         const why = error instanceof Error ? error.message : String(error);
         if (autospecOn) completionEvidence = () => [`autospec_config: integration failed to load: ${why}`];
       }
+      // Context-threshold continuity: enables the phase-boundary handoff, the live context trigger and the quota handoff.
+      const continuityModels = registryWorker
+        ? async () =>
+            (await (await registryWorker.getModelRuntime()).getAvailable()).map((model) => ({
+              provider: model.provider,
+              id: model.id,
+              contextWindow: model.contextWindow,
+            }))
+        : async () => [];
+      const phaseHandoff = await buildContinuityConfig({
+        agentDir: opts.agentDir ?? getAgentDir(),
+        models: continuityModels,
+        isModelUnavailable: (model) => rt.unavailableModels.has(model),
+        log: (line) => console.error(line),
+      });
       rt.orchestrator = new Orchestrator({
+        phaseHandoff,
         ...(completionEvidence ? { completionEvidence } : {}),
         recovery: recoveryBudget,
         store: rt.missionStore,

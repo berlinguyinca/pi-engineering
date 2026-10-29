@@ -11,7 +11,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROLE_BUDGETS, type WorkerRole } from "../core/types.ts";
 
-/** Share of the routed model's context window a worker may plan to use. */
+/**
+ * Share of the routed model's context window a worker may plan to use. A BUDGET share, not a handoff trigger: the
+ * triggers are the threshold triple in context/thresholds.ts.
+ */
 export const CONTEXT_WINDOW_SHARE = 0.7;
 /** Default share of the budget at which compaction starts (PI_WORKER_COMPACT_AT). */
 export const DEFAULT_COMPACT_AT = 0.6;

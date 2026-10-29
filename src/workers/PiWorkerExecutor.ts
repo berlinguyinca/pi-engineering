@@ -79,6 +79,7 @@ import {
   resolveTransientRetryConfig,
   withTransientRetry,
 } from "../guard/transient.ts";
+import { classifyInferenceFailure } from "../inference/failureClassifier.ts";
 import { currentInferenceInvocation, runWithInferenceInvocation } from "../inference/inferenceContext.ts";
 import { ExecutedActionTracker } from "../inference/recovery.ts";
 import { wireResilientModelRuntime } from "../inference/resilientInstall.ts";
@@ -100,6 +101,8 @@ import { emitTelemetry } from "../telemetry/sink.ts";
 import { MODEL_SUPERSEDED } from "./WorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
 import {
+  CONTEXT_USAGE_SUMMARY,
+  QUOTA_EXHAUSTED_SUMMARY,
   StreamingActivityThrottle,
   WAITING_FOR_INFERENCE_SUMMARY,
   activityFromSessionEvent,
@@ -1681,6 +1684,18 @@ ${recovery.recoveryPrompt}`;
       else if (event.type === "tool_execution_end") armStall();
       else if (event.type === "message_end" && (event.message as { role?: unknown } | undefined)?.role === "assistant")
         disarmStall();
+      if (event.type === "message_end" && (event.message as { role?: unknown } | undefined)?.role === "assistant") {
+        // Live context size for the orchestrator's threshold trigger (context/thresholds.ts): numbers only.
+        const total = (event.message as { usage?: { totalTokens?: unknown } }).usage?.totalTokens;
+        if (typeof total === "number" && typeof model.contextWindow === "number" && model.contextWindow > 0) {
+          emitWorkerActivity(req, {
+            kind: "state",
+            summary: CONTEXT_USAGE_SUMMARY,
+            meaningfulProgress: false,
+            context: { tokens: total, window: model.contextWindow, model: model.id },
+          });
+        }
+      }
       const streamed = streaming.note(event as { type?: string; message?: unknown });
       if (streamed) emitWorkerActivity(req, streamed);
       const activity = buildTimer.observe(event, activityFromSessionEvent(event));
@@ -1926,6 +1941,14 @@ ${recovery.recoveryPrompt}`;
     // loop can backoff+retry. Permanent/unknown errors fall through and are
     // reported as a failed worker below (no silent retry of non-transient bugs).
     if (promptError !== undefined) {
+      if (classifyInferenceFailure({ error: promptError }).class === "quota") {
+        emitWorkerActivity(req, {
+          kind: "state",
+          summary: QUOTA_EXHAUSTED_SUMMARY,
+          meaningfulProgress: false,
+          inferenceFailure: "quota",
+        });
+      }
       const cls = classifyError(promptError);
       if (cls.retryable) {
         session.dispose();

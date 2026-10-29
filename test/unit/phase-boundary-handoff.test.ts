@@ -85,13 +85,13 @@ describe("shouldEmitPhaseHandoff", () => {
   });
 
   it("does not emit below the threshold", () => {
-    const d = shouldEmitPhaseHandoff({ fromPhase: "classified", toPhase: "executing", contextUtilization: 0.74 });
+    const d = shouldEmitPhaseHandoff({ fromPhase: "classified", toPhase: "executing", contextUtilization: 0.69 });
     assert.equal(d.emit, false);
     assert.match(d.reason, /below/);
   });
 
   it("emits at the default threshold", () => {
-    const d = shouldEmitPhaseHandoff({ fromPhase: "classified", toPhase: "executing", contextUtilization: 0.75 });
+    const d = shouldEmitPhaseHandoff({ fromPhase: "classified", toPhase: "executing", contextUtilization: 0.7 });
     assert.equal(d.emit, true);
     assert.match(d.reason, />=/);
   });
@@ -107,7 +107,8 @@ describe("shouldEmitPhaseHandoff", () => {
   });
 
   it("exposes the standard threshold", () => {
-    assert.equal(PHASE_HANDOFF_THRESHOLD, 0.75);
+    // One threshold triple: the phase boundary hands off at the `soft` level (0.70), was a separate 0.75.
+    assert.equal(PHASE_HANDOFF_THRESHOLD, 0.7);
   });
 });
 
