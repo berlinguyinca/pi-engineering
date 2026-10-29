@@ -145,12 +145,24 @@ export function isGatewayLinkCut(text: string | undefined): boolean {
 const FLATTENED_REFUSAL_CODES: ReadonlySet<string> = new Set([
   "routing_snapshot_expired",
   "capacity_unavailable",
+  "node_updating",
   "model_activating",
   "queue_timeout",
   "queue_deadline_exceeded",
   "queue_limit_reached",
   "request_not_queueable",
 ]);
+
+/**
+ * A refusal code's own wait, when the hint was lost (flattened to the code,
+ * or a gateway that sent no Retry-After). `node_updating`: the console asks
+ * for 30 s while the only node serving the model restarts for a deployment;
+ * polling it every 5 s would only collect more refusals. Every other code
+ * keeps the generic DEFAULT_WAIT_MS.
+ */
+const REASON_DEFAULT_WAIT_MS: Readonly<Record<string, number>> = {
+  node_updating: 30_000,
+};
 
 /** "Error: 503: routing_snapshot_expired" → status 503, code. The whole text. */
 const BARE_REFUSAL = /^\s*(?:error:\s*)?(?:(?:http\s*)?(\d{3})\b[:\s]*)?([a-z_]+)\.?\s*$/i;
@@ -435,7 +447,7 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
     retryAfterMs = bodyWins ? bodyMaximum : (validHeaderWaitMs as number);
     source = bodyWins ? "body" : "header";
   } else {
-    retryAfterMs = DEFAULT_WAIT_MS;
+    retryAfterMs = REASON_DEFAULT_WAIT_MS[(reason ?? refusalCode ?? "").toLowerCase()] ?? DEFAULT_WAIT_MS;
     source = "default";
   }
 
@@ -563,8 +575,31 @@ export function gatewayFailureMarker(signal: GatewayWaitSignal): string {
   return `gateway:${signal.reason ?? signal.type ?? signal.status ?? "rate-limited"}`;
 }
 
-/** The gateway's own guidance: this model cannot serve now, another may. */
-export function advisesAlternateModel(signal: Pick<GatewayWaitSignal, "actionCode" | "action">): boolean {
+/**
+ * The only node serving the model is restarting for a deployment
+ * (`node_updating`). The console sends it with the capacity refusal's
+ * `retry_alternate` guidance, but the node is back in ~30 s: never a reason to
+ * switch models.
+ */
+export function isNodeUpdating(signal: Pick<GatewayWaitSignal, "reason" | "code">): boolean {
+  return signal.reason?.toLowerCase() === "node_updating" || signal.code?.toLowerCase() === "node_updating";
+}
+
+/**
+ * The gateway's own guidance: this model cannot serve now, another may.
+ *
+ * Never for `node_updating`, whatever its action says: a 30 s deployment
+ * restart is waited out on the same model. Every path that switches ON THE
+ * GATEWAY'S ADVICE (the pump's abandon, AdvisedModelSwitch, the fallback
+ * lifecycle's advised arm, a mission's advised give-up) reads this, so none of
+ * them switch for it. Switches that do not depend on the advice still can, by
+ * design: the opt-in hold-count fallback (three consecutive holds, off by
+ * default) and the planner worker's MODEL_LOADING third-strike switch.
+ */
+export function advisesAlternateModel(
+  signal: Pick<GatewayWaitSignal, "actionCode" | "action"> & Partial<Pick<GatewayWaitSignal, "reason" | "code">>,
+): boolean {
+  if (isNodeUpdating(signal)) return false;
   return signal.actionCode === "IW-ACT-RETRY-ALTERNATE" || signal.action === "retry_alternate";
 }
 

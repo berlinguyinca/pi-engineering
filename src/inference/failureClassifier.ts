@@ -126,6 +126,11 @@ export const INFERWEAVE_REASON_CLASS: Readonly<Record<string, InferenceFailureCl
   capacity_backpressure: "capacity_unavailable",
   global_saturation: "capacity_unavailable",
   admission_rejected: "capacity_unavailable",
+  // The only node serving the model is restarting for a deployment. Same
+  // replay guidance as capacity_unavailable (wait the declared delay; with
+  // scope "model", fallback once the wait budget is spent); `reason` keeps the
+  // token so telemetry and notices can still tell the two apart.
+  node_updating: "capacity_unavailable",
   routing_stale: "routing_stale",
   routing_snapshot_expired: "routing_stale",
   stale_route: "routing_stale",

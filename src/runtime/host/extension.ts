@@ -22,8 +22,10 @@ import { UpdateJournal } from "../../update/journal.ts";
 import { type UpdateCheckResult, UpdateManager, type UpdateOutcome, type UpdateRequest } from "../../update/manager.ts";
 import { MetadataError, parseCandidateMetadata, piCompatible } from "../../update/metadata.ts";
 import { MutationLockBusyError, type MutationLockHandle, RuntimeMutationLock } from "../../update/mutationLock.ts";
+import { type UpdateNotice, readUpdateNotice, takeUpdateNotice, writeUpdateNotice } from "../../update/notice.ts";
 import { readPreferences, writePreferences } from "../../update/preferences.ts";
 import { type RecoveryOutcome, recoverInterruptedTransaction } from "../../update/recovery.ts";
+import { describeMove, runtimeLabel } from "../../update/reporting.ts";
 import { applyRetention } from "../../update/retention.ts";
 import { planRollback } from "../../update/rollback.ts";
 import { DEFAULT_CHECK_INTERVAL_MS, shouldCheck } from "../../update/selfUpdate.ts";
@@ -389,15 +391,17 @@ export class EngineeringHostExtension {
 
   /**
    * The seam the legacy `/update` command drives when Pi loaded the extension
-   * from an installed version directory (no version-control metadata, so the
-   * checkout fast-forward cannot apply).
+   * from an installed runtime (no version-control metadata, so the checkout
+   * fast-forward cannot apply). Ownership is the install's question to answer,
+   * and it covers the generation snapshot the extension is actually imported
+   * from — not just `versions/<id>`.
    *
    * Activation stays here: the bridge only forwards to this Host's UpdateManager,
    * which is the single owner of the pointer switch and the handover.
    */
   private updateBridge(): RuntimeUpdateBridge {
     return {
-      owns: (dir: string) => this.layout.isVersionDir(dir),
+      owns: (dir: string) => this.layout.ownsRuntimeTree(dir),
       check: async () => {
         const check = await this.updates.check({});
         return {
@@ -499,6 +503,8 @@ export class EngineeringHostExtension {
     this.withdrawBridge();
     if (this.checkTimer) clearTimeout(this.checkTimer);
     this.checkTimer = undefined;
+    if (this.parkedTimer) clearTimeout(this.parkedTimer);
+    this.parkedTimer = undefined;
     this.host?.pendingTask()?.cancel();
     this.unpublishMaintenance();
     await this.stopSourceWatch();
@@ -515,6 +521,9 @@ export class EngineeringHostExtension {
    */
   private onSessionStart(ctx: Ctx): void {
     this.startSourceWatch(ctx);
+    // An outcome another process reported waits here: telemetry alone never
+    // reaches the operator (issue #484).
+    this.deliverPendingNotice(ctx);
     if (this.startupFallback) {
       try {
         ctx.ui?.setStatus?.(
@@ -658,37 +667,40 @@ export class EngineeringHostExtension {
           notify(target, `Pi Engineering update check failed: ${check.failure}`, "warning");
         }
         if (check.target && !check.upToDate && !check.failure) {
+          const to = { version: check.target.metadata.version, commit: check.target.sha };
+          const move = describeMove(check.current, to);
           try {
             target?.ui?.setStatus?.(
               UPDATE_STATUS_KEY,
-              `Pi Engineering ${check.current?.version ?? ""} · ${check.target.metadata.version} available`,
+              `Pi Engineering ${runtimeLabel(check.current)} · ${runtimeLabel(to)} available`,
             );
           } catch {
             // A stale ctx cannot show a status; the panel still does.
           }
           if (prefs.autoInstall && check.pi.ok) {
-            const to = check.target.metadata.version;
-            notify(
-              target,
-              `Pi Engineering ${check.current?.version ?? "?"} → ${to}: updating automatically (progress in the status line).`,
-            );
+            notify(target, `Pi Engineering ${move}: updating automatically (progress in the status line).`);
             const outcome = await this.updates.update({}, updateProgressReporter(target?.ui));
             this.lastUpdateOutcome = outcome;
             if (outcome.status === "handover") {
-              void outcome.done.then(({ result }) => {
+              void outcome.done.then(({ result, record }) => {
                 clearUpdateStatus(target);
-                notify(
-                  target,
-                  result.ok
-                    ? `Pi Engineering ${to} activated.`
-                    : `Pi Engineering ${to} did not activate (${result.failure ?? result.phase}): the running runtime was not touched.`,
-                  result.ok ? "info" : "warning",
-                );
+                this.reportOutcome(target, {
+                  kind: result.ok ? "activated" : "failed",
+                  transaction: record?.transaction ?? null,
+                  at: new Date().toISOString(),
+                  text: result.ok
+                    ? `Pi Engineering ${runtimeLabel(to)} activated.`
+                    : `Pi Engineering ${runtimeLabel(to)} did not activate (${result.failure ?? result.phase}): the running runtime was not touched.`,
+                });
               });
               await outcome.done;
             } else {
               clearUpdateStatus(target);
-              notify(target, formatOutcome(outcome), "warning");
+              this.reportOutcome(target, {
+                kind: outcome.status === "refused" ? "refused" : "failed",
+                at: new Date().toISOString(),
+                text: formatOutcome(outcome, move),
+              });
             }
           }
         }
@@ -736,6 +748,104 @@ export class EngineeringHostExtension {
     await this.host?.pruneSnapshots();
   }
 
+  /**
+   * Tell the operator how an update ended (issue #484). The notice is persisted
+   * first, so a process that dies mid-report still leaves its outcome behind;
+   * a session that could be told directly takes it back so the next session is
+   * not told the same thing again. A clean no-op never comes here.
+   */
+  private reportOutcome(ctx: Ctx | undefined, notice: UpdateNotice): void {
+    try {
+      writeUpdateNotice(this.layout.noticeFile, notice);
+    } catch {
+      // A notice that cannot be persisted cannot be delivered later; saying it
+      // now is still worth trying.
+    }
+    if (!ctx?.ui?.notify) return;
+    notify(ctx, notice.text, notice.kind === "activated" ? "info" : "warning");
+    takeUpdateNotice(this.layout.noticeFile);
+  }
+
+  /**
+   * Show what a previous process reported, exactly once. Returns null when
+   * there is nothing pending or nobody to tell it to — an undelivered notice
+   * waits for a session with a UI instead of being consumed and lost.
+   */
+  deliverPendingNotice(ctx?: Ctx): UpdateNotice | null {
+    const target = (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined;
+    const notice = readUpdateNotice(this.layout.noticeFile);
+    if (!notice || !target?.ui?.notify) return null;
+    notify(target, notice.text, notice.kind === "activated" ? "info" : "warning");
+    takeUpdateNotice(this.layout.noticeFile);
+    return notice;
+  }
+
+  /** The deferred continuation of a candidate recovery parked (issue #483). */
+  private parkedTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /**
+   * Finish an update a previous process left staged (issue #483). It runs
+   * through the ordinary update path — lock, re-validation, activation, rollback
+   * — so nothing about a handover weakens; only the reporting differs, because
+   * the session that started the transaction is gone (issue #484).
+   */
+  private continueParkedUpdate(): Promise<void> {
+    return (async () => {
+      const ctx = (this.host?.latestContext() ?? undefined) as Ctx | undefined;
+      const outcome = await this.updates.update({}, updateProgressReporter(ctx?.ui));
+      this.lastUpdateOutcome = outcome;
+      if (outcome.status === "handover") {
+        const to = { version: outcome.check.target?.metadata.version, commit: outcome.check.target?.sha };
+        const { result, record } = await outcome.done;
+        this.reportOutcome(ctx, {
+          kind: result.ok ? "activated" : "failed",
+          transaction: record?.transaction ?? null,
+          at: new Date().toISOString(),
+          text: result.ok
+            ? `Pi Engineering ${runtimeLabel(to)} activated.`
+            : `Pi Engineering ${runtimeLabel(to)} did not activate (${result.failure ?? result.phase}): the running runtime was not touched.`,
+        });
+        if (result.ok) void this.retain().catch(() => {});
+        return;
+      }
+      // Up to date is silence, and a refusal means another process owns the
+      // transaction and reports its own outcome; anything else has to be seen.
+      if (outcome.status === "up_to_date" || outcome.status === "refused") return;
+      this.reportOutcome(ctx, {
+        kind: "failed",
+        at: new Date().toISOString(),
+        text: formatOutcome(outcome),
+      });
+    })().catch(() => undefined);
+  }
+
+  /** What startup recovery did to a transaction another process was running. */
+  private reportRecovery(outcome: RecoveryOutcome): void {
+    const kind =
+      outcome.action === "resumable" ? "interrupted" : outcome.action === "rolled_back" ? "rolled_back" : "failed";
+    const text =
+      outcome.action === "resumable"
+        ? `Pi Engineering ${describeMove(
+            { version: outcome.record?.fromVersion, commit: outcome.record?.fromCommit },
+            { version: outcome.record?.toVersion, commit: outcome.record?.toCommit },
+          )} was interrupted during ${outcome.record?.phase}; the staged update is parked, run /engineering update to continue it.`
+        : outcome.action === "rolled_back"
+          ? `Pi Engineering ${describeMove(
+              { version: outcome.record?.fromVersion, commit: outcome.record?.fromCommit },
+              { version: outcome.record?.toVersion, commit: outcome.record?.toCommit },
+            )} was interrupted during ${outcome.record?.phase}; the previous runtime was restored.`
+          : `Pi Engineering ${describeMove(
+              { version: outcome.record?.fromVersion, commit: outcome.record?.fromCommit },
+              { version: outcome.record?.toVersion, commit: outcome.record?.toCommit },
+            )} was interrupted during ${outcome.record?.phase} and marked failed: the running runtime was not touched. Run /engineering update to retry.`;
+    this.reportOutcome(undefined, {
+      kind,
+      transaction: outcome.record?.transaction ?? null,
+      at: new Date().toISOString(),
+      text,
+    });
+  }
+
   /** Crash recovery under the mutation lock (spec §30). Never blocks startup. */
   async recoverOnStartup(): Promise<RecoveryOutcome> {
     let handle: MutationLockHandle;
@@ -748,7 +858,25 @@ export class EngineeringHostExtension {
       return { action: "none", detail: `recovery skipped: ${error instanceof Error ? error.message : String(error)}` };
     }
     try {
-      return await recoverInterruptedTransaction(this.layout, this.journal, this.telemetry);
+      const recovered = await recoverInterruptedTransaction(this.layout, this.journal, this.telemetry);
+      // Whatever recovery decided belongs to a transaction this process never
+      // ran, so no session is watching for it: report it (issue #484).
+      if (recovered.action !== "none" && recovered.action !== "quarantined_corrupt_journal") {
+        this.reportRecovery(recovered);
+      }
+      if (recovered.action === "resumable" && readPreferences(this.layout.preferencesFile).autoInstall) {
+        // The candidate an earlier process staged is finished here, not left
+        // waiting for a command (issue #483). Deferred and unref'd: recovery
+        // must never block startup, and the update path still takes the
+        // mutation lock, re-validates, and rolls back on failure.
+        const timer = setTimeout(() => {
+          this.parkedTimer = undefined;
+          void this.continueParkedUpdate();
+        }, 0);
+        timer.unref?.();
+        this.parkedTimer = timer;
+      }
+      return recovered;
     } catch (error) {
       // Recovery failing must not stop Pi: the Host's fallback chain still
       // finds a runtime that passes health.
@@ -1205,15 +1333,34 @@ export class EngineeringHostExtension {
     const steps = progress.length > 0 ? ["", ...progress] : [];
     if (outcome.status !== "handover") {
       clearUpdateStatus(ctx);
+      // Only a result that consulted the channel can name the move.
+      const move =
+        "check" in outcome
+          ? describeMove(
+              outcome.check.current,
+              outcome.check.target
+                ? { version: outcome.check.target.metadata.version, commit: outcome.check.target.sha }
+                : null,
+            )
+          : undefined;
       return notify(
         ctx,
-        [...(movedLine ? [movedLine, ""] : []), ...steps, formatOutcome(outcome)].join("\n"),
+        [...(movedLine ? [movedLine, ""] : []), ...steps, formatOutcome(outcome, move)].join("\n"),
         "warning",
       );
     }
     const from = outcome.check.current?.version;
     const to = outcome.check.target?.metadata.version;
-    const header = [`Pi Engineering ${from ?? "?"} → ${to ?? "?"}`, "", ...progress];
+    const header = [
+      `Pi Engineering ${describeMove(
+        outcome.check.current,
+        outcome.check.target
+          ? { version: outcome.check.target.metadata.version, commit: outcome.check.target.sha }
+          : null,
+      )}`,
+      "",
+      ...progress,
+    ];
     const format = (r: HandoverResult) =>
       [...header, formatHandover(r, { from, to, action: "Updated" }).replace(/^Pi Engineering\n\n/, "")].join("\n");
     // The status line keeps saying what it is waiting for until activation ends.
@@ -1503,17 +1650,17 @@ export function formatCheck(c: UpdateCheckResult): string {
   return lines.join("\n");
 }
 
-export function formatOutcome(o: Exclude<UpdateOutcome, { status: "handover" }>): string {
+export function formatOutcome(o: Exclude<UpdateOutcome, { status: "handover" }>, move?: string): string {
   switch (o.status) {
     case "refused":
       return o.reason;
     case "up_to_date":
-      return `Pi Engineering ${o.check.current?.version ?? ""} is up to date (${short(o.check.target?.sha)} on ${o.check.channel}). Use --force to reinstall it.`;
+      return `Pi Engineering ${runtimeLabel(o.check.current)} is up to date (${short(o.check.target?.sha)} on ${o.check.channel}). Use --force to reinstall it.`;
     case "pi_incompatible":
       return o.reason;
     case "failed":
       return [
-        `Pi Engineering update failed during ${o.stage}: ${o.reason}`,
+        `Pi Engineering ${move ? `${move} ` : ""}update failed during ${o.stage}: ${o.reason}`,
         ...(o.steps ?? []).map(
           (s) =>
             `${s.status === "passed" ? "✓" : s.status === "skipped" ? "–" : "✗"} ${s.name}${s.detail ? ` (${s.detail})` : ""}`,

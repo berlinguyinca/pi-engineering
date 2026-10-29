@@ -1,6 +1,6 @@
 /** Live local activity in Pi's native spinner, with a persistent gateway detail panel. */
 import type { AdmissionEvent } from "../gateway/AdmissionController.ts";
-import { formatWaitingFor, gatewayWaitLabel } from "../gateway/admissionNotice.ts";
+import { formatWaitingFor, gatewayWaitLabel, waitReasonText } from "../gateway/admissionNotice.ts";
 import type { GatewayWaitSignal } from "../gateway/signals.ts";
 import { activityFromSessionEvent, safeWorkerOutputPreview } from "../workers/activity.ts";
 import { StatusSurfaceBus, type SurfaceProducer } from "./surfaceBus.ts";
@@ -162,7 +162,7 @@ export class WorkingStatusController {
       const { signal, until, since } = this.wait;
       const remaining = Math.max(0, Math.ceil((until - now) / 1000));
       const retry = remaining > 0 ? `retry in ${remaining}s` : "Awaiting gateway response";
-      const reason = safeWorkerOutputPreview((signal.reason ?? signal.type ?? "gateway wait").replaceAll("_", " "));
+      const reason = safeWorkerOutputPreview(signal.reason || signal.type ? waitReasonText(signal) : "gateway wait");
       const load = [
         signal.queued !== undefined
           ? `${signal.queued}${signal.queueLimit !== undefined ? `/${signal.queueLimit}` : ""} queued`

@@ -44,8 +44,11 @@ export interface RuntimeUpdateApplyReport {
 
 export interface RuntimeUpdateBridge {
   /**
-   * True when `dir` is a version directory of the install this bridge drives —
-   * i.e. the tree Pi is actually loading the extension from.
+   * True when `dir` is a runtime tree of the install this bridge drives — the
+   * installed version directory or a generation snapshot copied out of one —
+   * i.e. the tree Pi is actually loading the extension from. A snapshot counts
+   * because Pi imports from the snapshot: owning only `versions/<id>` meant no
+   * installed session could ever drive an update.
    */
   owns(dir: string): boolean;
   /** Read-only: no staging, no pointer move, no journal write (§13). */

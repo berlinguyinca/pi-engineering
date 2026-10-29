@@ -6,6 +6,9 @@
  * working message is a label — neither may fail a mission, so every sink call
  * is guarded and a torn-down terminal is treated as a no-op sink.
  */
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { redactSecrets } from "../platform/redact.ts";
 import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
 import { type PresenceBasis, type PresenceView, presenceRank, projectPresence, renderWidgetLines } from "./presence.ts";
@@ -23,6 +26,13 @@ const NOTIFY_STATES = new Set(["FAILED", "COMPLETE"]);
  * notice, which claims 90.
  */
 const PRESENCE_PRIORITY = 50;
+/**
+ * A mission that stopped (or finished) longer ago than this is history when it
+ * first reaches a session as a live event: the operator is not interrupted for it.
+ */
+export const STALE_STOP_WINDOW_MS = 60 * 60 * 1000;
+/** Most missions the durable "already told" ledger remembers. */
+const LEDGER_MAX_ENTRIES = 500;
 
 export interface PresenceSink {
   setWorkingMessage?(text?: string): void;
@@ -48,6 +58,11 @@ export interface PresenceOptions {
    * controller, so neither one has to guard the other out by hand.
    */
   bus?: StatusSurfaceBus;
+  /**
+   * JSON file remembering the last state seen per mission, so a new session
+   * does not repeat a notification the operator already got. Absent: in-memory only.
+   */
+  notifiedLedgerFile?: string;
 }
 
 export interface PresenceEnvOptions extends PresenceOptions {
@@ -105,6 +120,30 @@ function stateKey(event: RuntimeMissionActivityEvent): string {
   return `${event.state}|${event.health}|${presenceRank(event)}`;
 }
 
+function readLedger(file: string | undefined): Map<string, string> {
+  if (!file) return new Map();
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return new Map();
+    return new Map(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * The most recent state timestamp the event carries; undefined when none parses
+ * (no evidence it is old). `observedAt` is the runtime's emit time, not the
+ * state's, so it is only a fallback when neither progress nor heartbeat parses.
+ */
+function lastStateAt(event: RuntimeMissionActivityEvent): number | undefined {
+  const parse = (stamp: string | null | undefined) => (stamp ? Date.parse(stamp) : Number.NaN);
+  const state = [parse(event.lastMeaningfulProgressAt), parse(event.lastHeartbeatAt)].filter(Number.isFinite);
+  if (state.length > 0) return Math.max(...state);
+  const observed = parse(event.observedAt);
+  return Number.isFinite(observed) ? observed : undefined;
+}
+
 function flat(text: string, max: number): string {
   const safe = redactSecrets(text)
     .replace(/[\p{Cc}\p{Cf}]/gu, " ")
@@ -127,6 +166,8 @@ export class MissionPresenceController {
   private readonly quietMs: number;
   private lastQuietAt = 0;
   private readonly live = new Map<string, Tracked>();
+  private readonly ledgerFile: string | undefined;
+  private ledger: Map<string, string>;
   private agentActive = false;
   private disposed = false;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -143,6 +184,8 @@ export class MissionPresenceController {
     this.quiet = options.quiet;
     this.now = options.now ?? Date.now;
     this.quietMs = options.quietMs ?? 60_000;
+    this.ledgerFile = options.notifiedLedgerFile;
+    this.ledger = readLedger(this.ledgerFile);
     const intervalMs = options.intervalMs ?? 1_000;
     if (intervalMs > 0) {
       this.timer = setInterval(() => this.tick(), intervalMs);
@@ -178,8 +221,43 @@ export class MissionPresenceController {
       // first sighting that is itself history, or a repeat of it, stays silent.
       baseline: previous
         ? previous.baseline && (source !== "activity" || stateKey(previous.event) === stateKey(event))
-        : source !== "activity",
+        : source !== "activity" || this.isStaleStop(event),
     });
+  }
+
+  /** A stopped or finished mission whose last state change is older than the window. */
+  private isStaleStop(event: RuntimeMissionActivityEvent): boolean {
+    if (presenceRank(event) > 1 && !NOTIFY_STATES.has(event.state)) return false;
+    const at = lastStateAt(event);
+    return at !== undefined && this.now() - at > STALE_STOP_WINDOW_MS;
+  }
+
+  /** Re-read the shared ledger so another live session's entries count. */
+  private refreshLedger(): void {
+    if (this.ledgerFile) this.ledger = readLedger(this.ledgerFile);
+  }
+
+  /** `fresh`: the caller read the ledger moments ago, so skip the second read. */
+  private remember(missionId: string, key: string, fresh = false): void {
+    if (!fresh) this.refreshLedger();
+    if (this.ledger.get(missionId) === key) return;
+    this.ledger.delete(missionId);
+    this.ledger.set(missionId, key);
+    while (this.ledger.size > LEDGER_MAX_ENTRIES) this.ledger.delete(this.ledger.keys().next().value as string);
+    if (!this.ledgerFile) return;
+    const temp = `${this.ledgerFile}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    try {
+      mkdirSync(dirname(this.ledgerFile), { recursive: true, mode: 0o700 });
+      writeFileSync(temp, JSON.stringify(Object.fromEntries(this.ledger)), { mode: 0o600 });
+      renameSync(temp, this.ledgerFile);
+    } catch {
+      // The ledger is a courtesy; a read-only state dir must not break presence.
+      try {
+        unlinkSync(temp);
+      } catch {
+        // Nothing to clean up.
+      }
+    }
   }
 
   /**
@@ -271,9 +349,11 @@ export class MissionPresenceController {
   private notifyAttention(): void {
     for (const tracked of this.live.values()) {
       const event = tracked.event;
+      const key = stateKey(event);
       if (tracked.baseline) {
         tracked.baseline = false;
         this.bus.observe(event.missionId, `${event.state}|${event.health}`);
+        this.remember(event.missionId, key);
         continue;
       }
       const rank = presenceRank(event);
@@ -281,6 +361,13 @@ export class MissionPresenceController {
       // A quiet sighting is still a change worth remembering: the next one
       // notifies even though nothing in between interrupted the operator.
       if (!urgent) {
+        this.bus.observe(event.missionId, `${event.state}|${event.health}`);
+        this.remember(event.missionId, key);
+        continue;
+      }
+      // An earlier session already told the operator about exactly this state.
+      this.refreshLedger();
+      if (this.ledger.get(event.missionId) === key) {
         this.bus.observe(event.missionId, `${event.state}|${event.health}`);
         continue;
       }
@@ -297,6 +384,7 @@ export class MissionPresenceController {
         `Mission ${event.missionId} ${what}${reason ? `: ${reason}` : ""}${next}`,
         rank <= 1 || event.state === "FAILED" ? "warning" : "info",
       );
+      this.remember(event.missionId, key, true);
     }
   }
 

@@ -42,6 +42,12 @@ export interface InstalledVersion extends InstalledVersionMeta {
 
 const VERSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 
+/** `generations/<pid>-<3 random bytes hex>/` — one per Pi process. */
+const PROCESS_GENERATIONS = /^\d+-[0-9a-f]{6}$/;
+
+/** A generation snapshot directory: `<sanitized label>-<time base36>-<3 bytes hex>`. */
+const SNAPSHOT_NAME = /^[A-Za-z0-9._-]{1,40}-[0-9a-z]{6,13}-[0-9a-f]{6}$/;
+
 export function versionId(version: string, commit: string | null): string {
   const v = version.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 40);
   return commit ? `${v}-${commit.slice(0, 12)}` : v;
@@ -57,6 +63,10 @@ export class InstallLayout {
   get versionsDir(): string {
     return join(this.root, "versions");
   }
+  /** Per-process generation snapshots live under `generations/<pid>-<rand>/`. */
+  get generationsDir(): string {
+    return join(this.root, "generations");
+  }
   get stagingDir(): string {
     return join(this.root, "staging");
   }
@@ -68,6 +78,10 @@ export class InstallLayout {
   }
   get lockFile(): string {
     return join(this.root, "runtime-update.lock");
+  }
+  /** The outcome a previous process reported but no session has shown yet. */
+  get noticeFile(): string {
+    return join(this.root, "update-notice.json");
   }
   get preferencesFile(): string {
     return join(this.root, "update-preferences.json");
@@ -90,6 +104,34 @@ export class InstallLayout {
     const abs = resolve(dir);
     if (dirname(abs) !== this.versionsDir) return false;
     return VERSION_ID.test(basename(abs));
+  }
+
+  /**
+   * Is `dir` a runtime tree this install produced — the installed version itself
+   * or a generation snapshot copied out of one? This is what the update seam asks
+   * about, because Pi imports the extension from a snapshot, never from
+   * `versions/<id>`: owning only the version directory made every installed
+   * session answer `/update` with the checkout fast-forward, which can only say
+   * "not a git checkout", so the update silently never ran.
+   *
+   * `isVersionDir` stays strict: a snapshot is a working copy, and a pointer may
+   * still only be aimed at `versions/<id>`.
+   */
+  ownsRuntimeTree(dir: string): boolean {
+    const abs = resolve(dir);
+    if (this.isVersionDir(abs)) return true;
+
+    // generations/<pid>-<rand>/<label>-<ts>-<rand>/, two levels deep and no
+    // deeper: `..` inside the path has already been resolved away.
+    const processDir = dirname(abs);
+    if (dirname(processDir) !== this.generationsDir) return false;
+    if (!PROCESS_GENERATIONS.test(basename(processDir))) return false;
+    if (!SNAPSHOT_NAME.test(basename(abs))) return false;
+
+    // A snapshot is a copy of a version this install has. Without the record —
+    // or with one naming a version that is not installed — it is not ours.
+    const meta = this.readMeta(abs);
+    return meta !== null && VERSION_ID.test(meta.id) && existsSync(this.versionDir(meta.id));
   }
 
   /** The version directory a pointer names, or null when absent/invalid. */
