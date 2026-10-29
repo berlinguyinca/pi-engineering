@@ -470,6 +470,10 @@ export class Orchestrator {
   private readonly continuityTrigger: ContextHandoffTrigger | null = null;
   /** Runs verify -> fence -> acknowledge for every handoff record the trigger creates; null with the trigger. */
   private readonly handoffDriver: HandoffDriver | null = null;
+  /** Writes the orchestrating session's checkpoint at a phase boundary. */
+  private readonly checkpointManager: CheckpointManager;
+  /** Phase-boundary handoff emissions in flight (checkpoint write + record), settled by settleHandoffs. */
+  private readonly phaseEmits = new Set<Promise<void>>();
   /** Last phase observed per mission, so the boundary handoff fires once per transition. */
   private readonly missionPhase = new Map<string, string>();
   private readonly failureClassifier = new FailureClassifier();
@@ -488,6 +492,7 @@ export class Orchestrator {
     this.recoveryPlanner = new RecoveryPlanner(opts.recovery);
     this.phaseHandoffCfg = opts.phaseHandoff ?? null;
     const checkpoints = new CheckpointManager({ store: this.store });
+    this.checkpointManager = checkpoints;
     this.broker = new ExecutionBroker({
       store: this.store,
       backends: opts.backends,
@@ -1832,7 +1837,8 @@ export class Orchestrator {
     const previous = this.missionPhase.get(mission.mission_id) ?? null;
     if (previous !== phase) {
       this.missionPhase.set(mission.mission_id, phase);
-      this.emitPhaseBoundaryHandoff(mission, previous, phase);
+      const emit = this.emitPhaseBoundaryHandoff(mission, previous, phase).finally(() => this.phaseEmits.delete(emit));
+      this.phaseEmits.add(emit);
     }
     // Crash recovery and retry: any open trigger-created handoff of this mission is driven again (idempotent).
     void this.handoffDriver?.resumeOpen(mission.mission_id);
@@ -1850,7 +1856,7 @@ export class Orchestrator {
    * fallback — native (selective) compaction under context pressure — and the
    * decision is reported; the handoff path itself never triggers compaction.
    */
-  private emitPhaseBoundaryHandoff(mission: Mission, fromPhase: string | null, toPhase: string): void {
+  private async emitPhaseBoundaryHandoff(mission: Mission, fromPhase: string | null, toPhase: string): Promise<void> {
     const cfg = this.phaseHandoffCfg;
     if (!cfg) return;
     const utilization = missionContextUtilization(
@@ -1877,8 +1883,17 @@ export class Orchestrator {
       return;
     }
 
-    const checkpointSha = this.store.listTaskCheckpoints(mission.mission_id).at(-1)?.candidateSha ?? undefined;
     try {
+      // The predecessor is the orchestrating session, which wrote no checkpoint of its own: write one now, from the
+      // mission's durable state, through the checkpoint writer. No checkpoint, no handoff (fallback below).
+      const checkpoint = this.checkpointManager.persistPhaseBoundary({
+        missionId: mission.mission_id,
+        fromPhase,
+        toPhase,
+        sessionId: endpoint.sessionId,
+        reason: decision.reason,
+      });
+      const checkpointSha = checkpoint.candidateSha ?? undefined;
       const record = this.store.addHandoffRecord({
         // A phase handoff is only emitted under context pressure (>= the soft level), so say so.
         ...buildPhaseTransitionRecord({
@@ -1894,6 +1909,9 @@ export class Orchestrator {
         mission.mission_id,
         `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff ${record.id}${checkpointSha ? ` @ ${checkpointSha.slice(0, 7)}` : ""} (utilization ${utilization!.toFixed(2)})`,
       );
+      // The production caller for phase records too: verify the orchestrator checkpoint, fence the previous phase's
+      // stragglers, acknowledge the next phase (see HandoffDriver).
+      void this.handoffDriver?.drive(record.id);
     } catch (error) {
       const errors =
         error instanceof HandoffRecordError ? error.errors : [error instanceof Error ? error.message : String(error)];
@@ -1907,6 +1925,7 @@ export class Orchestrator {
 
   /** Resolves when no handoff drive is in flight (tests, shutdown). */
   async settleHandoffs(): Promise<void> {
+    while (this.phaseEmits.size > 0) await Promise.allSettled([...this.phaseEmits]);
     await this.handoffDriver?.idle();
   }
 

@@ -2932,8 +2932,23 @@ export class MissionStore {
     if (mismatches.length > 0) throw new Error(`checkpoint origin mismatch: ${mismatches.join(", ")}`);
   }
 
+  /** Worker checkpoints only; orchestrator phase checkpoints are read through listOrchestratorCheckpoints. */
   listTaskCheckpoints(missionId?: string, taskId?: string): TaskCheckpoint[] {
+    return this.sortedCheckpoints(missionId, taskId, false);
+  }
+
+  /** Checkpoints the orchestrating session wrote at phase boundaries (oldest first). */
+  listOrchestratorCheckpoints(missionId?: string): TaskCheckpoint[] {
+    return this.sortedCheckpoints(missionId, undefined, true);
+  }
+
+  private sortedCheckpoints(
+    missionId: string | undefined,
+    taskId: string | undefined,
+    orchestrator: boolean,
+  ): TaskCheckpoint[] {
     return [...this.taskCheckpoints.values()]
+      .filter((checkpoint) => (checkpoint.scope === "orchestrator") === orchestrator)
       .filter((checkpoint) => (missionId ? checkpoint.missionId === missionId : true))
       .filter((checkpoint) => (taskId ? checkpoint.taskId === taskId : true))
       .sort(

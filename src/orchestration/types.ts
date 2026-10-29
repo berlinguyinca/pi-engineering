@@ -413,6 +413,12 @@ export interface TaskCheckpoint {
   fencingToken: number;
   /** Present only when the worker supplied handoff context. */
   handoff?: CheckpointHandoffContext;
+  /**
+   * `orchestrator`: written by the orchestrating session at a phase boundary, not by a worker execution. It is
+   * excluded from every task-level checkpoint read (recovery, quota/context handoffs, mission `.at(-1)` lookups) and
+   * only the phase handoff reads it (MissionStore.listOrchestratorCheckpoints).
+   */
+  scope?: "orchestrator";
   createdAt: string;
 }
 
