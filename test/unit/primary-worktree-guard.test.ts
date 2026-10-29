@@ -30,6 +30,7 @@ import {
   extractWriteTargets,
   isMutatingGitCommand,
   isPrimaryWorktree,
+  mutatingGitLocations,
   mutatingGitSegment,
   resolvePrimaryWorktreeGuardConfig,
 } from "../../src/guard/primaryWorktreeGuard.ts";
@@ -39,7 +40,18 @@ const exec = promisify(execFile);
 // ── config resolution ────────────────────────────────────────────────────────
 
 test("config: enabled by default, no primary authorization", () => {
-  assert.deepEqual(resolvePrimaryWorktreeGuardConfig({}), { enabled: true, primarySession: false });
+  assert.deepEqual(resolvePrimaryWorktreeGuardConfig({}), {
+    enabled: true,
+    primarySession: false,
+    branchTeardown: true,
+  });
+});
+
+test("config: PI_ENG_BRANCH_TEARDOWN=0 refuses even a provably no-loss branch delete", () => {
+  for (const off of ["0", "false", "off", "no"]) {
+    assert.equal(resolvePrimaryWorktreeGuardConfig({ PI_ENG_BRANCH_TEARDOWN: off }).branchTeardown, false, off);
+  }
+  assert.equal(resolvePrimaryWorktreeGuardConfig({ PI_ENG_BRANCH_TEARDOWN: "1" }).branchTeardown, true);
 });
 
 test("config: PI_ENG_WORKTREE_GUARD=0 disables the guard", () => {
@@ -313,6 +325,74 @@ test("effectiveGitCwd: session cwd by default, cd and git -C override", () => {
   assert.equal(effectiveGitCwd("cd /a && git -C /b commit", "/session"), "/b");
 });
 
+test("effectiveGitCwd: --git-dir and --work-tree name the checkout", () => {
+  // `--git-dir` is the way around `-C`. A session refused `git -C <primary>
+  // branch -D x` reached for `git --git-dir=<primary>/.git branch -D x` and got
+  // through, which is not a hole the guard should be surprised by.
+  assert.equal(effectiveGitCwd("git --git-dir=/repo/.git branch -D feat/x", "/session"), "/repo");
+  assert.equal(effectiveGitCwd("git --git-dir /repo/.git push origin main", "/session"), "/repo");
+  assert.equal(effectiveGitCwd("git -C /elsewhere --work-tree=/repo add -A", "/session"), "/repo");
+  assert.equal(effectiveGitCwd("git --work-tree=/repo --git-dir=/r/.git commit -m x", "/session"), "/repo");
+  // A relative value resolves against the directory the segment runs in.
+  assert.equal(effectiveGitCwd("cd /work && git --git-dir=.git commit -m x", "/session"), "/work");
+  // A linked worktree's git dir stays inside the primary tree: fail closed.
+  assert.equal(
+    effectiveGitCwd("git --git-dir=/repo/.git/worktrees/wt1 commit", "/session"),
+    "/repo/.git/worktrees/wt1",
+  );
+});
+
+test("mutatingGitLocations: each segment is judged where it runs", () => {
+  // The last step of a session's work, refused twice in a live session —
+  // including the push that would have published the guard fix itself. Under
+  // the whole-command view the tail's `-C` won and the push looked like a
+  // primary-checkout mutation.
+  const command = "cd /wt && git push -u origin fix/x && git -C /repo log --oneline -3";
+  const locations = mutatingGitLocations(command, "/session");
+  assert.deepEqual(
+    locations.map((l) => [l.verb, l.cwd]),
+    [["push", "/wt"]],
+    command,
+  );
+
+  // A mutating segment in the primary is still found, whatever the other
+  // segments do, and a `cd` carries across segments as the shell carries it.
+  assert.deepEqual(
+    mutatingGitLocations("git -C /wt commit -m x && cd /repo && git commit -m y", "/session").map((l) => l.cwd),
+    ["/wt", "/repo"],
+  );
+  assert.deepEqual(
+    mutatingGitLocations("git --git-dir=/repo/.git branch -D feat/x", "/session").map((l) => [l.verb, l.cwd]),
+    [["branch", "/repo"]],
+  );
+  assert.deepEqual(mutatingGitLocations("git status && git ls-remote --heads origin", "/session"), []);
+});
+
+test("guard: a push in the session's own worktree is not a primary mutation", async () => {
+  const guard = guardFor(async (root) => root === "/repo", {}, "/wt");
+  assert.equal(
+    await guard.onToolCall("bash", { command: "cd /wt && git push -u origin fix/x && git -C /repo log --oneline -3" }),
+    undefined,
+  );
+  // The same push aimed at the primary checkout's branch is still refused.
+  const blocked = await guard.onToolCall("bash", { command: "git -C /repo push origin main" });
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /Culprit segment/u);
+});
+
+test("guard: a write is judged where its own segment runs", async () => {
+  const guard = guardFor(async (root) => root === "/repo", {}, "/wt");
+  // The redirect lands in the session's worktree; only the LATER step names the
+  // primary checkout. Judged against that later directory, the write looked like
+  // a primary-checkout edit.
+  assert.equal(
+    await guard.onToolCall("bash", { command: "cd /wt && echo x > notes.md && git -C /repo log --oneline" }),
+    undefined,
+  );
+  // The same redirect aimed at the primary checkout is still refused.
+  assert.equal((await guard.onToolCall("bash", { command: "cd /wt && echo x > ../repo/notes.md" }))?.block, true);
+});
+
 // ── guard verdicts (injected primary checker: no git needed) ────────────────
 
 function guardFor(
@@ -438,6 +518,117 @@ test("guard end-to-end on a real repo: primary blocked, own worktree allowed", a
       (await sessionInWorktree.onToolCall("bash", { command: `cd ${primary} && git commit -m x` }))?.block,
       true,
     );
+  } finally {
+    cleanup();
+  }
+});
+
+// ── branch teardown: the convention's end-of-life step ───────────────────────
+
+/**
+ * A repository in the shape a finished session leaves: `feat/x` carries a
+ * commit, squash-merged into `main` so the branch's own commits stay ahead of
+ * the base while its content is entirely in it, and its worktree still checked
+ * out (callers remove it when the session is done).
+ */
+async function repoWithSessionBranch(): Promise<{ primary: string; linked: string; cleanup: () => void }> {
+  const repo = await scratchRepoWithWorktree();
+  writeFileSync(join(repo.linked, "feat.txt"), "work");
+  await exec("git", ["-C", repo.linked, "add", "-A"]);
+  await exec("git", ["-C", repo.linked, "commit", "-qm", "feat"]);
+  await exec("git", ["-C", repo.primary, "merge", "--squash", "feat/x"]);
+  await exec("git", ["-C", repo.primary, "commit", "-qm", "feat (squash)"]);
+  return repo;
+}
+
+test("guard: deleting the session's merged branch is allowed once nothing holds it", async () => {
+  const { primary, linked, cleanup } = await repoWithSessionBranch();
+  try {
+    // While the worktree holds the branch, deleting it is not teardown — it is
+    // someone else's checkout disappearing.
+    const guard = new PrimaryWorktreeGuard(primary);
+    const checkedOut = await guard.onToolCall("bash", { command: `git -C ${primary} branch -D feat/x` });
+    assert.equal(checkedOut?.block, true);
+    assert.match(checkedOut?.reason ?? "", /not checked out in any worktree/u);
+
+    await exec("git", ["-C", primary, "worktree", "remove", "--force", linked]);
+    // Same command, now provably no-loss. The session's cwd is the primary
+    // because removing its own worktree left it nowhere else — the exact state
+    // this allowance exists for.
+    const stranded = new PrimaryWorktreeGuard(linked);
+    assert.equal(await stranded.onToolCall("bash", { command: `git -C ${primary} branch -D feat/x` }), undefined);
+    // The allowance is for real local branches: a name that resolves to nothing
+    // (already deleted, a remote-tracking ref, a typo) is refused, not waved
+    // through because the proof came back empty.
+    for (const command of [
+      `git -C ${primary} branch -D feat/never-existed`,
+      `git -C ${primary} branch -D refs/remotes/origin/main`,
+    ]) {
+      assert.equal((await stranded.onToolCall("bash", { command }))?.block, true, command);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: an unmerged branch delete stays blocked, and says what would make it safe", async () => {
+  const { primary, linked, cleanup } = await repoWithSessionBranch();
+  try {
+    // Work committed after the squash: the branch is no longer patch-equivalent.
+    await exec("git", ["-C", linked, "commit", "-qm", "more work", "--allow-empty"]);
+    await exec("git", ["-C", primary, "worktree", "remove", "--force", linked]);
+    const guard = new PrimaryWorktreeGuard(linked);
+    const blocked = await guard.onToolCall("bash", { command: `git -C ${primary} branch -D feat/x` });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /provably loses nothing/u);
+    assert.match(blocked?.reason ?? "", /patch-equivalent/u);
+
+    // One unsafe name poisons the whole delete.
+    await exec("git", ["-C", primary, "branch", "feat/safe"]);
+    const mixed = await guard.onToolCall("bash", { command: `git -C ${primary} branch -D feat/safe feat/x` });
+    assert.equal(mixed?.block, true);
+
+    // `PI_ENG_BRANCH_TEARDOWN=0` refuses even the provable one.
+    const strict = new PrimaryWorktreeGuard(linked, resolvePrimaryWorktreeGuardConfig({ PI_ENG_BRANCH_TEARDOWN: "0" }));
+    assert.equal((await strict.onToolCall("bash", { command: `git -C ${primary} branch -D feat/safe` }))?.block, true);
+    // A merged branch deletes fine when asked for with `-d` or `--delete`.
+    assert.equal(await guard.onToolCall("bash", { command: `git -C ${primary} branch -d feat/safe` }), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: --git-dir does not route around the guard", async () => {
+  const { primary, linked, cleanup } = await repoWithSessionBranch();
+  try {
+    await exec("git", ["-C", linked, "commit", "-qm", "more work", "--allow-empty"]);
+    const guard = new PrimaryWorktreeGuard(linked);
+    // This is the form a session reached for after `-C` refused it, and it got
+    // through. Same checkout, same refusal.
+    for (const command of [
+      `git --git-dir=${primary}/.git branch -D feat/x`,
+      `git --git-dir ${primary}/.git commit -m x`,
+      `git --work-tree=${primary} --git-dir=${primary}/.git reset --hard HEAD~1`,
+    ]) {
+      assert.equal((await guard.onToolCall("bash", { command }))?.block, true, command);
+    }
+    // Against its own worktree the same forms are still allowed.
+    assert.equal(await guard.onToolCall("bash", { command: `git --git-dir=${linked}/.git status` }), undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test("guard: a session whose own worktree was removed is told so", async () => {
+  const { primary, linked, cleanup } = await repoWithSessionBranch();
+  try {
+    await exec("git", ["-C", primary, "worktree", "remove", "--force", linked]);
+    const stranded = new PrimaryWorktreeGuard(linked);
+    const blocked = await stranded.onToolCall("bash", { command: `git -C ${primary} commit -m x` });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /not inside a git worktree/u);
+    assert.match(blocked?.reason ?? "", /git worktree remove/u);
+    assert.match(blocked?.reason ?? "", /gives you one back/u);
   } finally {
     cleanup();
   }
