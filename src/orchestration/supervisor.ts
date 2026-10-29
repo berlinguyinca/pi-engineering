@@ -319,6 +319,8 @@ export class MissionSupervisor {
         history,
         now: this.now(),
         resumptionGeneration: expectedResumptionGeneration,
+        exhaustionIsTerminal: true,
+        budgetEpoch: this.operatorBudgetEpoch(mission.mission_id),
       });
       decision = this.store.planRecovery(
         diagnosis.operatorQuestion && decided.action === "WAIT_FOR_REQUIREMENT"
@@ -355,6 +357,15 @@ export class MissionSupervisor {
           preservedWork: this.preservedWork(mission.mission_id),
         }
       : result;
+  }
+
+  /** The generation of the latest operator resume; model and maintenance resumes do not refresh the recovery budget. */
+  private operatorBudgetEpoch(missionId: string): number {
+    const operator = this.store
+      .listMissionResumptions(missionId)
+      .filter((resumption) => (resumption.origin ?? "operator") === "operator")
+      .at(-1);
+    return operator?.generation ?? 0;
   }
 
   /** The open named wait (probe/backoff, requirement, persistence) of the current resumption, if any. */

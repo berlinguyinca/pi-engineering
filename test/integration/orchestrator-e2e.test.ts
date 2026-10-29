@@ -1096,7 +1096,7 @@ describe("passive requests — gate-bypass and illegal-transition regressions", 
           const active = store.listMissions().at(-1);
           if (active && !resumed) {
             resumed = true;
-            store.resumeMission(active.mission_id, "reentrant observer resumed mission");
+            store.resumeMission(active.mission_id, "reentrant observer resumed mission", "operator");
           }
         },
       }),

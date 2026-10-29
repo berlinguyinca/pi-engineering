@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { DEFAULT_STATUS_BAR_CONFIG } from "../src/status/config.ts";
+import { FULL_STATUS_BAR_CONFIG } from "../src/status/config.ts";
 import { GitContextProvider } from "../src/status/git-context.ts";
 import { renderStatus } from "../src/status/layout.ts";
 import type { HarnessStatusState } from "../src/status/state.ts";
@@ -75,7 +75,7 @@ async function main() {
 
   const clock = { now: 0 };
   const tracker = new ThroughputTracker({
-    windowMs: DEFAULT_STATUS_BAR_CONFIG.tpsWindowMs,
+    windowMs: FULL_STATUS_BAR_CONFIG.tpsWindowMs,
     now: () => clock.now,
   });
   const gitProvider = new GitContextProvider();
@@ -88,7 +88,7 @@ async function main() {
     const base = stateFrom(g, "deepseek-v4-flash");
     console.log("[1] primary worktree — responsive widths");
     for (const w of [140, 100, 70, 50, 40]) {
-      console.log(`  width ${String(w).padStart(3)} | ${renderStatus(base, w, DEFAULT_STATUS_BAR_CONFIG)}`);
+      console.log(`  width ${String(w).padStart(3)} | ${renderStatus(base, w, FULL_STATUS_BAR_CONFIG)}`);
     }
 
     // --- 2. Live streaming TPS ------------------------------------------
@@ -109,7 +109,7 @@ async function main() {
       const snap = tracker.snapshot();
       const tps = snap.currentTokensPerSecond ?? 0;
       console.log(
-        `  t=${String(t).padStart(4)}ms tokens=${String(tokens).padStart(4)} tps=${tps.toFixed(1).padStart(6)} | ${renderStatus(withTps(base, tps), 100, DEFAULT_STATUS_BAR_CONFIG)}`,
+        `  t=${String(t).padStart(4)}ms tokens=${String(tokens).padStart(4)} tps=${tps.toFixed(1).padStart(6)} | ${renderStatus(withTps(base, tps), 100, FULL_STATUS_BAR_CONFIG)}`,
       );
     }
 
@@ -122,7 +122,7 @@ async function main() {
     console.log(
       `  last=${idleSnap.lastCompletedTokensPerSecond?.toFixed(1)} live=${idleSnap.currentTokensPerSecond ?? 0}`,
     );
-    console.log(`  ${renderStatus(idleState, 100, DEFAULT_STATUS_BAR_CONFIG)}`);
+    console.log(`  ${renderStatus(idleState, 100, FULL_STATUS_BAR_CONFIG)}`);
 
     // --- 4. Linked worktree ---------------------------------------------
     wtPath = join(repo, "..", "statusbar-demo-wt");
@@ -133,7 +133,7 @@ async function main() {
     const wtState = stateFrom(wt, "qwen3.8-flash-next");
     console.log("\n[4] linked worktree (wt:<name>)");
     console.log(`  ${JSON.stringify({ repository: wt.repository, worktree: wt.worktree, branch: wt.branch })}`);
-    console.log(`  ${renderStatus(wtState, 100, DEFAULT_STATUS_BAR_CONFIG)}`);
+    console.log(`  ${renderStatus(wtState, 100, FULL_STATUS_BAR_CONFIG)}`);
 
     // --- 5. Detached HEAD -----------------------------------------------
     await git(repo, ["checkout", "-q", "--detach"]);
@@ -142,7 +142,7 @@ async function main() {
     const detState = stateFrom(det, "deepseek-v4-flash");
     console.log("\n[5] detached HEAD");
     console.log(`  ${JSON.stringify({ detachedHead: det.detachedHead, branch: det.branch ?? null })}`);
-    console.log(`  ${renderStatus(detState, 100, DEFAULT_STATUS_BAR_CONFIG)}`);
+    console.log(`  ${renderStatus(detState, 100, FULL_STATUS_BAR_CONFIG)}`);
     await git(repo, ["checkout", "-q", "main"]);
 
     // --- 6. Non-git directory -------------------------------------------
@@ -152,7 +152,7 @@ async function main() {
     const ngState = stateFrom(ng, "deepseek-v4-flash");
     console.log("\n[6] outside git — graceful degradation");
     for (const w of [100, 40]) {
-      console.log(`  width ${w} | ${renderStatus(ngState, w, DEFAULT_STATUS_BAR_CONFIG)}`);
+      console.log(`  width ${w} | ${renderStatus(ngState, w, FULL_STATUS_BAR_CONFIG)}`);
     }
     await rm(nonGit, { recursive: true, force: true });
 

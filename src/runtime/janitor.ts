@@ -53,10 +53,11 @@ export function missionOwnerLiveness(
   };
 }
 
-/** `PI_HOUSEKEEPING`: `1` acts, `0` is off, anything else (default) reports only. */
+/** `PI_HOUSEKEEPING`: `0` is off, `dry-run` reports only, anything else (default) acts. */
 export function housekeepingMode(env: Record<string, string | undefined> = process.env): "on" | "off" | "dry-run" {
   const raw = env.PI_HOUSEKEEPING?.trim().toLowerCase();
-  return raw === "1" ? "on" : raw === "0" ? "off" : "dry-run";
+  if (raw !== undefined && /^(0|false|off|no)$/.test(raw)) return "off";
+  return raw === "dry-run" ? "dry-run" : "on";
 }
 
 export interface HousekeepingResult {

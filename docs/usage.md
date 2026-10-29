@@ -974,16 +974,35 @@ primary checkout:
 - `write` / `edit` to a path in the primary checkout;
 - bash `git` commands that change its state (`commit`, `checkout`, `switch`,
   `reset`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `stash` (except
-  `list`/`show`), `add`, `rm`, `restore`, `update-ref`, `tag <name>`,
-  `branch <name>`/`-d`/`-D`/`-f`, `config` settings);
+  `list`/`show`), `add`, `rm`, `mv`, `restore`, `revert`, `update-ref`,
+  `gc`/`prune`/`clean`/`filter-branch`, `replace`, `notes` (except `list`),
+  `tag <name>` or a tag write flag (`-d`/`--delete`, `-f`/`--force`,
+  `-a`/`--annotate`, `-m`/`--message`, `-F`/`--file`, `-s`/`--sign`,
+  `-u`/`--local-user`), `branch <name>` or a branch write flag
+  (`-d`/`--delete`, `-f`/`--force`, `-m`/`-M`/`-c`/`-C` move and copy,
+  `-u`/`--set-upstream-to`, `--track`, `--unset-upstream`,
+  `--edit-description`), `config` settings);
 - bash writes into it (`> f`, `>> f`, `tee f`, `sed -i … f`, `mv`/`cp` into
   it).
 
-Read-only inspection (`git status`, `log`, `diff`, `show`, `fetch`, …) and
-worktree management (`git worktree add|remove|list|prune`) stay allowed —
-that is how a session observes the repo and **leaves** for its own worktree.
-The block reason tells the model the escape hatch: `git worktree add
-<sibling-dir> -b <branch> origin/<base>`.
+Each mutating invocation is judged **where its own segment runs**, not where
+the command started: `cd <own-worktree> && git push && git -C <primary> log`
+leaves the `push` allowed and blocks only a mutating tail aimed at the primary.
+The block reason names the culprit segment, so a compound command says which
+step to move rather than refusing the whole line.
+
+Read-only inspection (`git status`, `log`, `diff`, `show`, `fetch`, `ls-remote`,
+`cat-file`, `for-each-ref`, `rev-list`, `merge-base`, `reflog`, `grep`, a bare
+`git tag`, `git remote -v`, …) and worktree management (`git worktree
+add|remove|list|prune`) stay allowed — that is how a session observes the repo
+and **leaves** for its own worktree. A `branch`/`tag` command whose flags are
+all listing filters (`--merged`, `--no-merged`, `--contains`, `--points-at`,
+`--show-current`, `--format`, `--sort`, `-a`, `-r`, `-v`, `-l`) lists, whatever
+words follow them — they are patterns, base refs, or flag values; a flag this
+list does not know stays blocked. The block reason tells the model the
+escape hatch: `git worktree add <sibling-dir> -b <branch> origin/<base>`; when
+the session's own worktree is gone (it removed it, or it was cleaned up) the
+reason says so and gives the command that gets one back.
 
 A `git` command is recognised by the word itself (`git`, `/usr/bin/git`,
 `./git`) and by a verb git actually knows: a path segment
@@ -1002,9 +1021,18 @@ Knobs (set before starting the session):
   checkouts (production ops: deploys, docker, branch inspection that must
   happen in the production tree).
 - `PI_ENG_WORKTREE_GUARD=0` — disable the guard entirely.
+- `PI_ENG_BRANCH_TEARDOWN=0` — also refuse the one state change the guard
+  allows on proof: deleting a **local branch** that is merged into the base
+  (by ancestry or patch-equivalent, so a squash-merge counts) and checked out
+  in no worktree. That is the convention's end-of-life step — merge, then clean
+  up the branch you created — which had no in-session route at all beyond
+  restarting with `PI_ENG_PRIMARY=1`. Any name in the delete that fails the
+  proof blocks the whole command.
 
 The bash checks are best-effort (no full shell parsing); an unrecognized
-mutating form is a gap to close when it bites, not a contract hole.
+mutating form is a gap to close when it bites, not a contract hole. `git -C`,
+`--git-dir` and `--work-tree` are all read as naming the checkout, so the
+`--git-dir=<primary>/.git` form that once routed around the guard does not.
 The runtime's own in-process git operations (mission workers run in candidate
 worktrees; integration, janitor) do not go through the tool-call hook and are
 unaffected.

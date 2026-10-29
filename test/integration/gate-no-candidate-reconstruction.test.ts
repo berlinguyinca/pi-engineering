@@ -296,7 +296,7 @@ async function harnessFor(reconstructable: boolean) {
     attemptedRecoveries: [],
     resumeCondition: "resume",
   });
-  store.resumeMission(missionId, "operator resume");
+  store.resumeMission(missionId, "operator resume", "operator");
   await store.flush();
   await registry.register(manifest);
 

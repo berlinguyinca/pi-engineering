@@ -44,6 +44,7 @@ import {
 import { renderGatewayReport } from "../src/gateway/statusReport.ts";
 import { registerTerminalRefusalGuard } from "../src/gateway/terminalRefusalGuard.ts";
 import { GitRepo } from "../src/git/GitRepo.ts";
+import { RepoKeyResolver } from "../src/git/repoKey.ts";
 import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
@@ -389,9 +390,11 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       };
       if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
     },
-    onMissionActivity: (event) => {
+    onMissionActivity: (event, meta) => {
       publishMissionActivity(key, event);
-      presence?.update(event);
+      // The runtime's open-time re-emission of stored missions sets presence's
+      // baseline instead of notifying; real transitions during open still do.
+      presence?.update(event, undefined, meta?.replay ? "replay" : "activity");
       if (attentionReady) void attention?.update(event).catch(() => {});
     },
     // The quiet heartbeat: observability composes a human-readable sentence when
@@ -492,8 +495,8 @@ function seedPresenceFrom(runtime: EngineeringRuntime): void {
 
 async function refreshPresence(cwd: string): Promise<void> {
   if (!presence) return;
-  const key = await repoCacheKey(cwd).catch(() => "");
-  const open = key ? runtimes.get(key) : undefined;
+  // The poll runs every few seconds for the whole session: the remembered key answers without git; a miss re-resolves.
+  const open = await repoKeys.lookup(cwd, runtimes).catch(() => undefined);
   if (!open) return;
   seedPresenceFrom(open.runtime);
 }
@@ -624,18 +627,16 @@ function roadmapCompleteFor(repoRoot: string): () => Promise<boolean> {
  * simply has no answer, and the ambient row stays absent until it does —
  * strictly better than answering with another session's repository.
  */
-const repoKeyCache = new Map<string, string>();
+const repoKeys = new RepoKeyResolver();
 
 /** The resolved key for a cwd, if one has been resolved. Never does IO. */
 function cachedRepoKey(cwd: string): string | undefined {
-  return repoKeyCache.get(cwd);
+  return repoKeys.cached(cwd);
 }
 
-async function repoCacheKey(cwd: string): Promise<string> {
-  const repo = await GitRepo.open(cwd).catch(() => null);
-  const key = repo ? repo.root : cwd;
-  repoKeyCache.set(cwd, key);
-  return key;
+/** Always asks git: runtime opening and workspace rebinding decide from it. Only the presence poll uses the cache. */
+function repoCacheKey(cwd: string): Promise<string> {
+  return repoKeys.resolve(cwd, { fresh: true });
 }
 
 /** The real reason the runtime did not open, by cwd, for tool results. */
@@ -677,7 +678,7 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
       return w ? w.id : null;
     },
     actor: () => ({ type: "user" }),
-    resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
+    resumeMission: (id, s) => rt.resumeBlockedMission(id, s, "model"),
     cancelMission: (id) => rt.cancelMission(id),
     pauseMission: (id) => rt.pauseMission(id),
     clearMissionModelPin: (id) => rt.clearMissionModelPin(id),
@@ -733,8 +734,9 @@ export default function (pi: ExtensionAPI) {
   // so this is safe to run at session start and periodically while the
   // session stays open. Never awaited: a slow sweep must not delay a session.
   const housekeepingIntervalMs = Number(process.env.PI_HOUSEKEEPING_INTERVAL_MS ?? 6 * 60 * 60 * 1000);
-  // Report-only until PI_HOUSEKEEPING=1: liveness of missions run by other
-  // processes is not proven in production yet. `/gc` always acts.
+  // On by default (operator decision 2026-10-29): the janitor keeps any worktree
+  // with a live, unknown or durably referenced owner. PI_HOUSEKEEPING=dry-run
+  // reports only, =0 disables. `/gc` always acts.
   const hkMode = housekeepingMode(process.env);
   const housekeepingEnabled = hkMode !== "off";
   // First sweep waits this long so a session that reloads or exits at once

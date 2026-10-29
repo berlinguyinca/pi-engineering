@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { DEFAULT_STATUS_BAR_CONFIG, type StatusBarConfig } from "../../src/status/config.ts";
+import { FULL_STATUS_BAR_CONFIG, type StatusBarConfig } from "../../src/status/config.ts";
 import { FooterController } from "../../src/status/footer.ts";
 
-const cfg: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, refreshMs: 0 };
+const cfg: StatusBarConfig = { ...FULL_STATUS_BAR_CONFIG, refreshMs: 0 };
 
 interface Harness {
   renderCount: number;
@@ -364,7 +364,7 @@ test("lifecycle: the spinner actually advances through the footer's own render p
   let now = 1_000;
   const controller = new FooterController({
     ctx: h.ctx as never,
-    config: { ...DEFAULT_STATUS_BAR_CONFIG, refreshMs: 150 },
+    config: { ...FULL_STATUS_BAR_CONFIG, refreshMs: 150 },
     now: () => now,
   });
   try {

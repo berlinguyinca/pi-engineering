@@ -285,10 +285,10 @@ test("presence is on by default and off only when told", () => {
 });
 
 test("the row budget is bounded so a wide strip cannot eat the terminal", () => {
-  assert.equal(presenceOptionsFromEnv({}).rows, 4);
+  assert.equal(presenceOptionsFromEnv({}).rows, 2);
   assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "7" }).rows, 7);
   assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "400" }).rows, 10);
-  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "nonsense" }).rows, 4);
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "nonsense" }).rows, 2);
 });
 
 test("the title bar is opt-in and the poll has a floor", () => {
@@ -313,5 +313,43 @@ test("the quiet heartbeat has its own slower cadence than the strip", () => {
   controller.tick();
   assert.equal(quietCalls, 2);
   clock = T0;
+  controller.dispose();
+});
+
+test("a replay of stored stopped and complete missions sets a baseline and never notifies", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  const stopped = mission({ missionId: "MSN-old", state: "STOPPED", health: "stalled" });
+  const complete = mission({ missionId: "MSN-done", state: "COMPLETE", health: "complete" });
+  controller.update(stopped, undefined, "replay");
+  controller.update(complete, undefined, "replay");
+  controller.update(needsYou, undefined, "store");
+  controller.tick();
+  controller.update(stopped, undefined, "activity");
+  controller.tick();
+  assert.deepEqual(sink.notices, []);
+  assert.equal(controller.visible(), 3);
+  controller.dispose();
+});
+
+test("a live change after a replayed baseline still notifies", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running, undefined, "replay");
+  controller.tick();
+  controller.update(needsYou, undefined, "activity");
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  assert.match(sink.notices[0]!.text, /needs you/);
+  controller.dispose();
+});
+
+test("a live event that raises attention rank after a replay still notifies", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running, undefined, "replay");
+  controller.update(needsYou, undefined, "activity");
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
   controller.dispose();
 });

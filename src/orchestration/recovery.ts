@@ -48,6 +48,18 @@ export interface RecoveryDecisionInput {
   /** Structured counters behind `waitReason` for a zero-tool-call provider wait. */
   zeroToolWait?: ZeroToolWait;
   resumptionGeneration?: number;
+  /**
+   * The caller re-evaluates the mission on a clock (the supervisor), so an
+   * exhausted attempt count must end in a durable STOP even for failures that
+   * are otherwise waited out; a park would be re-planned every tick, forever.
+   * Callers that bound their own retries (the scheduler) leave this unset.
+   */
+  exhaustionIsTerminal?: boolean;
+  /**
+   * First resumption generation whose decisions count against the strategy
+   * budget: the latest operator resume. Defaults to 0, so every generation counts.
+   */
+  budgetEpoch?: number;
 }
 
 const DEFAULT_ACTIONS: Record<FailureCategory, RecoveryAction> = {
@@ -677,10 +689,33 @@ export class RecoveryPlanner {
 
   decide(input: RecoveryDecisionInput): RecoveryDecision {
     const fingerprint = input.classification.fingerprint;
-    const fingerprintAttempts = input.history.filter((decision) => decision.failureFingerprint === fingerprint).length;
-    const attempt = fingerprintAttempts + 1;
     const resumptionGeneration =
       input.resumptionGeneration ?? Math.max(0, ...input.history.map((decision) => decision.resumptionGeneration ?? 0));
+    // The strategy budget starts over at the latest OPERATOR resumption
+    // (`budgetEpoch`): a durable stop is terminal until the operator resumes.
+    // Resumes by the model tool or runtime maintenance keep the earlier count,
+    // so they cannot buy fresh attempts in a loop.
+    const budgetEpoch = input.budgetEpoch ?? 0;
+    // For a clock-driven caller, a capacity category's attempts that resolved
+    // (a wait or probe that ended succeeded because capacity returned) are the
+    // outage clearing, not failed attempts, so flapping capacity never exhausts
+    // the budget; only attempts that failed or were exhausted count.
+    const countsAsAttempt = (decision: RecoveryDecision): boolean =>
+      !(
+        input.exhaustionIsTerminal === true &&
+        CAPACITY_WAIT_ACTIONS[input.classification.category] !== undefined &&
+        decision.status === "succeeded"
+      );
+    const fingerprintAttempts = input.history.filter(
+      (decision) =>
+        decision.failureFingerprint === fingerprint &&
+        (decision.resumptionGeneration ?? 0) >= budgetEpoch &&
+        countsAsAttempt(decision),
+    ).length;
+    const attempt = fingerprintAttempts + 1;
+    const decisionsForFingerprint = input.history.filter(
+      (decision) => decision.failureFingerprint === fingerprint,
+    ).length;
     const durableDeadlines = input.history
       .filter((decision) => (decision.resumptionGeneration ?? 0) === resumptionGeneration)
       .map((decision) => (decision.deadline ? Date.parse(decision.deadline) : Number.NaN))
@@ -702,12 +737,19 @@ export class RecoveryPlanner {
     // durable wait/probe (deadline-aware: the wait carries the durable deadline
     // when the policy configures one) so a later tick resumes them.
     const capacityWait = CAPACITY_WAIT_ACTIONS[input.classification.category];
-    const action: RecoveryAction = !budgetExhausted ? defaultAction : (capacityWait ?? "STOP");
+    // For a clock-driven caller an exhausted count of FAILED attempts (see
+    // countsAsAttempt) is terminal even for capacity categories: further
+    // automatic attempts only burn leases and events until the operator
+    // resumes. A clock deadline says nothing about whether capacity returned,
+    // so it (and any caller bounding its own retries) still parks.
+    const countExhaustedForCaller = input.exhaustionIsTerminal === true && (missionExhausted || strategyExhausted);
+    const parksOnCapacity = capacityWait !== undefined && !countExhaustedForCaller;
+    const action: RecoveryAction = !budgetExhausted ? defaultAction : parksOnCapacity ? capacityWait : "STOP";
     const decidedAt = new Date(input.now).toISOString();
     // Parking on an expired deadline would re-diagnose as an expired wait on
     // the next tick, so a capacity park after the deadline carries no deadline:
     // it ends when its condition changes or the operator cancels.
-    const parkedDeadline = capacityWait !== undefined && durableDeadline !== undefined && input.now >= durableDeadline;
+    const parkedDeadline = parksOnCapacity && durableDeadline !== undefined && input.now >= durableDeadline;
     const durableDeadlineAt = durableDeadline === undefined ? null : new Date(durableDeadline).toISOString();
     const deadline = parkedDeadline ? null : durableDeadlineAt;
     const budgetReason = missionExhausted
@@ -719,7 +761,7 @@ export class RecoveryPlanner {
           : EXPECTED_CHANGE[action];
     const exhaustedReason = !budgetExhausted
       ? EXPECTED_CHANGE[action]
-      : capacityWait !== undefined
+      : parksOnCapacity
         ? `${budgetReason}; the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
         : (OPERATOR_QUESTIONS[input.classification.category] ?? budgetReason);
     // When automatic recovery is exhausted and there is no capacity wait to
@@ -729,7 +771,7 @@ export class RecoveryPlanner {
     // operatorGuidance, leaving expectedMaterialChange (the budget reason) intact
     // for downstream consumers and tests.
     const operatorGuidance =
-      budgetExhausted && capacityWait === undefined
+      budgetExhausted && !parksOnCapacity
         ? (ESCALATION_GUIDANCE[input.classification.category] ?? budgetReason)
         : undefined;
     const recoveryHash = hash({
@@ -739,6 +781,10 @@ export class RecoveryPlanner {
       action,
       attempt,
       deadline,
+      // A resumed mission restarts its attempt count and resolved capacity waits
+      // do not advance it, so the generation and decision ordinal keep ids distinct.
+      ...(resumptionGeneration > 0 ? { resumptionGeneration } : {}),
+      ...(decisionsForFingerprint !== fingerprintAttempts ? { decisionsForFingerprint } : {}),
     });
     return {
       recoveryId: `RCV-${recoveryHash.slice(0, 20)}`,

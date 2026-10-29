@@ -662,6 +662,12 @@ export interface MissionResumption {
   resumedAt: string;
   generation: number;
   stopGeneration: number;
+  /**
+   * Who asked for the resume. Only an operator resume grants a fresh recovery
+   * budget; a model tool call or runtime maintenance does not. Absent on
+   * history written before this field existed, which counts as an operator resume.
+   */
+  origin?: "operator" | "model" | "automatic";
 }
 
 export interface MissionStop {

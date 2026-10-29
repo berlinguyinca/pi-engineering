@@ -574,7 +574,8 @@ export interface EngineeringRuntimeOptions {
    */
   onMissionObservabilityUpdate?: (missionId: string, message: string) => void;
   /** Persistent, non-notification UI feed. Values are redacted and bounded. */
-  onMissionActivity?: (event: RuntimeMissionActivityEvent) => void;
+  /** `replay` is true only for the open-time re-emission of stored missions. */
+  onMissionActivity?: (event: RuntimeMissionActivityEvent, meta?: { replay: boolean }) => void;
   /** Bounded diagnostic when the live mission snapshot cannot be written. */
   onMissionSnapshotError?: (message: string) => void;
   /**
@@ -786,7 +787,7 @@ export class EngineeringRuntime {
       config?: Partial<import("../resilience/storagePressure.ts").StoragePressureConfig>;
     }
   > | null;
-  private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
+  private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent, meta?: { replay: boolean }) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private missionActivityTicker: MissionActivityTicker | null = null;
   private readonly missionActivityClock = new ClockOnlyGate();
@@ -1185,7 +1186,7 @@ export class EngineeringRuntime {
   }
 
   /** Project observability into a compact surface event without raw commands or metadata. */
-  private emitMissionActivity(missionId: string, observedAt = new Date().toISOString()): void {
+  private emitMissionActivity(missionId: string, observedAt = new Date().toISOString(), replay = false): void {
     if (!this.onMissionActivity) return;
     this.missionActivityTicker?.watch(missionId);
     const projection = this.missionObservability?.projection(missionId);
@@ -1312,7 +1313,7 @@ export class EngineeringRuntime {
         ],
         Date.parse(observedAt),
       );
-      this.onMissionActivity(event);
+      this.onMissionActivity(event, { replay });
     } catch {
       // UI listeners are observers, never participants in mission execution.
     }
@@ -1503,7 +1504,9 @@ export class EngineeringRuntime {
         rt.scheduleMissionSnapshot();
         rt.emitMissionActivity(missionId);
       });
-      for (const missionId of rt.missionObservability.listMissionIds()) rt.emitMissionActivity(missionId);
+      for (const missionId of rt.missionObservability.listMissionIds()) {
+        rt.emitMissionActivity(missionId, undefined, true);
+      }
       // Route orchestration worker roles through the capability router so per-role
       // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
       // is honored by the mission pipeline, matching the lifecycle roleRunner
@@ -2347,11 +2350,15 @@ export class EngineeringRuntime {
   }
 
   /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
-  resumeBlockedMission(missionId: string, signal?: AbortSignal): Promise<import("../orchestration/types.ts").Mission> {
+  resumeBlockedMission(
+    missionId: string,
+    signal?: AbortSignal,
+    origin: "operator" | "model" = "operator",
+  ): Promise<import("../orchestration/types.ts").Mission> {
     this.endMaintenance();
     const active = this.missionResumeFlights.get(missionId);
     if (active) return active;
-    const flight = this.performBlockedMissionResume(missionId, signal).finally(() => {
+    const flight = this.performBlockedMissionResume(missionId, signal, origin).finally(() => {
       if (this.missionResumeFlights.get(missionId) === flight) this.missionResumeFlights.delete(missionId);
     });
     this.missionResumeFlights.set(missionId, flight);
@@ -2370,9 +2377,16 @@ export class EngineeringRuntime {
     return this.orchestrator.pauseMission(missionId);
   }
 
+  private recoveryBudgetExhausted(missionId: string, generation: number): boolean {
+    return (this.missionStore?.listRecoveryDecisions(missionId) ?? []).some(
+      (decision) => (decision.resumptionGeneration ?? 0) === generation && decision.status === "exhausted",
+    );
+  }
+
   private async performBlockedMissionResume(
     missionId: string,
     signal?: AbortSignal,
+    origin: "operator" | "model" = "operator",
   ): Promise<import("../orchestration/types.ts").Mission> {
     if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
     // #427: the live projection is not the authority. A mission another session
@@ -2430,12 +2444,18 @@ export class EngineeringRuntime {
     ) {
       // Paused by an operator interrupt: continue exactly where it stopped. The
       // interrupted tasks were left resumable; another interrupt pauses again.
-      this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission");
+      this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission", origin);
       await this.missionStore.flush();
       return this.orchestrator.resume(missionId, { force: true, ...(signal ? { signal } : {}), interrupt: "pause" });
     }
+    if (origin === "model" && this.recoveryBudgetExhausted(missionId, generation)) {
+      // The model may not spend an exhausted budget by calling resume again.
+      throw new Error(
+        `recovery budget for mission ${missionId} is exhausted; only the operator can resume it (/mission resume ${missionId})`,
+      );
+    }
     mission = await this.normalizeMissionForRepair(missionId);
-    this.missionStore.resumeMission(missionId, "operator requested mission recovery");
+    this.missionStore.resumeMission(missionId, "operator requested mission recovery", origin);
     await this.missionStore.flush();
     // An interrupt during the operator's recovery pauses it again; it never cancels.
     const run = interruptibleRun(signal, "pause");

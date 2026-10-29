@@ -306,7 +306,7 @@ test("stale paused probe snapshots cannot stop a concurrently advanced mission",
     {
       name: "new resumption generation",
       advance: (runtime, missionId) => {
-        runtime.missionStore!.resumeMission(missionId, "concurrent operator resumption");
+        runtime.missionStore!.resumeMission(missionId, "concurrent operator resumption", "operator");
       },
       expectedStatus: "PAUSED_INFRASTRUCTURE",
       expectedGeneration: 1,
@@ -730,7 +730,7 @@ test("status consumer does not settle a repair failure into a newer resumption g
     });
     runtime.missionStore!.transitionTask(task.task_id, "READY");
     Orchestrator.prototype.repairBlockedMission = async (missionId: string) => {
-      runtime.missionStore!.resumeMission(missionId, "new generation won the race");
+      runtime.missionStore!.resumeMission(missionId, "new generation won the race", "operator");
       throw new Error("validation failed in stale generation");
     };
 

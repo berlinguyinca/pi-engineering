@@ -1,0 +1,313 @@
+import assert from "node:assert/strict";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, it } from "node:test";
+import { compactLeaseEvents, leaseCompactionHooks } from "../../src/orchestration/leaseCompaction.ts";
+import { runMissionsCommand } from "../../src/orchestration/missionCancelCli.ts";
+import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { MissionOwnership } from "../../src/orchestration/ownership.ts";
+import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
+import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { RuntimeRegistry } from "../../src/runtime/isolation/RuntimeRegistry.ts";
+import { readMergedEvents } from "../../src/runtime/isolation/SessionEventStore.ts";
+import { currentProcessIdentity } from "../../src/runtime/isolation/processIdentity.ts";
+
+function newMission(store: MissionStore, missionId: string) {
+  return store.createMission({
+    mission_id: missionId,
+    title: missionId,
+    goal: "lease churn",
+    user_request: "lease churn",
+    repository: ".",
+    base_ref: "HEAD",
+    risk_profile: "medium",
+    workflow_class: "engineering",
+  });
+}
+
+async function replay(file: string): Promise<MissionStore> {
+  const backend = await JsonlEventStore.openReadOnly(file);
+  try {
+    return MissionStore.fromEvents(backend.all());
+  } finally {
+    backend.close();
+  }
+}
+
+async function churnedLog(cycles: number): Promise<{ file: string; digest: string; revision: number }> {
+  const dir = await mkdtemp(join(tmpdir(), "lease-compaction-"));
+  const file = join(dir, "events.jsonl");
+  const backend = await JsonlEventStore.open(file);
+  const store = MissionStore.open(backend);
+  newMission(store, "MSN-a");
+  newMission(store, "MSN-b");
+  const ownership = new MissionOwnership(store, { ownerId: "controller" });
+  for (let cycle = 0; cycle < cycles; cycle++) {
+    for (const missionId of ["MSN-a", "MSN-b"]) {
+      const lease = await ownership.acquire(missionId);
+      await ownership.acquireRepository(lease, `repo-${missionId}`);
+      await ownership.release(lease);
+    }
+  }
+  await ownership.acquire("MSN-a");
+  await store.flush();
+  const revision = store.getMission("MSN-a")!.revision;
+  backend.close();
+  return { file, digest: (await replay(file)).stateDigest(), revision };
+}
+
+describe("lease event compaction", () => {
+  it("shrinks a churned log, keeps replayed state identical, and is dry-run by default", async () => {
+    const { file, digest, revision } = await churnedLog(6);
+    const originalBytes = (await stat(file)).size;
+
+    const dry = await compactLeaseEvents(file);
+    assert.equal(dry.applied, false);
+    assert.equal(dry.stateIdentical, true);
+    assert.ok(dry.leaseEventsAfter < dry.leaseEventsBefore / 3, "most lease events fold away");
+    assert.equal((await stat(file)).size, originalBytes, "dry run leaves the log untouched");
+
+    const done = await compactLeaseEvents(file, { apply: true });
+    assert.equal(done.applied, true);
+    assert.equal(done.backup, `${file}.bak`);
+    assert.equal((await stat(`${file}.bak`)).size, originalBytes);
+    assert.ok((await stat(file)).size < originalBytes);
+
+    const replayed = await replay(file);
+    assert.equal(replayed.stateDigest(), digest);
+    assert.equal(replayed.getMission("MSN-a")!.revision, revision, "folded events still count toward the revision");
+
+    const again = await compactLeaseEvents(file);
+    assert.equal(again.leaseEventsAfter, again.leaseEventsBefore, "compaction is idempotent");
+  });
+
+  it("replays an old-format log and its compacted form to the same lease state", async () => {
+    const { file } = await churnedLog(3);
+    const before = await replay(file);
+    await compactLeaseEvents(file, { apply: true });
+    const after = await replay(file);
+    assert.equal(after.stateDigest(), before.stateDigest());
+    assert.deepEqual(after.getLatestMissionLease("MSN-a"), before.getLatestMissionLease("MSN-a"));
+    assert.deepEqual(after.getMissionLease("MSN-a"), before.getMissionLease("MSN-a"));
+    assert.deepEqual(after.getLatestRepositoryLease("repo-MSN-b"), before.getLatestRepositoryLease("repo-MSN-b"));
+  });
+
+  it("keeps malformed lines it cannot interpret", async () => {
+    const { file } = await churnedLog(2);
+    await appendFile(file, "{not json\n");
+    const report = await compactLeaseEvents(file, { apply: true });
+    assert.equal(report.applied, true);
+    assert.match(await readFile(file, "utf8"), /\{not json/);
+  });
+
+  it("is exposed as `missions compact-leases` and does not write without --apply", async () => {
+    const { file } = await churnedLog(2);
+    const original = await readFile(file, "utf8");
+    let out = "";
+    const code = await runMissionsCommand(["compact-leases", "--file", file], {
+      write: (text) => {
+        out += text;
+      },
+    });
+    assert.equal(code, 0);
+    assert.match(out, /Would compact/);
+    assert.equal(await readFile(file, "utf8"), original);
+    const missing = await runMissionsCommand(["compact-leases"], { error: () => undefined });
+    assert.equal(missing, 2);
+  });
+});
+
+describe("lease compaction safety", () => {
+  it("compacts again after new churn and keeps state identical", async () => {
+    const { file } = await churnedLog(3);
+    await compactLeaseEvents(file, { apply: true });
+    await rm(`${file}.bak`);
+    const backend = await JsonlEventStore.open(file);
+    const store = MissionStore.open(backend);
+    const ownership = new MissionOwnership(store, { ownerId: "controller-2" });
+    for (let cycle = 0; cycle < 4; cycle++) {
+      const lease = await ownership.acquire("MSN-b");
+      await ownership.release(lease);
+    }
+    await store.flush();
+    const digest = store.stateDigest();
+    const revision = store.getMission("MSN-b")!.revision;
+    backend.close();
+    const second = await compactLeaseEvents(file, { apply: true });
+    assert.equal(second.applied, true);
+    assert.ok(second.leaseEventsAfter < second.leaseEventsBefore);
+    const replayed = await replay(file);
+    assert.equal(replayed.getMission("MSN-b")!.revision, revision);
+    assert.equal(replayed.stateDigest(), digest);
+  });
+
+  it("never overwrites an existing backup", async () => {
+    const { file } = await churnedLog(2);
+    await writeFile(`${file}.bak`, "precious");
+    const original = await readFile(file, "utf8");
+    await assert.rejects(compactLeaseEvents(file, { apply: true }), /already exists/);
+    assert.equal(await readFile(`${file}.bak`, "utf8"), "precious");
+    assert.equal(await readFile(file, "utf8"), original);
+    assert.equal((await compactLeaseEvents(file)).applied, false, "a dry run does not need the backup name");
+  });
+
+  it("refuses to apply when the log changes during compaction, leaving file and no temp behind", async () => {
+    const { file } = await churnedLog(2);
+    const original = await readFile(file, "utf8");
+    leaseCompactionHooks.beforeSwap = async () => {
+      await appendFile(file, "{}\n");
+    };
+    try {
+      await assert.rejects(compactLeaseEvents(file, { apply: true }), /changed while it was being compacted/);
+    } finally {
+      leaseCompactionHooks.beforeSwap = undefined;
+    }
+    assert.equal(await readFile(file, "utf8"), `${original}{}\n`);
+    await assert.rejects(stat(`${file}.bak`));
+    assert.deepEqual(
+      (await readdir(join(file, ".."))).filter((name) => name.includes(".tmp")),
+      [],
+    );
+  });
+
+  it("refuses to apply when replayed state would differ", async () => {
+    const { file } = await churnedLog(2);
+    const original = await readFile(file, "utf8");
+    leaseCompactionHooks.afterWrite = async (temporary) => {
+      const lines = (await readFile(temporary, "utf8")).split("\n");
+      const created = lines.find((line) => line.includes('"mission.created"'))!;
+      await appendFile(temporary, `${created.replace(/MSN-a/g, "MSN-forged")}\n`);
+    };
+    try {
+      const report = await compactLeaseEvents(file, { apply: true });
+      assert.equal(report.stateIdentical, false);
+      assert.equal(report.applied, false);
+    } finally {
+      leaseCompactionHooks.afterWrite = undefined;
+    }
+    assert.equal(await readFile(file, "utf8"), original);
+    assert.deepEqual(
+      (await readdir(join(file, ".."))).filter((name) => name.includes(".tmp")),
+      [],
+    );
+  });
+
+  it("refuses to apply while a live owner holds the writer lock", async () => {
+    const { file } = await churnedLog(2);
+    const lock = await ExclusiveFileLock.acquire(file);
+    try {
+      await assert.rejects(compactLeaseEvents(file, { apply: true }));
+    } finally {
+      lock.release();
+    }
+    await assert.rejects(stat(`${file}.bak`));
+  });
+
+  it("refuses to rewrite a per-session stream whose session the registry shows as live, and allows it once dead", async () => {
+    const { file } = await churnedLog(2);
+    const root = await mkdtemp(join(tmpdir(), "lease-session-"));
+    const eventsDir = join(root, "worktrees", "wt1", "events");
+    await mkdir(eventsDir, { recursive: true });
+    const sessionId = "00000000-0000-4000-8000-0000000000aa";
+    const stream = join(eventsDir, `${sessionId}.jsonl`);
+    await writeFile(stream, await readFile(file, "utf8"));
+    const registryFile = join(root, "registry.db");
+    const registry = RuntimeRegistry.open(registryFile);
+    try {
+      registry.register({ sessionId, process: currentProcessIdentity(), startedAt: new Date().toISOString() });
+      await assert.rejects(compactLeaseEvents(stream, { apply: true, registryFile }), /may still be writing/);
+      await assert.rejects(stat(`${stream}.bak`));
+      assert.equal((await compactLeaseEvents(stream, { registryFile })).applied, false, "dry run is always allowed");
+      registry.unregister(sessionId, registry.get(sessionId)!.generationId);
+      const done = await compactLeaseEvents(stream, { apply: true, registryFile });
+      assert.equal(done.applied, true);
+    } finally {
+      registry.close();
+    }
+  });
+
+  it("refuses a recently written per-session stream of a session the registry does not know", async () => {
+    const { file } = await churnedLog(2);
+    const root = await mkdtemp(join(tmpdir(), "lease-unknown-"));
+    const eventsDir = join(root, "worktrees", "wt1", "events");
+    await mkdir(eventsDir, { recursive: true });
+    const stream = join(eventsDir, "00000000-0000-4000-8000-0000000000bb.jsonl");
+    await writeFile(stream, await readFile(file, "utf8"));
+    await assert.rejects(compactLeaseEvents(stream, { apply: true }), /registry does not know/);
+  });
+
+  it("keeps the file present throughout and leaves the original as the backup", async () => {
+    const { file } = await churnedLog(2);
+    let existedAtSwap = false;
+    leaseCompactionHooks.beforeSwap = async () => {
+      existedAtSwap = (await stat(file)).isFile();
+    };
+    try {
+      await compactLeaseEvents(file, { apply: true });
+    } finally {
+      leaseCompactionHooks.beforeSwap = undefined;
+    }
+    assert.ok(existedAtSwap);
+    assert.ok((await stat(file)).isFile());
+    assert.ok((await readFile(`${file}.bak`, "utf8")).length > (await readFile(file, "utf8")).length);
+  });
+
+  it("handles a stream whose missions live in another stream (merged namespace state is unchanged)", async () => {
+    const { file } = await churnedLog(3);
+    const eventsDir = join(await mkdtemp(join(tmpdir(), "lease-multi-")), "events");
+    await mkdir(eventsDir);
+    const lines = (await readFile(file, "utf8")).split("\n").filter(Boolean);
+    const creation = lines.filter((line) => line.includes('"mission.created"'));
+    const rest = lines.filter((line) => !line.includes('"mission.created"'));
+    const first = join(eventsDir, "00000000-0000-4000-8000-000000000001.jsonl");
+    const second = join(eventsDir, "00000000-0000-4000-8000-000000000002.jsonl");
+    await writeFile(first, `${creation.join("\n")}\n`);
+    await writeFile(second, `${rest.join("\n")}\n`);
+    const digest = () => MissionStore.fromEvents(readMergedEvents(eventsDir)).stateDigest();
+    const before = digest();
+    const report = await compactLeaseEvents(second, { apply: true });
+    assert.equal(report.stateIdentical, true, "single-stream replay has no mission and still matches");
+    assert.ok(report.leaseEventsAfter < report.leaseEventsBefore);
+    assert.equal(digest(), before);
+  });
+});
+
+describe("lease events are not emitted when nothing changes", () => {
+  it("does not append a second fence for a lease that is no longer held", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lease-noop-"));
+    const backend = await JsonlEventStore.open(join(dir, "events.jsonl"));
+    const store = MissionStore.open(backend);
+    newMission(store, "MSN-a");
+    const ownership = new MissionOwnership(store, { ownerId: "controller" });
+    const lease = await ownership.acquire("MSN-a");
+    store.transitionMissionLease("fenced", lease);
+    await store.flush();
+    const count = backend.count();
+    store.transitionMissionLease("fenced", lease);
+    store.transitionMissionLease("expired", lease);
+    await store.flush();
+    assert.equal(backend.count(), count, "fencing or expiring an unheld lease appends nothing");
+    backend.close();
+  });
+
+  it("ignores a stale lower-generation fence while a newer lease is held", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lease-stale-"));
+    const backend = await JsonlEventStore.open(join(dir, "events.jsonl"));
+    const store = MissionStore.open(backend);
+    newMission(store, "MSN-a");
+    const ownership = new MissionOwnership(store, { ownerId: "controller" });
+    const first = await ownership.acquire("MSN-a");
+    store.transitionMissionLease("fenced", first);
+    const second = await ownership.acquire("MSN-a");
+    assert.equal(second.generation, first.generation + 1);
+    await store.flush();
+    const count = backend.count();
+    store.transitionMissionLease("fenced", first);
+    store.transitionMissionLease("expired", first);
+    await store.flush();
+    assert.equal(backend.count(), count);
+    assert.equal(store.getMissionLease("MSN-a")?.generation, second.generation, "the newer lease stays held");
+    backend.close();
+  });
+});

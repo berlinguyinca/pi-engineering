@@ -731,6 +731,52 @@ export class MissionStore {
     return store;
   }
 
+  /** Replay a stream of events without retaining them (compaction verification over huge logs). */
+  static fromEvents(events: Iterable<StoredEvent>): MissionStore {
+    const empty: EventStoreBackend = {
+      append: async (event) => event,
+      appendConditionally: async (event) => event,
+      appendAll: async () => undefined,
+      all: () => [],
+      get: () => undefined,
+      count: () => 0,
+    };
+    const store = new MissionStore(empty);
+    store.replayEvents(events);
+    return store;
+  }
+
+  /** Apply already-durable events to this store's in-memory state (replay only; nothing is appended). */
+  replayEvents(events: Iterable<StoredEvent>): void {
+    for (const e of events) this.apply(fromStored(e));
+  }
+
+  /**
+   * A canonical JSON image of everything replay derives, for proving two logs
+   * replay to identical state. Map entries are sorted so insertion order (which
+   * a compacted log may change) does not matter.
+   */
+  stateDigest(): string {
+    const skipped = new Set(["backend", "emitChain", "pendingWrites", "lineage"]);
+    const image: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(this)) {
+      if (skipped.has(key)) continue;
+      image[key] =
+        value instanceof Map
+          ? [...value.entries()].sort(([a], [b]) => (String(a) < String(b) ? -1 : 1))
+          : value instanceof Set
+            ? [...value].sort()
+            : value;
+    }
+    return JSON.stringify(image, (_key, value) =>
+      value instanceof Map
+        ? [...value.entries()].sort(([a], [b]) => (String(a) < String(b) ? -1 : 1))
+        : value instanceof Set
+          ? [...value].sort()
+          : value,
+    );
+  }
+
   private emit(
     type: OrchestrationEventType,
     missionId: string,
@@ -1161,6 +1207,14 @@ export class MissionStore {
             this.repositoryLeaseEpochs.set(lease.repoId, { ...lease });
             if (transition === "expired" || transition === "fenced") this.repositoryLeases.delete(lease.repoId);
             else this.repositoryLeases.set(lease.repoId, { ...lease });
+          }
+        }
+        // A compacted log folds superseded lease events into the one that
+        // survives; each folded event still counted toward its mission's revision.
+        const collapsed = e.payload.collapsed as Record<string, number> | undefined;
+        if (collapsed) {
+          for (const [collapsedMissionId, count] of Object.entries(collapsed)) {
+            for (let folded = 0; folded < count; folded++) this.advanceMissionRevision(collapsedMissionId);
           }
         }
         break;
@@ -3748,6 +3802,11 @@ export class MissionStore {
     lease: MissionLease | RepositoryLease,
   ): void {
     if (!this.missions.has(lease.missionId)) throw new Error(`unknown mission ${lease.missionId}`);
+    if ((transition === "fenced" || transition === "expired") && !this.holdsLeaseEpoch(scope, lease)) {
+      // Fencing or expiring a lease that is no longer held changes nothing, so
+      // it must not cost a durable event (recovery loops re-fence endlessly).
+      return;
+    }
     if (scope === "mission") {
       const prior = this.missionLeaseEpochs.get(lease.missionId);
       if (prior && prior.generation !== lease.generation) {
@@ -3774,7 +3833,20 @@ export class MissionStore {
     });
   }
 
-  resumeMission(missionId: string, reason: string): MissionResumption {
+  /** Whether this exact lease epoch is the one currently held for its resource. */
+  private holdsLeaseEpoch(scope: "mission" | "repository", lease: MissionLease | RepositoryLease): boolean {
+    const held =
+      scope === "mission"
+        ? this.missionLeases.get(lease.missionId)
+        : this.repositoryLeases.get((lease as RepositoryLease).repoId);
+    return held !== undefined && held.generation === lease.generation && held.fencingToken === lease.fencingToken;
+  }
+
+  resumeMission(
+    missionId: string,
+    reason: string,
+    origin: NonNullable<MissionResumption["origin"]>,
+  ): MissionResumption {
     if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
     const currentLease = this.missionLeases.get(missionId);
     if (currentLease) {
@@ -3789,6 +3861,7 @@ export class MissionStore {
       resumedAt: new Date().toISOString(),
       generation: (this.listMissionResumptions(missionId).at(-1)?.generation ?? 0) + 1,
       stopGeneration: this.listMissionStops(missionId).at(-1)?.generation ?? 0,
+      origin,
     };
     this.missionResumptions.push(resumption);
     this.emit("mission.resumed", missionId, { actor: "system", resumption });
@@ -3844,6 +3917,7 @@ export class MissionStore {
         resumedAt: new Date().toISOString(),
         generation: expected.resumptionGeneration + 1,
         stopGeneration: durable.listMissionStops(missionId).at(-1)?.generation ?? 0,
+        origin: "automatic",
       };
       const event: OrchestrationEvent = {
         event_id: id("oevt"),
