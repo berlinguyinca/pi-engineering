@@ -159,23 +159,41 @@ export class ExternalAgentClient {
     return this.cred.agentId;
   }
 
-  private async call(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
-    let res: Response;
+  /** The room this credential is bound to (an external agent is bound to exactly one). */
+  get roomId(): string | undefined {
+    return this.cred.roomId;
+  }
+
+  /**
+   * One authenticated collab request. Resolves with the Response whatever its status (the caller classifies it) and
+   * rejects only when the control plane cannot be reached. `timeoutMs: 0` means no timeout (event streams).
+   */
+  async raw(
+    method: "GET" | "POST",
+    path: string,
+    opts: { body?: unknown; signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<Response> {
+    const timeout = opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
+    const signals = [...(timeout > 0 ? [AbortSignal.timeout(timeout)] : []), ...(opts.signal ? [opts.signal] : [])];
     try {
-      res = await this.fetchImpl(`${this.cred.baseUrl}${COLLAB}${path}`, {
+      return await this.fetchImpl(`${this.cred.baseUrl}${COLLAB}${path}`, {
         method,
         redirect: "error",
         headers: {
           Authorization: `Agent ${this.cred.credential}`,
           "X-Herdr-Device": this.cred.deviceId,
-          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+          ...(opts.body !== undefined ? { "Content-Type": "application/json" } : {}),
         },
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+        ...(signals.length ? { signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals) } : {}),
       });
     } catch {
       throw new ExternalAgentError("could not reach the control plane");
     }
+  }
+
+  private async call(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
+    const res = await this.raw(method, path, body !== undefined ? { body } : {});
     if (!res.ok) throw new ExternalAgentError(`${path} refused (HTTP ${res.status})`, res.status);
     return res.json().catch(() => ({}));
   }
