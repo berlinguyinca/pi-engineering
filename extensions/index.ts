@@ -390,7 +390,9 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     },
     onMissionActivity: (event) => {
       publishMissionActivity(key, event);
-      presence?.update(event);
+      // Events before the open settles are the runtime replaying stored
+      // missions; they set presence's baseline instead of notifying.
+      presence?.update(event, undefined, attentionReady ? "activity" : "replay");
       if (attentionReady) void attention?.update(event).catch(() => {});
     },
     // The quiet heartbeat: observability composes a human-readable sentence when

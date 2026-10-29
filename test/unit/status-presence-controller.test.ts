@@ -315,3 +315,31 @@ test("the quiet heartbeat has its own slower cadence than the strip", () => {
   clock = T0;
   controller.dispose();
 });
+
+test("a replay of stored stopped and complete missions sets a baseline and never notifies", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  const stopped = mission({ missionId: "MSN-old", state: "STOPPED", health: "stalled" });
+  const complete = mission({ missionId: "MSN-done", state: "COMPLETE", health: "complete" });
+  controller.update(stopped, undefined, "replay");
+  controller.update(complete, undefined, "replay");
+  controller.update(needsYou, undefined, "store");
+  controller.tick();
+  controller.update(stopped, undefined, "activity");
+  controller.tick();
+  assert.deepEqual(sink.notices, []);
+  assert.equal(controller.visible(), 3);
+  controller.dispose();
+});
+
+test("a live change after a replayed baseline still notifies", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running, undefined, "replay");
+  controller.tick();
+  controller.update(needsYou, undefined, "activity");
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  assert.match(sink.notices[0]!.text, /needs you/);
+  controller.dispose();
+});
