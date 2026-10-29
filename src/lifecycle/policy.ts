@@ -181,8 +181,29 @@ export interface MissionLimitsConfig {
   worker_inactivity_ms: number;
 }
 
+/** How much the foreground agent delegates. All three use the same execution infrastructure. */
+export const EXECUTION_PREFERENCES = ["direct", "adaptive", "team"] as const;
+export type ExecutionPreference = (typeof EXECUTION_PREFERENCES)[number];
+
+/**
+ * Execution preference (Missionless Execution Fabric). Ordinary prompts are
+ * answered by the foreground agent; no preference wraps them in a Mission, and
+ * none relaxes review, verification or risk gates (those live under `policies`).
+ */
+export interface ExecutionConfig {
+  /** `direct`: explicit delegation only. `adaptive`: delegate when justified. `team`: coordinated multi-agent. */
+  preference: ExecutionPreference;
+  /**
+   * Compatibility switch. When true, an engineering-intent prompt is told to
+   * run through the `mission` tool (the pre-MEF behaviour). Default false.
+   */
+  legacy_auto_invoke: boolean;
+}
+
 export interface EngineeringPolicy {
   version: number;
+  /** Execution preference; see ExecutionConfig. */
+  execution: ExecutionConfig;
   /** Mission time limits (opt-in caps + the hung-worker window). */
   limits: MissionLimitsConfig;
   /** Dotted keys from the global layer that repository config cannot weaken. */
@@ -223,6 +244,7 @@ export interface EngineeringPolicy {
 
 export const DEFAULT_POLICY: EngineeringPolicy = {
   version: 1,
+  execution: { preference: "adaptive", legacy_auto_invoke: false },
   limits: {
     worker_inactivity_ms: 3_600_000,
   },
@@ -415,6 +437,7 @@ const BOOLEAN_FIELDS = [
   "lifecycle.automatic",
   "lifecycle.telemetry",
   "lifecycle.notify",
+  "execution.legacy_auto_invoke",
   "routing.mode",
   "policies.review.require_independent_review",
   "policies.review.independent_reviewer",
@@ -459,6 +482,13 @@ export function validatePolicy(policy: EngineeringPolicy): PolicyIssue[] {
     if (typeof v !== "boolean") issues.push({ path, message: "expected true or false", severity: "error" });
   }
 
+  if (!(EXECUTION_PREFERENCES as readonly unknown[]).includes(policy.execution?.preference)) {
+    issues.push({
+      path: "execution.preference",
+      message: `must be one of ${EXECUTION_PREFERENCES.join(", ")}`,
+      severity: "error",
+    });
+  }
   if (policy.routing.mode !== "auto" && policy.routing.mode !== "manual") {
     issues.push({ path: "routing.mode", message: 'must be "auto" or "manual"', severity: "error" });
   }
@@ -645,6 +675,23 @@ export async function loadMissionLimits(cwd: string, agentDir?: string): Promise
     return { ...DEFAULT_POLICY.limits, ...policy.limits };
   } catch {
     return { ...DEFAULT_POLICY.limits };
+  }
+}
+
+/**
+ * The effective execution settings for a directory. A policy that fails to
+ * load or validate yields the defaults (adaptive, no legacy Mission directive):
+ * a broken config must never silently re-enable mandatory Missions.
+ */
+export async function loadExecutionConfig(cwd: string, agentDir?: string): Promise<ExecutionConfig> {
+  try {
+    const { policy, issues } = await loadPolicy({ cwd, ...(agentDir ? { agentDir } : {}) });
+    if (issues.some((issue) => issue.severity === "error" && issue.path.startsWith("execution."))) {
+      return { ...DEFAULT_POLICY.execution };
+    }
+    return { ...DEFAULT_POLICY.execution, ...policy.execution };
+  } catch {
+    return { ...DEFAULT_POLICY.execution };
   }
 }
 

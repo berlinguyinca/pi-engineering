@@ -5,6 +5,7 @@ import {
   AUTO_INVOKE_MIN_WORDS,
   MISSION_UNAVAILABLE_RETRY_TURNS,
   decideAutoInvoke,
+  decideMissionDirective,
   isBareContinuation,
   missionToolReportedUnavailable,
 } from "../../src/orchestration/autoInvoke.ts";
@@ -184,4 +185,58 @@ describe("missionToolReportedUnavailable (PR #106 review)", () => {
       assert.equal(missionToolReportedUnavailable(report), false);
     });
   }
+});
+
+// ── Missionless Execution Fabric, phase 1 (O1 prompt corpus) ───────────────
+const MISSIONLESS = { preference: "adaptive", legacy_auto_invoke: false } as const;
+const LEGACY = { preference: "adaptive", legacy_auto_invoke: true } as const;
+
+/** The spec's O1 corpus: hello, question, fix, retry, continue, print, implement, plan. */
+const O1_CORPUS: { name: string; prompt: string; mode?: string }[] = [
+  { name: "hello", prompt: "hello there" },
+  { name: "question", prompt: "why does the build take so long?" },
+  { name: "fix", prompt: "fix the broken navigation menu in the header component" },
+  { name: "retry", prompt: "retry" },
+  { name: "continue", prompt: "continue" },
+  { name: "print", prompt: "implement a retry helper for the http client", mode: "print" },
+  { name: "implement", prompt: "implement pagination for the users list endpoint with tests" },
+  { name: "plan", prompt: "let's plan a rewrite of the session storage layer" },
+];
+
+describe("decideMissionDirective (MEF phase 1)", () => {
+  it("never injects the Mission directive for any O1 prompt by default", () => {
+    const injected = O1_CORPUS.filter(
+      (c) =>
+        decideMissionDirective({ ...base, prompt: c.prompt, ...(c.mode ? { mode: c.mode } : {}) }, MISSIONLESS).invoke,
+    );
+    assert.deepEqual(injected, []);
+  });
+
+  it("legacy opt-in reproduces the pre-MEF decision exactly for the whole corpus", () => {
+    for (const c of O1_CORPUS) {
+      const input = { ...base, prompt: c.prompt, ...(c.mode ? { mode: c.mode } : {}) };
+      assert.deepEqual(decideMissionDirective(input, LEGACY), decideAutoInvoke(input), c.name);
+    }
+  });
+
+  it("is a real change: the legacy path injects for at least one corpus prompt", () => {
+    const legacyCount = O1_CORPUS.filter(
+      (c) => decideAutoInvoke({ ...base, prompt: c.prompt, ...(c.mode ? { mode: c.mode } : {}) }).invoke,
+    ).length;
+    assert.ok(legacyCount >= 1, `legacy injected ${legacyCount}`);
+  });
+
+  it("explains why a legacy-eligible prompt was left to the foreground agent", () => {
+    const d = decideMissionDirective(
+      { ...base, prompt: "implement pagination for the users list endpoint with tests" },
+      { preference: "direct", legacy_auto_invoke: false },
+    );
+    assert.equal(d.invoke, false);
+    assert.match(d.reason, /missionless \(direct\)/);
+  });
+
+  it("keeps legacy skip reasons untouched when the classifier already declined", () => {
+    const d = decideMissionDirective({ ...base, prompt: "retry" }, MISSIONLESS);
+    assert.equal(d.reason, "bare retry/continue prompt");
+  });
 });

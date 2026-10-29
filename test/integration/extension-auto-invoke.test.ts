@@ -45,6 +45,44 @@ function autoInvokeHandler(handlers: Map<string, Handler[]>): Handler {
 
 const PROMPT = "Add a health endpoint to the API server";
 
+/**
+ * The Mission directive is opt-in (execution.legacy_auto_invoke, default off).
+ * The legacy-behaviour tests below opt in through the policy's env layer so
+ * they never read the operator's real engineering.yaml.
+ */
+async function withLegacyAutoInvoke<T>(on: boolean, run: () => Promise<T>): Promise<T> {
+  const prior = process.env.PI_ENGINEERING_POLICY;
+  process.env.PI_ENGINEERING_POLICY = JSON.stringify({ execution: { legacy_auto_invoke: on } });
+  try {
+    return await run();
+  } finally {
+    if (prior === undefined) delete process.env.PI_ENGINEERING_POLICY;
+    else process.env.PI_ENGINEERING_POLICY = prior;
+  }
+}
+
+test("by default an engineering prompt is not turned into a Mission directive", async () => {
+  await withLegacyAutoInvoke(false, async () => {
+    const hook = autoInvokeHandler(loadExtension());
+    assert.equal(await hook({ type: "before_agent_start", prompt: PROMPT }, { mode: "tui" }), undefined);
+  });
+});
+
+test("a non-boolean legacy_auto_invoke is rejected and leaves Missions off", async () => {
+  const prior = process.env.PI_ENGINEERING_POLICY;
+  process.env.PI_ENGINEERING_POLICY = JSON.stringify({ execution: { legacy_auto_invoke: "true" } });
+  try {
+    const hook = autoInvokeHandler(loadExtension());
+    assert.equal(await hook({ type: "before_agent_start", prompt: PROMPT }, { mode: "tui" }), undefined);
+  } finally {
+    if (prior === undefined) delete process.env.PI_ENGINEERING_POLICY;
+    else process.env.PI_ENGINEERING_POLICY = prior;
+  }
+});
+
+// The remaining tests cover the legacy hook itself, so they run with it opted in.
+process.env.PI_ENGINEERING_POLICY = JSON.stringify({ execution: { legacy_auto_invoke: true } });
+
 test("auto-invoke injects in the TUI but not in --print mode or for bare retries", async () => {
   const handlers = loadExtension();
   const hook = autoInvokeHandler(handlers);

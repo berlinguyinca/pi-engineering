@@ -13,6 +13,7 @@ import {
 import {
   DEFAULT_POLICY,
   deepMerge,
+  loadExecutionConfig,
   loadMissionLimits,
   loadPolicy,
   validatePolicy,
@@ -299,4 +300,66 @@ test("routing role fallback_model must be a provider/id string", () => {
     issues.some((i) => i.path === "routing.roles.planner.fallback_model"),
     "non-string fallback_model is a validation error",
   );
+});
+
+test("execution defaults to adaptive with no implicit Mission directive", async () => {
+  assert.deepEqual(DEFAULT_POLICY.execution, { preference: "adaptive", legacy_auto_invoke: false });
+  const cwd = await temp("pi-eng-exec-");
+  const agentDir = await temp("pi-eng-exec-agent-");
+  try {
+    assert.deepEqual(await loadExecutionConfig(cwd, agentDir), DEFAULT_POLICY.execution);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("execution preference and legacy opt-in load from repo yaml", async () => {
+  const cwd = await temp("pi-eng-exec-");
+  const agentDir = await temp("pi-eng-exec-agent-");
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(
+      join(cwd, ".pi", "engineering.yaml"),
+      "execution:\n  preference: team\n  legacy_auto_invoke: true\n",
+    );
+    assert.deepEqual(await loadExecutionConfig(cwd, agentDir), { preference: "team", legacy_auto_invoke: true });
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("an invalid execution preference is rejected and falls back to missionless defaults", async () => {
+  const cwd = await temp("pi-eng-exec-");
+  const agentDir = await temp("pi-eng-exec-agent-");
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(
+      join(cwd, ".pi", "engineering.yaml"),
+      "execution:\n  preference: mission\n  legacy_auto_invoke: true\n",
+    );
+    const { issues } = await loadPolicy({ cwd, agentDir });
+    assert.ok(issues.some((i) => i.path === "execution.preference" && i.severity === "error"));
+    assert.deepEqual(await loadExecutionConfig(cwd, agentDir), DEFAULT_POLICY.execution);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("execution preference never relaxes the mandatory review and verification gates", async () => {
+  const cwd = await temp("pi-eng-exec-");
+  const agentDir = await temp("pi-eng-exec-agent-");
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  preference: direct\n");
+    const { policy } = await loadPolicy({ cwd, agentDir });
+    assert.equal(policy.execution.preference, "direct");
+    assert.equal(policy.policies.review.require_independent_review, true);
+    assert.equal(policy.policies.completion_gate.require.verification_pass, true);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
+  }
 });
