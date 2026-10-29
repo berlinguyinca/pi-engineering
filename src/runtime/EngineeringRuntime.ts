@@ -1013,7 +1013,6 @@ export class EngineeringRuntime {
     const lock = await acquireSnapshotPublisherLock({
       dir: this.workDir,
       pid: process.pid,
-      ...(this.missionStore === undefined ? {} : {}),
       waitMs: SNAPSHOT_LOCK_WAIT_MS,
     });
     if (!lock) return null;

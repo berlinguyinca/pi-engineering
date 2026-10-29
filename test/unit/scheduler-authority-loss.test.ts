@@ -82,7 +82,12 @@ function liveAuthority(missionId: string): DispatchAuthority {
 /** A wall clock the test drives, so retry backoff never sleeps for real. */
 function clock(): { now: () => number; sleep: (ms: number) => Promise<void> } {
   let t = 0;
-  return { now: () => t, sleep: async (ms) => void (t += ms) };
+  return {
+    now: () => t,
+    sleep: async (ms) => {
+      t += ms;
+    },
+  };
 }
 
 function clockOptions() {

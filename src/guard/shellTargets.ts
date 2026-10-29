@@ -137,7 +137,7 @@ function splitCommand(command: string): Word[][] {
       if (ch === "`") {
         const close = command.indexOf("`", i + 1);
         const body = close === -1 ? command.slice(i + 1) : command.slice(i + 1, close);
-        buffer += "`" + body + "`";
+        buffer += `\`${body}\``;
         wordQuoted = true;
         i = close === -1 ? command.length : close + 1;
         continue;
@@ -439,7 +439,6 @@ function collect(
           const expanded = expandWord(raw, vars, env, literal);
           out.push(expanded ?? raw); // undefined => fail closed on the raw word
         }
-        continue;
       }
     }
 
