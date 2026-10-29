@@ -115,6 +115,9 @@ export const DEFAULT_ADMISSION_REASON_POLICY: Readonly<Record<string, AdmissionR
   worker_saturated: { action: "retry" },
   model_loading: { action: "retry" },
   capacity_unavailable: { action: "retry_then_fallback", fallbackAfterMs: 180_000 },
+  // A node restarting for a deployment: the console sends the capacity
+  // refusal's guidance with its own 30 s delay, so it is treated the same way.
+  node_updating: { action: "retry_then_fallback", fallbackAfterMs: 180_000 },
   quota_exhausted: { action: "fallback" },
   auth_failed: { action: "fail" },
   forbidden: { action: "fail" },

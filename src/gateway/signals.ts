@@ -145,12 +145,24 @@ export function isGatewayLinkCut(text: string | undefined): boolean {
 const FLATTENED_REFUSAL_CODES: ReadonlySet<string> = new Set([
   "routing_snapshot_expired",
   "capacity_unavailable",
+  "node_updating",
   "model_activating",
   "queue_timeout",
   "queue_deadline_exceeded",
   "queue_limit_reached",
   "request_not_queueable",
 ]);
+
+/**
+ * A refusal code's own wait, when the hint was lost (flattened to the code,
+ * or a gateway that sent no Retry-After). `node_updating`: the console asks
+ * for 30 s while the only node serving the model restarts for a deployment;
+ * polling it every 5 s would only collect more refusals. Every other code
+ * keeps the generic DEFAULT_WAIT_MS.
+ */
+const REASON_DEFAULT_WAIT_MS: Readonly<Record<string, number>> = {
+  node_updating: 30_000,
+};
 
 /** "Error: 503: routing_snapshot_expired" → status 503, code. The whole text. */
 const BARE_REFUSAL = /^\s*(?:error:\s*)?(?:(?:http\s*)?(\d{3})\b[:\s]*)?([a-z_]+)\.?\s*$/i;
@@ -435,7 +447,7 @@ export function parseGatewayWait(input: GatewayWaitInput): GatewayWaitSignal | n
     retryAfterMs = bodyWins ? bodyMaximum : (validHeaderWaitMs as number);
     source = bodyWins ? "body" : "header";
   } else {
-    retryAfterMs = DEFAULT_WAIT_MS;
+    retryAfterMs = REASON_DEFAULT_WAIT_MS[(reason ?? refusalCode ?? "").toLowerCase()] ?? DEFAULT_WAIT_MS;
     source = "default";
   }
 

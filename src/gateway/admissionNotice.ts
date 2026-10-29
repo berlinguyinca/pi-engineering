@@ -37,8 +37,19 @@ export function formatWaitingFor(ms: number): string {
   return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
-/** "queue timeout" from "queue_timeout"; the gateway's own words, made readable. */
-function reasonText(signal: GatewayWaitSignal): string {
+/**
+ * What the gateway says while the only node serving the model restarts for a
+ * deployment (`node_updating`). Used as is when the refusal reached us
+ * flattened to its bare code, with no message left to show.
+ */
+export const NODE_UPDATING_NOTICE = "updating node, please retry in 30 s";
+
+/**
+ * "queue timeout" from "queue_timeout"; the gateway's own words, made readable.
+ * `node_updating` reads as the console's sentence instead of the code.
+ */
+export function waitReasonText(signal: GatewayWaitSignal): string {
+  if (signal.reason?.toLowerCase() === "node_updating") return signal.message ?? NODE_UPDATING_NOTICE;
   const raw = signal.reason ?? signal.type ?? (signal.status ? `HTTP ${signal.status}` : "");
   return raw.replaceAll("_", " ");
 }
@@ -81,7 +92,7 @@ export function gatewayWaitLabel(signal: GatewayWaitSignal): string {
  */
 export function describeAdmissionEvent(event: AdmissionEvent, now: () => number = Date.now): TelemetryNotice {
   if (event.type === "wait") {
-    const reason = reasonText(event.signal);
+    const reason = waitReasonText(event.signal);
     const load = loadText(event.signal);
     const since = event.signal.waitingSinceMs;
     const lasted = since !== undefined ? `waiting for ${formatWaitingFor(now() - since)}` : "";
@@ -98,7 +109,7 @@ export function describeAdmissionEvent(event: AdmissionEvent, now: () => number 
     };
   }
   if (event.type === "clamp") {
-    const reason = reasonText(event.signal);
+    const reason = waitReasonText(event.signal);
     return {
       level: "warning",
       key: `clamp:${event.signal.reason ?? event.signal.type ?? event.signal.status ?? "unknown"}`,

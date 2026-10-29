@@ -261,7 +261,9 @@ model-capacity signals do not block local process or validation tasks.
 ### Long transient outages: wait for hours, fail only on permanent errors
 
 A model reloading or moving to another GPU, `capacity_unavailable` /
-`model_activating` / `no worker`, a gateway restart, a link cut, an expired
+`model_activating` / `no worker`, a node restarting for a deployment
+(`node_updating`: HTTP 503, `Retry-After: 30`, shown as "updating node, please
+retry in 30 s"), a gateway restart, a link cut, an expired
 routing snapshot or a queue timeout can last **hours**. None of them ends an
 interactive turn or a mission early. The **elapsed horizon** ends a wait;
 attempt counts never do. Permanent errors — auth, other 4xx, quota/billing,

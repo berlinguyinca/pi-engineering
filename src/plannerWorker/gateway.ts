@@ -430,6 +430,10 @@ const REASON_CODES: Readonly<Record<string, AvailabilityCode>> = {
   model_weights_do_not_fit: "MODEL_UNAVAILABLE",
   model_loading: "MODEL_LOADING",
   model_activating: "MODEL_LOADING",
+  // A node restarting for a deployment comes back on its own within the
+  // declared 30 s: wait it out (MODEL_LOADING's bounded waits) rather than
+  // switch models after one wait as NO_WORKERS does.
+  node_updating: "MODEL_LOADING",
   capacity_exhausted: "CAPACITY_EXHAUSTED",
   worker_saturated: "CAPACITY_EXHAUSTED",
   queue_limit_reached: "CAPACITY_EXHAUSTED",

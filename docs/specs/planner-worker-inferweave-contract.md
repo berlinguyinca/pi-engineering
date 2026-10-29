@@ -97,7 +97,7 @@ The availability code is read in this order:
 | Value read | Code |
 |---|---|
 | `capacity_unavailable` | `NO_WORKERS` |
-| `model_activating` | `MODEL_LOADING` |
+| `model_activating`, `node_updating` | `MODEL_LOADING` |
 | `queue_*`, `request_not_queueable`, `caller_hard_quota` | `CAPACITY_EXHAUSTED` |
 | `routing_snapshot_expired` | `NODE_LOST` |
 | `model_not_found`, `unsupported_model_capability`, … | `MODEL_UNAVAILABLE` |
