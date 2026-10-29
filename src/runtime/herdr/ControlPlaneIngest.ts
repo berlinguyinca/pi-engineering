@@ -29,6 +29,7 @@ import type { EnvelopeDraft, EnvelopeV2 } from "./envelope.ts";
 import { scopeIdsFromPayload } from "./envelopeAdapters.ts";
 import type { EnvelopeStore } from "./envelopeStore.ts";
 import type { OutboxStats } from "./outbox.ts";
+import { type SessionScope, SessionScopeRegistry } from "./sessionScope.ts";
 
 export interface ControlPlaneIngestOptions {
   /** Control-plane base URL, e.g. "http://dev.lan" (no trailing slash). */
@@ -54,6 +55,12 @@ export interface ControlPlaneIngestOptions {
   backoff?: BackoffOptions;
   /** Injectable clock (ms) for tests. */
   now?: () => number;
+  /**
+   * Default room / workspace / agent-instance ids (the YAML `herdr:` block). Session and mission bindings made on
+   * {@link ControlPlaneIngest.scopes} override them per event; one Pi attached to several rooms tags each session
+   * with its own room.
+   */
+  defaultScope?: SessionScope;
 }
 
 export interface BackoffOptions {
@@ -154,6 +161,8 @@ export class ControlPlaneIngest {
   readonly host: { hostId: string; hostName: string; tailnetIp?: string };
   readonly defaultMissionId?: string;
   enabled = true;
+  /** Per-session / per-mission room scope; see sessionScope.ts. */
+  readonly scopes: SessionScopeRegistry;
 
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
@@ -179,6 +188,7 @@ export class ControlPlaneIngest {
       tailnetIp: opts.host?.tailnetIp,
     };
     this.defaultMissionId = opts.defaultMissionId;
+    this.scopes = new SessionScopeRegistry(opts.defaultScope);
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.timeoutMs = opts.timeoutMs ?? 1500;
     this.apiKey = opts.apiKey?.trim() || undefined;
@@ -486,7 +496,10 @@ export class ControlPlaneIngest {
   missionStarted(missionId: string, title?: string): Promise<boolean> {
     if (this.seenMissions.has(missionId)) return Promise.resolve(true);
     this.seenMissions.add(missionId);
+    const scope = this.scopes.resolve({ missionId });
     return this.emit("mission", missionId, "mission.started", {
+      ...(scope.roomId ? { room_id: scope.roomId } : {}),
+      ...(scope.workspaceId ? { workspace_id: scope.workspaceId } : {}),
       title: title ?? missionId,
       stage: "active",
     });
@@ -515,11 +528,23 @@ export class ControlPlaneIngest {
       worktreeId?: string;
       commitSha?: string;
       repoUrl?: string;
+      /** Explicit scope for this event; wins over the session / mission binding and the YAML default. */
+      roomId?: string;
+      workspaceId?: string;
+      /** The agent instance (distinct from `instanceId`, which is the pane link). */
+      agentInstanceId?: string;
     } = {},
   ): Promise<boolean> {
     const missionId = payload.missionId ?? this.defaultMissionId;
     if (missionId) void this.missionStarted(missionId);
+    const scope = this.scopes.resolve(
+      { sessionId, ...(missionId ? { missionId } : {}) },
+      { roomId: payload.roomId, workspaceId: payload.workspaceId, agentInstanceId: payload.agentInstanceId },
+    );
     return this.emit("session", sessionId, eventType, {
+      ...(scope.roomId ? { room_id: scope.roomId } : {}),
+      ...(scope.workspaceId ? { workspace_id: scope.workspaceId } : {}),
+      ...(scope.agentInstanceId ? { agent_instance_id: scope.agentInstanceId } : {}),
       host_id: payload.hostId ?? this.host.hostId,
       mission_id: missionId ?? null,
       agent_role: payload.agentRole ?? "",

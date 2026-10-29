@@ -45,6 +45,8 @@ export interface EnvelopeIds {
   mission_id?: string;
   task_id?: string;
   agent_id?: string;
+  /** The agent INSTANCE (a Pi process / worker); not the pane-link `instance_id`. */
+  agent_instance_id?: string;
 }
 
 /** Everything an emitter knows about an event before it is stamped with a sequence. */
@@ -93,7 +95,16 @@ export interface BuildEnvelopeOptions {
   newEventId?: () => string;
 }
 
-const ID_KEYS = ["org_id", "project_id", "room_id", "workspace_id", "mission_id", "task_id", "agent_id"] as const;
+const ID_KEYS = [
+  "org_id",
+  "project_id",
+  "room_id",
+  "workspace_id",
+  "mission_id",
+  "task_id",
+  "agent_id",
+  "agent_instance_id",
+] as const;
 
 function nonEmpty(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
