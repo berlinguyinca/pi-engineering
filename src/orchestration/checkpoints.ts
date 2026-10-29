@@ -7,6 +7,11 @@ export interface CheckpointSnapshot {
   worktree: string | null;
   committedChanges: string[];
   preservedUncommittedChanges: string[];
+  /**
+   * Untracked files by content hash, when the snapshot could list and hash all of them within bounds. Absent means
+   * "not known", never "none": an empty list is a positive statement that the worktree has no untracked files.
+   */
+  untracked?: Array<{ path: string; sha256: string }>;
 }
 
 export interface CheckpointPersistInput {
@@ -74,7 +79,8 @@ function mergeHandoffContext(
       rationale: boundedText(d.rationale, "decision rationale", HANDOFF_LIMITS.text),
     });
   }
-  const tests = new Map((previous?.tests ?? []).map((t) => [t.ref, t] as const));
+  // Like untracked files, test outcomes describe the candidate now: a supplied list replaces, an omitted one leaves it be.
+  const tests = new Map(input?.tests ? [] : (previous?.tests ?? []).map((t) => [t.ref, t] as const));
   for (const raw of boundedList(input?.tests, "tests")) {
     const t = entry(raw, "tests");
     if (t.outcome !== "passed" && t.outcome !== "failed" && t.outcome !== "skipped") {
@@ -259,7 +265,12 @@ export class CheckpointManager {
         { refs: previous?.artifactRefs ?? [], hashes: previous?.artifactHashes ?? [] },
         { refs: input.artifactRefs ?? [], hashes: input.artifactHashes ?? [] },
       );
-      const handoff = mergeHandoffContext(previous?.handoff, input.handoff);
+      // A snapshot that listed the untracked files is the authority for them unless the caller supplied its own list.
+      const handoffInput =
+        snapshot.untracked && input.handoff?.untracked === undefined
+          ? { ...input.handoff, untracked: snapshot.untracked }
+          : input.handoff;
+      const handoff = mergeHandoffContext(previous?.handoff, handoffInput);
       const checkpoint: TaskCheckpoint = {
         checkpointId,
         executionId: execution.execution_id,

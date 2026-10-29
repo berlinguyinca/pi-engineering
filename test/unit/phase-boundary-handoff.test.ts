@@ -444,7 +444,7 @@ describe("orchestrator phase-boundary handoff", () => {
     store.addHandoffRecord = original;
   });
 
-  it("a fresh session resumes from the HandoffArtifact (AC)", () => {
+  it("a fresh session resumes from the HandoffArtifact (AC)", async () => {
     const { store, mission, setPhase } = makeHarness({
       usage: { input: 80000, contextTokens: 96000 },
       checkpointSha: "d".repeat(40),
@@ -456,11 +456,24 @@ describe("orchestrator phase-boundary handoff", () => {
 
     // The predecessor validates; the fresh session (next generation)
     // acknowledges the handoff from the artifact.
-    store.transitionHandoffRecord(record.id, "validated");
-    const acknowledged = store.transitionHandoffRecord(record.id, "acknowledged", {
-      sessionId: "sess-fresh",
-      generation: 1,
+    const checkpoint = {
+      missionId: mission.mission_id,
+      sessionId: "sess-pre",
+      baseSha: "base",
+      candidateSha: "d".repeat(40),
+      worktree: null,
+      artifactRefs: [],
+      artifactHashes: [],
+      handoff: { nextAction: null, decisions: [], unresolvedIssues: [], tests: [], memoryRefs: [], untracked: [] },
+    } as unknown as TaskCheckpoint;
+    // verify -> fence -> acknowledge: a record naming a checkpoint cannot skip the first two
+    await store.verifyHandoff(record.id, checkpoint, {
+      hashArtifact: async () => null,
+      commitExists: async () => true,
+      allowUnverifiable: true,
     });
+    await store.fenceHandoffSource(record.id, async () => {});
+    const acknowledged = store.acknowledgeHandoff(record.id, { sessionId: "sess-fresh", generation: 1 });
 
     // Resume decision for the fresh session at generation 1: the record is
     // acknowledged, the generation matches the lease, and the observed
