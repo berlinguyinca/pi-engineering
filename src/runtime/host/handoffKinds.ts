@@ -60,6 +60,14 @@ export interface HandoffRecord {
   sourceFencedAt?: string;
   /** Why the handoff was triggered, when it was an automatic continuity handoff. */
   cause?: HandoffCause;
+  /** Quota switch: the model the exhausted source was running, and the configured fallback the successor must run. */
+  fromModel?: string;
+  toModel?: string;
+  /**
+   * Why an automatic handoff was deliberately NOT driven (e.g. quota exhausted and no fallback configured). A record
+   * carrying this stays `prepared`: the source is not fenced and no successor is started.
+   */
+  blockedReason?: string;
 }
 
 const CHECKPOINT_SHA_PATTERN = /^[0-9a-f]{7,64}$/;
@@ -165,6 +173,12 @@ export function validateHandoffRecord(
     errors.push(`cause must be one of ${HANDOFF_CAUSES.join(", ")} when present`);
   }
 
+  for (const field of ["fromModel", "toModel", "blockedReason"] as const) {
+    if (obj[field] !== undefined && !isNonEmptyString(obj[field])) {
+      errors.push(`${field} must be a non-empty string when present`);
+    }
+  }
+
   if (typeof state === "string" && REQUIRED_ACK_STATES.has(state as HandoffState)) {
     if (obj.successor === undefined) errors.push(`successor is required for state ${state}`);
     if (obj.ackAt === undefined) errors.push(`ackAt is required for state ${state}`);
@@ -189,5 +203,8 @@ export function validateHandoffRecord(
   if (obj.verifiedAt !== undefined) record.verifiedAt = obj.verifiedAt as string;
   if (obj.sourceFencedAt !== undefined) record.sourceFencedAt = obj.sourceFencedAt as string;
   if (obj.cause !== undefined) record.cause = obj.cause as HandoffCause;
+  if (obj.fromModel !== undefined) record.fromModel = obj.fromModel as string;
+  if (obj.toModel !== undefined) record.toModel = obj.toModel as string;
+  if (obj.blockedReason !== undefined) record.blockedReason = obj.blockedReason as string;
   return { ok: true, record };
 }

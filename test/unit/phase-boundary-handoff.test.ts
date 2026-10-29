@@ -288,6 +288,7 @@ function makeHarness(opts: {
   });
   const task = store.createTask({
     mission_id: mission.mission_id,
+    repo_id: "repo",
     kind: "agent",
     role: "implementer",
     objective: "do the work",

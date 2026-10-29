@@ -21,9 +21,24 @@
  * `sourceFencedAt` and is acknowledged either by a later drive or by the observed rollover, which is gated on those
  * stamps (MissionStore.acknowledgeObservedHandoffs). Never inferred, never invented.
  *
+ * Quota switch: a `quota_exhausted` record that carries `toModel` (a model the operator listed under engineering.yaml
+ * `quota_fallbacks`) switches the TASK's model durably after verification and before the source is fenced
+ * (MissionStore.switchTaskModel, idempotent); the scheduler's ordinary retry of the fenced task then asks for that model
+ * through `execution_requirements.model` and starts from the verified checkpoint. Only an execution on `toModel`
+ * acknowledges. A record with `blockedReason` (no fallback configured/eligible) is never driven: the source is untouched.
+ *
  * Records without a checkpoint SHA have nothing to verify and are not driven: they keep the legacy direct
- * `acknowledgeHandoff` path. `phase_transition` records are not driven either: their predecessor is the orchestrating
- * session, which wrote no checkpoint, so the protocol would reject every one of them.
+ * `acknowledgeHandoff` path.
+ *
+ * Phase boundary (`phase_transition`): the predecessor is the orchestrating session. The boundary first writes a real
+ * checkpoint of the orchestration state (CheckpointManager.persistPhaseBoundary, scope "orchestrator", read only
+ * through MissionStore.listOrchestratorCheckpoints) and the record names its SHA, so the same verify -> fence ->
+ * acknowledge path runs. What "fence" means here is a DECISION: the orchestrator must not stop itself from running the
+ * handoff, so it is never fenced and neither is the mission lease; only the PREVIOUS phase's worker authority is
+ * revoked, i.e. executions still RUNNING that started strictly before the record was created (stragglers of the
+ * finished phase: writer authority plus their registered process groups). A worker the next phase started after the
+ * boundary is not touched. The successor is the orchestrating session itself entering the next phase one generation
+ * later (a phase may start no agent session at all), driven at the moment that phase begins.
  */
 
 import { DEFAULT_CONTEXT_THRESHOLDS } from "../context/thresholds.ts";
@@ -102,7 +117,7 @@ export class HandoffDriver {
   private drivable(record: HandoffRecord): boolean {
     return (
       record.checkpointSha !== undefined &&
-      record.kind !== "phase_transition" &&
+      record.blockedReason === undefined &&
       (record.state === "prepared" || record.state === "validated")
     );
   }
@@ -110,6 +125,13 @@ export class HandoffDriver {
   private pickCheckpoint(record: HandoffRecord): TaskCheckpoint | undefined {
     const sha = record.checkpointSha;
     if (!sha) return undefined;
+    if (record.kind === "phase_transition") {
+      // The orchestrating session's own checkpoint (scope "orchestrator"), never a worker's.
+      return this.deps.store
+        .listOrchestratorCheckpoints(record.missionId)
+        .filter((c) => c.candidateSha?.startsWith(sha) && c.sessionId === record.predecessor.sessionId)
+        .at(-1);
+    }
     const matching = this.deps.store
       .listTaskCheckpoints(record.missionId)
       .filter((c) => c.candidateSha?.startsWith(sha) && c.executionId);
@@ -123,6 +145,9 @@ export class HandoffDriver {
       .filter(
         (e) =>
           e.task_id === checkpoint.taskId &&
+          // A quota switch is only taken over by an execution on the configured fallback: a same-model retry racing in
+          // from the scheduler's resilience path is not the successor.
+          (record.toModel === undefined || e.model === record.toModel) &&
           e.execution_id !== checkpoint.executionId &&
           e.session_id &&
           e.session_id !== record.predecessor.sessionId &&
@@ -134,6 +159,36 @@ export class HandoffDriver {
     return first?.session_id
       ? { sessionId: first.session_id, generation: record.predecessor.generation + 1 }
       : undefined;
+  }
+
+  /**
+   * The successor of a phase boundary is the orchestrating session entering the next phase one generation later: the
+   * boundary is the orchestrator's own context boundary, and a phase may start no agent session at all (integration,
+   * validation), so no worker can be the one to take over. It is driven at the moment the next phase begins.
+   */
+  private phaseSuccessor(record: HandoffRecord) {
+    return { sessionId: record.predecessor.sessionId, generation: record.predecessor.generation + 1 };
+  }
+
+  /**
+   * Phase fence: revoke the PREVIOUS phase's worker authority and nothing else. Exactly the executions still RUNNING
+   * that started strictly before the boundary record was created (late stragglers of the finished phase) lose their
+   * writer authority and their registered process groups. The orchestrating session is never fenced (it runs this very
+   * handoff), the mission lease is untouched, and a worker the next phase started after the boundary is left alone
+   * (the drive is launched asynchronously, so it may already be running).
+   */
+  private phaseFence(record: HandoffRecord): () => Promise<void> {
+    return composeFences(
+      ...this.deps.store
+        .listExecutions(record.missionId)
+        .filter(
+          (e) =>
+            e.status === "RUNNING" && e.started_at !== null && Date.parse(e.started_at) < Date.parse(record.createdAt),
+        )
+        .map((e) =>
+          fenceExecutionWriter(this.deps.store, e.execution_id, () => this.deps.quarantineExecution(e.execution_id)),
+        ),
+    );
   }
 
   private async run(handoffId: string): Promise<DriveResult> {
@@ -149,7 +204,8 @@ export class HandoffDriver {
       );
       return { status: "skipped", reason: "no matching checkpoint" };
     }
-    const successor = this.discoverSuccessor(record, checkpoint);
+    const successor =
+      record.kind === "phase_transition" ? this.phaseSuccessor(record) : this.discoverSuccessor(record, checkpoint);
     const pressure = this.deps.pressureThreshold?.();
     // A record whose cause IS context pressure crossed a level above the pressure threshold by construction, even when
     // no usage figure was recorded on the executions; the fallback after a rejection must not forget that.
@@ -162,11 +218,26 @@ export class HandoffDriver {
       checkpoint,
       ...(successor ? { successor } : {}),
       deps: this.deps.verifyDeps ?? createHandoffVerifyDeps(this.deps.artifacts),
-      fenceSource: composeFences(
-        fenceExecutionWriter(store, checkpoint.executionId, () =>
-          this.deps.quarantineExecution(checkpoint.executionId),
-        ),
-      ),
+      fenceSource:
+        record.kind === "phase_transition"
+          ? this.phaseFence(record)
+          : composeFences(
+              // Quota switch: the task's model is switched (durably, idempotently) AFTER verification and BEFORE the writer
+              // is fenced, so the retry the fence unblocks already asks for the fallback model and starts from the checkpoint.
+              async () => {
+                if (record.cause === "quota_exhausted" && record.toModel) {
+                  store.switchTaskModel(
+                    checkpoint.taskId,
+                    record.toModel,
+                    checkpoint.candidateSha ?? undefined,
+                    record.id,
+                  );
+                }
+              },
+              fenceExecutionWriter(store, checkpoint.executionId, () =>
+                this.deps.quarantineExecution(checkpoint.executionId),
+              ),
+            ),
       contextUtilization: utilization,
       ...(pressure !== undefined ? { pressureThreshold: pressure } : {}),
     });
@@ -180,7 +251,7 @@ export class HandoffDriver {
       case "acknowledged":
         return `[mission ${m}] handoff ${id} verified, source fenced, acknowledged by ${outcome.record.successor?.sessionId}`;
       case "fenced":
-        return `[mission ${m}] handoff ${id} verified, source fenced; awaiting the successor session`;
+        return `[mission ${m}] handoff ${id} verified, source fenced${outcome.record.toModel ? ` (task switched ${outcome.record.fromModel ?? "?"} -> ${outcome.record.toModel})` : ""}; awaiting the successor session`;
       case "already_acknowledged":
         return `[mission ${m}] handoff ${id} already acknowledged (${outcome.resume.decision})`;
       case "rejected":

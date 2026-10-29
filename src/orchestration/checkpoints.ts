@@ -323,6 +323,92 @@ export class CheckpointManager {
     }
   }
 
+  /**
+   * The orchestrating session's own checkpoint at a phase boundary (spec: phase handoff). The orchestrator has no
+   * execution, so this does not go through `persist` (which proves a worker execution's authority); it builds the same
+   * `TaskCheckpoint` shape, with the same bounded handoff context validation (`mergeHandoffContext`), from the mission's
+   * durable state and publishes it with `scope: "orchestrator"`, anchored on the mission's most recent task so it
+   * satisfies the store's task/mission integrity check. What it records is ORCHESTRATION state: the phase pair, which
+   * deliverables are done and remaining, the open findings, and the newest candidate the workers checkpointed. It
+   * does not claim anything about untracked files (an empty list), and it never changes task or acceptance status.
+   * Throws when the mission has no task to anchor on or no repository identity: no checkpoint, no handoff.
+   */
+  persistPhaseBoundary(input: {
+    missionId: string;
+    fromPhase: string | null;
+    toPhase: string;
+    /** The orchestrating session; the handoff record names it as the predecessor and verification compares. */
+    sessionId: string;
+    reason: string;
+  }): TaskCheckpoint {
+    const mission = this.store.getMission(input.missionId);
+    if (!mission) throw new Error(`unknown mission ${input.missionId}`);
+    const tasks = this.store.listTasks(input.missionId);
+    const anchor = tasks.at(-1);
+    if (!anchor) throw new Error("phase checkpoint needs at least one task to anchor on");
+    const manifest = this.store.getWorkspaceManifest(input.missionId);
+    const repository =
+      manifest?.repositories.find((candidate) => candidate.repoId === anchor.repo_id) ?? manifest?.repositories[0];
+    const repoId = anchor.repo_id ?? repository?.repoId;
+    if (!repoId) throw new Error("phase checkpoint needs a repository identity");
+    const baseSha = repository?.baseSha ?? mission.base_ref;
+    if (!baseSha) throw new Error("phase checkpoint needs a base sha");
+    const workerCheckpoints = this.store.listTaskCheckpoints(input.missionId);
+    const candidateSha = workerCheckpoints.at(-1)?.candidateSha ?? baseSha;
+    const prior = this.store.listOrchestratorCheckpoints(input.missionId);
+    const sequence = (prior.at(-1)?.sequence ?? 0) + 1;
+    const done = tasks.filter((t) => t.status === "SUCCEEDED").flatMap((t) => t.deliverables ?? []);
+    const open = tasks.filter((t) => t.status !== "SUCCEEDED" && t.status !== "SKIPPED" && t.status !== "CANCELED");
+    const findings = this.store
+      .listFindings(input.missionId)
+      .filter((f) => f.status === "open")
+      .map((f) => `${f.severity}: ${f.summary}`.slice(0, HANDOFF_LIMITS.short));
+    const handoff = mergeHandoffContext(undefined, {
+      nextAction: `Run phase ${input.toPhase} of mission ${input.missionId}`,
+      decisions: [
+        {
+          id: `phase:${input.fromPhase ?? "start"}->${input.toPhase}`,
+          summary: `Phase ${input.fromPhase ?? "start"} -> ${input.toPhase}`,
+          rationale: input.reason.slice(0, HANDOFF_LIMITS.text) || "phase boundary",
+        },
+      ],
+      unresolvedIssues: findings.slice(0, HANDOFF_LIMITS.items),
+      tests: [],
+      memoryRefs: [],
+      untracked: [],
+    });
+    const checkpoint: TaskCheckpoint = {
+      checkpointId: `TCP-orch-${input.missionId}-${sequence}`,
+      executionId: `ORCH-${input.missionId}`,
+      missionId: input.missionId,
+      taskId: anchor.task_id,
+      repoId,
+      baseSha,
+      candidateSha,
+      branch: null,
+      worktree: repository?.canonicalRoot ?? null,
+      committedChanges: [],
+      preservedUncommittedChanges: [],
+      completedDeliverables: dedupe(done),
+      remainingDeliverables: dedupe(open.flatMap((t) => t.deliverables ?? [t.objective])),
+      acceptanceIds: mission.acceptance_criteria.flatMap((c) => (c.acceptance_id ? [c.acceptance_id] : [])),
+      validationEvidenceRefs: [],
+      artifactRefs: [],
+      artifactHashes: [],
+      workerId: null,
+      sessionId: input.sessionId,
+      model: null,
+      sequence,
+      missionGeneration: anchor.mission_generation ?? 0,
+      candidateGeneration: anchor.candidate_generation ?? 0,
+      fencingToken: anchor.fencing_token ?? 0,
+      ...(handoff ? { handoff } : {}),
+      scope: "orchestrator",
+      createdAt: this.now().toISOString(),
+    };
+    return this.store.checkpointTask(checkpoint);
+  }
+
   reconcile(taskId: string): ReconciledCheckpoint | null {
     const checkpoint = this.latest(taskId);
     if (!checkpoint) return null;
