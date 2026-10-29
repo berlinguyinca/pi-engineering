@@ -14,14 +14,19 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { describeAdmissionEvent } from "../../src/gateway/admissionNotice.ts";
 import { AfterOutputRetry } from "../../src/gateway/afterOutputRetry.ts";
+import { FallbackCoordinator } from "../../src/gateway/fallbackLifecycle.ts";
+import { recoverableFailure } from "../../src/gateway/settleRecovery.ts";
 import {
+  ALTERNATE_MODEL_ADVICE,
+  ALTERNATE_MODEL_SWITCHING,
   DEFAULT_WAIT_MS,
   type GatewayWaitSignal,
+  advisesAlternateModel,
   flattenedInferWeaveRefusalCode,
   isFlattenedInferWeaveRefusal,
   parseGatewayWait,
 } from "../../src/gateway/signals.ts";
-import { pumpWithGatewayRetry } from "../../src/gateway/streamRetry.ts";
+import { ALTERNATE_MODEL_MAX_ELAPSED_MS, pumpWithGatewayRetry } from "../../src/gateway/streamRetry.ts";
 import { classifyError } from "../../src/guard/transient.ts";
 import {
   DEFAULT_ADMISSION_REASON_POLICY,
@@ -316,4 +321,179 @@ test("unknown code falls back to generic retry", async () => {
   const run = await pump([[{ type: "error", error: { stopReason: "error", errorMessage: `503: ${code}` } }], answered]);
   assert.equal(run.ended?.stopReason, "stop");
   assert.equal(run.holds[0]?.retryAfterMs, DEFAULT_WAIT_MS);
+});
+
+// ─── Never a model switch ───────────────────────────────────────────────────
+
+const CAPACITY = {
+  error: {
+    ...ENVELOPE.error,
+    code: "capacity_unavailable",
+    reason: "capacity_unavailable",
+    message: "Try another eligible deployment after the declared delay.",
+    retry_after_ms: 20000,
+  },
+};
+const refusedWith = (body: unknown): Ev[] => [
+  { type: "error", error: { stopReason: "error", errorMessage: `503: ${JSON.stringify(body)}` } },
+];
+
+/** A pump run whose caller would abandon every advised hold (a stand-in is armed). */
+async function pumpWithStandIn(attempts: Ev[][]) {
+  const script = scripted(attempts);
+  let ended: Res | undefined;
+  const holds: GatewayWaitSignal[] = [];
+  const asked: GatewayWaitSignal[] = [];
+  await pumpWithGatewayRetry(
+    script.open,
+    {
+      push: () => {},
+      end: (r?: Res) => {
+        ended = r;
+      },
+    },
+    {
+      hold: async (signal) => {
+        holds.push(signal);
+      },
+      abandonForAlternate: (info) => {
+        asked.push(info.signal);
+        return true;
+      },
+    },
+  );
+  return { ended, holds, asked, opened: script.opened() };
+}
+
+test("node_updating is held on the same model even with a stand-in armed; capacity_unavailable still abandons", async () => {
+  const updating = await pumpWithStandIn([refusedWith(ENVELOPE), answered]);
+  assert.deepEqual(updating.asked, [], "abandonForAlternate is never consulted");
+  assert.equal(updating.holds.length, 1);
+  assert.equal(updating.holds[0]?.retryAfterMs, 30_000);
+  assert.equal(updating.opened, 2, "the same model is asked again after the wait");
+  assert.equal(updating.ended?.stopReason, "stop");
+
+  const capacity = await pumpWithStandIn([refusedWith(CAPACITY), answered]);
+  assert.equal(capacity.asked.length, 1, "existing behaviour: the advised hold is offered to the switch");
+  assert.equal(capacity.holds.length, 0);
+  assert.equal(capacity.opened, 1);
+  assert.equal(capacity.ended?.errorMessage, ALTERNATE_MODEL_SWITCHING);
+
+  // The coordinator (what arms setModel at the settle boundary) is not armed either.
+  const signal = parseGatewayWait({ text: TEXT, headers: HEADERS })!;
+  assert.equal(advisesAlternateModel(signal), false);
+  assert.equal(advisesAlternateModel(parseGatewayWait({ text: "node_updating" })!), false);
+  assert.equal(advisesAlternateModel(parseGatewayWait({ text: `503: ${JSON.stringify(CAPACITY)}` })!), true);
+  const c = new FallbackCoordinator({ advisedSwitch: true });
+  c.noteStandIn(true);
+  c.onGatewayHold({
+    modelId: "m",
+    provider: "gw",
+    source: signal.source,
+    accountWide: false,
+    advisesAlternate: advisesAlternateModel(signal),
+    retryAfterMs: signal.retryAfterMs,
+  });
+  assert.equal(c.hasPending, false, "no switch is armed for a deployment restart");
+});
+
+test("a node stuck updating ends the turn after the 15-minute ceiling, not the 12-hour horizon", async () => {
+  let clock = 0;
+  const script = scripted([refusedWith(ENVELOPE)]);
+  let ended: Res | undefined;
+  const outcome = await pumpWithGatewayRetry(
+    script.open,
+    {
+      push: () => {},
+      end: (r?: Res) => {
+        ended = r;
+      },
+    },
+    {
+      now: () => clock,
+      wallNow: () => clock,
+      hold: async (signal) => {
+        clock += signal.retryAfterMs;
+      },
+      abandonForAlternate: () => true,
+    },
+  );
+  assert.equal(outcome.settled, "error");
+  assert.ok(clock <= ALTERNATE_MODEL_MAX_ELAPSED_MS, `held ${clock} ms`);
+  assert.ok(clock >= ALTERNATE_MODEL_MAX_ELAPSED_MS - 60_000, `held ${clock} ms: the whole ceiling, not less`);
+  assert.ok(ended?.errorMessage?.includes("node_updating"));
+  assert.ok(!ended?.errorMessage?.includes(ALTERNATE_MODEL_ADVICE), "no advice to switch models");
+
+  // Settle recovery does not pick the turn up again: it ends.
+  assert.equal(
+    recoverableFailure({
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: ended?.errorMessage,
+      content: [],
+    } as never),
+    undefined,
+  );
+  assert.equal(
+    recoverableFailure({ role: "assistant", stopReason: "error", errorMessage: "node_updating", content: [] } as never),
+    undefined,
+  );
+  // Unchanged for other refusals.
+  assert.notEqual(
+    recoverableFailure({
+      role: "assistant",
+      stopReason: "error",
+      errorMessage: `503: ${JSON.stringify(CAPACITY)}`,
+      content: [],
+    } as never),
+    undefined,
+  );
+});
+
+test("Retry-After and retry_after_ms disagreeing: the larger wins", () => {
+  const longerHeader = parseGatewayWait({ text: TEXT, headers: { "retry-after": "60" } });
+  assert.equal(longerHeader?.retryAfterMs, 60_000);
+  assert.equal(longerHeader?.source, "header");
+  const longerBody = parseGatewayWait({
+    text: `503: ${JSON.stringify({ error: { ...ENVELOPE.error, retry_after_ms: 45_000 } })}`,
+    headers: HEADERS,
+  });
+  assert.equal(longerBody?.retryAfterMs, 45_000);
+  const bounds = { minDelayMs: 0, maxDelayMs: 5_000, baseBackoffMs: 1_000, jitterRatio: 0 };
+  assert.equal(
+    resolveRetryDelay({ headers: { "retry-after": "60" }, body: ENVELOPE.error, attempt: 1, bounds }).delayMs,
+    60_000,
+  );
+  assert.equal(
+    resolveRetryDelay({ headers: HEADERS, body: { retry_after_ms: 45_000 }, attempt: 1, bounds }).delayMs,
+    45_000,
+  );
+});
+
+test("planner worker: waits out node_updating twice more, then switches on the third strike", () => {
+  const availability = parseAvailabilityError(503, ENVELOPE, HEADERS)!;
+  for (const strikes of [0, 1, 2]) {
+    assert.deepEqual(decideAvailability(availability.code, strikes, availability.retryAfterMs), {
+      action: "wait",
+      ms: 30_000,
+    });
+  }
+  assert.deepEqual(decideAvailability(availability.code, 3, availability.retryAfterMs), { action: "switch" });
+});
+
+test("the gateway's message is sanitised before it reaches the terminal", () => {
+  const hostile = {
+    error: {
+      ...ENVELOPE.error,
+      message: `\u001b[2J\u001b[31mupdating node,\u0007 please retry in 30 s${"x".repeat(5_000)}`,
+    },
+  };
+  const signal = parseGatewayWait({ text: `503: ${JSON.stringify(hostile)}` })!;
+  const notice = describeAdmissionEvent({ type: "wait", waitMs: 30_000, signal, concurrency: 4 });
+  assert.ok(
+    [...notice.text].every((ch) => ch.charCodeAt(0) >= 32 && ch.charCodeAt(0) !== 127),
+    JSON.stringify(notice.text),
+  );
+  assert.ok(notice.text.length < 250, `capped: ${notice.text.length}`);
+  assert.ok(notice.text.includes("updating node, please retry in 30 s"), notice.text);
 });

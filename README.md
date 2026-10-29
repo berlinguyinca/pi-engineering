@@ -286,6 +286,16 @@ is disabled by default. When explicitly enabled, it is armed only by a model's
 own outage (three consecutive holds): an account-wide queue, a connection drop
 and a link cut do not switch models.
 
+`node_updating` is the exception to the hours-long wait. The console sends it
+while the only node serving a model restarts for a deployment, with
+`retry_alternate` advice, but Pi never switches models for it: the pump holds
+the request on the same model, honouring `Retry-After` / `retry_after_ms` (the
+larger wins; 30 s when the code arrives without either). The hold is capped at
+15 minutes (`ALTERNATE_MODEL_MAX_ELAPSED_MS`, or `PI_GATEWAY_MAX_ELAPSED_MS`
+when that is shorter). The console's updating mark expires after 10 minutes,
+so a node still refusing after that is stuck rather than updating. The turn
+then ends with the refusal, and settle recovery does not continue it.
+
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `PI_GATEWAY_ADMISSION_ENABLED` | `true` | Disable admission control entirely |

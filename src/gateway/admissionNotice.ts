@@ -11,9 +11,11 @@
  * than shows.
  */
 
+import { stripVTControlCharacters } from "node:util";
+import { redactSecrets } from "../platform/redact.ts";
 import type { TelemetryNotice } from "../telemetry/sink.ts";
 import type { AdmissionEvent } from "./AdmissionController.ts";
-import type { GatewayWaitSignal } from "./signals.ts";
+import { type GatewayWaitSignal, isNodeUpdating } from "./signals.ts";
 
 /** "30s", "2m 05s", "450ms" — the shortest form that is still exact enough. */
 export function formatDuration(ms: number): string {
@@ -44,12 +46,36 @@ export function formatWaitingFor(ms: number): string {
  */
 export const NODE_UPDATING_NOTICE = "updating node, please retry in 30 s";
 
+/** Longest gateway message a one-line notice shows. */
+const NOTICE_MESSAGE_MAX_CHARS = 160;
+
+/**
+ * Gateway-supplied text made safe for a one-line notice: terminal escapes and
+ * control characters removed, secrets redacted (the same steps as the worker
+ * output preview, safeWorkerOutputPreview), whitespace collapsed, and cut to
+ * its head, where the sentence is. Not safeWorkerOutputPreview itself: that
+ * module's import graph would pull worker tools (and `typebox`) into the
+ * session-auto-resume launcher, which copies this file's imports.
+ */
+function gatewayText(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const plain = [...stripVTControlCharacters(value.slice(0, 4 * NOTICE_MESSAGE_MAX_CHARS))]
+    .map((ch) => {
+      const code = ch.charCodeAt(0);
+      return code < 32 || (code >= 127 && code <= 159) ? " " : ch;
+    })
+    .join("")
+    .replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069]/gu, "");
+  const clean = redactSecrets(plain).replace(/\s+/g, " ").trim();
+  return clean.slice(0, NOTICE_MESSAGE_MAX_CHARS) || undefined;
+}
+
 /**
  * "queue timeout" from "queue_timeout"; the gateway's own words, made readable.
  * `node_updating` reads as the console's sentence instead of the code.
  */
 export function waitReasonText(signal: GatewayWaitSignal): string {
-  if (signal.reason?.toLowerCase() === "node_updating") return signal.message ?? NODE_UPDATING_NOTICE;
+  if (isNodeUpdating(signal)) return gatewayText(signal.message) ?? NODE_UPDATING_NOTICE;
   const raw = signal.reason ?? signal.type ?? (signal.status ? `HTTP ${signal.status}` : "");
   return raw.replaceAll("_", " ");
 }

@@ -36,7 +36,7 @@ import { emitTelemetry } from "../telemetry/sink.ts";
 import { carriesAlternateAdvice } from "./advisedSwitch.ts";
 import { type ProjectedEntry, hasVisibleOutput, lastFailedAssistant } from "./afterOutputRetry.ts";
 import { parseGatewayElapsedMs } from "./config.ts";
-import { parseGatewayWait } from "./signals.ts";
+import { isNodeUpdating, parseGatewayWait } from "./signals.ts";
 import { DEFAULT_GATEWAY_MAX_ELAPSED_MS } from "./streamRetry.ts";
 
 interface BeforeSettleEvent {
@@ -170,6 +170,14 @@ export function recoverableFailure(message: FailedLike | undefined, contextWindo
 
   // Exhausted quota, spend or usage limits do not clear by waiting minutes.
   if (EXHAUSTED_LIMIT.test(text)) return undefined;
+
+  // `node_updating` reaching the boundary means the pump already held it for
+  // its whole budget (ALTERNATE_MODEL_MAX_ELAPSED_MS, 15 min, or a shorter
+  // PI_GATEWAY_MAX_ELAPSED_MS), past the console's 10-minute updating mark:
+  // the node is stuck, not updating, and continuing would only wait in the
+  // same refusal for hours. End the turn.
+  const updating = parseGatewayWait({ text });
+  if (updating && isNodeUpdating(updating)) return undefined;
 
   // The pump gave up on an advised alternate and no stand-in was available.
   if (carriesAlternateAdvice(message)) return { kind: "capacity (no alternate model)" };

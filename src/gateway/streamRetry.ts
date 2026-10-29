@@ -58,6 +58,7 @@ import {
   advisesAlternateModel,
   escalateSyntheticWait,
   isLongWaitTransient,
+  isNodeUpdating,
   parseGatewayWait,
   transportDropWait,
 } from "./signals.ts";
@@ -288,6 +289,12 @@ export const SHORT_TRANSIENT_MAX_ELAPSED_MS = 300_000;
  * (IW-ACT-RETRY-ALTERNATE). Without automatic model switching the operator is
  * the only one who can act on that, so the turn ends with the advice after
  * this long instead of holding silently for the 12-hour long-wait horizon.
+ *
+ * `node_updating` (a node restarting for a deployment) is held on the same
+ * model and never abandoned for an alternate, but under this same ceiling: the
+ * console's updating mark expires after 10 minutes, so a node still refusing
+ * after 15 is stuck, not updating. The turn then ends with the refusal, and
+ * settle recovery does not continue it (settleRecovery.ts).
  */
 export const ALTERNATE_MODEL_MAX_ELAPSED_MS = 15 * 60_000;
 
@@ -447,7 +454,7 @@ export async function pumpWithGatewayRetry<E extends RetryableEvent, R extends R
     const attemptCap = longWait ? maxAttempts : Math.min(maxAttempts, SHORT_TRANSIENT_MAX_ATTEMPTS);
     const chainBudgetMs = !longWait
       ? Math.min(maxElapsedMs, SHORT_TRANSIENT_MAX_ELAPSED_MS)
-      : held && advisesAlternateModel(held)
+      : held && (advisesAlternateModel(held) || isNodeUpdating(held))
         ? Math.min(maxElapsedMs, ALTERNATE_MODEL_MAX_ELAPSED_MS)
         : undefined;
     const chainRemainingMs = chainBudgetMs === undefined ? remainingMs : chainBudgetMs - (now() - startedAt);

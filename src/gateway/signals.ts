@@ -575,8 +575,28 @@ export function gatewayFailureMarker(signal: GatewayWaitSignal): string {
   return `gateway:${signal.reason ?? signal.type ?? signal.status ?? "rate-limited"}`;
 }
 
-/** The gateway's own guidance: this model cannot serve now, another may. */
-export function advisesAlternateModel(signal: Pick<GatewayWaitSignal, "actionCode" | "action">): boolean {
+/**
+ * The only node serving the model is restarting for a deployment
+ * (`node_updating`). The console sends it with the capacity refusal's
+ * `retry_alternate` guidance, but the node is back in ~30 s: never a reason to
+ * switch models.
+ */
+export function isNodeUpdating(signal: Pick<GatewayWaitSignal, "reason" | "code">): boolean {
+  return signal.reason?.toLowerCase() === "node_updating" || signal.code?.toLowerCase() === "node_updating";
+}
+
+/**
+ * The gateway's own guidance: this model cannot serve now, another may.
+ *
+ * Never for `node_updating`, whatever its action says: a 30 s deployment
+ * restart is waited out on the same model. Every switch path (the pump's
+ * abandon, AdvisedModelSwitch, the fallback lifecycle, a mission's give-up)
+ * reads this, so the exclusion holds for all of them.
+ */
+export function advisesAlternateModel(
+  signal: Pick<GatewayWaitSignal, "actionCode" | "action"> & Partial<Pick<GatewayWaitSignal, "reason" | "code">>,
+): boolean {
+  if (isNodeUpdating(signal)) return false;
   return signal.actionCode === "IW-ACT-RETRY-ALTERNATE" || signal.action === "retry_alternate";
 }
 
