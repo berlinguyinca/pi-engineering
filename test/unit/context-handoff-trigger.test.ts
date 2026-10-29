@@ -13,7 +13,13 @@ import { CONTEXT_USAGE_SUMMARY, QUOTA_EXHAUSTED_SUMMARY, sanitizeWorkerActivity 
 const SHA = "d".repeat(40);
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-function fakeTrigger(opts: { sha?: () => string | undefined; catalogue?: { id: string; eligible: boolean }[] } = {}) {
+function fakeTrigger(
+  opts: {
+    sha?: () => string | undefined;
+    catalogue?: { id: string; eligible: boolean }[];
+    checkpoint?: () => boolean | Promise<boolean>;
+  } = {},
+) {
   const records: Record<string, unknown>[] = [];
   const lines: string[] = [];
   let checkpointRequests = 0;
@@ -21,7 +27,7 @@ function fakeTrigger(opts: { sha?: () => string | undefined; catalogue?: { id: s
     thresholdsFor: () => DEFAULT_CONTEXT_THRESHOLDS,
     requestCheckpoint: async () => {
       checkpointRequests++;
-      return true;
+      return opts.checkpoint ? await opts.checkpoint() : true;
     },
     latestCheckpointSha: () => (opts.sha ? opts.sha() : SHA),
     addHandoff: (record) => {
@@ -87,6 +93,33 @@ describe("ContextHandoffTrigger", () => {
     await t.trigger.observe(obs(950));
     assert.equal(t.records.length, 1);
     assert.equal(t.records[0]!.checkpointSha, SHA);
+  });
+
+  it("a failed checkpoint request never hands off at a stale earlier checkpoint, and is retried", async () => {
+    const box = { ok: false };
+    const t = fakeTrigger({ checkpoint: () => box.ok });
+    await t.trigger.observe(obs(950));
+    assert.equal(t.records.length, 0);
+    assert.match(t.lines.join("\n"), /checkpoint request not confirmed/);
+    box.ok = true;
+    await t.trigger.observe(obs(950));
+    assert.equal(t.records.length, 1);
+  });
+
+  it("a throwing dependency is contained and the crossing stays armed", async () => {
+    const box = { boom: true };
+    const t = fakeTrigger({
+      checkpoint: () => {
+        if (box.boom) throw new Error("disk gone");
+        return true;
+      },
+    });
+    await t.trigger.observe(obs(950));
+    assert.equal(t.records.length, 0);
+    assert.match(t.lines.join("\n"), /handoff failed: disk gone/);
+    box.boom = false;
+    await t.trigger.observe(obs(950));
+    assert.equal(t.records.length, 1);
   });
 
   it("forget() re-arms a finished execution id", async () => {
@@ -246,6 +279,11 @@ function harness() {
     parentSessionId: "sess-pre",
     phaseHandoff: {},
   });
+  // No live execution in a unit harness: stand in for the broker's confirmed-checkpoint answer.
+  const broker = (orchestrator as unknown as { broker: { requestCheckpoint: (id: string) => Promise<boolean> } })
+    .broker;
+  const checkpoint = { confirm: true };
+  broker.requestCheckpoint = async () => checkpoint.confirm;
   const ids = { missionId: mission.mission_id, taskId: task.task_id, executionId: execution.execution_id };
   const activity = (event: Record<string, unknown>) =>
     (orchestrator as unknown as { observeWorkerActivity: (e: unknown) => void }).observeWorkerActivity({
@@ -258,7 +296,7 @@ function harness() {
     activity({ kind: "state", summary: CONTEXT_USAGE_SUMMARY, context: { tokens, window: 1000, model: "gw/test" } });
   const setPhase = (phase: string) =>
     (orchestrator as unknown as { phase: (m: Mission, p: string) => void }).phase.call(orchestrator, mission, phase);
-  return { store, mission, activity, context, setPhase, ids };
+  return { store, mission, activity, context, setPhase, ids, checkpoint };
 }
 
 describe("Orchestrator continuity wiring", () => {
@@ -281,6 +319,14 @@ describe("Orchestrator continuity wiring", () => {
     assert.equal(records[0]!.cause, "context_pressure");
     assert.equal(records[0]!.checkpointSha, SHA);
     assert.deepEqual(records[0]!.predecessor, { sessionId: "sess-pre", generation: 0 });
+  });
+
+  it("an unconfirmed checkpoint (broker has no live channel) records nothing", async () => {
+    const h = harness();
+    h.checkpoint.confirm = false;
+    h.context(950);
+    await flush();
+    assert.equal(h.store.listHandoffRecords(h.mission.mission_id).length, 0);
   });
 
   it("emergency acts at once, once", async () => {

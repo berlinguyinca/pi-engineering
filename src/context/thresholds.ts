@@ -76,7 +76,7 @@ type Partial3 = Partial<ContextThresholds>;
 export interface ContextThresholdConfig {
   defaults: Partial3;
   runtimes: Record<string, Partial3>;
-  models: Array<{ pattern: string; exact: boolean; thresholds: Partial3 }>;
+  models: Array<{ pattern: string; exact: boolean; re: RegExp; thresholds: Partial3 }>;
 }
 
 export const EMPTY_CONTEXT_THRESHOLD_CONFIG: ContextThresholdConfig = { defaults: {}, runtimes: {}, models: [] };
@@ -116,20 +116,15 @@ export function parseContextThresholdConfig(raw: unknown): { config: ContextThre
   if (isPlain(raw.models)) {
     for (const [pattern, layer] of Object.entries(raw.models)) {
       const ok = check(`model ${pattern}`, baseDefaults, pick(layer));
-      if (ok) config.models.push({ pattern, exact: !pattern.includes("*"), thresholds: ok });
+      if (ok) config.models.push({ pattern, exact: !pattern.includes("*"), re: globRegExp(pattern), thresholds: ok });
     }
   }
   return { config, notes };
 }
 
-function globMatch(pattern: string, text: string): boolean {
-  const re = new RegExp(
-    `^${pattern
-      .split("*")
-      .map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
-      .join(".*")}$`,
-  );
-  return re.test(text);
+function globRegExp(pattern: string): RegExp {
+  const escaped = pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"));
+  return new RegExp(`^${escaped.join(".*")}$`);
 }
 
 /**
@@ -150,7 +145,7 @@ export function resolveContextThresholds(
   if (target.runtime) apply(config.runtimes[target.runtime]);
   if (target.model) {
     const model = target.model;
-    for (const m of config.models) if (!m.exact && globMatch(m.pattern, model)) apply(m.thresholds);
+    for (const m of config.models) if (!m.exact && m.re.test(model)) apply(m.thresholds);
     for (const m of config.models) if (m.exact && m.pattern === model) apply(m.thresholds);
   }
   return current;
@@ -180,15 +175,18 @@ export type CrossingAction = "preferred" | "emergency" | null;
 
 /**
  * Idempotent crossing detector. Feed it every observation; it returns an action only on a real crossing:
- * `emergency` immediately (once), `preferred` only at a safe point (once). Dropping below `preferred` (compaction, a
- * successor session) re-arms it. Repeated polls at the same level never re-fire.
+ * `emergency` immediately (once), `preferred` only at a safe point (once). Dropping below `soft` (compaction, a
+ * successor session) re-arms it; hovering between soft and preferred does not. Repeated polls at the same level never re-fire.
  */
 export function evaluateCrossing(
   state: CrossingState,
   level: ContextLevel,
   atSafePoint: boolean,
 ): { state: CrossingState; action: CrossingAction } {
-  if (RANK[level] < RANK.preferred) return { state: { fired: "ok" }, action: null };
+  // Re-arm only once the session is clearly below the action levels (`ok`); hovering around `preferred` (usage can
+  // fluctuate between turns) must not produce a handoff per oscillation.
+  if (level === "ok") return { state: { fired: "ok" }, action: null };
+  if (RANK[level] < RANK.preferred) return { state, action: null };
   if (level === "emergency" && state.fired !== "emergency")
     return { state: { fired: "emergency" }, action: "emergency" };
   if (level === "preferred" && atSafePoint && RANK[state.fired] < RANK.preferred) {

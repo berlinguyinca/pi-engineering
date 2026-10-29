@@ -47,13 +47,13 @@ function toolOutputPreview(result: unknown): string | undefined {
   );
 }
 
-/** Per-turn summary (mission.obs.worker): fixed shape, so the metrics are computable from events. */
 /** Live context size of a worker session; carries `context` (numbers + model id), never content. */
 export const CONTEXT_USAGE_SUMMARY = "Context usage";
 /** The provider refused the run for quota; carries `inferenceFailure: "quota"`. A distinct cause from context pressure. */
 export const QUOTA_EXHAUSTED_SUMMARY = "Inference quota exhausted";
 const SAFE_MODEL_ID = /^[A-Za-z0-9._:/@+-]{1,128}$/;
 
+/** Per-turn summary (mission.obs.worker): fixed shape, so the metrics are computable from events. */
 export const TURN_SUMMARY = /^Turn ended: stop=[a-zA-Z_]{1,32} tool_error=[a-z_]{1,32}$/;
 
 const FILE_TOOLS = new Set(["read", "edit", "write"]);

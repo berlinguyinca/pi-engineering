@@ -85,14 +85,16 @@ export class ContextHandoffTrigger {
     this.crossing.set(executionId, state);
     if (!action) return;
     this.inFlight.add(executionId);
+    let done = false;
     try {
-      const done = await this.handoff(obs, "context", "context_pressure", {
+      done = await this.handoff(obs, "context", "context_pressure", {
         note: `context ${(obs.tokens / obs.window).toFixed(2)} crossed ${action} (${thresholds[action]})`,
       });
-      // No durable checkpoint = no handoff: stay armed so the next opportunity retries instead of going silent.
-      if (!done) this.crossing.set(executionId, before);
     } finally {
       this.inFlight.delete(executionId);
+      // No durable checkpoint = no handoff: stay armed so the next opportunity retries instead of going silent.
+      // (Not when the execution was forgotten meanwhile: that would resurrect a finished execution's entry.)
+      if (!done && this.latest.has(executionId)) this.crossing.set(executionId, before);
     }
   }
 
@@ -109,7 +111,27 @@ export class ContextHandoffTrigger {
     retryAfterMs?: number;
   }): Promise<"pause" | "switch_model" | "wait" | "fail" | "already_handled"> {
     if (this.quotaDone.has(input.executionId)) return "already_handled";
-    // Best effort: the execution may already be gone, in which case the newest earlier checkpoint is what exists.
+    try {
+      return await this.decideAndRecordQuota(input);
+    } catch (error) {
+      this.quotaDone.delete(input.executionId);
+      this.deps.report(
+        input.missionId,
+        `[mission ${input.missionId}] quota handoff failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return "fail";
+    }
+  }
+
+  private async decideAndRecordQuota(input: {
+    missionId: string;
+    taskId: string;
+    executionId: string;
+    model: string;
+    failureClass: InferenceFailureClass;
+    retryAfterMs?: number;
+  }): Promise<"pause" | "switch_model" | "wait" | "fail"> {
+    // Best effort: a quota failure usually ends the run, so the newest EARLIER durable checkpoint is what exists.
     await this.deps.requestCheckpoint(input.executionId);
     const sha = this.deps.latestCheckpointSha(input.missionId, input.taskId);
     const nowMs = (this.deps.now?.() ?? new Date()).getTime();
@@ -148,12 +170,41 @@ export class ContextHandoffTrigger {
     detail: { note: string; skipRequest?: boolean },
   ): Promise<boolean> {
     const { missionId } = obs;
-    const endpoint = this.deps.endpoint(missionId);
-    if (!endpoint) {
-      this.deps.report(missionId, `[mission ${missionId}] ${cause} handoff skipped: no session endpoint available`);
+    try {
+      const endpoint = this.deps.endpoint(missionId);
+      if (!endpoint) {
+        this.deps.report(missionId, `[mission ${missionId}] ${cause} handoff skipped: no session endpoint available`);
+        return false;
+      }
+      if (!detail.skipRequest) {
+        // A live execution that could not checkpoint now must not be handed off at a STALE earlier checkpoint.
+        const requested = await this.deps.requestCheckpoint(obs.executionId);
+        if (!requested) {
+          this.deps.report(
+            missionId,
+            `[mission ${missionId}] ${cause} handoff deferred: checkpoint request not confirmed (${detail.note})`,
+          );
+          return false;
+        }
+      }
+      return await this.record(obs, kind, cause, detail, endpoint);
+    } catch (error) {
+      this.deps.report(
+        missionId,
+        `[mission ${missionId}] ${cause} handoff failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       return false;
     }
-    if (!detail.skipRequest) await this.deps.requestCheckpoint(obs.executionId);
+  }
+
+  private async record(
+    obs: Pick<ContextObservation, "missionId" | "taskId" | "executionId">,
+    kind: HandoffKind,
+    cause: HandoffCause,
+    detail: { note: string },
+    endpoint: HandoffEndpoint,
+  ): Promise<boolean> {
+    const { missionId } = obs;
     const checkpointSha = this.deps.latestCheckpointSha(missionId, obs.taskId);
     if (!checkpointSha) {
       this.deps.report(

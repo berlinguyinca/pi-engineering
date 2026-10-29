@@ -141,10 +141,14 @@ describe("evaluateCrossing: once per crossing", () => {
     assert.equal(r.action, null, "emergency already actioned; preferred must not follow it");
   });
 
-  it("re-arms after the level drops below preferred (e.g. after compaction)", () => {
+  it("re-arms only once the level is back below soft; hovering around preferred does not re-fire", () => {
     let r = evaluateCrossing({ fired: "ok" }, "preferred", true);
     assert.equal(r.action, "preferred");
-    r = evaluateCrossing(r.state, "soft", true);
+    for (let i = 0; i < 10; i++) {
+      r = evaluateCrossing(r.state, i % 2 ? "preferred" : "soft", true);
+      assert.equal(r.action, null, "oscillation between soft and preferred is the same crossing");
+    }
+    r = evaluateCrossing(r.state, "ok", true);
     assert.equal(r.action, null);
     r = evaluateCrossing(r.state, "preferred", true);
     assert.equal(r.action, "preferred", "a second, real crossing fires again");

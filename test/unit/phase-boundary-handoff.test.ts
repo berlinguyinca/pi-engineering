@@ -371,6 +371,7 @@ describe("orchestrator phase-boundary handoff", () => {
     assert.equal(records.length, 1, "one phase_transition handoff");
     assert.equal(records[0]!.kind, "phase_transition");
     assert.equal(records[0]!.state, "prepared");
+    assert.equal(records[0]!.cause, "context_pressure");
     assert.equal(records[0]!.checkpointSha, "c".repeat(40));
     assert.deepEqual(records[0]!.predecessor, { sessionId: "sess-pre", generation: 0 });
 

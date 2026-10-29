@@ -7,7 +7,7 @@
  *   /room say <text>              post a message to the room (idempotency key per command)
  *   /room assign <agent> <text>   give work to one agent of the room (id, name or address; ambiguous = refused)
  *   /room rooms                   list the rooms this key can read
- *   --room <id>                   on any command: use another room than `herdr.room_id`
+ *   --room <id> <command>         first on the line: use another room than `herdr.room_id`
  *
  * The key is read by loadHerdrConnection (absolute path, 0600, owned by you), sent only as `Authorization: Bearer` to the
  * configured url, never logged, printed or put in an error. Redirects are refused. Everything the server sends is
@@ -216,10 +216,10 @@ function resolveAgent(agents: Record<string, unknown>[], wanted: string): { id: 
 export async function runRoomCommand(args: string, deps: RoomCommandDeps): Promise<RoomCommandResult> {
   let rest = args.trim();
   let roomOverride: string | undefined;
-  const flag = /(?:^|\s)--room\s+(\S+)/.exec(rest);
+  const flag = /^--room\s+(\S+)\s*/.exec(rest);
   if (flag) {
     roomOverride = flag[1];
-    rest = rest.replace(flag[0], " ").trim();
+    rest = rest.slice(flag[0].length).trim();
   }
   const [verbRaw = "", ...tail] = rest.split(/\s+/).filter(Boolean);
   const verb = verbRaw.toLowerCase() || "status";

@@ -1799,8 +1799,6 @@ export class Orchestrator {
     if (previous !== phase) {
       this.missionPhase.set(mission.mission_id, phase);
       this.emitPhaseBoundaryHandoff(mission, previous, phase);
-      // A phase boundary is a safe point for any running execution that already crossed `preferred`.
-      void this.continuityTrigger?.safePointForMission(mission.mission_id).catch(() => undefined);
     }
     this.onPhase?.(mission, phase);
     this.report(mission.mission_id, `[mission ${mission.mission_id}] phase ${phase}`);
@@ -1845,15 +1843,17 @@ export class Orchestrator {
 
     const checkpointSha = this.store.listTaskCheckpoints(mission.mission_id).at(-1)?.candidateSha ?? undefined;
     try {
-      const record = this.store.addHandoffRecord(
-        buildPhaseTransitionRecord({
+      const record = this.store.addHandoffRecord({
+        // A phase handoff is only emitted under context pressure (>= the soft level), so say so.
+        ...buildPhaseTransitionRecord({
           missionId: mission.mission_id,
           fromPhase,
           toPhase,
           endpoint,
           ...(checkpointSha ? { checkpointSha } : {}),
         }),
-      );
+        cause: "context_pressure",
+      });
       this.report(
         mission.mission_id,
         `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff ${record.id}${checkpointSha ? ` @ ${checkpointSha.slice(0, 7)}` : ""} (utilization ${utilization!.toFixed(2)})`,
