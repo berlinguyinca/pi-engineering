@@ -5,7 +5,11 @@
  * COMMITTED transaction survives a crash. Anything else is undone to the state
  * the journal recorded before the transaction began:
  *
- *   - interrupted before anything mutated (checking … snapshotting):
+ *   - interrupted before anything mutated, with an intact staged candidate
+ *     (staging, validating): nothing to undo and nothing to throw away. The
+ *     candidate is parked so the next update re-adopted instead of re-running
+ *     `npm ci` and the whole test suite from scratch (issue #483);
+ *   - interrupted before anything mutated with no usable candidate:
  *     nothing to undo; the transaction is marked failed and its staging
  *     directory removed;
  *   - interrupted while mutating (migrating … committing, rolling_back):
@@ -19,12 +23,36 @@
 
 import { existsSync, renameSync } from "node:fs";
 import { rm } from "node:fs/promises";
+import { basename } from "node:path";
 import type { RuntimeTelemetry } from "../runtime/host/telemetry.ts";
 import { hasCheckpoint, restoreCheckpoint } from "../runtime/migrations/framework.ts";
 import { type InstallLayout, isInside } from "./installLayout.ts";
 import { type UpdateJournal, type UpdateJournalRecord, mayHaveMutated } from "./journal.ts";
 
-export type RecoveryAction = "none" | "marked_failed" | "rolled_back" | "quarantined_corrupt_journal";
+export type RecoveryAction = "none" | "resumable" | "marked_failed" | "rolled_back" | "quarantined_corrupt_journal";
+
+/**
+ * The staged tree an interrupted transaction left behind, when it can be
+ * re-adopted: the transaction had not mutated anything, the candidate is a
+ * staging tree that still exists, and it still names `targetCommit` (pass null
+ * to accept whatever was staged). Null means there is nothing to re-adopt, so
+ * the normal recovery decision applies.
+ */
+export function parkedCandidate(
+  layout: InstallLayout,
+  journal: UpdateJournal,
+  targetCommit: string | null,
+): string | null {
+  const record = journal.incomplete();
+  if (!record || mayHaveMutated(record.phase)) return null;
+  const candidate = record.candidateRuntime;
+  if (!candidate || !isInside(layout.stagingDir, candidate)) return null;
+  if (!existsSync(candidate)) return null;
+  const meta = layout.readMeta(candidate);
+  if (!meta || !meta.commit) return null;
+  if (targetCommit !== null && meta.commit !== targetCommit) return null;
+  return candidate;
+}
 
 export interface RecoveryOutcome {
   action: RecoveryAction;
@@ -36,6 +64,8 @@ export async function recoverInterruptedTransaction(
   layout: InstallLayout,
   journal: UpdateJournal,
   telemetry: RuntimeTelemetry,
+  /** Commit the channel points at now, when it is known (spec §30, issue #483). */
+  targetCommit: string | null = null,
 ): Promise<RecoveryOutcome> {
   const raw = journal.read();
   if (raw === "corrupt") {
@@ -62,6 +92,19 @@ export async function recoverInterruptedTransaction(
     interrupted_phase: record.phase,
   };
   telemetry.emit("runtime.crash_recovery.started", fields);
+
+  if (parkedCandidate(layout, journal, targetCommit)) {
+    // Validation is long (npm ci plus the full suite) and runs inside an
+    // ordinary session, so an interrupted one is the common case, not a crash.
+    // The pointers never moved and retention protects the tree while the
+    // journal stays open, so there is nothing to undo and nothing to delete.
+    telemetry.emit("runtime.crash_recovery.completed", { ...fields, action: "resumable" });
+    return {
+      action: "resumable",
+      record,
+      detail: `${basename(record.candidateRuntime as string)} is staged and intact; the next update re-adopts it`,
+    };
+  }
 
   if (!mayHaveMutated(record.phase)) {
     if (record.candidateRuntime && isInside(layout.stagingDir, record.candidateRuntime)) {

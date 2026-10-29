@@ -79,6 +79,10 @@ export class InstallLayout {
   get lockFile(): string {
     return join(this.root, "runtime-update.lock");
   }
+  /** The outcome a previous process reported but no session has shown yet. */
+  get noticeFile(): string {
+    return join(this.root, "update-notice.json");
+  }
   get preferencesFile(): string {
     return join(this.root, "update-preferences.json");
   }
