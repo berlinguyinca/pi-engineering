@@ -493,7 +493,8 @@ function seedPresenceFrom(runtime: EngineeringRuntime): void {
 
 async function refreshPresence(cwd: string): Promise<void> {
   if (!presence) return;
-  const key = await repoCacheKey(cwd).catch(() => "");
+  // The poll runs every few seconds for the whole session: answer from the resolved key, never by spawning git again.
+  const key = cachedRepoKey(cwd) ?? (await repoCacheKey(cwd).catch(() => ""));
   const open = key ? runtimes.get(key) : undefined;
   if (!open) return;
   seedPresenceFrom(open.runtime);

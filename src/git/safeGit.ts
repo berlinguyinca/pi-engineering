@@ -746,6 +746,8 @@ export const testHooks: {
    * cache is pinned: once per changed config, not once per call.
    */
   onConfigList?: () => void;
+  /** Tests only: called with the argv of every git child Pi starts (async or sync), so a test can count spawns. */
+  onSpawn?: (argv: readonly string[]) => void;
 } = {};
 
 const failed = (stderr: string): SafeGitResult => ({ code: 128, stdout: "", stderr });
@@ -764,6 +766,7 @@ function spawnGit(
 ): Promise<SafeGitResult> {
   return new Promise((resolvePromise) => {
     let child: ReturnType<typeof spawn>;
+    testHooks.onSpawn?.(argv);
     try {
       child = spawn("git", [...argv], {
         env,
@@ -825,6 +828,7 @@ function runSync(
   maxBuffer: number,
   cwd?: string,
 ): SafeGitResult {
+  testHooks.onSpawn?.(argv);
   const r: SpawnSyncReturns<string> = spawnSync("git", [...argv], {
     env,
     timeout: timeoutMs,
@@ -970,6 +974,35 @@ function operatorConfigStamp(env: NodeJS.ProcessEnv): string {
       }
     })
     .join(",");
+}
+
+/**
+ * Memo of the tracked-attributes-files listing (ls-files) for the LFS scan, one spawn per safeGit call otherwise.
+ *
+ * Why it is safe: the list is a function of the index alone, and the index is stamped (mtime in ns, inode, size) in the
+ * key. Git replaces the index through a lock file renamed over it, so every `add`/`rm`/`checkout`/`reset` yields a new
+ * inode and mtime and the entry stops matching. Only the list is remembered: `generateLfsAttributes` still reads each
+ * `.gitattributes` file's content from disk on every call, so an edit to a tracked or untracked attributes file takes
+ * effect at once. The TTL bounds the one residual case (an index rewritten in place within the same timestamp tick).
+ * `PI_ENG_LFS_SCAN_MEMO=0` turns it off.
+ */
+const LFS_LIST_TTL_MS = 5_000;
+const LFS_LIST_MEMO_MAX = 64;
+const lfsListMemo = new Map<string, { at: number; files: string[] }>();
+
+function lfsListStamp(gitDir: string, workTree: string): string | undefined {
+  if (process.env.PI_ENG_LFS_SCAN_MEMO === "0") return undefined;
+  try {
+    const st = statSync(join(gitDir, "index"), { bigint: true });
+    return `${workTree}\0${gitDir}\0${st.mtimeNs}:${st.ino}:${st.size}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function rememberLfsList(stamp: string, files: string[]): void {
+  if (lfsListMemo.size >= LFS_LIST_MEMO_MAX) lfsListMemo.delete(lfsListMemo.keys().next().value as string);
+  lfsListMemo.set(stamp, { at: Date.now(), files });
 }
 
 function operatorConfig(env: NodeJS.ProcessEnv): OperatorConfig {
@@ -1629,17 +1662,28 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
       GIT_COMMON_DIR: common,
       GIT_WORK_TREE: layout.workTree,
     };
-    const listed = runSync(
-      [...OPERATOR_FORCED, "ls-files", "-z", "--", ".gitattributes", "*/.gitattributes"],
-      gitEnv,
-      5_000,
-      16 * 1024 * 1024,
-      layout.workTree,
-    );
-    if (listed.code !== 0 || listed.truncated) {
-      return { text: "", patterns: 0, uncertain: ["the list of tracked .gitattributes files could not be read"] };
+    const stamp = lfsListStamp(layout.gitDir, layout.workTree);
+    const memo = stamp === undefined ? undefined : lfsListMemo.get(stamp);
+    let tracked: string[];
+    if (memo && Date.now() - memo.at < LFS_LIST_TTL_MS) {
+      tracked = memo.files;
+    } else {
+      const listed = runSync(
+        [...OPERATOR_FORCED, "ls-files", "-z", "--", ".gitattributes", "*/.gitattributes"],
+        gitEnv,
+        5_000,
+        16 * 1024 * 1024,
+        layout.workTree,
+      );
+      if (listed.code !== 0 || listed.truncated) {
+        if (stamp !== undefined) lfsListMemo.delete(stamp);
+        return { text: "", patterns: 0, uncertain: ["the list of tracked .gitattributes files could not be read"] };
+      }
+      tracked = listed.stdout.split("\0").filter(Boolean);
+      if (stamp !== undefined) rememberLfsList(stamp, tracked);
     }
-    return generateLfsAttributes(layout.workTree, [".gitattributes", ...listed.stdout.split("\0").filter(Boolean)]);
+    // The file CONTENTS are read afresh on every call; only the (spawned) list of which files are tracked is remembered.
+    return generateLfsAttributes(layout.workTree, [".gitattributes", ...tracked]);
   };
   try {
     // git creates `logs/` in the common directory on the first branch update; the shadow may be read-only, so it exists first

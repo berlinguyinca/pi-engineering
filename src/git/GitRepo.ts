@@ -193,6 +193,20 @@ export interface DurableRecordInventory<T> {
   diagnostics: DurableRecordDiagnostic[];
 }
 
+const openCache = new Map<string, { at: number; top: string }>();
+const DEFAULT_OPEN_TTL_MS = 10_000;
+
+function openTtlMs(): number {
+  const raw = process.env.PI_ENG_GIT_OPEN_TTL_MS;
+  const n = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_OPEN_TTL_MS;
+}
+
+/** Drop remembered `GitRepo.open` answers (tests, or a caller that just removed/created a repository). */
+export function forgetOpenCache(): void {
+  openCache.clear();
+}
+
 /**
  * Minimal Git repository provider (spec §7 `git/`, §13.3 worktree isolation).
  *
@@ -232,8 +246,21 @@ export class GitRepo {
     return run;
   }
 
-  /** Returns a GitRepo if `cwd` is inside a git work tree, else null. */
+  /**
+   * Returns a GitRepo if `cwd` is inside a git work tree, else null.
+   *
+   * The resolved toplevel is remembered per cwd for `PI_ENG_GIT_OPEN_TTL_MS` (default 10s, 0 disables): periodic
+   * callers (the presence poll) otherwise spend two safeGit calls, each several git children, to learn the same
+   * answer. Only a positive answer is remembered, and a fresh GitRepo is built each time (no shared state).
+   */
   static async open(cwd: string, signal?: AbortSignal): Promise<GitRepo | null> {
+    const ttl = openTtlMs();
+    const hit = ttl > 0 ? openCache.get(cwd) : undefined;
+    if (hit && Date.now() - hit.at < ttl) {
+      const repo = new GitRepo(cwd, hit.top);
+      repo.signal = signal;
+      return repo;
+    }
     try {
       // Resolve the actual repository toplevel so a caller in a subdirectory
       // (e.g. <repo>/src) still treats the whole repo as its root.
@@ -248,6 +275,10 @@ export class GitRepo {
       const repo = new GitRepo(cwd, stdout.trim());
       repo.signal = signal;
       await repo.git(["rev-parse", "--is-inside-work-tree"]);
+      if (ttl > 0) {
+        if (openCache.size >= 256) openCache.delete(openCache.keys().next().value as string);
+        openCache.set(cwd, { at: Date.now(), top: stdout.trim() });
+      }
       return repo;
     } catch {
       return null;
