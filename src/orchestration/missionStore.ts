@@ -653,28 +653,40 @@ export class MissionStore {
   /**
    * A rollover is the successor session taking over. Open handoff records of the mission that named the replaced
    * session as predecessor advance to `acknowledged` with the observed successor, but only when they carry a
-   * checkpoint (that is what `validated` means); a record without one is left for its owner.
+   * checkpoint (that is what `validated` means); a record without one is left for its owner. Records carry no
+   * execution id, so when another live execution of the mission still holds the replaced session the owner is
+   * ambiguous and nothing is advanced. Bookkeeping only: any failure is swallowed, because the checkpoint or status
+   * update that observed the rollover is already durable and must not be reported as failed.
    */
   private acknowledgeObservedHandoffs(ex: Execution, previous: string | null, next: string | null): void {
     if (!previous || !next || previous === next || !this.lineageAgentExecution(ex)) return;
-    const open = [...this.handoffRecords.values()].filter(
-      (r) =>
-        r.missionId === ex.mission_id &&
-        r.predecessor.sessionId === previous &&
-        r.checkpointSha &&
-        (r.state === "prepared" || r.state === "validated"),
-    );
-    for (const record of open) {
-      try {
+    try {
+      const shared = [...this.executions.values()].some(
+        (other) =>
+          other.execution_id !== ex.execution_id &&
+          other.mission_id === ex.mission_id &&
+          other.session_id === previous &&
+          other.status !== "SUCCEEDED" &&
+          other.status !== "FAILED" &&
+          other.status !== "CANCELED",
+      );
+      if (shared) return;
+      const open = [...this.handoffRecords.values()].filter(
+        (r) =>
+          r.missionId === ex.mission_id &&
+          r.predecessor.sessionId === previous &&
+          r.checkpointSha &&
+          (r.state === "prepared" || r.state === "validated"),
+      );
+      for (const record of open) {
         if (record.state === "prepared") this.transitionHandoffRecord(record.id, "validated");
         this.transitionHandoffRecord(record.id, "acknowledged", {
           sessionId: next,
           generation: record.predecessor.generation + 1,
         });
-      } catch (error) {
-        // Handoff bookkeeping must never fail the checkpoint or status update that observed the rollover.
-        if (!(error instanceof HandoffRecordError)) throw error;
       }
+    } catch {
+      // see above: never surface handoff bookkeeping failures to the caller
     }
   }
 
@@ -1809,8 +1821,8 @@ export class MissionStore {
             : "execution.canceled";
     this.emit(type, ex.mission_id, { actor: "system", execution: next });
     if (this.lineageAgentExecution(next)) {
-      this.acknowledgeObservedHandoffs(next, ex.session_id, next.session_id);
       this.lineageSessionChange(next, ex.session_id, next.session_id, now);
+      this.acknowledgeObservedHandoffs(next, ex.session_id, next.session_id);
       if (status === "RUNNING") {
         this.lineageDo((l) =>
           l.attemptState(
@@ -2633,7 +2645,7 @@ export class MissionStore {
       this.assertCheckpointAuthoritative(checkpoint);
 
       const copy = copyTaskCheckpoint(checkpoint);
-      const priorSession = this.lineage ? this.priorCheckpointSession(checkpoint) : null;
+      const priorSession = this.priorCheckpointSession(checkpoint);
       const payload = structuredClone({ actor: "system", checkpoint: copy });
       const event: OrchestrationEvent = {
         event_id: id("oevt"),
@@ -2696,8 +2708,8 @@ export class MissionStore {
   private lineageCheckpointVerified(checkpoint: TaskCheckpoint, priorSession: string | null): void {
     const execution = this.executions.get(checkpoint.executionId);
     if (!execution || !this.lineageAgentExecution(execution)) return;
-    this.acknowledgeObservedHandoffs(execution, priorSession, checkpoint.sessionId ?? null);
     this.lineageSessionChange(execution, priorSession, checkpoint.sessionId ?? null, checkpoint.createdAt);
+    this.acknowledgeObservedHandoffs(execution, priorSession, checkpoint.sessionId ?? null);
     this.lineageDo((l) =>
       l.checkpointVerified({
         checkpointId: checkpoint.checkpointId,

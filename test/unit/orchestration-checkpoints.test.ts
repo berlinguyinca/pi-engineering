@@ -483,3 +483,54 @@ describe("CheckpointManager handoff context", () => {
     assert.deepEqual(again?.handoff?.memoryRefs, ["viking://a"]);
   });
 });
+
+describe("CheckpointManager handoff context bounds", () => {
+  it("never makes a checkpoint fail because history is long: oldest entries are evicted at the cap", async () => {
+    const { store, task, execution } = setup();
+    const mgr = new CheckpointManager({ store });
+    let last = await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id });
+    for (let i = 0; i < 52; i++) {
+      last = await mgr.persist({
+        taskId: task.task_id,
+        executionId: execution.execution_id,
+        handoff: { memoryRefs: [`viking://m/${i}`], decisions: [{ id: `D${i}`, summary: "s", rationale: "r" }] },
+      });
+    }
+    assert.equal(last.handoff?.memoryRefs.length, 50);
+    assert.equal(last.handoff?.memoryRefs[0], "viking://m/2");
+    assert.equal(last.handoff?.memoryRefs.at(-1), "viking://m/51");
+    assert.equal(last.handoff?.decisions.length, 50);
+    assert.equal(last.handoff?.decisions.at(-1)?.id, "D51");
+  });
+
+  it("untracked files describe the worktree now: a new list replaces the old one", async () => {
+    const { store, task, execution } = setup();
+    const mgr = new CheckpointManager({ store });
+    const base = { taskId: task.task_id, executionId: execution.execution_id };
+    await mgr.persist({ ...base, handoff: { untracked: [{ path: "a.txt", sha256: "c".repeat(64) }] } });
+    const next = await mgr.persist({ ...base, handoff: { untracked: [{ path: "b.txt", sha256: "d".repeat(64) }] } });
+    assert.deepEqual(
+      next.handoff?.untracked.map((u) => u.path),
+      ["b.txt"],
+    );
+    const kept = await mgr.persist({ ...base, handoff: { nextAction: "go" } });
+    assert.deepEqual(
+      kept.handoff?.untracked.map((u) => u.path),
+      ["b.txt"],
+      "omitted means unchanged",
+    );
+  });
+
+  it("a null entry is a validation error, not a TypeError", async () => {
+    const { store, task, execution } = setup();
+    const mgr = new CheckpointManager({ store });
+    await assert.rejects(
+      mgr.persist({
+        taskId: task.task_id,
+        executionId: execution.execution_id,
+        handoff: { decisions: [null as never] },
+      }),
+      (error: unknown) => error instanceof Error && !(error instanceof TypeError) && /decision/.test(error.message),
+    );
+  });
+});

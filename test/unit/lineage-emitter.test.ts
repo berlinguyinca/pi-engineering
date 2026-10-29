@@ -854,3 +854,87 @@ describe("lineage: removing a bound edge", () => {
     assert.equal((events[0]?.payload as { attrs?: unknown }).attrs, undefined);
   });
 });
+
+describe("lineage: observed handoff acknowledgement edge cases", () => {
+  const sha = "a".repeat(40);
+  const open = (missionId: string, extra: Record<string, unknown> = {}) => ({
+    id: "hf-1",
+    kind: "context",
+    state: "prepared",
+    missionId,
+    predecessor: { sessionId: "sess-1", generation: 0 },
+    checkpointSha: sha,
+    createdAt: new Date().toISOString(),
+    ...extra,
+  });
+
+  it("acknowledges through a checkpoint even when no lineage emitter is configured", async () => {
+    const { store, task, execution } = missionRig(null);
+    store.addHandoffRecord(open(execution.mission_id));
+    const mgr = new CheckpointManager({ store });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
+    assert.equal(store.getHandoffRecord("hf-1")?.state, "acknowledged");
+  });
+
+  it("does not acknowledge when another execution of the mission still holds the replaced session", () => {
+    const { store, task, execution } = missionRig(null);
+    const other = store.createTask({
+      task_id: "task-b",
+      mission_id: execution.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "other",
+      repo_id: "repo-a",
+      acceptance_ids: ["AC-2"],
+      deliverables: ["other"],
+      execution_budget_ms: 60_000,
+      checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 1_000 },
+      candidate_generation: 0,
+      mission_generation: 0,
+      fencing_token: 0,
+    });
+    const second = store.createExecution({
+      task_id: other.task_id,
+      mission_id: execution.mission_id,
+      backend: "agent",
+      checkpoint_id: "TCP-b",
+      repo_id: "repo-a",
+      base_sha: "base-a",
+    });
+    store.setExecutionStatus(execution.execution_id, "RUNNING", { session_id: "sess-1" });
+    store.setExecutionStatus(second.execution_id, "RUNNING", { session_id: "sess-1" });
+    store.addHandoffRecord(open(execution.mission_id));
+    store.setExecutionStatus(second.execution_id, "RUNNING", { session_id: "sess-2" });
+    assert.equal(store.getHandoffRecord("hf-1")?.state, "prepared", "ambiguous predecessor: left for its owner");
+    assert.ok(task);
+  });
+
+  it("handoff bookkeeping failure never fails the checkpoint that observed the rollover", async () => {
+    const { store, task, execution } = missionRig(null);
+    store.addHandoffRecord(open(execution.mission_id));
+    const mgr = new CheckpointManager({ store });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    (store as unknown as { transitionHandoffRecord: () => never }).transitionHandoffRecord = () => {
+      throw new Error("boom");
+    };
+    const second = await mgr.persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      sessionId: "sess-2",
+    });
+    assert.equal(second.sessionId, "sess-2");
+  });
+
+  it("the successor session node is created with its agent and attempt before the handoff edge references it", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store, task, execution } = missionRig(emitter);
+    store.addHandoffRecord(open(execution.mission_id));
+    const mgr = new CheckpointManager({ store });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
+    const events = await lineageEvents(envStore, emitter);
+    const firstUpsert = events.find((e) => e.event_type === "node.upsert" && e.payload.node_id === "session:sess-2");
+    assert.equal((firstUpsert?.payload.attrs as Record<string, unknown> | undefined)?.agent_id, "agent:task-a");
+  });
+});
