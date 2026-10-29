@@ -24,6 +24,8 @@ import type { UpdateJournal, UpdateJournalRecord } from "./journal.ts";
 import { type CandidateMetadata, MetadataError, parseCandidateMetadata, piCompatible } from "./metadata.ts";
 import { MutationLockBusyError, type MutationLockHandle, type RuntimeMutationLock } from "./mutationLock.ts";
 import { readPreferences, writePreferences } from "./preferences.ts";
+import { parkedCandidate } from "./recovery.ts";
+import { describeMove } from "./reporting.ts";
 import { type ActivationHost, runActivation } from "./transaction.ts";
 import { type ValidationMode, type ValidationStep, provisionDependencies, validateCandidate } from "./validate.ts";
 
@@ -339,8 +341,14 @@ export class UpdateManager {
     const startedAt = Date.now();
     const step = (line: string) => progress(`${line} (${((Date.now() - startedAt) / 1000).toFixed(1)}s)`);
     progress(
-      `updating ${running?.version ?? "?"} → ${target.metadata.version} on ${fields.channel} (${target.sha.slice(0, 12)})`,
+      `updating ${describeMove(running, { version: target.metadata.version, commit: target.sha })} on ${fields.channel}`,
     );
+    // A candidate an earlier process staged for this same commit is re-adopted
+    // rather than re-exported (issue #483): recovery parked it, and the
+    // validation below runs over it again either way. It is read before begin(),
+    // which replaces the one record the journal holds; the directory stays
+    // protected because the new record names it.
+    const parked = parkedCandidate(layout, journal, target.sha);
     let record = journal.begin({
       transaction,
       kind: "update",
@@ -350,17 +358,17 @@ export class UpdateManager {
       toVersion: target.metadata.version,
       toCommit: target.sha,
       previousRuntime: running?.root ?? null,
-      candidateRuntime: null,
+      candidateRuntime: parked,
       pointers: { current: layout.readPointer("current"), previous: layout.readPointer("previous") },
       phase: "fetching",
     });
     telemetry.emit("runtime.update.fetched", fields);
     step("✓ fetched");
 
-    const staged = join(layout.stagingDir, `${transaction}`);
+    const staged = parked ?? join(layout.stagingDir, transaction);
     record = journal.advance(record, "staging", { candidateRuntime: staged });
     try {
-      await this.deps.cache.exportTree(target.sha, staged);
+      if (!parked) await this.deps.cache.exportTree(target.sha, staged);
     } catch (error) {
       await rm(staged, { recursive: true, force: true }).catch(() => {});
       const reason = error instanceof Error ? error.message : String(error);
