@@ -653,11 +653,15 @@ export class MissionStore {
 
   /**
    * A rollover is the successor session taking over. Open handoff records of the mission that named the replaced
-   * session as predecessor advance to `acknowledged` with the observed successor, but only when they carry a
-   * checkpoint (that is what `validated` means); a record without one is left for its owner. Records carry no
-   * execution id, so when another live execution of the mission still holds the replaced session the owner is
-   * ambiguous and nothing is advanced. Bookkeeping only: any failure is swallowed, because the checkpoint or status
-   * update that observed the rollover is already durable and must not be reported as failed.
+   * session as predecessor are acknowledged with the observed successor, but only when they carry a checkpoint AND the
+   * verify-before-revoke protocol already ran for them (`verifiedAt` and `sourceFencedAt`, stamped only by
+   * `verifyHandoff` / `fenceHandoffSource`). Observation supplies the successor's identity and nothing else: it never
+   * stands in for verification, so a checkpoint-bearing record that was not verified and fenced is left for the handoff
+   * driver (`HandoffDriver`), which runs `executeHandoff`. Records without a checkpoint are untouched, as before (they
+   * keep the direct `acknowledgeHandoff` path). Records carry no execution id, so when another live execution of the
+   * mission still holds the replaced session the owner is ambiguous and nothing is advanced. Bookkeeping only: any
+   * failure is swallowed, because the checkpoint or status update that observed the rollover is already durable and
+   * must not be reported as failed.
    */
   private acknowledgeObservedHandoffs(ex: Execution, previous: string | null, next: string | null): void {
     if (!previous || !next || previous === next || !this.lineageAgentExecution(ex)) return;
@@ -677,17 +681,16 @@ export class MissionStore {
           r.missionId === ex.mission_id &&
           r.predecessor.sessionId === previous &&
           r.checkpointSha &&
-          (r.state === "prepared" || r.state === "validated"),
+          r.state === "validated" &&
+          r.verifiedAt &&
+          r.sourceFencedAt,
       );
       for (const record of open) {
-        if (record.state === "prepared") this.transitionHandoffRecord(record.id, "validated");
-        this.transitionHandoff(
-          record.id,
-          "acknowledged",
-          { sessionId: next, generation: record.predecessor.generation + 1 },
-          undefined,
-          true,
-        );
+        try {
+          this.acknowledgeHandoff(record.id, { sessionId: next, generation: record.predecessor.generation + 1 });
+        } catch {
+          // one record's failure must not strand the others
+        }
       }
     } catch {
       // see above: never surface handoff bookkeeping failures to the caller
@@ -2448,7 +2451,7 @@ export class MissionStore {
    * id, an illegal transition, or a missing successor.
    */
   transitionHandoffRecord(id: string, to: HandoffState, successor?: HandoffEndpoint, ackAt?: string): HandoffRecord {
-    return this.transitionHandoff(id, to, successor, ackAt, false);
+    return this.transitionHandoff(id, to, successor, ackAt);
   }
 
   private transitionHandoff(
@@ -2456,7 +2459,6 @@ export class MissionStore {
     to: HandoffState,
     successor: HandoffEndpoint | undefined,
     ackAt: string | undefined,
-    observed: boolean,
   ): HandoffRecord {
     const current = this.handoffRecords.get(id);
     if (!current) {
@@ -2465,15 +2467,10 @@ export class MissionStore {
     if (!nextStates(current.state).includes(to)) {
       throw new HandoffRecordError([`illegal handoff transition ${current.state} -> ${to}`]);
     }
-    // Verify-before-revoke: a record that names a checkpoint (one without has nothing to verify; executeHandoff rejects it) may be acknowledged only after that checkpoint was
-    // verified and the source fenced, in that order. `observed` is the one exception: the successor session is
-    // already running (the rollover happened), so there is nothing left to gate; it is recorded as observed, not verified.
-    if (
-      to === "acknowledged" &&
-      current.checkpointSha &&
-      !observed &&
-      !(current.verifiedAt && current.sourceFencedAt)
-    ) {
+    // Verify-before-revoke: a record that names a checkpoint (one without has nothing to verify; executeHandoff
+    // rejects it) may be acknowledged only after that checkpoint was verified and the source fenced, in that order.
+    // There is no exception for an observed rollover: observation only supplies the successor identity.
+    if (to === "acknowledged" && current.checkpointSha && !(current.verifiedAt && current.sourceFencedAt)) {
       throw new HandoffRecordError([
         `handoff ${id} cannot be acknowledged before its checkpoint is verified and its source fenced`,
       ]);
@@ -2555,7 +2552,7 @@ export class MissionStore {
       }
       return { ...record };
     }
-    return this.transitionHandoff(id, "acknowledged", successor, undefined, false);
+    return this.transitionHandoff(id, "acknowledged", successor, undefined);
   }
 
   private lineageHandoff(record: HandoffRecord): void {

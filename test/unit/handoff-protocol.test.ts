@@ -800,3 +800,20 @@ describe("cross-host and cross-model handoff", () => {
     assert.equal([...ids].filter((id) => id.startsWith("attempt:")).length, 1);
   });
 });
+
+describe("executeHandoff without a successor", () => {
+  it("stops after the fence, never invents a successor, and a later call with one acknowledges without fencing again", async () => {
+    const { store, task, execution } = rig();
+    const cp = await checkpointFor(store, task.task_id, execution.execution_id, 1);
+    store.addHandoffRecord(record(1));
+    const s = spy();
+    const { successor: _omit, ...noSuccessor } = input(store, 1, cp, deps(), s.fence);
+    const fenced = await executeHandoff(store, noSuccessor);
+    assert.equal(fenced.status, "fenced");
+    assert.equal(store.getHandoffRecord("hf-1")?.state, "validated");
+    assert.equal(store.getHandoffRecord("hf-1")?.successor, undefined);
+    const done = await executeHandoff(store, input(store, 1, cp, deps(), s.fence));
+    assert.equal(done.status, "acknowledged");
+    assert.deepEqual(s.log, ["fence"], "the source was fenced exactly once");
+  });
+});

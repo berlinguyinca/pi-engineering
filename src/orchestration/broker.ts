@@ -315,6 +315,11 @@ export interface AgentRunner {
     /** Owning mission and task, for model bookkeeping and operator logs. */
     missionId?: string;
     taskId?: string;
+    /**
+     * The worker session identity the broker assigned to this execution. The worker must run under exactly this id:
+     * it is what checkpoints and handoff records name as the predecessor (verify-before-revoke compares them).
+     */
+    sessionId?: string;
     signal: AbortSignal;
     onActivity?: (event: WorkerActivity) => void;
   }): Promise<ExecutionOutcome>;
@@ -3178,10 +3183,13 @@ export class ExecutionBroker {
     const binding = this.store
       .getWorkspaceManifest(input.missionId)
       ?.repositories.find((repository) => repository.repoId === input.repoId);
+    // An agent execution is one worker session; the broker names it so checkpoints and handoffs can cite it.
+    const workerSessionId = backend === "agent" ? id("WKS") : undefined;
     const execution = this.store.createExecution({
       task_id: input.taskId,
       mission_id: input.missionId,
       backend,
+      ...(workerSessionId ? { session_id: workerSessionId } : {}),
       model: (input.modelRequirements as { model?: string } | undefined)?.model ?? null,
       thinking_level: (input.modelRequirements as { thinking?: string } | undefined)?.thinking ?? null,
       mission_generation: input.authority?.missionIdentity.generation,
@@ -3443,6 +3451,7 @@ export class ExecutionBroker {
             await this.checkpoints.persist({
               taskId: input.taskId,
               executionId: execution.execution_id,
+              ...(workerSessionId ? { sessionId: workerSessionId } : {}),
               completedDeliverables: [...new Set([...completedDeliverables, ...declaredCompleted])],
               artifactRefs,
               artifactHashes,
@@ -4165,6 +4174,9 @@ export class ExecutionBroker {
             wallClock,
             missionId: input.missionId,
             taskId: input.taskId,
+            ...(this.store.getExecution(executionId)?.session_id
+              ? { sessionId: this.store.getExecution(executionId)?.session_id as string }
+              : {}),
             signal,
             onActivity: base.onActivity,
           }),

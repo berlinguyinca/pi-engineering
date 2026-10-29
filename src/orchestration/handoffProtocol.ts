@@ -198,12 +198,18 @@ export type HandoffOutcome =
       errors: string[];
       fallback: { fallback: HandoffFallback; reason: string };
     }
-  | { status: "fence_failed"; record: HandoffRecord; error: string };
+  | { status: "fence_failed"; record: HandoffRecord; error: string }
+  /** Verified and fenced; no successor has attached yet. A later call (or the successor's attach) acknowledges. */
+  | { status: "fenced"; record: HandoffRecord };
 
 export interface ExecuteHandoffInput {
   handoffId: string;
   checkpoint: TaskCheckpoint;
-  successor: HandoffEndpoint;
+  /**
+   * The session taking over. Absent while none exists yet: the handoff then stops after the fence (`fenced`) and is
+   * acknowledged when a later call supplies the successor. Acknowledgement is never inferred without one.
+   */
+  successor?: HandoffEndpoint;
   deps: HandoffVerifyDeps;
   /** Revoke the source: lease fence, process quarantine. Must be idempotent. */
   fenceSource: () => Promise<void>;
@@ -211,6 +217,9 @@ export interface ExecuteHandoffInput {
   currentGeneration?: number;
   nowMs?: number;
   maxAgeMs?: number;
+  /** Context utilization at the time, and the configured pressure level: they only choose the fallback after a rejection. */
+  contextUtilization?: number | null;
+  pressureThreshold?: number;
 }
 
 /** Drive verify -> fence -> acknowledge. Safe to call again after a crash at any step. */
@@ -219,12 +228,12 @@ export async function executeHandoff(store: MissionStore, input: ExecuteHandoffI
   if (!existing) throw new Error(`unknown handoff record ${input.handoffId}`);
 
   if (existing.state === "acknowledged" || existing.state === "committed") {
-    if (existing.successor?.sessionId !== input.successor.sessionId) {
+    if (input.successor && existing.successor?.sessionId !== input.successor.sessionId) {
       throw new Error(`handoff ${input.handoffId} was already acknowledged by a different successor`);
     }
     const resume = decideHandoffResume({
       record: existing,
-      currentLease: { generation: input.currentGeneration ?? input.successor.generation },
+      currentLease: { generation: input.currentGeneration ?? existing.successor?.generation ?? 0 },
       observedCheckpointSha: input.checkpoint.candidateSha,
       expectedSourceSha: null,
       observedSourceSha: null,
@@ -245,7 +254,8 @@ export async function executeHandoff(store: MissionStore, input: ExecuteHandoffI
     const fallback = decideHandoffFallback({
       resumeDecision: "refuse",
       resumeReasons: verdict.errors,
-      contextUtilization: null,
+      contextUtilization: input.contextUtilization ?? null,
+      ...(input.pressureThreshold !== undefined ? { pressureThreshold: input.pressureThreshold } : {}),
     });
     return {
       status: "rejected",
@@ -263,6 +273,7 @@ export async function executeHandoff(store: MissionStore, input: ExecuteHandoffI
       error: error instanceof Error ? error.message : String(error),
     };
   }
+  if (!input.successor) return { status: "fenced", record: store.getHandoffRecord(input.handoffId) as HandoffRecord };
   const record = store.acknowledgeHandoff(input.handoffId, input.successor);
   return { status: "acknowledged", record };
 }
