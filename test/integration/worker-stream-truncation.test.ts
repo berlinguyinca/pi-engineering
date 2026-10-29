@@ -342,6 +342,39 @@ test("worker: resumes are capped; the next cut settles truncated_after_progress"
   assert.equal(requests, 5, "one tool turn, three resumed cuts, the fourth cut settles");
 });
 
+/**
+ * #96 — the gateway's cut can carry another failure's wording in the partial body:
+ * a stream cut in the middle of "404 model_not_found …" is still a CUT. The
+ * executor derives its gone-model marker from `classifyError` over the assistant
+ * error, and the truncated-stream rule is checked first. This pins that ordering:
+ * a false "that model is gone" would pull a healthy model out of routing for a TTL
+ * on the strength of text the model merely printed before the socket died.
+ */
+const cutWithUnavailableWording: Reply = (res) =>
+  sse(res, [chunk({ role: "assistant", content: "HTTP 404 model_not_found: probe-model is not served" })]);
+
+test("worker: a cut carrying unavailable-model wording keeps the truncated marker (#96)", async () => {
+  const requests = await withProbe(
+    [
+      bashMarker,
+      cutWithUnavailableWording,
+      cutWithUnavailableWording,
+      cutWithUnavailableWording,
+      cutWithUnavailableWording,
+    ],
+    async (executor, cwd) => {
+      const run = await bashRun(executor, cwd);
+      assert.equal(run.result.status, "failed");
+      assert.equal(run.error, "truncated_after_progress", `marker was ${run.error}: ${run.result.summary}`);
+      // The bash tool DID run before the cut, so the tree holds a partial edit
+      // (`side-effect.txt`). That is what a replacement model must be told (#96).
+      assert.match(String(run.executedActions), /bash/, "the executed action must travel with the result");
+      assert.match(String(run.executedActions), /MUST NOT be repeated/);
+    },
+  );
+  assert.equal(requests, 5, "one tool turn, three resumed cuts, the fourth cut settles");
+});
+
 test("worker: the resume cap is configurable", async () => {
   const requests = await withProbe([bashMarker, cutMidMessage, cutMidMessage], async (_e, cwd) => {
     const executor = new PiWorkerExecutor({
