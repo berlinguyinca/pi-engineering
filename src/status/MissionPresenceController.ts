@@ -79,7 +79,7 @@ function boundedNumber(raw: string | undefined, fallback: number, min: number, m
 export function presenceOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): PresenceEnvOptions {
   return {
     enabled: env.PI_MISSION_PRESENCE !== "0",
-    rows: boundedNumber(env.PI_MISSION_PRESENCE_ROWS, 4, 1, 10),
+    rows: boundedNumber(env.PI_MISSION_PRESENCE_ROWS, 2, 1, 10),
     title: env.PI_MISSION_TITLE === "1",
     intervalMs: 1_000,
     pollMs: boundedNumber(env.PI_MISSION_PRESENCE_POLL_MS, 5_000, 1_000, 600_000),
@@ -138,7 +138,7 @@ export class MissionPresenceController {
     this.strip = this.bus.producer("widget", "mission-strip", { key: WIDGET_KEY });
     this.workingLine = this.bus.producer("working", "presence-working");
     this.title = this.bus.producer("title", "presence-title");
-    this.rows = options.rows ?? 4;
+    this.rows = options.rows ?? 2;
     this.titleEnabled = options.title ?? false;
     this.quiet = options.quiet;
     this.now = options.now ?? Date.now;

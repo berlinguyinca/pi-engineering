@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { DEFAULT_STATUS_BAR_CONFIG, type StatusBarConfig } from "../../src/status/config.ts";
+import {
+  DEFAULT_STATUS_BAR_CONFIG,
+  FULL_STATUS_BAR_CONFIG,
+  type StatusBarConfig,
+  resolveStatusBarConfig,
+} from "../../src/status/config.ts";
 import { renderStatus } from "../../src/status/layout.ts";
 import type { HarnessStatusState } from "../../src/status/state.ts";
 
@@ -9,7 +14,7 @@ import type { HarnessStatusState } from "../../src/status/state.ts";
 // the CI/agent HOME. Must be set before the first renderStatus call (homeDir caches).
 process.env.HOME = "/home/u";
 
-const cfg: StatusBarConfig = DEFAULT_STATUS_BAR_CONFIG;
+const cfg: StatusBarConfig = FULL_STATUS_BAR_CONFIG;
 
 function state(overrides: Partial<HarnessStatusState> = {}): HarnessStatusState {
   return {
@@ -206,7 +211,7 @@ test("wait: no wait state renders no wait segment", () => {
 });
 
 test("wait: showWait=false hides the segment even while waiting", () => {
-  const config: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, showWait: false };
+  const config: StatusBarConfig = { ...FULL_STATUS_BAR_CONFIG, showWait: false };
   const s = state({
     throughput: { phase: "waiting" },
     wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
@@ -269,7 +274,7 @@ test("task: no task renders no task segment", () => {
 });
 
 test("task: showTask=false hides the segment", () => {
-  const config: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, showTask: false };
+  const config: StatusBarConfig = { ...FULL_STATUS_BAR_CONFIG, showTask: false };
   const s = state({ task: { workItemId: "WI-12", phase: "implement" } });
   assert.doesNotMatch(renderStatus(s, 200, config, 0), /WI-12/);
 });
@@ -289,4 +294,64 @@ test("mission live activity survives narrow layouts alongside its health", () =>
   assert.match(line, /STALLED/);
   assert.match(line, /tests 42s/);
   assert.match(line, /output 40s ago/);
+});
+
+test("the default status bar is lean: no repository, worktree, throughput or task segments", () => {
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showRepository, false);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showWorktree, false);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showThroughput, false);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showTask, false);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showBranch, true);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showModel, true);
+  assert.equal(resolveStatusBarConfig({ PI_STATUS_BAR_SHOW_THROUGHPUT: "1" }).showThroughput, true);
+});
+
+test("the lean default hides mission status text but a paused mission keeps its resume hint", () => {
+  const base = {
+    cwd: "/home/u/proj",
+    branch: "main",
+    task: {
+      workItemId: "WI-1",
+      phase: "implement",
+      missionStatus: { token: "R1/8 CONTINUE→monitor", live: "tests 4s", reason: "active", next: "monitor" },
+    },
+  } as never;
+  const running = renderStatus(base, 200, DEFAULT_STATUS_BAR_CONFIG, 0);
+  assert.doesNotMatch(running, /why active/);
+  const paused = renderStatus(
+    {
+      ...(base as object),
+      task: {
+        workItemId: "WI-1",
+        phase: "implement",
+        missionStatus: { token: "R1/8 PAUSED (operator)", reason: "paused", next: "resume with /mission resume MSN-1" },
+      },
+    } as never,
+    200,
+    DEFAULT_STATUS_BAR_CONFIG,
+    0,
+  );
+  assert.match(paused, /PAUSED/);
+  assert.match(paused, /\/mission resume MSN-1/);
+  for (const width of [120, 100, 80]) {
+    const narrow = renderStatus(
+      {
+        ...(base as object),
+        cwd: "/home/wohlgemuth/IdeaProjects/some/deep/project",
+        task: {
+          workItemId: "WI-1",
+          phase: "implement",
+          missionStatus: {
+            token: "R1/8 PAUSED (operator)",
+            reason: "paused",
+            next: "PAUSED by operator at 2026-10-29T10:00:00Z — resume with /mission resume MSN-1 (add --model auto)",
+          },
+        },
+      } as never,
+      width,
+      DEFAULT_STATUS_BAR_CONFIG,
+      0,
+    );
+    assert.match(narrow, /\/mission resume MSN-1/, `width ${width}: ${narrow}`);
+  }
 });
