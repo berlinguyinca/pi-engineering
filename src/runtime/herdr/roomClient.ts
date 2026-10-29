@@ -91,9 +91,21 @@ export class RoomClient {
     }
     if (!res) throw new RoomClientError("could not reach the control plane");
     if (!res.ok) {
+      // The real control plane answers every refusal with {"error": "<reason>"[, "code": ...]} (observed live: 401
+      // unauthorized, 404 not found / no such agent in this room, 400 idempotency_key required, 409 key reused for
+      // another message, 403 insights_disabled, 429 rate limit). The reason is server text: sanitized and capped.
+      const reason = await res
+        .json()
+        .then((b: unknown) =>
+          b && typeof b === "object" ? cleanForTerminal((b as Record<string, unknown>).error, 120) : "",
+        )
+        .catch(() => "");
       const hint =
         res.status === 401 ? " (key not accepted)" : res.status === 404 ? " (no such room, or no access)" : "";
-      throw new RoomClientError(`${method} ${path.split("?")[0]} refused: HTTP ${res.status}${hint}`, res.status);
+      throw new RoomClientError(
+        `${method} ${path.split("?")[0]} refused: HTTP ${res.status}${hint}${reason ? `: ${reason}` : ""}`,
+        res.status,
+      );
     }
     const parsed = (await res.json().catch(() => null)) as unknown;
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
@@ -109,6 +121,10 @@ export class RoomClient {
   attention(): Promise<Record<string, unknown>> {
     return this.call("GET", this.room("/attention"));
   }
+  /** The agents granted into this room (lighter than `state`, which also carries up to 200 events). */
+  agents(): Promise<Record<string, unknown>> {
+    return this.call("GET", this.room("/agents"));
+  }
   rooms(): Promise<Record<string, unknown>> {
     return this.call("GET", "/rooms");
   }
@@ -119,9 +135,10 @@ export class RoomClient {
     return this.call("POST", this.room("/tasks"), { target_agent_id: agentId, text, idempotency_key: key });
   }
 
-  /** The full lineage graph lives in Herdr's own UI; this is where to open it. */
+  /** The full lineage graph lives in Herdr's own UI. Verified against the real server: its standalone page is served
+   * at `/` and routes `#/room/<id>` (collab-view.js); the `#/collab?...` form belongs to the embedded dashboard tab. */
   graphUrl(): string {
-    return `${this.baseUrl}/#/collab?room=${encodeURIComponent(this.roomId)}`;
+    return `${this.baseUrl}/#/room/${encodeURIComponent(this.roomId)}`;
   }
 }
 
@@ -179,7 +196,13 @@ export function renderRoomView(
       attention.counts && typeof attention.counts === "object" ? (attention.counts as Record<string, unknown>) : {};
     lines.push(`Attention (${typeof counts.open === "number" ? counts.open : items.length} open)`);
     for (const it of items.slice(0, 15)) {
-      const subject = str(it.subject, 60);
+      // Real items carry `subject` as an object {node_id, node_type, label} and no `title`.
+      const rawSubject = it.subject;
+      const subject =
+        rawSubject && typeof rawSubject === "object"
+          ? str((rawSubject as Record<string, unknown>).label, 60) ||
+            str((rawSubject as Record<string, unknown>).node_id, 60)
+          : str(rawSubject, 60);
       lines.push(
         `  [${str(it.severity, 10)}] ${str(it.title, 80) || str(it.category, 40)}${subject ? ` — ${subject}` : ""}`,
       );
@@ -204,7 +227,11 @@ const USAGE =
 function resolveAgent(agents: Record<string, unknown>[], wanted: string): { id: string } | { error: string } {
   const w = wanted.toLowerCase();
   const exact = agents.filter(
-    (a) => str(a.agent_id).toLowerCase() === w || str(a.name).toLowerCase() === w || str(a.address).toLowerCase() === w,
+    (a) =>
+      str(a.agent_id).toLowerCase() === w ||
+      str(a.name).toLowerCase() === w ||
+      str(a.address).toLowerCase() === w ||
+      (Array.isArray(a.aliases) && a.aliases.some((x) => str(x).toLowerCase() === w)),
   );
   const pool = exact.length ? exact : agents.filter((a) => str(a.name).toLowerCase().startsWith(w));
   if (pool.length === 1) return { id: String(pool[0]!.agent_id) };
@@ -255,22 +282,27 @@ export async function runRoomCommand(args: string, deps: RoomCommandDeps): Promi
           level: "info",
           text: rooms
             .slice(0, MAX_ROWS)
-            .map((r) => `${str(r.id ?? r.room_id, 64)}  ${str(r.name, 60)}`)
+            .map(
+              (r) =>
+                `${str(r.room_id ?? r.id, 64)}  ${str(r.name, 60)}${str(r.role, 16) ? `  (${str(r.role, 16)})` : ""}`,
+            )
             .join("\n"),
         };
       }
       case "say": {
         if (!body) return { level: "error", text: USAGE };
         if (body.length > MAX_TEXT) return { level: "error", text: `message is longer than ${MAX_TEXT} characters` };
-        await client.say(body);
-        return { level: "info", text: "Posted to the room." };
+        const out = await client.say(body);
+        const ev = out.event && typeof out.event === "object" ? (out.event as Record<string, unknown>) : {};
+        const seq = typeof ev.sequence === "number" ? ` (event ${ev.sequence})` : "";
+        return { level: "info", text: `${out.replayed === true ? "Already posted" : "Posted to the room"}${seq}.` };
       }
       case "assign": {
         const [agentWord = ""] = tail;
         const text = body.slice(agentWord.length).trim();
         if (!agentWord || !text) return { level: "error", text: USAGE };
         if (text.length > MAX_TEXT) return { level: "error", text: `task text is longer than ${MAX_TEXT} characters` };
-        const resolved = resolveAgent(arr((await client.state()).agents), agentWord);
+        const resolved = resolveAgent(arr((await client.agents()).agents), agentWord);
         if ("error" in resolved) return { level: "error", text: resolved.error };
         const out = await client.assign(resolved.id, text);
         return {
