@@ -29,7 +29,7 @@ import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
-import { loadMissionLimits } from "../lifecycle/policy.ts";
+import { loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
@@ -1874,8 +1874,16 @@ export class EngineeringRuntime {
               contextWindow: model.contextWindow,
             }))
         : async () => [];
+      const rolePins: Record<string, string | undefined> = {};
+      try {
+        const { policy } = await loadPolicy({ cwd: repoRoot, agentDir: opts.agentDir ?? getAgentDir() });
+        for (const [role, cfg] of Object.entries(policy.routing.roles)) rolePins[role] = cfg?.model;
+      } catch {
+        // Pins only sharpen the quota_fallbacks validation; without them that one check is skipped.
+      }
       const phaseHandoff = await buildContinuityConfig({
         agentDir: opts.agentDir ?? getAgentDir(),
+        rolePins,
         models: continuityModels,
         isModelUnavailable: (model) => rt.unavailableModels.has(model),
         log: (line) => console.error(line),

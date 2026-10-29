@@ -23,11 +23,20 @@ import { EnvelopeStore } from "../../src/runtime/herdr/envelopeStore.ts";
 import { createLineageEmitter } from "../../src/runtime/herdr/lineage.ts";
 import { CONTEXT_USAGE_SUMMARY, QUOTA_EXHAUSTED_SUMMARY } from "../../src/workers/activity.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+import { exampleBlock } from "../support/quotaExample.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   for (const c of cleanups.splice(0).reverse()) await c();
 });
+
+const IMPLEMENTER_PIN = "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl";
+const EXAMPLE_REGISTRY = [
+  "metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl",
+  "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m",
+  "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl",
+  "metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4",
+].map((m) => ({ provider: m.split("/")[0] as string, id: m.split("/")[1] as string, contextWindow: 1000 }));
 
 interface Call {
   model: unknown;
@@ -43,11 +52,16 @@ interface HarnessOptions {
   pin?: string | null;
   /** Model the worker reports serving through a context reading before it hits quota. */
   reportsModel?: string;
+  /** Registry the continuity config resolves ids against. Default: gw/primary, gw/fallback, gw/fallback2. */
+  registry?: Array<{ provider: string; id: string; contextWindow: number }>;
+  /** Models the runtime marks unavailable (provider/id). */
+  unavailable?: string[];
 }
 
 async function harness(yaml: string | null, opts: HarnessOptions = {}) {
   const quotaCalls = opts.quotaCalls ?? [1];
   const pin = opts.pin === undefined ? "gw/primary" : opts.pin;
+  const logs: string[] = [];
   const fx = await makeFixtureRepo();
   cleanups.push(() => fx.cleanup());
   const agentDir = await mkdtemp(join(tmpdir(), "quota-agent-"));
@@ -55,11 +69,14 @@ async function harness(yaml: string | null, opts: HarnessOptions = {}) {
   if (yaml !== null) await writeFile(join(agentDir, "engineering.yaml"), yaml);
   const phaseHandoff = await buildContinuityConfig({
     agentDir,
-    models: async () => [
-      { provider: "gw", id: "primary", contextWindow: 1000 },
-      { provider: "gw", id: "fallback", contextWindow: 1000 },
-      { provider: "gw", id: "fallback2", contextWindow: 1000 },
-    ],
+    models: async () =>
+      opts.registry ?? [
+        { provider: "gw", id: "primary", contextWindow: 1000 },
+        { provider: "gw", id: "fallback", contextWindow: 1000 },
+        { provider: "gw", id: "fallback2", contextWindow: 1000 },
+      ],
+    isModelUnavailable: (m) => opts.unavailable?.includes(`${m.provider}/${m.id}`) === true,
+    log: (line) => logs.push(line),
   });
   const git = (await GitRepo.open(fx.root))!;
   const backend = JsonlEventStore.inMemory();
@@ -157,7 +174,7 @@ async function harness(yaml: string | null, opts: HarnessOptions = {}) {
     await orchestrator.settleHandoffs();
     return result.mission.mission_id;
   };
-  return { store, backend, orchestrator, calls, reports, run, lineage, envelopes, git, fx };
+  return { store, backend, orchestrator, calls, reports, run, lineage, envelopes, git, fx, logs };
 }
 
 const agentExecutions = (store: MissionStore, missionId: string) =>
@@ -243,16 +260,51 @@ describe("quota exhaustion switches the model through orchestrate()", () => {
     );
   });
 
-  it("a fallback that is listed but unavailable counts as none: blocked, naming the configured list", async () => {
-    const h = await harness("quota_fallbacks:\n  roles:\n    implementer: [gw/not-in-registry]\n");
+  it("a fallback that is listed but marked unavailable by the runtime counts as none: blocked, naming the configured list", async () => {
+    const h = await harness("quota_fallbacks:\n  roles:\n    implementer: [gw/fallback]\n", {
+      unavailable: ["gw/fallback"],
+    });
     const missionId = await h.run();
     const [record] = h.store.listHandoffRecords(missionId);
     assert.equal(record?.state, "prepared");
     assert.match(
       record?.blockedReason ?? "",
-      /none of the configured quota_fallbacks for role implementer is eligible \(gw\/not-in-registry\)/,
+      /none of the configured quota_fallbacks for role implementer is eligible \(gw\/fallback\)/,
     );
     assert.equal(agentExecutions(h.store, missionId).length, 1);
+  });
+
+  it("an id missing from the registry is a config error: fail-closed, switching disabled, loud log, handoff blocked", async () => {
+    const h = await harness("quota_fallbacks:\n  roles:\n    implementer: [gw/not-in-registry]\n");
+    const missionId = await h.run();
+    assert.ok(
+      h.logs.some((l) => /\[quota-fallbacks\] ERROR .*gw\/not-in-registry is not in the model registry/.test(l)),
+    );
+    const [record] = h.store.listHandoffRecords(missionId);
+    assert.equal(record?.state, "prepared");
+    assert.match(record?.blockedReason ?? "", /no quota_fallbacks configured for role implementer/);
+    assert.equal(agentExecutions(h.store, missionId).length, 1);
+  });
+});
+
+describe("the repo's example quota_fallbacks block", () => {
+  it("switches the implementer through orchestrate() when enabled", async () => {
+    const example = exampleBlock();
+    const h = await harness(example, {
+      pin: IMPLEMENTER_PIN,
+      registry: EXAMPLE_REGISTRY,
+    });
+    const missionId = await h.run();
+    assert.deepEqual(h.logs, []);
+    const [record] = h.store.listHandoffRecords(missionId);
+    assert.equal(record?.cause, "quota_exhausted");
+    assert.equal(record?.fromModel, IMPLEMENTER_PIN);
+    assert.equal(record?.toModel, "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m");
+    assert.equal(record?.state, "acknowledged");
+    assert.deepEqual(
+      h.calls.map((c) => c.model),
+      [IMPLEMENTER_PIN, "metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m"],
+    );
   });
 });
 

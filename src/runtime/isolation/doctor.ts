@@ -82,6 +82,8 @@ export async function runDoctor(options: {
   cwd: string;
   repair?: boolean;
   env?: NodeJS.ProcessEnv;
+  /** Global pi agent dir holding engineering.yaml; when given, the quota_fallbacks block is validated. */
+  agentDir?: string;
 }): Promise<DoctorReport> {
   const env = options.env ?? process.env;
   const repair = options.repair ?? false;
@@ -248,6 +250,30 @@ export async function runDoctor(options: {
           : "stale (owner gone or unreadable; no longer used)",
     repairable: lockState === "stale" ? 1 : 0,
   });
+
+  if (options.agentDir) {
+    // Shape, duplicates and pinned-model checks only: the doctor has no model registry, so ids are verified at startup.
+    const { loadPolicy } = await import("../../lifecycle/policy.ts");
+    const { loadValidatedQuotaFallbacks } = await import("../quotaFallbackConfig.ts");
+    const rolePins: Record<string, string | undefined> = {};
+    try {
+      const { policy } = await loadPolicy({ cwd: options.cwd, agentDir: options.agentDir });
+      for (const [role, cfg] of Object.entries(policy.routing.roles)) rolePins[role] = cfg?.model;
+    } catch {
+      // pins are optional context
+    }
+    const quota = await loadValidatedQuotaFallbacks(options.agentDir, { rolePins });
+    const warnings = quota.warnings.filter((w) => !w.startsWith("model registry unavailable"));
+    checks.push({
+      name: "Quota fallbacks",
+      status: quota.errors.length > 0 ? "fail" : warnings.length > 0 ? "warn" : "ok",
+      detail:
+        quota.errors.length > 0
+          ? `${quota.errors.join("; ")} (quota switching is disabled until fixed)`
+          : [...warnings, "ids are checked against the model registry at startup"].join("; "),
+      repairable: 0,
+    });
+  }
 
   // ── repair ──
   if (repair) {
