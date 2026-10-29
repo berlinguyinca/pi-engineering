@@ -101,7 +101,7 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
       priority: 10,
     });
     short.push({ text: mission.live ?? mission.token, priority: 10 });
-  } else if (mission && mission.token.includes("PAUSED")) {
+  } else if (mission?.token.includes("PAUSED")) {
     // The strip carries no resume hint, so a paused mission keeps one here even in the lean bar.
     full.push({ text: `${mission.token} · ${mission.next}`, priority: 10 });
     const hint = /\/mission resume \S+/.exec(mission.next)?.[0];

@@ -355,3 +355,41 @@ test("the lean default hides mission status text but a paused mission keeps its 
     assert.match(narrow, /\/mission resume MSN-1/, `width ${width}: ${narrow}`);
   }
 });
+
+test("a mission the lean bar does not report adds nothing unless it is paused", () => {
+  // showMissionStatus is false here, so the only mission text allowed is the
+  // paused resume hint. An active mission contributes nothing at all — its
+  // token is not merely trimmed, it is never pushed.
+  const lean = {
+    cwd: "/home/u/proj",
+    branch: "main",
+  } as never;
+  const active = renderStatus(
+    {
+      ...(lean as object),
+      task: {
+        workItemId: "WI-1",
+        phase: "implement",
+        missionStatus: { token: "R1/8 CONTINUE→monitor", reason: "active", next: "monitor" },
+      },
+    } as never,
+    200,
+    DEFAULT_STATUS_BAR_CONFIG,
+    0,
+  );
+  assert.doesNotMatch(active, /CONTINUE→monitor/);
+  const paused = renderStatus(
+    {
+      ...(lean as object),
+      task: {
+        workItemId: "WI-1",
+        phase: "implement",
+        missionStatus: { token: "R1/8 PAUSED (operator)", reason: "paused", next: "resume with /mission resume MSN-1" },
+      },
+    } as never,
+    200,
+    DEFAULT_STATUS_BAR_CONFIG,
+    0,
+  );
+  assert.match(paused, /R1\/8 PAUSED \(operator\)/);
+});
