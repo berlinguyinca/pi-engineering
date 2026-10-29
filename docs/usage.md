@@ -1584,6 +1584,15 @@ herdr:
   mission_id: m-1                      # optional default mission for events that carry none
 ```
 
+Session scope: `session.*` and `mission.started` ingest events carry `room_id`, `workspace_id` and `agent_instance_id`
+(payload and, in envelope mode, the envelope fields of the same names). The YAML `room_id`, `workspace_id` and
+`instance_id` are only the default. A Pi attached to several rooms binds each mission or session to its room on the
+ingest (`ingest.scopes.bindMission(missionId, {roomId})`, `bindSession(sessionId, {roomId, agentInstanceId})`) and every
+event is tagged from the most specific binding: explicit, then session, then mission, then YAML. `agent_instance_id`
+names the agent instance; it is not the pane-link `instance_id` (`pane:<host>:<pane>`), which is unchanged. The ids
+are claims: Herdr validates them against the caller's grants. Malformed ids are dropped, and with nothing configured
+nothing is added.
+
 Absent block means Pi does not talk to Herdr at all. The key is read from the file, never logged, and is not placed
 in the environment of anything Pi starts. Commands whose text a worker can author (the verifier's check commands,
 CAV test runs) run with a scrubbed environment: every `HERDR_*` variable, GitHub tokens, `SSH_AUTH_SOCK` and
