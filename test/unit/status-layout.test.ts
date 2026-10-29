@@ -333,4 +333,25 @@ test("the lean default hides mission status text but a paused mission keeps its 
   );
   assert.match(paused, /PAUSED/);
   assert.match(paused, /\/mission resume MSN-1/);
+  for (const width of [120, 100, 80]) {
+    const narrow = renderStatus(
+      {
+        ...(base as object),
+        cwd: "/home/wohlgemuth/IdeaProjects/some/deep/project",
+        task: {
+          workItemId: "WI-1",
+          phase: "implement",
+          missionStatus: {
+            token: "R1/8 PAUSED (operator)",
+            reason: "paused",
+            next: "PAUSED by operator at 2026-10-29T10:00:00Z — resume with /mission resume MSN-1 (add --model auto)",
+          },
+        },
+      } as never,
+      width,
+      DEFAULT_STATUS_BAR_CONFIG,
+      0,
+    );
+    assert.match(narrow, /\/mission resume MSN-1/, `width ${width}: ${narrow}`);
+  }
 });
