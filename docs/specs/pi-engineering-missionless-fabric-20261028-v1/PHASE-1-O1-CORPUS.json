@@ -1,52 +1,55 @@
 {
- "prompts": 8,
- "legacy_injections": 3,
- "new_injections": 0,
- "rows": [
-  {
-   "name": "hello",
-   "legacy_inject": false,
-   "legacy_workflow": "conversation",
-   "new_inject": false
-  },
-  {
-   "name": "question",
-   "legacy_inject": false,
-   "legacy_workflow": "conversation",
-   "new_inject": false
-  },
-  {
-   "name": "fix",
-   "legacy_inject": true,
-   "legacy_workflow": "engineering_review",
-   "new_inject": false
-  },
-  {
-   "name": "retry",
-   "legacy_inject": false,
-   "legacy_workflow": "conversation",
-   "new_inject": false
-  },
-  {
-   "name": "continue",
-   "legacy_inject": false,
-   "legacy_workflow": "conversation",
-   "new_inject": false
-  },
-  {
-   "name": "print",
-   "legacy_inject": false,
-   "legacy_workflow": "conversation",
-   "new_inject": false
-  },
-  {
-   "name": "implement",
-   "legacy_inject": true,
-   "legacy_workflow": "engineering_review",
-   "new_inject": false
-  },
-  {
-   "name": "plan",
-   "legacy_inject": true,
-   "legacy_workflow": "engineering_review",
-   "new_inject": false
+  "prompts": 8,
+  "legacy_injections": 3,
+  "new_injections": 0,
+  "rows": [
+    {
+      "name": "hello",
+      "legacy_inject": false,
+      "legacy_workflow": "conversation",
+      "new_inject": false
+    },
+    {
+      "name": "question",
+      "legacy_inject": false,
+      "legacy_workflow": "conversation",
+      "new_inject": false
+    },
+    {
+      "name": "fix",
+      "legacy_inject": true,
+      "legacy_workflow": "engineering_review",
+      "new_inject": false
+    },
+    {
+      "name": "retry",
+      "legacy_inject": false,
+      "legacy_workflow": "conversation",
+      "new_inject": false
+    },
+    {
+      "name": "continue",
+      "legacy_inject": false,
+      "legacy_workflow": "conversation",
+      "new_inject": false
+    },
+    {
+      "name": "print",
+      "legacy_inject": false,
+      "legacy_workflow": "conversation",
+      "new_inject": false
+    },
+    {
+      "name": "implement",
+      "legacy_inject": true,
+      "legacy_workflow": "engineering_review",
+      "new_inject": false
+    },
+    {
+      "name": "plan",
+      "legacy_inject": true,
+      "legacy_workflow": "engineering_review",
+      "new_inject": false
+    }
+  ]
+}
