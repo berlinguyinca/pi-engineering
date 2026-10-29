@@ -154,13 +154,16 @@ function gitInvocations(segment: string): GitInvocation[] {
 const READ_ONLY_VERBS = new Set([
   "status",
   "log",
+  "whatchanged",
   "diff",
   "show",
   "fetch",
   "rev-parse",
+  "rev-list",
   "ls-files",
   "remote",
   "blame",
+  "annotate",
   "describe",
   "shortlog",
   "tag",
@@ -171,7 +174,40 @@ const READ_ONLY_VERBS = new Set([
   "count-objects",
   "fsck",
   "gc",
+  // Object / ref inspection. These were in NEITHER list, and an unknown verb
+  // at a command position fails closed — so asking the primary checkout what it
+  // contains was blocked as if it changed it. A session that cannot inspect is
+  // left only with the mutating verbs it is allowed to run, which is the wrong
+  // trade: `git ls-remote --heads origin` (the question "what is upstream?")
+  // was refused in a live session while it was trying to recover its own
+  // worktree.
+  "ls-remote",
+  "ls-tree",
+  "ls-object",
+  "ls-objects",
+  "cat-file",
+  "show-ref",
+  "merge-base",
+  "name-rev",
+  "grep",
+  "cherry",
+  "verify-commit",
+  "verify-tag",
+  "verify-pack",
+  // Subcommand-aware (see the *Mutates helpers): listed read-only, refused
+  // when the subcommand or flag changes state.
+  "reflog",
+  "for-each-ref",
 ]);
+
+/** Read-only `reflog` subcommands; `delete`/`expire` rewrite the reflog. */
+const READ_ONLY_REFLOG_SUBCOMMANDS = new Set(["show", "exist", "exists"]);
+
+/** `git remote` subcommands that change the remote configuration. */
+const REMOTE_MUTATING_SUBCOMMANDS = new Set(["add", "remove", "rename", "set-url", "set-head", "setbranches", "prune"]);
+
+/** Flags that make `git for-each-ref` write instead of list. */
+const FOR_EACH_REF_MUTATING_FLAGS = new Set(["--delete", "--stdin", "--create-reflog"]);
 
 /**
  * Verbs that change repository state (worktree, index, HEAD, refs). Kept
@@ -230,24 +266,70 @@ const MUTATING_VERBS = new Set([
  * command position stays blocked in case git grows a mutating verb this list
  * predates.
  */
-export function isMutatingGitCommand(command: string): boolean {
-  return segments(command).some((segment) => {
+/**
+ * Read-only verbs whose subcommand decides whether the command writes. A Map,
+ * not an object literal, so a verb like `constructor` cannot resolve to
+ * something that is not a check.
+ */
+const SUBCOMMAND_CHECKS = new Map<string, (segment: string) => boolean>([
+  ["branch", (segment) => branchOrTagMutates(segment, "branch")],
+  ["tag", (segment) => branchOrTagMutates(segment, "tag")],
+  ["stash", stashMutates],
+  ["config", configMutates],
+  ["reflog", reflogMutates],
+  ["remote", remoteMutates],
+  ["for-each-ref", forEachRefMutates],
+]);
+
+export interface MutatingGitSegment {
+  /** The verb that changes state (`branch`, `commit`, …). */
+  verb: string;
+  /** The whole compound-command segment that contains it. */
+  segment: string;
+}
+
+/**
+ * The first segment of `command` that changes repository state, or null when
+ * the command is allowed. This is the verdict `isMutatingGitCommand` answers
+ * with as a boolean, kept visible because a compound command is refused
+ * WHOLESALE: `git worktree remove --force /wt && git branch -D fix/x` blocks
+ * on the second segment alone, and a reason that says only "this git command
+ * targets the primary checkout" leaves the session to guess which half was the
+ * problem. It guessed by retrying four times in a live session, each retry
+ * re-chaining the same allowed `worktree` half with the blocked `branch -D`
+ * half, until it reached for `--git-dir` to get around the refusal.
+ */
+export function mutatingGitSegment(command: string): MutatingGitSegment | null {
+  for (const segment of segments(command)) {
     for (const { verb, invoked } of gitInvocations(segment)) {
       if (verb === "worktree") continue; // escape hatch: add/remove/list/prune
       if (READ_ONLY_VERBS.has(verb)) {
-        if (verb === "branch" || verb === "tag") return branchOrTagMutates(segment, verb);
-        if (verb === "stash") return stashMutates(segment);
-        if (verb === "config") return configMutates(segment);
+        // A read-only verb can still write through its subcommand (`branch -D`,
+        // `stash pop`, `config user.email`, `remote set-url`).
+        if (SUBCOMMAND_CHECKS.get(verb)?.(segment)) return { verb, segment };
         continue;
       }
-      if (MUTATING_VERBS.has(verb)) return true;
-      if (invoked) return true; // `git <verb git does not know>`: fail closed
+      if (MUTATING_VERBS.has(verb)) return { verb, segment };
+      // `git <verb git does not know>`: fail closed
+      if (invoked) return { verb, segment };
     }
-    return false;
-  });
+  }
+  return null;
 }
 
-/** `git branch` lists; anything with a name or flag creates/renames/deletes. */
+export function isMutatingGitCommand(command: string): boolean {
+  return mutatingGitSegment(command) !== null;
+}
+
+/**
+ * `git branch` lists; anything with a name or flag creates/renames/deletes.
+ * `git tag` lists with no name and no write flag; a name creates, and
+ * `-d`/`-f`/`-a`/`-m`/`-s`/`-u`/`-F` delete, move, or write an annotated or
+ * signed tag. Those tag writes were missed: `git tag -d v1.0` and
+ * `git tag -a v1.0 -m msg` both start with a flag, and the rule "a flag means
+ * it is a listing" read them as read-only — so deleting a tag, or writing an
+ * annotated one, in the PRIMARY checkout was allowed.
+ */
 function branchOrTagMutates(segment: string, verb: "branch" | "tag"): boolean {
   const tokens = tokenize(segment);
   const i = tokens.findIndex((t) => t === verb);
@@ -258,12 +340,71 @@ function branchOrTagMutates(segment: string, verb: "branch" | "tag"): boolean {
   if (verb === "branch") {
     // -d/-D/-f/-m/-c (incl. combined like -dv) create/rename/delete.
     if (rest.some((t) => t.startsWith("-") && /[dDfmc]/.test(t.slice(1)))) return true;
-    if (rest.includes("--list")) return false; // `--list [pattern]` is read-only
-    if (rest.every((t) => ["-a", "-r", "-v", "-vv"].includes(t))) return false;
+    if (rest.includes("--list") || rest.includes("-l")) return false; // `--list [pattern]` is read-only
+    if (rest.every((t) => ["-a", "-r", "-v", "-vv", "--all", "--remotes"].includes(t))) return false;
     return true; // a name argument (create) or an unknown flag: be strict
   }
-  // `git tag` (list) vs `git tag <name> [commit]` (create).
-  return !first.startsWith("-");
+  // `git tag`: listing flags win over a pattern argument; write flags and a
+  // bare name write.
+  const LISTING = new Set(["-l", "--list"]);
+  const WRITING = new Set([
+    "-d",
+    "--delete",
+    "-f",
+    "--force",
+    "-a",
+    "--annotate",
+    "-m",
+    "--message",
+    "-F",
+    "--file",
+    "-s",
+    "--sign",
+    "-u",
+    "--local-user",
+  ]);
+  // Flags that consume the next word (so `-m v1.0` does not read `v1.0` as a
+  // tag name being created).
+  const TAKES_ARG = new Set(["-m", "--message", "-F", "--file", "-u", "--local-user"]);
+  const norm = (t: string) => (t.includes("=") ? t.slice(0, t.indexOf("=")) : t);
+  // An explicit listing flag wins: `git tag -l v*` lists, even though `v*` is a
+  // word that would otherwise read as a tag name.
+  if (rest.some((t) => LISTING.has(norm(t)))) return false;
+  for (let j = 0; j < rest.length; j++) {
+    const t = rest[j]!;
+    if (!t.startsWith("-")) return true; // a name argument: create
+    const flag = norm(t);
+    if (WRITING.has(flag)) return true;
+    if (TAKES_ARG.has(flag)) j++;
+  }
+  return false; // flags only (e.g. `--sort=-creatordate`): a listing
+}
+
+/** `git remote` lists/shows; `add|remove|rename|set-url|set-head|prune` write. */
+function remoteMutates(segment: string): boolean {
+  const tokens = tokenize(segment);
+  const i = tokens.findIndex((t) => t === "remote");
+  if (i === -1) return false;
+  // `remote -v`, `remote show`, `remote get-url`, bare `remote` read; `remote
+  // update` fetches, which `git fetch` is already allowed to do.
+  return tokens.slice(i + 1).some((t) => REMOTE_MUTATING_SUBCOMMANDS.has(t));
+}
+
+/** `git reflog` lists; `delete`/`expire` rewrite it. */
+function reflogMutates(segment: string): boolean {
+  const tokens = tokenize(segment);
+  const i = tokens.findIndex((t) => t === "reflog");
+  if (i === -1) return false;
+  const sub = tokens[i + 1];
+  return sub !== undefined && !READ_ONLY_REFLOG_SUBCOMMANDS.has(sub);
+}
+
+/** `git for-each-ref` lists; `--delete` / `--stdin` / `--create-reflog` write. */
+function forEachRefMutates(segment: string): boolean {
+  const tokens = tokenize(segment);
+  const i = tokens.findIndex((t) => t === "for-each-ref");
+  if (i === -1) return false;
+  return tokens.slice(i + 1).some((t) => FOR_EACH_REF_MUTATING_FLAGS.has(t));
 }
 
 /** `git stash list|show` read; `apply|pop|drop|clear|branch|save|push|store` mutate. */
@@ -372,14 +513,24 @@ export interface PrimaryWorktreeVerdict {
   reason: string;
 }
 
-function blockReason(what: string, root: string): string {
-  return [
+function blockReason(what: string, root: string, culprit?: MutatingGitSegment): string {
+  const lines = [
     `Blocked: ${what} targets the PRIMARY checkout ${root} (the repository's main worktree).`,
     "One agent, one worktree (AGENTS.md): this session must work in its own worktree —",
     "create one with `git worktree add <sibling-dir> -b <branch> origin/<base>` (or use an existing one)",
     "and operate there. Read-only inspection and `git worktree` management stay allowed here.",
-    "If this session must work in the primary checkout (production ops), start it with PI_ENG_PRIMARY=1.",
-  ].join("\n");
+  ];
+  if (culprit) {
+    // Name the half that tripped: a compound command is refused wholesale, and
+    // without this the session re-runs the same mix and reads the refusal as a
+    // blanket ban on the allowed part too.
+    lines.push(
+      `Culprit segment: \`${culprit.segment}\` (\`git ${culprit.verb}\` changes the primary checkout).`,
+      "Only that segment blocks — run the allowed parts of this command separately.",
+    );
+  }
+  lines.push("If this session must work in the primary checkout (production ops), start it with PI_ENG_PRIMARY=1.");
+  return lines.join("\n");
 }
 
 export class PrimaryWorktreeGuard {
@@ -450,9 +601,10 @@ export class PrimaryWorktreeGuard {
         const root = await this.primaryAt(dirname(abs));
         if (root) return { block: true, reason: blockReason(`the write target \`${target}\``, root) };
       }
-      if (isMutatingGitCommand(command)) {
+      const culprit = mutatingGitSegment(command);
+      if (culprit) {
         const root = await this.primaryAt(effectiveCwd);
-        if (root) return { block: true, reason: blockReason("this git command", root) };
+        if (root) return { block: true, reason: blockReason("this git command", root, culprit) };
       }
       return undefined;
     }
