@@ -1331,7 +1331,16 @@ export class MissionObservability {
     health: MissionHealth,
   ): Pick<
     MissionObservabilitySummary,
-    "action" | "reason" | "recovery" | "nextAction" | "nextActionAt" | "owner" | "repository" | "task" | "preservedWork"
+    | "action"
+    | "failureCategory"
+    | "reason"
+    | "recovery"
+    | "nextAction"
+    | "nextActionAt"
+    | "owner"
+    | "repository"
+    | "task"
+    | "preservedWork"
   > {
     const currentResumption = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     const recovery = this.store
@@ -1361,12 +1370,16 @@ export class MissionObservability {
       task?.objective ??
       "No further action is scheduled";
     return {
-      action:
-        recovery?.action ??
-        s.currentActivity?.summary ??
-        task?.objective ??
-        this.store.getMission(missionId)?.status ??
-        "UNKNOWN",
+      // A durable stop for this resumption generation ends any wait the latest
+      // decision describes (the orchestrator can stop right after a probe decision).
+      action: stop
+        ? "STOP"
+        : (recovery?.action ??
+          s.currentActivity?.summary ??
+          task?.objective ??
+          this.store.getMission(missionId)?.status ??
+          "UNKNOWN"),
+      ...(classification ? { failureCategory: classification.category } : {}),
       reason:
         stop?.reason ??
         repositoryWaitText ??

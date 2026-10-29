@@ -267,6 +267,8 @@ export interface MissionObservabilitySummary {
   completionStatus: CompletionStatus;
   runtimeStartedAt?: string;
   action: string;
+  /** Category of the latest failure classification, when one exists. */
+  failureCategory?: string;
   reason: string;
   recovery: { attempt: number; maxAttempts: number };
   nextAction: string;

@@ -106,7 +106,7 @@ const EXPECTED_CHANGE: Record<RecoveryAction, string> = {
  * COUNT, because on a saturated deployment the identical failure is what
  * waiting for capacity looks like (issue #112).
  */
-const CAPACITY_WAIT_ACTIONS: Partial<Record<FailureCategory, RecoveryAction>> = {
+export const CAPACITY_WAIT_ACTIONS: Partial<Record<FailureCategory, RecoveryAction>> = {
   PROVIDER_TRANSIENT: "PROBE_AND_BACKOFF",
   PROVIDER_PERMANENT: "PROBE_AND_BACKOFF",
   ORPHANED_EXECUTION: "PROBE_AND_BACKOFF",
@@ -117,6 +117,12 @@ const CAPACITY_WAIT_ACTIONS: Partial<Record<FailureCategory, RecoveryAction>> = 
   // failure IS what "waiting for free space" looks like.
   DISK_SUSPENDED: "PROBE_AND_BACKOFF",
 };
+
+/** Actions that park a mission on a durable wait; an attempt count past the budget is wait progress, not exhaustion. */
+export const PARKING_WAIT_ACTIONS: ReadonlySet<RecoveryAction> = new Set<RecoveryAction>([
+  "PROBE_AND_BACKOFF",
+  "PAUSE_FOR_PERSISTENCE",
+]);
 
 /** Failures no automatic action can resolve: they must ask the operator. */
 const OPERATOR_QUESTIONS: Partial<Record<FailureCategory, string>> = {
@@ -762,7 +768,7 @@ export class RecoveryPlanner {
     const exhaustedReason = !budgetExhausted
       ? EXPECTED_CHANGE[action]
       : parksOnCapacity
-        ? `waiting for capacity after ${fingerprintAttempts} attempts (the budget of ${this.strategyMaxAttempts} does not stop a capacity wait); the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
+        ? `waiting after ${fingerprintAttempts} attempts (${budgetReason}; this does not stop a wait); the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
         : (OPERATOR_QUESTIONS[input.classification.category] ?? budgetReason);
     // When automatic recovery is exhausted and there is no capacity wait to
     // park on, the mission must pause for an operator decision. Surface concrete,

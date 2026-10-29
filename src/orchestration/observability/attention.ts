@@ -14,6 +14,8 @@
  * operators reading the same mission see the same reason.
  */
 
+import { PARKING_WAIT_ACTIONS } from "../recovery.ts";
+import type { RecoveryAction } from "../types.ts";
 import type { LoopSignal, MissionHealth, MissionObservabilitySummary, WaitingReason } from "./types.ts";
 
 /** How strongly this mission should interrupt the operator. */
@@ -66,6 +68,8 @@ export interface AttentionInput {
   recovery: { attempt: number; maxAttempts: number };
   /** The recovery action behind `recovery`; a wait action is a park, not an exhausted budget. */
   recoveryAction?: string;
+  /** Failure category behind the latest classification; selects what the wait claims to be waiting for. */
+  failureCategory?: string;
   operatorPausedAt?: string | null;
   /** Loop signals flagged for this mission's live workers. */
   loopSignals?: LoopSignal[];
@@ -79,8 +83,6 @@ export interface AttentionInput {
 /** States where the operator, not the runtime, is the next actor. */
 const OPERATOR_STATES = new Set(["NEEDS_ATTENTION", "WAITING_FOR_USER", "REVIEW_BLOCKED", "AWAITING_APPROVAL"]);
 /** States where the mission stopped on its own and kept its work. */
-/** Recovery actions that wait for capacity; their attempt count is not a budget that ends the mission. */
-const CAPACITY_WAIT_ACTIONS = new Set(["PROBE_AND_BACKOFF", "PAUSE_FOR_PERSISTENCE"]);
 const PARKED_STATES = new Set(["PARKED", "PARKED_UNPROVEN", "PARKED_UNKNOWN", "BLOCKED"]);
 /** A named wait is informational; the runtime is doing something about it. */
 const SELF_SERVING_WAITS = new Set<WaitingReason>([
@@ -93,6 +95,20 @@ const SELF_SERVING_WAITS = new Set<WaitingReason>([
   "model_request",
   "rate_limit",
 ]);
+
+/** Wording for a parking wait; "capacity" is claimed only for provider failures. */
+function parkingWaitWording(action: string, category: string | undefined): { lead: string; resumes: string } {
+  if (action === "PAUSE_FOR_PERSISTENCE") {
+    return { lead: "durable writes failing: probe", resumes: "resumes once storage recovers" };
+  }
+  if (category === "PROVIDER_TRANSIENT" || category === "PROVIDER_PERMANENT") {
+    return { lead: "waiting for capacity: probe", resumes: "will resume automatically when capacity returns" };
+  }
+  if (category === "DISK_SUSPENDED") {
+    return { lead: "waiting for disk space: probe", resumes: "resumes once disk space is freed" };
+  }
+  return { lead: "waiting: probe", resumes: "resumes once the blocking condition clears" };
+}
 
 function ageMs(at: string | null | undefined, now: number): number | undefined {
   const parsed = Date.parse(at ?? "");
@@ -134,20 +150,25 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
   }
 
   if (input.recovery.attempt >= input.recovery.maxAttempts && input.recovery.maxAttempts > 0) {
-    if (input.recoveryAction !== undefined && CAPACITY_WAIT_ACTIONS.has(input.recoveryAction)) {
-      // Capacity waits are unbounded by design: the counter past its budget is
-      // wait progress, and the mission resumes by itself when capacity returns.
+    if (input.recoveryAction !== undefined && PARKING_WAIT_ACTIONS.has(input.recoveryAction as RecoveryAction)) {
+      // A parking wait is unbounded by design: the counter past its budget is
+      // wait progress. What the wait is for, and who ends it, depends on the
+      // failure category, so the wording names only what is true for it.
       const waited = ageMs(input.waitingSince, input.now);
       const nextAt = Date.parse(input.nextActionAt ?? "");
+      const nextProbe = Number.isNaN(nextAt)
+        ? []
+        : [nextAt <= input.now ? "next probe due now" : `next probe in ${humanAge(nextAt - input.now)}`];
+      const wait = parkingWaitWording(input.recoveryAction, input.failureCategory);
       const parts = [
-        `waiting for capacity: probe ${input.recovery.attempt}`,
-        ...(waited !== undefined ? [`waiting ${humanAge(waited)}`] : []),
-        ...(Number.isNaN(nextAt) ? [] : [`next probe in ${humanAge(Math.max(0, nextAt - input.now))}`]),
+        `${wait.lead} ${input.recovery.attempt}`,
+        ...(waited !== undefined ? [`parked ${humanAge(waited)}`] : []),
+        ...nextProbe,
       ];
       evidence.push({
         kind: "capacity_wait",
         ...(input.waitingSince ? { at: input.waitingSince } : {}),
-        detail: `${parts.join(", ")}; will resume automatically when capacity returns`,
+        detail: `${parts.join(", ")}; ${wait.resumes}`,
       });
     } else {
       evidence.push({
@@ -274,6 +295,7 @@ export function attentionFromSummary(
     nextActionAt: summary.nextActionAt,
     recovery: summary.recovery,
     recoveryAction: summary.action,
+    failureCategory: summary.failureCategory,
     operatorPausedAt: options.operatorPausedAt,
     loopSignals: options.loopSignals,
     review: options.review,

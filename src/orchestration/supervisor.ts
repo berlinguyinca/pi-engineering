@@ -1,20 +1,24 @@
 import { latestTaskCheckpoints } from "./checkpoints.ts";
 import type { MissionStore } from "./missionStore.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
-import { FailureClassifier, RecoveryPlanner, taskFailureReason } from "./recovery.ts";
+import { FailureClassifier, PARKING_WAIT_ACTIONS, RecoveryPlanner, taskFailureReason } from "./recovery.ts";
 import { canTransitionMission } from "./state.ts";
 import {
   type FailureCategory,
   type Mission,
   type OrchestrationTask,
   PLANNER_CLARIFICATION_CATEGORY,
+  type RecoveryAction,
   type RecoveryDecision,
 } from "./types.ts";
 
 const TERMINAL = new Set(["COMPLETE", "FAILED", "CANCELED"]);
 /** Task statuses that occupy no worker and can never become runnable again. */
 const TERMINAL_TASK_STATUSES = new Set(["SUCCEEDED", "FAILED", "SKIPPED", "CANCELED"]);
-const WAIT_ACTIONS = new Set(["WAIT_FOR_REQUIREMENT", "PROBE_AND_BACKOFF", "PAUSE_FOR_PERSISTENCE"]);
+const WAIT_ACTIONS: ReadonlySet<RecoveryAction> = new Set<RecoveryAction>([
+  "WAIT_FOR_REQUIREMENT",
+  ...PARKING_WAIT_ACTIONS,
+]);
 const FINISHING_PHASES: ReadonlySet<string> = new Set(["VALIDATING", "REVIEWING", "INTEGRATING", "FINAL_VALIDATION"]);
 
 /**

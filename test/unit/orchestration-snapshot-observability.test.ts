@@ -13,6 +13,7 @@ import {
 } from "../../src/orchestration/missionSnapshot.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
+import { attentionFromSummary } from "../../src/orchestration/observability/attention.ts";
 import { MissionSupervisor } from "../../src/orchestration/supervisor.ts";
 import type { TaskCheckpoint } from "../../src/orchestration/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
@@ -366,4 +367,64 @@ test("snapshot includes timestamps needed for clients to animate mission activit
   assert.equal(snapshot.waitingSince, "2026-10-20T12:00:00Z");
   assert.equal(snapshot.lastOutputAt, "2026-10-20T12:00:05Z");
   assert.equal(snapshot.currentActivityStartedAt, "2026-10-20T12:00:02Z");
+});
+
+function parkedAtCap(store: MissionStore, missionId: string, resumptionGeneration: number) {
+  const classification = store.classifyFailure({
+    classificationId: `FC-cap-${resumptionGeneration}`,
+    missionId,
+    taskId: null,
+    executionId: null,
+    category: "PROVIDER_TRANSIENT",
+    evidenceRefs: [],
+    fingerprint: "sha256:cap",
+    summary: "gateway returned 503",
+    classifiedAt: "2026-10-27T12:00:00.000Z",
+  });
+  store.planRecovery({
+    recoveryId: `RCV-cap-${resumptionGeneration}`,
+    missionId,
+    classificationId: classification.classificationId,
+    action: "PROBE_AND_BACKOFF",
+    expectedMaterialChange: "probe the gateway",
+    attempt: 9,
+    maxAttempts: 8,
+    deadline: null,
+    nextActionAt: "2026-10-27T12:05:00.000Z",
+    status: "planned",
+    decidedAt: "2026-10-27T12:00:00.000Z",
+    ...(resumptionGeneration > 0 ? { resumptionGeneration } : {}),
+  });
+}
+
+test("a durably stopped mission at the cap keeps recovery_exhausted, a live park says it resumes", () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store });
+  const m = mission(store, "Parked then stopped");
+  obs.missionCreated(m.mission_id, m.title);
+  const now = Date.parse("2026-10-27T12:01:00.000Z");
+  parkedAtCap(store, m.mission_id, 0);
+
+  const live = attentionFromSummary(obs.projection(m.mission_id)!.summary, { now });
+  assert.equal(live?.evidence[0]?.kind, "capacity_wait");
+  assert.match(live!.reason, /will resume automatically when capacity returns/);
+
+  store.stopMission(m.mission_id, {
+    reason: "gate repair refused",
+    preservedWork: [],
+    attemptedRecoveries: [],
+    resumeCondition: "cancel the mission",
+  });
+  const stopped = obs.projection(m.mission_id)!.summary;
+  assert.equal(stopped.action, "STOP");
+  const attention = attentionFromSummary(stopped, { now });
+  assert.equal(attention?.evidence[0]?.kind, "recovery_exhausted");
+  assert.doesNotMatch(attention!.reason, /resume automatically/);
+
+  // An operator resume starts a new generation; a fresh park there is live again.
+  store.resumeMission(m.mission_id, "operator resumed", "operator");
+  parkedAtCap(store, m.mission_id, 1);
+  const resumed = attentionFromSummary(obs.projection(m.mission_id)!.summary, { now });
+  assert.equal(resumed?.evidence[0]?.kind, "capacity_wait");
 });
