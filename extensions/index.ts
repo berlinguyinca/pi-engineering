@@ -52,6 +52,7 @@ import { registerPrimaryWorktreeGuard } from "../src/guard/primaryWorktreeGuard.
 import { guardFeedFor } from "../src/guard/streamText.ts";
 import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { admissionIdentityHeaders } from "../src/inference/admissionTransport.ts";
+import { loadExecutionConfig } from "../src/lifecycle/policy.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig } from "../src/models/modelsConfig.ts";
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
@@ -66,6 +67,7 @@ import {
 import {
   MISSION_UNAVAILABLE_RETRY_TURNS,
   decideAutoInvoke,
+  decideMissionDirective,
   missionToolReportedUnavailable,
 } from "../src/orchestration/autoInvoke.ts";
 import { MISSION_FLAGS_USAGE, parseMissionFlags } from "../src/orchestration/missionFlags.ts";
@@ -1099,13 +1101,17 @@ export default function (pi: ExtensionAPI) {
       if (missionToolUnavailable && ++turnsSinceMissionUnavailable > MISSION_UNAVAILABLE_RETRY_TURNS) {
         missionToolUnavailable = false;
       }
-      const decision = decideAutoInvoke({
+      const input = {
         prompt,
         mode: ctx?.mode,
         missionToolUnavailable,
         lastAutoInvoked,
         now: Date.now(),
-      });
+      };
+      // Config is read only when the legacy classifier would inject, so chat
+      // and questions pay no I/O.
+      if (!decideAutoInvoke(input).invoke) return;
+      const decision = decideMissionDirective(input, await loadExecutionConfig(runtimeCwd(ctx?.cwd ?? process.cwd())));
       if (!decision.invoke) return;
       lastAutoInvoked = { prompt, at: Date.now() };
       return {

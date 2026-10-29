@@ -9,6 +9,7 @@
  * told to call it. This decides, deterministically, whether to inject.
  */
 
+import type { ExecutionConfig } from "../lifecycle/policy.ts";
 import { classifyIntent, workflowForIntent } from "./intentRouter.ts";
 import type { WorkflowClass } from "./types.ts";
 
@@ -103,6 +104,23 @@ export function decideAutoInvoke(input: AutoInvokeInput): AutoInvokeDecision {
     return skip(`intent confidence ${classified.confidence.toFixed(2)} below ${min}`, workflow, classified.confidence);
   }
   return { invoke: true, workflow, confidence: classified.confidence, reason: `engineering intent (${workflow})` };
+}
+
+/**
+ * Policy-aware wrapper around decideAutoInvoke (Missionless Execution Fabric).
+ * The Mission directive is injected only when the operator opted into the
+ * legacy behaviour (`execution.legacy_auto_invoke`); otherwise the foreground
+ * agent handles the prompt directly and the reason says why. Classification
+ * still runs for the legacy path so its decision stays comparable.
+ */
+export function decideMissionDirective(input: AutoInvokeInput, execution: ExecutionConfig): AutoInvokeDecision {
+  const legacy = decideAutoInvoke(input);
+  if (!legacy.invoke || execution.legacy_auto_invoke) return legacy;
+  return {
+    ...legacy,
+    invoke: false,
+    reason: `missionless (${execution.preference}): no implicit Mission for ${legacy.workflow}`,
+  };
 }
 
 /**
