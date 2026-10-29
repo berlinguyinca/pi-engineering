@@ -472,6 +472,10 @@ export class Orchestrator {
   private readonly handoffDriver: HandoffDriver | null = null;
   /** Writes the orchestrating session's checkpoint at a phase boundary. */
   private readonly checkpointManager: CheckpointManager;
+  /** Models workers reported serving (context readings), for executions whose task pins no model. */
+  private readonly observedModels = new Map<string, string>();
+  /** In-memory phase timeline per mission: which phase an execution started in. Empty after a restart (= unknown). */
+  private readonly phaseTimeline = new Map<string, Array<{ phase: string; atMs: number }>>();
   /** Phase-boundary handoff emissions in flight (checkpoint write + record), settled by settleHandoffs. */
   private readonly phaseEmits = new Set<Promise<void>>();
   /** Last phase observed per mission, so the boundary handoff fires once per transition. */
@@ -572,6 +576,15 @@ export class Orchestrator {
             handoffCfg.contextWindowForModel ?? (() => null),
           ),
         pressureThreshold: () => handoffCfg.threshold,
+        phaseAt: (missionId, atIso) => {
+          const t = Date.parse(atIso);
+          return (
+            this.phaseTimeline
+              .get(missionId)
+              ?.filter((entry) => entry.atMs <= t)
+              .at(-1)?.phase ?? null
+          );
+        },
       });
       this.continuityTrigger = new ContextHandoffTrigger({
         thresholdsFor: (model) => handoffCfg.thresholdsForModel?.(model) ?? DEFAULT_CONTEXT_THRESHOLDS,
@@ -602,6 +615,18 @@ export class Orchestrator {
           );
         },
         report: (missionId, line) => this.report(missionId, line),
+        exhaustedModels: (missionId, taskId) => {
+          const sessions = new Set(
+            this.store
+              .listExecutions(missionId)
+              .filter((e) => e.task_id === taskId && e.session_id)
+              .map((e) => e.session_id as string),
+          );
+          return this.store
+            .listHandoffRecords(missionId)
+            .filter((r) => r.cause === "quota_exhausted" && r.fromModel && sessions.has(r.predecessor.sessionId))
+            .map((r) => r.fromModel as string);
+        },
         ...(handoffCfg.quotaCatalogue ? { catalogue: handoffCfg.quotaCatalogue } : {}),
       });
     }
@@ -1837,6 +1862,9 @@ export class Orchestrator {
     const previous = this.missionPhase.get(mission.mission_id) ?? null;
     if (previous !== phase) {
       this.missionPhase.set(mission.mission_id, phase);
+      const timeline = this.phaseTimeline.get(mission.mission_id) ?? [];
+      timeline.push({ phase, atMs: Date.now() });
+      this.phaseTimeline.set(mission.mission_id, timeline);
       const emit = this.emitPhaseBoundaryHandoff(mission, previous, phase).finally(() => this.phaseEmits.delete(emit));
       this.phaseEmits.add(emit);
     }
@@ -1904,6 +1932,8 @@ export class Orchestrator {
           ...(checkpointSha ? { checkpointSha } : {}),
         }),
         cause: "context_pressure",
+        ...(fromPhase ? { fromPhase } : {}),
+        toPhase,
       });
       this.report(
         mission.mission_id,
@@ -1937,6 +1967,7 @@ export class Orchestrator {
     if (!trigger) return;
     const swallow = (): undefined => undefined;
     if (event.context) {
+      if (event.context.model) this.observedModels.set(event.executionId, event.context.model);
       void trigger
         .observe({
           missionId: event.missionId,
@@ -1955,7 +1986,9 @@ export class Orchestrator {
           missionId: event.missionId,
           taskId: event.taskId,
           executionId: event.executionId,
-          model: this.store.getExecution(event.executionId)?.model ?? "unknown",
+          // The model actually serving: the pinned one, else what the worker reported; unknown stays null (no guess).
+          model:
+            this.store.getExecution(event.executionId)?.model ?? this.observedModels.get(event.executionId) ?? null,
           failureClass: "quota",
           role: this.store.getTask(event.taskId)?.role ?? null,
         })
@@ -1965,6 +1998,7 @@ export class Orchestrator {
       (event.phase === "completed" || event.phase === "failed" || event.phase === "canceled")
     ) {
       trigger.forget(event.executionId);
+      this.observedModels.delete(event.executionId);
     }
   }
 

@@ -66,6 +66,8 @@ export interface HandoffDriverDeps {
   artifacts?: { readContentByUri(uri: string): Promise<string | undefined> };
   /** Verification dependencies; defaults to the production ones (artifact store + the worktree's own repository). */
   verifyDeps?: HandoffVerifyDeps;
+  /** The phase a mission was in at an instant (ISO), or null when unknown (e.g. after a restart). */
+  phaseAt?(missionId: string, atIso: string): string | null;
   /** Mission context utilization and the configured pressure level; they only pick the fallback after a rejection. */
   utilization?(missionId: string): number | null;
   pressureThreshold?(): number | undefined;
@@ -129,7 +131,15 @@ export class HandoffDriver {
       // The orchestrating session's own checkpoint (scope "orchestrator"), never a worker's.
       return this.deps.store
         .listOrchestratorCheckpoints(record.missionId)
-        .filter((c) => c.candidateSha?.startsWith(sha) && c.sessionId === record.predecessor.sessionId)
+        .filter(
+          (c) =>
+            c.candidateSha?.startsWith(sha) &&
+            c.sessionId === record.predecessor.sessionId &&
+            Date.parse(c.createdAt) <= Date.parse(record.createdAt) &&
+            // It must be THIS boundary's checkpoint, not another record's that happens to share a SHA.
+            (record.toPhase === undefined ||
+              c.handoff?.decisions.some((d) => d.id === `phase:${record.fromPhase ?? "start"}->${record.toPhase}`)),
+        )
         .at(-1);
     }
     const matching = this.deps.store
@@ -183,7 +193,12 @@ export class HandoffDriver {
         .listExecutions(record.missionId)
         .filter(
           (e) =>
-            e.status === "RUNNING" && e.started_at !== null && Date.parse(e.started_at) < Date.parse(record.createdAt),
+            e.status === "RUNNING" &&
+            e.started_at !== null &&
+            Date.parse(e.started_at) < Date.parse(record.createdAt) &&
+            // Only the finished phase's workers; a worker of unknown phase (restart) or of the current phase is spared.
+            record.fromPhase !== undefined &&
+            this.deps.phaseAt?.(record.missionId, e.started_at) === record.fromPhase,
         )
         .map((e) =>
           fenceExecutionWriter(this.deps.store, e.execution_id, () => this.deps.quarantineExecution(e.execution_id)),
@@ -197,12 +212,33 @@ export class HandoffDriver {
     if (!record) return { status: "skipped", reason: "unknown handoff record" };
     if (!this.drivable(record)) return { status: "skipped", reason: `not drivable (${record.kind}, ${record.state})` };
     const checkpoint = this.pickCheckpoint(record);
+    if (!checkpoint && record.kind === "phase_transition") {
+      // Written before orchestrator checkpoints existed (or its checkpoint is gone): nothing can ever verify it.
+      const reason = "phase_transition record has no orchestrator checkpoint (predates them); aborted, nothing fenced";
+      store.abortHandoff(handoffId, reason);
+      this.deps.report(record.missionId, `[mission ${record.missionId}] handoff ${handoffId} ${reason}`);
+      return { status: "skipped", reason };
+    }
     if (!checkpoint) {
       this.deps.report(
         record.missionId,
         `[mission ${record.missionId}] handoff ${handoffId} waiting: no checkpoint ${record.checkpointSha?.slice(0, 7)} recorded`,
       );
       return { status: "skipped", reason: "no matching checkpoint" };
+    }
+    // Retry budget BEFORE the fence: the successor is the scheduler's retry of the fenced task. With no attempt left the
+    // fence would cancel the source and nobody would continue, so the record is aborted instead and the source untouched.
+    if (record.cause === "quota_exhausted" && record.toModel && !record.sourceFencedAt) {
+      const task = store.getTask(checkpoint.taskId);
+      if (!task || task.attempt >= task.max_attempts) {
+        const reason = `no retry budget left for task ${checkpoint.taskId} (attempt ${task?.attempt ?? "?"} of ${task?.max_attempts ?? "?"}); source not fenced, switch to ${record.toModel} not started`;
+        store.abortHandoff(handoffId, reason);
+        this.deps.report(
+          record.missionId,
+          `[mission ${record.missionId}] quota handoff ${handoffId} ABORTED: ${reason}`,
+        );
+        return { status: "skipped", reason };
+      }
     }
     const successor =
       record.kind === "phase_transition" ? this.phaseSuccessor(record) : this.discoverSuccessor(record, checkpoint);

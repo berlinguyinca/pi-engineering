@@ -206,3 +206,20 @@ test("quota resume: every decision carries exactly one reason", () => {
     assert.equal(typeof d.reasons[0], "string");
   }
 });
+
+test("quota switch compares id and provider/id as the same model", () => {
+  const d = decideQuotaResume({
+    failureClass: "quota",
+    currentModelId: "gw/primary",
+    catalogue: [
+      { id: "primary", eligible: true },
+      { id: "gw/other", eligible: true },
+    ],
+    nowMs: 0,
+    pausedAtMs: null,
+    maxPauseMs: 1,
+    sideEffects: [],
+    hasCheckpoint: true,
+  });
+  assert.equal(d.alternateModelId, "gw/other");
+});

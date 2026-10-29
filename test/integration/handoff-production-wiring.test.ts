@@ -181,6 +181,7 @@ async function rig(): Promise<Rig> {
     mutatesRepo: true,
     writeDomains: task.write_domains,
     isolation: "worktree",
+    modelRequirements: { model: "gw/test" },
     deliverables: task.deliverables,
     executionBudgetMs: task.execution_budget_ms,
     checkpointPolicy: task.checkpoint_policy,

@@ -54,17 +54,22 @@ const CAPACITY = new Set<InferenceFailureClass>([
 /** The model has vanished from the serving fleet. */
 const GONE = new Set<InferenceFailureClass>(["model_not_found", "model_unavailable"]);
 
+/** `id` and `provider/id` name the same model. */
+export function sameModel(a: string, b: string): boolean {
+  return a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+}
+
 /** First catalogue entry that is eligible and not the current model, else null. */
 function firstAlternate(catalogue: readonly QuotaResumeModel[], currentModelId: string): QuotaResumeModel | null {
   for (const model of catalogue) {
-    if (model.eligible === true && model.id !== currentModelId) return model;
+    if (model.eligible === true && !sameModel(model.id, currentModelId)) return model;
   }
   return null;
 }
 
 /** True when the current model is absent from the catalogue. */
 function currentAbsent(catalogue: readonly QuotaResumeModel[], currentModelId: string): boolean {
-  return !catalogue.some((model) => model.id === currentModelId);
+  return !catalogue.some((model) => sameModel(model.id, currentModelId));
 }
 
 /** True when at least one recorded side effect was never committed. */

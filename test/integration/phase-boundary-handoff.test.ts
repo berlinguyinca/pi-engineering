@@ -263,11 +263,18 @@ describe("what the phase fence covers", () => {
       if (status === "SUCCEEDED") store.setExecutionStatus(e.execution_id, "SUCCEEDED", { usage });
       return e.execution_id;
     };
-    run("WKS-done", "SUCCEEDED", { contextTokens: 800 });
-    const straggler = run("WKS-straggler", "RUNNING");
-    await new Promise((r) => setTimeout(r, 5));
+    const sleep = () => new Promise((r) => setTimeout(r, 8));
     const phase = (orchestrator as unknown as { phase(m: unknown, p: string): void }).phase.bind(orchestrator);
+    phase(store.getMission(mission.mission_id), "classified");
+    await sleep();
+    const earlierPhase = run("WKS-classified", "RUNNING");
+    await sleep();
     phase(store.getMission(mission.mission_id), "executing");
+    // Pressure data only appears now, so classified -> executing emits nothing and only executing -> repairing does.
+    run("WKS-done", "SUCCEEDED", { contextTokens: 800 });
+    await sleep();
+    const straggler = run("WKS-straggler", "RUNNING");
+    await sleep();
     phase(store.getMission(mission.mission_id), "repairing");
     await orchestrator.settleHandoffs();
     const later = run("WKS-next-phase", "RUNNING");
@@ -283,6 +290,132 @@ describe("what the phase fence covers", () => {
     );
     assert.match(store.getExecution(straggler)?.exit_status ?? "", /late_result_rejected:handoff source fenced/);
     assert.equal(store.getExecution(later)?.status, "RUNNING", "a worker the next phase started is not fenced");
+    assert.equal(
+      store.getExecution(earlierPhase)?.status,
+      "RUNNING",
+      "an execution of a phase before the finished one is not this boundary's to fence",
+    );
     assert.equal(store.getMission(mission.mission_id)?.status !== "CANCELED", true);
+  });
+});
+
+describe("restart and legacy records", () => {
+  async function bare() {
+    const fx = await makeFixtureRepo();
+    cleanups.push(() => fx.cleanup());
+    const git = (await GitRepo.open(fx.root))!;
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    const build = (s: MissionStore) =>
+      new Orchestrator({
+        store: s,
+        backends: {},
+        git,
+        parentSessionId: "sess-parent",
+        phaseHandoff: { contextWindowForModel: () => 1000 },
+        planner: async () => [],
+      });
+    const mission = store.createMission({
+      title: "p",
+      goal: "p",
+      user_request: "p",
+      repository: fx.root,
+      base_ref: await git.headCommit(),
+      risk_profile: "medium",
+      workflow_class: "engineering_review",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      repo_id: "repo-p",
+      kind: "agent",
+      role: "implementer",
+      objective: "p",
+      deliverables: ["d"],
+    });
+    const run = (session: string, status: "RUNNING" | "SUCCEEDED", usage: Record<string, unknown> = {}) => {
+      const e = store.createExecution({
+        task_id: task.task_id,
+        mission_id: mission.mission_id,
+        backend: "agent",
+        session_id: session,
+        model: "gw/primary",
+      });
+      store.setExecutionStatus(e.execution_id, "RUNNING", {});
+      if (status === "SUCCEEDED") store.setExecutionStatus(e.execution_id, "SUCCEEDED", { usage });
+      return e.execution_id;
+    };
+    return { store, build, mission, task, run, git };
+  }
+
+  it("after a restart (no phase timeline) the first phase() calls fence nothing", async () => {
+    const b = await bare();
+    b.run("WKS-done", "SUCCEEDED", { contextTokens: 800 });
+    const current = b.run("WKS-current", "RUNNING");
+    await new Promise((r) => setTimeout(r, 8));
+    const restarted = b.build(b.store);
+    const phase = (restarted as unknown as { phase(m: unknown, p: string): void }).phase.bind(restarted);
+    phase(b.store.getMission(b.mission.mission_id), "executing");
+    phase(b.store.getMission(b.mission.mission_id), "repairing");
+    await restarted.settleHandoffs();
+    assert.equal(b.store.getExecution(current)?.status, "RUNNING", "a worker of unknown phase is never quarantined");
+  });
+
+  it("an old phase_transition record without an orchestrator checkpoint is aborted once, quietly, not retried", async () => {
+    const b = await bare();
+    const old = b.store.addHandoffRecord({
+      id: "ho-old-phase",
+      kind: "phase_transition",
+      state: "prepared",
+      missionId: b.mission.mission_id,
+      predecessor: { sessionId: "sess-parent", generation: 0 },
+      checkpointSha: "c".repeat(40),
+      createdAt: new Date().toISOString(),
+      cause: "context_pressure",
+    });
+    const o = b.build(b.store);
+    const lines: string[] = [];
+    (o as unknown as { progress: Map<string, (l: string) => void> }).progress.set(b.mission.mission_id, (l) =>
+      lines.push(l),
+    );
+    await o.repairBlockedMission(b.mission.mission_id);
+    await o.settleHandoffs();
+    await o.repairBlockedMission(b.mission.mission_id);
+    await o.settleHandoffs();
+    const after = b.store.getHandoffRecord(old.id);
+    assert.equal(after?.state, "aborted");
+    assert.match(after?.blockedReason ?? "", /predates/);
+    assert.equal(lines.filter((l) => l.includes("ho-old-phase")).length, 1, "reported once, not on every call");
+  });
+
+  it("a record cannot be driven by another boundary's checkpoint that merely shares the SHA and session", async () => {
+    const b = await bare();
+    b.run("WKS-done", "SUCCEEDED", { contextTokens: 800 });
+    const o = b.build(b.store);
+    const manager = (
+      o as unknown as { checkpointManager: { persistPhaseBoundary(i: unknown): { candidateSha: string } } }
+    ).checkpointManager;
+    const cp = manager.persistPhaseBoundary({
+      missionId: b.mission.mission_id,
+      fromPhase: "executing",
+      toPhase: "repairing",
+      sessionId: "sess-parent",
+      reason: "r",
+    });
+    const forged = b.store.addHandoffRecord({
+      id: "ho-forged",
+      kind: "phase_transition",
+      state: "prepared",
+      missionId: b.mission.mission_id,
+      predecessor: { sessionId: "sess-parent", generation: 0 },
+      checkpointSha: cp.candidateSha,
+      createdAt: new Date(Date.now() + 1000).toISOString(),
+      fromPhase: "executing",
+      toPhase: "complete",
+    });
+    const result = await (
+      o as unknown as { handoffDriver: { drive(id: string): Promise<{ status: string }> } }
+    ).handoffDriver.drive(forged.id);
+    assert.equal(result.status, "skipped");
+    assert.equal(b.store.getHandoffRecord(forged.id)?.state, "aborted");
+    assert.equal(b.store.getHandoffRecord(forged.id)?.verifiedAt, undefined);
   });
 });

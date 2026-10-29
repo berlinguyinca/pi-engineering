@@ -68,6 +68,9 @@ export interface HandoffRecord {
    * carrying this stays `prepared`: the source is not fenced and no successor is started.
    */
   blockedReason?: string;
+  /** Phase boundary records: the phase pair crossed (the phase fence covers only `fromPhase`'s workers). */
+  fromPhase?: string;
+  toPhase?: string;
 }
 
 const CHECKPOINT_SHA_PATTERN = /^[0-9a-f]{7,64}$/;
@@ -173,7 +176,7 @@ export function validateHandoffRecord(
     errors.push(`cause must be one of ${HANDOFF_CAUSES.join(", ")} when present`);
   }
 
-  for (const field of ["fromModel", "toModel", "blockedReason"] as const) {
+  for (const field of ["fromModel", "toModel", "blockedReason", "fromPhase", "toPhase"] as const) {
     if (obj[field] !== undefined && !isNonEmptyString(obj[field])) {
       errors.push(`${field} must be a non-empty string when present`);
     }
@@ -206,5 +209,7 @@ export function validateHandoffRecord(
   if (obj.fromModel !== undefined) record.fromModel = obj.fromModel as string;
   if (obj.toModel !== undefined) record.toModel = obj.toModel as string;
   if (obj.blockedReason !== undefined) record.blockedReason = obj.blockedReason as string;
+  if (obj.fromPhase !== undefined) record.fromPhase = obj.fromPhase as string;
+  if (obj.toPhase !== undefined) record.toPhase = obj.toPhase as string;
   return { ok: true, record };
 }
