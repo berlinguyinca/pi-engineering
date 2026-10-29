@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
 import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
@@ -103,6 +103,7 @@ import { RuntimeSession } from "../src/runtime/isolation/RuntimeSession.ts";
 import { effectiveWorkspace, workspaceForPath } from "../src/runtime/isolation/WorkspaceResolver.ts";
 import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.ts";
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
+import { resolveStateRoot } from "../src/runtime/isolation/stateDir.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
 import { describeHousekeeping, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
 import {
@@ -2179,6 +2180,7 @@ ${RECOVERY_PROMPT}`;
         ctx.hasUI && presenceEnv.enabled
           ? new MissionPresenceController(ctx.ui, {
               bus: surfaces,
+              notifiedLedgerFile: join(resolveStateRoot(), "presence-notified.json"),
               rows: presenceEnv.rows,
               title: presenceEnv.title,
               quiet: (missionId) => {
