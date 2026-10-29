@@ -92,6 +92,7 @@ import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/run
 import { attachInspectorWhenReady, createInspectorSlot } from "../src/runtime/herdr/attachInspector.ts";
 import type { LineageEmitter } from "../src/runtime/herdr/lineage.ts";
 import { loadLineageEmitter } from "../src/runtime/herdr/lineageConfig.ts";
+import { registerRoomCommands } from "../src/runtime/herdr/roomCommands.ts";
 import { getHostMaintenance } from "../src/runtime/host/maintenance.ts";
 import { gitRunner } from "../src/runtime/host/sourceWatch.ts";
 import { sessionBindingInfo } from "../src/runtime/isolation/RuntimeBinding.ts";
@@ -1651,6 +1652,7 @@ ${RECOVERY_PROMPT}`;
   // `registerCommand`, and burying it in there meant it never appeared in a
   // session without event support — nor in the package smoke test, which is
   // how a missing command surface goes unnoticed.
+  registerRoomCommands(pi);
   // ─── /gateway: why are we waiting, and how badly ───────────────────────
   pi.registerCommand("gateway", {
     description: "Show model-gateway admission state: holds, queue position, concurrency clamp.",
