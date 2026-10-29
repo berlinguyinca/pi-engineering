@@ -1584,6 +1584,8 @@ herdr:
   mission_id: m-1                      # optional default mission for events that carry none
 ```
 
+Rooms: `pi-engineering room ...` and `/rooms`, `/room ...` are a terminal client for the joined Herdr room; see `docs/integration/ROOM_CLIENT.md`.
+
 Session scope: `session.*` and `mission.started` ingest events carry `room_id`, `workspace_id` and `agent_instance_id`
 (payload and, in envelope mode, the envelope fields of the same names). The YAML `room_id`, `workspace_id` and
 `instance_id` are only the default. A Pi attached to several rooms binds each mission or session to its room on the
