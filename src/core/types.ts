@@ -58,8 +58,26 @@ export type EventType =
   | "blackhole.promotion.decided"
   | "blackhole.recalled";
 
-export interface LedgerEvent {
+/**
+ * Optional envelope fields (Missionless Execution Fabric, schema_version 2).
+ * Every field is additive: lines written before them replay unchanged, and an
+ * event carries none of them unless its writer supplied one.
+ */
+export interface EventMeta {
+  /** The user-visible task this event belongs to (a work item id for ledger-owned work). */
+  task_id?: string;
+  session_id?: string;
+  run_id?: string;
+  correlation_id?: string;
+  causation_id?: string;
+  /** A second append with the same key returns the first event instead of writing again. */
+  idempotency_key?: string;
+}
+
+export interface LedgerEvent extends EventMeta {
   event_id: string;
+  /** 2 when the event carries EventMeta fields; absent on events written before them. */
+  schema_version?: number;
   work_item_id: string | null;
   timestamp: string;
   actor: Actor;

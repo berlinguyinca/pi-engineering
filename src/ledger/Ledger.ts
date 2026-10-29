@@ -4,6 +4,7 @@ import type {
   Candidate,
   CandidateStatus,
   EntityStatus,
+  EventMeta,
   Evidence,
   LedgerEntity,
   LedgerEvent,
@@ -31,6 +32,8 @@ export class Ledger {
   private tasks = new Map<string, Task>();
   private entities = new Map<string, LedgerEntity>();
   private evidence = new Map<string, Evidence>();
+  /** Events by idempotency key; rebuilt on replay, so a restart keeps deduplicating. */
+  private byIdempotencyKey = new Map<string, LedgerEvent>();
 
   private constructor(store: EventStore) {
     this.store = store;
@@ -64,8 +67,9 @@ export class Ledger {
     workItemId: string | null,
     actor: Actor,
     payload: Record<string, unknown>,
+    meta?: EventMeta,
   ): Promise<LedgerEvent> {
-    return this.emit(type, workItemId, actor, payload);
+    return this.emit(type, workItemId, actor, payload, meta);
   }
 
   private async emit(
@@ -73,6 +77,7 @@ export class Ledger {
     workItemId: string | null,
     actor: Actor,
     payload: Record<string, unknown>,
+    meta?: EventMeta,
   ): Promise<LedgerEvent> {
     const event: LedgerEvent = {
       event_id: newEventId(),
@@ -82,12 +87,48 @@ export class Ledger {
       type,
       payload,
     };
+    const defined = meta ? Object.entries(meta).filter(([, v]) => v !== undefined && v !== "") : [];
+    if (defined.length > 0) {
+      event.schema_version = 2;
+      Object.assign(event, Object.fromEntries(defined));
+    }
+    const key = event.idempotency_key;
+    if (key) {
+      const prior = this.byIdempotencyKey.get(key);
+      if (prior) return this.sameRequest(prior, event);
+      // The condition and the index update both run inside the store's append
+      // chain, so two concurrent appends with one key cannot both commit.
+      const stored = await this.store.appendConditionally(
+        event,
+        () => !this.byIdempotencyKey.has(key),
+        () => this.byIdempotencyKey.set(key, event),
+      );
+      if (!stored) return this.sameRequest(this.byIdempotencyKey.get(key) as LedgerEvent, event);
+      this.apply(event);
+      return stored;
+    }
     await this.store.append(event);
     this.apply(event);
     return event;
   }
 
+  /**
+   * A key names one request. Answering a different request with the first
+   * one's event would silently drop a write, so a mismatch is an error.
+   */
+  private sameRequest(prior: LedgerEvent, wanted: LedgerEvent): LedgerEvent {
+    if (prior.type !== wanted.type || prior.work_item_id !== wanted.work_item_id) {
+      throw new Error(
+        `idempotency key ${wanted.idempotency_key} already recorded ${prior.type} for ${prior.work_item_id}; refusing ${wanted.type} for ${wanted.work_item_id}`,
+      );
+    }
+    return prior;
+  }
+
   private apply(event: LedgerEvent): void {
+    if (event.idempotency_key && !this.byIdempotencyKey.has(event.idempotency_key)) {
+      this.byIdempotencyKey.set(event.idempotency_key, event);
+    }
     const p = event.payload;
     switch (event.type) {
       case "work_item.created": {

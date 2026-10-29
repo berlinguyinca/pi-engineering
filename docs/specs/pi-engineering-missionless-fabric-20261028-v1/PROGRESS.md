@@ -12,9 +12,9 @@ Updated: 2026-10-28. Update this file at every phase boundary.
 ## Phase status
 | Phase | State | Notes |
 |-------|-------|-------|
-| 0 inventory | partial | ENTRYPOINT-MAP, AUDIT-RESULTS written; REUSE-MATRIX, EVENT-OWNER-MAP, BASELINE-METRICS pending |
+| 0 inventory | mostly done | ENTRYPOINT-MAP, AUDIT-RESULTS, REUSE-MATRIX, EVENT-OWNER-MAP written; BASELINE-METRICS (needs live-model fixture) pending |
 | 1 stop implicit Missions | PR open, awaiting user review | see PHASE-1-AUDIT.md, PHASE-1-RESULTS.md |
-| 2 Task/Session/Run read model | not started | Candidate canonical writer: Ledger work_item (used by `/engineer`, `/plan`, `/execute`). Decide from the lineage table; do NOT add a new task store |
+| 2 Task/Session/Run read model | implemented, verifying | branch feat/mef-phase2-work-projection, stacked on #463; see PHASE-2-AUDIT.md. Runs/sessions empty on the Ledger side until Phase 3 emits agent.* |
 | 3 broker/scheduler/gate extraction | not started | |
 | 4 adaptive delegation + handoffs | not started | build on PR #460 |
 | 5 UX / Herdr / assistant | not started | |
