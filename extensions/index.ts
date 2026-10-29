@@ -733,8 +733,9 @@ export default function (pi: ExtensionAPI) {
   // so this is safe to run at session start and periodically while the
   // session stays open. Never awaited: a slow sweep must not delay a session.
   const housekeepingIntervalMs = Number(process.env.PI_HOUSEKEEPING_INTERVAL_MS ?? 6 * 60 * 60 * 1000);
-  // Report-only until PI_HOUSEKEEPING=1: liveness of missions run by other
-  // processes is not proven in production yet. `/gc` always acts.
+  // On by default (operator decision 2026-10-29): the janitor keeps any worktree
+  // with a live, unknown or durably referenced owner. PI_HOUSEKEEPING=dry-run
+  // reports only, =0 disables. `/gc` always acts.
   const hkMode = housekeepingMode(process.env);
   const housekeepingEnabled = hkMode !== "off";
   // First sweep waits this long so a session that reloads or exits at once

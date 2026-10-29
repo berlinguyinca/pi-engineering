@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { DEFAULT_STATUS_BAR_CONFIG, type StatusBarConfig } from "../../src/status/config.ts";
+import {
+  DEFAULT_STATUS_BAR_CONFIG,
+  FULL_STATUS_BAR_CONFIG,
+  type StatusBarConfig,
+  resolveStatusBarConfig,
+} from "../../src/status/config.ts";
 import { renderStatus } from "../../src/status/layout.ts";
 import type { HarnessStatusState } from "../../src/status/state.ts";
 
@@ -9,7 +14,7 @@ import type { HarnessStatusState } from "../../src/status/state.ts";
 // the CI/agent HOME. Must be set before the first renderStatus call (homeDir caches).
 process.env.HOME = "/home/u";
 
-const cfg: StatusBarConfig = DEFAULT_STATUS_BAR_CONFIG;
+const cfg: StatusBarConfig = FULL_STATUS_BAR_CONFIG;
 
 function state(overrides: Partial<HarnessStatusState> = {}): HarnessStatusState {
   return {
@@ -206,7 +211,7 @@ test("wait: no wait state renders no wait segment", () => {
 });
 
 test("wait: showWait=false hides the segment even while waiting", () => {
-  const config: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, showWait: false };
+  const config: StatusBarConfig = { ...FULL_STATUS_BAR_CONFIG, showWait: false };
   const s = state({
     throughput: { phase: "waiting" },
     wait: { kind: "gateway", detail: "queue_timeout", untilMs: 30_000 },
@@ -269,7 +274,7 @@ test("task: no task renders no task segment", () => {
 });
 
 test("task: showTask=false hides the segment", () => {
-  const config: StatusBarConfig = { ...DEFAULT_STATUS_BAR_CONFIG, showTask: false };
+  const config: StatusBarConfig = { ...FULL_STATUS_BAR_CONFIG, showTask: false };
   const s = state({ task: { workItemId: "WI-12", phase: "implement" } });
   assert.doesNotMatch(renderStatus(s, 200, config, 0), /WI-12/);
 });
@@ -289,4 +294,14 @@ test("mission live activity survives narrow layouts alongside its health", () =>
   assert.match(line, /STALLED/);
   assert.match(line, /tests 42s/);
   assert.match(line, /output 40s ago/);
+});
+
+test("the default status bar is lean: no repository, worktree, throughput or task segments", () => {
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showRepository, false);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showWorktree, false);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showThroughput, false);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showTask, false);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showBranch, true);
+  assert.equal(DEFAULT_STATUS_BAR_CONFIG.showModel, true);
+  assert.equal(resolveStatusBarConfig({ PI_STATUS_BAR_SHOW_THROUGHPUT: "1" }).showThroughput, true);
 });

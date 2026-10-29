@@ -34,22 +34,36 @@ export interface StatusBarConfig {
   estimateCharsPerToken: number;
 }
 
+/**
+ * Lean by default: repository/worktree duplicate the directory and branch,
+ * throughput redraws on every streamed delta, and the task/mission text repeats
+ * the mission strip. Each stays one `PI_STATUS_BAR_SHOW_*=1` away.
+ */
 export const DEFAULT_STATUS_BAR_CONFIG: StatusBarConfig = {
   enabled: true,
   showDirectory: true,
-  showRepository: true,
-  showWorktree: true,
+  showRepository: false,
+  showWorktree: false,
   showBranch: true,
   showModel: true,
   showContext: true,
-  showThroughput: true,
-  showTask: true,
+  showThroughput: false,
+  showTask: false,
   showWait: true,
   throughputWindowMs: 2500,
   refreshMs: 150,
   gitCacheTtlMs: 30_000,
   estimateBatchChars: 32,
   estimateCharsPerToken: 4,
+};
+
+/** Every segment on: for tests and operators who want the full line. */
+export const FULL_STATUS_BAR_CONFIG: StatusBarConfig = {
+  ...DEFAULT_STATUS_BAR_CONFIG,
+  showRepository: true,
+  showWorktree: true,
+  showThroughput: true,
+  showTask: true,
 };
 
 function bool(value: string | undefined, fallback: boolean): boolean {

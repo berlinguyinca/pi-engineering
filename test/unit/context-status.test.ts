@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { contextReading, planModelSwitch } from "../../src/context/usage.ts";
-import { DEFAULT_STATUS_BAR_CONFIG } from "../../src/status/config.ts";
+import { FULL_STATUS_BAR_CONFIG } from "../../src/status/config.ts";
 import { renderStatus } from "../../src/status/layout.ts";
 import type { HarnessStatusState } from "../../src/status/state.ts";
 
@@ -33,7 +33,7 @@ test("context reading renders the compact ctx segment", () => {
 });
 
 test("the status line carries model, ctx, tps, branch and worktree", () => {
-  const line = renderStatus(state(), 160, DEFAULT_STATUS_BAR_CONFIG);
+  const line = renderStatus(state(), 160, FULL_STATUS_BAR_CONFIG);
   assert.match(line, /qwen3\.8-27b/);
   assert.match(line, /ctx 143k\/262k 55%/);
   assert.match(line, /⚡ 31\.0 t\/s/);
@@ -46,7 +46,7 @@ test("the ctx segment follows the resolved window, not a hard-coded one", () => 
   const big = renderStatus(
     state({ context: { usedTokens: 400_000, windowTokens: 1_048_576 } }),
     160,
-    DEFAULT_STATUS_BAR_CONFIG,
+    FULL_STATUS_BAR_CONFIG,
   );
   assert.match(big, /ctx 400k\/1M 38%/);
   assert.doesNotMatch(big, /260k/, "no 260K anywhere in the status line");
@@ -54,24 +54,24 @@ test("the ctx segment follows the resolved window, not a hard-coded one", () => 
   const small = renderStatus(
     state({ context: { usedTokens: 20_000, windowTokens: 32_768 } }),
     160,
-    DEFAULT_STATUS_BAR_CONFIG,
+    FULL_STATUS_BAR_CONFIG,
   );
   assert.match(small, /ctx 20k\/33k 61%/);
 });
 
 test("narrow terminals drop the ctx segment before the model", () => {
-  const narrow = renderStatus(state(), 28, DEFAULT_STATUS_BAR_CONFIG);
+  const narrow = renderStatus(state(), 28, FULL_STATUS_BAR_CONFIG);
   assert.ok(visibleWidth(narrow) <= 28, `line too wide: ${narrow}`);
   assert.match(narrow, /qwen3\.8-27b/, "model is preserved");
   assert.doesNotMatch(narrow, /ctx /, "ctx drops first");
 
-  const mid = renderStatus(state(), 52, DEFAULT_STATUS_BAR_CONFIG);
+  const mid = renderStatus(state(), 52, FULL_STATUS_BAR_CONFIG);
   assert.ok(visibleWidth(mid) <= 52, `line too wide: ${mid}`);
   assert.match(mid, /ctx 143k\/262k 55%/);
 });
 
 test("PI_STATUS_BAR_SHOW_CONTEXT=0 hides the segment", () => {
-  const line = renderStatus(state(), 160, { ...DEFAULT_STATUS_BAR_CONFIG, showContext: false });
+  const line = renderStatus(state(), 160, { ...FULL_STATUS_BAR_CONFIG, showContext: false });
   assert.doesNotMatch(line, /ctx /);
 });
 
@@ -79,7 +79,7 @@ test("a stale capability window is marked, so the reading cannot be misread as t
   const line = renderStatus(
     state({ context: { usedTokens: 10_000, windowTokens: 131_072, note: "stale" } }),
     160,
-    DEFAULT_STATUS_BAR_CONFIG,
+    FULL_STATUS_BAR_CONFIG,
   );
   assert.match(line, /~ctx 10k\/131k 8%/);
 });
@@ -120,7 +120,7 @@ function footer(
   };
   return new FooterController({
     ctx: ctx as never,
-    config: DEFAULT_STATUS_BAR_CONFIG,
+    config: FULL_STATUS_BAR_CONFIG,
     capabilityWindow,
   });
 }

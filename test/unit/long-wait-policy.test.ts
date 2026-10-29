@@ -286,7 +286,7 @@ describe("long-wait policy: the operator sees what we wait for and since when", 
   it("footer, status line and notice carry how long the outage has lasted", async () => {
     const { FooterController } = await import("../../src/status/footer.ts");
     const { renderStatus } = await import("../../src/status/layout.ts");
-    const { DEFAULT_STATUS_BAR_CONFIG } = await import("../../src/status/config.ts");
+    const { FULL_STATUS_BAR_CONFIG } = await import("../../src/status/config.ts");
     const { describeAdmissionEvent, formatWaitingFor } = await import("../../src/gateway/admissionNotice.ts");
     const since = 1_700_000_000_000;
     const now = since + 2 * HOUR + 3 * 60_000;
@@ -310,11 +310,11 @@ describe("long-wait policy: the operator sees what we wait for and since when", 
 
     const renders: string[] = [];
     const ctx = { ui: { setFooter: () => {}, setStatus: () => {} } };
-    const footer = new FooterController({ ctx: ctx as never, config: DEFAULT_STATUS_BAR_CONFIG, now: () => now });
+    const footer = new FooterController({ ctx: ctx as never, config: FULL_STATUS_BAR_CONFIG, now: () => now });
     try {
       footer.onGatewayEvent({ type: "wait", waitMs: 60_000, signal, concurrency: 4 });
       assert.equal(footer.state.wait?.sinceMs, since);
-      const line = renderStatus(footer.state, 200, DEFAULT_STATUS_BAR_CONFIG, now);
+      const line = renderStatus(footer.state, 200, FULL_STATUS_BAR_CONFIG, now);
       renders.push(line);
       assert.match(line, /gateway 60s · capacity_unavailable · for 2h 03m/);
     } finally {

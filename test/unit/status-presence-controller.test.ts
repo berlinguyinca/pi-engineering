@@ -285,10 +285,10 @@ test("presence is on by default and off only when told", () => {
 });
 
 test("the row budget is bounded so a wide strip cannot eat the terminal", () => {
-  assert.equal(presenceOptionsFromEnv({}).rows, 4);
+  assert.equal(presenceOptionsFromEnv({}).rows, 2);
   assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "7" }).rows, 7);
   assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "400" }).rows, 10);
-  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "nonsense" }).rows, 4);
+  assert.equal(presenceOptionsFromEnv({ PI_MISSION_PRESENCE_ROWS: "nonsense" }).rows, 2);
 });
 
 test("the title bar is opt-in and the poll has a floor", () => {
