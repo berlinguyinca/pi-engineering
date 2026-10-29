@@ -1,6 +1,6 @@
 # MEF PROGRESS — resume point
 
-Updated: 2026-10-28. Update this file at every phase boundary.
+Updated: 2026-10-29. Update this file at every phase boundary.
 
 ## Setup facts
 - Host: bender. Spec ZIP came from the Mac (`ssh macbook-pro`, `~/Downloads/pi-engineering-missionless-fabric-v1-fixed.zip`), copied via scp, sha256 `cd66d4fc304272d809e4db7aeb4586806b249f11dc50ede6199508989cfb6ec8` verified identical on both ends. Archive listing had no absolute or `..` paths.
@@ -12,13 +12,13 @@ Updated: 2026-10-28. Update this file at every phase boundary.
 ## Phase status
 | Phase | State | Notes |
 |-------|-------|-------|
-| 0 inventory | mostly done | ENTRYPOINT-MAP, AUDIT-RESULTS, REUSE-MATRIX, EVENT-OWNER-MAP written; BASELINE-METRICS (needs live-model fixture) pending |
-| 1 stop implicit Missions | PR open, awaiting user review | see PHASE-1-AUDIT.md, PHASE-1-RESULTS.md |
-| 2 Task/Session/Run read model | implemented, verifying | branch feat/mef-phase2-work-projection, stacked on #463; see PHASE-2-AUDIT.md. Runs/sessions empty on the Ledger side until Phase 3 emits agent.* |
-| 3 broker/scheduler/gate extraction | not started | |
-| 4 adaptive delegation + handoffs | not started | build on PR #460 |
-| 5 UX / Herdr / assistant | not started | |
-| 6 canary + retirement | not started | needs user authorization |
+| 0 inventory | mostly done | ENTRYPOINT-MAP, AUDIT-RESULTS, REUSE-MATRIX, EVENT-OWNER-MAP written; BASELINE-METRICS.json written (live-model metrics listed as not measured) |
+| 1 stop implicit Missions | merged (#463) | default off, `execution.legacy_auto_invoke` restores |
+| 2 Task/Session/Run read model | merged (#470) | read-only projection over Ledger + MissionStore |
+| 3 run events + completion policy | PR open | `agent.*` events from `runWorker`; pure `evaluateWorkCompletion`; no broker/scheduler extraction (see PHASE-6-RETIREMENT.md) |
+| 4 delegation preference | PR open | `team` advisory; handoffs already unified by #461/#465 and projected in Phase 2 |
+| 5 UX | PR open | `/work`; Herdr graph/assistant/Plannotator not done |
+| 6 canary + retirement | plan written | PHASE-6-RETIREMENT.md; nothing deleted |
 
 ## Standing rules
 - One branch + one PR per phase. No merge or deploy without the user's OK (flipping a default for every Pi session is sensitive; the user deploys themselves).

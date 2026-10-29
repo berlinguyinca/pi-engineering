@@ -1,0 +1,23 @@
+{
+  "measured_on": "2026-10-29, bender, synthetic in-memory Ledger",
+  "measured": {
+    "implicit_mission_directive_rate_8_prompt_corpus": {
+      "legacy": "3/8",
+      "missionless_default": "0/8",
+      "source": "PHASE-1-O1-CORPUS.json"
+    },
+    "projection_replay": {
+      "10k_events": { "events": 10100, "full_catch_up_ms": 6, "graph_ms": 2 },
+      "100k_events": { "events": 101000, "full_catch_up_ms": 27, "graph_ms": 13, "incremental_noop_ms": 1.2 },
+      "caveat": "In-memory events only: excludes JSONL parse from disk and 1M events. Not a production latency claim."
+    },
+    "test_suite": { "tests": 6705, "pass": 6704, "fail": 0, "skipped": 1 }
+  },
+  "not_measured": [
+    "time to first tool call (needs live model)",
+    "subagent launches per prompt (needs live model)",
+    "token and cost deltas vs legacy",
+    "verification outcome rate vs legacy",
+    "disk replay at 1M events"
+  ]
+}

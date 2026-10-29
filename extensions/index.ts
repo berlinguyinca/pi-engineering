@@ -16,6 +16,7 @@ import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
 import { contextReading, planModelSwitch } from "../src/context/usage.ts";
+import { delegationAdvice } from "../src/execution/delegation.ts";
 import { gatewayWaitLabel } from "../src/gateway/admissionNotice.ts";
 import { AdvisedModelSwitch } from "../src/gateway/advisedSwitch.ts";
 import { AfterOutputRetry } from "../src/gateway/afterOutputRetry.ts";
@@ -133,6 +134,10 @@ import { runtimeUpdateBridge } from "../src/update/hostBridge.ts";
 import { type SelfUpdateResult, checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
+import { LedgerWorkProjection } from "../src/work/ledgerProjection.ts";
+import { projectLegacyMissions } from "../src/work/legacyMissionAdapter.ts";
+import { formatWorkStatus } from "../src/work/statusText.ts";
+import { mergeWorkGraphs } from "../src/work/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
 /**
@@ -1110,9 +1115,16 @@ export default function (pi: ExtensionAPI) {
       };
       // Config is read only when the legacy classifier would inject, so chat
       // and questions pay no I/O.
-      if (!decideAutoInvoke(input).invoke) return;
-      const decision = decideMissionDirective(input, await loadExecutionConfig(runtimeCwd(ctx?.cwd ?? process.cwd())));
-      if (!decision.invoke) return;
+      const classified = decideAutoInvoke(input);
+      if (!classified.invoke) return;
+      const execution = await loadExecutionConfig(runtimeCwd(ctx?.cwd ?? process.cwd()));
+      const decision = decideMissionDirective(input, execution);
+      if (!decision.invoke) {
+        const advice = delegationAdvice(execution.preference, classified);
+        if (!advice.advise) return;
+        lastAutoInvoked = { prompt, at: Date.now() };
+        return { message: { customType: "pi-engineering:delegation", content: advice.message ?? "", display: true } };
+      }
       lastAutoInvoked = { prompt, at: Date.now() };
       return {
         message: {
@@ -2674,6 +2686,18 @@ ${RECOVERY_PROMPT}`;
     handler: async (args, ctx) => {
       const out = await runRoomCommand(args, { agentDir: getAgentDir() });
       ctx.ui.notify(out.text, out.level);
+    },
+  });
+
+  pi.registerCommand("work", {
+    description: "Show tracked work (tasks, runs, verification) across the Ledger and existing Missions.",
+    handler: async (_args, ctx) => {
+      const rt = await getRuntime(ctx);
+      const projection = new LedgerWorkProjection(rt.ledger);
+      projection.catchUp();
+      const graphs = [projection.graph()];
+      if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
+      ctx.ui.notify(formatWorkStatus(mergeWorkGraphs(...graphs)), "info");
     },
   });
 

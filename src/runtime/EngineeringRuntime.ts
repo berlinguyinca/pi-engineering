@@ -13,6 +13,7 @@ import { newRunId } from "../core/ids.ts";
 import type {
   Actor,
   Candidate,
+  EventMeta,
   RiskLevel,
   Task,
   TaskKind,
@@ -2794,6 +2795,24 @@ export class EngineeringRuntime {
 
   // ------------------------------------------------------------- run a worker
 
+  /**
+   * Run lifecycle facts for the work read model. Best effort: the ledger is the
+   * record, but a failed append must never fail or stall the engineering run.
+   */
+  private async recordAgentEvent(
+    type: "agent.started" | "agent.completed" | "agent.failed",
+    workItemId: string,
+    actor: Actor,
+    payload: Record<string, unknown>,
+    meta: EventMeta,
+  ): Promise<void> {
+    try {
+      await this.ledger.emitEvent(type, workItemId, actor, payload, meta);
+    } catch {
+      // intentionally swallowed; see above
+    }
+  }
+
   private async runWorker(
     role: WorkerRole,
     task: string,
@@ -2882,7 +2901,37 @@ export class EngineeringRuntime {
       }
     }
     const executor = opts.worker ?? this.worker;
-    const run = await executor.run(req);
+    const runMeta = { task_id: opts.wi.id, session_id: sessionScope, run_id: runId };
+    await this.recordAgentEvent(
+      "agent.started",
+      opts.wi.id,
+      this.actor(runId, role),
+      { role, task: task.slice(0, 200) },
+      {
+        ...runMeta,
+        idempotency_key: `${runId}:started`,
+      },
+    );
+    let run: Awaited<ReturnType<WorkerExecutor["run"]>>;
+    try {
+      run = await executor.run(req);
+    } catch (error) {
+      await this.recordAgentEvent(
+        "agent.failed",
+        opts.wi.id,
+        this.actor(runId, role),
+        { role, error: error instanceof Error ? error.message : String(error) },
+        { ...runMeta, idempotency_key: `${runId}:ended` },
+      );
+      throw error;
+    }
+    await this.recordAgentEvent(
+      run.result.status === "completed" ? "agent.completed" : "agent.failed",
+      opts.wi.id,
+      { ...this.actor(runId, role), model: run.usage?.model },
+      { role, status: run.result.status },
+      { ...runMeta, idempotency_key: `${runId}:ended` },
+    );
     // After a completed worker, record the outcome into the session store and
     // schedule a lower-priority background observer (P3) that never preempts
     // engineering work. Fire-and-forget so a memory-worker failure never fails
