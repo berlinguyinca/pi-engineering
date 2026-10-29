@@ -19,6 +19,8 @@ export interface StatusBarConfig {
   showThroughput: boolean;
   /** Show the engineering task in flight. */
   showTask: boolean;
+  /** Show the mission's `token · why · next` text (a paused mission's resume hint always shows). */
+  showMissionStatus: boolean;
   /** Show why the runtime is waiting. */
   showWait: boolean;
 
@@ -49,6 +51,7 @@ export const DEFAULT_STATUS_BAR_CONFIG: StatusBarConfig = {
   showContext: true,
   showThroughput: false,
   showTask: false,
+  showMissionStatus: false,
   showWait: true,
   throughputWindowMs: 2500,
   refreshMs: 150,
@@ -64,6 +67,7 @@ export const FULL_STATUS_BAR_CONFIG: StatusBarConfig = {
   showWorktree: true,
   showThroughput: true,
   showTask: true,
+  showMissionStatus: true,
 };
 
 function bool(value: string | undefined, fallback: boolean): boolean {
@@ -90,6 +94,7 @@ const ENV = {
   context: "PI_STATUS_BAR_SHOW_CONTEXT",
   throughput: "PI_STATUS_BAR_SHOW_THROUGHPUT",
   task: "PI_STATUS_BAR_SHOW_TASK",
+  missionStatus: "PI_STATUS_BAR_SHOW_MISSION_STATUS",
   wait: "PI_STATUS_BAR_SHOW_WAIT",
   windowMs: "PI_STATUS_BAR_WINDOW_MS",
   refreshMs: "PI_STATUS_BAR_REFRESH_MS",
@@ -109,6 +114,7 @@ export function resolveStatusBarConfig(env: Record<string, string | undefined> =
     showContext: bool(env[ENV.context], base.showContext),
     showThroughput: bool(env[ENV.throughput], base.showThroughput),
     showTask: bool(env[ENV.task], base.showTask),
+    showMissionStatus: bool(env[ENV.missionStatus], base.showMissionStatus),
     showWait: bool(env[ENV.wait], base.showWait),
     throughputWindowMs: int(env[ENV.windowMs], base.throughputWindowMs),
     refreshMs: int(env[ENV.refreshMs], base.refreshMs),

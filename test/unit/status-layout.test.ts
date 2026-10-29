@@ -305,3 +305,32 @@ test("the default status bar is lean: no repository, worktree, throughput or tas
   assert.equal(DEFAULT_STATUS_BAR_CONFIG.showModel, true);
   assert.equal(resolveStatusBarConfig({ PI_STATUS_BAR_SHOW_THROUGHPUT: "1" }).showThroughput, true);
 });
+
+test("the lean default hides mission status text but a paused mission keeps its resume hint", () => {
+  const base = {
+    cwd: "/home/u/proj",
+    branch: "main",
+    task: {
+      workItemId: "WI-1",
+      phase: "implement",
+      missionStatus: { token: "R1/8 CONTINUE→monitor", live: "tests 4s", reason: "active", next: "monitor" },
+    },
+  } as never;
+  const running = renderStatus(base, 200, DEFAULT_STATUS_BAR_CONFIG, 0);
+  assert.doesNotMatch(running, /why active/);
+  const paused = renderStatus(
+    {
+      ...(base as object),
+      task: {
+        workItemId: "WI-1",
+        phase: "implement",
+        missionStatus: { token: "R1/8 PAUSED (operator)", reason: "paused", next: "resume with /mission resume MSN-1" },
+      },
+    } as never,
+    200,
+    DEFAULT_STATUS_BAR_CONFIG,
+    0,
+  );
+  assert.match(paused, /PAUSED/);
+  assert.match(paused, /\/mission resume MSN-1/);
+});

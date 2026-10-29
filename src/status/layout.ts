@@ -94,13 +94,17 @@ function renderUnsafe(state: HarnessStatusState, width: number, config: StatusBa
     full.push({ text: formatTask(state.task, 32), priority: 7 });
     short.push({ text: formatTask(state.task, 0), priority: 7 });
   }
-  if (config.showTask && state.task?.missionStatus) {
-    const mission = state.task.missionStatus;
+  const mission = state.task?.missionStatus;
+  if (mission && config.showMissionStatus) {
     full.push({
       text: `${mission.live ? `${mission.live} · ` : ""}${mission.token} · why ${mission.reason} · next ${mission.next}`,
       priority: 10,
     });
     short.push({ text: mission.live ?? mission.token, priority: 10 });
+  } else if (mission && mission.token.includes("PAUSED")) {
+    // The strip carries no resume hint, so a paused mission keeps one here even in the lean bar.
+    full.push({ text: `${mission.token} · ${mission.next}`, priority: 10 });
+    short.push({ text: mission.token, priority: 10 });
   }
   if (config.showWait && state.wait) {
     const wait = formatWait(state.wait, nowMs);

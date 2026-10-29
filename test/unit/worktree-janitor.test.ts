@@ -382,6 +382,8 @@ test("housekeeping is on by default; only 0 disables it and dry-run reports only
   assert.equal(housekeepingMode({}), "on");
   assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "1" }), "on");
   assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "0" }), "off");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "false" }), "off");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "off" }), "off");
   assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "dry-run" }), "dry-run");
   assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "yes" }), "on");
 });

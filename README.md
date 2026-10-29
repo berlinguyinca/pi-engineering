@@ -390,10 +390,12 @@ diffs, tokens and tests, use the Herdr agent inspector
 | -------- | ------- | ------- |
 | `PI_STATUS_BAR_ENABLED` | `true` | Disable the footer entirely |
 | `PI_STATUS_BAR_SHOW_WAIT` | `true` | Show why the runtime is waiting |
-| `PI_STATUS_BAR_SHOW_TASK` | `true` | Show the engineering task in flight |
+| `PI_STATUS_BAR_SHOW_TASK` | `false` | Show the engineering task in flight |
+| `PI_STATUS_BAR_SHOW_MISSION_STATUS` | `false` | Show the mission `token · why · next` text (a paused mission's resume hint always shows) |
 | `PI_STATUS_BAR_SHOW_MODEL` | `true` | Show the producing model |
-| `PI_STATUS_BAR_SHOW_THROUGHPUT` | `true` | Show rolling output tokens/sec |
-| `PI_STATUS_BAR_SHOW_BRANCH` / `_REPOSITORY` / `_WORKTREE` / `_DIRECTORY` | `true` | Git and path segments |
+| `PI_STATUS_BAR_SHOW_THROUGHPUT` | `false` | Show rolling output tokens/sec |
+| `PI_STATUS_BAR_SHOW_BRANCH` / `_DIRECTORY` | `true` | Git and path segments |
+| `PI_STATUS_BAR_SHOW_REPOSITORY` / `_WORKTREE` | `false` | Repository and worktree segments |
 | `PI_STATUS_BAR_REFRESH_MS` | `150` | Redraw coalescing window |
 | `PI_STATUS_BAR_GIT_TTL_MS` | `30000` | How long cached git context is trusted |
 
@@ -461,7 +463,7 @@ start, every six hours while a session stays open, and on demand with `/gc`
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_HOUSEKEEPING` | unset | Automatic housekeeping only reports (dry-run) until set to `1`; `0` disables it. `/gc` always acts (`/gc --dry-run` previews) |
+| `PI_HOUSEKEEPING` | on | Automatic housekeeping acts by default; `0`/`false`/`off` disables it, `dry-run` only reports. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` always acts (`/gc --dry-run` previews) |
 | `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
 | `PI_WORKTREE_IDLE_HOURS` | `24` | Idle threshold for worktrees with no known owner |
 
