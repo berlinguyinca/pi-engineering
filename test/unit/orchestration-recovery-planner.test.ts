@@ -281,6 +281,28 @@ describe("RecoveryPlanner", () => {
     assert.equal(parked.operatorGuidance, undefined);
   });
 
+  it("makes an exhausted attempt budget terminal for capacity categories when the caller is clock-driven", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 1_000, strategyMaxAttempts: 2 });
+    const transient = new FailureClassifier().classify(baseEvidence("gateway returned 503"));
+    const history = [decision(transient.fingerprint, 1), decision(transient.fingerprint, 2)];
+    const now = Date.parse("2026-09-27T00:00:10.000Z");
+    const stopped = planner.decide({ classification: transient, history, now, exhaustionIsTerminal: true });
+    assert.equal(stopped.action, "STOP");
+    assert.equal(stopped.attempt, 3);
+    assert.ok(stopped.operatorGuidance, "the operator is told what to do");
+    assert.equal(planner.decide({ classification: transient, history, now }).action, "PROBE_AND_BACKOFF");
+  });
+
+  it("starts a fresh strategy budget for a new resumption instead of counting every earlier episode", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 1_000, strategyMaxAttempts: 2 });
+    const old = [1, 2, 3, 4, 5].map((n) => ({ ...decision(classification.fingerprint, n), resumptionGeneration: 0 }));
+    const resumed = planner.decide({ classification, history: old, now: 10_000, resumptionGeneration: 1 });
+    assert.equal(resumed.action, "CREATE_REPAIR_TASKS");
+    assert.equal(resumed.attempt, 1);
+    const stillOld = planner.decide({ classification, history: old, now: 10_000, resumptionGeneration: 0 });
+    assert.equal(stillOld.action, "STOP");
+  });
+
   it("allows the next strategy when material evidence changes", () => {
     const planner = new RecoveryPlanner({ missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 });
     const history = [decision(classification.fingerprint, 1), decision(classification.fingerprint, 2)];

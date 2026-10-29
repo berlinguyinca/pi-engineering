@@ -319,6 +319,7 @@ export class MissionSupervisor {
         history,
         now: this.now(),
         resumptionGeneration: expectedResumptionGeneration,
+        exhaustionIsTerminal: true,
       });
       decision = this.store.planRecovery(
         diagnosis.operatorQuestion && decided.action === "WAIT_FOR_REQUIREMENT"

@@ -23,6 +23,7 @@ import { join, resolve } from "node:path";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { MIGRATIONS_FILE } from "../runtime/isolation/legacyMigration.ts";
 import { resolveOrchestrationOverride, resolveStateRoot } from "../runtime/isolation/stateDir.ts";
+import { compactLeaseEvents } from "./leaseCompaction.ts";
 import { type MissionCancellation, type MissionSelector, cancelStaleMission, listMissions } from "./missionCancel.ts";
 import { MissionStore } from "./missionStore.ts";
 import { explainMission, formatMissionWhy } from "./missionWhy.ts";
@@ -38,6 +39,7 @@ export interface MissionsCliOptions {
 const USAGE =
   "usage: pi-engineering missions list --store <dir|orchestration.jsonl> [--repo-id ID] [--created-after ISO] [--all] [--json]\n" +
   "       pi-engineering missions why --store <dir|orchestration.jsonl> [--json] <missionId>\n" +
+  "       pi-engineering missions compact-leases --file <events/*.jsonl> [--apply] [--json]\n" +
   "       pi-engineering missions cancel --store <dir|orchestration.jsonl> (--mission ID ... | --repo-id ID --created-after ISO) [--yes] [--json]\n";
 
 function values(args: string[], flag: string): string[] {
@@ -100,6 +102,23 @@ export async function runMissionsCommand(args: string[], options: MissionsCliOpt
   const err = options.error ?? ((value: string) => process.stderr.write(value));
   const sub = args[0];
   const rest = args.slice(1);
+  if (sub === "compact-leases") {
+    // Dry run unless --apply; --apply keeps the original as <file>.bak. Stop every session writing the log first.
+    try {
+      const [file] = values(rest, "--file");
+      if (!file) throw new Error("--file is required");
+      const report = await compactLeaseEvents(resolve(file), { apply: rest.includes("--apply") });
+      out(
+        rest.includes("--json")
+          ? `${JSON.stringify(report, null, 2)}\n`
+          : `${report.applied ? "Compacted" : "Would compact"} ${report.file}: lease events ${report.leaseEventsBefore} -> ${report.leaseEventsAfter}, lines ${report.linesBefore} -> ${report.linesAfter}, bytes ${report.bytesBefore} -> ${report.bytesAfter}; replayed state ${report.stateIdentical ? "identical" : "DIFFERS (not applied)"}${report.backup ? `; original kept at ${report.backup}` : ""}\n${report.applied ? "" : "Re-run with --apply to rewrite the file.\n"}`,
+      );
+      return report.stateIdentical ? 0 : 1;
+    } catch (error) {
+      err(`${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
+      return 2;
+    }
+  }
   let selector: MissionSelector;
   let storePath: string;
   try {

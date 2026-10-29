@@ -1888,7 +1888,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.equal(decisions.length, 2);
     assert.equal(h.store.getRecoveryDecision(first.recoveryId)?.status, "failed");
     assert.equal(decisions[1]?.resumptionGeneration, 1);
-    assert.equal(decisions[1]?.attempt, 2, "explicit resumption does not reset the cumulative fingerprint budget");
+    assert.equal(decisions[1]?.attempt, 1, "explicit resumption starts a fresh fingerprint budget");
     assert.equal(decisions[1]?.deadline, "2026-09-27T00:01:10.000Z");
   });
 
