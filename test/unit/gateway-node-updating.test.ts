@@ -28,11 +28,13 @@ import {
 } from "../../src/gateway/signals.ts";
 import { ALTERNATE_MODEL_MAX_ELAPSED_MS, pumpWithGatewayRetry } from "../../src/gateway/streamRetry.ts";
 import { classifyError } from "../../src/guard/transient.ts";
+import { decideAdmission, normalizeAdmissionConfig } from "../../src/inference/admissionConfig.ts";
 import {
   DEFAULT_ADMISSION_REASON_POLICY,
   isAutomaticReplayAllowed,
   parseAdmissionPayload,
 } from "../../src/inference/admissionContract.ts";
+import { evaluateTerminal } from "../../src/inference/admissionTransport.ts";
 import { classifyInferenceFailure } from "../../src/inference/failureClassifier.ts";
 import { metadataFromResponse } from "../../src/inference/inferweaveMetadata.ts";
 import { resolveRetryDelay } from "../../src/inference/retryDelay.ts";
@@ -143,9 +145,30 @@ test("node_updating is retried", async () => {
   assert.equal(envelopeSignal?.retryable, true);
   assert.equal(envelopeSignal?.reason, "node_updating");
 
-  // The reason taxonomy: retried like capacity_unavailable, then routing decides.
-  assert.deepEqual(DEFAULT_ADMISSION_REASON_POLICY.node_updating, DEFAULT_ADMISSION_REASON_POLICY.capacity_unavailable);
-  assert.equal(DEFAULT_ADMISSION_REASON_POLICY.node_updating?.action, "retry_then_fallback");
+  // The reason taxonomy: a plain retry, never "fallback" after 3 min (nothing
+  // switches models for it), for the whole reason budget — the default
+  // max_elapsed_ms, the same 15 min as the pump's interactive cap.
+  assert.deepEqual(DEFAULT_ADMISSION_REASON_POLICY.node_updating, { action: "retry" });
+  const cfg = normalizeAdmissionConfig({});
+  const legacy = decideAdmission(cfg, { reason: "node_updating", status: 503 });
+  assert.equal(legacy.action, "retry");
+  assert.equal(legacy.maxElapsedMs, ALTERNATE_MODEL_MAX_ELAPSED_MS);
+  const terminal = (elapsedMs: number) =>
+    evaluateTerminal({
+      decision: legacy.action,
+      ...(legacy.fallbackAfterMs !== undefined ? { fallbackAfterMs: legacy.fallbackAfterMs } : {}),
+      reasonBudgetMs: legacy.maxElapsedMs,
+      waitedMs: elapsedMs,
+      attempt: 2,
+      maxAttempts: 100,
+      budgetKey: "gw/m",
+      windowMs: 60_000,
+      sharedBudgetMs: Number.POSITIVE_INFINITY,
+    });
+  assert.equal(terminal(4 * 60_000), undefined, "still retrying after 3 min: no misleading fallback");
+  assert.equal(terminal(ALTERNATE_MODEL_MAX_ELAPSED_MS), "budget_elapsed", "ends at the 15 min budget");
+  // capacity_unavailable keeps its own retry_then_fallback (unchanged).
+  assert.equal(decideAdmission(cfg, { reason: "capacity_unavailable", status: 503 }).action, "retry_then_fallback");
 
   // The unified classifier: a wait honouring the server's hint, on this model.
   const f = classifyInferenceFailure({
@@ -485,7 +508,7 @@ test("the gateway's message is sanitised before it reaches the terminal", () => 
   const hostile = {
     error: {
       ...ENVELOPE.error,
-      message: `\u001b[2J\u001b[31mupdating node,\u0007 please retry in 30 s${"x".repeat(5_000)}`,
+      message: `\u001b[2J\u001b[31mnode gpu-7 rolling to r42,\u0007 back in 30 s${"x".repeat(5_000)}`,
     },
   };
   const signal = parseGatewayWait({ text: `503: ${JSON.stringify(hostile)}` })!;
@@ -495,5 +518,6 @@ test("the gateway's message is sanitised before it reaches the terminal", () => 
     JSON.stringify(notice.text),
   );
   assert.ok(notice.text.length < 250, `capped: ${notice.text.length}`);
-  assert.ok(notice.text.includes("updating node, please retry in 30 s"), notice.text);
+  assert.ok(notice.text.includes("node gpu-7 rolling to r42, back in 30 s"), notice.text);
+  assert.ok(!notice.text.includes(NOTICE), "the gateway's own message, not the fallback constant");
 });

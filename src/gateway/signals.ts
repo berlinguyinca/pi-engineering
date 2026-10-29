@@ -589,9 +589,12 @@ export function isNodeUpdating(signal: Pick<GatewayWaitSignal, "reason" | "code"
  * The gateway's own guidance: this model cannot serve now, another may.
  *
  * Never for `node_updating`, whatever its action says: a 30 s deployment
- * restart is waited out on the same model. Every switch path (the pump's
- * abandon, AdvisedModelSwitch, the fallback lifecycle, a mission's give-up)
- * reads this, so the exclusion holds for all of them.
+ * restart is waited out on the same model. Every path that switches ON THE
+ * GATEWAY'S ADVICE (the pump's abandon, AdvisedModelSwitch, the fallback
+ * lifecycle's advised arm, a mission's advised give-up) reads this, so none of
+ * them switch for it. Switches that do not depend on the advice still can, by
+ * design: the opt-in hold-count fallback (three consecutive holds, off by
+ * default) and the planner worker's MODEL_LOADING third-strike switch.
  */
 export function advisesAlternateModel(
   signal: Pick<GatewayWaitSignal, "actionCode" | "action"> & Partial<Pick<GatewayWaitSignal, "reason" | "code">>,

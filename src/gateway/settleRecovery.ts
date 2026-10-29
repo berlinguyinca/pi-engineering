@@ -172,10 +172,10 @@ export function recoverableFailure(message: FailedLike | undefined, contextWindo
   if (EXHAUSTED_LIMIT.test(text)) return undefined;
 
   // `node_updating` reaching the boundary means the pump already held it for
-  // its whole budget (ALTERNATE_MODEL_MAX_ELAPSED_MS, 15 min, or a shorter
-  // PI_GATEWAY_MAX_ELAPSED_MS), past the console's 10-minute updating mark:
-  // the node is stuck, not updating, and continuing would only wait in the
-  // same refusal for hours. End the turn.
+  // its whole interactive cap (ALTERNATE_MODEL_MAX_ELAPSED_MS, 15 min, or a
+  // shorter PI_GATEWAY_MAX_ELAPSED_MS), past the console's updating mark (10
+  // min by default, up to 1 h): the node is most likely stuck, and continuing
+  // would only wait in the same refusal for hours. End the turn.
   const updating = parseGatewayWait({ text });
   if (updating && isNodeUpdating(updating)) return undefined;
 

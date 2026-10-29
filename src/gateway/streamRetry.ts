@@ -291,10 +291,14 @@ export const SHORT_TRANSIENT_MAX_ELAPSED_MS = 300_000;
  * this long instead of holding silently for the 12-hour long-wait horizon.
  *
  * `node_updating` (a node restarting for a deployment) is held on the same
- * model and never abandoned for an alternate, but under this same ceiling: the
- * console's updating mark expires after 10 minutes, so a node still refusing
- * after 15 is stuck, not updating. The turn then ends with the refusal, and
- * settle recovery does not continue it (settleRecovery.ts).
+ * model and never abandoned on the gateway's alternate advice, but under this
+ * same 15-minute interactive cap. The console's updating mark lasts 10 minutes
+ * by default (configurable up to 1 hour), so a node still refusing after 15
+ * minutes is most likely stuck. The turn then ends with the refusal, and settle
+ * recovery does not continue it (settleRecovery.ts). This cap is interactive
+ * only: a mission worker has no such cap and keeps waiting for as long as the
+ * console keeps answering node_updating, which is bounded only by the mark's
+ * TTL (an updater re-marking the node extends it).
  */
 export const ALTERNATE_MODEL_MAX_ELAPSED_MS = 15 * 60_000;
 

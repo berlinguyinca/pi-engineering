@@ -115,9 +115,14 @@ export const DEFAULT_ADMISSION_REASON_POLICY: Readonly<Record<string, AdmissionR
   worker_saturated: { action: "retry" },
   model_loading: { action: "retry" },
   capacity_unavailable: { action: "retry_then_fallback", fallbackAfterMs: 180_000 },
-  // A node restarting for a deployment: the console sends the capacity
-  // refusal's guidance with its own 30 s delay, so it is treated the same way.
-  node_updating: { action: "retry_then_fallback", fallbackAfterMs: 180_000 },
+  // A node restarting for a deployment. Plain retry within the reason budget
+  // (max_elapsed_ms, 15 min by default, the same as the pump's interactive
+  // cap), NOT retry_then_fallback: that ends the request as "fallback" after
+  // 3 min with a "falling back" notice, while nothing switches models for
+  // node_updating (signals.ts advisesAlternateModel). Only reached without an
+  // explicit replay contract; the console's envelope carries one, which
+  // decideAdmission already treats as "retry".
+  node_updating: { action: "retry" },
   quota_exhausted: { action: "fallback" },
   auth_failed: { action: "fail" },
   forbidden: { action: "fail" },
@@ -130,6 +135,7 @@ export const RETRYABLE_ADMISSION_REASONS: readonly string[] = [
   "caller_concurrency",
   "worker_saturated",
   "model_loading",
+  "node_updating",
 ];
 
 /** Reasons that must not be waited on; model routing decides instead. */
