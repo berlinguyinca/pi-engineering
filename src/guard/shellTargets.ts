@@ -471,6 +471,39 @@ export function extractWriteTargets(command: string, env: NodeJS.ProcessEnv = pr
 }
 
 /**
+ * Expand `$NAME` and a leading `~` in a word the shell would expand. Returns
+ * undefined when the word names a variable this process cannot resolve, or
+ * carries a command substitution — the caller must then treat the path as
+ * unknown rather than guessing, which is what keeps the guard fail-closed.
+ *
+ * `literal` is the single-quote case: `'$HOME/log'` really is a file named
+ * `$HOME/log` under the cwd, so it stays exactly as written.
+ */
+export function expandPathWord(
+  text: string,
+  env: NodeJS.ProcessEnv = process.env,
+  literal = false,
+): string | undefined {
+  return expandWord(text, new Map(), env, literal);
+}
+
+/**
+ * Resolve a directory the way the shell would: absolute paths as written, `~`
+ * against `$HOME` (falling back to `os.homedir()`), everything else against the
+ * directory the command runs in. Undefined when the word cannot be expanded.
+ */
+export function resolveDirectoryWord(
+  text: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+  literal = false,
+): string | undefined {
+  const expanded = expandPathWord(text, env, literal);
+  if (expanded === undefined) return undefined;
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
+}
+
+/**
  * Resolve a write target the way the guard needs it: absolute paths as written,
  * `~` against the home directory, everything else against the effective cwd.
  *

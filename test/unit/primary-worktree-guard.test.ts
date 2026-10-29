@@ -398,6 +398,60 @@ test("mutatingGitLocations: each segment is judged where it runs", () => {
   assert.deepEqual(mutatingGitLocations("git status && git ls-remote --heads origin", "/session"), []);
 });
 
+test("effectiveGitCwd: `~` and `$VAR` name the directory the way the shell names it", () => {
+  // Refused in a live session twice on 2026-10-30: `cd ~/pi-eng-x && git add …`
+  // resolved to `<session cwd>/~/pi-eng-x`, matched no worktree, fell back to the
+  // session directory, and the guard accused a linked worktree of being the
+  // primary checkout. The absolute-path form of the same command passed.
+  const env = { HOME: "/home/u", WT: "/home/u/wt" };
+  assert.equal(effectiveGitCwd("cd ~/wt && git commit -m x", "/home/u/IdeaProjects", env), "/home/u/wt");
+  assert.equal(effectiveGitCwd("cd $HOME/wt && git commit -m x", "/home/u/IdeaProjects", env), "/home/u/wt");
+  assert.equal(effectiveGitCwd("cd ${WT} && git commit -m x", "/home/u/IdeaProjects", env), "/home/u/wt");
+  assert.equal(effectiveGitCwd("cd ~ && git commit -m x", "/home/u/IdeaProjects", env), "/home/u");
+  assert.equal(effectiveGitCwd('git -C "$WT" commit -m x', "/session", env), "/home/u/wt");
+  assert.equal(effectiveGitCwd("git -C $WT commit -m x", "/session", env), "/home/u/wt");
+  assert.equal(effectiveGitCwd("git -C ~/wt commit -m x", "/session", env), "/home/u/wt");
+  assert.equal(effectiveGitCwd("git --work-tree=~/wt --git-dir=~/wt/.git add -A", "/session", env), "/home/u/wt");
+  // A `cd` that expands still carries into the later segments, as the shell does.
+  assert.deepEqual(
+    mutatingGitLocations("cd ~/wt && git push -u origin fix/x && git -C ~/other log", "/home/u/IdeaProjects", env).map(
+      (l) => l.cwd,
+    ),
+    ["/home/u/wt"],
+  );
+});
+
+test("an unresolvable directory is marked unresolved, not blamed on the session cwd", () => {
+  // A path this process cannot expand is not evidence that the command targets
+  // the primary checkout. Saying so was what sent a session re-running the same
+  // tilde form; the verdict must fail closed AND name the real problem.
+  const env = { HOME: "/home/u" };
+  const missing = mutatingGitLocations('git -C "$WT" commit -m x', "/home/u/IdeaProjects", env);
+  assert.deepEqual(
+    missing.map((l) => [l.verb, l.cwdUnresolved]),
+    [["commit", true]],
+  );
+  assert.equal(
+    mutatingGitLocations("cd ~/wt && git commit -m x", "/home/u/IdeaProjects", env)[0]?.cwdUnresolved,
+    false,
+    "an expanded path is not unresolved",
+  );
+  // Command substitution is a command, not a value: it cannot name a directory.
+  assert.equal(mutatingGitLocations("git -C $(pwd) commit -m x", "/session", env)[0]?.cwdUnresolved, true);
+  // `$"…"` and `$'…'` are quoted words (locale translation, ANSI-C quoting), not
+  // variables: the flag still names a checkout, so it cannot slip past the
+  // directory resolution the way a bare `$VAR` does.
+  assert.equal(mutatingGitLocations('git $"-C" /repo branch -D feat/x', "/session", env)[0]?.cwd, "/repo");
+  assert.equal(mutatingGitLocations("git $'-C' /repo commit -m x", "/session", env)[0]?.cwd, "/repo");
+  // A single-quoted variable is a literal directory name under the cwd, so the
+  // path is resolvable as written and stays resolved (fail closed, correctly).
+  assert.equal(
+    mutatingGitLocations("git -C '$WT' commit -m x", "/session", env)[0]?.cwdUnresolved,
+    false,
+    "a single-quoted path is literal, not unexpanded",
+  );
+});
+
 test("guard: a push in the session's own worktree is not a primary mutation", async () => {
   const guard = guardFor(async (root) => root === "/repo", {}, "/wt");
   assert.equal(
@@ -430,8 +484,37 @@ function guardFor(
   env: NodeJS.ProcessEnv = {},
   sessionCwd = "/session",
 ) {
-  return new PrimaryWorktreeGuard(sessionCwd, resolvePrimaryWorktreeGuardConfig(env), { isPrimary });
+  // The same environment that configures the guard is what expands `~` and
+  // `$VAR` in the paths it judges.
+  return new PrimaryWorktreeGuard(sessionCwd, resolvePrimaryWorktreeGuardConfig(env), { isPrimary, env });
 }
+
+test("guard: an unexpanded path refuses with its own reason, not a false primary accusation", async () => {
+  const isPrimary = (dir: string) => dir === "/home/u/primary";
+  const guard = guardFor(isPrimary, { HOME: "/home/u", WT: "/home/u/wt" }, "/home/u/IdeaProjects");
+
+  // `$WT` expands: the command runs in a linked worktree, so it is allowed.
+  assert.equal(await guard.onToolCall("bash", { command: 'git -C "$WT" commit -m x' }), undefined);
+  assert.equal(await guard.onToolCall("bash", { command: "cd ~/wt && git commit -m x" }), undefined);
+
+  // The same command naming a variable this process does not have is refused —
+  // but the reason says the directory is unresolvable instead of accusing the
+  // session directory of being the primary checkout.
+  const unresolvable = guardFor(isPrimary, { HOME: "/home/u" }, "/home/u/IdeaProjects");
+  const blocked = await unresolvable.onToolCall("bash", { command: 'git -C "$WT" commit -m x' });
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /cannot resolve the directory/iu);
+  assert.doesNotMatch(blocked?.reason ?? "", /targets the PRIMARY checkout/iu);
+  assert.match(blocked?.reason ?? "", /restate/iu);
+
+  // A command substitution cannot name a directory either: refused, same reason.
+  const substituted = await guard.onToolCall("bash", { command: "git -C $(pwd) commit -m x" });
+  assert.equal(substituted?.block, true);
+  assert.match(substituted?.reason ?? "", /cannot resolve the directory/iu);
+
+  // Reading is unaffected: an unexpanded path in a read-only verb runs.
+  assert.equal(await guard.onToolCall("bash", { command: 'git -C "$WT" log --oneline -3' }), undefined);
+});
 
 test("guard: write/edit into the primary checkout is blocked with an actionable reason", async () => {
   const guard = guardFor(async () => true);

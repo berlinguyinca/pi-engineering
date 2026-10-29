@@ -45,7 +45,7 @@
 import { realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { safeGit } from "../git/safeGit.ts";
-import { resolveWriteTarget, extractWriteTargets as shellWriteTargets } from "./shellTargets.ts";
+import { resolveDirectoryWord, resolveWriteTarget, extractWriteTargets as shellWriteTargets } from "./shellTargets.ts";
 
 export interface PrimaryWorktreeGuardConfig {
   enabled: boolean;
@@ -65,6 +65,8 @@ export interface PrimaryWorktreeGuardConfig {
 export interface PrimaryWorktreeGuardOptions {
   /** Injectable for tests; defaults to the real git-based check. */
   isPrimary?: (dir: string) => boolean | Promise<boolean>;
+  /** The environment whose `~`/`$VAR` the paths this guard judges are expanded against. */
+  env?: NodeJS.ProcessEnv;
 }
 
 function truthy(value: string | undefined): boolean {
@@ -351,6 +353,12 @@ function segmentOffenders(segment: string): MutatingGitSegment[] {
 export interface MutatingGitLocation extends MutatingGitSegment {
   /** The directory THAT segment's git runs in. */
   cwd: string;
+  /**
+   * True when the segment names a directory this process cannot expand (a `$VAR`
+   * it does not have, a `$(…)`), so `cwd` is only a guess: the verdict must then
+   * fail closed on the UNRESOLVED path instead of on the guessed directory.
+   */
+  cwdUnresolved: boolean;
 }
 
 /**
@@ -364,13 +372,19 @@ export interface MutatingGitLocation extends MutatingGitSegment {
  * twice in a live session, including the push that would have published the
  * fix for the guard itself. Each segment is judged where it actually runs.
  */
-export function mutatingGitLocations(command: string, sessionCwd: string): MutatingGitLocation[] {
+export function mutatingGitLocations(
+  command: string,
+  sessionCwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): MutatingGitLocation[] {
   let cwd = sessionCwd;
   const out: MutatingGitLocation[] = [];
   for (const segment of segments(command)) {
-    const segmentCwd = segmentGitCwd(segment, cwd);
-    for (const offender of segmentOffenders(segment)) out.push({ ...offender, cwd: segmentCwd });
-    cwd = segmentCwd; // a `cd` carries into later segments, as it does in the shell
+    const run = segmentGitCwd(segment, cwd, env);
+    for (const offender of segmentOffenders(segment)) {
+      out.push({ ...offender, cwd: run.cwd, cwdUnresolved: run.unresolved });
+    }
+    cwd = run.cwd; // a `cd` carries into later segments, as it does in the shell
   }
   return out;
 }
@@ -569,18 +583,32 @@ const GIT_DIR_FLAGS = new Set(["-C", "--git-dir", "--work-tree"]);
  * `git -C <primary> branch -D x` reached for `git --git-dir=<primary>/.git
  * branch -D x` and got through. Same checkout, same answer now either way.
  */
-function gitDirFlagCwd(tokens: string[], from: string): string {
+function gitDirFlagCwd(
+  tokens: PathToken[],
+  from: string,
+  env: NodeJS.ProcessEnv,
+): { dir: string; unresolved: boolean } {
   let dir = from;
+  let unresolved = false;
   let workTree: string | null = null;
   let gitDirCwd: string | null = null;
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i]!;
-    const eq = token.startsWith("--") ? token.indexOf("=") : -1;
-    const flag = eq === -1 ? token : token.slice(0, eq);
+    const eq = token.value.startsWith("--") ? token.value.indexOf("=") : -1;
+    const flag = eq === -1 ? token.value : token.value.slice(0, eq);
     if (!GIT_DIR_FLAGS.has(flag)) continue;
-    const value = eq === -1 ? tokens[i + 1] : token.slice(eq + 1);
-    if (value === undefined || value.startsWith("-")) continue;
-    const abs = resolve(dir, value);
+    const named: PathToken | undefined =
+      eq === -1 ? tokens[i + 1] : { value: token.value.slice(eq + 1), literal: token.literal };
+    if (named === undefined || named.value.startsWith("-")) continue;
+    const abs = resolveDirectoryWord(named.value, dir, env, named.literal);
+    // A name this process cannot expand is not a directory the guard can place.
+    // Guessing one and judging the guess is what made `git -C "$WT" …` read as a
+    // mutation of the session's own checkout; record it and let the caller
+    // refuse on the unresolved path.
+    if (abs === undefined) {
+      unresolved = true;
+      continue;
+    }
     if (flag === "-C") dir = abs;
     else if (flag === "--work-tree") workTree = abs;
     // `--git-dir` names the metadata directory; its parent is the checkout for
@@ -589,28 +617,85 @@ function gitDirFlagCwd(tokens: string[], from: string): string {
     else gitDirCwd = basename(abs) === ".git" ? dirname(abs) : abs;
   }
   // `--work-tree` states the checkout outright; `--git-dir` only implies one.
-  return workTree ?? gitDirCwd ?? dir;
+  return { dir: workTree ?? gitDirCwd ?? dir, unresolved };
 }
 
 /** A bash write target, resolved against the directory its own segment runs in. */
-function writeTargetsBySegment(segments: string[], sessionCwd: string): { target: string; abs: string }[] {
+function writeTargetsBySegment(
+  segments: string[],
+  sessionCwd: string,
+  env: NodeJS.ProcessEnv,
+): { target: string; abs: string }[] {
   let cwd = sessionCwd;
   const out: { target: string; abs: string }[] = [];
   for (const segment of segments) {
-    cwd = segmentGitCwd(segment, cwd);
-    for (const target of extractWriteTargets(segment)) out.push({ target, abs: resolveWriteTarget(target, cwd) });
+    cwd = segmentGitCwd(segment, cwd, env).cwd;
+    for (const target of extractWriteTargets(segment, env)) {
+      out.push({ target, abs: resolveWriteTarget(target, cwd, env) });
+    }
   }
   return out;
 }
 
+/**
+ * The words of a segment as PATHS, keeping the quoting the shell honors. Unlike
+ * `tokenize` (which strips a leading `$` so a quoted verb still reads as a verb),
+ * this keeps `$VAR` and `~` intact so a directory can be expanded the way the
+ * shell would expand it, and reports single quoting so a literal `'$WT'` stays
+ * the literal directory name it is.
+ */
+interface PathToken {
+  value: string;
+  literal: boolean;
+}
+
+function pathTokens(segment: string): PathToken[] {
+  return segment
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((raw) => ({
+      literal: raw.includes("'"),
+      value: pathValue(raw),
+    }))
+    .filter((token) => token.value.length > 0);
+}
+
+/**
+ * The word with the punctuation that clings to it removed, keeping a variable
+ * reference intact. `$"-C"` and `$'-C'` are quoted words (locale translation and
+ * ANSI-C quoting), not variables, so their `$` goes with the quotes — the way
+ * `tokenize` already strips it for verbs. Without that, `git $"-C" <primary>
+ * branch -D x` would run with `-C` in the shell and read as no flag here.
+ */
+function pathValue(raw: string): string {
+  let text = raw;
+  if (text.startsWith("$'") || text.startsWith('$"')) text = text.slice(1);
+  return text.replace(/^[(('"`!]+/, "").replace(/[,'"`)\]:;]+$/, "");
+}
+
 /** The directory the `git` in ONE segment of a compound command runs in. */
-function segmentGitCwd(segment: string, sessionCwd: string): string {
-  const tokens = tokenize(segment);
+function segmentGitCwd(
+  segment: string,
+  sessionCwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { cwd: string; unresolved: boolean } {
+  const tokens = pathTokens(segment);
   let cwd = sessionCwd;
+  let unresolved = false;
   for (let i = 0; i < tokens.length - 1; i++) {
-    if (tokens[i] === "cd") cwd = resolve(cwd, tokens[i + 1]!);
+    if (tokens[i]!.value !== "cd") continue;
+    const target = tokens[i + 1]!;
+    const next = resolveDirectoryWord(target.value, cwd, env, target.literal);
+    // `cd $UNSET` moves the shell to a directory nobody can name: everything
+    // after it is in that state too, so the segment cannot be placed.
+    if (next === undefined) {
+      unresolved = true;
+      continue;
+    }
+    cwd = next;
   }
-  return gitDirFlagCwd(tokens, cwd);
+  const flags = gitDirFlagCwd(tokens, cwd, env);
+  return { cwd: flags.dir, unresolved: unresolved || flags.unresolved };
 }
 
 /**
@@ -623,9 +708,9 @@ function segmentGitCwd(segment: string, sessionCwd: string): string {
  * runs). A command that mixes directories must be judged per segment; see
  * `mutatingGitLocations`.
  */
-export function effectiveGitCwd(command: string, sessionCwd: string): string {
+export function effectiveGitCwd(command: string, sessionCwd: string, env: NodeJS.ProcessEnv = process.env): string {
   let cwd = sessionCwd;
-  for (const segment of segments(command)) cwd = segmentGitCwd(segment, cwd);
+  for (const segment of segments(command)) cwd = segmentGitCwd(segment, cwd, env).cwd;
   return cwd;
 }
 
@@ -812,6 +897,26 @@ function blockReason(what: string, root: string, culprit?: MutatingGitSegment, h
   return lines.join("\n");
 }
 
+/**
+ * The command names a directory this process cannot place: `$VAR` it does not
+ * have, or a `$(…)` that is a command rather than a path. It is refused — a
+ * mutation whose checkout is unknown cannot be cleared — but the reason must not
+ * claim the primary checkout. It did not: the accusation sent a session
+ * re-running the same `cd ~/worktree && git add …` form (the path resolved to
+ * `<session cwd>/~/worktree`, matched no worktree, and fell back to the session
+ * directory), which is the loop this message exists to break.
+ */
+function unresolvedPathReason(segment: string): string {
+  return [
+    "Blocked: this session cannot resolve the directory that git command runs in.",
+    `Culprit segment: \`${segment}\` — it names a path with a \`~\`, a variable this process does not have,`,
+    "or a `$(…)` substitution, so the guard cannot tell which checkout it would change.",
+    "Restate the path literally — an absolute directory, no `~`, no `$VAR` — and run it again.",
+    "A mutation whose checkout cannot be placed is refused whether or not it points at the primary checkout.",
+    "If this session must work in the primary checkout (production ops), start it with PI_ENG_PRIMARY=1.",
+  ].join("\n");
+}
+
 export class PrimaryWorktreeGuard {
   private readonly cache = new Map<string, WorktreeCheck | Promise<WorktreeCheck>>();
   /** No-loss branch-delete verdicts, keyed by root + names + resolved shas. */
@@ -832,6 +937,11 @@ export class PrimaryWorktreeGuard {
 
   private cwd(): string {
     return typeof this.sessionCwd === "function" ? this.sessionCwd() : this.sessionCwd;
+  }
+
+  /** The environment `~` and `$VAR` in the judged paths are expanded against. */
+  private env(): NodeJS.ProcessEnv {
+    return this.options.env ?? process.env;
   }
 
   /** What `dir` is: primary checkout, linked worktree, or not a repository. */
@@ -924,7 +1034,7 @@ export class PrimaryWorktreeGuard {
       // the worktree the session owns, and judging that write against the
       // directory a LATER step names blocks work that is allowed.
       const parts = segments(command);
-      for (const target of writeTargetsBySegment(parts, this.cwd())) {
+      for (const target of writeTargetsBySegment(parts, this.cwd(), this.env())) {
         const root = await this.primaryAt(dirname(target.abs));
         if (root) return { block: true, reason: blockReason(`the write target \`${target.target}\``, root) };
       }
@@ -932,7 +1042,12 @@ export class PrimaryWorktreeGuard {
       // `git -C <primary> log` in the tail must not turn the session's own
       // `git push` into a primary-checkout mutation.
       let refusedDelete = false;
-      for (const location of mutatingGitLocations(command, this.cwd())) {
+      for (const location of mutatingGitLocations(command, this.cwd(), this.env())) {
+        // A directory this process cannot expand is not a directory this guard
+        // can clear — refuse on the unresolved path, and say exactly that.
+        if (location.cwdUnresolved) {
+          return { block: true, reason: unresolvedPathReason(location.segment) };
+        }
         const root = await this.primaryAt(location.cwd);
         if (!root) continue; // that segment runs where the session may work
         if (this.config.branchTeardown && location.verb === "branch") {
