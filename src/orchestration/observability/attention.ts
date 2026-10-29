@@ -37,6 +37,7 @@ export interface AttentionEvidence {
     | "progress_age"
     | "no_proof_of_life"
     | "recovery_exhausted"
+    | "capacity_wait"
     | "review_blocked"
     | "tests_failing";
   /** When the fact became true, if it has a time. */
@@ -63,6 +64,8 @@ export interface AttentionInput {
   lastHeartbeatAt?: string;
   nextActionAt?: string | null;
   recovery: { attempt: number; maxAttempts: number };
+  /** The recovery action behind `recovery`; a wait action is a park, not an exhausted budget. */
+  recoveryAction?: string;
   operatorPausedAt?: string | null;
   /** Loop signals flagged for this mission's live workers. */
   loopSignals?: LoopSignal[];
@@ -76,6 +79,8 @@ export interface AttentionInput {
 /** States where the operator, not the runtime, is the next actor. */
 const OPERATOR_STATES = new Set(["NEEDS_ATTENTION", "WAITING_FOR_USER", "REVIEW_BLOCKED", "AWAITING_APPROVAL"]);
 /** States where the mission stopped on its own and kept its work. */
+/** Recovery actions that wait for capacity; their attempt count is not a budget that ends the mission. */
+const CAPACITY_WAIT_ACTIONS = new Set(["PROBE_AND_BACKOFF", "PAUSE_FOR_PERSISTENCE"]);
 const PARKED_STATES = new Set(["PARKED", "PARKED_UNPROVEN", "PARKED_UNKNOWN", "BLOCKED"]);
 /** A named wait is informational; the runtime is doing something about it. */
 const SELF_SERVING_WAITS = new Set<WaitingReason>([
@@ -129,10 +134,27 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
   }
 
   if (input.recovery.attempt >= input.recovery.maxAttempts && input.recovery.maxAttempts > 0) {
-    evidence.push({
-      kind: "recovery_exhausted",
-      detail: `recovery attempt ${input.recovery.attempt} of ${input.recovery.maxAttempts} did not restore progress`,
-    });
+    if (input.recoveryAction !== undefined && CAPACITY_WAIT_ACTIONS.has(input.recoveryAction)) {
+      // Capacity waits are unbounded by design: the counter past its budget is
+      // wait progress, and the mission resumes by itself when capacity returns.
+      const waited = ageMs(input.waitingSince, input.now);
+      const nextAt = Date.parse(input.nextActionAt ?? "");
+      const parts = [
+        `waiting for capacity: probe ${input.recovery.attempt}`,
+        ...(waited !== undefined ? [`waiting ${humanAge(waited)}`] : []),
+        ...(Number.isNaN(nextAt) ? [] : [`next probe in ${humanAge(Math.max(0, nextAt - input.now))}`]),
+      ];
+      evidence.push({
+        kind: "capacity_wait",
+        ...(input.waitingSince ? { at: input.waitingSince } : {}),
+        detail: `${parts.join(", ")}; will resume automatically when capacity returns`,
+      });
+    } else {
+      evidence.push({
+        kind: "recovery_exhausted",
+        detail: `recovery attempt ${input.recovery.attempt} of ${input.recovery.maxAttempts} did not restore progress`,
+      });
+    }
   }
   if (state === "FAILED") {
     evidence.push({ kind: "failure", detail: input.reason?.trim() || "the mission failed" });
@@ -251,6 +273,7 @@ export function attentionFromSummary(
     lastHeartbeatAt: summary.lastHeartbeatAt,
     nextActionAt: summary.nextActionAt,
     recovery: summary.recovery,
+    recoveryAction: summary.action,
     operatorPausedAt: options.operatorPausedAt,
     loopSignals: options.loopSignals,
     review: options.review,

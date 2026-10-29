@@ -109,6 +109,38 @@ test("exhausted recovery and failing tests are listed together, strongest first"
   );
 });
 
+test("a capacity park past its strategy budget reports wait progress, not exhausted recovery", () => {
+  const attention = deriveAttention(
+    base({
+      state: "BLOCKED",
+      health: "blocked",
+      recovery: { attempt: 195, maxAttempts: 8 },
+      recoveryAction: "PROBE_AND_BACKOFF",
+      nextActionAt: new Date(T0 + 120_000).toISOString(),
+      waitingSince: new Date(T0 - 3_600_000).toISOString(),
+    }),
+  );
+
+  assert.equal(attention?.severity, "high");
+  assert.equal(attention?.evidence[0]?.kind, "capacity_wait");
+  assert.ok(!attention!.evidence.some((entry) => entry.kind === "recovery_exhausted"));
+  assert.doesNotMatch(attention!.reason, /did not restore progress|of 8/);
+  assert.match(attention!.reason, /waiting for capacity/);
+  assert.match(attention!.reason, /probe 195/);
+  assert.match(attention!.reason, /waiting 1h 0m/);
+  assert.match(attention!.reason, /next probe in 2m/);
+  assert.match(attention!.reason, /resume automatically/);
+});
+
+test("a real STOP at the cap keeps the attempt N of M recovery_exhausted wording", () => {
+  const attention = deriveAttention(
+    base({ state: "BLOCKED", health: "blocked", recovery: { attempt: 3, maxAttempts: 3 }, recoveryAction: "STOP" }),
+  );
+
+  assert.equal(attention?.evidence[0]?.kind, "recovery_exhausted");
+  assert.equal(attention?.reason, "recovery attempt 3 of 3 did not restore progress");
+});
+
 test("a wait the runtime is handling itself informs without interrupting", () => {
   const attention = deriveAttention(base({ health: "waiting", waitingReason: "inferweave_admission" }));
 

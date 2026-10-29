@@ -762,7 +762,7 @@ export class RecoveryPlanner {
     const exhaustedReason = !budgetExhausted
       ? EXPECTED_CHANGE[action]
       : parksOnCapacity
-        ? `${budgetReason}; the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
+        ? `waiting for capacity after ${fingerprintAttempts} attempts (the budget of ${this.strategyMaxAttempts} does not stop a capacity wait); the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
         : (OPERATOR_QUESTIONS[input.classification.category] ?? budgetReason);
     // When automatic recovery is exhausted and there is no capacity wait to
     // park on, the mission must pause for an operator decision. Surface concrete,
