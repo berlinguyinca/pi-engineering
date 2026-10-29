@@ -388,11 +388,11 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
       };
       if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
     },
-    onMissionActivity: (event) => {
+    onMissionActivity: (event, meta) => {
       publishMissionActivity(key, event);
-      // Events before the open settles are the runtime replaying stored
-      // missions; they set presence's baseline instead of notifying.
-      presence?.update(event, undefined, attentionReady ? "activity" : "replay");
+      // The runtime's open-time re-emission of stored missions sets presence's
+      // baseline instead of notifying; real transitions during open still do.
+      presence?.update(event, undefined, meta?.replay ? "replay" : "activity");
       if (attentionReady) void attention?.update(event).catch(() => {});
     },
     // The quiet heartbeat: observability composes a human-readable sentence when

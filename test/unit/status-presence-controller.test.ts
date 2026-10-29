@@ -343,3 +343,13 @@ test("a live change after a replayed baseline still notifies", () => {
   assert.match(sink.notices[0]!.text, /needs you/);
   controller.dispose();
 });
+
+test("a live event that raises attention rank after a replay still notifies", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running, undefined, "replay");
+  controller.update(needsYou, undefined, "activity");
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  controller.dispose();
+});

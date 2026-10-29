@@ -102,7 +102,7 @@ interface Tracked {
 }
 
 function stateKey(event: RuntimeMissionActivityEvent): string {
-  return `${event.state}|${event.health}`;
+  return `${event.state}|${event.health}|${presenceRank(event)}`;
 }
 
 function flat(text: string, max: number): string {
