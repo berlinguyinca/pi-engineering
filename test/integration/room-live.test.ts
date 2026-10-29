@@ -1,19 +1,25 @@
 // /room against a REAL Herdr control plane (ControlPlaneServer + CollabService on loopback), not a fake.
-// Gated: runs only when PI_HERDR_SRC names a Herdr checkout and `PI_HERDR_PYTHON` (default python3) can import it;
-// otherwise it skips cleanly. The server is test/fixtures/herdr-live-room-server.py: random user token written to a
+// Gated: runs only when the gitignored test/fixtures/room-live.local.yaml names a Herdr checkout (herdr_src) and a
+// python (default python3) that can import it; otherwise it skips cleanly. The server is test/fixtures/herdr-live-room-server.py: random user token written to a
 // 0600 file, in-memory repo, bound to 127.0.0.1:<ephemeral>, killed by exact PID in after(). No production host is touched.
 delete process.env.HERDR_DISABLED;
 
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
+import { readYaml } from "../../src/lifecycle/policy.ts";
 import { runRoomCommand } from "../../src/runtime/herdr/roomClient.ts";
 
-const SRC = process.env.PI_HERDR_SRC ?? "";
-const PYTHON = process.env.PI_HERDR_PYTHON ?? "python3";
+// Local, optional, gitignored config (no environment variables): test/fixtures/room-live.local.yaml
+//   herdr_src: /abs/path/to/herdr-engineering   # a Herdr checkout
+//   python: /abs/path/to/python                 # optional, default python3; must have Herdr's dependencies
+const LOCAL = join(import.meta.dirname, "..", "fixtures", "room-live.local.yaml");
+const cfg = existsSync(LOCAL) ? ((await readYaml(LOCAL)).raw as Record<string, unknown> | null) : null;
+const SRC = typeof cfg?.herdr_src === "string" ? cfg.herdr_src : "";
+const PYTHON = typeof cfg?.python === "string" ? cfg.python : "python3";
 const available =
   SRC !== "" &&
   spawnSync(PYTHON, ["-I", "-c", "import herdr_engineering.control_plane.collab"], {
@@ -29,7 +35,7 @@ interface Ready {
 
 describe(
   "/room against the real Herdr control plane",
-  { skip: !available && "PI_HERDR_SRC / Python herdr not available" },
+  { skip: !available && "test/fixtures/room-live.local.yaml absent or Herdr not importable" },
   () => {
     let child: ChildProcess;
     let dir = "";

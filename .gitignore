@@ -34,3 +34,6 @@ rr*.ts
 
 # T16 e2e local acceptance override
 test/e2e/acceptance.local.yaml
+
+# /room live test: local Herdr checkout paths
+test/fixtures/room-live.local.yaml

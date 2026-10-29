@@ -2,9 +2,15 @@
 
 Verified by `test/integration/room-live.test.ts`, which boots a real `ControlPlaneServer` + `CollabService`
 (Herdr `origin/main` 0391a6bb, loopback, in-memory repo, random token in a 0600 file) via
-`test/fixtures/herdr-live-room-server.py`. Run it with
-`PI_HERDR_SRC=<herdr checkout> PI_HERDR_PYTHON=<python with its deps> node --test ... test/integration/room-live.test.ts`;
-without `PI_HERDR_SRC` it skips cleanly. All paths are under `/api/v1/collab` on the public listener.
+`test/fixtures/herdr-live-room-server.py`. Enable it with a gitignored local file
+`test/fixtures/room-live.local.yaml` (no environment variables):
+
+```yaml
+herdr_src: /abs/path/to/a/herdr-engineering/checkout
+python: /abs/path/to/python   # optional, default python3; needs Herdr's dependencies
+```
+
+If the file is absent, or Herdr cannot be imported, the test skips cleanly. All paths are under `/api/v1/collab` on the public listener.
 
 | Pi command | Request | Observed response |
 |---|---|---|
