@@ -380,62 +380,134 @@ export function isMutatingGitCommand(command: string): boolean {
 }
 
 /**
- * `git branch` lists; anything with a name or flag creates/renames/deletes.
- * `git tag` lists with no name and no write flag; a name creates, and
- * `-d`/`-f`/`-a`/`-m`/`-s`/`-u`/`-F` delete, move, or write an annotated or
- * signed tag. Those tag writes were missed: `git tag -d v1.0` and
- * `git tag -a v1.0 -m msg` both start with a flag, and the rule "a flag means
- * it is a listing" read them as read-only — so deleting a tag, or writing an
- * annotated one, in the PRIMARY checkout was allowed.
+ * `git branch` and `git tag` list or write depending on their flags, so the
+ * flags are what has to be classified — not their first letter.
+ *
+ * The first version of this check asked whether any token starting with `-`
+ * contained a `d`, `f`, `m` or `c` (the letters of `-d`, `-f`, `-m`, `-c`). That
+ * reads a LONG flag as a cluster of short ones: `git branch --list --merged
+ * origin/main` matched on the `m` and `d` of `--merged`, and `--contains`,
+ * `--show-current` and `--format` matched on theirs, so the ordinary way of
+ * asking "which of these branches is merged into main" was refused as a branch
+ * delete. It was hit live, in the session that fixed the previous two rounds.
+ *
+ * So: a known write flag (long or short, cluster split letter by letter) wins;
+ * a command whose flags are all known listing flags lists, whatever words
+ * follow them (they are patterns, base refs, or flag values); anything else — a
+ * bare name, a flag this list does not know — fails closed.
  */
+const BRANCH_WRITE_FLAGS = new Set([
+  "-d",
+  "--delete",
+  "-D",
+  "-f",
+  "--force",
+  "-m",
+  "--move",
+  "-M",
+  "-c",
+  "--copy",
+  "-C",
+  "-u",
+  "--set-upstream-to",
+  "--track",
+  "--unset-upstream",
+  "--edit-description",
+  "--create-reflog",
+]);
+
+const BRANCH_LISTING_FLAGS = new Set([
+  "-l",
+  "--list",
+  "-a",
+  "--all",
+  "-r",
+  "--remotes",
+  "-v",
+  "-q",
+  "--quiet",
+  "--merged",
+  "--no-merged",
+  "--contains",
+  "--no-contains",
+  "--points-at",
+  "--format",
+  "--sort",
+  "--color",
+  "--column",
+  "--no-column",
+  "--show-current",
+  "--ignore-case",
+]);
+
+const TAG_WRITE_FLAGS = new Set([
+  "-d",
+  "--delete",
+  "-f",
+  "--force",
+  "-a",
+  "--annotate",
+  "-m",
+  "--message",
+  "-F",
+  "--file",
+  "-s",
+  "--sign",
+  "-u",
+  "--local-user",
+  "--cleanup",
+]);
+
+const TAG_LISTING_FLAGS = new Set([
+  "-l",
+  "--list",
+  "-v",
+  "--verify",
+  "--contains",
+  "--no-contains",
+  "--merged",
+  "--no-merged",
+  "--points-at",
+  "--format",
+  "--sort",
+  "--color",
+]);
+
+/**
+ * The flags of a `branch`/`tag` argument list, one per line: `--sort=-date`
+ * becomes `--sort`, and `-dv` becomes `-d` and `-v`. A word that does not look
+ * like a flag (`--format="-%(upstream)"` leaves `-%(upstream)` behind) is not
+ * one — treating a value as a flag turned a format string into a verdict.
+ */
+function flagTokens(rest: string[]): string[] {
+  const out: string[] = [];
+  for (const token of rest) {
+    if (!/^--?[A-Za-z]/.test(token)) continue;
+    const flag = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+    if (/^-[A-Za-z]{2,}$/.test(flag)) out.push(...[...flag.slice(1)].map((c) => `-${c}`));
+    else out.push(flag);
+  }
+  return out;
+}
+
 function branchOrTagMutates(segment: string, verb: "branch" | "tag"): boolean {
   const tokens = tokenize(segment);
   const i = tokens.findIndex((t) => t === verb);
   if (i === -1) return false;
   const rest = tokens.slice(i + 1);
-  const first = rest[0];
-  if (first === undefined) return false; // bare `git branch` / `git tag` lists
-  if (verb === "branch") {
-    // -d/-D/-f/-m/-c (incl. combined like -dv) create/rename/delete.
-    if (rest.some((t) => t.startsWith("-") && /[dDfmc]/.test(t.slice(1)))) return true;
-    if (rest.includes("--list") || rest.includes("-l")) return false; // `--list [pattern]` is read-only
-    if (rest.every((t) => ["-a", "-r", "-v", "-vv", "--all", "--remotes"].includes(t))) return false;
-    return true; // a name argument (create) or an unknown flag: be strict
-  }
-  // `git tag`: listing flags win over a pattern argument; write flags and a
-  // bare name write.
-  const LISTING = new Set(["-l", "--list"]);
-  const WRITING = new Set([
-    "-d",
-    "--delete",
-    "-f",
-    "--force",
-    "-a",
-    "--annotate",
-    "-m",
-    "--message",
-    "-F",
-    "--file",
-    "-s",
-    "--sign",
-    "-u",
-    "--local-user",
-  ]);
-  // Flags that consume the next word (so `-m v1.0` does not read `v1.0` as a
-  // tag name being created).
-  const TAKES_ARG = new Set(["-m", "--message", "-F", "--file", "-u", "--local-user"]);
-  const norm = (t: string) => (t.includes("=") ? t.slice(0, t.indexOf("=")) : t);
-  // An explicit listing flag wins: `git tag -l v*` lists, even though `v*` is a
-  // word that would otherwise read as a tag name.
-  if (rest.some((t) => LISTING.has(norm(t)))) return false;
-  for (let j = 0; j < rest.length; j++) {
-    const t = rest[j]!;
-    if (!t.startsWith("-")) return true; // a name argument: create
-    const flag = norm(t);
-    if (WRITING.has(flag)) return true;
-    if (TAKES_ARG.has(flag)) j++;
-  }
-  return false; // flags only (e.g. `--sort=-creatordate`): a listing
+  if (rest.length === 0) return false; // bare `git branch` / `git tag` lists
+  const flags = flagTokens(rest);
+  const write = verb === "branch" ? BRANCH_WRITE_FLAGS : TAG_WRITE_FLAGS;
+  const listing = verb === "branch" ? BRANCH_LISTING_FLAGS : TAG_LISTING_FLAGS;
+  // A write flag wins over whatever else the command lists: `git branch -l -d x`
+  // deletes.
+  if (flags.some((f) => write.has(f))) return true;
+  // All listing flags: the remaining words are patterns (`git tag -l v*`), base
+  // refs (`git branch --merged origin/main`), or values.
+  if (flags.length > 0 && flags.every((f) => listing.has(f))) return false;
+  // A name argument creates (`git branch feat/x`, `git tag v1.0`), and a flag
+  // this list does not know stays blocked in case git grows a writer overnight.
+  return true;
 }
 
 /** `git remote` lists/shows; `add|remove|rename|set-url|set-head|prune` write. */

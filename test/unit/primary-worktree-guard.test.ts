@@ -122,6 +122,17 @@ test("isMutatingGitCommand: blocks commands that change checkout state", () => {
     "git branch -d -v feat/x",
     "git branch -dv feat/x",
     "git branch -f feat/x origin/main",
+    // Long write flags, not just their short forms.
+    "git branch --delete feat/x",
+    "git branch --force feat/x origin/main",
+    "git branch -u origin/main feat/x",
+    "git branch --set-upstream-to=origin/main feat/x",
+    "git branch --unset-upstream",
+    "git branch --edit-description feat/x",
+    "git branch -cv feat/x feat/y",
+    // A flag this list does not know, next to a name: fail closed.
+    "git branch --some-new-flag feat/x",
+    "git tag --cleanup=strip -a v1.0",
     "cd repo && git commit -m x",
     // Unknown verb at a real command position: fail closed in case git grows a
     // mutating verb this list predates.
@@ -152,6 +163,25 @@ test("isMutatingGitCommand: allows read-only inspection and worktree management"
     "git tag --list",
     'git tag --list "v*"',
     "git tag --sort=-creatordate",
+    // Listing filters. The first version of this check looked for the letters
+    // d/f/m/c in any flag, so `--merged` (m, d), `--contains` (c) and
+    // `--format` (f, m) read as a delete or a create — refusing the ordinary
+    // way a session asks which of its branches are already in the base.
+    "git branch --list --merged origin/main",
+    "git branch --merged origin/main",
+    "git branch --no-merged origin/main",
+    "git branch --contains 1a2b3c4",
+    "git branch --points-at HEAD",
+    "git branch --show-current",
+    "git branch -av",
+    "git branch -vv --no-merged origin/main",
+    "git branch --all --sort=-committerdate --color=always",
+    "git branch --format='%(refname:short) %(upstream:track)'",
+    // A format VALUE that starts with a dash is a value, not a flag.
+    'git branch --format="-%(upstream:track)"',
+    "git tag --contains 1a2b3c4",
+    "git tag --merged origin/main",
+    "git tag -v v1.0",
     "git remote -v",
     "git ls-files",
     "git worktree add /tmp/wt -b feat/x",
