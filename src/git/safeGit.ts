@@ -748,6 +748,8 @@ export const testHooks: {
   onConfigList?: () => void;
   /** Tests only: called with the argv of every git child Pi starts (async or sync), so a test can count spawns. */
   onSpawn?: (argv: readonly string[]) => void;
+  /** Tests only: the LFS listing memo's lifetime in ms (default 5000). */
+  lfsListTtlMs?: number;
 } = {};
 
 const failed = (stderr: string): SafeGitResult => ({ code: 128, stdout: "", stderr });
@@ -1665,7 +1667,7 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
     const stamp = lfsListStamp(layout.gitDir, layout.workTree);
     const memo = stamp === undefined ? undefined : lfsListMemo.get(stamp);
     let tracked: string[];
-    if (memo && Date.now() - memo.at < LFS_LIST_TTL_MS) {
+    if (memo && Date.now() - memo.at < (testHooks.lfsListTtlMs ?? LFS_LIST_TTL_MS)) {
       tracked = memo.files;
     } else {
       const listed = runSync(

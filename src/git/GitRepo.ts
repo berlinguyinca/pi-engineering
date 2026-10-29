@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Dirent } from "node:fs";
+import { type Dirent, existsSync, realpathSync } from "node:fs";
 import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
@@ -196,7 +196,8 @@ export interface DurableRecordInventory<T> {
 const openCache = new Map<string, { at: number; top: string }>();
 const DEFAULT_OPEN_TTL_MS = 10_000;
 
-function openTtlMs(): number {
+/** TTL for callers that opt into the open cache: `PI_ENG_GIT_OPEN_TTL_MS` (default 10s, 0 disables). */
+export function openTtlMs(): number {
   const raw = process.env.PI_ENG_GIT_OPEN_TTL_MS;
   const n = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_OPEN_TTL_MS;
@@ -249,14 +250,24 @@ export class GitRepo {
   /**
    * Returns a GitRepo if `cwd` is inside a git work tree, else null.
    *
-   * The resolved toplevel is remembered per cwd for `PI_ENG_GIT_OPEN_TTL_MS` (default 10s, 0 disables): periodic
-   * callers (the presence poll) otherwise spend two safeGit calls, each several git children, to learn the same
-   * answer. Only a positive answer is remembered, and a fresh GitRepo is built each time (no shared state).
+   * Uncached by default: security-relevant callers (binding TOCTOU checks, janitor, orchestrator) must see the
+   * repository as it is now. A periodic, advisory caller (the presence poll) may pass `{ cacheMs }`: the toplevel is
+   * then remembered for that long, keyed on realpath(cwd), and a hit is revalidated with a stat of `<top>/.git`
+   * (a deleted or moved repository misses at once). An aborted signal never uses the cache. Only positive answers are
+   * remembered, and a fresh GitRepo is built each time (no shared state).
    */
-  static async open(cwd: string, signal?: AbortSignal): Promise<GitRepo | null> {
-    const ttl = openTtlMs();
-    const hit = ttl > 0 ? openCache.get(cwd) : undefined;
-    if (hit && Date.now() - hit.at < ttl) {
+  static async open(cwd: string, signal?: AbortSignal, opts: { cacheMs?: number } = {}): Promise<GitRepo | null> {
+    const ttl = opts.cacheMs ?? 0;
+    let cacheKey: string | undefined;
+    if (ttl > 0 && !signal?.aborted) {
+      try {
+        cacheKey = realpathSync(cwd);
+      } catch {
+        cacheKey = undefined;
+      }
+    }
+    const hit = cacheKey !== undefined ? openCache.get(cacheKey) : undefined;
+    if (hit && Date.now() - hit.at < ttl && existsSync(join(hit.top, ".git"))) {
       const repo = new GitRepo(cwd, hit.top);
       repo.signal = signal;
       return repo;
@@ -275,9 +286,9 @@ export class GitRepo {
       const repo = new GitRepo(cwd, stdout.trim());
       repo.signal = signal;
       await repo.git(["rev-parse", "--is-inside-work-tree"]);
-      if (ttl > 0) {
+      if (cacheKey !== undefined) {
         if (openCache.size >= 256) openCache.delete(openCache.keys().next().value as string);
-        openCache.set(cwd, { at: Date.now(), top: stdout.trim() });
+        openCache.set(cacheKey, { at: Date.now(), top: stdout.trim() });
       }
       return repo;
     } catch {
