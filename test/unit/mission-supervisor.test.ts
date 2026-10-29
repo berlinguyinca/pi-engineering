@@ -472,7 +472,7 @@ describe("MissionSupervisor", () => {
 
     const stale = h.supervisor.tick(h.mission.mission_id);
     await firstBlocked;
-    h.store.resumeMission(h.mission.mission_id, "new supervisor generation");
+    h.store.resumeMission(h.mission.mission_id, "new supervisor generation", "operator");
     let dispatched = 0;
     const current = h.supervisor.reconcileOnStartup(() => {
       dispatched++;
@@ -524,7 +524,7 @@ describe("MissionSupervisor", () => {
       supervisor.start();
       await entered;
       supervisor.stop();
-      h.store.resumeMission(h.mission.mission_id, "invalidate blocked interval tick");
+      h.store.resumeMission(h.mission.mission_id, "invalidate blocked interval tick", "operator");
       releaseFlush();
       await new Promise<void>((resolve) => setImmediate(resolve));
       await new Promise<void>((resolve) => setImmediate(resolve));

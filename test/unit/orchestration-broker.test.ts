@@ -335,7 +335,7 @@ describe("ExecutionBroker (spec 03)", () => {
       git.captureDiff = async (...args) => {
         if (!resumed) {
           resumed = true;
-          store.resumeMission(mission.mission_id, "operator resumed during evidence capture");
+          store.resumeMission(mission.mission_id, "operator resumed during evidence capture", "operator");
         }
         return originalCaptureDiff(...args);
       };

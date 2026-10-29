@@ -281,6 +281,37 @@ describe("RecoveryPlanner", () => {
     assert.equal(parked.operatorGuidance, undefined);
   });
 
+  it("makes an exhausted attempt budget terminal for capacity categories when the caller is clock-driven", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 1_000, strategyMaxAttempts: 2 });
+    const transient = new FailureClassifier().classify(baseEvidence("gateway returned 503"));
+    const history = [decision(transient.fingerprint, 1), decision(transient.fingerprint, 2)];
+    const now = Date.parse("2026-09-27T00:00:10.000Z");
+    const stopped = planner.decide({ classification: transient, history, now, exhaustionIsTerminal: true });
+    assert.equal(stopped.action, "STOP");
+    assert.equal(stopped.attempt, 3);
+    assert.ok(stopped.operatorGuidance, "the operator is told what to do");
+    assert.equal(planner.decide({ classification: transient, history, now }).action, "PROBE_AND_BACKOFF");
+  });
+
+  it("starts a fresh budget only at the supplied operator epoch; callers that omit it count every generation", () => {
+    const planner = new RecoveryPlanner({ missionCeiling: 1_000, strategyMaxAttempts: 2 });
+    const old = [1, 2, 3].map((n) => ({ ...decision(classification.fingerprint, n), resumptionGeneration: 0 }));
+    const omitted = (generation: number) =>
+      planner.decide({ classification, history: old, now: 10_000, resumptionGeneration: generation });
+    assert.equal(omitted(0).attempt, 4);
+    assert.equal(omitted(1).attempt, 4, "scheduler/orchestrator callers keep the cumulative count across generations");
+    assert.equal(omitted(1).action, "STOP");
+    const operator = planner.decide({
+      classification,
+      history: old,
+      now: 10_000,
+      resumptionGeneration: 1,
+      budgetEpoch: 1,
+    });
+    assert.equal(operator.attempt, 1);
+    assert.equal(operator.action, "CREATE_REPAIR_TASKS");
+  });
+
   it("allows the next strategy when material evidence changes", () => {
     const planner = new RecoveryPlanner({ missionCeiling: 4, strategyMaxAttempts: 2, decisionTtlMs: 60_000 });
     const history = [decision(classification.fingerprint, 1), decision(classification.fingerprint, 2)];

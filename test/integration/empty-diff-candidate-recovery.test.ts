@@ -383,7 +383,7 @@ describe("never publish an empty-diff candidate over preserved worker work (#173
       attemptedRecoveries: [],
       resumeCondition: "resume",
     });
-    store.resumeMission(missionId, "operator resume");
+    store.resumeMission(missionId, "operator resume", "operator");
     await store.flush();
     const freshOrchestrator = async (modes: AgentMode[]) => {
       const freshStore = MissionStore.open(h.backend);
