@@ -93,6 +93,16 @@ interface Tracked {
   sentence?: string;
   /** True once the runtime itself reported this mission; durable seeds may not demote it. */
   authoritative: boolean;
+  /**
+   * True until the first notification pass. A sighting that merely replays
+   * history (a store seed, the runtime's replay on open) sets the baseline
+   * for change detection and never notifies.
+   */
+  baseline: boolean;
+}
+
+function stateKey(event: RuntimeMissionActivityEvent): string {
+  return `${event.state}|${event.health}|${presenceRank(event)}`;
 }
 
 function flat(text: string, max: number): string {
@@ -146,8 +156,16 @@ export class MissionPresenceController {
    * `source: "store"` is the durable backstop (a mission this session never saw
    * emit anything). It may open a row but never rewrite one the runtime already
    * reported — a seeded row would make a live mission look quieter than it is.
+   *
+   * `source: "replay"` is the runtime re-emitting missions it found on open. It
+   * is current state, so it may rewrite a row, but it is history to the
+   * operator: it never notifies.
    */
-  update(event: RuntimeMissionActivityEvent, basis?: PresenceBasis, source: "activity" | "store" = "activity"): void {
+  update(
+    event: RuntimeMissionActivityEvent,
+    basis?: PresenceBasis,
+    source: "activity" | "store" | "replay" = "activity",
+  ): void {
     if (this.disposed) return;
     const previous = this.live.get(event.missionId);
     if (source === "store" && previous?.authoritative) return;
@@ -155,7 +173,12 @@ export class MissionPresenceController {
       event,
       basis: basis ?? previous?.basis,
       sentence: previous?.sentence,
-      authoritative: source === "activity" ? true : (previous?.authoritative ?? false),
+      authoritative: source === "store" ? (previous?.authoritative ?? false) : true,
+      // A live event that changes state after a replay is a real change; a
+      // first sighting that is itself history, or a repeat of it, stays silent.
+      baseline: previous
+        ? previous.baseline && (source !== "activity" || stateKey(previous.event) === stateKey(event))
+        : source !== "activity",
     });
   }
 
@@ -205,7 +228,7 @@ export class MissionPresenceController {
     this.publishWidget(view);
     this.publishWorkingLine(view);
     this.publishTitle(view);
-    this.notifyAttention(events);
+    this.notifyAttention();
   }
 
   visible(): number {
@@ -245,8 +268,14 @@ export class MissionPresenceController {
   }
 
   /** One notification per state change; a mission cannot spam the terminal. */
-  private notifyAttention(events: readonly RuntimeMissionActivityEvent[]): void {
-    for (const event of events) {
+  private notifyAttention(): void {
+    for (const tracked of this.live.values()) {
+      const event = tracked.event;
+      if (tracked.baseline) {
+        tracked.baseline = false;
+        this.bus.observe(event.missionId, `${event.state}|${event.health}`);
+        continue;
+      }
       const rank = presenceRank(event);
       const urgent = rank <= 1 || NOTIFY_STATES.has(event.state);
       // A quiet sighting is still a change worth remembering: the next one
