@@ -17,6 +17,7 @@
 
 import { createHash } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
+import { DEFAULT_CONTEXT_THRESHOLDS } from "../context/thresholds.ts";
 import { id } from "../core/ids.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import type { MissionLimitsConfig } from "../lifecycle/policy.ts";
@@ -27,6 +28,7 @@ import { describeOperatorPause } from "../runtime/operatorModelPin.ts";
 import type { WorkerActivity } from "../workers/WorkerExecutor.ts";
 import {
   AWAITING_MODEL_RESPONSE_SUMMARY,
+  CONTEXT_USAGE_SUMMARY,
   TOOL_PROGRESS_SUMMARY,
   TURN_SUMMARY,
   WAITING_FOR_INFERENCE_SUMMARY,
@@ -43,6 +45,7 @@ import {
 } from "./broker.ts";
 import { CheckpointManager } from "./checkpoints.ts";
 import { CompletionGate } from "./completionGate.ts";
+import { ContextHandoffTrigger } from "./contextHandoffTrigger.ts";
 import {
   buildCandidateEvidenceIdentity,
   hashCandidateEvidenceIdentity,
@@ -184,13 +187,20 @@ export interface OrchestratorOptions {
   phaseHandoff?: {
     /** Resolves a model id to its context window (tokens), or null when unknown. */
     contextWindowForModel?: ContextWindowResolver;
-    /** Utilization at/above which a boundary hands off. Default 0.75. */
+    /** Utilization at/above which a boundary hands off. Default 0.70 (the soft level). */
     threshold?: number;
     /**
      * Resolves the handing-off session endpoint (predecessor) for a mission.
      * Default: the orchestrator's parent session at generation 0, when set.
      */
     endpoint?: (mission: Mission) => { sessionId: string; generation: number } | null | undefined;
+    /**
+     * Resolved context-threshold triple for a model (context/thresholds.ts). The live trigger uses it: `preferred`
+     * requests a checkpoint and a `context` handoff at the next safe point, `emergency` at once. Default triple when absent.
+     */
+    thresholdsForModel?: (model: string | null) => import("../context/thresholds.ts").ContextThresholds;
+    /** Models a quota-exhausted run may switch to (runtime/host/quotaResume.ts). Empty = none known. */
+    quotaCatalogue?: () => readonly import("../runtime/host/quotaResume.ts").QuotaResumeModel[];
   } | null;
   parentSessionId?: string | null;
   limits?: {
@@ -452,6 +462,8 @@ export class Orchestrator {
   private readonly specApproval?: OrchestratorOptions["specApproval"];
   private readonly recoveryPlanner: RecoveryPlanner;
   private readonly phaseHandoffCfg: OrchestratorOptions["phaseHandoff"] | null;
+  /** Live context-threshold and quota handoff trigger; null unless `phaseHandoff` is configured. */
+  private readonly continuityTrigger: ContextHandoffTrigger | null = null;
   /** Last phase observed per mission, so the boundary handoff fires once per transition. */
   private readonly missionPhase = new Map<string, string>();
   private readonly failureClassifier = new FailureClassifier();
@@ -536,6 +548,26 @@ export class Orchestrator {
     this.onPhase = opts.onPhase;
     this.observability = opts.observability ?? null;
     this.parentSessionId = opts.parentSessionId ?? null;
+    const handoffCfg = this.phaseHandoffCfg;
+    if (handoffCfg) {
+      this.continuityTrigger = new ContextHandoffTrigger({
+        thresholdsFor: (model) => handoffCfg.thresholdsForModel?.(model) ?? DEFAULT_CONTEXT_THRESHOLDS,
+        requestCheckpoint: (executionId) => this.broker.requestCheckpoint(executionId),
+        latestCheckpointSha: (missionId, taskId) =>
+          this.store.listTaskCheckpoints(missionId, taskId).at(-1)?.candidateSha ?? undefined,
+        addHandoff: (record) => this.store.addHandoffRecord(record),
+        endpoint: (missionId) => {
+          const mission = this.store.getMission(missionId);
+          if (!mission) return null;
+          return (
+            handoffCfg.endpoint?.(mission) ??
+            (this.parentSessionId ? { sessionId: this.parentSessionId, generation: 0 } : null)
+          );
+        },
+        report: (missionId, line) => this.report(missionId, line),
+        ...(handoffCfg.quotaCatalogue ? { catalogue: handoffCfg.quotaCatalogue } : {}),
+      });
+    }
     this.workspaceResolver = opts.workspaceResolver ?? new WorkspaceManifestResolver();
     this.repositoryRegistry = opts.repositoryRegistry;
     this.launchCwd = opts.launchCwd ?? ".";
@@ -1811,15 +1843,17 @@ export class Orchestrator {
 
     const checkpointSha = this.store.listTaskCheckpoints(mission.mission_id).at(-1)?.candidateSha ?? undefined;
     try {
-      const record = this.store.addHandoffRecord(
-        buildPhaseTransitionRecord({
+      const record = this.store.addHandoffRecord({
+        // A phase handoff is only emitted under context pressure (>= the soft level), so say so.
+        ...buildPhaseTransitionRecord({
           missionId: mission.mission_id,
           fromPhase,
           toPhase,
           endpoint,
           ...(checkpointSha ? { checkpointSha } : {}),
         }),
-      );
+        cause: "context_pressure",
+      });
       this.report(
         mission.mission_id,
         `[mission ${mission.mission_id}] phase ${fromPhase ?? "start"} -> ${toPhase}: phase_transition handoff ${record.id}${checkpointSha ? ` @ ${checkpointSha.slice(0, 7)}` : ""} (utilization ${utilization!.toFixed(2)})`,
@@ -1835,6 +1869,44 @@ export class Orchestrator {
     }
   }
 
+  /** Feed the live context/quota signals of a worker to the continuity trigger (never throws, never blocks). */
+  private observeContinuitySignals(
+    event: WorkerActivity & { missionId: string; taskId: string; executionId: string },
+  ): void {
+    const trigger = this.continuityTrigger;
+    if (!trigger) return;
+    const swallow = (): undefined => undefined;
+    if (event.context) {
+      void trigger
+        .observe({
+          missionId: event.missionId,
+          taskId: event.taskId,
+          executionId: event.executionId,
+          model: event.context.model,
+          tokens: event.context.tokens,
+          window: event.context.window,
+        })
+        .catch(swallow);
+    } else if (event.kind === "checkpoint") {
+      void trigger.safePoint(event.executionId).catch(swallow);
+    } else if (event.inferenceFailure === "quota") {
+      void trigger
+        .quotaExhausted({
+          missionId: event.missionId,
+          taskId: event.taskId,
+          executionId: event.executionId,
+          model: this.store.getExecution(event.executionId)?.model ?? "unknown",
+          failureClass: "quota",
+        })
+        .catch(swallow);
+    } else if (
+      event.kind === "execution" &&
+      (event.phase === "completed" || event.phase === "failed" || event.phase === "canceled")
+    ) {
+      trigger.forget(event.executionId);
+    }
+  }
+
   private observeWorkerActivity(
     event: WorkerActivity & {
       missionId: string;
@@ -1842,6 +1914,7 @@ export class Orchestrator {
       executionId: string;
     },
   ): void {
+    this.observeContinuitySignals(event);
     const obs = this.observability;
     if (!this.observedExecutions.has(event.executionId)) {
       this.observedExecutions.add(event.executionId);
@@ -1910,7 +1983,7 @@ export class Orchestrator {
         }
       }
     }
-    if (!TURN_SUMMARY.test(event.summary))
+    if (!TURN_SUMMARY.test(event.summary) && event.summary !== CONTEXT_USAGE_SUMMARY)
       this.report(event.missionId, `[mission ${event.missionId}] ${event.summary}`);
   }
 

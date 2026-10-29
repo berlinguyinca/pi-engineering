@@ -14,6 +14,7 @@
  */
 
 import { formatTokens } from "./capability.ts";
+import { CONTEXT_PRESSURE_RATIO } from "./thresholds.ts";
 
 export interface ContextReading {
   usedTokens: number;
@@ -26,8 +27,8 @@ export interface ContextReading {
   pressure: boolean;
 }
 
-/** Warn-before threshold as a fraction of the window (spec: Pi warns ~20% left). */
-export const CONTEXT_PRESSURE_RATIO = 0.8;
+/** Warn-before threshold: the `preferred` level of the one threshold triple (context/thresholds.ts). */
+export { CONTEXT_PRESSURE_RATIO };
 
 export function contextReading(usedTokens: number, windowTokens: number): ContextReading {
   const used = Math.max(0, Math.round(Number.isFinite(usedTokens) ? usedTokens : 0));

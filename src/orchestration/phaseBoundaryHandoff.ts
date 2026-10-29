@@ -11,11 +11,16 @@
  * for deterministic ids), no classes, never mutates its inputs.
  */
 
+import { DEFAULT_CONTEXT_THRESHOLDS } from "../context/thresholds.ts";
 import type { HandoffEndpoint } from "../runtime/host/handoffKinds.ts";
 import { type HandoffFallback, decideHandoffFallback } from "../runtime/host/handoffRecovery.ts";
 
-/** Context-utilization ratio at/above which a boundary triggers a handoff. */
-export const PHASE_HANDOFF_THRESHOLD = 0.75;
+/**
+ * Context-utilization ratio at/above which a boundary triggers a handoff: the `soft` level of the one threshold triple
+ * (context/thresholds.ts). A phase boundary is a free safe point, so it hands off at `soft` rather than waiting for
+ * `preferred`. (Was a separate 0.75.)
+ */
+export const PHASE_HANDOFF_THRESHOLD = DEFAULT_CONTEXT_THRESHOLDS.soft;
 
 /** The execution fields the utilization computation needs. */
 export interface PhaseHandoffExecution {
@@ -66,7 +71,7 @@ export interface PhaseHandoffDecisionInput {
   toPhase: string;
   /** Current context utilization, or null when no data is available. */
   contextUtilization: number | null;
-  /** Utilization at/above which the boundary hands off. Default 0.75. */
+  /** Utilization at/above which the boundary hands off. Default 0.70 (the soft level). */
   threshold?: number;
 }
 

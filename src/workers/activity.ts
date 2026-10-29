@@ -47,6 +47,12 @@ function toolOutputPreview(result: unknown): string | undefined {
   );
 }
 
+/** Live context size of a worker session; carries `context` (numbers + model id), never content. */
+export const CONTEXT_USAGE_SUMMARY = "Context usage";
+/** The provider refused the run for quota; carries `inferenceFailure: "quota"`. A distinct cause from context pressure. */
+export const QUOTA_EXHAUSTED_SUMMARY = "Inference quota exhausted";
+const SAFE_MODEL_ID = /^[A-Za-z0-9._:/@+-]{1,128}$/;
+
 /** Per-turn summary (mission.obs.worker): fixed shape, so the metrics are computable from events. */
 export const TURN_SUMMARY = /^Turn ended: stop=[a-zA-Z_]{1,32} tool_error=[a-z_]{1,32}$/;
 
@@ -287,6 +293,30 @@ export function sanitizeWorkerActivity(value: unknown): WorkerActivity | null {
       summary: `${stageLabel(stage)} ${verb}`,
       meaningfulProgress: input.phase === "completed",
     };
+  }
+  if (input.kind === "state" && input.summary === CONTEXT_USAGE_SUMMARY && input.phase === undefined) {
+    const c = input.context;
+    if (
+      !c ||
+      !Number.isFinite(c.tokens) ||
+      !Number.isFinite(c.window) ||
+      c.tokens < 0 ||
+      c.window <= 0 ||
+      typeof c.model !== "string" ||
+      !SAFE_MODEL_ID.test(c.model)
+    ) {
+      return null;
+    }
+    return {
+      kind: "state",
+      summary: CONTEXT_USAGE_SUMMARY,
+      meaningfulProgress: false,
+      context: { tokens: Math.round(c.tokens), window: Math.round(c.window), model: c.model },
+    };
+  }
+  if (input.kind === "state" && input.summary === QUOTA_EXHAUSTED_SUMMARY && input.phase === undefined) {
+    if (input.inferenceFailure !== "quota") return null;
+    return { kind: "state", summary: QUOTA_EXHAUSTED_SUMMARY, meaningfulProgress: false, inferenceFailure: "quota" };
   }
   if (input.kind === "state") {
     if (

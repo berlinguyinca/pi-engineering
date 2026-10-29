@@ -33,6 +33,13 @@ export interface HandoffEndpoint {
   generation: number;
 }
 
+/**
+ * WHY a handoff was prepared when it was not asked for. Context pressure (a threshold crossing) and provider quota
+ * exhaustion are distinct causes and are never conflated; absent means an ordinary phase/manual handoff.
+ */
+export const HANDOFF_CAUSES = ["context_pressure", "quota_exhausted"] as const;
+export type HandoffCause = (typeof HANDOFF_CAUSES)[number];
+
 /** The durable, typed record of one handoff. */
 export interface HandoffRecord {
   id: string;
@@ -51,6 +58,8 @@ export interface HandoffRecord {
   verifiedAt?: string;
   /** ISO timestamp at which the source's lease/process was fenced; only ever set after `verifiedAt`. */
   sourceFencedAt?: string;
+  /** Why the handoff was triggered, when it was an automatic continuity handoff. */
+  cause?: HandoffCause;
 }
 
 const CHECKPOINT_SHA_PATTERN = /^[0-9a-f]{7,64}$/;
@@ -152,6 +161,10 @@ export function validateHandoffRecord(
     errors.push("sourceFencedAt requires verifiedAt (verify before revoke)");
   }
 
+  if (obj.cause !== undefined && !(HANDOFF_CAUSES as readonly unknown[]).includes(obj.cause)) {
+    errors.push(`cause must be one of ${HANDOFF_CAUSES.join(", ")} when present`);
+  }
+
   if (typeof state === "string" && REQUIRED_ACK_STATES.has(state as HandoffState)) {
     if (obj.successor === undefined) errors.push(`successor is required for state ${state}`);
     if (obj.ackAt === undefined) errors.push(`ackAt is required for state ${state}`);
@@ -175,5 +188,6 @@ export function validateHandoffRecord(
   if (obj.ackAt !== undefined) record.ackAt = obj.ackAt as string;
   if (obj.verifiedAt !== undefined) record.verifiedAt = obj.verifiedAt as string;
   if (obj.sourceFencedAt !== undefined) record.sourceFencedAt = obj.sourceFencedAt as string;
+  if (obj.cause !== undefined) record.cause = obj.cause as HandoffCause;
   return { ok: true, record };
 }
