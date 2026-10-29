@@ -975,7 +975,12 @@ primary checkout:
   `reset`, `merge`, `rebase`, `cherry-pick`, `am`, `apply`, `stash` (except
   `list`/`show`), `add`, `rm`, `mv`, `restore`, `revert`, `update-ref`,
   `gc`/`prune`/`clean`/`filter-branch`, `replace`, `notes` (except `list`),
-  `tag <name>`, `branch <name>`/`-d`/`-D`/`-f`, `config` settings);
+  `tag <name>` or a tag write flag (`-d`/`--delete`, `-f`/`--force`,
+  `-a`/`--annotate`, `-m`/`--message`, `-F`/`--file`, `-s`/`--sign`,
+  `-u`/`--local-user`), `branch <name>` or a branch write flag
+  (`-d`/`--delete`, `-f`/`--force`, `-m`/`-M`/`-c`/`-C` move and copy,
+  `-u`/`--set-upstream-to`, `--track`, `--unset-upstream`,
+  `--edit-description`), `config` settings);
 - bash writes into it (`> f`, `>> f`, `tee f`, `sed -i … f`, `mv`/`cp` into
   it).
 
@@ -989,7 +994,11 @@ Read-only inspection (`git status`, `log`, `diff`, `show`, `fetch`, `ls-remote`,
 `cat-file`, `for-each-ref`, `rev-list`, `merge-base`, `reflog`, `grep`, a bare
 `git tag`, `git remote -v`, …) and worktree management (`git worktree
 add|remove|list|prune`) stay allowed — that is how a session observes the repo
-and **leaves** for its own worktree. The block reason tells the model the
+and **leaves** for its own worktree. A `branch`/`tag` command whose flags are
+all listing filters (`--merged`, `--no-merged`, `--contains`, `--points-at`,
+`--show-current`, `--format`, `--sort`, `-a`, `-r`, `-v`, `-l`) lists, whatever
+words follow them — they are patterns, base refs, or flag values; a flag this
+list does not know stays blocked. The block reason tells the model the
 escape hatch: `git worktree add <sibling-dir> -b <branch> origin/<base>`; when
 the session's own worktree is gone (it removed it, or it was cleaned up) the
 reason says so and gives the command that gets one back.
