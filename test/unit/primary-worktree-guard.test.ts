@@ -30,6 +30,7 @@ import {
   extractWriteTargets,
   isMutatingGitCommand,
   isPrimaryWorktree,
+  mutatingGitSegment,
   resolvePrimaryWorktreeGuardConfig,
 } from "../../src/guard/primaryWorktreeGuard.ts";
 
@@ -137,6 +138,8 @@ test("isMutatingGitCommand: allows read-only inspection and worktree management"
     "git branch -vv",
     "git tag -l v*",
     "git tag --list",
+    'git tag --list "v*"',
+    "git tag --sort=-creatordate",
     "git remote -v",
     "git ls-files",
     "git worktree add /tmp/wt -b feat/x",
@@ -146,6 +149,121 @@ test("isMutatingGitCommand: allows read-only inspection and worktree management"
     "gh pr checks 168",
   ]) {
     assert.equal(isMutatingGitCommand(command), false, command);
+  }
+});
+
+// ── inspection verbs that were in neither list, so they failed closed ───────
+
+test("isMutatingGitCommand: object and ref inspection is read-only", () => {
+  // Every verb here was refused in a live session as if it changed the primary
+  // checkout: it is neither in READ_ONLY_VERBS nor MUTATING_VERBS, and an
+  // unknown verb at a command position fails closed. The command that gave it
+  // away was `git ls-remote --heads origin` — asking what upstream holds, while
+  // the session was trying to recover the worktree it had just removed.
+  for (const command of [
+    "git ls-remote --heads origin",
+    "git -C /repo ls-remote origin refs/heads/main",
+    "git rev-list --count origin/main..HEAD",
+    "git cat-file -p 524176f18392",
+    "git ls-tree -r HEAD src",
+    "git ls-files --others",
+    "git show-ref --heads",
+    "git merge-base --is-ancestor HEAD origin/main",
+    "git for-each-ref --format=%(refname) refs/heads",
+    "git reflog",
+    "git reflog show HEAD",
+    "git name-rev 524176f18392",
+    "git grep TODO src",
+    "git annotate src/a.py",
+    "git cherry origin/main HEAD",
+    "git whatchanged -1",
+    "git verify-commit 524176f18392",
+    "git verify-tag v0.2.0",
+    "git verify-pack -v .git/objects/pack/pack.idx",
+    "git count-objects -v",
+    "git remote",
+    "git remote show origin",
+    "git remote get-url origin",
+    "git remote update origin",
+  ]) {
+    assert.equal(isMutatingGitCommand(command), false, command);
+  }
+});
+
+test("isMutatingGitCommand: the write subcommands of read-only verbs still block", () => {
+  for (const command of [
+    "git reflog delete HEAD@{0}",
+    "git reflog expire --expire=now --all",
+    "git for-each-ref --stdin --delete",
+    "git for-each-ref --create-reflog",
+    "git branch -D feat/x",
+    "git tag -d v1.0",
+    // Tag writes that the "a flag means it is a listing" rule read as harmless:
+    // an annotated/signed tag creation and a forced move both write a ref.
+    "git tag -a v1.0 -m release",
+    "git tag --annotate v1.0 --message release",
+    "git tag -s v1.0",
+    "git tag -f v1.0 HEAD",
+    "git tag --delete v1.0",
+    "git tag v1.0 HEAD",
+    "git stash drop",
+    "git config user.email a@b.c",
+    "git remote set-url origin https://evil.example/repo",
+    "git remote remove origin",
+    "git remote rename origin upstream",
+    "git remote prune origin",
+  ]) {
+    assert.equal(isMutatingGitCommand(command), true, command);
+  }
+});
+
+// ── which half of a compound command tripped ────────────────────────────────
+
+test("mutatingGitSegment: names the segment that blocks, not the whole command", () => {
+  // The exact shape that stranded a live session: the allowed `worktree` half
+  // chained to the blocked `branch -D` half. The refusal was correct; the
+  // reason pointed at neither half, so the session re-ran the same mix four
+  // times before reaching for `--git-dir` to get around it.
+  const command =
+    "git -C /repo worktree remove --force /repo-wt && git -C /repo branch -D fix/x && git -C /repo worktree list";
+  const culprit = mutatingGitSegment(command);
+  assert.equal(culprit?.verb, "branch", command);
+  assert.match(culprit?.segment ?? "", /branch -D fix\/x/);
+  assert.ok(!culprit!.segment.includes("worktree remove"), "the allowed half is not the culprit");
+
+  // An allowed compound command has no culprit at all.
+  assert.equal(mutatingGitSegment("git -C /repo worktree remove --force /repo-wt && git -C /repo worktree list"), null);
+  assert.equal(mutatingGitSegment("git -C /repo ls-remote --heads origin && git -C /repo log --oneline -3"), null);
+
+  // The first offender wins; unknown verbs at a command position still count.
+  assert.equal(mutatingGitSegment("git commit -m x && git push origin main")?.verb, "commit");
+  assert.equal(mutatingGitSegment("git status && git what")?.verb, "what");
+});
+
+test("guard: the block reason names the segment that tripped", async () => {
+  const guard = guardFor(async (root) => root === "/repo", {}, "/repo");
+  const blocked = await guard.onToolCall("bash", {
+    command: "git worktree remove --force /repo-wt && git branch -D fix/x",
+  });
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /Culprit segment/u);
+  assert.match(blocked?.reason ?? "", /branch -D fix\/x/u);
+  assert.match(blocked?.reason ?? "", /run the allowed parts/u);
+  // The standing escape hatches are still spelled out.
+  assert.match(blocked?.reason ?? "", /worktree add/i);
+  assert.match(blocked?.reason ?? "", /PI_ENG_PRIMARY/);
+});
+
+test("guard: inspection commands run in the primary checkout", async () => {
+  const guard = guardFor(async (root) => root === "/repo", {}, "/repo");
+  for (const command of [
+    "git ls-remote --heads origin",
+    "git rev-list --count origin/main..HEAD",
+    "git for-each-ref refs/heads",
+    "git reflog",
+    "git worktree remove --force /repo-wt && git worktree list",
+  ]) {
+    assert.equal(await guard.onToolCall("bash", { command }), undefined, command);
   }
 });
 
