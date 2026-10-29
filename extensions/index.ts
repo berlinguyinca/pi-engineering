@@ -633,8 +633,9 @@ function cachedRepoKey(cwd: string): string | undefined {
   return repoKeys.cached(cwd);
 }
 
+/** Always asks git: runtime opening and workspace rebinding decide from it. Only the presence poll uses the cache. */
 function repoCacheKey(cwd: string): Promise<string> {
-  return repoKeys.resolve(cwd);
+  return repoKeys.resolve(cwd, { fresh: true });
 }
 
 /** The real reason the runtime did not open, by cwd, for tool results. */

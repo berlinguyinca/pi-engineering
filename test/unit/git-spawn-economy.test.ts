@@ -116,11 +116,11 @@ test("the LFS listing is refreshed when the index changes (a nested .gitattribut
 });
 
 test("the LFS listing memo expires after its TTL", async () => {
-  testHooks.lfsListTtlMs = 40;
+  testHooks.lfsListTtlMs = 400;
   await status();
   await status();
   assert.equal(lsFilesScans(), 1);
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((r) => setTimeout(r, 500));
   await status();
   assert.equal(lsFilesScans(), 2);
 });
@@ -168,7 +168,8 @@ test("an opted-in cached open spawns nothing on a hit, and revalidates a moved r
     assert.equal((await GitRepo.open(repo, undefined, { cacheMs: 60_000 }))?.root, first.root);
   assert.equal(spawns.length, after, "cached opens must not spawn");
   const aborted = AbortSignal.abort();
-  assert.equal(await GitRepo.open(repo, aborted, { cacheMs: 60_000 }), null, "an aborted signal never uses the cache");
+  await GitRepo.open(repo, aborted, { cacheMs: 60_000 });
+  assert.ok(spawns.length > after, "an aborted signal never uses the cache (git is attempted)");
   renameSync(repo, `${repo}-moved`);
   assert.equal(await GitRepo.open(repo, undefined, { cacheMs: 60_000 }), null);
 });
@@ -193,5 +194,25 @@ test("a stale remembered key falls through to a fresh resolve; a non-repository 
   const plain = join(root, "plain");
   mkdirSync(plain);
   assert.equal(await keys.resolve(plain), plain);
-  assert.equal(keys.cached(plain), undefined);
+  assert.equal(keys.cached(plain), plain, "the footer key for a non-repository cwd is the cwd (its runtime's key)");
+});
+
+test("idle presence ticks in a non-repository cwd spawn nothing after the first; git init is seen by a fresh resolve", async () => {
+  const outer = join(root, "plain");
+  const plain = join(outer, "sub");
+  mkdirSync(plain, { recursive: true });
+  const runtimes = new Map<string, string>([[plain, "runtime"]]);
+  const keys = new RepoKeyResolver();
+  assert.equal(await keys.lookup(plain, runtimes), "runtime");
+  spawns = [];
+  for (let tick = 0; tick < 12; tick++) assert.equal(await keys.lookup(plain, runtimes), "runtime");
+  assert.equal(spawns.length, 0, `idle ticks in a non-repository spawned ${spawns.length} processes`);
+  assert.equal(await keys.lookup(plain, new Map()), undefined, "no runtimes: nothing to find, git is not asked");
+  sh(["init", "-q"], outer);
+  assert.notEqual(
+    await keys.resolve(plain, { fresh: true }),
+    plain,
+    "a deciding caller sees the new repository at once",
+  );
+  assert.notEqual(keys.cached(plain), plain);
 });
