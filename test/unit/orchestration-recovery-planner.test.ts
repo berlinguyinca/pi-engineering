@@ -358,6 +358,7 @@ describe("RecoveryPlanner", () => {
       });
       assert.equal(parked.action, wait, summary);
       assert.match(parked.expectedMaterialChange, /parks instead of stopping/i, summary);
+      assert.doesNotMatch(parked.expectedMaterialChange, /exhausted/i, summary);
     }
   });
 
