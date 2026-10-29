@@ -131,12 +131,17 @@ function readLedger(file: string | undefined): Map<string, string> {
   }
 }
 
-/** The most recent timestamp the event carries; undefined when none parses (no evidence it is old). */
+/**
+ * The most recent state timestamp the event carries; undefined when none parses
+ * (no evidence it is old). `observedAt` is the runtime's emit time, not the
+ * state's, so it is only a fallback when neither progress nor heartbeat parses.
+ */
 function lastStateAt(event: RuntimeMissionActivityEvent): number | undefined {
-  const stamps = [event.lastMeaningfulProgressAt, event.lastHeartbeatAt, event.observedAt]
-    .map((stamp) => (stamp ? Date.parse(stamp) : Number.NaN))
-    .filter(Number.isFinite);
-  return stamps.length > 0 ? Math.max(...stamps) : undefined;
+  const parse = (stamp: string | null | undefined) => (stamp ? Date.parse(stamp) : Number.NaN);
+  const state = [parse(event.lastMeaningfulProgressAt), parse(event.lastHeartbeatAt)].filter(Number.isFinite);
+  if (state.length > 0) return Math.max(...state);
+  const observed = parse(event.observedAt);
+  return Number.isFinite(observed) ? observed : undefined;
 }
 
 function flat(text: string, max: number): string {
@@ -232,8 +237,9 @@ export class MissionPresenceController {
     if (this.ledgerFile) this.ledger = readLedger(this.ledgerFile);
   }
 
-  private remember(missionId: string, key: string): void {
-    this.refreshLedger();
+  /** `fresh`: the caller read the ledger moments ago, so skip the second read. */
+  private remember(missionId: string, key: string, fresh = false): void {
+    if (!fresh) this.refreshLedger();
     if (this.ledger.get(missionId) === key) return;
     this.ledger.delete(missionId);
     this.ledger.set(missionId, key);
@@ -378,7 +384,7 @@ export class MissionPresenceController {
         `Mission ${event.missionId} ${what}${reason ? `: ${reason}` : ""}${next}`,
         rank <= 1 || event.state === "FAILED" ? "warning" : "info",
       );
-      this.remember(event.missionId, key);
+      this.remember(event.missionId, key, true);
     }
   }
 

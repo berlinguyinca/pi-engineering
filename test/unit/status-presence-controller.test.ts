@@ -21,6 +21,8 @@ const now = () => clock;
 function mission(overrides: Partial<RuntimeMissionActivityEvent> = {}): RuntimeMissionActivityEvent {
   return {
     missionId: "MSN-1",
+    // The runtime stamps every emit with the time it was observed, never the time of the state.
+    observedAt: new Date(now()).toISOString(),
     title: "presence strip",
     phase: "EXECUTING",
     state: "EXECUTING",
@@ -525,4 +527,28 @@ test("a ledger that is not an object of strings is ignored entry by entry", () =
     assert.equal(sink.notices.length, 1, content);
     controller.dispose();
   }
+});
+
+test("a long-stopped mission stays silent even though the runtime stamps observedAt with now", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  const event = staleFailed();
+  assert.equal(event.observedAt, new Date(T0).toISOString());
+  controller.update(event, undefined, "activity");
+  controller.tick();
+  assert.deepEqual(sink.notices, []);
+  controller.dispose();
+});
+
+test("observedAt alone is the fallback only when no state timestamp parses", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(
+    mission({ state: "FAILED", health: "failed", lastMeaningfulProgressAt: null, lastHeartbeatAt: undefined }),
+    undefined,
+    "activity",
+  );
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  controller.dispose();
 });
