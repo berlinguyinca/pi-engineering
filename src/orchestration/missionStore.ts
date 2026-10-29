@@ -3756,7 +3756,7 @@ export class MissionStore {
   resumeMission(
     missionId: string,
     reason: string,
-    origin: NonNullable<MissionResumption["origin"]> = "operator",
+    origin: NonNullable<MissionResumption["origin"]>,
   ): MissionResumption {
     if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
     const currentLease = this.missionLeases.get(missionId);

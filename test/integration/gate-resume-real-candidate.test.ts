@@ -284,7 +284,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
     const h = await harness({ category: "PROVIDER_TRANSIENT", failureReason: "failed: Connection error." });
     try {
       const integrationsBefore = h.store.listTasks(h.missionId).filter((task) => task.kind === "integration").length;
-      h.store.resumeMission(h.missionId, "provider answers");
+      h.store.resumeMission(h.missionId, "provider answers", "operator");
       const resumed = await h.orchestrator.repairBlockedMission(h.missionId);
 
       const signals = SIGNALS(h);
@@ -307,7 +307,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
     const h = await harness({ category: "PROVIDER_TRANSIENT", failureReason: "failed: Connection error." });
     try {
       const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-process-controller" }));
-      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      h.store.resumeMission(h.missionId, "operator resumed from a new session", "operator");
       const resumed = await freshProcess.repairBlockedMission(h.missionId);
 
       const signals = SIGNALS(h);
@@ -327,7 +327,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
     });
     try {
       const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "review-controller" }));
-      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      h.store.resumeMission(h.missionId, "operator resumed from a new session", "operator");
       const resumed = await freshProcess.repairBlockedMission(h.missionId);
 
       assert.equal(resumed.status, "COMPLETE", JSON.stringify(SIGNALS(h)));
@@ -350,7 +350,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
     });
     try {
       const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-validated" }));
-      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      h.store.resumeMission(h.missionId, "operator resumed from a new session", "operator");
       const resumed = await freshProcess.repairBlockedMission(h.missionId);
 
       const stop = h.store.listMissionStops(h.missionId).at(-1);
@@ -378,7 +378,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
     });
     try {
       const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-red" }));
-      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      h.store.resumeMission(h.missionId, "operator resumed from a new session", "operator");
       const resumed = await freshProcess.repairBlockedMission(h.missionId);
 
       assert.notEqual(resumed.status, "COMPLETE");
@@ -404,7 +404,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
     });
     try {
       const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-changes" }));
-      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      h.store.resumeMission(h.missionId, "operator resumed from a new session", "operator");
       const resumed = await freshProcess.repairBlockedMission(h.missionId);
 
       assert.notEqual(resumed.status, "COMPLETE");
@@ -424,7 +424,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
     });
     try {
       const freshProcess = h.buildOrchestrator(new MissionOwnership(h.store, { ownerId: "fresh-single-probe" }));
-      h.store.resumeMission(h.missionId, "operator resumed from a new session");
+      h.store.resumeMission(h.missionId, "operator resumed from a new session", "operator");
       await freshProcess.repairBlockedMission(h.missionId);
       const generation = h.store.listMissionResumptions(h.missionId).at(-1)!.generation;
       const probes = h.store
@@ -440,7 +440,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
   describe("fallback to the current resumption lease", () => {
     type FlightHolder = { recoveryOwnershipByFlight: Map<string, unknown> };
     const withFlightLease = async (h: Awaited<ReturnType<typeof harness>>, ownerId: string, now?: () => number) => {
-      h.store.resumeMission(h.missionId, "operator resume");
+      h.store.resumeMission(h.missionId, "operator resume", "operator");
       const ownership = new MissionOwnership(h.store, { ownerId, leaseMs: 1_000, now });
       const orchestrator = h.buildOrchestrator(ownership);
       const generation = h.store.listMissionResumptions(h.missionId).at(-1)!.generation;
@@ -525,7 +525,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
   it("re-derives a legacy REVIEW_FAILED row whose reason is a transport failure", async () => {
     const h = await harness({ category: "VALIDATION_FAILED", failureReason: "failed: Connection error." });
     try {
-      h.store.resumeMission(h.missionId, "operator resume");
+      h.store.resumeMission(h.missionId, "operator resume", "operator");
       const resumed = await h.orchestrator.repairBlockedMission(h.missionId);
 
       const signals = SIGNALS(h);
@@ -543,7 +543,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
       failureReason: "failed: tests failed: network timeout in the provider adapter test",
     });
     try {
-      h.store.resumeMission(h.missionId, "operator resume");
+      h.store.resumeMission(h.missionId, "operator resume", "operator");
       await h.orchestrator.repairBlockedMission(h.missionId);
 
       const signals = SIGNALS(h);
@@ -562,7 +562,7 @@ describe("gate resume against a Git-verified candidate (issue #170)", () => {
       unverifiableCandidate: true,
     });
     try {
-      h.store.resumeMission(h.missionId, "provider answers");
+      h.store.resumeMission(h.missionId, "provider answers", "operator");
       const resumed = await h.orchestrator.repairBlockedMission(h.missionId);
 
       assert.equal(h.calls.validation, 0);

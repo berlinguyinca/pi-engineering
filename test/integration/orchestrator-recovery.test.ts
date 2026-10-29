@@ -640,7 +640,7 @@ async function realGateRepairHarness(
       attemptedRecoveries: [],
       resumeCondition: "install recovery fix",
     });
-    store.resumeMission(mission.mission_id, "verified maintenance recovery");
+    store.resumeMission(mission.mission_id, "verified maintenance recovery", "operator");
   }
   const order: string[] = [];
   const registry = new RepositoryRegistry();
@@ -651,7 +651,7 @@ async function realGateRepairHarness(
   const originalCaptureDiff = promotionGit.captureDiff.bind(promotionGit);
   if (race === "promotion") {
     promotionGit.promoteCandidate = async (...args) => {
-      store.resumeMission(mission.mission_id, "explicit resumption during promotion");
+      store.resumeMission(mission.mission_id, "explicit resumption during promotion", "operator");
       return originalPromotion(...args);
     };
   }
@@ -661,7 +661,7 @@ async function realGateRepairHarness(
       const diff = await originalCaptureDiff(...args);
       if (!resumed) {
         resumed = true;
-        store.resumeMission(mission.mission_id, "explicit resumption during captureDiff");
+        store.resumeMission(mission.mission_id, "explicit resumption during captureDiff", "operator");
       }
       return diff;
     };
@@ -698,7 +698,7 @@ async function realGateRepairHarness(
         runIntegration: async (input) => {
           order.push("integration");
           if (race === "integration") {
-            store.resumeMission(mission.mission_id, "explicit resumption during integration");
+            store.resumeMission(mission.mission_id, "explicit resumption during integration", "operator");
           }
           for (const [sequence, handoff] of input.handoffs.entries()) {
             const merged = await git.mergeRefInWorktree(
@@ -1145,7 +1145,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
     };
     const stale = h.orchestrator.repairBlockedMission(h.missionId);
     await firstStarted;
-    h.store.resumeMission(h.missionId, "operator resumed while old preflight was pending");
+    h.store.resumeMission(h.missionId, "operator resumed while old preflight was pending", "operator");
     const current = h.orchestrator.repairBlockedMission(h.missionId);
     releaseFirst();
 
@@ -1210,7 +1210,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
     };
     const stale = h.orchestrator.repairBlockedMission(h.missionId);
     await started;
-    h.store.resumeMission(h.missionId, "new generation");
+    h.store.resumeMission(h.missionId, "new generation", "operator");
     const current = h.orchestrator.repairBlockedMission(h.missionId);
     releaseFirst();
 
@@ -1237,7 +1237,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
     };
     const stale = h.orchestrator.repairBlockedMission(h.missionId);
     await entered;
-    h.store.resumeMission(h.missionId, "resume during preserved work");
+    h.store.resumeMission(h.missionId, "resume during preserved work", "operator");
     release();
 
     await assert.rejects(stale, /STALE_RECOVERY_GENERATION/);
@@ -1260,7 +1260,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
     };
     const stale = h.orchestrator.repairBlockedMission(h.missionId);
     await entered;
-    h.store.resumeMission(h.missionId, "resume during scheduler");
+    h.store.resumeMission(h.missionId, "resume during scheduler", "operator");
     release();
 
     await assert.rejects(stale, /STALE_RECOVERY_GENERATION/);
@@ -1415,7 +1415,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
   it("does not adopt a wait from an older resumption generation", async () => {
     const h = blockedRepairHarness({ category: "REQUIREMENT_AMBIGUITY" });
     const { decision } = supervisorWait(h);
-    h.store.resumeMission(h.missionId, "operator resumed");
+    h.store.resumeMission(h.missionId, "operator resumed", "operator");
     h.store.transitionMission(h.missionId, "BLOCKED");
 
     await h.orchestrator.repairBlockedMission(h.missionId);
@@ -1849,7 +1849,7 @@ describe("orchestrator: durable blocked-mission repair", () => {
     const h = blockedRepairHarness({ category: "PERSISTENCE_FAILURE" });
     await h.orchestrator.repairBlockedMission(h.missionId);
     const staleDecision = h.store.listRecoveryDecisions(h.missionId).at(-1)!;
-    h.store.resumeMission(h.missionId, "new recovery generation");
+    h.store.resumeMission(h.missionId, "new recovery generation", "operator");
     h.store.stopMission(h.missionId, {
       reason: "operator requires investigation",
       preservedWork: [],
@@ -1881,14 +1881,14 @@ describe("orchestrator: durable blocked-mission repair", () => {
     assert.equal(first.status, "started");
     assert.equal(first.resumptionGeneration, 0);
 
-    h.store.resumeMission(h.missionId, "durable storage restored");
+    h.store.resumeMission(h.missionId, "durable storage restored", "operator");
     await h.orchestrator.repairBlockedMission(h.missionId);
 
     const decisions = h.store.listRecoveryDecisions(h.missionId);
     assert.equal(decisions.length, 2);
     assert.equal(h.store.getRecoveryDecision(first.recoveryId)?.status, "failed");
     assert.equal(decisions[1]?.resumptionGeneration, 1);
-    assert.equal(decisions[1]?.attempt, 1, "explicit resumption starts a fresh fingerprint budget");
+    assert.equal(decisions[1]?.attempt, 2, "explicit resumption does not reset the cumulative fingerprint budget");
     assert.equal(decisions[1]?.deadline, "2026-09-27T00:01:10.000Z");
   });
 

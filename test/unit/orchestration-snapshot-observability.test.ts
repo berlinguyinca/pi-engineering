@@ -302,7 +302,7 @@ test("snapshot writes nullable timing fields and combines checkpoint and stopped
     attemptedRecoveries: [],
     resumeCondition: "provide input",
   });
-  store.resumeMission(m.mission_id, "input arrived");
+  store.resumeMission(m.mission_id, "input arrived", "operator");
   const classification = store.classifyFailure({
     classificationId: "FC-recovery",
     missionId: m.mission_id,

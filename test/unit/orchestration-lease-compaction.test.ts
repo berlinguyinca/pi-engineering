@@ -9,7 +9,9 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionOwnership } from "../../src/orchestration/ownership.ts";
 import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { RuntimeRegistry } from "../../src/runtime/isolation/RuntimeRegistry.ts";
 import { readMergedEvents } from "../../src/runtime/isolation/SessionEventStore.ts";
+import { currentProcessIdentity } from "../../src/runtime/isolation/processIdentity.ts";
 
 function newMission(store: MissionStore, missionId: string) {
   return store.createMission({
@@ -200,6 +202,39 @@ describe("lease compaction safety", () => {
       lock.release();
     }
     await assert.rejects(stat(`${file}.bak`));
+  });
+
+  it("refuses to rewrite a per-session stream whose session the registry shows as live, and allows it once dead", async () => {
+    const { file } = await churnedLog(2);
+    const root = await mkdtemp(join(tmpdir(), "lease-session-"));
+    const eventsDir = join(root, "worktrees", "wt1", "events");
+    await mkdir(eventsDir, { recursive: true });
+    const sessionId = "00000000-0000-4000-8000-0000000000aa";
+    const stream = join(eventsDir, `${sessionId}.jsonl`);
+    await writeFile(stream, await readFile(file, "utf8"));
+    const registryFile = join(root, "registry.db");
+    const registry = RuntimeRegistry.open(registryFile);
+    try {
+      registry.register({ sessionId, process: currentProcessIdentity(), startedAt: new Date().toISOString() });
+      await assert.rejects(compactLeaseEvents(stream, { apply: true, registryFile }), /may still be writing/);
+      await assert.rejects(stat(`${stream}.bak`));
+      assert.equal((await compactLeaseEvents(stream, { registryFile })).applied, false, "dry run is always allowed");
+      registry.unregister(sessionId, registry.get(sessionId)!.generationId);
+      const done = await compactLeaseEvents(stream, { apply: true, registryFile });
+      assert.equal(done.applied, true);
+    } finally {
+      registry.close();
+    }
+  });
+
+  it("refuses a recently written per-session stream of a session the registry does not know", async () => {
+    const { file } = await churnedLog(2);
+    const root = await mkdtemp(join(tmpdir(), "lease-unknown-"));
+    const eventsDir = join(root, "worktrees", "wt1", "events");
+    await mkdir(eventsDir, { recursive: true });
+    const stream = join(eventsDir, "00000000-0000-4000-8000-0000000000bb.jsonl");
+    await writeFile(stream, await readFile(file, "utf8"));
+    await assert.rejects(compactLeaseEvents(stream, { apply: true }), /registry does not know/);
   });
 
   it("keeps the file present throughout and leaves the original as the backup", async () => {

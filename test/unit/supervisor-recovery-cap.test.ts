@@ -90,7 +90,7 @@ describe("recovery cap enforcement", () => {
     const [stopped] = await h.supervisor.tick();
     assert.equal(stopped?.action, "STOP");
 
-    h.store.resumeMission(h.missionId, "operator requested mission recovery");
+    h.store.resumeMission(h.missionId, "operator requested mission recovery", "operator");
     h.advance(60_000);
     const [resumed] = await h.supervisor.tick();
     assert.notEqual(resumed?.action, "STOP");

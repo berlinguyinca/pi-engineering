@@ -261,7 +261,7 @@ describe("MissionStore", () => {
     for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING", "FINAL_VALIDATION"] as const) {
       s.transitionMission(m.mission_id, status);
     }
-    s.resumeMission(m.mission_id, "operator resumed while finalization was pending");
+    s.resumeMission(m.mission_id, "operator resumed while finalization was pending", "operator");
 
     assert.throws(
       () => s.completeMission(m.mission_id, { expectedResumptionGeneration: 0 }),
@@ -1091,7 +1091,7 @@ describe("MissionStore", () => {
     };
     s1.transitionMissionLease("acquired", missionLease);
     s1.transitionRepositoryLease("acquired", repositoryLease);
-    s1.resumeMission(mission.mission_id, "repair state is durable");
+    s1.resumeMission(mission.mission_id, "repair state is durable", "operator");
     s1.stopMission(mission.mission_id, {
       reason: "recovery budget exhausted",
       preservedWork: ["artifact://handoff"],
@@ -1320,7 +1320,7 @@ describe("MissionStore", () => {
       attemptedRecoveries: ["RCV-before-resume"],
       resumeCondition: "provider health returns",
     });
-    s.resumeMission(mission.mission_id, "provider health returned");
+    s.resumeMission(mission.mission_id, "provider health returned", "operator");
     s.planRecovery(recovery("RCV-after-resume", "2026-09-27T00:05:00.000Z"));
 
     const stop = s.stopMission(mission.mission_id, {
@@ -1497,7 +1497,8 @@ describe("automatic maintenance resumption", () => {
         /persistence unavailable/,
       );
       assert.equal(s.persistenceDiagnostics().length, 1);
-      if (supersedingIntent === "new_generation") s.resumeMission(mission.mission_id, "operator recovery won");
+      if (supersedingIntent === "new_generation")
+        s.resumeMission(mission.mission_id, "operator recovery won", "operator");
       else s.markOperatorPause(mission.mission_id);
       await s.flush();
       assert.equal(await s.resumeMissionIfCurrent(mission.mission_id, "maintenance", fence), undefined);
@@ -1583,7 +1584,7 @@ describe("automatic maintenance resumption", () => {
       backend.appendConditionally = async (event, condition, onCommit) => {
         if (race === "operator_pause") s.markOperatorPause(mission.mission_id);
         else if (race === "cancel") s.transitionMission(mission.mission_id, "CANCELED");
-        else s.resumeMission(mission.mission_id, "newer recovery won");
+        else s.resumeMission(mission.mission_id, "newer recovery won", "operator");
         return append(event, condition, onCommit);
       };
       const resumed = await s.resumeMissionIfCurrent(mission.mission_id, "maintenance", {

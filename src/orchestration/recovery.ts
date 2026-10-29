@@ -57,7 +57,7 @@ export interface RecoveryDecisionInput {
   exhaustionIsTerminal?: boolean;
   /**
    * First resumption generation whose decisions count against the strategy
-   * budget: the latest operator resume. Defaults to the current generation.
+   * budget: the latest operator resume. Defaults to 0, so every generation counts.
    */
   budgetEpoch?: number;
 }
@@ -695,7 +695,7 @@ export class RecoveryPlanner {
     // (`budgetEpoch`): a durable stop is terminal until the operator resumes.
     // Resumes by the model tool or runtime maintenance keep the earlier count,
     // so they cannot buy fresh attempts in a loop.
-    const budgetEpoch = input.budgetEpoch ?? resumptionGeneration;
+    const budgetEpoch = input.budgetEpoch ?? 0;
     // For a clock-driven caller, a capacity category's attempts that resolved
     // (a wait or probe that ended succeeded because capacity returned) are the
     // outage clearing, not failed attempts, so flapping capacity never exhausts

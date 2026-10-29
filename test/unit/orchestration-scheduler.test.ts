@@ -591,7 +591,7 @@ describe("MissionScheduler (spec 02)", () => {
     const running = scheduler.runMission(mission.mission_id);
     await dispatched;
 
-    store.resumeMission(mission.mission_id, "operator resumed during worker settlement");
+    store.resumeMission(mission.mission_id, "operator resumed during worker settlement", "operator");
     const takeover = await firstOwner.acquire(mission.mission_id, { resumptionGeneration: 1 });
     await broker.cancelStaleResumptionExecutions(mission.mission_id, 1);
     await running;
@@ -639,7 +639,7 @@ describe("MissionScheduler (spec 02)", () => {
         ),
       ]);
       await new Promise((resolve) => setTimeout(resolve, 20));
-      store.resumeMission(mission.mission_id, "replacement controller fenced old authority");
+      store.resumeMission(mission.mission_id, "replacement controller fenced old authority", "operator");
       if (bulkCancel) await broker.cancelStaleResumptionExecutions(mission.mission_id, 1);
       await Promise.race([
         running,

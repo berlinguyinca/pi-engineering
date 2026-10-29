@@ -257,7 +257,7 @@ describe("MissionOwnership", () => {
     });
     const stale = await ownership.maintain(staleMission, "repo-resume");
 
-    store.resumeMission("M-repo-resume", "operator resumed while repository work was active");
+    store.resumeMission("M-repo-resume", "operator resumed while repository work was active", "operator");
     const currentMission = await ownership.acquire("M-repo-resume", {
       resumptionGeneration: 1,
     });
@@ -280,7 +280,7 @@ describe("MissionOwnership", () => {
       resumptionGeneration: 0,
     });
 
-    store.resumeMission("M-resume", "explicit operator resumption");
+    store.resumeMission("M-resume", "explicit operator resumption", "operator");
     const current = await ownership.acquire("M-resume", {
       resumptionGeneration: 1,
     });

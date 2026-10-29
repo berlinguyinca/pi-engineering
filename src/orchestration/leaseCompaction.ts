@@ -18,9 +18,11 @@
  * temporary over the file, so the file exists at every instant. It also
  * refuses to swap if the log changed while it was being compacted.
  *
- * Limits: per-session streams (`events/<session>.jsonl`) take no writer lock,
- * so a live session appending to one is only caught by the size/mtime recheck
- * just before the swap; stop sessions first. Verification replays this one
+ * Per-session streams (`events/<session>.jsonl`) take no writer lock, so apply
+ * instead refuses while the runtime registry shows that session as anything
+ * but dead (or, when the session is unknown to the registry, while the stream
+ * was written to within the last five minutes). The size/mtime recheck before
+ * the swap remains as a last guard. Verification replays this one
  * stream. That is sufficient for the merged namespace too: replay keeps the last
  * lease event per resource, and the surviving event is this stream's last one,
  * so merging with other streams cannot change which event wins.
@@ -28,10 +30,12 @@
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import { copyFile, constants as fsConstants, link, open, rename, stat, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import type { StoredEvent } from "../platform/eventstore/backend.ts";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
+import { RuntimeRegistry } from "../runtime/isolation/RuntimeRegistry.ts";
+import { registryFileFor } from "../runtime/isolation/RuntimeSession.ts";
 import { toStoredEvent } from "../runtime/isolation/jsonlFiles.ts";
 import { MissionStore } from "./missionStore.ts";
 
@@ -131,18 +135,55 @@ export const leaseCompactionHooks: {
  */
 export async function compactLeaseEvents(
   file: string,
-  options: { apply?: boolean } = {},
+  options: { apply?: boolean; registryFile?: string } = {},
 ): Promise<LeaseCompactionReport> {
   const backup = `${file}.bak`;
   if (options.apply) {
     const existing = await stat(backup).catch(() => null);
     if (existing) throw new Error(`${backup} already exists; move it away first (it is never overwritten)`);
   }
+  if (options.apply) await assertSessionWriterGone(file, options.registryFile);
   const lock = options.apply ? await ExclusiveFileLock.acquire(file) : null;
   try {
     return await compactLocked(file, backup, options.apply === true);
   } finally {
     lock?.release();
+  }
+}
+
+const UNKNOWN_WRITER_QUIET_MS = 5 * 60_000;
+
+/** Refuse to rewrite a per-session stream whose session may still be appending to it. */
+async function assertSessionWriterGone(file: string, registryOverride?: string): Promise<void> {
+  const parts = resolve(file).split(sep);
+  const n = parts.length;
+  if (parts[n - 2] !== "events" || !(parts[n - 4] === "worktrees" || parts[n - 4] === "sessions")) return;
+  const sessionId = basename(file, ".jsonl");
+  const registryFile = registryOverride ?? registryFileFor(parts.slice(0, n - 4).join(sep) || sep);
+  let registryExists = true;
+  await stat(registryFile).catch(() => {
+    registryExists = false;
+  });
+  if (registryExists) {
+    const registry = RuntimeRegistry.open(registryFile);
+    try {
+      const record = registry.get(sessionId);
+      if (record) {
+        const assessment = registry.assess(record);
+        if (assessment.verdict !== "dead") {
+          throw new Error(`session ${sessionId} may still be writing ${file} (${assessment.verdict}); stop it first`);
+        }
+        return;
+      }
+    } finally {
+      registry.close();
+    }
+  }
+  const quietFor = Date.now() - (await stat(file)).mtimeMs;
+  if (quietFor < UNKNOWN_WRITER_QUIET_MS) {
+    throw new Error(
+      `${file} was written ${Math.round(quietFor / 1000)}s ago by a session the registry does not know; stop it first`,
+    );
   }
 }
 
