@@ -6,7 +6,8 @@
  * working message is a label — neither may fail a mission, so every sink call
  * is guarded and a torn-down terminal is treated as a no-op sink.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { redactSecrets } from "../platform/redact.ts";
 import type { RuntimeMissionActivityEvent } from "../runtime/EngineeringRuntime.ts";
@@ -130,13 +131,12 @@ function readLedger(file: string | undefined): Map<string, string> {
   }
 }
 
-/** The best "when did it stop" evidence the event carries; undefined when none parses. */
+/** The most recent timestamp the event carries; undefined when none parses (no evidence it is old). */
 function lastStateAt(event: RuntimeMissionActivityEvent): number | undefined {
-  for (const stamp of [event.lastMeaningfulProgressAt, event.lastHeartbeatAt, event.observedAt]) {
-    const parsed = stamp ? Date.parse(stamp) : Number.NaN;
-    if (Number.isFinite(parsed)) return parsed;
-  }
-  return undefined;
+  const stamps = [event.lastMeaningfulProgressAt, event.lastHeartbeatAt, event.observedAt]
+    .map((stamp) => (stamp ? Date.parse(stamp) : Number.NaN))
+    .filter(Number.isFinite);
+  return stamps.length > 0 ? Math.max(...stamps) : undefined;
 }
 
 function flat(text: string, max: number): string {
@@ -162,7 +162,7 @@ export class MissionPresenceController {
   private lastQuietAt = 0;
   private readonly live = new Map<string, Tracked>();
   private readonly ledgerFile: string | undefined;
-  private readonly ledger: Map<string, string>;
+  private ledger: Map<string, string>;
   private agentActive = false;
   private disposed = false;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -227,19 +227,30 @@ export class MissionPresenceController {
     return at !== undefined && this.now() - at > STALE_STOP_WINDOW_MS;
   }
 
+  /** Re-read the shared ledger so another live session's entries count. */
+  private refreshLedger(): void {
+    if (this.ledgerFile) this.ledger = readLedger(this.ledgerFile);
+  }
+
   private remember(missionId: string, key: string): void {
+    this.refreshLedger();
     if (this.ledger.get(missionId) === key) return;
     this.ledger.delete(missionId);
     this.ledger.set(missionId, key);
     while (this.ledger.size > LEDGER_MAX_ENTRIES) this.ledger.delete(this.ledger.keys().next().value as string);
     if (!this.ledgerFile) return;
+    const temp = `${this.ledgerFile}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     try {
       mkdirSync(dirname(this.ledgerFile), { recursive: true, mode: 0o700 });
-      const temp = `${this.ledgerFile}.${process.pid}.tmp`;
       writeFileSync(temp, JSON.stringify(Object.fromEntries(this.ledger)), { mode: 0o600 });
       renameSync(temp, this.ledgerFile);
     } catch {
       // The ledger is a courtesy; a read-only state dir must not break presence.
+      try {
+        unlinkSync(temp);
+      } catch {
+        // Nothing to clean up.
+      }
     }
   }
 
@@ -349,6 +360,7 @@ export class MissionPresenceController {
         continue;
       }
       // An earlier session already told the operator about exactly this state.
+      this.refreshLedger();
       if (this.ledger.get(event.missionId) === key) {
         this.bus.observe(event.missionId, `${event.state}|${event.health}`);
         continue;

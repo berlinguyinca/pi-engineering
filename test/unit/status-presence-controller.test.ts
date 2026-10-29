@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -454,4 +454,75 @@ test("an unreadable ledger file never blocks notification", () => {
   controller.tick();
   assert.equal(sink.notices.length, 1);
   controller.dispose();
+});
+
+for (const [state, health] of [
+  ["NEEDS_ATTENTION", "blocked"],
+  ["FAILED", "failed"],
+] as const) {
+  test(`a long-quiet mission that ${state} just now still notifies on its first activity event`, () => {
+    const sink = recordingSink();
+    const controller = new MissionPresenceController(sink, opts());
+    controller.update(
+      mission({
+        state,
+        health,
+        lastMeaningfulProgressAt: new Date(T0 - 3 * 60 * 60 * 1000).toISOString(),
+        lastHeartbeatAt: new Date(T0 - 10_000).toISOString(),
+      }),
+      undefined,
+      "activity",
+    );
+    controller.tick();
+    assert.equal(sink.notices.length, 1);
+    controller.dispose();
+  });
+}
+
+test("two live sessions on one ledger both keep their entries and announce a stop once", () => {
+  const file = ledgerFile();
+  const a = recordingSink();
+  const b = recordingSink();
+  const one = new MissionPresenceController(a, opts({ notifiedLedgerFile: file }));
+  const two = new MissionPresenceController(b, opts({ notifiedLedgerFile: file }));
+  one.update(needsYou, undefined, "activity");
+  one.tick();
+  two.update(mission({ missionId: "MSN-2", state: "FAILED", health: "failed" }), undefined, "activity");
+  two.tick();
+  two.update(needsYou, undefined, "activity");
+  two.tick();
+  assert.equal(a.notices.length, 1);
+  assert.equal(b.notices.length, 1);
+  assert.match(b.notices[0]!.text, /MSN-2/);
+  const stored = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
+  assert.deepEqual(Object.keys(stored).sort(), ["MSN-1", "MSN-2"]);
+  one.dispose();
+  two.dispose();
+});
+
+test("the ledger keeps only the newest 500 missions", () => {
+  const file = ledgerFile();
+  const controller = new MissionPresenceController(recordingSink(), opts({ notifiedLedgerFile: file }));
+  for (let i = 0; i < 501; i++) {
+    controller.update(mission({ missionId: `MSN-${i}`, state: "FAILED", health: "failed" }), undefined, "activity");
+  }
+  controller.tick();
+  const stored = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
+  assert.equal(Object.keys(stored).length, 500);
+  assert.equal(stored["MSN-0"], undefined);
+  assert.ok(stored["MSN-500"]);
+  controller.dispose();
+});
+
+test("a ledger that is not an object of strings is ignored entry by entry", () => {
+  for (const content of ["[]", "42", '{"MSN-1": 5, "MSN-9": "x"}']) {
+    const file = ledgerFile();
+    writeFileSync(file, content);
+    const sink = recordingSink();
+    const controller = new MissionPresenceController(sink, opts({ notifiedLedgerFile: file }));
+    controller.update(needsYou, undefined, "activity");
+    controller.tick();
+    assert.equal(sink.notices.length, 1, content);
+    controller.dispose();
+  }
 });
