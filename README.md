@@ -261,7 +261,9 @@ model-capacity signals do not block local process or validation tasks.
 ### Long transient outages: wait for hours, fail only on permanent errors
 
 A model reloading or moving to another GPU, `capacity_unavailable` /
-`model_activating` / `no worker`, a gateway restart, a link cut, an expired
+`model_activating` / `no worker`, a node restarting for a deployment
+(`node_updating`: HTTP 503, `Retry-After: 30`, shown as "updating node, please
+retry in 30 s"), a gateway restart, a link cut, an expired
 routing snapshot or a queue timeout can last **hours**. None of them ends an
 interactive turn or a mission early. The **elapsed horizon** ends a wait;
 attempt counts never do. Permanent errors — auth, other 4xx, quota/billing,
@@ -283,6 +285,22 @@ retry countdown and, once the outage passes a minute, how long it has lasted
 is disabled by default. When explicitly enabled, it is armed only by a model's
 own outage (three consecutive holds): an account-wide queue, a connection drop
 and a link cut do not switch models.
+
+`node_updating` is the exception to the hours-long wait. The console sends it
+while the only node serving a model restarts for a deployment, with
+`retry_alternate` advice, but Pi never switches models on that advice: the
+pump holds the request on the same model, honouring `Retry-After` /
+`retry_after_ms` (the larger wins; 30 s when the code arrives without either).
+Switches that do not depend on the advice still apply by design: the opt-in
+hold-count fallback above, and the planner worker's switch after its third
+`MODEL_LOADING` strike. An interactive turn's hold is capped at 15 minutes
+(`ALTERNATE_MODEL_MAX_ELAPSED_MS`, or `PI_GATEWAY_MAX_ELAPSED_MS` when that is
+shorter). The console's updating mark lasts 10 minutes by default (up to
+1 hour), so a node still refusing after that is most likely stuck. The turn
+then ends with the refusal, and settle recovery does not continue it. A
+mission worker has no such cap: it waits for as long as the console answers
+`node_updating`, which is bounded only by the mark's TTL (an updater re-marking
+the node extends it).
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
