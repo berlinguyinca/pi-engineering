@@ -18,6 +18,7 @@
  */
 
 import { monotonicNow } from "../core/clock.ts";
+import { QUEUE_OBSERVATION_MAX_AGE_MS, type QueueObservation, QueueObservations } from "./queueObservation.ts";
 import { type GatewayWaitSignal, describeGatewayWait } from "./signals.ts";
 
 export interface AdmissionControllerOptions {
@@ -152,6 +153,8 @@ export class AdmissionController {
   private readonly modelCooldownUntil = new Map<string, number>();
   private consecutiveSuccesses = 0;
   private lastSignal: GatewayWaitSignal | undefined;
+  /** The last capacity/queue facts the gateway reported (#418). */
+  private readonly queueObservations = new QueueObservations();
   /** Waiters parked on a free slot, resolved in FIFO order. */
   private readonly slotWaiters: Array<() => void> = [];
   /** Event observers (the status footer, and anything else watching). */
@@ -325,6 +328,10 @@ export class AdmissionController {
   noteWait(signal: GatewayWaitSignal): number {
     this.consecutiveSuccesses = 0;
     this.lastSignal = signal;
+    // #418: the queue facts the gateway reported outlive this wait. Keep the last
+    // capacity-shaped observation so a mission parked on capacity can persist it
+    // and later say "31 of 100 queued · ETA ~2m" instead of "waits for capacity".
+    this.queueObservations.record(signal, this.now);
 
     const waitMs = signal.retryAfterMs;
     const until = this.now() + waitMs;
@@ -391,6 +398,7 @@ export class AdmissionController {
    */
   async noteCallerWaitAndSleep(signal: GatewayWaitSignal, opts: AdmissionWaitOptions = {}): Promise<number> {
     this.lastSignal = signal;
+    this.queueObservations.record(signal, this.now);
     const waitMs = signal.retryAfterMs;
     this.waiting++;
     try {
@@ -401,6 +409,16 @@ export class AdmissionController {
       this.waiting--;
     }
     return opts.signal?.aborted ? 0 : waitMs;
+  }
+
+  /**
+   * The queue state a parked mission should persist (#418): the last capacity
+   * observation, or null when nothing was reported or it has aged out. Null is
+   * the honest answer — the report then says nothing about the queue rather than
+   * quoting a wait the gateway never promised.
+   */
+  queueState(): QueueObservation | null {
+    return this.queueObservations.fresh(QUEUE_OBSERVATION_MAX_AGE_MS, this.now);
   }
 
   /**

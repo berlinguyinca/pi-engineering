@@ -316,6 +316,14 @@ export class MissionScheduler {
   private readonly zeroToolRetries = new Map<string, number>();
   /** Tasks past the zero-tool retry cap: relaunch only on an authoritative healthy probe. */
   private readonly zeroToolHeld = new Set<string>();
+  /**
+   * Missions whose dispatch authority this process lost mid-run (#95). A fenced
+   * process must not finalize the mission it no longer holds: the task is left
+   * resumable for the NEW holder, which leaves the mission parked in whatever
+   * `WAITING_*` state the resilience window set, and finalizing from there threw
+   * an illegal transition out of `finalizeMission`.
+   */
+  private readonly authorityLost = new Set<string>();
   /** Per-task circuit breaker (prevents a request storm during recovery). */
   private readonly breakers = new Map<string, CircuitBreaker>();
   /** Consecutive "model not listed" probe answers per task (see probeGate). */
@@ -477,6 +485,7 @@ export class MissionScheduler {
   async runMission(missionId: string, signal?: AbortSignal): Promise<void> {
     // Topological sanity check (throws on cycle).
     assertAcyclic(this.store.listTasks(missionId));
+    this.authorityLost.delete(missionId);
     let done = false;
     let canceling: Promise<void> | null = null;
     const cancelActive = (): Promise<void> => {
@@ -493,6 +502,12 @@ export class MissionScheduler {
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
       while (!done && !signal?.aborted) {
+        // #95: authority moved to another holder mid-run. Stop dispatching and
+        // return — the new holder owns this mission now. Continuing would re-offer
+        // the READY/RETRYING task this process can no longer settle, spinning
+        // forever against its own fenced authority, and the orchestrator would
+        // then finalize a mission it no longer holds.
+        if (this.authorityLost.has(missionId)) return;
         const mission = this.store.getMission(missionId);
         if (!mission || mission.status === "CANCELED" || mission.status === "FAILED" || mission.status === "COMPLETE") {
           return;
@@ -577,6 +592,22 @@ export class MissionScheduler {
     void run.catch(() => undefined);
   }
 
+  /**
+   * True when this process lost dispatch authority for the mission during the
+   * run that just finished (#95).
+   *
+   * The caller — the orchestrator — must then report the loss and make NO mission
+   * transitions. The task is deliberately left resumable for the new holder, so
+   * the mission is still parked in a `WAITING_*` state, and post-execution
+   * finalization from there is an illegal transition. Un-parking it here would
+   * also be wrong: another owner holds it now.
+   *
+   * Set by a fencing/ownership assertion failure at a settlement point, or by an
+   * authority invalidation callback. Cleared when a run for that mission starts.
+   */
+  authorityLostFor(missionId: string): boolean {
+    return this.authorityLost.has(missionId);
+  }
   /**
    * True when this task has already reached a terminal state, i.e. a concurrent
    * run already settled it.
@@ -859,6 +890,11 @@ export class MissionScheduler {
           authority,
         });
         authority?.onInvalidated(() => {
+          // A controller-disconnect invalidation must NOT terminally cancel the
+          // in-flight task: leave it RETRYING so orphan-recovery re-runs the SAME
+          // task instead of advancing the phase (e.g. dispatching the integrator
+          // against an empty candidate).
+          this.authorityLost.add(task.mission_id);
           void handle?.cancel({ resumable: true });
         });
         if (signal?.aborted) {
@@ -1043,6 +1079,12 @@ export class MissionScheduler {
           try {
             authority.assertAuthoritative();
           } catch (authorityError) {
+            // #95: this process no longer holds the mission. Cancel resumably so
+            // the new holder re-runs the SAME task, reject the late execution, and
+            // stop touching this mission: no task terminal transition, no un-park,
+            // no finalization. The orchestrator reads `authorityLostFor` and
+            // returns without making mission transitions of its own.
+            this.authorityLost.add(task.mission_id);
             await handle?.cancel({ resumable: true }).catch(() => undefined);
             if (handle) {
               this.store.rejectLateExecution(

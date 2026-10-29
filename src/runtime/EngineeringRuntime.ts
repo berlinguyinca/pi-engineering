@@ -22,6 +22,7 @@ import type {
   WorkerRole,
 } from "../core/types.ts";
 import { ROLE_BUDGETS } from "../core/types.ts";
+import { sharedAdmissionController } from "../gateway/config.ts";
 import { GitRepo } from "../git/GitRepo.ts";
 import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
@@ -44,7 +45,11 @@ import {
 import {
   MISSION_SNAPSHOT_FILENAME,
   type MissionSnapshotFile,
+  acquireSnapshotPublisherLock,
   buildMissionSnapshotFile,
+  mergeSnapshotFiles,
+  readMissionSnapshotFile,
+  tagSnapshotPublisher,
 } from "../orchestration/missionSnapshot.ts";
 import { MissionStore } from "../orchestration/missionStore.ts";
 import { buildVerifierStages } from "../orchestration/missionWhy.ts";
@@ -71,7 +76,12 @@ import { canTransitionMission } from "../orchestration/state.ts";
 import { resolveSteeringTarget } from "../orchestration/steeringResolve.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../orchestration/supervisor.ts";
 import { SupervisorRepairBackoff } from "../orchestration/supervisorBackoff.ts";
-import { type Mission, type MissionStop, PLANNER_CLARIFICATION_CATEGORY } from "../orchestration/types.ts";
+import {
+  type Mission,
+  type MissionStop,
+  type MissionStopQueue,
+  PLANNER_CLARIFICATION_CATEGORY,
+} from "../orchestration/types.ts";
 import { WorkspaceManifestResolver } from "../orchestration/workspaceManifest.ts";
 import { tasksConflict, topoSort } from "../plan/taskDag.ts";
 import { redactSecrets } from "../platform/redact.ts";
@@ -174,6 +184,10 @@ export interface EngineerReport {
 const SNAPSHOT_PUBLISH_MAX_RETRIES = 4;
 /** Base backoff (ms) between snapshot publish retries; grows linearly (~1s total). */
 const SNAPSHOT_PUBLISH_BACKOFF_MS = 100;
+/** Consecutive publishes skipped while another session holds the publisher lock (#427). */
+const SNAPSHOT_LOCK_BUSY_MAX_ATTEMPTS = 5;
+/** How long a publish waits for a live holder before skipping (#427). */
+const SNAPSHOT_LOCK_WAIT_MS = 250;
 /** Minimum interval between internal live-view snapshot publications. */
 const SNAPSHOT_PUBLISH_INTERVAL_MS = 750;
 
@@ -782,6 +796,8 @@ export class EngineeringRuntime {
   private snapshotPublishDirty = false;
   private snapshotPublishTimer: ReturnType<typeof setTimeout> | null = null;
   private snapshotPublishRetries = 0;
+  /** Consecutive publishes skipped because another session held the publisher lock (#427). */
+  private snapshotLockBusyAttempts = 0;
   /**
    * FR-03/04/05 — storage-pressure wiring: the controller the snapshot
    * publisher is connected to (lazy; healthy runs never construct it).
@@ -906,19 +922,28 @@ export class EngineeringRuntime {
           const writeFault = this.snapshotWriteFault?.();
           if (writeFault) throw writeFault;
           const path = join(this.workDir, MISSION_SNAPSHOT_FILENAME);
-          const temporary = join(this.workDir, `.${MISSION_SNAPSHOT_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
-          try {
-            await writeFile(temporary, JSON.stringify(latest, null, 2), "utf8");
-            await rename(temporary, path);
-          } catch (error) {
-            await unlink(temporary).catch(() => undefined);
-            throw error;
+          const published = await this.writeSnapshotMerged(path, latest);
+          if (!published) {
+            // Another session holds the publisher lock. Skipping loses nothing —
+            // the snapshot stays dirty and the next mutation republishes — but a
+            // publisher must not spin against a long-lived holder, so this flight
+            // gives up after a bounded number of attempts.
+            this.snapshotLockBusyAttempts += 1;
+            if (this.snapshotLockBusyAttempts >= SNAPSHOT_LOCK_BUSY_MAX_ATTEMPTS) {
+              this.snapshotLockBusyAttempts = 0;
+              this.snapshotPublishDirty = true;
+              break;
+            }
+            this.snapshotPublishDirty = true;
+            await delay(SNAPSHOT_PUBLISH_BACKOFF_MS * this.snapshotLockBusyAttempts);
+            continue;
           }
+          this.snapshotLockBusyAttempts = 0;
           // A successful publish resets the in-call retry counter so the next
           // failure starts fresh instead of inheriting an elevated backoff.
           this.snapshotPublishRetries = 0;
           this.snapshotPublishFinalAttempt = false;
-          this.lastPublishedSnapshot = latest;
+          this.lastPublishedSnapshot = published;
         } catch (error) {
           latest = null;
           lastError = error;
@@ -969,6 +994,51 @@ export class EngineeringRuntime {
       if (this.snapshotPublishDirty) void this.publishMissionSnapshot();
     });
     return this.snapshotPublishPending;
+  }
+
+  /**
+   * Write the snapshot as a merge under the publisher lock (#427).
+   *
+   * Several `pi` sessions share one `.pi-eng` directory. Each one only knows the
+   * missions IT holds live, so a plain write made the published file whichever
+   * session wrote last — a blocked mission read back as absent minutes later.
+   * Here the write reads the file first, replaces only this publisher's entries,
+   * and keeps every other publisher's, so no session can erase another's view.
+   *
+   * Returns null when a live holder owns the publisher lock: merging without it
+   * would have both publishers merge against the pre-merge file, which is the
+   * same loss with extra steps. The caller leaves the snapshot dirty instead.
+   */
+  private async writeSnapshotMerged(path: string, snapshot: MissionSnapshotFile): Promise<MissionSnapshotFile | null> {
+    const lock = await acquireSnapshotPublisherLock({
+      dir: this.workDir,
+      pid: process.pid,
+      waitMs: SNAPSHOT_LOCK_WAIT_MS,
+    });
+    if (!lock) return null;
+    try {
+      const existing = await readMissionSnapshotFile(path);
+      const tag = { ownerPid: process.pid, publishedAtMs: Date.now() };
+      const merged = mergeSnapshotFiles(existing, tagSnapshotPublisher(snapshot, tag), tag);
+      const temporary = join(this.workDir, `.${MISSION_SNAPSHOT_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
+      try {
+        await writeFile(temporary, JSON.stringify(merged, null, 2), "utf8");
+        await rename(temporary, path);
+      } catch (error) {
+        await unlink(temporary).catch(() => undefined);
+        throw error;
+      }
+      // The tags describe the FILE this process wrote, not the logical snapshot the
+      // runtime reasons about. Returning them would make the value differ by code path
+      // — a disk-backed read carries tags, an in-memory retry does not — and callers
+      // that compare consecutive publishes would see a change that is only bookkeeping.
+      return {
+        ...merged,
+        missions: merged.missions.map(({ ownerPid: _owner, publishedAtMs: _at, ...rest }) => rest),
+      };
+    } finally {
+      await lock.release().catch(() => undefined);
+    }
   }
 
   /**
@@ -2288,7 +2358,10 @@ export class EngineeringRuntime {
     signal?: AbortSignal,
   ): Promise<import("../orchestration/types.ts").Mission> {
     if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
-    let mission = this.missionStore.getMission(missionId);
+    // #427: the live projection is not the authority. A mission another session
+    // appended to this namespace is resumable here — declaring it unknown strands
+    // work the durable log still describes perfectly.
+    let mission = this.missionStore.resolveMission(missionId);
     if (!mission) throw new Error(`unknown mission ${missionId}`);
     // The session that resumes a mission is the one whose model choice it follows.
     claimMissionForSession(RuntimeSession.current().sessionId, missionId);
@@ -2594,6 +2667,7 @@ export class EngineeringRuntime {
     const currentGeneration = this.missionStore.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     if (expectedResumptionGeneration !== undefined && currentGeneration !== expectedResumptionGeneration) return;
     const decisions = this.missionStore.listRecoveryDecisions(missionId).map((decision) => decision.recoveryId);
+    const queueState = this.queueStateForStop() ?? undefined;
     const fence = expectedMission ?? mission;
     await this.missionStore.stopMissionIfCurrent(
       missionId,
@@ -2602,6 +2676,10 @@ export class EngineeringRuntime {
         attemptedRecoveries: [...new Set([...source.attemptedRecoveries, ...decisions])],
         preservedWork: [...source.preservedWork],
         resumeCondition: source.resumeCondition,
+        // #418: a mission parked on capacity keeps the queue state the gateway
+        // last reported, so hours later the operator still sees the load and the
+        // hold-off instead of an open-ended "waits for capacity".
+        ...(queueState ? { queue: queueState } : {}),
       },
       {
         revision: fence.revision,
@@ -2611,6 +2689,36 @@ export class EngineeringRuntime {
       },
     );
     await this.missionStore.flush();
+  }
+
+  /**
+   * The queue state to persist with a park (#418), read from the admission
+   * controller that actually honoured the wait. Test seam so a unit test can
+   * present a queue without a gateway. Returns null when nothing was reported or
+   * the observation has aged out — the report then says nothing about the queue.
+   */
+  queueStateForStop(): MissionStopQueue | null {
+    if (this.queueStateOverride !== undefined) return this.queueStateOverride;
+    const observed = sharedAdmissionController().queueState();
+    if (!observed) return null;
+    return {
+      observedAtMs: observed.observedAtMs,
+      ...(observed.queued !== undefined ? { queued: observed.queued } : {}),
+      ...(observed.queueLimit !== undefined ? { queueLimit: observed.queueLimit } : {}),
+      ...(observed.activeLimit !== undefined ? { activeLimit: observed.activeLimit } : {}),
+      ...(observed.retryAfterMs !== undefined ? { retryAfterMs: observed.retryAfterMs } : {}),
+      ...(observed.waitingSinceMs !== undefined ? { waitingSinceMs: observed.waitingSinceMs } : {}),
+      ...(observed.reason ? { reason: observed.reason } : {}),
+      ...(observed.scope ? { scope: observed.scope } : {}),
+      ...(observed.provider ? { provider: observed.provider } : {}),
+      ...(observed.model ? { model: observed.model } : {}),
+    };
+  }
+
+  /** Test seam: present a fixed queue state as the state a park would persist. */
+  private queueStateOverride?: MissionStopQueue | null;
+  setQueueStateForTesting(state: MissionStopQueue | null): void {
+    this.queueStateOverride = state;
   }
 
   private retainOpenReference(): void {

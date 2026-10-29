@@ -740,6 +740,12 @@ export const testHooks: {
   afterShadow?: (shadowRoot: string) => void;
   /** Tests only: the user id the ownership check compares against (a repository cannot be chowned without privileges). */
   uid?: number;
+  /**
+   * Tests only: called each time the repository's own config is listed FROM GIT.
+   * That listing is the per-call cost the cache removes, so counting it is how the
+   * cache is pinned: once per changed config, not once per call.
+   */
+  onConfigList?: () => void;
 } = {};
 
 const failed = (stderr: string): SafeGitResult => ({ code: 128, stdout: "", stderr });
@@ -878,7 +884,52 @@ export { dropPinCacheForTests, listSafeGitPins, resetSafeGitPins, stateHooks } f
 export function forgetRemotePinsForTests(): void {
   forgetPinsForTests();
   allowCache = undefined;
+  localConfigCache.clear();
   noticed.clear();
+}
+
+/**
+ * The repository's own config, as git listed it the last time this process looked
+ * at it. Keyed by path; invalidated when the file's stamp changes or when Pi's own
+ * write-back edits it.
+ *
+ * Reading that file costs one `git` process per call — measured at ~10 ms, which
+ * doubled the fixed cost of every `safeGit` call and, because the listing runs
+ * through `runSync`, blocked the event loop even from async callers. The read is
+ * the same read every time for an unchanged config, so it is the one worth
+ * caching. Staleness here is not cosmetic: the listing decides what the generated
+ * shadow config contains, so the stamp has to be trusted.
+ *
+ * The stamp is inode + size + mtime, the same basis `operatorConfigStamp` uses for
+ * the operator's own config. Residual window: a rewrite that preserves inode and
+ * size within the filesystem's mtime resolution would not be noticed. Writes this
+ * module makes are invalidated explicitly rather than left to the stamp, so that
+ * window only applies to a process editing `.git/config` behind Pi's back.
+ */
+const localConfigCache = new Map<string, { stamp: string; entries: FileEntry[] }>();
+/** Repositories remembered at once; dozens of missions touch a handful of repos. */
+const LOCAL_CONFIG_CACHE_LIMIT = 32;
+
+function configFileStamp(path: string): string | undefined {
+  try {
+    const st = statSync(path);
+    return `${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch {
+    return undefined; // unreadable: git will say so, and nothing is cached
+  }
+}
+
+function rememberLocalConfig(path: string, stamp: string, entries: FileEntry[]): void {
+  if (!localConfigCache.has(path) && localConfigCache.size >= LOCAL_CONFIG_CACHE_LIMIT) {
+    const oldest = localConfigCache.keys().next();
+    if (!oldest.done) localConfigCache.delete(oldest.value);
+  }
+  localConfigCache.set(path, { stamp, entries });
+}
+
+/** Pi wrote to a repository config; whatever was listed before is no longer current. */
+function forgetLocalConfig(path: string): void {
+  localConfigCache.delete(path);
 }
 
 /** What the operator's own (system and global) git config says that safeGit needs. Cached for a few seconds. */
@@ -1508,21 +1559,31 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
   const realConfig = join(layout.commonDir, "config");
   let entries: FileEntry[] = [];
   if (exists(realConfig)) {
-    const listed = runSync(
-      ["config", "--file", realConfig, "--list", "-z"],
-      cleanEnv,
-      Math.min(5_000, Math.max(1_000, timeoutMs)),
-      configListMax,
-      tmpdir(),
-    );
-    // Fail closed: a listing that failed or was cut short (a worker can pad the shared config with junk keys) means
-    // the allow-list cannot be applied, and running anyway would hand git the unfiltered file.
-    if (listed.code !== 0 || listed.truncated) {
-      return refuse(
-        listed.truncated ? "the repository config is too large to inspect" : "the repository config is unreadable",
+    const stamp = configFileStamp(realConfig);
+    const remembered = stamp === undefined ? undefined : localConfigCache.get(realConfig);
+    if (remembered && remembered.stamp === stamp) {
+      entries = remembered.entries;
+    } else {
+      testHooks.onConfigList?.();
+      const listed = runSync(
+        ["config", "--file", realConfig, "--list", "-z"],
+        cleanEnv,
+        Math.min(5_000, Math.max(1_000, timeoutMs)),
+        configListMax,
+        tmpdir(),
       );
+      // Fail closed: a listing that failed or was cut short (a worker can pad the shared config with junk keys) means
+      // the allow-list cannot be applied, and running anyway would hand git the unfiltered file.
+      if (listed.code !== 0 || listed.truncated) {
+        // A refusal is never cached: the next call must see the file as it is now.
+        localConfigCache.delete(realConfig);
+        return refuse(
+          listed.truncated ? "the repository config is too large to inspect" : "the repository config is unreadable",
+        );
+      }
+      entries = parseFileConfig(listed.stdout);
+      if (stamp !== undefined) rememberLocalConfig(realConfig, stamp, entries);
     }
-    entries = parseFileConfig(listed.stdout);
   }
   const generated = generateConfig(entries, layout.workTree === null);
 
@@ -1867,6 +1928,9 @@ function replayConfig(p: Prepared): { after: FileEntry[]; remove: FileEntry[]; a
   for (const e of add) {
     gitConfigFile(real, ["--add", e.key, e.value ?? "true"], p.cleanEnv);
   }
+  // Pi edited the repository config. The listing cached for it is stale whatever
+  // the filesystem stamp says, so it is dropped rather than waited out.
+  if (remove.length > 0 || add.length > 0) forgetLocalConfig(real);
   return { after, remove, add };
 }
 

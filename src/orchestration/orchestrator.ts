@@ -297,6 +297,13 @@ export interface OrchestrateResult {
   paused?: boolean;
   /** "operator": paused by an interrupt (Esc), resumable with `/mission resume <id>`. */
   pausedBy?: "infrastructure" | "operator";
+  /**
+   * True when this process lost dispatch authority mid-run (#95). It made NO
+   * mission transitions: the new holder re-runs the same task. Not a failure —
+   * the mission belongs to another owner now, and un-parking it here would be
+   * the same bug pointed the other way.
+   */
+  lostOwnership?: boolean;
 }
 
 type FinalizationResult = Omit<OrchestrateResult, "intent" | "paused" | "pausedBy">;
@@ -1476,6 +1483,9 @@ export class Orchestrator {
       await this.store.flush();
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       await this.scheduler.runMission(missionId, signal);
+      // #95: authority moved away during the repair run. Return the mission as the
+      // new holder left it — no recovery transition, no integration dispatch.
+      if (this.scheduler.authorityLostFor(missionId)) return this.store.getMission(missionId)!;
       this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
       const replacementsFailed = recoveryLineages.some(
         (lineage) => !this.store.isTaskSatisfiedBySupersession(lineage.failedTaskId),
@@ -2679,6 +2689,23 @@ export class Orchestrator {
       this.phase(this.store.getMission(mission.mission_id)!, "executing");
       await this.renewMissionOwnership(mission.mission_id);
       await this.scheduler.runMission(mission.mission_id, opts.signal);
+
+      // #95: authority moved to another holder during the run. Report the loss
+      // and stop. The task was left resumable for the new holder, so the mission
+      // is still parked in a `WAITING_*` state; finalizing from there threw an
+      // illegal transition out of `finalizeMission`, and un-parking it would
+      // seize a mission another owner holds.
+      if (this.scheduler.authorityLostFor(mission.mission_id)) {
+        const orphaned = this.store.getMission(mission.mission_id)!;
+        return {
+          mission: orphaned,
+          intent,
+          verdict: this.gate.evaluate(orphaned),
+          completed: false,
+          failureReason: "dispatch authority lost mid-run — another holder owns this mission; nothing was finalized",
+          lostOwnership: true,
+        };
+      }
 
       if (isPauseAbort(opts.signal)) {
         const pausedByOperator = await this.pauseInterruptedMission(

@@ -6,6 +6,7 @@
 
 import { stripVTControlCharacters } from "node:util";
 import { formatWaitingFor } from "../gateway/admissionNotice.ts";
+import { queueStateText } from "../gateway/queueObservation.ts";
 import { latestTaskCheckpoints } from "../orchestration/checkpoints.ts";
 import type { MissionStore } from "../orchestration/missionStore.ts";
 import { taskFailureReason } from "../orchestration/recovery.ts";
@@ -68,6 +69,11 @@ export function missionReportLines(store: MissionStore, missionId: string): stri
     .filter((candidate) => candidate.resumptionGeneration === generation)
     .at(-1);
   if (stop) lines.push(`Stopped: ${clip(stop.reason, 240)}`);
+  // #418: a capacity park has to say how deep the queue is and roughly how long
+  // the gateway said to hold off. "Waits for capacity" alone reads as open-ended,
+  // and the gateway had already answered the question the operator is asking.
+  const queueState = queueStateText(stop?.queue ?? null);
+  if (queueState) lines.push(`Queue: ${queueState}`);
 
   const checkpoints = latestTaskCheckpoints(store.listTaskCheckpoints(missionId));
   const preserved = [

@@ -3582,6 +3582,27 @@ export class MissionStore {
     return fresh.length;
   }
 
+  /**
+   * Resolve a mission for a MUTATION, applying what other sessions appended to
+   * this namespace first (#427).
+   *
+   * The live projection is not the authority — the appended events are. Observed
+   * on a shared dev box: `mission status/resume MSN-J9sycT` answered "Unknown
+   * mission" from the session that had just run it, while the per-session streams
+   * replayed that mission perfectly. A mutation path that declares a mission
+   * unknown without this re-read strands work the durable log still describes.
+   *
+   * Deliberately not used by ordinary reads: `refresh()` re-scans stream files,
+   * so hot read paths keep the projection and the tool layer's cached durable
+   * lookup instead.
+   */
+  resolveMission(missionId: string): Mission | undefined {
+    const known = this.getMission(missionId);
+    if (known) return known;
+    this.syncExternal();
+    return this.getMission(missionId);
+  }
+
   /** Local takeover is permitted only while this process owns the JSONL writer boundary. */
   hasExclusiveWriterAuthority(): boolean {
     const backend = this.backend as EventStoreBackend & {
@@ -3770,6 +3791,9 @@ export class MissionStore {
       preservedWork: [...input.preservedWork],
       attemptedRecoveries: [...input.attemptedRecoveries],
       resumeCondition: input.resumeCondition,
+      // #418: the queue state observed at park time rides with the stop, so a
+      // mission parked hours ago can still tell the operator what the gateway said.
+      ...(input.queue ? { queue: { ...input.queue } } : {}),
       stoppedAt: new Date().toISOString(),
       generation: (this.listMissionStops(missionId).at(-1)?.generation ?? 0) + 1,
       resumptionGeneration,
@@ -3820,6 +3844,7 @@ export class MissionStore {
         preservedWork: [...input.preservedWork],
         attemptedRecoveries: [...input.attemptedRecoveries],
         resumeCondition: input.resumeCondition,
+        ...(input.queue ? { queue: { ...input.queue } } : {}),
         stoppedAt: new Date().toISOString(),
         generation: (durableBefore.listMissionStops(missionId).at(-1)?.generation ?? 0) + 1,
         resumptionGeneration: expected.resumptionGeneration,
@@ -4178,6 +4203,7 @@ function copyMissionStop(stop: MissionStop): MissionStop {
     ...stop,
     preservedWork: [...stop.preservedWork],
     attemptedRecoveries: [...stop.attemptedRecoveries],
+    ...(stop.queue ? { queue: { ...stop.queue } } : {}),
     ...(stop.settlementIdentity ? { settlementIdentity: { ...stop.settlementIdentity } } : {}),
   };
 }
