@@ -3753,7 +3753,11 @@ export class MissionStore {
     return held !== undefined && held.generation === lease.generation && held.fencingToken === lease.fencingToken;
   }
 
-  resumeMission(missionId: string, reason: string): MissionResumption {
+  resumeMission(
+    missionId: string,
+    reason: string,
+    origin: NonNullable<MissionResumption["origin"]> = "operator",
+  ): MissionResumption {
     if (!this.missions.has(missionId)) throw new Error(`unknown mission ${missionId}`);
     const currentLease = this.missionLeases.get(missionId);
     if (currentLease) {
@@ -3768,6 +3772,7 @@ export class MissionStore {
       resumedAt: new Date().toISOString(),
       generation: (this.listMissionResumptions(missionId).at(-1)?.generation ?? 0) + 1,
       stopGeneration: this.listMissionStops(missionId).at(-1)?.generation ?? 0,
+      origin,
     };
     this.missionResumptions.push(resumption);
     this.emit("mission.resumed", missionId, { actor: "system", resumption });
@@ -3823,6 +3828,7 @@ export class MissionStore {
         resumedAt: new Date().toISOString(),
         generation: expected.resumptionGeneration + 1,
         stopGeneration: durable.listMissionStops(missionId).at(-1)?.generation ?? 0,
+        origin: "automatic",
       };
       const event: OrchestrationEvent = {
         event_id: id("oevt"),

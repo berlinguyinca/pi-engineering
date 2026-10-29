@@ -2333,11 +2333,15 @@ export class EngineeringRuntime {
   }
 
   /** Explicit, idempotent operator fallback for one durably stopped blocked mission. */
-  resumeBlockedMission(missionId: string, signal?: AbortSignal): Promise<import("../orchestration/types.ts").Mission> {
+  resumeBlockedMission(
+    missionId: string,
+    signal?: AbortSignal,
+    origin: "operator" | "model" = "operator",
+  ): Promise<import("../orchestration/types.ts").Mission> {
     this.endMaintenance();
     const active = this.missionResumeFlights.get(missionId);
     if (active) return active;
-    const flight = this.performBlockedMissionResume(missionId, signal).finally(() => {
+    const flight = this.performBlockedMissionResume(missionId, signal, origin).finally(() => {
       if (this.missionResumeFlights.get(missionId) === flight) this.missionResumeFlights.delete(missionId);
     });
     this.missionResumeFlights.set(missionId, flight);
@@ -2356,9 +2360,16 @@ export class EngineeringRuntime {
     return this.orchestrator.pauseMission(missionId);
   }
 
+  private recoveryBudgetExhausted(missionId: string, generation: number): boolean {
+    return (this.missionStore?.listRecoveryDecisions(missionId) ?? []).some(
+      (decision) => (decision.resumptionGeneration ?? 0) === generation && decision.status === "exhausted",
+    );
+  }
+
   private async performBlockedMissionResume(
     missionId: string,
     signal?: AbortSignal,
+    origin: "operator" | "model" = "operator",
   ): Promise<import("../orchestration/types.ts").Mission> {
     if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
     // #427: the live projection is not the authority. A mission another session
@@ -2416,12 +2427,18 @@ export class EngineeringRuntime {
     ) {
       // Paused by an operator interrupt: continue exactly where it stopped. The
       // interrupted tasks were left resumable; another interrupt pauses again.
-      this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission");
+      this.missionStore.resumeMission(missionId, "operator resumed an interrupted mission", origin);
       await this.missionStore.flush();
       return this.orchestrator.resume(missionId, { force: true, ...(signal ? { signal } : {}), interrupt: "pause" });
     }
+    if (origin === "model" && this.recoveryBudgetExhausted(missionId, generation)) {
+      // The model may not spend an exhausted budget by calling resume again.
+      throw new Error(
+        `recovery budget for mission ${missionId} is exhausted; only the operator can resume it (/mission resume ${missionId})`,
+      );
+    }
     mission = await this.normalizeMissionForRepair(missionId);
-    this.missionStore.resumeMission(missionId, "operator requested mission recovery");
+    this.missionStore.resumeMission(missionId, "operator requested mission recovery", origin);
     await this.missionStore.flush();
     // An interrupt during the operator's recovery pauses it again; it never cancels.
     const run = interruptibleRun(signal, "pause");

@@ -678,7 +678,7 @@ async function resolveServices(cwd: string): Promise<CoreServices | null> {
       return w ? w.id : null;
     },
     actor: () => ({ type: "user" }),
-    resumeMission: (id, s) => rt.resumeBlockedMission(id, s),
+    resumeMission: (id, s) => rt.resumeBlockedMission(id, s, "model"),
     cancelMission: (id) => rt.cancelMission(id),
     pauseMission: (id) => rt.pauseMission(id),
     clearMissionModelPin: (id) => rt.clearMissionModelPin(id),

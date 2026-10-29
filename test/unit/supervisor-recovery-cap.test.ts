@@ -96,4 +96,36 @@ describe("recovery cap enforcement", () => {
     assert.notEqual(resumed?.action, "STOP");
     assert.equal(resumed?.decision?.attempt, 1);
   });
+
+  it("does not let model or maintenance resumes buy a fresh budget", async () => {
+    const h = harness(1);
+    await h.supervisor.tick();
+    failOpenAttempts(h.store, h.missionId);
+    assert.equal((await h.supervisor.tick())[0]?.action, "STOP");
+    for (const origin of ["model", "automatic", "model", "model"] as const) {
+      h.store.resumeMission(h.missionId, "resume attempt", origin);
+      h.advance(60_000);
+      const [status] = await h.supervisor.tick();
+      assert.equal(status?.action, "STOP", `a ${origin} resume stays at the ceiling`);
+    }
+    h.store.resumeMission(h.missionId, "operator requested mission recovery", "operator");
+    h.advance(60_000);
+    assert.notEqual((await h.supervisor.tick())[0]?.action, "STOP", "only the operator refreshes the budget");
+  });
+
+  it("does not stop a mission for flapping capacity whose probes resolved", async () => {
+    const h = harness(2);
+    for (let round = 0; round < 8; round++) {
+      const [status] = await h.supervisor.tick();
+      assert.notEqual(status?.action, "STOP", `round ${round}`);
+      for (const decision of h.store.listRecoveryDecisions(h.missionId)) {
+        if (decision.status === "planned") h.store.transitionRecovery(decision.recoveryId, "started");
+        if (decision.status === "planned" || decision.status === "started") {
+          h.store.transitionRecovery(decision.recoveryId, "succeeded");
+        }
+      }
+      h.advance(60_000);
+    }
+    assert.equal(h.store.listMissionStops(h.missionId).length, 0);
+  });
 });

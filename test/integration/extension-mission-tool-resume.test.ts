@@ -179,6 +179,86 @@ test("mission tool resume reaches EngineeringRuntime.resumeBlockedMission instea
   }
 });
 
+test("mission tool resume cannot spend an exhausted recovery budget, however often the model calls it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-mission-tool-exhausted-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: root });
+    await execFileAsync(
+      "git",
+      ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"],
+      { cwd: root },
+    );
+    const runtime = await EngineeringRuntime.open({ cwd: root, worker: new FakeWorkerExecutor({}) });
+    const store = runtime.missionStore!;
+    const created = store.createMission({
+      repository: root,
+      base_ref: await runtime.git!.headCommit(),
+      risk_profile: "low",
+      workflow_class: "engineering",
+      title: "exhausted",
+      goal: "exhausted",
+      user_request: "exhausted",
+    });
+    store.transitionMission(created.mission_id, "CLASSIFYING");
+    store.transitionMission(created.mission_id, "BLOCKED");
+    store.classifyFailure({
+      classificationId: "FC-exhausted",
+      missionId: created.mission_id,
+      taskId: null,
+      executionId: null,
+      category: "VALIDATION_FAILED",
+      evidenceRefs: [],
+      fingerprint: "sha256:exhausted",
+      summary: "validation keeps failing",
+      classifiedAt: new Date().toISOString(),
+    });
+    const decision = store.planRecovery({
+      recoveryId: "RCV-exhausted",
+      missionId: created.mission_id,
+      classificationId: "FC-exhausted",
+      action: "STOP",
+      expectedMaterialChange: "budget exhausted",
+      attempt: 3,
+      maxAttempts: 2,
+      deadline: null,
+      nextActionAt: new Date().toISOString(),
+      status: "planned",
+      decidedAt: new Date().toISOString(),
+    });
+    store.transitionRecovery(decision.recoveryId, "exhausted");
+    store.stopMission(created.mission_id, {
+      reason: "validation keeps failing",
+      preservedWork: [],
+      attemptedRecoveries: [decision.recoveryId],
+      resumeCondition: "operator decision",
+    });
+    await store.flush();
+
+    const { tools, handlers } = loadHarness();
+    const mission = tools.get("mission");
+    assert.ok(mission);
+    const ctx = context(root);
+    for (let call = 0; call < 5; call++) {
+      const result = await mission.execute(
+        `call-${call}`,
+        { action: "resume", missionId: created.mission_id },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(
+        result.content.map((part) => part.text).join("\n"),
+        /recovery budget .* exhausted; only the operator can resume it/,
+      );
+    }
+    assert.equal(store.listMissionResumptions(created.mission_id).length, 0, "no resumption was created");
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    await runtime.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#427 mission tool answers from durable replay instead of Unknown mission", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-mission-tool-durable-"));
   try {

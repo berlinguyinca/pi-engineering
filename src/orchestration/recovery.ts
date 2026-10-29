@@ -55,6 +55,11 @@ export interface RecoveryDecisionInput {
    * Callers that bound their own retries (the scheduler) leave this unset.
    */
   exhaustionIsTerminal?: boolean;
+  /**
+   * First resumption generation whose decisions count against the strategy
+   * budget: the latest operator resume. Defaults to the current generation.
+   */
+  budgetEpoch?: number;
 }
 
 const DEFAULT_ACTIONS: Record<FailureCategory, RecoveryAction> = {
@@ -686,14 +691,31 @@ export class RecoveryPlanner {
     const fingerprint = input.classification.fingerprint;
     const resumptionGeneration =
       input.resumptionGeneration ?? Math.max(0, ...input.history.map((decision) => decision.resumptionGeneration ?? 0));
-    // The strategy budget is per resumption: a durable stop is terminal until
-    // the operator resumes, and a resume starts a fresh budget instead of
-    // inheriting (and endlessly growing) the count of every earlier episode.
+    // The strategy budget starts over at the latest OPERATOR resumption
+    // (`budgetEpoch`): a durable stop is terminal until the operator resumes.
+    // Resumes by the model tool or runtime maintenance keep the earlier count,
+    // so they cannot buy fresh attempts in a loop.
+    const budgetEpoch = input.budgetEpoch ?? resumptionGeneration;
+    // For a clock-driven caller, a capacity category's attempts that resolved
+    // (a wait or probe that ended succeeded because capacity returned) are the
+    // outage clearing, not failed attempts, so flapping capacity never exhausts
+    // the budget; only attempts that failed or were exhausted count.
+    const countsAsAttempt = (decision: RecoveryDecision): boolean =>
+      !(
+        input.exhaustionIsTerminal === true &&
+        CAPACITY_WAIT_ACTIONS[input.classification.category] !== undefined &&
+        decision.status === "succeeded"
+      );
     const fingerprintAttempts = input.history.filter(
       (decision) =>
-        decision.failureFingerprint === fingerprint && (decision.resumptionGeneration ?? 0) === resumptionGeneration,
+        decision.failureFingerprint === fingerprint &&
+        (decision.resumptionGeneration ?? 0) >= budgetEpoch &&
+        countsAsAttempt(decision),
     ).length;
     const attempt = fingerprintAttempts + 1;
+    const decisionsForFingerprint = input.history.filter(
+      (decision) => decision.failureFingerprint === fingerprint,
+    ).length;
     const durableDeadlines = input.history
       .filter((decision) => (decision.resumptionGeneration ?? 0) === resumptionGeneration)
       .map((decision) => (decision.deadline ? Date.parse(decision.deadline) : Number.NaN))
@@ -715,10 +737,11 @@ export class RecoveryPlanner {
     // durable wait/probe (deadline-aware: the wait carries the durable deadline
     // when the policy configures one) so a later tick resumes them.
     const capacityWait = CAPACITY_WAIT_ACTIONS[input.classification.category];
-    // For a clock-driven caller an attempt-count ceiling is terminal for every
-    // category: further automatic attempts only burn leases and events until the
-    // operator resumes. A clock deadline says nothing about whether capacity
-    // returned, so it (and any caller bounding its own retries) still parks.
+    // For a clock-driven caller an exhausted count of FAILED attempts (see
+    // countsAsAttempt) is terminal even for capacity categories: further
+    // automatic attempts only burn leases and events until the operator
+    // resumes. A clock deadline says nothing about whether capacity returned,
+    // so it (and any caller bounding its own retries) still parks.
     const countExhaustedForCaller = input.exhaustionIsTerminal === true && (missionExhausted || strategyExhausted);
     const parksOnCapacity = capacityWait !== undefined && !countExhaustedForCaller;
     const action: RecoveryAction = !budgetExhausted ? defaultAction : parksOnCapacity ? capacityWait : "STOP";
@@ -758,8 +781,10 @@ export class RecoveryPlanner {
       action,
       attempt,
       deadline,
-      // A resumed mission restarts its attempt count, so the generation keeps ids distinct.
+      // A resumed mission restarts its attempt count and resolved capacity waits
+      // do not advance it, so the generation and decision ordinal keep ids distinct.
       ...(resumptionGeneration > 0 ? { resumptionGeneration } : {}),
+      ...(decisionsForFingerprint !== fingerprintAttempts ? { decisionsForFingerprint } : {}),
     });
     return {
       recoveryId: `RCV-${recoveryHash.slice(0, 20)}`,

@@ -10,16 +10,28 @@
  * that in `payload.collapsed` ({ missionId: count }), which `MissionStore`
  * applies on replay.
  *
- * Safety: the output is written to a temporary file, then both logs are
- * replayed and their canonical state digests must match before anything is
- * swapped in. The default is a dry run; `apply` keeps the original as `.bak`
- * and refuses to swap if the log changed while it was being compacted. Never
- * run it while a session that writes this log is alive.
+ * Safety: the output is written to a uniquely named temporary file, fsynced,
+ * then both logs are replayed and their canonical state digests must match
+ * before anything is swapped in. The default is a dry run. `apply` holds the
+ * file's writer lock (refusing when a live owner has it), refuses to overwrite
+ * an existing `.bak`, hard-links the original to `.bak`, and renames the
+ * temporary over the file, so the file exists at every instant. It also
+ * refuses to swap if the log changed while it was being compacted.
+ *
+ * Limits: per-session streams (`events/<session>.jsonl`) take no writer lock,
+ * so a live session appending to one is only caught by the size/mtime recheck
+ * just before the swap; stop sessions first. Verification replays this one
+ * stream. That is sufficient for the merged namespace too: replay keeps the last
+ * lease event per resource, and the surviving event is this stream's last one,
+ * so merging with other streams cannot change which event wins.
  */
+import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { rename, stat, unlink } from "node:fs/promises";
+import { copyFile, constants as fsConstants, link, open, rename, stat, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
 import { createInterface } from "node:readline";
 import type { StoredEvent } from "../platform/eventstore/backend.ts";
+import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 import { toStoredEvent } from "../runtime/isolation/jsonlFiles.ts";
 import { MissionStore } from "./missionStore.ts";
 
@@ -54,6 +66,8 @@ function parseLease(line: string): Parsed | null {
   } catch {
     return null;
   }
+  // Replay would skip an invalid record, so it must not be treated as one.
+  if (!toStoredEvent(record)) return null;
   const type = record.type;
   if (typeof type !== "string" || !LEASE_TYPES.has(type)) return null;
   const payload = record.payload as Record<string, unknown> | undefined;
@@ -105,6 +119,12 @@ async function streamDigest(file: string): Promise<string> {
   return store.stateDigest();
 }
 
+/** Test seams: run between phases of an apply so a test can simulate interference. */
+export const leaseCompactionHooks: {
+  afterWrite?: (temporary: string) => Promise<void> | void;
+  beforeSwap?: (file: string) => Promise<void> | void;
+} = {};
+
 /**
  * Compact one orchestration event file. Dry run unless `apply` is true.
  * Idempotent: compacting an already-compacted log changes nothing.
@@ -113,6 +133,20 @@ export async function compactLeaseEvents(
   file: string,
   options: { apply?: boolean } = {},
 ): Promise<LeaseCompactionReport> {
+  const backup = `${file}.bak`;
+  if (options.apply) {
+    const existing = await stat(backup).catch(() => null);
+    if (existing) throw new Error(`${backup} already exists; move it away first (it is never overwritten)`);
+  }
+  const lock = options.apply ? await ExclusiveFileLock.acquire(file) : null;
+  try {
+    return await compactLocked(file, backup, options.apply === true);
+  } finally {
+    lock?.release();
+  }
+}
+
+async function compactLocked(file: string, backup: string, apply: boolean): Promise<LeaseCompactionReport> {
   const before = await stat(file);
   // Pass 1: the last line of each resource, and what every superseded event owes it.
   const lastLine = new Map<string, number>();
@@ -141,13 +175,18 @@ export async function compactLeaseEvents(
     index++;
   }
   // Pass 2: write the compacted copy.
-  const temporary = `${file}.compact.tmp`;
-  const output = createWriteStream(temporary, { encoding: "utf8" });
+  const temporary = `${file}.compact.${process.pid}-${randomUUID().slice(0, 8)}.tmp`;
+  const output = createWriteStream(temporary, { encoding: "utf8", flags: "wx" });
+  let streamError: Error | undefined;
+  output.on("error", (error) => {
+    streamError = error;
+  });
   let linesAfter = 0;
   let leaseEventsAfter = 0;
   index = 0;
   try {
     for await (const line of lines(file)) {
+      if (streamError) throw streamError;
       const lease = parseLease(line);
       let text = line;
       if (lease) {
@@ -169,10 +208,15 @@ export async function compactLeaseEvents(
       linesAfter++;
       index++;
     }
-    await new Promise<void>((resolve, reject) => {
-      output.once("error", reject);
-      output.end(resolve);
-    });
+    await new Promise<void>((resolve) => output.end(resolve));
+    if (streamError) throw streamError;
+    await leaseCompactionHooks.afterWrite?.(temporary);
+    const handle = await open(temporary, "r+");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     const [digestBefore, digestAfter] = [await streamDigest(file), await streamDigest(temporary)];
     const stateIdentical = digestBefore === digestAfter;
     const after = await stat(temporary);
@@ -188,20 +232,32 @@ export async function compactLeaseEvents(
       bytesAfter: after.size,
       stateIdentical,
     };
-    if (!options.apply || !stateIdentical) {
+    if (!apply || !stateIdentical) {
       await unlink(temporary);
       return report;
     }
+    await leaseCompactionHooks.beforeSwap?.(file);
     const current = await stat(file);
     if (current.size !== before.size || current.mtimeMs !== before.mtimeMs) {
-      await unlink(temporary);
       throw new Error(`${file} changed while it was being compacted; nothing was modified`);
     }
-    const backup = `${file}.bak`;
-    await rename(file, backup);
+    // The backup is a second name for the original inode, so `file` never stops
+    // existing: rename(2) then atomically points `file` at the compacted copy.
+    try {
+      await link(file, backup);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw error;
+      await copyFile(file, backup, fsConstants.COPYFILE_EXCL);
+    }
     await rename(temporary, file);
+    const directory = await open(dirname(file), "r").catch(() => null);
+    if (directory) {
+      await directory.sync().catch(() => undefined);
+      await directory.close();
+    }
     return { ...report, applied: true, backup };
   } catch (error) {
+    output.destroy();
     await unlink(temporary).catch(() => undefined);
     throw error;
   }
