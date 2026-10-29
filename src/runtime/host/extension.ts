@@ -389,15 +389,17 @@ export class EngineeringHostExtension {
 
   /**
    * The seam the legacy `/update` command drives when Pi loaded the extension
-   * from an installed version directory (no version-control metadata, so the
-   * checkout fast-forward cannot apply).
+   * from an installed runtime (no version-control metadata, so the checkout
+   * fast-forward cannot apply). Ownership is the install's question to answer,
+   * and it covers the generation snapshot the extension is actually imported
+   * from — not just `versions/<id>`.
    *
    * Activation stays here: the bridge only forwards to this Host's UpdateManager,
    * which is the single owner of the pointer switch and the handover.
    */
   private updateBridge(): RuntimeUpdateBridge {
     return {
-      owns: (dir: string) => this.layout.isVersionDir(dir),
+      owns: (dir: string) => this.layout.ownsRuntimeTree(dir),
       check: async () => {
         const check = await this.updates.check({});
         return {
