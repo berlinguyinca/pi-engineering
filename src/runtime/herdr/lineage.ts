@@ -561,6 +561,17 @@ export class LineageEmitter {
         input.at,
       );
       this.nodeState(from, "rolled_over", input.transition, { reason: "session rollover" }, scope, input.at);
+      // The control transfer itself: evidence is the attempt's recorded session id changing, not any text. An
+      // explicit handoff record later reaching acknowledged adds the same edge key with richer attrs (a merge).
+      this.edgeAdd(
+        "handoff",
+        from,
+        to,
+        input.transition,
+        { source: "session_id_change", cause: "session_rollover" },
+        scope,
+        input.at,
+      );
     } catch (error) {
       this.fail(error);
     }

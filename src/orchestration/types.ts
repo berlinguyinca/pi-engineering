@@ -373,6 +373,18 @@ export interface WorkspaceManifest {
   createdAt: string;
 }
 
+/** Bounded, curated state a successor needs beyond the git snapshot. Never a transcript. */
+export interface CheckpointHandoffContext {
+  nextAction: string | null;
+  decisions: Array<{ id: string; summary: string; rationale: string }>;
+  unresolvedIssues: string[];
+  /** Latest outcome per test reference. */
+  tests: Array<{ ref: string; outcome: "passed" | "failed" | "skipped" }>;
+  memoryRefs: string[];
+  /** Untracked files in the worktree, by content hash, so a successor can verify what it inherits. */
+  untracked: Array<{ path: string; sha256: string }>;
+}
+
 /** Preserved task work. A checkpoint is not validation or approval evidence. */
 export interface TaskCheckpoint {
   checkpointId: EntityId;
@@ -399,6 +411,8 @@ export interface TaskCheckpoint {
   missionGeneration: number;
   candidateGeneration: number;
   fencingToken: number;
+  /** Present only when the worker supplied handoff context. */
+  handoff?: CheckpointHandoffContext;
   createdAt: string;
 }
 

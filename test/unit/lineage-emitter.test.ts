@@ -292,8 +292,9 @@ describe("lineage: session rollover and migration", () => {
     await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
     await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
     const events = await lineageEvents(envStore, emitter);
+    // Field-bearing upserts only: an edge endpoint also gets an empty "ensure" upsert (no fields, no ownership).
     const sessions = events.filter(
-      (e) => e.event_type === "node.upsert" && String(e.payload.node_id).startsWith("session:"),
+      (e) => e.event_type === "node.upsert" && String(e.payload.node_id).startsWith("session:") && e.payload.attrs,
     );
     assert.deepEqual(
       sessions.map((e) => e.payload.node_id),
@@ -315,6 +316,84 @@ describe("lineage: session rollover and migration", () => {
       [...nodeIds(events)].filter((id) => id.startsWith("agent:") || id.startsWith("attempt:")).sort(),
       ["agent:task-a", `attempt:${execution.execution_id}`].sort(),
     );
+  });
+
+  it("a rollover records the handoff edge between the two sessions from structured evidence", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store, task, execution } = missionRig(emitter);
+    const mgr = new CheckpointManager({ store });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
+    const events = await lineageEvents(envStore, emitter);
+    const handoffs = edges(events, "handoff");
+    assert.equal(handoffs.length, 1);
+    assert.equal(handoffs[0]?.from_id, "session:sess-1");
+    assert.equal(handoffs[0]?.to_id, "session:sess-2");
+    assert.equal(handoffs[0]?.attrs?.source, "session_id_change");
+  });
+
+  it("ten sequential rollovers form one ordered handoff chain under one agent and attempt", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store, task, execution } = missionRig(emitter);
+    const mgr = new CheckpointManager({ store });
+    for (let i = 1; i <= 11; i++) {
+      await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: `sess-${i}` });
+    }
+    const events = await lineageEvents(envStore, emitter);
+    const chain = edges(events, "handoff").map((e) => `${e.from_id}>${e.to_id}`);
+    assert.deepEqual(
+      chain,
+      Array.from({ length: 10 }, (_, i) => `session:sess-${i + 1}>session:sess-${i + 2}`),
+    );
+    assert.deepEqual(
+      [...nodeIds(events)].filter((id) => id.startsWith("agent:") || id.startsWith("attempt:")).sort(),
+      ["agent:task-a", `attempt:${execution.execution_id}`].sort(),
+    );
+    const rolled = events.filter((e) => e.event_type === "node.state" && e.payload.state === "rolled_over");
+    assert.equal(rolled.length, 10, "every session but the last is rolled_over");
+  });
+
+  it("re-observing the same rollover does not add a second handoff edge", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store, task, execution } = missionRig(emitter);
+    const mgr = new CheckpointManager({ store });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
+    assert.equal(edges(await lineageEvents(envStore, emitter), "handoff").length, 1);
+  });
+
+  it("an observed rollover acknowledges the open handoff record that named the replaced session", async () => {
+    const { store: envStore, emitter } = rig();
+    const { store, task, execution } = missionRig(emitter);
+    const sha = "a".repeat(40);
+    const record = (id: string, extra: Record<string, unknown> = {}) => ({
+      id,
+      kind: "context",
+      state: "prepared",
+      missionId: execution.mission_id,
+      predecessor: { sessionId: "sess-1", generation: 0 },
+      createdAt: new Date().toISOString(),
+      ...extra,
+    });
+    store.addHandoffRecord(record("hf-ok", { checkpointSha: sha }));
+    store.addHandoffRecord(record("hf-no-checkpoint"));
+    store.addHandoffRecord(
+      record("hf-other-session", { checkpointSha: sha, predecessor: { sessionId: "sess-9", generation: 0 } }),
+    );
+    const mgr = new CheckpointManager({ store });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-1" });
+    await mgr.persist({ taskId: task.task_id, executionId: execution.execution_id, sessionId: "sess-2" });
+
+    const done = store.getHandoffRecord("hf-ok");
+    assert.equal(done?.state, "acknowledged");
+    assert.deepEqual(done?.successor, { sessionId: "sess-2", generation: 1 });
+    assert.equal(store.getHandoffRecord("hf-no-checkpoint")?.state, "prepared", "no checkpoint: never validated");
+    assert.equal(store.getHandoffRecord("hf-other-session")?.state, "prepared", "different predecessor untouched");
+
+    const events = await lineageEvents(envStore, emitter);
+    const handoff = edges(events, "handoff").filter((e) => e.attrs?.handoff_id === "handoff:hf-ok");
+    assert.equal(handoff.length, 1, "the explicit record's edge merges into the same edge key");
   });
 
   it("a verified checkpoint adds a checkpoint artifact produced by the attempt", async () => {

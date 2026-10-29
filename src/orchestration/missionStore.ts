@@ -650,6 +650,34 @@ export class MissionStore {
     });
   }
 
+  /**
+   * A rollover is the successor session taking over. Open handoff records of the mission that named the replaced
+   * session as predecessor advance to `acknowledged` with the observed successor, but only when they carry a
+   * checkpoint (that is what `validated` means); a record without one is left for its owner.
+   */
+  private acknowledgeObservedHandoffs(ex: Execution, previous: string | null, next: string | null): void {
+    if (!previous || !next || previous === next || !this.lineageAgentExecution(ex)) return;
+    const open = [...this.handoffRecords.values()].filter(
+      (r) =>
+        r.missionId === ex.mission_id &&
+        r.predecessor.sessionId === previous &&
+        r.checkpointSha &&
+        (r.state === "prepared" || r.state === "validated"),
+    );
+    for (const record of open) {
+      try {
+        if (record.state === "prepared") this.transitionHandoffRecord(record.id, "validated");
+        this.transitionHandoffRecord(record.id, "acknowledged", {
+          sessionId: next,
+          generation: record.predecessor.generation + 1,
+        });
+      } catch (error) {
+        // Handoff bookkeeping must never fail the checkpoint or status update that observed the rollover.
+        if (!(error instanceof HandoffRecordError)) throw error;
+      }
+    }
+  }
+
   /** A model session attached to (or replacing the one on) an attempt. */
   private lineageSessionChange(ex: Execution, previous: string | null, next: string | null, at: string): void {
     if (!next || next === previous || !this.lineageAgentExecution(ex)) return;
@@ -1781,6 +1809,7 @@ export class MissionStore {
             : "execution.canceled";
     this.emit(type, ex.mission_id, { actor: "system", execution: next });
     if (this.lineageAgentExecution(next)) {
+      this.acknowledgeObservedHandoffs(next, ex.session_id, next.session_id);
       this.lineageSessionChange(next, ex.session_id, next.session_id, now);
       if (status === "RUNNING") {
         this.lineageDo((l) =>
@@ -2667,6 +2696,7 @@ export class MissionStore {
   private lineageCheckpointVerified(checkpoint: TaskCheckpoint, priorSession: string | null): void {
     const execution = this.executions.get(checkpoint.executionId);
     if (!execution || !this.lineageAgentExecution(execution)) return;
+    this.acknowledgeObservedHandoffs(execution, priorSession, checkpoint.sessionId ?? null);
     this.lineageSessionChange(execution, priorSession, checkpoint.sessionId ?? null, checkpoint.createdAt);
     this.lineageDo((l) =>
       l.checkpointVerified({
@@ -4118,6 +4148,7 @@ function copyTaskCheckpoint(checkpoint: TaskCheckpoint): TaskCheckpoint {
     validationEvidenceRefs: [...checkpoint.validationEvidenceRefs],
     artifactRefs: [...checkpoint.artifactRefs],
     artifactHashes: [...checkpoint.artifactHashes],
+    ...(checkpoint.handoff ? { handoff: structuredClone(checkpoint.handoff) } : {}),
   };
 }
 

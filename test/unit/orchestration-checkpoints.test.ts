@@ -386,3 +386,100 @@ describe("CheckpointManager durability and immutable origin", () => {
     assert.deepEqual(preserved.preservedUncommittedChanges, ["src/dirty.ts"]);
   });
 });
+
+describe("CheckpointManager handoff context", () => {
+  const sha = "b".repeat(64);
+
+  it("carries next action, decisions, unresolved issues, test outcomes, memory refs and untracked hashes", async () => {
+    const { store, task, execution } = setup();
+    const checkpoint = await new CheckpointManager({ store }).persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      handoff: {
+        nextAction: "run the integration suite",
+        decisions: [{ id: "D1", summary: "use a private scope", rationale: "artifact ACLs govern readers" }],
+        unresolvedIssues: ["flaky port race in test X"],
+        tests: [
+          { ref: "unit", outcome: "passed" },
+          { ref: "e2e", outcome: "failed" },
+        ],
+        memoryRefs: ["viking://project/notes/1"],
+        untracked: [{ path: "scratch/plot.py", sha256: sha }],
+      },
+    });
+    assert.equal(checkpoint.handoff?.nextAction, "run the integration suite");
+    assert.deepEqual(
+      checkpoint.handoff?.tests.map((t) => `${t.ref}:${t.outcome}`),
+      ["unit:passed", "e2e:failed"],
+    );
+    assert.equal(store.listTaskCheckpoints(execution.mission_id, task.task_id).at(-1)?.handoff?.decisions[0]?.id, "D1");
+  });
+
+  it("merges across checkpoints: decisions accumulate, tests keep the latest outcome per ref", async () => {
+    const { store, task, execution } = setup();
+    const mgr = new CheckpointManager({ store });
+    await mgr.persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      handoff: {
+        decisions: [{ id: "D1", summary: "a", rationale: "r" }],
+        tests: [{ ref: "e2e", outcome: "failed" }],
+      },
+    });
+    const second = await mgr.persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      handoff: {
+        decisions: [{ id: "D2", summary: "b", rationale: "r" }],
+        tests: [{ ref: "e2e", outcome: "passed" }],
+        nextAction: "open the PR",
+      },
+    });
+    assert.deepEqual(
+      second.handoff?.decisions.map((d) => d.id),
+      ["D1", "D2"],
+    );
+    assert.deepEqual(second.handoff?.tests, [{ ref: "e2e", outcome: "passed" }]);
+    assert.equal(second.handoff?.nextAction, "open the PR");
+  });
+
+  it("a checkpoint with no handoff input has no handoff block", async () => {
+    const { store, task, execution } = setup();
+    const checkpoint = await new CheckpointManager({ store }).persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+    });
+    assert.equal(checkpoint.handoff, undefined);
+  });
+
+  it("rejects malformed or unbounded handoff context instead of storing it", async () => {
+    const { store, task, execution } = setup();
+    const mgr = new CheckpointManager({ store });
+    const base = { taskId: task.task_id, executionId: execution.execution_id };
+    await assert.rejects(
+      mgr.persist({ ...base, handoff: { tests: [{ ref: "u", outcome: "great" as never }] } }),
+      /outcome/,
+    );
+    await assert.rejects(mgr.persist({ ...base, handoff: { untracked: [{ path: "a", sha256: "nothex" }] } }), /sha256/);
+    await assert.rejects(mgr.persist({ ...base, handoff: { nextAction: "x".repeat(2001) } }), /nextAction/);
+    await assert.rejects(
+      mgr.persist({
+        ...base,
+        handoff: { decisions: Array.from({ length: 51 }, (_, i) => ({ id: `D${i}`, summary: "s", rationale: "r" })) },
+      }),
+      /decisions/,
+    );
+  });
+
+  it("the stored checkpoint is a copy: mutating the returned handoff does not alter the store", async () => {
+    const { store, task, execution } = setup();
+    const checkpoint = await new CheckpointManager({ store }).persist({
+      taskId: task.task_id,
+      executionId: execution.execution_id,
+      handoff: { memoryRefs: ["viking://a"] },
+    });
+    checkpoint.handoff?.memoryRefs.push("viking://tampered");
+    const again = store.listTaskCheckpoints(execution.mission_id, task.task_id).at(-1);
+    assert.deepEqual(again?.handoff?.memoryRefs, ["viking://a"]);
+  });
+});

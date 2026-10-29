@@ -1,5 +1,5 @@
 import type { MissionStore } from "./missionStore.ts";
-import type { TaskCheckpoint } from "./types.ts";
+import type { CheckpointHandoffContext, TaskCheckpoint } from "./types.ts";
 
 export interface CheckpointSnapshot {
   candidateSha: string | null;
@@ -20,6 +20,84 @@ export interface CheckpointPersistInput {
   sessionId?: string | null;
   model?: string | null;
   snapshot?: CheckpointSnapshot;
+  handoff?: Partial<CheckpointHandoffContext>;
+}
+
+const HANDOFF_LIMITS = { text: 2000, short: 500, items: 50, hex: /^[0-9a-f]{64}$/ } as const;
+
+function boundedText(value: unknown, field: string, max: number): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > max) {
+    throw new Error(`checkpoint handoff ${field} must be a non-empty string of at most ${max} characters`);
+  }
+  return value;
+}
+
+function boundedList<T>(value: readonly T[] | undefined, field: string): readonly T[] {
+  const list = value ?? [];
+  if (!Array.isArray(list) || list.length > HANDOFF_LIMITS.items) {
+    throw new Error(`checkpoint handoff ${field} must be a list of at most ${HANDOFF_LIMITS.items} entries`);
+  }
+  return list;
+}
+
+/** Validate this checkpoint's handoff input and merge it over the previous checkpoint's. Undefined when empty. */
+function mergeHandoffContext(
+  previous: CheckpointHandoffContext | undefined,
+  input: Partial<CheckpointHandoffContext> | undefined,
+): CheckpointHandoffContext | undefined {
+  if (!previous && !input) return undefined;
+  const nextAction =
+    input?.nextAction === undefined
+      ? (previous?.nextAction ?? null)
+      : input.nextAction === null
+        ? null
+        : boundedText(input.nextAction, "nextAction", HANDOFF_LIMITS.text);
+  const decisions = new Map((previous?.decisions ?? []).map((d) => [d.id, d] as const));
+  for (const d of boundedList(input?.decisions, "decisions")) {
+    decisions.set(boundedText(d.id, "decision id", 128), {
+      id: d.id,
+      summary: boundedText(d.summary, "decision summary", HANDOFF_LIMITS.short),
+      rationale: boundedText(d.rationale, "decision rationale", HANDOFF_LIMITS.text),
+    });
+  }
+  const tests = new Map((previous?.tests ?? []).map((t) => [t.ref, t] as const));
+  for (const t of boundedList(input?.tests, "tests")) {
+    if (t.outcome !== "passed" && t.outcome !== "failed" && t.outcome !== "skipped") {
+      throw new Error("checkpoint handoff test outcome must be passed, failed or skipped");
+    }
+    tests.set(boundedText(t.ref, "test ref", 256), { ref: t.ref, outcome: t.outcome });
+  }
+  const untracked = new Map((previous?.untracked ?? []).map((u) => [u.path, u] as const));
+  for (const u of boundedList(input?.untracked, "untracked")) {
+    if (!HANDOFF_LIMITS.hex.test(String(u.sha256)))
+      throw new Error("checkpoint handoff untracked sha256 must be 64 hex");
+    untracked.set(boundedText(u.path, "untracked path", 1024), { path: u.path, sha256: u.sha256 });
+  }
+  const strings = (field: "unresolvedIssues" | "memoryRefs"): string[] => {
+    const added = boundedList(input?.[field], field).map((v) => boundedText(v, field, HANDOFF_LIMITS.short));
+    return field === "unresolvedIssues" && input?.unresolvedIssues
+      ? dedupe(added)
+      : dedupe([...(previous?.[field] ?? []), ...added]);
+  };
+  const merged: CheckpointHandoffContext = {
+    nextAction,
+    decisions: [...decisions.values()],
+    unresolvedIssues: strings("unresolvedIssues"),
+    tests: [...tests.values()],
+    memoryRefs: strings("memoryRefs"),
+    untracked: [...untracked.values()],
+  };
+  for (const [field, list] of [
+    ["decisions", merged.decisions],
+    ["tests", merged.tests],
+    ["untracked", merged.untracked],
+    ["unresolvedIssues", merged.unresolvedIssues],
+    ["memoryRefs", merged.memoryRefs],
+  ] as const) {
+    if (list.length > HANDOFF_LIMITS.items)
+      throw new Error(`checkpoint handoff ${field} exceeds ${HANDOFF_LIMITS.items} entries`);
+  }
+  return merged;
 }
 
 export interface ReconciledCheckpoint {
@@ -171,6 +249,7 @@ export class CheckpointManager {
         { refs: previous?.artifactRefs ?? [], hashes: previous?.artifactHashes ?? [] },
         { refs: input.artifactRefs ?? [], hashes: input.artifactHashes ?? [] },
       );
+      const handoff = mergeHandoffContext(previous?.handoff, input.handoff);
       const checkpoint: TaskCheckpoint = {
         checkpointId,
         executionId: execution.execution_id,
@@ -199,6 +278,7 @@ export class CheckpointManager {
         missionGeneration: execution.mission_generation ?? 0,
         candidateGeneration: execution.candidate_generation ?? 0,
         fencingToken: execution.fencing_token ?? 0,
+        ...(handoff ? { handoff } : {}),
         createdAt: this.now().toISOString(),
       };
       assertCurrentOrigin();
