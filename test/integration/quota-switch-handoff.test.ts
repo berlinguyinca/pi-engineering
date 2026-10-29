@@ -21,7 +21,7 @@ import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { buildContinuityConfig } from "../../src/runtime/continuityWiring.ts";
 import { EnvelopeStore } from "../../src/runtime/herdr/envelopeStore.ts";
 import { createLineageEmitter } from "../../src/runtime/herdr/lineage.ts";
-import { QUOTA_EXHAUSTED_SUMMARY } from "../../src/workers/activity.ts";
+import { CONTEXT_USAGE_SUMMARY, QUOTA_EXHAUSTED_SUMMARY } from "../../src/workers/activity.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -35,7 +35,19 @@ interface Call {
   sessionId: string | undefined;
 }
 
-async function harness(yaml: string | null) {
+interface HarnessOptions {
+  /** Calls (1-based) whose worker reports quota exhaustion. Default: only the first. */
+  quotaCalls?: number[];
+  maxAttempts?: number;
+  /** Task model pin; null = role-routed, no model on the task. */
+  pin?: string | null;
+  /** Model the worker reports serving through a context reading before it hits quota. */
+  reportsModel?: string;
+}
+
+async function harness(yaml: string | null, opts: HarnessOptions = {}) {
+  const quotaCalls = opts.quotaCalls ?? [1];
+  const pin = opts.pin === undefined ? "gw/primary" : opts.pin;
   const fx = await makeFixtureRepo();
   cleanups.push(() => fx.cleanup());
   const agentDir = await mkdtemp(join(tmpdir(), "quota-agent-"));
@@ -46,6 +58,7 @@ async function harness(yaml: string | null) {
     models: async () => [
       { provider: "gw", id: "primary", contextWindow: 1000 },
       { provider: "gw", id: "fallback", contextWindow: 1000 },
+      { provider: "gw", id: "fallback2", contextWindow: 1000 },
     ],
   });
   const git = (await GitRepo.open(fx.root))!;
@@ -68,7 +81,15 @@ async function harness(yaml: string | null) {
         await mkdir(join(worktree!, "src"), { recursive: true });
         await writeFile(join(worktree!, "src", `w${n}.js`), `export const a = ${n};\n`);
         await git.commitAll(worktree!, `work ${n}`);
-        if (n === 1) {
+        if (quotaCalls.includes(n)) {
+          if (opts.reportsModel) {
+            onActivity?.({
+              kind: "state",
+              summary: CONTEXT_USAGE_SUMMARY,
+              meaningfulProgress: false,
+              context: { tokens: 10, window: 1000, model: opts.reportsModel },
+            });
+          }
           onActivity?.({
             kind: "state",
             summary: QUOTA_EXHAUSTED_SUMMARY,
@@ -80,7 +101,13 @@ async function harness(yaml: string | null) {
           while (
             Date.now() < end &&
             !signal.aborted &&
-            !store.listHandoffRecords().some((h) => h.sourceFencedAt || h.blockedReason)
+            !store
+              .listHandoffRecords()
+              .some(
+                (h) =>
+                  h.predecessor.sessionId === sessionId &&
+                  (h.sourceFencedAt || h.blockedReason || h.state === "aborted"),
+              )
           ) {
             await new Promise((r) => setTimeout(r, 20));
           }
@@ -111,10 +138,10 @@ async function harness(yaml: string | null) {
         isolation: "worktree" as const,
         depends_on: [],
         priority: 0,
-        execution_requirements: { model: "gw/primary" },
+        execution_requirements: pin === null ? {} : { model: pin },
         acceptance_ids: mission.acceptance_criteria.flatMap((c) => (c.acceptance_id ? [c.acceptance_id] : [])),
         deliverables: ["one"],
-        max_attempts: 3,
+        max_attempts: opts.maxAttempts ?? 3,
         failure_policy: "retry" as const,
       },
     ],
@@ -226,6 +253,66 @@ describe("quota exhaustion switches the model through orchestrate()", () => {
       /none of the configured quota_fallbacks for role implementer is eligible \(gw\/not-in-registry\)/,
     );
     assert.equal(agentExecutions(h.store, missionId).length, 1);
+  });
+});
+
+describe("quota switch safety", () => {
+  it("an unpinned task whose serving model is unknown is refused, never switched", async () => {
+    const h = await harness("quota_fallbacks:\n  default: [gw/primary, gw/fallback]\n", { pin: null });
+    const missionId = await h.run();
+    const [record] = h.store.listHandoffRecords(missionId);
+    assert.match(record?.blockedReason ?? "", /serving model is unknown/);
+    assert.equal(record?.toModel, undefined);
+    assert.equal(record?.fromModel, undefined);
+    assert.equal(record?.sourceFencedAt, undefined);
+    assert.equal(agentExecutions(h.store, missionId).length, 1, "nothing was started on any model");
+  });
+
+  it("an unpinned task that reports its model switches away from it, comparing id and provider/id", async () => {
+    const h = await harness("quota_fallbacks:\n  default: [primary, gw/fallback]\n", {
+      pin: null,
+      reportsModel: "gw/primary",
+    });
+    const missionId = await h.run();
+    const [record] = h.store.listHandoffRecords(missionId);
+    assert.equal(record?.fromModel, "gw/primary");
+    assert.equal(record?.toModel, "gw/fallback", "never the exhausted model itself");
+    assert.equal(record?.state, "acknowledged");
+  });
+
+  it("two exhausted fallbacks do not ping-pong: the chain ends blocked with 'fallback list exhausted'", async () => {
+    const h = await harness("quota_fallbacks:\n  default: [gw/primary, gw/fallback]\n", {
+      quotaCalls: [1, 2, 3, 4],
+      maxAttempts: 4,
+    });
+    const missionId = await h.run();
+    const records = h.store.listHandoffRecords(missionId);
+    assert.deepEqual(
+      h.calls.map((c) => c.model),
+      ["gw/primary", "gw/fallback"],
+      "primary -> fallback, then no way back to primary",
+    );
+    assert.equal(records.length, 2);
+    assert.equal(records[0]?.toModel, "gw/fallback");
+    assert.equal(records[1]?.toModel, undefined);
+    assert.match(records[1]?.blockedReason ?? "", /fallback list exhausted/);
+    assert.equal(records[1]?.sourceFencedAt, undefined);
+  });
+
+  it("with no retry budget left the source is NOT fenced and the record is aborted with a reason", async () => {
+    const h = await harness("quota_fallbacks:\n  default: [gw/fallback]\n", { maxAttempts: 1 });
+    const missionId = await h.run();
+    const [record] = h.store.listHandoffRecords(missionId);
+    assert.equal(record?.state, "aborted");
+    assert.match(record?.blockedReason ?? "", /no retry budget left/);
+    assert.equal(record?.sourceFencedAt, undefined);
+    const executions = agentExecutions(h.store, missionId);
+    assert.equal(executions.length, 1);
+    assert.notEqual(executions[0]?.status, "CANCELED", "the source was not cancelled");
+    assert.equal(
+      h.store.listTasks(missionId).find((t) => t.kind === "agent")?.execution_requirements.model,
+      "gw/primary",
+    );
   });
 });
 

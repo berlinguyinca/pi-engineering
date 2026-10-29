@@ -16,7 +16,7 @@
 import { type ContextThresholds, type CrossingState, contextLevel, evaluateCrossing } from "../context/thresholds.ts";
 import type { InferenceFailureClass } from "../inference/failureClassifier.ts";
 import type { HandoffCause, HandoffEndpoint, HandoffKind, HandoffRecord } from "../runtime/host/handoffKinds.ts";
-import { type QuotaResumeModel, decideQuotaResume } from "../runtime/host/quotaResume.ts";
+import { type QuotaResumeModel, decideQuotaResume, sameModel } from "../runtime/host/quotaResume.ts";
 
 export interface ContextHandoffDeps {
   thresholdsFor(model: string | null): ContextThresholds;
@@ -30,6 +30,8 @@ export interface ContextHandoffDeps {
   report(missionId: string, line: string): void;
   /** The operator-configured, ordered fallback models for a role; empty = none configured (the handoff stays blocked). */
   catalogue?(role: string | null): readonly QuotaResumeModel[];
+  /** Models already quota-exhausted for this task (durable, from earlier quota handoffs): never switched back to. */
+  exhaustedModels?(missionId: string, taskId: string): readonly string[];
   now?(): Date;
 }
 
@@ -107,7 +109,8 @@ export class ContextHandoffTrigger {
     missionId: string;
     taskId: string;
     executionId: string;
-    model: string;
+    /** The model actually serving the execution; null when unknown (then the switch is refused, never guessed). */
+    model: string | null;
     failureClass: InferenceFailureClass;
     role?: string | null;
     retryAfterMs?: number;
@@ -129,7 +132,8 @@ export class ContextHandoffTrigger {
     missionId: string;
     taskId: string;
     executionId: string;
-    model: string;
+    /** The model actually serving the execution; null when unknown (then the switch is refused, never guessed). */
+    model: string | null;
     failureClass: InferenceFailureClass;
     role?: string | null;
     retryAfterMs?: number;
@@ -138,11 +142,19 @@ export class ContextHandoffTrigger {
     await this.deps.requestCheckpoint(input.executionId);
     const sha = this.deps.latestCheckpointSha(input.missionId, input.taskId);
     const nowMs = (this.deps.now?.() ?? new Date()).getTime();
-    const catalogue = this.deps.catalogue?.(input.role ?? null) ?? [];
+    const configured = this.deps.catalogue?.(input.role ?? null) ?? [];
+    const tried = [
+      ...(this.deps.exhaustedModels?.(input.missionId, input.taskId) ?? []),
+      ...(input.model ? [input.model] : []),
+    ];
+    const isTried = (id: string) => tried.some((t) => sameModel(t, id));
+    // A model that already ran out of quota for this task is not a candidate again: the chain ends when the list is spent.
+    const catalogue = configured.map((m) => ({ ...m, eligible: m.eligible && !isTried(m.id) }));
+    const listSpent = configured.length > 0 && configured.every((m) => isTried(m.id));
     const decision = decideQuotaResume({
       failureClass: input.failureClass,
-      currentModelId: input.model,
-      catalogue,
+      currentModelId: input.model ?? "",
+      catalogue: input.model === null ? [] : catalogue,
       ...(input.retryAfterMs !== undefined ? { retryAfterMs: input.retryAfterMs } : {}),
       nowMs,
       pausedAtMs: null,
@@ -151,23 +163,29 @@ export class ContextHandoffTrigger {
       sideEffects: [],
       hasCheckpoint: sha !== undefined,
     });
-    if (decision.action === "pause" || decision.action === "switch_model") {
+    if (decision.action === "pause" || decision.action === "switch_model" || input.model === null) {
       this.quotaDone.add(input.executionId);
-      const switching = decision.action === "switch_model" && decision.alternateModelId !== null;
+      const switching =
+        input.model !== null && decision.action === "switch_model" && decision.alternateModelId !== null;
       const role = input.role ?? "(no role)";
-      // Never a silent pick: without a configured, eligible fallback the record says why it is not driven.
+      // Never a silent pick: without a known serving model and a configured, eligible, untried fallback the record
+      // says why it is not driven.
       const blockedReason = switching
         ? undefined
-        : `${decision.reasons.join("; ")}; ${
-            catalogue.length === 0
-              ? `no quota_fallbacks configured for role ${role} (engineering.yaml quota_fallbacks.roles.${input.role ?? "<role>"} or quota_fallbacks.default)`
-              : `none of the configured quota_fallbacks for role ${role} is eligible (${catalogue.map((m) => m.id).join(", ")})`
-          }; handoff stays blocked`;
+        : input.model === null
+          ? "quota exhausted but the serving model is unknown (role-routed task with no pinned model and no model reported by the worker); refusing to switch; handoff stays blocked"
+          : `${decision.reasons.join("; ")}; ${
+              listSpent
+                ? `fallback list exhausted (all of ${configured.map((m) => m.id).join(", ")} already ran out of quota for this task; tried: ${tried.join(", ")})`
+                : configured.length === 0
+                  ? `no quota_fallbacks configured for role ${role} (engineering.yaml quota_fallbacks.roles.${input.role ?? "<role>"} or quota_fallbacks.default)`
+                  : `none of the configured quota_fallbacks for role ${role} is eligible (${configured.map((m) => m.id).join(", ")})`
+            }; handoff stays blocked`;
       const done = await this.handoff(input, decision.handoffKind ?? "recovery", "quota_exhausted", {
         skipRequest: true,
         note: `${decision.action}: ${decision.reasons.join("; ")}${decision.alternateModelId ? ` -> ${decision.alternateModelId}` : ""}`,
         extra: {
-          fromModel: input.model,
+          ...(input.model ? { fromModel: input.model } : {}),
           ...(switching ? { toModel: decision.alternateModelId } : {}),
           ...(blockedReason ? { blockedReason } : {}),
         },
@@ -182,7 +200,7 @@ export class ContextHandoffTrigger {
         `[mission ${input.missionId}] quota failure: ${decision.action} (${decision.reasons.join("; ")})`,
       );
     }
-    return decision.action;
+    return input.model === null ? "pause" : decision.action;
   }
 
   private async handoff(

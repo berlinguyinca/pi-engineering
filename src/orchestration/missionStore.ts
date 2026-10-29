@@ -2557,6 +2557,15 @@ export class MissionStore {
     return { ...next };
   }
 
+  /** Abort an open handoff with a durable, reported reason (stored as `blockedReason`). Terminal records are left alone. */
+  abortHandoff(id: string, reason: string): HandoffRecord {
+    const current = this.handoffRecords.get(id);
+    if (!current) throw new HandoffRecordError([`unknown handoff record ${id}`]);
+    if (current.state === "aborted" || current.state === "committed") return { ...current };
+    this.handoffRecords.set(id, { ...current, blockedReason: reason });
+    return this.transitionHandoff(id, "aborted", undefined, undefined);
+  }
+
   /** Persist a field stamp on a handoff record without changing its state. */
   private stampHandoff(id: string, patch: Pick<HandoffRecord, "verifiedAt" | "sourceFencedAt">): HandoffRecord {
     const current = this.handoffRecords.get(id);
