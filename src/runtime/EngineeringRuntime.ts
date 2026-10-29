@@ -574,7 +574,8 @@ export interface EngineeringRuntimeOptions {
    */
   onMissionObservabilityUpdate?: (missionId: string, message: string) => void;
   /** Persistent, non-notification UI feed. Values are redacted and bounded. */
-  onMissionActivity?: (event: RuntimeMissionActivityEvent) => void;
+  /** `replay` is true only for the open-time re-emission of stored missions. */
+  onMissionActivity?: (event: RuntimeMissionActivityEvent, meta?: { replay: boolean }) => void;
   /** Bounded diagnostic when the live mission snapshot cannot be written. */
   onMissionSnapshotError?: (message: string) => void;
   /**
@@ -786,7 +787,7 @@ export class EngineeringRuntime {
       config?: Partial<import("../resilience/storagePressure.ts").StoragePressureConfig>;
     }
   > | null;
-  private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent) => void) | null;
+  private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent, meta?: { replay: boolean }) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
   private missionActivityTicker: MissionActivityTicker | null = null;
   private readonly missionActivityClock = new ClockOnlyGate();
@@ -1185,7 +1186,7 @@ export class EngineeringRuntime {
   }
 
   /** Project observability into a compact surface event without raw commands or metadata. */
-  private emitMissionActivity(missionId: string, observedAt = new Date().toISOString()): void {
+  private emitMissionActivity(missionId: string, observedAt = new Date().toISOString(), replay = false): void {
     if (!this.onMissionActivity) return;
     this.missionActivityTicker?.watch(missionId);
     const projection = this.missionObservability?.projection(missionId);
@@ -1312,7 +1313,7 @@ export class EngineeringRuntime {
         ],
         Date.parse(observedAt),
       );
-      this.onMissionActivity(event);
+      this.onMissionActivity(event, { replay });
     } catch {
       // UI listeners are observers, never participants in mission execution.
     }
@@ -1503,7 +1504,9 @@ export class EngineeringRuntime {
         rt.scheduleMissionSnapshot();
         rt.emitMissionActivity(missionId);
       });
-      for (const missionId of rt.missionObservability.listMissionIds()) rt.emitMissionActivity(missionId);
+      for (const missionId of rt.missionObservability.listMissionIds()) {
+        rt.emitMissionActivity(missionId, undefined, true);
+      }
       // Route orchestration worker roles through the capability router so per-role
       // model placement (policy.routing.roles, e.g. a pinned implementer/reviewer)
       // is honored by the mission pipeline, matching the lifecycle roleRunner
