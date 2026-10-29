@@ -23,6 +23,7 @@ let server: Server;
 let base = "";
 let dir = "";
 const seen: Seen[] = [];
+const postedMessages = new Set<string>();
 const posted = new Map<string, string>(); // idempotency key -> task id
 let failTransportOnce = false;
 let failOnlyMethod: string | null = null;
@@ -48,8 +49,17 @@ const ROOM_STATE = {
   ],
   missions: [{ mission_id: "m-77" }],
 };
+// Wire shapes below were observed against the REAL control plane (test/integration/room-live.test.ts), not guessed:
+// an attention item has no `title` and its `subject` is an object; rooms are {room_id, name, role, project_id}.
 const ATTENTION = {
-  items: [{ severity: "error", category: "ci_failed", title: "CI failed", subject: "pr#12" }],
+  items: [
+    {
+      severity: "error",
+      category: "ci_failed",
+      subject: { node_id: "pr#12", node_type: "pull_request", label: "PR 12 CI" },
+      for_you: false,
+    },
+  ],
   counts: { open: 1 },
 };
 
@@ -85,9 +95,18 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     const p = url.pathname;
     if (req.method === "GET" && p === "/api/v1/collab/rooms/room-1/state") return json(200, ROOM_STATE);
     if (req.method === "GET" && p === "/api/v1/collab/rooms/room-1/attention") return json(200, ATTENTION);
+    if (req.method === "GET" && p === "/api/v1/collab/rooms/room-1/agents")
+      return json(200, { agents: ROOM_STATE.agents });
     if (req.method === "GET" && p === "/api/v1/collab/rooms")
-      return json(200, { rooms: [{ id: "room-1", name: "Main" }] });
-    if (req.method === "POST" && p === "/api/v1/collab/rooms/room-1/messages") return json(201, { ok: true });
+      return json(200, { rooms: [{ room_id: "room-1", name: "Main", role: "owner", project_id: "p-1" }] });
+    if (req.method === "POST" && p === "/api/v1/collab/rooms/room-1/messages") {
+      const key = String(entry.body?.idempotency_key);
+      const replayed = postedMessages.has(key);
+      postedMessages.add(key);
+      return replayed
+        ? json(200, { event: { sequence: 9, event_type: "message" }, replayed: true })
+        : json(201, { event: { sequence: 9, event_type: "message" } });
+    }
     if (req.method === "POST" && p === "/api/v1/collab/rooms/room-1/tasks") {
       const key = String(entry.body?.idempotency_key);
       const replayed = posted.has(key);
@@ -132,8 +151,8 @@ describe("/room over the authenticated Herdr API", () => {
     assert.match(out.text, /└ \[pending\] claude-b: review it/, "child task nests under its parent");
     assert.match(out.text, /● pi-laptop \[pi\] ag-1/);
     assert.match(out.text, /○ claude-a/);
-    assert.match(out.text, /\[error\] CI failed — pr#12/);
-    assert.match(out.text, new RegExp(`Full graph: ${base.replace(/[.:/]/g, "\\$&")}/#/collab\\?room=room-1`));
+    assert.match(out.text, /\[error\] ci_failed — PR 12 CI/);
+    assert.match(out.text, new RegExp(`Full graph: ${base.replace(/[.:/]/g, "\\$&")}/#/room/room-1`));
     assert.ok(seen.every((s) => s.auth === `Bearer ${KEY}`));
     assert.deepEqual(seen.map((s) => `${s.method} ${s.path}`).sort(), [
       "GET /api/v1/collab/rooms/room-1/attention",
@@ -155,8 +174,11 @@ describe("/room over the authenticated Herdr API", () => {
   it("say posts with an idempotency key and does nothing else", async () => {
     const out = await runRoomCommand("say hello team", { agentDir: dir, newKey: () => "pi-room-k1" });
     assert.equal(out.level, "info");
+    assert.match(out.text, /Posted to the room \(event 9\)\./);
     assert.equal(seen.length, 1);
     assert.deepEqual(seen[0]!.body, { text: "hello team", idempotency_key: "pi-room-k1" });
+    const again = await runRoomCommand("say hello team", { agentDir: dir, newKey: () => "pi-room-k1" });
+    assert.match(again.text, /Already posted/);
   });
 
   it("a transport failure is retried ONCE with the same idempotency key (cannot double-post)", async () => {
@@ -206,7 +228,7 @@ describe("/room over the authenticated Herdr API", () => {
       );
       const out = await runRoomCommand("", { agentDir: other });
       assert.equal(out.level, "error");
-      assert.match(out.text, /HTTP 401/);
+      assert.match(out.text, /HTTP 401 \(key not accepted\): unauthorized/);
       assert.ok(!out.text.includes("sk-WRONG"));
       assert.ok(!out.text.includes(KEY));
     } finally {
@@ -240,9 +262,10 @@ describe("/room over the authenticated Herdr API", () => {
 
   it("--room overrides the configured room; rooms lists", async () => {
     const out = await runRoomCommand("rooms", { agentDir: dir });
-    assert.match(out.text, /room-1\s+Main/);
+    assert.match(out.text, /room-1\s+Main\s+\(owner\)/);
     const nope = await runRoomCommand("--room room-2", { agentDir: dir });
     assert.match(nope.text, /HTTP 404/);
+    assert.match(nope.text, /: not found/, "the server's own reason is shown, sanitized");
   });
 
   it("renderRoomView is bounded for large rooms", () => {

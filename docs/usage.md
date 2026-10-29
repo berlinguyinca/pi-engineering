@@ -1596,7 +1596,8 @@ anything named `*_API_KEY`, `*_SECRET` or `*_PASSWORD` are removed.
 `api_key_file`, `room_id`; the key is sent as `Authorization: Bearer` and never printed). `/room` shows the compact
 project tree, agents and attention inbox plus the link to the full lineage graph in Herdr; `/room say <text>` and
 `/room assign <agent> <text>` carry an idempotency key, so a retry cannot double-post. Put `--room <id>` first (`/room --room other say hi`) to use another
-room. `/mission attach` is not provided: `/mission` takes a free-form request.
+room. The wire contract was verified against a real Herdr control plane; see `docs/integration/herdr-room-wire-contract.md`
+(the key must be a collaboration user token, not an ingest key). `/mission attach` is not provided: `/mission` takes a free-form request.
 
 Context handoffs use one threshold triple, default `soft` 0.70 (phase boundary hands off), `preferred` 0.80 (checkpoint
 and a `context` handoff at the next checkpoint or phase boundary) and `emergency` 0.90 (checkpoint and handoff at once).
