@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
@@ -6,6 +9,7 @@ import {
   MissionPresenceController,
   type PresenceOptions,
   type PresenceSink,
+  STALE_STOP_WINDOW_MS,
   presenceOptionsFromEnv,
 } from "../../src/status/MissionPresenceController.ts";
 import { StatusSurfaceBus } from "../../src/status/surfaceBus.ts";
@@ -17,6 +21,8 @@ const now = () => clock;
 function mission(overrides: Partial<RuntimeMissionActivityEvent> = {}): RuntimeMissionActivityEvent {
   return {
     missionId: "MSN-1",
+    // The runtime stamps every emit with the time it was observed, never the time of the state.
+    observedAt: new Date(now()).toISOString(),
     title: "presence strip",
     phase: "EXECUTING",
     state: "EXECUTING",
@@ -349,6 +355,199 @@ test("a live event that raises attention rank after a replay still notifies", ()
   const controller = new MissionPresenceController(sink, opts());
   controller.update(running, undefined, "replay");
   controller.update(needsYou, undefined, "activity");
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  controller.dispose();
+});
+
+const longAgo = "2026-10-07T08:00:00.000Z";
+const staleFailed = () =>
+  mission({
+    missionId: "MSN-D3McHd",
+    state: "FAILED",
+    health: "failed",
+    reason: "worker crashed",
+    lastMeaningfulProgressAt: longAgo,
+    lastHeartbeatAt: longAgo,
+  });
+
+function ledgerFile(): string {
+  return join(mkdtempSync(join(tmpdir(), "pi-eng-presence-ledger-")), "presence-notified.json");
+}
+
+test("a long-stopped mission arriving as the first activity event does not notify", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(staleFailed(), undefined, "activity");
+  controller.tick();
+  assert.deepEqual(sink.notices, []);
+  assert.equal(controller.visible(), 1);
+  controller.dispose();
+});
+
+test("a stop just inside the staleness window still notifies once", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  const recent = new Date(T0 - STALE_STOP_WINDOW_MS + 60_000).toISOString();
+  controller.update(
+    mission({ state: "FAILED", health: "failed", lastMeaningfulProgressAt: recent }),
+    undefined,
+    "activity",
+  );
+  controller.tick();
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  controller.dispose();
+});
+
+test("a stale mission that later changes state still notifies", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(staleFailed(), undefined, "activity");
+  controller.tick();
+  controller.update(
+    mission({ missionId: "MSN-D3McHd", state: "NEEDS_ATTENTION", health: "blocked", reason: "approval required" }),
+    undefined,
+    "activity",
+  );
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  assert.match(sink.notices[0]!.text, /needs you/);
+  controller.dispose();
+});
+
+test("a new controller does not repeat a notification the ledger already recorded", () => {
+  const file = ledgerFile();
+  const first = recordingSink();
+  const one = new MissionPresenceController(first, opts({ notifiedLedgerFile: file }));
+  one.update(needsYou, undefined, "activity");
+  one.tick();
+  assert.equal(first.notices.length, 1);
+  one.dispose();
+
+  const second = recordingSink();
+  const two = new MissionPresenceController(second, opts({ notifiedLedgerFile: file }));
+  two.update(needsYou, undefined, "activity");
+  two.tick();
+  assert.deepEqual(second.notices, []);
+
+  // Leaving and re-entering the state is a genuine change and notifies.
+  two.update(running, undefined, "activity");
+  two.tick();
+  two.update(needsYou, undefined, "activity");
+  two.tick();
+  assert.equal(second.notices.length, 1);
+  two.dispose();
+
+  const third = recordingSink();
+  const three = new MissionPresenceController(third, opts({ notifiedLedgerFile: file }));
+  three.update(mission({ state: "FAILED", health: "failed" }), undefined, "activity");
+  three.tick();
+  assert.equal(third.notices.length, 1);
+  three.dispose();
+});
+
+test("an unreadable ledger file never blocks notification", () => {
+  const file = ledgerFile();
+  writeFileSync(file, "{not json");
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts({ notifiedLedgerFile: file }));
+  controller.update(needsYou, undefined, "activity");
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  controller.dispose();
+});
+
+for (const [state, health] of [
+  ["NEEDS_ATTENTION", "blocked"],
+  ["FAILED", "failed"],
+] as const) {
+  test(`a long-quiet mission that ${state} just now still notifies on its first activity event`, () => {
+    const sink = recordingSink();
+    const controller = new MissionPresenceController(sink, opts());
+    controller.update(
+      mission({
+        state,
+        health,
+        lastMeaningfulProgressAt: new Date(T0 - 3 * 60 * 60 * 1000).toISOString(),
+        lastHeartbeatAt: new Date(T0 - 10_000).toISOString(),
+      }),
+      undefined,
+      "activity",
+    );
+    controller.tick();
+    assert.equal(sink.notices.length, 1);
+    controller.dispose();
+  });
+}
+
+test("two live sessions on one ledger both keep their entries and announce a stop once", () => {
+  const file = ledgerFile();
+  const a = recordingSink();
+  const b = recordingSink();
+  const one = new MissionPresenceController(a, opts({ notifiedLedgerFile: file }));
+  const two = new MissionPresenceController(b, opts({ notifiedLedgerFile: file }));
+  one.update(needsYou, undefined, "activity");
+  one.tick();
+  two.update(mission({ missionId: "MSN-2", state: "FAILED", health: "failed" }), undefined, "activity");
+  two.tick();
+  two.update(needsYou, undefined, "activity");
+  two.tick();
+  assert.equal(a.notices.length, 1);
+  assert.equal(b.notices.length, 1);
+  assert.match(b.notices[0]!.text, /MSN-2/);
+  const stored = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
+  assert.deepEqual(Object.keys(stored).sort(), ["MSN-1", "MSN-2"]);
+  one.dispose();
+  two.dispose();
+});
+
+test("the ledger keeps only the newest 500 missions", () => {
+  const file = ledgerFile();
+  const controller = new MissionPresenceController(recordingSink(), opts({ notifiedLedgerFile: file }));
+  for (let i = 0; i < 501; i++) {
+    controller.update(mission({ missionId: `MSN-${i}`, state: "FAILED", health: "failed" }), undefined, "activity");
+  }
+  controller.tick();
+  const stored = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
+  assert.equal(Object.keys(stored).length, 500);
+  assert.equal(stored["MSN-0"], undefined);
+  assert.ok(stored["MSN-500"]);
+  controller.dispose();
+});
+
+test("a ledger that is not an object of strings is ignored entry by entry", () => {
+  for (const content of ["[]", "42", '{"MSN-1": 5, "MSN-9": "x"}']) {
+    const file = ledgerFile();
+    writeFileSync(file, content);
+    const sink = recordingSink();
+    const controller = new MissionPresenceController(sink, opts({ notifiedLedgerFile: file }));
+    controller.update(needsYou, undefined, "activity");
+    controller.tick();
+    assert.equal(sink.notices.length, 1, content);
+    controller.dispose();
+  }
+});
+
+test("a long-stopped mission stays silent even though the runtime stamps observedAt with now", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  const event = staleFailed();
+  assert.equal(event.observedAt, new Date(T0).toISOString());
+  controller.update(event, undefined, "activity");
+  controller.tick();
+  assert.deepEqual(sink.notices, []);
+  controller.dispose();
+});
+
+test("observedAt alone is the fallback only when no state timestamp parses", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(
+    mission({ state: "FAILED", health: "failed", lastMeaningfulProgressAt: null, lastHeartbeatAt: undefined }),
+    undefined,
+    "activity",
+  );
   controller.tick();
   assert.equal(sink.notices.length, 1);
   controller.dispose();
