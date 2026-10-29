@@ -660,13 +660,28 @@ export function realBackends(opts: RealBackendsOptions) {
        */
       failoverWhenNoToolCalls?: boolean;
     },
-  ): Promise<{ run: Awaited<ReturnType<WorkerExecutor["run"]>>; route: ModelRoute | undefined; model?: ModelRef }> => {
+  ): Promise<{
+    run: Awaited<ReturnType<WorkerExecutor["run"]>>;
+    route: ModelRoute | undefined;
+    model?: ModelRef;
+    /** The model observed to have served the final attempt, if any was named. */
+    served?: ModelRef;
+  }> => {
     const announce = (summary: string): void => {
       try {
         input.onActivity?.({ kind: "state", phase: "started", summary, meaningfulProgress: false });
       } catch {
         // Activity consumers are observers, never participants.
       }
+    };
+    // A takeover re-runs the task in a FRESH session on the SAME worktree, and the
+    // executed-action tracker does not survive the new session id. So whatever the
+    // previous model already wrote has to be said out loud, in the one wording the
+    // executor already uses for "these ran, do not repeat them" (#96).
+    const carryPartialEdits = (previous: Awaited<ReturnType<WorkerExecutor["run"]>>): void => {
+      const evidence = previous.executedActions;
+      if (!evidence || req.context?.includes(evidence)) return;
+      req.context = req.context ? `${req.context}\n\n${evidence}` : evidence;
     };
     let route = plan.initial;
     if (!route && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route };
@@ -708,6 +723,7 @@ export function realBackends(opts: RealBackendsOptions) {
         // that same pin — otherwise this would spin.
         const unchanged = (next ? modelKey(next) : null) === (route ? modelKey(route) : null);
         route = next;
+        carryPartialEdits(run);
         req.sessionId = plan.freshSessionId();
         arm(req, route, plan.context.missionId, unchanged ? pinKeyOf(plan.context.missionId) : null);
         run = await runWorker(req, input);
@@ -771,16 +787,25 @@ export function realBackends(opts: RealBackendsOptions) {
       plan.onSwitch?.(failed, next);
       route = next;
       model = next;
+      carryPartialEdits(run);
       req.sessionId = plan.freshSessionId();
       arm(req, route, plan.context.missionId);
       run = await runWorker(req, input);
     }
     // A model that serves an attempt again is no longer considered gone.
-    if (model && run.result.status === "completed") opts.onModelServed?.(model);
+    //
+    // Credit a SUCCESS only to a model that actually served it. `model` falls back
+    // to the session default on purpose for a FAILURE — unrouted work ran on the
+    // executor default, so that is the model to mark gone. On success the same
+    // guess would declare a model served, and clear its provider's cooldown, for a
+    // model that never ran: a caller-supplied executor names its own model, or
+    // names none (#96).
+    const served = route ?? ranOn(run);
+    if (served && run.result.status === "completed") opts.onModelServed?.(served);
     if (switches.length > 0) {
       run = { ...run, result: { ...run.result, summary: `${switches.join("; ")}. ${run.result.summary}` } };
     }
-    return { run, route, model };
+    return { run, route, model, served };
   };
   /** Takeover plan for a routed worker role: the next model the router offers. */
   const routedPlan = async (
@@ -806,13 +831,25 @@ export function realBackends(opts: RealBackendsOptions) {
     };
     return {
       // An unrouted role runs on the session default; when that provider is
-      // cooling, the registry places it on a live model instead.
+      // cooling, or the default itself is a model this session already marked
+      // unavailable, the registry places it on a live model instead.
       initial: await (async () => {
         const routed = await opts.routeModel?.(role, { missionId: context.missionId, ...requirementOpts });
         const fallback = opts.reviewFallbackModel;
-        if (!routed && requiresReviewRoute(role)) return registryRoute(role, [], [], extraRequires);
-        if (routed ? !cooling(routed.provider) : !fallback || !cooling(fallback.provider)) return routed;
-        return (await registryRoute(role, routed ? [routed] : [], [], extraRequires)) ?? routed;
+        // An unrouted role lands on `fallback`, a routed one on its route. Either
+        // can be a model already known dead, and PROVIDER cooldown does not cover
+        // that — one unavailable model on an otherwise live provider is exactly how
+        // a whole-family 404 presents. Placing a run there spends the run to learn
+        // what is already known, so go straight to a replacement (#96).
+        const placement = routed ?? fallback;
+        const knownDead = placement && opts.isModelUnavailable?.(placement) ? placement : undefined;
+        if (!routed && requiresReviewRoute(role)) {
+          return registryRoute(role, knownDead ? [knownDead] : [], [], extraRequires);
+        }
+        const providerLive = routed ? !cooling(routed.provider) : !fallback || !cooling(fallback.provider);
+        if (providerLive && !knownDead) return routed;
+        const exclude = knownDead ? [knownDead] : routed ? [routed] : [];
+        return (await registryRoute(role, exclude, [], extraRequires)) ?? routed;
       })(),
       next: async (tried: ModelRef[]) => {
         // Failover: the required model already failed, so drop the override
@@ -1244,7 +1281,7 @@ export function realBackends(opts: RealBackendsOptions) {
             ),
         });
         const run = takeover.run;
-        if (takeover.model && run.result.status === "completed") unreachableProviders.delete(takeover.model.provider);
+        if (takeover.served && run.result.status === "completed") unreachableProviders.delete(takeover.served.provider);
         // Independence is judged on the model that actually reviewed.
         const modelRoute = takeover.route;
         const independent = !!modelRoute && !reviewWarning(modelRoute);

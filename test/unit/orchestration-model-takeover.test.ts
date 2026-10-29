@@ -10,16 +10,9 @@
  * the worker (the gateway) is a stub.
  */
 import assert from "node:assert/strict";
-import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
-import type { RoleRouterAdapter } from "../../src/capability/adapter.ts";
-import type { ModelSource } from "../../src/capability/discovery.ts";
-import { normalizeModelRecord } from "../../src/capability/modelRecord.ts";
-import { ModelCapabilityRegistry } from "../../src/capability/registry.ts";
-import { RoleRouter } from "../../src/capability/router.ts";
 import type { WorkerResult } from "../../src/core/types.ts";
-import { DEFAULT_POLICY } from "../../src/lifecycle/policy.ts";
-import { type ModelRecord, type ModelRef, modelKey } from "../../src/lifecycle/types.ts";
+import { type ModelRef, modelKey } from "../../src/lifecycle/types.ts";
 import { type BrokerBackends, ExecutionBroker } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MAX_TRACKED_MISSIONS, realBackends } from "../../src/orchestration/realBackends.ts";
@@ -34,45 +27,13 @@ import {
 } from "../../src/runtime/modelRouting.ts";
 import { type TelemetryNotice, setTelemetrySink } from "../../src/telemetry/sink.ts";
 import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from "../../src/workers/WorkerExecutor.ts";
+import { realRouter } from "../support/realRouter.ts";
 
 const A: ModelRef = { provider: "gw", id: "model-a" };
 const B: ModelRef = { provider: "gw", id: "model-b" };
 const C: ModelRef = { provider: "gw", id: "model-c" };
 const Z: ModelRef = { provider: "gw", id: "model-z" };
 const SESSION: ModelRef = { provider: "gw", id: "session" };
-
-class InventorySource implements ModelSource {
-  readonly name = "test-inventory";
-  private readonly records: ModelRecord[];
-  constructor(records: ModelRecord[]) {
-    this.records = records;
-  }
-  async discover(): Promise<ModelRecord[]> {
-    return this.records;
-  }
-}
-
-/**
- * A real RoleRouter over `models`. Every model is equally capable, so ranking
- * falls back to provider/model name order: model-a before model-b, and so on.
- */
-async function realRouter(models: ModelRef[]): Promise<Pick<RoleRouterAdapter, "route">> {
-  const records = models.map((m) =>
-    normalizeModelRecord({ ...m, source: "test", toolCall: true, contextWindow: 200_000 }),
-  );
-  const registry = await ModelCapabilityRegistry.open({
-    sources: [new InventorySource(records)],
-    context: { cwd: tmpdir(), agentDir: tmpdir() },
-  });
-  await registry.refresh();
-  const router = new RoleRouter({ registry, policy: DEFAULT_POLICY });
-  return {
-    route: async (role, query) => {
-      const selected = (await router.select({ ...(query ?? {}), role })).selected;
-      return selected ? { provider: selected.provider, id: selected.id } : undefined;
-    },
-  };
-}
 
 function workerRun(result: Partial<WorkerResult> & Pick<WorkerResult, "status" | "summary">): WorkerRun {
   return {
@@ -317,6 +278,42 @@ describe("model takeover: agent workers", () => {
     assert.deepEqual(h.marks, [
       { model: modelKey(A), missionId: "MSN-1", taskId: "TSK-1", reason: notFound.result.summary },
     ]);
+  });
+
+  /**
+   * #96 — the tracker is keyed by session id and cleared when the attempt ends, so
+   * the replacement model starts with an empty view of what already happened. The
+   * first model may have written files and committed before it lost the model; a
+   * model told nothing redoes that work, and the diff it produces is the sum of two
+   * models doing the same job twice. The notice has to cross the session boundary.
+   */
+  it("a takeover hands the previous attempt's partial edits to the replacement model", async () => {
+    const h = await harness({
+      pool: [A, B],
+      gone: [A],
+      failure: {
+        ...notFound,
+        executedActions: "Executed actions (MUST NOT be repeated):\n- bash: touch NOTES.md",
+      },
+    });
+    const outcome = await h.backends.agent.runAgent({
+      role: "implementer",
+      objective: "x",
+      missionId: "MSN-1",
+      taskId: "TSK-1",
+      signal: signal(),
+      onActivity: () => {},
+    });
+    assert.equal(outcome.exitStatus, "succeeded");
+    assert.deepEqual(h.models(), [modelKey(A), modelKey(B)]);
+    assert.match(
+      String(h.seen[1]!.context),
+      /MUST NOT be repeated/,
+      "the replacement must be told the worktree already carries edits",
+    );
+    assert.match(String(h.seen[1]!.context), /NOTES\.md/, "and which work");
+    // The first attempt is told nothing: it has no predecessor's edits to avoid.
+    assert.ok(!String(h.seen[0]!.context ?? "").includes("MUST NOT be repeated"));
   });
 
   it("keeps the dead model out of routing until the TTL expires, then offers it again", async () => {

@@ -470,9 +470,10 @@ export class PiWorkerExecutor implements WorkerExecutor {
     // so the resilient layer can gate fallback by the role's envelope and
     // inject idempotency evidence into a retried request (spec §6/§23).
     const actions = new ExecutedActionTracker();
-    this.runActions.set(req.sessionId ?? req.role, actions);
+    const trackerKey = req.sessionId ?? req.role;
+    this.runActions.set(trackerKey, actions);
     try {
-      return await runWithInferenceInvocation(
+      const run = await runWithInferenceInvocation(
         {
           role: req.role,
           ...(req.runId ? { missionId: req.runId } : {}),
@@ -481,8 +482,16 @@ export class PiWorkerExecutor implements WorkerExecutor {
         },
         () => this.runOnce(req),
       );
+      // The actions this attempt executed have to leave with the RESULT. The
+      // tracker is keyed by session id and is deleted here, and a model takeover
+      // re-runs the task under a NEW session id — so the next attempt's tracker
+      // starts empty and the replacement model is never told the worktree already
+      // carries another model's edits. Passing the notice along is what lets the
+      // caller hand it across the session boundary (#96).
+      const evidence = actions.evidenceForRetry();
+      return evidence ? { ...run, executedActions: evidence } : run;
     } finally {
-      this.runActions.delete(req.sessionId ?? req.role);
+      this.runActions.delete(trackerKey);
     }
   }
 

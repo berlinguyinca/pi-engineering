@@ -149,6 +149,14 @@ export interface WorkerRun {
   toolCalls?: number;
   /** Payload of the terminating tool when it is not a plain worker_result. */
   structured?: unknown;
+  /**
+   * What this attempt had already executed, in the idempotency notice's own
+   * wording. A model takeover runs the task again in a FRESH session on the SAME
+   * worktree, where the executed-action tracker — keyed by session id — starts
+   * empty. Without this the replacement model cannot tell the tree holds another
+   * model's partial edits, so it repeats work or "fixes" edits it never made.
+   */
+  executedActions?: string;
 }
 
 /**
