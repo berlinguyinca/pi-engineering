@@ -125,7 +125,8 @@ import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/te
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
 import { describeSkippedTools, registerToolsTolerant } from "../src/tools/registration.ts";
-import { checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
+import { runtimeUpdateBridge } from "../src/update/hostBridge.ts";
+import { type SelfUpdateResult, checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
@@ -1237,8 +1238,14 @@ ${RECOVERY_PROMPT}`;
   // The same unattended, tty-less runner the auto-reload watcher uses.
   const runGit = gitRunner(extensionRoot);
 
-  const runSelfUpdate = async (apply: boolean) => {
+  const runSelfUpdate = async (apply: boolean): Promise<SelfUpdateResult> => {
     lastUpdateCheckAt = Date.now();
+    // An installed runtime moves through the host's transactional updater, which
+    // runs its own automatic check (preferences, telemetry, activation at a safe
+    // point). Probing git here would only ever answer "not a git checkout".
+    if (runtimeUpdateBridge()?.owns(extensionRoot)) {
+      return { decision: { action: "skip", reason: "installed runtime updates transactionally" }, applied: false };
+    }
     return checkForUpdate({ cwd: extensionRoot, git: runGit, apply });
   };
 
@@ -1301,15 +1308,46 @@ ${RECOVERY_PROMPT}`;
   }
 
   pi.registerCommand("update", {
-    description: "Check for and apply extension updates (fast-forward only, never over uncommitted work).",
+    description: "Check for and apply updates (installed runtime transactionally; source checkouts by fast-forward).",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       // Tokenised, not a substring test: `includes("--check")` would fire on
       // any argument that merely contains the text.
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const check = argv.includes("--check");
+
+      // An installed runtime is a version directory under the install root with
+      // current/previous pointers and no version-control metadata, so the only
+      // thing that can move it is the host's transactional updater. Asking git
+      // first made `/update` answer "not a git checkout" while a real update sat
+      // pending — true, and useless. The bridge answers only for the tree it
+      // actually owns; everything else keeps the checkout path.
+      const bridge = runtimeUpdateBridge();
+      if (bridge?.owns(extensionRoot)) {
+        if (check) {
+          const result = await bridge.check();
+          const guidance = result.failure
+            ? []
+            : result.pending
+              ? ["Run /update to fetch, validate and activate it at a safe point."]
+              : [];
+          ctx.ui.notify([...result.lines, ...guidance].filter(Boolean).join("\n"), result.failure ? "warning" : "info");
+          return;
+        }
+        const applied = await bridge.apply((line) => ctx.ui.notify(line, "info"));
+        ctx.ui.notify(
+          [applied.outcome, ...(applied.lines.length ? ["", ...applied.lines] : [])].join("\n"),
+          applied.ok ? "info" : "warning",
+        );
+        return;
+      }
+
       const result = await runSelfUpdate(!check);
       if (result.unavailable) {
-        ctx.ui.notify(`Update check unavailable: ${result.unavailable}`, "info");
+        // Say what the operator can do, not only that the check could not run.
+        ctx.ui.notify(
+          [`Update check unavailable: ${result.unavailable}`, ...(result.fix ? [result.fix] : [])].join("\n"),
+          "info",
+        );
         return;
       }
       const lines = [describeUpdate(result.decision, { applied: result.applied })];

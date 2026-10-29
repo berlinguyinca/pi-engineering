@@ -41,6 +41,12 @@ export interface SelfUpdateResult {
   head?: string;
   /** Why the check could not run, when it could not. */
   unavailable?: string;
+  /**
+   * What the operator can do about it. A reason with no fix is a dead end the
+   * operator has to decode themselves, so every unavailable answer names the
+   * action that actually applies to the tree it was said from.
+   */
+  fix?: string;
 }
 
 /**
@@ -50,15 +56,18 @@ export interface SelfUpdateResult {
  * decision, because a session must not fail over its own maintenance.
  */
 export async function checkForUpdate(opts: SelfUpdateOptions): Promise<SelfUpdateResult> {
-  const unavailable = (reason: string): SelfUpdateResult => ({
+  const unavailable = (reason: string, fix?: string): SelfUpdateResult => ({
     decision: { action: "skip", reason },
     applied: false,
     unavailable: reason,
+    ...(fix ? { fix } : {}),
   });
 
   try {
     const inside = await opts.git(["rev-parse", "--is-inside-work-tree"]);
-    if (inside.code !== 0 || inside.stdout.trim() !== "true") return unavailable("not a git checkout");
+    if (inside.code !== 0 || inside.stdout.trim() !== "true") {
+      return unavailable("not a git checkout", NOT_A_CHECKOUT_FIX);
+    }
 
     if (!opts.offline) {
       // Failure here is normal — offline, no credentials, no remote. Judge
@@ -122,6 +131,20 @@ export async function checkForUpdate(opts: SelfUpdateOptions): Promise<SelfUpdat
 function firstLine(text: string): string {
   return (text.split("\n")[0] ?? "").trim().slice(0, 200);
 }
+
+/**
+ * The recovery for "this tree is not a source checkout".
+ *
+ * The common case is an installed runtime: a version directory under the install
+ * root with `current`/`previous` pointers and no version-control metadata. That
+ * tree is updated by the transactional updater, not by a fast-forward, so the
+ * message has to say which command moves it.
+ */
+export const NOT_A_CHECKOUT_FIX =
+  "This tree is not a source checkout, so /update cannot fast-forward it. " +
+  "An installed runtime updates transactionally: run /engineering update (or /pie update) to fetch, stage, " +
+  "validate and activate at a safe point. To work from source instead, clone the repository and point Pi's " +
+  "extension path at the clone.";
 
 /**
  * How often a session may check.

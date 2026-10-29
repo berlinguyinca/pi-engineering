@@ -436,6 +436,30 @@ Update available.
 
 ---
 
+## 13.1 `/update` (the checkout command) on an installed runtime
+
+`/update` lives in the legacy extension and its own mechanism is a strict
+fast-forward of a source checkout. An installed runtime is not a checkout: it is
+a version directory under the install root, with `current`/`previous` pointers, a
+transaction journal, and no version-control metadata. Asking git first made
+`/update` answer `Update check unavailable: not a git checkout` while a real
+update was pending — true, and useless.
+
+`/update` therefore asks the runtime host whether it owns the tree Pi loaded the
+extension from:
+
+* **installed version directory** — drive the same transaction `/engineering
+  update` drives (fetch the channel, stage, validate, activate at a safe point,
+  health-check, commit, keep `previous` for rollback), reporting each phase. With
+  `--check` it performs the read-only check only: the pending commit is reported
+  and nothing is staged, activated, pointed or journalled.
+* **source checkout** — unchanged: report, or fast-forward only when clean and
+  only to the tracked upstream ref.
+* **neither** — the honest reason plus the action that applies to that tree, so
+  the message is never a dead end.
+
+---
+
 # 14. Automatic Update Checks
 
 Pi Engineering may check for updates automatically.
