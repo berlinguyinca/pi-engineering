@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
 import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
+import { runRoomCommand } from "../src/runtime/herdr/roomClient.ts";
 import { formatMissionActivity } from "../src/status/missionActivity.ts";
 import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
@@ -2656,6 +2657,17 @@ ${RECOVERY_PROMPT}`;
       ];
       // A paused mission is not a failure: notify as info, not error.
       ctx.ui.notify(lines.join("\n"), result.completed || result.paused ? "info" : "error");
+    },
+  });
+
+  // Thin client over Herdr's authenticated room API (src/runtime/herdr/roomClient.ts): no local state, closing the
+  // terminal cancels nothing. `/mission attach` is deliberately NOT added: /mission takes a free-form request.
+  pi.registerCommand("room", {
+    description:
+      "Herdr room: /room shows the project tree, agents and attention inbox with a link to the full graph; /room say <text>; /room assign <agent> <text>; /room rooms. Needs the herdr: block in engineering.yaml.",
+    handler: async (args, ctx) => {
+      const out = await runRoomCommand(args, { agentDir: getAgentDir() });
+      ctx.ui.notify(out.text, out.level);
     },
   });
 

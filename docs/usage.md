@@ -733,6 +733,7 @@ rather than a branch name that could move after verification.
 | `/mission pause <id>` | Pause one named mission (no live turn needed). Esc pauses the turn on screen; this pauses the mission you name. Its work is kept and only `/mission resume <id>` continues it. |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
+| `/room [say <text> \| assign <agent> <text> \| rooms]` | Thin client over Herdr's room API (needs the `herdr:` block): project tree, current agents, attention inbox and a link to the full graph; post a message or assign work. No local state; closing Pi cancels nothing. |
 | `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
 | `/engineering-status` / `-plan` / `-workers` | Planner/worker mission status, contract DAG, role/model telemetry. `-status` also shows the session's mission model (`model: X (operator pin)`). |
 | `/engineering-model [auto]` | Show the model this session's missions use; `auto` clears the operator pin set by `/model`. |
@@ -1588,6 +1589,29 @@ Absent block means Pi does not talk to Herdr at all. The key is read from the fi
 in the environment of anything Pi starts. Commands whose text a worker can author (the verifier's check commands,
 CAV test runs) run with a scrubbed environment: every `HERDR_*` variable, GitHub tokens, `SSH_AUTH_SOCK` and
 anything named `*_API_KEY`, `*_SECRET` or `*_PASSWORD` are removed.
+
+### `/room` and context thresholds
+
+`/room` is a thin client over Herdr's authenticated collaboration API, using only the `herdr:` block above (`url`,
+`api_key_file`, `room_id`; the key is sent as `Authorization: Bearer` and never printed). `/room` shows the compact
+project tree, agents and attention inbox plus the link to the full lineage graph in Herdr; `/room say <text>` and
+`/room assign <agent> <text>` carry an idempotency key, so a retry cannot double-post. Put `--room <id>` first (`/room --room other say hi`) to use another
+room. `/mission attach` is not provided: `/mission` takes a free-form request.
+
+Context handoffs use one threshold triple, default `soft` 0.70 (phase boundary hands off), `preferred` 0.80 (checkpoint
+and a `context` handoff at the next checkpoint or phase boundary) and `emergency` 0.90 (checkpoint and handoff at once).
+Adjust it in the global `engineering.yaml`; a model entry wins over a runtime (provider) entry:
+
+```yaml
+context_thresholds:
+  preferred: 0.82
+  runtimes:
+    llama.cpp: { soft: 0.6, preferred: 0.7, emergency: 0.85 }
+  models:
+    "glm-*": { emergency: 0.95 }
+```
+
+Each handoff record carries its `cause`: `context_pressure` or `quota_exhausted` (provider quota is a separate trigger).
 
 Sequence recovery: Herdr orders each source by `source_sequence`. If Pi's sequence file is lost or restored from an
 older copy, Pi lifts the counter above its own outbox, and on a `409` naming a taken sequence it learns the server's

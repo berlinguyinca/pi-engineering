@@ -29,6 +29,10 @@ export interface WorkerActivity {
   elapsedMs?: number;
   lastActivityMs?: number;
   claims?: CheckpointProgressClaim[];
+  /** Live context size of the worker's session (summary CONTEXT_USAGE_SUMMARY). Numbers and a model id only. */
+  context?: { tokens: number; window: number; model: string };
+  /** The inference failure class that ended the run, when it was provider quota exhaustion (QUOTA_EXHAUSTED_SUMMARY). */
+  inferenceFailure?: "quota";
 }
 
 /** A delegated task for a fresh-context worker (INV-002, §12). */
