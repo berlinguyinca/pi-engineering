@@ -1815,6 +1815,8 @@ export class Orchestrator {
   }
 
   private async activateMissionRepository(missionId: string): Promise<void> {
+    // Every (re)drive of a mission (run, resume, repair after a restart) first re-drives its open handoffs.
+    void this.handoffDriver?.resumeOpen(missionId);
     const repoId = this.repoIdForMission(missionId);
     const manifest = this.store.getWorkspaceManifest(missionId);
     if (repoId && manifest && this.repositoryRegistry) {
@@ -1900,16 +1902,6 @@ export class Orchestrator {
     }
   }
 
-  /**
-   * Drive every open, checkpoint-bearing handoff record through verify -> fence -> acknowledge (idempotent; safe after
-   * a crash at any stage). No-op without `phaseHandoff`. Resolves when every drive started here has settled.
-   */
-  async resumeHandoffs(missionId?: string): Promise<void> {
-    if (!this.handoffDriver) return;
-    await this.handoffDriver.resumeOpen(missionId);
-    await this.handoffDriver.idle();
-  }
-
   /** Resolves when no handoff drive is in flight (tests, shutdown). */
   async settleHandoffs(): Promise<void> {
     await this.handoffDriver?.idle();
@@ -1964,6 +1956,8 @@ export class Orchestrator {
     const obs = this.observability;
     if (!this.observedExecutions.has(event.executionId)) {
       this.observedExecutions.add(event.executionId);
+      // A new execution may be the successor an open handoff is waiting for.
+      void this.handoffDriver?.resumeOpen(event.missionId);
       this.taskExecutions.set(`${event.missionId}:${event.taskId}`, event.executionId);
       const task = this.store.getTask(event.taskId);
       // P4: surface routing provenance per worker. The execution record

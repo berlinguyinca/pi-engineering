@@ -2,7 +2,7 @@
  * The verified handoff protocol is the production path: a context-pressure trigger fired through the REAL Orchestrator
  * (worker activity -> ContextHandoffTrigger -> broker checkpoint -> HandoffDriver -> executeHandoff -> MissionStore)
  * verifies the checkpoint, fences the source writer, terminates only its registered process groups, and acknowledges
- * only a successor that actually exists. Crash recovery goes through Orchestrator.resumeHandoffs on a reopened store.
+ * only a successor that actually exists. Crash recovery re-enters through the Orchestrator's own mission-drive and first-activity paths on a reopened store.
  */
 
 import assert from "node:assert/strict";
@@ -17,7 +17,7 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import type { EventStoreBackend } from "../../src/platform/eventstore/backend.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-import { CONTEXT_USAGE_SUMMARY } from "../../src/workers/activity.ts";
+import { CONTEXT_USAGE_SUMMARY, QUOTA_EXHAUSTED_SUMMARY } from "../../src/workers/activity.ts";
 import { sharedProcessQuarantine } from "../../src/workers/processQuarantine.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
@@ -77,6 +77,7 @@ interface Rig {
   unrelatedPid: number;
   reports: string[];
   emit: (tokens: number) => void;
+  emitRaw: (event: Record<string, unknown>) => void;
   quarantineCalls: string[];
   git: GitRepo;
   root: string;
@@ -206,6 +207,7 @@ async function rig(): Promise<Rig> {
     quarantineCalls,
     git,
     root: fx.root,
+    emitRaw: (event) => activity?.(event),
     emit: (tokens) =>
       activity?.({
         kind: "state",
@@ -221,6 +223,23 @@ const stamps = (backend: EventStoreBackend) =>
   events(backend, "handoff.transitioned").filter(
     (e) => (e.payload as { handoff?: { sourceFencedAt?: string } }).handoff?.sourceFencedAt,
   );
+
+/** Production re-drive entry points: a mission being (re)driven, and the first activity of a new execution. */
+async function redrive(o: Orchestrator, missionId: string): Promise<void> {
+  await o.repairBlockedMission(missionId);
+  await o.settleHandoffs();
+}
+async function firstActivity(o: Orchestrator, missionId: string, taskId: string, executionId: string): Promise<void> {
+  (o as unknown as { observeWorkerActivity(e: unknown): void }).observeWorkerActivity({
+    kind: "state",
+    summary: "Worker session started",
+    meaningfulProgress: false,
+    missionId,
+    taskId,
+    executionId,
+  });
+  await o.settleHandoffs();
+}
 
 async function settleTrigger(r: Rig): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -252,7 +271,7 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
     assert.ok(r.reports.some((l) => l.includes("verified, source fenced; awaiting the successor")));
 
     // No successor yet: never acknowledged on its own.
-    await r.orchestrator.resumeHandoffs(r.missionId);
+    await redrive(r.orchestrator, r.missionId);
     assert.equal(r.store.getHandoffRecord(record.id)?.state, "validated");
 
     // The successor execution (same task, another session) attaches; the next drive acknowledges it, nothing else.
@@ -263,7 +282,7 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
       session_id: "WKS-successor",
     });
     r.store.setExecutionStatus(successor.execution_id, "RUNNING", {});
-    await r.orchestrator.resumeHandoffs(r.missionId);
+    await firstActivity(r.orchestrator, r.missionId, r.taskId, successor.execution_id);
     const done = r.store.getHandoffRecord(record.id);
     assert.equal(done?.state, "acknowledged");
     assert.equal(done?.successor?.sessionId, "WKS-successor");
@@ -283,7 +302,7 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
     for (let i = 0; i < 6; i++) r.emit(950 + i);
     await until(() => r.store.listHandoffRecords(r.missionId).some((h) => h.sourceFencedAt));
     await settleTrigger(r);
-    for (let i = 0; i < 3; i++) await r.orchestrator.resumeHandoffs(r.missionId);
+    for (let i = 0; i < 3; i++) await redrive(r.orchestrator, r.missionId);
     r.emit(990);
     await settleTrigger(r);
     assert.equal(r.store.listHandoffRecords(r.missionId).length, 1);
@@ -320,7 +339,7 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
 
     // Evidence is repaired: the same record is driven again from where it stopped.
     (r.driver as unknown as { deps: { verifyDeps?: HandoffVerifyDeps } }).deps.verifyDeps = passingDeps;
-    await r.orchestrator.resumeHandoffs(r.missionId);
+    await redrive(r.orchestrator, r.missionId);
     assert.ok(r.store.getHandoffRecord(record?.id as string)?.sourceFencedAt);
     assert.equal(r.store.getExecution(r.executionId())?.status, "CANCELED");
     await until(() => !alive(r.childPid));
@@ -352,16 +371,19 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
     const reopened = MissionStore.open(r.backend);
     const git = r.git;
     const resumed = buildOrchestrator(reopened, git, async () => ok);
-    await resumed.resumeHandoffs(r.missionId);
+    await redrive(resumed, r.missionId);
     record = reopened.getHandoffRecord(record?.id as string);
     assert.ok(record?.sourceFencedAt, "fenced on resume");
+    // KNOWN LIMIT, pinned so it cannot be forgotten: process registrations live in the dead runtime's memory, so a
+    // restarted runtime can revoke the writer's authority but cannot terminate processes it never registered.
+    assert.equal(alive(r.childPid), true, "processes started before a runtime restart are NOT terminated");
     assert.equal(record?.verifiedAt !== undefined, true);
     assert.equal(
       events(r.backend, "execution.late_result_rejected").length,
       1,
       "the writer authority was revoked once even though the fence ran twice",
     );
-    await resumed.resumeHandoffs(r.missionId);
+    await redrive(resumed, r.missionId);
     assert.equal(stamps(r.backend).length, 1, "one fence stamp in the durable history");
   });
 
@@ -384,7 +406,7 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
     (
       second as unknown as { handoffDriver: { deps: { verifyDeps?: HandoffVerifyDeps } } }
     ).handoffDriver.deps.verifyDeps = passingDeps;
-    await second.resumeHandoffs(r.missionId);
+    await redrive(second, r.missionId);
     const fenced = reopened.getHandoffRecord(prepared?.id as string);
     assert.ok(fenced?.verifiedAt && fenced.sourceFencedAt, "resumed: verified then fenced");
     assert.equal(fenced?.state, "validated");
@@ -403,12 +425,33 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
     const thirdCalls: string[] = [];
     const thirdBroker = (third as unknown as { broker: ExecutionBroker }).broker;
     thirdBroker.quarantineExecution = async (id: string) => void thirdCalls.push(id);
-    await third.resumeHandoffs(r.missionId);
+    await firstActivity(third, r.missionId, r.taskId, successor.execution_id);
     const acknowledged = again.getHandoffRecord(prepared?.id as string);
     assert.equal(acknowledged?.state, "acknowledged");
     assert.equal(acknowledged?.successor?.sessionId, "WKS-next");
     assert.equal(acknowledged?.sourceFencedAt, fenced?.sourceFencedAt, "the original fence stamp is kept");
     assert.deepEqual(thirdCalls, [], "no second fence");
+    assert.equal(events(r.backend, "execution.late_result_rejected").length, 1);
+  });
+});
+
+describe("quota exhaustion takes the same verified path with its own cause", () => {
+  it("a quota failure observed through the Orchestrator hands off as a recovery record, verified and fenced", async () => {
+    const r = await rig();
+    r.emitRaw({
+      kind: "state",
+      summary: QUOTA_EXHAUSTED_SUMMARY,
+      meaningfulProgress: false,
+      inferenceFailure: "quota",
+    });
+    await until(() => r.store.listHandoffRecords(r.missionId).some((h) => h.sourceFencedAt));
+    await settleTrigger(r);
+    const [record] = r.store.listHandoffRecords(r.missionId);
+    assert.equal(record?.kind, "recovery");
+    assert.equal(record?.cause, "quota_exhausted");
+    assert.equal(record?.state, "validated");
+    assert.ok(record?.verifiedAt && record.sourceFencedAt);
+    await until(() => !alive(r.childPid));
     assert.equal(events(r.backend, "execution.late_result_rejected").length, 1);
   });
 });
