@@ -17,7 +17,7 @@
  * queue's job (it is SHA-fenced like any other entry). Remote PR creation is out
  * of scope.
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { safeGitOrThrow } from "../git/safeGit.ts";
@@ -127,6 +127,11 @@ export function gitPostMerge(repoDir: string): PostMergeGit {
       if (existing) return { ok: true, sha: existing, created: false };
       const parents = (await git(repoDir, "rev-list", "--parents", "-n", "1", mergedSha)).split(" ").length - 1;
       const dir = await mkdtemp(join(tmpdir(), "pi-postmerge-"));
+      const baseSha = await git(repoDir, "rev-parse", "--verify", `${base}^{commit}`);
+      // Never --force and never `branch -D`: plain remove (git refuses a dirty tree) and a
+      // compare-and-swap delete that only succeeds while the branch still sits at the base.
+      const dropEmptyBranch = (): Promise<unknown> =>
+        git(repoDir, "update-ref", "-d", `refs/heads/${branch}`, baseSha).catch(() => {});
       try {
         await git(repoDir, "worktree", "add", "-q", "-b", branch, dir, base);
         const hasIdentity = await git(dir, "config", "user.email").then(
@@ -140,25 +145,26 @@ export function gitPostMerge(repoDir: string): PostMergeGit {
           await git(dir, ...identity, "revert", "--no-edit", ...(parents > 1 ? ["-m", "1"] : []), mergedSha);
         } catch (error) {
           await git(dir, "revert", "--abort").catch(() => {});
-          await git(repoDir, "worktree", "remove", "--force", dir).catch(() => {});
-          await git(repoDir, "branch", "-D", branch).catch(() => {});
+          await git(repoDir, "worktree", "remove", dir).catch(() => {});
+          await dropEmptyBranch();
           return {
             ok: false,
             reason: error instanceof Error ? (error.message.split("\n")[0] ?? "revert failed") : "revert failed",
           };
         }
         const sha = await git(dir, "rev-parse", "HEAD");
-        await git(repoDir, "worktree", "remove", "--force", dir);
+        await git(repoDir, "worktree", "remove", dir);
         return { ok: true, sha, created: true };
       } catch (error) {
-        await git(repoDir, "worktree", "remove", "--force", dir).catch(() => {});
-        await git(repoDir, "branch", "-D", branch).catch(() => {});
+        await git(repoDir, "worktree", "remove", dir).catch(() => {});
+        await dropEmptyBranch();
         return {
           ok: false,
           reason: error instanceof Error ? (error.message.split("\n")[0] ?? "git failed") : "git failed",
         };
       } finally {
-        await rm(dir, { recursive: true, force: true });
+        // Empty after a successful `worktree remove`; a refused removal leaves its content in place.
+        await rmdir(dir).catch(() => {});
       }
     },
   };

@@ -367,7 +367,7 @@ export class PlannerWorkerExecutor {
         }
         // Interrupted, failed or never integrated: discard its worktree and start over.
         if (prior.worktree) await this.dropWorktree({ path: prior.worktree, branch: this.branchFor(id) });
-        else await git(this.opts.repoRoot, ["branch", "-D", this.branchFor(id)]);
+        else await this.retireBranch(this.branchFor(id));
         this.addContract(prior.contract);
         const rt = this.contracts.get(id)!;
         rt.state.history = [
@@ -455,8 +455,9 @@ export class PlannerWorkerExecutor {
       return { path: target, branch };
     }
     await git(this.opts.repoRoot, ["worktree", "remove", target]);
-    // -f: a crashed worktree whose directory vanished may still register the branch.
-    const add = await git(this.opts.repoRoot, ["worktree", "add", "-f", target, branch]);
+    // No -f: a crashed worktree whose directory vanished may still register the branch; that
+    // fails closed here and the operator runs `git worktree prune` after looking at it.
+    const add = await git(this.opts.repoRoot, ["worktree", "add", target, branch]);
     if (add.code !== 0) throw new Error(`cannot reattach ${branch}: ${add.stderr.trim()}`);
     return { path: target, branch };
   }
@@ -1601,7 +1602,30 @@ export class PlannerWorkerExecutor {
       this.emit({ type: "phase", text: `preserved worktree at ${info.path}: cleanup could not confirm removal` });
       return;
     }
-    if (!keepBranch) await checkedGit(this.opts.repoRoot, ["branch", "-D", info.branch]);
+    if (!keepBranch) await this.retireBranch(info.branch);
+  }
+
+  /** `branch -d` when merged; otherwise rename to `superseded/<branch>-<ts>` so no commit is lost. Never `-D`. */
+  private async retireBranch(branch: string): Promise<void> {
+    if ((await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code !== 0) return;
+    if ((await git(this.opts.repoRoot, ["branch", "-d", branch])).code === 0) return;
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace(/\.\d+Z$/, "Z");
+    for (let n = 0; ; n++) {
+      const target = `superseded/${branch}-${stamp}${n === 0 ? "" : `.${n}`}`;
+      if ((await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${target}`])).code === 0) continue;
+      const renamed = await git(this.opts.repoRoot, ["branch", "-m", branch, target]);
+      this.emit({
+        type: "phase",
+        text:
+          renamed.code === 0
+            ? `kept ${branch} as ${target}: it has commits not merged elsewhere`
+            : `kept branch ${branch}: ${renamed.stderr.trim()}`,
+      });
+      return;
+    }
   }
 
   private async cleanup(): Promise<void> {

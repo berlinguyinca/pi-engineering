@@ -20,7 +20,9 @@ import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { GitRepo, shortHash } from "../../src/git/GitRepo.ts";
+import { CliForkGit } from "../../src/git/forkGit.ts";
 import { readOwnerMarker } from "../../src/git/ownerMarker.ts";
+import { gitPostMerge } from "../../src/merge/postMerge.ts";
 import { repairTornTail } from "../../src/platform/eventstore/jsonl.ts";
 import { emitRuntimeEvent, setRuntimeEventLog } from "../../src/runtime/isolation/runtimeEvents.ts";
 import { TranscriptWriter } from "../../src/workers/transcriptStore.ts";
@@ -241,4 +243,60 @@ test("event-store torn-tail repair quarantines the discarded bytes before trunca
   const q = readdirSync(dirname(file)).find((n) => n.startsWith("events.jsonl.torn-"));
   assert.ok(q);
   assert.equal(readFileSync(join(dirname(file), q), "utf8"), '{"c":"par');
+});
+
+test("fork worktrees get an ownership marker keyed by the owning repo's shortHash", async () => {
+  const { dir, head } = await scratchRepo();
+  const wt = join(dirname(dir), `pi-fork-${shortHash(dir)}-t1`);
+  await new CliForkGit(dir).addWorktree(wt, "pi-fork/fk-0123456789abcdef", head);
+  const read = readOwnerMarker(await g(wt, "rev-parse", "--absolute-git-dir"));
+  assert.ok(read.ok);
+  assert.equal(read.marker.repoRootHash, shortHash(dir));
+  assert.equal(read.marker.branch, "pi-fork/fk-0123456789abcdef");
+});
+
+test("a branch whose tip is reachable from another ref is dropped without a superseded copy", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const info = await git.createWorktree(head, "reach-1");
+  writeFileSync(join(info.path, "w.txt"), "work");
+  await g(info.path, "add", "-A");
+  await g(info.path, "commit", "-qm", "worker commit");
+  await g(dir, "branch", "sibling", "reach-1");
+  await git.removeWorktree(info);
+  assert.equal(await g(dir, "for-each-ref", "refs/heads/superseded/"), "");
+  assert.equal(await g(dir, "for-each-ref", "refs/heads/reach-1"), "");
+  assert.ok(await g(dir, "rev-parse", "--verify", "refs/heads/sibling"));
+});
+
+test("post-merge revert conflict leaves no branch, no worktree and no temp dir", async () => {
+  const { dir } = await scratchRepo();
+  const commit = async (content: string): Promise<string> => {
+    writeFileSync(join(dir, "a.txt"), content);
+    await g(dir, "commit", "-qam", content);
+    return g(dir, "rev-parse", "HEAD");
+  };
+  const first = await commit("one");
+  await commit("two");
+  const base = await g(dir, "rev-parse", "HEAD");
+  const out = await gitPostMerge(dir).createRevertBranch({ branch: "revert-x", mergedSha: first, base });
+  assert.equal(out.ok, false);
+  assert.equal(await g(dir, "for-each-ref", "refs/heads/revert-x"), "");
+  assert.equal((await g(dir, "worktree", "list", "--porcelain")).split("\n\n").length, 1);
+});
+
+test("no destructive git flags remain in the data-bearing cleanup paths", () => {
+  const files = [
+    "src/git/GitRepo.ts",
+    "src/git/forkGit.ts",
+    "src/merge/postMerge.ts",
+    "src/plannerWorker/executor.ts",
+    "src/runtime/EngineeringRuntime.ts",
+    "src/orchestration/broker.ts",
+  ];
+  for (const f of files) {
+    const src = readFileSync(join(import.meta.dirname, "..", "..", f), "utf8");
+    assert.ok(!/"branch",\s*"-D"/.test(src), `${f}: branch -D`);
+    assert.ok(!/"worktree",\s*"remove",\s*"--force"/.test(src), `${f}: worktree remove --force`);
+    assert.ok(!/"worktree",\s*"add",\s*"-f"/.test(src), `${f}: worktree add -f`);
+  }
 });

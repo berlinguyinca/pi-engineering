@@ -1662,6 +1662,26 @@ export class GitRepo {
     guard?.assertAuthoritative();
     const deleted = await this.git(["branch", "-d", branch]);
     if (deleted.code === 0) return deleted;
+    // `-d` only compares with HEAD/upstream. A tip that is reachable from another
+    // ref (merged into the mission base, a sibling branch, a tag) holds nothing
+    // unique, so it is dropped with a compare-and-swap; anything else is renamed.
+    const tip = await this.git(["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
+    if (tip.code === 0 && tip.stdout) {
+      const others = await this.git([
+        "for-each-ref",
+        "--contains",
+        tip.stdout,
+        "--format=%(refname)",
+        "refs/heads",
+        "refs/remotes",
+        "refs/tags",
+      ]);
+      const elsewhere = others.stdout.split("\n").filter((ref) => ref && ref !== `refs/heads/${branch}`);
+      if (others.code === 0 && elsewhere.length > 0) {
+        const cas = await this.git(["update-ref", "-d", `refs/heads/${branch}`, tip.stdout]);
+        if (cas.code === 0) return cas;
+      }
+    }
     const stamp = new Date()
       .toISOString()
       .replace(/[-:]/g, "")
