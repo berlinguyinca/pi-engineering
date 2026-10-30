@@ -75,6 +75,37 @@ export function wantsCommitDiscipline(role: WorkerRole, opts?: { isolatedWorktre
 }
 
 /**
+ * Roles whose deliverable is a judgement about somebody else's change. Their
+ * findings are read as fact by the promotion gate, so they carry the claim
+ * discipline rule (issue #509).
+ */
+export const REVIEW_FAMILY_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
+  "reviewer",
+  "security-review",
+  "architecture-reviewer",
+  "performance-review",
+]);
+
+/**
+ * Why a comment is not a probe. Reviews justified deletions by quoting a header
+ * comment ("X ARE Y") and asserted capability matrices that had never been
+ * exercised; both were wrong, and nothing in the pipeline could have caught
+ * either, because reading prose about behaviour was accepted as evidence of it.
+ */
+export const CLAIM_DISCIPLINE = `\
+Claim discipline:
+- A comment, doc header, PR body, or usage string is a CLAIM about behaviour, never evidence of it.
+- To assert "A delegates to / is the same as B", open B and cite the line the call lands on.
+- To assert a capability ("returns 403", "supports SSE resume", "handles abort"), cite a probe you ran, or write "claimed by <file>:<line> (comment), not probed".
+- To propose deleting, renaming, or aliasing away a command, flag, file or key, search the whole tree, read every hit, and quote each hit as file:line. If any hit is text the tool shows the user, removing that name is a defect, not a cleanup.
+- Cite file:line only where you read it at the commit under review. An unresolved citation makes your finding a guess, and a guess cannot carry a verdict.`;
+
+/** Whether a role's prompt carries the claim-discipline block. */
+export function wantsClaimDiscipline(role: WorkerRole): boolean {
+  return REVIEW_FAMILY_ROLES.has(role);
+}
+
+/**
  * Build the system prompt for a worker.
  * `task` and optional `context` are injected; the worker is told to finish with
  * `worker_result`.
@@ -104,6 +135,7 @@ export function buildSystemPrompt(
   }
   parts.push("");
   parts.push(BASE_RULES);
+  if (wantsClaimDiscipline(role)) parts.push(CLAIM_DISCIPLINE);
   if (wantsCommitDiscipline(role, opts)) parts.push(COMMIT_DISCIPLINE);
   return parts.join("\n");
 }

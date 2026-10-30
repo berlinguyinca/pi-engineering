@@ -2,8 +2,9 @@ import { type ToolDefinition, defineTool } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { ContextBroker } from "../context/ContextBroker.ts";
-import { type Actor, isMachineEvidence } from "../core/types.ts";
+import { type Actor, type Evidence, isMachineEvidence } from "../core/types.ts";
 import type { Ledger } from "../ledger/Ledger.ts";
+import { countClaims, countGuardMessage, countsAreBacked } from "../ledger/claimDiscipline.ts";
 import type { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { Mission } from "../orchestration/types.ts";
 import { lookupMissionDurable } from "../runtime/host/durableMissionLookup.ts";
@@ -62,6 +63,39 @@ export async function hasRecordedEvidence(
   const id = ref.startsWith("test-run://") ? ref.slice("test-run://".length) : ref;
   const evidence = services.ledger.getEvidence(id);
   return evidence !== undefined && evidence.trust !== "unverified";
+}
+
+/** How much stored output the count guard reads from each end of an artifact. */
+const COUNT_GUARD_HEAD_CHARS = 8_000;
+const COUNT_GUARD_TAIL_CHARS = 24_000;
+
+/**
+ * The stored output behind an evidence reference: head and tail, because a test
+ * runner prints its summary at the end and its plan lines at the start.
+ */
+async function evidenceOutputText(
+  ref: string,
+  services: Pick<CoreServices, "ledger" | "artifacts">,
+): Promise<{ evidence: Evidence | null; text: string | null }> {
+  const readWindow = async (uri: string, fromEnd: boolean): Promise<string | null> => {
+    try {
+      const meta = services.artifacts.getByUri(uri);
+      const size = meta?.size ?? 0;
+      const cap = fromEnd ? COUNT_GUARD_TAIL_CHARS : COUNT_GUARD_HEAD_CHARS;
+      const offset = fromEnd ? Math.max(0, size - cap) : 0;
+      const slice = await services.artifacts.readSliceByUri(uri, offset, cap);
+      return slice?.content ?? null;
+    } catch {
+      return null;
+    }
+  };
+  if (ref.startsWith("artifact://")) return { evidence: null, text: await readWindow(ref, true) };
+  const id = ref.startsWith("test-run://") ? ref.slice("test-run://".length) : ref;
+  const evidence = services.ledger.getEvidence(id) ?? null;
+  if (!evidence) return { evidence: null, text: null };
+  const windows = await Promise.all((evidence.artifacts ?? []).slice(0, 2).map((uri) => readWindow(uri, true)));
+  const text = windows.filter((w): w is string => typeof w === "string").join("\n");
+  return { evidence, text: text.length > 0 ? text : null };
 }
 
 /**
@@ -191,7 +225,7 @@ export function buildCoreTools(
     name: "ledger_claim",
     label: "Ledger Claim",
     description:
-      "Record an unverified hypothesis or an evidence-backed fact/finding into the Engineering Ledger. Hypotheses stay open even with evidence. Cite stored evidence for observations; a heartbeat proves liveness, not progress, and failed or unauthorized probes leave live state unknown. A reference does not establish a causal explanation.",
+      "Record an unverified hypothesis or an evidence-backed fact/finding into the Engineering Ledger. Hypotheses stay open even with evidence. Cite stored evidence for observations; a heartbeat proves liveness, not progress, and failed or unauthorized probes leave live state unknown. A reference does not establish a causal explanation. A claim that states a count (tests, commits, files, lines) must cite the machine output that produced that number — an evidence id or artifact:// whose stored output reports it — or the claim is refused.",
     parameters: Type.Object({
       kind: Type.Union([
         Type.Literal("fact"),
@@ -213,6 +247,19 @@ export function buildCoreTools(
       const ref = params.evidence ? String(params.evidence) : undefined;
       // Prefixes classify references; they cannot authenticate evidence (INV-006).
       const machine = await hasRecordedEvidence(ref, services);
+      // A count is the easiest claim to invent, so it never enters on a bare
+      // assertion: the number must appear in the machine output cited (issue #507).
+      const counts = countClaims(String(params.claim));
+      if (counts.length > 0) {
+        const backed = ref && machine ? await evidenceOutputText(ref, services) : { evidence: null, text: null };
+        const { ok, unbacked } = countsAreBacked(counts, backed.evidence, backed.text);
+        if (!ok) {
+          return {
+            content: [{ type: "text", text: countGuardMessage(unbacked, ref) }],
+            details: { refused: "count_without_metric_evidence", unbacked },
+          };
+        }
+      }
       const status = params.kind === "finding" || params.kind === "hypothesis" ? "open" : machine ? "verified" : "open";
       const entity = await services.ledger.recordEntity(
         params.kind as "fact" | "hypothesis" | "finding" | "decision",
