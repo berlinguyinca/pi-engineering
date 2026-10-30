@@ -1605,6 +1605,8 @@ export class GitRepo {
       return refusal;
     }
     guard?.assertAuthoritative();
+    const admin = await this.findAdminDir(path);
+    if (admin !== null) await this.preserveDetachedHead(admin, basename(path));
     const ownLink = await this.isOwnNodeModulesLink(path);
     if (ownLink) await unlink(join(path, "node_modules")).catch(() => {});
     // Re-check immediately before the remove: shrinks the window in which a worker could write.
@@ -1658,7 +1660,17 @@ export class GitRepo {
       const file = join(await this.candidateStateDir(), "kept-scratch-worktrees.jsonl");
       const record = { path, reason, ts: new Date().toISOString(), marker };
       // Bounded: one line per path (a repeat updates it, an identical repeat is skipped) and a hard cap.
-      const lines = (await readFile(file, "utf8").catch(() => "")).split("\n").filter(Boolean);
+      const lines = (await readFile(file, "utf8").catch(() => ""))
+        .split("\n")
+        .filter(Boolean)
+        .filter((line) => {
+          try {
+            const p = (JSON.parse(line) as { path?: string }).path;
+            return p === path || (typeof p === "string" && existsSync(p)); // drop entries whose worktree is gone
+          } catch {
+            return false;
+          }
+        });
       const index = lines.findIndex((line) => {
         try {
           return (JSON.parse(line) as { path?: string }).path === path;
@@ -1678,7 +1690,7 @@ export class GitRepo {
       } else {
         lines.push(JSON.stringify(record));
       }
-      const tmp = `${file}.${process.pid}.tmp`;
+      const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
       await writeFile(tmp, `${lines.join("\n")}\n`, "utf8");
       await rename(tmp, file);
       emitTelemetry({ level: "warning", text: `worktree kept (not removed): ${path}: ${reason}` });
@@ -1745,7 +1757,22 @@ export class GitRepo {
 
   /** Path of the worktree (primary included) that has `branch` checked out, or null. */
   private async checkedOutAt(branch: string): Promise<string | null> {
-    return (await this.registeredWorktrees()).find((w) => w.branch === branch)?.path ?? null;
+    const listed = (await this.registeredWorktrees()).find((w) => w.branch === branch)?.path;
+    if (listed) return listed;
+    // A worktree mid-rebase/bisect has a DETACHED HEAD but still owns the branch it will move.
+    const common = await this.commonGitDir();
+    if (common === null) return null;
+    const dirs = [common];
+    for (const name of await readdir(join(common, "worktrees")).catch(() => [] as string[])) {
+      dirs.push(join(common, "worktrees", name));
+    }
+    for (const dir of dirs) {
+      for (const file of ["rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"]) {
+        const value = (await readFile(join(dir, file), "utf8").catch(() => "")).trim();
+        if (value === `refs/heads/${branch}` || value === branch) return `${dir} (rebase/bisect in progress)`;
+      }
+    }
+    return null;
   }
 
   /** The tip of `refs/heads/<branch>`, or null. */
@@ -1792,7 +1819,7 @@ export class GitRepo {
   async deleteOrPreserveBranch(
     branch: string,
     guard?: GitMutationGuard,
-  ): Promise<(GitResult & { renamedTo?: string }) | null> {
+  ): Promise<(GitResult & { renamedTo?: string; kept?: string }) | null> {
     // Repo-wide worktree lock: two instances deleting branches at the same unique tip must not
     // each see the other as "elsewhere".
     return this.serialize(() =>
@@ -1808,7 +1835,7 @@ export class GitRepo {
   async deleteScratchBranch(
     branch: string,
     guard?: GitMutationGuard,
-  ): Promise<(GitResult & { renamedTo?: string }) | null> {
+  ): Promise<(GitResult & { renamedTo?: string; kept?: string }) | null> {
     return this.serialize(() =>
       this.withWorktreeSection(guard, async () => {
         const tip = await this.branchTip(branch);
@@ -1833,7 +1860,9 @@ export class GitRepo {
     if (unique.code !== 0 || unique.stdout !== "") return false;
     const merges = await this.git(["rev-list", "--merges", "--parents", tip, ...notElsewhere]);
     if (merges.code !== 0) return false;
-    for (const line of merges.stdout.split("\n").filter(Boolean)) {
+    const mergeLines = merges.stdout.split("\n").filter(Boolean);
+    if (mergeLines.length > 50) return false; // too many to re-merge cheaply: preserve instead
+    for (const line of mergeLines) {
       const [commit, ...parents] = line.split(" ");
       if (parents.length !== 2) return false;
       const fresh = await this.git(["merge-tree", "--write-tree", parents[0] as string, parents[1] as string]);
@@ -1846,14 +1875,14 @@ export class GitRepo {
   private async deleteOrPreserveBranchLocked(
     branch: string,
     guard?: GitMutationGuard,
-  ): Promise<(GitResult & { renamedTo?: string }) | null> {
+  ): Promise<(GitResult & { renamedTo?: string; kept?: string }) | null> {
     if ((await this.branchTip(branch)) === null) return null;
     guard?.assertAuthoritative();
     const holder = await this.checkedOutAt(branch);
     if (holder !== null) {
       // Neither deleting nor renaming a branch another worktree has checked out is safe: keep it as is.
       emitTelemetry({ level: "warning", text: `branch ${branch} kept: it is checked out at ${holder}` });
-      return { stdout: "", stderr: `branch ${branch} is checked out at ${holder}; kept`, code: 0 };
+      return { stdout: "", stderr: `branch ${branch} is checked out at ${holder}; kept`, code: 0, kept: holder };
     }
     const deleted = await this.deleteIfContained(branch);
     if (deleted) return deleted;
@@ -1956,14 +1985,63 @@ export class GitRepo {
    * path's entry needs no lock, because every caller owns a distinct path.
    */
   private async forgetWorktreeAdmin(path: string): Promise<void> {
+    const admin = await this.findAdminDir(path);
+    if (admin === null) return;
+    // Save detached-HEAD commits that no branch/tag holds BEFORE the admin dir (and its HEAD) goes.
+    await this.preserveDetachedHead(admin, basename(path));
+    await rm(admin, { recursive: true, force: true }).catch(() => {});
+  }
+
+  private async commonGitDir(): Promise<string | null> {
     const common = await this.git(["rev-parse", "--git-common-dir"]);
-    if (common.code !== 0) return;
-    const gitDir = common.stdout.trim();
-    if (!gitDir) return;
-    const absolute = gitDir.startsWith("/") ? gitDir : join(this.repoRoot, gitDir);
-    // `git worktree add` names the administrative directory after the leaf of
-    // the worktree path.
-    await rm(join(absolute, "worktrees", basename(path)), { recursive: true, force: true }).catch(() => {});
+    if (common.code !== 0 || !common.stdout) return null;
+    return common.stdout.startsWith("/") ? common.stdout : join(this.repoRoot, common.stdout);
+  }
+
+  /**
+   * The administrative directory of the worktree at `path`, found by the `gitdir` pointer each admin
+   * dir records (never by guessing from the leaf name: git suffixes the name when the leaf is taken).
+   * Null (and a telemetry note) when there is no single unambiguous match.
+   */
+  private async findAdminDir(path: string): Promise<string | null> {
+    const common = await this.commonGitDir();
+    if (common === null) return null;
+    const root = join(common, "worktrees");
+    const names = await readdir(root).catch(() => [] as string[]);
+    const wanted = new Set([join(path, ".git"), join(await realpath(path).catch(() => path), ".git")]);
+    const matches: string[] = [];
+    for (const name of names) {
+      const pointer = (await readFile(join(root, name, "gitdir"), "utf8").catch(() => "")).trim();
+      if (pointer && wanted.has(pointer)) matches.push(join(root, name));
+    }
+    if (matches.length > 1) {
+      emitTelemetry({
+        level: "warning",
+        text: `ambiguous worktree admin dirs for ${path}; left untouched: ${matches.join(", ")}`,
+      });
+    }
+    return matches.length === 1 ? (matches[0] as string) : null;
+  }
+
+  /**
+   * A DETACHED worktree HEAD whose commit no local branch/tag contains would be orphaned when the
+   * worktree or its admin dir goes: keep it as `superseded/detached-<leaf>-<ts>` first.
+   */
+  private async preserveDetachedHead(adminDir: string, leaf: string): Promise<void> {
+    const head = (await readFile(join(adminDir, "HEAD"), "utf8").catch(() => "")).trim();
+    if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head)) return; // symbolic ref or unreadable
+    if ((await this.git(["cat-file", "-e", `${head}^{commit}`])).code !== 0) return;
+    const held = await this.git(["for-each-ref", "--contains", head, "--format=%(refname)", "refs/heads", "refs/tags"]);
+    if (held.code === 0 && held.stdout !== "") return;
+    const base = `superseded/detached-${leaf}-${compactStamp()}`;
+    for (let n = 0; ; n++) {
+      const name = n === 0 ? base : `${base}.${n}`;
+      if ((await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`])).code === 0) continue;
+      const made = await this.git(["branch", name, head]);
+      if (made.code !== 0) throw new Error(`cannot preserve detached HEAD ${head} of ${leaf}: ${made.stderr}`);
+      emitTelemetry({ level: "warning", text: `detached worktree HEAD ${head} kept as ${name}` });
+      return;
+    }
   }
 
   /**

@@ -140,11 +140,11 @@ function recoverInterruptedRestore(target: string): boolean {
     return false;
   }
   let recovered = false;
-  // Deterministic: newest first (names embed pid + a base-36 timestamp, so sort descending).
+  // Deterministic: newest first by the base-36 timestamp in `<leaf>.replaced-<pid>-<ts36>`.
+  const stampOf = (n: string): number => Number.parseInt(n.split("-").pop() ?? "", 36) || 0;
   for (const name of names
     .filter((n) => n.startsWith(`${leaf}.replaced-`) && !n.startsWith(`${leaf}.replaced-recovered-`))
-    .sort()
-    .reverse()) {
+    .sort((x, y) => stampOf(y) - stampOf(x) || (x < y ? 1 : -1))) {
     if (!existsSync(target)) {
       recovered = true;
       renameSync(join(parent, name), target);
@@ -163,6 +163,14 @@ function recoverInterruptedRestore(target: string): boolean {
     });
   }
   return recovered;
+}
+
+function uniqueRecoveredName(target: string): string {
+  const base = `${target}.replaced-recovered-${Date.now().toString(36)}-${process.pid}`;
+  for (let n = 0; ; n++) {
+    const name = n === 0 ? base : `${base}.${n}`;
+    if (!existsSync(name)) return name;
+  }
 }
 
 /** Put the checkpointed paths back exactly; paths that did not exist are removed. */
@@ -194,10 +202,15 @@ export async function restoreCheckpoint(checkpointDir: string, stateDir: string)
         if (hadLive) await rename(previous, target);
         throw error;
       }
-      if (hadLive) await rm(previous, { recursive: true, force: true }); // replaced by the checkpoint copy
+      if (hadLive) {
+        // A copy recovered from an interrupted restore is set aside like in the existed=false case;
+        // only the ordinary live state that this restore replaced is removed.
+        if (recovered) await rename(previous, uniqueRecoveredName(target));
+        else await rm(previous, { recursive: true, force: true });
+      }
     } else if (recovered) {
       // The "live state" here was just recovered from an interrupted restore: set it aside, never delete it.
-      await rename(target, `${target}.replaced-recovered-${Date.now().toString(36)}`);
+      await rename(target, uniqueRecoveredName(target));
     } else {
       await rm(target, { recursive: true, force: true });
     }

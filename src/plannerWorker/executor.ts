@@ -1648,7 +1648,9 @@ export class PlannerWorkerExecutor {
       const result = scratch
         ? await this.repo.deleteScratchBranch(branch)
         : await this.repo.deleteOrPreserveBranch(branch);
-      if (result?.renamedTo) {
+      if (result?.kept) {
+        this.emit({ type: "phase", text: `kept branch ${branch}: ${result.kept}` });
+      } else if (result?.renamedTo) {
         this.emit({
           type: "phase",
           text: `kept ${branch} as ${result.renamedTo}: it has commits not merged elsewhere`,

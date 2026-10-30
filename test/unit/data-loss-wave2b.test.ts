@@ -965,6 +965,123 @@ test("the kept-worktrees list holds one line per path", async () => {
   assert.equal(lines.length, 1);
 });
 
+const reachable = async (dir: string, sha: string): Promise<string> =>
+  g(dir, "for-each-ref", "--contains", sha, "--format=%(refname)", "refs/heads", "refs/tags");
+
+test("re-creating over a worktree with a DETACHED HEAD keeps its unreferenced commit", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const wt = await git.createWorktree(head, "det-1");
+  await g(wt.path, "checkout", "-q", "--detach");
+  writeFileSync(join(wt.path, "work.txt"), "w");
+  await g(wt.path, "add", "-A");
+  await g(wt.path, "commit", "-qm", "detached work");
+  const lost = await g(wt.path, "rev-parse", "HEAD");
+  await git.createWorktree(head, "det-1");
+  assert.match(await reachable(dir, lost), /superseded\/detached-/);
+});
+
+test("a registered worktree whose directory is gone and whose HEAD is detached keeps its commit", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const wt = await git.createWorktree(head, "det-2");
+  await g(wt.path, "checkout", "-q", "--detach");
+  writeFileSync(join(wt.path, "work.txt"), "w");
+  await g(wt.path, "add", "-A");
+  await g(wt.path, "commit", "-qm", "detached work");
+  const lost = await g(wt.path, "rev-parse", "HEAD");
+  rmSync(wt.path, { recursive: true, force: true });
+  await git.createWorktree(head, "det-2");
+  assert.match(await reachable(dir, lost), /superseded\/detached-/);
+});
+
+test("admin cleanup never touches another worktree whose admin dir got a suffixed name", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const probe = await git.createWorktree(head, "leaf-x");
+  const leaf = basename(probe.path);
+  await git.removeWorktree(probe, { keepBranch: true });
+  const other = join(dir, "..", "elsewhere", leaf);
+  mkdirSync(dirname(other), { recursive: true });
+  await g(dir, "worktree", "add", "-q", "--detach", other, head); // takes the plain admin name
+  writeFileSync(join(other, "w"), "w");
+  await g(other, "add", "-A");
+  await g(other, "commit", "-qm", "operator detached work");
+  const work = await g(other, "rev-parse", "HEAD");
+  const wt = await git.createWorktree(head, "leaf-x"); // its admin dir is <leaf>1
+  await git.removeWorktree(wt, { keepBranch: true });
+  assert.equal(await g(other, "rev-parse", "HEAD"), work, "the operator's worktree still works");
+  assert.ok(existsSync(join(dir, ".git", "worktrees", leaf)));
+});
+
+for (const secret of [".envrc", "id_rsa", ".ENV", "service-account-prod.json", ".npmrc"]) {
+  test(`removal keeps a worktree with ${secret} under target/`, async () => {
+    const { head, git } = await userDataRepo();
+    const info = await git.createWorktree(head, `sec-${secret.replace(/\W/g, "")}`);
+    mkdirSync(join(info.path, "target", "x"), { recursive: true });
+    writeFileSync(join(info.path, "target", "x", secret), "s");
+    await assert.rejects(git.removeWorktree(info, { keepBranch: true }));
+    assert.ok(existsSync(join(info.path, "target", "x", secret)));
+  });
+}
+
+test("a branch being rebased in another worktree (detached HEAD) is kept and reported", async () => {
+  const { dir, git } = await remoteRepo();
+  await g(dir, "branch", "rb", "main");
+  const wt = join(dir, "..", "wt-rb");
+  await g(dir, "worktree", "add", "-q", wt, "rb");
+  writeFileSync(join(wt, "c"), "1");
+  await g(wt, "add", "-A");
+  await g(wt, "commit", "-qm", "rb1");
+  const rb1 = await g(wt, "rev-parse", "HEAD");
+  await g(dir, "branch", "keepcopy", rb1);
+  writeFileSync(join(wt, "c"), "2");
+  await g(wt, "commit", "-qam", "rb2");
+  try {
+    await g(wt, "rebase", "-q", "--exec", "false", "main");
+  } catch {
+    // stops mid-rebase on purpose
+  }
+  assert.ok(existsSync(join(dir, ".git", "worktrees")), "linked worktree present");
+  const r = await git.deleteOrPreserveBranch("rb");
+  assert.match(r?.kept ?? "", /rebase/);
+  assert.ok(await g(dir, "rev-parse", "--verify", "refs/heads/rb"));
+});
+
+test("restoreCheckpoint recovers the NEWEST leftover (by timestamp, not pid) and keeps a recovered copy when swapping", async () => {
+  const root = mkdtempSync(join(tmpdir(), "w2b-ck4-"));
+  const checkpoint = join(root, "cp");
+  const state = join(root, "state");
+  mkdirSync(join(checkpoint, "state"), { recursive: true });
+  mkdirSync(state);
+  writeFileSync(join(checkpoint, "state", "live.json"), "CHECKPOINT");
+  writeFileSync(join(state, "live.json.replaced-9-1"), "OLDER");
+  writeFileSync(join(state, "live.json.replaced-1-zzzz"), "NEWEST");
+  writeFileSync(
+    join(checkpoint, "checkpoint-manifest.json"),
+    JSON.stringify({ stateDir: state, createdAt: "x", entries: [{ path: "live.json", existed: true }] }),
+  );
+  await restoreCheckpoint(checkpoint, state);
+  assert.equal(readFileSync(join(state, "live.json"), "utf8"), "CHECKPOINT");
+  const kept = readdirSync(state).filter((n) => n.startsWith("live.json.replaced-recovered-"));
+  assert.equal(kept.length, 1);
+  assert.equal(readFileSync(join(state, kept[0] as string), "utf8"), "NEWEST");
+});
+
+test("the kept-worktrees list drops entries whose worktree no longer exists", async () => {
+  const { head, git, dir } = await ignoredRepo();
+  const a = await git.createWorktree(head, "kept-a");
+  writeFileSync(join(a.path, ".env"), "S");
+  await assert.rejects(git.removeWorktree(a));
+  rmSync(a.path, { recursive: true, force: true });
+  const b = await git.createWorktree(head, "kept-b");
+  writeFileSync(join(b.path, ".env"), "S");
+  await assert.rejects(git.removeWorktree(b));
+  const common = join(dir, await g(dir, "rev-parse", "--git-common-dir"));
+  const lines = readFileSync(join(common, "pi-engineering-candidates", "kept-scratch-worktrees.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l).path);
+  assert.deepEqual(lines, [b.path]);
+});
+
 // A tripwire, not a proof: it greps the data-bearing files for destructive git tokens in any argument position.
 test("no destructive git tokens remain in the data-bearing cleanup paths", () => {
   const files = [
