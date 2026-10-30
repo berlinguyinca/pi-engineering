@@ -13,7 +13,7 @@ import { PanelState } from "../../src/panel/PanelState.ts";
 import { EngineeringHostExtension } from "../../src/runtime/host/extension.ts";
 import { runtimeStatusLines } from "../../src/runtime/host/runtimeStatus.ts";
 import { readStateSchema, writeStateSchema } from "../../src/runtime/migrations/schema.ts";
-import { readPreferences, writePreferences } from "../../src/update/preferences.ts";
+import { DEFAULT_PREFERENCES, readPreferences, writePreferences } from "../../src/update/preferences.ts";
 import { createUpdateRepo } from "../support/gitRemote.ts";
 import { type PiTestSession, startPiSession } from "../support/piSession.ts";
 import { bag } from "../support/runtimeFixtures.ts";
@@ -24,7 +24,14 @@ afterEach(async () => {
 });
 
 let seq = 0;
-async function world(opts: { autoUpdateCheck?: boolean; beforeStart?: (w: { install: string }) => void } = {}) {
+async function world(
+  opts: {
+    autoUpdateCheck?: boolean;
+    beforeStart?: (w: { install: string }) => void;
+    /** Stamp the preferences with an older check, past the 4h interval (#480). */
+    staleLastCheckAt?: string;
+  } = {},
+) {
   const key = `__rt_ux_${process.pid}_${++seq}`;
   const b = bag(key);
   const root = mkdtempSync(join(tmpdir(), "rt-ux-"));
@@ -40,6 +47,13 @@ async function world(opts: { autoUpdateCheck?: boolean; beforeStart?: (w: { inst
   writeStateSchema(state, 7);
   writeFileSync(join(state, "missions.json"), JSON.stringify({ schema: 7, missions: ["MSN-1"] }));
   const install = join(root, "install");
+  if (opts.staleLastCheckAt) {
+    mkdirSync(install, { recursive: true });
+    await writePreferences(join(install, "update-preferences.json"), {
+      ...DEFAULT_PREFERENCES,
+      lastCheckAt: opts.staleLastCheckAt,
+    });
+  }
   opts.beforeStart?.({ install });
   const ext = new EngineeringHostExtension({
     installRoot: install,
@@ -206,6 +220,28 @@ test("automatic update check: on by default, reports availability, installs noth
   assert.equal(w.ext.layout.readPointer("current"), null, "automatic installation is disabled by default");
   assert.equal(await w.settle("A"), "A");
   assert.ok(w.ext.telemetry.recent(100).some((e) => e.event === "runtime.update.available"));
+});
+
+test("session_start with a stale lastCheckAt runs the check and rewrites it (#480)", async () => {
+  // The trigger is the host event, not a caller: a session start whose
+  // preferences are older than the interval must check by itself. Nothing here
+  // asks for a check - the assertions only watch the preferences land.
+  const stale = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+  const w = await world({ autoUpdateCheck: true, staleLastCheckAt: stale });
+  // The check is deferred off the session-start path (setTimeout 0) and runs in
+  // the background, so poll briefly for the stamp to move.
+  let stamped = "";
+  for (let i = 0; i < 200; i++) {
+    stamped = readPreferences(w.ext.layout.preferencesFile).lastCheckAt ?? "";
+    if (stamped && stamped !== stale) break;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.ok(stamped && stamped !== stale, `the session start rewrote the stamp; still ${stamped || "(none)"}`);
+  assert.ok(Date.now() - Date.parse(stamped) < 60_000, `the rewrite is fresh: ${stamped}`);
+  assert.ok(
+    w.ext.telemetry.recent(100).some((e) => e.event === "runtime.update.check"),
+    "the check was recorded",
+  );
 });
 
 test("automatic installation only when explicitly configured", async () => {

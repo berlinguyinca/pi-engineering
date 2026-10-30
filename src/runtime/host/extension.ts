@@ -28,7 +28,7 @@ import { type RecoveryOutcome, recoverInterruptedTransaction } from "../../updat
 import { describeMove, runtimeLabel } from "../../update/reporting.ts";
 import { applyRetention } from "../../update/retention.ts";
 import { planRollback } from "../../update/rollback.ts";
-import { DEFAULT_CHECK_INTERVAL_MS, shouldCheck } from "../../update/selfUpdate.ts";
+import { DEFAULT_CHECK_INTERVAL_MS, checkTimeoutMs, shouldCheck } from "../../update/selfUpdate.ts";
 import { runActivation } from "../../update/transaction.ts";
 import type { ValidationMode } from "../../update/validate.ts";
 import { readStateSchema } from "../migrations/schema.ts";
@@ -301,6 +301,32 @@ type Ctx = {
   cwd?: string;
 };
 
+/**
+ * Resolve `undefined` if `work` has not settled by `timeoutMs`. The work itself
+ * is not cancelled - it keeps running and lands its own bookkeeping whenever it
+ * finishes; only the wait is bounded.
+ */
+function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  return new Promise((resolve, reject) => {
+    // Ref'd on purpose: whoever awaits this is waiting on the deadline, so the
+    // loop must stay alive to fire it. (The session-start scheduler that starts
+    // the check is the unref'd part.)
+    const timer = setTimeout(() => resolve(undefined), timeoutMs);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        // A check that cannot run says why; only a check that never answers is
+        // reported as a timeout.
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 export class EngineeringHostExtension {
   readonly config: HostExtensionConfig;
   readonly generationsDir: string;
@@ -510,7 +536,8 @@ export class EngineeringHostExtension {
     await this.stopSourceWatch();
     this.unpublish();
     // A check in flight writes the preferences file; let it land before the
-    // session (and possibly the process) goes away.
+    // session (and possibly the process) goes away. The wait for the check
+    // itself is bounded (#480), so this join cannot outlive its deadline.
     await this.checking?.catch(() => undefined);
   }
 
@@ -647,9 +674,27 @@ export class EngineeringHostExtension {
 
   async automaticCheck(ctx?: Ctx): Promise<UpdateCheckResult | undefined> {
     if (this.checking) return this.checking;
+    // The wait for the CHECK is bounded (#480). Without a deadline a fetch that
+    // never comes back latches `checking` forever: every later session start is
+    // handed the same dead promise, so no check runs, lastCheckAt stays frozen,
+    // and nothing is said out loud. An automatic install that follows a
+    // successful check is deliberately NOT cut off - it is a transaction the
+    // mutation lock already owns.
     this.checking = (async () => {
       try {
-        const check = await this.updates.check({});
+        const timeoutMs = checkTimeoutMs();
+        const check = await withDeadline(this.updates.check({}), timeoutMs);
+        if (check === undefined) {
+          // `check()` returns a result even when it fails; undefined here means
+          // it never came back. Say so - a silent check is how a runtime goes
+          // stale - and leave the latch free so the next session start tries again.
+          notify(
+            (ctx ?? (this.host?.latestContext() as Ctx | undefined)) as Ctx | undefined,
+            `Pi Engineering update check timed out after ${Math.max(1, Math.round(timeoutMs / 1000))}s; nothing was installed and the next session start will try again.`,
+            "warning",
+          );
+          return undefined;
+        }
         this.lastCheck = check;
         const prefs = readPreferences(this.layout.preferencesFile);
         await writePreferences(this.layout.preferencesFile, {
