@@ -43,6 +43,7 @@
 
 import { DEFAULT_CONTEXT_THRESHOLDS } from "../context/thresholds.ts";
 import type { HandoffRecord } from "../runtime/host/handoffKinds.ts";
+import { sameModel } from "../runtime/host/quotaResume.ts";
 import {
   type HandoffOutcome,
   type HandoffVerifyDeps,
@@ -155,9 +156,12 @@ export class HandoffDriver {
       .filter(
         (e) =>
           e.task_id === checkpoint.taskId &&
-          // A quota switch is only taken over by an execution on the configured fallback: a same-model retry racing in
-          // from the scheduler's resilience path is not the successor.
-          (record.toModel === undefined || e.model === record.toModel) &&
+          // A quota fallback is only taken over by an execution on the configured model: a same-model retry racing in from
+          // the scheduler's resilience path is not the successor. A context handoff's pin is a preference: an operator pin
+          // or a failover may route the successor elsewhere and it is still the session that took over.
+          (record.cause !== "quota_exhausted" ||
+            record.toModel === undefined ||
+            (e.model !== null && sameModel(e.model, record.toModel))) &&
           e.execution_id !== checkpoint.executionId &&
           e.session_id &&
           e.session_id !== record.predecessor.sessionId &&
@@ -228,14 +232,17 @@ export class HandoffDriver {
     }
     // Retry budget BEFORE the fence: the successor is the scheduler's retry of the fenced task. With no attempt left the
     // fence would cancel the source and nobody would continue, so the record is aborted instead and the source untouched.
-    if (record.cause === "quota_exhausted" && record.toModel && !record.sourceFencedAt) {
+    if (
+      !record.sourceFencedAt &&
+      ((record.cause === "quota_exhausted" && record.toModel) || record.cause === "context_pressure")
+    ) {
       const task = store.getTask(checkpoint.taskId);
       if (!task || task.attempt >= task.max_attempts) {
-        const reason = `no retry budget left for task ${checkpoint.taskId} (attempt ${task?.attempt ?? "?"} of ${task?.max_attempts ?? "?"}); source not fenced, switch to ${record.toModel} not started`;
+        const reason = `no retry budget left for task ${checkpoint.taskId} (attempt ${task?.attempt ?? "?"} of ${task?.max_attempts ?? "?"}); source not fenced, successor${record.toModel ? ` on ${record.toModel}` : ""} not started`;
         store.abortHandoff(handoffId, reason);
         this.deps.report(
           record.missionId,
-          `[mission ${record.missionId}] quota handoff ${handoffId} ABORTED: ${reason}`,
+          `[mission ${record.missionId}] ${record.cause === "quota_exhausted" ? "quota" : "context"} handoff ${handoffId} ABORTED: ${reason}`,
         );
         return { status: "skipped", reason };
       }
@@ -258,10 +265,11 @@ export class HandoffDriver {
         record.kind === "phase_transition"
           ? this.phaseFence(record)
           : composeFences(
-              // Quota switch: the task's model is switched (durably, idempotently) AFTER verification and BEFORE the writer
-              // is fenced, so the retry the fence unblocks already asks for the fallback model and starts from the checkpoint.
+              // Model switch: the task's model is switched (durably, idempotently) AFTER verification and BEFORE the writer
+              // is fenced, so the retry the fence unblocks already asks for that model and starts from the checkpoint. A
+              // quota fallback names another model; a context-pressure handoff names the predecessor's own.
               async () => {
-                if (record.cause === "quota_exhausted" && record.toModel) {
+                if ((record.cause === "quota_exhausted" || record.cause === "context_pressure") && record.toModel) {
                   store.switchTaskModel(
                     checkpoint.taskId,
                     record.toModel,
@@ -281,13 +289,20 @@ export class HandoffDriver {
     return { status: outcome.status, record: outcome.record };
   }
 
+  private switchNote(record: HandoffRecord): string {
+    if (!record.toModel) return "";
+    return record.fromModel && sameModel(record.fromModel, record.toModel)
+      ? ` (successor pinned to ${record.toModel})`
+      : ` (task switched ${record.fromModel ?? "?"} -> ${record.toModel})`;
+  }
+
   private describe(id: string, outcome: HandoffOutcome): string {
     const m = outcome.record.missionId;
     switch (outcome.status) {
       case "acknowledged":
         return `[mission ${m}] handoff ${id} verified, source fenced, acknowledged by ${outcome.record.successor?.sessionId}`;
       case "fenced":
-        return `[mission ${m}] handoff ${id} verified, source fenced${outcome.record.toModel ? ` (task switched ${outcome.record.fromModel ?? "?"} -> ${outcome.record.toModel})` : ""}; awaiting the successor session`;
+        return `[mission ${m}] handoff ${id} verified, source fenced${this.switchNote(outcome.record)}; awaiting the successor session`;
       case "already_acknowledged":
         return `[mission ${m}] handoff ${id} already acknowledged (${outcome.resume.decision})`;
       case "rejected":

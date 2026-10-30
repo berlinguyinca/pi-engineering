@@ -32,6 +32,12 @@ export interface ContextHandoffDeps {
   catalogue?(role: string | null): readonly QuotaResumeModel[];
   /** Models already quota-exhausted for this task (durable, from earlier quota handoffs): never switched back to. */
   exhaustedModels?(missionId: string, taskId: string): readonly string[];
+  /**
+   * The routable `provider/id` for the model an execution is running on, or a reason it cannot be pinned (not in the
+   * registry, or marked unavailable). A context-pressure handoff pins its successor to that model; without a result the
+   * successor routes normally and the record says why. Absent = pin only a model already reported as `provider/id`.
+   */
+  sameModelRef?(model: string): { ref: string } | { reason: string };
   now?(): Date;
 }
 
@@ -90,15 +96,31 @@ export class ContextHandoffTrigger {
     this.inFlight.add(executionId);
     let done = false;
     try {
+      // The successor continues on the model the predecessor ran on (handoff instead of compaction), pinned through the
+      // same durable task switch a quota fallback uses. A model that can no longer be pinned routes normally, said so.
+      const same = this.sameModelFor(obs.model);
       done = await this.handoff(obs, "context", "context_pressure", {
         note: `context ${(obs.tokens / obs.window).toFixed(2)} crossed ${action} (${thresholds[action]})`,
+        extra: { fromModel: obs.model, ...("ref" in same ? { toModel: same.ref } : {}) },
       });
+      if (done && "reason" in same) {
+        this.deps.report(
+          obs.missionId,
+          `[mission ${obs.missionId}] context handoff: successor not pinned to ${obs.model} (${same.reason}); it routes normally`,
+        );
+      }
     } finally {
       this.inFlight.delete(executionId);
       // No durable checkpoint = no handoff: stay armed so the next opportunity retries instead of going silent.
       // (Not when the execution was forgotten meanwhile: that would resurrect a finished execution's entry.)
       if (!done && this.latest.has(executionId)) this.crossing.set(executionId, before);
     }
+  }
+
+  private sameModelFor(model: string): { ref: string } | { reason: string } {
+    if (!model) return { reason: "the serving model is unknown" };
+    if (this.deps.sameModelRef) return this.deps.sameModelRef(model);
+    return model.includes("/") ? { ref: model } : { reason: "the model is not reported as provider/id" };
   }
 
   /**

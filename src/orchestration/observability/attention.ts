@@ -15,7 +15,7 @@
  */
 
 import { PARKING_WAIT_ACTIONS } from "../recovery.ts";
-import type { FailureCategory, RecoveryAction } from "../types.ts";
+import type { FailureCategory, RecoveryAction, RecoveryStatus } from "../types.ts";
 import type { LoopSignal, MissionHealth, MissionObservabilitySummary, WaitingReason } from "./types.ts";
 
 /** How strongly this mission should interrupt the operator. */
@@ -68,6 +68,8 @@ export interface AttentionInput {
   recovery: { attempt: number; maxAttempts: number };
   /** The recovery action behind `recovery`; a wait action is a park, not an exhausted budget. */
   recoveryAction?: string;
+  /** Status of that recovery decision; only a planned/started one is an open wait. */
+  recoveryStatus?: RecoveryStatus;
   /** Failure category behind the latest classification; selects what the wait claims to be waiting for. */
   failureCategory?: FailureCategory;
   operatorPausedAt?: string | null;
@@ -104,32 +106,30 @@ const SELF_SERVING_WAITS = new Set<WaitingReason>([
  * claimed only for transient provider failures.
  */
 function parkingWaitWording(action: string, category: FailureCategory | undefined): { lead: string; resumes: string } {
+  // The caveat comes before any detail so a 120-character cut never drops it.
+  const unless = "unless paused or stopped";
   if (action === "PAUSE_FOR_PERSISTENCE") {
     return {
       lead: "durable writes failing: probe",
-      resumes: "resumes once storage recovers, unless paused or stopped",
+      resumes: `resumes once storage recovers, ${unless}`,
     };
   }
-  const unless = "unless paused or stopped";
   switch (category) {
     case "PROVIDER_TRANSIENT":
-      return {
-        lead: "waiting for capacity: probe",
-        resumes: `resumes once the gateway health probe succeeds, ${unless}`,
-      };
+      return { lead: "waiting for capacity: probe", resumes: `resumes once the gateway probe succeeds, ${unless}` };
     case "PROVIDER_PERMANENT":
       return {
         lead: "waiting on a provider error: probe",
-        resumes: `resumes once the gateway health probe succeeds, ${unless}; this may need operator action (credentials or provider)`,
+        resumes: `resumes once the gateway probe succeeds, ${unless}; may need credentials or provider fix`,
       };
     case "DISK_SUSPENDED":
       // The wait is the gateway probe; disk space is never checked by it.
       return {
         lead: "waiting: probe",
-        resumes: `resumes once the gateway health probe succeeds (disk space is not checked), ${unless}`,
+        resumes: `resumes once the gateway probe succeeds (disk not checked), ${unless}`,
       };
     default:
-      return { lead: "waiting: probe", resumes: `resumes once the gateway health probe succeeds, ${unless}` };
+      return { lead: "waiting: probe", resumes: `resumes once the gateway probe succeeds, ${unless}` };
   }
 }
 
@@ -177,10 +177,16 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
       input.recoveryAction !== undefined && PARKING_WAIT_ACTIONS.has(input.recoveryAction as RecoveryAction)
         ? input.recoveryAction
         : undefined;
+    const openWait = input.recoveryStatus === undefined || ["planned", "started"].includes(input.recoveryStatus);
     if (parkingAction !== undefined && (TERMINAL_STATES.has(state) || input.operatorPausedAt)) {
       // A paused or finished mission does not resume from its wait; the
       // paused/failure handling below says what is true instead.
-    } else if (parkingAction !== undefined) {
+    } else if (parkingAction !== undefined && input.recoveryStatus === "succeeded") {
+      // The decision settled and restored progress: neither a wait nor exhaustion.
+    } else if (parkingAction !== undefined && openWait && state === "REPAIRING") {
+      // A gate re-run leaves the decision `started` while the mission runs the
+      // gate: work is active, so "waiting, next probe in …" would be false.
+    } else if (parkingAction !== undefined && openWait) {
       // A parking wait is unbounded by design: the counter past its budget is
       // wait progress. What the wait is for, and who ends it, depends on the
       // failure category, so the wording names only what is true for it.
@@ -190,15 +196,11 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
         ? []
         : [nextAt <= input.now ? "next probe due now" : `next probe in ${humanAge(nextAt - input.now)}`];
       const wait = parkingWaitWording(parkingAction, input.failureCategory);
-      const parts = [
-        `${wait.lead} ${input.recovery.attempt}`,
-        ...(waited !== undefined ? [`parked ${humanAge(waited)}`] : []),
-        ...nextProbe,
-      ];
+      const timing = [...(waited !== undefined ? [`parked ${humanAge(waited)}`] : []), ...nextProbe];
       evidence.push({
         kind: "capacity_wait",
         ...(input.waitingSince ? { at: input.waitingSince } : {}),
-        detail: `${parts.join(", ")}; ${wait.resumes}`,
+        detail: `${wait.lead} ${input.recovery.attempt}; ${wait.resumes}${timing.length > 0 ? `; ${timing.join(", ")}` : ""}`,
       });
     } else {
       evidence.push({
@@ -228,7 +230,8 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
     return { severity: "high", reason: evidence[0]!.detail, evidence };
   }
 
-  if (input.operatorPausedAt) {
+  // A finished mission is not paused; a stale operator pause must not be reported.
+  if (input.operatorPausedAt && !TERMINAL_STATES.has(state)) {
     const pausedFor = ageMs(input.operatorPausedAt, input.now);
     evidence.push({
       kind: "operator_paused",
@@ -325,6 +328,7 @@ export function attentionFromSummary(
     nextActionAt: summary.nextActionAt,
     recovery: summary.recovery,
     recoveryAction: summary.action,
+    recoveryStatus: summary.recoveryStatus,
     failureCategory: summary.failureCategory,
     operatorPausedAt: options.operatorPausedAt,
     loopSignals: options.loopSignals,

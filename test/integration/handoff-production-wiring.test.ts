@@ -269,7 +269,9 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
     assert.match(execution.exit_status ?? "", /late_result_rejected:handoff source fenced/);
     await until(() => !alive(r.childPid));
     assert.equal(alive(r.unrelatedPid), true, "a process group nobody registered is never touched");
-    assert.ok(r.reports.some((l) => l.includes("verified, source fenced; awaiting the successor")));
+    assert.ok(
+      r.reports.some((l) => /verified, source fenced \(successor pinned to gw\/test\); awaiting the successor/.test(l)),
+    );
 
     // No successor yet: never acknowledged on its own.
     await redrive(r.orchestrator, r.missionId);
@@ -281,6 +283,7 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
       mission_id: r.missionId,
       backend: "agent",
       session_id: "WKS-successor",
+      model: "gw/test",
     });
     r.store.setExecutionStatus(successor.execution_id, "RUNNING", {});
     await firstActivity(r.orchestrator, r.missionId, r.taskId, successor.execution_id);
@@ -296,6 +299,27 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
       "the fence was stamped once",
     );
     assert.equal(events(r.backend, "execution.late_result_rejected").length, 1, "the writer was fenced exactly once");
+  });
+
+  it("a successor routed to another model (operator pin, failover) still takes over a context handoff", async () => {
+    const r = await rig();
+    r.emit(950);
+    await until(() => r.store.listHandoffRecords(r.missionId).some((h) => h.sourceFencedAt));
+    await settleTrigger(r);
+    const [record] = r.store.listHandoffRecords(r.missionId);
+    assert.equal(record?.toModel, "gw/test", "the pin was the predecessor's own model");
+    const successor = r.store.createExecution({
+      task_id: r.taskId,
+      mission_id: r.missionId,
+      backend: "agent",
+      session_id: "WKS-elsewhere",
+      model: "gw/other",
+    });
+    r.store.setExecutionStatus(successor.execution_id, "RUNNING", {});
+    await firstActivity(r.orchestrator, r.missionId, r.taskId, successor.execution_id);
+    const done = r.store.getHandoffRecord(record!.id);
+    assert.equal(done?.state, "acknowledged");
+    assert.equal(done?.successor?.sessionId, "WKS-elsewhere");
   });
 
   it("a duplicate trigger is idempotent: one record, one fence, one process termination", async () => {
@@ -420,6 +444,7 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
       mission_id: r.missionId,
       backend: "agent",
       session_id: "WKS-next",
+      model: "gw/test",
     });
     again.setExecutionStatus(successor.execution_id, "RUNNING", {});
     const third = buildOrchestrator(again, r.git, async () => ok);
