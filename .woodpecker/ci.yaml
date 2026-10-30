@@ -53,9 +53,13 @@ steps:
       # would read as stale. The commit itself is fetched by SHA too, since a
       # PR head is not on any branch.
       - 'git fetch --tags --prune origin "+refs/heads/*:refs/remotes/origin/*" "$CI_COMMIT_SHA"'
-      - 'git checkout -q FETCH_HEAD'
-      # The test venv lives in the workspace (see install); keep it out of git.
-      - 'echo "/.ci-venv/" >> .git/info/exclude'
+      # NOT `FETCH_HEAD`: after a multi-ref fetch it is the first ref
+      # fetched, not the commit. Check out the SHA and prove it (also right
+      # for tag events).
+      - 'git checkout -q --detach "$CI_COMMIT_SHA"'
+      - 'test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA" || { echo "checked out $(git rev-parse HEAD), expected $CI_COMMIT_SHA" >&2; exit 1; }'
+      # Stale per-pipeline venvs from earlier runs (6h outlives any pipeline).
+      - 'find /tmp/woodpecker-cache -maxdepth 1 -name "venv-*" -mmin +360 -exec rm -rf {} + 2>/dev/null || true'
       - 'git --no-pager log --oneline -1'
 
   - name: toolchain
@@ -66,6 +70,7 @@ steps:
       # package.json runs .ts files with no flag: type stripping is on by
       # default only from Node 22.18.
       - 'node -e "const [a,b]=process.versions.node.split(\".\").map(Number); if (a<22||(a===22&&b<18)) { console.error(\"Node 22.18+ required, found \"+process.version); process.exit(1); }"'
+      - 'python3 -m venv --help >/dev/null 2>&1 || { echo "python3 venv module missing on this agent" >&2; exit 1; }'
       - 'echo "node=$(node --version) npm=$(npm --version) $(python3 --version) $(make --version | head -1)"'
 
   - name: install
@@ -82,11 +87,16 @@ steps:
       - 'timeout -k 30 15m npx playwright install chromium'
       # test/unit/verifier.test.ts drives a real `make test` and a real
       # pytest suite, with no skip guard. PATH is NOT persisted between steps
-      # (nor HOME), so the venv lives in the shared workspace and the test
-      # steps re-export PATH.
-      - 'python3 -m venv .ci-venv'
-      - '.ci-venv/bin/pip install -q pytest'
-      - '.ci-venv/bin/python -m pytest --version'
+      # (nor HOME), so the venv lives at a path derived from the pipeline
+      # and the test steps re-export PATH. It must be OUTSIDE the checkout:
+      # the runtime host snapshots the source tree and rejects symlinks
+      # that escape it (.venv/bin/python3 -> /usr/bin/python3), which fails
+      # runtime-host-isolation-reload. The number is per repo, so the repo
+      # name is in the path.
+      - 'VENV="/tmp/woodpecker-cache/venv-$(echo "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER"; rm -rf "$VENV"'
+      - 'python3 -m venv "$VENV"'
+      - '"$VENV/bin/pip" install -q pytest'
+      - '"$VENV/bin/python" -m pytest --version'
 
   - name: lint
     image: bash
@@ -105,7 +115,7 @@ steps:
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
-      - 'export PATH="$PWD/.ci-venv/bin:$PATH"'
+      - 'export PATH="/tmp/woodpecker-cache/venv-$(echo "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER/bin:$PATH"'
       - 'timeout -k 30 30m npm run test:unit'
 
   - name: test-integration
@@ -113,7 +123,7 @@ steps:
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
-      - 'export PATH="$PWD/.ci-venv/bin:$PATH"'
+      - 'export PATH="/tmp/woodpecker-cache/venv-$(echo "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER/bin:$PATH"'
       - 'timeout -k 30 40m npm run test:integration'
 
   # The old verify job's "Package-load + command smoke".
@@ -129,5 +139,5 @@ steps:
   - name: roadmap-structural
     image: bash
     commands:
-      - 'export PATH="$PWD/.ci-venv/bin:$PATH"'
+      - 'export PATH="/tmp/woodpecker-cache/venv-$(echo "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER/bin:$PATH"'
       - 'timeout -k 30 10m npm run roadmap:structural'
