@@ -83,8 +83,9 @@ import {
 import { classifyInferenceFailure } from "../inference/failureClassifier.ts";
 import { currentInferenceInvocation, runWithInferenceInvocation } from "../inference/inferenceContext.ts";
 import { ExecutedActionTracker } from "../inference/recovery.ts";
-import { wireResilientModelRuntime } from "../inference/resilientInstall.ts";
+import { resilientServices, wireResilientModelRuntime } from "../inference/resilientInstall.ts";
 import type { ResilientStreamScheduler } from "../inference/resilientStream.ts";
+import { type RetryTrace, recordRetryTrace } from "../inference/retryTrace.ts";
 import {
   type AssistantLike,
   dropFailedTail,
@@ -759,6 +760,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
     const admission = this.admission;
     const gatewayConfig = this.gatewayConfig;
     let gatewayRetries = 0;
+    // One failure, one owner, one trace (src/inference/retryTrace.ts).
+    const retryTrace: RetryTrace[] = [];
     // A reply cut at the output limit gets ONE retry with a larger allowance.
     let lengthRetried = false;
     let allowance: number | undefined;
@@ -838,6 +841,18 @@ export class PiWorkerExecutor implements WorkerExecutor {
       error: MODEL_SUPERSEDED,
     });
     const holdForGateway = (signal: GatewayWaitSignal): Promise<number> => {
+      recordRetryTrace(
+        retryTrace,
+        {
+          layer: "worker-gateway-hold",
+          attempt: gatewayRetries,
+          reason: `${signal.status ?? 429}:${signal.reason ?? signal.code ?? signal.type ?? "refused"}`,
+          next: "hold",
+          owner: "worker-gateway-hold",
+        },
+        resilientServices().telemetry,
+        { ...(req.runId ? { mission_id: req.runId } : {}), role: req.role },
+      );
       const paced = signal.flattened ? escalateSyntheticWait(signal, gatewayRetries, MAX_ESCALATED_WAIT_MS) : signal;
       const scoped = { ...paced, provider: model.provider, model: model.id };
       // Waiting for capacity is liveness: tell the owner, so the wait is
@@ -961,8 +976,19 @@ export class PiWorkerExecutor implements WorkerExecutor {
                   account,
                 );
               // The raised allowance of a length-stop retry rides the invocation.
-              return await (allowance && inv
-                ? runWithInferenceInvocation({ ...inv, maxTokens: allowance }, attemptRun)
+              // While gateway holds are enabled this worker owns the wait on an
+              // admission refusal: the in-call resilient ladder settles instead of
+              // replaying it too (RETRY-OWNERS.md), so attempts are not multiplied.
+              const owned = inv && gatewayConfig.enabled;
+              return await (inv && (allowance || owned)
+                ? runWithInferenceInvocation(
+                    {
+                      ...inv,
+                      ...(allowance ? { maxTokens: allowance } : {}),
+                      ...(owned ? { gatewayWaitOwner: "worker-gateway-hold" as const } : {}),
+                    },
+                    attemptRun,
+                  )
                 : attemptRun());
             } catch (error) {
               // A pinned gate role is waited on, except when its host refuses
@@ -1364,6 +1390,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
                     : isStalledStream(lastAssistantError)
                       ? "transient:network"
                       : (lastAssistantError ?? "no-result");
+        if (gateway) {
+          recordRetryTrace(retryTrace, {
+            layer: "worker-gateway-hold",
+            attempt: gatewayRetries + 1,
+            reason: `${gateway.status ?? 429}:${gateway.reason ?? gateway.code ?? gateway.type ?? "refused"}`,
+            next: "give-up",
+            owner: "worker-gateway-hold",
+          });
+        }
         return {
           result: {
             status: "failed",
@@ -1373,7 +1408,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
             new_hypotheses: [],
             proposed_tasks: [],
             details: gateway
-              ? { gateway_wait: gateway, gateway_retries: gatewayRetries }
+              ? { gateway_wait: gateway, gateway_retries: gatewayRetries, retry_trace: retryTrace }
               : modelGone
                 ? { model: { provider: model.provider, id: model.id } }
                 : {},

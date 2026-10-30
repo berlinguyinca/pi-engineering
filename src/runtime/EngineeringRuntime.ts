@@ -105,6 +105,7 @@ import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "
 import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { LedgerWorkProjection } from "../work/ledgerProjection.ts";
 import { TaskLineageProjector } from "../work/taskLineage.ts";
+import { ledgerTaskRefs } from "../work/taskRefs.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { WAITING_FOR_INFERENCE_SUMMARY } from "../workers/activity.ts";
@@ -1441,8 +1442,13 @@ export class EngineeringRuntime {
     });
     if (opts.lineage)
       rt.taskLineage = new TaskLineageProjector(
-        new LedgerWorkProjection(ledger, { staleAfterMs: rt.livenessStaleMs }),
+        new LedgerWorkProjection(ledger, {
+          staleAfterMs: rt.livenessStaleMs,
+          snapshotFile: join(workDir, "work-projection.snapshot.json"),
+        }),
         opts.lineage,
+        undefined,
+        ledgerTaskRefs(ledger),
       );
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
     rt.testQuarantine = new TestQuarantine(workDir);
@@ -2138,7 +2144,10 @@ export class EngineeringRuntime {
         };
         // Mission-less work (Ledger work items and the sessions that ran them) forks and hands off too: the work read
         // model names the task, and the repository and base branch come from this session's own checkout.
-        const projection = new LedgerWorkProjection(rt.ledger, { staleAfterMs: rt.livenessStaleMs });
+        const projection = new LedgerWorkProjection(rt.ledger, {
+          staleAfterMs: rt.livenessStaleMs,
+          snapshotFile: join(rt.workDir, "work-projection.snapshot.json"),
+        });
         return withFallbackForkSources(
           missionForkSources(store, host),
           workForkSources(

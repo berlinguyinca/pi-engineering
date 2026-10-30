@@ -24,6 +24,7 @@ export const INFERENCE_TELEMETRY_EVENTS = [
   "inference.retry.scheduled",
   "inference.retry.started",
   "inference.retry.succeeded",
+  "inference.retry.trace",
   "inference.model.unavailable",
   "inference.model.circuit_opened",
   "inference.model.circuit_closed",
