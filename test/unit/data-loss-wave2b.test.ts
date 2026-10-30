@@ -30,6 +30,7 @@ import { gitPostMerge } from "../../src/merge/postMerge.ts";
 import { JsonlEventStore, repairTornTail } from "../../src/platform/eventstore/jsonl.ts";
 import { emitRuntimeEvent, setRuntimeEventLog } from "../../src/runtime/isolation/runtimeEvents.ts";
 import { restoreCheckpoint } from "../../src/runtime/migrations/framework.ts";
+import { rotateWithoutOverwrite } from "../../src/runtime/rotateFile.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { subtractBaselineFailures } from "../../src/verify/baselineSubtraction.ts";
 import { TranscriptWriter } from "../../src/workers/transcriptStore.ts";
@@ -364,7 +365,10 @@ test("torn tail + failed quarantine (ENOSPC for new files) never fuses the next 
     ["e1", "e2"],
     "the committed event survives",
   );
-  assert.ok(readFileSync(file, "utf8").includes('{"event_id":"partial-wri\n'), "the fragment is kept, terminated");
+  assert.ok(
+    readFileSync(file, "utf8").includes('{"event_id":"partial-wri\u001e#torn\n'),
+    "the fragment is kept, closed with a sentinel",
+  );
 });
 
 test("an unrepairable torn tail makes every append throw until repair succeeds", async () => {
@@ -532,6 +536,233 @@ test("rotation under 8 concurrent processes loses no lines", async () => {
     .flatMap((n) => readFileSync(join(dir, n), "utf8").split("\n").filter(Boolean));
   assert.equal(lines.length, 2400);
   assert.equal(new Set(lines).size, 2400);
+});
+
+test("a complete-but-unacknowledged event is not resurrected as a duplicate after a failed quarantine", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "w2b-torn-complete-"));
+  const file = join(dir, "events.jsonl");
+  const store = await JsonlEventStore.open(file);
+  await store.append(ev("e1"));
+  appendFileSync(file, JSON.stringify(ev("e2"))); // every byte of e2 except its newline; the caller was told it failed
+  chmodSync(dir, 0o555);
+  try {
+    await repairTornTail(file, { owner: (store as unknown as { writerLock: never }).writerLock });
+    await store.append(ev("e2")); // the caller retries
+  } finally {
+    chmodSync(dir, 0o755);
+  }
+  store.close();
+  for (let i = 0; i < 2; i++) {
+    const reloaded = await JsonlEventStore.openReadOnly(file);
+    assert.deepEqual(
+      reloaded.all().map((e) => e.event_id),
+      ["e1", "e2"],
+      `reload ${i + 1}`,
+    );
+  }
+});
+
+test("the quarantined torn tail is byte-exact (no UTF-8 decoding)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "w2b-torn-bytes-"));
+  const file = join(dir, "events.jsonl");
+  writeFileSync(file, Buffer.concat([Buffer.from('{"a":1}\n'), Buffer.from([0xff, 0xfe, 0xc3])]));
+  await repairTornTail(file);
+  const q = readdirSync(dir).find((n) => n.startsWith("events.jsonl.torn-"));
+  assert.ok(q);
+  assert.deepEqual([...readFileSync(join(dir, q))], [0xff, 0xfe, 0xc3]);
+  assert.equal(readFileSync(file, "utf8"), '{"a":1}\n');
+});
+
+async function remoteRepo(): Promise<{ dir: string; remote: string; git: GitRepo }> {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "w2b-up-")));
+  const remote = join(root, "remote.git");
+  await exec("git", ["init", "-q", "--bare", remote]);
+  const dir = join(root, "repo");
+  await exec("git", ["init", "-q", "-b", "main", dir]);
+  await g(dir, "config", "user.email", "t@example.invalid");
+  await g(dir, "config", "user.name", "t");
+  await g(dir, "commit", "-q", "--allow-empty", "-m", "i");
+  await g(dir, "remote", "add", "origin", remote);
+  await g(dir, "push", "-q", "origin", "main");
+  const git = await GitRepo.open(dir);
+  assert.ok(git);
+  return { dir, remote, git };
+}
+
+test("a branch with an upstream is not deleted just because its remote-tracking ref has the tip", async () => {
+  const { dir, remote, git } = await remoteRepo();
+  await g(dir, "checkout", "-q", "-b", "cand-up");
+  await g(dir, "commit", "-q", "--allow-empty", "-m", "unique-up");
+  await g(dir, "push", "-q", "-u", "origin", "cand-up");
+  const tip = await g(dir, "rev-parse", "HEAD");
+  await g(dir, "checkout", "-q", "main");
+  const r = await git.deleteOrPreserveBranch("cand-up");
+  assert.ok(r?.renamedTo, "kept under superseded/");
+  await exec("git", ["--git-dir", remote, "update-ref", "-d", "refs/heads/cand-up"]);
+  await g(dir, "fetch", "-q", "--prune", "origin");
+  assert.equal(
+    await g(dir, "for-each-ref", "--contains", tip, "--format=%(refname)", "refs/heads"),
+    `refs/heads/${r.renamedTo}`,
+  );
+});
+
+test("two branches at the same unique tip: the second is preserved", async () => {
+  const { dir, git } = await remoteRepo();
+  await g(dir, "checkout", "-q", "-b", "A");
+  await g(dir, "commit", "-q", "--allow-empty", "-m", "unique-AB");
+  await g(dir, "branch", "B");
+  const tip = await g(dir, "rev-parse", "HEAD");
+  await g(dir, "checkout", "-q", "main");
+  await git.deleteOrPreserveBranch("A");
+  await git.deleteOrPreserveBranch("B");
+  assert.notEqual(await g(dir, "for-each-ref", "--contains", tip, "--format=%(refname)", "refs/heads"), "");
+});
+
+test("concurrent deleteOrPreserveBranch on two instances never loses a shared unique tip", async () => {
+  const { dir, git } = await remoteRepo();
+  const other = await GitRepo.open(dir);
+  assert.ok(other);
+  for (let round = 0; round < 5; round++) {
+    await g(dir, "checkout", "-q", "-b", `C${round}`);
+    await g(dir, "commit", "-q", "--allow-empty", "-m", `unique-${round}`);
+    await g(dir, "branch", `D${round}`);
+    const tip = await g(dir, "rev-parse", "HEAD");
+    await g(dir, "checkout", "-q", "main");
+    await Promise.all([git.deleteOrPreserveBranch(`C${round}`), other.deleteOrPreserveBranch(`D${round}`)]);
+    assert.notEqual(
+      await g(dir, "for-each-ref", "--contains", tip, "--format=%(refname)", "refs/heads"),
+      "",
+      `round ${round}`,
+    );
+  }
+});
+
+test("a scratch review branch holding only reproducible merges is deleted; one with unique work is preserved", async () => {
+  const { head, git, dir } = await scratchRepo();
+  await g(dir, "checkout", "-q", "-b", "cand");
+  writeFileSync(join(dir, "c.txt"), "c");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "candidate work");
+  await g(dir, "checkout", "-q", "main");
+  const review = await git.createWorktree(head, "batch-review-1");
+  await g(review.path, "merge", "-q", "--no-ff", "-m", "review merge", "cand");
+  await git.removeWorktree(review, { keepBranch: true });
+  const r = await git.deleteScratchBranch("batch-review-1");
+  assert.equal(r?.renamedTo, undefined);
+  assert.equal(await g(dir, "for-each-ref", "refs/heads/batch-review-1", "refs/heads/superseded/"), "");
+  const own = await git.createWorktree(head, "batch-review-2");
+  writeFileSync(join(own.path, "u.txt"), "unique");
+  await g(own.path, "add", "-A");
+  await g(own.path, "commit", "-qm", "unique work");
+  await git.removeWorktree(own, { keepBranch: true });
+  const r2 = await git.deleteScratchBranch("batch-review-2");
+  assert.ok(r2?.renamedTo);
+});
+
+test("python caches and nested node_modules do not block removal; a re-create then succeeds", async () => {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "w2b-py-")));
+  await exec("git", ["init", "-q", "-b", "main", dir]);
+  await g(dir, "config", "user.email", "t@example.invalid");
+  await g(dir, "config", "user.name", "t");
+  writeFileSync(join(dir, ".gitignore"), "__pycache__/\n.pytest_cache/\n*.pyc\nnode_modules/\n*.tsbuildinfo\n");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "init");
+  const git = await GitRepo.open(dir);
+  assert.ok(git);
+  const head = await g(dir, "rev-parse", "HEAD");
+  const info = await git.createWorktree(head, "pi-eng-pw-m1");
+  mkdirSync(join(info.path, "pkg", "__pycache__"), { recursive: true });
+  writeFileSync(join(info.path, "pkg", "__pycache__", "m.cpython-312.pyc"), "x");
+  mkdirSync(join(info.path, ".pytest_cache"));
+  writeFileSync(join(info.path, ".pytest_cache", "README.md"), "x");
+  mkdirSync(join(info.path, "pkg", "a", "node_modules", "x"), { recursive: true });
+  writeFileSync(join(info.path, "pkg", "a", "node_modules", "x", "i.js"), "");
+  writeFileSync(join(info.path, "tsconfig.tsbuildinfo"), "{}");
+  await git.removeWorktree(info, { keepBranch: true });
+  assert.ok(!existsSync(info.path));
+  await git.createWorktree(head, "pi-eng-pw-m1");
+});
+
+test("a nested git repository under a derived dir keeps the worktree", async () => {
+  const { head, git } = await ignoredRepo();
+  const info = await git.createWorktree(head, "nested-1");
+  mkdirSync(join(info.path, "target", "vendor"), { recursive: true });
+  await exec("git", ["init", "-q", join(info.path, "target", "vendor")]);
+  writeFileSync(join(info.path, "target", "vendor", "precious.txt"), "x");
+  await assert.rejects(git.removeWorktree(info), /target/);
+  assert.equal(readFileSync(join(info.path, "target", "vendor", "precious.txt"), "utf8"), "x");
+});
+
+test("a huge ignored target/ does not make the worktree 'uninspectable'", async () => {
+  const { head, git } = await ignoredRepo();
+  const info = await git.createWorktree(head, "huge-1");
+  const long = "d".repeat(180);
+  for (let d = 0; d < 80; d++) {
+    const dd = join(info.path, "target", "debug", "deps", `${long}-${d}`);
+    mkdirSync(dd, { recursive: true });
+    for (let f = 0; f < 1000; f++) writeFileSync(join(dd, `artifact-with-a-long-file-name-${f}.rmeta`), "");
+  }
+  await git.removeWorktree(info, { keepBranch: true });
+  assert.ok(!existsSync(info.path));
+});
+
+test("a refused removal is recorded in the durable kept-worktrees list with its marker", async () => {
+  const { head, git, dir } = await ignoredRepo();
+  const info = await git.createWorktree(head, "kept-1");
+  writeFileSync(join(info.path, ".env"), "SECRET=1");
+  await assert.rejects(git.removeWorktree(info));
+  const list = join(
+    await g(dir, "rev-parse", "--git-common-dir").then((c) => join(dir, c)),
+    "pi-engineering-candidates",
+    "kept-scratch-worktrees.jsonl",
+  );
+  const rec = JSON.parse(readFileSync(list, "utf8").trim().split("\n")[0] ?? "{}");
+  assert.equal(rec.path, info.path);
+  assert.match(rec.reason, /\.env/);
+  assert.equal(rec.marker.branch, "kept-1");
+});
+
+test("readOwnerMarker with a branch rejects a marker copied from a sibling worktree", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const a = await git.createWorktree(head, "sib-a");
+  const gitdir = await g(a.path, "rev-parse", "--absolute-git-dir");
+  assert.ok(readOwnerMarker(gitdir, { repoRoot: dir, branch: "sib-a" }).ok);
+  assert.deepEqual(readOwnerMarker(gitdir, { repoRoot: dir, branch: "sib-b" }), {
+    ok: false,
+    reason: "branch mismatch",
+  });
+});
+
+test("rotation steals a dead holder's lock at once and skips (does not stall) behind a live one", () => {
+  const dir = mkdtempSync(join(tmpdir(), "w2b-lock-"));
+  const file = join(dir, "t.jsonl");
+  writeFileSync(file, "line\n");
+  writeFileSync(`${file}.rotate.lock`, "2147483646"); // no such process
+  let t = Date.now();
+  const rotated = rotateWithoutOverwrite(file);
+  assert.ok(rotated);
+  assert.ok(Date.now() - t < 1000, "dead holder's lock is stolen immediately");
+  writeFileSync(file, "line\n");
+  writeFileSync(`${file}.rotate.lock`, String(process.pid)); // a live holder
+  t = Date.now();
+  assert.equal(rotateWithoutOverwrite(file), null);
+  assert.ok(Date.now() - t < 1500, "bounded wait");
+  assert.equal(readFileSync(file, "utf8"), "line\n", "the live file is untouched");
+});
+
+test("restoreCheckpoint recovers the live state left behind by a crash between its two renames", async () => {
+  const root = mkdtempSync(join(tmpdir(), "w2b-ck2-"));
+  const checkpoint = join(root, "cp");
+  const state = join(root, "state");
+  mkdirSync(checkpoint);
+  mkdirSync(state);
+  writeFileSync(join(state, "live.json.replaced-123-abc"), "LIVE"); // crashed: target gone, previous kept aside
+  writeFileSync(
+    join(checkpoint, "checkpoint-manifest.json"),
+    JSON.stringify({ stateDir: state, createdAt: "x", entries: [{ path: "live.json", existed: true }] }),
+  );
+  await assert.rejects(restoreCheckpoint(checkpoint, state)); // the checkpoint copy is missing
+  assert.equal(readFileSync(join(state, "live.json"), "utf8"), "LIVE");
 });
 
 // A tripwire, not a proof: it greps the data-bearing files for destructive git tokens in any argument position.

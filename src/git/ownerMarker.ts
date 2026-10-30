@@ -33,10 +33,14 @@ export type OwnerMarkerRead = { ok: true; marker: OwnerMarker } | { ok: false; r
  *
  * With `{ repoRoot }` the marker must also belong to THAT repository:
  * `repoRootHash` must equal `shortHash(repoRoot)` (or of its realpath) and
- * `repoRootSha256` the sha256 of `realpath(repoRoot)`. Without it only the
+ * `repoRootSha256` the sha256 of `realpath(repoRoot)`; with `branch` the recorded branch must equal it
+ * (a marker copied from a sibling worktree names a different branch). Without `repoRoot` only the
  * format is checked (format-only callers); cleanup paths must pass `repoRoot`.
  */
-export function readOwnerMarker(gitdir: string, opts: { repoRoot?: string } = {}): OwnerMarkerRead {
+export function readOwnerMarker(
+  gitdir: string,
+  opts: { repoRoot?: string; branch?: string | null } = {},
+): OwnerMarkerRead {
   const read = readOwnerMarkerFormat(gitdir);
   if (!read.ok || opts.repoRoot === undefined) return read;
   let real = opts.repoRoot;
@@ -50,6 +54,10 @@ export function readOwnerMarker(gitdir: string, opts: { repoRoot?: string } = {}
   }
   if (read.marker.repoRootSha256 !== createHash("sha256").update(real).digest("hex")) {
     return { ok: false, reason: "repo mismatch (repoRootSha256)" };
+  }
+  // A marker copied from a sibling worktree of the same repo names another branch.
+  if (opts.branch !== undefined && read.marker.branch !== opts.branch) {
+    return { ok: false, reason: "branch mismatch" };
   }
   return read;
 }

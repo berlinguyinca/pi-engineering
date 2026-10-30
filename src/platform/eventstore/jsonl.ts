@@ -135,6 +135,7 @@ export class JsonlEventStore implements EventStoreBackend {
       if (!line.trim()) continue;
       try {
         const evt = JSON.parse(line) as StoredEvent;
+        if (this.byId.has(evt.event_id)) continue; // a retried append of an earlier, unacknowledged write
         this.events.push(evt);
         this.byId.set(evt.event_id, evt);
       } catch {
@@ -311,15 +312,16 @@ export async function repairTornTail(
   file: string,
   options: { owner?: ExclusiveFileLock | null } = {},
 ): Promise<string | null> {
-  let raw: string;
+  let buf: Buffer;
   try {
-    raw = await readFile(file, "utf-8");
+    buf = await readFile(file);
   } catch {
     // File missing/unreadable (e.g. never created): nothing to repair.
     return null;
   }
-  if (raw.length === 0 || raw.endsWith("\n")) return raw;
-  const complete = raw.slice(0, raw.lastIndexOf("\n") + 1);
+  if (buf.length === 0 || buf[buf.length - 1] === 0x0a) return buf.toString("utf-8");
+  const keep = buf.lastIndexOf(0x0a) + 1;
+  const complete = buf.subarray(0, keep).toString("utf-8");
   // Ownership gate (FR-05): a torn tail is only TRUNCATED when the caller proves
   // it owns the writer lock, or when no live owner exists. A caller that cannot
   // prove ownership (e.g. recovery tooling reaching a file another live process
@@ -332,28 +334,36 @@ export async function repairTornTail(
     });
     return complete;
   }
-  // Quarantine first: the discarded bytes are appended to `<file>.torn-<ts>` and
-  // the file is truncated only once they are safely on disk (fail closed).
-  const tail = raw.slice(complete.length);
+  // Quarantine first: the discarded bytes (byte-exact, no decoding) are appended to
+  // `<file>.torn-<ts>` and the file is truncated only once they are durable (fail closed).
+  const tail = Buffer.from(buf.subarray(keep));
   const quarantine = `${file}.torn-${new Date()
     .toISOString()
     .replace(/[-:]/g, "")
     .replace(/\.\d+Z$/, "Z")}`;
   try {
-    // open + write + fsync + close BEFORE the truncate: the bytes are durable first.
+    // open + write + fsync + close, then fsync the directory entry, BEFORE the truncate.
     const handle = await open(quarantine, "a", 0o600);
     try {
-      await handle.writeFile(tail, "utf-8");
+      await handle.writeFile(tail);
       await handle.sync();
     } finally {
       await handle.close();
     }
+    const dirHandle = await open(dirname(quarantine), "r");
+    try {
+      await dirHandle.sync();
+    } finally {
+      await dirHandle.close();
+    }
   } catch {
     // The quarantine needs a NEW file, which is exactly what ENOSPC refuses. Never leave the
-    // fragment unterminated (the next append would fuse onto it and lose a committed event):
-    // terminate it so it becomes one isolated, skippable corrupt line. Nothing is discarded.
+    // fragment unterminated (the next append would fuse onto it and lose a committed event). A bare
+    // "\n" could turn a complete-but-unacknowledged event into a VALID line that the caller's retry
+    // then duplicates, so the fragment is closed with a sentinel that can never parse as an event:
+    // one isolated corrupt line. Nothing is discarded.
     try {
-      await appendFile(file, "\n", "utf-8");
+      await appendFile(file, TORN_SENTINEL, "utf-8");
     } catch (error) {
       throw new Error(
         `event store: torn tail of ${file} could neither be quarantined nor terminated: ${error instanceof Error ? error.message : error}`,
@@ -361,17 +371,21 @@ export async function repairTornTail(
     }
     emitTelemetry({
       level: "warning",
-      text: `event store: could not quarantine the torn tail of ${file}; the fragment was terminated in place (one corrupt line, no bytes discarded)`,
+      text: `event store: could not quarantine the torn tail of ${file}; the fragment was closed with a sentinel (one corrupt line, no bytes discarded)`,
     });
     return complete;
   }
-  await truncate(file, Buffer.byteLength(complete, "utf-8")).catch(() => undefined);
+  // A failed truncate must surface (the store then refuses to append onto the fragment).
+  await truncate(file, keep);
   emitTelemetry({
     level: "warning",
     text: `event store: repaired a torn tail in ${file} (discarded bytes kept in ${quarantine})`,
   });
   return complete;
 }
+
+/** Closes an unquarantinable torn fragment; the RS control char makes the line unparseable as JSON. */
+const TORN_SENTINEL = "\u001e#torn\n";
 
 /** Rewrite a JSONL store's file atomically. Exported for recovery tooling. */
 export async function rewriteJsonl(file: string, events: readonly StoredEvent[]): Promise<void> {

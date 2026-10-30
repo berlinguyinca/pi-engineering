@@ -13,10 +13,11 @@
  * in the middle of a step is handled by restoring the checkpoint (recovery).
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, renameSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { emitTelemetry } from "../../telemetry/sink.ts";
 import { STATE_SCHEMA_FILE, readStateSchema, writeStateSchema } from "./schema.ts";
 
 export interface StateMigration {
@@ -124,6 +125,39 @@ export async function createCheckpoint(
   );
 }
 
+/**
+ * A crash between the two renames of a restore leaves `<target>.replaced-*` (the live state) and no
+ * `<target>`: put it back (completing the rollback), and report any leftover `.restore-*` copy.
+ * Nothing is deleted.
+ */
+function recoverInterruptedRestore(target: string): void {
+  const parent = dirname(target);
+  const leaf = basename(target);
+  let names: string[];
+  try {
+    names = readdirSync(parent);
+  } catch {
+    return;
+  }
+  for (const name of names.filter((n) => n.startsWith(`${leaf}.replaced-`))) {
+    if (!existsSync(target)) {
+      renameSync(join(parent, name), target);
+      emitTelemetry({ level: "warning", text: `migration: recovered ${target} from an interrupted restore (${name})` });
+    } else {
+      emitTelemetry({
+        level: "warning",
+        text: `migration: leftover ${join(parent, name)} from an interrupted restore; inspect it`,
+      });
+    }
+  }
+  for (const name of names.filter((n) => n.startsWith(`${leaf}.restore-`))) {
+    emitTelemetry({
+      level: "warning",
+      text: `migration: leftover partial restore copy ${join(parent, name)}; inspect it`,
+    });
+  }
+}
+
 /** Put the checkpointed paths back exactly; paths that did not exist are removed. */
 export async function restoreCheckpoint(checkpointDir: string, stateDir: string): Promise<void> {
   const manifest = JSON.parse(await readFile(join(checkpointDir, MANIFEST), "utf8")) as {
@@ -133,6 +167,7 @@ export async function restoreCheckpoint(checkpointDir: string, stateDir: string)
     const n = normalize(path);
     if (isAbsolute(n) || n.startsWith("..")) throw new MigrationError(`corrupt checkpoint path ${path}`);
     const target = join(stateDir, n);
+    recoverInterruptedRestore(target);
     if (existed) {
       // Copy the checkpoint to a sibling temp FIRST, then swap: a failed copy leaves the live
       // state untouched instead of having already removed it.

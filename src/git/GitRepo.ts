@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { type Dirent, existsSync, realpathSync } from "node:fs";
 import {
   access,
+  appendFile,
   lstat,
   mkdir,
   readFile,
@@ -18,7 +19,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 import { compactStamp } from "../runtime/rotateFile.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
-import { writeOwnerMarker } from "./ownerMarker.ts";
+import { readOwnerMarker, writeOwnerMarker } from "./ownerMarker.ts";
 import { safeGit } from "./safeGit.ts";
 import { shortHash } from "./shortHash.ts";
 import { removalBlockers } from "./worktreeSafety.ts";
@@ -1594,20 +1595,72 @@ export class GitRepo {
    * Returns a refusal reason, or null once the worktree is gone.
    */
   private async removeWorktreeChecked(path: string, guard?: GitMutationGuard): Promise<string | null> {
+    const refusal = await this.refusalFor(path);
+    if (refusal !== null) {
+      await this.recordKeptWorktree(path, refusal);
+      return refusal;
+    }
+    guard?.assertAuthoritative();
+    const ownLink = await this.isOwnNodeModulesLink(path);
+    if (ownLink) await unlink(join(path, "node_modules")).catch(() => {});
+    // Re-check immediately before the remove: shrinks the window in which a worker could write.
+    const again = await this.refusalFor(path);
+    if (again === null) {
+      const removed = await this.git(["worktree", "remove", path]);
+      if (removed.code === 0) return null;
+      await this.relinkNodeModules(ownLink, path);
+      const reason = removed.stderr || removed.stdout || "git worktree remove failed";
+      await this.recordKeptWorktree(path, reason);
+      return reason;
+    }
+    await this.relinkNodeModules(ownLink, path);
+    await this.recordKeptWorktree(path, again);
+    return again;
+  }
+
+  private async refusalFor(path: string): Promise<string | null> {
     const ownLink = await this.isOwnNodeModulesLink(path);
     const blockers = await removalBlockers(path, { ownNodeModulesLink: ownLink });
     if (blockers === null) return "the worktree cannot be inspected";
     if (blockers.length > 0) {
       return `it holds files removal would lose (${blockers.length}): ${blockers.slice(0, 5).join(", ")}`;
     }
-    guard?.assertAuthoritative();
-    if (ownLink) await unlink(join(path, "node_modules")).catch(() => {});
-    const removed = await this.git(["worktree", "remove", path]);
-    if (removed.code !== 0) {
-      if (ownLink) await this.linkSharedNodeModules(path);
-      return removed.stderr || removed.stdout || "git worktree remove failed";
-    }
     return null;
+  }
+
+  private async relinkNodeModules(wasLinked: boolean, path: string): Promise<void> {
+    if (!wasLinked) return;
+    await this.linkSharedNodeModules(path);
+    if (!(await this.isOwnNodeModulesLink(path))) {
+      emitTelemetry({ level: "warning", text: `could not restore the node_modules link in kept worktree ${path}` });
+    }
+  }
+
+  /**
+   * Durable list of worktrees that cleanup refused to remove (`kept-scratch-worktrees.jsonl` in the
+   * candidate state dir): nobody else reclaims them, so a later janitor can adopt this list. Also the
+   * place where the ownership marker is read (for the record only, never as a gate).
+   */
+  private async recordKeptWorktree(path: string, reason: string): Promise<void> {
+    try {
+      let marker: unknown = null;
+      try {
+        const gitdir = (await this.git(["-C", path, "rev-parse", "--absolute-git-dir"])).stdout;
+        const read = readOwnerMarker(gitdir, { repoRoot: this.repoRoot });
+        marker = read.ok ? read.marker : { invalid: read.reason };
+      } catch {
+        marker = { invalid: "unreadable" };
+      }
+      const dir = await this.candidateStateDir();
+      await appendFile(
+        join(dir, "kept-scratch-worktrees.jsonl"),
+        `${JSON.stringify({ path, reason, ts: new Date().toISOString(), marker })}\n`,
+        "utf8",
+      );
+      emitTelemetry({ level: "warning", text: `worktree kept (not removed): ${path}: ${reason}` });
+    } catch {
+      // Reporting must never turn a refusal into a failure of the caller.
+    }
   }
 
   private async registeredWorktrees(): Promise<Array<{ path: string; branch: string | null }>> {
@@ -1663,7 +1716,7 @@ export class GitRepo {
     }
     const holder = (await this.registeredWorktrees()).find((w) => w.branch === branch);
     if (holder) throw new Error(`branch ${branch} is checked out at ${holder.path}; refusing to reuse it`);
-    await this.deleteOrPreserveBranch(branch, guard);
+    await this.deleteOrPreserveBranchLocked(branch, guard);
   }
 
   /** The tip of `refs/heads/<branch>`, or null. */
@@ -1674,19 +1727,14 @@ export class GitRepo {
 
   /**
    * Delete `branch` only when provably contained elsewhere, never `-D`:
-   *  - HEAD is a branch (symbolic) and the branch is merged into it (`branch -d`); a detached HEAD
-   *    proves nothing (it moves), so it is not trusted; or
-   *  - its tip is reachable from ANOTHER local branch or a tag (compare-and-swap `update-ref -d`).
-   * Remote-tracking refs do not count: `fetch --prune` / lease pushes can drop them.
+   * its tip is reachable from ANOTHER local branch or a tag (compare-and-swap `update-ref -d`).
+   * Not `git branch -d` (it also trusts the upstream), not remote-tracking refs (`fetch --prune` /
+   * lease pushes can drop them), not a detached HEAD (it moves). HEAD's own branch is in refs/heads.
    * Returns null when it was not deleted.
    */
   private async deleteIfContained(branch: string): Promise<GitResult | null> {
     const tip = await this.branchTip(branch);
     if (tip === null) return null;
-    if ((await this.git(["symbolic-ref", "-q", "HEAD"])).code === 0) {
-      const deleted = await this.git(["branch", "-d", branch]);
-      if (deleted.code === 0) return deleted;
-    }
     const others = await this.git([
       "for-each-ref",
       "--contains",
@@ -1707,6 +1755,48 @@ export class GitRepo {
    * when the branch was preserved. Returns null when the branch does not exist.
    */
   async deleteOrPreserveBranch(
+    branch: string,
+    guard?: GitMutationGuard,
+  ): Promise<(GitResult & { renamedTo?: string }) | null> {
+    // Repo-wide worktree lock: two instances deleting branches at the same unique tip must not
+    // each see the other as "elsewhere".
+    return this.serialize(() =>
+      this.withWorktreeSection(guard, () => this.deleteOrPreserveBranchLocked(branch, guard)),
+    );
+  }
+
+  /**
+   * For a throwaway review branch: when every non-merge commit on it is already contained in
+   * another local branch/tag, only reproducible test merges are unique to it, so it is deleted
+   * (compare-and-swap); otherwise it goes through `deleteOrPreserveBranch` (renamed, never lost).
+   */
+  async deleteScratchBranch(
+    branch: string,
+    guard?: GitMutationGuard,
+  ): Promise<(GitResult & { renamedTo?: string }) | null> {
+    return this.serialize(() =>
+      this.withWorktreeSection(guard, async () => {
+        const tip = await this.branchTip(branch);
+        if (tip === null) return null;
+        const unique = await this.git([
+          "rev-list",
+          "--no-merges",
+          tip,
+          "--not",
+          `--exclude=${branch}`, // relative to refs/heads/ when used with --branches
+          "--branches",
+          "--tags",
+        ]);
+        if (unique.code === 0 && unique.stdout === "") {
+          const cas = await this.git(["update-ref", "-d", `refs/heads/${branch}`, tip]);
+          if (cas.code === 0) return cas;
+        }
+        return this.deleteOrPreserveBranchLocked(branch, guard);
+      }),
+    );
+  }
+
+  private async deleteOrPreserveBranchLocked(
     branch: string,
     guard?: GitMutationGuard,
   ): Promise<(GitResult & { renamedTo?: string }) | null> {
@@ -1959,7 +2049,7 @@ export class GitRepo {
             guard?.assertAuthoritative();
             const deleted = hooks.deleteBranch
               ? await hooks.deleteBranch()
-              : ((await this.deleteOrPreserveBranch(info.branch, guard)) ?? { stdout: "", stderr: "", code: 0 });
+              : ((await this.deleteOrPreserveBranchLocked(info.branch, guard)) ?? { stdout: "", stderr: "", code: 0 });
             if (deleted.code !== 0) {
               throw new Error(`git branch delete failed for ${info.branch}: ${deleted.stderr || deleted.stdout}`);
             }
@@ -2054,7 +2144,7 @@ export class GitRepo {
       return;
     }
     // Never `-D`: only a branch contained elsewhere is deleted; anything else is kept.
-    await this.deleteIfContained(branch).catch(() => null);
+    await this.serialize(() => this.withWorktreeSection(guard, () => this.deleteIfContained(branch))).catch(() => null);
   }
 
   /** Move an orphaned worktree directory to `<parent>/.pi-eng-trash/<ts>-<name>`; never deletes. */
