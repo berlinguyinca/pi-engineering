@@ -1441,7 +1441,10 @@ export class EngineeringRuntime {
     });
     if (opts.lineage)
       rt.taskLineage = new TaskLineageProjector(
-        new LedgerWorkProjection(ledger, { staleAfterMs: rt.livenessStaleMs }),
+        new LedgerWorkProjection(ledger, {
+          staleAfterMs: rt.livenessStaleMs,
+          snapshotFile: join(workDir, "work-projection.snapshot.json"),
+        }),
         opts.lineage,
       );
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
@@ -2138,7 +2141,10 @@ export class EngineeringRuntime {
         };
         // Mission-less work (Ledger work items and the sessions that ran them) forks and hands off too: the work read
         // model names the task, and the repository and base branch come from this session's own checkout.
-        const projection = new LedgerWorkProjection(rt.ledger, { staleAfterMs: rt.livenessStaleMs });
+        const projection = new LedgerWorkProjection(rt.ledger, {
+          staleAfterMs: rt.livenessStaleMs,
+          snapshotFile: join(rt.workDir, "work-projection.snapshot.json"),
+        });
         return withFallbackForkSources(
           missionForkSources(store, host),
           workForkSources(
