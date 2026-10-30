@@ -111,6 +111,11 @@ describe("a mission starts on its session's model", () => {
       await f.store.flush();
       const replayed = MissionStore.open(f.backend);
       assert.equal(replayed.getMission(id)?.operator_model_pin?.id, QWEN.id, "survives a restart");
+      assert.equal(
+        replayed.getMission(id)?.operator_model_pin?.implicit,
+        true,
+        "still marked implicit after a restart",
+      );
     } finally {
       await f.cleanup();
     }
@@ -172,6 +177,17 @@ describe("placement under a starting-model pin", () => {
     const placed = await routeModel("implementer", { missionId: "MSN-1" });
     assert.equal(placed?.id, QWEN.id);
     assert.equal(placed?.operatorPin, true);
+  });
+
+  it("an implicit pin places the role on the model but is not waited on forever", async () => {
+    const routeModel = createRouteModel({
+      router: await router(),
+      unavailable: new UnavailableModels(),
+      operatorPin: () => ({ provider: "gw", id: QWEN.id, implicit: true }),
+    });
+    const placed = await routeModel("implementer", { missionId: "MSN-1" });
+    assert.equal(placed?.id, QWEN.id);
+    assert.notEqual(placed?.operatorPin, true, "an unchosen pin must not suppress the capacity give-up");
   });
 
   it("keeps the reviewer on a distinct model and says why", async () => {

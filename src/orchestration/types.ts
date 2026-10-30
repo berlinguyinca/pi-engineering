@@ -159,6 +159,12 @@ export interface OperatorModelPin {
   id: string;
   /** When the operator chose it. */
   set_at: string;
+  /**
+   * The mission took the session's starting model; the operator never chose it.
+   * It is still the model the mission runs on, but it is not waited on forever
+   * when the gateway has no capacity for it.
+   */
+  implicit?: true;
 }
 
 export type TaskKind =
