@@ -59,12 +59,20 @@ The pipeline runs **asynchronously** with progress notifications:
    and the ledger records it. Material findings spawn a fix round (a child
    candidate) instead.
 
-## Orchestration missions (automatic, no slash command required)
+## Orchestration missions (explicit; no longer automatic)
 
-Normal-language intent automatically invokes the orchestration workflow through
-the semantic `mission` tool. An optional `/mission <request>` command runs the
-same pipeline explicitly (correctness never depends on it). See
-[`docs/orchestration.md`](orchestration.md) for the full design.
+A Mission starts when you ask for one: `/mission <request>`, or the model calling
+the `mission` tool because you asked for a durable, verified run. Ordinary
+coding prompts no longer start a Mission by default; they run in the normal
+interactive session, and `/work` shows the tasks, runs and verification.
+See [`docs/orchestration.md`](orchestration.md) for the full design.
+
+The earlier behaviour (an engineering-intent prompt is told to run through the
+`mission` tool) is still available with `execution.legacy_auto_invoke: true` in
+`engineering.yaml`. **That setting is deprecated** and planned for removal once
+the criteria in
+`docs/specs/pi-engineering-missionless-fabric-20261028-v1/PHASE-6-RETIREMENT.md`
+hold; nothing has been removed yet, and `/mission` and the `mission` tool stay.
 
 ```bash
 /mission Add a health endpoint

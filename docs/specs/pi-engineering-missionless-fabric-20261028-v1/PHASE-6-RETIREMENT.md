@@ -19,7 +19,7 @@ Status: **plan plus the safe parts shipped; nothing legacy was deleted.**
 4. Explicit operator approval in writing for each removal step.
 
 ## Removal order (each its own reviewed PR, never batched)
-1. Mark `legacy_auto_invoke` deprecated in docs.
+1. Mark `legacy_auto_invoke` deprecated in docs. **Done 2026-10-30** (usage.md, policy.ts JSDoc `@deprecated`); nothing removed.
 2. Remove the auto-invoke directive text and `decideMissionDirective`'s legacy branch.
 3. Stop registering the `mission` tool only after step 1 criteria hold; `/mission` stays as an explicit command.
 4. MissionStore is **not** retired by this plan: it remains the write authority for existing Missions and for explicit `/mission` runs.

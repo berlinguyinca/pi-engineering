@@ -196,6 +196,11 @@ export interface ExecutionConfig {
   /**
    * Compatibility switch. When true, an engineering-intent prompt is told to
    * run through the `mission` tool (the pre-MEF behaviour). Default false.
+   *
+   * @deprecated Compatibility only: planned for removal once the retirement
+   * criteria in docs/specs/pi-engineering-missionless-fabric-20261028-v1/
+   * PHASE-6-RETIREMENT.md hold. Nothing is removed yet. `/mission` and the
+   * `mission` tool keep working.
    */
   legacy_auto_invoke: boolean;
   /**
