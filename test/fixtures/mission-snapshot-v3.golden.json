@@ -123,7 +123,13 @@
         "owner": null,
         "repository": null,
         "task": null,
-        "preservedWork": []
+        "preservedWork": [],
+        "modelUse": {
+          "pin": null,
+          "pinnedAt": null,
+          "agents": [],
+          "elsewhere": 0
+        }
       },
       "specApproval": {
         "phase": "drafting",
@@ -298,7 +304,13 @@
         "owner": "host-a:1234",
         "repository": "repo-full",
         "task": "TSK-golden-full",
-        "preservedWork": []
+        "preservedWork": [],
+        "modelUse": {
+          "pin": null,
+          "pinnedAt": null,
+          "agents": [],
+          "elsewhere": 0
+        }
       },
       "specApproval": {
         "phase": "approved",

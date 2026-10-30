@@ -650,7 +650,8 @@ test("exact maintenance selection changes only the fenced mission and dispatches
     });
     assert.equal(activeResult.status, "skipped");
     assert.equal(activeResult.status === "skipped" && activeResult.code, "ACTIVE_EXECUTION");
-    assert.equal(runtime.missionStore!.getMission(active.mission_id)?.operator_model_pin ?? null, null);
+    // The refused selection must not reach the active mission (it keeps its session-start pin, never DEEPSEEK).
+    assert.notEqual(runtime.missionStore!.getMission(active.mission_id)?.operator_model_pin?.id, DEEPSEEK.id);
     assert.equal((await runtime.prepareForMaintenance({ timeoutMs: 5000 })).status, "ready");
     const mission = (await flight).mission;
     const store = runtime.missionStore!;
