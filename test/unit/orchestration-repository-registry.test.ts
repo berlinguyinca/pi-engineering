@@ -5,10 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { ContextBroker } from "../../src/context/ContextBroker.ts";
 import type { GitRepo } from "../../src/git/GitRepo.ts";
-import {
-  RepositoryRegistry,
-  type OpenedRepository,
-} from "../../src/orchestration/repositoryRegistry.ts";
+import { type OpenedRepository, RepositoryRegistry } from "../../src/orchestration/repositoryRegistry.ts";
 import type { RepositoryBinding, WorkspaceManifest } from "../../src/orchestration/types.ts";
 import { WorkspaceScopeError } from "../../src/orchestration/workspaceManifest.ts";
 
@@ -95,10 +92,9 @@ describe("RepositoryRegistry shared repository opens", () => {
     await registry.register(manifest("MSN-A", [binding("repo-a", rootA, ["a/**"])]));
     await registry.register(manifest("MSN-B", [binding("repo-b", rootB, ["b/**"])]));
     // Same roots again under a different mission: no new opens.
-    await registry.register(manifest("MSN-C", [
-      binding("repo-a", rootA, ["a/**"]),
-      binding("repo-b", rootB, ["b/**"]),
-    ]));
+    await registry.register(
+      manifest("MSN-C", [binding("repo-a", rootA, ["a/**"]), binding("repo-b", rootB, ["b/**"])]),
+    );
 
     assert.equal(calls.length, 2, `expected two opens, got ${calls.length}: ${JSON.stringify(calls)}`);
     assert.deepEqual(calls.map((c) => c.root).sort(), [rootA, rootB].sort(), "one open per distinct root");
@@ -120,10 +116,7 @@ describe("RepositoryRegistry shared repository opens", () => {
       },
     });
 
-    await assert.rejects(
-      () => registry.register(manifest("MSN-X", [binding("repo-x", root)])),
-      WorkspaceScopeError,
-    );
+    await assert.rejects(() => registry.register(manifest("MSN-X", [binding("repo-x", root)])), WorkspaceScopeError);
     // A later register must retry the open (the repository may have appeared).
     await registry.register(manifest("MSN-Y", [binding("repo-x", root)]));
     assert.equal(attempts, 2, `expected two attempts, got ${attempts}`);
@@ -135,8 +128,7 @@ describe("RepositoryRegistry shared repository opens", () => {
     await assert.rejects(
       () => registry.register(manifest("MSN-Z", [binding("repo-z", root)])),
       (error: unknown) =>
-        error instanceof WorkspaceScopeError &&
-        error.message.includes("Repository binding cannot be opened"),
+        error instanceof WorkspaceScopeError && error.message.includes("Repository binding cannot be opened"),
     );
   });
 

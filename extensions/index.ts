@@ -105,7 +105,16 @@ import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.t
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { resolveStateRoot } from "../src/runtime/isolation/stateDir.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
-import { describeHousekeeping, gcPlan, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
+import {
+  describeAdoptPreview,
+  describeHousekeeping,
+  describeTrashPurge,
+  gcPlan,
+  housekeepingMode,
+  runAdoptPreview,
+  runHousekeeping,
+  runTrashPurge,
+} from "../src/runtime/janitor.ts";
 import {
   clearOperatorModelPin,
   describeMissionControl,
@@ -796,14 +805,33 @@ export default function (pi: ExtensionAPI) {
   }
   pi.registerCommand("gc", {
     description:
-      "Preview which abandoned pi-eng candidate worktrees and expired Rust build caches housekeeping would reclaim, and what it keeps and why. Nothing is removed unless you pass --apply (--dry-run is the default and accepted as an alias).",
+      "Preview which abandoned pi-eng candidate worktrees and idle Rust build caches housekeeping would move to the trash (<state-dir>/trash, <rust-cache>/.trash), and what it keeps and why. A sweep never deletes: without --apply nothing moves. `/gc --purge-trash --older-than <days> --apply` is the only command that deletes, and only trash entries housekeeping created that are at least <days> old (default 14, minimum 7); without --apply it lists them. Unmarked `.pi-eng-trash` orphans beside the repo are only listed, never deleted (the listing shows the command you may run yourself). `/gc --adopt-preview` is a read-only listing of legacy worktrees and Rust caches that lack ownership markers. --dry-run is the default and accepted as an alias.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const { dryRun, note } = gcPlan(args);
+      const { dryRun, note, purge, adoptPreview } = gcPlan(args);
+      if (adoptPreview) {
+        const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+        const preview = await runAdoptPreview({ cwd: ctx.cwd, missions: runtime?.missionStore });
+        ctx.ui.notify(describeAdoptPreview(preview).join("\n"), "info");
+        return;
+      }
+      if (purge) {
+        const purged = await runTrashPurge({
+          olderThanDays: purge.olderThanDays,
+          apply: !dryRun,
+          cwd: ctx.cwd,
+        });
+        const lines = describeTrashPurge(purged, dryRun);
+        if (note) lines.unshift(`[/gc] ${note}`);
+        if (dryRun) lines.push("Preview only: nothing was deleted. Add `--apply` to purge what is listed above.");
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
       const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
       const result = await runHousekeeping({ cwd: ctx.cwd, missions: runtime?.missionStore, dryRun });
       const lines = describeHousekeeping(result, { verbose: true });
       if (note) lines.unshift(`[/gc] ${note}`);
-      if (dryRun) lines.push("Preview only: nothing was removed. Run `/gc --apply` to reclaim what is listed above.");
+      if (dryRun)
+        lines.push("Preview only: nothing was moved. Run `/gc --apply` to move what is listed above to the trash.");
       ctx.ui.notify(
         lines.length > 0 ? lines.join("\n") : "Nothing to reclaim.",
         result.worktrees?.failed.length ? "warning" : "info",

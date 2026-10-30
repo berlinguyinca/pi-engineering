@@ -28,10 +28,17 @@
  *    would block a plain remove; index flags (assume-unchanged, skip-worktree)
  *    could hide edits; HEAD is detached and either unreachable from every
  *    local branch or tag (remote-tracking refs and stash do not count) or the tree is dirty; or the
- *    shared `_shared` Rust cache key would be the cleanup target. Otherwise
- *    uncommitted changes are committed onto the worktree's own branch and a
- *    plain (never forced) `git worktree remove` runs; if changes remain after
- *    the commit or git refuses, the worktree is kept. The branch always stays.
+ *    shared `_shared` Rust cache key would be the cleanup target; or it lacks
+ *    the ownership marker `pi-eng-owner.json` in its git dir (proof the runtime
+ *    created it for THIS repository); or a root derived folder holds files newer
+ *    than the owning mission's terminal timestamp. Otherwise uncommitted
+ *    changes are committed onto the worktree's own branch and the quarantined
+ *    checkout is MOVED (never deleted) to `<state-dir>/trash/<ts>/<name>`, after
+ *    which its git registration is pruned; if changes remain after the commit,
+ *    the move crosses a filesystem or git refuses, the worktree is kept. The
+ *    branch always stays. Only `/gc --purge-trash` ever deletes trash.
+ *  - Fork worktrees (`pi-fork-<hash>-<id>`) are outside the `pi-eng-<hash>-` namespace and never swept here; their
+ *    markers are for a future janitor.
  *  - Sibling directories inside the namespace that git no longer lists are
  *    reported as strays and never removed. `git worktree repair` may first
  *    re-register one (metadata only; no file is touched), after which it is
@@ -47,12 +54,10 @@ import {
   open,
   readFile,
   readdir,
-  readlink,
   realpath,
   rename,
   rm,
   stat,
-  symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -60,8 +65,11 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitRepo } from "./GitRepo.ts";
+import { readOwnerMarker } from "./ownerMarker.ts";
 import { UNSCOPED_TARGET_KEY, rustTargetDir } from "./rustBuildCache.ts";
 import { safeGitOrThrow } from "./safeGit.ts";
+import { defaultTrashRoot, moveToTrash, trashRootInsideProblem } from "./trashStore.ts";
+import { MAX_WALK_ENTRIES, ROOT_DERIVED_DIRS, containsGitEntry } from "./worktreeSafety.ts";
 
 const exec = promisify(execFile);
 
@@ -91,6 +99,14 @@ export interface JanitorOptions {
    * worktree; `terminal` makes it eligible; `unknown` (or no resolver) keeps it.
    */
   ownerLiveness?: (owner: WorktreeOwner) => OwnerLiveness | Promise<OwnerLiveness>;
+  /**
+   * Epoch ms at which the owner's mission durably became terminal. A worktree whose root
+   * derived folders (node_modules, target, ...) hold anything newer, or that has such folders
+   * while this is unknown (null/absent), is kept: something used the checkout after the mission ended.
+   */
+  ownerTerminalAt?: (owner: WorktreeOwner) => number | null | Promise<number | null>;
+  /** Where reclaimed checkouts are moved. Default `<state-dir>/trash`. */
+  trashRoot?: string;
   /** Retained for callers; age alone no longer reclaims anything, so this governs nothing. */
   maxIdleMs?: number;
   /** Nothing younger than this is reclaimed. Default 1 h, env-raisable; never lower in production. */
@@ -110,6 +126,8 @@ export interface ReclaimedWorktree {
   /** Commit created to preserve uncommitted work, if any. */
   preservedCommit: string | null;
   reason: string;
+  /** Where the checkout was moved (null in a dry run). It is never deleted by a sweep. */
+  trashedTo?: string | null;
   /** Bytes the checkout occupied, when it could be measured. */
   bytes: number | null;
 }
@@ -148,6 +166,11 @@ export function worktreeIdleMs(env: Record<string, string | undefined> = process
  * `.git` link, and the admin files git touches on checkout/commit/status.
  */
 export async function worktreeLastActivity(path: string): Promise<number> {
+  return (await worktreeActivity(path)).at;
+}
+
+/** `worktreeLastActivity` plus the unreadable directory that forced it to "now", if any. */
+async function worktreeActivity(path: string): Promise<{ at: number; unreadable: string | null }> {
   const probes = [path, join(path, ".git")];
   try {
     const link = (await readFile(join(path, ".git"), "utf8")).trim();
@@ -159,7 +182,8 @@ export async function worktreeLastActivity(path: string): Promise<number> {
   } catch {
     /* no .git link: fall back to the directory itself */
   }
-  let newest = await newestTreeMtime(path);
+  const scan = await scanTree(path);
+  let newest = scan.newest;
   for (const probe of probes) {
     try {
       const s = await stat(probe);
@@ -168,7 +192,7 @@ export async function worktreeLastActivity(path: string): Promise<number> {
       /* missing probe */
     }
   }
-  return newest;
+  return { at: newest, unreadable: scan.unreadable };
 }
 
 async function directoryBytes(path: string): Promise<number | null> {
@@ -182,8 +206,10 @@ async function directoryBytes(path: string): Promise<number | null> {
 }
 
 /** Refuse anything that is not a namespace sibling of the repo root. */
-async function assertNamespacePath(repo: GitRepo, path: string): Promise<void> {
+async function assertNamespacePath(repo: GitRepo, path: string, branch: string | null): Promise<void> {
   repo.assertSafeWorktreePath(path);
+  const markerWhy = ownerMarkerProblem(repo, await worktreeGitDir(path), branch);
+  if (markerWhy) throw new Error(`refusing to reclaim ${path}: ${markerWhy}`);
   const parent = dirname(repo.root);
   const prefix = repo.worktreeNamespacePrefix();
   if (dirname(path) !== parent || !basename(path).startsWith(prefix) || path === repo.root) {
@@ -195,23 +221,38 @@ async function assertNamespacePath(repo: GitRepo, path: string): Promise<void> {
   }
 }
 
-/** Rebuildable output directory names. Only a ROOT-level, ignored, repo-free folder with one of these names is derived. */
-const DERIVED_DIRS = ["node_modules", "target", ".next", "dist", "coverage"] as const;
+async function worktreeGitDir(path: string): Promise<string> {
+  return (await safeGitOrThrow(["rev-parse", "--absolute-git-dir"], { ...READ_ONLY_GIT, cwd: path })).stdout.trim();
+}
 
-/** Upper bound on directory entries any single janitor walk visits; beyond it the answer fails closed. */
-const MAX_WALK_ENTRIES = 200_000;
+/**
+ * Why a worktree is not provably ours, or null. The marker is written and validated by `ownerMarker.ts`
+ * (repoRootHash + full repoRootSha256 over realpath(repoRoot), exact branch, regular file); a missing, unparseable or
+ * mismatching marker all mean "not provably ours": the worktree is kept. A detached worktree matches only a marker
+ * that recorded no branch.
+ */
+function ownerMarkerProblem(repo: GitRepo, gitDir: string, branch: string | null): string | null {
+  const read = readOwnerMarker(gitDir, { repoRoot: repo.root, branch });
+  if (read.ok) return null;
+  return read.reason === "missing"
+    ? "no ownership marker (pi-eng-owner.json in its git dir): not provably created by pi-engineering"
+    : `ownership marker rejected (${read.reason}): not provably created by pi-engineering for this repository and branch`;
+}
+
+/** Rebuildable output directory names. Only a ROOT-level, ignored, repo-free folder with one of these names is derived. */
+const DERIVED_DIRS: readonly string[] = [...ROOT_DERIVED_DIRS];
 
 /** Name-only test (any depth): used to refuse, never to permit. */
 function isDerivedName(entry: string): boolean {
   if (!entry.endsWith("/")) return false;
   const last = entry.replace(/\/+$/, "").split("/").pop() ?? "";
-  return (DERIVED_DIRS as readonly string[]).includes(last);
+  return DERIVED_DIRS.includes(last);
 }
 
-/** Exists? Only "not there" (ENOENT/ENOTDIR) is false; any other error propagates so the caller fails closed. */
+/** Exists? lstat, so a dangling symlink counts as present. Only "not there" (ENOENT/ENOTDIR) is false; any other error propagates so the caller fails closed. */
 async function existsStrict(path: string): Promise<boolean> {
   try {
-    await stat(path);
+    await lstat(path);
     return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
@@ -224,18 +265,21 @@ const entryPath = (line: string): string => line.slice(3);
 
 const READ_ONLY_GIT = { trust: "operator", env: { GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 60_000 } as const;
 
-/** Newest mtime of any file or directory under `dir`, skipping `.git`, node_modules and target. Fails closed to "now". */
-async function newestTreeMtime(dir: string): Promise<number> {
+/**
+ * Newest mtime of any file or directory under `dir`, skipping `.git`, node_modules and target.
+ * `unreadable` names the first directory that could not be listed (or the walk limit): the tree cannot be proven idle.
+ */
+async function scanTree(dir: string): Promise<{ newest: number; unreadable: string | null }> {
   let newest = 0;
   let seen = 0;
   const queue = [dir];
   while (queue.length > 0) {
     const current = queue.pop() as string;
     const entries = await readdir(current, { withFileTypes: true }).catch(() => null);
-    if (!entries) return Date.now(); // unreadable: cannot prove it idle
+    if (!entries) return { newest: Date.now(), unreadable: current };
     for (const entry of entries) {
       if (entry.name === ".git" || entry.name === "node_modules" || entry.name === "target") continue;
-      if (++seen > MAX_WALK_ENTRIES) return Date.now();
+      if (++seen > MAX_WALK_ENTRIES) return { newest: Date.now(), unreadable: current };
       const full = join(current, entry.name);
       const s = await stat(full).catch(() => null);
       if (s) newest = Math.max(newest, s.mtimeMs);
@@ -243,24 +287,50 @@ async function newestTreeMtime(dir: string): Promise<number> {
     }
   }
   const self = await stat(dir).catch(() => null);
-  return Math.max(newest, self?.mtimeMs ?? 0);
+  return { newest: Math.max(newest, self?.mtimeMs ?? 0), unreadable: null };
 }
 
-/** Does anything named `.git` (file or directory) exist beneath `dir`? Too large to scan counts as yes. */
-async function containsGitEntry(dir: string): Promise<boolean> {
-  let seen = 0;
-  const queue = [dir];
-  while (queue.length > 0) {
-    const current = queue.pop() as string;
-    const entries = await readdir(current, { withFileTypes: true }).catch(() => null);
-    if (!entries) return true; // unreadable: cannot prove it repo-free
-    for (const entry of entries) {
-      if (entry.name === ".git") return true;
-      if (++seen > MAX_WALK_ENTRIES) return true;
-      if (entry.isDirectory()) queue.push(join(current, entry.name));
+/** Fails closed to "now" when the tree cannot be read. */
+async function newestTreeMtime(dir: string): Promise<number> {
+  return (await scanTree(dir)).newest;
+}
+
+/**
+ * N2 guard: root derived folders (node_modules, target, ...) are only disposable while nothing touched them
+ * after the owning mission ended. Returns why the worktree must be kept, or null.
+ */
+async function derivedActivityProblem(path: string, terminalAt: number | null): Promise<string | null> {
+  for (const name of DERIVED_DIRS) {
+    const dir = join(path, name);
+    const l = await lstat(dir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return null;
+      throw error;
+    });
+    if (!l) continue;
+    if (terminalAt === null) {
+      return `${name}/ present but the owning mission has no durable terminal timestamp, so it cannot be shown untouched since the mission ended`;
+    }
+    const newer = `${name}/ holds files newer than the mission's terminal timestamp (${new Date(terminalAt).toISOString()}): the checkout was used after the mission ended`;
+    if (l.mtimeMs > terminalAt) return newer;
+    if (!l.isDirectory()) continue; // a symlink (the provisioned node_modules) is judged by its own mtime and never followed
+    let seen = 0;
+    const queue = [dir];
+    while (queue.length > 0) {
+      const current = queue.pop() as string;
+      const entries = await readdir(current, { withFileTypes: true }).catch(() => null);
+      if (!entries)
+        return `unreadable directory under ${current}: cannot show ${name}/ untouched since the mission ended`;
+      for (const entry of entries) {
+        if (++seen > MAX_WALK_ENTRIES) return `${name}/ is too large to verify untouched since the mission ended`;
+        const full = join(current, entry.name);
+        const s = await lstat(full).catch(() => null);
+        if (!s) return `${name}/ changed while it was being checked`;
+        if (s.mtimeMs > terminalAt) return newer;
+        if (entry.isDirectory()) queue.push(full);
+      }
     }
   }
-  return false;
+  return null;
 }
 
 /**
@@ -271,11 +341,11 @@ async function containsGitEntry(dir: string): Promise<boolean> {
  */
 async function isDisposableDerived(path: string, entry: string): Promise<boolean> {
   const name = entry.replace(/\/+$/, "");
-  if (!entry.endsWith("/") || name.includes("/") || !(DERIVED_DIRS as readonly string[]).includes(name)) return false;
+  if (!entry.endsWith("/") || name.includes("/") || !DERIVED_DIRS.includes(name)) return false;
   const ignored = await safeGitOrThrow(["check-ignore", "-q", "--no-index", entry], { ...READ_ONLY_GIT, cwd: path })
     .then(() => true)
     .catch(() => false);
-  return ignored && !(await containsGitEntry(join(path, name)));
+  return ignored && !(await containsGitEntry(join(path, name), name === "node_modules"));
 }
 
 /**
@@ -435,7 +505,7 @@ async function indexLockReason(gitDir: string): Promise<string | null> {
   if (!(await existsStrict(lock))) return null;
   const marker = LOCK_MARKER.exec(await readFile(lock, "utf8").catch(() => ""));
   if (marker && !pidAlive(Number(marker[1])) && Date.now() - Number(marker[2]) > STALE_LOCK_MS) {
-    return `stale index.lock left by a dead janitor run (pid ${marker[1]}); a preserving commit may exist on the branch; after checking, remove the lock yourself and run \`git reset\` (mixed) before committing, because the index is stale`;
+    return `stale index.lock left by a dead janitor run (pid ${marker[1]}); a preserving commit may exist on the branch; after checking, remove the lock yourself; run \`git reset\` (mixed) only if \`git log -1\` shows the pi-engineering preserve commit (the index is stale then), never otherwise`;
   }
   return "index.lock present (a git command may be running or was killed); never removed by housekeeping";
 }
@@ -573,10 +643,12 @@ async function reasonToKeep(
   repo: GitRepo,
   wt: { path: string; branch: string | null; head: string | null },
   locked: Set<string>,
+  terminalAt: number | null,
+  skipMarker = false,
 ): Promise<string | null> {
   // Any probe that errors (unreadable file, git failure, timeout) must keep the worktree, never pass it.
   try {
-    return await reasonToKeepUnchecked(repo, wt, locked);
+    return await reasonToKeepUnchecked(repo, wt, locked, terminalAt, skipMarker);
   } catch (error) {
     return `could not verify it is safe to reclaim, kept: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`;
   }
@@ -586,11 +658,15 @@ async function reasonToKeepUnchecked(
   repo: GitRepo,
   wt: { path: string; branch: string | null; head: string | null },
   locked: Set<string>,
+  terminalAt: number | null,
+  skipMarker: boolean,
 ): Promise<string | null> {
   if (locked.has(wt.path)) return "locked by git (`git worktree lock`); left untouched";
   const gitDir = (
     await safeGitOrThrow(["rev-parse", "--absolute-git-dir"], { ...READ_ONLY_GIT, cwd: wt.path })
   ).stdout.trim();
+  const markerWhy = skipMarker ? null : ownerMarkerProblem(repo, gitDir, wt.branch);
+  if (markerWhy) return markerWhy;
   const lockWhy = await indexLockReason(gitDir);
   if (lockWhy) return lockWhy;
   const opWhy = await operationInProgress(gitDir);
@@ -628,6 +704,8 @@ async function reasonToKeepUnchecked(
   }
   const onlyHere = await worktreeOnlyHistory(wt.path);
   if (onlyHere) return onlyHere;
+  const derivedWhy = await derivedActivityProblem(wt.path, terminalAt);
+  if (derivedWhy) return derivedWhy;
   let target: string | null;
   try {
     target = await rustTargetDir(wt.path);
@@ -837,7 +915,16 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       });
       continue;
     }
-    const ageMs = now - (await worktreeLastActivity(wt.path));
+    const activity = await worktreeActivity(wt.path);
+    if (activity.unreadable) {
+      report.kept.push({
+        path: wt.path,
+        branch: wt.branch,
+        reason: `unreadable directory under ${activity.unreadable}: cannot show the tree is idle`,
+      });
+      continue;
+    }
+    const ageMs = now - activity.at;
     if (ageMs < minAge) {
       report.kept.push({
         path: wt.path,
@@ -847,17 +934,40 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       continue;
     }
     const reason = `owner ${owner.missionId ?? owner.taskId} finished`;
+    let terminalAt: number | null = null;
+    try {
+      terminalAt = (await opts.ownerTerminalAt?.(owner)) ?? null;
+    } catch {
+      terminalAt = null;
+    }
 
     try {
-      await assertNamespacePath(repo, wt.path);
+      const unowned = await worktreeGitDir(wt.path)
+        .then((g) => ownerMarkerProblem(repo, g, wt.branch))
+        .catch(
+          (e: unknown) =>
+            `could not read the ownership marker, kept: ${e instanceof Error ? e.message.split("\n")[0] : String(e)}`,
+        );
+      if (unowned) {
+        report.kept.push({ path: wt.path, branch: wt.branch, reason: unowned });
+        continue;
+      }
+      await assertNamespacePath(repo, wt.path, wt.branch);
       const bytes = await directoryBytes(wt.path);
-      const keep = await reasonToKeep(repo, wt, locked);
+      const keep = await reasonToKeep(repo, wt, locked, terminalAt);
       if (keep) {
         report.kept.push({ path: wt.path, branch: wt.branch, reason: keep });
         continue;
       }
       if (opts.dryRun) {
-        report.reclaimed.push({ path: wt.path, branch: wt.branch, preservedCommit: null, reason, bytes });
+        report.reclaimed.push({
+          path: wt.path,
+          branch: wt.branch,
+          preservedCommit: null,
+          reason,
+          trashedTo: null,
+          bytes,
+        });
         continue;
       }
       const planSnapshot = await newestTreeMtime(wt.path);
@@ -875,7 +985,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       // Re-run every keep check right before removal: anything created or changed
       // since the plan (a concurrent writer, a hook) must keep the worktree.
       const late =
-        (await reasonToKeep(repo, wt, await lockedWorktreePaths(repo))) ??
+        (await reasonToKeep(repo, wt, await lockedWorktreePaths(repo), terminalAt)) ??
         ((await newestTreeMtime(wt.path)) > planSnapshot ? "files changed while it was being reclaimed" : null);
       if (late) {
         report.kept.push({
@@ -885,9 +995,6 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         });
         continue;
       }
-      // Resolved while the worktree is still registered at its original path
-      // (the key is derived from it); the shared fallback key is never deleted.
-      const target = await rustTargetDir(wt.path).catch(() => null);
       // Quarantine: `git worktree move` (bookkeeping-aware, reversible) takes the checkout out from
       // under any writer that only knows its original path, then everything is re-checked there.
       const quarantined = join(parent, `${prefix}reclaim-${Date.now().toString(36)}-${originalName(repo, wt.path)}`);
@@ -913,7 +1020,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       }
       const moved = { ...wt, path: quarantined };
       const lateQuarantined =
-        (await reasonToKeep(repo, moved, await lockedWorktreePaths(repo)).catch(
+        (await reasonToKeep(repo, moved, await lockedWorktreePaths(repo), terminalAt).catch(
           (e: unknown) => `re-check failed: ${e instanceof Error ? e.message : String(e)}`,
         )) ??
         ((await newestTreeMtime(quarantined)) > planSnapshot ? "files changed while it was being reclaimed" : null);
@@ -932,34 +1039,35 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         await restore(lateQuarantined);
         continue;
       }
-      // Provisioned node_modules is a symlink to the repo's own: unlink the link only, never follow it.
-      const provisioned = await provisionedNodeModules(quarantined, repo.root);
-      const linkText = provisioned ? await readlink(join(quarantined, "node_modules")) : null;
-      let linkRestoreFailed = "";
-      if (linkText !== null) await unlink(join(quarantined, "node_modules"));
+      // Move (never delete) the quarantined checkout into the trash. A rename cannot cross filesystems:
+      // that is reported and the checkout goes back. The provisioned node_modules link travels with it, unfollowed.
+      let trashedTo: string;
       try {
-        // Plain remove, never --force: git refuses on locks and untracked files.
-        await safeGitOrThrow(["worktree", "remove", quarantined], {
-          cwd: repo.root,
-          trust: "operator",
-          timeoutMs: 300_000,
-        });
+        const trashRoot = opts.trashRoot ?? defaultTrashRoot();
+        const inside = await trashRootInsideProblem(trashRoot, [
+          repo.root,
+          wt.path,
+          ...(await repo.listLinkedWorktrees()).map((w) => w.path),
+        ]);
+        if (inside) throw new Error(inside);
+        trashedTo = await moveToTrash(trashRoot, "worktree", quarantined, basename(wt.path), wt.branch);
       } catch (error) {
-        if (linkText !== null) {
-          await symlink(linkText, join(quarantined, "node_modules")).catch((e: unknown) => {
-            linkRestoreFailed = `; could not restore the node_modules symlink (${e instanceof Error ? e.message : String(e)})`;
-          });
-        }
+        const cross = (error as NodeJS.ErrnoException).code === "EXDEV";
         await restore(
-          `git worktree remove refused, kept (not forced): ${error instanceof Error ? error.message.split("\n")[0] : String(error)}${linkRestoreFailed}`,
+          `could not move it into the trash (${cross ? "state dir on different filesystem: set PI_TRASH_DIR next to the repos" : error instanceof Error ? error.message.split("\n")[0] : String(error)}), kept`,
         );
         continue;
       }
-      // The worktree's own cargo target dir is derived output; it goes with it.
-      if (target && basename(target) !== UNSCOPED_TARGET_KEY) {
-        await rm(target, { recursive: true, force: true }).catch(() => {});
-      }
-      report.reclaimed.push({ path: wt.path, branch: wt.branch, preservedCommit, reason, bytes });
+      // The registration now points at a missing directory; move only our own admin dir into the trash entry (never `git worktree prune`).
+      const pruneNote = await moveOwnAdminDir(repo, quarantined, dirname(trashedTo));
+      report.reclaimed.push({
+        path: wt.path,
+        branch: wt.branch,
+        preservedCommit,
+        reason: `${reason}; moved to ${trashedTo}${pruneNote}`,
+        trashedTo,
+        bytes,
+      });
     } catch (error) {
       report.failed.push({
         path: wt.path,
@@ -969,6 +1077,119 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
     }
   }
   return report;
+}
+
+/**
+ * MOVE (never delete) ONLY the admin dir (`<common-git-dir>/worktrees/<id>`) of the checkout that was just moved to the
+ * trash into the same trash entry as `<entry>/.pi-eng-admin`, so the worktree can be restored. `git worktree prune` is
+ * never used: it has no path argument and would also drop any other registration whose `.git` file is missing
+ * (an unmounted disk whose mount point still exists). The admin dir is found by `GitRepo.adminMatches` (the path its
+ * `gitdir` file names, relative pointers resolved), must match exactly one entry, and must not be locked; anything
+ * ambiguous, or a move that fails (e.g. another filesystem), leaves the registration in place and names the exact
+ * admin dir. Everything in it was already checked as a keep condition or preserved on the branch before the move.
+ */
+async function moveOwnAdminDir(repo: GitRepo, movedFrom: string, trashEntryDir: string): Promise<string> {
+  const left = (why: string, admin?: string): string => {
+    const where = admin ? `its admin dir is ${admin}` : "its admin dir is under the repository's .git/worktrees";
+    const next =
+      "after checking `git worktree list`, run `git worktree repair <path>` if you restore the checkout, or `git worktree remove --force <path>` once you are sure it is not needed";
+    return `; its git registration was left in place (${why}); ${where}: ${next}`;
+  };
+  try {
+    const matches = await repo.adminMatches(movedFrom);
+    if (matches.length !== 1) return left(`${matches.length} admin dirs match its path`);
+    const admin = matches[0] as string;
+    if (await existsStrict(join(admin, "locked"))) return left("it is locked", admin);
+    try {
+      await rename(admin, join(trashEntryDir, ".pi-eng-admin"));
+    } catch (error) {
+      return left(
+        `could not move it into the trash entry: ${error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error)}`,
+        admin,
+      );
+    }
+    return `; git registration moved to ${join(trashEntryDir, ".pi-eng-admin")}`;
+  } catch (error) {
+    return left(error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error));
+  }
+}
+
+export interface UnmarkedWorktreeRow {
+  path: string;
+  branch: string | null;
+  /** Why the worktree has no valid marker. */
+  markerProblem: string;
+  ownerStatus: OwnerLiveness | "no owner";
+  /** No modified or untracked files (ignored derived output does not count). Null when it could not be read. */
+  clean: boolean | null;
+  ignored: string[];
+  lastActivity: string | null;
+  /** The exact command an operator may run, or null when the worktree must be kept; `note` says why. */
+  command: string | null;
+  note: string;
+}
+
+/**
+ * READ-ONLY listing of namespace worktrees that lack a valid ownership marker (the ones created before markers
+ * existed) with what an operator needs to decide by hand. Nothing is written or adopted: the janitor never reclaims
+ * these, and adopting them is a deliberate future step. `command` is a plain `git worktree remove <path>` (never
+ * forced) and appears only for a worktree that every other keep check would let the janitor reclaim and that is clean.
+ */
+export async function previewUnmarkedWorktrees(
+  opts: Pick<JanitorOptions, "repo" | "ownerLiveness" | "ownerTerminalAt">,
+): Promise<UnmarkedWorktreeRow[]> {
+  const { repo } = opts;
+  const prefix = repo.worktreeNamespacePrefix();
+  const parent = dirname(repo.root);
+  const locked = await lockedWorktreePaths(repo);
+  const rows: UnmarkedWorktreeRow[] = [];
+  for (const wt of await repo.listLinkedWorktrees()) {
+    if (dirname(wt.path) !== parent || !basename(wt.path).startsWith(prefix)) continue;
+    if (basename(wt.path).startsWith(`${prefix}pi-eng-pw-`)) continue;
+    const row: UnmarkedWorktreeRow = {
+      path: wt.path,
+      branch: wt.branch,
+      markerProblem: "",
+      ownerStatus: "no owner",
+      clean: null,
+      ignored: [],
+      lastActivity: null,
+      command: null,
+      note: "",
+    };
+    try {
+      const problem = ownerMarkerProblem(repo, await worktreeGitDir(wt.path), wt.branch);
+      if (!problem) continue; // marked: the janitor's business, not an adoption candidate
+      row.markerProblem = problem;
+      const owner = parseWorktreeOwner(ownerName(repo, wt));
+      if (isPiEngOwned(repo, wt) && (owner.missionId || owner.taskId) && opts.ownerLiveness) {
+        row.ownerStatus = await Promise.resolve(opts.ownerLiveness(owner)).catch(() => "unknown" as const);
+      }
+      const lines = await statusLines(wt.path, repo.root);
+      row.clean = !lines.some((l) => !l.startsWith("!! "));
+      row.ignored = lines.filter((l) => l.startsWith("!! ")).map(entryPath);
+      row.lastActivity = new Date((await worktreeActivity(wt.path)).at).toISOString();
+      if (!isPiEngOwned(repo, wt)) {
+        row.note = "keep: not a pi-eng-candidate/orch branch, never reclaimed";
+      } else if (row.ownerStatus !== "terminal") {
+        row.note = `keep: owner is ${row.ownerStatus}`;
+      } else {
+        const terminalAt = (await opts.ownerTerminalAt?.(owner)) ?? null;
+        const keep = await reasonToKeep(repo, wt, locked, terminalAt, true);
+        if (keep) row.note = `keep: ${keep}`;
+        else if (!row.clean) row.note = "keep: has uncommitted changes; commit or discard them yourself first";
+        else {
+          row.command = `git -C ${JSON.stringify(repo.root)} worktree remove ${JSON.stringify(wt.path)}`;
+          row.note =
+            "eligible by every other check (clean, owner finished); review it first, then remove it yourself (plain remove, never --force)";
+        }
+      }
+    } catch (error) {
+      row.note = `keep: could not inspect (${error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error)})`;
+    }
+    rows.push(row);
+  }
+  return rows;
 }
 
 /** One-line human summary for a notification or log. */

@@ -2143,7 +2143,7 @@ export class GitRepo {
   }
 
   /** Every admin dir whose `gitdir` pointer names `path`. */
-  private async adminMatches(path: string): Promise<string[]> {
+  async adminMatches(path: string): Promise<string[]> {
     const common = await this.commonGitDir();
     if (common === null) return [];
     const root = join(common, "worktrees");
