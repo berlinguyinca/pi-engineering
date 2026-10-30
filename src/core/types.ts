@@ -73,6 +73,12 @@ export interface EventMeta {
   causation_id?: string;
   /** A second append with the same key returns the first event instead of writing again. */
   idempotency_key?: string;
+  /**
+   * The writer's authority epoch for this event's work item (a MissionStore lease generation).
+   * Enforced at append: a generation lower than one already recorded is rejected
+   * (LedgerAuthorityStaleError) and the event is not written.
+   */
+  authority_generation?: number;
 }
 
 export interface LedgerEvent extends EventMeta {

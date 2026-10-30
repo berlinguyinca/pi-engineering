@@ -16,13 +16,34 @@ import {
   type RemotePin,
 } from "../../orchestration/forks.ts";
 import type { ForkSteeringPort } from "../../orchestration/steering.ts";
+import type { WorkGraph } from "../../work/types.ts";
 import { loadForkSettings } from "./forkSettings.ts";
 
-/** The slice of MissionStore + RepositoryRegistry the wiring reads. Injected so tests need neither. */
+/** A unit of work a fork can start from, identified without reference to a Mission. */
+export interface ForkTaskRef {
+  task_id: string;
+  /** The enclosing work id: a Mission id for Mission-backed work, else the root work task. Persisted as `missionId` in fork records. */
+  work_id: string;
+  repo_id?: string;
+}
+
+/** Where the work lives: the repository and the branch a fork is based on. */
+export interface ForkScope {
+  work_id: string;
+  repository: string;
+  base_ref: string;
+}
+
+/**
+ * What the fork wiring reads, independent of any one store. Satisfied by a Mission ({@link missionForkSources}) and
+ * by the generic work read model ({@link workForkSources}), so a fork or handoff from a Mission-less session resolves
+ * the same way. Injected so tests need neither.
+ */
 export interface ForkRuntimeSources {
-  getTask(taskId: string): { task_id: string; mission_id: string; repo_id?: string } | undefined;
+  getTask(taskId: string): ForkTaskRef | undefined;
   getExecution(executionId: string): { task_id: string } | undefined;
-  getMission(missionId: string): { mission_id: string; repository: string; base_ref: string } | undefined;
+  /** Repository and base ref of the work a task belongs to; undefined = not known on this host. */
+  getScope(workId: string): ForkScope | undefined;
   /** Repository root bound to a task's repo id (throws when no manifest is active). */
   boundRoot(repoId: string): string | null;
   /** Root of the git repository at `path`, or null. */
@@ -30,6 +51,85 @@ export interface ForkRuntimeSources {
   links: GithubLinkStore;
   /** Canonical PR ids of the tasks that depend (transitively) on `taskId`; absent = no downstream invalidation. */
   downstreamPrs?: (taskId: string) => string[];
+}
+
+/** The parts of {@link ForkRuntimeSources} that do not depend on how work is stored. */
+export type ForkHostSources = Pick<ForkRuntimeSources, "boundRoot" | "openRoot" | "links" | "downstreamPrs">;
+
+/** Adapter over MissionStore: a Mission is the work, its repository and base_ref are the scope. */
+export function missionForkSources(
+  store: {
+    getTask(id: string): { task_id: string; mission_id: string; repo_id?: string } | undefined;
+    getExecution(id: string): { task_id: string } | undefined;
+    getMission(id: string): { mission_id: string; repository: string; base_ref: string } | undefined;
+  },
+  host: ForkHostSources,
+): ForkRuntimeSources {
+  return {
+    ...host,
+    getTask: (id) => {
+      const t = store.getTask(id);
+      return t
+        ? { task_id: t.task_id, work_id: t.mission_id, ...(t.repo_id ? { repo_id: t.repo_id } : {}) }
+        : undefined;
+    },
+    getExecution: (id) => store.getExecution(id),
+    getScope: (workId) => {
+      const m = store.getMission(workId);
+      return m ? { work_id: m.mission_id, repository: m.repository, base_ref: m.base_ref } : undefined;
+    },
+  };
+}
+
+/** Where a Mission-less piece of work lives. Supplied by whatever holds the session's checkout facts. */
+export interface WorkScopeFacts {
+  repository: string;
+  base_ref: string;
+  repo_id?: string;
+}
+
+/**
+ * Adapter over the Phase-2 work read model (src/work/*). The graph gives task and run identity (it never stores a
+ * repository), so the checkout facts come from `scopeOf`, keyed by the root work task id. A session id also names its
+ * task, so a handoff addressed by session works with no Mission present.
+ */
+export function workForkSources(
+  graph: () => Pick<WorkGraph, "tasks" | "runs" | "sessions">,
+  scopeOf: (workId: string) => WorkScopeFacts | undefined,
+  host: ForkHostSources,
+): ForkRuntimeSources {
+  const rootOf = (g: ReturnType<typeof graph>, id: string): string => {
+    let cur = g.tasks.find((t) => t.id === id);
+    for (let hops = 0; cur?.parent_id && hops < 64; hops++) {
+      const parent = g.tasks.find((t) => t.id === cur?.parent_id);
+      if (!parent) break;
+      cur = parent;
+    }
+    return cur?.id ?? id;
+  };
+  const taskIdOf = (g: ReturnType<typeof graph>, id: string): string | undefined => {
+    if (g.tasks.some((t) => t.id === id)) return id;
+    return g.sessions.find((s) => s.id === id)?.task_ids[0];
+  };
+  return {
+    ...host,
+    getTask: (id) => {
+      const g = graph();
+      const taskId = taskIdOf(g, id);
+      if (!taskId) return undefined;
+      const workId = rootOf(g, taskId);
+      const repoId = scopeOf(workId)?.repo_id;
+      return { task_id: taskId, work_id: workId, ...(repoId ? { repo_id: repoId } : {}) };
+    },
+    getExecution: (id) => {
+      const run = graph().runs.find((r) => r.id === id);
+      return run ? { task_id: run.task_id } : undefined;
+    },
+    getScope: (workId) => {
+      const f = scopeOf(workId);
+      return f ? { work_id: workId, repository: f.repository, base_ref: f.base_ref } : undefined;
+    },
+  };
 }
 
 /** The active PR links of every task that depends, directly or not, on `taskId` (a pure read of the ledger). */
@@ -145,7 +245,7 @@ export async function createForkRuntime(input: {
       if (rec && !task) return { unresolvable: "the mission of that approach is no longer known here" };
     } else return null;
     if (!task) return null;
-    const mission = s.getMission(task.mission_id);
+    const mission = s.getScope(task.work_id);
     if (!mission) return { unresolvable: "the mission is not known on this host" };
     if (!SAFE_BRANCH.test(mission.base_ref)) return { unresolvable: "the mission base ref is not a plain branch name" };
     let repoRoot = knownRoot;
@@ -161,7 +261,7 @@ export async function createForkRuntime(input: {
     if (!repoRoot) return { unresolvable: "the repository of that mission is not available on this host" };
     const origin: ForkOrigin = {
       nodeId,
-      missionId: mission.mission_id,
+      missionId: mission.work_id,
       taskId: task.task_id,
       repoRoot,
       baseBranch: mission.base_ref,
