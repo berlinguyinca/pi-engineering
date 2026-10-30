@@ -1605,8 +1605,18 @@ export class GitRepo {
       return refusal;
     }
     guard?.assertAuthoritative();
-    const admin = await this.findAdminDir(path);
-    if (admin !== null) await this.preserveDetachedHead(admin, basename(path));
+    // Authoritative admin dir (a live worktree names it itself); without one we cannot save a detached
+    // HEAD or see an in-progress rebase, so the worktree stays.
+    const admin = await this.adminDirFor(path);
+    const unsafe =
+      admin === null
+        ? "its administrative directory cannot be identified unambiguously"
+        : await this.inProgressReason(admin);
+    if (unsafe !== null) {
+      await this.recordKeptWorktree(path, unsafe);
+      return unsafe;
+    }
+    await this.preserveDetachedHead(admin as string, basename(path));
     const ownLink = await this.isOwnNodeModulesLink(path);
     if (ownLink) await unlink(join(path, "node_modules")).catch(() => {});
     // Re-check immediately before the remove: shrinks the window in which a worker could write.
@@ -1739,7 +1749,10 @@ export class GitRepo {
           );
         }
       } else {
-        await this.forgetWorktreeAdmin(path); // metadata only: the working directory is already gone
+        const kept = await this.forgetWorktreeAdmin(path); // metadata only: the working directory is already gone
+        if (kept !== null) {
+          this.refuseReplace(`refusing to replace the registered worktree at ${path} (admin data kept): ${kept}`);
+        }
       }
     } else if (present) {
       const entries = await readdir(path).catch(() => null);
@@ -1770,6 +1783,12 @@ export class GitRepo {
       for (const file of ["rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"]) {
         const value = (await readFile(join(dir, file), "utf8").catch(() => "")).trim();
         if (value === `refs/heads/${branch}` || value === branch) return `${dir} (rebase/bisect in progress)`;
+      }
+      // `rebase --update-refs` will move every branch listed here.
+      const updates = await readFile(join(dir, "rebase-merge/update-refs"), "utf8").catch(() => "");
+      for (const line of updates.split("\n")) {
+        const ref = line.trim().split(/\s+/)[0];
+        if (ref === `refs/heads/${branch}`) return `${dir} (rebase --update-refs in progress)`;
       }
     }
     return null;
@@ -1984,12 +2003,67 @@ export class GitRepo {
    * protecting — candidates stopped overlapping at all. Removing only this
    * path's entry needs no lock, because every caller owns a distinct path.
    */
-  private async forgetWorktreeAdmin(path: string): Promise<void> {
-    const admin = await this.findAdminDir(path);
-    if (admin === null) return;
+  private async forgetWorktreeAdmin(path: string): Promise<string | null> {
+    const admin = await this.adminDirFor(path);
+    if (admin === null) return null;
+    const busy = await this.inProgressReason(admin);
+    if (busy !== null) return busy;
+    if (
+      await lstat(join(admin, "locked")).then(
+        () => true,
+        () => false,
+      )
+    ) {
+      emitTelemetry({ level: "warning", text: `worktree admin ${admin} is locked; left untouched` });
+      return "the worktree is locked";
+    }
     // Save detached-HEAD commits that no branch/tag holds BEFORE the admin dir (and its HEAD) goes.
     await this.preserveDetachedHead(admin, basename(path));
     await rm(admin, { recursive: true, force: true }).catch(() => {});
+    return null;
+  }
+
+  /** Why this admin dir must not be dropped: an operation (rebase, merge, ...) still holds state in it. */
+  private async inProgressReason(adminDir: string): Promise<string | null> {
+    for (const entry of [
+      "rebase-merge",
+      "rebase-apply",
+      "sequencer",
+      "MERGE_HEAD",
+      "MERGE_AUTOSTASH",
+      "CHERRY_PICK_HEAD",
+      "REVERT_HEAD",
+      "BISECT_LOG",
+    ]) {
+      if (
+        await lstat(join(adminDir, entry)).then(
+          () => true,
+          () => false,
+        )
+      ) {
+        return `an operation is in progress in it (${entry}); finish or abort it first`;
+      }
+    }
+    return null;
+  }
+
+  /** The admin dir of the worktree at `path`: asked of git when the directory exists, else matched by pointer. */
+  private async adminDirFor(path: string): Promise<string | null> {
+    const common = await this.commonGitDir();
+    if (common === null) return null;
+    const present = await lstat(path).then(
+      () => true,
+      () => false,
+    );
+    if (present) {
+      const own = await this.git(["-C", path, "rev-parse", "--absolute-git-dir"]);
+      if (own.code === 0 && own.stdout) {
+        const abs = await realpath(own.stdout).catch(() => own.stdout);
+        const root = await realpath(join(common, "worktrees")).catch(() => join(common, "worktrees"));
+        if (dirname(abs) === root) return join(common, "worktrees", basename(abs));
+      }
+    }
+    return this.findAdminDir(path);
   }
 
   private async commonGitDir(): Promise<string | null> {
@@ -2011,7 +2085,9 @@ export class GitRepo {
     const wanted = new Set([join(path, ".git"), join(await realpath(path).catch(() => path), ".git")]);
     const matches: string[] = [];
     for (const name of names) {
-      const pointer = (await readFile(join(root, name, "gitdir"), "utf8").catch(() => "")).trim();
+      const raw = (await readFile(join(root, name, "gitdir"), "utf8").catch(() => "")).trim();
+      // git >= 2.48 (`worktree.useRelativePaths`) may record the pointer relative to the admin dir.
+      const pointer = raw && !isAbsolute(raw) ? resolve(join(root, name), raw) : raw;
       if (pointer && wanted.has(pointer)) matches.push(join(root, name));
     }
     if (matches.length > 1) {
@@ -2033,7 +2109,13 @@ export class GitRepo {
     if ((await this.git(["cat-file", "-e", `${head}^{commit}`])).code !== 0) return;
     const held = await this.git(["for-each-ref", "--contains", head, "--format=%(refname)", "refs/heads", "refs/tags"]);
     if (held.code === 0 && held.stdout !== "") return;
-    const base = `superseded/detached-${leaf}-${compactStamp()}`;
+    const clean =
+      leaf
+        .replace(/[^A-Za-z0-9._-]/g, "_")
+        .replace(/\.{2,}/g, ".")
+        .replace(/^[.-]+|[.-]+$/g, "")
+        .slice(0, 60) || "wt";
+    const base = `superseded/detached-${clean}-${shortHash(leaf)}-${compactStamp()}`;
     for (let n = 0; ; n++) {
       const name = n === 0 ? base : `${base}.${n}`;
       if ((await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`])).code === 0) continue;
@@ -2167,7 +2249,10 @@ export class GitRepo {
           // Targeted, for the same reason creation is: a global prune here would
           // be able to delete a concurrently-created sibling's administration.
           guard?.assertAuthoritative();
-          await this.forgetWorktreeAdmin(info.path);
+          const keptAdmin = await this.forgetWorktreeAdmin(info.path);
+          if (keptAdmin !== null) {
+            throw new Error(`worktree administration of ${info.path} kept (branch ${info.branch} kept): ${keptAdmin}`);
+          }
           if (pending) {
             pending = { ...pending, state: "worktree_removed", updatedAt: new Date().toISOString() };
             await this.persistPendingBranchCleanup(pending, guard);
@@ -2282,6 +2367,9 @@ export class GitRepo {
 
   /** Move an orphaned worktree directory to `<parent>/.pi-eng-trash/<ts>-<name>`; never deletes. */
   private async moveAsideOrphan(path: string): Promise<void> {
+    const admin = await this.findAdminDir(path);
+    const busy = admin === null ? null : await this.inProgressReason(admin);
+    if (busy !== null) throw new Error(`refusing to move ${path} aside (kept): ${busy}`);
     const trash = join(dirname(path), ".pi-eng-trash");
     await mkdir(trash, { recursive: true });
     const stamp = new Date()

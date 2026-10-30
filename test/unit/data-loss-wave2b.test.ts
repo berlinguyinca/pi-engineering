@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import {
   appendFileSync,
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -21,7 +22,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
@@ -1044,6 +1045,152 @@ test("a branch being rebased in another worktree (detached HEAD) is kept and rep
   assert.match(r?.kept ?? "", /rebase/);
   assert.ok(await g(dir, "rev-parse", "--verify", "refs/heads/rb"));
 });
+
+async function detachedWork(git: GitRepo, head: string, name: string): Promise<{ path: string; work: string }> {
+  const wt = await git.createWorktree(head, name);
+  await g(wt.path, "checkout", "-q", "--detach");
+  writeFileSync(join(wt.path, "work.txt"), "w");
+  await g(wt.path, "add", "-A");
+  await g(wt.path, "commit", "-qm", "detached work");
+  return { path: wt.path, work: await g(wt.path, "rev-parse", "HEAD") };
+}
+
+const adminOf = (dir: string, path: string): string => {
+  const root = join(dir, ".git", "worktrees");
+  const name = readdirSync(root).find(
+    (n) => readFileSync(join(root, n, "gitdir"), "utf8").trim() === join(path, ".git"),
+  );
+  assert.ok(name);
+  return join(root, name);
+};
+
+test("duplicate admin dirs for one path: the live worktree's detached commit is still kept", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const { path, work } = await detachedWork(git, head, "dup-1");
+  const admin = adminOf(dir, path);
+  cpSync(admin, `${admin}-stale`, { recursive: true });
+  cpSync(admin, `${admin}-copy`, { recursive: true });
+  rmSync(admin, { recursive: true });
+  cpSync(`${admin}-copy`, admin, { recursive: true });
+  rmSync(`${admin}-copy`, { recursive: true });
+  try {
+    await git.createWorktree(head, "dup-1");
+  } catch {
+    // refusing is also safe
+  }
+  const alive = existsSync(path) && (await g(path, "rev-parse", "HEAD")) === work;
+  assert.ok(alive || (await reachable(dir, work)) !== "", "the detached commit survived");
+});
+
+test("a relative gitdir pointer (git >= 2.48) still identifies the admin dir", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const { path } = await detachedWork(git, head, "rel-1");
+  const admin = adminOf(dir, path);
+  writeFileSync(join(admin, "gitdir"), `${relative(admin, join(path, ".git"))}\n`);
+  const priv = git as unknown as { findAdminDir(p: string): Promise<string | null> };
+  assert.equal(await priv.findAdminDir(path), admin);
+  rmSync(path, { recursive: true, force: true });
+  assert.equal(await priv.findAdminDir(path), admin);
+});
+
+test("a worktree mid-rebase with an autostash is never replaced, present or gone", async () => {
+  for (const gone of [false, true]) {
+    const { head, git, dir } = await scratchRepo();
+    const wt = await git.createWorktree(head, "rb-auto");
+    writeFileSync(join(wt.path, "c1"), "c1");
+    await g(wt.path, "add", "-A");
+    await g(wt.path, "commit", "-qm", "c1");
+    writeFileSync(join(dir, "m2"), "m2");
+    await g(dir, "add", "-A");
+    await g(dir, "commit", "-qm", "m2");
+    writeFileSync(join(wt.path, "a.txt"), "UNCOMMITTED PRECIOUS");
+    await g(wt.path, "rebase", "--autostash", "--exec", "false", "main").catch(() => "");
+    const admin = adminOf(dir, wt.path);
+    assert.ok(existsSync(join(admin, "rebase-merge", "autostash")), "setup: rebase stopped with an autostash");
+    if (gone) rmSync(wt.path, { recursive: true, force: true });
+    await assert.rejects(git.createWorktree(head, "rb-auto"));
+    assert.ok(existsSync(join(admin, "rebase-merge", "autostash")), `autostash kept (dir gone: ${gone})`);
+  }
+});
+
+for (const entry of ["MERGE_HEAD", "MERGE_AUTOSTASH", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "sequencer"]) {
+  test(`a registered worktree with ${entry} in its admin dir is not forgotten`, async () => {
+    const { head, git, dir } = await scratchRepo();
+    const wt = await git.createWorktree(head, "ip-1");
+    const admin = adminOf(dir, wt.path);
+    if (entry === "sequencer") mkdirSync(join(admin, entry));
+    else writeFileSync(join(admin, entry), `${head}\n`);
+    rmSync(wt.path, { recursive: true, force: true });
+    await assert.rejects(git.createWorktree(head, "ip-1"));
+    assert.ok(existsSync(join(admin, entry)));
+  });
+}
+
+test("a locked admin dir is left alone when its directory is gone", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const wt = await git.createWorktree(head, "lk-1");
+  const admin = adminOf(dir, wt.path);
+  writeFileSync(join(admin, "locked"), "on a removable drive");
+  rmSync(wt.path, { recursive: true, force: true });
+  await assert.rejects(git.createWorktree(head, "lk-1"));
+  assert.ok(existsSync(join(admin, "locked")));
+});
+
+test("rebase --update-refs counts the branches it will move as checked out", async () => {
+  const { dir, git } = await remoteRepo();
+  await g(dir, "checkout", "-q", "-b", "stackA");
+  writeFileSync(join(dir, "a"), "a");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "a1");
+  await g(dir, "checkout", "-q", "-b", "stackB");
+  writeFileSync(join(dir, "b"), "b");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "b1");
+  await g(dir, "checkout", "-q", "main");
+  writeFileSync(join(dir, "m"), "m");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "m2");
+  const wt = join(dir, "..", "wt-upd");
+  await g(dir, "worktree", "add", "-q", wt, "stackB");
+  await g(wt, "rebase", "-q", "--update-refs", "--exec", "false", "main").catch(() => "");
+  assert.ok(existsSync(join(adminOf(dir, wt), "rebase-merge", "update-refs")), "setup: update-refs recorded");
+  const r = await git.deleteOrPreserveBranch("stackA");
+  assert.match(r?.kept ?? "", /rebase/);
+  assert.ok(await g(dir, "rev-parse", "--verify", "refs/heads/stackA"));
+});
+
+test("detached-HEAD ref names are sanitised and never throw for naming reasons", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const { path, work } = await detachedWork(git, head, "nm-1");
+  const admin = adminOf(dir, path);
+  for (const leaf of ["a b..c", `${"x".repeat(300)}`, "..", "-lead.lock", "tab\tq~^:"]) {
+    await (git as unknown as { preserveDetachedHead(a: string, l: string): Promise<void> }).preserveDetachedHead(
+      admin,
+      leaf,
+    );
+  }
+  const refs = (await reachable(dir, work)).split("\n").filter((r) => r.includes("detached-"));
+  assert.ok(refs.length >= 1);
+  for (const r of refs) assert.ok(r.length < 140 && /^[A-Za-z0-9._/-]+$/.test(r), r);
+});
+
+for (const [name, blocks] of [
+  ["credentials.json", true],
+  ["id_rsa", true],
+  ["CredentialsService.class", false],
+  ["credentials_helper.rs", false],
+  ["credentials-0123abcd", false],
+] as const) {
+  test(`${name} under target/ ${blocks ? "keeps" : "does not keep"} the worktree`, async () => {
+    const { head, git } = await userDataRepo();
+    const info = await git.createWorktree(head, `cr-${name.replace(/\W/g, "")}`);
+    mkdirSync(join(info.path, "target", "deps"), { recursive: true });
+    writeFileSync(join(info.path, "target", "deps", name), "s");
+    if (blocks) await assert.rejects(git.removeWorktree(info, { keepBranch: true }));
+    else await git.removeWorktree(info, { keepBranch: true });
+    assert.equal(existsSync(info.path), blocks);
+  });
+}
 
 test("restoreCheckpoint recovers the NEWEST leftover (by timestamp, not pid) and keeps a recovered copy when swapping", async () => {
   const root = mkdtempSync(join(tmpdir(), "w2b-ck4-"));
