@@ -83,6 +83,8 @@ export interface AttentionInput {
 /** States where the operator, not the runtime, is the next actor. */
 const OPERATOR_STATES = new Set(["NEEDS_ATTENTION", "WAITING_FOR_USER", "REVIEW_BLOCKED", "AWAITING_APPROVAL"]);
 /** States where the mission stopped on its own and kept its work. */
+/** States that never resume from a wait. */
+const TERMINAL_STATES = new Set(["COMPLETE", "FAILED", "CANCELED"]);
 const PARKED_STATES = new Set(["PARKED", "PARKED_UNPROVEN", "PARKED_UNKNOWN", "BLOCKED"]);
 /** A named wait is informational; the runtime is doing something about it. */
 const SELF_SERVING_WAITS = new Set<WaitingReason>([
@@ -103,24 +105,31 @@ const SELF_SERVING_WAITS = new Set<WaitingReason>([
  */
 function parkingWaitWording(action: string, category: FailureCategory | undefined): { lead: string; resumes: string } {
   if (action === "PAUSE_FOR_PERSISTENCE") {
-    return { lead: "durable writes failing: probe", resumes: "resumes once storage recovers" };
+    return {
+      lead: "durable writes failing: probe",
+      resumes: "resumes once storage recovers, unless paused or stopped",
+    };
   }
+  const unless = "unless paused or stopped";
   switch (category) {
     case "PROVIDER_TRANSIENT":
       return {
         lead: "waiting for capacity: probe",
-        resumes: "resumes automatically once the gateway health probe succeeds",
+        resumes: `resumes once the gateway health probe succeeds, ${unless}`,
       };
     case "PROVIDER_PERMANENT":
       return {
         lead: "waiting on a provider error: probe",
-        resumes:
-          "resumes once the gateway health probe succeeds, but this may need operator action (credentials or provider)",
+        resumes: `resumes once the gateway health probe succeeds, ${unless}; this may need operator action (credentials or provider)`,
       };
     case "DISK_SUSPENDED":
-      return { lead: "waiting for disk space: probe", resumes: "resumes once disk space is freed" };
+      // The wait is the gateway probe; disk space is never checked by it.
+      return {
+        lead: "waiting: probe",
+        resumes: `resumes once the gateway health probe succeeds (disk space is not checked), ${unless}`,
+      };
     default:
-      return { lead: "waiting: probe", resumes: "resumes once the gateway health probe succeeds" };
+      return { lead: "waiting: probe", resumes: `resumes once the gateway health probe succeeds, ${unless}` };
   }
 }
 
@@ -164,7 +173,14 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
   }
 
   if (input.recovery.attempt >= input.recovery.maxAttempts && input.recovery.maxAttempts > 0) {
-    if (input.recoveryAction !== undefined && PARKING_WAIT_ACTIONS.has(input.recoveryAction as RecoveryAction)) {
+    const parkingAction =
+      input.recoveryAction !== undefined && PARKING_WAIT_ACTIONS.has(input.recoveryAction as RecoveryAction)
+        ? input.recoveryAction
+        : undefined;
+    if (parkingAction !== undefined && (TERMINAL_STATES.has(state) || input.operatorPausedAt)) {
+      // A paused or finished mission does not resume from its wait; the
+      // paused/failure handling below says what is true instead.
+    } else if (parkingAction !== undefined) {
       // A parking wait is unbounded by design: the counter past its budget is
       // wait progress. What the wait is for, and who ends it, depends on the
       // failure category, so the wording names only what is true for it.
@@ -173,7 +189,7 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
       const nextProbe = Number.isNaN(nextAt)
         ? []
         : [nextAt <= input.now ? "next probe due now" : `next probe in ${humanAge(nextAt - input.now)}`];
-      const wait = parkingWaitWording(input.recoveryAction, input.failureCategory);
+      const wait = parkingWaitWording(parkingAction, input.failureCategory);
       const parts = [
         `${wait.lead} ${input.recovery.attempt}`,
         ...(waited !== undefined ? [`parked ${humanAge(waited)}`] : []),

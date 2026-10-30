@@ -408,7 +408,7 @@ test("a durably stopped mission at the cap keeps recovery_exhausted, a live park
 
   const live = attentionFromSummary(obs.projection(m.mission_id)!.summary, { now });
   assert.equal(live?.evidence[0]?.kind, "capacity_wait");
-  assert.match(live!.reason, /resumes automatically once the gateway health probe succeeds/);
+  assert.match(live!.reason, /resumes once the gateway health probe succeeds/);
 
   store.stopMission(m.mission_id, {
     reason: "gate repair refused",
@@ -454,6 +454,8 @@ test("the wait category comes from the classification behind the current decisio
   const attention = attentionFromSummary(summary, { now });
   assert.match(attention!.reason, /^waiting for capacity: probe 9/);
   assert.doesNotMatch(attention!.reason, /disk/);
+  // The summary reason must come from the same classification as the lead.
+  assert.equal(summary.reason, "gateway returned 503");
 });
 
 test("no current-generation recovery means no failureCategory", () => {

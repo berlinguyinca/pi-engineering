@@ -1359,9 +1359,10 @@ export class MissionObservability {
     const classification = this.store.listFailureClassifications(missionId).at(-1);
     // The wait wording must describe the failure behind the current decision,
     // not whichever classification happens to be newest.
-    const recoveryCategory = recovery
-      ? this.store.getFailureClassification(recovery.classificationId)?.category
+    const recoveryClassification = recovery
+      ? this.store.getFailureClassification(recovery.classificationId)
       : undefined;
+    const recoveryCategory = recoveryClassification?.category;
     const repositoryWaits = this.store.listRepositoryWaits(missionId);
     const repositoryWaitText = repositoryWaits.length
       ? repositoryWaits
@@ -1388,7 +1389,7 @@ export class MissionObservability {
       reason:
         stop?.reason ??
         repositoryWaitText ??
-        classification?.summary ??
+        (recovery ? recoveryClassification : classification)?.summary ??
         recovery?.expectedMaterialChange ??
         `Mission health is ${health}`,
       recovery: {
