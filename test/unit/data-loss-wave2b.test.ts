@@ -12,9 +12,9 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
+  mkdtempSync as realMkdtempSync,
   realpathSync,
   rmSync,
   statSync,
@@ -23,7 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { GitRepo, shortHash } from "../../src/git/GitRepo.ts";
@@ -40,6 +40,23 @@ import { subtractBaselineFailures } from "../../src/verify/baselineSubtraction.t
 import { TranscriptWriter } from "../../src/workers/transcriptStore.ts";
 
 const exec = promisify(execFile);
+
+/** Every scratch dir this file makes is removed afterwards (siblings such as worktrees live inside them). */
+const madeDirs: string[] = [];
+const mkdtempSync = (prefix: string): string => {
+  const dir = realMkdtempSync(prefix);
+  madeDirs.push(dir);
+  return dir;
+};
+afterEach(() => {
+  for (const d of madeDirs.splice(0)) {
+    // Worktrees of a repo created directly in `d` are siblings named after its path hash.
+    const real = realpathSync(d);
+    const siblings = readdirSync(dirname(real)).filter((n) => n.startsWith(`pi-eng-${shortHash(real)}-`));
+    for (const n of siblings) rmSync(join(dirname(real), n), { recursive: true, force: true });
+    rmSync(d, { recursive: true, force: true });
+  }
+});
 const g = async (cwd: string, ...args: string[]): Promise<string> =>
   (await exec("git", ["-C", cwd, ...args])).stdout.trim();
 
@@ -291,9 +308,19 @@ test("post-merge revert conflict leaves no branch, no worktree and no temp dir",
   const first = await commit("one");
   await commit("two");
   const base = await g(dir, "rev-parse", "HEAD");
-  const temps = () => readdirSync(tmpdir()).filter((n) => n.startsWith("pi-postmerge-")).length;
+  // Count only under a test-owned TMPDIR, so parallel test files cannot change the number.
+  const ownTmp = mkdtempSync(join(tmpdir(), "w2b-pm-"));
+  const savedTmp = process.env.TMPDIR;
+  process.env.TMPDIR = ownTmp;
+  const temps = () => readdirSync(ownTmp).filter((n) => n.startsWith("pi-postmerge-")).length;
   const before = temps();
-  const out = await gitPostMerge(dir).createRevertBranch({ branch: "revert-x", mergedSha: first, base });
+  let out: Awaited<ReturnType<ReturnType<typeof gitPostMerge>["createRevertBranch"]>>;
+  try {
+    out = await gitPostMerge(dir).createRevertBranch({ branch: "revert-x", mergedSha: first, base });
+  } finally {
+    if (savedTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = savedTmp;
+  }
   assert.equal(out.ok, false);
   assert.equal(await g(dir, "for-each-ref", "refs/heads/revert-x"), "");
   assert.equal((await g(dir, "worktree", "list", "--porcelain")).split("\n\n").length, 1);
@@ -771,7 +798,8 @@ test("restoreCheckpoint recovers the live state left behind by a crash between i
 });
 
 async function userDataRepo(): Promise<{ dir: string; head: string; git: GitRepo }> {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "w2b-ud-")));
+  const dir = join(realpathSync(mkdtempSync(join(tmpdir(), "w2b-ud-"))), "repo");
+  mkdirSync(dir);
   await exec("git", ["init", "-q", "-b", "main", dir]);
   await g(dir, "config", "user.email", "t@example.invalid");
   await g(dir, "config", "user.name", "t");

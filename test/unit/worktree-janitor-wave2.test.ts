@@ -599,7 +599,7 @@ const LATE_WRITERS: Array<{ name: string; ignore: string; rel: string; cwdInside
 ];
 for (const sc of LATE_WRITERS) {
   test(`late writer ${sc.name}: the file survives (kept in place or carried into the trash)`, async () => {
-    const fixture = await makeFixtureRepo();
+    const fixture = await isolatedFixture();
     const gate = await mkdtemp(join(tmpdir(), "pi-eng-gate-"));
     const savedPath = process.env.PATH;
     try {
@@ -1050,5 +1050,24 @@ test("a trash root that ensureTrashRoot would reject is refused up front: no pre
     assert.equal(await exists(join(root, "photo.jpg")), true);
   } finally {
     await fixture.cleanup();
+  }
+});
+
+test("a failed second mv undoes the first: the admin dir is back in the trash entry and nothing is registered", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+  const tr = await trashedForRestore("rsD");
+  try {
+    await chmod(tr.parent, 0o555); // renaming the checkout back into the parent fails
+    const code = await bash(tr.cmd, tr.parent);
+    await chmod(tr.parent, 0o755);
+    assert.notEqual(code, 0);
+    assert.equal(await exists(join(dirname(tr.trashed), ".pi-eng-admin", "HEAD")), true, "admin dir moved back");
+    assert.equal(await exists(tr.admin), false);
+    assert.equal(await exists(tr.trashed), true);
+    const list = (await exec("git", ["-C", tr.root, "worktree", "list", "--porcelain"])).stdout;
+    assert.ok(!list.includes("reclaim-"), list);
+  } finally {
+    await chmod(tr.parent, 0o755).catch(() => {});
+    await tr.cleanup();
   }
 });

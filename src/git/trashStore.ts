@@ -95,7 +95,10 @@ export async function trashRootInsideProblem(root: string, workingTrees: readonl
  * make, plus (when `sameFilesystemAs` is given) a root on another filesystem than that path, so a sweep can refuse
  * BEFORE it preserves or moves anything instead of after.
  */
-export async function trashRootProblem(root: string, opts: { sameFilesystemAs?: string } = {}): Promise<string | null> {
+export async function trashRootProblem(
+  root: string,
+  opts: { sameFilesystemAs?: string; env?: Record<string, string | undefined> } = {},
+): Promise<string | null> {
   const linked = await symlinkedRootProblem(root);
   if (linked) return linked;
   const marked = (await lstat(join(root, TRASH_ROOT_MARKER)).catch(() => null))?.isFile();
@@ -127,7 +130,11 @@ export async function trashRootProblem(root: string, opts: { sameFilesystemAs?: 
   if (opts.sameFilesystemAs) {
     const [a, b] = await Promise.all([stat(existing).catch(() => null), stat(opts.sameFilesystemAs).catch(() => null)]);
     if (a && b && a.dev !== b.dev) {
-      return "state dir on different filesystem: set PI_TRASH_DIR next to the repos";
+      const configured = (opts.env ?? process.env)[TRASH_DIR_ENV]?.trim();
+      const base = `the trash root ${root} is on a different filesystem than ${opts.sameFilesystemAs} (a move into it would have to copy)`;
+      return configured && resolve(configured) === resolve(root)
+        ? `${base}: point ${TRASH_DIR_ENV} at a directory next to the repos`
+        : `${base}: set ${TRASH_DIR_ENV} to a directory next to the repos`;
     }
   }
   return null;

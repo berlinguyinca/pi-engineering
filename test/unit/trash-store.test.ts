@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -200,5 +200,43 @@ test("unmarked .pi-eng-trash orphans are only listed, with the manual command, a
     assert.match(why[stray] ?? "", /not a <timestamp>-<name> directory/);
   } finally {
     await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("trashRootProblem: unwritable, unreadable and different-filesystem roots are refused with a precise reason", async (t) => {
+  const { trashRootProblem } = await import("../../src/git/trashStore.ts");
+  const base = await mkdtemp(join(tmpdir(), "pi-eng-trp-"));
+  leaked.push(base);
+  try {
+    assert.equal(await trashRootProblem(join(base, "fresh")), null);
+    if (process.getuid?.() !== 0) {
+      const ro = join(base, "ro");
+      await mkdir(ro, { mode: 0o555 });
+      assert.match((await trashRootProblem(join(ro, "trash"))) ?? "", /not writable/);
+      const hidden = join(base, "hidden");
+      await mkdir(join(hidden, "inner"), { recursive: true });
+      await chmod(hidden, 0o000);
+      assert.match((await trashRootProblem(hidden)) ?? "", /cannot be read/);
+      await chmod(hidden, 0o755);
+      await chmod(ro, 0o755);
+    } else t.diagnostic("running as root: skipped the unwritable and unreadable branches");
+    const shm = "/dev/shm";
+    const other = await stat(shm).then(
+      (s) => s,
+      () => null,
+    );
+    if (!other || other.dev === (await stat(base)).dev) {
+      t.diagnostic("no second filesystem (/dev/shm missing or the same device): skipped the cross-filesystem branch");
+    } else {
+      const root = join(shm, `pi-eng-trp-${process.pid}`);
+      const fresh = await trashRootProblem(root, { sameFilesystemAs: base, env: {} });
+      assert.ok(fresh?.includes(root) && fresh.includes(base), fresh ?? "null");
+      assert.match(fresh ?? "", /set PI_TRASH_DIR to a directory next to the repos/);
+      const inUse = await trashRootProblem(root, { sameFilesystemAs: base, env: { PI_TRASH_DIR: root } });
+      assert.match(inUse ?? "", /point PI_TRASH_DIR at a directory next to the repos/);
+    }
+  } finally {
+    await chmod(join(base, "hidden"), 0o755).catch(() => {});
+    await chmod(join(base, "ro"), 0o755).catch(() => {});
   }
 });

@@ -556,7 +556,11 @@ start, every six hours while a session stays open, and on demand with `/gc`
   the `gitdir:` line in `<trash entry>/<name>/.git`; move `<trash entry>/<name>`
   back to its original path; run `git worktree repair <original path>`. If that
   id is already taken, use a new admin name AND rewrite `<checkout>/.git` to
-  `gitdir: <new admin dir>` before the repair. Restore soon: once the admin dir
+  `gitdir: <new admin dir>` before the repair. If the ORIGINAL PATH is taken,
+  restore the checkout to another path instead and run
+  `git worktree repair <new path>`. The printed one-liner refuses (non-zero,
+  nothing moved) when the id or the path is taken, and if its second `mv` fails
+  it moves the admin dir back, leaving the trash entry exactly as it was. Restore soon: once the admin dir
   is out of `.git`, objects that only its reflog or `refs/worktree` held can be
   pruned by `git gc` (branch commits and preserved work are kept by earlier
   guards). Known residuals: `config.worktree` is not checked, Rust liveness

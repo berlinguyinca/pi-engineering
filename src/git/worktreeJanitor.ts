@@ -1122,6 +1122,7 @@ async function moveOwnAdminDir(
     const next = `the registration points at the quarantine path ${movedFrom}; after verifying that, run a plain \`git worktree remove ${shellQuote(movedFrom)}\`, or \`git worktree prune\` only after checking \`git worktree list --porcelain\` for other prunable entries (or restore the checkout and run \`git worktree repair\`)`;
     return `; its git registration was left in place (${why}); ${where}; ${next}`;
   };
+  let moved: string | null = null;
   try {
     const matches = await repo.adminMatches(movedFrom);
     if (matches.length !== 1) return left(`${matches.length} admin dirs match its path`);
@@ -1136,6 +1137,7 @@ async function moveOwnAdminDir(
         admin,
       );
     }
+    moved = kept;
     const common = dirname(dirname(admin));
     await recordTrashAdmin(entry, { adminId: basename(admin), commonDir: common }).catch(() => {});
     const free = (p: string): string => `test ! -e ${shellQuote(p)} && test ! -L ${shellQuote(p)}`;
@@ -1145,10 +1147,16 @@ async function moveOwnAdminDir(
     // Refuses (non-zero, nothing moved) instead of letting `mv` nest into, or `repair` rewrite, something that took the id or path.
     const restore =
       `${free(admin)} && ${free(originalPath)} && mkdir -p ${shellQuote(dirname(admin))} && ` +
-      `mv ${shellQuote(kept)} ${shellQuote(admin)} && mv ${shellQuote(trashedTo)} ${shellQuote(originalPath)} && ` +
+      `mv ${shellQuote(kept)} ${shellQuote(admin)} && ` +
+      `{ mv ${shellQuote(trashedTo)} ${shellQuote(originalPath)} || ` +
+      `{ mv ${shellQuote(admin)} ${shellQuote(kept)}; echo 'restore failed, admin dir moved back'; false; }; } && ` +
       `git -C ${shellQuote(repo.root)} worktree repair ${shellQuote(originalPath)}`;
     return `; git registration moved to ${kept}. To restore: ${restore}`;
   } catch (error) {
+    if (moved) {
+      // The admin dir is already in the trash entry: do not claim the registration is still in place.
+      return `; git registration moved to ${moved}, but the restore command could not be prepared (${error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error)}); to restore, follow the README manual recipe`;
+    }
     return left(error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error));
   }
 }
