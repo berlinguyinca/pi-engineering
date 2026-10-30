@@ -26,6 +26,7 @@ import type { PlannotatorAdapter } from "../platform/Plannotator.ts";
 import type { EnvelopeDraft, EvidenceRef } from "../runtime/herdr/envelope.ts";
 import type { PlanTaskInput } from "./orchestrator.ts";
 import {
+  type PlanArtifactRef,
   type PlanDecisionOutcome,
   type PlanDecisionRecord,
   type PlanLedger,
@@ -68,6 +69,8 @@ export interface PlanGateInput {
   adapter?: PlannotatorAdapter | null;
   policy?: PlanReviewPolicyConfig;
   emitter?: PlanLineageEmitter | null;
+  /** An existing registry ref for this plan, recorded on the revisions this call mints. Read-only for Pi. */
+  planArtifactRef?: PlanArtifactRef;
   /** Revisions allowed per mission before the gate blocks (default 3). */
   maxRevisions?: number;
   now?: () => Date;
@@ -159,6 +162,7 @@ export async function gatePlanBeforeWorkers(input: PlanGateInput): Promise<PlanG
       planText,
       tasks: structuredClone(tasks),
       createdAt: now().toISOString(),
+      ...(validArtifactRef(input.planArtifactRef) ? { planArtifactRef: { ...input.planArtifactRef } } : {}),
     };
     ledger.appendPlanRevision(record);
     await emitRevision(input.emitter, record, parent);
@@ -390,6 +394,16 @@ async function safeStage(emitter: PlanLineageEmitter | null | undefined, draft: 
   }
 }
 
+function validArtifactRef(ref: PlanArtifactRef | undefined): ref is PlanArtifactRef {
+  return (
+    !!ref &&
+    typeof ref.id === "string" &&
+    ref.id.trim() !== "" &&
+    typeof ref.version === "string" &&
+    ref.version.trim() !== ""
+  );
+}
+
 async function emitRevision(
   emitter: PlanLineageEmitter | null | undefined,
   rev: PlanRevisionRecord,
@@ -416,6 +430,9 @@ async function emitRevision(
         risk_class: rev.riskClass,
         complexity_score: rev.complexityScore,
         cause: rev.cause,
+        ...(validArtifactRef(rev.planArtifactRef)
+          ? { plan_artifact_id: rev.planArtifactRef.id, plan_artifact_version: rev.planArtifactRef.version }
+          : {}),
       },
     },
     evidence_refs: evidence,
