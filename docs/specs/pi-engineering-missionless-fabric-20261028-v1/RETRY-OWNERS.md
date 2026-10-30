@@ -28,7 +28,22 @@ Layers 1 and 4 do not stack (1 defers under 2; 4 hands a 429 over). The stacking
 
 Measured: a real local HTTP gateway (`test/integration/single-retry-owner.test.ts`) with `maxRetries=2` receives exactly `1 + 2 = 3` requests. On that bare-text path the ladder already settles (it classifies `unknown -> fail`), so the 36 above is computed from the code constants plus the unit test that the ladder does replay a classified admission 429 when no worker owns it; it was not reproduced over HTTP because the openai-completions provider does not expose response status to the ladder.
 
-Residual, not changed here: the scheduler relaunch re-walks the takeover list from scratch (the `tried` set is per call), and layer 2 (4) still stacks with layer 4 (4) for 5xx/network faults, because the worker does not own those waits (16 requests, bounded). Both are listed as follow-ups.
+## Transient faults and relaunches (follow-up)
+
+Defaults: ladder 4 attempts, worker transient retry 4 attempts, takeover 16 models, relaunch 100.
+
+### (A) Ladder x worker transient retry (5xx, network, timeout)
+
+- Before: a fault the worker retries (e.g. 503, connection reset) could be replayed by the ladder (4 requests) inside each of the worker's 4 attempts: `4 x 4 = 16` requests for one fault on one model.
+- After: `InferenceInvocation.transientRetryOwner = "worker-transient-retry"` (set by the worker around every attempt, whether or not gateway holds are enabled). For a same-model step (`retry`, `wait_capacity`) on a fault the worker's own `classifyError` would retry (`server_error`, `server_unavailable`, `network`, `timeout`), the ladder returns "settle", traces `defer`, and the worker's loop is the only retrier: `4` requests (its budget). Without an owner (non-worker callers) the ladder retries as before. A fault the worker would not retry (e.g. a bare 500, classified permanent) is not deferred, so exactly one layer still retries it.
+- Measured: `test/integration/single-retry-owner-transient.test.ts`. Over a real local HTTP server a connection reset costs exactly the worker budget (3 requests with `maxAttempts` 2) and a 5xx costs the gateway-hold budget (the worker reads a 5xx body as a gateway refusal), with and without this change: the provider path does not expose the status/headers the ladder needs, so the 16x is not reproducible over HTTP (same limitation as the 429 case). The ladder's behaviour is pinned by unit assertions: replay without an owner, `defer` with one, for 503 / ECONNRESET.
+
+### (B) Relaunch re-walking the takeover list
+
+- Before: the `tried` set was per `runWithModelTakeover` call, so each scheduler relaunch started on the router's first choice and walked the same dead models again: up to `100 x 16 = 1,600` dead-model attempts per task.
+- After: `realBackends` keeps, per `mission|task|role`, the models a walk found dead (capacity, gone, provider fault) with a TTL (`takeoverMemoryTtlMs`, default 15 min). A relaunch swaps a remembered initial model for `plan.next(remembered)` and excludes them from later `next` calls. Result: each dead model is retried at most once per TTL window per task, so `1 x 16` per window rather than `100 x 16`. If every candidate is remembered dead the memory is dropped and the list is walked afresh (no starvation, same as before).
+- Why here: `UnavailableModels` is global and for gateway-confirmed gone models; putting a capacity-exhausted model there would remove it from routing for every task. The task record is owned by the scheduler store, which this layer cannot write. In-memory loses the memory on process restart, costing one extra walk.
+- Reset / exemptions: an operator pin change (or an operator supersede) clears it; an explicitly pinned model (`operatorPin` route / `operatorPinned` request) is never recorded, never excluded, and never replaced; `takeoverMemoryTtlMs: 0` disables it.
 
 ## The rule now
 
