@@ -205,6 +205,8 @@ export interface OrchestratorOptions {
      * switch only to one of these (runtime/host/quotaResume.ts). Empty = none configured: the handoff stays blocked.
      */
     quotaCatalogue?: (role: string | null) => readonly import("../runtime/host/quotaResume.ts").QuotaResumeModel[];
+    /** Routable provider/id of the model a context-pressure handoff's successor is pinned to, or why it cannot be. */
+    sameModelRef?: (model: string) => { ref: string } | { reason: string };
   } | null;
   parentSessionId?: string | null;
   limits?: {
@@ -628,6 +630,7 @@ export class Orchestrator {
             .map((r) => r.fromModel as string);
         },
         ...(handoffCfg.quotaCatalogue ? { catalogue: handoffCfg.quotaCatalogue } : {}),
+        ...(handoffCfg.sameModelRef ? { sameModelRef: handoffCfg.sameModelRef } : {}),
       });
     }
     this.workspaceResolver = opts.workspaceResolver ?? new WorkspaceManifestResolver();
