@@ -25,6 +25,10 @@ describe("mission model summary", () => {
       ],
     );
     assert.equal(summary.elsewhere, 1, "an agent that reported no model is unknown, not elsewhere");
+    assert.deepEqual(
+      summary.agents.map((a) => a.why),
+      [null, "independent review runs on a different model than the work it reviews", null],
+    );
   });
 
   it("an unpinned mission has no pin and nothing is elsewhere", () => {
