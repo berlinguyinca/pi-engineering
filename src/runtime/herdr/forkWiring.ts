@@ -40,10 +40,10 @@ export interface ForkScope {
  * the same way. Injected so tests need neither.
  */
 export interface ForkRuntimeSources {
-  getTask(taskId: string): ForkTaskRef | undefined;
+  getTask(taskId: string): ForkTaskRef | undefined | Promise<ForkTaskRef | undefined>;
   getExecution(executionId: string): { task_id: string } | undefined;
   /** Repository and base ref of the work a task belongs to; undefined = not known on this host. */
-  getScope(workId: string): ForkScope | undefined;
+  getScope(workId: string): ForkScope | undefined | Promise<ForkScope | undefined>;
   /** Repository root bound to a task's repo id (throws when no manifest is active). */
   boundRoot(repoId: string): string | null;
   /** Root of the git repository at `path`, or null. */
@@ -95,7 +95,7 @@ export interface WorkScopeFacts {
  */
 export function workForkSources(
   graph: () => Pick<WorkGraph, "tasks" | "runs" | "sessions">,
-  scopeOf: (workId: string) => WorkScopeFacts | undefined,
+  scopeOf: (workId: string) => WorkScopeFacts | undefined | Promise<WorkScopeFacts | undefined>,
   host: ForkHostSources,
 ): ForkRuntimeSources {
   const rootOf = (g: ReturnType<typeof graph>, id: string): string => {
@@ -113,21 +113,47 @@ export function workForkSources(
   };
   return {
     ...host,
-    getTask: (id) => {
+    getTask: async (id) => {
       const g = graph();
       const taskId = taskIdOf(g, id);
       if (!taskId) return undefined;
       const workId = rootOf(g, taskId);
-      const repoId = scopeOf(workId)?.repo_id;
+      const repoId = (await scopeOf(workId))?.repo_id;
       return { task_id: taskId, work_id: workId, ...(repoId ? { repo_id: repoId } : {}) };
     },
     getExecution: (id) => {
       const run = graph().runs.find((r) => r.id === id);
       return run ? { task_id: run.task_id } : undefined;
     },
-    getScope: (workId) => {
-      const f = scopeOf(workId);
+    getScope: async (workId) => {
+      const f = await scopeOf(workId);
       return f ? { work_id: workId, repository: f.repository, base_ref: f.base_ref } : undefined;
+    },
+  };
+}
+
+/**
+ * Mission-backed work first, the generic work read model as the fallback. A Mission id or task is answered by the
+ * Mission store exactly as before; anything it does not know (a Ledger work item, a Mission-less session) falls through
+ * to `fallback`. A node the Mission store knows is never re-resolved by the fallback, so a shared id cannot change
+ * meaning. `getScope` is routed by whichever source recognises the work id as a task root.
+ */
+export function withFallbackForkSources(primary: ForkRuntimeSources, fallback: ForkRuntimeSources): ForkRuntimeSources {
+  const primaryWork = new Set<string>();
+  return {
+    ...primary,
+    getTask: async (id) => {
+      const t = await primary.getTask(id);
+      if (t) {
+        primaryWork.add(t.work_id);
+        return t;
+      }
+      return fallback.getTask(id);
+    },
+    getExecution: (id) => primary.getExecution(id) ?? fallback.getExecution(id),
+    getScope: async (workId) => {
+      if (primaryWork.has(workId)) return await primary.getScope(workId);
+      return (await primary.getScope(workId)) ?? (await fallback.getScope(workId));
     },
   };
 }
@@ -232,20 +258,20 @@ export async function createForkRuntime(input: {
     const i = nodeId.indexOf(":");
     const kind = nodeId.slice(0, i);
     const id = nodeId.slice(i + 1);
-    let task: ReturnType<ForkRuntimeSources["getTask"]>;
+    let task: ForkTaskRef | undefined;
     let knownRoot: string | null = null;
-    if (kind === "task" || kind === "agent") task = s.getTask(id);
+    if (kind === "task" || kind === "agent") task = await s.getTask(id);
     else if (kind === "attempt") {
       const ex = s.getExecution(id);
-      task = ex ? s.getTask(ex.task_id) : undefined;
+      task = ex ? await s.getTask(ex.task_id) : undefined;
     } else if (kind === "approach") {
       const rec = registry.get(id);
-      task = rec ? s.getTask(rec.taskId) : undefined;
+      task = rec ? await s.getTask(rec.taskId) : undefined;
       knownRoot = rec?.repoRoot ?? null;
       if (rec && !task) return { unresolvable: "the mission of that approach is no longer known here" };
     } else return null;
     if (!task) return null;
-    const mission = s.getScope(task.work_id);
+    const mission = await s.getScope(task.work_id);
     if (!mission) return { unresolvable: "the mission is not known on this host" };
     if (!SAFE_BRANCH.test(mission.base_ref)) return { unresolvable: "the mission base ref is not a plain branch name" };
     let repoRoot = knownRoot;
