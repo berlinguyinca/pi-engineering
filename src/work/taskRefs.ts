@@ -13,8 +13,8 @@
  *  - evidence `artifact:evidence/<id>`        (commons kind; the Ledger evidence row id)
  */
 
-import type { Candidate, Evidence, Task, WorkItem } from "../core/types.ts";
-import { parseCanonicalId } from "../github/refs.ts";
+import type { Candidate, Evidence, Task, WorkItem, WorkItemPrLink } from "../core/types.ts";
+import { canonicalId, parseCanonicalId } from "../github/refs.ts";
 import type { GithubLinkRecord } from "../github/types.ts";
 import type { PlanArtifactRef } from "../orchestration/planRecords.ts";
 import type { WorkTask } from "./types.ts";
@@ -70,6 +70,8 @@ export interface TaskRefsLedger {
   getTask(id: string): Task | undefined;
   listCandidates(workItemId?: string): Candidate[];
   listEvidence(candidateId?: string): Evidence[];
+  /** PRs recorded on the work item (`work_item.pr_linked`). Absent on a ledger that predates them. */
+  listPrLinks?(workItemId: string): WorkItemPrLink[];
 }
 
 export interface LedgerTaskRefsOptions {
@@ -112,7 +114,19 @@ export function ledgerTaskRefs(ledger: TaskRefsLedger, opts: LedgerTaskRefsOptio
           }
         }
       }
-      refs.prs = prRefsFromLinks(opts.githubLinks?.(task.id) ?? [], task.id);
+      const prs = prRefsFromLinks(opts.githubLinks?.(task.id) ?? [], task.id);
+      // Durable Ledger-recorded PRs: the same canonical id github/sync.ts emits, so a PR is one node whoever linked it.
+      for (const l of wi ? (ledger.listPrLinks?.(wi.id) ?? []) : []) {
+        const id = canonicalId({
+          host: l.host,
+          owner: l.owner,
+          repo: l.repo,
+          number: l.number,
+          kind: "pr",
+        })?.toLowerCase();
+        if (id && parseCanonicalId(id) && !prs.includes(id)) prs.push(id);
+      }
+      refs.prs = prs.slice(0, MAX_PRS);
       refs.plans = [...(opts.plans?.(task.id) ?? [])].slice(0, 5);
       return refs;
     } catch {

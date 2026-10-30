@@ -103,6 +103,17 @@ export class LedgerTransitions {
     });
   }
 
+  /** Record a PR on a work item through the same guarded write as a status change. Returns whether it was newly linked. */
+  async linkPullRequest(
+    workItemId: string,
+    pr: { host: string; owner: string; repo: string; number: number },
+    actor: Actor,
+  ): Promise<boolean> {
+    return this.fenced(workItemId, `work item ${workItemId} pr link`, (write) =>
+      this.ledger.recordPrLink(workItemId, pr, actor, write),
+    );
+  }
+
   private blockersFor(workItemId: string): string[] {
     const graph = this.projection.graph();
     const task = graph.tasks.find((t) => t.id === workItemId);

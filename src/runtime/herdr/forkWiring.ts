@@ -6,7 +6,13 @@
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { CliForkGit } from "../../git/forkGit.ts";
-import { type GithubLinkStore, createGithubClient, normaliseRepo, refConfigOf } from "../../github/index.ts";
+import {
+  type GithubLinkStore,
+  type GithubRef,
+  createGithubClient,
+  normaliseRepo,
+  refConfigOf,
+} from "../../github/index.ts";
 import {
   type ForkLineage,
   ForkManager,
@@ -51,10 +57,15 @@ export interface ForkRuntimeSources {
   links: GithubLinkStore;
   /** Canonical PR ids of the tasks that depend (transitively) on `taskId`; absent = no downstream invalidation. */
   downstreamPrs?: (taskId: string) => string[];
+  /** A promoted fork's PR was opened and linked for `taskId`; record it where the task's work lives (best effort). */
+  onPrLinked?: (taskId: string, pr: GithubRef) => void | Promise<void>;
 }
 
 /** The parts of {@link ForkRuntimeSources} that do not depend on how work is stored. */
-export type ForkHostSources = Pick<ForkRuntimeSources, "boundRoot" | "openRoot" | "links" | "downstreamPrs">;
+export type ForkHostSources = Pick<
+  ForkRuntimeSources,
+  "boundRoot" | "openRoot" | "links" | "downstreamPrs" | "onPrLinked"
+>;
 
 /** Adapter over MissionStore: a Mission is the work, its repository and base_ref are the scope. */
 export function missionForkSources(
@@ -251,6 +262,7 @@ export async function createForkRuntime(input: {
     limits: settings.limits,
     promote,
     ...(input.sources.downstreamPrs ? { downstreamPrs: input.sources.downstreamPrs } : {}),
+    ...(input.sources.onPrLinked ? { onPrLinked: input.sources.onPrLinked } : {}),
     ...(input.log ? { log: input.log } : {}),
   });
   const s = input.sources;

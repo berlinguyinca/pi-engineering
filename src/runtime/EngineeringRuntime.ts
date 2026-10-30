@@ -2141,6 +2141,11 @@ export class EngineeringRuntime {
           openRoot: async (path: string) => (await GitRepo.open(path))?.root ?? null,
           links: store,
           downstreamPrs: (taskId: string) => downstreamPrNodes(store, taskId),
+          // A PR opened for Ledger-native work is recorded on its work item; a Mission task id is not one, so it is skipped.
+          onPrLinked: async (taskId: string, pr: { host: string; owner: string; repo: string; number: number }) => {
+            const wiId = rt.ledger.getWorkItem(taskId) ? taskId : rt.ledger.getTask(taskId)?.result_work_item_id;
+            if (wiId) await rt.transitions.linkPullRequest(wiId, pr, rt.actor(newRunId()));
+          },
         };
         // Mission-less work (Ledger work items and the sessions that ran them) forks and hands off too: the work read
         // model names the task, and the repository and base branch come from this session's own checkout.
