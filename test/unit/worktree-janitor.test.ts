@@ -1,6 +1,21 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  access,
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
@@ -1018,4 +1033,213 @@ test("MSN-ext-/MSN-local- ids parse truncated, so they never match a real missio
   });
   const mine = { getMission: () => undefined, getTask: () => undefined };
   assert.equal(missionOwnerLiveness(mine)({ missionId: "MSN-ext" }), "unknown");
+});
+
+// ---- Review round 3 ----
+
+test("a partially staged file (staged and further modified) keeps the worktree; the staged version is not lost", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("x1aaaa"));
+    await writeFile(join(wt.path, "src/add.js"), "STAGED-GOOD\n");
+    await exec("git", ["-C", wt.path, "add", "src/add.js"]);
+    await writeFile(join(wt.path, "src/add.js"), "broken experiment WORKTREE\n");
+    const stagedBlob = (await exec("git", ["-C", wt.path, "rev-parse", ":src/add.js"])).stdout.trim();
+    await ageWorktree(wt.path, 100 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /partially staged.*src\/add\.js/);
+    }
+    assert.equal((await exec("git", ["-C", wt.path, "rev-parse", ":src/add.js"])).stdout.trim(), stagedBlob);
+    assert.equal(await readFile(join(wt.path, "src/add.js"), "utf8"), "broken experiment WORKTREE\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+for (const pattern of ["node_modules/", "node_modules", ""]) {
+  test(`the provisioned node_modules symlink (.gitignore '${pattern}') is never committed, never followed, only unlinked`, async () => {
+    const fixture = await makeFixtureRepo();
+    try {
+      if (pattern) await commitFile(fixture.root, ".gitignore", `${pattern}\n`);
+      await mkdir(join(fixture.root, "node_modules", "pkg"), { recursive: true });
+      await writeFile(join(fixture.root, "node_modules", "pkg", "index.js"), "PKG\n");
+      const repo = (await GitRepo.open(fixture.root))!;
+      const branch = CAND(`sl${pattern.length}aa`);
+      const wt = await repo.createWorktree(await repo.headCommit(), branch);
+      assert.equal(
+        (await lstat(join(wt.path, "node_modules"))).isSymbolicLink(),
+        true,
+        "createWorktree provisions the link",
+      );
+      await writeFile(join(wt.path, "work.txt"), "w\n");
+      await ageWorktree(wt.path, 100 * HOUR);
+      const dry = await sweepOld(repo, { dryRun: true });
+      assert.equal(dry.reclaimed.length, 1, JSON.stringify(dry));
+      const report = await sweepOld(repo);
+      assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
+      assert.equal(await exists(wt.path), false);
+      const tree = (await exec("git", ["-C", fixture.root, "ls-tree", "-r", "--name-only", branch])).stdout;
+      assert.match(tree, /work\.txt/);
+      assert.doesNotMatch(tree, /node_modules/, "the symlink is never committed");
+      assert.equal(await readFile(join(fixture.root, "node_modules", "pkg", "index.js"), "utf8"), "PKG\n");
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+}
+
+test("a node_modules symlink pointing anywhere else is user content: kept or committed as a link, its target never followed or deleted", async () => {
+  const fixture = await makeFixtureRepo();
+  const other = await mkdtemp(join(tmpdir(), "pi-eng-other-"));
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("slfake");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(other, "mine.txt"), "mine\n");
+    await symlink(other, join(wt.path, "node_modules"));
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.failed.length, 0, JSON.stringify(report));
+    if (report.reclaimed.length === 1) {
+      const entry = (await exec("git", ["-C", fixture.root, "ls-tree", branch, "node_modules"])).stdout;
+      assert.match(entry, /^120000 blob/, "preserved as a symlink entry, not its contents");
+    }
+    assert.equal(await readFile(join(other, "mine.txt"), "utf8"), "mine\n");
+  } finally {
+    await rm(other, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+async function snapshotTree(dir: string, out: Map<string, string> = new Map()): Promise<Map<string, string>> {
+  for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+    const full = join(dir, entry.name);
+    const s = await lstat(full);
+    // Git "freshens" (re-touches) an existing identical loose object; harmless, so
+    // objects are compared by name and content only, never by mtime.
+    const mtime = full.includes("/.git/objects") ? "" : s.mtimeMs;
+    if (entry.isDirectory()) {
+      out.set(full, `d ${mtime}`);
+      await snapshotTree(full, out);
+    } else if (entry.isFile()) {
+      out.set(
+        full,
+        `f ${mtime} ${createHash("sha1")
+          .update(await readFile(full))
+          .digest("hex")}`,
+      );
+    } else out.set(full, `o ${s.mtimeMs}`);
+  }
+  return out;
+}
+
+test("a dry run writes nothing: no objects, refs, index or worktree file changes (non-vacuous aging)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("dry001"));
+    await writeFile(join(wt.path, "new-work.txt"), "never staged by a preview\n");
+    await writeFile(join(wt.path, "src", "add.js"), "edited\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const adminDir = (await exec("git", ["-C", wt.path, "rev-parse", "--absolute-git-dir"])).stdout.trim();
+    const watched = [join(fixture.root, ".git"), adminDir, wt.path];
+    const before = await Promise.all(watched.map((d) => snapshotTree(d)));
+    const report = await sweepOld(repo, { dryRun: true });
+    assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
+    const after = await Promise.all(watched.map((d) => snapshotTree(d)));
+    for (let i = 0; i < watched.length; i++) {
+      const changed = [...new Set([...before[i]!.keys(), ...after[i]!.keys()])].filter(
+        (k) => before[i]!.get(k) !== after[i]!.get(k),
+      );
+      assert.deepEqual(changed, [], `${watched[i]} was modified by a dry run`);
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a file a concurrent process writes at the original path while git worktree remove runs is never deleted", async () => {
+  const fixture = await makeFixtureRepo();
+  const gate = await mkdtemp(join(tmpdir(), "pi-eng-gate-"));
+  const savedPath = process.env.PATH;
+  try {
+    await commitFile(fixture.root, ".gitignore", "*.env\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("w1aaaa"));
+    await writeFile(join(wt.path, "dirty.txt"), "x\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const realGit = (await exec("sh", ["-c", "command -v git"])).stdout.trim();
+    const ready = join(gate, "READY");
+    const go = join(gate, "GO");
+    const wrote = join(gate, "WROTE");
+    await mkdir(join(gate, "bin"));
+    await writeFile(
+      join(gate, "bin", "git"),
+      `#!/bin/sh
+case " $* " in *" worktree remove "*) : > "${ready}"; i=0; while [ ! -e "${go}" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done;; esac
+exec "${realGit}" "$@"
+`,
+    );
+    await chmod(join(gate, "bin", "git"), 0o755);
+    process.env.PATH = `${join(gate, "bin")}:${savedPath}`;
+    // Independent OS process: writes into the ORIGINAL path as soon as the janitor reaches remove.
+    const late = join(wt.path, "late.env");
+    const writer = new Promise<void>((done) => {
+      const p = spawn(
+        "sh",
+        [
+          "-c",
+          `while [ ! -e "${ready}" ]; do sleep 0.02; done; if printf SECRET > "${late}"; then : > "${wrote}"; fi; : > "${go}"`,
+        ],
+        { stdio: "ignore" },
+      );
+      p.on("exit", () => done());
+    });
+    const report = await sweepOld(repo);
+    await writer;
+    process.env.PATH = savedPath;
+    assert.equal(await exists(ready), true, "the gate must have been reached");
+    // The invariant: a write that succeeded is never deleted.
+    if (await exists(wrote)) assert.equal(await readFile(late, "utf8"), "SECRET", JSON.stringify(report));
+    else assert.equal(report.failed.length, 0, JSON.stringify(report));
+  } finally {
+    process.env.PATH = savedPath;
+    await rm(gate, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+test("an embedded repo in an untracked directory whose name git would quote keeps the worktree before any staging", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("x6aaaa"));
+    for (const name of ['we"ird\tdir', "café"]) await nestedRepo(join(wt.path, name));
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /embedded git repository/);
+    assert.equal((await exec("git", ["-C", wt.path, "diff", "--cached", "--name-only"])).stdout.trim(), "");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("renamed files and unusual names are handled (status -z): a staged rename keeps the worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("ren001"));
+    await exec("git", ["-C", wt.path, "mv", "src/add.js", "src/plus.js"]);
+    await writeFile(join(wt.path, "src/plus.js"), "changed after staging\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /partially staged.*plus\.js/);
+  } finally {
+    await fixture.cleanup();
+  }
 });

@@ -491,15 +491,27 @@ start, every six hours while a session stays open, and on demand with `/gc`
   not itself ignored, keep the worktree. An ignored root `dist/` is treated as
   rebuildable output even if someone hand-wrote into it; keep such files
   elsewhere.
-- Otherwise uncommitted changes are staged in a temporary copy of the index (the
-  worktree's real index is replaced only after the commit succeeds) and committed
-  onto the worktree's own branch. Every keep check is then re-run immediately
-  before a plain (never `--force`d) `git worktree remove`, and the tree's newest
-  file mtime must not have moved; a file that appears in that last window keeps
-  the worktree. The branch is always kept. A namespace directory git no longer
-  lists is reported as a stray and its files are never removed (`git worktree
-  repair` may re-register it first, which only rewrites git metadata); delete it
-  yourself if you do not want it.
+- Otherwise uncommitted changes are staged in a temporary copy of the index
+  (the dry-run simulation also writes new objects to a throw-away object
+  directory) and committed onto the worktree's own branch; the real index is
+  replaced afterwards under `index.lock` with an atomic rename. A file that is
+  both staged and further modified (`MM`, `AM`, ...) keeps the worktree, since
+  restaging would lose the staged version. The repo's own `node_modules`
+  symlink that `createWorktree` provisions is never staged; on reclaim only the
+  link is unlinked.
+- Removal is guarded as follows. Every keep check runs, the checkout is moved
+  with `git worktree move` to a `reclaim-` quarantine name beside it, every
+  check runs again there (plus a comparison of the tree's newest mtime), and
+  only then does a plain (never `--force`d) `git worktree remove` run. If any
+  check fails the checkout is moved back. A writer that only knows the original
+  path can no longer reach the files. Residual window: a process with its
+  working directory already inside the checkout, or one that follows the
+  quarantine path, can still add an ignored file or a file in a root derived
+  folder between the final re-check and git's own removal; git itself refuses
+  for untracked files, but not for ignored ones. The branch is always kept. A
+  namespace directory git no longer lists is reported as a stray and its files
+  are never removed (`git worktree repair` may re-register it first, which only
+  rewrites git metadata); delete it yourself if you do not want it.
 - A reclaimed worktree's cargo target dir goes with it, and target dirs (see
   above) that no build touched for `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
 

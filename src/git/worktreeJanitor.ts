@@ -39,7 +39,21 @@
  */
 
 import { execFile } from "node:child_process";
-import { copyFile, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -79,7 +93,7 @@ export interface JanitorOptions {
   maxIdleMs?: number;
   /** Nothing younger than this is reclaimed. Default 1 h, env-raisable; never lower in production. */
   minAgeMs?: number;
-  /** Report what would happen without touching anything. */
+  /** Report what would happen without modifying the repository or any worktree (temporary files live in the OS temp dir). */
   dryRun?: boolean;
   now?: () => number;
 }
@@ -188,7 +202,7 @@ function isDerivedName(entry: string): boolean {
   return (DERIVED_DIRS as readonly string[]).includes(last);
 }
 
-const entryPath = (line: string): string => line.slice(3).replace(/^"|"$/g, "");
+const entryPath = (line: string): string => line.slice(3);
 
 const READ_ONLY_GIT = { trust: "operator", env: { GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 60_000 } as const;
 
@@ -244,44 +258,126 @@ async function isDisposableDerived(path: string, entry: string): Promise<boolean
   return ignored && !(await containsGitEntry(join(path, name)));
 }
 
-/** Raw `git status --porcelain --ignored` lines. Read-only: a refreshed index would reset the idle clock. */
-async function statusLines(path: string, indexFile?: string): Promise<string[]> {
-  const status = await safeGitOrThrow(["status", "--porcelain", "--ignored", "--untracked-files=normal"], {
+/**
+ * `GitRepo.createWorktree` symlinks the repo root's `node_modules` into every
+ * worktree. That symlink is provisioning, not user data: it is never staged,
+ * never counted as ignored/untracked content, and on reclaim only the link is
+ * unlinked (never followed). Returns the link's target when `path/node_modules`
+ * is exactly such a link.
+ */
+async function provisionedNodeModules(path: string, repoRoot: string): Promise<string | null> {
+  const link = join(path, "node_modules");
+  const l = await lstat(link).catch(() => null);
+  if (!l?.isSymbolicLink()) return null;
+  const [there, here] = await Promise.all([
+    realpath(link).catch(() => null),
+    realpath(join(repoRoot, "node_modules")).catch(() => null),
+  ]);
+  return there && here && there === here ? there : null;
+}
+
+/** Raw `git status --porcelain --ignored` lines, minus the provisioned node_modules link. Read-only: a refreshed index would reset the idle clock. */
+async function statusLines(path: string, repoRoot: string, indexFile?: string): Promise<string[]> {
+  const status = await safeGitOrThrow(["status", "--porcelain", "-z", "--ignored", "--untracked-files=normal"], {
     ...READ_ONLY_GIT,
     env: { ...READ_ONLY_GIT.env, ...(indexFile ? { GIT_INDEX_FILE: indexFile } : {}) },
     cwd: path,
     maxBuffer: 16 * 1024 * 1024,
   });
-  return status.stdout.split("\n").filter((line) => line.trim());
+  const provisioned = (await provisionedNodeModules(path, repoRoot)) !== null;
+  // -z: NUL-separated, paths unquoted. A rename/copy record is followed by its origin path: skip that.
+  const lines: string[] = [];
+  const tokens = status.stdout.split("\0");
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i] as string;
+    if (!t.trim()) continue;
+    if (/^[RC]|^.[RC]/.test(t)) i++;
+    lines.push(t);
+  }
+  return lines.filter((line) => !(provisioned && /^(\?\?|!!) node_modules\/?$/.test(line)));
+}
+
+/** Staged AND further modified entries (MM, AM, RM, AD, UU...): `add -A` would overwrite the staged-only version. */
+function partiallyStaged(lines: string[]): string[] {
+  return lines.filter((l) => !/^[ ?!]/.test(l) && l[1] !== " ").map(entryPath);
 }
 
 /**
  * Stage the worktree's changes into a COPY of its index, so the user's real
- * index is never touched unless the preserving commit is completed. Returns the
- * lines `git add` would leave behind (changes it cannot or will not stage).
+ * index is never touched unless the preserving commit is completed. With
+ * `simulate`, new objects go to a throw-away object directory (the real one is
+ * only an alternate), so a preview writes nothing into the repository. Returns
+ * the lines `git add` would leave behind (changes it cannot or will not stage).
  */
 async function stageInTempIndex(
   path: string,
+  repoRoot: string,
+  simulate: boolean,
 ): Promise<{ indexFile: string; remaining: string[]; dispose: () => Promise<void> }> {
   const gitDir = (
     await safeGitOrThrow(["rev-parse", "--absolute-git-dir"], { ...READ_ONLY_GIT, cwd: path })
   ).stdout.trim();
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-janitor-index-"));
   const indexFile = join(dir, "index");
-  await copyFile(join(gitDir, "index"), indexFile).catch(() => {});
+  await copyFileIfPresent(join(gitDir, "index"), indexFile);
   const dispose = () => rm(dir, { recursive: true, force: true }).catch(() => {});
   try {
-    await safeGitOrThrow(["add", "-A", "--", ".", ...DERIVED_DIRS.map((d) => `:(exclude,glob)**/${d}/**`)], {
-      cwd: path,
-      trust: "operator",
-      env: { GIT_INDEX_FILE: indexFile },
-      timeoutMs: 120_000,
-    });
+    const env: Record<string, string> = { GIT_INDEX_FILE: indexFile };
+    if (simulate) {
+      const objects = (
+        await safeGitOrThrow(["rev-parse", "--path-format=absolute", "--git-path", "objects"], {
+          ...READ_ONLY_GIT,
+          cwd: path,
+        })
+      ).stdout.trim();
+      env.GIT_OBJECT_DIRECTORY = join(dir, "objects");
+      await mkdir(env.GIT_OBJECT_DIRECTORY);
+      env.GIT_ALTERNATE_OBJECT_DIRECTORIES = objects;
+    }
+    // An already-ignored link needs no exclude (and git add complains about excluding ignored paths).
+    const provisioned =
+      (await provisionedNodeModules(path, repoRoot)) !== null &&
+      !(await safeGitOrThrow(["check-ignore", "-q", "--no-index", "node_modules"], { ...READ_ONLY_GIT, cwd: path })
+        .then(() => true)
+        .catch(() => false));
+    await safeGitOrThrow(
+      [
+        "add",
+        "-A",
+        "--",
+        ".",
+        ...DERIVED_DIRS.map((d) => `:(exclude,glob)**/${d}/**`),
+        ...(provisioned ? [":(exclude)node_modules"] : []),
+      ],
+      { cwd: path, trust: "operator", env, timeoutMs: 120_000 },
+    );
     // Anything whose worktree column (Y) is not clean, or untracked, was left behind.
-    const remaining = (await statusLines(path, indexFile)).filter((l) => !l.startsWith("!! ") && l[1] !== " ");
+    const remaining = (await statusLines(path, repoRoot, indexFile)).filter(
+      (l) => !l.startsWith("!! ") && l[1] !== " ",
+    );
     return { indexFile, remaining, dispose };
   } catch (error) {
     await dispose();
+    throw error;
+  }
+}
+
+async function copyFileIfPresent(from: string, to: string): Promise<void> {
+  const data = await readFile(from).catch(() => null);
+  if (data) await writeFile(to, data);
+}
+
+/** Replace `gitDir/index` atomically the way git does: take index.lock (fails if held), write, rename over. */
+async function installIndex(gitDir: string, indexFile: string): Promise<void> {
+  const lock = join(gitDir, "index.lock");
+  const handle = await open(lock, "wx");
+  try {
+    await handle.writeFile(await readFile(indexFile));
+    await handle.close();
+    await rename(lock, join(gitDir, "index"));
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await unlink(lock).catch(() => {});
     throw error;
   }
 }
@@ -357,7 +453,7 @@ async function reasonToKeep(
   const subs = await initializedSubmodules(wt.path);
   if (subs.length > 0)
     return `initialized submodule(s) ${preview(subs)}: their work is not part of this repository's commit`;
-  const lines = await statusLines(wt.path);
+  const lines = await statusLines(wt.path, repo.root);
   const ignored: string[] = [];
   for (const line of lines.filter((l) => l.startsWith("!! "))) {
     if (!(await isDisposableDerived(wt.path, entryPath(line)))) ignored.push(entryPath(line));
@@ -372,6 +468,10 @@ async function reasonToKeep(
   for (const dir of untrackedDirs) if (await containsGitEntry(join(wt.path, dir))) embedded.push(dir);
   if (embedded.length > 0)
     return `embedded git repository under ${preview(embedded)}: its commits are not part of this repository`;
+  const partial = partiallyStaged(lines);
+  if (partial.length > 0) {
+    return `partially staged (index differs from both HEAD and the worktree): ${preview(partial)}; restaging would lose the staged version`;
+  }
   const hidden = await hiddenIndexEntries(wt.path);
   if (hidden.length > 0) return `assume-unchanged/skip-worktree index entries hide edits from git: ${preview(hidden)}`;
   if (!wt.branch) {
@@ -386,10 +486,14 @@ async function reasonToKeep(
     return "its Rust cache key is the shared `_shared` fallback; not deleting a directory other checkouts use";
   }
   // Simulate the preserving commit's staging (same pathspec) so a preview never over-reports.
-  const staged = await stageInTempIndex(wt.path);
-  await staged.dispose();
-  if (staged.remaining.length > 0) {
-    return `changes would remain after the preserving commit (${staged.remaining.slice(0, 3).join("; ")})`;
+  try {
+    const staged = await stageInTempIndex(wt.path, repo.root, true);
+    await staged.dispose();
+    if (staged.remaining.length > 0) {
+      return `changes would remain after the preserving commit (${staged.remaining.slice(0, 3).join("; ")})`;
+    }
+  } catch (error) {
+    return `could not simulate the preserving commit, kept untouched: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`;
   }
   return null;
 }
@@ -400,15 +504,15 @@ async function reasonToKeep(
  * real index is replaced only once the commit succeeded. Returns the commit
  * sha, or null when there was nothing to commit.
  */
-async function preserveUncommittedWork(path: string, branch: string | null): Promise<string | null> {
-  if ((await statusLines(path)).every((l) => l.startsWith("!! "))) return null;
+async function preserveUncommittedWork(path: string, branch: string | null, repoRoot: string): Promise<string | null> {
+  if ((await statusLines(path, repoRoot)).every((l) => l.startsWith("!! "))) return null;
   const env = {
     GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "pi-engineering janitor",
     GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "pi-engineering@localhost",
     GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "pi-engineering janitor",
     GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "pi-engineering@localhost",
   };
-  const staged = await stageInTempIndex(path);
+  const staged = await stageInTempIndex(path, repoRoot, false);
   try {
     if (staged.remaining.length > 0) {
       throw new Error(`changes would remain after the preserving commit: ${staged.remaining.slice(0, 3).join("; ")}`);
@@ -429,7 +533,7 @@ async function preserveUncommittedWork(path: string, branch: string | null): Pro
     const gitDir = (
       await safeGitOrThrow(["rev-parse", "--absolute-git-dir"], { ...READ_ONLY_GIT, cwd: path })
     ).stdout.trim();
-    await copyFile(staged.indexFile, join(gitDir, "index"));
+    await installIndex(gitDir, staged.indexFile);
     const { stdout } = await safeGitOrThrow(["rev-parse", "HEAD"], { cwd: path, trust: "operator", timeoutMs: 30_000 });
     return stdout.trim();
   } finally {
@@ -585,17 +689,15 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         report.reclaimed.push({ path: wt.path, branch: wt.branch, preservedCommit: null, reason, bytes });
         continue;
       }
-      // Resolved while the worktree is still registered: it needs git.
-      const target = await rustTargetDir(wt.path).catch(() => null);
       const planSnapshot = await newestTreeMtime(wt.path);
       let preservedCommit: string | null;
       try {
-        preservedCommit = await preserveUncommittedWork(wt.path, wt.branch);
+        preservedCommit = await preserveUncommittedWork(wt.path, wt.branch, repo.root);
       } catch (error) {
         report.kept.push({
           path: wt.path,
           branch: wt.branch,
-          reason: `could not preserve uncommitted work, kept untouched: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`,
+          reason: `could not preserve uncommitted work, kept (a preserving commit may already be on the branch): ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`,
         });
         continue;
       }
@@ -612,23 +714,77 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         });
         continue;
       }
-      try {
-        // Plain remove, never --force: git refuses on locks and untracked files.
-        await safeGitOrThrow(["worktree", "remove", wt.path], {
+      // Resolved while the worktree is still registered at its original path
+      // (the key is derived from it); the shared fallback key is never deleted.
+      const target = await rustTargetDir(wt.path).catch(() => null);
+      // Quarantine: `git worktree move` (bookkeeping-aware, reversible) takes the checkout out from
+      // under any writer that only knows its original path, then everything is re-checked there.
+      const quarantined = join(
+        parent,
+        `${prefix}reclaim-${Date.now().toString(36)}-${basename(wt.path).slice(prefix.length)}`,
+      );
+      const moveBack = () =>
+        safeGitOrThrow(["worktree", "move", quarantined, wt.path], {
           cwd: repo.root,
           trust: "operator",
-          timeoutMs: 300_000,
+          timeoutMs: 60_000,
+        });
+      try {
+        await safeGitOrThrow(["worktree", "move", wt.path, quarantined], {
+          cwd: repo.root,
+          trust: "operator",
+          timeoutMs: 60_000,
         });
       } catch (error) {
         report.kept.push({
           path: wt.path,
           branch: wt.branch,
-          reason: `git worktree remove refused, kept (not forced): ${error instanceof Error ? error.message.split("\n")[0] : String(error)}${preservedCommit ? `; uncommitted work was preserved as ${preservedCommit}` : ""}`,
+          reason: `git worktree move to quarantine refused, kept: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}${preservedCommit ? `; uncommitted work was preserved as ${preservedCommit}` : ""}`,
         });
         continue;
       }
+      const moved = { ...wt, path: quarantined };
+      const lateQuarantined =
+        (await reasonToKeep(repo, moved, await lockedWorktreePaths(repo)).catch(
+          (e: unknown) => `re-check failed: ${e instanceof Error ? e.message : String(e)}`,
+        )) ??
+        ((await newestTreeMtime(quarantined)) > planSnapshot ? "files changed while it was being reclaimed" : null);
+      const restore = async (why: string): Promise<void> => {
+        const back = await moveBack().then(
+          () => null,
+          (e: unknown) => (e instanceof Error ? e.message.split("\n")[0] : String(e)),
+        );
+        report.kept.push({
+          path: back ? quarantined : wt.path,
+          branch: wt.branch,
+          reason: `${why}${preservedCommit ? `; uncommitted work was preserved as ${preservedCommit}` : ""}${back ? `; could not move it back from quarantine (${back})` : ""}`,
+        });
+      };
+      if (lateQuarantined) {
+        await restore(lateQuarantined);
+        continue;
+      }
+      // Provisioned node_modules is a symlink to the repo's own: unlink the link only, never follow it.
+      const linkTarget = await provisionedNodeModules(quarantined, repo.root);
+      if (linkTarget) await unlink(join(quarantined, "node_modules"));
+      try {
+        // Plain remove, never --force: git refuses on locks and untracked files.
+        await safeGitOrThrow(["worktree", "remove", quarantined], {
+          cwd: repo.root,
+          trust: "operator",
+          timeoutMs: 300_000,
+        });
+      } catch (error) {
+        if (linkTarget) await symlink(linkTarget, join(quarantined, "node_modules")).catch(() => {});
+        await restore(
+          `git worktree remove refused, kept (not forced): ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`,
+        );
+        continue;
+      }
       // The worktree's own cargo target dir is derived output; it goes with it.
-      if (target) await rm(target, { recursive: true, force: true }).catch(() => {});
+      if (target && basename(target) !== UNSCOPED_TARGET_KEY) {
+        await rm(target, { recursive: true, force: true }).catch(() => {});
+      }
       report.reclaimed.push({ path: wt.path, branch: wt.branch, preservedCommit, reason, bytes });
     } catch (error) {
       report.failed.push({
