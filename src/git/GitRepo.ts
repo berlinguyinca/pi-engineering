@@ -330,21 +330,43 @@ export class GitRepo {
     return { stdout: opts.preserveStdout ? r.stdout : r.stdout.trim(), stderr: r.stderr.trim(), code: r.code };
   }
 
-  private identityFallback: Promise<string[]> | undefined;
+  /**
+   * Whether `path` exists. Only ENOENT/ENOTDIR mean gone; any other error (EACCES, ESTALE, EIO...)
+   * is unknown, so it throws rather than let a live worktree's administration be treated as vanished.
+   */
+  private async pathExists(path: string): Promise<boolean> {
+    try {
+      await lstat(path);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
+      throw new Error(`cannot tell whether ${path} exists (${code ?? String(error)}); nothing was changed`);
+    }
+  }
+
+  private readonly identityFallbacks = new Map<string, Promise<string[]>>();
 
   /**
-   * `-c` options giving merge commits an identity ONLY when git has none
-   * configured (CI runners, fresh containers); a configured identity is kept.
+   * `-c` options giving commits an identity ONLY for the key git lacks (CI runners, fresh containers);
+   * a configured name or email is kept. Read in `cwd` (the worktree that commits).
    */
-  private fallbackIdentityArgs(): Promise<string[]> {
-    this.identityFallback ??= (async () => {
-      const name = await this.git(["config", "--get", "user.name"]);
-      const email = await this.git(["config", "--get", "user.email"]);
-      return name.code === 0 && name.stdout && email.code === 0 && email.stdout
-        ? []
-        : ["-c", "user.name=pi-engineering", "-c", "user.email=lanes@pi-engineering.local"];
-    })();
-    return this.identityFallback;
+  private fallbackIdentityArgs(cwd: string = this.repoRoot): Promise<string[]> {
+    let cached = this.identityFallbacks.get(cwd);
+    if (!cached) {
+      cached = (async () => {
+        const configured = async (key: string): Promise<boolean> => {
+          const r = await this.git(["-C", cwd, "config", "--get", key]);
+          return r.code === 0 && r.stdout !== "";
+        };
+        return [
+          ...((await configured("user.name")) ? [] : ["-c", "user.name=pi-engineering"]),
+          ...((await configured("user.email")) ? [] : ["-c", "user.email=lanes@pi-engineering.local"]),
+        ];
+      })();
+      this.identityFallbacks.set(cwd, cached);
+    }
+    return cached;
   }
 
   private requireQuery(result: GitResult, operation: string, args: readonly string[]): GitResult {
@@ -1745,10 +1767,7 @@ export class GitRepo {
    * Never uses `--force`, `rm -rf` or `branch -D`.
    */
   private async clearStaleWorktreeTarget(path: string, branch: string, guard?: GitMutationGuard): Promise<void> {
-    const present = await lstat(path).then(
-      () => true,
-      () => false,
-    );
+    const present = await this.pathExists(path);
     const real = present ? await realpath(path).catch(() => path) : path;
     const registered = (await this.registeredWorktrees()).find((w) => w.path === path || w.path === real);
     if (registered) {
@@ -2026,12 +2045,7 @@ export class GitRepo {
    */
   private async forgetWorktreeAdmin(path: string): Promise<string | null> {
     // Metadata only: while the directory exists it may be a copy or another spelling of a LIVE worktree.
-    if (
-      await lstat(path).then(
-        () => true,
-        () => false,
-      )
-    ) {
+    if (await this.pathExists(path)) {
       return `${path} still exists; only the administration of a vanished worktree is forgotten`;
     }
     const admin = await this.adminDirFor(path);
@@ -2081,10 +2095,7 @@ export class GitRepo {
   private async adminDirFor(path: string): Promise<string | null> {
     const common = await this.commonGitDir();
     if (common === null) return null;
-    const present = await lstat(path).then(
-      () => true,
-      () => false,
-    );
+    const present = await this.pathExists(path);
     if (present) {
       const own = await this.git(["-C", path, "rev-parse", "--absolute-git-dir"]);
       if (own.code === 0 && own.stdout) {
@@ -2543,7 +2554,14 @@ export class GitRepo {
       };
     }
     guard?.assertAuthoritative();
-    const args = ["-C", worktree.path, ...(await this.fallbackIdentityArgs()), "rebase", "--quiet", ontoSha];
+    const args = [
+      "-C",
+      worktree.path,
+      ...(await this.fallbackIdentityArgs(worktree.path)),
+      "rebase",
+      "--quiet",
+      ontoSha,
+    ];
     const r = await this.git(args);
     if (r.code !== 0) {
       const text = `${r.stderr}\n${r.stdout}`;

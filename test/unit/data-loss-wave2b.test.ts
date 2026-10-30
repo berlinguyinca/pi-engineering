@@ -1282,6 +1282,59 @@ test("rebaseWorktreeOnto works when git has no identity (the -c options precede 
   }
 });
 
+test(
+  "an unreadable parent (EACCES) is not 'directory gone': the live worktree's admin dir survives",
+  {
+    skip: process.getuid?.() === 0 ? "root ignores directory permissions" : false,
+  },
+  async () => {
+    const { head, git, dir } = await scratchRepo();
+    const parent = realpathSync(mkdtempSync(join(tmpdir(), "w2b-eacces-")));
+    const path = join(parent, "pi-eng-live");
+    await g(dir, "worktree", "add", "-q", "-b", "live-eacces", path, head);
+    writeFileSync(join(path, "staged.txt"), "STAGED");
+    await g(path, "add", "staged.txt");
+    const admin = adminOf(dir, path);
+    const priv = git as unknown as {
+      forgetWorktreeAdmin(p: string): Promise<string | null>;
+      clearStaleWorktreeTarget(p: string, b: string): Promise<void>;
+    };
+    chmodSync(parent, 0o000);
+    try {
+      await assert.rejects(priv.forgetWorktreeAdmin(path), /cannot tell whether .* exists \(EACCES\)/);
+      await assert.rejects(priv.clearStaleWorktreeTarget(path, "live-eacces"), /EACCES/);
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+    assert.ok(existsSync(join(admin, "index")));
+    assert.match(await g(path, "status", "--short"), /^A\s+staged\.txt/m);
+  },
+);
+
+test("fallbackIdentityArgs fills in only the missing key", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const saved = { global: process.env.GIT_CONFIG_GLOBAL, nosys: process.env.GIT_CONFIG_NOSYSTEM };
+  process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+  process.env.GIT_CONFIG_NOSYSTEM = "1";
+  const ask = async (cwd?: string): Promise<string[]> => {
+    const fresh = await GitRepo.open(dir);
+    assert.ok(fresh);
+    return (fresh as unknown as { fallbackIdentityArgs(c?: string): Promise<string[]> }).fallbackIdentityArgs(cwd);
+  };
+  try {
+    assert.deepEqual(await ask(), []); // scratchRepo configures both
+    await g(dir, "config", "--unset", "user.email");
+    assert.deepEqual(await ask(), ["-c", "user.email=lanes@pi-engineering.local"]);
+    await g(dir, "config", "--unset", "user.name");
+    assert.deepEqual(await ask(), ["-c", "user.name=pi-engineering", "-c", "user.email=lanes@pi-engineering.local"]);
+  } finally {
+    if (saved.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = saved.global;
+    if (saved.nosys === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+    else process.env.GIT_CONFIG_NOSYSTEM = saved.nosys;
+  }
+});
+
 test("restoreCheckpoint recovers the NEWEST leftover (by timestamp, not pid) and keeps a recovered copy when swapping", async () => {
   const root = mkdtempSync(join(tmpdir(), "w2b-ck4-"));
   const checkpoint = join(root, "cp");
