@@ -126,7 +126,8 @@ async function main(): Promise<number> {
 async function doctorCommand(rest: string[]): Promise<number> {
   const cwdIndex = rest.indexOf("--cwd");
   const cwd = cwdIndex >= 0 && rest[cwdIndex + 1] ? resolve(rest[cwdIndex + 1]!) : process.cwd();
-  const report = await runDoctor({ cwd, repair: rest.includes("--repair") });
+  const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
+  const report = await runDoctor({ cwd, repair: rest.includes("--repair"), agentDir: getAgentDir() });
   console.log(rest.includes("--json") ? JSON.stringify(report, null, 2) : formatDoctorReport(report));
   return doctorExitCode(report);
 }

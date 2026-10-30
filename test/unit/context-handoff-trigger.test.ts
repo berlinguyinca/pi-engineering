@@ -382,7 +382,7 @@ describe("buildContinuityConfig (EngineeringRuntime wiring)", () => {
     try {
       writeFileSync(
         join(dir, "engineering.yaml"),
-        "context_thresholds:\n  runtimes:\n    gw: { preferred: 0.75 }\n  models:\n    special: { soft: 0.5, preferred: 0.6, emergency: 0.7 }\nquota_fallbacks:\n  roles:\n    implementer: [special, nowindow, gw/test, unlisted]\n",
+        "context_thresholds:\n  runtimes:\n    gw: { preferred: 0.75 }\n  models:\n    special: { soft: 0.5, preferred: 0.6, emergency: 0.7 }\nquota_fallbacks:\n  roles:\n    implementer: [special, nowindow, gw/test]\n",
       );
       const cfg = await buildContinuityConfig({
         agentDir: dir,
@@ -406,11 +406,23 @@ describe("buildContinuityConfig (EngineeringRuntime wiring)", () => {
           ["special", true],
           ["nowindow", false],
           ["gw/test", true],
-          ["unlisted", false],
         ],
-        "only the operator's ordered list, never the whole registry; unavailable/unknown models are ineligible",
+        "only the operator's ordered list, never the whole registry; unavailable models are ineligible",
       );
       assert.deepEqual(cfg.quotaCatalogue?.("reviewer"), [], "no list for the role and no default: none configured");
+      // An id that is not in the registry is a config error: fail-closed, the whole block is dropped and logged.
+      writeFileSync(
+        join(dir, "engineering.yaml"),
+        "quota_fallbacks:\n  roles:\n    implementer: [special, unlisted]\n",
+      );
+      const logs: string[] = [];
+      const closed = await buildContinuityConfig({
+        agentDir: dir,
+        models: async () => [{ provider: "gw", id: "special", contextWindow: 100000 }],
+        log: (l) => logs.push(l),
+      });
+      assert.deepEqual(closed.quotaCatalogue?.("implementer"), []);
+      assert.ok(logs.some((l) => /\[quota-fallbacks\] ERROR .*unlisted/.test(l)));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

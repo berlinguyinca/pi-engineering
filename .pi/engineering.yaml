@@ -128,3 +128,42 @@ routing:
     # loop_prevented (no_mutation_stall); if the implementer stalls the same
     # way, the operator flips the pin (or /model) to flint/flint-40b — also
     # served — and resumes. Backup: engineering.yaml.bak-20261025-point-at-deepseek.
+
+# ---------------------------------------------------------------------------
+# quota_fallbacks — OPT-IN model switch when a run exhausts its provider quota.
+#
+# THIS BLOCK IS NOT READ FROM THIS FILE. Quota fallbacks are operator-owned and
+# are read ONLY from the GLOBAL engineering.yaml (<pi agent dir>/engineering.yaml,
+# by default ~/.pi/agent/engineering.yaml). Copy the block below there and remove
+# the leading "# ". Without it nothing switches: the quota handoff blocks and says
+# "no quota_fallbacks configured". (The tests uncomment the region between the two
+# BEGIN/END markers and validate it, so keep the markers and the "# " prefix.)
+#
+# Rules:
+#  * Prefer SAME-PROVIDER-FAMILY fallbacks per role (a quota-exhausted 27b q8
+#    implementer falls back to the 27b q4, not to an unrelated model).
+#  * Every id must exist in the model registry: `provider/id` or the plain id as
+#    the registry lists it. Unknown ids, duplicates in a list, non-string entries,
+#    unknown keys, wrong shapes, and a list holding only the role's own pinned
+#    model are ERRORS: the whole block is then ignored (fail-closed, no switching)
+#    and startup logs "[quota-fallbacks] ERROR ..." (`pi-engineering doctor` checks
+#    the shape too). If the registry cannot be read ids are not checked (warning).
+#  * ORDER = PREFERENCE: the first eligible model that has not already run out of
+#    quota for the task wins.
+#  * A chain ENDS when the list is spent ("fallback list exhausted"): it never
+#    returns to a model that already ran out, so two models never ping-pong.
+#  * A role without its own list uses `default`. An empty or missing list means no
+#    fallback: the handoff stays BLOCKED with a clear reason; the source is not
+#    fenced and no model is picked on your behalf.
+#  * A successor only runs if the task has a retry left: the planned task's
+#    max_attempts must be >= 2 (planner default is 3). With max_attempts: 1 the
+#    handoff aborts with "no retry budget left" and the source keeps running.
+#
+# BEGIN quota_fallbacks example
+# quota_fallbacks:
+#   roles:
+#     planner: [metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl]
+#     implementer: [metabolomics/qwen3.8-27b-modality-vision-quant-q4_k_m]
+#     reviewer: [metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl]
+#   default: [metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4]
+# END quota_fallbacks example

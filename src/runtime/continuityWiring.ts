@@ -8,7 +8,7 @@
 import type { ContextThresholds } from "../context/thresholds.ts";
 import { loadContextThresholdConfig, resolveContextThresholds } from "../context/thresholds.ts";
 import type { OrchestratorOptions } from "../orchestration/orchestrator.ts";
-import { loadQuotaFallbackConfig, quotaFallbacksFor } from "./quotaFallbackConfig.ts";
+import { loadValidatedQuotaFallbacks, quotaFallbacksFor } from "./quotaFallbackConfig.ts";
 
 export interface RegistryModel {
   provider: string;
@@ -20,6 +20,8 @@ export async function buildContinuityConfig(input: {
   agentDir: string;
   models: () => Promise<readonly RegistryModel[]>;
   isModelUnavailable?: (model: { provider: string; id: string }) => boolean;
+  /** role -> pinned model (`routing.roles.<role>.model`), so a list of only the role's own model is rejected. */
+  rolePins?: Record<string, string | undefined>;
   log?: (line: string) => void;
 }): Promise<NonNullable<OrchestratorOptions["phaseHandoff"]>> {
   const { config, notes } = await loadContextThresholdConfig(input.agentDir);
@@ -37,8 +39,15 @@ export async function buildContinuityConfig(input: {
   } catch (error) {
     input.log?.(`[context-thresholds] model registry unreadable (${error instanceof Error ? error.message : error})`);
   }
-  const quota = await loadQuotaFallbackConfig(input.agentDir);
-  for (const note of quota.notes) input.log?.(`[quota-fallbacks] ${note}`);
+  // Fail-closed: any error in the block disables quota switching entirely (handoff then blocks with a reason); it
+  // never half-trusts a list. Unknown ids are only errors when the registry could be read.
+  const quota = await loadValidatedQuotaFallbacks(input.agentDir, {
+    registry,
+    ...(input.rolePins ? { rolePins: input.rolePins } : {}),
+  });
+  for (const e of quota.errors)
+    input.log?.(`[quota-fallbacks] ERROR ${e}; quota model switching is DISABLED until fixed`);
+  for (const w of quota.warnings) input.log?.(`[quota-fallbacks] WARNING ${w}`);
   const windows = new Map<string, number>();
   const providers = new Map<string, string>();
   for (const m of registry) {
