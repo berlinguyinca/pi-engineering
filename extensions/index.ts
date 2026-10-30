@@ -105,7 +105,7 @@ import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.t
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { resolveStateRoot } from "../src/runtime/isolation/stateDir.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
-import { describeHousekeeping, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
+import { describeHousekeeping, gcDryRun, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
 import {
   clearOperatorModelPin,
   describeMissionControl,
@@ -745,8 +745,8 @@ export default function (pi: ExtensionAPI) {
   // Dry-run by default. Owner rule 2026-10-30, superseding the 2026-10-29
   // decision to default on: "we can't lose data due to sweeps". Automatic
   // sweeps act only with an explicit PI_HOUSEKEEPING=1|true|on|yes; =0 disables.
-  // `/gc` is the explicit operator action (`/gc --dry-run` previews) and
-  // lists what it kept and why.
+  // `/gc` previews by default; `/gc --apply` is the explicit operator action.
+  // Either way it lists what it kept and why.
   const hkMode = housekeepingMode(process.env);
   const housekeepingEnabled = hkMode !== "off";
   // First sweep waits this long so a session that reloads or exits at once
@@ -796,13 +796,13 @@ export default function (pi: ExtensionAPI) {
   }
   pi.registerCommand("gc", {
     description:
-      "Reclaim abandoned pi-eng candidate worktrees and expired Rust build caches; lists what was kept and why (--dry-run to preview).",
+      "Preview which abandoned pi-eng candidate worktrees and expired Rust build caches housekeeping would reclaim, and what it keeps and why. Nothing is removed unless you pass --apply (--dry-run is the default and accepted as an alias).",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
-      const dryRun = argv.includes("--dry-run");
+      const dryRun = gcDryRun(args);
       const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
       const result = await runHousekeeping({ cwd: ctx.cwd, missions: runtime?.missionStore, dryRun });
       const lines = describeHousekeeping(result, { verbose: true });
+      if (dryRun) lines.push("Preview only: nothing was removed. Run `/gc --apply` to reclaim what is listed above.");
       ctx.ui.notify(
         lines.length > 0 ? lines.join("\n") : "Nothing to reclaim.",
         result.worktrees?.failed.length ? "warning" : "info",

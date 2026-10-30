@@ -461,7 +461,7 @@ a crashed session, a killed worker or a mission that never reached a terminal
 state leaves `pi-eng-<hash>-<branch>` checkouts next to the repository, each a
 full working tree plus whatever the worker built. Housekeeping runs at session
 start, every six hours while a session stays open, and on demand with `/gc`
-(`/gc --dry-run` previews):
+(`/gc` previews by default; `/gc --apply` acts; `--dry-run` is accepted as an alias):
 
 - Only worktrees on `pi-eng-candidate-*` / `pi-eng-orch-*` branches in the
   runtime's own namespace (`pi-eng-<hash(repoRoot)>-*` siblings of the repo
@@ -477,7 +477,12 @@ start, every six hours while a session stays open, and on demand with `/gc`
   mission is durably `COMPLETE` or `CANCELED`; no owner means it is kept, however
   idle (`MSN-ext-*`/`MSN-local-*` ids parse truncated and so are always kept).
   It is also kept and reported, before anything is committed, when git has it
-  locked; it holds an initialized submodule or an untracked embedded git
+  locked; a git operation is in progress in it (rebase incl. `--autostash`,
+  merge, cherry-pick, revert, bisect; their state lives only in the git dir);
+  an `index.lock` exists (never removed; one a crashed janitor run left is
+  reported as stale and still kept); per-worktree refs (`refs/worktree/*`,
+  `refs/bisect/*`, `refs/rewritten/*`) exist or its HEAD reflog (scanned up to
+  1000 entries) holds a commit no branch or tag contains; it holds an initialized submodule or an untracked embedded git
   repository; it holds ignored files other than disposable derived folders;
   an untracked derived folder would block a plain remove; assume-unchanged or
   skip-worktree index entries could hide edits; its HEAD is detached and dirty or
@@ -504,7 +509,10 @@ start, every six hours while a session stays open, and on demand with `/gc`
   check runs again there (plus a comparison of the tree's newest mtime), and
   only then does a plain (never `--force`d) `git worktree remove` run. If any
   check fails the checkout is moved back. A writer that only knows the original
-  path can no longer reach the files. Residual window: a process with its
+  path can no longer reach the files. Accepted residual (not fixed in this
+  wave; wave 2 should delete a quarantined checkout only on a later sweep after
+  the minimum age and a fresh re-check, and `/gc` therefore previews by
+  default): a process with its
   working directory already inside the checkout, or one that follows the
   quarantine path, can still add an ignored file or a file in a root derived
   folder between the final re-check and git's own removal; git itself refuses
@@ -517,7 +525,7 @@ start, every six hours while a session stays open, and on demand with `/gc`
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_HOUSEKEEPING` | dry-run | Automatic housekeeping only reports by default (owner rule 2026-10-30: nothing is deleted by a sweep unless you opt in); `1`/`true`/`on`/`yes` lets it act, `0`/`false`/`off`/`no` disables it. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` is the explicit action (`/gc --dry-run` previews) and lists what it kept and why |
+| `PI_HOUSEKEEPING` | dry-run | Automatic housekeeping only reports by default (owner rule 2026-10-30: nothing is deleted by a sweep unless you opt in); `1`/`true`/`on`/`yes` lets it act, `0`/`false`/`off`/`no` disables it. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` previews by default and lists what it kept and why; `/gc --apply` is the explicit action |
 | `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
 | `PI_WORKTREE_IDLE_HOURS` | `24` | Retained for compatibility; governs nothing now. A worktree with no parsable mission/task owner is kept, never reclaimed by age. `PI_WORKTREE_MIN_AGE_HOURS` still sets the minimum age for a terminal-owner reclaim |
 

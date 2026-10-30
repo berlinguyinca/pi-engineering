@@ -39,6 +39,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -46,6 +47,7 @@ import {
   open,
   readFile,
   readdir,
+  readlink,
   realpath,
   rename,
   rm,
@@ -93,7 +95,11 @@ export interface JanitorOptions {
   maxIdleMs?: number;
   /** Nothing younger than this is reclaimed. Default 1 h, env-raisable; never lower in production. */
   minAgeMs?: number;
-  /** Report what would happen without modifying the repository or any worktree (temporary files live in the OS temp dir). */
+  /**
+   * Report what would happen. No ref, index, worktree file or new object is written to the repository;
+   * temporary files live in the OS temp dir. Git itself may re-touch the mtime of an existing identical
+   * loose object it would otherwise have written (object "freshening").
+   */
   dryRun?: boolean;
   now?: () => number;
 }
@@ -319,9 +325,9 @@ async function stageInTempIndex(
   ).stdout.trim();
   const dir = await mkdtemp(join(tmpdir(), "pi-eng-janitor-index-"));
   const indexFile = join(dir, "index");
-  await copyFileIfPresent(join(gitDir, "index"), indexFile);
   const dispose = () => rm(dir, { recursive: true, force: true }).catch(() => {});
   try {
+    await copyFileIfPresent(join(gitDir, "index"), indexFile);
     const env: Record<string, string> = { GIT_INDEX_FILE: indexFile };
     if (simulate) {
       const objects = (
@@ -367,19 +373,103 @@ async function copyFileIfPresent(from: string, to: string): Promise<void> {
   if (data) await writeFile(to, data);
 }
 
-/** Replace `gitDir/index` atomically the way git does: take index.lock (fails if held), write, rename over. */
-async function installIndex(gitDir: string, indexFile: string): Promise<void> {
+const LOCK_MARKER = /^pi-eng-janitor pid=(\d+) ts=(\d+)/;
+const STALE_LOCK_MS = 60 * 60 * 1000;
+
+const sha1 = (data: Buffer): string => createHash("sha1").update(data).digest("hex");
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Take `index.lock` (fails if anyone holds it). The content marks it as ours so a crash leaves an identifiable lock. */
+async function takeIndexLock(gitDir: string): Promise<string> {
   const lock = join(gitDir, "index.lock");
   const handle = await open(lock, "wx");
   try {
-    await handle.writeFile(await readFile(indexFile));
+    await handle.writeFile(`pi-eng-janitor pid=${process.pid} ts=${Date.now()}\n`);
+  } finally {
     await handle.close();
-    await rename(lock, join(gitDir, "index"));
-  } catch (error) {
-    await handle.close().catch(() => {});
-    await unlink(lock).catch(() => {});
-    throw error;
   }
+  return lock;
+}
+
+/** Install the new index while the lock is held: write beside it, rename over, release the lock. */
+async function installIndexUnderLock(gitDir: string, lock: string, indexFile: string): Promise<void> {
+  const next = join(gitDir, "index.pi-eng-new");
+  await writeFile(next, await readFile(indexFile));
+  await rename(next, join(gitDir, "index"));
+  await unlink(lock);
+}
+
+/**
+ * Why an index.lock keeps the worktree. Never deleted: a lock may be a live git
+ * command or a killed worker's; only a lock this janitor wrote (pid marker) whose
+ * pid is dead and older than an hour is called stale, and is still kept.
+ */
+async function indexLockReason(gitDir: string): Promise<string | null> {
+  const lock = join(gitDir, "index.lock");
+  const st = await stat(lock).catch(() => null);
+  if (!st) return null;
+  const marker = LOCK_MARKER.exec(await readFile(lock, "utf8").catch(() => ""));
+  if (marker && !pidAlive(Number(marker[1])) && Date.now() - Number(marker[2]) > STALE_LOCK_MS) {
+    return `stale index.lock left by a dead janitor run (pid ${marker[1]}); a preserving commit may exist on the branch; remove the lock yourself after checking \`git status\``;
+  }
+  return "index.lock present (a git command may be running or was killed); never removed by housekeeping";
+}
+
+/** In-progress git operations whose state lives only in the git dir (autostash, todo lists, merge parents...). */
+const OPERATION_MARKERS = [
+  ["rebase-merge", "rebase in progress"],
+  ["rebase-apply", "rebase/am in progress"],
+  ["sequencer", "cherry-pick/revert sequence in progress"],
+  ["MERGE_HEAD", "merge in progress"],
+  ["CHERRY_PICK_HEAD", "cherry-pick in progress"],
+  ["REVERT_HEAD", "revert in progress"],
+  ["BISECT_LOG", "bisect in progress"],
+  ["MERGE_AUTOSTASH", "merge with autostash in progress"],
+  ["AUTO_MERGE", "merge state present (AUTO_MERGE)"],
+] as const;
+
+async function operationInProgress(gitDir: string): Promise<string | null> {
+  for (const [marker, why] of OPERATION_MARKERS) {
+    if (await stat(join(gitDir, marker)).catch(() => null)) {
+      return `${why} (${marker} in the git dir); its state is not part of any branch, so removing the checkout would lose it`;
+    }
+  }
+  return null;
+}
+
+/** Commits only the worktree itself can reach: per-worktree refs, or HEAD-reflog commits no branch/tag contains. */
+async function worktreeOnlyHistory(path: string): Promise<string | null> {
+  const refs = await safeGitOrThrow(
+    ["for-each-ref", "--format=%(refname)", "refs/worktree", "refs/bisect", "refs/rewritten"],
+    {
+      ...READ_ONLY_GIT,
+      cwd: path,
+    },
+  );
+  if (refs.stdout.trim())
+    return `per-worktree refs exist (${preview(refs.stdout.trim().split("\n"))}); they vanish with the worktree`;
+  const log = await safeGitOrThrow(["log", "-g", "--format=%H", "-n", "1001", "HEAD"], {
+    ...READ_ONLY_GIT,
+    cwd: path,
+  }).catch(() => null);
+  const shas = [...new Set((log?.stdout ?? "").split("\n").filter(Boolean))];
+  if (shas.length > 1000) return "HEAD reflog has more than 1000 entries; not scanned, kept";
+  if (shas.length === 0) return null;
+  const lost = await safeGitOrThrow(["rev-list", "--max-count=1", ...shas, "--not", "--branches", "--tags"], {
+    ...READ_ONLY_GIT,
+    cwd: path,
+  });
+  return lost.stdout.trim()
+    ? `commit ${lost.stdout.trim().slice(0, 12)} is only in this worktree's HEAD reflog (no branch or tag contains it); removing would lose it`
+    : null;
 }
 
 /** Paths git reports `locked` in `worktree list --porcelain` (GitRepo's listing drops the flag). */
@@ -429,7 +519,14 @@ async function isReachableFromRef(repo: GitRepo, commit: string): Promise<boolea
 
 /** Branch name, or for a detached worktree the folder-name suffix (`<prefix><branch>`). */
 function ownerName(repo: GitRepo, wt: { path: string; branch: string | null }): string {
-  return wt.branch ?? basename(wt.path).slice(repo.worktreeNamespacePrefix().length);
+  return wt.branch ?? originalName(repo, wt.path);
+}
+
+/** Folder name without the namespace prefix and any `reclaim-<ts>-` quarantine prefixes a crashed run left. */
+function originalName(repo: GitRepo, path: string): string {
+  return basename(path)
+    .slice(repo.worktreeNamespacePrefix().length)
+    .replace(/^(reclaim-[a-z0-9]+-)+/, "");
 }
 
 /** Only pi-eng candidate/orchestrator branches (or their detached worktrees, by name) are the runtime's own. */
@@ -450,6 +547,13 @@ async function reasonToKeep(
   locked: Set<string>,
 ): Promise<string | null> {
   if (locked.has(wt.path)) return "locked by git (`git worktree lock`); left untouched";
+  const gitDir = (
+    await safeGitOrThrow(["rev-parse", "--absolute-git-dir"], { ...READ_ONLY_GIT, cwd: wt.path })
+  ).stdout.trim();
+  const lockWhy = await indexLockReason(gitDir);
+  if (lockWhy) return lockWhy;
+  const opWhy = await operationInProgress(gitDir);
+  if (opWhy) return opWhy;
   const subs = await initializedSubmodules(wt.path);
   if (subs.length > 0)
     return `initialized submodule(s) ${preview(subs)}: their work is not part of this repository's commit`;
@@ -481,6 +585,8 @@ async function reasonToKeep(
     }
     if (dirty) return "detached HEAD with uncommitted changes that could not be kept on a branch";
   }
+  const onlyHere = await worktreeOnlyHistory(wt.path);
+  if (onlyHere) return onlyHere;
   const target = await rustTargetDir(wt.path).catch(() => null);
   if (target && basename(target) === UNSCOPED_TARGET_KEY) {
     return "its Rust cache key is the shared `_shared` fallback; not deleting a directory other checkouts use";
@@ -512,7 +618,14 @@ async function preserveUncommittedWork(path: string, branch: string | null, repo
     GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "pi-engineering janitor",
     GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "pi-engineering@localhost",
   };
+  const gitDir = (
+    await safeGitOrThrow(["rev-parse", "--absolute-git-dir"], { ...READ_ONLY_GIT, cwd: path })
+  ).stdout.trim();
+  const realIndex = join(gitDir, "index");
+  const snapshot = await readFile(realIndex).then(sha1, () => "");
   const staged = await stageInTempIndex(path, repoRoot, false);
+  let lock: string | null = null;
+  let committed = false;
   try {
     if (staged.remaining.length > 0) {
       throw new Error(`changes would remain after the preserving commit: ${staged.remaining.slice(0, 3).join("; ")}`);
@@ -520,6 +633,11 @@ async function preserveUncommittedWork(path: string, branch: string | null, repo
     const base = { cwd: path, trust: "operator", env: { ...env, GIT_INDEX_FILE: staged.indexFile } } as const;
     const names = await safeGitOrThrow(["diff", "--cached", "--name-only"], { ...base, timeoutMs: 60_000 });
     if (!names.stdout.trim()) return null;
+    // Hold index.lock from here to the end so no other git command can move the real index under us.
+    lock = await takeIndexLock(gitDir);
+    if ((await readFile(realIndex).then(sha1, () => "")) !== snapshot) {
+      throw new Error("the index changed while the preserving commit was being prepared");
+    }
     await safeGitOrThrow(
       [
         "commit",
@@ -530,12 +648,16 @@ async function preserveUncommittedWork(path: string, branch: string | null, repo
       ],
       { ...base, timeoutMs: 120_000 },
     );
-    const gitDir = (
-      await safeGitOrThrow(["rev-parse", "--absolute-git-dir"], { ...READ_ONLY_GIT, cwd: path })
-    ).stdout.trim();
-    await installIndex(gitDir, staged.indexFile);
+    committed = true;
+    await installIndexUnderLock(gitDir, lock, staged.indexFile);
+    lock = null;
     const { stdout } = await safeGitOrThrow(["rev-parse", "HEAD"], { cwd: path, trust: "operator", timeoutMs: 30_000 });
     return stdout.trim();
+  } catch (error) {
+    // Before the commit the lock is ours to drop; after it, leave the marked lock so a stale
+    // real index can never be used silently (it keeps the worktree until a human looks).
+    if (lock && !committed) await unlink(lock).catch(() => {});
+    throw error;
   } finally {
     await staged.dispose();
   }
@@ -596,7 +718,10 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
     });
   }
 
-  const referenced = await repo.durablyReferencedWorktreePaths([...registered.keys()]);
+  const originalPath = (path: string): string => join(parent, `${prefix}${originalName(repo, path)}`);
+  const referenced = await repo.durablyReferencedWorktreePaths([
+    ...new Set([...registered.keys()].flatMap((p) => [p, originalPath(p)])),
+  ]);
   const locked = await lockedWorktreePaths(repo);
 
   for (const wt of registered.values()) {
@@ -616,7 +741,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
     }
     // A durable candidate/cleanup record still names this checkout: the
     // mission's recovery path owns its removal, never the janitor.
-    if (referenced.has(wt.path)) {
+    if (referenced.has(wt.path) || referenced.has(originalPath(wt.path))) {
       report.kept.push({ path: wt.path, branch: wt.branch, reason: "a durable mission record still references it" });
       continue;
     }
@@ -719,10 +844,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       const target = await rustTargetDir(wt.path).catch(() => null);
       // Quarantine: `git worktree move` (bookkeeping-aware, reversible) takes the checkout out from
       // under any writer that only knows its original path, then everything is re-checked there.
-      const quarantined = join(
-        parent,
-        `${prefix}reclaim-${Date.now().toString(36)}-${basename(wt.path).slice(prefix.length)}`,
-      );
+      const quarantined = join(parent, `${prefix}reclaim-${Date.now().toString(36)}-${originalName(repo, wt.path)}`);
       const moveBack = () =>
         safeGitOrThrow(["worktree", "move", quarantined, wt.path], {
           cwd: repo.root,
@@ -765,8 +887,10 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         continue;
       }
       // Provisioned node_modules is a symlink to the repo's own: unlink the link only, never follow it.
-      const linkTarget = await provisionedNodeModules(quarantined, repo.root);
-      if (linkTarget) await unlink(join(quarantined, "node_modules"));
+      const provisioned = await provisionedNodeModules(quarantined, repo.root);
+      const linkText = provisioned ? await readlink(join(quarantined, "node_modules")) : null;
+      let linkRestoreFailed = "";
+      if (linkText !== null) await unlink(join(quarantined, "node_modules"));
       try {
         // Plain remove, never --force: git refuses on locks and untracked files.
         await safeGitOrThrow(["worktree", "remove", quarantined], {
@@ -775,9 +899,13 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
           timeoutMs: 300_000,
         });
       } catch (error) {
-        if (linkTarget) await symlink(linkTarget, join(quarantined, "node_modules")).catch(() => {});
+        if (linkText !== null) {
+          await symlink(linkText, join(quarantined, "node_modules")).catch((e: unknown) => {
+            linkRestoreFailed = `; could not restore the node_modules symlink (${e instanceof Error ? e.message : String(e)})`;
+          });
+        }
         await restore(
-          `git worktree remove refused, kept (not forced): ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`,
+          `git worktree remove refused, kept (not forced): ${error instanceof Error ? error.message.split("\n")[0] : String(error)}${linkRestoreFailed}`,
         );
         continue;
       }

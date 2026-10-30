@@ -66,6 +66,15 @@ export function housekeepingMode(env: Record<string, string | undefined> = proce
   return "dry-run";
 }
 
+/**
+ * `/gc` arguments. It previews by default; only an explicit `--apply` acts.
+ * `--dry-run` is accepted as a no-op alias, and `--apply --dry-run` stays a preview.
+ */
+export function gcDryRun(args: string): boolean {
+  const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+  return !argv.includes("--apply") || argv.includes("--dry-run");
+}
+
 export interface HousekeepingResult {
   worktrees: JanitorReport | null;
   rustCache: RustCacheSweepReport;
