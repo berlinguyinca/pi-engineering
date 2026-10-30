@@ -29,7 +29,7 @@ import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
-import { loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
+import { loadExecutionConfig, loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
@@ -1514,6 +1514,7 @@ export class EngineeringRuntime {
       // path. Degrades to the worker's construction-time default model when the
       // router cannot be built, so core never requires discovery or network.
       let routeModel: RouteModel | undefined;
+      const holdPin = (await loadExecutionConfig(repoRoot)).hold_mission_model;
       let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
       // The operator's explicit model switch (Pi `/model`), adopted by this
       // session's missions at their next inference boundary and persisted on
@@ -1555,6 +1556,7 @@ export class EngineeringRuntime {
               unavailable: rt.unavailableModels,
               reviewFallbackModel,
               operatorPin: currentOperatorPin,
+              holdPin,
             })
           : undefined;
       } catch {
@@ -1564,6 +1566,7 @@ export class EngineeringRuntime {
           unavailable: rt.unavailableModels,
           reviewFallbackModel,
           operatorPin: currentOperatorPin,
+          holdPin,
         });
       }
       const maintenanceRouter = routerAdapter as RoleRouterAdapter | undefined;

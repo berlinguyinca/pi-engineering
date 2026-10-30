@@ -196,3 +196,38 @@ describe("placement under a starting-model pin", () => {
     assert.notEqual(moved?.operatorPin, true);
   });
 });
+
+describe("holding the mission on its pin (execution.hold_mission_model)", () => {
+  const pinOf = (key: string) => (id: string) => (id === key ? QWEN : null);
+  const hold = async (holdPin: boolean) =>
+    createRouteModel({
+      router: await router(),
+      unavailable: new UnavailableModels(),
+      reviewFallbackModel: QWEN,
+      operatorPin: pinOf("MSN-1"),
+      holdPin,
+    });
+
+  it("retries the pin on the next dispatch and offers no replacement model", async () => {
+    const routeModel = await hold(true);
+    const retry = await routeModel("implementer", { missionId: "MSN-1", exclude: [QWEN] });
+    assert.equal(retry?.id, QWEN.id, "the pin is tried again, not abandoned");
+    assert.equal(retry?.operatorPin, true);
+    const replacement = await routeModel("implementer", { missionId: "MSN-1", exclude: [QWEN], replacement: true });
+    assert.equal(replacement, undefined, "no other model is offered, so the task fails with the pin's own error");
+  });
+
+  it("still routes the independent reviewer away from the pin", async () => {
+    const routeModel = await hold(true);
+    const review = await routeModel("reviewer", { missionId: "MSN-1", exclude: [QWEN] });
+    assert.equal(review?.id, DEEPSEEK.id);
+    assert.notEqual(review?.operatorPin, true);
+  });
+
+  it("with hold off, the previous failover is unchanged", async () => {
+    const routeModel = await hold(false);
+    const moved = await routeModel("implementer", { missionId: "MSN-1", exclude: [QWEN] });
+    assert.equal(moved?.id, FLINT.id);
+    assert.equal(moved?.pinRefused, `gw/${QWEN.id}`);
+  });
+});

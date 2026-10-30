@@ -303,7 +303,11 @@ test("routing role fallback_model must be a provider/id string", () => {
 });
 
 test("execution defaults to adaptive with no implicit Mission directive", async () => {
-  assert.deepEqual(DEFAULT_POLICY.execution, { preference: "adaptive", legacy_auto_invoke: false });
+  assert.deepEqual(DEFAULT_POLICY.execution, {
+    preference: "adaptive",
+    legacy_auto_invoke: false,
+    hold_mission_model: true,
+  });
   const cwd = await temp("pi-eng-exec-");
   const agentDir = await temp("pi-eng-exec-agent-");
   try {
@@ -323,7 +327,11 @@ test("execution preference and legacy opt-in load from repo yaml", async () => {
       join(cwd, ".pi", "engineering.yaml"),
       "execution:\n  preference: team\n  legacy_auto_invoke: true\n",
     );
-    assert.deepEqual(await loadExecutionConfig(cwd, agentDir), { preference: "team", legacy_auto_invoke: true });
+    assert.deepEqual(await loadExecutionConfig(cwd, agentDir), {
+      preference: "team",
+      legacy_auto_invoke: true,
+      hold_mission_model: true,
+    });
   } finally {
     await rm(cwd, { recursive: true, force: true });
     await rm(agentDir, { recursive: true, force: true });

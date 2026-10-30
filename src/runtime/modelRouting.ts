@@ -113,6 +113,14 @@ export function createRouteModel(opts: {
   reviewFallbackModel?: ModelRef;
   /** The operator pin a mission dispatches with (adopted at this boundary). */
   operatorPin?: (missionId: string) => ModelRef | null | undefined;
+  /**
+   * Keep a mission on its pin (`execution.hold_mission_model`). A pin that was
+   * tried or is marked unavailable is retried on its next dispatch, and no
+   * replacement model is offered, so the task fails with the pinned model's own
+   * error instead of moving. Independent roles still avoid the pin: a reviewer
+   * must differ from the model that produced the work.
+   */
+  holdPin?: boolean;
 }): RouteModel {
   const requester = opts.reviewFallbackModel;
   return async (role, routeOpts) => {
@@ -133,6 +141,10 @@ export function createRouteModel(opts: {
     // reviewer of work the pin produced) is not forced back; the placement
     // records it so an operator-switch check does not restart the attempt.
     if (exclude.some((model) => modelKey(model) === modelKey(pin))) {
+      const independent = ROLE_REQUIREMENTS[routerRoleFor(role) ?? "implementer"].independent;
+      if (opts.holdPin && !independent) {
+        return routeOpts?.replacement ? undefined : { provider: pin.provider, id: pin.id, operatorPin: true };
+      }
       const routed = await routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude, taskQuery);
       return routed && { ...routed, pinRefused: modelKey(pin) };
     }
