@@ -3,10 +3,13 @@
  * non-overwriting rotation, torn-tail quarantine. Real git, real files.
  */
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  appendFileSync,
+  chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -19,12 +22,16 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { GitRepo, shortHash } from "../../src/git/GitRepo.ts";
 import { CliForkGit } from "../../src/git/forkGit.ts";
 import { readOwnerMarker } from "../../src/git/ownerMarker.ts";
 import { gitPostMerge } from "../../src/merge/postMerge.ts";
-import { repairTornTail } from "../../src/platform/eventstore/jsonl.ts";
+import { JsonlEventStore, repairTornTail } from "../../src/platform/eventstore/jsonl.ts";
 import { emitRuntimeEvent, setRuntimeEventLog } from "../../src/runtime/isolation/runtimeEvents.ts";
+import { restoreCheckpoint } from "../../src/runtime/migrations/framework.ts";
+import { CommandVerifier } from "../../src/verify/Verifier.ts";
+import { subtractBaselineFailures } from "../../src/verify/baselineSubtraction.ts";
 import { TranscriptWriter } from "../../src/workers/transcriptStore.ts";
 
 const exec = promisify(execFile);
@@ -278,13 +285,257 @@ test("post-merge revert conflict leaves no branch, no worktree and no temp dir",
   const first = await commit("one");
   await commit("two");
   const base = await g(dir, "rev-parse", "HEAD");
+  const temps = () => readdirSync(tmpdir()).filter((n) => n.startsWith("pi-postmerge-")).length;
+  const before = temps();
   const out = await gitPostMerge(dir).createRevertBranch({ branch: "revert-x", mergedSha: first, base });
   assert.equal(out.ok, false);
   assert.equal(await g(dir, "for-each-ref", "refs/heads/revert-x"), "");
   assert.equal((await g(dir, "worktree", "list", "--porcelain")).split("\n\n").length, 1);
+  assert.equal(temps(), before, "the temp directory is not leaked");
 });
 
-test("no destructive git flags remain in the data-bearing cleanup paths", () => {
+test("post-merge: an empty leftover revert branch at the base is not a finished revert", async () => {
+  const { dir } = await scratchRepo();
+  writeFileSync(join(dir, "b.txt"), "b");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "to revert");
+  const merged = await g(dir, "rev-parse", "HEAD");
+  const base = merged;
+  await g(dir, "branch", "revert-y", base); // failed earlier attempt: empty branch at the base
+  const out = await gitPostMerge(dir).createRevertBranch({ branch: "revert-y", mergedSha: merged, base });
+  assert.ok(out.ok);
+  assert.equal(out.created, true);
+  assert.notEqual(out.sha, base);
+});
+
+test("restoreCheckpoint keeps the live state when the checkpoint copy fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "w2b-ck-"));
+  const checkpoint = join(root, "cp");
+  const state = join(root, "state");
+  mkdirSync(checkpoint);
+  mkdirSync(state);
+  writeFileSync(join(state, "live.json"), "LIVE");
+  // The manifest promises a checkpointed copy that is missing, so the copy fails.
+  writeFileSync(
+    join(checkpoint, "checkpoint-manifest.json"),
+    JSON.stringify({ stateDir: state, createdAt: "x", entries: [{ path: "live.json", existed: true }] }),
+  );
+  await assert.rejects(restoreCheckpoint(checkpoint, state));
+  assert.equal(readFileSync(join(state, "live.json"), "utf8"), "LIVE");
+  assert.deepEqual(readdirSync(state), ["live.json"], "no half-written sibling left behind");
+});
+
+test("restoreCheckpoint swaps in the checkpoint copy", async () => {
+  const root = mkdtempSync(join(tmpdir(), "w2b-ck-"));
+  const checkpoint = join(root, "cp");
+  const state = join(root, "state");
+  mkdirSync(join(checkpoint, "state"), { recursive: true });
+  mkdirSync(state);
+  writeFileSync(join(checkpoint, "state", "live.json"), "OLD");
+  writeFileSync(join(state, "live.json"), "NEW");
+  writeFileSync(
+    join(checkpoint, "checkpoint-manifest.json"),
+    JSON.stringify({ stateDir: state, createdAt: "x", entries: [{ path: "live.json", existed: true }] }),
+  );
+  await restoreCheckpoint(checkpoint, state);
+  assert.equal(readFileSync(join(state, "live.json"), "utf8"), "OLD");
+  assert.deepEqual(readdirSync(state), ["live.json"]);
+});
+
+const ev = (id: string) => ({ event_id: id, stream: "s", type: "t", at: new Date().toISOString(), data: {} }) as never;
+
+test("torn tail + failed quarantine (ENOSPC for new files) never fuses the next event onto the fragment", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "w2b-enospc-"));
+  const file = join(dir, "events.jsonl");
+  const store = await JsonlEventStore.open(file);
+  await store.append(ev("e1"));
+  appendFileSync(file, '{"event_id":"partial-wri'); // torn tail left by a failed append
+  chmodSync(dir, 0o555); // no NEW files: the quarantine write fails; the existing file is still appendable
+  try {
+    await repairTornTail(file, { owner: (store as unknown as { writerLock: never }).writerLock });
+    await store.append(ev("e2"));
+  } finally {
+    chmodSync(dir, 0o755);
+  }
+  store.close();
+  const reloaded = await JsonlEventStore.openReadOnly(file);
+  assert.deepEqual(
+    reloaded.all().map((e) => e.event_id),
+    ["e1", "e2"],
+    "the committed event survives",
+  );
+  assert.ok(readFileSync(file, "utf8").includes('{"event_id":"partial-wri\n'), "the fragment is kept, terminated");
+});
+
+test("an unrepairable torn tail makes every append throw until repair succeeds", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "w2b-enospc2-"));
+  const file = join(dir, "events.jsonl");
+  const store = await JsonlEventStore.open(file);
+  await store.append(ev("e1"));
+  appendFileSync(file, '{"event_id":"partial-wri');
+  chmodSync(file, 0o444);
+  chmodSync(dir, 0o555);
+  try {
+    await assert.rejects(store.append(ev("e2")), "the failed write is surfaced");
+    await assert.rejects(store.append(ev("e2b")), "still unrepairable: still throws, never fuses");
+  } finally {
+    chmodSync(dir, 0o755);
+    chmodSync(file, 0o644);
+  }
+  await store.append(ev("e3"));
+  store.close();
+  const reloaded = await JsonlEventStore.openReadOnly(file);
+  assert.deepEqual(
+    reloaded.all().map((e) => e.event_id),
+    ["e1", "e3"],
+  );
+});
+
+test("a dirty leftover baseline worktree does not block later baselines", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "w2b-bl-")));
+  const artifacts = mkdtempSync(join(tmpdir(), "w2b-bl-art-"));
+  await exec("git", ["init", "-q", "-b", "main", root]);
+  await g(root, "config", "user.email", "t@example.invalid");
+  await g(root, "config", "user.name", "t");
+  mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
+  writeFileSync(
+    join(root, "test", "old.test.js"),
+    'import test from "node:test";\nimport assert from "node:assert/strict";\nimport { writeFileSync } from "node:fs";\nwriteFileSync("junit.xml", "<x/>");\ntest("old defect", () => assert.equal(1, 2));\n',
+  );
+  await g(root, "add", "-A");
+  await g(root, "commit", "-qm", "base");
+  const baseSha = await g(root, "rev-parse", "HEAD");
+  const git = await GitRepo.open(root);
+  assert.ok(git);
+  const verifier = new CommandVerifier();
+  const store = await ArtifactStore.create(artifacts);
+  const profile = await verifier.detect(root);
+  const run = async () => {
+    const outcome = await verifier.run(root, profile, store);
+    return subtractBaselineFailures({ git, verifier, artifacts: store, baseSha, cwd: root, profile, outcome });
+  };
+  const first = await run();
+  assert.ok(
+    first.inheritedFailures.some((id) => id.includes("old defect")),
+    JSON.stringify(first.warnings),
+  );
+  const cache = join(await git.commonDir(), "pi-engineering-baselines");
+  for (const n of readdirSync(cache)) if (n.endsWith(".json")) writeFileSync(join(cache, n), "{}"); // force recompute
+  const second = await run();
+  assert.ok(
+    second.inheritedFailures.some((id) => id.includes("old defect")),
+    `baseline retried despite the dirty leftover: ${JSON.stringify(second.warnings)}`,
+  );
+});
+
+test("remote-tracking refs do not count as 'contained elsewhere'", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const info = await git.createWorktree(head, "remote-1");
+  writeFileSync(join(info.path, "w.txt"), "work");
+  await g(info.path, "add", "-A");
+  await g(info.path, "commit", "-qm", "worker commit");
+  const sha = await g(info.path, "rev-parse", "HEAD");
+  await g(dir, "update-ref", "refs/remotes/origin/remote-1", sha);
+  await git.removeWorktree(info);
+  assert.equal(await g(dir, "for-each-ref", "--format=%(objectname)", "refs/heads/superseded/"), sha);
+});
+
+test("a detached main checkout does not make 'merged into HEAD' trustworthy", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const info = await git.createWorktree(head, "detached-1");
+  writeFileSync(join(info.path, "w.txt"), "work");
+  await g(info.path, "add", "-A");
+  await g(info.path, "commit", "-qm", "worker commit");
+  const sha = await g(info.path, "rev-parse", "HEAD");
+  await g(dir, "checkout", "-q", "--detach", sha);
+  await git.removeWorktree(info);
+  assert.equal(await g(dir, "for-each-ref", "--format=%(objectname)", "refs/heads/superseded/"), sha);
+});
+
+async function ignoredRepo(): Promise<{ dir: string; head: string; git: GitRepo }> {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "w2b-ign-")));
+  await exec("git", ["init", "-q", "-b", "main", dir]);
+  await g(dir, "config", "user.email", "t@example.invalid");
+  await g(dir, "config", "user.name", "t");
+  writeFileSync(join(dir, ".gitignore"), ".env\nnode_modules/\ntarget/\n");
+  writeFileSync(join(dir, "a.txt"), "x");
+  mkdirSync(join(dir, "node_modules"));
+  writeFileSync(join(dir, "node_modules", "dep.txt"), "d");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "init");
+  const git = await GitRepo.open(dir);
+  assert.ok(git);
+  return { dir, head: await g(dir, "rev-parse", "HEAD"), git };
+}
+
+test("removeWorktree keeps a worktree holding an ignored user file (.env) and its node_modules link", async () => {
+  const { head, git } = await ignoredRepo();
+  const info = await git.createWorktree(head, "ign-1");
+  writeFileSync(join(info.path, ".env"), "SECRET=1");
+  await assert.rejects(git.removeWorktree(info), /\.env/);
+  assert.equal(readFileSync(join(info.path, ".env"), "utf8"), "SECRET=1");
+  assert.ok(lstatSync(join(info.path, "node_modules")).isSymbolicLink(), "link untouched after a refusal");
+});
+
+test("createWorktree also refuses to replace a worktree holding an ignored user file", async () => {
+  const { head, git } = await ignoredRepo();
+  const info = await git.createWorktree(head, "ign-2");
+  writeFileSync(join(info.path, ".env"), "SECRET=1");
+  await assert.rejects(git.createWorktree(head, "ign-2"), /refusing to replace/);
+  assert.equal(readFileSync(join(info.path, ".env"), "utf8"), "SECRET=1");
+});
+
+test("derived root dirs (target/, node_modules link) do not block removal of a clean worktree", async () => {
+  const { head, git } = await ignoredRepo();
+  const info = await git.createWorktree(head, "ign-3");
+  mkdirSync(join(info.path, "target"));
+  writeFileSync(join(info.path, "target", "out.o"), "o");
+  await git.removeWorktree(info);
+  assert.ok(!existsSync(info.path));
+});
+
+test("readOwnerMarker with repoRoot rejects another repository's marker", async () => {
+  const a = await scratchRepo();
+  const b = await scratchRepo();
+  const info = await a.git.createWorktree(a.head, "mark-a");
+  const gitdir = await g(info.path, "rev-parse", "--absolute-git-dir");
+  assert.ok(readOwnerMarker(gitdir, { repoRoot: a.dir }).ok);
+  assert.deepEqual(readOwnerMarker(gitdir, { repoRoot: b.dir }), { ok: false, reason: "repo mismatch (repoRootHash)" });
+  const file = join(gitdir, "pi-eng-owner.json");
+  const marker = JSON.parse(readFileSync(file, "utf8"));
+  writeFileSync(file, JSON.stringify({ ...marker, repoRootSha256: "0".repeat(64) }));
+  assert.deepEqual(readOwnerMarker(gitdir, { repoRoot: a.dir }), {
+    ok: false,
+    reason: "repo mismatch (repoRootSha256)",
+  });
+  assert.ok(readOwnerMarker(gitdir).ok, "format-only callers keep working");
+});
+
+test("rotation under 8 concurrent processes loses no lines", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "w2b-rot-"));
+  const file = join(dir, "runtime.jsonl");
+  const child = join(import.meta.dirname, "..", "support", "rotateStressChild.ts");
+  const codes = await Promise.all(
+    Array.from(
+      { length: 8 },
+      (_, i) =>
+        new Promise<number>((resolve) => {
+          const p = spawn(process.execPath, [child, file, `p${i}`, "300"], { stdio: "inherit" });
+          p.on("exit", (c) => resolve(c ?? 1));
+        }),
+    ),
+  );
+  assert.deepEqual(codes, Array(8).fill(0));
+  const lines = readdirSync(dir)
+    .filter((n) => n.startsWith("runtime.jsonl") && !n.endsWith(".lock"))
+    .flatMap((n) => readFileSync(join(dir, n), "utf8").split("\n").filter(Boolean));
+  assert.equal(lines.length, 2400);
+  assert.equal(new Set(lines).size, 2400);
+});
+
+// A tripwire, not a proof: it greps the data-bearing files for destructive git tokens in any argument position.
+test("no destructive git tokens remain in the data-bearing cleanup paths", () => {
   const files = [
     "src/git/GitRepo.ts",
     "src/git/forkGit.ts",
@@ -292,11 +543,12 @@ test("no destructive git flags remain in the data-bearing cleanup paths", () => 
     "src/plannerWorker/executor.ts",
     "src/runtime/EngineeringRuntime.ts",
     "src/orchestration/broker.ts",
+    "src/verify/baselineSubtraction.ts",
   ];
   for (const f of files) {
     const src = readFileSync(join(import.meta.dirname, "..", "..", f), "utf8");
-    assert.ok(!/"branch",\s*"-D"/.test(src), `${f}: branch -D`);
-    assert.ok(!/"worktree",\s*"remove",\s*"--force"/.test(src), `${f}: worktree remove --force`);
-    assert.ok(!/"worktree",\s*"add",\s*"-f"/.test(src), `${f}: worktree add -f`);
+    for (const token of ['"-D"', '"-M"', '"--force"', '"-f"', '"--delete"']) {
+      assert.ok(!src.includes(token), `${f}: ${token}`);
+    }
   }
 });

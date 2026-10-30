@@ -587,7 +587,7 @@ by mission id. Redaction is key-aware (password/secret/token/api key/authorizati
 values in JSON and `KEY=value` lines), covers Basic/Bearer headers, URL userinfo and
 sensitive query params, known token prefixes, prose ("password is X") and PEM blocks.
 The per-turn line does not count as worker activity for the inactivity watchdog.
-runtime.jsonl rotation never overwrites: each rotation gets a fresh `.<timestamp>.<n>` name.
+runtime.jsonl rotation never overwrites: each rotation gets a fresh `.<timestamp>.<n>` name and concurrent processes rotate one at a time under a `<file>.rotate.lock` sidecar. A rotation failure is reported as a telemetry warning and the live file keeps growing until it is fixed; rotated files are never deleted automatically.
 
 The worktree janitor must leave `transcripts/` alone; nothing deletes rotated transcripts automatically.
 

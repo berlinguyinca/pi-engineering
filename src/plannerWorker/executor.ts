@@ -26,6 +26,7 @@ import type { WorkerRole } from "../core/types.ts";
 import { GitRepo, type WorktreeInfo } from "../git/GitRepo.ts";
 import { safeGit } from "../git/safeGit.ts";
 import { workerInactivityMs, workerTimeoutMs } from "../orchestration/broker.ts";
+import { compactStamp } from "../runtime/rotateFile.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import { DEFAULT_STAGE_INACTIVITY_MS, runWithInactivityGuard } from "../verify/Verifier.ts";
 import { sanitizeVerifierEnv } from "../verify/childEnv.ts";
@@ -287,7 +288,16 @@ export class PlannerWorkerExecutor {
       await this.opts.resolver.refresh();
       const base = await repo.headCommit();
       this.baseCommit = base;
-      this.integration = await repo.createWorktree(base, `pi-eng-pw-${slug(brief.mission_id)}`);
+      try {
+        this.integration = await repo.createWorktree(base, `pi-eng-pw-${slug(brief.mission_id)}`);
+      } catch (error) {
+        // createWorktree keeps a leftover it cannot prove disposable and says where; surface it.
+        this.emit({
+          type: "phase",
+          text: `cannot start: ${error instanceof Error ? error.message.split("\n")[0] : error}`,
+        });
+        throw error;
+      }
       try {
         if (!(await this.planMission())) return await this.finish("failed");
         return await this.proceed();
@@ -1235,7 +1245,10 @@ export class PlannerWorkerExecutor {
     let reviewTree: WorktreeInfo | null = null;
     try {
       const head = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
-      reviewTree = await this.repo.createWorktree(head, this.branchFor(`batch-review-${ids.join("-")}`));
+      reviewTree = await this.repo.createWorktree(
+        head,
+        this.branchFor(`batch-review-${ids.join("-")}-${Date.now().toString(36)}`),
+      );
       for (const rt of batch) {
         const merged = await git(reviewTree.path, [
           ...COMMITTER,
@@ -1456,6 +1469,14 @@ export class PlannerWorkerExecutor {
 
   private async resetWorktree(rt: Runtime): Promise<void> {
     const head = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
+    // `reset --hard` would orphan reviewed worker commits that never reached the integration
+    // branch: keep them reachable under superseded/* first.
+    const own = (await checkedGit(rt.worktree!.path, ["rev-parse", "HEAD"])).stdout.trim();
+    if ((await git(rt.worktree!.path, ["merge-base", "--is-ancestor", own, head])).code !== 0) {
+      const keep = `superseded/${rt.worktree!.branch}-${compactStamp()}`;
+      await checkedGit(this.opts.repoRoot, ["branch", keep, own]);
+      this.emit({ type: "phase", text: `kept unintegrated worker commits as ${keep}` });
+    }
     await checkedGit(rt.worktree!.path, ["reset", "-q", "--hard", head]);
     rt.baseCommit = head;
     rt.lastHead = head;
@@ -1595,36 +1616,33 @@ export class PlannerWorkerExecutor {
       this.emit({ type: "phase", text: `preserved worker output at ${info.path} on ${info.branch}` });
       return;
     }
-    // Git itself rechecks cleanliness at removal: a write after status must not
-    // turn cleanup into deletion of new uncommitted output.
-    const removed = await git(this.opts.repoRoot, ["worktree", "remove", info.path]);
-    if (removed.code !== 0) {
-      this.emit({ type: "phase", text: `preserved worktree at ${info.path}: cleanup could not confirm removal` });
+    // GitRepo.removeWorktree: plain `worktree remove` (git rechecks cleanliness at removal, so a
+    // write after the status above cannot be deleted), after also checking for ignored user
+    // files git would silently delete. A refusal keeps the worktree.
+    try {
+      await this.repo.removeWorktree(info, { keepBranch: true });
+    } catch (error) {
+      this.emit({
+        type: "phase",
+        text: `preserved worktree at ${info.path}: ${error instanceof Error ? error.message.split("\n")[0] : error}`,
+      });
       return;
     }
     if (!keepBranch) await this.retireBranch(info.branch);
   }
 
-  /** `branch -d` when merged; otherwise rename to `superseded/<branch>-<ts>` so no commit is lost. Never `-D`. */
+  /** Delete the branch when contained in another local ref/tag, else rename it to `superseded/*`. Never `-D`. */
   private async retireBranch(branch: string): Promise<void> {
-    if ((await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code !== 0) return;
-    if ((await git(this.opts.repoRoot, ["branch", "-d", branch])).code === 0) return;
-    const stamp = new Date()
-      .toISOString()
-      .replace(/[-:]/g, "")
-      .replace(/\.\d+Z$/, "Z");
-    for (let n = 0; ; n++) {
-      const target = `superseded/${branch}-${stamp}${n === 0 ? "" : `.${n}`}`;
-      if ((await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${target}`])).code === 0) continue;
-      const renamed = await git(this.opts.repoRoot, ["branch", "-m", branch, target]);
-      this.emit({
-        type: "phase",
-        text:
-          renamed.code === 0
-            ? `kept ${branch} as ${target}: it has commits not merged elsewhere`
-            : `kept branch ${branch}: ${renamed.stderr.trim()}`,
-      });
-      return;
+    try {
+      const result = await this.repo.deleteOrPreserveBranch(branch);
+      if (result?.renamedTo) {
+        this.emit({
+          type: "phase",
+          text: `kept ${branch} as ${result.renamedTo}: it has commits not merged elsewhere`,
+        });
+      }
+    } catch (error) {
+      this.emit({ type: "phase", text: `kept branch ${branch}: ${error instanceof Error ? error.message : error}` });
     }
   }
 

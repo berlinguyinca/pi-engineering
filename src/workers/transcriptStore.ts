@@ -14,9 +14,9 @@
  *   PI_WORKER_TRANSCRIPT_MAX_BYTES        (default 5 MiB per file)
  *   PI_WORKER_TRANSCRIPT_TOOL_CHARS       (default 4000 chars per tool arg/result)
  */
-import { appendFileSync, mkdirSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { rotateWithoutOverwrite } from "../runtime/rotateFile.ts";
+import { rotateIfOver } from "../runtime/rotateFile.ts";
 import { redactSecrets } from "../security/SecurityPolicy.ts";
 
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
@@ -120,11 +120,7 @@ export class TranscriptWriter {
         line = `${JSON.stringify({ at: new Date().toISOString(), kind: record.kind, truncated: true })}\n`;
       }
       mkdirSync(dirname(this.file), { recursive: true });
-      try {
-        if (statSync(this.file).size + Buffer.byteLength(line) > this.maxBytes) rotateWithoutOverwrite(this.file);
-      } catch {
-        // No file yet.
-      }
+      rotateIfOver(this.file, Buffer.byteLength(line), this.maxBytes);
       appendFileSync(this.file, line, "utf8");
     } catch {
       // Observer only.

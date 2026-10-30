@@ -14,7 +14,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, normalize, sep } from "node:path";
 import { STATE_SCHEMA_FILE, readStateSchema, writeStateSchema } from "./schema.ts";
@@ -133,8 +133,29 @@ export async function restoreCheckpoint(checkpointDir: string, stateDir: string)
     const n = normalize(path);
     if (isAbsolute(n) || n.startsWith("..")) throw new MigrationError(`corrupt checkpoint path ${path}`);
     const target = join(stateDir, n);
-    await rm(target, { recursive: true, force: true });
-    if (existed) await cp(join(checkpointDir, "state", n), target, { recursive: true });
+    if (existed) {
+      // Copy the checkpoint to a sibling temp FIRST, then swap: a failed copy leaves the live
+      // state untouched instead of having already removed it.
+      const staged = `${target}.restore-${process.pid}-${Date.now().toString(36)}`;
+      const previous = `${target}.replaced-${process.pid}-${Date.now().toString(36)}`;
+      try {
+        await cp(join(checkpointDir, "state", n), staged, { recursive: true });
+      } catch (error) {
+        await rm(staged, { recursive: true, force: true }); // our own half-written copy
+        throw error;
+      }
+      const hadLive = existsSync(target);
+      if (hadLive) await rename(target, previous);
+      try {
+        await rename(staged, target);
+      } catch (error) {
+        if (hadLive) await rename(previous, target);
+        throw error;
+      }
+      if (hadLive) await rm(previous, { recursive: true, force: true }); // replaced by the checkpoint copy
+    } else {
+      await rm(target, { recursive: true, force: true });
+    }
   }
 }
 

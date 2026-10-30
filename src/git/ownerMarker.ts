@@ -7,10 +7,11 @@
  * proof of who created a worktree, independent of its directory name, so
  * cleanup tooling can refuse to touch worktrees it cannot prove it owns.
  */
-import { createHash } from "node:crypto";
-import { chmodSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { closeSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { safeGitOrThrow } from "./safeGit.ts";
+import { shortHash } from "./shortHash.ts";
 
 export const OWNER_MARKER_FILE = "pi-eng-owner.json";
 
@@ -27,8 +28,33 @@ export interface OwnerMarker {
 
 export type OwnerMarkerRead = { ok: true; marker: OwnerMarker } | { ok: false; reason: string };
 
-/** Read and validate `<gitdir>/pi-eng-owner.json`. Never throws. */
-export function readOwnerMarker(gitdir: string): OwnerMarkerRead {
+/**
+ * Read and validate `<gitdir>/pi-eng-owner.json`. Never throws.
+ *
+ * With `{ repoRoot }` the marker must also belong to THAT repository:
+ * `repoRootHash` must equal `shortHash(repoRoot)` (or of its realpath) and
+ * `repoRootSha256` the sha256 of `realpath(repoRoot)`. Without it only the
+ * format is checked (format-only callers); cleanup paths must pass `repoRoot`.
+ */
+export function readOwnerMarker(gitdir: string, opts: { repoRoot?: string } = {}): OwnerMarkerRead {
+  const read = readOwnerMarkerFormat(gitdir);
+  if (!read.ok || opts.repoRoot === undefined) return read;
+  let real = opts.repoRoot;
+  try {
+    real = realpathSync(opts.repoRoot);
+  } catch {
+    // unresolvable root: compare against the string as given
+  }
+  if (read.marker.repoRootHash !== shortHash(opts.repoRoot) && read.marker.repoRootHash !== shortHash(real)) {
+    return { ok: false, reason: "repo mismatch (repoRootHash)" };
+  }
+  if (read.marker.repoRootSha256 !== createHash("sha256").update(real).digest("hex")) {
+    return { ok: false, reason: "repo mismatch (repoRootSha256)" };
+  }
+  return read;
+}
+
+function readOwnerMarkerFormat(gitdir: string): OwnerMarkerRead {
   let raw: string;
   try {
     raw = readFileSync(join(gitdir, OWNER_MARKER_FILE), "utf8");
@@ -93,9 +119,15 @@ export async function writeOwnerMarker(
     createdAt: new Date().toISOString(),
   };
   const file = join(gitdir, OWNER_MARKER_FILE);
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
-  chmodSync(tmp, 0o600);
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  // O_EXCL: never write through a pre-existing file or symlink; fsync before the rename.
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    writeSync(fd, `${JSON.stringify(marker)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
   renameSync(tmp, file);
   return file;
 }

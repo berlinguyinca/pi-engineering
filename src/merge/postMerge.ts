@@ -123,11 +123,17 @@ export function gitPostMerge(repoDir: string): PostMergeGit {
   return {
     resolveRef: (ref) => git(repoDir, "rev-parse", "--verify", `${ref}^{commit}`),
     async createRevertBranch({ branch, mergedSha, base }) {
-      const existing = await git(repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`).catch(() => "");
+      const baseSha = await git(repoDir, "rev-parse", "--verify", `${base}^{commit}`);
+      let existing = await git(repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`).catch(() => "");
+      if (existing === baseSha) {
+        // An empty branch at the base is a failed earlier attempt, not a finished revert: drop it
+        // (compare-and-swap, nothing on it) and build the revert again.
+        await git(repoDir, "update-ref", "-d", `refs/heads/${branch}`, baseSha).catch(() => {});
+        existing = await git(repoDir, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`).catch(() => "");
+      }
       if (existing) return { ok: true, sha: existing, created: false };
       const parents = (await git(repoDir, "rev-list", "--parents", "-n", "1", mergedSha)).split(" ").length - 1;
       const dir = await mkdtemp(join(tmpdir(), "pi-postmerge-"));
-      const baseSha = await git(repoDir, "rev-parse", "--verify", `${base}^{commit}`);
       // Never --force and never `branch -D`: plain remove (git refuses a dirty tree) and a
       // compare-and-swap delete that only succeeds while the branch still sits at the base.
       const dropEmptyBranch = (): Promise<unknown> =>

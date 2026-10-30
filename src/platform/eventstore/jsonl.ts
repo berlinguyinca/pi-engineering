@@ -29,7 +29,7 @@
 
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
-import { appendFile, mkdir, readFile, rename, truncate, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, truncate, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
 import type { EventStoreBackend, StoredEvent } from "./backend.ts";
@@ -46,6 +46,8 @@ export class JsonlEventStore implements EventStoreBackend {
   private appendChain: Promise<void> = Promise.resolve();
   private readonly memoryOnly: boolean;
   private writerLock: ExclusiveFileLock | null = null;
+  /** A failed append left a tail that could not be made safe; every append repairs first and throws until it can. */
+  private tornTail = false;
   private pendingAppends = 0;
   private closed = false;
   private readOnly = false;
@@ -154,6 +156,7 @@ export class JsonlEventStore implements EventStoreBackend {
       .then(async () => {
         if (!this.memoryOnly) {
           await mkdir(dirname(this.file), { recursive: true });
+          await this.ensureCleanTail();
           try {
             await appendFile(this.file, line, "utf-8");
           } catch (error) {
@@ -161,7 +164,7 @@ export class JsonlEventStore implements EventStoreBackend {
             // Repair the tail so a retried append lands cleanly instead of
             // fusing onto the fragment (the failed head stays queued for the
             // caller's flush() to retry once space frees).
-            await repairTornTail(this.file, { owner: this.writerLock });
+            await this.repairAfterFailedWrite();
             throw error;
           }
         }
@@ -185,7 +188,10 @@ export class JsonlEventStore implements EventStoreBackend {
     this.pendingAppends++;
     const op = this.appendChain
       .then(async (): Promise<StoredEvent | undefined> => {
-        if (!this.memoryOnly) await mkdir(dirname(this.file), { recursive: true });
+        if (!this.memoryOnly) {
+          await mkdir(dirname(this.file), { recursive: true });
+          await this.ensureCleanTail();
+        }
         if (!condition()) return undefined;
         // The predicate and commit intentionally do not yield. Mission authority
         // changes synchronously, so none can interleave this critical section.
@@ -193,7 +199,7 @@ export class JsonlEventStore implements EventStoreBackend {
           try {
             appendFileSync(this.file, line, "utf-8");
           } catch (error) {
-            await repairTornTail(this.file, { owner: this.writerLock });
+            await this.repairAfterFailedWrite();
             throw error;
           }
         }
@@ -230,10 +236,11 @@ export class JsonlEventStore implements EventStoreBackend {
       .then(async () => {
         if (!this.memoryOnly) {
           await mkdir(dirname(this.file), { recursive: true });
+          await this.ensureCleanTail();
           try {
             await appendFile(this.file, body, "utf-8");
           } catch (error) {
-            await repairTornTail(this.file, { owner: this.writerLock });
+            await this.repairAfterFailedWrite();
             throw error;
           }
         }
@@ -257,6 +264,22 @@ export class JsonlEventStore implements EventStoreBackend {
 
   count(): number {
     return this.events.length;
+  }
+
+  /** After a failed write: repair the tail now; if that fails too, remember it so no append can fuse onto it. */
+  private async repairAfterFailedWrite(): Promise<void> {
+    try {
+      await repairTornTail(this.file, { owner: this.writerLock });
+    } catch {
+      this.tornTail = true;
+    }
+  }
+
+  /** Re-run the repair before an append while a previous one failed; throws (surfacing it) until it succeeds. */
+  private async ensureCleanTail(): Promise<void> {
+    if (!this.tornTail) return;
+    await repairTornTail(this.file, { owner: this.writerLock });
+    this.tornTail = false;
   }
 
   private appendSettled(): void {
@@ -317,11 +340,28 @@ export async function repairTornTail(
     .replace(/[-:]/g, "")
     .replace(/\.\d+Z$/, "Z")}`;
   try {
-    await appendFile(quarantine, tail, "utf-8");
+    // open + write + fsync + close BEFORE the truncate: the bytes are durable first.
+    const handle = await open(quarantine, "a", 0o600);
+    try {
+      await handle.writeFile(tail, "utf-8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   } catch {
+    // The quarantine needs a NEW file, which is exactly what ENOSPC refuses. Never leave the
+    // fragment unterminated (the next append would fuse onto it and lose a committed event):
+    // terminate it so it becomes one isolated, skippable corrupt line. Nothing is discarded.
+    try {
+      await appendFile(file, "\n", "utf-8");
+    } catch (error) {
+      throw new Error(
+        `event store: torn tail of ${file} could neither be quarantined nor terminated: ${error instanceof Error ? error.message : error}`,
+      );
+    }
     emitTelemetry({
       level: "warning",
-      text: `event store: could not quarantine the torn tail of ${file}; file left untruncated`,
+      text: `event store: could not quarantine the torn tail of ${file}; the fragment was terminated in place (one corrupt line, no bytes discarded)`,
     });
     return complete;
   }

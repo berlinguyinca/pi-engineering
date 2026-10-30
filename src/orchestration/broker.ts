@@ -2481,7 +2481,7 @@ export class ExecutionBroker {
       let tip: string | null = null;
       try {
         tip = await git.resolveCommit(branch);
-        count = await git.revListCount(`${base}..${branch}`);
+        count = tip === null ? null : await git.revListCount(`${base}..${tip}`);
       } catch {
         count = null;
       }

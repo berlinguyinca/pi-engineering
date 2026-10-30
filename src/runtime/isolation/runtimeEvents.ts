@@ -6,10 +6,10 @@
  * in-memory ring for status/doctor views. Nothing here reaches the normal UI:
  * recovery is routine, and routine recovery must not produce warnings.
  */
-import { appendFileSync, mkdirSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
-import { rotateWithoutOverwrite } from "../rotateFile.ts";
+import { rotateIfOver } from "../rotateFile.ts";
 
 export type RuntimeEventName =
   | "runtime.started"
@@ -62,7 +62,7 @@ interface RuntimeEventState {
   suppressedSinceSummary: number;
 }
 
-/** runtime.jsonl size cap before it rotates to `.1` (PI_RUNTIME_LOG_MAX_BYTES). */
+/** runtime.jsonl size cap before it rotates to `.<timestamp>.<n>` (PI_RUNTIME_LOG_MAX_BYTES). */
 const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
 /** How often suppressed lease contention is summarised (PI_RUNTIME_CONTENTION_SUMMARY_MS). */
 const DEFAULT_CONTENTION_SUMMARY_MS = 5 * 60_000;
@@ -109,19 +109,16 @@ export function onRuntimeEvent(listener: RuntimeEventSink): () => void {
 }
 
 /**
- * Rotation renames to `<file>.<timestamp>.<n>` and never overwrites an earlier
- * generation, so two processes sharing one runtime.jsonl cannot lose history.
+ * Rotation renames to `<file>.<timestamp>.<n>` under a sidecar lock and never
+ * overwrites an earlier generation. A rotation failure is reported (telemetry),
+ * not swallowed; the live file keeps growing until it is fixed.
  */
 function appendLog(file: string, record: RuntimeEvent): void {
   try {
     mkdirSync(dirname(file), { recursive: true });
     const line = `${JSON.stringify(record)}\n`;
     const max = envNumber("PI_RUNTIME_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES);
-    try {
-      if (statSync(file).size + line.length > max) rotateWithoutOverwrite(file);
-    } catch {
-      // No file yet.
-    }
+    rotateIfOver(file, line.length, max);
     appendFileSync(file, line, "utf8");
   } catch {
     // Diagnostics are observers; a full disk must not break the runtime.
