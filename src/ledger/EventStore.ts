@@ -172,6 +172,53 @@ export class EventStore {
     return await op;
   }
 
+  /**
+   * Append several events as ONE unit: one lock acquisition, one catch-up, one `write(2)` for every line. `prepare`
+   * runs under the lock after catching up with other processes, so it judges (and may build the events from) the true
+   * tail of the log; it returns undefined to write nothing, or throws to reject. All events are appended or none.
+   * (A process killed mid-write can still tear the last line, exactly as for a single append; a torn tail is skipped
+   * on replay and the next writer starts a fresh line.)
+   */
+  async appendBatch(
+    prepare: () => LedgerEvent[] | undefined,
+    onCommit?: (events: LedgerEvent[]) => void,
+  ): Promise<LedgerEvent[] | undefined> {
+    const op = this.appendChain.then(async (): Promise<LedgerEvent[] | undefined> => {
+      const commit = (events: LedgerEvent[]): LedgerEvent[] => {
+        for (const e of events) {
+          this.events.push(e);
+          this.byId.set(e.event_id, e);
+        }
+        onCommit?.(events);
+        return events;
+      };
+      if (this.memoryOnly) {
+        const events = prepare();
+        return events && events.length > 0 ? commit(events) : undefined;
+      }
+      await mkdir(dirname(this.file), { recursive: true });
+      const lock = await acquireFileLock(`${this.file}.lock`, this.options.lock);
+      try {
+        this.catchUp();
+        const events = prepare();
+        if (!events || events.length === 0) return undefined;
+        const body = events.map((e) => `${JSON.stringify(e)}\n`).join("");
+        const text = `${this.needsNewline ? "\n" : ""}${body}`;
+        appendFileSync(this.file, text, "utf-8");
+        this.offset += Buffer.byteLength(text);
+        this.needsNewline = false;
+        return commit(events);
+      } finally {
+        lock.release();
+      }
+    });
+    this.appendChain = op.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await op;
+  }
+
   private record(event: LedgerEvent, onCommit?: () => void): void {
     this.events.push(event);
     this.byId.set(event.event_id, event);

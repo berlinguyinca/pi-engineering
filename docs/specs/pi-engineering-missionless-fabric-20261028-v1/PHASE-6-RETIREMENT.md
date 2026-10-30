@@ -26,5 +26,5 @@ Status: **plan plus the safe parts shipped; nothing legacy was deleted.**
 
 ## Explicitly not done
 - No Mission code, state or events were removed or migrated.
-- `authority_generation` (envelope) and `expected_revision` (append guard) are enforced under a cross-process lockfile (`<ledger>.lock`, `src/ledger/fileLock.ts`); a stale writer gets `LedgerRevisionConflictError` / `LedgerAuthorityStaleError` and nothing is written. Revision is per work item. Multi-event Ledger methods (e.g. `createCandidate`) are still not atomic across processes.
+- `authority_generation` (envelope) and `expected_revision` (append guard) are enforced under a cross-process lockfile (`<ledger>.lock`, `src/ledger/fileLock.ts`); a stale writer gets `LedgerRevisionConflictError` / `LedgerAuthorityStaleError` and nothing is written. Revision is per work item. The typed helpers take an optional `LedgerWriteOptions` (guard + authority_generation), and the multi-event ones (`createCandidate`, `promoteCandidate`, `recordEvidence`) append all their events under one lock acquisition or none.
 - No `RunQueue` / `RunExecutor` extraction from broker and scheduler: `runWorker` is the single run choke point on the Ledger path, and extracting an interface from ~11k lines of orchestration without a second consumer would add an abstraction, not remove a duplicate.

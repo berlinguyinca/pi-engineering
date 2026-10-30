@@ -33,6 +33,16 @@ export interface AppendGuard {
 }
 
 /**
+ * Optional fencing for the typed helper methods (`createCandidate`, `promoteCandidate`, ...), the same two controls
+ * `emitEvent` takes: `guard.expected_revision`, and `authority_generation` (stamped on every event the helper writes).
+ * Absent = unfenced, exactly as before. A multi-event helper checks them ONCE, up front, under the lock.
+ */
+export interface LedgerWriteOptions {
+  guard?: AppendGuard;
+  authority_generation?: number;
+}
+
+/**
  * The Engineering Ledger (spec §9): durable, event-sourced shared memory.
  *
  * Immutable events are appended to an EventStore; a materialized in-memory view
@@ -131,14 +141,13 @@ export class Ledger {
     return this.emit(type, workItemId, actor, payload, meta, guard);
   }
 
-  private async emit(
+  private makeEvent(
     type: LedgerEvent["type"],
     workItemId: string | null,
     actor: Actor,
     payload: Record<string, unknown>,
     meta?: EventMeta,
-    guard?: AppendGuard,
-  ): Promise<LedgerEvent> {
+  ): LedgerEvent {
     const event: LedgerEvent = {
       event_id: newEventId(),
       work_item_id: workItemId,
@@ -152,6 +161,66 @@ export class Ledger {
       event.schema_version = 2;
       Object.assign(event, Object.fromEntries(defined));
     }
+    return event;
+  }
+
+  private emitWith(
+    type: LedgerEvent["type"],
+    workItemId: string | null,
+    actor: Actor,
+    payload: Record<string, unknown>,
+    write?: LedgerWriteOptions,
+  ): Promise<LedgerEvent> {
+    return this.emit(
+      type,
+      workItemId,
+      actor,
+      payload,
+      write?.authority_generation !== undefined ? { authority_generation: write.authority_generation } : undefined,
+      write?.guard,
+    );
+  }
+
+  /**
+   * Several events as one atomic unit: one lock acquisition, fences checked once before anything is written, and then
+   * every event appended in order or none. `build` runs under the lock after catching up with other processes, so
+   * payloads that depend on current state see the true tail of the log.
+   */
+  private async emitBatch(
+    actor: Actor,
+    write: LedgerWriteOptions | undefined,
+    build: () => Array<{ type: LedgerEvent["type"]; workItemId: string | null; payload: Record<string, unknown> }>,
+  ): Promise<LedgerEvent[]> {
+    const meta: EventMeta | undefined =
+      write?.authority_generation !== undefined ? { authority_generation: write.authority_generation } : undefined;
+    const stored = await this.store.appendBatch(
+      () => {
+        const specs = build();
+        const events = specs.map((s) => this.makeEvent(s.type, s.workItemId, actor, s.payload, meta));
+        const first = events[0];
+        if (!first) return undefined;
+        if (events.some((e) => e.work_item_id !== first.work_item_id))
+          throw new Error("a multi-event ledger write must stay inside one work item");
+        this.assertFences(first, write?.guard);
+        return events;
+      },
+      (events) => {
+        for (const e of events) this.track(e);
+      },
+    );
+    for (const e of stored ?? []) this.apply(e);
+    return stored ?? [];
+  }
+
+  private async emit(
+    type: LedgerEvent["type"],
+    workItemId: string | null,
+    actor: Actor,
+    payload: Record<string, unknown>,
+    meta?: EventMeta,
+    guard?: AppendGuard,
+  ): Promise<LedgerEvent> {
+    const event = this.makeEvent(type, workItemId, actor, payload, meta);
     const key = event.idempotency_key;
     if (key) {
       const prior = this.byIdempotencyKey.get(key);
@@ -284,7 +353,13 @@ export class Ledger {
 
   // ---------------------------------------------------------------- work items
 
-  async createWorkItem(goal: string, risk: RiskLevel, repositories: string[], actor: Actor): Promise<WorkItem> {
+  async createWorkItem(
+    goal: string,
+    risk: RiskLevel,
+    repositories: string[],
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<WorkItem> {
     const now = new Date().toISOString();
     const wi: WorkItem = {
       id: newWorkItemId(),
@@ -297,12 +372,17 @@ export class Ledger {
       current_candidate_id: null,
       incumbent_candidate_id: null,
     };
-    await this.emit("work_item.created", wi.id, actor, { workItem: wi });
+    await this.emitWith("work_item.created", wi.id, actor, { workItem: wi }, write);
     return wi;
   }
 
-  async updateWorkItem(id: string, changes: Partial<WorkItem>, actor: Actor): Promise<void> {
-    await this.emit("work_item.updated", id, actor, changes as Record<string, unknown>);
+  async updateWorkItem(
+    id: string,
+    changes: Partial<WorkItem>,
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<void> {
+    await this.emitWith("work_item.updated", id, actor, changes as Record<string, unknown>, write);
   }
 
   getWorkItem(id: string): WorkItem | undefined {
@@ -324,6 +404,7 @@ export class Ledger {
     producerRunId: string,
     parentId: string | null,
     actor: Actor,
+    write?: LedgerWriteOptions,
   ): Promise<Candidate> {
     const now = new Date().toISOString();
     const candidate: Candidate = {
@@ -343,22 +424,38 @@ export class Ledger {
       rejection_reason: null,
       created_at: now,
     };
-    await this.emit("candidate.created", workItemId, actor, { candidate });
-    await this.updateWorkItem(workItemId, { current_candidate_id: candidate.id }, actor);
+    await this.emitBatch(actor, write, () => [
+      { type: "candidate.created", workItemId, payload: { candidate } },
+      { type: "work_item.updated", workItemId, payload: { current_candidate_id: candidate.id } },
+    ]);
     return candidate;
   }
 
-  async changeCandidate(id: string, changes: Partial<Candidate>, workItemId: string, actor: Actor): Promise<void> {
-    await this.emit("candidate.changed", workItemId, actor, { candidate_id: id, changes });
+  async changeCandidate(
+    id: string,
+    changes: Partial<Candidate>,
+    workItemId: string,
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<void> {
+    await this.emitWith("candidate.changed", workItemId, actor, { candidate_id: id, changes }, write);
   }
 
-  async rejectCandidate(id: string, workItemId: string, reason: string, actor: Actor): Promise<void> {
-    await this.emit("candidate.rejected", workItemId, actor, { candidate_id: id, reason });
+  async rejectCandidate(
+    id: string,
+    workItemId: string,
+    reason: string,
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<void> {
+    await this.emitWith("candidate.rejected", workItemId, actor, { candidate_id: id, reason }, write);
   }
 
-  async promoteCandidate(id: string, workItemId: string, actor: Actor): Promise<void> {
-    await this.emit("candidate.promoted", workItemId, actor, { candidate_id: id });
-    await this.updateWorkItem(workItemId, { incumbent_candidate_id: id }, actor);
+  async promoteCandidate(id: string, workItemId: string, actor: Actor, write?: LedgerWriteOptions): Promise<void> {
+    await this.emitBatch(actor, write, () => [
+      { type: "candidate.promoted", workItemId, payload: { candidate_id: id } },
+      { type: "work_item.updated", workItemId, payload: { incumbent_candidate_id: id } },
+    ]);
   }
 
   getCandidate(id: string): Candidate | undefined {
@@ -380,6 +477,7 @@ export class Ledger {
     actor: Actor,
     scopePaths: string[] = [],
     dependsOn: string[] = [],
+    write?: LedgerWriteOptions,
   ): Promise<Task> {
     const task: Task = {
       id: newTaskId(),
@@ -392,11 +490,17 @@ export class Ledger {
       risk,
       result_work_item_id: null,
     };
-    await this.emit("task.created", workItemId, actor, { task });
+    await this.emitWith("task.created", workItemId, actor, { task }, write);
     return task;
   }
 
-  async setTaskStatus(id: string, status: Task["status"], workItemId: string, actor: Actor): Promise<void> {
+  async setTaskStatus(
+    id: string,
+    status: Task["status"],
+    workItemId: string,
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<void> {
     const type =
       status === "completed"
         ? "task.completed"
@@ -405,7 +509,7 @@ export class Ledger {
           : status === "failed"
             ? "task.failed"
             : "task.started";
-    await this.emit(type, workItemId, actor, { task_id: id, status });
+    await this.emitWith(type, workItemId, actor, { task_id: id, status }, write);
   }
 
   /**
@@ -418,10 +522,11 @@ export class Ledger {
     changes: Partial<Pick<Task, "depends_on" | "scope_paths" | "result_work_item_id">>,
     workItemId: string,
     actor: Actor,
+    write?: LedgerWriteOptions,
   ): Promise<void> {
     const t = this.tasks.get(id);
     if (!t) return;
-    await this.emit("task.updated", workItemId, actor, { task_id: id, ...changes });
+    await this.emitWith("task.updated", workItemId, actor, { task_id: id, ...changes }, write);
   }
 
   getTask(id: string): Task | undefined {
@@ -446,6 +551,7 @@ export class Ledger {
       severity?: LedgerEntity["severity"];
       candidateId?: string;
     } = {},
+    write?: LedgerWriteOptions,
   ): Promise<LedgerEntity> {
     const entity: LedgerEntity = {
       id: newEntityId(kind === "test-obligation" ? "TESTOB" : kind),
@@ -476,18 +582,23 @@ export class Ledger {
                 : "decision.proposed"
               : `${kind}.created`
     ) as LedgerEvent["type"];
-    await this.emit(eventType, workItemId, actor, { entity });
+    await this.emitWith(eventType, workItemId, actor, { entity }, write);
     return entity;
   }
 
-  async updateEntityStatus(id: string, status: EntityStatus, workItemId: string | null, actor: Actor): Promise<void> {
+  async updateEntityStatus(
+    id: string,
+    status: EntityStatus,
+    workItemId: string | null,
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<void> {
     const e = this.entities.get(id);
     if (!e) return;
-    // Update in place and emit a single in-place event so replay stays
-    // consistent (no duplicate entity with a fresh id).
+    // One in-place event so replay stays consistent (no duplicate entity with a fresh id). The in-memory entity is
+    // replaced by apply() once the event is durable, so a fenced (rejected) write leaves no phantom update behind.
     const updated: LedgerEntity = { ...e, status, created_at: e.created_at };
-    this.entities.set(id, updated);
-    await this.emit("entity.updated", workItemId, actor, { entity: updated });
+    await this.emitWith("entity.updated", workItemId, actor, { entity: updated }, write);
   }
 
   getEntity(id: string): LedgerEntity | undefined {
@@ -519,6 +630,7 @@ export class Ledger {
     trust: Evidence["trust"],
     workItemId: string | null,
     actor: Actor,
+    write?: LedgerWriteOptions,
   ): Promise<Evidence> {
     const now = new Date().toISOString();
     const ev: Evidence = {
@@ -535,17 +647,23 @@ export class Ledger {
       artifacts,
       trust,
     };
-    await this.emit("evidence.recorded", workItemId, actor, { evidence: ev });
-    if (candidateId) {
+    await this.emitBatch(actor, write, () => {
+      const specs: Array<{ type: LedgerEvent["type"]; workItemId: string | null; payload: Record<string, unknown> }> = [
+        { type: "evidence.recorded", workItemId, payload: { evidence: ev } },
+      ];
+      // Built under the lock, so the candidate's evidence list is the current one, not a stale replay.
+      const c = candidateId ? this.candidates.get(candidateId) : undefined;
+      if (c && workItemId)
+        specs.push({
+          type: "candidate.changed",
+          workItemId,
+          payload: { candidate_id: candidateId, changes: { evidence_ids: [...c.evidence_ids, ev.id] } },
+        });
+      return specs;
+    });
+    if (!workItemId && candidateId) {
       const c = this.candidates.get(candidateId);
-      if (c) {
-        c.evidence_ids = [...c.evidence_ids, ev.id];
-        if (workItemId)
-          await this.emit("candidate.changed", workItemId, actor, {
-            candidate_id: candidateId,
-            changes: { evidence_ids: c.evidence_ids },
-          });
-      }
+      if (c) c.evidence_ids = [...c.evidence_ids, ev.id]; // unchanged legacy behaviour: no work item, so memory only
     }
     return ev;
   }

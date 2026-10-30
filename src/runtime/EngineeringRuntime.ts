@@ -102,12 +102,21 @@ import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools, hasRecordedEvidence } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { TestQuarantine } from "../verify/testQuarantine.ts";
+import { LedgerWorkProjection } from "../work/ledgerProjection.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { buildContinuityConfig } from "./continuityWiring.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
 import { type ExternalBridge, startExternalBridge } from "./herdr/externalAgent.ts";
-import { type ForkRuntime, createForkRuntime, downstreamPrNodes, missionForkSources } from "./herdr/forkWiring.ts";
+import {
+  type ForkRuntime,
+  type WorkScopeFacts,
+  createForkRuntime,
+  downstreamPrNodes,
+  missionForkSources,
+  withFallbackForkSources,
+  workForkSources,
+} from "./herdr/forkWiring.ts";
 import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
@@ -2050,6 +2059,18 @@ export class EngineeringRuntime {
   }
 
   /**
+   * Where Mission-less work lives: this session's checkout root and the branch it is on, read through GitRepo (the
+   * same helpers every other git fact uses). Undefined on a detached HEAD or outside a repository, which the fork
+   * wiring reports as an unresolvable origin rather than guessing a base.
+   */
+  private async sessionForkScope(): Promise<WorkScopeFacts | undefined> {
+    const git = this.git;
+    if (!git) return undefined;
+    const branch = await git.currentBranch();
+    return branch ? { repository: git.root, base_ref: branch } : undefined;
+  }
+
+  /**
    * T12. Start the steering poller only when the GLOBAL engineering YAML enables it and a Herdr control plane is
    * configured; otherwise nothing is constructed and no network call is ever made. The poller can reach exactly two
    * things: `MissionStore.steerTask` (labelled, untrusted text) and `Orchestrator.resume`.
@@ -2082,12 +2103,25 @@ export class EngineeringRuntime {
       stateDir: resolveStateRoot(),
       lineage: opts.lineage ?? null,
       log: (message) => console.error(message),
-      sources: missionForkSources(store, {
-        boundRoot: (repoId) => rt.repositoryRegistry.get(repoId).root,
-        openRoot: async (path) => (await GitRepo.open(path))?.root ?? null,
-        links: store,
-        downstreamPrs: (taskId) => downstreamPrNodes(store, taskId),
-      }),
+      sources: (() => {
+        const host = {
+          boundRoot: (repoId: string) => rt.repositoryRegistry.get(repoId).root,
+          openRoot: async (path: string) => (await GitRepo.open(path))?.root ?? null,
+          links: store,
+          downstreamPrs: (taskId: string) => downstreamPrNodes(store, taskId),
+        };
+        // Mission-less work (Ledger work items and the sessions that ran them) forks and hands off too: the work read
+        // model names the task, and the repository and base branch come from this session's own checkout.
+        const projection = new LedgerWorkProjection(rt.ledger);
+        return withFallbackForkSources(
+          missionForkSources(store, host),
+          workForkSources(
+            () => projection.graph(),
+            () => rt.sessionForkScope(),
+            host,
+          ),
+        );
+      })(),
     });
     if (rt.forkRuntime) ports.forks = rt.forkRuntime.port;
     const receiver = await createSteeringReceiver({

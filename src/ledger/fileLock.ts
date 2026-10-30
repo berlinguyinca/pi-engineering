@@ -82,21 +82,39 @@ function staleContent(path: string, staleMs: number): { raw: string; owner?: Loc
   return undefined;
 }
 
-/** Atomically move a stale lock aside (only one reclaimer wins), then drop it. */
-function reclaim(path: string, stale: { raw: string }): void {
+/**
+ * Atomically move a stale lock aside (only one reclaimer wins), then drop it.
+ *
+ * Residual window, deliberately accepted. POSIX has no atomic "unlink this path only if it still holds THIS content",
+ * so a reclaimer judges (read) and then acts (rename) in two steps. If, between them, the judged lock is released and a
+ * new owner A creates a fresh one, `rename` captures A's live lock. The code then notices (content differs) and puts it
+ * back with `link`, which never overwrites. The remaining hazard is a third process B creating the lock in the instant
+ * between the rename and the link: then `link` fails, A's lock is dropped and A and B overlap for one critical section.
+ * Reaching it needs ALL of: a lock older than `staleMs` (default 30 s) or whose owner died, that lock released or
+ * replaced in the microseconds between two adjacent syscalls, a new owner in that same gap, and a third contender in
+ * the next one. For a dead owner (same host, pid gone) it cannot happen at all, because nobody can release or replace
+ * the judged lock but another reclaimer, and a loser's rename fails with ENOENT. Every append is also re-judged by
+ * its own idempotency/revision fence under the lock, so an overlap can at worst duplicate-order two appends of
+ * different writers, not corrupt a line (appends are single `write(2)` calls in O_APPEND mode).
+ * The check is deliberately not hardened with a second lock: that lock would need its own stale reclaim and so
+ * would just move the same window. `@internal`, exported for tests.
+ */
+export function reclaimStaleLock(path: string, stale: { raw: string }): "removed" | "restored" | "lost" | "raced" {
   const aside = `${path}.stale.${process.pid}.${randomBytes(4).toString("hex")}`;
   try {
     renameSync(path, aside);
   } catch {
-    return; // another reclaimer or the owner got there first
+    return "raced"; // another reclaimer or the owner got there first
   }
+  let outcome: "removed" | "restored" | "lost" = "removed";
   try {
     if (readFileSync(aside, "utf-8") !== stale.raw) {
       // We moved a lock that was re-created after we judged the old one: put it back (never overwrite).
       try {
         linkSync(aside, path);
+        outcome = "restored";
       } catch {
-        // someone else already holds a fresh lock; the moved one is theirs to lose
+        outcome = "lost"; // someone took the lock in the gap; see the residual-window note above
       }
     }
   } catch {
@@ -107,6 +125,7 @@ function reclaim(path: string, stale: { raw: string }): void {
   } catch {
     // best effort
   }
+  return outcome;
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -141,7 +160,7 @@ export async function acquireFileLock(path: string, options: FileLockOptions = {
     }
     const stale = staleContent(path, staleMs);
     if (stale) {
-      reclaim(path, stale);
+      reclaimStaleLock(path, stale);
       continue;
     }
     const waited = Date.now() - started;
