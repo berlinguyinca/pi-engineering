@@ -70,30 +70,36 @@ const COUNT_GUARD_HEAD_CHARS = 8_000;
 const COUNT_GUARD_TAIL_CHARS = 24_000;
 
 /**
- * The stored output behind an evidence reference: head and tail, because a test
- * runner prints its summary at the end and its plan lines at the start.
+ * The stored output behind an evidence reference: both ends, because a test
+ * runner prints its plan at the start (`1..12`) and its summary at the end
+ * (`# tests 12`), and a count may be reported at either.
  */
 async function evidenceOutputText(
   ref: string,
   services: Pick<CoreServices, "ledger" | "artifacts">,
 ): Promise<{ evidence: Evidence | null; text: string | null }> {
-  const readWindow = async (uri: string, fromEnd: boolean): Promise<string | null> => {
+  const readWindow = async (uri: string): Promise<string | null> => {
     try {
       const meta = services.artifacts.getByUri(uri);
       const size = meta?.size ?? 0;
-      const cap = fromEnd ? COUNT_GUARD_TAIL_CHARS : COUNT_GUARD_HEAD_CHARS;
-      const offset = fromEnd ? Math.max(0, size - cap) : 0;
-      const slice = await services.artifacts.readSliceByUri(uri, offset, cap);
-      return slice?.content ?? null;
+      if (!meta || size <= COUNT_GUARD_HEAD_CHARS + COUNT_GUARD_TAIL_CHARS) {
+        const whole = await services.artifacts.readSliceByUri(uri, 0, Math.max(size, COUNT_GUARD_TAIL_CHARS));
+        return whole?.content ?? null;
+      }
+      const [head, tail] = await Promise.all([
+        services.artifacts.readSliceByUri(uri, 0, COUNT_GUARD_HEAD_CHARS),
+        services.artifacts.readSliceByUri(uri, size - COUNT_GUARD_TAIL_CHARS, COUNT_GUARD_TAIL_CHARS),
+      ]);
+      return [head?.content, tail?.content].filter((part): part is string => typeof part === "string").join("\n…\n");
     } catch {
       return null;
     }
   };
-  if (ref.startsWith("artifact://")) return { evidence: null, text: await readWindow(ref, true) };
+  if (ref.startsWith("artifact://")) return { evidence: null, text: await readWindow(ref) };
   const id = ref.startsWith("test-run://") ? ref.slice("test-run://".length) : ref;
   const evidence = services.ledger.getEvidence(id) ?? null;
   if (!evidence) return { evidence: null, text: null };
-  const windows = await Promise.all((evidence.artifacts ?? []).slice(0, 2).map((uri) => readWindow(uri, true)));
+  const windows = await Promise.all((evidence.artifacts ?? []).slice(0, 2).map((uri) => readWindow(uri)));
   const text = windows.filter((w): w is string => typeof w === "string").join("\n");
   return { evidence, text: text.length > 0 ? text : null };
 }

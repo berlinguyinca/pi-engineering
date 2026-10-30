@@ -118,6 +118,25 @@ test("a count claim with a fabricated reference is refused, not downgraded into 
   }
 });
 
+test("a count printed at the start of a long log still backs the claim", async () => {
+  const { dir, ledger, artifacts, claim } = await harness();
+  try {
+    // The guard reads both ends of the stored output: a runner prints its plan
+    // before it prints anything else, and this log is longer than one window.
+    const long = `# tests 12\n# Subtest: room client\n${"x".repeat(40_000)}\nno count printed at the end\n`;
+    await artifacts.put("verify", "long-run", long, "node --test summary");
+    const result = await claim({
+      kind: "finding",
+      claim: "the room-client file has 12 unit tests",
+      evidence: "artifact://verify/long-run",
+    });
+    assert.equal(result.details.refused, undefined, "the head window carries the number");
+    assert.equal(ledger.listEntities("finding").length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("claims without a count are unaffected, evidenced or not", async () => {
   const { dir, ledger, claim } = await harness();
   try {

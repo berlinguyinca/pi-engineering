@@ -67,6 +67,15 @@ test("a citation in prose that names no identifier is checked structurally only"
   assert.equal(report.resolved, 1);
 });
 
+test("paths that are not repository-relative are not treated as citations", async () => {
+  // An absolute or drive-qualified path names something outside the tree under
+  // review; resolving it against this repository would report a false miss and
+  // cost a repair cycle for nothing.
+  const text = "read /home/u/repo/src/a.ts:12 and ~/other/src/b.ts:3 and C:\\repo\\d.ts:5 and http://host/x.ts:9";
+  assert.deepEqual(extractCitations(text), []);
+  assert.deepEqual(extractCitations("the fix at src/c.ts:4 holds"), extractCitations("src/c.ts:4"));
+});
+
 test("gitObjectReader resolves the cited content at the commit, not at whatever the work tree holds", async () => {
   const dir = await mkdtemp(join("/tmp", "pi-eng-citations-"));
   try {

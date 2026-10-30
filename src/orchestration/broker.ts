@@ -1286,11 +1286,6 @@ export class ExecutionBroker {
    * leaks, and the eventual result overwrites CANCELED with SUCCEEDED.
    */
   /**
-   * Why an approving review's citations block promotion, or null when they do not
-   * (issue #508). Evidence recorded before citation checking existed carries no
-   * report and is left as it stands; a report with problems never promotes.
-   */
-  /**
    * Apply an operator's hung-worker window at runtime. Engineering policy is
    * read once when the orchestrator is built, so an edit to
    * `limits.worker_inactivity_ms` would otherwise need a pi restart; the

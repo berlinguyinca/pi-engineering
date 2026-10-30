@@ -60,7 +60,7 @@ export type CitationReader = (file: string) => Promise<string | null>;
 
 /** Path-like token followed by `:line` or `:line-line`. */
 const CITATION_RE =
-  /(?<![\w/.-])([A-Za-z0-9_.-][A-Za-z0-9_./-]*\.[A-Za-z][A-Za-z0-9]{0,7}):(\d{1,7})(?:-(\d{1,7}))?\b/g;
+  /(?<![\w/.\-\\])([A-Za-z0-9_.-][A-Za-z0-9_./-]*\.[A-Za-z][A-Za-z0-9]{0,7}):(\d{1,7})(?:-(\d{1,7}))?\b/g;
 
 /** Machine URIs and URLs are references, not file:line citations. */
 const NOT_A_FILE = /:\/|^[a-z][a-z0-9+.-]*:\/\//i;
