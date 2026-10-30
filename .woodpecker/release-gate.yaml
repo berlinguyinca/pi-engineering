@@ -1,0 +1,92 @@
+# Woodpecker CI -- the release gate (full `npm run roadmap:check`).
+#
+# Ported from the removed Actions `release-gate` job (spec §20). That job ran
+# on release/* tag pushes AND workflow_dispatch; only the tag trigger exists
+# here: a `manual` trigger would also fire on every manual run of the
+# repo (ci.yaml's too), so manual release-gate runs are not supported. Same checkout,
+# toolchain and install as ci.yaml (keep them in step).
+when:
+  - event: tag
+    ref: refs/tags/release/**
+    # Unproven on this server; if it never matches, try `refs/tags/release/*`.
+
+skip_clone: true
+
+# Same hive pool as the other repos' gates.
+labels:
+  cluster: hive
+
+# Each step gets a clean environment AND its own HOME, so the Playwright
+# browser cache must live at an explicit shared path or the install step's
+# download is invisible to the test steps.
+variables:
+  - &browsers /tmp/woodpecker-cache/playwright
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      # Full history, all branches and tags, as the Actions job had
+      # (fetch-depth: 0): roadmap evidence freshness diffs against the
+      # recorded evidence commit (changedPathsSince) and a shallow clone
+      # would read as stale. The commit itself is fetched by SHA too, since a
+      # PR head is not on any branch.
+      - 'git fetch --tags --prune origin "+refs/heads/*:refs/remotes/origin/*" "$CI_COMMIT_SHA"'
+      # NOT `FETCH_HEAD`: after a multi-ref fetch it is the first ref
+      # fetched, not the commit. Check out the SHA and prove it (also right
+      # for tag events).
+      - 'git checkout -q --detach "$CI_COMMIT_SHA"'
+      - 'test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA" || { echo "checked out $(git rev-parse HEAD), expected $CI_COMMIT_SHA" >&2; exit 1; }'
+      # Stale per-pipeline venvs from earlier runs (6h outlives any pipeline).
+      - 'find /tmp/woodpecker-cache -maxdepth 1 -name "venv-*" -mmin +360 -exec rm -rf {} + 2>/dev/null || true'
+      - 'git --no-pager log --oneline -1'
+
+  - name: toolchain
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'for t in node npm git make python3 bash; do command -v "$t" >/dev/null || { echo "missing on this agent: $t" >&2; exit 1; }; done'
+      # package.json runs .ts files with no flag: type stripping is on by
+      # default only from Node 22.18.
+      - 'node -e "const [a,b]=process.versions.node.split(\".\").map(Number); if (a<22||(a===22&&b<18)) { console.error(\"Node 22.18+ required, found \"+process.version); process.exit(1); }"'
+      - 'python3 -m venv --help >/dev/null 2>&1 || { echo "python3 venv module missing on this agent" >&2; exit 1; }'
+      - 'echo "node=$(node --version) npm=$(npm --version) $(python3 --version) $(make --version | head -1)"'
+
+  - name: install
+    image: bash
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: *browsers
+    commands:
+      - 'set -eu'
+      - 'timeout -k 30 15m npm ci --no-audit --no-fund'
+      # The CAV suites drive a real headless Chromium; npm ci does not fetch
+      # the binary. No --with-deps: the hosts have no apt/sudo, so system
+      # libraries must already be present. The browser cache path is not
+      # commit-keyed; the download is version-locked by package-lock.json.
+      - 'timeout -k 30 15m npx playwright install chromium'
+      # test/unit/verifier.test.ts drives a real `make test` and a real
+      # pytest suite, with no skip guard. PATH is NOT persisted between steps
+      # (nor HOME), so the venv lives at a path derived from the pipeline
+      # and the test steps re-export PATH. It must be OUTSIDE the checkout:
+      # the runtime host snapshots the source tree and rejects symlinks
+      # that escape it (.venv/bin/python3 -> /usr/bin/python3), which fails
+      # runtime-host-isolation-reload. The number is per repo, so the repo
+      # name is in the path.
+      - 'VENV="/tmp/woodpecker-cache/venv-$(echo "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER"; rm -rf "$VENV"'
+      - 'python3 -m venv "$VENV"'
+      - '"$VENV/bin/pip" install -q pytest'
+      - '"$VENV/bin/python" -m pytest --version'
+
+  - name: roadmap-check
+    image: bash
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: *browsers
+    commands:
+      - 'export PATH="/tmp/woodpecker-cache/venv-$(echo "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER/bin:$PATH"'
+      # Exit 0 = every required milestone VERIFIED, evidence fresh, no
+      # unresolved critical/high findings, dogfood evidence present.
+      - 'timeout -k 30 60m npm run roadmap:check'
