@@ -195,3 +195,89 @@ export async function purgeTrash(
   }
   return report;
 }
+
+/** `<parent>/.pi-eng-trash/<yyyymmddThhmmssZ>-<name>`: where GitRepo.moveAsideOrphan parks a directory git no longer knows. */
+const ORPHAN_ENTRY = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-(.+)$/;
+
+/**
+ * Orphan entries carry no marker (and cannot get one retroactively), so they are LIST-ONLY unless the operator passes
+ * `includeUnmarked` together with `apply`. Even then an entry is deleted only when it is a real directory directly under
+ * `<parent>/.pi-eng-trash`, its name carries a parsable timestamp at least `olderThanDays` old, nothing inside it was
+ * modified within that many days, and its original path is not a registered worktree.
+ */
+export async function purgeOrphanTrash(
+  parent: string,
+  opts: {
+    olderThanDays: number;
+    apply: boolean;
+    includeUnmarked: boolean;
+    registeredPaths: ReadonlySet<string>;
+    now?: number;
+  },
+): Promise<TrashPurgeReport> {
+  const root = join(parent, ".pi-eng-trash");
+  const now = opts.now ?? Date.now();
+  const doDelete = opts.apply && opts.includeUnmarked;
+  const report: TrashPurgeReport = { purged: [], skipped: [], dryRun: !doDelete };
+  const realRoot = await realpath(root).catch(() => null);
+  if (!realRoot) return report;
+  for (const name of await readdir(root).catch(() => [] as string[])) {
+    const path = join(root, name);
+    const skip = (reason: string) => report.skipped.push({ path, reason });
+    const m = ORPHAN_ENTRY.exec(name);
+    const l = await lstat(path).catch(() => null);
+    if (
+      !m ||
+      !l?.isDirectory() ||
+      l.isSymbolicLink() ||
+      (await realpath(path).catch(() => null)) !== join(realRoot, name)
+    ) {
+      skip("not a <timestamp>-<name> directory made by housekeeping; left alone");
+      continue;
+    }
+    const at = Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!);
+    const ageDays = (now - at) / 86_400_000;
+    if (ageDays < opts.olderThanDays) {
+      skip(`orphaned ${Math.floor(ageDays)} d ago (< ${opts.olderThanDays} d)`);
+      continue;
+    }
+    if (opts.registeredPaths.has(join(parent, m[7]!))) {
+      skip("its original path is a registered worktree again; left alone");
+      continue;
+    }
+    if (await hasRecentFile(path, now - opts.olderThanDays * 86_400_000)) {
+      skip(`holds files modified within ${opts.olderThanDays} d (or could not be fully read); left alone`);
+      continue;
+    }
+    if (!opts.includeUnmarked) {
+      skip("no marker (made before markers existed): listed only; pass --include-unmarked with --apply to purge");
+      continue;
+    }
+    if (!opts.apply) {
+      report.purged.push({ path, ageDays: Math.floor(ageDays) });
+      continue;
+    }
+    await rm(path, { recursive: true, force: false });
+    report.purged.push({ path, ageDays: Math.floor(ageDays) });
+  }
+  return report;
+}
+
+/** Any entry under `dir` modified after `since`; unreadable or oversized counts as yes. Never follows symlinks. */
+async function hasRecentFile(dir: string, since: number): Promise<boolean> {
+  let seen = 0;
+  const queue = [dir];
+  while (queue.length > 0) {
+    const current = queue.pop() as string;
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => null);
+    if (!entries) return true;
+    for (const e of entries) {
+      if (++seen > 1_000_000) return true;
+      const full = join(current, e.name);
+      const s = await lstat(full).catch(() => null);
+      if (!s || s.mtimeMs > since) return true;
+      if (e.isDirectory()) queue.push(full);
+    }
+  }
+  return false;
+}

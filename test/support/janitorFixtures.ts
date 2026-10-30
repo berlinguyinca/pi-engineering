@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
 import { access, lutimes, readFile, readdir, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { type GitRepo, shortHash } from "../../src/git/GitRepo.ts";
+import type { GitRepo } from "../../src/git/GitRepo.ts";
+import { OWNER_MARKER_FILE, writeOwnerMarker as writeMarker } from "../../src/git/ownerMarker.ts";
+import { shortHash } from "../../src/git/shortHash.ts";
 
 const exec = promisify(execFile);
 
@@ -36,39 +37,34 @@ export async function ageWorktree(path: string, ageMs: number): Promise<void> {
   }
 }
 
-/**
- * `createWorktree` plus the ownership marker the runtime writes (`pi-eng-owner.json` in the worktree's git dir,
- * contract shared with the worktree-creation side). Written here so these tests do not depend on that side.
- */
+/** `GitRepo.createWorktree` writes the ownership marker itself (src/git/ownerMarker.ts); no hand-written markers. */
 export async function createOwned(
   repo: GitRepo,
   base: string,
   branch: string,
 ): Promise<Awaited<ReturnType<GitRepo["createWorktree"]>>> {
-  const wt = await repo.createWorktree(base, branch);
-  await writeOwnerMarker(repo, wt.path, branch);
-  return wt;
+  return repo.createWorktree(base, branch);
 }
 
-export async function writeOwnerMarker(
-  repo: GitRepo,
-  path: string,
-  branch: string | null,
-  overrides: Record<string, unknown> = {},
-): Promise<string> {
+/** Stamp a worktree made by plain `git worktree add` with the runtime's own marker writer. */
+export async function writeOwnerMarker(repo: GitRepo, path: string, branch: string | null): Promise<string> {
+  return writeMarker(path, { repoRoot: repo.root, repoRootHash: shortHash(repo.root), branch });
+}
+
+/** Absolute path of the marker file of a worktree. */
+export async function markerFile(path: string): Promise<string> {
   const { stdout } = await exec("git", ["-C", path, "rev-parse", "--absolute-git-dir"]);
-  const file = join(stdout.trim(), "pi-eng-owner.json");
-  await writeFile(
-    file,
-    JSON.stringify({
-      version: 1,
-      creator: "pi-engineering",
-      repoRootHash: shortHash(repo.root),
-      repoRootSha256: createHash("sha256").update(repo.root).digest("hex"),
-      branch,
-      createdAt: new Date().toISOString(),
-      ...overrides,
-    }),
-  );
-  return file;
+  return join(stdout.trim(), OWNER_MARKER_FILE);
+}
+
+/** The ONE hand-written marker form: take the real marker and overwrite fields (`undefined` deletes a field). */
+export async function tamperMarker(path: string, patch: Record<string, unknown>): Promise<void> {
+  const file = await markerFile(path);
+  const marker = { ...JSON.parse(await readFile(file, "utf8")), ...patch };
+  await writeFile(file, JSON.stringify(marker));
+}
+
+/** A worktree whose HEAD is detached carries a marker that recorded no branch (marker branch must equal the live branch exactly). */
+export async function markDetached(path: string): Promise<void> {
+  await tamperMarker(path, { branch: null });
 }

@@ -37,7 +37,7 @@ import {
   runHousekeeping,
 } from "../../src/runtime/janitor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
-import { ageWorktree, createOwned, exists, writeOwnerMarker } from "../support/janitorFixtures.ts";
+import { ageWorktree, createOwned, exists, markDetached, writeOwnerMarker } from "../support/janitorFixtures.ts";
 
 const exec = promisify(execFile);
 const HOUR = 60 * 60 * 1000;
@@ -94,7 +94,7 @@ test("terminal owner: worktree reclaimed, uncommitted work preserved on its bran
       maxIdleMs: 24 * HOUR,
       minAgeMs: 0,
       // File mtimes carry sub-millisecond precision and can sit a fraction ahead of Date.now().
-      now: () => Date.now() + 1000,
+      now: () => Date.now() + 5000,
     });
     assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
     assert.equal(report.failed.length, 0);
@@ -522,6 +522,7 @@ test("a detached unreachable HEAD in a pi-eng worktree is kept and reported", as
     await exec("git", ["-C", wt.path, "commit", "-qm", "unique work"]);
     const sha = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
     await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await markDetached(wt.path);
     await exec("git", ["-C", fixture.root, "branch", "-D", branch]);
     await ageWorktree(wt.path, 100 * HOUR);
     for (const dryRun of [true, false]) {
@@ -702,6 +703,7 @@ test("a detached HEAD whose only containing ref is refs/stash is still unreachab
     await exec("git", ["-C", wt.path, "commit", "-qm", "unique"]);
     const sha = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
     await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await markDetached(wt.path);
     await exec("git", ["-C", fixture.root, "branch", "-D", branch]);
     await writeFile(join(wt.path, "u.txt"), "stashme\n");
     await exec("git", ["-C", wt.path, "stash", "-q"]);
@@ -983,6 +985,7 @@ test("a detached HEAD reachable only from a remote-tracking ref is kept", async 
     await exec("git", ["-C", wt.path, "add", "-A"]);
     await exec("git", ["-C", wt.path, "commit", "-qm", "unique"]);
     await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await markDetached(wt.path);
     await exec("git", ["-C", fixture.root, "update-ref", "refs/remotes/origin/feature", "HEAD"], {
       cwd: wt.path,
     }).catch(() => {});
@@ -1278,6 +1281,7 @@ test("an interrupted rebase --autostash keeps the worktree: the autostashed edit
     const gd = await gitDirOf(wt.path);
     const stash = (await readFile(join(gd, "rebase-merge", "autostash"), "utf8")).trim();
     assert.match(stash, /^[0-9a-f]{40}$/, "the scenario must hold an autostash");
+    await markDetached(wt.path); // mid-rebase HEAD is detached: model a detached-created worktree
     await ageWorktree(wt.path, 100 * HOUR);
     for (const dryRun of [true, false]) {
       const report = await sweepOld(repo, { dryRun });
@@ -1335,6 +1339,7 @@ test("a commit made on a detached HEAD and then left (only the HEAD reflog holds
     const wt = await createOwned(repo, await repo.headCommit(), CAND("q9aaaa"));
     const base = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
     await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await markDetached(wt.path);
     await commitFile(wt.path, "work.txt", "detached commit work\n");
     const lost = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
     await exec("git", ["-C", wt.path, "checkout", "-q", base]);
@@ -1438,6 +1443,7 @@ test("a crash-leftover quarantine directory is not stuck: its owner parses from 
     await exec("git", ["-C", wt.path, "add", "-A"]);
     await exec("git", ["-C", wt.path, "commit", "-qm", "detached work"]);
     await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await markDetached(wt.path);
     await exec("git", ["-C", fixture.root, "branch", "-D", branch]);
     const q = join(dirname(fixture.root), `${prefix}reclaim-zzz-${basename(wt.path).slice(prefix.length)}`);
     await exec("git", ["-C", fixture.root, "worktree", "move", wt.path, q]);
@@ -1594,6 +1600,7 @@ test("detached-HEAD reason text names branches and tags only (remote-tracking re
     const wt = await createOwned(repo, await repo.headCommit(), branch);
     await commitFile(wt.path, "u.txt", "u\n");
     await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await markDetached(wt.path);
     await exec("git", ["-C", fixture.root, "branch", "-D", branch]);
     await ageWorktree(wt.path, 100 * HOUR);
     const reason = (await sweepOld(repo)).kept.find((k) => k.path === wt.path)!.reason;

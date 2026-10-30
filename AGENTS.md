@@ -158,7 +158,8 @@ work is committed to the worktree's branch first, and anything that cannot be
 preserved is kept and reported. A sweep never deletes: the checkout is moved to
 `<state-dir>/trash/<ts>/`, and only `/gc --purge-trash --older-than <days> --apply`
 (default 14, minimum 7) deletes trash. Idle Rust cache generations
-(`.pi-eng-rust-cache.json` marker required) go to `<rust-cache>/.trash` the same way. Hand-made worktrees like the one above live outside
+(`.pi-eng-rust-cache.json` marker required) go to `<rust-cache>/.trash` the same way.
+`/gc --adopt-preview` is a read-only listing of legacy unmarked worktrees and Rust caches; nothing is adopted. Hand-made worktrees like the one above live outside
 the `pi-eng-*` namespace and are never touched, so remove them yourself when
 the branch has merged.
 

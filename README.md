@@ -470,11 +470,20 @@ start, every six hours while a session stays open, and on demand with `/gc`
   by other pi processes count) **and** the worktree carries the runtime's
   ownership marker `pi-eng-owner.json` in its git dir
   (`.git/worktrees/<id>/`; JSON `{version:1, creator:"pi-engineering",
-  repoRootHash, repoRootSha256?, branch, createdAt}`, written when the runtime
-  creates the worktree). A missing, unparseable or mismatching marker (different
-  repository, different `repoRootSha256`, different branch) means "not provably
-  ours": kept and reported as "no ownership marker". Worktrees created before the
-  marker existed therefore stay kept until you remove them yourself. A worktree on any other branch is yours: it is
+  repoRootHash, repoRootSha256, branch, createdAt}`, written by
+  `GitRepo.createWorktree` via `src/git/ownerMarker.ts`, which is also the only
+  reader: `repoRootSha256` is mandatory and hashed over `realpath(repoRoot)`, the
+  branch must match the live branch exactly, a detached worktree matches only a
+  marker that recorded no branch, and a symlinked marker is never trusted). A
+  missing, unparseable or mismatching marker means "not provably ours": kept and
+  reported ("no ownership marker" / "ownership marker rejected (<reason>)").
+  Worktrees created before the marker existed therefore stay kept until you
+  remove them yourself; `/gc --adopt-preview` lists them read-only with the plain
+  `git worktree remove <path>` an operator could run for each eligible one (it
+  adopts and writes nothing; adopting is a deliberate future step). Fork
+  worktrees (`pi-fork-<hash>-<id>`) live outside the swept `pi-eng-<hash>-`
+  namespace, are never touched by this janitor, and their markers are for a
+  future janitor. A worktree on any other branch is yours: it is
   kept and reported, however idle. A mission this process cannot prove terminal
   is kept, as is any worktree a durable candidate, cleanup or quarantined record
   still names. Nothing younger than `PI_WORKTREE_MIN_AGE_HOURS` (default and
@@ -501,6 +510,11 @@ start, every six hours while a session stays open, and on demand with `/gc`
   in-process store and the durable event log), or such a folder exists and no
   terminal timestamp is known: something used the checkout after the mission
   ended.
+- Ignored-file rules are shared with the repository layer
+  (`src/git/worktreeSafety.ts`: nested `.git`, bare repositories and secret-looking
+  files such as `.env` or `id_rsa` under a derived folder other than `node_modules`
+  keep the worktree), but the janitor stays stricter: only the five root-level
+  names below count as disposable, never the any-depth cache names.
 - **Disposable derived folders** are exactly these, and only at the worktree
   root: `node_modules/`, `target/`, `.next/`, `dist/`, `coverage/`, and only when
   the folder itself is git-ignored and nothing named `.git` lives beneath it.
@@ -548,7 +562,12 @@ start, every six hours while a session stays open, and on demand with `/gc`
   It deletes only entries directly under a trash root that are regular
   directories carrying a valid `.pi-eng-trash.json` written by housekeeping,
   at least `<days>` old, and it never follows symlinks; everything else is
-  skipped and reported. A preview never writes or chmods anything, and a Rust
+  skipped and reported. Directories the repository layer parked in
+  `<repo parent>/.pi-eng-trash/<ts>-<name>` carry no marker and cannot get one
+  retroactively, so they are listed only; `--include-unmarked` together with
+  `--apply` purges those whose timestamp is old enough, with nothing inside
+  modified within `<days>` and whose original path is not a registered worktree
+  again. A preview never writes or chmods anything, and a Rust
   cache root without `.pi-eng-rust-cache-root` is not purged. It covers `<state-dir>/trash` and `<rust-cache>/.trash`.
 - Rust cache: the runtime writes `.pi-eng-rust-cache.json` into every
   generation dir (`<cache>/target/<repo>/<worktree>`) it assigns. The sweep moves

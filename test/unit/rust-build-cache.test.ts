@@ -467,3 +467,30 @@ test("two worktrees of one Rust repo share one cache root but get distinct targe
     await node.cleanup();
   }
 });
+
+test("/gc --adopt-preview lists unmarked Rust generations read-only, with a command only for idle ones", async () => {
+  const { runAdoptPreview } = await import("../../src/runtime/janitor.ts");
+  const root = await mkdtemp(join(tmpdir(), "pi-rust-adopt-"));
+  const saved = process.env.PI_RUST_CACHE_DIR;
+  const fixture = await makeFixtureRepo();
+  try {
+    await writeFile(join(root, ROOT_MARKER), JSON.stringify({ version: 1, creator: "pi-engineering" }));
+    const idle = await makeGeneration(root, "legacy-1", "idle", 90, { marker: false });
+    const busy = await makeGeneration(root, "legacy-2", "busy", 1, { marker: false });
+    const marked = await makeGeneration(root, "new-1", "marked", 90);
+    process.env.PI_RUST_CACHE_DIR = root;
+    const preview = await runAdoptPreview({ cwd: fixture.root });
+    const rows = Object.fromEntries(preview.rustCache.map((r) => [r.path, r]));
+    assert.deepEqual(Object.keys(rows).sort(), [busy, idle].sort());
+    assert.match(rows[idle]?.command ?? "", /rm -rf/);
+    assert.equal(rows[busy]?.command, null);
+    assert.equal(marked in rows, false);
+    for (const d of [idle, busy, marked]) assert.equal((await stat(d)).isDirectory(), true, "nothing moved");
+    assert.equal(await stat(join(root, ".trash")).catch(() => null), null);
+  } finally {
+    if (saved === undefined) delete process.env.PI_RUST_CACHE_DIR;
+    else process.env.PI_RUST_CACHE_DIR = saved;
+    await rm(root, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});

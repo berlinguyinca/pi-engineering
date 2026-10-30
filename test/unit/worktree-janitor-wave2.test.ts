@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import {
   chmod,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -18,10 +19,11 @@ import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
-import { OWNER_MARKER_FILE, sweepWorktrees } from "../../src/git/worktreeJanitor.ts";
-import { gcPlan } from "../../src/runtime/janitor.ts";
+import { OWNER_MARKER_FILE } from "../../src/git/ownerMarker.ts";
+import { sweepWorktrees } from "../../src/git/worktreeJanitor.ts";
+import { describeAdoptPreview, gcPlan, runAdoptPreview } from "../../src/runtime/janitor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
-import { ageWorktree, createOwned, exists, writeOwnerMarker } from "../support/janitorFixtures.ts";
+import { ageWorktree, createOwned, exists, markerFile, tamperMarker } from "../support/janitorFixtures.ts";
 
 const exec = promisify(execFile);
 const HOUR = 60 * 60 * 1000;
@@ -71,78 +73,82 @@ test("a worktree without an ownership marker is kept and reported, however idle"
   }
 });
 
-test("a missing, unparseable or mismatching ownership marker keeps the worktree", async () => {
+test("a tampered or foreign ownership marker keeps the worktree, one case per failure class", async () => {
   const fixture = await makeFixtureRepo();
   try {
     await withTrash(async (trashRoot) => {
       const repo = (await GitRepo.open(fixture.root))!;
-      const cases: Array<[string, (path: string, branch: string) => Promise<void>, RegExp]> = [
-        [
-          "notjson",
-          async (p) => void (await writeFile(join(await gitDirOf(p), OWNER_MARKER_FILE), "{nope")),
-          /unreadable or not JSON/,
-        ],
-        [
-          "creator",
-          async (p, b) => void (await writeOwnerMarker(repo, p, b, { creator: "someone-else" })),
-          /not a version 1 pi-engineering marker/,
-        ],
-        ["version", async (p, b) => void (await writeOwnerMarker(repo, p, b, { version: 2 })), /not a version 1/],
-        [
-          "hash",
-          async (p, b) => void (await writeOwnerMarker(repo, p, b, { repoRootHash: "zzzz" })),
-          /repoRootHash mismatch/,
-        ],
-        [
-          "sha",
-          async (p, b) => void (await writeOwnerMarker(repo, p, b, { repoRootSha256: "0".repeat(64) })),
-          /repoRootSha256 mismatch/,
-        ],
-        [
-          "branch",
-          async (p) => void (await writeOwnerMarker(repo, p, "some-other-branch")),
-          /written for branch some-other-branch/,
-        ],
+      const cases: Array<[string, (path: string) => Promise<void>, RegExp]> = [
+        ["notjson", async (p) => void (await writeFile(await markerFile(p), "{nope")), /invalid json/],
+        ["creator", (p) => tamperMarker(p, { creator: "someone-else" }), /foreign creator/],
+        ["version", (p) => tamperMarker(p, { version: 2 }), /unsupported version/],
+        ["nover", (p) => tamperMarker(p, { version: undefined }), /unsupported version/],
+        ["nocrea", (p) => tamperMarker(p, { createdAt: undefined }), /bad createdAt/],
+        ["hash", (p) => tamperMarker(p, { repoRootHash: "zzzz" }), /repoRootHash/],
+        ["sha", (p) => tamperMarker(p, { repoRootSha256: "0".repeat(64) }), /repoRootSha256/],
+        ["nosha", (p) => tamperMarker(p, { repoRootSha256: undefined }), /bad repoRootSha256/],
+        ["branch", (p) => tamperMarker(p, { branch: "some-other-branch" }), /branch mismatch/],
+        ["nullbr", (p) => tamperMarker(p, { branch: null }), /branch mismatch/],
         [
           "dir",
           async (p) => {
-            const file = join(await gitDirOf(p), OWNER_MARKER_FILE);
+            const file = await markerFile(p);
             await rm(file, { force: true });
             await mkdir(file);
           },
           /not a regular file/,
         ],
+        [
+          "sibling",
+          async (p) => {
+            // Copy the marker of ANOTHER worktree of the same repository (a different branch).
+            const sibling = await createOwned(repo, await repo.headCommit(), CAND("sibl-src"));
+            await copyFile(await markerFile(sibling.path), await markerFile(p));
+          },
+          /branch mismatch/,
+        ],
       ];
-      const made = [];
+      const made: Array<{ wt: { path: string }; why: RegExp; name: string }> = [];
       for (const [name, tamper, why] of cases) {
-        const branch = CAND(name);
-        const wt = await createOwned(repo, await repo.headCommit(), branch);
-        await tamper(wt.path, branch);
+        const wt = await createOwned(repo, await repo.headCommit(), CAND(name));
+        await tamper(wt.path);
         await ageWorktree(wt.path, 100 * HOUR);
-        made.push({ wt, why });
+        made.push({ wt, why, name });
       }
       const report = await sweep(repo, trashRoot);
-      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
-      for (const { wt, why } of made) {
-        assert.match(report.kept.find((k) => k.path === wt.path)!.reason, why, wt.path);
-        assert.equal(await exists(wt.path), true);
+      for (const { wt, why, name } of made) {
+        const kept = report.kept.find((k) => k.path === wt.path);
+        assert.ok(kept, `${name}: ${JSON.stringify(report)}`);
+        assert.match(kept.reason, why, name);
+        assert.equal(await exists(wt.path), true, name);
       }
+      assert.deepEqual(
+        report.reclaimed.filter((r) => made.some((m) => m.wt.path === r.path)),
+        [],
+      );
     });
   } finally {
     await fixture.cleanup();
   }
 });
 
-test("a marker without repoRootSha256 is still honoured (the field is optional)", async () => {
+test("end to end: a worktree made by createWorktree is accepted and trashed; unmarked is kept", async () => {
   const fixture = await makeFixtureRepo();
   try {
     await withTrash(async (trashRoot) => {
       const repo = (await GitRepo.open(fixture.root))!;
-      const wt = await createOwned(repo, await repo.headCommit(), CAND("nosha1"));
-      await writeOwnerMarker(repo, wt.path, null, { repoRootSha256: undefined, branch: null });
-      await ageWorktree(wt.path, 100 * HOUR);
+      const good = await repo.createWorktree(await repo.headCommit(), CAND("e2e001"));
+      const bare = await repo.createWorktree(await repo.headCommit(), CAND("e2e002"));
+      await rm(await markerFile(bare.path), { force: true });
+      for (const wt of [good, bare]) await ageWorktree(wt.path, 100 * HOUR);
       const report = await sweep(repo, trashRoot);
-      assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
+      assert.deepEqual(
+        report.reclaimed.map((r) => r.path),
+        [good.path],
+        JSON.stringify(report),
+      );
+      assert.equal(await exists(good.path), false);
+      assert.match(report.kept.find((k) => k.path === bare.path)!.reason, /no ownership marker/);
     });
   } finally {
     await fixture.cleanup();
@@ -416,12 +422,21 @@ test("a dangling-symlink submodule .git counts as present (lstat, not stat)", as
 test("/gc argument parsing: purge needs --apply, --older-than defaults to 14 and rejects < 7, unknown tokens preview", () => {
   assert.deepEqual(gcPlan("--purge-trash"), {
     dryRun: true,
-    purge: { olderThanDays: 14 },
+    purge: { olderThanDays: 14, includeUnmarked: false },
     note: "purging trash needs --apply; listing what it would purge",
   });
-  assert.deepEqual(gcPlan("--purge-trash --apply"), { dryRun: false, purge: { olderThanDays: 14 } });
-  assert.deepEqual(gcPlan("--purge-trash --older-than 30 --apply"), { dryRun: false, purge: { olderThanDays: 30 } });
-  assert.deepEqual(gcPlan("--apply --purge-trash --older-than=7"), { dryRun: false, purge: { olderThanDays: 7 } });
+  assert.deepEqual(gcPlan("--purge-trash --apply"), {
+    dryRun: false,
+    purge: { olderThanDays: 14, includeUnmarked: false },
+  });
+  assert.deepEqual(gcPlan("--purge-trash --older-than 30 --apply"), {
+    dryRun: false,
+    purge: { olderThanDays: 30, includeUnmarked: false },
+  });
+  assert.deepEqual(gcPlan("--apply --purge-trash --older-than=7"), {
+    dryRun: false,
+    purge: { olderThanDays: 7, includeUnmarked: false },
+  });
   for (const bad of [
     "--purge-trash --older-than 3 --apply",
     "--purge-trash --older-than --apply",
@@ -442,6 +457,211 @@ test("/gc argument parsing: purge needs --apply, --older-than defaults to 14 and
     assert.equal(plan.purge, undefined, bad);
     assert.match(plan.note ?? "", /only applies to --purge-trash/, bad);
   }
+  assert.deepEqual(gcPlan("--purge-trash --include-unmarked --apply"), {
+    dryRun: false,
+    purge: { olderThanDays: 14, includeUnmarked: true },
+  });
+  assert.match(gcPlan("--include-unmarked --apply").note ?? "", /only applies to --purge-trash/);
+  assert.deepEqual(gcPlan("--adopt-preview"), { dryRun: true, adoptPreview: true });
+  for (const bad of ["--adopt-preview --apply", "--adopt-preview --purge-trash"]) {
+    assert.equal(gcPlan(bad).adoptPreview, undefined, bad);
+    assert.match(gcPlan(bad).note ?? "", /read-only listing/, bad);
+  }
   assert.deepEqual(gcPlan("--apply"), { dryRun: false });
   assert.equal(gcPlan("--purge-trash --apply --dry-run").dryRun, true);
 });
+
+test("secrets and nested repositories under an ignored target/ keep the worktree; node_modules may hold .env files", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await withTrash(async (trashRoot) => {
+      await writeFile(join(fixture.root, ".gitignore"), "node_modules/\ntarget/\n");
+      await exec("git", ["-C", fixture.root, "add", ".gitignore"]);
+      await exec("git", ["-C", fixture.root, "commit", "-qm", "ignore"]);
+      const repo = (await GitRepo.open(fixture.root))!;
+      const env = await createOwned(repo, await repo.headCommit(), CAND("sec001"));
+      const key = await createOwned(repo, await repo.headCommit(), CAND("sec002"));
+      const bareRepo = await createOwned(repo, await repo.headCommit(), CAND("sec003"));
+      const nm = await createOwned(repo, await repo.headCommit(), CAND("sec004"));
+      await mkdir(join(env.path, "target", "debug"), { recursive: true });
+      await writeFile(join(env.path, "target", "debug", ".env"), "TOKEN=1\n");
+      await mkdir(join(key.path, "target"), { recursive: true });
+      await writeFile(join(key.path, "target", "id_rsa"), "PRIVATE\n");
+      await exec("git", ["init", "-q", "--bare", join(bareRepo.path, "target", "mirror.git")]);
+      await mkdir(join(nm.path, "node_modules", "pkg"), { recursive: true });
+      await writeFile(join(nm.path, "node_modules", "pkg", ".env.example"), "X=1\n");
+      for (const wt of [env, key, bareRepo, nm]) await ageWorktree(wt.path, 100 * HOUR);
+      const report = await sweep(repo, trashRoot);
+      assert.deepEqual(
+        report.reclaimed.map((r) => r.path),
+        [nm.path],
+        JSON.stringify(report),
+      );
+      for (const wt of [env, key, bareRepo]) {
+        assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /ignored files present.*target/, wt.path);
+        assert.equal(await exists(wt.path), true);
+      }
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a symlinked ownership marker is never trusted: git itself refuses the repository, so the sweep fails closed and touches nothing", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await withTrash(async (trashRoot) => {
+      const repo = (await GitRepo.open(fixture.root))!;
+      const wt = await createOwned(repo, await repo.headCommit(), CAND("symlk1"));
+      const file = await markerFile(wt.path);
+      await rename(file, `${file}.real`);
+      await symlink(`${file}.real`, file);
+      await ageWorktree(wt.path, 100 * HOUR);
+      await assert.rejects(sweep(repo, trashRoot), /symbolic link/);
+      assert.equal(await exists(wt.path), true);
+      assert.equal(await exists(trashRoot), false);
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("/gc --adopt-preview lists unmarked worktrees with the manual command, and writes nothing", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const eligible = await createOwned(repo, await repo.headCommit(), CAND("adpt01"));
+    const dirty = await createOwned(repo, await repo.headCommit(), CAND("adpt02"));
+    const live = await createOwned(repo, await repo.headCommit(), CAND("adpt03"));
+    const marked = await createOwned(repo, await repo.headCommit(), CAND("adpt04"));
+    for (const wt of [eligible, dirty, live]) await rm(await markerFile(wt.path), { force: true });
+    await writeFile(join(dirty.path, "src", "edited.js"), "work\n");
+    for (const wt of [eligible, dirty, live, marked]) await ageWorktree(wt.path, 100 * HOUR);
+    const before = await Promise.all(
+      [eligible, dirty, live].map(async (wt) => [await markerFile(wt.path), await exists(wt.path)] as const),
+    );
+    const { execFile: ef } = await import("node:child_process");
+    const snapshot = async () =>
+      (await promisify(ef)("git", ["-C", fixture.root, "status", "--porcelain=v2", "--branch"])).stdout +
+      (await promisify(ef)("git", ["-C", fixture.root, "worktree", "list", "--porcelain"])).stdout;
+    const gitBefore = await snapshot();
+    const missions = {
+      getMission: (id: string) => ({ status: id === "MSN-adpt03" ? ("EXECUTING" as const) : ("COMPLETE" as const) }),
+      getTask: () => undefined,
+    };
+    const preview = await runAdoptPreview({ cwd: fixture.root, missions });
+    const byPath = Object.fromEntries(preview.worktrees.map((w) => [w.path, w]));
+    assert.equal(preview.worktrees.length, 3, "the marked worktree is not an adoption candidate");
+    assert.match(byPath[eligible.path]!.command ?? "", /worktree remove/);
+    assert.doesNotMatch(byPath[eligible.path]!.command ?? "", /--force/);
+    assert.equal(byPath[eligible.path]!.clean, true);
+    assert.equal(byPath[dirty.path]!.command, null);
+    assert.equal(byPath[dirty.path]!.clean, false);
+    assert.match(byPath[dirty.path]!.note, /uncommitted changes/);
+    assert.equal(byPath[live.path]!.command, null);
+    assert.match(byPath[live.path]!.note, /owner is live/);
+    assert.match(describeAdoptPreview(preview).join("\n"), /Read-only: nothing was changed/);
+    assert.equal(await snapshot(), gitBefore, "no git state changed");
+    assert.deepEqual(
+      await Promise.all(
+        [eligible, dirty, live].map(async (wt) => [await markerFile(wt.path), await exists(wt.path)] as const),
+      ),
+      before,
+    );
+    for (const wt of [eligible, dirty, live])
+      assert.equal(await exists(await markerFile(wt.path)), false, "no marker written");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// Ports of the reviewer's W1/W2/W3/Q1/Q2 repros. They used to gate `git worktree remove`; a sweep no longer removes
+// anything, so the window that matters now is the quarantine `git worktree move`: a late writer either lands before it
+// (the janitor's re-check sees a changed tree and moves the checkout back) or follows the checkout (cwd-inside writers
+// follow the inode) into the trash. Either way the file must still exist somewhere on disk.
+const LATE_WRITERS: Array<{ name: string; ignore: string; rel: string; cwdInside: boolean; seed?: string }> = [
+  { name: "W1 ignored file via original path", ignore: "*.env\n", rel: "late.env", cwdInside: false },
+  { name: "W2 untracked file via original path", ignore: "", rel: "late.txt", cwdInside: false },
+  {
+    name: "W3 file in an ignored root dist/",
+    ignore: "dist/\n",
+    rel: "dist/notes.md",
+    cwdInside: false,
+    seed: "dist/app.js",
+  },
+  { name: "Q1 cwd-inside writer, ignored file", ignore: "*.env\n", rel: "late2.env", cwdInside: true },
+  { name: "Q2 cwd-inside writer, untracked file", ignore: "", rel: "late2.txt", cwdInside: true },
+];
+for (const sc of LATE_WRITERS) {
+  test(`late writer ${sc.name}: the file survives (kept in place or carried into the trash)`, async () => {
+    const fixture = await makeFixtureRepo();
+    const gate = await mkdtemp(join(tmpdir(), "pi-eng-gate-"));
+    const savedPath = process.env.PATH;
+    try {
+      await withTrash(async (trashRoot) => {
+        if (sc.ignore) {
+          await writeFile(join(fixture.root, ".gitignore"), sc.ignore);
+          await exec("git", ["-C", fixture.root, "add", ".gitignore"]);
+          await exec("git", ["-C", fixture.root, "commit", "-qm", "ignore"]);
+        }
+        const repo = (await GitRepo.open(fixture.root))!;
+        const wt = await createOwned(
+          repo,
+          await repo.headCommit(),
+          CAND(`lw${sc.rel.length}${sc.cwdInside ? "c" : "p"}`),
+        );
+        await writeFile(join(wt.path, "dirty.txt"), "x\n");
+        if (sc.seed) {
+          await mkdir(join(wt.path, "dist"));
+          await writeFile(join(wt.path, sc.seed), "built\n");
+        }
+        await ageWorktree(wt.path, 100 * HOUR);
+        const realGit = (await exec("sh", ["-c", "command -v git"])).stdout.trim();
+        const ready = join(gate, "READY");
+        const go = join(gate, "GO");
+        await mkdir(join(gate, "bin"));
+        await writeFile(
+          join(gate, "bin", "git"),
+          `#!/bin/sh
+case " $* " in *" worktree move "*) : > "${ready}"; i=0; while [ ! -e "${go}" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done;; esac
+exec "${realGit}" "$@"
+`,
+        );
+        await chmod(join(gate, "bin", "git"), 0o755);
+        process.env.PATH = `${join(gate, "bin")}:${savedPath}`;
+        const target = sc.cwdInside ? sc.rel : join(wt.path, sc.rel);
+        const writer = new Promise<void>((done) => {
+          const p = spawn(
+            "sh",
+            ["-c", `while [ ! -e "${ready}" ]; do sleep 0.02; done; printf SECRET > "${target}"; : > "${go}"`],
+            {
+              stdio: "ignore",
+              cwd: sc.cwdInside ? wt.path : undefined,
+            },
+          );
+          p.on("exit", () => done());
+        });
+        const report = await sweep(repo, trashRoot);
+        await writer;
+        process.env.PATH = savedPath;
+        assert.equal(await exists(ready), true, "the gate must have been reached");
+        assert.equal(report.failed.length, 0, JSON.stringify(report));
+        const found = (
+          await exec("sh", [
+            "-c",
+            `find "${join(fixture.root, "..")}" "${trashRoot}" -name "${basename(sc.rel)}" 2>/dev/null || true`,
+          ])
+        ).stdout
+          .trim()
+          .split("\n")
+          .filter(Boolean);
+        assert.ok(found.length > 0, `LOST: ${sc.rel} (${JSON.stringify(report)})`);
+        assert.equal(await readFile(found[0] as string, "utf8"), "SECRET");
+      });
+    } finally {
+      process.env.PATH = savedPath;
+      await rm(gate, { recursive: true, force: true });
+      await fixture.cleanup();
+    }
+  });
+}
