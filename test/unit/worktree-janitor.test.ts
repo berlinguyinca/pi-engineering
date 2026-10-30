@@ -125,8 +125,8 @@ test("live owner is kept; unknown owner is kept while recently active and reclai
     const repo = (await GitRepo.open(fixture.root))!;
     const head = await repo.headCommit();
     const live = await repo.createWorktree(head, "pi-eng-candidate-MSN-live01-repo-1-0-EXC-a");
-    const fresh = await repo.createWorktree(head, "pi-eng-scratch-fresh1");
-    const stale = await repo.createWorktree(head, "pi-eng-scratch-stale1");
+    const fresh = await repo.createWorktree(head, "pi-eng-candidate-nofresh1");
+    const stale = await repo.createWorktree(head, "pi-eng-candidate-nostale1");
     await ageWorktree(stale.path, 30 * HOUR);
 
     const liveness = (owner: { missionId?: string; taskId?: string }) =>
@@ -150,7 +150,7 @@ test("live owner is kept; unknown owner is kept while recently active and reclai
     assert.equal(await exists(live.path), true);
     assert.equal(await exists(fresh.path), true);
     assert.equal(report.reclaimed[0]!.preservedCommit, null, "clean worktree needs no preserving commit");
-    assert.ok(await repo.resolveCommit("pi-eng-scratch-stale1"), "branch survives");
+    assert.ok(await repo.resolveCommit("pi-eng-candidate-nostale1"), "branch survives");
   } finally {
     await fixture.cleanup();
   }
@@ -179,39 +179,25 @@ test("only the runtime's own namespace is touched; foreign worktrees and sibling
   }
 });
 
-test("a namespace directory git lost track of is kept while fresh and removed once idle", async () => {
+test("a namespace directory git lost track of is reported as a stray and never removed, however idle", async () => {
   const fixture = await makeFixtureRepo();
   try {
     const repo = (await GitRepo.open(fixture.root))!;
     const head = await repo.headCommit();
     const wt = await repo.createWorktree(head, "pi-eng-candidate-MSN-lost01-repo-1-0-EXC-a");
     // Lose the admin metadata the way `git worktree prune` after a move would.
-    // Nothing in the directory is recoverable through git any more, so the
-    // janitor must not trust the owner's terminal state alone: it waits for
-    // the idle threshold before removing it.
     const link = (await readFile(join(wt.path, ".git"), "utf8")).trim().replace(/^gitdir:\s*/, "");
     await rm(link, { recursive: true, force: true });
     assert.equal((await repo.listLinkedWorktrees()).length, 0, "git no longer lists it");
-
-    const fresh = await sweepWorktrees({
-      repo,
-      ownerLiveness: () => "terminal",
-      maxIdleMs: 24 * HOUR,
-      minAgeMs: 0,
-    });
-    assert.equal(fresh.reclaimed.length, 0);
-    assert.equal(fresh.failed.length, 0, JSON.stringify(fresh.failed));
-    assert.equal(fresh.kept.length, 1);
-    assert.match(fresh.kept[0]!.reason, /no known owner; active/);
-    assert.equal(await exists(wt.path), true);
-
+    await writeFile(join(wt.path, "unsaved.txt"), "only copy\n");
     await ageWorktree(wt.path, 30 * HOUR);
-    const idle = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 24 * HOUR });
-    assert.equal(idle.reclaimed.length, 1);
-    assert.equal(idle.reclaimed[0]!.branch, null);
-    assert.equal(idle.reclaimed[0]!.preservedCommit, null);
-    assert.match(idle.reclaimed[0]!.reason, /idle/);
-    assert.equal(await exists(wt.path), false);
+    for (const dryRun of [true, false]) {
+      const report = await sweepWorktrees({ repo, ownerLiveness: () => "terminal", maxIdleMs: 24 * HOUR, dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.equal(report.failed.length, 0, JSON.stringify(report.failed));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /stray, not removed/);
+      assert.equal(await readFile(join(wt.path, "unsaved.txt"), "utf8"), "only copy\n");
+    }
   } finally {
     await fixture.cleanup();
   }
@@ -378,16 +364,6 @@ test("a path assertSafeWorktreePath refuses lands in report.failed, untouched", 
   }
 });
 
-test("housekeeping is on by default; only 0 disables it and dry-run reports only", () => {
-  assert.equal(housekeepingMode({}), "on");
-  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "1" }), "on");
-  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "0" }), "off");
-  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "false" }), "off");
-  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "off" }), "off");
-  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "dry-run" }), "dry-run");
-  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "yes" }), "on");
-});
-
 test("runHousekeeping aborts: a pre-aborted run rejects before touching git, an in-flight one leaves no child handles", async () => {
   const fixture = await makeFixtureRepo();
   const handles = () =>
@@ -419,7 +395,7 @@ for (const metadata of ["registered", "pruned"] as const) {
       await exec("git", ["-C", fixture.root, "commit", "-qm", "ignore recovery output"]);
       const base = await repo.headCommit();
       const worker = await repo.createWorktree(base, "pi-eng-pw-recovery-blocked");
-      const ordinary = await repo.createWorktree(base, "pi-eng-scratch-orphan");
+      const ordinary = await repo.createWorktree(base, "pi-eng-candidate-noowner1");
       const output = join(worker.path, "recover.txt");
       await writeFile(output, "ignored worker output remains recoverable\n");
       const stateDir = join(fixture.root, ".pi-eng", "planner-worker", "recovery");
@@ -455,3 +431,178 @@ for (const metadata of ["registered", "pruned"] as const) {
     }
   });
 }
+
+// ---- Owner rule 2026-10-30: "we can't lose data due to sweeps" ----
+
+const CAND = (n: string) => `pi-eng-candidate-MSN-${n}-repo-1-0-EXC-a`;
+const terminal = () => "terminal" as const;
+const sweepOld = (repo: GitRepo, extra: { dryRun?: boolean } = {}) =>
+  sweepWorktrees({ repo, ownerLiveness: terminal, maxIdleMs: 24 * HOUR, ...extra });
+
+test("housekeeping defaults to dry-run; only explicit 1/true/on/yes act, 0/false/off/no disable", () => {
+  assert.equal(housekeepingMode({}), "dry-run");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "" }), "dry-run");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "  " }), "dry-run");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "dry-run" }), "dry-run");
+  assert.equal(housekeepingMode({ PI_HOUSEKEEPING: "banana" }), "dry-run");
+  for (const v of ["1", "true", "on", "yes", "ON", " Yes "]) {
+    assert.equal(housekeepingMode({ PI_HOUSEKEEPING: v }), "on", v);
+  }
+  for (const v of ["0", "false", "off", "no", "OFF"]) {
+    assert.equal(housekeepingMode({ PI_HOUSEKEEPING: v }), "off", v);
+  }
+});
+
+test("an unregistered stray directory with files is never deleted, in dry-run or on mode, and is reported", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const stray = join(dirname(fixture.root), `${repo.worktreeNamespacePrefix()}stray-with-data`);
+    await mkdir(stray, { recursive: true });
+    await writeFile(join(stray, "precious.txt"), "irreplaceable\n");
+    await ageWorktree(stray, 100 * HOUR).catch(() => {});
+    const then = new Date(Date.now() - 100 * HOUR);
+    await utimes(stray, then, then);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.equal(report.failed.length, 0);
+      const kept = report.kept.find((k) => k.path === stray);
+      assert.ok(kept, "stray reported");
+      assert.match(kept.reason, /stray, not removed/);
+      assert.equal(await readFile(join(stray, "precious.txt"), "utf8"), "irreplaceable\n");
+    }
+    await rm(stray, { recursive: true, force: true });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a worktree on a user branch is kept however long it has been idle", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("user01"));
+    await exec("git", ["-C", wt.path, "checkout", "-q", "-b", "feature/x"]);
+    await ageWorktree(wt.path, 10 * 24 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /user branch/);
+      assert.equal(await exists(wt.path), true);
+    }
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a detached unreachable HEAD in a pi-eng worktree is kept and reported", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("detach");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "only-here.txt"), "work\n");
+    await exec("git", ["-C", wt.path, "add", "-A"]);
+    await exec("git", ["-C", wt.path, "commit", "-qm", "unique work"]);
+    const sha = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
+    await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await exec("git", ["-C", fixture.root, "branch", "-D", branch]);
+    await ageWorktree(wt.path, 100 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /detached/);
+      assert.equal(await exists(wt.path), true);
+    }
+    await exec("git", ["-C", fixture.root, "cat-file", "-e", sha]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a worktree holding an ignored .env is kept; ignored derived dirs do not block", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    await writeFile(join(fixture.root, ".gitignore"), ".env\nnode_modules/\n");
+    await exec("git", ["-C", fixture.root, "add", ".gitignore"]);
+    await exec("git", ["-C", fixture.root, "commit", "-qm", "ignore"]);
+    const secret = await repo.createWorktree(await repo.headCommit(), CAND("envs01"));
+    const derived = await repo.createWorktree(await repo.headCommit(), CAND("deriv1"));
+    await writeFile(join(secret.path, ".env"), "TOKEN=abc\n");
+    await mkdir(join(derived.path, "node_modules", "x"), { recursive: true });
+    await writeFile(join(derived.path, "node_modules", "x", "i.js"), "1\n");
+    await ageWorktree(secret.path, 100 * HOUR);
+    await ageWorktree(derived.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.deepEqual(
+      report.reclaimed.map((r) => r.path),
+      [derived.path],
+      JSON.stringify(report),
+    );
+    assert.match(report.kept.find((k) => k.path === secret.path)!.reason, /ignored files.*\.env/);
+    assert.equal(await readFile(join(secret.path, ".env"), "utf8"), "TOKEN=abc\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an eligible clean pi-eng worktree is reclaimed in on mode only, and its branch survives", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("clean01");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await ageWorktree(wt.path, 100 * HOUR);
+    const dry = await sweepOld(repo, { dryRun: true });
+    assert.equal(dry.reclaimed.length, 1);
+    assert.equal(await exists(wt.path), true, "dry run removes nothing");
+    const on = await sweepOld(repo);
+    assert.equal(on.reclaimed.length, 1);
+    assert.equal(await exists(wt.path), false);
+    assert.ok(await repo.resolveCommit(branch), "branch survives");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("the preserve step never commits node_modules; unignored node_modules is left on disk and the worktree kept", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("nm0001");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "real-work.txt"), "keep me\n");
+    await mkdir(join(wt.path, "node_modules", "pkg"), { recursive: true });
+    await writeFile(join(wt.path, "node_modules", "pkg", "index.js"), "x\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    const files = (await exec("git", ["-C", fixture.root, "ls-tree", "-r", "--name-only", branch])).stdout;
+    assert.match(files, /real-work\.txt/, "real work was preserved on the branch");
+    assert.doesNotMatch(files, /node_modules/);
+    assert.equal(report.failed.length, 0, JSON.stringify(report));
+    // Plain `worktree remove` refuses untracked node_modules: kept, not forced.
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.equal(await exists(join(wt.path, "node_modules", "pkg", "index.js")), true);
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /worktree remove/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("when plain `git worktree remove` fails (locked), the worktree is kept, not forced", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("lock01"));
+    await exec("git", ["-C", fixture.root, "worktree", "lock", wt.path]);
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /worktree remove/);
+    assert.equal(await exists(wt.path), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});

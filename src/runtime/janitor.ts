@@ -53,11 +53,17 @@ export function missionOwnerLiveness(
   };
 }
 
-/** `PI_HOUSEKEEPING`: `0` is off, `dry-run` reports only, anything else (default) acts. */
+/**
+ * `PI_HOUSEKEEPING`: acts only for an explicit `1|true|on|yes`; `0|false|off|no`
+ * disables; unset, empty, `dry-run` or anything unknown only reports.
+ * Owner rule 2026-10-30: "we can't lose data due to sweeps".
+ */
 export function housekeepingMode(env: Record<string, string | undefined> = process.env): "on" | "off" | "dry-run" {
   const raw = env.PI_HOUSEKEEPING?.trim().toLowerCase();
-  if (raw !== undefined && /^(0|false|off|no)$/.test(raw)) return "off";
-  return raw === "dry-run" ? "dry-run" : "on";
+  if (raw === undefined) return "dry-run";
+  if (/^(1|true|on|yes)$/.test(raw)) return "on";
+  if (/^(0|false|off|no)$/.test(raw)) return "off";
+  return "dry-run";
 }
 
 export interface HousekeepingResult {

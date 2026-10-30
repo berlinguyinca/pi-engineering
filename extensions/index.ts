@@ -742,9 +742,11 @@ export default function (pi: ExtensionAPI) {
   // so this is safe to run at session start and periodically while the
   // session stays open. Never awaited: a slow sweep must not delay a session.
   const housekeepingIntervalMs = Number(process.env.PI_HOUSEKEEPING_INTERVAL_MS ?? 6 * 60 * 60 * 1000);
-  // On by default (operator decision 2026-10-29): the janitor keeps any worktree
-  // with a live, unknown or durably referenced owner. PI_HOUSEKEEPING=dry-run
-  // reports only, =0 disables. `/gc` always acts.
+  // Dry-run by default. Owner rule 2026-10-30, superseding the 2026-10-29
+  // decision to default on: "we can't lose data due to sweeps". Automatic
+  // sweeps act only with an explicit PI_HOUSEKEEPING=1|true|on|yes; =0 disables.
+  // `/gc` is the explicit operator action (`/gc --dry-run` previews) and
+  // lists what it kept and why.
   const hkMode = housekeepingMode(process.env);
   const housekeepingEnabled = hkMode !== "off";
   // First sweep waits this long so a session that reloads or exits at once
@@ -793,7 +795,8 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_shutdown", stopHousekeeping);
   }
   pi.registerCommand("gc", {
-    description: "Reclaim abandoned candidate worktrees and expired Rust build caches (--dry-run to preview).",
+    description:
+      "Reclaim abandoned pi-eng candidate worktrees and expired Rust build caches; lists what was kept and why (--dry-run to preview).",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const dryRun = argv.includes("--dry-run");

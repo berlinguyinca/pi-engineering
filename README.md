@@ -463,27 +463,32 @@ full working tree plus whatever the worker built. Housekeeping runs at session
 start, every six hours while a session stays open, and on demand with `/gc`
 (`/gc --dry-run` previews):
 
-- Worktrees in the runtime's own namespace (`pi-eng-<hash(repoRoot)>-*`
-  siblings of the repo root, nothing else) are reclaimed only when their
-  mission is durably `COMPLETE`, `CANCELED` or `FAILED` (read from the
-  orchestration event log, so missions run by other pi processes count), or
-  when the branch names no owner at all and the checkout has been idle for
-  `PI_WORKTREE_IDLE_HOURS` (default 24). A mission this process cannot prove
-  terminal is kept, as is any worktree a durable candidate, cleanup or
-  quarantined record still names. Nothing younger than
-  `PI_WORKTREE_MIN_AGE_HOURS` (default and minimum 1) is reclaimed.
-- Reclaiming never loses work. Uncommitted changes are committed onto the
-  worktree's own branch first and the branch is always kept; only the checkout
-  on disk goes away. A directory whose git metadata is gone cannot be
-  preserved, so it is removed only once idle.
+- Only worktrees on `pi-eng-candidate-*` / `pi-eng-orch-*` branches in the
+  runtime's own namespace (`pi-eng-<hash(repoRoot)>-*` siblings of the repo
+  root) are ever reclaimed, and only when their mission is durably `COMPLETE`,
+  `CANCELED` or `FAILED` (read from the orchestration event log, so missions run
+  by other pi processes count). A worktree on any other branch is yours: it is
+  kept and reported, however idle. A mission this process cannot prove terminal
+  is kept, as is any worktree a durable candidate, cleanup or quarantined record
+  still names. Nothing younger than `PI_WORKTREE_MIN_AGE_HOURS` (default and
+  minimum 1) is reclaimed.
+- Housekeeping never loses data. It keeps and reports a worktree whose HEAD is
+  detached and unreachable from any ref, that holds ignored files other than
+  `node_modules`/`target`/`.next`/`dist`/`coverage`, that still has changes after
+  the preserving commit, or that a plain (never `--force`d) `git worktree
+  remove` refuses. Otherwise uncommitted changes (never `node_modules` or the
+  other derived dirs) are committed onto the worktree's own branch first and the
+  branch is always kept; only the checkout goes away. A namespace directory git
+  no longer lists is reported as a stray and never removed; delete it yourself
+  if you do not want it.
 - A reclaimed worktree's cargo target dir goes with it, and target dirs (see
   above) that no build touched for `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_HOUSEKEEPING` | on | Automatic housekeeping acts by default; `0`/`false`/`off` disables it, `dry-run` only reports. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` always acts (`/gc --dry-run` previews) |
+| `PI_HOUSEKEEPING` | dry-run | Automatic housekeeping only reports by default (owner rule 2026-10-30: nothing is deleted by a sweep unless you opt in); `1`/`true`/`on`/`yes` lets it act, `0`/`false`/`off`/`no` disables it. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` is the explicit action (`/gc --dry-run` previews) and lists what it kept and why |
 | `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
-| `PI_WORKTREE_IDLE_HOURS` | `24` | Idle threshold for worktrees with no known owner |
+| `PI_WORKTREE_IDLE_HOURS` | `24` | Idle threshold for pi-eng-owned worktrees whose branch names no parsable owner |
 
 ## Semantic tools
 

@@ -151,8 +151,10 @@ worktree reuse another's build of the repository's own crates. Set
 
 Worktrees the runtime creates are reclaimed by housekeeping
 (`src/git/worktreeJanitor.ts`, README "Housekeeping") once their mission is
-durably terminal or they name no owner and sit idle; uncommitted work is committed to the
-worktree's branch first. Hand-made worktrees like the one above live outside
+durably terminal (only on `pi-eng-candidate-*`/`pi-eng-orch-*` branches, and
+only when `PI_HOUSEKEEPING=1`/`/gc` opts in; the default is dry-run); uncommitted
+work is committed to the worktree's branch first, and anything that cannot be
+preserved is kept and reported. Hand-made worktrees like the one above live outside
 the `pi-eng-*` namespace and are never touched, so remove them yourself when
 the branch has merged.
 

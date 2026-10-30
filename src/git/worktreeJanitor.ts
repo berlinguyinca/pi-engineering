@@ -14,16 +14,21 @@
  *    including unregistered directories whose Git metadata was pruned.
  *  - A worktree whose owning mission is still live (any non-terminal status)
  *    is kept untouched.
- *  - A worktree whose mission is terminal, or whose owner cannot be found and
- *    which has been idle longer than `maxIdleMs`, is reclaimed.
- *  - Reclaiming never loses work: uncommitted changes are committed onto the
- *    worktree's own branch first, and the branch is always kept. Only the
- *    checkout on disk goes away. If the preserving commit fails, the worktree
- *    is left alone and reported.
+ *  - Only worktrees on `pi-eng-candidate-*` / `pi-eng-orch-*` branches (or
+ *    detached, with such a name) are ever reclaimed. Any other branch belongs
+ *    to the user and is kept and reported, however idle.
+ *  - A pi-eng-owned worktree whose mission is terminal is reclaimed.
+ *  - Reclaiming never loses work (owner rule 2026-10-30: "we can't lose data
+ *    due to sweeps"). It fails closed, keeping and reporting the worktree, when
+ *    HEAD is detached (a commit made there would become unreachable), when
+ *    ignored files other than known derived directories exist, when changes
+ *    remain after the preserving commit, or when a plain (never forced)
+ *    `git worktree remove` refuses. Otherwise uncommitted changes are committed
+ *    onto the worktree's own branch, the branch is kept and only the checkout
+ *    goes away.
  *  - Sibling directories inside the namespace that git no longer lists (their
  *    admin metadata was pruned) are re-registered with `git worktree repair`
- *    when possible so the same preserve-then-remove path applies; otherwise
- *    they are removed only once idle.
+ *    when possible; otherwise they are reported as strays and never removed.
  */
 
 import { execFile } from "node:child_process";
@@ -162,18 +167,53 @@ async function assertNamespacePath(repo: GitRepo, path: string): Promise<void> {
   }
 }
 
-/**
- * Commit everything in the worktree onto its own branch so removing the
- * checkout loses nothing. Returns the commit sha, or null when clean.
- */
-async function preserveUncommittedWork(path: string, branch: string | null): Promise<string | null> {
-  const status = await safeGitOrThrow(["status", "--porcelain"], {
+/** Rebuildable output directories: never committed, never counted as user data. */
+const DERIVED_DIRS = ["node_modules", "target", ".next", "dist", "coverage"] as const;
+
+function isDerivedPath(entry: string): boolean {
+  return entry
+    .replace(/\/+$/, "")
+    .split("/")
+    .some((segment) => (DERIVED_DIRS as readonly string[]).includes(segment));
+}
+
+/** Status lines (`XY path`) that are not derived-directory noise. */
+async function meaningfulStatus(path: string, ignored: boolean): Promise<string[]> {
+  const status = await safeGitOrThrow(["status", "--porcelain", ...(ignored ? ["--ignored"] : [])], {
     cwd: path,
     trust: "operator",
+    // Read-only: a refreshed index would reset the idle clock the next sweep reads.
+    env: { GIT_OPTIONAL_LOCKS: "0" },
     timeoutMs: 60_000,
     maxBuffer: 16 * 1024 * 1024,
   });
-  if (!status.stdout.trim()) return null;
+  return status.stdout.split("\n").filter((line) => line.trim() && !isDerivedPath(line.slice(3).replace(/^"|"$/g, "")));
+}
+
+/** Is `commit` reachable from any branch, tag or remote-tracking ref? */
+async function isReachableFromRef(repo: GitRepo, commit: string): Promise<boolean> {
+  const refs = await safeGitOrThrow(["for-each-ref", "--count=1", "--contains", commit, "refs/"], {
+    cwd: repo.root,
+    trust: "operator",
+    timeoutMs: 60_000,
+  });
+  return refs.stdout.trim().length > 0;
+}
+
+/** Only pi-eng candidate/orchestrator branches (or their detached worktrees, by name) are the runtime's own. */
+function isPiEngOwned(repo: GitRepo, wt: { path: string; branch: string | null }): boolean {
+  const pattern = /^pi-eng-(candidate|orch)-/;
+  if (wt.branch) return pattern.test(wt.branch);
+  return pattern.test(basename(wt.path).slice(repo.worktreeNamespacePrefix().length));
+}
+
+/**
+ * Commit everything in the worktree onto its own branch so removing the
+ * checkout loses nothing. Returns the commit sha, or null when clean.
+ * Derived directories (node_modules, target, ...) are never committed.
+ */
+async function preserveUncommittedWork(path: string, branch: string | null): Promise<string | null> {
+  if ((await meaningfulStatus(path, false)).length === 0) return null;
   const env = {
     GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "pi-engineering janitor",
     GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "pi-engineering@localhost",
@@ -181,7 +221,10 @@ async function preserveUncommittedWork(path: string, branch: string | null): Pro
     GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "pi-engineering@localhost",
   };
   const base = { cwd: path, trust: "operator", env } as const;
-  await safeGitOrThrow(["add", "-A"], { ...base, timeoutMs: 120_000 });
+  await safeGitOrThrow(["add", "-A", "--", ".", ...DERIVED_DIRS.map((d) => `:(exclude,glob)**/${d}/**`)], {
+    ...base,
+    timeoutMs: 120_000,
+  });
   await safeGitOrThrow(
     [
       "commit",
@@ -224,21 +267,32 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
     if (s?.isDirectory()) strays.push(path);
   }
   for (const path of strays) {
-    if (opts.dryRun) {
+    if (basename(path).startsWith(`${prefix}pi-eng-pw-`)) {
+      // Reported below with the planner-worker recovery reason.
       registered.set(path, { path, branch: null, head: null });
       continue;
     }
-    // Re-register so the preserve-then-remove path applies; failure means the
-    // directory is handled as an unrecoverable stray below.
-    const repaired = await safeGitOrThrow(["worktree", "repair", path], {
-      cwd: repo.root,
-      trust: "operator",
-      timeoutMs: 60_000,
-    })
-      .then(() => true)
-      .catch(() => false);
+    // Re-register when git can (metadata only, no file is touched). Anything
+    // else is reported as a stray and never removed.
+    const repaired = opts.dryRun
+      ? false
+      : await safeGitOrThrow(["worktree", "repair", path], {
+          cwd: repo.root,
+          trust: "operator",
+          timeoutMs: 60_000,
+        })
+          .then(() => true)
+          .catch(() => false);
     const after = repaired ? (await repo.listLinkedWorktrees()).find((wt) => wt.path === path) : undefined;
-    registered.set(path, after ?? { path, branch: null, head: null });
+    if (after) {
+      registered.set(path, after);
+      continue;
+    }
+    report.kept.push({
+      path,
+      branch: null,
+      reason: "stray, not removed: git no longer lists this directory; inspect it and delete it yourself if unwanted",
+    });
   }
 
   const referenced = await repo.durablyReferencedWorktreePaths([...registered.keys()]);
@@ -262,6 +316,16 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
     // mission's recovery path owns its removal, never the janitor.
     if (referenced.has(wt.path)) {
       report.kept.push({ path: wt.path, branch: wt.branch, reason: "a durable mission record still references it" });
+      continue;
+    }
+    if (!isPiEngOwned(repo, wt)) {
+      report.kept.push({
+        path: wt.path,
+        branch: wt.branch,
+        reason: wt.branch
+          ? `user branch ${wt.branch}: not a pi-eng-candidate/orch branch, never reclaimed`
+          : "no pi-eng-candidate/orch branch: not the runtime's own, never reclaimed",
+      });
       continue;
     }
     const owner = parseWorktreeOwner(wt.branch);
@@ -320,28 +384,65 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
     try {
       await assertNamespacePath(repo, wt.path);
       const bytes = await directoryBytes(wt.path);
+      // wt.head === null only for a worktree git could not list; strays never reach here.
+      const dirty = await meaningfulStatus(wt.path, false);
+      if (!wt.branch) {
+        // Detached: a preserving commit would be unreachable once the admin dir goes.
+        const reachable = wt.head ? await isReachableFromRef(repo, wt.head) : false;
+        if (!reachable || dirty.length > 0) {
+          report.kept.push({
+            path: wt.path,
+            branch: wt.branch,
+            reason: !reachable
+              ? `detached HEAD ${wt.head?.slice(0, 12) ?? "?"} is not reachable from any ref; removing would lose it`
+              : "detached HEAD with uncommitted changes that could not be kept on a branch",
+          });
+          continue;
+        }
+      }
+      const ignoredFiles = (await meaningfulStatus(wt.path, true)).filter((l) => l.startsWith("!! "));
+      if (ignoredFiles.length > 0) {
+        const names = ignoredFiles.map((l) => l.slice(3)).slice(0, 5);
+        report.kept.push({
+          path: wt.path,
+          branch: wt.branch,
+          reason: `ignored files present (${names.join(", ")}${ignoredFiles.length > 5 ? ", ..." : ""}); git does not track them`,
+        });
+        continue;
+      }
       if (opts.dryRun) {
         report.reclaimed.push({ path: wt.path, branch: wt.branch, preservedCommit: null, reason, bytes });
         continue;
       }
-      const isRegistered = wt.head !== null;
-      let preservedCommit: string | null = null;
-      if (isRegistered) {
-        // Resolved while the worktree is still registered: it needs git.
-        const target = await rustTargetDir(wt.path).catch(() => null);
-        preservedCommit = await preserveUncommittedWork(wt.path, wt.branch);
-        await safeGitOrThrow(["worktree", "remove", "--force", wt.path], {
+      // Resolved while the worktree is still registered: it needs git.
+      const target = await rustTargetDir(wt.path).catch(() => null);
+      const preservedCommit = await preserveUncommittedWork(wt.path, wt.branch);
+      const left = await meaningfulStatus(wt.path, false);
+      if (left.length > 0) {
+        report.kept.push({
+          path: wt.path,
+          branch: wt.branch,
+          reason: `changes remain after the preserving commit (${left.slice(0, 3).join("; ")}); kept`,
+        });
+        continue;
+      }
+      try {
+        // Plain remove, never --force: git refuses on locks and untracked files.
+        await safeGitOrThrow(["worktree", "remove", wt.path], {
           cwd: repo.root,
           trust: "operator",
           timeoutMs: 300_000,
         });
-        // The worktree's own cargo target dir is derived output; it goes with it.
-        if (target) await rm(target, { recursive: true, force: true }).catch(() => {});
-      } else {
-        // Unrecoverable stray: no git metadata, so nothing can be preserved.
-        // Only reached once the directory has sat idle past the threshold.
-        await rm(wt.path, { recursive: true, force: true });
+      } catch (error) {
+        report.kept.push({
+          path: wt.path,
+          branch: wt.branch,
+          reason: `git worktree remove refused, kept (not forced): ${error instanceof Error ? error.message.split("\n")[0] : String(error)}${preservedCommit ? `; uncommitted work was preserved as ${preservedCommit}` : ""}`,
+        });
+        continue;
       }
+      // The worktree's own cargo target dir is derived output; it goes with it.
+      if (target) await rm(target, { recursive: true, force: true }).catch(() => {});
       report.reclaimed.push({ path: wt.path, branch: wt.branch, preservedCommit, reason, bytes });
     } catch (error) {
       report.failed.push({
