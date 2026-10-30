@@ -11,9 +11,10 @@ import { generateEvents } from "../support/ledgerEventGen.ts";
 
 /**
  * Benchmark of LedgerWorkProjection.graph() over synthetic Ledger streams. 10k runs in the default
- * suite with a generous bound. 100k is opt-in: the ONLY gate is the env var PI_ENG_BENCH_100K, read
- * only by this test file (node --test gives test files no argument channel).
+ * suite with a generous bound. 100k is opt-in: set RUN_100K to true locally (a constant, not an
+ * environment variable; the project configures through YAML only). Numbers: BENCH-PROJECTION.md.
  */
+const RUN_100K = false;
 v8.setFlagsFromString("--expose-gc");
 const gc = (): void => {
   runInNewContext("gc")();
@@ -84,7 +85,7 @@ describe("projection benchmark", () => {
     assert.ok(r.coldMs < 5_000, `cold graph() ${r.coldMs}ms`);
     assert.ok(r.warmMs < 2_000, `warm graph() ${r.warmMs}ms`);
   });
-  it("100k events (opt-in: PI_ENG_BENCH_100K=1)", { skip: !process.env.PI_ENG_BENCH_100K }, async () => {
+  it("100k events (opt-in: RUN_100K)", { skip: !RUN_100K }, async () => {
     const r = await measure(100_000);
     assert.ok(r.coldMs < 120_000);
   });

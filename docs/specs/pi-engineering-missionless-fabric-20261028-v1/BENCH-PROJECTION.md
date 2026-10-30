@@ -4,7 +4,7 @@ Harness: `test/unit/work-projection-bench.test.ts` with generator `test/support/
 work item: plan tasks and their lifecycle, a candidate, evidence rows, status updates, 1-3 agent runs with up to 40
 heartbeats, some finished, some failed, some left running). The stream is written to a JSONL file and loaded with
 `Ledger.create`, so the numbers include a real log. 10k runs in the default suite (bounds: cold < 5 s, warm < 2 s).
-100k is opt-in: `PI_ENG_BENCH_100K=1 node --test --import ./test/support/isolatedState.ts test/unit/work-projection-bench.test.ts`
+100k is opt-in: `set RUN_100K in the test file node --test --import ./test/support/isolatedState.ts test/unit/work-projection-bench.test.ts`
 (an env var read only by that test file; node --test gives test files no argument channel).
 
 Machine: shared dev workstation with other agents running; treat figures as order-of-magnitude (2 runs each).
