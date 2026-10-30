@@ -1,0 +1,108 @@
+# Woodpecker CI (ci.metabolomics.us) -- the pi-engineering harness gate.
+#
+# Replaces .github/workflows/ci.yml, removed in 85b1b06 when GitHub Actions
+# billing started failing. Same gates, same order the harness documents:
+# lint, typecheck, unit, integration, then the structural roadmap check.
+# `bash`-level reproduction: run the same npm scripts from a clean checkout.
+#
+# NOT carried over from the Actions workflow: nightly-dogfood, the
+# `release-gate` job (`npm run roadmap:check`, release/* tags only), and
+# `npm run test:e2e`. The PR-time roadmap check stays structural only.
+#
+# Conventions follow the org's other Woodpecker pipelines (inferweave
+# .woodpecker/rust.yaml, herdr ui-gates.yml). Read from them, not observed
+# here:
+#  * `image: bash` names an EXECUTABLE on the agent, not a container: the
+#    agents are Slurm exec hosts (no docker, no apt, no sudo). Node 22 and
+#    npm are expected on the host (herdr's ui-gates.sh states "Node 22");
+#    the `toolchain` step fails fast and says so if they are not.
+#  * The clone plugin fails invisibly on this backend (no step logs), so
+#    skip_clone plus a plain git checkout with the credential the job stages
+#    at /etc/woodpecker-git-credentials.
+when:
+  - event: [pull_request, manual]
+  # Main builds on push; branches build on their pull_request event only, so
+  # a push to a PR branch does not build twice.
+  - event: push
+    branch: main
+
+skip_clone: true
+
+# Same hive pool as the other repos' gates.
+labels:
+  cluster: hive
+
+# Each step gets a clean environment AND its own HOME, so the Playwright
+# browser cache must live at an explicit shared path or the install step's
+# download is invisible to the test steps.
+variables:
+  - &browsers /tmp/woodpecker-cache/playwright
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      # Full history, as the Actions job had (fetch-depth: 0): roadmap
+      # evidence freshness diffs against the recorded evidence commit and a
+      # shallow clone would read as stale.
+      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'
+      - 'git checkout -q FETCH_HEAD'
+      - 'git --no-pager log --oneline -1'
+
+  - name: toolchain
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'command -v node >/dev/null && command -v npm >/dev/null || { echo "node/npm missing on this agent" >&2; exit 1; }'
+      # The harness runs .ts files with Node's type stripping: needs 22.6+.
+      - 'node -e "const [a,b]=process.versions.node.split(\".\").map(Number); if (a<22||(a===22&&b<6)) { console.error(\"Node 22.6+ required, found \"+process.version); process.exit(1); }"'
+      - 'echo "node=$(node --version) npm=$(npm --version)"'
+
+  - name: install
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'npm ci --no-audit --no-fund'
+      # The CAV suites drive a real headless Chromium; npm ci does not fetch
+      # the binary. No --with-deps: the hosts have no apt/sudo, so system
+      # libraries must already be present.
+      - 'npx playwright install chromium'
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: *browsers
+
+  - name: lint
+    image: bash
+    commands:
+      - 'npm run lint'
+
+  - name: typecheck
+    image: bash
+    commands:
+      - 'npm run typecheck'
+
+  # Never bare `node --test`: git-touching suites need
+  # test/support/isolatedState.ts, which the npm scripts import.
+  - name: test-unit
+    image: bash
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: *browsers
+    commands:
+      - 'npm run test:unit'
+
+  - name: test-integration
+    image: bash
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: *browsers
+    commands:
+      - 'npm run test:integration'
+
+  # PR-time structural check only (definition + manual evidence index); the
+  # full `roadmap:check` release gate is deliberately not run here.
+  - name: roadmap-structural
+    image: bash
+    commands:
+      - 'npm run roadmap:structural'
