@@ -147,6 +147,7 @@ import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { LedgerWorkProjection } from "../src/work/ledgerProjection.ts";
 import { projectLegacyMissions } from "../src/work/legacyMissionAdapter.ts";
 import { formatWorkStatus } from "../src/work/statusText.ts";
+import { formatTaskView, formatTeamView, formatWorkStatusRow, formatWorkSummary } from "../src/work/summaryText.ts";
 import { mergeWorkGraphs } from "../src/work/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
@@ -508,6 +509,27 @@ function seedPresenceFrom(runtime: EngineeringRuntime): void {
   // Draw now. Waiting for the next clock tick would leave a session that opens
   // a runtime and immediately sits idle showing nothing at all.
   presence.tick();
+}
+
+/**
+ * Compact work status row (one line). Reads only an already-open runtime, never opens one, and writes only when
+ * the text changed, so an idle session causes no UI churn.
+ */
+let workStatusLast: string | undefined;
+async function refreshWorkStatus(
+  ui: { setStatus?(key: string, text: string | undefined): void },
+  cwd: string,
+): Promise<void> {
+  const open = await repoKeys.lookup(cwd, runtimes).catch(() => undefined);
+  if (!open) return;
+  const rt = open.runtime;
+  const projection = new LedgerWorkProjection(rt.ledger);
+  const graphs = [projection.graph()];
+  if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
+  const text = formatWorkStatusRow(mergeWorkGraphs(...graphs));
+  if (text === workStatusLast) return;
+  workStatusLast = text;
+  ui.setStatus?.("work", text);
 }
 
 async function refreshPresence(cwd: string): Promise<void> {
@@ -2228,6 +2250,7 @@ ${RECOVERY_PROMPT}`;
       }
     });
     pi.on("agent_start", (_event, ctx) => {
+      if (ctx.hasUI) void refreshWorkStatus(ctx.ui, ctx.cwd).catch(() => {});
       workingSignal = ctx.signal;
       working?.onAgentStart();
       presence?.onAgentStart();
@@ -2237,7 +2260,8 @@ ${RECOVERY_PROMPT}`;
     pi.on("tool_execution_update", (event) => working?.onToolEvent(event));
     pi.on("tool_execution_end", (event) => working?.onToolEvent(event));
     pi.on("model_select", (event) => working?.onModelSelect(event.model));
-    pi.on("agent_settled", () => {
+    pi.on("agent_settled", (_event, ctx) => {
+      if (ctx?.hasUI) void refreshWorkStatus(ctx.ui, ctx.cwd).catch(() => {});
       workingSignal = undefined;
       working?.onAgentEnd();
       presence?.onAgentEnd();
@@ -2250,6 +2274,7 @@ ${RECOVERY_PROMPT}`;
       presencePoll = undefined;
       presence?.dispose();
       presence = undefined;
+      workStatusLast = undefined;
     });
   }
 
@@ -2732,6 +2757,40 @@ ${RECOVERY_PROMPT}`;
       const graphs = [projection.graph()];
       if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
       ctx.ui.notify(formatWorkStatus(mergeWorkGraphs(...graphs)), "info");
+    },
+  });
+
+  // Deterministic, model-free views over the same work graph as /work. No new store, no model call.
+  const workGraphOf = (rt: EngineeringRuntime) => {
+    const projection = new LedgerWorkProjection(rt.ledger);
+    const graphs = [projection.graph()];
+    if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
+    return mergeWorkGraphs(...graphs);
+  };
+  pi.registerCommand("summary", {
+    description: "Deterministic work timeline from the work read model: tasks, runs, verification, blockers, handoffs.",
+    handler: async (_args, ctx) => {
+      const rt = await getRuntime(ctx);
+      ctx.ui.notify(formatWorkSummary(workGraphOf(rt), rt.ledger.events()), "info");
+    },
+  });
+  pi.registerCommand("task", {
+    description: "Show one tracked task (alias view of /work): /task <task id>.",
+    handler: async (args, ctx) => {
+      const id = args.trim();
+      if (!id) {
+        ctx.ui.notify("Usage: /task <task id>. /work lists tracked work.", "info");
+        return;
+      }
+      ctx.ui.notify(formatTaskView(workGraphOf(await getRuntime(ctx)), id), "info");
+    },
+  });
+  pi.registerCommand("team", {
+    description: "Read-only: the execution (delegation) preference and live runs per task.",
+    handler: async (_args, ctx) => {
+      const rt = await getRuntime(ctx);
+      const execution = await loadExecutionConfig(runtimeCwd(ctx.cwd ?? process.cwd()));
+      ctx.ui.notify(formatTeamView(workGraphOf(rt), execution.preference), "info");
     },
   });
 
