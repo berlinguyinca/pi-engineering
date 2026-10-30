@@ -238,11 +238,24 @@ export async function withRustBuildEnv<T extends Env>(env: T, cwd: string): Prom
     const root = rustCacheRoot(env);
     // A root that is not ours (e.g. PI_RUST_CACHE_DIR pointing at a home or work dir) is never used:
     // the build proceeds without the shared cache rather than scattering target dirs into it.
-    if (!(await prepareRustCacheRoot(root)).ok) return env;
+    const check = await prepareRustCacheRoot(root);
+    if (!check.ok) {
+      warnRefusedRoot(root, check.reason);
+      return env;
+    }
     if (additions.CARGO_TARGET_DIR) await markGeneration(additions.CARGO_TARGET_DIR, cwd);
   }
   applyAdditions(env, additions);
   return env;
+}
+
+const warnedRoots = new Set<string>();
+
+/** One visible warning per root and process: without it a refused root silently disables the shared cache. */
+function warnRefusedRoot(root: string, reason: string): void {
+  if (warnedRoots.has(root)) return;
+  warnedRoots.add(root);
+  process.emitWarning(`the shared Rust cache is disabled: ${reason}`, { type: "PiRustCacheWarning" });
 }
 
 /** Marks the cache root as pi-engineering's. A root without it is refused (see `prepareRustCacheRoot`). */
@@ -254,7 +267,7 @@ const ADOPTABLE_ROOT_ENTRIES = new Set(["target", "sccache", ".trash", RUST_CACH
 
 export type RustCacheRootCheck = { ok: true } | { ok: false; reason: string };
 
-async function hasRootMarker(root: string): Promise<boolean> {
+export async function hasRootMarker(root: string): Promise<boolean> {
   const file = join(root, RUST_CACHE_ROOT_MARKER);
   if (!(await lstat(file).catch(() => null))?.isFile()) return false;
   try {
@@ -440,7 +453,11 @@ export async function sweepRustCache(
         await keep("referenced by a live worktree");
         continue;
       }
-      if (marker.worktreePath && (await stat(marker.worktreePath).catch(() => null))) {
+      if (!marker.worktreePath) {
+        await keep("its marker records no worktree path, so whether its worktree still exists is unknown");
+        continue;
+      }
+      if (await stat(marker.worktreePath).catch(() => null)) {
         await keep(`its worktree ${marker.worktreePath} still exists`);
         continue;
       }

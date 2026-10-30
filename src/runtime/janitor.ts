@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { GitRepo } from "../git/GitRepo.ts";
 import {
   type RustCacheSweepReport,
-  prepareRustCacheRoot,
+  hasRootMarker,
   rustCacheEnabled,
   rustCacheRoot,
   rustTargetDir,
@@ -21,6 +21,7 @@ import {
   DEFAULT_PURGE_OLDER_THAN_DAYS,
   MIN_PURGE_OLDER_THAN_DAYS,
   type TrashPurgeReport,
+  defaultTrashRoot,
   purgeTrash,
 } from "../git/trashStore.ts";
 import {
@@ -32,7 +33,6 @@ import {
 } from "../git/worktreeJanitor.ts";
 import type { MissionStatus } from "../orchestration/types.ts";
 import { discoverMissionHandover } from "./host/missionHandover.ts";
-import { resolveStateRoot } from "./isolation/stateDir.ts";
 
 /**
  * Mission statuses after which a mission never touches its worktrees again.
@@ -123,11 +123,13 @@ export function gcPlan(args: string): GcPlan {
   let purge = false;
   let days: number = DEFAULT_PURGE_OLDER_THAN_DAYS;
   let daysProblem: string | undefined;
+  let sawOlderThan = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
     if (a === "--apply" || a === "--dry-run") continue;
     if (a === "--purge-trash") purge = true;
     else if (a === "--older-than" || a.startsWith("--older-than=")) {
+      sawOlderThan = true;
       const raw = a === "--older-than" ? argv[++i] : a.slice("--older-than=".length);
       const n = Number(raw);
       if (raw === undefined || raw === "" || !Number.isFinite(n) || n < MIN_PURGE_OLDER_THAN_DAYS) {
@@ -143,7 +145,7 @@ export function gcPlan(args: string): GcPlan {
     };
   }
   if (daysProblem) return { dryRun: true, note: daysProblem };
-  if (!purge && argv.includes("--older-than")) {
+  if (!purge && sawOlderThan) {
     return { dryRun: true, note: "--older-than only applies to --purge-trash: showing a preview instead" };
   }
   if (purge && !apply) {
@@ -208,11 +210,17 @@ export async function runTrashPurge(opts: {
   env?: Record<string, string | undefined>;
 }): Promise<TrashPurgeResult> {
   const env = opts.env ?? process.env;
-  const worktreeTrash = await purgeTrash(join(resolveStateRoot(env), "trash"), opts);
+  const worktreeTrash = await purgeTrash(defaultTrashRoot(env), opts);
   if (!rustCacheEnabled(env)) return { worktreeTrash, rustCacheTrash: null };
   const root = rustCacheRoot(env);
-  const check = await prepareRustCacheRoot(root);
-  if (!check.ok) return { worktreeTrash, rustCacheTrash: null, rustCacheRefused: check.reason };
+  // Read-only: a purge or its preview never marks, adopts or chmods a cache root.
+  if (!(await hasRootMarker(root))) {
+    return {
+      worktreeTrash,
+      rustCacheTrash: null,
+      rustCacheRefused: `${root} is not a marked pi-engineering Rust cache (no .pi-eng-rust-cache-root); its .trash is not purged`,
+    };
+  }
   return { worktreeTrash, rustCacheTrash: await purgeTrash(join(root, ".trash"), opts) };
 }
 

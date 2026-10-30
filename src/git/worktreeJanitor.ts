@@ -62,11 +62,10 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 import { type GitRepo, shortHash } from "./GitRepo.ts";
 import { UNSCOPED_TARGET_KEY, rustTargetDir } from "./rustBuildCache.ts";
 import { safeGitOrThrow } from "./safeGit.ts";
-import { moveToTrash } from "./trashStore.ts";
+import { defaultTrashRoot, moveToTrash } from "./trashStore.ts";
 
 const exec = promisify(execFile);
 
@@ -1089,7 +1088,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       let trashedTo: string;
       try {
         trashedTo = await moveToTrash(
-          opts.trashRoot ?? join(resolveStateRoot(), "trash"),
+          opts.trashRoot ?? defaultTrashRoot(),
           "worktree",
           quarantined,
           basename(wt.path),
@@ -1098,14 +1097,12 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       } catch (error) {
         const cross = (error as NodeJS.ErrnoException).code === "EXDEV";
         await restore(
-          `could not move it into the trash (${cross ? "the trash is on a different filesystem" : error instanceof Error ? error.message.split("\n")[0] : String(error)}), kept`,
+          `could not move it into the trash (${cross ? "state dir on different filesystem: set PI_TRASH_DIR next to the repos" : error instanceof Error ? error.message.split("\n")[0] : String(error)}), kept`,
         );
         continue;
       }
-      // The registration now points at a missing directory. `git worktree prune` has no path argument and would
-      // also drop every OTHER registration whose directory is currently missing (an unmounted disk), so it only
-      // runs when ours is the only one; otherwise the stale registration is left for the user.
-      const pruneNote = await pruneOwnRegistration(repo, quarantined);
+      // The registration now points at a missing directory; drop only our own admin dir (never `git worktree prune`).
+      const pruneNote = await removeOwnAdminDir(repo, quarantined);
       report.reclaimed.push({
         path: wt.path,
         branch: wt.branch,
@@ -1125,28 +1122,40 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
   return report;
 }
 
-/** Prune the registration of a checkout that was just moved away; returns a note when it could not be pruned. */
-async function pruneOwnRegistration(repo: GitRepo, movedFrom: string): Promise<string> {
+/**
+ * Remove ONLY the admin dir (`<common-git-dir>/worktrees/<id>`) of the checkout that was just moved away.
+ * `git worktree prune` is never used: it has no path argument and would also drop any other registration whose
+ * `.git` file is missing (an unmounted disk whose mount point still exists), losing its index and per-worktree state.
+ * The admin dir is found by the path its `gitdir` file names (admin ids can carry a numeric suffix), must match
+ * exactly one entry, and must not be locked; anything ambiguous leaves the registration in place and says so.
+ * Everything in it was already checked as a keep condition or preserved on the branch before the move.
+ */
+async function removeOwnAdminDir(repo: GitRepo, movedFrom: string): Promise<string> {
+  const left = (why: string) =>
+    `; its git registration was left in place (${why}); \`git worktree prune\` clears it once you have checked other missing worktrees`;
   try {
-    const listed = await safeGitOrThrow(["worktree", "list", "--porcelain"], { ...READ_ONLY_GIT, cwd: repo.root });
-    const others: string[] = [];
-    for (const entry of listed.stdout.split(/\n\n+/)) {
-      const lines = entry.split("\n");
-      const path = lines
-        .find((l) => l.startsWith("worktree "))
-        ?.slice("worktree ".length)
-        .trim();
-      if (!path || path === movedFrom || path === repo.root) continue;
-      if (lines.some((l) => l === "locked" || l.startsWith("locked "))) continue;
-      if (!(await existsStrict(path))) others.push(path);
+    const common = (
+      await safeGitOrThrow(["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+        ...READ_ONLY_GIT,
+        cwd: repo.root,
+      })
+    ).stdout.trim();
+    const norm = async (p: string): Promise<string> =>
+      join(await realpath(dirname(p)).catch(() => dirname(p)), basename(p));
+    const want = await norm(movedFrom);
+    const root = join(common, "worktrees");
+    const matches: string[] = [];
+    for (const id of await readdir(root).catch(() => [] as string[])) {
+      const text = (await readFile(join(root, id, "gitdir"), "utf8").catch(() => "")).trim();
+      if (text && (await norm(dirname(text))) === want) matches.push(join(root, id));
     }
-    if (others.length > 0) {
-      return `; its git registration was NOT pruned because \`git worktree prune\` would also drop ${others.length} other missing worktree(s) (${preview(others)}); run it yourself when ready`;
-    }
-    await safeGitOrThrow(["worktree", "prune"], { cwd: repo.root, trust: "operator", timeoutMs: 60_000 });
+    if (matches.length !== 1) return left(`${matches.length} admin dirs match its path`);
+    const admin = matches[0] as string;
+    if (await existsStrict(join(admin, "locked"))) return left("it is locked");
+    await rm(admin, { recursive: true });
     return "";
   } catch (error) {
-    return `; its git registration could not be pruned (${error instanceof Error ? error.message.split("\n")[0] : String(error)}); \`git worktree prune\` clears it`;
+    return left(error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error));
   }
 }
 

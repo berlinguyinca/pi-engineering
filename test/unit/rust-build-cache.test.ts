@@ -253,7 +253,7 @@ async function makeGeneration(
       JSON.stringify({
         version: 1,
         creator: "pi-engineering",
-        worktreePath: opts.worktreePath ?? null,
+        worktreePath: "worktreePath" in opts ? opts.worktreePath : join(root, "gone-worktree"),
         createdAt: "x",
       }),
     );
@@ -314,6 +314,46 @@ test("sweepRustCache MOVES marked, idle, worktree-less generations to <cache>/.t
     });
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a generation marker without worktreePath is kept (liveness unknown), not trashed", async () => {
+  const { sweepRustCache } = await import("../../src/git/rustBuildCache.ts");
+  const root = await mkdtemp(join(tmpdir(), "pi-rust-nopath-"));
+  try {
+    await writeFile(join(root, ROOT_MARKER), JSON.stringify({ version: 1, creator: "pi-engineering" }));
+    const dir = await makeGeneration(root, "r-1", "wt", 400, { worktreePath: null });
+    const report = await sweepRustCache({ env: { HOME: root, PATH: "", PI_RUST_CACHE_DIR: root } });
+    assert.deepEqual(report.trashed, []);
+    assert.match(report.kept.find((k) => k.path === dir)?.reason ?? "", /no worktree path/);
+    assert.equal((await stat(dir)).isDirectory(), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a refused PI_RUST_CACHE_DIR emits one visible warning that the shared cache is disabled", async () => {
+  resetRustTargetKeys();
+  const rust = await makeFixtureRepo();
+  const foreign = await mkdtemp(join(tmpdir(), "pi-rust-warn-"));
+  const seen: string[] = [];
+  const onWarning = (w: Error) => {
+    if (w.name === "PiRustCacheWarning") seen.push(w.message);
+  };
+  process.on("warning", onWarning);
+  try {
+    await makeRust(rust.root);
+    await writeFile(join(foreign, "mine.txt"), "x");
+    const env = () => ({ HOME: foreign, PATH: "", PI_RUST_CACHE_DIR: foreign });
+    await withRustBuildEnv(env(), rust.root);
+    await withRustBuildEnv(env(), rust.root);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(seen.length, 1, JSON.stringify(seen));
+    assert.match(seen[0]!, /shared Rust cache is disabled/);
+  } finally {
+    process.off("warning", onWarning);
+    await rm(foreign, { recursive: true, force: true });
+    await rust.cleanup();
   }
 });
 

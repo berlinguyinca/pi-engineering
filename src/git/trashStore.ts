@@ -12,9 +12,14 @@
  */
 
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 
 export const TRASH_MARKER_FILE = ".pi-eng-trash.json";
+/** Marks a directory as a trash root; a non-empty directory without it is refused. */
+export const TRASH_ROOT_MARKER = ".pi-eng-trash-root";
+/** Relocates the worktree trash (default `<state-dir>/trash`), e.g. next to the repositories when the state dir is on another filesystem. */
+export const TRASH_DIR_ENV = "PI_TRASH_DIR";
 export const DEFAULT_PURGE_OLDER_THAN_DAYS = 14;
 export const MIN_PURGE_OLDER_THAN_DAYS = 7;
 
@@ -33,6 +38,35 @@ export interface TrashEntry {
   dest: string;
 }
 
+export function defaultTrashRoot(env: Record<string, string | undefined> = process.env): string {
+  const explicit = env[TRASH_DIR_ENV]?.trim();
+  return explicit ? resolve(explicit) : join(resolveStateRoot(env), "trash");
+}
+
+/** A root is usable when marked, missing, empty, or holding only entries housekeeping created. */
+async function ensureTrashRoot(root: string): Promise<void> {
+  const marker = join(root, TRASH_ROOT_MARKER);
+  if ((await lstat(marker).catch(() => null))?.isFile()) return;
+  const entries = await readdir(root).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [] as string[];
+    throw error;
+  });
+  for (const e of entries) {
+    if (e === TRASH_ROOT_MARKER) continue;
+    if (!(await readTrashMarker(join(root, e)))) {
+      throw new Error(
+        `${root} is not a pi-engineering trash root (no ${TRASH_ROOT_MARKER} and it holds other files); refusing to use it`,
+      );
+    }
+  }
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  await writeFile(marker, `${JSON.stringify({ version: 1, creator: "pi-engineering" })}\n`, { flag: "wx" }).catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    },
+  );
+}
+
 /** Create a fresh trash entry for `item` (marker written, destination not yet occupied). */
 export async function createTrashEntry(
   trashRoot: string,
@@ -40,7 +74,7 @@ export async function createTrashEntry(
   item: { name: string; from: string; branch?: string | null },
   now: number = Date.now(),
 ): Promise<TrashEntry> {
-  await mkdir(trashRoot, { recursive: true, mode: 0o700 });
+  await ensureTrashRoot(trashRoot);
   const stamp = new Date(now).toISOString().replace(/:/g, "-");
   for (let n = 0; n < 1000; n++) {
     const dir = join(trashRoot, n === 0 ? stamp : `${stamp}-${n}`);
@@ -126,6 +160,7 @@ export async function purgeTrash(
   const realRoot = await realpath(trashRoot).catch(() => null);
   if (!realRoot) return report;
   for (const name of await readdir(trashRoot).catch(() => [] as string[])) {
+    if (name === TRASH_ROOT_MARKER) continue;
     const path = join(trashRoot, name);
     const skip = (reason: string) => report.skipped.push({ path, reason });
     const l = await lstat(path).catch(() => null);

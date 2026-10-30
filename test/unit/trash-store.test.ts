@@ -108,9 +108,49 @@ test("runTrashPurge covers the worktree trash and the Rust cache trash, and refu
       env: { PI_ENGINEERING_STATE_DIR: state, PI_RUST_CACHE_DIR: foreign, HOME: state },
     });
     assert.equal(refused.rustCacheTrash, null);
-    assert.match(refused.rustCacheRefused ?? "", /not a pi-engineering Rust cache/);
+    assert.match(refused.rustCacheRefused ?? "", /not a marked pi-engineering Rust cache/);
     assert.equal(await exists(decoy), true);
   } finally {
     for (const d of [state, cache, foreign]) await rm(d, { recursive: true, force: true });
+  }
+});
+
+test("a purge preview has no side effects on a legacy (unmarked) Rust cache root", async () => {
+  const state = await mkdtemp(join(tmpdir(), "pi-eng-state-"));
+  const cache = await mkdtemp(join(tmpdir(), "pi-eng-cache-"));
+  try {
+    await mkdir(join(cache, "target"));
+    const { chmod } = await import("node:fs/promises");
+    await chmod(cache, 0o755);
+    const r = await runTrashPurge({
+      olderThanDays: 14,
+      apply: false,
+      env: { PI_ENGINEERING_STATE_DIR: state, PI_RUST_CACHE_DIR: cache, HOME: state },
+    });
+    assert.equal(r.rustCacheTrash, null, "an unmarked root is not purged");
+    assert.equal(await exists(join(cache, ".pi-eng-rust-cache-root")), false, "no marker written by a preview");
+    assert.equal((await stat(cache)).mode & 0o777, 0o755, "permissions untouched by a preview");
+  } finally {
+    for (const d of [state, cache]) await rm(d, { recursive: true, force: true });
+  }
+});
+
+test("PI_TRASH_DIR relocates the trash; a non-empty directory that is not a trash root is refused", async () => {
+  const { defaultTrashRoot } = await import("../../src/git/trashStore.ts");
+  const base = await mkdtemp(join(tmpdir(), "pi-eng-trashdir-"));
+  try {
+    assert.equal(defaultTrashRoot({ PI_TRASH_DIR: join(base, "t") }), join(base, "t"));
+    assert.equal(defaultTrashRoot({ PI_ENGINEERING_STATE_DIR: base }), join(base, "trash"));
+    const mine = join(base, "mine");
+    const dest = await trashed(mine, "wt", 1);
+    assert.equal(await exists(dest), true);
+    assert.equal(await exists(join(mine, ".pi-eng-trash-root")), true, "root marked on first use");
+    const foreign = join(base, "photos");
+    await mkdir(foreign);
+    await writeFile(join(foreign, "a.jpg"), "x");
+    await assert.rejects(trashed(foreign, "wt", 1), /not a pi-engineering trash root/);
+    assert.equal(await exists(join(foreign, "a.jpg")), true);
+  } finally {
+    await rm(base, { recursive: true, force: true });
   }
 });

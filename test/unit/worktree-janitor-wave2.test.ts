@@ -1,8 +1,20 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
@@ -153,7 +165,7 @@ test("an eligible worktree is MOVED to <trash>/<ts>/<name>, never deleted; its r
       assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
       const r = report.reclaimed[0]!;
       assert.equal(await exists(wt.path), false, "original path vacated");
-      const [entry] = await readdir(trashRoot);
+      const [entry] = (await readdir(trashRoot)).filter((e) => !e.startsWith(".pi-eng-trash-root"));
       assert.ok(entry, "one trash entry");
       assert.equal(r.trashedTo, join(trashRoot, entry, basename(wt.path)));
       const marker = JSON.parse(await readFile(join(trashRoot, entry, ".pi-eng-trash.json"), "utf8"));
@@ -183,23 +195,61 @@ test("an eligible worktree is MOVED to <trash>/<ts>/<name>, never deleted; its r
   }
 });
 
-test("git worktree prune is skipped when it would also drop another missing worktree's registration", async () => {
+test("only the reclaimed worktree's own admin dir is removed: another registered worktree whose .git file is missing survives intact", async () => {
   const fixture = await makeFixtureRepo();
   try {
     await withTrash(async (trashRoot) => {
       const repo = (await GitRepo.open(fixture.root))!;
-      const gone = await createOwned(repo, await repo.headCommit(), CAND("gone01"));
+      // Looks like an unmounted disk: the directory exists (empty mount point) but its .git file does not.
+      const other = await createOwned(repo, await repo.headCommit(), CAND("mount1"));
+      await writeFile(join(other.path, "src", "staged-only.js"), "STAGED ONLY\n");
+      await exec("git", ["-C", other.path, "add", "src/staged-only.js"]);
+      const otherAdmin = await gitDirOf(other.path);
+      const indexBefore = await readFile(join(otherAdmin, "index"));
+      await rm(join(other.path, ".git"));
       const wt = await createOwned(repo, await repo.headCommit(), CAND("trash2"));
       await ageWorktree(wt.path, 100 * HOUR);
-      await rm(gone.path, { recursive: true, force: true }); // e.g. an unmounted disk in real life
       const report = await sweep(repo, trashRoot);
       const r = report.reclaimed.find((x) => x.path === wt.path);
       assert.ok(r, JSON.stringify(report));
-      assert.match(r.reason, /registration was NOT pruned.*1 other missing worktree/);
+      assert.equal(await exists(otherAdmin), true, "the other worktree's admin dir must survive");
+      assert.deepEqual(await readFile(join(otherAdmin, "index")), indexBefore, "its staged-only index survives");
+      assert.equal(await exists(await gitDirOf(wt.path).catch(() => "/nonexistent")), false);
       const { stdout } = await exec("git", ["-C", fixture.root, "worktree", "list", "--porcelain"]);
-      assert.ok(stdout.includes(gone.path), "the other registration is untouched");
+      assert.doesNotMatch(stdout, /trash2/, "our own registration is gone");
     });
   } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a suffixed admin name (<leaf>1) is matched by path, not by name", async () => {
+  const fixture = await makeFixtureRepo();
+  const elsewhere = await mkdtemp(join(tmpdir(), "pi-eng-leaf-"));
+  try {
+    await withTrash(async (trashRoot) => {
+      const repo = (await GitRepo.open(fixture.root))!;
+      const branch = CAND("suffx1");
+      const leaf = basename(join(dirname(fixture.root), `${repo.worktreeNamespacePrefix()}${branch}`));
+      const wt = await createOwned(repo, await repo.headCommit(), branch);
+      // Give ours a suffixed admin name, then let a foreign worktree with the same leaf take the plain one.
+      const plain = await gitDirOf(wt.path);
+      const ours = `${plain}1`;
+      await rename(plain, ours);
+      await writeFile(join(wt.path, ".git"), `gitdir: ${ours}\n`);
+      await writeFile(join(ours, "gitdir"), `${join(wt.path, ".git")}\n`);
+      const foreign = join(elsewhere, leaf);
+      await exec("git", ["-C", fixture.root, "worktree", "add", "-q", "-b", "foreign-branch", foreign]);
+      assert.equal(basename(await gitDirOf(foreign)), leaf, "the foreign worktree took the plain admin name");
+      const foreignAdmin = await gitDirOf(foreign);
+      await ageWorktree(wt.path, 100 * HOUR);
+      const report = await sweep(repo, trashRoot);
+      assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
+      assert.equal(await exists(ours), false, "our suffixed admin dir removed");
+      assert.equal(await exists(foreignAdmin), true, "the same-leaf foreign admin dir untouched");
+    });
+  } finally {
+    await rm(elsewhere, { recursive: true, force: true });
     await fixture.cleanup();
   }
 });
@@ -217,9 +267,13 @@ test("a trash on another filesystem keeps the worktree (rename cannot cross devi
     await ageWorktree(wt.path, 100 * HOUR);
     const report = await sweep(repo, trashRoot);
     assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
-    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /different filesystem/);
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /different filesystem.*PI_TRASH_DIR/);
     assert.equal(await exists(wt.path), true, "moved back to its original path");
-    assert.deepEqual(await readdir(trashRoot), [], "no empty trash entry left behind");
+    assert.deepEqual(
+      (await readdir(trashRoot)).filter((e) => e !== ".pi-eng-trash-root"),
+      [],
+      "no empty trash entry left behind",
+    );
   } finally {
     await rm(trashRoot, { recursive: true, force: true });
     await fixture.cleanup();
@@ -382,6 +436,12 @@ test("/gc argument parsing: purge needs --apply, --older-than defaults to 14 and
   assert.equal(gcPlan("--older-than 30 --apply").dryRun, true);
   assert.match(gcPlan("--purge-trash --bogus --apply").note ?? "", /unknown argument.*--bogus/);
   assert.equal(gcPlan("--purge-trash --bogus --apply").purge, undefined);
+  for (const bad of ["--apply --older-than=30", "--apply --older-than 30", "--older-than=30"]) {
+    const plan = gcPlan(bad);
+    assert.equal(plan.dryRun, true, bad);
+    assert.equal(plan.purge, undefined, bad);
+    assert.match(plan.note ?? "", /only applies to --purge-trash/, bad);
+  }
   assert.deepEqual(gcPlan("--apply"), { dryRun: false });
   assert.equal(gcPlan("--purge-trash --apply --dry-run").dryRun, true);
 });

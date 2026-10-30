@@ -524,10 +524,15 @@ start, every six hours while a session stays open, and on demand with `/gc`
   else `$XDG_STATE_HOME/pi-engineering`, else `~/.local/state/pi-engineering`),
   next to a `.pi-eng-trash.json` marker. The rename needs the trash on the same
   filesystem as the repository; if it is not, the checkout is moved back, kept
-  and reported. Its git registration is then pruned with `git worktree prune`,
-  but only when that would not also drop another worktree whose directory is
-  currently missing (an unmounted disk); otherwise the stale registration is
-  left and reported. If any check fails the checkout is moved back. A writer
+  and reported ("state dir on different filesystem: set PI_TRASH_DIR next to the
+  repos"; `PI_TRASH_DIR` relocates the trash, and the directory must be empty,
+  missing, or already a trash root marked `.pi-eng-trash-root`). Its git
+  registration is then removed by deleting ONLY its own
+  `<common-git-dir>/worktrees/<id>` (found by the path in its `gitdir` file,
+  exactly one match, not locked); `git worktree prune` is never run because it
+  would also drop other worktrees whose `.git` file is missing (an unmounted disk
+  whose mount point still exists). An ambiguous match leaves the registration
+  and reports it. If any check fails the checkout is moved back. A writer
   that only knows the original path can no longer reach the files. Accepted
   residual: a process with its
   working directory already inside the checkout, or one that follows the
@@ -543,7 +548,8 @@ start, every six hours while a session stays open, and on demand with `/gc`
   It deletes only entries directly under a trash root that are regular
   directories carrying a valid `.pi-eng-trash.json` written by housekeeping,
   at least `<days>` old, and it never follows symlinks; everything else is
-  skipped and reported. It covers `<state-dir>/trash` and `<rust-cache>/.trash`.
+  skipped and reported. A preview never writes or chmods anything, and a Rust
+  cache root without `.pi-eng-rust-cache-root` is not purged. It covers `<state-dir>/trash` and `<rust-cache>/.trash`.
 - Rust cache: the runtime writes `.pi-eng-rust-cache.json` into every
   generation dir (`<cache>/target/<repo>/<worktree>`) it assigns. The sweep moves
   (never deletes) a generation to `<cache>/.trash/<ts>/` only when that marker is
@@ -553,7 +559,8 @@ start, every six hours while a session stays open, and on demand with `/gc`
   must carry `.pi-eng-rust-cache-root`, written on first use of an empty cache or
   an older one holding only `target/` and `sccache/`; a `PI_RUST_CACHE_DIR`
   naming any other directory is refused (no shared cache is used, nothing is
-  written or swept in it). A reclaimed worktree's cargo target dir is left to
+  written or swept in it; a one-time process warning and the `/gc` report say
+  so). A generation marker without a recorded worktree path is kept. A reclaimed worktree's cargo target dir is left to
   this sweep.
 
 | Variable | Default | Meaning |

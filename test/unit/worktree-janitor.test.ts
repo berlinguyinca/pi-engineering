@@ -1167,7 +1167,7 @@ test("a file a concurrent process writes at the original path while the registra
     await writeFile(
       join(gate, "bin", "git"),
       `#!/bin/sh
-case " $* " in *" worktree prune "*) : > "${ready}"; i=0; while [ ! -e "${go}" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done;; esac
+case " $* " in *" worktree move "*) : > "${ready}"; i=0; while [ ! -e "${go}" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done;; esac
 exec "${realGit}" "$@"
 `,
     );
