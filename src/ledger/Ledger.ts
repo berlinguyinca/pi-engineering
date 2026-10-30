@@ -105,6 +105,13 @@ export class Ledger {
     return this.revisions.get(workItemId ?? "") ?? 0;
   }
 
+  /** Highest `authority_generation` recorded anywhere in the log (0 when none): a floor for a new owner's generation. */
+  highestAuthorityGeneration(): number {
+    let max = 0;
+    for (const g of this.authorities.values()) max = Math.max(max, g);
+    return max;
+  }
+
   /** Throws when `event` is fenced off. Runs under the append lock, after catching up with other writers. */
   private assertFences(event: LedgerEvent, guard: AppendGuard | undefined): void {
     const scope = event.work_item_id ?? "";
@@ -315,7 +322,10 @@ export class Ledger {
       case "task.updated": {
         const t = this.tasks.get(p.task_id as string);
         if (t) {
-          if (typeof p.status === "string") t.status = p.status as Task["status"];
+          if (typeof p.status === "string") {
+            t.status = p.status as Task["status"];
+            t.blocked_reason = event.type === "task.blocked" && typeof p.reason === "string" ? p.reason : null;
+          }
           if (Array.isArray(p.depends_on)) t.depends_on = p.depends_on as string[];
           if (Array.isArray(p.scope_paths)) t.scope_paths = p.scope_paths as string[];
           if (typeof p.result_work_item_id === "string") t.result_work_item_id = p.result_work_item_id;

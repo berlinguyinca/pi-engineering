@@ -28,6 +28,7 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { claimAuthorityGeneration } from "../ledger/authority.ts";
 import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
 import { loadExecutionConfig, loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
@@ -130,6 +131,7 @@ import {
 import { assessProcess } from "./isolation/processIdentity.ts";
 import { isReloadShutdown } from "./isolation/reloadCustody.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "./isolation/stateDir.ts";
+import { LedgerTransitions } from "./ledgerTransitions.ts";
 import { validateMaintenanceModel } from "./maintenanceModel.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 import {
@@ -730,6 +732,8 @@ function describeSnapshotError(error: unknown): string {
 
 export class EngineeringRuntime {
   ledger: Ledger;
+  /** Guarded Ledger status transitions (completion policy, expected_revision, authority_generation); assigned by open(). */
+  transitions: LedgerTransitions;
   /** Ledger task -> Herdr lineage; absent without a lineage emitter. */
   taskLineage?: TaskLineageProjector;
   /**
@@ -1361,6 +1365,7 @@ export class EngineeringRuntime {
     };
     // Assigned by open().
     this.ledger = undefined as unknown as Ledger;
+    this.transitions = undefined as unknown as LedgerTransitions;
     this.resourceRegistry = undefined as unknown as ResourceRegistry;
     this.testQuarantine = undefined as unknown as TestQuarantine;
     this.artifacts = undefined as unknown as ArtifactStore;
@@ -1421,6 +1426,14 @@ export class EngineeringRuntime {
     const broker = await ContextBroker.open(repoRoot);
     const rt = new EngineeringRuntime(opts);
     rt.ledger = ledger;
+    rt.transitions = new LedgerTransitions({
+      ledger,
+      authorityGeneration: await claimAuthorityGeneration(
+        join(workDir, "ledger.jsonl"),
+        ledger.highestAuthorityGeneration(),
+      ),
+      strictCompletion: (await loadExecutionConfig(repoRoot, opts.agentDir)).strict_completion,
+    });
     if (opts.lineage) rt.taskLineage = new TaskLineageProjector(new LedgerWorkProjection(ledger), opts.lineage);
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
     rt.testQuarantine = new TestQuarantine(workDir);
@@ -3843,7 +3856,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
       await this.releaseCandidate(winner.candidate, wi);
     }
 
-    await this.ledger.updateWorkItem(wi.id, { status: incumbent ? "COMPLETED" : "FAILED" }, actor);
+    await this.transitions.settleWorkItem(wi.id, incumbent ? "COMPLETED" : "FAILED", actor);
     return {
       work_item: wi,
       risk,
@@ -4092,26 +4105,33 @@ Goal: "${goal}"`;
       }
       // A dependency failed (or was blocked): this task cannot run.
       if (t.depends_on.some((d) => failedSet.has(d))) {
-        await this.ledger.setTaskStatus(t.id, "blocked", wi.id, actor);
+        await this.transitions.settleTask(t.id, "blocked", wi.id, actor);
         this.taskLineage?.scheduleSync();
         failedSet.add(t.id);
         blocked.push(t.id);
         summaries.push(`${t.id} blocked (dependency failed)`);
         return;
       }
-      await this.ledger.setTaskStatus(t.id, "started", wi.id, actor);
+      await this.transitions.settleTask(t.id, "started", wi.id, actor);
       this.taskLineage?.scheduleSync();
       summaries.push(`running ${t.id}: ${t.title}`);
       const report = await this.engineer(t.title);
       if (report.outcome === "promoted") {
-        await this.ledger.setTaskStatus(t.id, "completed", wi.id, actor);
+        const settled = await this.transitions.settleTask(t.id, "completed", wi.id, actor, report.work_item.id);
         this.taskLineage?.scheduleSync();
         await this.ledger.updateTask(t.id, { result_work_item_id: report.work_item.id }, wi.id, actor);
-        completed.push(t.id);
-        summaries.push(`${t.id} completed -> ${report.work_item.id}`);
+        if (settled.applied) {
+          completed.push(t.id);
+          summaries.push(`${t.id} completed -> ${report.work_item.id}`);
+        } else {
+          // The completion policy refused: not done, and not a failed pipeline either.
+          failedSet.add(t.id);
+          blocked.push(t.id);
+          summaries.push(`${t.id} blocked, completion refused: ${settled.blockers.join("; ")}`);
+        }
       } else {
         // The task's own pipeline run failed (not dependency-blocked).
-        await this.ledger.setTaskStatus(t.id, "failed", wi.id, actor);
+        await this.transitions.settleTask(t.id, "failed", wi.id, actor);
         this.taskLineage?.scheduleSync();
         failedSet.add(t.id);
         failed.push(t.id);
@@ -4138,9 +4158,14 @@ Goal: "${goal}"`;
 
     const status: WorkItemStatus =
       completed.length === tasks.length ? "COMPLETED" : completed.length === 0 ? "FAILED" : "PARTIAL";
-    await this.ledger.updateWorkItem(wi.id, { status }, actor);
-    const outcome: DagReport["outcome"] =
-      status === "COMPLETED" ? "completed" : status === "FAILED" ? "failed" : "partial";
+    const settledPlan = await this.transitions.settleWorkItem(wi.id, status, actor);
+    const outcome: DagReport["outcome"] = !settledPlan.applied
+      ? "blocked"
+      : status === "COMPLETED"
+        ? "completed"
+        : status === "FAILED"
+          ? "failed"
+          : "partial";
     return {
       plan_work_item: wi,
       tasks: this.ledger.listTasks(wi.id),
@@ -4385,11 +4410,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       parentId = candidate.id;
     }
 
-    await this.ledger.updateWorkItem(
-      wi.id,
-      { status: incumbent ? "COMPLETED" : "FAILED" },
-      this.actor(newRunId(), "planner"),
-    );
+    await this.transitions.settleWorkItem(wi.id, incumbent ? "COMPLETED" : "FAILED", this.actor(newRunId(), "planner"));
 
     return {
       work_item: wi,

@@ -155,6 +155,8 @@ export interface WorkItem {
   updated_at: string;
   current_candidate_id: string | null;
   incumbent_candidate_id: string | null;
+  /** Why completion was refused (set with status BLOCKED by the completion gate); cleared by a later status change. */
+  blocked_reason?: string | null;
 }
 
 export type CandidateStatus =
@@ -199,6 +201,8 @@ export interface Task {
   risk: RiskLevel;
   /** Work item produced when this task was executed (via the engineer pipeline). */
   result_work_item_id: string | null;
+  /** Why the task was blocked, when a gate (not just a failed dependency) refused it. */
+  blocked_reason?: string | null;
 }
 
 export type EvidenceTrust = "authoritative" | "deterministic" | "observed" | "reviewed" | "unverified";

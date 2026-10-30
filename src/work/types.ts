@@ -29,6 +29,8 @@ export interface WorkTask {
   /** The store's own status, unmapped. */
   raw_status: string;
   verification_status: VerificationStatus;
+  /** Why a gate refused completion, when it did. */
+  blocked_reason?: string;
   parent_id: string | null;
   created_at: string | null;
   updated_at: string | null;

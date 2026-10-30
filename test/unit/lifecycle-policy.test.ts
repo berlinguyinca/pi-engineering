@@ -307,6 +307,7 @@ test("execution defaults to adaptive with no implicit Mission directive", async 
     preference: "adaptive",
     legacy_auto_invoke: false,
     hold_mission_model: true,
+    strict_completion: true,
   });
   const cwd = await temp("pi-eng-exec-");
   const agentDir = await temp("pi-eng-exec-agent-");
@@ -331,6 +332,7 @@ test("execution preference and legacy opt-in load from repo yaml", async () => {
       preference: "team",
       legacy_auto_invoke: true,
       hold_mission_model: true,
+      strict_completion: true,
     });
   } finally {
     await rm(cwd, { recursive: true, force: true });

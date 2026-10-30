@@ -206,6 +206,14 @@ export interface ExecutionConfig {
    * restore automatic failover to the next eligible model. Default true.
    */
   hold_mission_model: boolean;
+  /**
+   * Ledger tasks and work items are only marked completed when the work read
+   * model agrees (`evaluateWorkCompletion`): no live, stalled or failed run, no
+   * pending, stale, failed or unknown verification. A refused completion is
+   * recorded as blocked with the reason. Set false to restore unchecked
+   * completion. Default true.
+   */
+  strict_completion: boolean;
 }
 
 export interface EngineeringPolicy {
@@ -252,7 +260,7 @@ export interface EngineeringPolicy {
 
 export const DEFAULT_POLICY: EngineeringPolicy = {
   version: 1,
-  execution: { preference: "adaptive", legacy_auto_invoke: false, hold_mission_model: true },
+  execution: { preference: "adaptive", legacy_auto_invoke: false, hold_mission_model: true, strict_completion: true },
   limits: {
     worker_inactivity_ms: 3_600_000,
   },
@@ -447,6 +455,7 @@ const BOOLEAN_FIELDS = [
   "lifecycle.notify",
   "execution.legacy_auto_invoke",
   "execution.hold_mission_model",
+  "execution.strict_completion",
   "routing.mode",
   "policies.review.require_independent_review",
   "policies.review.independent_reviewer",

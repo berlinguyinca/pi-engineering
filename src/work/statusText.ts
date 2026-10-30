@@ -18,7 +18,8 @@ function line(task: WorkTask, graph: WorkGraph): string {
       `runs ${runs.length - live - failed}/${runs.length} done${live ? `, ${live} live` : ""}${failed ? `, ${failed} failed` : ""}`,
     );
   const title = task.title.length > 70 ? `${task.title.slice(0, 69)}…` : task.title;
-  return `${task.id} [${task.source}] ${title} — ${parts.join(" · ")}`;
+  const why = task.blocked_reason ? `\n  blocked: ${task.blocked_reason}` : "";
+  return `${task.id} [${task.source}] ${title} — ${parts.join(" · ")}${why}`;
 }
 
 export function formatWorkStatus(graph: WorkGraph, limit = 10): string {
