@@ -148,6 +148,7 @@ import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
 import { LedgerWorkProjection } from "../src/work/ledgerProjection.ts";
 import { projectLegacyMissions } from "../src/work/legacyMissionAdapter.ts";
+import { StatusRowRefresher } from "../src/work/statusRowRefresher.ts";
 import { formatWorkStatus } from "../src/work/statusText.ts";
 import { formatTaskView, formatTeamView, formatWorkStatusRow, formatWorkSummary } from "../src/work/summaryText.ts";
 import { mergeWorkGraphs } from "../src/work/types.ts";
@@ -517,21 +518,32 @@ function seedPresenceFrom(runtime: EngineeringRuntime): void {
  * Compact work status row (one line). Reads only an already-open runtime, never opens one, and writes only when
  * the text changed, so an idle session causes no UI churn.
  */
-let workStatusLast: string | undefined;
+let workRefresher: StatusRowRefresher | undefined;
+let workProjection: { ledger: unknown; projection: LedgerWorkProjection } | undefined;
 async function refreshWorkStatus(
   ui: { setStatus?(key: string, text: string | undefined): void },
   cwd: string,
 ): Promise<void> {
-  const open = await repoKeys.lookup(cwd, runtimes).catch(() => undefined);
-  if (!open) return;
-  const rt = open.runtime;
-  const projection = new LedgerWorkProjection(rt.ledger);
-  const graphs = [projection.graph()];
-  if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
-  const text = formatWorkStatusRow(mergeWorkGraphs(...graphs));
-  if (text === workStatusLast) return;
-  workStatusLast = text;
-  ui.setStatus?.("work", text);
+  if (!workRefresher) {
+    const execution = await loadExecutionConfig(runtimeCwd(cwd));
+    const staleAfterMs = execution.stale_after_ms;
+    workRefresher = new StatusRowRefresher({
+      intervalMs: execution.status_refresh_interval_ms ?? 15_000,
+      setStatus: (text) => ui.setStatus?.("work", text),
+      getGraph: async () => {
+        const open = await repoKeys.lookup(cwd, runtimes).catch(() => undefined);
+        if (!open) return undefined;
+        const rt = open.runtime;
+        // One projection per open runtime: later refreshes only apply new events.
+        if (workProjection?.ledger !== rt.ledger)
+          workProjection = { ledger: rt.ledger, projection: new LedgerWorkProjection(rt.ledger, { staleAfterMs }) };
+        const graphs = [workProjection.projection.graph()];
+        if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
+        return mergeWorkGraphs(...graphs);
+      },
+    });
+  }
+  await workRefresher.refresh();
 }
 
 async function refreshPresence(cwd: string): Promise<void> {
@@ -2276,7 +2288,9 @@ ${RECOVERY_PROMPT}`;
       presencePoll = undefined;
       presence?.dispose();
       presence = undefined;
-      workStatusLast = undefined;
+      workRefresher?.dispose();
+      workRefresher = undefined;
+      workProjection = undefined;
     });
   }
 
