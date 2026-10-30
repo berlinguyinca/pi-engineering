@@ -173,26 +173,58 @@ test("other 4xx (404, 413) are terminal -> dead-letter immediately, later events
 
 // ── MAJOR 2: performance ─────────────────────────────────────────────────────
 
-test("outbox perf: stage + deliver scales linearly (no per-emit rescan) and 2000 events finish", async () => {
-  async function run(n: number): Promise<number> {
-    const sent: Array<Record<string, unknown>> = [];
-    const c = new ControlPlaneIngest({
-      url: "http://x",
-      fetch: scripted([200], sent),
-      envelopeStore: new EnvelopeStore({ dir: tmp() }),
-    });
-    const t0 = Date.now();
-    for (let i = 0; i < n; i++) assert.equal(await c.emit("session", `s${i}`, "session.updated"), true);
-    const ms = Date.now() - t0;
-    assert.equal(sent.length, n);
-    assert.equal(c.diagnostics()?.pending, 0);
-    return ms;
+test("outbox perf: 2000 events stage + deliver end to end (functional, no wall-clock budget)", async () => {
+  const sent: Array<Record<string, unknown>> = [];
+  const c = new ControlPlaneIngest({
+    url: "http://x",
+    fetch: scripted([200], sent),
+    envelopeStore: new EnvelopeStore({ dir: tmp() }),
+  });
+  for (let i = 0; i < 2000; i++) assert.equal(await c.emit("session", `s${i}`, "session.updated"), true);
+  assert.equal(sent.length, 2000);
+  assert.equal(c.diagnostics()?.pending, 0);
+});
+
+test("outbox perf: per-operation cost does not grow with file history (index, no per-op rescan)", async () => {
+  // History is written straight to the file (event + ack tombstone per id, compaction irrelevant) so a large file is
+  // cheap to build. With the incremental index, a read-only op costs the same whatever the history length; a per-op
+  // rescan costs ~O(history), i.e. a ratio near BIG/SMALL (30) instead of ~1.
+  const SMALL = 200;
+  const BIG = 6000;
+  const OPS = 40;
+  async function perOpMs(history: number): Promise<number> {
+    const file = join(tmp(), "o.jsonl");
+    const body: string[] = [];
+    for (let i = 0; i < history; i++) {
+      const envelope = buildEnvelope(draft(`h${i}`), { source: "pi", sourceSequence: i + 1 });
+      body.push(
+        JSON.stringify({ t: "event", envelope }),
+        JSON.stringify({ t: "ack", event_id: `h${i}`, s: "delivered" }),
+      );
+    }
+    writeFileSync(file, `${body.join("\n")}\n`);
+    const box = new EnvelopeOutbox({ file });
+    await box.peek(1); // first sync builds the index from the file, once
+    const t0 = performance.now();
+    for (let i = 0; i < OPS; i++) {
+      assert.equal((await box.peek(1)).length, 0);
+      assert.equal(await box.lookup(`h${history - 1}`).then((r) => r?.state), "delivered");
+    }
+    return (performance.now() - t0) / OPS;
   }
-  const small = await run(500);
-  const big = await run(2000);
-  console.log(`# perf: 500 emit+deliver=${small}ms, 2000 emit+deliver=${big}ms`);
-  // 4x the events must cost ~4x; a quadratic rescan would cost ~16x.
-  assert.ok(big < small * 7, `non-linear: 500=${small}ms 2000=${big}ms`);
+  await perOpMs(SMALL); // warm-up (JIT, fs caches)
+  // Interleave and take the minimum per size: machine load only ever adds time, so min is the least-noisy estimate.
+  const small: number[] = [];
+  const big: number[] = [];
+  for (let r = 0; r < 5; r++) {
+    small.push(await perOpMs(SMALL));
+    big.push(await perOpMs(BIG));
+  }
+  const ratio = Math.min(...big) / Math.max(Math.min(...small), 0.005);
+  console.log(
+    `# perf: per-op min ${Math.min(...small).toFixed(4)}ms @${SMALL} vs ${Math.min(...big).toFixed(4)}ms @${BIG}, ratio=${ratio.toFixed(2)}`,
+  );
+  assert.ok(ratio < 5, `per-op cost grew ${ratio.toFixed(2)}x from ${SMALL} to ${BIG} history lines: non-linear`);
 });
 
 test("outbox: index survives restart and picks up another process's appends without a rescan", async () => {

@@ -155,6 +155,27 @@ describe("ContextHandoffTrigger", () => {
     assert.match(t.lines.join("\n"), /gw\/alt/);
   });
 
+  it("two quota events racing on one execution record exactly one handoff (claimed before the checkpoint await)", async () => {
+    let release!: (ok: boolean) => void;
+    const gate = new Promise<boolean>((resolve) => {
+      release = resolve;
+    });
+    const t = fakeTrigger({ checkpoint: () => gate });
+    const input = {
+      missionId: "m-1",
+      taskId: "t-1",
+      executionId: "e-1",
+      model: null,
+      failureClass: "quota" as const,
+    };
+    const first = t.trigger.quotaExhausted(input);
+    const second = t.trigger.quotaExhausted(input);
+    release(true);
+    const [, again] = await Promise.all([first, second]);
+    assert.equal(again, "already_handled");
+    assert.equal(t.records.length, 1);
+  });
+
   it("quota without an alternate pauses; without a checkpoint it records nothing", async () => {
     const paused = fakeTrigger();
     assert.equal(

@@ -56,6 +56,8 @@ export class ContextHandoffTrigger {
   private readonly crossing = new Map<string, CrossingState>();
   private readonly inFlight = new Set<string>();
   private readonly quotaDone = new Set<string>();
+  /** Executions whose quota decision is mid-flight: claimed synchronously so a second quota event cannot also record. */
+  private readonly quotaInFlight = new Set<string>();
 
   constructor(deps: ContextHandoffDeps) {
     this.deps = deps;
@@ -82,6 +84,7 @@ export class ContextHandoffTrigger {
     this.crossing.delete(executionId);
     this.inFlight.delete(executionId);
     this.quotaDone.delete(executionId);
+    this.quotaInFlight.delete(executionId);
   }
 
   private async evaluate(executionId: string, atSafePoint: boolean): Promise<void> {
@@ -137,7 +140,10 @@ export class ContextHandoffTrigger {
     role?: string | null;
     retryAfterMs?: number;
   }): Promise<"pause" | "switch_model" | "wait" | "fail" | "already_handled"> {
-    if (this.quotaDone.has(input.executionId)) return "already_handled";
+    // Claim before the first await: quotaDone is only set after the checkpoint request resolves, so a second event
+    // arriving in that window would otherwise pass this guard and write a duplicate recovery handoff.
+    if (this.quotaDone.has(input.executionId) || this.quotaInFlight.has(input.executionId)) return "already_handled";
+    this.quotaInFlight.add(input.executionId);
     try {
       return await this.decideAndRecordQuota(input);
     } catch (error) {
@@ -147,6 +153,8 @@ export class ContextHandoffTrigger {
         `[mission ${input.missionId}] quota handoff failed: ${error instanceof Error ? error.message : String(error)}`,
       );
       return "fail";
+    } finally {
+      this.quotaInFlight.delete(input.executionId);
     }
   }
 
