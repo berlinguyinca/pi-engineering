@@ -155,8 +155,8 @@ test("PI_TRASH_DIR relocates the trash; a non-empty directory that is not a tras
   }
 });
 
-test("unmarked .pi-eng-trash orphans are listed only; --include-unmarked with --apply purges old, quiet, unregistered ones", async () => {
-  const { purgeOrphanTrash } = await import("../../src/git/trashStore.ts");
+test("unmarked .pi-eng-trash orphans are only listed, with the manual command, and never deleted", async () => {
+  const { listOrphanTrash } = await import("../../src/git/trashStore.ts");
   const parent = await mkdtemp(join(tmpdir(), "pi-eng-orphans-"));
   const stamp = (daysAgo: number) =>
     new Date(Date.now() - daysAgo * DAY)
@@ -165,50 +165,32 @@ test("unmarked .pi-eng-trash orphans are listed only; --include-unmarked with --
       .replace(/\.\d+Z$/, "Z");
   try {
     const root = join(parent, ".pi-eng-trash");
-    const mk = async (name: string, file = "a.txt"): Promise<string> => {
+    const mk = async (name: string): Promise<string> => {
       const dir = join(root, name);
       await mkdir(dir, { recursive: true });
-      await writeFile(join(dir, file), "x\n");
+      await writeFile(join(dir, "a.txt"), "x\n");
+      const t = new Date(Date.now() - 40 * DAY);
+      await utimes(join(dir, "a.txt"), t, t);
+      await utimes(dir, t, t);
       return dir;
     };
     const old = await mk(`${stamp(30)}-pi-eng-abc-old`);
+    const user = await mk(`${stamp(30)}-userstuff`);
     const young = await mk(`${stamp(2)}-pi-eng-abc-young`);
     const reg = await mk(`${stamp(30)}-pi-eng-abc-back`);
     const stray = await mk("not-a-timestamped-name");
-    const busy = await mk(`${stamp(30)}-pi-eng-abc-busy`);
-    const { utimes } = await import("node:fs/promises");
-    for (const d of [old, reg, stray]) {
-      const t = new Date(Date.now() - 40 * DAY);
-      await utimes(join(d, "a.txt"), t, t);
-      await utimes(d, t, t);
-    }
-    const registeredPaths = new Set([join(parent, "pi-eng-abc-back")]);
-    const base = { olderThanDays: 14, registeredPaths };
-
-    const listOnly = await purgeOrphanTrash(parent, { ...base, apply: true, includeUnmarked: false });
-    assert.deepEqual(listOnly.purged, []);
-    assert.match(listOnly.skipped.find((k) => k.path === old)!.reason, /listed only.*--include-unmarked/);
-    assert.equal(await exists(old), true, "never purged without --include-unmarked");
-
-    const preview = await purgeOrphanTrash(parent, { ...base, apply: false, includeUnmarked: true });
-    assert.deepEqual(
-      preview.purged.map((p) => p.path),
-      [old],
-    );
-    assert.equal(await exists(old), true, "no --apply, no delete");
-
-    const done = await purgeOrphanTrash(parent, { ...base, apply: true, includeUnmarked: true });
-    assert.deepEqual(
-      done.purged.map((p) => p.path),
-      [old],
-    );
-    assert.equal(await exists(old), false);
-    for (const kept of [young, reg, stray, busy]) assert.equal(await exists(kept), true, kept);
-    const why = Object.fromEntries(done.skipped.map((k) => [k.path, k.reason]));
+    const report = await listOrphanTrash(parent, {
+      olderThanDays: 14,
+      registeredPaths: new Set([join(parent, "pi-eng-abc-back")]),
+    });
+    assert.deepEqual(report.purged, [], "nothing is ever reported as purged");
+    for (const d of [old, user, young, reg, stray]) assert.equal(await exists(d), true, d);
+    const why = Object.fromEntries(report.skipped.map((k) => [k.path, k.reason]));
+    assert.match(why[old] ?? "", /never deleted by housekeeping.*rm -rf/);
+    assert.match(why[user] ?? "", /never deleted by housekeeping.*rm -rf/);
     assert.match(why[young] ?? "", /orphaned 2 d ago/);
     assert.match(why[reg] ?? "", /registered worktree again/);
     assert.match(why[stray] ?? "", /not a <timestamp>-<name> directory/);
-    assert.match(why[busy] ?? "", /modified within 14 d/);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

@@ -23,8 +23,10 @@ import {
   MIN_PURGE_OLDER_THAN_DAYS,
   type TrashPurgeReport,
   defaultTrashRoot,
-  purgeOrphanTrash,
+  listOrphanTrash,
   purgeTrash,
+  symlinkedRootProblem,
+  trashRootInsideProblem,
 } from "../git/trashStore.ts";
 import {
   type JanitorReport,
@@ -110,7 +112,7 @@ export function missionTerminalAt(
 export interface GcPlan {
   dryRun: boolean;
   /** Present for `--purge-trash`: purge trash instead of sweeping. */
-  purge?: { olderThanDays: number; includeUnmarked: boolean };
+  purge?: { olderThanDays: number };
   /** Read-only listing of unmarked legacy worktrees and Rust cache generations (`--adopt-preview`). */
   adoptPreview?: boolean;
   note?: string;
@@ -130,13 +132,11 @@ export function gcPlan(args: string): GcPlan {
   let days: number = DEFAULT_PURGE_OLDER_THAN_DAYS;
   let daysProblem: string | undefined;
   let sawOlderThan = false;
-  let includeUnmarked = false;
   let adoptPreview = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
     if (a === "--apply" || a === "--dry-run") continue;
     if (a === "--purge-trash") purge = true;
-    else if (a === "--include-unmarked") includeUnmarked = true;
     else if (a === "--adopt-preview") adoptPreview = true;
     else if (a === "--older-than" || a.startsWith("--older-than=")) {
       sawOlderThan = true;
@@ -162,20 +162,17 @@ export function gcPlan(args: string): GcPlan {
     };
   }
   if (adoptPreview) return { dryRun: true, adoptPreview: true };
-  if (includeUnmarked && !purge) {
-    return { dryRun: true, note: "--include-unmarked only applies to --purge-trash: showing a preview instead" };
-  }
   if (!purge && sawOlderThan) {
     return { dryRun: true, note: "--older-than only applies to --purge-trash: showing a preview instead" };
   }
   if (purge && !apply) {
     return {
       dryRun: true,
-      purge: { olderThanDays: days, includeUnmarked },
+      purge: { olderThanDays: days },
       note: "purging trash needs --apply; listing what it would purge",
     };
   }
-  return purge ? { dryRun: false, purge: { olderThanDays: days, includeUnmarked } } : { dryRun: !apply };
+  return purge ? { dryRun: false, purge: { olderThanDays: days } } : { dryRun: !apply };
 }
 
 export interface HousekeepingResult {
@@ -254,13 +251,13 @@ export function describeAdoptPreview(p: AdoptPreview): string[] {
     lines.push(
       `  worktree ${w.path} [branch ${w.branch ?? "detached"}] owner=${w.ownerStatus} ${w.clean === null ? "state unknown" : w.clean ? "clean" : "dirty"}, ${w.ignored.length} ignored, last activity ${w.lastActivity ?? "unknown"}`,
       `    ${w.markerProblem}`,
-      `    ${w.command ? `to remove: ${w.command}` : "keep"} (${w.note})`,
+      `    ${w.command ? `to remove (review first): ${w.command}` : "keep"} (${w.note})`,
     );
   }
   for (const r of p.rustCache) {
     lines.push(
       `  rust cache ${r.path} idle ${r.idleDays} d`,
-      `    ${r.command ? `derived output, to remove: ${r.command}` : "keep (recently used)"}`,
+      `    ${r.command ? `derived output. This rm ignores liveness: first confirm with \`git worktree list\` that no worktree still uses it and that no build is running, then: ${r.command}` : "keep (recently used)"}`,
     );
   }
   return lines;
@@ -270,7 +267,7 @@ export interface TrashPurgeResult {
   worktreeTrash: TrashPurgeReport;
   rustCacheTrash: TrashPurgeReport | null;
   rustCacheRefused?: string;
-  /** Unmarked `.pi-eng-trash` orphans beside the repository: listed, purged only with `--include-unmarked --apply`. */
+  /** Unmarked `.pi-eng-trash` orphans beside the repository: listed only; never deleted. */
   orphanTrash?: TrashPurgeReport;
 }
 
@@ -278,22 +275,34 @@ export interface TrashPurgeResult {
 export async function runTrashPurge(opts: {
   olderThanDays: number;
   apply: boolean;
-  /** Also purge unmarked `<parent>/.pi-eng-trash` orphans (needs `apply`). */
-  includeUnmarked?: boolean;
-  /** Repository whose sibling `.pi-eng-trash` orphans are listed (and purged with `includeUnmarked`). */
+  /** Repository whose sibling `.pi-eng-trash` orphans are listed (never deleted). */
   cwd?: string;
   env?: Record<string, string | undefined>;
 }): Promise<TrashPurgeResult> {
   const env = opts.env ?? process.env;
-  const worktreeTrash = await purgeTrash(defaultTrashRoot(env), opts);
-  let orphanTrash: TrashPurgeReport | undefined;
   const repo = opts.cwd ? await GitRepo.open(opts.cwd) : null;
+  const linked = repo ? await repo.listLinkedWorktrees() : [];
+  const trees = repo ? [repo.root, ...linked.map((w) => w.path)] : [];
+  let worktreeTrash: TrashPurgeReport;
+  try {
+    const root = defaultTrashRoot(env);
+    const problem = (await trashRootInsideProblem(root, trees)) ?? (await symlinkedRootProblem(root));
+    worktreeTrash = problem
+      ? { purged: [], skipped: [{ path: root, reason: problem }], dryRun: !opts.apply }
+      : await purgeTrash(root, opts);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    worktreeTrash = {
+      purged: [],
+      skipped: [{ path: env.PI_TRASH_DIR ?? "(trash root)", reason }],
+      dryRun: !opts.apply,
+    };
+  }
+  let orphanTrash: TrashPurgeReport | undefined;
   if (repo) {
-    orphanTrash = await purgeOrphanTrash(dirname(repo.root), {
+    orphanTrash = await listOrphanTrash(dirname(repo.root), {
       olderThanDays: opts.olderThanDays,
-      apply: opts.apply,
-      includeUnmarked: opts.includeUnmarked === true,
-      registeredPaths: new Set((await repo.listLinkedWorktrees()).map((w) => w.path)),
+      registeredPaths: new Set(linked.map((w) => w.path)),
     });
   }
   if (!rustCacheEnabled(env)) return { worktreeTrash, rustCacheTrash: null, orphanTrash };

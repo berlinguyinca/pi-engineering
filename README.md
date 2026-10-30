@@ -540,13 +540,19 @@ start, every six hours while a session stays open, and on demand with `/gc`
   filesystem as the repository; if it is not, the checkout is moved back, kept
   and reported ("state dir on different filesystem: set PI_TRASH_DIR next to the
   repos"; `PI_TRASH_DIR` relocates the trash, and the directory must be empty,
-  missing, or already a trash root marked `.pi-eng-trash-root`). Its git
-  registration is then removed by deleting ONLY its own
-  `<common-git-dir>/worktrees/<id>` (found by the path in its `gitdir` file,
-  exactly one match, not locked); `git worktree prune` is never run because it
+  missing, or already a trash root marked `.pi-eng-trash-root`; it must be an
+  absolute path, must not be a symlink and must not lie inside any working tree
+  of the repository, otherwise the worktree is kept). Its git registration is
+  then MOVED, not deleted: ONLY its own `<common-git-dir>/worktrees/<id>` (found
+  by the path in its `gitdir` file, exactly one match, not locked) goes to
+  `<trash entry>/.pi-eng-admin`; `git worktree prune` is never run because it
   would also drop other worktrees whose `.git` file is missing (an unmounted disk
   whose mount point still exists). An ambiguous match leaves the registration
-  and reports it. If any check fails the checkout is moved back. A writer
+  and reports the exact admin dir with `git worktree repair` / `remove`
+  guidance. To restore a trashed worktree: move `<trash entry>/<name>` back to
+  its original path, move `<trash entry>/.pi-eng-admin` to
+  `<common-git-dir>/worktrees/<id>` (any unused name), then run
+  `git worktree repair <original path>`. If any check fails the checkout is moved back. A writer
   that only knows the original path can no longer reach the files. Accepted
   residual: a process with its
   working directory already inside the checkout, or one that follows the
@@ -562,12 +568,11 @@ start, every six hours while a session stays open, and on demand with `/gc`
   It deletes only entries directly under a trash root that are regular
   directories carrying a valid `.pi-eng-trash.json` written by housekeeping,
   at least `<days>` old, and it never follows symlinks; everything else is
-  skipped and reported. Directories the repository layer parked in
-  `<repo parent>/.pi-eng-trash/<ts>-<name>` carry no marker and cannot get one
-  retroactively, so they are listed only; `--include-unmarked` together with
-  `--apply` purges those whose timestamp is old enough, with nothing inside
-  modified within `<days>` and whose original path is not a registered worktree
-  again. A preview never writes or chmods anything, and a Rust
+  skipped and reported. A trash root that is a symlink is refused. Directories
+  the repository layer parked in `<repo parent>/.pi-eng-trash/<ts>-<name>` carry
+  no marker and cannot get one retroactively, so NO command ever deletes them:
+  they are listed by `/gc --purge-trash` with the `rm -rf` an operator
+  may run after looking inside. A preview never writes or chmods anything, and a Rust
   cache root without `.pi-eng-rust-cache-root` is not purged. It covers `<state-dir>/trash` and `<rust-cache>/.trash`.
 - Rust cache: the runtime writes `.pi-eng-rust-cache.json` into every
   generation dir (`<cache>/target/<repo>/<worktree>`) it assigns. The sweep moves

@@ -12,7 +12,7 @@
  */
 
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 
 export const TRASH_MARKER_FILE = ".pi-eng-trash.json";
@@ -40,11 +40,46 @@ export interface TrashEntry {
 
 export function defaultTrashRoot(env: Record<string, string | undefined> = process.env): string {
   const explicit = env[TRASH_DIR_ENV]?.trim();
+  if (explicit && !isAbsolute(explicit)) {
+    throw new Error(`${TRASH_DIR_ENV} must be an absolute path (got "${explicit}"); refusing to use it`);
+  }
   return explicit ? resolve(explicit) : join(resolveStateRoot(env), "trash");
+}
+
+/** A trash root that is itself a symlink could point anywhere (including at user data): never used, purged or listed. */
+export async function symlinkedRootProblem(root: string): Promise<string | null> {
+  const l = await lstat(root).catch(() => null);
+  return l?.isSymbolicLink() ? `${root} is a symbolic link; refusing to use it as a trash root` : null;
+}
+
+/** Why `root` may not be a trash root because it lies inside one of `workingTrees` (checked by real path), else null. */
+export async function trashRootInsideProblem(root: string, workingTrees: readonly string[]): Promise<string | null> {
+  let probe = resolve(root);
+  const tail: string[] = [];
+  for (;;) {
+    const real = await realpath(probe).catch(() => null);
+    if (real) {
+      probe = join(real, ...tail);
+      break;
+    }
+    const up = dirname(probe);
+    if (up === probe) break;
+    tail.unshift(basename(probe));
+    probe = up;
+  }
+  for (const tree of workingTrees) {
+    const real = await realpath(tree).catch(() => resolve(tree));
+    if (probe === real || probe.startsWith(`${real}${sep}`)) {
+      return `${root} is inside the working tree ${tree}; refusing to use it as a trash root`;
+    }
+  }
+  return null;
 }
 
 /** A root is usable when marked, missing, empty, or holding only entries housekeeping created. */
 async function ensureTrashRoot(root: string): Promise<void> {
+  const linked = await symlinkedRootProblem(root);
+  if (linked) throw new Error(linked);
   const marker = join(root, TRASH_ROOT_MARKER);
   if ((await lstat(marker).catch(() => null))?.isFile()) return;
   const entries = await readdir(root).catch((error: NodeJS.ErrnoException) => {
@@ -157,6 +192,11 @@ export async function purgeTrash(
   }
   const now = opts.now ?? Date.now();
   const report: TrashPurgeReport = { purged: [], skipped: [], dryRun: !opts.apply };
+  const linked = await symlinkedRootProblem(trashRoot);
+  if (linked) {
+    report.skipped.push({ path: trashRoot, reason: linked });
+    return report;
+  }
   const realRoot = await realpath(trashRoot).catch(() => null);
   if (!realRoot) return report;
   for (const name of await readdir(trashRoot).catch(() => [] as string[])) {
@@ -200,25 +240,22 @@ export async function purgeTrash(
 const ORPHAN_ENTRY = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-(.+)$/;
 
 /**
- * Orphan entries carry no marker (and cannot get one retroactively), so they are LIST-ONLY unless the operator passes
- * `includeUnmarked` together with `apply`. Even then an entry is deleted only when it is a real directory directly under
- * `<parent>/.pi-eng-trash`, its name carries a parsable timestamp at least `olderThanDays` old, nothing inside it was
- * modified within that many days, and its original path is not a registered worktree.
+ * Orphan entries carry no marker (and cannot get one retroactively), so they are NEVER deleted by any command here:
+ * this only lists them (as `skipped`, with the manual command an operator may run after looking inside). Entries whose
+ * original path is a registered worktree again, or that hold recent files, are listed with that reason instead.
  */
-export async function purgeOrphanTrash(
+export async function listOrphanTrash(
   parent: string,
-  opts: {
-    olderThanDays: number;
-    apply: boolean;
-    includeUnmarked: boolean;
-    registeredPaths: ReadonlySet<string>;
-    now?: number;
-  },
+  opts: { olderThanDays: number; registeredPaths: ReadonlySet<string>; now?: number },
 ): Promise<TrashPurgeReport> {
   const root = join(parent, ".pi-eng-trash");
   const now = opts.now ?? Date.now();
-  const doDelete = opts.apply && opts.includeUnmarked;
-  const report: TrashPurgeReport = { purged: [], skipped: [], dryRun: !doDelete };
+  const report: TrashPurgeReport = { purged: [], skipped: [], dryRun: true };
+  const linked = await symlinkedRootProblem(root);
+  if (linked) {
+    report.skipped.push({ path: root, reason: linked });
+    return report;
+  }
   const realRoot = await realpath(root).catch(() => null);
   if (!realRoot) return report;
   for (const name of await readdir(root).catch(() => [] as string[])) {
@@ -237,28 +274,19 @@ export async function purgeOrphanTrash(
     }
     const at = Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!);
     const ageDays = (now - at) / 86_400_000;
-    if (ageDays < opts.olderThanDays) {
-      skip(`orphaned ${Math.floor(ageDays)} d ago (< ${opts.olderThanDays} d)`);
-      continue;
-    }
     if (opts.registeredPaths.has(join(parent, m[7]!))) {
       skip("its original path is a registered worktree again; left alone");
       continue;
     }
-    if (await hasRecentFile(path, now - opts.olderThanDays * 86_400_000)) {
-      skip(`holds files modified within ${opts.olderThanDays} d (or could not be fully read); left alone`);
+    if (ageDays < opts.olderThanDays) {
+      skip(`orphaned ${Math.floor(ageDays)} d ago (< ${opts.olderThanDays} d); never deleted automatically`);
       continue;
     }
-    if (!opts.includeUnmarked) {
-      skip("no marker (made before markers existed): listed only; pass --include-unmarked with --apply to purge");
-      continue;
-    }
-    if (!opts.apply) {
-      report.purged.push({ path, ageDays: Math.floor(ageDays) });
-      continue;
-    }
-    await rm(path, { recursive: true, force: false });
-    report.purged.push({ path, ageDays: Math.floor(ageDays) });
+    const recent = await hasRecentFile(path, now - opts.olderThanDays * 86_400_000);
+    skip(
+      `no marker (made before markers existed): never deleted by housekeeping${recent ? `; holds files modified within ${opts.olderThanDays} d` : ""}. ` +
+        `After looking inside, you may remove it yourself: rm -rf ${JSON.stringify(path)}`,
+    );
   }
   return report;
 }

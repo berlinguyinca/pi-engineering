@@ -12,6 +12,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,7 +22,7 @@ import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { OWNER_MARKER_FILE } from "../../src/git/ownerMarker.ts";
 import { sweepWorktrees } from "../../src/git/worktreeJanitor.ts";
-import { describeAdoptPreview, gcPlan, runAdoptPreview } from "../../src/runtime/janitor.ts";
+import { describeAdoptPreview, gcPlan, runAdoptPreview, runTrashPurge } from "../../src/runtime/janitor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 import { ageWorktree, createOwned, exists, markerFile, tamperMarker } from "../support/janitorFixtures.ts";
 
@@ -251,7 +252,9 @@ test("a suffixed admin name (<leaf>1) is matched by path, not by name", async ()
       await ageWorktree(wt.path, 100 * HOUR);
       const report = await sweep(repo, trashRoot);
       assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
-      assert.equal(await exists(ours), false, "our suffixed admin dir removed");
+      assert.equal(await exists(ours), false, "our suffixed admin dir left the repository");
+      const entry = dirname(report.reclaimed[0]!.trashedTo!);
+      assert.equal(await exists(join(entry, ".pi-eng-admin", "gitdir")), true, "it was moved into the trash entry");
       assert.equal(await exists(foreignAdmin), true, "the same-leaf foreign admin dir untouched");
     });
   } finally {
@@ -422,20 +425,20 @@ test("a dangling-symlink submodule .git counts as present (lstat, not stat)", as
 test("/gc argument parsing: purge needs --apply, --older-than defaults to 14 and rejects < 7, unknown tokens preview", () => {
   assert.deepEqual(gcPlan("--purge-trash"), {
     dryRun: true,
-    purge: { olderThanDays: 14, includeUnmarked: false },
+    purge: { olderThanDays: 14 },
     note: "purging trash needs --apply; listing what it would purge",
   });
   assert.deepEqual(gcPlan("--purge-trash --apply"), {
     dryRun: false,
-    purge: { olderThanDays: 14, includeUnmarked: false },
+    purge: { olderThanDays: 14 },
   });
   assert.deepEqual(gcPlan("--purge-trash --older-than 30 --apply"), {
     dryRun: false,
-    purge: { olderThanDays: 30, includeUnmarked: false },
+    purge: { olderThanDays: 30 },
   });
   assert.deepEqual(gcPlan("--apply --purge-trash --older-than=7"), {
     dryRun: false,
-    purge: { olderThanDays: 7, includeUnmarked: false },
+    purge: { olderThanDays: 7 },
   });
   for (const bad of [
     "--purge-trash --older-than 3 --apply",
@@ -457,11 +460,12 @@ test("/gc argument parsing: purge needs --apply, --older-than defaults to 14 and
     assert.equal(plan.purge, undefined, bad);
     assert.match(plan.note ?? "", /only applies to --purge-trash/, bad);
   }
-  assert.deepEqual(gcPlan("--purge-trash --include-unmarked --apply"), {
-    dryRun: false,
-    purge: { olderThanDays: 14, includeUnmarked: true },
-  });
-  assert.match(gcPlan("--include-unmarked --apply").note ?? "", /only applies to --purge-trash/);
+  for (const flag of ["--purge-trash --include-unmarked --apply", "--include-unmarked --apply"]) {
+    const plan = gcPlan(flag);
+    assert.equal(plan.dryRun, true, flag);
+    assert.equal(plan.purge, undefined, flag);
+    assert.match(plan.note ?? "", /unknown argument.*--include-unmarked/, flag);
+  }
   assert.deepEqual(gcPlan("--adopt-preview"), { dryRun: true, adoptPreview: true });
   for (const bad of ["--adopt-preview --apply", "--adopt-preview --purge-trash"]) {
     assert.equal(gcPlan(bad).adoptPreview, undefined, bad);
@@ -665,3 +669,132 @@ exec "${realGit}" "$@"
     }
   });
 }
+
+const OLD = new Date("2020-01-01T00:00:00Z");
+async function makeMarkedTrash(root: string): Promise<string> {
+  const { moveToTrash } = await import("../../src/git/trashStore.ts");
+  const src = join(await mkdtemp(join(tmpdir(), "pi-eng-src-")), "old-wt");
+  await mkdir(src, { recursive: true });
+  await writeFile(join(src, "a.txt"), "precious\n");
+  return moveToTrash(root, "worktree", src, "old-wt", "br", OLD.getTime());
+}
+
+test("unmarked orphans are never deleted, even with --apply", async () => {
+  const fixture = await makeFixtureRepo();
+  const trash = await mkdtemp(join(tmpdir(), "pi-eng-t-"));
+  try {
+    const dir = join(dirname(fixture.root), ".pi-eng-trash", "20200101T000000Z-userstuff");
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "mine.txt"), "user data\n");
+    await utimes(join(dir, "mine.txt"), OLD, OLD);
+    await utimes(dir, OLD, OLD);
+    const out = await runTrashPurge({
+      olderThanDays: 14,
+      apply: true,
+      cwd: fixture.root,
+      env: { PI_TRASH_DIR: join(trash, "t"), PI_RUST_CACHE_DIR: join(trash, "rc") },
+    });
+    assert.equal(await exists(join(dir, "mine.txt")), true, "user data survives");
+    assert.deepEqual(out.orphanTrash?.purged, []);
+    assert.match(out.orphanTrash?.skipped.find((k) => k.path === dir)?.reason ?? "", /rm -rf/);
+  } finally {
+    await rm(join(dirname(fixture.root), ".pi-eng-trash"), { recursive: true, force: true });
+    await rm(trash, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+test("a symlinked trash root is never purged or listed, and a relative PI_TRASH_DIR is refused", async () => {
+  const fixture = await makeFixtureRepo();
+  const base = await mkdtemp(join(tmpdir(), "pi-eng-t-"));
+  try {
+    // (a) <parent>/.pi-eng-trash -> a directory holding a timestamp-named folder
+    const target = join(base, "elsewhere");
+    await mkdir(join(target, "20200101T000000Z-photos"), { recursive: true });
+    await writeFile(join(target, "20200101T000000Z-photos", "a.jpg"), "x");
+    await symlink(target, join(dirname(fixture.root), ".pi-eng-trash"));
+    // (b) PI_TRASH_DIR -> a real trash root holding an old, properly marked entry
+    const realTrash = join(base, "real-trash");
+    const entry = await makeMarkedTrash(realTrash);
+    const linked = join(base, "linked-trash");
+    await symlink(realTrash, linked);
+    const out = await runTrashPurge({
+      olderThanDays: 14,
+      apply: true,
+      cwd: fixture.root,
+      env: { PI_TRASH_DIR: linked, PI_RUST_CACHE_DIR: join(base, "rc") },
+    });
+    assert.equal(await exists(join(target, "20200101T000000Z-photos", "a.jpg")), true, "symlink target survives");
+    assert.equal(await exists(entry), true, "entry behind a symlinked PI_TRASH_DIR survives --apply");
+    assert.match(out.orphanTrash?.skipped[0]?.reason ?? "", /symbolic link/);
+    assert.match(out.worktreeTrash.skipped[0]?.reason ?? "", /symbolic link/);
+
+    const rel = await runTrashPurge({
+      olderThanDays: 14,
+      apply: true,
+      cwd: fixture.root,
+      env: { PI_TRASH_DIR: "relative/trash", PI_RUST_CACHE_DIR: join(base, "rc") },
+    });
+    assert.match(rel.worktreeTrash.skipped[0]?.reason ?? "", /absolute path/);
+  } finally {
+    await rm(join(dirname(fixture.root), ".pi-eng-trash"), { force: true });
+    await rm(base, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+test("the sweep refuses a symlinked trash root and one inside a working tree; the checkout stays", async () => {
+  const fixture = await makeFixtureRepo();
+  const base = await mkdtemp(join(tmpdir(), "pi-eng-t-"));
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await createOwned(repo, await repo.headCommit(), CAND("trashroot"));
+    await ageWorktree(wt.path, 100 * HOUR);
+    const real = join(base, "real");
+    await mkdir(real);
+    const link = join(base, "link");
+    await symlink(real, link);
+    for (const [root, why] of [
+      [link, /symbolic link/],
+      [join(fixture.root, "inside-trash"), /inside the working tree/],
+      [join(wt.path, "inside-trash"), /inside the working tree/],
+    ] as const) {
+      const report = await sweep(repo, root);
+      assert.equal(report.reclaimed.length, 0, `${root}: ${JSON.stringify(report)}`);
+      assert.match(report.kept.find((k) => k.path === wt.path)?.reason ?? "", why);
+      assert.equal(await exists(join(wt.path, ".git")), true, "checkout untouched");
+    }
+    assert.deepEqual(await readdir(real), [], "nothing was written through the symlink");
+  } finally {
+    await rm(base, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+test("a trashed worktree keeps its git registration in the trash entry and can be restored", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await withTrash(async (trashRoot) => {
+      const repo = (await GitRepo.open(fixture.root))!;
+      const wt = await createOwned(repo, await repo.headCommit(), CAND("restore"));
+      await ageWorktree(wt.path, 100 * HOUR);
+      const admin = await gitDirOf(wt.path);
+      const report = await sweep(repo, trashRoot);
+      assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
+      const trashed = report.reclaimed[0]!.trashedTo!;
+      const kept = join(dirname(trashed), ".pi-eng-admin");
+      assert.equal(await exists(admin), false);
+      assert.equal(await exists(join(kept, "HEAD")), true, "registration is restorable, not deleted");
+      assert.doesNotMatch(report.reclaimed[0]!.reason, /worktree prune/);
+      // README restore recipe
+      await rename(trashed, wt.path);
+      await rename(kept, admin);
+      await exec("git", ["-C", fixture.root, "worktree", "repair", wt.path]);
+      const list = (await exec("git", ["-C", fixture.root, "worktree", "list", "--porcelain"])).stdout;
+      assert.match(list, new RegExp(`worktree ${wt.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+      assert.equal((await exec("git", ["-C", wt.path, "status", "--short"])).stdout.trim(), "");
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
