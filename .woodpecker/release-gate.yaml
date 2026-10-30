@@ -21,12 +21,29 @@ labels:
 # download is invisible to the test steps.
 variables:
   - &browsers /tmp/woodpecker-cache/playwright
+  # The ONE place the venv path is computed and checked; every step that
+  # touches the venv (create, PATH, cleanup) includes it by alias. The path
+  # is owned by this pipeline: a distinctive prefix, plus repo and pipeline
+  # number, so no other repo's pipeline can produce or collide with it.
+  # Written with plain $VAR on purpose: Woodpecker substitutes ${VAR} in the
+  # YAML itself and would blank a variable it does not know.
+  - &venv_resolve |
+    VENV_PREFIX=/tmp/woodpecker-cache/pe-venv-
+    case "$CI_REPO" in ''|*[!A-Za-z0-9._/-]*) echo "refusing: CI_REPO empty or unexpected: '$CI_REPO'" >&2; exit 1;; esac
+    case "$CI_PIPELINE_NUMBER" in ''|*[!0-9]*) echo "refusing: CI_PIPELINE_NUMBER empty or not a number: '$CI_PIPELINE_NUMBER'" >&2; exit 1;; esac
+    VENV="$VENV_PREFIX$(printf '%s' "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER"
+    case "$VENV" in "$VENV_PREFIX"?*) ;; *) echo "refusing: '$VENV' is outside $VENV_PREFIX" >&2; exit 1;; esac
+    if [ -L "$VENV" ]; then echo "refusing: $VENV is a symlink" >&2; exit 1; fi
 
 steps:
   - name: checkout
     image: bash
     commands:
       - 'set -eu'
+      # The credential reaches git through the host's system git config
+      # (/etc/gitconfig, bound in by the Slurm job; the other pipelines of
+      # this org rely on the same). This test only proves the staged file is
+      # there; nothing here passes it to git explicitly.
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
       - 'git remote add origin "https://github.com/${CI_REPO}.git"'
@@ -41,8 +58,6 @@ steps:
       # for tag events).
       - 'git checkout -q --detach "$CI_COMMIT_SHA"'
       - 'test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA" || { echo "checked out $(git rev-parse HEAD), expected $CI_COMMIT_SHA" >&2; exit 1; }'
-      # Stale per-pipeline venvs from earlier runs (6h outlives any pipeline).
-      - 'find /tmp/woodpecker-cache -maxdepth 1 -name "venv-*" -mmin +360 -exec rm -rf {} + 2>/dev/null || true'
       - 'git --no-pager log --oneline -1'
 
   - name: toolchain
@@ -75,8 +90,10 @@ steps:
       # the runtime host snapshots the source tree and rejects symlinks
       # that escape it (.venv/bin/python3 -> /usr/bin/python3), which fails
       # runtime-host-isolation-reload. The number is per repo, so the repo
-      # name is in the path.
-      - 'VENV="/tmp/woodpecker-cache/venv-$(echo "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER"; rm -rf "$VENV"'
+      # name is in the path, under the owned pe-venv- prefix (see the shared
+      # guard in `variables`).
+      - *venv_resolve
+      - 'rm -rf -- "$VENV"'
       - 'python3 -m venv "$VENV"'
       - '"$VENV/bin/pip" install -q pytest'
       - '"$VENV/bin/python" -m pytest --version'
@@ -86,7 +103,23 @@ steps:
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
-      - 'export PATH="/tmp/woodpecker-cache/venv-$(echo "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER/bin:$PATH"'
+      - *venv_resolve
+      - 'export PATH="$VENV/bin:$PATH"'
       # Exit 0 = every required milestone VERIFIED, evidence fresh, no
       # unresolved critical/high findings, dogfood evidence present.
       - 'timeout -k 30 60m npm run roadmap:check'
+
+  # Always runs, pass or fail. Removes ONLY this pipeline's own venv (exact
+  # path from the shared guard above). ACCEPTED LEAK: a pipeline killed or
+  # cancelled before this step leaves one small venv (tens of MB) in
+  # /tmp/woodpecker-cache until a human removes it. Leaking is chosen over
+  # deleting by age or pattern: nothing in this repo's pipelines deletes
+  # anything it did not create in the same run.
+  - name: cleanup-venv
+    image: bash
+    when:
+      - status: [success, failure]
+    commands:
+      - 'set -eu'
+      - *venv_resolve
+      - 'if [ -d "$VENV" ]; then rm -rf -- "$VENV"; echo "removed $VENV"; else echo "no venv at $VENV"; fi'
