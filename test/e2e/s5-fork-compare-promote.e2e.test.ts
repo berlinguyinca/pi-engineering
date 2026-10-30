@@ -29,7 +29,12 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import type { SteeringPorts } from "../../src/orchestration/steering.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "../../src/runtime/herdr/SteeringReceiver.ts";
-import { type ForkRuntime, createForkRuntime, downstreamPrNodes } from "../../src/runtime/herdr/forkWiring.ts";
+import {
+  type ForkRuntime,
+  createForkRuntime,
+  downstreamPrNodes,
+  missionForkSources,
+} from "../../src/runtime/herdr/forkWiring.ts";
 import { FakeGithubClient } from "../support/fakeGithubClient.ts";
 import { type PiHost, startPiHost } from "./support/piHost.ts";
 import { Plane, eventually } from "./support/plane.ts";
@@ -371,15 +376,12 @@ describe("scenario 5: comment on a failed review, fork from history, compare, pr
     await rawEdge("rev", "reviewed", "review:r1", attemptNode, { commit: sha.C1, verdict: "changes_requested" });
 
     // Pi's runtime pieces, wired the way EngineeringRuntime wires them
-    const sources = {
-      getTask: (id: string) => store.getTask(id),
-      getExecution: (id: string) => store.getExecution(id),
-      getMission: (id: string) => store.getMission(id),
+    const sources = missionForkSources(store, {
       boundRoot: (_repoId: string) => repo,
       openRoot: async (path: string) => (await GitRepo.open(path))?.root ?? null,
       links: store,
       downstreamPrs: (taskId: string) => downstreamPrNodes(store, taskId),
-    };
+    });
     const rt = await createForkRuntime({
       agentDir: host.agentDir,
       stateDir: host.stateDir,
