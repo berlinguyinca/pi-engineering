@@ -506,6 +506,20 @@ export interface ValidationEvidence {
 export type ReviewVerdict = "approve" | "request_changes";
 export type ReviewIndependenceMode = "independent" | "same_model_reduced";
 
+/**
+ * What resolving the reviewer's `file:line` citations against the candidate
+ * commit established (issue #508). Recorded with the review so the next reviewer
+ * and the promotion gate see what was checked, against what.
+ */
+export interface ReviewCitationReport {
+  /** The commit (or `"worktree"`) the citations were resolved against. */
+  atRef: string;
+  checked: number;
+  resolved: number;
+  /** One entry per citation that did not resolve, in words. */
+  unresolved: string[];
+}
+
 export interface ReviewEvidence {
   evidenceId: EntityId;
   missionId: EntityId;
@@ -522,6 +536,12 @@ export interface ReviewEvidence {
   outputValid: boolean;
   accessible: boolean;
   acceptanceResults?: AcceptanceEvidenceResult[];
+  /**
+   * Absent on evidence recorded before citation checking existed, and on reviews
+   * that ran outside a readable checkout. Present with entries in `unresolved`
+   * means the review cites references that are not there at `atRef`.
+   */
+  citationReport?: ReviewCitationReport;
   recordedAt: string;
 }
 

@@ -207,6 +207,7 @@ export interface ExecutionOutcome {
     | "outputValid"
     | "accessible"
     | "acceptanceResults"
+    | "citationReport"
   >;
 }
 
@@ -2941,6 +2942,11 @@ export class ExecutionBroker {
     if (!review || !review.accessible || !review.outputValid || review.verdict !== "approve") {
       throw refuse(`no approving review exists for candidate ${sha}`);
     }
+    // An approval that cites references which are not in the candidate is not an
+    // approval of this candidate (issue #508): the reviewer asserted a line it
+    // never read at this commit.
+    const citationProblem = promotionCitationProblem(review, sha);
+    if (citationProblem) throw refuse(citationProblem);
     if (review.independenceMode === "same_model_reduced") {
       const policy = this.mergeQueueOptions;
       const available =
@@ -4506,4 +4512,18 @@ export class ExecutionBroker {
       })) ?? false
     );
   }
+}
+
+/**
+ * Why an approving review's citations block promotion, or null when they do not
+ * (issue #508). Evidence recorded before citation checking existed carries no
+ * report and is left as it stands; a report with problems never promotes.
+ */
+export function promotionCitationProblem(review: Pick<ReviewEvidence, "citationReport">, sha: string): string | null {
+  const report = review.citationReport;
+  if (!report || report.unresolved.length === 0) return null;
+  return (
+    `the approving review of ${sha} cites ${report.unresolved.length} reference(s) that do not resolve ` +
+    `at ${report.atRef}: ${report.unresolved[0]}`
+  );
 }

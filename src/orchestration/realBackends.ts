@@ -26,6 +26,13 @@ import { id } from "../core/ids.ts";
 import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
+import {
+  type CitationReport,
+  citationSummary,
+  fileSystemReader,
+  gitObjectReader,
+  resolveCitations,
+} from "../ledger/citations.ts";
 import { type ModelRef, modelKey } from "../lifecycle/types.ts";
 import type { MissionBuildOptions } from "../resources/buildBudget.ts";
 import {
@@ -1306,6 +1313,33 @@ export function realBackends(opts: RealBackendsOptions) {
         }
         const mutation = guard ? await guard.check() : undefined;
         if (mutation) invalidReasons.push(mutation);
+        // A `file:line` the reviewer cites is a checkable assertion about the
+        // candidate, so it gets resolved against the candidate commit before the
+        // verdict is recorded (issue #508). Findings and acceptance details are the
+        // reviewer's assertions, so those are the texts resolved. An approval whose
+        // citations do not resolve is downgraded: the review still says what it
+        // found, but a guess cannot carry `approve`.
+        const citationRoot = req.cwd || input.worktree || undefined;
+        let citationReport: CitationReport | undefined;
+        if (citationRoot) {
+          const assertionText = [
+            ...normalizedFindings.map((finding) => finding.summary),
+            ...acceptanceResults.map((result) => result.detail),
+          ].join("\n");
+          const reader = input.candidateSha
+            ? gitObjectReader(citationRoot, input.candidateSha)
+            : fileSystemReader(citationRoot);
+          citationReport = await resolveCitations(assertionText, reader, {
+            atRef: input.candidateSha ?? "worktree",
+          });
+          if (verdict === "approve" && citationReport.unresolved.length > 0) {
+            normalizedFindings.push({
+              severity: "major",
+              summary: `citations: ${citationSummary(citationReport)}; an approval may not rest on references that do not resolve`,
+              status: "open",
+            });
+          }
+        }
         if (guard?.removedIgnored.length) {
           input.onActivity?.({
             kind: "execution",
@@ -1321,12 +1355,25 @@ export function realBackends(opts: RealBackendsOptions) {
           reviewerSessionId: req.sessionId ?? reviewerSessionId,
           model: modelRoute?.id ?? "",
           provider: modelRoute?.provider ?? "",
-          verdict: verdict === "approve" ? "approve" : "request_changes",
+          verdict:
+            verdict === "approve" && !(citationReport && citationReport.unresolved.length > 0)
+              ? "approve"
+              : "request_changes",
           independenceMode: independent ? "independent" : "same_model_reduced",
           findings: normalizedFindings,
           outputValid,
           accessible: artifactEvidence.allAccessible,
           acceptanceResults,
+          ...(citationReport
+            ? {
+                citationReport: {
+                  atRef: citationReport.atRef,
+                  checked: citationReport.checked,
+                  resolved: citationReport.resolved,
+                  unresolved: citationReport.unresolved,
+                },
+              }
+            : {}),
         };
         outcome.artifactHashes = artifactEvidence.hashes;
         // A review whose output could not be read says nothing about the
