@@ -29,7 +29,9 @@ of compacting. The successor runs on the same model the predecessor was serving;
   that session still takes over and acknowledges (unlike a quota fallback, which only an execution on the fallback does).
 - A model that cannot be pinned (marked unavailable by the runtime, absent from a readable registry, serving model
   unknown, or a bare id with an unreadable registry) is never guessed. The record has no `toModel`, the report says
-  `successor not pinned to <model> (<reason>); it routes normally`, and the successor is routed as any retry.
+  `successor not pinned to <model> (<reason>); it routes normally`, and the successor is routed as any retry. It still starts from the verified checkpoint: the task's resume base is set
+  (`MissionStore.resumeTaskFromCheckpoint`, the same `task.model_switched` event without a model), so the verified work is
+  never thrown away.
 - Precedence is unchanged: an operator pin for the mission still outranks the task's model, and a failed pinned model
   fails over (the pin applies only to the first placement).
 - Like a quota switch, the successor is the task's next attempt: with no attempt left the record is aborted, the source

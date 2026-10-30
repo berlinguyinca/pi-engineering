@@ -119,3 +119,58 @@ describe("MissionStore handoff records", () => {
     );
   });
 });
+
+describe("MissionStore.resumeTaskFromCheckpoint", () => {
+  const SHA = "a".repeat(40);
+  function withTask(backend = JsonlEventStore.inMemory()) {
+    const store = MissionStore.open(backend);
+    const mission = store.createMission({
+      title: "R",
+      goal: "g",
+      user_request: "g",
+      repository: "repo",
+      base_ref: "main",
+      risk_profile: "low",
+      workflow_class: "engineering",
+    });
+    const task = store.createTask({
+      mission_id: mission.mission_id,
+      kind: "agent",
+      role: "implementer",
+      objective: "o",
+      execution_requirements: { model: "gw/own" },
+    });
+    return { store, backend, task };
+  }
+
+  it("sets the resume base and leaves the task's model alone", () => {
+    const { store, task } = withTask();
+    const after = store.resumeTaskFromCheckpoint(task.task_id, SHA, "hf-1");
+    assert.equal(after.repair_base_candidate_sha, SHA);
+    assert.equal(after.execution_requirements.model, "gw/own");
+  });
+
+  it("is idempotent: a replay writes no second event", async () => {
+    const { store, backend, task } = withTask();
+    store.resumeTaskFromCheckpoint(task.task_id, SHA);
+    await store.flush();
+    const before = backend.count();
+    store.resumeTaskFromCheckpoint(task.task_id, SHA);
+    await store.flush();
+    assert.equal(backend.count(), before);
+  });
+
+  it("survives a reopen of the store (the event replays without a model)", async () => {
+    const { backend, store, task } = withTask();
+    store.resumeTaskFromCheckpoint(task.task_id, SHA, "hf-1");
+    await store.flush();
+    const reopened = MissionStore.open(backend);
+    const again = reopened.getTask(task.task_id);
+    assert.equal(again?.repair_base_candidate_sha, SHA);
+    assert.equal(again?.execution_requirements.model, "gw/own");
+  });
+
+  it("refuses an unknown task", () => {
+    assert.throws(() => makeStore().resumeTaskFromCheckpoint("nope", SHA), /unknown task/);
+  });
+});

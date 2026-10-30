@@ -276,6 +276,9 @@ export class HandoffDriver {
                     checkpoint.candidateSha ?? undefined,
                     record.id,
                   );
+                } else if (record.cause === "context_pressure" && checkpoint.candidateSha) {
+                  // Model not pinned: the successor routes normally but still starts from the verified checkpoint.
+                  store.resumeTaskFromCheckpoint(checkpoint.taskId, checkpoint.candidateSha, record.id);
                 }
               },
               fenceExecutionWriter(store, checkpoint.executionId, () =>
