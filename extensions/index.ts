@@ -105,7 +105,7 @@ import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.t
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { resolveStateRoot } from "../src/runtime/isolation/stateDir.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
-import { describeHousekeeping, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
+import { describeHousekeeping, gcPlan, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
 import {
   clearOperatorModelPin,
   describeMissionControl,
@@ -742,9 +742,11 @@ export default function (pi: ExtensionAPI) {
   // so this is safe to run at session start and periodically while the
   // session stays open. Never awaited: a slow sweep must not delay a session.
   const housekeepingIntervalMs = Number(process.env.PI_HOUSEKEEPING_INTERVAL_MS ?? 6 * 60 * 60 * 1000);
-  // On by default (operator decision 2026-10-29): the janitor keeps any worktree
-  // with a live, unknown or durably referenced owner. PI_HOUSEKEEPING=dry-run
-  // reports only, =0 disables. `/gc` always acts.
+  // Dry-run by default. Owner rule 2026-10-30, superseding the 2026-10-29
+  // decision to default on: "we can't lose data due to sweeps". Automatic
+  // sweeps act only with an explicit PI_HOUSEKEEPING=1|true|on|yes; =0 disables.
+  // `/gc` previews by default; `/gc --apply` is the explicit operator action.
+  // Either way it lists what it kept and why.
   const hkMode = housekeepingMode(process.env);
   const housekeepingEnabled = hkMode !== "off";
   // First sweep waits this long so a session that reloads or exits at once
@@ -793,13 +795,15 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_shutdown", stopHousekeeping);
   }
   pi.registerCommand("gc", {
-    description: "Reclaim abandoned candidate worktrees and expired Rust build caches (--dry-run to preview).",
+    description:
+      "Preview which abandoned pi-eng candidate worktrees and expired Rust build caches housekeeping would reclaim, and what it keeps and why. Nothing is removed unless you pass --apply (--dry-run is the default and accepted as an alias).",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
-      const dryRun = argv.includes("--dry-run");
+      const { dryRun, note } = gcPlan(args);
       const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
       const result = await runHousekeeping({ cwd: ctx.cwd, missions: runtime?.missionStore, dryRun });
       const lines = describeHousekeeping(result, { verbose: true });
+      if (note) lines.unshift(`[/gc] ${note}`);
+      if (dryRun) lines.push("Preview only: nothing was removed. Run `/gc --apply` to reclaim what is listed above.");
       ctx.ui.notify(
         lines.length > 0 ? lines.join("\n") : "Nothing to reclaim.",
         result.worktrees?.failed.length ? "warning" : "info",

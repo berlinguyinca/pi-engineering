@@ -19,12 +19,12 @@ import {
 import type { MissionStatus } from "../orchestration/types.ts";
 import { discoverMissionHandover } from "./host/missionHandover.ts";
 
-/** Mission statuses after which a mission never touches its worktrees again. */
-const TERMINAL_MISSION_STATUSES: ReadonlySet<MissionStatus> = new Set<MissionStatus>([
-  "COMPLETE",
-  "CANCELED",
-  "FAILED",
-]);
+/**
+ * Mission statuses after which a mission never touches its worktrees again.
+ * FAILED is deliberately absent: a failed mission can be reopened and resumed
+ * in the same worktree, so its checkout is never reclaimed.
+ */
+const TERMINAL_MISSION_STATUSES: ReadonlySet<MissionStatus> = new Set<MissionStatus>(["COMPLETE", "CANCELED"]);
 
 /** The slice of MissionStore the janitor needs; keeps the binding testable. */
 export interface MissionLookup {
@@ -53,11 +53,38 @@ export function missionOwnerLiveness(
   };
 }
 
-/** `PI_HOUSEKEEPING`: `0` is off, `dry-run` reports only, anything else (default) acts. */
+/**
+ * `PI_HOUSEKEEPING`: acts only for an explicit `1|true|on|yes`; `0|false|off|no`
+ * disables; unset, empty, `dry-run` or anything unknown only reports.
+ * Owner rule 2026-10-30: "we can't lose data due to sweeps".
+ */
 export function housekeepingMode(env: Record<string, string | undefined> = process.env): "on" | "off" | "dry-run" {
   const raw = env.PI_HOUSEKEEPING?.trim().toLowerCase();
-  if (raw !== undefined && /^(0|false|off|no)$/.test(raw)) return "off";
-  return raw === "dry-run" ? "dry-run" : "on";
+  if (raw === undefined) return "dry-run";
+  if (/^(1|true|on|yes)$/.test(raw)) return "on";
+  if (/^(0|false|off|no)$/.test(raw)) return "off";
+  return "dry-run";
+}
+
+/**
+ * `/gc` arguments. It previews by default; only an explicit `--apply` acts.
+ * `--dry-run` is accepted as a no-op alias and wins over `--apply`. Any other
+ * token is unknown and makes the command fall back to a preview, with a note.
+ */
+export function gcPlan(args: string): { dryRun: boolean; note?: string } {
+  const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+  const unknown = argv.filter((a) => a !== "--apply" && a !== "--dry-run");
+  if (unknown.length > 0) {
+    return {
+      dryRun: true,
+      note: `unknown argument(s) ${unknown.join(", ")}: showing a preview instead; use \`/gc --apply\` alone to act`,
+    };
+  }
+  return { dryRun: !argv.includes("--apply") || argv.includes("--dry-run") };
+}
+
+export function gcDryRun(args: string): boolean {
+  return gcPlan(args).dryRun;
 }
 
 export interface HousekeepingResult {
