@@ -3,7 +3,7 @@
  * non-overwriting rotation, torn-tail quarantine. Real git, real files.
  */
 import assert from "node:assert/strict";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
@@ -15,7 +15,9 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -763,6 +765,204 @@ test("restoreCheckpoint recovers the live state left behind by a crash between i
   );
   await assert.rejects(restoreCheckpoint(checkpoint, state)); // the checkpoint copy is missing
   assert.equal(readFileSync(join(state, "live.json"), "utf8"), "LIVE");
+});
+
+async function userDataRepo(): Promise<{ dir: string; head: string; git: GitRepo }> {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "w2b-ud-")));
+  await exec("git", ["init", "-q", "-b", "main", dir]);
+  await g(dir, "config", "user.email", "t@example.invalid");
+  await g(dir, "config", "user.name", "t");
+  writeFileSync(join(dir, ".gitignore"), "build/\n.venv/\n*.pyc\ngen/\nnode_modules/\ntarget/\n.tox/\nout/\n");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "init");
+  const git = await GitRepo.open(dir);
+  assert.ok(git);
+  return { dir, head: await g(dir, "rev-parse", "HEAD"), git };
+}
+
+const KEEP_CASES: Array<[string, (p: string) => void, string]> = [
+  [
+    "build/release-notes-final.md",
+    (p) => {
+      mkdirSync(join(p, "build"));
+      writeFileSync(join(p, "build", "release-notes-final.md"), "hand");
+    },
+    "build/release-notes-final.md",
+  ],
+  [
+    "pkg/build/.env",
+    (p) => {
+      mkdirSync(join(p, "pkg", "build"), { recursive: true });
+      writeFileSync(join(p, "pkg", "build", ".env"), "SECRET=1");
+    },
+    "pkg/build/.env",
+  ],
+  [
+    ".venv/.env",
+    (p) => {
+      mkdirSync(join(p, ".venv", "bin"), { recursive: true });
+      writeFileSync(join(p, ".venv", ".env"), "TOKEN=x");
+    },
+    ".venv/.env",
+  ],
+  [
+    "notes.pyc (a user file, not in __pycache__)",
+    (p) => writeFileSync(join(p, "notes.pyc"), "user notes"),
+    "notes.pyc",
+  ],
+  [
+    "bare repo in target/",
+    (p) => {
+      mkdirSync(join(p, "target"), { recursive: true });
+      execFileSync("git", ["init", "-q", "--bare", join(p, "target", "mirror.git")]);
+    },
+    "target/mirror.git/HEAD",
+  ],
+  [
+    "bare repo in build/",
+    (p) => {
+      mkdirSync(join(p, "build"), { recursive: true });
+      execFileSync("git", ["init", "-q", "--bare", join(p, "build", "backup.git")]);
+    },
+    "build/backup.git/HEAD",
+  ],
+  [
+    "secret key under target/",
+    (p) => {
+      mkdirSync(join(p, "target", "debug"), { recursive: true });
+      writeFileSync(join(p, "target", "debug", "deploy.pem"), "KEY");
+    },
+    "target/debug/deploy.pem",
+  ],
+];
+for (const [name, setup, kept] of KEEP_CASES) {
+  test(`removal keeps the worktree: ${name}`, async () => {
+    const { head, git } = await userDataRepo();
+    const info = await git.createWorktree(head, `keep-${basename(kept).replace(/\W/g, "")}`);
+    setup(info.path);
+    await assert.rejects(git.removeWorktree(info, { keepBranch: true }));
+    assert.ok(existsSync(join(info.path, kept)), `${kept} still there`);
+  });
+}
+
+test("a __pycache__ directory under an ignored gen/ is still disposable", async () => {
+  const { head, git } = await userDataRepo();
+  const info = await git.createWorktree(head, "py-ok");
+  mkdirSync(join(info.path, "gen", "__pycache__"), { recursive: true });
+  writeFileSync(join(info.path, "gen", "__pycache__", "a.pyc"), "");
+  await git.removeWorktree(info, { keepBranch: true });
+  assert.ok(!existsSync(info.path));
+});
+
+test("symbolic aliases under refs/heads do not count as an independent copy of the tip", async () => {
+  const { dir, git } = await remoteRepo();
+  await g(dir, "checkout", "-q", "-b", "S");
+  await g(dir, "commit", "-q", "--allow-empty", "-m", "unique-S");
+  const tip = await g(dir, "rev-parse", "HEAD");
+  await g(dir, "checkout", "-q", "main");
+  await g(dir, "symbolic-ref", "refs/heads/S-alias", "refs/heads/S");
+  const r = await git.deleteOrPreserveBranch("S");
+  assert.ok(r?.renamedTo, "preserved");
+  assert.ok((await g(dir, "for-each-ref", "--contains", tip, "--format=%(refname)")).includes("superseded/"));
+});
+
+test("a scratch merge with an amended resolution is not reproducible: the branch is preserved", async () => {
+  const { dir, git } = await remoteRepo();
+  await g(dir, "checkout", "-q", "-b", "worker1");
+  writeFileSync(join(dir, "w.txt"), "w");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-q", "-m", "w");
+  await g(dir, "checkout", "-q", "main");
+  await g(dir, "checkout", "-q", "-b", "review-x");
+  await g(dir, "merge", "--no-ff", "-q", "-m", "review", "worker1");
+  writeFileSync(join(dir, "resolution.txt"), "hand-written conflict resolution");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-q", "--amend", "--no-edit");
+  const merge = await g(dir, "rev-parse", "HEAD");
+  await g(dir, "checkout", "-q", "main");
+  const r = await git.deleteScratchBranch("review-x");
+  assert.ok(r?.renamedTo, "preserved, not deleted");
+  assert.notEqual(await g(dir, "for-each-ref", "--contains", merge, "--format=%(refname)"), "");
+});
+
+test("a branch checked out in another worktree is neither deleted nor renamed", async () => {
+  const { dir, git } = await remoteRepo();
+  await g(dir, "branch", "co", "main");
+  const wt = join(dirname(dir), "wt-co");
+  await g(dir, "worktree", "add", "-q", wt, "co");
+  const r = await git.deleteOrPreserveBranch("co");
+  assert.equal(r?.renamedTo, undefined);
+  assert.equal(await g(wt, "rev-parse", "--abbrev-ref", "HEAD"), "co");
+  assert.ok(await g(dir, "rev-parse", "--verify", "refs/heads/co"));
+  await assert.rejects(git.deleteBranch("co", undefined, await g(dir, "rev-parse", "co")), /checked out/);
+  assert.equal(await g(wt, "rev-parse", "--abbrev-ref", "HEAD"), "co");
+});
+
+test("restoreCheckpoint (existed=false) sets a recovered live copy aside instead of deleting it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "w2b-ck3-"));
+  const checkpoint = join(root, "cp");
+  const state = join(root, "state");
+  mkdirSync(checkpoint);
+  mkdirSync(join(state, "db.replaced-9-x"), { recursive: true });
+  writeFileSync(join(state, "db.replaced-9-x", "a"), "LIVE state from interrupted restore");
+  writeFileSync(
+    join(checkpoint, "checkpoint-manifest.json"),
+    JSON.stringify({ stateDir: state, createdAt: "x", entries: [{ path: "db", existed: false }] }),
+  );
+  await restoreCheckpoint(checkpoint, state);
+  const kept = readdirSync(state).find((n) => n.startsWith("db.replaced-recovered-"));
+  assert.ok(kept, readdirSync(state).join(","));
+  assert.equal(readFileSync(join(state, kept, "a"), "utf8"), "LIVE state from interrupted restore");
+  assert.ok(!existsSync(join(state, "db")));
+});
+
+test("openReadOnly skips a repeated event_id like load()", async () => {
+  const file = join(mkdtempSync(join(tmpdir(), "w2b-ro-")), "events.jsonl");
+  writeFileSync(file, `${[ev("e1"), ev("e2"), ev("e2")].map((e) => JSON.stringify(e)).join("\n")}\n`);
+  const ro = await JsonlEventStore.openReadOnly(file);
+  assert.deepEqual(
+    ro.all().map((e) => e.event_id),
+    ["e1", "e2"],
+  );
+});
+
+test("torn tails quarantined in the same second never concatenate into one file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "w2b-torn-same-"));
+  const file = join(dir, "events.jsonl");
+  writeFileSync(file, '{"a":1}\n');
+  for (const frag of ["AAA", "BBB", "CCC"]) {
+    appendFileSync(file, frag);
+    await repairTornTail(file);
+  }
+  const parts = readdirSync(dir)
+    .filter((n) => n.startsWith("events.jsonl.torn-"))
+    .map((n) => readFileSync(join(dir, n), "utf8"))
+    .sort();
+  assert.deepEqual(parts, ["AAA", "BBB", "CCC"]);
+});
+
+test("a symlinked marker is not trusted", async () => {
+  const { head, git } = await scratchRepo();
+  const info = await git.createWorktree(head, "sym-mark");
+  const gitdir = await g(info.path, "rev-parse", "--absolute-git-dir");
+  const real = join(gitdir, "pi-eng-owner.json");
+  const copy = join(gitdir, "elsewhere.json");
+  writeFileSync(copy, readFileSync(real));
+  rmSync(real);
+  symlinkSync(copy, real);
+  assert.deepEqual(readOwnerMarker(gitdir), { ok: false, reason: "not a regular file" });
+});
+
+test("the kept-worktrees list holds one line per path", async () => {
+  const { head, git, dir } = await ignoredRepo();
+  const info = await git.createWorktree(head, "kept-2");
+  writeFileSync(join(info.path, ".env"), "SECRET=1");
+  for (let i = 0; i < 3; i++) await assert.rejects(git.removeWorktree(info));
+  const common = join(dir, await g(dir, "rev-parse", "--git-common-dir"));
+  const lines = readFileSync(join(common, "pi-engineering-candidates", "kept-scratch-worktrees.jsonl"), "utf8")
+    .trim()
+    .split("\n");
+  assert.equal(lines.length, 1);
 });
 
 // A tripwire, not a proof: it greps the data-bearing files for destructive git tokens in any argument position.

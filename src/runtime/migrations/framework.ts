@@ -130,17 +130,23 @@ export async function createCheckpoint(
  * `<target>`: put it back (completing the rollback), and report any leftover `.restore-*` copy.
  * Nothing is deleted.
  */
-function recoverInterruptedRestore(target: string): void {
+function recoverInterruptedRestore(target: string): boolean {
   const parent = dirname(target);
   const leaf = basename(target);
   let names: string[];
   try {
     names = readdirSync(parent);
   } catch {
-    return;
+    return false;
   }
-  for (const name of names.filter((n) => n.startsWith(`${leaf}.replaced-`))) {
+  let recovered = false;
+  // Deterministic: newest first (names embed pid + a base-36 timestamp, so sort descending).
+  for (const name of names
+    .filter((n) => n.startsWith(`${leaf}.replaced-`) && !n.startsWith(`${leaf}.replaced-recovered-`))
+    .sort()
+    .reverse()) {
     if (!existsSync(target)) {
+      recovered = true;
       renameSync(join(parent, name), target);
       emitTelemetry({ level: "warning", text: `migration: recovered ${target} from an interrupted restore (${name})` });
     } else {
@@ -156,6 +162,7 @@ function recoverInterruptedRestore(target: string): void {
       text: `migration: leftover partial restore copy ${join(parent, name)}; inspect it`,
     });
   }
+  return recovered;
 }
 
 /** Put the checkpointed paths back exactly; paths that did not exist are removed. */
@@ -167,7 +174,7 @@ export async function restoreCheckpoint(checkpointDir: string, stateDir: string)
     const n = normalize(path);
     if (isAbsolute(n) || n.startsWith("..")) throw new MigrationError(`corrupt checkpoint path ${path}`);
     const target = join(stateDir, n);
-    recoverInterruptedRestore(target);
+    const recovered = recoverInterruptedRestore(target);
     if (existed) {
       // Copy the checkpoint to a sibling temp FIRST, then swap: a failed copy leaves the live
       // state untouched instead of having already removed it.
@@ -188,6 +195,9 @@ export async function restoreCheckpoint(checkpointDir: string, stateDir: string)
         throw error;
       }
       if (hadLive) await rm(previous, { recursive: true, force: true }); // replaced by the checkpoint copy
+    } else if (recovered) {
+      // The "live state" here was just recovered from an interrupted restore: set it aside, never delete it.
+      await rename(target, `${target}.replaced-recovered-${Date.now().toString(36)}`);
     } else {
       await rm(target, { recursive: true, force: true });
     }

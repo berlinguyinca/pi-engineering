@@ -98,6 +98,7 @@ export class JsonlEventStore implements EventStoreBackend {
       if (!line.trim()) continue;
       try {
         const evt = JSON.parse(line) as StoredEvent;
+        if (store.byId.has(evt.event_id)) continue; // a retried append of an earlier, unacknowledged write
         store.events.push(evt);
         store.byId.set(evt.event_id, evt);
       } catch {
@@ -337,13 +338,23 @@ export async function repairTornTail(
   // Quarantine first: the discarded bytes (byte-exact, no decoding) are appended to
   // `<file>.torn-<ts>` and the file is truncated only once they are durable (fail closed).
   const tail = Buffer.from(buf.subarray(keep));
-  const quarantine = `${file}.torn-${new Date()
+  const stamp = new Date()
     .toISOString()
     .replace(/[-:]/g, "")
-    .replace(/\.\d+Z$/, "Z")}`;
+    .replace(/\.\d+Z$/, "Z");
+  let quarantine = `${file}.torn-${stamp}`;
   try {
     // open + write + fsync + close, then fsync the directory entry, BEFORE the truncate.
-    const handle = await open(quarantine, "a", 0o600);
+    // "wx" with a counter: two same-second torn tails never share (and concatenate into) one file.
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    for (let n = 0; handle === undefined; n++) {
+      quarantine = `${file}.torn-${stamp}${n === 0 ? "" : `.${n}`}`;
+      try {
+        handle = await open(quarantine, "wx", 0o600);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
     try {
       await handle.writeFile(tail);
       await handle.sync();

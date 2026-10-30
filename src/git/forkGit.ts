@@ -127,9 +127,10 @@ export class CliForkGit implements ForkGit {
     if (!(await this.commitExists(base))) throw new Error("the base commit is not in this repository");
     const add = await this.run(["worktree", "add", "-b", branch, path, base]);
     if (add.code !== 0) throw new Error(`git worktree add failed: ${tidyStderr(add.stderr)}`);
-    // Fork worktrees live at `pi-fork-<shortHash(repoRoot)>-<id>`, not under the `pi-eng-<hash>-`
-    // namespace, but the marker's repoRootHash is the same shortHash(repoRoot) so 2A can match
-    // it to the owning repo; the marker, not the directory name, is the proof of ownership.
+    // Fork worktrees live at `pi-fork-<shortHash(repoRoot)>-<id>`, OUTSIDE the `pi-eng-<hash>-`
+    // namespace the janitor sweeps, so today nothing reads this marker for forks. It is written for a
+    // future janitor: repoRootHash is the same shortHash(repoRoot), and the marker, not the directory
+    // name, is the proof of ownership.
     await writeOwnerMarker(path, { repoRoot: this.repoRoot, repoRootHash: shortHash(this.repoRoot), branch });
   }
 

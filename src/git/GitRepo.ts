@@ -26,6 +26,9 @@ import { removalBlockers } from "./worktreeSafety.ts";
 
 export { shortHash };
 
+/** Cap on distinct paths in the kept-worktrees list; beyond it new ones are only reported. */
+const MAX_KEPT_RECORDS = 1000;
+
 export interface WorktreeInfo {
   path: string;
   branch: string;
@@ -1529,8 +1532,9 @@ export class GitRepo {
    * replaced only when it is a registered, clean worktree (plain
    * `git worktree remove`, never `--force`); a dirty or unregistered leftover
    * makes creation fail with an operator-facing error. A leftover branch is
-   * deleted only when fully merged (`branch -d`), else renamed to
-   * `superseded/<branch>-<ts>` so its commits stay reachable.
+   * deleted only when its tip is contained in another local branch or tag
+   * (compare-and-swap), else renamed to `superseded/<branch>-<ts>` so its
+   * commits stay reachable.
    */
   async createWorktree(baseCommit: string, branch: string, guard?: GitMutationGuard): Promise<WorktreeInfo> {
     return this.serialize(() =>
@@ -1651,12 +1655,32 @@ export class GitRepo {
       } catch {
         marker = { invalid: "unreadable" };
       }
-      const dir = await this.candidateStateDir();
-      await appendFile(
-        join(dir, "kept-scratch-worktrees.jsonl"),
-        `${JSON.stringify({ path, reason, ts: new Date().toISOString(), marker })}\n`,
-        "utf8",
-      );
+      const file = join(await this.candidateStateDir(), "kept-scratch-worktrees.jsonl");
+      const record = { path, reason, ts: new Date().toISOString(), marker };
+      // Bounded: one line per path (a repeat updates it, an identical repeat is skipped) and a hard cap.
+      const lines = (await readFile(file, "utf8").catch(() => "")).split("\n").filter(Boolean);
+      const index = lines.findIndex((line) => {
+        try {
+          return (JSON.parse(line) as { path?: string }).path === path;
+        } catch {
+          return false;
+        }
+      });
+      if (index >= 0) {
+        if ((JSON.parse(lines[index] as string) as { reason?: string }).reason === reason) return;
+        lines[index] = JSON.stringify(record);
+      } else if (lines.length >= MAX_KEPT_RECORDS) {
+        emitTelemetry({
+          level: "warning",
+          text: `kept-worktrees list is full (${MAX_KEPT_RECORDS}); not recording ${path}`,
+        });
+        return;
+      } else {
+        lines.push(JSON.stringify(record));
+      }
+      const tmp = `${file}.${process.pid}.tmp`;
+      await writeFile(tmp, `${lines.join("\n")}\n`, "utf8");
+      await rename(tmp, file);
       emitTelemetry({ level: "warning", text: `worktree kept (not removed): ${path}: ${reason}` });
     } catch {
       // Reporting must never turn a refusal into a failure of the caller.
@@ -1719,6 +1743,11 @@ export class GitRepo {
     await this.deleteOrPreserveBranchLocked(branch, guard);
   }
 
+  /** Path of the worktree (primary included) that has `branch` checked out, or null. */
+  private async checkedOutAt(branch: string): Promise<string | null> {
+    return (await this.registeredWorktrees()).find((w) => w.branch === branch)?.path ?? null;
+  }
+
   /** The tip of `refs/heads/<branch>`, or null. */
   private async branchTip(branch: string): Promise<string | null> {
     const tip = await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`]);
@@ -1735,15 +1764,21 @@ export class GitRepo {
   private async deleteIfContained(branch: string): Promise<GitResult | null> {
     const tip = await this.branchTip(branch);
     if (tip === null) return null;
+    if ((await this.checkedOutAt(branch)) !== null) return null;
     const others = await this.git([
       "for-each-ref",
       "--contains",
       tip,
-      "--format=%(refname)",
+      "--format=%(refname) %(symref)",
       "refs/heads",
       "refs/tags",
     ]);
-    const elsewhere = others.stdout.split("\n").filter((ref) => ref && ref !== `refs/heads/${branch}`);
+    // A symbolic alias under refs/heads that points AT this branch is not an independent copy.
+    const elsewhere = others.stdout
+      .split("\n")
+      .filter((line) => line && !line.endsWith(` refs/heads/${branch}`))
+      .map((line) => line.split(" ")[0] as string)
+      .filter((ref) => ref !== `refs/heads/${branch}`);
     if (others.code !== 0 || elsewhere.length === 0) return null;
     const cas = await this.git(["update-ref", "-d", `refs/heads/${branch}`, tip]);
     return cas.code === 0 ? cas : null;
@@ -1778,16 +1813,7 @@ export class GitRepo {
       this.withWorktreeSection(guard, async () => {
         const tip = await this.branchTip(branch);
         if (tip === null) return null;
-        const unique = await this.git([
-          "rev-list",
-          "--no-merges",
-          tip,
-          "--not",
-          `--exclude=${branch}`, // relative to refs/heads/ when used with --branches
-          "--branches",
-          "--tags",
-        ]);
-        if (unique.code === 0 && unique.stdout === "") {
+        if ((await this.checkedOutAt(branch)) === null && (await this.onlyReproducibleHere(branch, tip))) {
           const cas = await this.git(["update-ref", "-d", `refs/heads/${branch}`, tip]);
           if (cas.code === 0) return cas;
         }
@@ -1796,12 +1822,39 @@ export class GitRepo {
     );
   }
 
+  /**
+   * True when everything unique to `branch` can be rebuilt: every non-merge commit is contained in
+   * another local branch/tag, and every unique merge commit's tree equals a fresh merge of its own
+   * two parents (so it carries no hand-made resolution or amended content).
+   */
+  private async onlyReproducibleHere(branch: string, tip: string): Promise<boolean> {
+    const notElsewhere = ["--not", `--exclude=${branch}`, "--branches", "--tags"]; // exclude is relative to refs/heads/
+    const unique = await this.git(["rev-list", "--no-merges", tip, ...notElsewhere]);
+    if (unique.code !== 0 || unique.stdout !== "") return false;
+    const merges = await this.git(["rev-list", "--merges", "--parents", tip, ...notElsewhere]);
+    if (merges.code !== 0) return false;
+    for (const line of merges.stdout.split("\n").filter(Boolean)) {
+      const [commit, ...parents] = line.split(" ");
+      if (parents.length !== 2) return false;
+      const fresh = await this.git(["merge-tree", "--write-tree", parents[0] as string, parents[1] as string]);
+      const actual = await this.git(["rev-parse", `${commit}^{tree}`]);
+      if (fresh.code !== 0 || fresh.stdout.split("\n")[0] !== actual.stdout) return false;
+    }
+    return true;
+  }
+
   private async deleteOrPreserveBranchLocked(
     branch: string,
     guard?: GitMutationGuard,
   ): Promise<(GitResult & { renamedTo?: string }) | null> {
     if ((await this.branchTip(branch)) === null) return null;
     guard?.assertAuthoritative();
+    const holder = await this.checkedOutAt(branch);
+    if (holder !== null) {
+      // Neither deleting nor renaming a branch another worktree has checked out is safe: keep it as is.
+      emitTelemetry({ level: "warning", text: `branch ${branch} kept: it is checked out at ${holder}` });
+      return { stdout: "", stderr: `branch ${branch} is checked out at ${holder}; kept`, code: 0 };
+    }
     const deleted = await this.deleteIfContained(branch);
     if (deleted) return deleted;
     const stamp = compactStamp();
@@ -2138,6 +2191,8 @@ export class GitRepo {
     await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
     if (expectedSha) {
+      const holder = await this.checkedOutAt(branch);
+      if (holder !== null) throw new Error(`branch ${branch} not deleted: it is checked out at ${holder}`);
       // Compare-and-swap: fails (and the branch stays) if the tip moved since the caller looked.
       const r = await this.git(["update-ref", "-d", `refs/heads/${branch}`, expectedSha]);
       if (r.code !== 0) throw new Error(`branch ${branch} not deleted (tip moved or ref busy): ${r.stderr}`);

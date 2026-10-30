@@ -11,34 +11,42 @@ import { join } from "node:path";
 import { safeGit } from "./safeGit.ts";
 
 /** Rebuildable build output, disposable when ignored at the worktree ROOT. */
-const ROOT_DERIVED_DIRS = new Set(["node_modules", "target", ".next", "dist", "coverage"]);
-/** Well-known cache/build directories, disposable at ANY depth when ignored. */
-const ANY_DEPTH_DERIVED_DIRS = new Set([
+export const ROOT_DERIVED_DIRS: ReadonlySet<string> = new Set(["node_modules", "target", ".next", "dist", "coverage"]);
+/**
+ * Clearly-regenerable cache directories, disposable at ANY depth when ignored. Deliberately NOT
+ * `build`, `.venv` or `.tox`: people keep hand-written files and secrets in those.
+ */
+export const ANY_DEPTH_DERIVED_DIRS: ReadonlySet<string> = new Set([
   "node_modules",
   "__pycache__",
   ".pytest_cache",
   ".mypy_cache",
   ".ruff_cache",
   ".turbo",
-  ".tox",
-  ".venv",
-  "build",
 ]);
-/** Well-known derived files, disposable at any depth when ignored. */
-const DERIVED_FILE = /(\.pyc|\.tsbuildinfo)$/;
+/** Derived files disposable when ignored (`*.pyc` only counts inside a `__pycache__` directory). */
+export const DERIVED_FILE = /\.tsbuildinfo$/;
+/** Files that look like secrets: found beneath a derived dir (other than node_modules) they keep the worktree. */
+const SECRET_FILE = /^(\.env(\..*)?|.*\.pem|.*\.key)$/;
 
-const MAX_WALK_ENTRIES = 1_000_000;
+export const MAX_WALK_ENTRIES = 1_000_000;
 
-/** True when a `.git` file or directory exists anywhere beneath `dir`, or it cannot be proven repo-free. */
-async function containsGitEntry(dir: string): Promise<boolean> {
+/**
+ * True when beneath `dir` there is a `.git` file/dir, a bare repository (HEAD + objects/ + refs/),
+ * or (unless `allowSecrets`) a secret-looking file; also when it cannot be proven otherwise.
+ */
+export async function containsGitEntry(dir: string, allowSecrets = true): Promise<boolean> {
   let seen = 0;
   const queue = [dir];
   while (queue.length > 0) {
     const current = queue.pop() as string;
     const entries = await readdir(current, { withFileTypes: true }).catch(() => null);
     if (!entries) return true; // unreadable: cannot prove it repo-free
+    const names = new Set(entries.map((e) => e.name));
+    if (names.has("HEAD") && names.has("objects") && names.has("refs")) return true; // bare repository
     for (const entry of entries) {
       if (entry.name === ".git") return true;
+      if (!allowSecrets && SECRET_FILE.test(entry.name)) return true;
       if (++seen > MAX_WALK_ENTRIES) return true;
       if (entry.isDirectory()) queue.push(join(current, entry.name));
     }
@@ -51,30 +59,32 @@ async function containsGitEntry(dir: string): Promise<boolean> {
  * inside (a `pkg/` holding only `__pycache__/` and `node_modules/`, or a `.env`). Walk it: it is
  * disposable only when every file is derived output and no nested repository is beneath it.
  */
-async function onlyDerivedBeneath(dir: string, budget: { left: number }): Promise<boolean> {
+export async function onlyDerivedBeneath(dir: string, budget: { left: number }): Promise<boolean> {
   const entries = await readdir(dir, { withFileTypes: true }).catch(() => null);
   if (!entries) return false;
+  const names = new Set(entries.map((e) => e.name));
+  if (names.has("HEAD") && names.has("objects") && names.has("refs")) return false; // bare repository
   for (const entry of entries) {
     if (--budget.left < 0 || entry.name === ".git") return false;
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
       if (ANY_DEPTH_DERIVED_DIRS.has(entry.name)) {
-        if (await containsGitEntry(full)) return false;
+        if (await containsGitEntry(full, entry.name === "node_modules")) return false;
       } else if (!(await onlyDerivedBeneath(full, budget))) return false;
     } else if (!DERIVED_FILE.test(entry.name)) return false;
   }
   return true;
 }
 
-async function isDisposableDerived(worktreePath: string, path: string): Promise<boolean> {
+export async function isDisposableDerived(worktreePath: string, path: string): Promise<boolean> {
   const isDir = path.endsWith("/");
   const clean = path.replace(/\/+$/, "");
   const name = clean.split("/").pop() ?? clean;
   const atRoot = !clean.includes("/");
   if (isDir) {
     const ok = (atRoot && ROOT_DERIVED_DIRS.has(name)) || ANY_DEPTH_DERIVED_DIRS.has(name);
-    // A nested git repository under derived output is somebody's work, not output.
-    if (ok) return !(await containsGitEntry(join(worktreePath, clean)));
+    // A nested repository (or a secret file) under derived output is somebody's work, not output.
+    if (ok) return !(await containsGitEntry(join(worktreePath, clean), name === "node_modules"));
     return onlyDerivedBeneath(join(worktreePath, clean), { left: MAX_WALK_ENTRIES });
   }
   return DERIVED_FILE.test(name);

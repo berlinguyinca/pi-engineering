@@ -8,7 +8,7 @@
  * cleanup tooling can refuse to touch worktrees it cannot prove it owns.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, fsyncSync, openSync, readFileSync, realpathSync, renameSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { safeGitOrThrow } from "./safeGit.ts";
 import { shortHash } from "./shortHash.ts";
@@ -65,6 +65,8 @@ export function readOwnerMarker(
 function readOwnerMarkerFormat(gitdir: string): OwnerMarkerRead {
   let raw: string;
   try {
+    // A symlink or other non-regular file is never trusted as a marker.
+    if (!lstatSync(join(gitdir, OWNER_MARKER_FILE)).isFile()) return { ok: false, reason: "not a regular file" };
     raw = readFileSync(join(gitdir, OWNER_MARKER_FILE), "utf8");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
