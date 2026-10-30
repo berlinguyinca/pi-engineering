@@ -429,6 +429,74 @@ describe("gatePlanBeforeWorkers", () => {
     assert.equal(r.status, "proceed");
   });
 
+  it("records an existing plan artifact ref on the revision and the plan node, apart from the digest", async () => {
+    const drafts: EnvelopeDraft[] = [];
+    const emitter = { stage: async (d: EnvelopeDraft) => void drafts.push(d) };
+    const run = async (id: string, planArtifactRef?: { id: string; version: string }) => {
+      const ledger = new MemoryPlanLedger();
+      await gatePlanBeforeWorkers({
+        missionId: id,
+        goal: "g",
+        plan: async () => LOW(),
+        ledger,
+        emitter,
+        ...(planArtifactRef ? { planArtifactRef } : {}),
+      });
+      return ledger.listPlanRevisions(id)[0]!;
+    };
+    const withRef = await run("M30", { id: "art_1", version: "v3" });
+    const without = await run("M31");
+    assert.deepEqual(withRef.planArtifactRef, { id: "art_1", version: "v3" });
+    assert.equal(withRef.planDigest, without.planDigest, "the ref never enters the digest");
+    assert.ok(!("planArtifactRef" in without), "no ref given => the field is absent, not null");
+    const attrs = (m: string) =>
+      (drafts.find((d) => d.entity_id === `plan:${m}/1`)!.payload as { attrs: Record<string, unknown> }).attrs;
+    assert.equal(attrs("M30").plan_artifact_id, "art_1");
+    assert.equal(attrs("M30").plan_artifact_version, "v3");
+    assert.equal(attrs("M30").plan_digest, withRef.planDigest);
+    assert.ok(!("plan_artifact_id" in attrs("M31")));
+    assert.ok(!drafts.some((d) => d.entity_id.startsWith("artifact:")), "no artifact node is pre-created");
+  });
+
+  it("a blank ref is ignored, and an emitter failure with a ref still never blocks planning", async () => {
+    const ledger = new MemoryPlanLedger();
+    const r = await gatePlanBeforeWorkers({
+      missionId: "M32",
+      goal: "g",
+      plan: async () => LOW(),
+      ledger,
+      planArtifactRef: { id: " ", version: "v1" },
+      emitter: { stage: async () => Promise.reject(new Error("disk full")) },
+    });
+    assert.equal(r.status, "proceed");
+    assert.ok(!("planArtifactRef" in ledger.listPlanRevisions("M32")[0]!));
+  });
+
+  it("old revision records without the ref replay unchanged through MissionStore", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-planref-"));
+    const backend = await JsonlEventStore.open(join(dir, "o.jsonl"));
+    const store = MissionStore.open(backend);
+    const old = {
+      missionId: "M33",
+      revision: 1,
+      planDigest: "d".repeat(64),
+      parentRevision: null,
+      parentDigest: null,
+      riskClass: "low",
+      complexityScore: 1,
+      cause: "initial",
+      planText: "t",
+      tasks: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+    } as unknown as Parameters<typeof store.appendPlanRevision>[0];
+    store.appendPlanRevision(old);
+    await store.flush();
+    backend.close();
+    const again = await JsonlEventStore.open(join(dir, "o.jsonl"));
+    assert.deepEqual(MissionStore.open(again).listPlanRevisions("M33"), [old]);
+    again.close();
+  });
+
   it("a changed submission under the same mission mints a new revision and needs a fresh decision", async () => {
     const ledger = new MemoryPlanLedger();
     const t = transport((d) => ({ decision: "approved", externalDecisionId: "E", planDigest: d }));

@@ -102,6 +102,8 @@ import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools, hasRecordedEvidence } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { TestQuarantine } from "../verify/testQuarantine.ts";
+import { LedgerWorkProjection } from "../work/ledgerProjection.ts";
+import { TaskLineageProjector } from "../work/taskLineage.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { buildContinuityConfig } from "./continuityWiring.ts";
@@ -720,6 +722,8 @@ function describeSnapshotError(error: unknown): string {
 
 export class EngineeringRuntime {
   ledger: Ledger;
+  /** Ledger task -> Herdr lineage; absent without a lineage emitter. */
+  taskLineage?: TaskLineageProjector;
   /**
    * Owned-resource journal for candidate worktrees and branches (issue #143).
    * Rooted in the runtime state dir; assigned by open().
@@ -1409,6 +1413,7 @@ export class EngineeringRuntime {
     const broker = await ContextBroker.open(repoRoot);
     const rt = new EngineeringRuntime(opts);
     rt.ledger = ledger;
+    if (opts.lineage) rt.taskLineage = new TaskLineageProjector(new LedgerWorkProjection(ledger), opts.lineage);
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
     rt.testQuarantine = new TestQuarantine(workDir);
     // Records this host left in `releasing` (a crash between beginRelease and
@@ -3939,6 +3944,7 @@ Goal: "${goal}"`;
       actor,
       wi.id,
     );
+    this.taskLineage?.scheduleSync();
     return {
       plan_work_item: wi,
       tasks: created,
@@ -4054,22 +4060,26 @@ Goal: "${goal}"`;
       // A dependency failed (or was blocked): this task cannot run.
       if (t.depends_on.some((d) => failedSet.has(d))) {
         await this.ledger.setTaskStatus(t.id, "blocked", wi.id, actor);
+        this.taskLineage?.scheduleSync();
         failedSet.add(t.id);
         blocked.push(t.id);
         summaries.push(`${t.id} blocked (dependency failed)`);
         return;
       }
       await this.ledger.setTaskStatus(t.id, "started", wi.id, actor);
+      this.taskLineage?.scheduleSync();
       summaries.push(`running ${t.id}: ${t.title}`);
       const report = await this.engineer(t.title);
       if (report.outcome === "promoted") {
         await this.ledger.setTaskStatus(t.id, "completed", wi.id, actor);
+        this.taskLineage?.scheduleSync();
         await this.ledger.updateTask(t.id, { result_work_item_id: report.work_item.id }, wi.id, actor);
         completed.push(t.id);
         summaries.push(`${t.id} completed -> ${report.work_item.id}`);
       } else {
         // The task's own pipeline run failed (not dependency-blocked).
         await this.ledger.setTaskStatus(t.id, "failed", wi.id, actor);
+        this.taskLineage?.scheduleSync();
         failedSet.add(t.id);
         failed.push(t.id);
         summaries.push(`${t.id} failed (${report.outcome})`);
@@ -4136,9 +4146,11 @@ Goal: "${goal}"`;
       return await this.engineerInner(goal, (id, phaseGoal) => {
         workItemId = id;
         this.currentPhaseGoal = phaseGoal;
+        this.taskLineage?.scheduleSync();
       });
     } finally {
       if (workItemId) this.emitPhase({ workItemId, phase: "settled", goal });
+      this.taskLineage?.scheduleSync();
       this.currentWorkItemId = "";
       this.currentPhaseGoal = "";
     }
