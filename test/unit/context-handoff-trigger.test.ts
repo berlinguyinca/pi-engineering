@@ -18,6 +18,7 @@ function fakeTrigger(
     sha?: () => string | undefined;
     catalogue?: { id: string; eligible: boolean }[];
     checkpoint?: () => boolean | Promise<boolean>;
+    sameModelRef?: (model: string) => { ref: string } | { reason: string };
   } = {},
 ) {
   const records: Record<string, unknown>[] = [];
@@ -37,6 +38,7 @@ function fakeTrigger(
     endpoint: () => ({ sessionId: "sess-1", generation: 0 }),
     report: (_m, line) => lines.push(line),
     ...(opts.catalogue ? { catalogue: () => opts.catalogue! } : {}),
+    ...(opts.sameModelRef ? { sameModelRef: opts.sameModelRef } : {}),
   });
   return { trigger, records, lines, checkpoints: () => checkpointRequests };
 }
@@ -178,6 +180,79 @@ describe("ContextHandoffTrigger", () => {
       "fail",
     );
     assert.equal(none.records.length, 0);
+  });
+});
+
+describe("a context handoff keeps the predecessor's model", () => {
+  it("records fromModel and a toModel equal to the routable ref the resolver returns", async () => {
+    const asked: string[] = [];
+    const t = fakeTrigger({
+      sameModelRef: (m) => {
+        asked.push(m);
+        return { ref: `gw/${m}` };
+      },
+    });
+    await t.trigger.observe({ ...obs(950), model: "test" });
+    assert.equal(t.records.length, 1);
+    assert.equal(t.records[0]!.cause, "context_pressure");
+    assert.equal(t.records[0]!.fromModel, "test");
+    assert.equal(t.records[0]!.toModel, "gw/test");
+    assert.deepEqual(asked, ["test"]);
+    assert.ok(!t.lines.some((l) => /not pinned/.test(l)));
+  });
+
+  it("a model that cannot be pinned still hands off, without toModel, and says why once", async () => {
+    const t = fakeTrigger({ sameModelRef: () => ({ reason: "the gateway marked it unavailable" }) });
+    await t.trigger.observe(obs(950));
+    await t.trigger.observe(obs(960));
+    assert.equal(t.records.length, 1);
+    assert.equal(t.records[0]!.fromModel, "gw/test");
+    assert.equal("toModel" in t.records[0]!, false);
+    assert.equal(
+      t.lines.filter((l) => /successor not pinned to gw\/test \(the gateway marked it unavailable\)/.test(l)).length,
+      1,
+    );
+  });
+
+  it("without a resolver only a model already reported as provider/id is pinned", async () => {
+    const qualified = fakeTrigger();
+    await qualified.trigger.observe(obs(950));
+    assert.equal(qualified.records[0]!.toModel, "gw/test");
+    const bare = fakeTrigger();
+    await bare.trigger.observe({ ...obs(950), model: "bare" });
+    assert.equal("toModel" in bare.records[0]!, false, "a bare id is never guessed into a provider");
+    assert.ok(bare.lines.some((l) => /not reported as provider\/id/.test(l)));
+  });
+
+  it("an unknown serving model is not pinned", async () => {
+    const t = fakeTrigger();
+    await t.trigger.observe({ ...obs(950), model: "" });
+    assert.equal("toModel" in t.records[0]!, false);
+    assert.ok(t.lines.some((l) => /serving model is unknown/.test(l)));
+  });
+
+  it("a deferred handoff (no durable checkpoint) writes no record and no 'not pinned' line", async () => {
+    const t = fakeTrigger({ sha: () => undefined, sameModelRef: () => ({ reason: "gone" }) });
+    await t.trigger.observe(obs(950));
+    assert.equal(t.records.length, 0);
+    assert.ok(!t.lines.some((l) => /not pinned/.test(l)));
+  });
+
+  it("the quota path is unchanged: its toModel is still the configured fallback, not the predecessor", async () => {
+    const t = fakeTrigger({
+      catalogue: [{ id: "gw/fallback", eligible: true }],
+      sameModelRef: () => ({ ref: "gw/test" }),
+    });
+    await t.trigger.quotaExhausted({
+      missionId: "m-1",
+      taskId: "t-1",
+      executionId: "e-1",
+      model: "gw/test",
+      failureClass: "quota",
+      role: "implementer",
+    });
+    assert.equal(t.records[0]!.cause, "quota_exhausted");
+    assert.equal(t.records[0]!.toModel, "gw/fallback");
   });
 });
 
@@ -436,5 +511,39 @@ describe("buildContinuityConfig (EngineeringRuntime wiring)", () => {
       },
     });
     assert.equal(cfg.contextWindowForModel?.("anything"), null);
+  });
+});
+
+describe("buildContinuityConfig sameModelRef", () => {
+  const build = (models: () => Promise<{ provider: string; id: string }[]>, unavailable: string[] = []) =>
+    buildContinuityConfig({
+      agentDir: "/nonexistent-agent-dir",
+      models,
+      isModelUnavailable: (m) => unavailable.includes(`${m.provider}/${m.id}`),
+    });
+
+  it("qualifies a bare id and keeps a provider/id as it is", async () => {
+    const cfg = await build(async () => [{ provider: "gw", id: "a" }]);
+    assert.deepEqual(cfg.sameModelRef?.("a"), { ref: "gw/a" });
+    assert.deepEqual(cfg.sameModelRef?.("gw/a"), { ref: "gw/a" });
+  });
+
+  it("refuses a model the runtime marked unavailable", async () => {
+    const cfg = await build(async () => [{ provider: "gw", id: "a" }], ["gw/a"]);
+    assert.deepEqual(cfg.sameModelRef?.("gw/a"), { reason: "the gateway marked it unavailable" });
+  });
+
+  it("refuses a model missing from a readable registry, qualified or not", async () => {
+    const cfg = await build(async () => [{ provider: "gw", id: "a" }]);
+    assert.deepEqual(cfg.sameModelRef?.("b"), { reason: "not in the model registry" });
+    assert.deepEqual(cfg.sameModelRef?.("gw/b"), { reason: "not in the model registry" });
+  });
+
+  it("with an unreadable registry pins only an explicit provider/id, never a bare id", async () => {
+    const cfg = await build(async () => {
+      throw new Error("boom");
+    });
+    assert.deepEqual(cfg.sameModelRef?.("gw/a"), { ref: "gw/a" });
+    assert.deepEqual(cfg.sameModelRef?.("a"), { reason: "the model registry is unreadable" });
   });
 });

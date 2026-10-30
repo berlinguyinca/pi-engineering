@@ -65,6 +65,18 @@ export async function buildContinuityConfig(input: {
     // The phase boundary hands off at the global `soft` level.
     threshold: thresholdsForModel(null).soft,
     thresholdsForModel,
+    // A context handoff's successor stays on the predecessor's model: its routable provider/id, unless the registry
+    // is known and lacks it or the runtime marked it unavailable.
+    sameModelRef: (model) => {
+      const known = registry.find((m) => m.id === model || `${m.provider}/${m.id}` === model);
+      if (!known) {
+        if (registry.length > 0) return { reason: "not in the model registry" };
+        return model.includes("/") ? { ref: model } : { reason: "the model registry is unreadable" };
+      }
+      if (input.isModelUnavailable?.({ provider: known.provider, id: known.id }) === true)
+        return { reason: "the gateway marked it unavailable" };
+      return { ref: `${known.provider}/${known.id}` };
+    },
     // ONLY the models the operator listed for the role, in their order. A listed model is eligible unless the registry
     // is known and lacks it, or the runtime marked it unavailable. Never the whole registry: no silent pick.
     quotaCatalogue: (role) =>
