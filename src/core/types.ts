@@ -11,6 +11,7 @@
 export type EventType =
   | "work_item.created"
   | "work_item.updated"
+  | "work_item.pr_linked"
   | "plan.created"
   | "task.created"
   | "task.ready"
@@ -145,6 +146,16 @@ export type WorkItemStatus =
   | "CANCELLED"
   | "NEEDS_HUMAN"
   | "BUDGET_EXHAUSTED";
+
+/** A GitHub pull request a work item produced or was handed (additive; recorded by `work_item.pr_linked`). */
+export interface WorkItemPrLink {
+  host: string;
+  owner: string;
+  repo: string;
+  number: number;
+  /** `https://<host>/<owner>/<repo>/pull/<n>`: the PR's canonical URL, derived from the four fields above. */
+  url_canonical: string;
+}
 
 export interface WorkItem {
   id: string;
