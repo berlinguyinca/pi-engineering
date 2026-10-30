@@ -442,8 +442,13 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
     summary: result.result.summary,
     artifactRefs: result.result.evidence_refs ?? [],
     usage: {
-      input: result.usage?.input ?? 0,
-      output: result.usage?.output ?? 0,
+      // The task's one token record; null = not reported (a failed run has none).
+      input: result.usage?.input ?? null,
+      output: result.usage?.output ?? null,
+      thinking: result.usage?.thinking ?? null,
+      total: result.usage?.total ?? null,
+      compactions: result.usage?.compactions ?? null,
+      maxTokens: result.usage?.maxTokens ?? null,
       // A failed run has no usage; it still names the model it attempted.
       model: result.usage?.model ?? (ranOn(result) ? modelKey(ranOn(result) as ModelRef) : "unknown"),
     },

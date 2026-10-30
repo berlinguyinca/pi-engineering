@@ -274,8 +274,17 @@ export interface Telemetry {
 
 /** Token/usage accounting for a single worker invocation. */
 export interface WorkerUsage {
-  input: number;
-  output: number;
+  /** Tokens the provider reported; null when it reported none (never 0 for "not reported"). */
+  input: number | null;
+  output: number | null;
+  /** Reasoning tokens: a SUBSET of `output`, null when not reported. */
+  thinking?: number | null;
+  /** input + output (thinking is already inside output); null when neither was reported. */
+  total?: number | null;
+  /** Compactions run during the task. */
+  compactions?: number;
+  /** Largest output allowance (max_tokens) a request of the task was sent with. */
+  maxTokens?: number | null;
   cacheRead: number;
   cacheWrite: number;
   cost: number;

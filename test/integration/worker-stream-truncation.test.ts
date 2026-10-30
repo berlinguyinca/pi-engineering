@@ -519,3 +519,45 @@ test("worker: a length stop followed by a complete answer on the larger allowanc
   );
   assert.equal(requests, 2);
 });
+
+test("worker: the task's one token record sums a length-stop retry and records the raised allowance", async () => {
+  const usage = (prompt: number, completion: number, reasoning: number): string =>
+    `data: ${JSON.stringify({
+      id: "u",
+      object: "chat.completion.chunk",
+      created: 0,
+      model: "probe-model",
+      choices: [],
+      usage: {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        completion_tokens_details: { reasoning_tokens: reasoning },
+      },
+    })}\n\n`;
+  const cut: Reply = (res) =>
+    sse(res, [chunk({ role: "assistant", content: "partial" }), chunk({}, "length"), usage(100, 50, 20)]);
+  const done: Reply = (res) =>
+    sse(res, [
+      chunk({
+        role: "assistant",
+        tool_calls: [
+          {
+            index: 0,
+            id: "c0",
+            type: "function",
+            function: { name: "worker_result", arguments: JSON.stringify(WORKER_RESULT) },
+          },
+        ],
+      }),
+      chunk({}, "tool_calls"),
+      usage(200, 10, 0),
+    ]);
+  await withProbe([cut, done], async (executor, cwd) => {
+    const u = (await run(executor, cwd)).usage;
+    assert.deepEqual(
+      [u?.input, u?.output, u?.thinking, u?.total, u?.maxTokens, u?.turns],
+      [300, 60, 20, 360, 8_192, 2],
+    );
+  });
+});

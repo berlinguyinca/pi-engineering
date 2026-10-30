@@ -29,6 +29,7 @@ import { DEFAULT_ROLLOUT_PHASE, resolveRollout } from "../aps/rollout.ts";
 import { AGENT_LOOP_PREVENTED_EVENT, type AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
 import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/types.ts";
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
+import { TokenAccount } from "../budget/TokenAccount.ts";
 import type { ModelCapabilityRegistry } from "../capability/registry.ts";
 import type { RoleRouter } from "../capability/router.ts";
 import { tunedCompactionTokens } from "../compaction/autoTune.ts";
@@ -760,6 +761,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
     // A reply cut at the output limit gets ONE retry with a larger allowance.
     let lengthRetried = false;
     let allowance: number | undefined;
+    // One token record for the whole task: every attempt's session adds to it.
+    const account = new TokenAccount();
     // Cut-stream resumes spent by this execution (cap: streamResumeMax).
     const streamResumes = { count: 0 };
     // Scope every hold to the model actually called, then route it the same way
@@ -954,6 +957,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
                   attempt,
                   guardConfig,
                   streamResumes,
+                  account,
                 );
               // The raised allowance of a length-stop retry rides the invocation.
               return await (allowance && inv
@@ -1062,6 +1066,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         loopPreventedEvent,
         unknownToolLoop,
       } = transientOutcome.value!;
+      account.useAllowance(allowance ?? model.maxTokens);
       if (assistantError) lastAssistantError = assistantError;
 
       session.dispose();
@@ -1092,7 +1097,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
           recoveryPending = false;
         }
         if (gatewayConfig.enabled) admission.noteSuccess();
-        const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
+        const usage = account.usage(streamResumes.count);
         // Name the model that actually served this attempt (P4 provenance):
         // the resolved route when routed, else the executor's default. Failure
         // paths already attach `details.model`; the success path must too, so the
@@ -1116,7 +1121,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
             details: { unknown_tool: unknownToolLoop },
             error: "unknown_tool_loop",
           },
-          usage: this.collectUsage(this.asMessages(session.messages), streamResumes.count),
+          usage: account.usage(streamResumes.count),
           error: "unknown_tool_loop",
           toolCalls,
         };
@@ -1240,7 +1245,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
             loopPreventedNoChange = false;
           }
         }
-        const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
+        const usage = account.usage(streamResumes.count);
         // Attribute the failure to the signal that actually fired. The stall
         // signal used to be reported as "identical no-progress turns", which
         // sent operators hunting for a repeat loop that never existed - the run
@@ -1294,7 +1299,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
           lastAssistantError = undefined;
           continue;
         }
-        return { ...overflow, usage: this.collectUsage(this.asMessages(session.messages)) };
+        return { ...overflow, usage: account.usage(streamResumes.count) };
       }
 
       // A reply cut at the output limit: retry once in a fresh session with a
@@ -1365,7 +1370,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
                 : {},
             error,
           },
-          usage: this.collectUsage(this.asMessages(session.messages), streamResumes.count),
+          usage: account.usage(streamResumes.count),
           error,
           toolCalls: Math.max(toolCalls, this.executedActionCount(req)),
         };
@@ -1476,6 +1481,7 @@ ${recovery.recoveryPrompt}`;
     attempt: number,
     guardConfig: GenerationGuardConfig = this.guardConfig,
     streamResumes: { count: number } = { count: 0 },
+    account: TokenAccount = new TokenAccount(),
   ): Promise<{
     session: { dispose: () => void; messages: readonly unknown[] };
     guardAborted: boolean;
@@ -1672,6 +1678,9 @@ ${recovery.recoveryPrompt}`;
     let turnToolErrors: string[] = [];
     const unsubscribe = session.subscribe((event) => {
       armInactivity();
+      // Every request is counted as it ends, including a reply Pi later drops.
+      if (event.type === "compaction_end" && event.result) account.addCompactions(1);
+      if (event.type === "message_end" && event.message.role === "assistant") account.addMessages([event.message]);
       if (transcript) {
         const t = event as unknown as Record<string, any>;
         if (t.type === "message_end" && t.message?.role !== "toolResult") {
@@ -2135,16 +2144,9 @@ ${recovery.recoveryPrompt}`;
     return undefined;
   }
 
-  /** Estimate output tokens from session messages (for telemetry). */
+  /** Output tokens one session's messages reported (for telemetry). */
   private estimateOutputTokens(messages: readonly unknown[]): number {
-    let tokens = 0;
-    for (const msg of messages) {
-      const m = msg as { role?: string; usage?: { output?: number } };
-      if (m.role === "assistant" && m.usage?.output != null) {
-        tokens += m.usage.output;
-      }
-    }
-    return tokens;
+    return new TokenAccount().addMessages(this.asMessages(messages)).usage()?.output ?? 0;
   }
 
   /** Emit a structured telemetry event (spec §21). */
@@ -2162,52 +2164,6 @@ ${recovery.recoveryPrompt}`;
         detail: event,
       });
     }
-  }
-
-  private collectUsage(messages: readonly { role: string }[], streamResumes = 0): WorkerUsage | null {
-    let input = 0;
-    let output = 0;
-    let cacheRead = 0;
-    let cacheWrite = 0;
-    let cost = 0;
-    let contextTokens = 0;
-    let turns = 0;
-    let model = "";
-    for (const msg of messages) {
-      if (msg.role !== "assistant") continue;
-      const m = msg as { usage?: Record<string, unknown>; model?: string };
-      const u = m.usage as
-        | {
-            input?: number;
-            output?: number;
-            cacheRead?: number;
-            cacheWrite?: number;
-            totalTokens?: number;
-            cost?: { total?: number };
-          }
-        | undefined;
-      if (!u) continue;
-      input += u.input ?? 0;
-      output += u.output ?? 0;
-      cacheRead += u.cacheRead ?? 0;
-      cacheWrite += u.cacheWrite ?? 0;
-      cost += u.cost?.total ?? 0;
-      contextTokens = Math.max(contextTokens, u.totalTokens ?? 0);
-      turns++;
-      if (m.model) model = m.model;
-    }
-    if (turns === 0) return null;
-    return {
-      input,
-      output,
-      cacheRead,
-      cacheWrite,
-      cost,
-      contextTokens,
-      turns,
-      model,
-      ...(streamResumes > 0 ? { streamResumes } : {}),
-    };
   }
 }
 
