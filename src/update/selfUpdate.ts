@@ -155,6 +155,23 @@ export const NOT_A_CHECKOUT_FIX =
  */
 export const DEFAULT_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
 
+/**
+ * How long the session-start path waits for a check before giving up on it.
+ *
+ * The check itself is not cancelled - it keeps running and stamps the
+ * preferences whenever it finishes. What this bounds is the latch: without a
+ * deadline a check that never returns (a fetch that hangs) silences every later
+ * automatic check in the process, because each session start is handed the same
+ * pending promise (#480).
+ */
+export const DEFAULT_CHECK_TIMEOUT_MS = 2 * 60 * 1000;
+
+/** The wait the automatic check gives a check, in ms. */
+export function checkTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const configured = Number(env.PI_ENGINEERING_UPDATE_CHECK_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_CHECK_TIMEOUT_MS;
+}
+
 /** Should a check run now, given when one last did? */
 export function shouldCheck(
   lastCheckedAtMs: number | undefined,

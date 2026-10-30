@@ -199,6 +199,32 @@ test("an unexpected failure in the automatic check is not swallowed", async () =
   assert.match(u.notices.map((n) => n.text).join("\n"), /not a git repository/);
 });
 
+test("a check that never settles is bounded and does not silence later sessions (#480)", async () => {
+  const ext = world();
+  const u = ui();
+  let calls = 0;
+  stubUpdates(ext, {
+    check: () => {
+      calls++;
+      return new Promise(() => {}); // a fetch that never comes back
+    },
+  });
+  process.env.PI_ENGINEERING_UPDATE_CHECK_TIMEOUT_MS = "25";
+  try {
+    const first = await ext.automaticCheck(u.ctx as never);
+    assert.equal(first, undefined, "a hung check returns instead of hanging the session");
+    const text = u.notices.map((n) => n.text).join("\n");
+    assert.match(text, /update check (timed out|failed)/, "the operator sees why nothing was checked");
+    // The dead check must not hold the automatic path hostage: a later session
+    // start checks again instead of inheriting a promise that never settles.
+    const second = await ext.automaticCheck(u.ctx as never);
+    assert.equal(calls, 2, "the latch was released, so the next session start checks");
+    assert.equal(second, undefined);
+  } finally {
+    delete process.env.PI_ENGINEERING_UPDATE_CHECK_TIMEOUT_MS;
+  }
+});
+
 test("an automatic install reports every step, then its outcome", async () => {
   const ext = world();
   const prefs = readPreferences(ext.layout.preferencesFile);
