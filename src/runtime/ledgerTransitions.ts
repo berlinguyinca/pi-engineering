@@ -16,6 +16,8 @@ export interface LedgerTransitionOptions {
   authorityGeneration: number;
   /** `execution.strict_completion`: consult the work read model before marking anything completed. */
   strictCompletion: boolean;
+  /** `execution.stale_after_ms`: a run with no heartbeat this long is `unknown` and blocks completion. */
+  staleAfterMs?: number;
 }
 
 /**
@@ -38,7 +40,10 @@ export class LedgerTransitions {
     this.ledger = opts.ledger;
     this.generation = opts.authorityGeneration;
     this.strict = opts.strictCompletion;
-    this.projection = new LedgerWorkProjection(opts.ledger);
+    this.projection = new LedgerWorkProjection(
+      opts.ledger,
+      opts.staleAfterMs === undefined ? undefined : { staleAfterMs: opts.staleAfterMs },
+    );
   }
 
   get authorityGeneration(): number {

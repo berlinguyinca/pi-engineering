@@ -214,6 +214,13 @@ export interface ExecutionConfig {
    * completion. Default true.
    */
   strict_completion: boolean;
+  /** How often a running worker writes an `agent.heartbeat` event to the Ledger (ms). Default 30s. */
+  heartbeat_interval_ms?: number;
+  /**
+   * A run with no heartbeat for this long is shown as `unknown` (never healthy); a run that heartbeats
+   * but records no meaningful progress for this long is `stalled` (ms). Default 5 min.
+   */
+  stale_after_ms?: number;
 }
 
 export interface EngineeringPolicy {
@@ -260,7 +267,14 @@ export interface EngineeringPolicy {
 
 export const DEFAULT_POLICY: EngineeringPolicy = {
   version: 1,
-  execution: { preference: "adaptive", legacy_auto_invoke: false, hold_mission_model: true, strict_completion: true },
+  execution: {
+    preference: "adaptive",
+    legacy_auto_invoke: false,
+    hold_mission_model: true,
+    strict_completion: true,
+    heartbeat_interval_ms: 30_000,
+    stale_after_ms: 300_000,
+  },
   limits: {
     worker_inactivity_ms: 3_600_000,
   },
@@ -441,6 +455,8 @@ const OPTIONAL_NUMBER_RANGE_FIELDS: Record<string, [number, number]> = {
 
 const NUMBER_RANGE_FIELDS: Record<string, [number, number]> = {
   "limits.worker_inactivity_ms": [60_000, 2_147_483_647],
+  "execution.heartbeat_interval_ms": [5_000, 3_600_000],
+  "execution.stale_after_ms": [10_000, 86_400_000],
   "lifecycle.max_remediation_rounds": [0, 20],
   "lifecycle.budget_ms": [10_000, 7_200_000],
   "lifecycle.max_concurrency": [1, 16],

@@ -308,11 +308,33 @@ test("execution defaults to adaptive with no implicit Mission directive", async 
     legacy_auto_invoke: false,
     hold_mission_model: true,
     strict_completion: true,
+    heartbeat_interval_ms: 30_000,
+    stale_after_ms: 300_000,
   });
   const cwd = await temp("pi-eng-exec-");
   const agentDir = await temp("pi-eng-exec-agent-");
   try {
     assert.deepEqual(await loadExecutionConfig(cwd, agentDir), DEFAULT_POLICY.execution);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("liveness knobs load from yaml and out-of-range values are rejected", async () => {
+  const cwd = await temp("pi-eng-exec-");
+  const agentDir = await temp("pi-eng-exec-agent-");
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(
+      join(cwd, ".pi", "engineering.yaml"),
+      "execution:\n  heartbeat_interval_ms: 10000\n  stale_after_ms: 60000\n",
+    );
+    const cfg = await loadExecutionConfig(cwd, agentDir);
+    assert.equal(cfg.heartbeat_interval_ms, 10_000);
+    assert.equal(cfg.stale_after_ms, 60_000);
+    await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  stale_after_ms: 5\n");
+    assert.equal((await loadExecutionConfig(cwd, agentDir)).stale_after_ms, 300_000);
   } finally {
     await rm(cwd, { recursive: true, force: true });
     await rm(agentDir, { recursive: true, force: true });
@@ -333,6 +355,8 @@ test("execution preference and legacy opt-in load from repo yaml", async () => {
       legacy_auto_invoke: true,
       hold_mission_model: true,
       strict_completion: true,
+      heartbeat_interval_ms: 30_000,
+      stale_after_ms: 300_000,
     });
   } finally {
     await rm(cwd, { recursive: true, force: true });

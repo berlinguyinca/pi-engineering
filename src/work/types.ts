@@ -17,9 +17,13 @@ export type WorkTaskState = "open" | "working" | "needs_input" | "blocked" | "do
  * `unknown` is an addition to the spec's five values: a legacy Mission has no
  * revision-bound evidence this projection can read, so it must not claim one.
  */
-export type VerificationStatus = "not_required" | "pending" | "passed" | "failed" | "stale" | "unknown";
+export type VerificationStatus = "not_required" | "pending" | "passed" | "failed" | "stale" | "incomplete" | "unknown";
 
-export type RunHealth = "active" | "waiting" | "stalled" | "recovering" | "failed" | "finished";
+/**
+ * `unknown` is a run with no heartbeat inside the stale threshold (or an offline service): state unknown,
+ * never presented as healthy.
+ */
+export type RunHealth = "active" | "waiting" | "stalled" | "recovering" | "unknown" | "failed" | "finished";
 
 export interface WorkTask {
   id: string;
@@ -50,6 +54,12 @@ export interface WorkRun {
   worktree: string | null;
   started_at: string | null;
   ended_at: string | null;
+  /** Who runs it (`role@model`), when an event said so. */
+  owner?: string | null;
+  /** Last `agent.started` / `agent.heartbeat` for the run. */
+  last_heartbeat_at?: string | null;
+  /** Last event that shows work moving (anything but a bare heartbeat), or what a heartbeat reported. */
+  last_progress_at?: string | null;
 }
 
 export interface WorkSession {

@@ -22,6 +22,7 @@ export type EventType =
   | "agent.started"
   | "agent.completed"
   | "agent.failed"
+  | "agent.heartbeat"
   | "incident.detected"
   | "candidate.created"
   | "candidate.changed"
@@ -174,6 +175,10 @@ export interface Candidate {
   parent_id: string | null;
   status: CandidateStatus;
   base_commit: string;
+  /** Commit the candidate was last verified at; evidence recorded for another commit is stale. */
+  head_commit?: string;
+  /** Tree of `head_commit`, when the writer knows it. */
+  tree?: string;
   branch: string;
   worktree_path: string | null;
   producer_run_id: string | null;

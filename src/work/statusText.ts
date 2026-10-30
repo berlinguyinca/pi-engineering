@@ -4,9 +4,9 @@
  * and live-run count kept as separate facts so "run finished" is never shown as
  * "task done".
  */
-import type { WorkGraph, WorkTask } from "./types.ts";
+import type { WorkGraph, WorkRun, WorkTask } from "./types.ts";
 
-const LIVE = new Set(["active", "waiting", "stalled", "recovering"]);
+const LIVE = new Set(["active", "waiting", "stalled", "recovering", "unknown"]);
 
 function line(task: WorkTask, graph: WorkGraph): string {
   const runs = graph.runs.filter((r) => r.task_id === task.id);
@@ -19,7 +19,17 @@ function line(task: WorkTask, graph: WorkGraph): string {
     );
   const title = task.title.length > 70 ? `${task.title.slice(0, 69)}…` : task.title;
   const why = task.blocked_reason ? `\n  blocked: ${task.blocked_reason}` : "";
-  return `${task.id} [${task.source}] ${title} — ${parts.join(" · ")}${why}`;
+  const head = `${task.id} [${task.source}] ${title} — ${parts.join(" · ")}${why}`;
+  const liveRuns = runs.filter((r) => LIVE.has(r.health)).map(runLine);
+  return liveRuns.length > 0 ? `${head}\n${liveRuns.join("\n")}` : head;
+}
+
+/** One live run: its health, owner and last heartbeat. A run we cannot see is "state unknown", never healthy. */
+function runLine(run: WorkRun): string {
+  const beat = run.last_heartbeat_at ? `last heartbeat ${run.last_heartbeat_at}` : "no heartbeat recorded";
+  const state = run.health === "unknown" ? "state unknown" : run.health;
+  const progress = run.health === "stalled" && run.last_progress_at ? `, last progress ${run.last_progress_at}` : "";
+  return `    ${run.id} ${state} · owner ${run.owner ?? "unknown"} · ${beat}${progress}`;
 }
 
 export function formatWorkStatus(graph: WorkGraph, limit = 10): string {
