@@ -15,6 +15,22 @@ import type {
   WorkerRole,
 } from "../core/types.ts";
 import { EventStore } from "./EventStore.ts";
+import { LedgerAuthorityStaleError, LedgerRevisionConflictError } from "./errors.ts";
+import type { FileLockOptions } from "./fileLock.ts";
+
+export { LedgerAuthorityStaleError, LedgerRevisionConflictError } from "./errors.ts";
+export { LedgerLockTimeoutError } from "./fileLock.ts";
+
+/**
+ * Append preconditions. `expected_revision` is the number of events the log
+ * holds for the event's work item (null work item: the events with none), as
+ * returned by `Ledger.revision()`; it is checked under the cross-process lock,
+ * so a writer that read a stale revision is rejected and nothing is written.
+ * (A fence on the writer's authority is `EventMeta.authority_generation`.)
+ */
+export interface AppendGuard {
+  expected_revision?: number;
+}
 
 /**
  * The Engineering Ledger (spec §9): durable, event-sourced shared memory.
@@ -34,24 +50,66 @@ export class Ledger {
   private evidence = new Map<string, Evidence>();
   /** Events by idempotency key; rebuilt on replay, so a restart keeps deduplicating. */
   private byIdempotencyKey = new Map<string, LedgerEvent>();
+  /** Events per work item (key "" = none); the fence `expected_revision` compares against. */
+  private revisions = new Map<string, number>();
+  /** Highest `authority_generation` recorded per work item; lower generations are fenced off. */
+  private authorities = new Map<string, number>();
 
   private constructor(store: EventStore) {
     this.store = store;
   }
 
-  static async create(eventFile: string): Promise<Ledger> {
-    const store = await EventStore.create(eventFile);
+  static async create(eventFile: string, options: { lock?: FileLockOptions } = {}): Promise<Ledger> {
+    const store = await EventStore.create(eventFile, { lock: options.lock });
     const ledger = new Ledger(store);
     // Rebuild materialized state from events (INV-012, AC-011).
-    for (const evt of store.all()) ledger.apply(evt);
+    for (const evt of store.all()) ledger.ingest(evt);
+    // Events another process appends are folded in under the append lock, before any fence is judged.
+    store.setExternalHandler((evt) => ledger.ingest(evt));
     return ledger;
   }
 
   /** Reconstruct a ledger directly from an in-memory event list (for tests). */
   static fromEvents(events: LedgerEvent[]): Ledger {
     const ledger = new Ledger(EventStore.inMemory());
-    for (const evt of events) ledger.apply(evt);
+    for (const evt of events) ledger.ingest(evt);
     return ledger;
+  }
+
+  /** Materialize an event that is already in the log. */
+  private ingest(event: LedgerEvent): void {
+    this.apply(event);
+    this.track(event);
+  }
+
+  private track(event: LedgerEvent): void {
+    const scope = event.work_item_id ?? "";
+    this.revisions.set(scope, (this.revisions.get(scope) ?? 0) + 1);
+    if (event.authority_generation !== undefined) {
+      this.authorities.set(scope, Math.max(this.authorities.get(scope) ?? 0, event.authority_generation));
+    }
+  }
+
+  /** Current revision of a work item's slice of the log (what `expected_revision` is checked against). */
+  revision(workItemId: string | null = null): number {
+    return this.revisions.get(workItemId ?? "") ?? 0;
+  }
+
+  /** Throws when `event` is fenced off. Runs under the append lock, after catching up with other writers. */
+  private assertFences(event: LedgerEvent, guard: AppendGuard | undefined): void {
+    const scope = event.work_item_id ?? "";
+    if (guard?.expected_revision !== undefined && guard.expected_revision !== this.revision(event.work_item_id)) {
+      throw new LedgerRevisionConflictError(
+        event.work_item_id,
+        guard.expected_revision,
+        this.revision(event.work_item_id),
+      );
+    }
+    const generation = event.authority_generation;
+    const current = this.authorities.get(scope);
+    if (generation !== undefined && current !== undefined && generation < current) {
+      throw new LedgerAuthorityStaleError(event.work_item_id, generation, current);
+    }
   }
 
   // ------------------------------------------------------------------ events
@@ -68,8 +126,9 @@ export class Ledger {
     actor: Actor,
     payload: Record<string, unknown>,
     meta?: EventMeta,
+    guard?: AppendGuard,
   ): Promise<LedgerEvent> {
-    return this.emit(type, workItemId, actor, payload, meta);
+    return this.emit(type, workItemId, actor, payload, meta, guard);
   }
 
   private async emit(
@@ -78,6 +137,7 @@ export class Ledger {
     actor: Actor,
     payload: Record<string, unknown>,
     meta?: EventMeta,
+    guard?: AppendGuard,
   ): Promise<LedgerEvent> {
     const event: LedgerEvent = {
       event_id: newEventId(),
@@ -96,20 +156,25 @@ export class Ledger {
     if (key) {
       const prior = this.byIdempotencyKey.get(key);
       if (prior) return this.sameRequest(prior, event);
-      // The condition and the index update both run inside the store's append
-      // chain, so two concurrent appends with one key cannot both commit.
-      const stored = await this.store.appendConditionally(
-        event,
-        () => !this.byIdempotencyKey.has(key),
-        () => this.byIdempotencyKey.set(key, event),
-      );
-      if (!stored) return this.sameRequest(this.byIdempotencyKey.get(key) as LedgerEvent, event);
-      this.apply(event);
-      return stored;
     }
-    await this.store.append(event);
+    // The conditions and the index updates all run inside the store's append
+    // chain and under the file lock, so neither two appends with one key nor a
+    // stale writer can commit. A replayed key is answered before any fence.
+    const stored = await this.store.appendConditionally(
+      event,
+      () => {
+        if (key && this.byIdempotencyKey.has(key)) return false;
+        this.assertFences(event, guard);
+        return true;
+      },
+      () => {
+        if (key) this.byIdempotencyKey.set(key, event);
+        this.track(event);
+      },
+    );
+    if (!stored) return this.sameRequest(this.byIdempotencyKey.get(key as string) as LedgerEvent, event);
     this.apply(event);
-    return event;
+    return stored;
   }
 
   /**

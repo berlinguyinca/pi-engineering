@@ -26,5 +26,5 @@ Status: **plan plus the safe parts shipped; nothing legacy was deleted.**
 
 ## Explicitly not done
 - No Mission code, state or events were removed or migrated.
-- No `authority_generation` / `expected_revision` fencing: the Ledger has no cross-process lock, so a fence could not be enforced. A fenced owner is a prerequisite for multi-process idempotency and is open work.
+- `authority_generation` (envelope) and `expected_revision` (append guard) are enforced under a cross-process lockfile (`<ledger>.lock`, `src/ledger/fileLock.ts`); a stale writer gets `LedgerRevisionConflictError` / `LedgerAuthorityStaleError` and nothing is written. Revision is per work item. Multi-event Ledger methods (e.g. `createCandidate`) are still not atomic across processes.
 - No `RunQueue` / `RunExecutor` extraction from broker and scheduler: `runWorker` is the single run choke point on the Ledger path, and extracting an interface from ~11k lines of orchestration without a second consumer would add an abstraction, not remove a duplicate.
