@@ -1331,7 +1331,16 @@ export class MissionObservability {
     health: MissionHealth,
   ): Pick<
     MissionObservabilitySummary,
-    "action" | "reason" | "recovery" | "nextAction" | "nextActionAt" | "owner" | "repository" | "task" | "preservedWork"
+    | "action"
+    | "failureCategory"
+    | "reason"
+    | "recovery"
+    | "nextAction"
+    | "nextActionAt"
+    | "owner"
+    | "repository"
+    | "task"
+    | "preservedWork"
   > {
     const currentResumption = this.store.listMissionResumptions(missionId).at(-1)?.generation ?? 0;
     const recovery = this.store
@@ -1348,6 +1357,12 @@ export class MissionObservability {
     const lease = this.store.getMissionLease(missionId);
     const manifest = this.store.getWorkspaceManifest(missionId);
     const classification = this.store.listFailureClassifications(missionId).at(-1);
+    // The wait wording must describe the failure behind the current decision,
+    // not whichever classification happens to be newest.
+    const recoveryClassification = recovery
+      ? this.store.getFailureClassification(recovery.classificationId)
+      : undefined;
+    const recoveryCategory = recoveryClassification?.category;
     const repositoryWaits = this.store.listRepositoryWaits(missionId);
     const repositoryWaitText = repositoryWaits.length
       ? repositoryWaits
@@ -1361,16 +1376,20 @@ export class MissionObservability {
       task?.objective ??
       "No further action is scheduled";
     return {
-      action:
-        recovery?.action ??
-        s.currentActivity?.summary ??
-        task?.objective ??
-        this.store.getMission(missionId)?.status ??
-        "UNKNOWN",
+      // A durable stop for this resumption generation ends any wait the latest
+      // decision describes (the orchestrator can stop right after a probe decision).
+      action: stop
+        ? "STOP"
+        : (recovery?.action ??
+          s.currentActivity?.summary ??
+          task?.objective ??
+          this.store.getMission(missionId)?.status ??
+          "UNKNOWN"),
+      ...(recoveryCategory ? { failureCategory: recoveryCategory } : {}),
       reason:
         stop?.reason ??
         repositoryWaitText ??
-        classification?.summary ??
+        (recovery ? recoveryClassification : classification)?.summary ??
         recovery?.expectedMaterialChange ??
         `Mission health is ${health}`,
       recovery: {

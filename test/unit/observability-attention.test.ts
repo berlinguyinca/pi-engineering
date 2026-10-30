@@ -116,6 +116,7 @@ test("a capacity park past its strategy budget reports wait progress, not exhaus
       health: "blocked",
       recovery: { attempt: 195, maxAttempts: 8 },
       recoveryAction: "PROBE_AND_BACKOFF",
+      failureCategory: "PROVIDER_TRANSIENT",
       nextActionAt: new Date(T0 + 120_000).toISOString(),
       waitingSince: new Date(T0 - 3_600_000).toISOString(),
     }),
@@ -127,9 +128,105 @@ test("a capacity park past its strategy budget reports wait progress, not exhaus
   assert.doesNotMatch(attention!.reason, /did not restore progress|of 8/);
   assert.match(attention!.reason, /waiting for capacity/);
   assert.match(attention!.reason, /probe 195/);
-  assert.match(attention!.reason, /waiting 1h 0m/);
+  assert.match(attention!.reason, /parked 1h 0m/);
+  assert.doesNotMatch(attention!.reason, /waiting.*waiting/);
   assert.match(attention!.reason, /next probe in 2m/);
-  assert.match(attention!.reason, /resume automatically/);
+  assert.match(attention!.reason, /resumes once the gateway health probe succeeds/);
+});
+
+const capped = (overrides: Partial<Parameters<typeof deriveAttention>[0]>) =>
+  deriveAttention(
+    base({
+      state: "BLOCKED",
+      health: "blocked",
+      recovery: { attempt: 9, maxAttempts: 8 },
+      recoveryAction: "PROBE_AND_BACKOFF",
+      ...overrides,
+    }),
+  );
+
+test("a probe due now says so instead of 'in 0s'; a past nextActionAt is due now", () => {
+  const past = capped({ failureCategory: "PROVIDER_TRANSIENT", nextActionAt: new Date(T0 - 5_000).toISOString() });
+  assert.match(past!.reason, /next probe due now/);
+  assert.doesNotMatch(past!.reason, /in 0s/);
+});
+
+test("a missing nextActionAt or waitingSince omits those parts without breaking the wording", () => {
+  const attention = capped({ failureCategory: "PROVIDER_TRANSIENT" });
+  assert.equal(attention?.evidence[0]?.kind, "capacity_wait");
+  assert.equal(attention?.evidence[0]?.at, undefined);
+  assert.equal(
+    attention?.reason,
+    "waiting for capacity: probe 9; resumes once the gateway health probe succeeds, unless paused or stopped",
+  );
+});
+
+test("only transient provider failures are called a capacity wait", () => {
+  const attention = capped({ failureCategory: "PROVIDER_TRANSIENT" });
+  assert.match(attention!.reason, /^waiting for capacity: probe 9; /);
+  assert.doesNotMatch(attention!.reason, /automatically/);
+  assert.match(attention!.reason, /resumes once the gateway health probe succeeds, unless paused or stopped$/);
+});
+
+test("a permanent provider failure is not promised to resume automatically", () => {
+  const attention = capped({ failureCategory: "PROVIDER_PERMANENT" });
+  assert.doesNotMatch(attention!.reason, /capacity|automatically/);
+  assert.match(attention!.reason, /operator action/);
+});
+
+test("orphaned execution and unavailable evidence name the gateway probe they actually wait on", () => {
+  for (const failureCategory of [undefined, "ORPHANED_EXECUTION", "EVIDENCE_UNAVAILABLE"] as const) {
+    const attention = capped({ failureCategory });
+    assert.equal(attention?.evidence[0]?.kind, "capacity_wait");
+    assert.doesNotMatch(attention!.reason, /capacity|blocking condition/, String(failureCategory));
+    assert.match(
+      attention!.reason,
+      /^waiting: probe 9; resumes once the gateway health probe succeeds, unless paused or stopped$/,
+    );
+  }
+});
+
+test("a disk suspension park does not claim disk space is checked", () => {
+  const attention = capped({ failureCategory: "DISK_SUSPENDED" });
+  assert.equal(
+    attention?.reason,
+    "waiting: probe 9; resumes once the gateway health probe succeeds (disk space is not checked), unless paused or stopped",
+  );
+});
+
+test("a parking wait is not described as resuming when the operator paused or the mission is terminal", () => {
+  const paused = capped({
+    failureCategory: "PROVIDER_TRANSIENT",
+    operatorPausedAt: new Date(T0 - 60_000).toISOString(),
+  });
+  assert.equal(paused?.evidence[0]?.kind, "operator_paused");
+  assert.doesNotMatch(paused!.reason, /resumes/);
+
+  const canceled = capped({ state: "CANCELED", failureCategory: "PROVIDER_TRANSIENT" });
+  assert.ok(!canceled?.evidence.some((entry) => entry.kind === "capacity_wait"));
+  assert.doesNotMatch(canceled?.reason ?? "", /resumes/);
+
+  const failed = capped({ state: "FAILED", reason: "gateway down", failureCategory: "PROVIDER_TRANSIENT" });
+  assert.equal(failed?.evidence[0]?.kind, "failure");
+  assert.ok(!failed!.evidence.some((entry) => entry.kind === "capacity_wait"));
+  assert.doesNotMatch(failed!.reason, /resumes/);
+});
+
+test("durable write failures are worded as storage recovery, not capacity", () => {
+  const attention = capped({ recoveryAction: "PAUSE_FOR_PERSISTENCE", failureCategory: "PERSISTENCE_FAILURE" });
+  assert.equal(attention?.evidence[0]?.kind, "capacity_wait");
+  assert.match(
+    attention!.reason,
+    /^durable writes failing: probe 9; resumes once storage recovers, unless paused or stopped$/,
+  );
+});
+
+test("an undefined recoveryAction or a non-wait action at the cap stays recovery_exhausted", () => {
+  for (const recoveryAction of [undefined, "CREATE_REPAIR_TASKS"]) {
+    const attention = capped({ recoveryAction });
+    assert.equal(attention?.evidence[0]?.kind, "recovery_exhausted", String(recoveryAction));
+    assert.equal(attention?.reason, "recovery attempt 9 of 8 did not restore progress");
+  }
 });
 
 test("a real STOP at the cap keeps the attempt N of M recovery_exhausted wording", () => {

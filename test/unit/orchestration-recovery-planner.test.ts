@@ -358,8 +358,39 @@ describe("RecoveryPlanner", () => {
       });
       assert.equal(parked.action, wait, summary);
       assert.match(parked.expectedMaterialChange, /parks instead of stopping/i, summary);
-      assert.doesNotMatch(parked.expectedMaterialChange, /exhausted/i, summary);
     }
+  });
+
+  it("keeps the true cause of a capacity park: strategy budget, mission ceiling or deadline", () => {
+    const transient = new FailureClassifier().classify(baseEvidence("gateway returned 503"));
+    const now = Date.parse("2026-09-27T00:00:10.000Z");
+    const strategy = new RecoveryPlanner({ missionCeiling: 50, strategyMaxAttempts: 2 }).decide({
+      classification: transient,
+      history: [decision(transient.fingerprint, 1), decision(transient.fingerprint, 2)],
+      now,
+    });
+    assert.match(strategy.expectedMaterialChange, /attempt budget reached \(2\/2\)/);
+    assert.match(strategy.expectedMaterialChange, /this does not stop a wait/);
+    assert.match(strategy.expectedMaterialChange, /parks instead of stopping/);
+    assert.doesNotMatch(strategy.expectedMaterialChange, /exhausted/i);
+    const ceiling = new RecoveryPlanner({ missionCeiling: 2, strategyMaxAttempts: 8 }).decide({
+      classification: transient,
+      history: [decision(transient.fingerprint, 1), decision(transient.fingerprint, 2)],
+      now,
+    });
+    assert.equal(ceiling.action, "PROBE_AND_BACKOFF");
+    assert.match(ceiling.expectedMaterialChange, /mission recovery ceiling reached \(2\/2\)/);
+    assert.match(ceiling.expectedMaterialChange, /parks instead of stopping/);
+    assert.doesNotMatch(ceiling.expectedMaterialChange, /exhausted/i);
+    assert.doesNotMatch(ceiling.expectedMaterialChange, /budget of 8/);
+  });
+
+  it("the attention wait set covers every action the planner parks capacity categories on", async () => {
+    const { CAPACITY_WAIT_ACTIONS, PARKING_WAIT_ACTIONS } = await import("../../src/orchestration/recovery.ts");
+    for (const action of Object.values(CAPACITY_WAIT_ACTIONS)) {
+      assert.ok(PARKING_WAIT_ACTIONS.has(action), String(action));
+    }
+    assert.deepEqual([...PARKING_WAIT_ACTIONS].sort(), [...new Set(Object.values(CAPACITY_WAIT_ACTIONS))].sort());
   });
 
   it("does not end a mission on the durable outage deadline for a provider-ish failure", () => {
