@@ -1357,6 +1357,11 @@ export class MissionObservability {
     const lease = this.store.getMissionLease(missionId);
     const manifest = this.store.getWorkspaceManifest(missionId);
     const classification = this.store.listFailureClassifications(missionId).at(-1);
+    // The wait wording must describe the failure behind the current decision,
+    // not whichever classification happens to be newest.
+    const recoveryCategory = recovery
+      ? this.store.getFailureClassification(recovery.classificationId)?.category
+      : undefined;
     const repositoryWaits = this.store.listRepositoryWaits(missionId);
     const repositoryWaitText = repositoryWaits.length
       ? repositoryWaits
@@ -1379,7 +1384,7 @@ export class MissionObservability {
           task?.objective ??
           this.store.getMission(missionId)?.status ??
           "UNKNOWN"),
-      ...(classification ? { failureCategory: classification.category } : {}),
+      ...(recoveryCategory ? { failureCategory: recoveryCategory } : {}),
       reason:
         stop?.reason ??
         repositoryWaitText ??

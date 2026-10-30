@@ -15,7 +15,7 @@
  */
 
 import { PARKING_WAIT_ACTIONS } from "../recovery.ts";
-import type { RecoveryAction } from "../types.ts";
+import type { FailureCategory, RecoveryAction } from "../types.ts";
 import type { LoopSignal, MissionHealth, MissionObservabilitySummary, WaitingReason } from "./types.ts";
 
 /** How strongly this mission should interrupt the operator. */
@@ -69,7 +69,7 @@ export interface AttentionInput {
   /** The recovery action behind `recovery`; a wait action is a park, not an exhausted budget. */
   recoveryAction?: string;
   /** Failure category behind the latest classification; selects what the wait claims to be waiting for. */
-  failureCategory?: string;
+  failureCategory?: FailureCategory;
   operatorPausedAt?: string | null;
   /** Loop signals flagged for this mission's live workers. */
   loopSignals?: LoopSignal[];
@@ -96,18 +96,32 @@ const SELF_SERVING_WAITS = new Set<WaitingReason>([
   "rate_limit",
 ]);
 
-/** Wording for a parking wait; "capacity" is claimed only for provider failures. */
-function parkingWaitWording(action: string, category: string | undefined): { lead: string; resumes: string } {
+/**
+ * Wording for a parking wait. PROBE_AND_BACKOFF resumes when the gateway health
+ * probe succeeds (orchestrator), so only that is promised; "capacity" is
+ * claimed only for transient provider failures.
+ */
+function parkingWaitWording(action: string, category: FailureCategory | undefined): { lead: string; resumes: string } {
   if (action === "PAUSE_FOR_PERSISTENCE") {
     return { lead: "durable writes failing: probe", resumes: "resumes once storage recovers" };
   }
-  if (category === "PROVIDER_TRANSIENT" || category === "PROVIDER_PERMANENT") {
-    return { lead: "waiting for capacity: probe", resumes: "will resume automatically when capacity returns" };
+  switch (category) {
+    case "PROVIDER_TRANSIENT":
+      return {
+        lead: "waiting for capacity: probe",
+        resumes: "resumes automatically once the gateway health probe succeeds",
+      };
+    case "PROVIDER_PERMANENT":
+      return {
+        lead: "waiting on a provider error: probe",
+        resumes:
+          "resumes once the gateway health probe succeeds, but this may need operator action (credentials or provider)",
+      };
+    case "DISK_SUSPENDED":
+      return { lead: "waiting for disk space: probe", resumes: "resumes once disk space is freed" };
+    default:
+      return { lead: "waiting: probe", resumes: "resumes once the gateway health probe succeeds" };
   }
-  if (category === "DISK_SUSPENDED") {
-    return { lead: "waiting for disk space: probe", resumes: "resumes once disk space is freed" };
-  }
-  return { lead: "waiting: probe", resumes: "resumes once the blocking condition clears" };
 }
 
 function ageMs(at: string | null | undefined, now: number): number | undefined {

@@ -369,14 +369,19 @@ describe("RecoveryPlanner", () => {
       history: [decision(transient.fingerprint, 1), decision(transient.fingerprint, 2)],
       now,
     });
-    assert.match(strategy.expectedMaterialChange, /strategy budget \(2\/2\)/);
+    assert.match(strategy.expectedMaterialChange, /attempt budget reached \(2\/2\)/);
+    assert.match(strategy.expectedMaterialChange, /this does not stop a wait/);
+    assert.match(strategy.expectedMaterialChange, /parks instead of stopping/);
+    assert.doesNotMatch(strategy.expectedMaterialChange, /exhausted/i);
     const ceiling = new RecoveryPlanner({ missionCeiling: 2, strategyMaxAttempts: 8 }).decide({
       classification: transient,
       history: [decision(transient.fingerprint, 1), decision(transient.fingerprint, 2)],
       now,
     });
     assert.equal(ceiling.action, "PROBE_AND_BACKOFF");
-    assert.match(ceiling.expectedMaterialChange, /mission recovery ceiling exhausted \(2\/2\)/);
+    assert.match(ceiling.expectedMaterialChange, /mission recovery ceiling reached \(2\/2\)/);
+    assert.match(ceiling.expectedMaterialChange, /parks instead of stopping/);
+    assert.doesNotMatch(ceiling.expectedMaterialChange, /exhausted/i);
     assert.doesNotMatch(ceiling.expectedMaterialChange, /budget of 8/);
   });
 

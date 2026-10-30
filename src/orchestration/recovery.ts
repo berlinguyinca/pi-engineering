@@ -765,10 +765,16 @@ export class RecoveryPlanner {
         : strategyExhausted
           ? `identical failure fingerprint exhausted its strategy budget (${fingerprintAttempts}/${this.strategyMaxAttempts})`
           : EXPECTED_CHANGE[action];
+    // The cause of a capacity park, worded without "exhausted": a park is not an end.
+    const parkCause = missionExhausted
+      ? `mission recovery ceiling reached (${input.history.length}/${this.missionCeiling})`
+      : deadlineExhausted
+        ? `mission recovery deadline reached at ${durableDeadlineAt}`
+        : `attempt budget reached (${fingerprintAttempts}/${this.strategyMaxAttempts})`;
     const exhaustedReason = !budgetExhausted
       ? EXPECTED_CHANGE[action]
       : parksOnCapacity
-        ? `waiting after ${fingerprintAttempts} attempts (${budgetReason}; this does not stop a wait); the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
+        ? `waiting (${parkCause}; this does not stop a wait); the mission parks instead of stopping: ${EXPECTED_CHANGE[capacityWait]}`
         : (OPERATOR_QUESTIONS[input.classification.category] ?? budgetReason);
     // When automatic recovery is exhausted and there is no capacity wait to
     // park on, the mission must pause for an operator decision. Surface concrete,

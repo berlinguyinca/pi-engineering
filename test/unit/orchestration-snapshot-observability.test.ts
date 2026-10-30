@@ -408,7 +408,7 @@ test("a durably stopped mission at the cap keeps recovery_exhausted, a live park
 
   const live = attentionFromSummary(obs.projection(m.mission_id)!.summary, { now });
   assert.equal(live?.evidence[0]?.kind, "capacity_wait");
-  assert.match(live!.reason, /will resume automatically when capacity returns/);
+  assert.match(live!.reason, /resumes automatically once the gateway health probe succeeds/);
 
   store.stopMission(m.mission_id, {
     reason: "gate repair refused",
@@ -427,4 +427,49 @@ test("a durably stopped mission at the cap keeps recovery_exhausted, a live park
   parkedAtCap(store, m.mission_id, 1);
   const resumed = attentionFromSummary(obs.projection(m.mission_id)!.summary, { now });
   assert.equal(resumed?.evidence[0]?.kind, "capacity_wait");
+});
+
+test("the wait category comes from the classification behind the current decision, not the newest one", () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store });
+  const m = mission(store, "Newer unrelated classification");
+  obs.missionCreated(m.mission_id, m.title);
+  const now = Date.parse("2026-10-27T12:01:00.000Z");
+  parkedAtCap(store, m.mission_id, 0);
+  store.classifyFailure({
+    classificationId: "FC-disk",
+    missionId: m.mission_id,
+    taskId: null,
+    executionId: null,
+    category: "DISK_SUSPENDED",
+    evidenceRefs: [],
+    fingerprint: "sha256:disk",
+    summary: "disk full",
+    classifiedAt: "2026-10-27T12:00:30.000Z",
+  });
+
+  const summary = obs.projection(m.mission_id)!.summary;
+  assert.equal(summary.failureCategory, "PROVIDER_TRANSIENT");
+  const attention = attentionFromSummary(summary, { now });
+  assert.match(attention!.reason, /^waiting for capacity: probe 9/);
+  assert.doesNotMatch(attention!.reason, /disk/);
+});
+
+test("no current-generation recovery means no failureCategory", () => {
+  const backend = JsonlEventStore.inMemory();
+  const store = MissionStore.open(backend);
+  const obs = new MissionObservability({ backend, store });
+  const m = mission(store, "Resumed generation");
+  obs.missionCreated(m.mission_id, m.title);
+  parkedAtCap(store, m.mission_id, 0);
+  store.stopMission(m.mission_id, {
+    reason: "operator input required",
+    preservedWork: [],
+    attemptedRecoveries: [],
+    resumeCondition: "provide input",
+  });
+  store.resumeMission(m.mission_id, "input arrived", "operator");
+
+  assert.equal(obs.projection(m.mission_id)!.summary.failureCategory, undefined);
 });

@@ -11,6 +11,8 @@
  * events without coupling UI rendering into orchestration logic.
  */
 
+import type { FailureCategory } from "../types.ts";
+
 /** Mission health (spec 03). */
 export type MissionHealth = "active" | "waiting" | "slow" | "stalled" | "blocked" | "failed" | "complete";
 
@@ -268,7 +270,7 @@ export interface MissionObservabilitySummary {
   runtimeStartedAt?: string;
   action: string;
   /** Category of the latest failure classification, when one exists. */
-  failureCategory?: string;
+  failureCategory?: FailureCategory;
   reason: string;
   recovery: { attempt: number; maxAttempts: number };
   nextAction: string;
