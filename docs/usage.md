@@ -733,7 +733,7 @@ rather than a branch name that could move after verification.
 | `/mission pause <id>` | Pause one named mission (no live turn needed). Esc pauses the turn on screen; this pauses the mission you name. Its work is kept and only `/mission resume <id>` continues it. |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
-| `/room [say <text> \| assign <agent> <text> \| rooms]` | Thin client over Herdr's room API (needs the `herdr:` block): project tree, current agents, attention inbox and a link to the full graph; post a message or assign work. No local state; closing Pi cancels nothing. |
+| `/room [say <text> \| assign <agent> <text> \| rooms \| log [simple\|activity\|expert] [--after <sequence>]]` | Thin client over Herdr's room API (needs the `herdr:` block): project tree, current agents, attention inbox and a link to the full graph; post a message or assign work; `log` prints the room's events (simple = chat and finished or blocked tasks, activity adds every task change, expert adds sequence and event id) with terminal escapes stripped. No local state; closing Pi cancels nothing. |
 | `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
 | `/engineering-status` / `-plan` / `-workers` | Planner/worker mission status, contract DAG, role/model telemetry. `-status` also shows the session's mission model (`model: X (operator pin)`). |
 | `/engineering-model [auto]` | Show the model this session's missions use; `auto` clears the operator pin set by `/model`. |
