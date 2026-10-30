@@ -101,6 +101,7 @@ import {
   isTruncatedReply,
   raisedAllowance,
   resolveThinkingOffConfig,
+  sentAllowance,
 } from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "../runtime/isolation/stateDir.ts";
@@ -1066,7 +1067,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         loopPreventedEvent,
         unknownToolLoop,
       } = transientOutcome.value!;
-      account.useAllowance(allowance ?? model.maxTokens);
+      account.useAllowance(allowance ?? sentAllowance(model, currentInferenceInvocation()?.maxOutputTokens));
       if (assistantError) lastAssistantError = assistantError;
 
       session.dispose();
@@ -1302,13 +1303,21 @@ export class PiWorkerExecutor implements WorkerExecutor {
         return { ...overflow, usage: account.usage(streamResumes.count) };
       }
 
-      // A reply cut at the output limit: retry once in a fresh session with a
-      // larger allowance; the second cut fails visibly below as "truncated".
+      // A reply cut at the output limit: retry once with a larger allowance.
+      // The retry is a NEW attempt (attempt += 1), exactly like the overflow
+      // retry, so the fresh session carries the idempotency evidence: tool calls
+      // the cut run already executed are listed, never replayed. A cut late in
+      // a long run therefore restarts the task in a fresh session on that
+      // evidence. It needs an invocation to carry the override and must raise
+      // the allowance ACTUALLY sent (after the invocation cap); otherwise the
+      // same request would repeat deterministically and the cut fails below.
       if (!guardAborted && !budgetExhausted && !timedOut && !lengthRetried && isTruncatedReply(lastAssistantError)) {
-        const maxTokens = raisedAllowance(model);
+        const inv = currentInferenceInvocation();
+        const maxTokens = inv ? raisedAllowance(model, inv.maxOutputTokens) : undefined;
         if (maxTokens) {
           lengthRetried = true;
           allowance = maxTokens;
+          attempt += 1;
           emitTelemetry({
             level: "warning",
             key: "worker:truncated-retry",
@@ -1339,7 +1348,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
               ? `Worker reply truncated at the output limit${lengthRetried ? " (again after a retry with a larger allowance)" : ""}; no worker_result. ${lastAssistantError}`
               : gateway
                 ? `Model gateway refused the request after ${gatewayRetries} honoured wait(s): ${lastAssistantError}`
-                : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
+                : `Worker returned no worker_result${lengthRetried ? " (the retry after a reply cut at the output limit failed)" : ""}.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
         const error = budgetExhausted
           ? "budget-exhausted"
           : timedOut
@@ -1679,7 +1688,7 @@ ${recovery.recoveryPrompt}`;
     const unsubscribe = session.subscribe((event) => {
       armInactivity();
       // Every request is counted as it ends, including a reply Pi later drops.
-      if (event.type === "compaction_end" && event.result) account.addCompactions(1);
+      if (event.type === "compaction_end" && event.result) account.addCompaction(event.result.usage);
       if (event.type === "message_end" && event.message.role === "assistant") account.addMessages([event.message]);
       if (transcript) {
         const t = event as unknown as Record<string, any>;
@@ -1834,8 +1843,10 @@ ${recovery.recoveryPrompt}`;
           assistantError = msg.errorMessage;
         }
         // Cut at the output limit, whatever partial text it carries: not a result.
-        if (msg.role === "assistant" && msg.stopReason === "length") {
-          assistantError = `${TRUNCATED_REPLY}: stop reason length.`;
+        // Scoped to the final turn: a later turn that ends normally clears it.
+        if (msg.role === "assistant" && event.type === "message_end") {
+          if (msg.stopReason === "length") assistantError = `${TRUNCATED_REPLY}: stop reason length.`;
+          else if (msg.stopReason !== "error" && isTruncatedReply(assistantError)) assistantError = undefined;
         }
         // `event.message` is the ACCUMULATED partial message; charge the guard
         // the incremental delta the stream event carries (see guardFeedFor).

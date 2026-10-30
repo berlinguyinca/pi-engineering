@@ -25,29 +25,33 @@ export class TokenAccount {
   private compactions = 0;
   private maxTokens: number | null = null;
 
+  private sum(u: Record<string, any>): void {
+    this.input = add(this.input, u.input);
+    this.output = add(this.output, u.output);
+    this.thinking = add(this.thinking, u.reasoning);
+    this.cacheRead += reported(u.cacheRead) ?? 0;
+    this.cacheWrite += reported(u.cacheWrite) ?? 0;
+    this.cost += reported(u.cost?.total) ?? 0;
+  }
+
   /** Add the assistant messages of one session. */
   addMessages(messages: readonly { role: string }[]): this {
     for (const msg of messages) {
       if (msg.role !== "assistant") continue;
       const m = msg as { usage?: Record<string, any>; model?: string };
-      const u = m.usage;
-      if (!u) continue;
-      this.input = add(this.input, u.input);
-      this.output = add(this.output, u.output);
-      this.thinking = add(this.thinking, u.reasoning);
-      this.cacheRead += reported(u.cacheRead) ?? 0;
-      this.cacheWrite += reported(u.cacheWrite) ?? 0;
-      this.cost += reported(u.cost?.total) ?? 0;
-      this.contextTokens = Math.max(this.contextTokens, reported(u.totalTokens) ?? 0);
+      if (!m.usage) continue;
+      this.sum(m.usage);
+      this.contextTokens = Math.max(this.contextTokens, reported(m.usage.totalTokens) ?? 0);
       this.turns++;
       if (m.model) this.model = m.model;
     }
     return this;
   }
 
-  /** Compactions run by a session. */
-  addCompactions(n: number): void {
-    this.compactions += n;
+  /** One compaction and the tokens of its summary request (not a worker turn), when reported. */
+  addCompaction(usage?: Record<string, any>): void {
+    this.compactions++;
+    if (usage) this.sum(usage);
   }
 
   /** The output allowance a request was sent with; the largest one is kept. */

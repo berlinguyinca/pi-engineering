@@ -305,12 +305,37 @@ export function isTruncatedReply(text: string | undefined): boolean {
   return text?.startsWith(TRUNCATED_REPLY) === true;
 }
 
-/** One retry's allowance: double the current one, within half the window. Undefined when that is no more. */
-export function raisedAllowance(model: { maxTokens?: number; contextWindow?: number }): number | undefined {
-  const { maxTokens: cur, contextWindow: win } = model;
-  if (!cur || cur <= 0) return undefined;
-  const next = Math.min(cur * 2, win ? Math.floor(win / 2) : cur * 2);
-  return next > cur ? next : undefined;
+/**
+ * Ceiling of a retry allowance. Pi's registry holds only `maxTokens`, with no
+ * separate provider hard limit, so the raise is a bounded multiple: a provider
+ * that still refuses it says so in the retry's error, which the failure keeps.
+ */
+export const RETRY_ALLOWANCE_CEILING = 65_536;
+
+type Allowance = { maxTokens?: number; contextWindow?: number };
+
+/** The output allowance a request is sent with: the registered one, after the invocation cap. */
+export function sentAllowance(model: Allowance, cap?: number): number | undefined {
+  const { maxTokens } = model;
+  if (!maxTokens || maxTokens <= 0) return undefined;
+  return cap !== undefined ? Math.min(maxTokens, cap) : maxTokens;
+}
+
+/**
+ * The retry allowance after a length stop: double, within half the window, the
+ * ceiling and the invocation cap. Undefined unless it exceeds what was sent.
+ */
+export function raisedAllowance(model: Allowance, cap?: number): number | undefined {
+  const sent = sentAllowance(model, cap);
+  if (sent === undefined) return undefined;
+  const { contextWindow: win } = model;
+  const next = Math.min(
+    sent * 2,
+    win ? Math.floor(win / 2) : Number.POSITIVE_INFINITY,
+    RETRY_ALLOWANCE_CEILING,
+    cap ?? Number.POSITIVE_INFINITY,
+  );
+  return next > sent ? next : undefined;
 }
 
 /**

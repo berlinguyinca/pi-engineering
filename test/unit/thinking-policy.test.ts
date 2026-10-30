@@ -21,12 +21,14 @@ import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { generateSummary } from "@earendil-works/pi-coding-agent";
 import { runWithInferenceInvocation } from "../../src/inference/inferenceContext.ts";
 import {
+  RETRY_ALLOWANCE_CEILING,
   applyThinkingOff,
   describeHiddenReasoningTruncation,
   isSummarizationRequest,
   isTruncatedReply,
   raisedAllowance,
   resolveThinkingOffConfig,
+  sentAllowance,
   streamWithThinkingPolicy,
   thinkingOffReason,
 } from "../../src/request/thinkingPolicy.ts";
@@ -385,11 +387,25 @@ test("override: the 27B model on a non-policy gateway is also never touched", as
   });
 });
 
-test("a retry after a length stop doubles the allowance within half the window, and only if that is more", () => {
+test("a retry after a length stop doubles the SENT allowance within half the window, the ceiling and the cap, and only if that is more", () => {
   assert.equal(raisedAllowance({ maxTokens: 4_096, contextWindow: 100_000 }), 8_192);
   assert.equal(raisedAllowance({ maxTokens: 4_096 }), 8_192);
-  assert.equal(raisedAllowance({ maxTokens: 40_000, contextWindow: 100_000 }), 50_000);
-  assert.equal(raisedAllowance({ maxTokens: 50_000, contextWindow: 100_000 }), undefined, "already at the bound");
+  assert.equal(raisedAllowance({ maxTokens: 40_000, contextWindow: 200_000 }), RETRY_ALLOWANCE_CEILING);
+  assert.equal(
+    raisedAllowance({ maxTokens: 64_000, contextWindow: 400_000 }),
+    RETRY_ALLOWANCE_CEILING,
+    "bounded, not 128000",
+  );
+  assert.equal(raisedAllowance({ maxTokens: 65_536, contextWindow: 400_000 }), undefined, "at the ceiling: no retry");
+  assert.equal(raisedAllowance({ maxTokens: 50_000, contextWindow: 100_000 }), undefined, "already at half the window");
   assert.equal(raisedAllowance({}), undefined, "unknown allowance");
+  // The invocation cap lowers what is sent, and bounds the raise.
+  assert.equal(sentAllowance({ maxTokens: 32_768 }, 6_000), 6_000);
+  assert.equal(
+    raisedAllowance({ maxTokens: 32_768, contextWindow: 100_000 }, 6_000),
+    undefined,
+    "clamped: same request again",
+  );
+  assert.equal(raisedAllowance({ maxTokens: 4_096, contextWindow: 100_000 }, 6_000), 6_000);
   assert.equal(isTruncatedReply("Worker returned no worker_result."), false);
 });

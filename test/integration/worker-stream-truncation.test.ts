@@ -561,3 +561,51 @@ test("worker: the task's one token record sums a length-stop retry and records t
     );
   });
 });
+
+test("worker: the length-stop retry carries the idempotency evidence of the tool calls the cut run executed", async () => {
+  const write = toolCalls([{ name: "write", args: { path: "out.txt", content: "once\n" } }]);
+  await withProbe(
+    [write, LENGTH_SHAPES["partial text"]!, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
+    async (executor, cwd, bodies) => {
+      const out = await executor.run({
+        role: "implementer",
+        task: "t",
+        tools: ["write"],
+        cwd,
+        modelOverride: { provider: "probe", id: "probe-model" },
+      });
+      assert.equal(out.result.status, "completed", out.result.summary);
+      assert.equal(bodies.length, 3);
+      assert.ok(!bodies[1]!.includes("Idempotency notice"), "the first request has no evidence");
+      assert.ok(bodies[2]!.includes("Idempotency notice"), "the retry lists what already ran");
+      assert.ok(bodies[2]!.includes("MUST NOT be repeated"), "...with the do-not-repeat instruction");
+    },
+  );
+});
+
+test("worker: an earlier length-stopped message is not reported as truncated when a later turn ended normally", async () => {
+  const stop: Reply = (res) => sse(res, [chunk({ role: "assistant", content: "I am done." }), chunk({}, "stop")]);
+  const readThenCut: Reply = (res) =>
+    sse(res, [
+      chunk({
+        role: "assistant",
+        tool_calls: [
+          { index: 0, id: "c0", type: "function", function: { name: "read", arguments: '{"path":"note.txt"}' } },
+        ],
+      }),
+      chunk({}, "length"),
+    ]);
+  await withProbe([readThenCut, stop, stop, stop], async (executor, cwd, bodies) => {
+    const out = await executor.run({
+      role: "implementer",
+      task: "t",
+      tools: ["read"],
+      cwd,
+      modelOverride: { provider: "probe", id: "probe-model" },
+    });
+    assert.equal(out.result.status, "failed");
+    assert.notEqual(out.result.error, "truncated", out.result.summary);
+    assert.match(out.result.summary, /no worker_result/);
+    assert.equal(bodies.length, 3, "the cut turn, the normal turn, one nudge: no larger-allowance retry");
+  });
+});

@@ -29,14 +29,15 @@ test("sums every request of every attempt, the compactions and the largest allow
   const account = new TokenAccount();
   account.addMessages([reply({ input: 10, output: 5, reasoning: 2 }), reply({ input: 20, output: 5 })]);
   account.addMessages([reply({ input: 30, output: 10, reasoning: 0 })]); // a retry's fresh session
-  account.addCompactions(1);
-  account.addCompactions(2);
+  account.addCompaction();
+  account.addCompaction({ input: 5, output: 1 }); // the summary request's tokens count, not as a turn
+  account.addCompaction();
   account.useAllowance(4_096);
   account.useAllowance(8_192);
   account.useAllowance(undefined);
   const u = account.usage(1);
   assert.deepEqual(
     [u?.input, u?.output, u?.thinking, u?.total, u?.compactions, u?.maxTokens, u?.turns, u?.streamResumes],
-    [60, 20, 2, 80, 3, 8_192, 3, 1],
+    [65, 21, 2, 86, 3, 8_192, 3, 1],
   );
 });

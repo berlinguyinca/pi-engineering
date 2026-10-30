@@ -563,6 +563,7 @@ export {
   estimatePayloadBytes,
   estimateTokensForBytes,
   classifyBudget,
+  RequestBudgetManager,
   PAYLOAD_REDUCTION_ORDER,
   DEFAULT_BUDGET_THRESHOLDS,
   JSON_SERIALIZATION_OVERHEAD_BYTES,
