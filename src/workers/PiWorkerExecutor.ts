@@ -29,6 +29,7 @@ import { DEFAULT_ROLLOUT_PHASE, resolveRollout } from "../aps/rollout.ts";
 import { AGENT_LOOP_PREVENTED_EVENT, type AgentProgressSupervisorOptions } from "../aps/supervisor.ts";
 import { type AgentLoopPreventedEvent, DEFAULT_LOOP_PREVENTION } from "../aps/types.ts";
 import { WorkerActivityAdapter } from "../aps/workerActivity.ts";
+import { TokenAccount } from "../budget/TokenAccount.ts";
 import type { ModelCapabilityRegistry } from "../capability/registry.ts";
 import type { RoleRouter } from "../capability/router.ts";
 import { tunedCompactionTokens } from "../compaction/autoTune.ts";
@@ -94,7 +95,14 @@ import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { missionDepthSpawnHook } from "../orchestration/missionMode.ts";
 import { NO_CHANGE_LOOP_PREVENTED_MARKER } from "../orchestration/recovery.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
-import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
+import {
+  TRUNCATED_REPLY,
+  type ThinkingOffConfig,
+  isTruncatedReply,
+  raisedAllowance,
+  resolveThinkingOffConfig,
+  sentAllowance,
+} from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "../runtime/isolation/stateDir.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
@@ -751,6 +759,11 @@ export class PiWorkerExecutor implements WorkerExecutor {
     const admission = this.admission;
     const gatewayConfig = this.gatewayConfig;
     let gatewayRetries = 0;
+    // A reply cut at the output limit gets ONE retry with a larger allowance.
+    let lengthRetried = false;
+    let allowance: number | undefined;
+    // One token record for the whole task: every attempt's session adds to it.
+    const account = new TokenAccount();
     // Cut-stream resumes spent by this execution (cap: streamResumeMax).
     const streamResumes = { count: 0 };
     // Scope every hold to the model actually called, then route it the same way
@@ -930,20 +943,27 @@ export class PiWorkerExecutor implements WorkerExecutor {
         transientOutcome = await withTransientRetry({
           fn: async () => {
             try {
-              return await this.runSingleAttempt(
-                req,
-                model,
-                // A retry of a generation that already ran tool calls carries the
-                // evidence block: the executed edits/commits are LISTED, never
-                // replayed (spec §6). Nothing is re-executed by the runtime.
-                attempt === 0 ? systemPrompt : withIdempotencyEvidence(systemPrompt, this.trackerFor(req)),
-                modelRuntime,
-                customTools,
-                tools,
-                attempt,
-                guardConfig,
-                streamResumes,
-              );
+              const inv = currentInferenceInvocation();
+              const attemptRun = () =>
+                this.runSingleAttempt(
+                  req,
+                  model,
+                  // A retry of a generation that already ran tool calls carries the
+                  // evidence block: the executed edits/commits are LISTED, never
+                  // replayed (spec §6). Nothing is re-executed by the runtime.
+                  attempt === 0 ? systemPrompt : withIdempotencyEvidence(systemPrompt, this.trackerFor(req)),
+                  modelRuntime,
+                  customTools,
+                  tools,
+                  attempt,
+                  guardConfig,
+                  streamResumes,
+                  account,
+                );
+              // The raised allowance of a length-stop retry rides the invocation.
+              return await (allowance && inv
+                ? runWithInferenceInvocation({ ...inv, maxTokens: allowance }, attemptRun)
+                : attemptRun());
             } catch (error) {
               // A pinned gate role is waited on, except when its host refuses
               // connections or does not resolve: that is not retried in-session.
@@ -1047,6 +1067,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         loopPreventedEvent,
         unknownToolLoop,
       } = transientOutcome.value!;
+      account.useAllowance(allowance ?? sentAllowance(model, currentInferenceInvocation()?.maxOutputTokens));
       if (assistantError) lastAssistantError = assistantError;
 
       session.dispose();
@@ -1077,7 +1098,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
           recoveryPending = false;
         }
         if (gatewayConfig.enabled) admission.noteSuccess();
-        const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
+        const usage = account.usage(streamResumes.count);
         // Name the model that actually served this attempt (P4 provenance):
         // the resolved route when routed, else the executor's default. Failure
         // paths already attach `details.model`; the success path must too, so the
@@ -1101,7 +1122,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
             details: { unknown_tool: unknownToolLoop },
             error: "unknown_tool_loop",
           },
-          usage: this.collectUsage(this.asMessages(session.messages), streamResumes.count),
+          usage: account.usage(streamResumes.count),
           error: "unknown_tool_loop",
           toolCalls,
         };
@@ -1225,7 +1246,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
             loopPreventedNoChange = false;
           }
         }
-        const usage = this.collectUsage(this.asMessages(session.messages), streamResumes.count);
+        const usage = account.usage(streamResumes.count);
         // Attribute the failure to the signal that actually fired. The stall
         // signal used to be reported as "identical no-progress turns", which
         // sent operators hunting for a repeat loop that never existed - the run
@@ -1279,11 +1300,37 @@ export class PiWorkerExecutor implements WorkerExecutor {
           lastAssistantError = undefined;
           continue;
         }
-        return { ...overflow, usage: this.collectUsage(this.asMessages(session.messages)) };
+        return { ...overflow, usage: account.usage(streamResumes.count) };
+      }
+
+      // A reply cut at the output limit: retry once with a larger allowance.
+      // The retry is a NEW attempt (attempt += 1), exactly like the overflow
+      // retry, so the fresh session carries the idempotency evidence: tool calls
+      // the cut run already executed are listed, never replayed. A cut late in
+      // a long run therefore restarts the task in a fresh session on that
+      // evidence. It needs an invocation to carry the override and must raise
+      // the allowance ACTUALLY sent (after the invocation cap); otherwise the
+      // same request would repeat deterministically and the cut fails below.
+      if (!guardAborted && !budgetExhausted && !timedOut && !lengthRetried && isTruncatedReply(lastAssistantError)) {
+        const inv = currentInferenceInvocation();
+        const maxTokens = inv ? raisedAllowance(model, inv.maxOutputTokens) : undefined;
+        if (maxTokens) {
+          lengthRetried = true;
+          allowance = maxTokens;
+          attempt += 1;
+          emitTelemetry({
+            level: "warning",
+            key: "worker:truncated-retry",
+            text: `${req.role} reply cut at the output limit; retrying once with a ${maxTokens}-token allowance`,
+          });
+          lastAssistantError = undefined;
+          continue;
+        }
       }
 
       if (!guardAborted || !this.guardConfig.enabled) {
         // Non-guard failure (timeout, budget, gateway, no-result) — no recovery ladder.
+        const truncated = isTruncatedReply(lastAssistantError);
         const gateway = lastAssistantError ? parseGatewayWait({ text: lastAssistantError }) : null;
         // A 404 model_not_found usually arrives as an assistant-message error,
         // not a throw, so the transient layer never saw it. Give it the same
@@ -1297,22 +1344,26 @@ export class PiWorkerExecutor implements WorkerExecutor {
           ? "Worker exceeded the hard context-token budget."
           : timedOut
             ? "Worker timed out."
-            : gateway
-              ? `Model gateway refused the request after ${gatewayRetries} honoured wait(s): ${lastAssistantError}`
-              : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
+            : truncated
+              ? `Worker reply truncated at the output limit${lengthRetried ? " (again after a retry with a larger allowance)" : ""}; no worker_result. ${lastAssistantError}`
+              : gateway
+                ? `Model gateway refused the request after ${gatewayRetries} honoured wait(s): ${lastAssistantError}`
+                : `Worker returned no worker_result${lengthRetried ? " (the retry after a reply cut at the output limit failed)" : ""}.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
         const error = budgetExhausted
           ? "budget-exhausted"
           : timedOut
             ? "timeout"
-            : gateway
-              ? gatewayFailureMarker(gateway)
-              : modelGone
-                ? "transient:model_unavailable"
-                : isTruncatedStream(lastAssistantError)
-                  ? "truncated_after_progress"
-                  : isStalledStream(lastAssistantError)
-                    ? "transient:network"
-                    : (lastAssistantError ?? "no-result");
+            : truncated
+              ? "truncated"
+              : gateway
+                ? gatewayFailureMarker(gateway)
+                : modelGone
+                  ? "transient:model_unavailable"
+                  : isTruncatedStream(lastAssistantError)
+                    ? "truncated_after_progress"
+                    : isStalledStream(lastAssistantError)
+                      ? "transient:network"
+                      : (lastAssistantError ?? "no-result");
         return {
           result: {
             status: "failed",
@@ -1328,7 +1379,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
                 : {},
             error,
           },
-          usage: this.collectUsage(this.asMessages(session.messages), streamResumes.count),
+          usage: account.usage(streamResumes.count),
           error,
           toolCalls: Math.max(toolCalls, this.executedActionCount(req)),
         };
@@ -1439,6 +1490,7 @@ ${recovery.recoveryPrompt}`;
     attempt: number,
     guardConfig: GenerationGuardConfig = this.guardConfig,
     streamResumes: { count: number } = { count: 0 },
+    account: TokenAccount = new TokenAccount(),
   ): Promise<{
     session: { dispose: () => void; messages: readonly unknown[] };
     guardAborted: boolean;
@@ -1635,6 +1687,9 @@ ${recovery.recoveryPrompt}`;
     let turnToolErrors: string[] = [];
     const unsubscribe = session.subscribe((event) => {
       armInactivity();
+      // Every request is counted as it ends, including a reply Pi later drops.
+      if (event.type === "compaction_end" && event.result) account.addCompaction(event.result.usage);
+      if (event.type === "message_end" && event.message.role === "assistant") account.addMessages([event.message]);
       if (transcript) {
         const t = event as unknown as Record<string, any>;
         if (t.type === "message_end" && t.message?.role !== "toolResult") {
@@ -1786,6 +1841,12 @@ ${recovery.recoveryPrompt}`;
         // limit from a degeneration.
         if (msg.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
           assistantError = msg.errorMessage;
+        }
+        // Cut at the output limit, whatever partial text it carries: not a result.
+        // Scoped to the final turn: a later turn that ends normally clears it.
+        if (msg.role === "assistant" && event.type === "message_end") {
+          if (msg.stopReason === "length") assistantError = `${TRUNCATED_REPLY}: stop reason length.`;
+          else if (msg.stopReason !== "error" && isTruncatedReply(assistantError)) assistantError = undefined;
         }
         // `event.message` is the ACCUMULATED partial message; charge the guard
         // the incremental delta the stream event carries (see guardFeedFor).
@@ -2094,16 +2155,9 @@ ${recovery.recoveryPrompt}`;
     return undefined;
   }
 
-  /** Estimate output tokens from session messages (for telemetry). */
+  /** Output tokens one session's messages reported (for telemetry). */
   private estimateOutputTokens(messages: readonly unknown[]): number {
-    let tokens = 0;
-    for (const msg of messages) {
-      const m = msg as { role?: string; usage?: { output?: number } };
-      if (m.role === "assistant" && m.usage?.output != null) {
-        tokens += m.usage.output;
-      }
-    }
-    return tokens;
+    return new TokenAccount().addMessages(this.asMessages(messages)).usage()?.output ?? 0;
   }
 
   /** Emit a structured telemetry event (spec §21). */
@@ -2121,52 +2175,6 @@ ${recovery.recoveryPrompt}`;
         detail: event,
       });
     }
-  }
-
-  private collectUsage(messages: readonly { role: string }[], streamResumes = 0): WorkerUsage | null {
-    let input = 0;
-    let output = 0;
-    let cacheRead = 0;
-    let cacheWrite = 0;
-    let cost = 0;
-    let contextTokens = 0;
-    let turns = 0;
-    let model = "";
-    for (const msg of messages) {
-      if (msg.role !== "assistant") continue;
-      const m = msg as { usage?: Record<string, unknown>; model?: string };
-      const u = m.usage as
-        | {
-            input?: number;
-            output?: number;
-            cacheRead?: number;
-            cacheWrite?: number;
-            totalTokens?: number;
-            cost?: { total?: number };
-          }
-        | undefined;
-      if (!u) continue;
-      input += u.input ?? 0;
-      output += u.output ?? 0;
-      cacheRead += u.cacheRead ?? 0;
-      cacheWrite += u.cacheWrite ?? 0;
-      cost += u.cost?.total ?? 0;
-      contextTokens = Math.max(contextTokens, u.totalTokens ?? 0);
-      turns++;
-      if (m.model) model = m.model;
-    }
-    if (turns === 0) return null;
-    return {
-      input,
-      output,
-      cacheRead,
-      cacheWrite,
-      cost,
-      contextTokens,
-      turns,
-      model,
-      ...(streamResumes > 0 ? { streamResumes } : {}),
-    };
   }
 }
 

@@ -2965,7 +2965,7 @@ export class EngineeringRuntime {
           phase,
           goal: this.currentPhaseGoal || undefined,
           model: run.usage.model,
-          usage: { input: run.usage.input, output: run.usage.output, cost: run.usage.cost },
+          usage: { input: run.usage.input ?? 0, output: run.usage.output ?? 0, cost: run.usage.cost },
         });
       }
     }
@@ -2975,8 +2975,8 @@ export class EngineeringRuntime {
     this.telemetry.toolCalls += run.toolCalls ?? 0;
     if (run.result.status !== "completed") this.telemetry.blockedOrFailedWorkers++;
     if (run.usage) {
-      this.telemetry.inputTokens += run.usage.input;
-      this.telemetry.outputTokens += run.usage.output;
+      this.telemetry.inputTokens += run.usage.input ?? 0;
+      this.telemetry.outputTokens += run.usage.output ?? 0;
       this.telemetry.contextTokens = Math.max(this.telemetry.contextTokens, run.usage.contextTokens);
       this.telemetry.turns += run.usage.turns;
     }
