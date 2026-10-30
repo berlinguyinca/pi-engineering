@@ -14,6 +14,7 @@
 import { readFile } from "node:fs/promises";
 
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
+import { type MissionModelSummary, summarizeMissionModels } from "./missionModels.ts";
 import type { CanonicalLifecycle } from "./missionStore.ts";
 import {
   type ModelErrorRollup,
@@ -70,6 +71,8 @@ export interface StoragePressureSnapshot {
 }
 
 export interface MissionObservabilitySnapshot {
+  /** Additive: the model the mission is pinned to and each agent's model against it. */
+  modelUse?: MissionModelSummary;
   progress: {
     approximatePercent: number;
     verifiedComplete: boolean;
@@ -382,7 +385,14 @@ export function buildMissionSnapshot(
           verifierStages: accounting.verifierStages ?? [],
         }
       : {}),
-    ...(observability ? { observability: toObservabilitySnapshot(observability) } : {}),
+    ...(observability
+      ? {
+          observability: {
+            ...toObservabilitySnapshot(observability),
+            modelUse: summarizeMissionModels(mission, tasks, observability.workers),
+          },
+        }
+      : {}),
     ...(spec
       ? {
           specApproval: {

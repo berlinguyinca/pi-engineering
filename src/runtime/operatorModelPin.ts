@@ -177,7 +177,8 @@ export function adoptOperatorModelPin(opts: {
   if (["COMPLETE", "FAILED", "CANCELED"].includes(mission.status)) return current;
   const state = sessions().get(opts.sessionId);
   const choice = state?.choice;
-  if (!isMissionOfSession(opts.sessionId, mission) || !choice) return current;
+  if (!isMissionOfSession(opts.sessionId, mission)) return current;
+  if (!choice) return seedFromStartingModel(opts, mission, current, state?.baseline);
   // A decision about this mission newer than the session's choice (the
   // operator released its pin) wins until the operator switches again.
   const chosenAt = choice.kind === "pin" ? choice.pin.set_at : choice.set_at;
@@ -201,6 +202,32 @@ export function adoptOperatorModelPin(opts: {
     // Observers never break dispatch.
   }
   return desired;
+}
+
+/**
+ * A mission runs on the model its session started on. With no operator choice
+ * yet, the session's starting model becomes the mission's pin (persisted, so a
+ * restart or handoff keeps it); the router still refuses a pin that cannot
+ * serve a role, and independent review stays on a distinct model under
+ * separation of duties. A mission that already has a pin or an operator
+ * decision (including a release) is left alone, and an explicit operator
+ * choice later in the session wins, as before.
+ */
+function seedFromStartingModel(
+  opts: { store: PinStore; missionId: string; onTransition?: (transition: PinTransition) => void },
+  mission: Mission,
+  current: OperatorModelPin | null,
+  baseline: ModelRef | undefined,
+): OperatorModelPin | null {
+  if (current || mission.operator_model_decided_at || !baseline) return current;
+  const pin: OperatorModelPin = { provider: baseline.provider, id: baseline.id, set_at: new Date().toISOString() };
+  opts.store.updateMission(opts.missionId, { operator_model_pin: { ...pin }, operator_model_decided_at: pin.set_at });
+  try {
+    opts.onTransition?.({ missionId: opts.missionId, from: null, to: modelKey(pin), reason: "session starting model" });
+  } catch {
+    // Observers never break dispatch.
+  }
+  return pin;
 }
 
 interface PinStore {

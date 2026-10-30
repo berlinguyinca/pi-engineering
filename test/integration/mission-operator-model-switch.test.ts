@@ -296,7 +296,11 @@ test("a /model switch moves a mission worker waiting on an exhausted role-pinned
       assert.equal(MissionStore.open(h.backend).getMission(h.missionId)?.operator_model_pin?.id, DEEPSEEK.id);
       assert.deepEqual(
         h.transitions.map((t) => [t.from, t.to, t.reason]),
-        [[null, modelKey(DEEPSEEK), "operator pin"]],
+        [
+          [null, modelKey(GLM), "session starting model"],
+          [modelKey(GLM), modelKey(DEEPSEEK), "operator pin"],
+        ],
+        "the mission starts on its session's model, then follows the operator's switch",
       );
 
       // The wait said what was wrong and how to get out of it.
