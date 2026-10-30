@@ -408,7 +408,7 @@ test("a durably stopped mission at the cap keeps recovery_exhausted, a live park
 
   const live = attentionFromSummary(obs.projection(m.mission_id)!.summary, { now });
   assert.equal(live?.evidence[0]?.kind, "capacity_wait");
-  assert.match(live!.reason, /resumes once the gateway health probe succeeds/);
+  assert.match(live!.reason, /resumes once the gateway probe succeeds/);
 
   store.stopMission(m.mission_id, {
     reason: "gate repair refused",

@@ -131,7 +131,7 @@ test("a capacity park past its strategy budget reports wait progress, not exhaus
   assert.match(attention!.reason, /parked 1h 0m/);
   assert.doesNotMatch(attention!.reason, /waiting.*waiting/);
   assert.match(attention!.reason, /next probe in 2m/);
-  assert.match(attention!.reason, /resumes once the gateway health probe succeeds/);
+  assert.match(attention!.reason, /resumes once the gateway probe succeeds/);
 });
 
 const capped = (overrides: Partial<Parameters<typeof deriveAttention>[0]>) =>
@@ -157,7 +157,7 @@ test("a missing nextActionAt or waitingSince omits those parts without breaking 
   assert.equal(attention?.evidence[0]?.at, undefined);
   assert.equal(
     attention?.reason,
-    "waiting for capacity: probe 9; resumes once the gateway health probe succeeds, unless paused or stopped",
+    "waiting for capacity: probe 9; resumes once the gateway probe succeeds, unless paused or stopped",
   );
 });
 
@@ -165,13 +165,13 @@ test("only transient provider failures are called a capacity wait", () => {
   const attention = capped({ failureCategory: "PROVIDER_TRANSIENT" });
   assert.match(attention!.reason, /^waiting for capacity: probe 9; /);
   assert.doesNotMatch(attention!.reason, /automatically/);
-  assert.match(attention!.reason, /resumes once the gateway health probe succeeds, unless paused or stopped$/);
+  assert.match(attention!.reason, /resumes once the gateway probe succeeds, unless paused or stopped$/);
 });
 
 test("a permanent provider failure is not promised to resume automatically", () => {
   const attention = capped({ failureCategory: "PROVIDER_PERMANENT" });
   assert.doesNotMatch(attention!.reason, /capacity|automatically/);
-  assert.match(attention!.reason, /operator action/);
+  assert.match(attention!.reason, /credentials or provider fix/);
 });
 
 test("orphaned execution and unavailable evidence name the gateway probe they actually wait on", () => {
@@ -181,7 +181,7 @@ test("orphaned execution and unavailable evidence name the gateway probe they ac
     assert.doesNotMatch(attention!.reason, /capacity|blocking condition/, String(failureCategory));
     assert.match(
       attention!.reason,
-      /^waiting: probe 9; resumes once the gateway health probe succeeds, unless paused or stopped$/,
+      /^waiting: probe 9; resumes once the gateway probe succeeds, unless paused or stopped$/,
     );
   }
 });
@@ -190,7 +190,7 @@ test("a disk suspension park does not claim disk space is checked", () => {
   const attention = capped({ failureCategory: "DISK_SUSPENDED" });
   assert.equal(
     attention?.reason,
-    "waiting: probe 9; resumes once the gateway health probe succeeds (disk space is not checked), unless paused or stopped",
+    "waiting: probe 9; resumes once the gateway probe succeeds (disk not checked), unless paused or stopped",
   );
 });
 
@@ -316,4 +316,77 @@ test("the working line leads with the evidence when there is any", () => {
   assert.match(view.workingLine ?? "", /repeated tool call ×9/, "the line says why to look");
   assert.doesNotMatch(view.workingLine ?? "", /working on it/, "self-narration is not evidence");
   assert.equal(view.rows[0]?.attentionReason, "repeated tool call ×9 — bash npm test");
+});
+
+test("a settled or actively-rerunning decision is not rendered as a wait (#497 F1)", () => {
+  for (const recoveryStatus of ["planned", "started"] as const) {
+    const wait = capped({ failureCategory: "PROVIDER_TRANSIENT", recoveryStatus });
+    assert.equal(wait?.evidence[0]?.kind, "capacity_wait", recoveryStatus);
+  }
+  for (const recoveryStatus of ["succeeded", "failed", "exhausted"] as const) {
+    const attention = capped({ failureCategory: "PROVIDER_TRANSIENT", recoveryStatus });
+    assert.ok(!attention?.evidence.some((entry) => entry.kind === "capacity_wait"), recoveryStatus);
+    assert.doesNotMatch(attention?.reason ?? "", /waiting|resumes/, recoveryStatus);
+  }
+  // exhausted/failed at the cap fall back to the existing non-wait attention path.
+  assert.equal(
+    capped({ failureCategory: "PROVIDER_TRANSIENT", recoveryStatus: "exhausted" })?.evidence[0]?.kind,
+    "recovery_exhausted",
+  );
+  // A succeeded decision did restore progress, so it claims no exhaustion either.
+  assert.ok(
+    !capped({ failureCategory: "PROVIDER_TRANSIENT", recoveryStatus: "succeeded" })?.evidence.some(
+      (entry) => entry.kind === "recovery_exhausted",
+    ),
+  );
+});
+
+test("a started decision during an active gate re-run (REPAIRING) is not a wait", () => {
+  const attention = capped({
+    state: "REPAIRING",
+    health: "active",
+    failureCategory: "PROVIDER_TRANSIENT",
+    recoveryStatus: "started",
+    nextActionAt: new Date(T0 + 120_000).toISOString(),
+  });
+  assert.ok(!attention?.evidence.some((entry) => entry.kind === "capacity_wait"));
+  assert.ok(!attention?.evidence.some((entry) => entry.kind === "recovery_exhausted"));
+  assert.doesNotMatch(attention?.reason ?? "", /waiting|resumes|next probe|did not restore/);
+});
+
+const WAIT_CATEGORIES = [
+  "PROVIDER_TRANSIENT",
+  "PROVIDER_PERMANENT",
+  "DISK_SUSPENDED",
+  "ORPHANED_EXECUTION",
+  undefined,
+] as const;
+
+test("the 'unless paused or stopped' caveat ends before character 120 for every wait (#497 F3)", () => {
+  const long = {
+    recovery: { attempt: 1999, maxAttempts: 8 },
+    nextActionAt: new Date(T0 + 12 * 3_600_000).toISOString(),
+    waitingSince: new Date(T0 - 99 * 3_600_000).toISOString(),
+  };
+  const cases = [
+    ...WAIT_CATEGORIES.map((failureCategory) => capped({ ...long, failureCategory })),
+    capped({ ...long, recoveryAction: "PAUSE_FOR_PERSISTENCE", failureCategory: "PERSISTENCE_FAILURE" }),
+  ];
+  for (const attention of cases) {
+    const at = attention!.reason.indexOf("unless paused or stopped");
+    assert.ok(at >= 0, attention!.reason);
+    assert.ok(at + "unless paused or stopped".length <= 120, `${at}: ${attention!.reason}`);
+  }
+});
+
+test("a terminal mission with operatorPausedAt set is not described as paused by you (#497 F5)", () => {
+  for (const state of ["COMPLETE", "CANCELED"]) {
+    const attention = deriveAttention(
+      base({ state, health: "active", operatorPausedAt: new Date(T0 - 60_000).toISOString() }),
+    );
+    assert.ok(!attention?.evidence.some((entry) => entry.kind === "operator_paused"), state);
+    assert.doesNotMatch(attention?.reason ?? "", /paused/, state);
+  }
+  const live = deriveAttention(base({ operatorPausedAt: new Date(T0 - 60_000).toISOString() }));
+  assert.equal(live?.evidence[0]?.kind, "operator_paused");
 });
