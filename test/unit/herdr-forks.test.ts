@@ -26,7 +26,7 @@ import {
   parseSteeringItem,
 } from "../../src/orchestration/steering.ts";
 import { loadForkSettings } from "../../src/runtime/herdr/forkSettings.ts";
-import { type ForkRuntimeSources, createForkRuntime } from "../../src/runtime/herdr/forkWiring.ts";
+import { type ForkRuntimeSources, createForkRuntime, missionForkSources } from "../../src/runtime/herdr/forkWiring.ts";
 import { FakeGithubClient } from "../support/fakeGithubClient.ts";
 
 const sh = (cwd: string, ...args: string[]): string =>
@@ -764,15 +764,20 @@ describe("forks settings: global YAML only, off unless valid", () => {
 });
 
 describe("production wiring (createForkRuntime)", () => {
-  const sources = (over: Partial<ForkRuntimeSources> = {}): ForkRuntimeSources => ({
-    getTask: (id) => (id === "t1" ? { task_id: "t1", mission_id: "m1" } : undefined),
-    getExecution: () => undefined,
-    getMission: (id) => (id === "m1" ? { mission_id: "m1", repository: "relative/repo", base_ref: "main" } : undefined),
-    boundRoot: () => null,
-    openRoot: async (p) => p,
-    links: new Store(),
-    ...over,
-  });
+  type Legacy = {
+    getMission: (id: string) => { mission_id: string; repository: string; base_ref: string } | undefined;
+  };
+  const sources = (over: Partial<Legacy> = {}): ForkRuntimeSources =>
+    missionForkSources(
+      {
+        getTask: (id) => (id === "t1" ? { task_id: "t1", mission_id: "m1" } : undefined),
+        getExecution: () => undefined,
+        getMission: (id) =>
+          id === "m1" ? { mission_id: "m1", repository: "relative/repo", base_ref: "main" } : undefined,
+        ...over,
+      },
+      { boundRoot: () => null, openRoot: async (p) => p, links: new Store() },
+    );
   const boot = async (yaml: string, src: ForkRuntimeSources) => {
     const agentDir = tmp();
     writeFileSync(join(agentDir, "engineering.yaml"), yaml);
