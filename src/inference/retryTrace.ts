@@ -17,6 +17,7 @@ import type { InferenceTelemetry } from "./telemetry.ts";
 export type RetryLayer =
   | "resilient-stream" // src/inference/resilientStream.ts: in-call replay ladder
   | "worker-gateway-hold" // PiWorkerExecutor: honours the gateway's advertised wait
+  | "worker-transient-retry" // PiWorkerExecutor: withTransientRetry for 5xx / network / timeout
   | "model-takeover" // realBackends.runWithModelTakeover: move the run to another model
   | "scheduler-window"; // orchestration scheduler: mission-level relaunch window
 

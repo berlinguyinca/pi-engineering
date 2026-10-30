@@ -124,6 +124,13 @@ export interface RealBackendsOptions {
    * between inference requests re-dispatches it on the new choice.
    */
   currentOperatorPin?: (missionId: string) => ModelRef | null | undefined;
+  /**
+   * How long a model that failed a task's takeover walk stays excluded from that
+   * task's later relaunches (default 15 minutes). 0 disables the carry-over.
+   */
+  takeoverMemoryTtlMs?: number;
+  /** Clock for the takeover memory (tests). */
+  now?: () => number;
   /** Resolve the repository selected by the current mission's async binding. */
   repository?: (repoId?: string) => Promise<{ git: GitRepo; cwd: string }> | { git: GitRepo; cwd: string };
 }
@@ -281,6 +288,12 @@ const MAX_FAMILY_PROBES = 16;
 
 /** Bound a takeover even when refreshed discovery keeps returning new failing models. */
 const MAX_MODEL_TAKEOVER_ATTEMPTS = 16;
+
+/** Default lifetime of a task's remembered dead models across scheduler relaunches. */
+export const DEFAULT_TAKEOVER_MEMORY_TTL_MS = 15 * 60_000;
+
+/** Tasks whose takeover memory is kept (oldest dropped past the bound). */
+const MAX_TAKEOVER_MEMORY_TASKS = 512;
 
 /** Missions whose producing models are remembered for reviewer separation. */
 export const MAX_TRACKED_MISSIONS = 256;
@@ -594,6 +607,44 @@ export function realBackends(opts: RealBackendsOptions) {
       if (oldest !== undefined) producedBy.delete(oldest);
     }
   };
+  /**
+   * Models a task's takeover walk already found dead, carried across scheduler
+   * relaunches of the same task so a relaunch starts after them instead of
+   * re-walking the list (RETRY-OWNERS.md). Held here, not in UnavailableModels
+   * (global, only for gateway-confirmed gone models, so a capacity-exhausted
+   * model would wrongly leave routing for every task) and not in the task
+   * record (this layer has no write access to it). In memory: a process restart
+   * only costs one re-walk. Bounded by TTL and MAX_TAKEOVER_MEMORY_TASKS.
+   */
+  const takeoverMemory = new Map<string, { pin: string | null; dead: Map<string, { ref: ModelRef; until: number }> }>();
+  const memoryTtl = opts.takeoverMemoryTtlMs ?? DEFAULT_TAKEOVER_MEMORY_TTL_MS;
+  const clock = (): number => (opts.now ? opts.now() : Date.now());
+  /** The task's live dead-model list; drops it when the operator pin changed. */
+  const memoryFor = (key: string | undefined, pin: string | null): ModelRef[] => {
+    if (!key || memoryTtl <= 0) return [];
+    const entry = takeoverMemory.get(key);
+    if (!entry) return [];
+    if (entry.pin !== pin) {
+      takeoverMemory.delete(key);
+      return [];
+    }
+    const now = clock();
+    for (const [k, v] of entry.dead) if (v.until <= now) entry.dead.delete(k);
+    if (entry.dead.size === 0) takeoverMemory.delete(key);
+    return [...entry.dead.values()].map((v) => v.ref);
+  };
+  const remember = (key: string | undefined, pin: string | null, model: ModelRef): void => {
+    if (!key || memoryTtl <= 0) return;
+    let entry = takeoverMemory.get(key);
+    if (!entry || entry.pin !== pin) entry = { pin, dead: new Map() };
+    entry.dead.set(modelKey(model), { ref: { provider: model.provider, id: model.id }, until: clock() + memoryTtl });
+    takeoverMemory.delete(key);
+    takeoverMemory.set(key, entry);
+    if (takeoverMemory.size > MAX_TAKEOVER_MEMORY_TASKS) {
+      const oldest = takeoverMemory.keys().next().value;
+      if (oldest !== undefined) takeoverMemory.delete(oldest);
+    }
+  };
   /** The operator pin a mission dispatches with right now (adopting a new choice). */
   const pinKeyOf = (missionId: string | undefined): string | null => {
     if (!missionId || !opts.currentOperatorPin) return null;
@@ -682,6 +733,18 @@ export function realBackends(opts: RealBackendsOptions) {
       }
     };
     let route = plan.initial;
+    const memoryKey =
+      plan.context.missionId && plan.context.taskId
+        ? `${plan.context.missionId}|${plan.context.taskId}|${req.role}`
+        : undefined;
+    const memoryPin = pinKeyOf(plan.context.missionId);
+    // A relaunch of the same task starts after the models its earlier walks found
+    // dead. An explicit operator pin is never excluded or replaced: it is waited on.
+    let carried = memoryFor(memoryKey, memoryPin);
+    if (route && !route.operatorPin && carried.some((known) => sameModel(known, route as ModelRef))) {
+      const alternative = await plan.next(carried);
+      if (alternative) route = alternative;
+    }
     if (!route && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route };
     if (plan.announceWarnings && route?.warning) announce(route.warning);
     if (route?.pinNotice) announce(route.pinNotice);
@@ -700,6 +763,9 @@ export function realBackends(opts: RealBackendsOptions) {
     while (!input.signal.aborted) {
       const error = outcomeOf(run).error ?? "";
       if (error === MODEL_SUPERSEDED) {
+        // A new operator choice outranks everything learned under the old one.
+        if (memoryKey) takeoverMemory.delete(memoryKey);
+        carried = [];
         const next = await plan.repick(tried);
         if (!next && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route: undefined };
         // The operator's choice resolves to the model already running: nothing
@@ -763,13 +829,21 @@ export function realBackends(opts: RealBackendsOptions) {
       if (gone && !REQUEST_SPECIFIC_REFUSAL.test(reason))
         opts.onModelUnavailable?.(failed, { ...plan.context, reason });
       tried.push(failed);
+      if (req.operatorPinned !== true && failed !== UNNAMED_MODEL) remember(memoryKey, memoryPin, failed);
       if (tried.length >= MAX_MODEL_TAKEOVER_ATTEMPTS) {
         const notice = `model takeover exhausted after ${tried.length} model attempts; last failure on ${modelKey(failed)}`;
         switches.push(notice);
         announce(notice);
         break;
       }
-      const next = await plan.next(tried);
+      let next = await plan.next([...carried, ...tried]);
+      // Everything the task remembered as dead is all that is left: forget it and
+      // walk afresh rather than starve the task until the TTL passes.
+      if (!next && carried.length > 0) {
+        if (memoryKey) takeoverMemory.delete(memoryKey);
+        carried = [];
+        next = await plan.next(tried);
+      }
       if (!next || tried.some((known) => sameModel(known, next))) break;
       const notice = providerFault
         ? `model ${modelKey(failed)} failed the request (${reason.slice(0, 200)}) — switched ${req.role} to ${modelKey(next)}`
