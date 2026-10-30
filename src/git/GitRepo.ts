@@ -22,6 +22,7 @@ import { emitTelemetry } from "../telemetry/sink.ts";
 import { readOwnerMarker, writeOwnerMarker } from "./ownerMarker.ts";
 import { safeGit } from "./safeGit.ts";
 import { shortHash } from "./shortHash.ts";
+import { shellQuote } from "./trashStore.ts";
 import { removalBlockers } from "./worktreeSafety.ts";
 
 export { shortHash };
@@ -2085,7 +2086,7 @@ export class GitRepo {
           () => false,
         )
       ) {
-        return `an operation is in progress in ${path} (${entry}); finish it or run \`git -C ${path} ${command}\``;
+        return `an operation is in progress in ${path} (${entry}); finish it or run \`git -C ${shellQuote(path)} ${command}\``;
       }
     }
     return null;

@@ -11,7 +11,21 @@
  * follows symlinks.
  */
 
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import {
+  access,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 
@@ -76,24 +90,55 @@ export async function trashRootInsideProblem(root: string, workingTrees: readonl
   return null;
 }
 
-/** A root is usable when marked, missing, empty, or holding only entries housekeeping created. */
-async function ensureTrashRoot(root: string): Promise<void> {
+/**
+ * Why `root` cannot be used as a trash root, else null; changes nothing. Covers every refusal `ensureTrashRoot` would
+ * make, plus (when `sameFilesystemAs` is given) a root on another filesystem than that path, so a sweep can refuse
+ * BEFORE it preserves or moves anything instead of after.
+ */
+export async function trashRootProblem(root: string, opts: { sameFilesystemAs?: string } = {}): Promise<string | null> {
   const linked = await symlinkedRootProblem(root);
-  if (linked) throw new Error(linked);
-  const marker = join(root, TRASH_ROOT_MARKER);
-  if ((await lstat(marker).catch(() => null))?.isFile()) return;
-  const entries = await readdir(root).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return [] as string[];
-    throw error;
-  });
-  for (const e of entries) {
-    if (e === TRASH_ROOT_MARKER) continue;
-    if (!(await readTrashMarker(join(root, e)))) {
-      throw new Error(
-        `${root} is not a pi-engineering trash root (no ${TRASH_ROOT_MARKER} and it holds other files); refusing to use it`,
-      );
+  if (linked) return linked;
+  const marked = (await lstat(join(root, TRASH_ROOT_MARKER)).catch(() => null))?.isFile();
+  if (!marked) {
+    const entries = await readdir(root).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      return error;
+    });
+    if (entries instanceof Error)
+      return `${root} cannot be read (${entries.message.split("\n")[0]}); refusing to use it`;
+    for (const e of entries) {
+      if (!(await readTrashMarker(join(root, e)))) {
+        return `${root} is not a pi-engineering trash root (no ${TRASH_ROOT_MARKER} and it holds other files); refusing to use it`;
+      }
     }
   }
+  let existing = resolve(root);
+  for (;;) {
+    if (await lstat(existing).catch(() => null)) break;
+    const up = dirname(existing);
+    if (up === existing) break;
+    existing = up;
+  }
+  try {
+    await access(existing, constants.W_OK);
+  } catch {
+    return `${root} is not writable (${existing}); refusing to use it`;
+  }
+  if (opts.sameFilesystemAs) {
+    const [a, b] = await Promise.all([stat(existing).catch(() => null), stat(opts.sameFilesystemAs).catch(() => null)]);
+    if (a && b && a.dev !== b.dev) {
+      return "state dir on different filesystem: set PI_TRASH_DIR next to the repos";
+    }
+  }
+  return null;
+}
+
+/** A root is usable when marked, missing, empty, or holding only entries housekeeping created. */
+async function ensureTrashRoot(root: string): Promise<void> {
+  const problem = await trashRootProblem(root);
+  if (problem) throw new Error(problem);
+  const marker = join(root, TRASH_ROOT_MARKER);
+  if ((await lstat(marker).catch(() => null))?.isFile()) return;
   await mkdir(root, { recursive: true, mode: 0o700 });
   await writeFile(marker, `${JSON.stringify({ version: 1, creator: "pi-engineering" })}\n`, { flag: "wx" }).catch(
     (error: NodeJS.ErrnoException) => {
@@ -142,7 +187,11 @@ export async function recordTrashAdmin(entryDir: string, admin: { adminId: strin
   const marker = await readTrashMarker(entryDir);
   if (!marker?.items[0]) return;
   marker.items[0] = { ...marker.items[0], ...admin };
-  await writeFile(join(entryDir, TRASH_MARKER_FILE), `${JSON.stringify(marker, null, 2)}\n`);
+  // Temp file + rename: a crash never leaves a truncated marker (which would make the entry unpurgeable).
+  // `adminId` and `commonDir` are informational (restore hints) and nothing consumes them without validating them.
+  const tmp = join(entryDir, `${TRASH_MARKER_FILE}.tmp-${process.pid}`);
+  await writeFile(tmp, `${JSON.stringify(marker, null, 2)}\n`, { flag: "wx" });
+  await rename(tmp, join(entryDir, TRASH_MARKER_FILE));
 }
 
 /** Undo `createTrashEntry` when the move failed: drops only the marker and the (empty) entry directory. */

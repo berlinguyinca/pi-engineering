@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import { moveToTrash, purgeTrash } from "../../src/git/trashStore.ts";
 import { describeTrashPurge, runTrashPurge } from "../../src/runtime/janitor.ts";
 
@@ -13,8 +13,15 @@ const exists = (p: string) =>
     () => false,
   );
 
+const leaked: string[] = [];
+afterEach(async () => {
+  for (const d of leaked.splice(0)) await rm(d, { recursive: true, force: true });
+});
+
 async function trashed(trashRoot: string, name: string, daysAgo: number): Promise<string> {
-  const from = join(await mkdtemp(join(tmpdir(), "pi-eng-trash-src-")), name);
+  const srcRoot = await mkdtemp(join(tmpdir(), "pi-eng-trash-src-"));
+  leaked.push(srcRoot);
+  const from = join(srcRoot, name);
   await mkdir(join(from, "src"), { recursive: true });
   await writeFile(join(from, "src", "a.txt"), "data\n");
   return moveToTrash(trashRoot, "worktree", from, name, "br", Date.now() - daysAgo * DAY);

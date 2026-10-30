@@ -29,6 +29,7 @@ import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { GitRepo, shortHash } from "../../src/git/GitRepo.ts";
 import { CliForkGit } from "../../src/git/forkGit.ts";
 import { readOwnerMarker } from "../../src/git/ownerMarker.ts";
+import { shellQuote } from "../../src/git/trashStore.ts";
 import { gitPostMerge } from "../../src/merge/postMerge.ts";
 import { JsonlEventStore, repairTornTail } from "../../src/platform/eventstore/jsonl.ts";
 import { emitRuntimeEvent, setRuntimeEventLog } from "../../src/runtime/isolation/runtimeEvents.ts";
@@ -43,7 +44,8 @@ const g = async (cwd: string, ...args: string[]): Promise<string> =>
   (await exec("git", ["-C", cwd, ...args])).stdout.trim();
 
 async function scratchRepo(): Promise<{ dir: string; head: string; git: GitRepo }> {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "w2b-")));
+  const dir = join(realpathSync(mkdtempSync(join(tmpdir(), "w2b-"))), "repo");
+  mkdirSync(dir);
   await exec("git", ["init", "-q", "-b", "main", dir]);
   await g(dir, "config", "user.email", "t@example.invalid");
   await g(dir, "config", "user.name", "t");
@@ -1219,7 +1221,7 @@ test("in-progress refusals name the path and the exact command", async () => {
   mkdirSync(join(admin, "rebase-merge"));
   rmSync(wt.path, { recursive: true, force: true });
   await assert.rejects(git.createWorktree(head, "msg-1"), (e: Error) => {
-    assert.ok(e.message.includes(`git -C ${wt.path} rebase --abort`), e.message);
+    assert.ok(e.message.includes(`git -C ${shellQuote(wt.path)} rebase --abort`), e.message);
     return true;
   });
   rmSync(join(admin, "rebase-merge"), { recursive: true });

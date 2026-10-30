@@ -73,8 +73,8 @@ import {
   moveToTrash,
   recordTrashAdmin,
   shellQuote,
-  symlinkedRootProblem,
   trashRootInsideProblem,
+  trashRootProblem,
 } from "./trashStore.ts";
 import { MAX_WALK_ENTRIES, ROOT_DERIVED_DIRS, containsGitEntry } from "./worktreeSafety.ts";
 
@@ -858,15 +858,15 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
   // A misconfigured trash root (inside the repo, a symlink, relative) is judged ONCE, before any candidate is
   // preserved or quarantined, so it cannot churn every candidate on every sweep.
   let trashRoot = "";
-  let trashRootProblem: string | null = null;
+  let rootProblem: string | null = null;
   try {
     trashRoot = opts.trashRoot ?? defaultTrashRoot();
-    trashRootProblem =
+    rootProblem =
       (isAbsolute(trashRoot) ? null : `${trashRoot} is not an absolute path`) ??
       (await trashRootInsideProblem(trashRoot, [repo.root, ...registered.keys()])) ??
-      (await symlinkedRootProblem(trashRoot));
+      (await trashRootProblem(trashRoot, { sameFilesystemAs: parent }));
   } catch (error) {
-    trashRootProblem = error instanceof Error ? error.message.split("\n")[0] || String(error) : String(error);
+    rootProblem = error instanceof Error ? error.message.split("\n")[0] || String(error) : String(error);
   }
 
   for (const wt of registered.values()) {
@@ -980,11 +980,11 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         report.kept.push({ path: wt.path, branch: wt.branch, reason: keep });
         continue;
       }
-      if (trashRootProblem) {
+      if (rootProblem) {
         report.kept.push({
           path: wt.path,
           branch: wt.branch,
-          reason: `could not move it into the trash (${trashRootProblem}), kept`,
+          reason: `could not move it into the trash (${rootProblem}), kept`,
         });
         continue;
       }
@@ -1138,9 +1138,15 @@ async function moveOwnAdminDir(
     }
     const common = dirname(dirname(admin));
     await recordTrashAdmin(entry, { adminId: basename(admin), commonDir: common }).catch(() => {});
+    const free = (p: string): string => `test ! -e ${shellQuote(p)} && test ! -L ${shellQuote(p)}`;
+    if ((await existsStrict(admin)) || (await existsStrict(originalPath))) {
+      return `; git registration moved to ${kept}. Restore: its admin id or original path is taken: follow the README manual recipe (new admin name + rewrite .git)`;
+    }
+    // Refuses (non-zero, nothing moved) instead of letting `mv` nest into, or `repair` rewrite, something that took the id or path.
     const restore =
-      `mkdir -p ${shellQuote(dirname(admin))} && mv ${shellQuote(kept)} ${shellQuote(admin)} && ` +
-      `mv ${shellQuote(trashedTo)} ${shellQuote(originalPath)} && git -C ${shellQuote(repo.root)} worktree repair ${shellQuote(originalPath)}`;
+      `${free(admin)} && ${free(originalPath)} && mkdir -p ${shellQuote(dirname(admin))} && ` +
+      `mv ${shellQuote(kept)} ${shellQuote(admin)} && mv ${shellQuote(trashedTo)} ${shellQuote(originalPath)} && ` +
+      `git -C ${shellQuote(repo.root)} worktree repair ${shellQuote(originalPath)}`;
     return `; git registration moved to ${kept}. To restore: ${restore}`;
   } catch (error) {
     return left(error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error));
