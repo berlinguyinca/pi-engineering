@@ -26,6 +26,7 @@ import { id } from "../core/ids.ts";
 import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
+import type { RetryTrace } from "../inference/retryTrace.ts";
 import {
   type CitationReport,
   citationSummary,
@@ -685,6 +686,7 @@ export function realBackends(opts: RealBackendsOptions) {
     if (plan.announceWarnings && route?.warning) announce(route.warning);
     if (route?.pinNotice) announce(route.pinNotice);
     const switches: string[] = [];
+    const failovers: RetryTrace[] = [];
     if (route?.registryNotice) {
       switches.push(route.registryNotice);
       announce(route.registryNotice);
@@ -780,6 +782,15 @@ export function realBackends(opts: RealBackendsOptions) {
         switches.push(next.registryNotice);
         announce(next.registryNotice);
       }
+      const previous = run.result.details?.retry_trace;
+      if (Array.isArray(previous)) failovers.push(...(previous as RetryTrace[]));
+      failovers.push({
+        layer: "model-takeover",
+        attempt: tried.length,
+        reason: `${error}:${modelKey(failed)}`,
+        next: "failover",
+        owner: "model-takeover",
+      });
       plan.onSwitch?.(failed, next);
       route = next;
       model = next;
@@ -789,6 +800,16 @@ export function realBackends(opts: RealBackendsOptions) {
     }
     // A model that serves an attempt again is no longer considered gone.
     if (model && run.result.status === "completed") opts.onModelServed?.(model);
+    if (failovers.length > 0) {
+      const earlier = run.result.details?.retry_trace;
+      run = {
+        ...run,
+        result: {
+          ...run.result,
+          details: { ...run.result.details, retry_trace: [...failovers, ...(Array.isArray(earlier) ? earlier : [])] },
+        },
+      };
+    }
     if (switches.length > 0) {
       run = { ...run, result: { ...run.result, summary: `${switches.join("; ")}. ${run.result.summary}` } };
     }

@@ -43,6 +43,13 @@ export interface InferenceInvocation {
    * (saturation + gate) but must not add a second retry loop when set.
    */
   resilient?: boolean;
+  /**
+   * The caller that already honours the gateway's advertised wait for this
+   * invocation (a worker's gateway hold). The in-call resilient ladder must not
+   * replay the same admission refusal as well: it settles at once and leaves the
+   * single retry to this owner (see src/inference/retryTrace.ts).
+   */
+  gatewayWaitOwner?: "worker-gateway-hold";
 }
 
 const storage = new AsyncLocalStorage<InferenceInvocation>();
