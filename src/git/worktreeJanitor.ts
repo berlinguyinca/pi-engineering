@@ -27,7 +27,7 @@
  *    (node_modules, target, .next, dist, coverage); an untracked derived folder
  *    would block a plain remove; index flags (assume-unchanged, skip-worktree)
  *    could hide edits; HEAD is detached and either unreachable from every
- *    branch/tag/remote ref (stash does not count) or the tree is dirty; or the
+ *    local branch or tag (remote-tracking refs and stash do not count) or the tree is dirty; or the
  *    shared `_shared` Rust cache key would be the cleanup target. Otherwise
  *    uncommitted changes are committed onto the worktree's own branch and a
  *    plain (never forced) `git worktree remove` runs; if changes remain after
@@ -208,6 +208,18 @@ function isDerivedName(entry: string): boolean {
   return (DERIVED_DIRS as readonly string[]).includes(last);
 }
 
+/** Exists? Only "not there" (ENOENT/ENOTDIR) is false; any other error propagates so the caller fails closed. */
+async function existsStrict(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
 const entryPath = (line: string): string => line.slice(3);
 
 const READ_ONLY_GIT = { trust: "operator", env: { GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 60_000 } as const;
@@ -219,7 +231,8 @@ async function newestTreeMtime(dir: string): Promise<number> {
   const queue = [dir];
   while (queue.length > 0) {
     const current = queue.pop() as string;
-    const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => null);
+    if (!entries) return Date.now(); // unreadable: cannot prove it idle
     for (const entry of entries) {
       if (entry.name === ".git" || entry.name === "node_modules" || entry.name === "target") continue;
       if (++seen > MAX_WALK_ENTRIES) return Date.now();
@@ -239,7 +252,8 @@ async function containsGitEntry(dir: string): Promise<boolean> {
   const queue = [dir];
   while (queue.length > 0) {
     const current = queue.pop() as string;
-    const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => null);
+    if (!entries) return true; // unreadable: cannot prove it repo-free
     for (const entry of entries) {
       if (entry.name === ".git") return true;
       if (++seen > MAX_WALK_ENTRIES) return true;
@@ -369,7 +383,11 @@ async function stageInTempIndex(
 }
 
 async function copyFileIfPresent(from: string, to: string): Promise<void> {
-  const data = await readFile(from).catch(() => null);
+  // A missing index is fine (nothing staged); an unreadable one must not become an empty index.
+  const data = await readFile(from).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
   if (data) await writeFile(to, data);
 }
 
@@ -414,11 +432,10 @@ async function installIndexUnderLock(gitDir: string, lock: string, indexFile: st
  */
 async function indexLockReason(gitDir: string): Promise<string | null> {
   const lock = join(gitDir, "index.lock");
-  const st = await stat(lock).catch(() => null);
-  if (!st) return null;
+  if (!(await existsStrict(lock))) return null;
   const marker = LOCK_MARKER.exec(await readFile(lock, "utf8").catch(() => ""));
   if (marker && !pidAlive(Number(marker[1])) && Date.now() - Number(marker[2]) > STALE_LOCK_MS) {
-    return `stale index.lock left by a dead janitor run (pid ${marker[1]}); a preserving commit may exist on the branch; remove the lock yourself after checking \`git status\``;
+    return `stale index.lock left by a dead janitor run (pid ${marker[1]}); a preserving commit may exist on the branch; after checking, remove the lock yourself and run \`git reset\` (mixed) before committing, because the index is stale`;
   }
   return "index.lock present (a git command may be running or was killed); never removed by housekeeping";
 }
@@ -434,11 +451,15 @@ const OPERATION_MARKERS = [
   ["BISECT_LOG", "bisect in progress"],
   ["MERGE_AUTOSTASH", "merge with autostash in progress"],
   ["AUTO_MERGE", "merge state present (AUTO_MERGE)"],
+  ["NOTES_MERGE_REF", "notes merge in progress"],
+  ["NOTES_MERGE_PARTIAL", "notes merge in progress"],
+  ["NOTES_MERGE_WORKTREE", "notes merge in progress"],
+  ["SQUASH_MSG", "squash merge pending (SQUASH_MSG)"],
 ] as const;
 
 async function operationInProgress(gitDir: string): Promise<string | null> {
   for (const [marker, why] of OPERATION_MARKERS) {
-    if (await stat(join(gitDir, marker)).catch(() => null)) {
+    if (await existsStrict(join(gitDir, marker))) {
       return `${why} (${marker} in the git dir); its state is not part of any branch, so removing the checkout would lose it`;
     }
   }
@@ -456,12 +477,19 @@ async function worktreeOnlyHistory(path: string): Promise<string | null> {
   );
   if (refs.stdout.trim())
     return `per-worktree refs exist (${preview(refs.stdout.trim().split("\n"))}); they vanish with the worktree`;
-  const log = await safeGitOrThrow(["log", "-g", "--format=%H", "-n", "1001", "HEAD"], {
-    ...READ_ONLY_GIT,
-    cwd: path,
-  }).catch(() => null);
-  const shas = [...new Set((log?.stdout ?? "").split("\n").filter(Boolean))];
-  if (shas.length > 1000) return "HEAD reflog has more than 1000 entries; not scanned, kept";
+  let entries: string[];
+  try {
+    const log = await safeGitOrThrow(["log", "-g", "--format=%H", "-n", "1001", "HEAD"], {
+      ...READ_ONLY_GIT,
+      cwd: path,
+    });
+    entries = log.stdout.split("\n").filter(Boolean);
+  } catch (error) {
+    return `HEAD reflog could not be read, kept: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`;
+  }
+  // Count raw entries BEFORE deduplicating: many resets at one commit must not hide older commits.
+  if (entries.length > 1000) return "HEAD reflog too long to verify (more than 1000 entries); kept";
+  const shas = [...new Set(entries)];
   if (shas.length === 0) return null;
   const lost = await safeGitOrThrow(["rev-list", "--max-count=1", ...shas, "--not", "--branches", "--tags"], {
     ...READ_ONLY_GIT,
@@ -494,7 +522,7 @@ async function initializedSubmodules(path: string): Promise<string[]> {
   for (const line of files.stdout.split("\n")) {
     if (!line.startsWith("160000 ")) continue;
     const sub = line.slice(line.indexOf("\t") + 1);
-    if (await stat(join(path, sub, ".git")).catch(() => null)) found.push(sub);
+    if (await existsStrict(join(path, sub, ".git"))) found.push(sub);
   }
   return found;
 }
@@ -546,6 +574,19 @@ async function reasonToKeep(
   wt: { path: string; branch: string | null; head: string | null },
   locked: Set<string>,
 ): Promise<string | null> {
+  // Any probe that errors (unreadable file, git failure, timeout) must keep the worktree, never pass it.
+  try {
+    return await reasonToKeepUnchecked(repo, wt, locked);
+  } catch (error) {
+    return `could not verify it is safe to reclaim, kept: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`;
+  }
+}
+
+async function reasonToKeepUnchecked(
+  repo: GitRepo,
+  wt: { path: string; branch: string | null; head: string | null },
+  locked: Set<string>,
+): Promise<string | null> {
   if (locked.has(wt.path)) return "locked by git (`git worktree lock`); left untouched";
   const gitDir = (
     await safeGitOrThrow(["rev-parse", "--absolute-git-dir"], { ...READ_ONLY_GIT, cwd: wt.path })
@@ -581,13 +622,18 @@ async function reasonToKeep(
   if (!wt.branch) {
     const dirty = lines.some((l) => !l.startsWith("!! "));
     if (!wt.head || !(await isReachableFromRef(repo, wt.head))) {
-      return `detached HEAD ${wt.head?.slice(0, 12) ?? "?"} is not reachable from any branch, tag or remote ref; removing would lose it`;
+      return `detached HEAD ${wt.head?.slice(0, 12) ?? "?"} is not reachable from any local branch or tag; removing would lose it`;
     }
     if (dirty) return "detached HEAD with uncommitted changes that could not be kept on a branch";
   }
   const onlyHere = await worktreeOnlyHistory(wt.path);
   if (onlyHere) return onlyHere;
-  const target = await rustTargetDir(wt.path).catch(() => null);
+  let target: string | null;
+  try {
+    target = await rustTargetDir(wt.path);
+  } catch (error) {
+    return `its Rust cache key could not be determined, kept: ${error instanceof Error ? error.message : String(error)}`;
+  }
   if (target && basename(target) === UNSCOPED_TARGET_KEY) {
     return "its Rust cache key is the shared `_shared` fallback; not deleting a directory other checkouts use";
   }

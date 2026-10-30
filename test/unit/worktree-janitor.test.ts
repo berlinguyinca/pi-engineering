@@ -32,6 +32,7 @@ import {
 import {
   describeHousekeeping,
   gcDryRun,
+  gcPlan,
   housekeepingMode,
   missionOwnerLiveness,
   runHousekeeping,
@@ -1255,6 +1256,10 @@ test("/gc previews unless --apply is given; --dry-run is an accepted alias and w
   assert.equal(gcDryRun("--dry-run"), true);
   assert.equal(gcDryRun("--apply"), false);
   assert.equal(gcDryRun("--apply --dry-run"), true);
+  assert.equal(gcDryRun("foo --apply bar"), true, "unknown tokens fall back to a preview");
+  assert.equal(gcDryRun("--apply\t\n"), false);
+  assert.match(gcPlan("foo --apply bar").note ?? "", /unknown argument.*foo.*bar/);
+  assert.equal(gcPlan("--apply").note, undefined);
 });
 
 test("an interrupted rebase --autostash keeps the worktree: the autostashed edit lives only in the git dir", async () => {
@@ -1486,6 +1491,125 @@ test("a leftover quarantine directory whose original path a durable record refer
     const report = await sweepOld(repo);
     assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
     assert.match(report.kept.find((k) => k.path === q)!.reason, /durable mission record/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+// ---- Review round 5 ----
+
+test("more than 1000 HEAD-reflog entries (few distinct commits) keep the worktree: the older worktree-only commit is not hidden", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("r1aaaa");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await commitFile(wt.path, "lost.txt", "ONLY-IN-HEAD-REFLOG\n");
+    const lost = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
+    await exec("git", ["-C", wt.path, "checkout", "-q", branch]);
+    const tip = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
+    // 1100 more entries at the same commit, exactly what repeated `git reset --hard HEAD` appends.
+    const logFile = join(await gitDirOf(wt.path), "logs", "HEAD");
+    let text = await readFile(logFile, "utf8");
+    for (let i = 0; i < 1100; i++) {
+      text += `${tip} ${tip} T <t@t> ${1700000000 + i} +0000\treset: moving to HEAD\n`;
+    }
+    await writeFile(logFile, text);
+    await ageWorktree(wt.path, 100 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /reflog too long to verify/);
+    }
+    await exec("git", ["-C", fixture.root, "cat-file", "-e", lost]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a HEAD reflog git cannot walk (entry naming a missing object) fails closed and keeps the worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("r2aaaa");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await commitFile(wt.path, "lost.txt", "ONLY-IN-HEAD-REFLOG\n");
+    const lost = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
+    await exec("git", ["-C", wt.path, "checkout", "-q", branch]);
+    const tip = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
+    const logFile = join(await gitDirOf(wt.path), "logs", "HEAD");
+    const missing = "d".repeat(40);
+    await writeFile(
+      logFile,
+      `${await readFile(logFile, "utf8")}${tip} ${missing} T <t@t> 1800000000 +0000\tbroken\n${missing} ${tip} T <t@t> 1800000001 +0000\tback\n`,
+    );
+    await ageWorktree(wt.path, 100 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    }
+    await exec("git", ["-C", fixture.root, "cat-file", "-e", lost]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("notes-merge state files and a pending squash merge keep the worktree and name the operation", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const notes = await repo.createWorktree(await repo.headCommit(), CAND("r5aaaa"));
+    const squash = await repo.createWorktree(await repo.headCommit(), CAND("r5bbbb"));
+    await writeFile(join(await gitDirOf(notes.path), "NOTES_MERGE_PARTIAL"), "x\n");
+    await exec("git", ["-C", squash.path, "branch", "side"]);
+    await exec("git", ["-C", squash.path, "checkout", "-q", "side"]);
+    await commitFile(squash.path, "s.txt", "side\n");
+    await exec("git", ["-C", squash.path, "checkout", "-q", CAND("r5bbbb")]);
+    await exec("git", ["-C", squash.path, "merge", "-q", "--squash", "side"]);
+    assert.equal(await exists(join(await gitDirOf(squash.path), "SQUASH_MSG")), true);
+    await ageWorktree(notes.path, 100 * HOUR);
+    await ageWorktree(squash.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === notes.path)!.reason, /notes merge in progress/);
+    assert.match(report.kept.find((k) => k.path === squash.path)!.reason, /squash merge pending/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("the stale index.lock advice tells the user to run git reset before committing", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("q5bbbb"));
+    await writeFile(
+      join(await gitDirOf(wt.path), "index.lock"),
+      `pi-eng-janitor pid=2147483646 ts=${Date.now() - 3 * HOUR}\n`,
+    );
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /git reset/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("detached-HEAD reason text names branches and tags only (remote-tracking refs do not count)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("txt001");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await commitFile(wt.path, "u.txt", "u\n");
+    await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await exec("git", ["-C", fixture.root, "branch", "-D", branch]);
+    await ageWorktree(wt.path, 100 * HOUR);
+    const reason = (await sweepOld(repo)).kept.find((k) => k.path === wt.path)!.reason;
+    assert.match(reason, /not reachable from any local branch or tag/);
+    assert.doesNotMatch(reason, /remote/);
   } finally {
     await fixture.cleanup();
   }

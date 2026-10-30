@@ -105,7 +105,7 @@ import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.t
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { resolveStateRoot } from "../src/runtime/isolation/stateDir.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
-import { describeHousekeeping, gcDryRun, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
+import { describeHousekeeping, gcPlan, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
 import {
   clearOperatorModelPin,
   describeMissionControl,
@@ -798,10 +798,11 @@ export default function (pi: ExtensionAPI) {
     description:
       "Preview which abandoned pi-eng candidate worktrees and expired Rust build caches housekeeping would reclaim, and what it keeps and why. Nothing is removed unless you pass --apply (--dry-run is the default and accepted as an alias).",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const dryRun = gcDryRun(args);
+      const { dryRun, note } = gcPlan(args);
       const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
       const result = await runHousekeeping({ cwd: ctx.cwd, missions: runtime?.missionStore, dryRun });
       const lines = describeHousekeeping(result, { verbose: true });
+      if (note) lines.unshift(`[/gc] ${note}`);
       if (dryRun) lines.push("Preview only: nothing was removed. Run `/gc --apply` to reclaim what is listed above.");
       ctx.ui.notify(
         lines.length > 0 ? lines.join("\n") : "Nothing to reclaim.",

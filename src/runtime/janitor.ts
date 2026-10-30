@@ -68,11 +68,23 @@ export function housekeepingMode(env: Record<string, string | undefined> = proce
 
 /**
  * `/gc` arguments. It previews by default; only an explicit `--apply` acts.
- * `--dry-run` is accepted as a no-op alias, and `--apply --dry-run` stays a preview.
+ * `--dry-run` is accepted as a no-op alias and wins over `--apply`. Any other
+ * token is unknown and makes the command fall back to a preview, with a note.
  */
-export function gcDryRun(args: string): boolean {
+export function gcPlan(args: string): { dryRun: boolean; note?: string } {
   const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
-  return !argv.includes("--apply") || argv.includes("--dry-run");
+  const unknown = argv.filter((a) => a !== "--apply" && a !== "--dry-run");
+  if (unknown.length > 0) {
+    return {
+      dryRun: true,
+      note: `unknown argument(s) ${unknown.join(", ")}: showing a preview instead; use \`/gc --apply\` alone to act`,
+    };
+  }
+  return { dryRun: !argv.includes("--apply") || argv.includes("--dry-run") };
+}
+
+export function gcDryRun(args: string): boolean {
+  return gcPlan(args).dryRun;
 }
 
 export interface HousekeepingResult {
