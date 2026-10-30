@@ -140,3 +140,23 @@ test("evidence is recorded and linked to a candidate", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("a failed task is logged as task.failed, not task.started", async () => {
+  const dir = await tmpDir();
+  try {
+    const file = join(dir, "ledger.jsonl");
+    const ledger = await Ledger.create(file);
+    const wi = await ledger.createWorkItem("implement add", "medium", ["."], actor);
+    const task = await ledger.createTask(wi.id, "do it", "implement", "medium", actor);
+    await ledger.setTaskStatus(task.id, "failed", wi.id, actor);
+    assert.equal(ledger.getTask(task.id)?.status, "failed");
+    const types = (await readFile(file, "utf8"))
+      .trim()
+      .split("\n")
+      .map((l) => (JSON.parse(l) as { type: string }).type);
+    assert.equal(types.at(-1), "task.failed");
+    assert.ok(!types.includes("task.started"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

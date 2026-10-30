@@ -177,6 +177,7 @@ export class Ledger {
       case "task.completed":
       case "task.started":
       case "task.blocked":
+      case "task.failed":
       case "task.updated": {
         const t = this.tasks.get(p.task_id as string);
         if (t) {
@@ -331,7 +332,14 @@ export class Ledger {
   }
 
   async setTaskStatus(id: string, status: Task["status"], workItemId: string, actor: Actor): Promise<void> {
-    const type = status === "completed" ? "task.completed" : status === "blocked" ? "task.blocked" : "task.started";
+    const type =
+      status === "completed"
+        ? "task.completed"
+        : status === "blocked"
+          ? "task.blocked"
+          : status === "failed"
+            ? "task.failed"
+            : "task.started";
     await this.emit(type, workItemId, actor, { task_id: id, status });
   }
 

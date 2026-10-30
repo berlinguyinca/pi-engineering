@@ -17,6 +17,7 @@ export type EventType =
   | "task.started"
   | "task.completed"
   | "task.blocked"
+  | "task.failed"
   | "task.updated"
   | "agent.started"
   | "agent.completed"
