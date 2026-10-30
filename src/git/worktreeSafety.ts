@@ -28,7 +28,7 @@ export const ANY_DEPTH_DERIVED_DIRS: ReadonlySet<string> = new Set([
 export const DERIVED_FILE = /\.tsbuildinfo$/;
 /** Files that look like secrets: found beneath a derived dir (other than node_modules) they keep the worktree. */
 const SECRET_FILE =
-  /^(\.env(\..*|-.*)?|\.envrc|.*\.env|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|.*\.(p12|pfx|jks|keystore|kdbx)|\.npmrc|\.netrc|\.pgpass|credentials(\.(json|ya?ml|toml|ini|xml|csv|txt))?|kubeconfig|service-account.*\.json)$/i;
+  /^(\.env(\..*|-.*)?|\.envrc|.*\.env|.*\.pem|.*\.key|id_(rsa|dsa|ecdsa|ed25519)([._-].*)?|\.git-credentials|.*\.(p12|pfx|jks|keystore|kdbx)|\.npmrc|\.netrc|\.pgpass|credentials(\.(json|ya?ml|toml|ini|xml|csv|txt))?|kubeconfig|service-account.*\.json)$/i;
 
 export const MAX_WALK_ENTRIES = 1_000_000;
 

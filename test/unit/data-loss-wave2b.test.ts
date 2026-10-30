@@ -1192,6 +1192,96 @@ for (const [name, blocks] of [
   });
 }
 
+for (const mode of ["copied-checkout", "symlink-spelling"] as const) {
+  test(`cleanup of a ${mode} of a live worktree never touches the live worktree's admin dir`, async () => {
+    const { head, git, dir } = await scratchRepo();
+    const branchName = `alias-${mode}-${process.pid}-${Date.now().toString(36)}`;
+    const wt = await git.createWorktree(head, branchName);
+    writeFileSync(join(wt.path, "staged.txt"), "STAGED ONLY");
+    await g(wt.path, "add", "staged.txt");
+    const alias = join(dirname(wt.path), basename(wt.path).replace(/^pi-eng-[0-9a-z]+-/, "pi-eng-zzzzzz-"));
+    if (mode === "copied-checkout") cpSync(wt.path, alias, { recursive: true });
+    else symlinkSync(wt.path, alias);
+    await git
+      .removeWorktree({ path: alias, branch: branchName }, { cleanupIdentity: { missionId: "m1", repoId: "r1" } })
+      .catch(() => {});
+    assert.match(await g(wt.path, "status", "--short"), /^A\s+staged\.txt/m);
+    assert.ok((await g(dir, "worktree", "list")).includes(wt.path));
+    assert.ok(existsSync(adminOf(dir, wt.path)));
+    assert.ok(existsSync(join(adminOf(dir, wt.path), "index")));
+  });
+}
+
+test("in-progress refusals name the path and the exact command", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const wt = await git.createWorktree(head, "msg-1");
+  const admin = adminOf(dir, wt.path);
+  mkdirSync(join(admin, "rebase-merge"));
+  rmSync(wt.path, { recursive: true, force: true });
+  await assert.rejects(git.createWorktree(head, "msg-1"), (e: Error) => {
+    assert.ok(e.message.includes(`git -C ${wt.path} rebase --abort`), e.message);
+    return true;
+  });
+  rmSync(join(admin, "rebase-merge"), { recursive: true });
+  writeFileSync(join(admin, "locked"), "usb drive");
+  await assert.rejects(git.createWorktree(head, "msg-1"), (e: Error) => {
+    assert.ok(e.message.includes("usb drive") && e.message.includes(`git worktree unlock ${wt.path}`), e.message);
+    return true;
+  });
+});
+
+test("ambiguous admin dirs for a vanished worktree are named in the operator error", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const wt = await git.createWorktree(head, "amb-1");
+  const admin = adminOf(dir, wt.path);
+  cpSync(admin, `${admin}-stale`, { recursive: true });
+  rmSync(wt.path, { recursive: true, force: true });
+  await assert.rejects(git.createWorktree(head, "amb-1"), (e: Error) => {
+    assert.ok(e.message.includes(`${admin}-stale`) && /several administrative directories/.test(e.message), e.message);
+    return true;
+  });
+});
+
+for (const secret of [".git-credentials", "id_rsa_backup", "id_ed25519-old", "id_rsa.bak"]) {
+  test(`removal keeps a worktree with ${secret} under target/`, async () => {
+    const { head, git } = await userDataRepo();
+    const info = await git.createWorktree(head, `sec6-${secret.replace(/\W/g, "")}`);
+    mkdirSync(join(info.path, "target", "x"), { recursive: true });
+    writeFileSync(join(info.path, "target", "x", secret), "s");
+    await assert.rejects(git.removeWorktree(info, { keepBranch: true }));
+    assert.ok(existsSync(join(info.path, "target", "x", secret)));
+  });
+}
+
+test("rebaseWorktreeOnto works when git has no identity (the -c options precede the subcommand)", async () => {
+  const { head, git, dir } = await scratchRepo();
+  const wt = await git.createWorktree(head, "rb-id");
+  const id = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"];
+  writeFileSync(join(wt.path, "c.txt"), "c");
+  await exec("git", ["-C", wt.path, ...id, "add", "-A"]);
+  await exec("git", ["-C", wt.path, ...id, "commit", "-qm", "c"]);
+  writeFileSync(join(dir, "m.txt"), "m");
+  await g(dir, "add", "-A");
+  await g(dir, "commit", "-qm", "m");
+  const onto = await g(dir, "rev-parse", "HEAD");
+  const saved = { global: process.env.GIT_CONFIG_GLOBAL, nosys: process.env.GIT_CONFIG_NOSYSTEM };
+  await exec("git", ["-C", dir, "config", "--unset", "user.name"]);
+  await exec("git", ["-C", dir, "config", "--unset", "user.email"]);
+  process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+  process.env.GIT_CONFIG_NOSYSTEM = "1";
+  try {
+    const fresh = await GitRepo.open(dir);
+    assert.ok(fresh);
+    const r = await fresh.rebaseWorktreeOnto(wt, onto);
+    assert.equal(r.ok, true, String(r.reason));
+  } finally {
+    if (saved.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = saved.global;
+    if (saved.nosys === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+    else process.env.GIT_CONFIG_NOSYSTEM = saved.nosys;
+  }
+});
+
 test("restoreCheckpoint recovers the NEWEST leftover (by timestamp, not pid) and keeps a recovered copy when swapping", async () => {
   const root = mkdtempSync(join(tmpdir(), "w2b-ck4-"));
   const checkpoint = join(root, "cp");

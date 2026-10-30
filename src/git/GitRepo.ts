@@ -1608,10 +1608,7 @@ export class GitRepo {
     // Authoritative admin dir (a live worktree names it itself); without one we cannot save a detached
     // HEAD or see an in-progress rebase, so the worktree stays.
     const admin = await this.adminDirFor(path);
-    const unsafe =
-      admin === null
-        ? "its administrative directory cannot be identified unambiguously"
-        : await this.inProgressReason(admin);
+    const unsafe = admin === null ? await this.unidentifiedAdminReason(path) : await this.inProgressReason(admin, path);
     if (unsafe !== null) {
       await this.recordKeptWorktree(path, unsafe);
       return unsafe;
@@ -1634,12 +1631,26 @@ export class GitRepo {
     return again;
   }
 
+  /** `; a rebase/merge may be in progress in <path> (...)` when the worktree's admin dir shows one, else "". */
+  private async inProgressHint(path: string): Promise<string> {
+    const admin = await this.adminDirFor(path).catch(() => null);
+    const busy = admin === null ? null : await this.inProgressReason(admin, path);
+    return busy === null ? "" : `; a rebase/merge may be in progress in ${path}: ${busy}`;
+  }
+
+  private async unidentifiedAdminReason(path: string): Promise<string> {
+    const matches = await this.adminMatches(path);
+    return matches.length > 1
+      ? `several administrative directories claim ${path} (${matches.join(", ")}); remove the stale one(s) yourself`
+      : `the administrative directory of ${path} cannot be identified; inspect it yourself`;
+  }
+
   private async refusalFor(path: string): Promise<string | null> {
     const ownLink = await this.isOwnNodeModulesLink(path);
     const blockers = await removalBlockers(path, { ownNodeModulesLink: ownLink });
     if (blockers === null) return "the worktree cannot be inspected";
     if (blockers.length > 0) {
-      return `it holds files removal would lose (${blockers.length}): ${blockers.slice(0, 5).join(", ")}`;
+      return `it holds files removal would lose (${blockers.length}): ${blockers.slice(0, 5).join(", ")}${await this.inProgressHint(path)}`;
     }
     return null;
   }
@@ -1749,6 +1760,16 @@ export class GitRepo {
           );
         }
       } else {
+        const claims = await this.adminMatches(path);
+        if (claims.length !== 1) {
+          this.refuseReplace(
+            `refusing to replace the registered worktree at ${path}: ${
+              claims.length > 1
+                ? `several administrative directories claim it (${claims.join(", ")}); remove the stale one(s) yourself`
+                : "its administrative directory cannot be found; run `git worktree prune` after checking it"
+            }`,
+          );
+        }
         const kept = await this.forgetWorktreeAdmin(path); // metadata only: the working directory is already gone
         if (kept !== null) {
           this.refuseReplace(`refusing to replace the registered worktree at ${path} (admin data kept): ${kept}`);
@@ -2004,18 +2025,26 @@ export class GitRepo {
    * path's entry needs no lock, because every caller owns a distinct path.
    */
   private async forgetWorktreeAdmin(path: string): Promise<string | null> {
-    const admin = await this.adminDirFor(path);
-    if (admin === null) return null;
-    const busy = await this.inProgressReason(admin);
-    if (busy !== null) return busy;
+    // Metadata only: while the directory exists it may be a copy or another spelling of a LIVE worktree.
     if (
-      await lstat(join(admin, "locked")).then(
+      await lstat(path).then(
         () => true,
         () => false,
       )
     ) {
+      return `${path} still exists; only the administration of a vanished worktree is forgotten`;
+    }
+    const admin = await this.adminDirFor(path);
+    if (admin === null) return null;
+    const busy = await this.inProgressReason(admin, path);
+    if (busy !== null) return busy;
+    const lock = await readFile(join(admin, "locked"), "utf8").then(
+      (text) => text.trim(),
+      () => null,
+    );
+    if (lock !== null) {
       emitTelemetry({ level: "warning", text: `worktree admin ${admin} is locked; left untouched` });
-      return "the worktree is locked";
+      return `the worktree is locked (${lock || "no reason given"}); run \`git worktree unlock ${path}\` if that is intended`;
     }
     // Save detached-HEAD commits that no branch/tag holds BEFORE the admin dir (and its HEAD) goes.
     await this.preserveDetachedHead(admin, basename(path));
@@ -2023,25 +2052,26 @@ export class GitRepo {
     return null;
   }
 
-  /** Why this admin dir must not be dropped: an operation (rebase, merge, ...) still holds state in it. */
-  private async inProgressReason(adminDir: string): Promise<string | null> {
-    for (const entry of [
-      "rebase-merge",
-      "rebase-apply",
-      "sequencer",
-      "MERGE_HEAD",
-      "MERGE_AUTOSTASH",
-      "CHERRY_PICK_HEAD",
-      "REVERT_HEAD",
-      "BISECT_LOG",
-    ]) {
+  /** Why this admin dir must not be dropped (an operation holds state in it), naming the command that ends it. */
+  private async inProgressReason(adminDir: string, path: string): Promise<string | null> {
+    const fixes: Array<[string, string]> = [
+      ["rebase-merge", "rebase --abort"],
+      ["rebase-apply", "rebase --abort"],
+      ["MERGE_HEAD", "merge --abort"],
+      ["MERGE_AUTOSTASH", "merge --abort"],
+      ["CHERRY_PICK_HEAD", "cherry-pick --abort (or --quit)"],
+      ["REVERT_HEAD", "revert --abort (or --quit)"],
+      ["sequencer", "cherry-pick --quit (or revert --quit)"],
+      ["BISECT_LOG", "bisect reset"],
+    ];
+    for (const [entry, command] of fixes) {
       if (
         await lstat(join(adminDir, entry)).then(
           () => true,
           () => false,
         )
       ) {
-        return `an operation is in progress in it (${entry}); finish or abort it first`;
+        return `an operation is in progress in ${path} (${entry}); finish it or run \`git -C ${path} ${command}\``;
       }
     }
     return null;
@@ -2060,7 +2090,20 @@ export class GitRepo {
       if (own.code === 0 && own.stdout) {
         const abs = await realpath(own.stdout).catch(() => own.stdout);
         const root = await realpath(join(common, "worktrees")).catch(() => join(common, "worktrees"));
-        if (dirname(abs) === root) return join(common, "worktrees", basename(abs));
+        if (dirname(abs) === root) {
+          const admin = join(common, "worktrees", basename(abs));
+          // Git answers for a COPY or another spelling of a live worktree too: accept only the admin dir
+          // that points back at exactly this directory.
+          const real = await realpath(path).catch(() => path);
+          const raw = (await readFile(join(admin, "gitdir"), "utf8").catch(() => "")).trim();
+          const pointer = raw && !isAbsolute(raw) ? resolve(admin, raw) : raw;
+          const pointed = pointer ? await realpath(pointer).catch(() => pointer) : "";
+          if (pointed !== join(real, ".git")) return null;
+          // A symlink onto a registered worktree is that worktree under another name.
+          const leafLink = (await lstat(path)).isSymbolicLink();
+          if (real !== path && leafLink && (await this.registeredWorktrees()).some((w) => w.path === real)) return null;
+          return admin;
+        }
       }
     }
     return this.findAdminDir(path);
@@ -2078,8 +2121,20 @@ export class GitRepo {
    * Null (and a telemetry note) when there is no single unambiguous match.
    */
   private async findAdminDir(path: string): Promise<string | null> {
+    const matches = await this.adminMatches(path);
+    if (matches.length > 1) {
+      emitTelemetry({
+        level: "warning",
+        text: `ambiguous worktree admin dirs for ${path}; left untouched: ${matches.join(", ")}`,
+      });
+    }
+    return matches.length === 1 ? (matches[0] as string) : null;
+  }
+
+  /** Every admin dir whose `gitdir` pointer names `path`. */
+  private async adminMatches(path: string): Promise<string[]> {
     const common = await this.commonGitDir();
-    if (common === null) return null;
+    if (common === null) return [];
     const root = join(common, "worktrees");
     const names = await readdir(root).catch(() => [] as string[]);
     const wanted = new Set([join(path, ".git"), join(await realpath(path).catch(() => path), ".git")]);
@@ -2090,13 +2145,7 @@ export class GitRepo {
       const pointer = raw && !isAbsolute(raw) ? resolve(join(root, name), raw) : raw;
       if (pointer && wanted.has(pointer)) matches.push(join(root, name));
     }
-    if (matches.length > 1) {
-      emitTelemetry({
-        level: "warning",
-        text: `ambiguous worktree admin dirs for ${path}; left untouched: ${matches.join(", ")}`,
-      });
-    }
-    return matches.length === 1 ? (matches[0] as string) : null;
+    return matches;
   }
 
   /**
@@ -2120,6 +2169,9 @@ export class GitRepo {
       const name = n === 0 ? base : `${base}.${n}`;
       if ((await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`])).code === 0) continue;
       const made = await this.git(["branch", name, head]);
+      if (made.code !== 0 && (await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`])).code === 0) {
+        continue; // a concurrent creator took this name between the check and the branch
+      }
       if (made.code !== 0) throw new Error(`cannot preserve detached HEAD ${head} of ${leaf}: ${made.stderr}`);
       emitTelemetry({ level: "warning", text: `detached worktree HEAD ${head} kept as ${name}` });
       return;
@@ -2184,7 +2236,9 @@ export class GitRepo {
             }
           }
           if (inventory.records.length > 0 && !pending) {
-            throw new Error("cleanup ownership does not match the requested repository worktree path and branch");
+            throw new Error(
+              `cleanup ownership does not match the requested repository worktree path and branch${await this.inProgressHint(info.path)}`,
+            );
           }
           if (!pending) {
             pending = {
@@ -2233,7 +2287,9 @@ export class GitRepo {
                 await this.moveAsideOrphan(info.path);
               }
             } else if (!pathEntry.split("\n").includes(`branch ${expectedBranch}`)) {
-              throw new Error("cleanup ownership does not match an exact repository worktree path and branch mapping");
+              throw new Error(
+                `cleanup ownership does not match an exact repository worktree path and branch mapping${await this.inProgressHint(info.path)}`,
+              );
             } else {
               guard?.assertAuthoritative();
               // Plain remove after checking for ignored user files too (git deletes those
@@ -2249,9 +2305,20 @@ export class GitRepo {
           // Targeted, for the same reason creation is: a global prune here would
           // be able to delete a concurrently-created sibling's administration.
           guard?.assertAuthoritative();
-          const keptAdmin = await this.forgetWorktreeAdmin(info.path);
-          if (keptAdmin !== null) {
-            throw new Error(`worktree administration of ${info.path} kept (branch ${info.branch} kept): ${keptAdmin}`);
+          // Skipped while the directory is still there (a foreign worktree-shaped checkout was left alone):
+          // its admin dir, if any, belongs to a live worktree.
+          if (
+            !(await lstat(info.path).then(
+              () => true,
+              () => false,
+            ))
+          ) {
+            const keptAdmin = await this.forgetWorktreeAdmin(info.path);
+            if (keptAdmin !== null) {
+              throw new Error(
+                `worktree administration of ${info.path} kept (branch ${info.branch} kept): ${keptAdmin}`,
+              );
+            }
           }
           if (pending) {
             pending = { ...pending, state: "worktree_removed", updatedAt: new Date().toISOString() };
@@ -2368,7 +2435,7 @@ export class GitRepo {
   /** Move an orphaned worktree directory to `<parent>/.pi-eng-trash/<ts>-<name>`; never deletes. */
   private async moveAsideOrphan(path: string): Promise<void> {
     const admin = await this.findAdminDir(path);
-    const busy = admin === null ? null : await this.inProgressReason(admin);
+    const busy = admin === null ? null : await this.inProgressReason(admin, path);
     if (busy !== null) throw new Error(`refusing to move ${path} aside (kept): ${busy}`);
     const trash = join(dirname(path), ".pi-eng-trash");
     await mkdir(trash, { recursive: true });
@@ -2476,7 +2543,7 @@ export class GitRepo {
       };
     }
     guard?.assertAuthoritative();
-    const args = ["-C", worktree.path, "rebase", "--quiet", ...(await this.fallbackIdentityArgs()), ontoSha];
+    const args = ["-C", worktree.path, ...(await this.fallbackIdentityArgs()), "rebase", "--quiet", ontoSha];
     const r = await this.git(args);
     if (r.code !== 0) {
       const text = `${r.stderr}\n${r.stdout}`;
