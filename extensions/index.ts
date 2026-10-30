@@ -4,6 +4,8 @@ import { join, resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
 import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
+import { createGraphReader, formatTaskGraph } from "../src/runtime/herdr/graphClient.ts";
+import { loadHerdrConnection } from "../src/runtime/herdr/herdrConnection.ts";
 import { runRoomCommand } from "../src/runtime/herdr/roomClient.ts";
 import { formatMissionActivity } from "../src/status/missionActivity.ts";
 import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
@@ -2724,8 +2726,16 @@ ${RECOVERY_PROMPT}`;
   });
 
   pi.registerCommand("work", {
-    description: "Show tracked work (tasks, runs, verification) across the Ledger and existing Missions.",
-    handler: async (_args, ctx) => {
+    description:
+      "Show tracked work (tasks, runs, verification) across the Ledger and existing Missions; /work <task id> shows the task's Herdr graph.",
+    handler: async (args, ctx) => {
+      const taskId = String(args ?? "").trim();
+      if (taskId) {
+        // `/work <task id>`: read the task's neighbourhood back from the Herdr graph. Never throws; "unavailable" if Herdr is down.
+        const { connection } = await loadHerdrConnection(getAgentDir());
+        ctx.ui.notify(formatTaskGraph(await createGraphReader(connection).getTaskGraph(taskId), taskId), "info");
+        return;
+      }
       const rt = await getRuntime(ctx);
       const projection = new LedgerWorkProjection(rt.ledger);
       projection.catchUp();

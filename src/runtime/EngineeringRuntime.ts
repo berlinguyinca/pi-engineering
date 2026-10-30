@@ -105,6 +105,7 @@ import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "
 import { TestQuarantine } from "../verify/testQuarantine.ts";
 import { LedgerWorkProjection } from "../work/ledgerProjection.ts";
 import { TaskLineageProjector } from "../work/taskLineage.ts";
+import { ledgerTaskRefs } from "../work/taskRefs.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { WAITING_FOR_INFERENCE_SUMMARY } from "../workers/activity.ts";
@@ -1443,6 +1444,8 @@ export class EngineeringRuntime {
       rt.taskLineage = new TaskLineageProjector(
         new LedgerWorkProjection(ledger, { staleAfterMs: rt.livenessStaleMs }),
         opts.lineage,
+        undefined,
+        ledgerTaskRefs(ledger),
       );
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
     rt.testQuarantine = new TestQuarantine(workDir);

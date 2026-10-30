@@ -383,7 +383,7 @@ async function review(input: PlanGateInput, rev: PlanRevisionRecord, now: () => 
 
 // ── Lineage emission (only when an emitter is configured) ────────────────────
 
-const planNode = (missionId: string, revision: number): string => `plan:${missionId}/${revision}`;
+export const planNode = (missionId: string, revision: number): string => `plan:${missionId}/${revision}`;
 
 async function safeStage(emitter: PlanLineageEmitter | null | undefined, draft: EnvelopeDraft): Promise<void> {
   if (!emitter) return;
