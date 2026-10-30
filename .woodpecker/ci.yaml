@@ -5,9 +5,10 @@
 # lint, typecheck, unit, integration, then the structural roadmap check.
 # `bash`-level reproduction: run the same npm scripts from a clean checkout.
 #
-# NOT carried over from the Actions workflow: nightly-dogfood, the
-# `release-gate` job (`npm run roadmap:check`, release/* tags only), and
-# `npm run test:e2e`. The PR-time roadmap check stays structural only.
+# NOT carried over from the Actions workflow: nightly-dogfood. The
+# `release-gate` job (full `npm run roadmap:check`) lives in
+# .woodpecker/release-gate.yaml and runs on release/* tags only.
+# The PR-time roadmap check stays structural only.
 #
 # Conventions follow the org's other Woodpecker pipelines (inferweave
 # .woodpecker/rust.yaml, herdr ui-gates.yml). Read from them, not observed
@@ -46,43 +47,56 @@ steps:
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
       - 'git remote add origin "https://github.com/${CI_REPO}.git"'
-      # Full history, as the Actions job had (fetch-depth: 0): roadmap
-      # evidence freshness diffs against the recorded evidence commit and a
-      # shallow clone would read as stale.
-      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'
+      # Full history, all branches and tags, as the Actions job had
+      # (fetch-depth: 0): roadmap evidence freshness diffs against the
+      # recorded evidence commit (changedPathsSince) and a shallow clone
+      # would read as stale. The commit itself is fetched by SHA too, since a
+      # PR head is not on any branch.
+      - 'git fetch --tags --prune origin "+refs/heads/*:refs/remotes/origin/*" "$CI_COMMIT_SHA"'
       - 'git checkout -q FETCH_HEAD'
+      # The test venv lives in the workspace (see install); keep it out of git.
+      - 'echo "/.ci-venv/" >> .git/info/exclude'
       - 'git --no-pager log --oneline -1'
 
   - name: toolchain
     image: bash
     commands:
       - 'set -eu'
-      - 'command -v node >/dev/null && command -v npm >/dev/null || { echo "node/npm missing on this agent" >&2; exit 1; }'
-      # The harness runs .ts files with Node's type stripping: needs 22.6+.
-      - 'node -e "const [a,b]=process.versions.node.split(\".\").map(Number); if (a<22||(a===22&&b<6)) { console.error(\"Node 22.6+ required, found \"+process.version); process.exit(1); }"'
-      - 'echo "node=$(node --version) npm=$(npm --version)"'
+      - 'for t in node npm git make python3 bash; do command -v "$t" >/dev/null || { echo "missing on this agent: $t" >&2; exit 1; }; done'
+      # package.json runs .ts files with no flag: type stripping is on by
+      # default only from Node 22.18.
+      - 'node -e "const [a,b]=process.versions.node.split(\".\").map(Number); if (a<22||(a===22&&b<18)) { console.error(\"Node 22.18+ required, found \"+process.version); process.exit(1); }"'
+      - 'echo "node=$(node --version) npm=$(npm --version) $(python3 --version) $(make --version | head -1)"'
 
   - name: install
     image: bash
-    commands:
-      - 'set -eu'
-      - 'npm ci --no-audit --no-fund'
-      # The CAV suites drive a real headless Chromium; npm ci does not fetch
-      # the binary. No --with-deps: the hosts have no apt/sudo, so system
-      # libraries must already be present.
-      - 'npx playwright install chromium'
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
+    commands:
+      - 'set -eu'
+      - 'timeout -k 30 15m npm ci --no-audit --no-fund'
+      # The CAV suites drive a real headless Chromium; npm ci does not fetch
+      # the binary. No --with-deps: the hosts have no apt/sudo, so system
+      # libraries must already be present. The browser cache path is not
+      # commit-keyed; the download is version-locked by package-lock.json.
+      - 'timeout -k 30 15m npx playwright install chromium'
+      # test/unit/verifier.test.ts drives a real `make test` and a real
+      # pytest suite, with no skip guard. PATH is NOT persisted between steps
+      # (nor HOME), so the venv lives in the shared workspace and the test
+      # steps re-export PATH.
+      - 'python3 -m venv .ci-venv'
+      - '.ci-venv/bin/pip install -q pytest'
+      - '.ci-venv/bin/python -m pytest --version'
 
   - name: lint
     image: bash
     commands:
-      - 'npm run lint'
+      - 'timeout -k 30 10m npm run lint'
 
   - name: typecheck
     image: bash
     commands:
-      - 'npm run typecheck'
+      - 'timeout -k 30 10m npm run typecheck'
 
   # Never bare `node --test`: git-touching suites need
   # test/support/isolatedState.ts, which the npm scripts import.
@@ -91,18 +105,29 @@ steps:
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
-      - 'npm run test:unit'
+      - 'export PATH="$PWD/.ci-venv/bin:$PATH"'
+      - 'timeout -k 30 30m npm run test:unit'
 
   - name: test-integration
     image: bash
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
-      - 'npm run test:integration'
+      - 'export PATH="$PWD/.ci-venv/bin:$PATH"'
+      - 'timeout -k 30 40m npm run test:integration'
+
+  # The old verify job's "Package-load + command smoke".
+  - name: smoke
+    image: bash
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: *browsers
+    commands:
+      - 'timeout -k 30 10m npm run test:e2e'
 
   # PR-time structural check only (definition + manual evidence index); the
   # full `roadmap:check` release gate is deliberately not run here.
   - name: roadmap-structural
     image: bash
     commands:
-      - 'npm run roadmap:structural'
+      - 'export PATH="$PWD/.ci-venv/bin:$PATH"'
+      - 'timeout -k 30 10m npm run roadmap:structural'

@@ -594,7 +594,7 @@ npm run typecheck     # core + mission-recovery script tsconfigs
 npm test              # node --test (unit + integration, deterministic)
 ```
 
-- Tests run via `node --test` (Node >= 22.6 native type-stripping); imports use
+- Tests run via `node --test` (Node >= 22.18 native type-stripping); imports use
   explicit `.ts` extensions.
 - `test/fixtures/make-fixture.ts` builds temporary git fixture repos.
 - `test/integration/vertical-slice.test.ts` is the end-to-end slice using a
