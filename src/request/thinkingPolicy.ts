@@ -295,6 +295,50 @@ const VISIBLE_CHAR_LIMIT = 40;
 const MIN_HIDDEN_OUTPUT_TOKENS = 256;
 
 /**
+ * Lead of every error that reports a reply cut at the output limit (stop reason
+ * "length"). A cut reply is never a result, whatever partial text it carries.
+ * No digits: Pi's retry matcher, lacking word boundaries, could catch them.
+ */
+export const TRUNCATED_REPLY = "Reply truncated at the output limit";
+
+export function isTruncatedReply(text: string | undefined): boolean {
+  return text?.startsWith(TRUNCATED_REPLY) === true;
+}
+
+/**
+ * Ceiling of a retry allowance. Pi's registry holds only `maxTokens`, with no
+ * separate provider hard limit, so the raise is a bounded multiple: a provider
+ * that still refuses it says so in the retry's error, which the failure keeps.
+ */
+export const RETRY_ALLOWANCE_CEILING = 65_536;
+
+type Allowance = { maxTokens?: number; contextWindow?: number };
+
+/** The output allowance a request is sent with: the registered one, after the invocation cap. */
+export function sentAllowance(model: Allowance, cap?: number): number | undefined {
+  const { maxTokens } = model;
+  if (!maxTokens || maxTokens <= 0) return undefined;
+  return cap !== undefined ? Math.min(maxTokens, cap) : maxTokens;
+}
+
+/**
+ * The retry allowance after a length stop: double, within half the window, the
+ * ceiling and the invocation cap. Undefined unless it exceeds what was sent.
+ */
+export function raisedAllowance(model: Allowance, cap?: number): number | undefined {
+  const sent = sentAllowance(model, cap);
+  if (sent === undefined) return undefined;
+  const { contextWindow: win } = model;
+  const next = Math.min(
+    sent * 2,
+    win ? Math.floor(win / 2) : Number.POSITIVE_INFINITY,
+    RETRY_ALLOWANCE_CEILING,
+    cap ?? Number.POSITIVE_INFINITY,
+  );
+  return next > sent ? next : undefined;
+}
+
+/**
  * Explain a reply cut at "length" that shows almost nothing because the model
  * spent its WHOLE output allowance (`maxTokens`) on hidden reasoning.
  * Undefined for anything else — in particular for a length stop below
@@ -319,7 +363,7 @@ export function describeHiddenReasoningTruncation(
   const output = message.usage?.output ?? 0;
   if (output < Math.max(MIN_HIDDEN_OUTPUT_TOKENS, Math.ceil(visible.length / 4) * 8)) return undefined;
   const shown = visible ? `"${visible}"` : "nothing";
-  return `The model was cut off after ${shown}: it spent its whole output allowance on hidden reasoning before answering, so the reply is out of budget as sent. Thinking is switched off automatically for summaries and near-full contexts on gateways that support it; compact the conversation (/compact) or start a new session, then ask again.`;
+  return `${TRUNCATED_REPLY}. The model was cut off after ${shown}: it spent its whole output allowance on hidden reasoning before answering, so the reply is out of budget as sent. Thinking is switched off automatically for summaries and near-full contexts on gateways that support it; compact the conversation (/compact) or start a new session, then ask again.`;
 }
 
 interface AttemptLike<E, R> extends AsyncIterable<E> {

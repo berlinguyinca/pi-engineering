@@ -65,8 +65,6 @@ export { ModelRouter, ROLE_CAPABILITIES } from "./routing/ModelRouter.ts";
 export type { ModelProvider, RouteResult, Capability, WorkerRoleName } from "./routing/ModelRouter.ts";
 export { Scheduler } from "./sched/Scheduler.ts";
 export type { SchedulableTask, ScheduledOutcome } from "./sched/Scheduler.ts";
-export { BudgetManager, DEFAULT_BUDGETS } from "./budget/BudgetManager.ts";
-export type { BudgetSpec, BudgetState, BudgetRole } from "./budget/BudgetManager.ts";
 export {
   ToolPolicy,
   redactSecrets,

@@ -62,6 +62,7 @@ export function summaryInstructions(entries: readonly unknown[], callerFocus: st
       ? `Anchor the summary's Goal on the user's most recent request/spec, quoted between the markers below. It supersedes earlier goals wherever they conflict.\n<<<LATEST USER REQUEST\n${clip(latest)}\nLATEST USER REQUEST>>>`
       : "Anchor the summary's Goal on the user's most recent request.",
     "Drop completed goals from the Goal section: mention finished work at most once, briefly, under progress. Do not carry earlier goals forward as open unless the user is still asking for them.",
+    "Keep verbatim any required output format (for example a final `ANSWER: x` line). Keep the exact commands used to test or verify. List open decisions and unresolved failures in their own section.",
     `Keep the whole summary under about ${SUMMARY_WORD_CAP} words: prefer file paths, decisions and next steps over narrative.`,
   ];
   if (callerFocus?.trim()) parts.push(`Additional focus from the caller: ${callerFocus.trim()}`);
