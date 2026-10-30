@@ -578,7 +578,8 @@ can be computed per worker.
 
 - `PI_WORKER_TRANSCRIPTS` (`on`|`off`, default `on`).
 - `PI_WORKER_TRANSCRIPT_MAX_BYTES` (default 5 MiB): per-file cap; the file rotates
-  to `<file>.1` (one predecessor kept).
+  to `<file>.<timestamp>.<n>`; earlier generations are never overwritten or deleted
+  (prune old rotations yourself).
 - `PI_WORKER_TRANSCRIPT_TOOL_CHARS` (default 4000): cap per tool argument/result.
 
 Transcripts are keyed by the mission's state worktree (the orchestrator's identity), then
@@ -586,11 +587,11 @@ by mission id. Redaction is key-aware (password/secret/token/api key/authorizati
 values in JSON and `KEY=value` lines), covers Basic/Bearer headers, URL userinfo and
 sensitive query params, known token prefixes, prose ("password is X") and PEM blocks.
 The per-turn line does not count as worker activity for the inactivity watchdog.
-runtime.jsonl rotation is per process: two processes sharing one file may overwrite `.1`.
+runtime.jsonl rotation never overwrites: each rotation gets a fresh `.<timestamp>.<n>` name and concurrent processes rotate one at a time under a `<file>.rotate.lock` sidecar. A rotation failure is reported as a telemetry warning and the live file keeps growing until it is fixed; rotated files are never deleted automatically.
 
-The worktree janitor must leave `transcripts/` alone except by age.
+The worktree janitor must leave `transcripts/` alone; nothing deletes rotated transcripts automatically.
 
-`sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.1` at
+`sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.<timestamp>.<n>` (never overwriting older rotations) at
 `PI_RUNTIME_LOG_MAX_BYTES` (default 10 MiB). `lease.contended` is logged once per
 (resource, holder); repeats are counted and a `lease.contended_summary` line
 carries the counters every `PI_RUNTIME_CONTENTION_SUMMARY_MS` (default 5 min).
@@ -733,7 +734,7 @@ rather than a branch name that could move after verification.
 | `/mission pause <id>` | Pause one named mission (no live turn needed). Esc pauses the turn on screen; this pauses the mission you name. Its work is kept and only `/mission resume <id>` continues it. |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
-| `/room [say <text> \| assign <agent> <text> \| rooms]` | Thin client over Herdr's room API (needs the `herdr:` block): project tree, current agents, attention inbox and a link to the full graph; post a message or assign work. No local state; closing Pi cancels nothing. |
+| `/room [say <text> \| assign <agent> <text> \| rooms \| log [simple\|activity\|expert] [--after <sequence>]]` | Thin client over Herdr's room API (needs the `herdr:` block): project tree, current agents, attention inbox and a link to the full graph; post a message or assign work; `log` prints the room's events (simple = chat and finished or blocked tasks, activity adds every task change, expert adds sequence and event id) with terminal escapes stripped. No local state; closing Pi cancels nothing. |
 | `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
 | `/engineering-status` / `-plan` / `-workers` | Planner/worker mission status, contract DAG, role/model telemetry. `-status` also shows the session's mission model (`model: X (operator pin)`). |
 | `/engineering-model [auto]` | Show the model this session's missions use; `auto` clears the operator pin set by `/model`. |
