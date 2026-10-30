@@ -119,38 +119,40 @@ test("terminal owner: worktree reclaimed, uncommitted work preserved on its bran
   }
 });
 
-test("live owner is kept; unknown owner is kept while recently active and reclaimed once idle", async () => {
+test("live owner is kept; a terminal owner is reclaimed once past the minimum age; ownerless is kept however idle", async () => {
   const fixture = await makeFixtureRepo();
   try {
     const repo = (await GitRepo.open(fixture.root))!;
     const head = await repo.headCommit();
     const live = await repo.createWorktree(head, "pi-eng-candidate-MSN-live01-repo-1-0-EXC-a");
-    const fresh = await repo.createWorktree(head, "pi-eng-candidate-nofresh1");
-    const stale = await repo.createWorktree(head, "pi-eng-candidate-nostale1");
+    const fresh = await repo.createWorktree(head, "pi-eng-candidate-MSN-fresh1-repo-1-0-EXC-a");
+    const stale = await repo.createWorktree(head, "pi-eng-candidate-MSN-stale1-repo-1-0-EXC-a");
+    const ownerless = await repo.createWorktree(head, "pi-eng-candidate-nostale1");
     await ageWorktree(stale.path, 30 * HOUR);
+    await ageWorktree(ownerless.path, 300 * HOUR);
 
     const liveness = (owner: { missionId?: string; taskId?: string }) =>
-      owner.missionId === "MSN-live01" ? ("live" as const) : ("unknown" as const);
-    const dry = await sweepWorktrees({ repo, ownerLiveness: liveness, maxIdleMs: 24 * HOUR, dryRun: true });
+      owner.missionId === "MSN-live01" ? ("live" as const) : ("terminal" as const);
+    const dry = await sweepWorktrees({ repo, ownerLiveness: liveness, dryRun: true });
     assert.deepEqual(
       dry.reclaimed.map((r) => r.path),
       [stale.path],
     );
     assert.equal(await exists(stale.path), true, "dry run touches nothing");
 
-    const report = await sweepWorktrees({ repo, ownerLiveness: liveness, maxIdleMs: 24 * HOUR });
+    const report = await sweepWorktrees({ repo, ownerLiveness: liveness });
     assert.deepEqual(
       report.reclaimed.map((r) => r.path),
       [stale.path],
     );
-    assert.deepEqual(report.kept.map((k) => k.path).sort(), [live.path, fresh.path].sort());
+    assert.deepEqual(report.kept.map((k) => k.path).sort(), [live.path, fresh.path, ownerless.path].sort());
     assert.match(report.kept.find((k) => k.path === live.path)!.reason, /live/);
     assert.match(report.kept.find((k) => k.path === fresh.path)!.reason, /active .* min ago/);
+    assert.match(report.kept.find((k) => k.path === ownerless.path)!.reason, /no parsable mission\/task owner/);
     assert.equal(await exists(stale.path), false);
-    assert.equal(await exists(live.path), true);
-    assert.equal(await exists(fresh.path), true);
+    assert.equal(await exists(ownerless.path), true);
     assert.equal(report.reclaimed[0]!.preservedCommit, null, "clean worktree needs no preserving commit");
-    assert.ok(await repo.resolveCommit("pi-eng-candidate-nostale1"), "branch survives");
+    assert.ok(await repo.resolveCommit(stale.branch), "branch survives");
   } finally {
     await fixture.cleanup();
   }
@@ -395,7 +397,7 @@ for (const metadata of ["registered", "pruned"] as const) {
       await exec("git", ["-C", fixture.root, "commit", "-qm", "ignore recovery output"]);
       const base = await repo.headCommit();
       const worker = await repo.createWorktree(base, "pi-eng-pw-recovery-blocked");
-      const ordinary = await repo.createWorktree(base, "pi-eng-candidate-noowner1");
+      const ordinary = await repo.createWorktree(base, CAND("ordinary"));
       const output = join(worker.path, "recover.txt");
       await writeFile(output, "ignored worker output remains recoverable\n");
       const stateDir = join(fixture.root, ".pi-eng", "planner-worker", "recovery");
@@ -416,7 +418,7 @@ for (const metadata of ["registered", "pruned"] as const) {
           false,
         );
       }
-      const report = await sweepWorktrees({ repo, now: () => Date.now() + 48 * HOUR });
+      const report = await sweepWorktrees({ repo, ownerLiveness: terminal, now: () => Date.now() + 48 * HOUR });
       assert.equal(await readFile(output, "utf8"), "ignored worker output remains recoverable\n");
       assert.ok(report.kept.some((wt) => wt.path === worker.path && /planner-worker.*recovery/i.test(wt.reason)));
       assert.deepEqual(
@@ -567,7 +569,7 @@ test("an eligible clean pi-eng worktree is reclaimed in on mode only, and its br
   }
 });
 
-test("the preserve step never commits node_modules; unignored node_modules is left on disk and the worktree kept", async () => {
+test("untracked node_modules keeps the worktree before anything is committed", async () => {
   const fixture = await makeFixtureRepo();
   try {
     const repo = (await GitRepo.open(fixture.root))!;
@@ -577,32 +579,216 @@ test("the preserve step never commits node_modules; unignored node_modules is le
     await mkdir(join(wt.path, "node_modules", "pkg"), { recursive: true });
     await writeFile(join(wt.path, "node_modules", "pkg", "index.js"), "x\n");
     await ageWorktree(wt.path, 100 * HOUR);
-    const report = await sweepOld(repo);
-    const files = (await exec("git", ["-C", fixture.root, "ls-tree", "-r", "--name-only", branch])).stdout;
-    assert.match(files, /real-work\.txt/, "real work was preserved on the branch");
-    assert.doesNotMatch(files, /node_modules/);
-    assert.equal(report.failed.length, 0, JSON.stringify(report));
-    // Plain `worktree remove` refuses untracked node_modules: kept, not forced.
-    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
-    assert.equal(await exists(join(wt.path, "node_modules", "pkg", "index.js")), true);
-    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /worktree remove/);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /untracked derived folder/);
+    }
+    assert.equal(await repo.resolveCommit(branch), await repo.headCommit(), "no preserving commit was made");
+    assert.equal(await readFile(join(wt.path, "real-work.txt"), "utf8"), "keep me\n");
   } finally {
     await fixture.cleanup();
   }
 });
 
-test("when plain `git worktree remove` fails (locked), the worktree is kept, not forced", async () => {
+test("a locked worktree is left untouched in dry-run and on: no preserving commit, no removal", async () => {
   const fixture = await makeFixtureRepo();
   try {
     const repo = (await GitRepo.open(fixture.root))!;
-    const wt = await repo.createWorktree(await repo.headCommit(), CAND("lock01"));
+    const branch = CAND("lock01");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "dirty.txt"), "uncommitted\n");
     await exec("git", ["-C", fixture.root, "worktree", "lock", wt.path]);
+    await ageWorktree(wt.path, 100 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /locked/);
+    }
+    assert.equal(await repo.resolveCommit(branch), await repo.headCommit(), "no preserving commit was made");
+    assert.equal(await readFile(join(wt.path, "dirty.txt"), "utf8"), "uncommitted\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+async function commitFile(root: string, file: string, content: string): Promise<void> {
+  await mkdir(dirname(join(root, file)), { recursive: true });
+  await writeFile(join(root, file), content);
+  await exec("git", ["-C", root, "add", "-f", file]);
+  await exec("git", ["-C", root, "commit", "-qm", file]);
+}
+
+test("an ignored user file inside a tracked docs/dist folder keeps the worktree (not a derived folder)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await commitFile(fixture.root, ".gitignore", "*.local\n");
+    await commitFile(fixture.root, "docs/dist/README.md", "tracked\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("ign001"));
+    await writeFile(join(wt.path, "docs/dist/notes.local"), "HUMAN DATA\n");
     await ageWorktree(wt.path, 100 * HOUR);
     const report = await sweepOld(repo);
     assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
-    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /worktree remove/);
-    assert.equal(await exists(wt.path), true);
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /ignored files.*notes\.local/);
+    assert.equal(await readFile(join(wt.path, "docs/dist/notes.local"), "utf8"), "HUMAN DATA\n");
   } finally {
     await fixture.cleanup();
+  }
+});
+
+test("an ignored FILE whose own name is a derived name keeps the worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await commitFile(fixture.root, ".gitignore", "coverage\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("ign002"));
+    await mkdir(join(wt.path, "notes"), { recursive: true });
+    await writeFile(join(wt.path, "notes/coverage"), "HUMAN\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.equal(await readFile(join(wt.path, "notes/coverage"), "utf8"), "HUMAN\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("assume-unchanged and skip-worktree edits keep the worktree and are listed", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const a = await repo.createWorktree(await repo.headCommit(), CAND("asm001"));
+    const b = await repo.createWorktree(await repo.headCommit(), CAND("skp001"));
+    await exec("git", ["-C", a.path, "update-index", "--assume-unchanged", "src/add.js"]);
+    await writeFile(join(a.path, "src/add.js"), "HUMAN EDIT\n");
+    await exec("git", ["-C", b.path, "update-index", "--skip-worktree", "src/add.js"]);
+    await writeFile(join(b.path, "src/add.js"), "HUMAN EDIT 2\n");
+    await ageWorktree(a.path, 100 * HOUR);
+    await ageWorktree(b.path, 100 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      for (const wt of [a, b]) assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /src\/add\.js/);
+    }
+    assert.equal(await readFile(join(a.path, "src/add.js"), "utf8"), "HUMAN EDIT\n");
+    assert.equal(await readFile(join(b.path, "src/add.js"), "utf8"), "HUMAN EDIT 2\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a detached HEAD whose only containing ref is refs/stash is still unreachable and kept", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("stash1");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "u.txt"), "u\n");
+    await exec("git", ["-C", wt.path, "add", "-A"]);
+    await exec("git", ["-C", wt.path, "commit", "-qm", "unique"]);
+    const sha = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
+    await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await exec("git", ["-C", fixture.root, "branch", "-D", branch]);
+    await writeFile(join(wt.path, "u.txt"), "stashme\n");
+    await exec("git", ["-C", wt.path, "stash", "-q"]);
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /not reachable/);
+    assert.equal(await exists(wt.path), true);
+    await exec("git", ["-C", fixture.root, "cat-file", "-e", sha]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an owner-less pi-eng-candidate-mine branch with work is kept however idle, in every liveness", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), "pi-eng-candidate-mine");
+    await writeFile(join(wt.path, "wip.txt"), "human wip\n");
+    await ageWorktree(wt.path, 300 * HOUR);
+    for (const liveness of ["unknown", "terminal"] as const) {
+      const report = await sweepWorktrees({ repo, ownerLiveness: () => liveness, maxIdleMs: 24 * HOUR });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /no parsable mission\/task owner/);
+    }
+    assert.equal(await readFile(join(wt.path, "wip.txt"), "utf8"), "human wip\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("changes that remain after the preserve step keep the worktree (tracked edit inside dist/)", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await commitFile(fixture.root, "dist/out.js", "built\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("remain1");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "dist/out.js"), "HUMAN EDIT\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.equal(report.failed.length, 0, JSON.stringify(report.failed));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /changes remain after the preserving commit/);
+    assert.equal(await readFile(join(wt.path, "dist/out.js"), "utf8"), "HUMAN EDIT\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("status.showUntrackedFiles=no in the repo config does not hide untracked work", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    await exec("git", ["-C", fixture.root, "config", "status.showUntrackedFiles", "no"]);
+    const branch = CAND("unt001");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "untracked-human.txt"), "HUMAN\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    const preserved = (await exec("git", ["-C", fixture.root, "ls-tree", "-r", "--name-only", branch])).stdout;
+    assert.ok(
+      (await exists(join(wt.path, "untracked-human.txt"))) || /untracked-human\.txt/.test(preserved),
+      JSON.stringify(report),
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an initialized submodule keeps the worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  const sub = await makeFixtureRepo();
+  try {
+    await exec("git", [
+      "-C",
+      fixture.root,
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      "-q",
+      sub.root,
+      "sub",
+    ]);
+    await exec("git", ["-C", fixture.root, "commit", "-qm", "sub"]);
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("sub001"));
+    await exec("git", ["-C", wt.path, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"]);
+    await writeFile(join(wt.path, "sub", "new.txt"), "HUMAN SUB NEW\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /submodule/);
+    }
+    assert.equal(await readFile(join(wt.path, "sub", "new.txt"), "utf8"), "HUMAN SUB NEW\n");
+  } finally {
+    await fixture.cleanup();
+    await sub.cleanup();
   }
 });

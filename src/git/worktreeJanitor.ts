@@ -15,20 +15,27 @@
  *  - A worktree whose owning mission is still live (any non-terminal status)
  *    is kept untouched.
  *  - Only worktrees on `pi-eng-candidate-*` / `pi-eng-orch-*` branches (or
- *    detached, with such a name) are ever reclaimed. Any other branch belongs
- *    to the user and is kept and reported, however idle.
- *  - A pi-eng-owned worktree whose mission is terminal is reclaimed.
+ *    detached, with such a folder name) are ever reclaimed. Any other branch
+ *    belongs to the user and is kept and reported, however idle.
+ *  - Reclaiming needs a provable owner: a parsable mission/task id in the
+ *    branch (or folder) name whose mission is durably terminal. A worktree with
+ *    no parsable owner is kept; age alone never reclaims anything.
  *  - Reclaiming never loses work (owner rule 2026-10-30: "we can't lose data
- *    due to sweeps"). It fails closed, keeping and reporting the worktree, when
- *    HEAD is detached (a commit made there would become unreachable), when
- *    ignored files other than known derived directories exist, when changes
- *    remain after the preserving commit, or when a plain (never forced)
- *    `git worktree remove` refuses. Otherwise uncommitted changes are committed
- *    onto the worktree's own branch, the branch is kept and only the checkout
- *    goes away.
- *  - Sibling directories inside the namespace that git no longer lists (their
- *    admin metadata was pruned) are re-registered with `git worktree repair`
- *    when possible; otherwise they are reported as strays and never removed.
+ *    due to sweeps"). Before anything is committed or removed, the worktree is
+ *    kept and reported when: git has it locked; it holds an initialized
+ *    submodule; it holds ignored files other than collapsed derived folders
+ *    (node_modules, target, .next, dist, coverage); an untracked derived folder
+ *    would block a plain remove; index flags (assume-unchanged, skip-worktree)
+ *    could hide edits; HEAD is detached and either unreachable from every
+ *    branch/tag/remote ref (stash does not count) or the tree is dirty; or the
+ *    shared `_shared` Rust cache key would be the cleanup target. Otherwise
+ *    uncommitted changes are committed onto the worktree's own branch and a
+ *    plain (never forced) `git worktree remove` runs; if changes remain after
+ *    the commit or git refuses, the worktree is kept. The branch always stays.
+ *  - Sibling directories inside the namespace that git no longer lists are
+ *    reported as strays and never removed. `git worktree repair` may first
+ *    re-register one (metadata only; no file is touched), after which it is
+ *    treated as an ordinary worktree.
  */
 
 import { execFile } from "node:child_process";
@@ -36,12 +43,12 @@ import { readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { GitRepo } from "./GitRepo.ts";
-import { rustTargetDir } from "./rustBuildCache.ts";
+import { UNSCOPED_TARGET_KEY, rustTargetDir } from "./rustBuildCache.ts";
 import { safeGitOrThrow } from "./safeGit.ts";
 
 const exec = promisify(execFile);
 
-/** Hours a worktree with no known owner may sit idle before it is reclaimed. */
+/** Retained for compatibility only: age alone no longer reclaims any worktree (owner rule 2026-10-30). */
 export const WORKTREE_IDLE_HOURS_ENV = "PI_WORKTREE_IDLE_HOURS";
 export const DEFAULT_WORKTREE_IDLE_HOURS = 24;
 
@@ -64,10 +71,10 @@ export interface JanitorOptions {
   repo: GitRepo;
   /**
    * Resolve whether a worktree's owner still needs it. `live` keeps the
-   * worktree; `terminal` reclaims it immediately; `unknown` (or no resolver)
-   * falls back to the idle timeout.
+   * worktree; `terminal` makes it eligible; `unknown` (or no resolver) keeps it.
    */
   ownerLiveness?: (owner: WorktreeOwner) => OwnerLiveness | Promise<OwnerLiveness>;
+  /** Retained for callers; age alone no longer reclaims anything, so this governs nothing. */
   maxIdleMs?: number;
   /** Nothing younger than this is reclaimed. Default 1 h, env-raisable; never lower in production. */
   minAgeMs?: number;
@@ -170,41 +177,119 @@ async function assertNamespacePath(repo: GitRepo, path: string): Promise<void> {
 /** Rebuildable output directories: never committed, never counted as user data. */
 const DERIVED_DIRS = ["node_modules", "target", ".next", "dist", "coverage"] as const;
 
-function isDerivedPath(entry: string): boolean {
-  return entry
-    .replace(/\/+$/, "")
-    .split("/")
-    .some((segment) => (DERIVED_DIRS as readonly string[]).includes(segment));
+/** A collapsed folder entry (`path/`) whose own name is a derived name; nothing else is derived. */
+function isDerivedDir(entry: string): boolean {
+  if (!entry.endsWith("/")) return false;
+  const last = entry.replace(/\/+$/, "").split("/").pop() ?? "";
+  return (DERIVED_DIRS as readonly string[]).includes(last);
 }
 
-/** Status lines (`XY path`) that are not derived-directory noise. */
-async function meaningfulStatus(path: string, ignored: boolean): Promise<string[]> {
-  const status = await safeGitOrThrow(["status", "--porcelain", ...(ignored ? ["--ignored"] : [])], {
+const entryPath = (line: string): string => line.slice(3).replace(/^"|"$/g, "");
+
+const READ_ONLY_GIT = { trust: "operator", env: { GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 60_000 } as const;
+
+/** Raw `git status --porcelain --ignored` lines. Read-only: a refreshed index would reset the idle clock. */
+async function statusLines(path: string): Promise<string[]> {
+  const status = await safeGitOrThrow(["status", "--porcelain", "--ignored", "--untracked-files=normal"], {
+    ...READ_ONLY_GIT,
     cwd: path,
-    trust: "operator",
-    // Read-only: a refreshed index would reset the idle clock the next sweep reads.
-    env: { GIT_OPTIONAL_LOCKS: "0" },
-    timeoutMs: 60_000,
     maxBuffer: 16 * 1024 * 1024,
   });
-  return status.stdout.split("\n").filter((line) => line.trim() && !isDerivedPath(line.slice(3).replace(/^"|"$/g, "")));
+  return status.stdout.split("\n").filter((line) => line.trim());
 }
 
-/** Is `commit` reachable from any branch, tag or remote-tracking ref? */
+/** Paths git reports `locked` in `worktree list --porcelain` (GitRepo's listing drops the flag). */
+async function lockedWorktreePaths(repo: GitRepo): Promise<Set<string>> {
+  const listed = await safeGitOrThrow(["worktree", "list", "--porcelain"], { ...READ_ONLY_GIT, cwd: repo.root });
+  const locked = new Set<string>();
+  for (const entry of listed.stdout.split(/\n\n+/)) {
+    const lines = entry.split("\n");
+    const path = lines
+      .find((l) => l.startsWith("worktree "))
+      ?.slice("worktree ".length)
+      .trim();
+    if (path && lines.some((l) => l === "locked" || l.startsWith("locked "))) locked.add(path);
+  }
+  return locked;
+}
+
+/** Initialized submodule checkouts: their own work is invisible to a superproject commit. */
+async function initializedSubmodules(path: string): Promise<string[]> {
+  const files = await safeGitOrThrow(["ls-files", "-s"], { ...READ_ONLY_GIT, cwd: path, maxBuffer: 64 * 1024 * 1024 });
+  const found: string[] = [];
+  for (const line of files.stdout.split("\n")) {
+    if (!line.startsWith("160000 ")) continue;
+    const sub = line.slice(line.indexOf("\t") + 1);
+    if (await stat(join(path, sub, ".git")).catch(() => null)) found.push(sub);
+  }
+  return found;
+}
+
+/** Index entries flagged assume-unchanged (lowercase tag) or skip-worktree (`S`): edits there are invisible to status. */
+async function hiddenIndexEntries(path: string): Promise<string[]> {
+  const files = await safeGitOrThrow(["ls-files", "-v"], { ...READ_ONLY_GIT, cwd: path, maxBuffer: 64 * 1024 * 1024 });
+  return files.stdout
+    .split("\n")
+    .filter((line) => /^[a-zS] /.test(line))
+    .map((line) => line.slice(2));
+}
+
+/** Is `commit` reachable from any branch, tag or remote-tracking ref? (refs/stash does not count.) */
 async function isReachableFromRef(repo: GitRepo, commit: string): Promise<boolean> {
-  const refs = await safeGitOrThrow(["for-each-ref", "--count=1", "--contains", commit, "refs/"], {
-    cwd: repo.root,
-    trust: "operator",
-    timeoutMs: 60_000,
-  });
+  const refs = await safeGitOrThrow(
+    ["for-each-ref", "--count=1", "--contains", commit, "refs/heads", "refs/tags", "refs/remotes"],
+    { ...READ_ONLY_GIT, cwd: repo.root },
+  );
   return refs.stdout.trim().length > 0;
+}
+
+/** Branch name, or for a detached worktree the folder-name suffix (`<prefix><branch>`). */
+function ownerName(repo: GitRepo, wt: { path: string; branch: string | null }): string {
+  return wt.branch ?? basename(wt.path).slice(repo.worktreeNamespacePrefix().length);
 }
 
 /** Only pi-eng candidate/orchestrator branches (or their detached worktrees, by name) are the runtime's own. */
 function isPiEngOwned(repo: GitRepo, wt: { path: string; branch: string | null }): boolean {
-  const pattern = /^pi-eng-(candidate|orch)-/;
-  if (wt.branch) return pattern.test(wt.branch);
-  return pattern.test(basename(wt.path).slice(repo.worktreeNamespacePrefix().length));
+  return /^pi-eng-(candidate|orch)-/.test(ownerName(repo, wt));
+}
+
+const preview = (items: string[]) => `${items.slice(0, 5).join(", ")}${items.length > 5 ? ", ..." : ""}`;
+
+/**
+ * Decide, without changing anything, whether a registered pi-eng worktree may
+ * be reclaimed. Returns the reason to keep it, or null when it is eligible.
+ * Shared by dry-run and real runs so a preview never over-reports.
+ */
+async function reasonToKeep(
+  repo: GitRepo,
+  wt: { path: string; branch: string | null; head: string | null },
+  locked: Set<string>,
+): Promise<string | null> {
+  if (locked.has(wt.path)) return "locked by git (`git worktree lock`); left untouched";
+  const subs = await initializedSubmodules(wt.path);
+  if (subs.length > 0)
+    return `initialized submodule(s) ${preview(subs)}: their work is not part of this repository's commit`;
+  const lines = await statusLines(wt.path);
+  const ignored = lines.filter((l) => l.startsWith("!! ") && !isDerivedDir(entryPath(l)));
+  if (ignored.length > 0) return `ignored files present (${preview(ignored.map(entryPath))}); git does not track them`;
+  const untrackedDerived = lines.filter((l) => l.startsWith("?? ") && isDerivedDir(entryPath(l)));
+  if (untrackedDerived.length > 0) {
+    return `untracked derived folder(s) ${preview(untrackedDerived.map(entryPath))} would block a plain git worktree remove`;
+  }
+  const hidden = await hiddenIndexEntries(wt.path);
+  if (hidden.length > 0) return `assume-unchanged/skip-worktree index entries hide edits from git: ${preview(hidden)}`;
+  if (!wt.branch) {
+    const dirty = lines.some((l) => !l.startsWith("!! "));
+    if (!wt.head || !(await isReachableFromRef(repo, wt.head))) {
+      return `detached HEAD ${wt.head?.slice(0, 12) ?? "?"} is not reachable from any branch, tag or remote ref; removing would lose it`;
+    }
+    if (dirty) return "detached HEAD with uncommitted changes that could not be kept on a branch";
+  }
+  const target = await rustTargetDir(wt.path).catch(() => null);
+  if (target && basename(target) === UNSCOPED_TARGET_KEY) {
+    return "its Rust cache key is the shared `_shared` fallback; not deleting a directory other checkouts use";
+  }
+  return null;
 }
 
 /**
@@ -213,7 +298,7 @@ function isPiEngOwned(repo: GitRepo, wt: { path: string; branch: string | null }
  * Derived directories (node_modules, target, ...) are never committed.
  */
 async function preserveUncommittedWork(path: string, branch: string | null): Promise<string | null> {
-  if ((await meaningfulStatus(path, false)).length === 0) return null;
+  if ((await statusLines(path)).every((l) => l.startsWith("!! "))) return null;
   const env = {
     GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "pi-engineering janitor",
     GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "pi-engineering@localhost",
@@ -225,6 +310,9 @@ async function preserveUncommittedWork(path: string, branch: string | null): Pro
     ...base,
     timeoutMs: 120_000,
   });
+  // Nothing staged (e.g. only tracked edits inside a derived dir): no commit; the caller keeps the worktree.
+  const staged = await safeGitOrThrow(["diff", "--cached", "--name-only"], { ...base, timeoutMs: 60_000 });
+  if (!staged.stdout.trim()) return null;
   await safeGitOrThrow(
     [
       "commit",
@@ -247,7 +335,6 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
   const { repo } = opts;
   const now = opts.now?.() ?? Date.now();
   const minAge = opts.minAgeMs ?? worktreeMinAgeMs();
-  const maxIdle = Math.max(opts.maxIdleMs ?? worktreeIdleMs(), minAge);
   const report: JanitorReport = { reclaimed: [], kept: [], failed: [], dryRun: Boolean(opts.dryRun) };
   const prefix = repo.worktreeNamespacePrefix();
   const parent = dirname(repo.root);
@@ -296,6 +383,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
   }
 
   const referenced = await repo.durablyReferencedWorktreePaths([...registered.keys()]);
+  const locked = await lockedWorktreePaths(repo);
 
   for (const wt of registered.values()) {
     // Planner-worker retirement/recovery fences live outside candidate records.
@@ -328,7 +416,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       });
       continue;
     }
-    const owner = parseWorktreeOwner(wt.branch);
+    const owner = parseWorktreeOwner(ownerName(repo, wt));
     let liveness: OwnerLiveness = "unknown";
     if (opts.ownerLiveness && (owner.missionId || owner.taskId)) {
       try {
@@ -345,10 +433,18 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       });
       continue;
     }
-    // An owner we cannot prove terminal is presumed alive in another process
-    // (or parked for days waiting on inference): the idle rule is only for
-    // checkouts that name no owner at all.
-    if ((owner.missionId || owner.taskId) && liveness !== "terminal") {
+    // No parsable owner: nothing proves the runtime may reclaim it, and age alone never does.
+    if (!owner.missionId && !owner.taskId) {
+      report.kept.push({
+        path: wt.path,
+        branch: wt.branch,
+        reason: "no parsable mission/task owner in its name; never reclaimed by age",
+      });
+      continue;
+    }
+    // An owner we cannot prove durably terminal is presumed alive in another
+    // process (or parked for days waiting on inference).
+    if (liveness !== "terminal") {
       report.kept.push({
         path: wt.path,
         branch: wt.branch,
@@ -365,49 +461,14 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       });
       continue;
     }
-    let reason: string;
-    if (liveness === "terminal") {
-      reason = `owner ${owner.missionId ?? owner.taskId} finished`;
-    } else {
-      const idleMs = now - (await worktreeLastActivity(wt.path));
-      if (idleMs < maxIdle) {
-        report.kept.push({
-          path: wt.path,
-          branch: wt.branch,
-          reason: `no known owner; active ${Math.round(idleMs / 60_000)} min ago (< ${Math.round(maxIdle / 3_600_000)} h)`,
-        });
-        continue;
-      }
-      reason = `no known owner; idle ${Math.round(idleMs / 3_600_000)} h`;
-    }
+    const reason = `owner ${owner.missionId ?? owner.taskId} finished`;
 
     try {
       await assertNamespacePath(repo, wt.path);
       const bytes = await directoryBytes(wt.path);
-      // wt.head === null only for a worktree git could not list; strays never reach here.
-      const dirty = await meaningfulStatus(wt.path, false);
-      if (!wt.branch) {
-        // Detached: a preserving commit would be unreachable once the admin dir goes.
-        const reachable = wt.head ? await isReachableFromRef(repo, wt.head) : false;
-        if (!reachable || dirty.length > 0) {
-          report.kept.push({
-            path: wt.path,
-            branch: wt.branch,
-            reason: !reachable
-              ? `detached HEAD ${wt.head?.slice(0, 12) ?? "?"} is not reachable from any ref; removing would lose it`
-              : "detached HEAD with uncommitted changes that could not be kept on a branch",
-          });
-          continue;
-        }
-      }
-      const ignoredFiles = (await meaningfulStatus(wt.path, true)).filter((l) => l.startsWith("!! "));
-      if (ignoredFiles.length > 0) {
-        const names = ignoredFiles.map((l) => l.slice(3)).slice(0, 5);
-        report.kept.push({
-          path: wt.path,
-          branch: wt.branch,
-          reason: `ignored files present (${names.join(", ")}${ignoredFiles.length > 5 ? ", ..." : ""}); git does not track them`,
-        });
+      const keep = await reasonToKeep(repo, wt, locked);
+      if (keep) {
+        report.kept.push({ path: wt.path, branch: wt.branch, reason: keep });
         continue;
       }
       if (opts.dryRun) {
@@ -417,7 +478,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       // Resolved while the worktree is still registered: it needs git.
       const target = await rustTargetDir(wt.path).catch(() => null);
       const preservedCommit = await preserveUncommittedWork(wt.path, wt.branch);
-      const left = await meaningfulStatus(wt.path, false);
+      const left = (await statusLines(wt.path)).filter((l) => !l.startsWith("!! "));
       if (left.length > 0) {
         report.kept.push({
           path: wt.path,

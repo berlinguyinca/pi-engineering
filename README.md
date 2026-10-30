@@ -472,15 +472,22 @@ start, every six hours while a session stays open, and on demand with `/gc`
   is kept, as is any worktree a durable candidate, cleanup or quarantined record
   still names. Nothing younger than `PI_WORKTREE_MIN_AGE_HOURS` (default and
   minimum 1) is reclaimed.
-- Housekeeping never loses data. It keeps and reports a worktree whose HEAD is
-  detached and unreachable from any ref, that holds ignored files other than
-  `node_modules`/`target`/`.next`/`dist`/`coverage`, that still has changes after
-  the preserving commit, or that a plain (never `--force`d) `git worktree
-  remove` refuses. Otherwise uncommitted changes (never `node_modules` or the
-  other derived dirs) are committed onto the worktree's own branch first and the
-  branch is always kept; only the checkout goes away. A namespace directory git
-  no longer lists is reported as a stray and never removed; delete it yourself
-  if you do not want it.
+- Housekeeping never loses data. A worktree is reclaimed only when its branch
+  (or, if detached, its folder name) carries a parsable mission/task id whose
+  mission is durably terminal; no owner means it is kept, however idle. It is
+  also kept and reported, before anything is committed, when git has it locked,
+  it holds an initialized submodule, it holds ignored files other than collapsed
+  `node_modules/`, `target/`, `.next/`, `dist/` or `coverage/` folders, an
+  untracked derived folder would block a plain remove, assume-unchanged or
+  skip-worktree index entries could hide edits, its HEAD is detached and
+  unreachable from every branch, tag or remote ref (a stash does not count) or
+  dirty, or its Rust cache key is the shared `_shared` fallback. Otherwise
+  uncommitted changes (never the derived dirs) are committed onto the
+  worktree's own branch and a plain (never `--force`d) `git worktree remove`
+  runs; if changes remain or git refuses, it is kept. The branch is always
+  kept. A namespace directory git no longer lists is reported as a stray and its
+  files are never removed (`git worktree repair` may re-register it first, which
+  only rewrites git metadata); delete it yourself if you do not want it.
 - A reclaimed worktree's cargo target dir goes with it, and target dirs (see
   above) that no build touched for `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
 
@@ -488,7 +495,7 @@ start, every six hours while a session stays open, and on demand with `/gc`
 | -------- | ------- | ------- |
 | `PI_HOUSEKEEPING` | dry-run | Automatic housekeeping only reports by default (owner rule 2026-10-30: nothing is deleted by a sweep unless you opt in); `1`/`true`/`on`/`yes` lets it act, `0`/`false`/`off`/`no` disables it. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` is the explicit action (`/gc --dry-run` previews) and lists what it kept and why |
 | `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
-| `PI_WORKTREE_IDLE_HOURS` | `24` | Idle threshold for pi-eng-owned worktrees whose branch names no parsable owner |
+| `PI_WORKTREE_IDLE_HOURS` | `24` | Retained for compatibility; governs nothing now. A worktree with no parsable mission/task owner is kept, never reclaimed by age. `PI_WORKTREE_MIN_AGE_HOURS` still sets the minimum age for a terminal-owner reclaim |
 
 ## Semantic tools
 
