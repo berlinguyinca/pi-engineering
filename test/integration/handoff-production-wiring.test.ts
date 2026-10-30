@@ -301,6 +301,27 @@ describe("a context trigger through the Orchestrator runs the verified protocol"
     assert.equal(events(r.backend, "execution.late_result_rejected").length, 1, "the writer was fenced exactly once");
   });
 
+  it("a successor routed to another model (operator pin, failover) still takes over a context handoff", async () => {
+    const r = await rig();
+    r.emit(950);
+    await until(() => r.store.listHandoffRecords(r.missionId).some((h) => h.sourceFencedAt));
+    await settleTrigger(r);
+    const [record] = r.store.listHandoffRecords(r.missionId);
+    assert.equal(record?.toModel, "gw/test", "the pin was the predecessor's own model");
+    const successor = r.store.createExecution({
+      task_id: r.taskId,
+      mission_id: r.missionId,
+      backend: "agent",
+      session_id: "WKS-elsewhere",
+      model: "gw/other",
+    });
+    r.store.setExecutionStatus(successor.execution_id, "RUNNING", {});
+    await firstActivity(r.orchestrator, r.missionId, r.taskId, successor.execution_id);
+    const done = r.store.getHandoffRecord(record!.id);
+    assert.equal(done?.state, "acknowledged");
+    assert.equal(done?.successor?.sessionId, "WKS-elsewhere");
+  });
+
   it("a duplicate trigger is idempotent: one record, one fence, one process termination", async () => {
     const r = await rig();
     for (let i = 0; i < 6; i++) r.emit(950 + i);

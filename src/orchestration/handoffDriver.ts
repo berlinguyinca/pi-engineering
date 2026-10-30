@@ -156,9 +156,12 @@ export class HandoffDriver {
       .filter(
         (e) =>
           e.task_id === checkpoint.taskId &&
-          // A switching record (quota fallback, or the same-model pin of a context handoff) is only taken over by an
-          // execution on that model: a retry racing in from the scheduler's resilience path on another is not the successor.
-          (record.toModel === undefined || (e.model !== null && sameModel(e.model, record.toModel))) &&
+          // A quota fallback is only taken over by an execution on the configured model: a same-model retry racing in from
+          // the scheduler's resilience path is not the successor. A context handoff's pin is a preference: an operator pin
+          // or a failover may route the successor elsewhere and it is still the session that took over.
+          (record.cause !== "quota_exhausted" ||
+            record.toModel === undefined ||
+            (e.model !== null && sameModel(e.model, record.toModel))) &&
           e.execution_id !== checkpoint.executionId &&
           e.session_id &&
           e.session_id !== record.predecessor.sessionId &&
@@ -230,13 +233,12 @@ export class HandoffDriver {
     // Retry budget BEFORE the fence: the successor is the scheduler's retry of the fenced task. With no attempt left the
     // fence would cancel the source and nobody would continue, so the record is aborted instead and the source untouched.
     if (
-      (record.cause === "quota_exhausted" || record.cause === "context_pressure") &&
-      record.toModel &&
-      !record.sourceFencedAt
+      !record.sourceFencedAt &&
+      ((record.cause === "quota_exhausted" && record.toModel) || record.cause === "context_pressure")
     ) {
       const task = store.getTask(checkpoint.taskId);
       if (!task || task.attempt >= task.max_attempts) {
-        const reason = `no retry budget left for task ${checkpoint.taskId} (attempt ${task?.attempt ?? "?"} of ${task?.max_attempts ?? "?"}); source not fenced, successor on ${record.toModel} not started`;
+        const reason = `no retry budget left for task ${checkpoint.taskId} (attempt ${task?.attempt ?? "?"} of ${task?.max_attempts ?? "?"}); source not fenced, successor${record.toModel ? ` on ${record.toModel}` : ""} not started`;
         store.abortHandoff(handoffId, reason);
         this.deps.report(
           record.missionId,

@@ -528,6 +528,15 @@ describe("buildContinuityConfig sameModelRef", () => {
     assert.deepEqual(cfg.sameModelRef?.("gw/a"), { ref: "gw/a" });
   });
 
+  it("refuses a bare id that two providers serve, but takes the qualified one", async () => {
+    const cfg = await build(async () => [
+      { provider: "gw", id: "a" },
+      { provider: "other", id: "a" },
+    ]);
+    assert.deepEqual(cfg.sameModelRef?.("a"), { reason: "ambiguous: several providers serve that id" });
+    assert.deepEqual(cfg.sameModelRef?.("other/a"), { ref: "other/a" });
+  });
+
   it("refuses a model the runtime marked unavailable", async () => {
     const cfg = await build(async () => [{ provider: "gw", id: "a" }], ["gw/a"]);
     assert.deepEqual(cfg.sameModelRef?.("gw/a"), { reason: "the gateway marked it unavailable" });

@@ -25,14 +25,15 @@ of compacting. The successor runs on the same model the predecessor was serving;
 - The record (`cause: context_pressure`) carries `fromModel` and a `toModel` equal to the routable `provider/id`. After the
   checkpoint is verified and before the writer is fenced, the task is pinned to that model through the same durable
   switch a quota fallback uses (`task.model_switched`, `execution_requirements.model`), so the scheduler's retry starts
-  there from the verified checkpoint. Only an execution on that model acknowledges the handoff.
+  there from the verified checkpoint. The pin is a preference, not a requirement: if an operator pin or a failover routes the successor to another model,
+  that session still takes over and acknowledges (unlike a quota fallback, which only an execution on the fallback does).
 - A model that cannot be pinned (marked unavailable by the runtime, absent from a readable registry, serving model
   unknown, or a bare id with an unreadable registry) is never guessed. The record has no `toModel`, the report says
   `successor not pinned to <model> (<reason>); it routes normally`, and the successor is routed as any retry.
 - Precedence is unchanged: an operator pin for the mission still outranks the task's model, and a failed pinned model
   fails over (the pin applies only to the first placement).
 - Like a quota switch, the successor is the task's next attempt: with no attempt left the record is aborted, the source
-  keeps running and is not fenced (`no retry budget left ... successor on <model> not started`).
+  keeps running and is not fenced (`no retry budget left ... successor [on <model>] not started`). This holds whether or not the model could be pinned.
 - The task keeps that model in its execution requirements; if the model fails, the failover attempt is routed normally.
 
 ## Enabling quota fallbacks (operator checklist)

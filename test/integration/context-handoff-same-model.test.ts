@@ -303,4 +303,15 @@ describe("a context handoff keeps the model through orchestrate()", () => {
     assert.equal(executions.length, 1);
     assert.notEqual(executions[0]?.status, "CANCELED");
   });
+
+  it("an unpinnable model with no retry budget left does not fence the source either", async () => {
+    const h = await harness(null, { maxAttempts: 1, unavailable: ["gw/primary"] });
+    const missionId = await h.run();
+    const [record] = h.store.listHandoffRecords(missionId);
+    assert.equal(record?.toModel, undefined);
+    assert.equal(record?.state, "aborted");
+    assert.match(record?.blockedReason ?? "", /no retry budget left.*successor not started/);
+    assert.equal(record?.sourceFencedAt, undefined);
+    assert.notEqual(agentExecutions(h.store, missionId)[0]?.status, "CANCELED");
+  });
 });
