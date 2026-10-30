@@ -17,10 +17,11 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 import { GitRepo } from "../../src/git/GitRepo.ts";
 import { OWNER_MARKER_FILE } from "../../src/git/ownerMarker.ts";
+import { listOrphanTrash, shellQuote } from "../../src/git/trashStore.ts";
 import { sweepWorktrees } from "../../src/git/worktreeJanitor.ts";
 import { describeAdoptPreview, gcPlan, runAdoptPreview, runTrashPurge } from "../../src/runtime/janitor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -598,7 +599,7 @@ const LATE_WRITERS: Array<{ name: string; ignore: string; rel: string; cwdInside
 ];
 for (const sc of LATE_WRITERS) {
   test(`late writer ${sc.name}: the file survives (kept in place or carried into the trash)`, async () => {
-    const fixture = await makeFixtureRepo();
+    const fixture = await isolatedFixture();
     const gate = await mkdtemp(join(tmpdir(), "pi-eng-gate-"));
     const savedPath = process.env.PATH;
     try {
@@ -671,16 +672,32 @@ exec "${realGit}" "$@"
 }
 
 const OLD = new Date("2020-01-01T00:00:00Z");
+/** A fixture repo inside its own parent directory, so sibling `.pi-eng-trash` dirs never touch other tests (or $TMPDIR). */
+async function isolatedFixture(): Promise<{ root: string; cleanup: () => Promise<void> }> {
+  const inner = await makeFixtureRepo();
+  const parent = await mkdtemp(join(tmpdir(), "pi-eng-iso-"));
+  const root = join(parent, "repo");
+  await rename(inner.root, root);
+  return { root, cleanup: () => rm(parent, { recursive: true, force: true }) };
+}
+
+const leaked: string[] = [];
+afterEach(async () => {
+  for (const d of leaked.splice(0)) await rm(d, { recursive: true, force: true });
+});
+
 async function makeMarkedTrash(root: string): Promise<string> {
   const { moveToTrash } = await import("../../src/git/trashStore.ts");
-  const src = join(await mkdtemp(join(tmpdir(), "pi-eng-src-")), "old-wt");
+  const srcRoot = await mkdtemp(join(tmpdir(), "pi-eng-trash-src-"));
+  leaked.push(srcRoot);
+  const src = join(srcRoot, "old-wt");
   await mkdir(src, { recursive: true });
   await writeFile(join(src, "a.txt"), "precious\n");
   return moveToTrash(root, "worktree", src, "old-wt", "br", OLD.getTime());
 }
 
 test("unmarked orphans are never deleted, even with --apply", async () => {
-  const fixture = await makeFixtureRepo();
+  const fixture = await isolatedFixture();
   const trash = await mkdtemp(join(tmpdir(), "pi-eng-t-"));
   try {
     const dir = join(dirname(fixture.root), ".pi-eng-trash", "20200101T000000Z-userstuff");
@@ -698,14 +715,13 @@ test("unmarked orphans are never deleted, even with --apply", async () => {
     assert.deepEqual(out.orphanTrash?.purged, []);
     assert.match(out.orphanTrash?.skipped.find((k) => k.path === dir)?.reason ?? "", /rm -rf/);
   } finally {
-    await rm(join(dirname(fixture.root), ".pi-eng-trash"), { recursive: true, force: true });
     await rm(trash, { recursive: true, force: true });
     await fixture.cleanup();
   }
 });
 
 test("a symlinked trash root is never purged or listed, and a relative PI_TRASH_DIR is refused", async () => {
-  const fixture = await makeFixtureRepo();
+  const fixture = await isolatedFixture();
   const base = await mkdtemp(join(tmpdir(), "pi-eng-t-"));
   try {
     // (a) <parent>/.pi-eng-trash -> a directory holding a timestamp-named folder
@@ -737,7 +753,6 @@ test("a symlinked trash root is never purged or listed, and a relative PI_TRASH_
     });
     assert.match(rel.worktreeTrash.skipped[0]?.reason ?? "", /absolute path/);
   } finally {
-    await rm(join(dirname(fixture.root), ".pi-eng-trash"), { force: true });
     await rm(base, { recursive: true, force: true });
     await fixture.cleanup();
   }
@@ -796,5 +811,263 @@ test("a trashed worktree keeps its git registration in the trash entry and can b
     });
   } finally {
     await fixture.cleanup();
+  }
+});
+
+const restoreCommand = (reason: string): string => reason.slice(reason.indexOf("To restore: ") + "To restore: ".length);
+
+test("the printed restore command works even after git gc and with <common>/worktrees gone; the marker records adminId and commonDir", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await withTrash(async (trashRoot) => {
+      const repo = (await GitRepo.open(fixture.root))!;
+      const wt = await createOwned(repo, await repo.headCommit(), CAND("restore2"));
+      await ageWorktree(wt.path, 100 * HOUR);
+      const admin = await gitDirOf(wt.path);
+      const report = await sweep(repo, trashRoot);
+      const r = report.reclaimed[0]!;
+      const marker = JSON.parse(await readFile(join(dirname(r.trashedTo!), ".pi-eng-trash.json"), "utf8"));
+      assert.equal(marker.items[0].adminId, basename(admin));
+      assert.equal(marker.items[0].commonDir, dirname(dirname(admin)));
+      await exec("git", ["-C", fixture.root, "gc", "-q"]);
+      await rm(dirname(admin), { recursive: true, force: true }); // <common>/worktrees may not exist
+      await exec("sh", ["-c", restoreCommand(r.reason)]);
+      const list = (await exec("git", ["-C", fixture.root, "worktree", "list", "--porcelain"])).stdout;
+      assert.ok(list.includes(`worktree ${wt.path}\n`), list);
+      assert.equal((await exec("git", ["-C", wt.path, "status", "--short"])).stdout.trim(), "");
+    });
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("restore under a new admin name (the id is taken) follows the documented recipe", async () => {
+  const fixture = await makeFixtureRepo();
+  const elsewhere = await mkdtemp(join(tmpdir(), "pi-eng-leaf-"));
+  try {
+    await withTrash(async (trashRoot) => {
+      const repo = (await GitRepo.open(fixture.root))!;
+      const wt = await createOwned(repo, await repo.headCommit(), CAND("restore3"));
+      await ageWorktree(wt.path, 100 * HOUR);
+      const admin = await gitDirOf(wt.path);
+      const report = await sweep(repo, trashRoot);
+      const r = report.reclaimed[0]!;
+      // A foreign worktree now takes the freed id.
+      await exec("git", ["-C", fixture.root, "worktree", "add", "-q", "-b", "taker", join(elsewhere, basename(admin))]);
+      assert.equal(await exists(join(admin, "HEAD")), true, "the id is taken");
+      const entry = dirname(r.trashedTo!);
+      const fresh = `${admin}-restored`;
+      await rename(r.trashedTo!, wt.path);
+      await rename(join(entry, ".pi-eng-admin"), fresh);
+      await writeFile(join(wt.path, ".git"), `gitdir: ${fresh}\n`);
+      await exec("git", ["-C", fixture.root, "worktree", "repair", wt.path]);
+      const list = (await exec("git", ["-C", fixture.root, "worktree", "list", "--porcelain"])).stdout;
+      assert.ok(list.includes(`worktree ${wt.path}\n`), list);
+      assert.equal((await exec("git", ["-C", wt.path, "status", "--short"])).stdout.trim(), "");
+    });
+  } finally {
+    await rm(elsewhere, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+test("a bad trash root is judged before any candidate is touched: no move, no preserve commit, all kept with the reason", async () => {
+  const fixture = await makeFixtureRepo();
+  const base = await mkdtemp(join(tmpdir(), "pi-eng-t-"));
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await createOwned(repo, await repo.headCommit(), CAND("early"));
+    await writeFile(join(wt.path, "dirty.txt"), "uncommitted\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const headBefore = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout;
+    const link = join(base, "link");
+    await symlink(base, link);
+    for (const root of [link, join(fixture.root, "t"), "relative/trash"]) {
+      const report = await sweep(repo, root);
+      assert.equal(report.reclaimed.length, 0, root);
+      assert.match(report.kept.find((k) => k.path === wt.path)?.reason ?? "", /could not move it into the trash/, root);
+    }
+    assert.equal((await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout, headBefore, "no preserve commit");
+    assert.equal(await exists(join(wt.path, "dirty.txt")), true);
+    assert.deepEqual(
+      (await readdir(dirname(fixture.root))).filter(
+        (n) => n.startsWith(repo.worktreeNamespacePrefix()) && n.includes("reclaim-"),
+      ),
+      [],
+      "nothing was quarantined",
+    );
+  } finally {
+    await rm(base, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+test("copy/paste hints are shell-safe whatever the directory is called", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-eng-quote-"));
+  leaked.push(parent);
+  const nasty = "a'b$(touch PWNED)`touch PWNED2`\"q";
+  assert.equal((await exec("sh", ["-c", `printf %s ${shellQuote(nasty)}`])).stdout, nasty);
+  const dir = join(parent, ".pi-eng-trash", `20200101T000000Z-${nasty}`);
+  await mkdir(dir, { recursive: true });
+  const report = await listOrphanTrash(parent, { olderThanDays: 14, registeredPaths: new Set() });
+  const hint = report.skipped.find((k) => k.path === dir)?.reason ?? "";
+  const cmd = hint.slice(hint.indexOf("rm -rf "));
+  await exec("sh", ["-c", cmd], { cwd: parent });
+  assert.equal(await exists(dir), false, "the hint removed exactly the directory");
+  assert.equal(await exists(join(parent, "PWNED")), false);
+  assert.equal(await exists(join(parent, "PWNED2")), false);
+});
+
+test("moveAsideOrphan refuses a symlinked .pi-eng-trash", async () => {
+  const fixture = await isolatedFixture();
+  const base = await mkdtemp(join(tmpdir(), "pi-eng-t-"));
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const orphan = join(dirname(fixture.root), "pi-eng-orphan-x");
+    await mkdir(orphan);
+    await writeFile(join(orphan, "a.txt"), "x");
+    await symlink(base, join(dirname(fixture.root), ".pi-eng-trash"));
+    await assert.rejects(
+      (repo as unknown as { moveAsideOrphan(p: string): Promise<void> }).moveAsideOrphan(orphan),
+      /symbolic link/,
+    );
+    assert.equal(await exists(join(orphan, "a.txt")), true);
+    assert.deepEqual(await readdir(base), []);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
+});
+
+async function trashedForRestore(label: string): Promise<{
+  root: string;
+  parent: string;
+  wt: { path: string };
+  admin: string;
+  cmd: string;
+  trashed: string;
+  cleanup: () => Promise<void>;
+}> {
+  const fixture = await isolatedFixture();
+  const repo = (await GitRepo.open(fixture.root))!;
+  const wt = await createOwned(repo, await repo.headCommit(), CAND(label));
+  await ageWorktree(wt.path, 100 * HOUR);
+  const admin = await gitDirOf(wt.path);
+  const trashRoot = join(dirname(fixture.root), "trash");
+  const report = await sweep(repo, trashRoot);
+  const r = report.reclaimed[0]!;
+  assert.ok(r, JSON.stringify(report));
+  return {
+    root: fixture.root,
+    parent: dirname(fixture.root),
+    wt,
+    admin,
+    cmd: restoreCommand(r.reason),
+    trashed: r.trashedTo!,
+    cleanup: fixture.cleanup,
+  };
+}
+const bash = (cmd: string, cwd: string) =>
+  exec("bash", ["-c", cmd], { cwd }).then(
+    () => 0,
+    (e: { code?: number }) => e.code ?? 1,
+  );
+
+test("the printed restore command, really run in bash: works normally", async () => {
+  const t = await trashedForRestore("rsA");
+  try {
+    assert.equal(await bash(t.cmd, t.parent), 0);
+    const list = (await exec("git", ["-C", t.root, "worktree", "list", "--porcelain"])).stdout;
+    assert.ok(list.includes(`worktree ${t.wt.path}\n`), list);
+    assert.equal((await exec("git", ["-C", t.wt.path, "status", "--short"])).stdout.trim(), "");
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("the printed restore command refuses (non-zero, nothing moved) when the admin id is taken, leaving the taker intact", async () => {
+  const t = await trashedForRestore("rsB");
+  try {
+    const taker = join(t.parent, "elsewhere", basename(t.admin));
+    await mkdir(dirname(taker));
+    await exec("git", ["-C", t.root, "worktree", "add", "-q", "-b", "taker", taker]);
+    const snap = async () => ({
+      list: (await exec("git", ["-C", t.root, "worktree", "list", "--porcelain"])).stdout,
+      head: (await exec("git", ["-C", taker, "rev-parse", "HEAD"])).stdout,
+      index: (await exec("git", ["-C", taker, "status", "--porcelain=v2", "--branch"])).stdout,
+      dotgit: await readFile(join(taker, ".git"), "utf8"),
+      gitdir: await readFile(join(t.admin, "gitdir"), "utf8"),
+    });
+    const before = await snap();
+    assert.notEqual(await bash(t.cmd, t.parent), 0);
+    assert.deepEqual(await snap(), before, "the taker is untouched");
+    assert.equal(
+      await exists(join(dirname(t.trashed), ".pi-eng-admin", "HEAD")),
+      true,
+      "nothing was moved out of the trash",
+    );
+    assert.equal(await exists(t.trashed), true);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("the printed restore command refuses when the original path exists again", async () => {
+  const t = await trashedForRestore("rsC");
+  try {
+    await mkdir(t.wt.path);
+    await writeFile(join(t.wt.path, "mine.txt"), "someone else's\n");
+    assert.notEqual(await bash(t.cmd, t.parent), 0);
+    assert.deepEqual(await readdir(t.wt.path), ["mine.txt"], "nothing was nested into the existing directory");
+    assert.equal(await exists(join(dirname(t.trashed), ".pi-eng-admin", "HEAD")), true);
+    assert.equal(await exists(t.trashed), true);
+    assert.equal(await exists(t.admin), false, "the admin dir was not moved back either");
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("a trash root that ensureTrashRoot would reject is refused up front: no preserve commit, no quarantine", async () => {
+  const fixture = await isolatedFixture();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await createOwned(repo, await repo.headCommit(), CAND("early2"));
+    await writeFile(join(wt.path, "dirty.txt"), "uncommitted\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const headBefore = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout;
+    const root = join(dirname(fixture.root), "photos");
+    await mkdir(root);
+    await writeFile(join(root, "photo.jpg"), "x");
+    const report = await sweep(repo, root);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)?.reason ?? "", /not a pi-engineering trash root/);
+    assert.equal((await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout, headBefore, "no preserve commit");
+    assert.deepEqual(
+      (await readdir(dirname(fixture.root))).filter((n) => n.includes("reclaim-")),
+      [],
+      "no quarantine move",
+    );
+    assert.equal(await exists(join(root, "photo.jpg")), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a failed second mv undoes the first: the admin dir is back in the trash entry and nothing is registered", async (t) => {
+  if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+  const tr = await trashedForRestore("rsD");
+  try {
+    await chmod(tr.parent, 0o555); // renaming the checkout back into the parent fails
+    const code = await bash(tr.cmd, tr.parent);
+    await chmod(tr.parent, 0o755);
+    assert.notEqual(code, 0);
+    assert.equal(await exists(join(dirname(tr.trashed), ".pi-eng-admin", "HEAD")), true, "admin dir moved back");
+    assert.equal(await exists(tr.admin), false);
+    assert.equal(await exists(tr.trashed), true);
+    const list = (await exec("git", ["-C", tr.root, "worktree", "list", "--porcelain"])).stdout;
+    assert.ok(!list.includes("reclaim-"), list);
+  } finally {
+    await chmod(tr.parent, 0o755).catch(() => {});
+    await tr.cleanup();
   }
 });

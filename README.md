@@ -549,10 +549,23 @@ start, every six hours while a session stays open, and on demand with `/gc`
   would also drop other worktrees whose `.git` file is missing (an unmounted disk
   whose mount point still exists). An ambiguous match leaves the registration
   and reports the exact admin dir with `git worktree repair` / `remove`
-  guidance. To restore a trashed worktree: move `<trash entry>/<name>` back to
-  its original path, move `<trash entry>/.pi-eng-admin` to
-  `<common-git-dir>/worktrees/<id>` (any unused name), then run
-  `git worktree repair <original path>`. If any check fails the checkout is moved back. A writer
+  guidance. The trash marker records `adminId` and `commonDir`, and the `/gc`
+  report prints the exact restore command. By hand: `mkdir -p
+  <common-git-dir>/worktrees`; move `<trash entry>/.pi-eng-admin` to
+  `<common-git-dir>/worktrees/<id>`, where `<id>` is the last path component of
+  the `gitdir:` line in `<trash entry>/<name>/.git`; move `<trash entry>/<name>`
+  back to its original path; run `git worktree repair <original path>`. If that
+  id is already taken, use a new admin name AND rewrite `<checkout>/.git` to
+  `gitdir: <new admin dir>` before the repair. If the ORIGINAL PATH is taken,
+  restore the checkout to another path instead and run
+  `git worktree repair <new path>`. The printed one-liner refuses (non-zero,
+  nothing moved) when the id or the path is taken, and if its second `mv` fails
+  it moves the admin dir back, leaving the trash entry exactly as it was. Restore soon: once the admin dir
+  is out of `.git`, objects that only its reflog or `refs/worktree` held can be
+  pruned by `git gc` (branch commits and preserved work are kept by earlier
+  guards). Known residuals: `config.worktree` is not checked, Rust liveness
+  treats EACCES as gone, object mtimes are not freshened, and an orphan
+  directory's own mtime is not consulted. If any check fails the checkout is moved back. A writer
   that only knows the original path can no longer reach the files. Accepted
   residual: a process with its
   working directory already inside the checkout, or one that follows the

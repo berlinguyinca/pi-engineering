@@ -68,7 +68,14 @@ import type { GitRepo } from "./GitRepo.ts";
 import { readOwnerMarker } from "./ownerMarker.ts";
 import { UNSCOPED_TARGET_KEY, rustTargetDir } from "./rustBuildCache.ts";
 import { safeGitOrThrow } from "./safeGit.ts";
-import { defaultTrashRoot, moveToTrash, trashRootInsideProblem } from "./trashStore.ts";
+import {
+  defaultTrashRoot,
+  moveToTrash,
+  recordTrashAdmin,
+  shellQuote,
+  trashRootInsideProblem,
+  trashRootProblem,
+} from "./trashStore.ts";
 import { MAX_WALK_ENTRIES, ROOT_DERIVED_DIRS, containsGitEntry } from "./worktreeSafety.ts";
 
 const exec = promisify(execFile);
@@ -848,6 +855,20 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
   ]);
   const locked = await lockedWorktreePaths(repo);
 
+  // A misconfigured trash root (inside the repo, a symlink, relative) is judged ONCE, before any candidate is
+  // preserved or quarantined, so it cannot churn every candidate on every sweep.
+  let trashRoot = "";
+  let rootProblem: string | null = null;
+  try {
+    trashRoot = opts.trashRoot ?? defaultTrashRoot();
+    rootProblem =
+      (isAbsolute(trashRoot) ? null : `${trashRoot} is not an absolute path`) ??
+      (await trashRootInsideProblem(trashRoot, [repo.root, ...registered.keys()])) ??
+      (await trashRootProblem(trashRoot, { sameFilesystemAs: parent }));
+  } catch (error) {
+    rootProblem = error instanceof Error ? error.message.split("\n")[0] || String(error) : String(error);
+  }
+
   for (const wt of registered.values()) {
     // Planner-worker retirement/recovery fences live outside candidate records.
     // Only that executor (on success) or explicit recovery may remove its trees.
@@ -959,6 +980,14 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         report.kept.push({ path: wt.path, branch: wt.branch, reason: keep });
         continue;
       }
+      if (rootProblem) {
+        report.kept.push({
+          path: wt.path,
+          branch: wt.branch,
+          reason: `could not move it into the trash (${rootProblem}), kept`,
+        });
+        continue;
+      }
       if (opts.dryRun) {
         report.reclaimed.push({
           path: wt.path,
@@ -1043,13 +1072,6 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
       // that is reported and the checkout goes back. The provisioned node_modules link travels with it, unfollowed.
       let trashedTo: string;
       try {
-        const trashRoot = opts.trashRoot ?? defaultTrashRoot();
-        const inside = await trashRootInsideProblem(trashRoot, [
-          repo.root,
-          wt.path,
-          ...(await repo.listLinkedWorktrees()).map((w) => w.path),
-        ]);
-        if (inside) throw new Error(inside);
         trashedTo = await moveToTrash(trashRoot, "worktree", quarantined, basename(wt.path), wt.branch);
       } catch (error) {
         const cross = (error as NodeJS.ErrnoException).code === "EXDEV";
@@ -1059,7 +1081,7 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
         continue;
       }
       // The registration now points at a missing directory; move only our own admin dir into the trash entry (never `git worktree prune`).
-      const pruneNote = await moveOwnAdminDir(repo, quarantined, dirname(trashedTo));
+      const pruneNote = await moveOwnAdminDir(repo, quarantined, trashedTo, wt.path);
       report.reclaimed.push({
         path: wt.path,
         branch: wt.branch,
@@ -1088,28 +1110,53 @@ export async function sweepWorktrees(opts: JanitorOptions): Promise<JanitorRepor
  * ambiguous, or a move that fails (e.g. another filesystem), leaves the registration in place and names the exact
  * admin dir. Everything in it was already checked as a keep condition or preserved on the branch before the move.
  */
-async function moveOwnAdminDir(repo: GitRepo, movedFrom: string, trashEntryDir: string): Promise<string> {
+async function moveOwnAdminDir(
+  repo: GitRepo,
+  movedFrom: string,
+  trashedTo: string,
+  originalPath: string,
+): Promise<string> {
+  const entry = dirname(trashedTo);
   const left = (why: string, admin?: string): string => {
     const where = admin ? `its admin dir is ${admin}` : "its admin dir is under the repository's .git/worktrees";
-    const next =
-      "after checking `git worktree list`, run `git worktree repair <path>` if you restore the checkout, or `git worktree remove --force <path>` once you are sure it is not needed";
-    return `; its git registration was left in place (${why}); ${where}: ${next}`;
+    const next = `the registration points at the quarantine path ${movedFrom}; after verifying that, run a plain \`git worktree remove ${shellQuote(movedFrom)}\`, or \`git worktree prune\` only after checking \`git worktree list --porcelain\` for other prunable entries (or restore the checkout and run \`git worktree repair\`)`;
+    return `; its git registration was left in place (${why}); ${where}; ${next}`;
   };
+  let moved: string | null = null;
   try {
     const matches = await repo.adminMatches(movedFrom);
     if (matches.length !== 1) return left(`${matches.length} admin dirs match its path`);
     const admin = matches[0] as string;
     if (await existsStrict(join(admin, "locked"))) return left("it is locked", admin);
+    const kept = join(entry, ".pi-eng-admin");
     try {
-      await rename(admin, join(trashEntryDir, ".pi-eng-admin"));
+      await rename(admin, kept);
     } catch (error) {
       return left(
         `could not move it into the trash entry: ${error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error)}`,
         admin,
       );
     }
-    return `; git registration moved to ${join(trashEntryDir, ".pi-eng-admin")}`;
+    moved = kept;
+    const common = dirname(dirname(admin));
+    await recordTrashAdmin(entry, { adminId: basename(admin), commonDir: common }).catch(() => {});
+    const free = (p: string): string => `test ! -e ${shellQuote(p)} && test ! -L ${shellQuote(p)}`;
+    if ((await existsStrict(admin)) || (await existsStrict(originalPath))) {
+      return `; git registration moved to ${kept}. Restore: its admin id or original path is taken: follow the README manual recipe (new admin name + rewrite .git)`;
+    }
+    // Refuses (non-zero, nothing moved) instead of letting `mv` nest into, or `repair` rewrite, something that took the id or path.
+    const restore =
+      `${free(admin)} && ${free(originalPath)} && mkdir -p ${shellQuote(dirname(admin))} && ` +
+      `mv ${shellQuote(kept)} ${shellQuote(admin)} && ` +
+      `{ mv ${shellQuote(trashedTo)} ${shellQuote(originalPath)} || ` +
+      `{ mv ${shellQuote(admin)} ${shellQuote(kept)}; echo 'restore failed, admin dir moved back'; false; }; } && ` +
+      `git -C ${shellQuote(repo.root)} worktree repair ${shellQuote(originalPath)}`;
+    return `; git registration moved to ${kept}. To restore: ${restore}`;
   } catch (error) {
+    if (moved) {
+      // The admin dir is already in the trash entry: do not claim the registration is still in place.
+      return `; git registration moved to ${moved}, but the restore command could not be prepared (${error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error)}); to restore, follow the README manual recipe`;
+    }
     return left(error instanceof Error ? (error.message.split("\n")[0] ?? "") : String(error));
   }
 }
@@ -1179,7 +1226,7 @@ export async function previewUnmarkedWorktrees(
         if (keep) row.note = `keep: ${keep}`;
         else if (!row.clean) row.note = "keep: has uncommitted changes; commit or discard them yourself first";
         else {
-          row.command = `git -C ${JSON.stringify(repo.root)} worktree remove ${JSON.stringify(wt.path)}`;
+          row.command = `git -C ${shellQuote(repo.root)} worktree remove ${shellQuote(wt.path)}`;
           row.note =
             "eligible by every other check (clean, owner finished); review it first, then remove it yourself (plain remove, never --force)";
         }
