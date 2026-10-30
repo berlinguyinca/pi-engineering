@@ -309,8 +309,27 @@ export async function repairTornTail(
     });
     return complete;
   }
+  // Quarantine first: the discarded bytes are appended to `<file>.torn-<ts>` and
+  // the file is truncated only once they are safely on disk (fail closed).
+  const tail = raw.slice(complete.length);
+  const quarantine = `${file}.torn-${new Date()
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d+Z$/, "Z")}`;
+  try {
+    await appendFile(quarantine, tail, "utf-8");
+  } catch {
+    emitTelemetry({
+      level: "warning",
+      text: `event store: could not quarantine the torn tail of ${file}; file left untruncated`,
+    });
+    return complete;
+  }
   await truncate(file, Buffer.byteLength(complete, "utf-8")).catch(() => undefined);
-  emitTelemetry({ level: "warning", text: `event store: repaired a torn tail in ${file}` });
+  emitTelemetry({
+    level: "warning",
+    text: `event store: repaired a torn tail in ${file} (discarded bytes kept in ${quarantine})`,
+  });
   return complete;
 }
 

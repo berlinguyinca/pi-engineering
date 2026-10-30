@@ -6,9 +6,10 @@
  * in-memory ring for status/doctor views. Nothing here reaches the normal UI:
  * recovery is routine, and routine recovery must not produce warnings.
  */
-import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { emitTelemetry } from "../../telemetry/sink.ts";
+import { rotateWithoutOverwrite } from "../rotateFile.ts";
 
 export type RuntimeEventName =
   | "runtime.started"
@@ -108,9 +109,8 @@ export function onRuntimeEvent(listener: RuntimeEventSink): () => void {
 }
 
 /**
- * Rotation is per process: two processes sharing one runtime.jsonl can both
- * rotate and the later rename overwrites `.1` (bounded loss of old diagnostics,
- * never of the live file). Sessions normally own their own file.
+ * Rotation renames to `<file>.<timestamp>.<n>` and never overwrites an earlier
+ * generation, so two processes sharing one runtime.jsonl cannot lose history.
  */
 function appendLog(file: string, record: RuntimeEvent): void {
   try {
@@ -118,7 +118,7 @@ function appendLog(file: string, record: RuntimeEvent): void {
     const line = `${JSON.stringify(record)}\n`;
     const max = envNumber("PI_RUNTIME_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES);
     try {
-      if (statSync(file).size + line.length > max) renameSync(file, `${file}.1`);
+      if (statSync(file).size + line.length > max) rotateWithoutOverwrite(file);
     } catch {
       // No file yet.
     }

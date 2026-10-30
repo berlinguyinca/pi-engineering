@@ -1,8 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import { type Dirent, existsSync, realpathSync } from "node:fs";
-import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  rmdir,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
+import { writeOwnerMarker } from "./ownerMarker.ts";
 import { safeGit } from "./safeGit.ts";
 
 /** Short, stable, filesystem-safe hash of a path for unique worktree dirs. */
@@ -1290,6 +1304,7 @@ export class GitRepo {
       guard?.assertAuthoritative();
       const add = await this.git(["worktree", "add", record.path, record.branch]);
       if (add.code !== 0) return null;
+      await this.stampWorktreeOwner(record.path, record.branch).catch(() => {});
       guard?.assertAuthoritative();
       return (await this.headCommitIn(record.path)) === record.candidateSha
         ? { path: record.path, branch: record.branch }
@@ -1511,7 +1526,11 @@ export class GitRepo {
    *
    * The worktree path is derived from the repo root so that multiple repos (or
    * parallel test fixtures) never collide. A stale leftover at the path is
-   * removed first (crash recovery).
+   * replaced only when it is a registered, clean worktree (plain
+   * `git worktree remove`, never `--force`); a dirty or unregistered leftover
+   * makes creation fail with an operator-facing error. A leftover branch is
+   * deleted only when fully merged (`branch -d`), else renamed to
+   * `superseded/<branch>-<ts>` so its commits stay reachable.
    */
   async createWorktree(baseCommit: string, branch: string, guard?: GitMutationGuard): Promise<WorktreeInfo> {
     return this.serialize(() =>
@@ -1527,18 +1546,14 @@ export class GitRepo {
         // a path outside this repo's worktree namespace (see assertSafeWorktreePath).
         this.assertSafeWorktreePath(path);
         await mkdir(parent, { recursive: true }).catch(() => {});
-        // Crash recovery: clear any stale worktree or leftover directory at the path.
+        // Crash recovery, fail closed: a leftover at the path or branch is only
+        // replaced when it provably holds nothing; otherwise the data is kept.
         guard?.assertAuthoritative();
-        await this.git(["worktree", "remove", "--force", path]).catch(() => {});
-        guard?.assertAuthoritative();
-        await this.git(["branch", "-D", branch]).catch(() => {});
-        guard?.assertAuthoritative();
-        await this.forgetWorktreeAdmin(path);
-        guard?.assertAuthoritative();
-        await rm(path, { recursive: true, force: true }).catch(() => {});
+        await this.clearStaleWorktreeTarget(path, branch, guard);
         guard?.assertAuthoritative();
         const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
         if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr}`);
+        await this.stampWorktreeOwner(path, branch);
         await this.linkSharedNodeModules(path);
         return { path, branch };
       }),
@@ -1558,6 +1573,110 @@ export class GitRepo {
    * `node_modules` or the worktree already has one. Best-effort: a link
    * failure never breaks worktree creation (git operations don't need it).
    */
+  /** Write the `pi-eng-owner.json` ownership marker (see ownerMarker.ts). */
+  private async stampWorktreeOwner(path: string, branch: string | null): Promise<void> {
+    await writeOwnerMarker(path, { repoRoot: this.repoRoot, repoRootHash: shortHash(this.repoRoot), branch });
+  }
+
+  /**
+   * Remove the `node_modules` symlink that `linkSharedNodeModules` created, so a
+   * plain `git worktree remove` is not refused over our own untracked link
+   * (`node_modules/` in .gitignore does not match a symlink). Only a symlink that
+   * points at this repo's `node_modules` is removed; the target is untouched.
+   */
+  private async unlinkSharedNodeModules(worktreePath: string): Promise<void> {
+    const target = join(worktreePath, "node_modules");
+    try {
+      if (!(await lstat(target)).isSymbolicLink()) return;
+      if ((await realpath(target)) !== (await realpath(join(this.repoRoot, "node_modules")))) return;
+      await unlink(target);
+    } catch {
+      // Not ours or already gone: leave it for git to judge.
+    }
+  }
+
+  private async registeredWorktrees(): Promise<Array<{ path: string; branch: string | null }>> {
+    const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+    if (listed.code !== 0) throw new Error(`cannot list worktrees: ${listed.stderr}`);
+    const out: Array<{ path: string; branch: string | null }> = [];
+    for (const block of listed.stdout.split(/\n\n+/)) {
+      const lines = block.split("\n");
+      const wt = lines.find((l) => l.startsWith("worktree "));
+      if (!wt) continue;
+      const br = lines.find((l) => l.startsWith("branch refs/heads/"));
+      out.push({ path: wt.slice("worktree ".length), branch: br ? br.slice("branch refs/heads/".length) : null });
+    }
+    return out;
+  }
+
+  /**
+   * Make `path` and `branch` free for `worktree add` without destroying data.
+   * Never uses `--force`, `rm -rf` or `branch -D`.
+   */
+  private async clearStaleWorktreeTarget(path: string, branch: string, guard?: GitMutationGuard): Promise<void> {
+    const present = await lstat(path).then(
+      () => true,
+      () => false,
+    );
+    const real = present ? await realpath(path).catch(() => path) : path;
+    const registered = (await this.registeredWorktrees()).find((w) => w.path === path || w.path === real);
+    if (registered) {
+      if (present) {
+        const status = await this.git(["-C", path, "status", "--porcelain", "--untracked-files=all"]);
+        await this.unlinkSharedNodeModules(path);
+        const after = await this.git(["-C", path, "status", "--porcelain", "--untracked-files=all"]);
+        if (status.code !== 0 || after.code !== 0 || after.stdout.trim() !== "") {
+          throw new Error(
+            `refusing to replace the existing worktree at ${path}: it has uncommitted changes or cannot be inspected; inspect it and remove it yourself`,
+          );
+        }
+        guard?.assertAuthoritative();
+        const removed = await this.git(["worktree", "remove", path]);
+        if (removed.code !== 0) {
+          throw new Error(`refusing to replace the existing worktree at ${path}: ${removed.stderr || removed.stdout}`);
+        }
+      } else {
+        await this.forgetWorktreeAdmin(path); // metadata only: the working directory is already gone
+      }
+    } else if (present) {
+      const entries = await readdir(path).catch(() => null);
+      if (entries === null || entries.length > 0) {
+        throw new Error(
+          `refusing to replace ${path}: it exists but is not a registered worktree of this repository; move or remove it yourself`,
+        );
+      }
+      await rmdir(path);
+    }
+    const holder = (await this.registeredWorktrees()).find((w) => w.branch === branch);
+    if (holder) throw new Error(`branch ${branch} is checked out at ${holder.path}; refusing to reuse it`);
+    await this.deleteOrPreserveBranch(branch, guard);
+  }
+
+  /**
+   * `git branch -d` when the branch is fully merged; otherwise rename it to
+   * `superseded/<branch>-<ts>` so its commits stay reachable. Never `-D`.
+   */
+  private async deleteOrPreserveBranch(branch: string, guard?: GitMutationGuard): Promise<GitResult | null> {
+    const exists = await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+    if (exists.code !== 0) return null;
+    guard?.assertAuthoritative();
+    const deleted = await this.git(["branch", "-d", branch]);
+    if (deleted.code === 0) return deleted;
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace(/\.\d+Z$/, "Z");
+    for (let n = 0; ; n++) {
+      const target = `superseded/${branch}-${stamp}${n === 0 ? "" : `.${n}`}`;
+      if ((await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${target}`])).code === 0) continue;
+      const renamed = await this.git(["branch", "-m", branch, target]);
+      if (renamed.code !== 0) {
+        throw new Error(`cannot preserve branch ${branch}: ${renamed.stderr || renamed.stdout}`);
+      }
+      return renamed;
+    }
+  }
+
   private async linkSharedNodeModules(worktreePath: string): Promise<void> {
     const source = join(this.repoRoot, "node_modules");
     try {
@@ -1744,15 +1863,22 @@ export class GitRepo {
               ) {
                 this.assertSafeWorktreePath(info.path);
                 guard?.assertAuthoritative();
-                await rm(info.path, { recursive: true, force: true }).catch(() => {});
+                // No git metadata left to judge it by: move it aside (data kept)
+                // instead of deleting it.
+                await this.moveAsideOrphan(info.path);
               }
             } else if (!pathEntry.split("\n").includes(`branch ${expectedBranch}`)) {
               throw new Error("cleanup ownership does not match an exact repository worktree path and branch mapping");
             } else {
               guard?.assertAuthoritative();
-              const removed = await this.git(["worktree", "remove", "--force", info.path]);
+              await this.unlinkSharedNodeModules(info.path);
+              // Plain remove: git refuses a worktree with changes, and the
+              // refusal surfaces so the worktree (and its branch) is kept.
+              const removed = await this.git(["worktree", "remove", info.path]);
               if (removed.code !== 0) {
-                throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+                throw new Error(
+                  `git worktree remove failed for ${info.path} (refused; worktree and branch ${info.branch} kept): ${removed.stderr || removed.stdout}`,
+                );
               }
             }
           }
@@ -1772,7 +1898,7 @@ export class GitRepo {
             guard?.assertAuthoritative();
             const deleted = hooks.deleteBranch
               ? await hooks.deleteBranch()
-              : await this.git(["branch", "-D", info.branch]);
+              : ((await this.deleteOrPreserveBranch(info.branch, guard)) ?? { stdout: "", stderr: "", code: 0 });
             if (deleted.code !== 0) {
               throw new Error(`git branch delete failed for ${info.branch}: ${deleted.stderr || deleted.stdout}`);
             }
@@ -1857,10 +1983,28 @@ export class GitRepo {
     return out;
   }
 
-  async deleteBranch(branch: string, guard?: GitMutationGuard): Promise<void> {
+  async deleteBranch(branch: string, guard?: GitMutationGuard, expectedSha?: string): Promise<void> {
     await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
-    await this.git(["branch", "-D", branch]).catch(() => {});
+    if (expectedSha) {
+      // Compare-and-swap: fails (and the branch stays) if the tip moved since the caller looked.
+      const r = await this.git(["update-ref", "-d", `refs/heads/${branch}`, expectedSha]);
+      if (r.code !== 0) throw new Error(`branch ${branch} not deleted (tip moved or ref busy): ${r.stderr}`);
+      return;
+    }
+    // `-d`, never `-D`: an unmerged branch is refused and kept.
+    await this.git(["branch", "-d", branch]).catch(() => {});
+  }
+
+  /** Move an orphaned worktree directory to `<parent>/.pi-eng-trash/<ts>-<name>`; never deletes. */
+  private async moveAsideOrphan(path: string): Promise<void> {
+    const trash = join(dirname(path), ".pi-eng-trash");
+    await mkdir(trash, { recursive: true });
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace(/\.\d+Z$/, "Z");
+    await rename(path, join(trash, `${stamp}-${basename(path)}`));
   }
 
   /**

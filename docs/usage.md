@@ -578,7 +578,8 @@ can be computed per worker.
 
 - `PI_WORKER_TRANSCRIPTS` (`on`|`off`, default `on`).
 - `PI_WORKER_TRANSCRIPT_MAX_BYTES` (default 5 MiB): per-file cap; the file rotates
-  to `<file>.1` (one predecessor kept).
+  to `<file>.<timestamp>.<n>`; earlier generations are never overwritten or deleted
+  (prune old rotations yourself).
 - `PI_WORKER_TRANSCRIPT_TOOL_CHARS` (default 4000): cap per tool argument/result.
 
 Transcripts are keyed by the mission's state worktree (the orchestrator's identity), then
@@ -586,11 +587,11 @@ by mission id. Redaction is key-aware (password/secret/token/api key/authorizati
 values in JSON and `KEY=value` lines), covers Basic/Bearer headers, URL userinfo and
 sensitive query params, known token prefixes, prose ("password is X") and PEM blocks.
 The per-turn line does not count as worker activity for the inactivity watchdog.
-runtime.jsonl rotation is per process: two processes sharing one file may overwrite `.1`.
+runtime.jsonl rotation never overwrites: each rotation gets a fresh `.<timestamp>.<n>` name.
 
-The worktree janitor must leave `transcripts/` alone except by age.
+The worktree janitor must leave `transcripts/` alone; nothing deletes rotated transcripts automatically.
 
-`sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.1` at
+`sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.<timestamp>.<n>` (never overwriting older rotations) at
 `PI_RUNTIME_LOG_MAX_BYTES` (default 10 MiB). `lease.contended` is logged once per
 (resource, holder); repeats are counted and a `lease.contended_summary` line
 carries the counters every `PI_RUNTIME_CONTENTION_SUMMARY_MS` (default 5 min).

@@ -3118,6 +3118,8 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     }
     if (begun.status !== "ok" || begun.record.state === "released") return;
     try {
+      // removeWorktree is non-destructive: plain `worktree remove`, and the branch is
+      // deleted only when fully merged (`branch -d`), else renamed to superseded/*.
       await this.git.removeWorktree({ path: begun.record.locator, branch: candidate.branch });
       await this.resourceRegistry.completeRelease(id);
     } catch (error) {

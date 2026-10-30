@@ -8,14 +8,15 @@
  *
  * Records carry role, tool calls/results (truncated), per-turn stop reason,
  * tokens, model and timestamps. Secrets are redacted; the file is size-capped
- * and rotated to `<file>.1` (one predecessor kept).
+ * and rotated to `<file>.<timestamp>.<n>` (earlier generations are never overwritten or deleted).
  *
  *   PI_WORKER_TRANSCRIPTS=on|off          (default on)
  *   PI_WORKER_TRANSCRIPT_MAX_BYTES        (default 5 MiB per file)
  *   PI_WORKER_TRANSCRIPT_TOOL_CHARS       (default 4000 chars per tool arg/result)
  */
-import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { rotateWithoutOverwrite } from "../runtime/rotateFile.ts";
 import { redactSecrets } from "../security/SecurityPolicy.ts";
 
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
@@ -120,7 +121,7 @@ export class TranscriptWriter {
       }
       mkdirSync(dirname(this.file), { recursive: true });
       try {
-        if (statSync(this.file).size + Buffer.byteLength(line) > this.maxBytes) renameSync(this.file, `${this.file}.1`);
+        if (statSync(this.file).size + Buffer.byteLength(line) > this.maxBytes) rotateWithoutOverwrite(this.file);
       } catch {
         // No file yet.
       }
