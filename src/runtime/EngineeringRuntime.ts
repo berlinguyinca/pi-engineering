@@ -29,7 +29,7 @@ import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
 import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
-import { loadExecutionConfig, loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
+import { DEFAULT_POLICY, loadExecutionConfig, loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
@@ -106,6 +106,7 @@ import { LedgerWorkProjection } from "../work/ledgerProjection.ts";
 import { TaskLineageProjector } from "../work/taskLineage.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { WAITING_FOR_INFERENCE_SUMMARY } from "../workers/activity.ts";
 import { buildContinuityConfig } from "./continuityWiring.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
 import { type ExternalBridge, startExternalBridge } from "./herdr/externalAgent.ts";
@@ -802,6 +803,8 @@ export class EngineeringRuntime {
   > | null;
   private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent, meta?: { replay: boolean }) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
+  /** `execution.stale_after_ms` for work-run liveness; undefined = projection default. */
+  private livenessStaleMs: number | undefined;
   private missionActivityTicker: MissionActivityTicker | null = null;
   private readonly missionActivityClock = new ClockOnlyGate();
   private unsubscribeMissionActivity: (() => void) | null = null;
@@ -1421,7 +1424,12 @@ export class EngineeringRuntime {
     const broker = await ContextBroker.open(repoRoot);
     const rt = new EngineeringRuntime(opts);
     rt.ledger = ledger;
-    if (opts.lineage) rt.taskLineage = new TaskLineageProjector(new LedgerWorkProjection(ledger), opts.lineage);
+    rt.livenessStaleMs = (await loadExecutionConfig(repoRoot)).stale_after_ms;
+    if (opts.lineage)
+      rt.taskLineage = new TaskLineageProjector(
+        new LedgerWorkProjection(ledger, { staleAfterMs: rt.livenessStaleMs }),
+        opts.lineage,
+      );
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
     rt.testQuarantine = new TestQuarantine(workDir);
     // Records this host left in `releasing` (a crash between beginRelease and
@@ -2116,7 +2124,7 @@ export class EngineeringRuntime {
         };
         // Mission-less work (Ledger work items and the sessions that ran them) forks and hands off too: the work read
         // model names the task, and the repository and base branch come from this session's own checkout.
-        const projection = new LedgerWorkProjection(rt.ledger);
+        const projection = new LedgerWorkProjection(rt.ledger, { staleAfterMs: rt.livenessStaleMs });
         return withFallbackForkSources(
           missionForkSources(store, host),
           workForkSources(
@@ -2846,7 +2854,7 @@ export class EngineeringRuntime {
    * record, but a failed append must never fail or stall the engineering run.
    */
   private async recordAgentEvent(
-    type: "agent.started" | "agent.completed" | "agent.failed",
+    type: "agent.started" | "agent.completed" | "agent.failed" | "agent.heartbeat",
     workItemId: string,
     actor: Actor,
     payload: Record<string, unknown>,
@@ -2857,6 +2865,42 @@ export class EngineeringRuntime {
     } catch {
       // intentionally swallowed; see above
     }
+  }
+
+  /**
+   * While a worker runs, append an `agent.heartbeat` to the Ledger every `execution.heartbeat_interval_ms`,
+   * carrying the last meaningful-progress time the worker's own activity reported. Never fails the run: the
+   * timer is unref'd, appends are best-effort, and a key per interval slot makes a repeat a no-op.
+   * Returns the function that stops it.
+   */
+  private startRunHeartbeat(
+    workItemId: string,
+    actor: Actor,
+    meta: EventMeta,
+    state: { lastProgressAt: string; waiting: boolean },
+  ): () => void {
+    let stopped = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    void loadExecutionConfig(this.cwd)
+      .then((cfg) => {
+        const every = cfg.heartbeat_interval_ms ?? DEFAULT_POLICY.execution.heartbeat_interval_ms ?? 30_000;
+        if (stopped) return;
+        timer = setInterval(() => {
+          void this.recordAgentEvent(
+            "agent.heartbeat",
+            workItemId,
+            actor,
+            { last_progress_at: state.lastProgressAt, ...(state.waiting ? { phase: "waiting" } : {}) },
+            { ...meta, idempotency_key: `${meta.run_id}:hb:${Math.floor(Date.now() / every)}` },
+          );
+        }, every);
+        timer.unref?.();
+      })
+      .catch(() => {});
+    return () => {
+      stopped = true;
+      if (timer) clearInterval(timer);
+    };
   }
 
   private async runWorker(
@@ -2948,6 +2992,18 @@ export class EngineeringRuntime {
     }
     const executor = opts.worker ?? this.worker;
     const runMeta = { task_id: opts.wi.id, session_id: sessionScope, run_id: runId };
+    // Liveness: remember when the worker last made meaningful progress; the heartbeat reports it.
+    const liveness = { lastProgressAt: new Date().toISOString(), waiting: false };
+    const callerActivity = req.onActivity;
+    req.onActivity = (event) => {
+      if (event.meaningfulProgress) {
+        liveness.lastProgressAt = new Date().toISOString();
+        liveness.waiting = false;
+      } else if (event.kind === "state" && event.summary === WAITING_FOR_INFERENCE_SUMMARY) {
+        liveness.waiting = true;
+      }
+      callerActivity?.(event);
+    };
     await this.recordAgentEvent(
       "agent.started",
       opts.wi.id,
@@ -2959,9 +3015,12 @@ export class EngineeringRuntime {
       },
     );
     let run: Awaited<ReturnType<WorkerExecutor["run"]>>;
+    const stopHeartbeat = this.startRunHeartbeat(opts.wi.id, this.actor(runId, role), runMeta, liveness);
     try {
       run = await executor.run(req);
+      stopHeartbeat();
     } catch (error) {
+      stopHeartbeat();
       await this.recordAgentEvent(
         "agent.failed",
         opts.wi.id,
@@ -3274,7 +3333,7 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
         );
         await this.ledger.changeCandidate(
           candidate.id,
-          { diff: diff || null, diff_artifact_uri: diffArtifact.uri, changed_files: files },
+          { diff: diff || null, diff_artifact_uri: diffArtifact.uri, changed_files: files, head_commit: head },
           wi.id,
           this.actor(run.runId, "implementer"),
         );
@@ -3315,8 +3374,18 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     const actor = this.actor(newRunId(), "reviewer");
     this.telemetry.verifyStages += outcome.stages.length;
     const evidenceIds: string[] = [];
+    // Bind this verification to the commit it ran against, and say which stages the profile required, so the
+    // work read model can tell stale evidence and a skipped required gate from a pass.
+    const headCommit =
+      this.git && worktreePath ? await this.git.headCommitIn(runCwd).catch(() => undefined) : undefined;
+    const requiredStages = profile.stages.filter((s) => s.required).map((s) => s.name);
+    if (headCommit) {
+      await this.ledger.changeCandidate(candidate.id, { head_commit: headCommit }, wi.id, actor).catch(() => {});
+    }
     for (const ev of outcome.evidence) {
       this.telemetry.evidence++;
+      if (headCommit) ev.summary = { ...ev.summary, head_commit: headCommit };
+      ev.summary = { ...ev.summary, required_stages: requiredStages };
       const recorded = await this.ledger.recordEvidence(
         candidate.id,
         ev.type,
