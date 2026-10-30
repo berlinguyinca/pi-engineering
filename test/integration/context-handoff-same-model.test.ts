@@ -242,6 +242,14 @@ describe("a context handoff keeps the model through orchestrate()", () => {
     assert.equal(record?.fromModel, "gw/primary");
     assert.equal(record?.toModel, undefined, "never pinned to a model that cannot serve");
     assert.ok(record?.sourceFencedAt, "the context handoff still happens: the old session is out of room");
+    assert.equal(
+      h.calls[1]?.sawFirstWorkersCommit,
+      true,
+      "an unpinned successor still starts from the verified checkpoint",
+    );
+    const task = h.store.listTasks(missionId).find((t) => t.kind === "agent");
+    assert.ok(task?.repair_base_candidate_sha?.startsWith(record?.checkpointSha as string));
+    assert.equal(task?.execution_requirements.model, "gw/primary", "the task's own model is untouched");
     assert.ok(
       h.reports.some((l) =>
         /successor not pinned to gw\/primary \(the gateway marked it unavailable\); it routes normally/.test(l),

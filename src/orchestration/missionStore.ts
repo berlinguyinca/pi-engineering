@@ -1051,7 +1051,7 @@ export class MissionStore {
       case "task.model_switched": {
         this.applyTaskModelSwitch(
           e.payload.task_id as string,
-          e.payload.model as string,
+          e.payload.model as string | undefined,
           e.payload.resume_from_sha as string | undefined,
         );
         break;
@@ -2782,10 +2782,10 @@ export class MissionStore {
     return manifest ? copyWorkspaceManifest(manifest) : undefined;
   }
 
-  private applyTaskModelSwitch(taskId: string, model: string, resumeFromSha: string | undefined): void {
+  private applyTaskModelSwitch(taskId: string, model: string | undefined, resumeFromSha: string | undefined): void {
     const task = this.tasks.get(taskId);
     if (!task) return;
-    task.execution_requirements = { ...task.execution_requirements, model };
+    if (model !== undefined) task.execution_requirements = { ...task.execution_requirements, model };
     if (resumeFromSha) task.repair_base_candidate_sha = resumeFromSha;
   }
 
@@ -2809,6 +2809,27 @@ export class MissionStore {
         task_id: taskId,
         model,
         ...(resumeFromSha ? { resume_from_sha: resumeFromSha } : {}),
+        ...(handoffId ? { handoff_id: handoffId } : {}),
+      });
+    }
+    return this.getTask(taskId)!;
+  }
+
+  /**
+   * Start every LATER execution of the task from `resumeFromSha` (a Git-verified checkpoint) WITHOUT choosing a model: a
+   * context handoff whose model cannot be pinned still must not throw the verified work away. Same event as a model
+   * switch, minus the model; idempotent like it. Terminal tasks are immutable.
+   */
+  resumeTaskFromCheckpoint(taskId: string, resumeFromSha: string, handoffId?: string): OrchestrationTask {
+    const task = this.tasks.get(taskId);
+    if (!task) throw new Error(`unknown task ${taskId}`);
+    if (TERMINAL_TASK_STATUSES.has(task.status)) throw new Error(`terminal task ${taskId} is immutable`);
+    if (task.repair_base_candidate_sha !== resumeFromSha) {
+      this.applyTaskModelSwitch(taskId, undefined, resumeFromSha);
+      this.emit("task.model_switched", task.mission_id, {
+        actor: "system",
+        task_id: taskId,
+        resume_from_sha: resumeFromSha,
         ...(handoffId ? { handoff_id: handoffId } : {}),
       });
     }
