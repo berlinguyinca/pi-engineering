@@ -45,7 +45,7 @@ import {
   type ProviderResponseOptions,
   captureGatewayAttemptResponse,
 } from "../gateway/installStreamRetry.ts";
-import type { GatewayWaitSignal } from "../gateway/signals.ts";
+import { type GatewayWaitSignal, isGatewayAdmissionRefusal } from "../gateway/signals.ts";
 import {
   type AttemptObservation,
   type RetrySink,
@@ -70,6 +70,7 @@ import { ModelHealthRegistry } from "./modelHealth.ts";
 import { type ExecutedActionTracker, type RecoveryStep, decideRecoveryStep } from "./recovery.ts";
 import { type InferenceResilienceConfig, resolveInferenceResilienceConfig } from "./resilienceConfig.ts";
 import { StreamRetryPolicy } from "./retryPolicy.ts";
+import { recordRetryTrace } from "./retryTrace.ts";
 import {
   type InferenceTelemetry,
   type InferenceTelemetryData,
@@ -185,6 +186,8 @@ export class ResilientAttemptFlow {
   readonly missionId: string | undefined;
   readonly workerId: string | undefined;
   readonly interactive: boolean | undefined;
+  /** Set when the caller itself honours gateway waits (see InferenceInvocation). */
+  private readonly gatewayWaitOwner: "worker-gateway-hold" | undefined;
   private current: ModelRef;
   private readonly startedAt: number;
   private attemptOnModel = 0;
@@ -205,6 +208,7 @@ export class ResilientAttemptFlow {
     this.missionId = call.missionId ?? opts.missionId;
     this.workerId = call.workerId ?? opts.workerId;
     this.interactive = call.interactive ?? opts.interactive;
+    this.gatewayWaitOwner = call.gatewayWaitOwner;
     this.actions = call.actions ?? opts.actions;
     this.current = model;
     this.now = opts.now ?? (() => Date.now());
@@ -375,6 +379,29 @@ export class ResilientAttemptFlow {
           note: `${failure.class}: circuit OPEN — waiting for capacity`,
         };
       }
+    }
+    // One retry owner per failure: a worker that honours the gateway's advertised
+    // wait itself (a hold on this exact refusal) owns the retry, so replaying it
+    // here as well would multiply the two budgets (this ladder's attempts times
+    // the worker's holds). Model switches are a different decision and stay.
+    if (
+      this.gatewayWaitOwner !== undefined &&
+      (step.kind === "retry" || step.kind === "wait_capacity") &&
+      isGatewayAdmissionRefusal(observed.text)
+    ) {
+      recordRetryTrace(
+        undefined,
+        {
+          layer: "resilient-stream",
+          attempt: observed.attempt,
+          reason: `${observed.status ?? 429}:${failure.class}`,
+          next: "defer",
+          owner: this.gatewayWaitOwner,
+        },
+        this.opts.telemetry,
+        { ...(this.missionId ? { mission_id: this.missionId } : {}), role: this.role },
+      );
+      return { retryAfterMs: 0, retryable: false, source: "default", reason: failure.reason ?? failure.class };
     }
     return this.runStep(step, failure, base);
   }
