@@ -1335,6 +1335,7 @@ export class MissionObservability {
     | "failureCategory"
     | "reason"
     | "recovery"
+    | "recoveryStatus"
     | "nextAction"
     | "nextActionAt"
     | "owner"
@@ -1396,6 +1397,7 @@ export class MissionObservability {
         attempt: recovery?.attempt ?? 0,
         maxAttempts: recovery?.maxAttempts ?? 0,
       },
+      ...(recovery ? { recoveryStatus: recovery.status } : {}),
       nextAction,
       nextActionAt: recovery?.nextActionAt ?? null,
       owner: lease?.ownerId ?? null,

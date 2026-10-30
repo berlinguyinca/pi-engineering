@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { deriveAttention } from "../../src/orchestration/observability/attention.ts";
+import type { FailureCategory } from "../../src/orchestration/types.ts";
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
 import {
   MissionPresenceController,
@@ -551,4 +553,75 @@ test("observedAt alone is the fallback only when no state timestamp parses", () 
   controller.tick();
   assert.equal(sink.notices.length, 1);
   controller.dispose();
+});
+
+// #497 F2/F3: the notification verb and its 120-character reason cut.
+function parkedEvent(attention: ReturnType<typeof deriveAttention>) {
+  return mission({
+    state: "BLOCKED",
+    health: "blocked",
+    reason: "gateway returned 503",
+    attention: attention ?? undefined,
+  });
+}
+
+const cappedBase = (overrides: Partial<Parameters<typeof deriveAttention>[0]> = {}) => ({
+  state: "BLOCKED",
+  health: "blocked" as const,
+  lastMeaningfulProgressAt: "2026-10-27T10:09:40.000Z",
+  lastHeartbeatAt: "2026-10-27T10:09:50.000Z",
+  recovery: { attempt: 1999, maxAttempts: 8 },
+  recoveryAction: "PROBE_AND_BACKOFF",
+  nextActionAt: new Date(T0 + 12 * 3_600_000).toISOString(),
+  waitingSince: new Date(T0 - 99 * 3_600_000).toISOString(),
+  now: T0,
+  ...overrides,
+});
+
+test("a rank-1 BLOCKED capacity park says 'is waiting', not 'has stopped'", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running, undefined, "replay");
+  controller.update(parkedEvent(deriveAttention(cappedBase({ failureCategory: "PROVIDER_TRANSIENT" }))));
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  assert.match(sink.notices[0]!.text, /^Mission MSN-1 is waiting: /);
+  assert.doesNotMatch(sink.notices[0]!.text, /has stopped/);
+  assert.equal(sink.notices[0]!.level, "warning");
+  controller.dispose();
+});
+
+test("a real stop at the cap still says 'has stopped'", () => {
+  const sink = recordingSink();
+  const controller = new MissionPresenceController(sink, opts());
+  controller.update(running, undefined, "replay");
+  controller.update(parkedEvent(deriveAttention(cappedBase({ recoveryAction: "STOP" }))));
+  controller.tick();
+  assert.equal(sink.notices.length, 1);
+  assert.match(sink.notices[0]!.text, /^Mission MSN-1 has stopped: /);
+  controller.dispose();
+});
+
+test("the 'unless paused or stopped' caveat survives the 120-character cut for every wait category", () => {
+  const categories: (FailureCategory | undefined)[] = [
+    "PROVIDER_TRANSIENT",
+    "PROVIDER_PERMANENT",
+    "DISK_SUSPENDED",
+    "ORPHANED_EXECUTION",
+    undefined,
+  ];
+  const inputs = [
+    ...categories.map((failureCategory) => cappedBase({ failureCategory })),
+    cappedBase({ recoveryAction: "PAUSE_FOR_PERSISTENCE", failureCategory: "PERSISTENCE_FAILURE" }),
+  ];
+  for (const input of inputs) {
+    const sink = recordingSink();
+    const controller = new MissionPresenceController(sink, opts());
+    controller.update(running, undefined, "replay");
+    controller.update(parkedEvent(deriveAttention(input)));
+    controller.tick();
+    assert.equal(sink.notices.length, 1, String(input.failureCategory));
+    assert.match(sink.notices[0]!.text, /unless paused or stopped/, String(input.failureCategory));
+    controller.dispose();
+  }
 });

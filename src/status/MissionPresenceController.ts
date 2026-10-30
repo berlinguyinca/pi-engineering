@@ -371,8 +371,18 @@ export class MissionPresenceController {
         this.bus.observe(event.missionId, `${event.state}|${event.health}`);
         continue;
       }
+      // A capacity park resumes on its own; "has stopped" would contradict its reason.
+      const parkedWait = event.attention?.evidence[0]?.kind === "capacity_wait";
       const what =
-        rank === 0 ? "needs you" : rank === 1 ? "has stopped" : event.state === "COMPLETE" ? "is complete" : "failed";
+        rank === 0
+          ? "needs you"
+          : rank === 1
+            ? parkedWait
+              ? "is waiting"
+              : "has stopped"
+            : event.state === "COMPLETE"
+              ? "is complete"
+              : "failed";
       // Cite the evidence, not the mission's own narration: a counter the
       // operator can act on beats a sentence the model wrote about itself.
       const why = event.attention ? `${event.attention.reason} (${event.attention.evidence[0]!.kind})` : event.reason;
