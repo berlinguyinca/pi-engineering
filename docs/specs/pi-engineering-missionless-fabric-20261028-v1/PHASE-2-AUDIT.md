@@ -11,7 +11,7 @@ Stacked on PR #463 (Phase 1). Decision record: `EVENT-OWNER-MAP.md`; component c
 
 ## Deliberately not done
 - **No new store, no fake Missions for new work.** New tasks are written only to the Ledger; Missions only to MissionStore.
-- **`authority_generation` and `expected_revision` are not on the envelope.** Nothing could enforce them until the Phase 3 run executor owns fencing; a recorded-but-unchecked field is a control that looks wired and is not.
+- **`authority_generation` and `expected_revision`**: now enforced at append under the Ledger's cross-process lock (see PHASE-6-RETIREMENT.md); idempotency keys are likewise judged against the true log tail across processes.
 - **The runtime does not emit `agent.*` yet.** Today the Ledger never writes `agent.started/completed/failed` (checked: no emitter in `src/`), so Ledger-side runs and sessions are empty in production until Phase 3 emits them. The projection and tests exercise the contract with real Ledger events.
 - **No handoff events on the Ledger side.** Handoffs stay on `HandoffRecord` (extended by PR #460); Phase 4 extends that, not a second registry.
 - No Herdr emission change: `LineageEmitter` and the outbox are already generic and unchanged.
