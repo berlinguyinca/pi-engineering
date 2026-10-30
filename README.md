@@ -465,8 +465,8 @@ start, every six hours while a session stays open, and on demand with `/gc`
 
 - Only worktrees on `pi-eng-candidate-*` / `pi-eng-orch-*` branches in the
   runtime's own namespace (`pi-eng-<hash(repoRoot)>-*` siblings of the repo
-  root) are ever reclaimed, and only when their mission is durably `COMPLETE`,
-  `CANCELED` or `FAILED` (read from the orchestration event log, so missions run
+  root) are ever reclaimed, and only when their mission is durably `COMPLETE`
+  or `CANCELED` (`FAILED` missions can be reopened, so they are never reclaimed; read from the orchestration event log, so missions run
   by other pi processes count). A worktree on any other branch is yours: it is
   kept and reported, however idle. A mission this process cannot prove terminal
   is kept, as is any worktree a durable candidate, cleanup or quarantined record
@@ -474,20 +474,32 @@ start, every six hours while a session stays open, and on demand with `/gc`
   minimum 1) is reclaimed.
 - Housekeeping never loses data. A worktree is reclaimed only when its branch
   (or, if detached, its folder name) carries a parsable mission/task id whose
-  mission is durably terminal; no owner means it is kept, however idle. It is
-  also kept and reported, before anything is committed, when git has it locked,
-  it holds an initialized submodule, it holds ignored files other than collapsed
-  `node_modules/`, `target/`, `.next/`, `dist/` or `coverage/` folders, an
-  untracked derived folder would block a plain remove, assume-unchanged or
-  skip-worktree index entries could hide edits, its HEAD is detached and
-  unreachable from every branch, tag or remote ref (a stash does not count) or
-  dirty, or its Rust cache key is the shared `_shared` fallback. Otherwise
-  uncommitted changes (never the derived dirs) are committed onto the
-  worktree's own branch and a plain (never `--force`d) `git worktree remove`
-  runs; if changes remain or git refuses, it is kept. The branch is always
-  kept. A namespace directory git no longer lists is reported as a stray and its
-  files are never removed (`git worktree repair` may re-register it first, which
-  only rewrites git metadata); delete it yourself if you do not want it.
+  mission is durably `COMPLETE` or `CANCELED`; no owner means it is kept, however
+  idle (`MSN-ext-*`/`MSN-local-*` ids parse truncated and so are always kept).
+  It is also kept and reported, before anything is committed, when git has it
+  locked; it holds an initialized submodule or an untracked embedded git
+  repository; it holds ignored files other than disposable derived folders;
+  an untracked derived folder would block a plain remove; assume-unchanged or
+  skip-worktree index entries could hide edits; its HEAD is detached and dirty or
+  unreachable from every local branch and tag (remote-tracking refs and a stash
+  do not count); changes would remain after staging; or its Rust cache key is
+  the shared `_shared` fallback.
+- **Disposable derived folders** are exactly these, and only at the worktree
+  root: `node_modules/`, `target/`, `.next/`, `dist/`, `coverage/`, and only when
+  the folder itself is git-ignored and nothing named `.git` lives beneath it.
+  Same-named folders at any other depth, or ignored files inside a folder that is
+  not itself ignored, keep the worktree. An ignored root `dist/` is treated as
+  rebuildable output even if someone hand-wrote into it; keep such files
+  elsewhere.
+- Otherwise uncommitted changes are staged in a temporary copy of the index (the
+  worktree's real index is replaced only after the commit succeeds) and committed
+  onto the worktree's own branch. Every keep check is then re-run immediately
+  before a plain (never `--force`d) `git worktree remove`, and the tree's newest
+  file mtime must not have moved; a file that appears in that last window keeps
+  the worktree. The branch is always kept. A namespace directory git no longer
+  lists is reported as a stray and its files are never removed (`git worktree
+  repair` may re-register it first, which only rewrites git metadata); delete it
+  yourself if you do not want it.
 - A reclaimed worktree's cargo target dir goes with it, and target dirs (see
   above) that no build touched for `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
 

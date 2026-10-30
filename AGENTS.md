@@ -151,7 +151,7 @@ worktree reuse another's build of the repository's own crates. Set
 
 Worktrees the runtime creates are reclaimed by housekeeping
 (`src/git/worktreeJanitor.ts`, README "Housekeeping") once their mission is
-durably terminal (only on `pi-eng-candidate-*`/`pi-eng-orch-*` branches with a parsable mission/task owner, never by age alone, and
+durably `COMPLETE`/`CANCELED` (never `FAILED`; only on `pi-eng-candidate-*`/`pi-eng-orch-*` branches with a parsable mission/task owner, never by age alone, and
 only when `PI_HOUSEKEEPING=1`/`/gc` opts in; the default is dry-run); uncommitted
 work is committed to the worktree's branch first, and anything that cannot be
 preserved is kept and reported. Hand-made worktrees like the one above live outside

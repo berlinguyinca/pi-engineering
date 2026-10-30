@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { access, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
@@ -35,8 +35,18 @@ async function exists(path: string): Promise<boolean> {
 }
 
 /** Push every activity probe of a worktree into the past. */
+async function ageTree(dir: string, then: Date): Promise<void> {
+  for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+    if (entry.name === ".git") continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) await ageTree(full, then);
+    await utimes(full, then, then).catch(() => {});
+  }
+}
+
 async function ageWorktree(path: string, ageMs: number): Promise<void> {
   const then = new Date(Date.now() - ageMs);
+  await ageTree(path, then);
   const link = (await readFile(join(path, ".git"), "utf8")).trim().replace(/^gitdir:\s*/, "");
   for (const p of [path, join(path, ".git"), join(link, "index"), join(link, "HEAD"), join(link, "logs", "HEAD")]) {
     await utimes(p, then, then).catch(() => {});
@@ -55,7 +65,7 @@ test("branch names identify their owning mission or task", () => {
   assert.equal(worktreeIdleMs({ PI_WORKTREE_IDLE_HOURS: "nonsense" }), 24 * HOUR);
 });
 
-test("mission liveness: live keeps, terminal reclaims, unknown defers to idleness", () => {
+test("mission liveness: live and FAILED keep, COMPLETE/CANCELED reclaim, unknown keeps", () => {
   const store = {
     getMission: (id: string) =>
       ({ "MSN-live": { status: "EXECUTING" }, "MSN-done": { status: "COMPLETE" }, "MSN-dead": { status: "FAILED" } })[
@@ -66,7 +76,7 @@ test("mission liveness: live keeps, terminal reclaims, unknown defers to idlenes
   const liveness = missionOwnerLiveness(store);
   assert.equal(liveness({ missionId: "MSN-live" }), "live");
   assert.equal(liveness({ missionId: "MSN-done" }), "terminal");
-  assert.equal(liveness({ missionId: "MSN-dead" }), "terminal");
+  assert.equal(liveness({ missionId: "MSN-dead" }), "live", "FAILED missions can be reopened: never terminal");
   assert.equal(liveness({ missionId: "MSN-missing" }), "unknown");
   assert.equal(liveness({ taskId: "TSK-1" }), "live");
   assert.equal(liveness({ taskId: "TSK-404" }), "unknown");
@@ -730,10 +740,15 @@ test("changes that remain after the preserve step keep the worktree (tracked edi
     const wt = await repo.createWorktree(await repo.headCommit(), branch);
     await writeFile(join(wt.path, "dist/out.js"), "HUMAN EDIT\n");
     await ageWorktree(wt.path, 100 * HOUR);
+    const dry = await sweepOld(repo, { dryRun: true });
+    assert.equal(dry.reclaimed.length, 0, "dry-run must not over-report");
     const report = await sweepOld(repo);
     assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
     assert.equal(report.failed.length, 0, JSON.stringify(report.failed));
-    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /changes remain after the preserving commit/);
+    assert.match(
+      report.kept.find((k) => k.path === wt.path)!.reason,
+      /changes would remain after the preserving commit/,
+    );
     assert.equal(await readFile(join(wt.path, "dist/out.js"), "utf8"), "HUMAN EDIT\n");
   } finally {
     await fixture.cleanup();
@@ -791,4 +806,216 @@ test("an initialized submodule keeps the worktree", async () => {
     await fixture.cleanup();
     await sub.cleanup();
   }
+});
+
+// ---- Review round 2 ----
+
+async function nestedRepo(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  await exec("git", ["init", "-q", dir]);
+  await writeFile(join(dir, "x.txt"), "HUMAN COMMITTED\n");
+  await exec("git", ["-C", dir, "add", "x.txt"]);
+  await exec("git", ["-C", dir, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-qm", "unpushed"]);
+}
+
+test("an ignored root target/ holding a nested git repo keeps the worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await commitFile(fixture.root, ".gitignore", "target/\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("n3aaaa"));
+    await nestedRepo(join(wt.path, "target", "experiment"));
+    await ageWorktree(wt.path, 100 * HOUR);
+    for (const dryRun of [true, false]) {
+      const report = await sweepOld(repo, { dryRun });
+      assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+      assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /ignored files.*target/);
+    }
+    assert.equal(await exists(join(wt.path, "target", "experiment", ".git")), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a node_modules/ that is not itself ignored (only *.log inside is) keeps the worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await commitFile(fixture.root, ".gitignore", "*.log\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("n5aaaa"));
+    await mkdir(join(wt.path, "node_modules"), { recursive: true });
+    await writeFile(join(wt.path, "node_modules", "debug.log"), "HUMAN LOG\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.equal(await readFile(join(wt.path, "node_modules", "debug.log"), "utf8"), "HUMAN LOG\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("derived means: ROOT-level, ignored itself, repo-free. A nested ignored dist/ keeps; a root ignored dist/ is reclaimed", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await commitFile(fixture.root, ".gitignore", "dist/\n");
+    await commitFile(fixture.root, "pkg/keep.txt", "tracked\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const root = await repo.createWorktree(await repo.headCommit(), CAND("rootd1"));
+    const nested = await repo.createWorktree(await repo.headCommit(), CAND("nestd1"));
+    await mkdir(join(root.path, "dist"), { recursive: true });
+    await writeFile(join(root.path, "dist", "bundle.js"), "built\n");
+    await mkdir(join(nested.path, "pkg", "dist"), { recursive: true });
+    await writeFile(join(nested.path, "pkg", "dist", "bundle.js"), "built?\n");
+    await ageWorktree(root.path, 100 * HOUR);
+    await ageWorktree(nested.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.deepEqual(
+      report.reclaimed.map((r) => r.path),
+      [root.path],
+      JSON.stringify(report),
+    );
+    assert.equal(await exists(join(nested.path, "pkg", "dist", "bundle.js")), true);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an embedded git repository (untracked) keeps the worktree and is never staged as a gitlink", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("n4aaaa"));
+    await nestedRepo(join(wt.path, "scratch"));
+    await writeFile(join(wt.path, "scratch", "wip.txt"), "HUMAN WIP\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /embedded git repository/);
+    assert.equal(await exists(join(wt.path, "scratch", "wip.txt")), true);
+    const staged = (await exec("git", ["-C", wt.path, "diff", "--cached", "--name-only"])).stdout;
+    assert.equal(staged.trim(), "", "a kept worktree's index is untouched");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an ignored file created after the preserving commit (concurrent writer) keeps the worktree", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await commitFile(fixture.root, ".gitignore", "*.env\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("t1aaaa");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "dirty.txt"), "x\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const refFile = join(fixture.root, ".git", "refs", "heads", branch);
+    const before = await readFile(refFile, "utf8");
+    let wrote = false;
+    let done = false;
+    // A real concurrent writer: drops an ignored file the moment the preserving commit moves the branch.
+    const writer = (async () => {
+      while (!done && !wrote) {
+        if ((await readFile(refFile, "utf8").catch(() => before)) !== before) {
+          await writeFile(join(wt.path, "late.env"), "WRITTEN AFTER PLAN\n");
+          wrote = true;
+        }
+      }
+    })();
+    const report = await sweepOld(repo).finally(() => {
+      done = true;
+    });
+    await writer;
+    assert.equal(wrote, true, "the writer must have raced the sweep");
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /ignored files.*late\.env/);
+    assert.equal(await readFile(join(wt.path, "late.env"), "utf8"), "WRITTEN AFTER PLAN\n");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("dry-run matches the real run for a tracked edit inside dist/", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    await commitFile(fixture.root, "dist/app.js", "orig\n");
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("n7aaaa"));
+    await writeFile(join(wt.path, "dist/app.js"), "HUMAN EDIT\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const dry = await sweepOld(repo, { dryRun: true });
+    const real = await sweepOld(repo);
+    assert.equal(dry.reclaimed.length, real.reclaimed.length);
+    assert.equal(real.reclaimed.length, 0);
+    assert.equal(await readFile(join(wt.path, "dist/app.js"), "utf8"), "HUMAN EDIT\n");
+    assert.equal((await exec("git", ["-C", wt.path, "diff", "--cached", "--name-only"])).stdout.trim(), "");
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("an eligible dirty worktree is preserved through a temporary index and reclaimed", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("idx001");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "work.txt"), "w\n");
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 1, JSON.stringify(report));
+    const files = (await exec("git", ["-C", fixture.root, "ls-tree", "-r", "--name-only", branch])).stdout;
+    assert.match(files, /work\.txt/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("a detached HEAD reachable only from a remote-tracking ref is kept", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const branch = CAND("remo01");
+    const wt = await repo.createWorktree(await repo.headCommit(), branch);
+    await writeFile(join(wt.path, "u.txt"), "u\n");
+    await exec("git", ["-C", wt.path, "add", "-A"]);
+    await exec("git", ["-C", wt.path, "commit", "-qm", "unique"]);
+    await exec("git", ["-C", wt.path, "checkout", "-q", "--detach"]);
+    await exec("git", ["-C", fixture.root, "update-ref", "refs/remotes/origin/feature", "HEAD"], {
+      cwd: wt.path,
+    }).catch(() => {});
+    const sha = (await exec("git", ["-C", wt.path, "rev-parse", "HEAD"])).stdout.trim();
+    await exec("git", ["-C", fixture.root, "update-ref", "refs/remotes/origin/feature", sha]);
+    await exec("git", ["-C", fixture.root, "branch", "-D", branch]);
+    await ageWorktree(wt.path, 100 * HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /not reachable/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("recent activity deep in the tree (not just the top dir) keeps the worktree young", async () => {
+  const fixture = await makeFixtureRepo();
+  try {
+    const repo = (await GitRepo.open(fixture.root))!;
+    const wt = await repo.createWorktree(await repo.headCommit(), CAND("act001"));
+    await ageWorktree(wt.path, 100 * HOUR);
+    assert.ok(Date.now() - (await worktreeLastActivity(wt.path)) > 99 * HOUR);
+    await writeFile(join(wt.path, "src", "deep.txt"), "edited just now\n");
+    assert.ok(Date.now() - (await worktreeLastActivity(wt.path)) < HOUR);
+    const report = await sweepOld(repo);
+    assert.equal(report.reclaimed.length, 0, JSON.stringify(report));
+    assert.match(report.kept.find((k) => k.path === wt.path)!.reason, /minimum age/);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("MSN-ext-/MSN-local- ids parse truncated, so they never match a real mission and stay kept", async () => {
+  assert.deepEqual(parseWorktreeOwner("pi-eng-candidate-MSN-ext-0123456789abcdef0123-repo-1-0-EXC-a"), {
+    missionId: "MSN-ext",
+  });
+  const mine = { getMission: () => undefined, getTask: () => undefined };
+  assert.equal(missionOwnerLiveness(mine)({ missionId: "MSN-ext" }), "unknown");
 });

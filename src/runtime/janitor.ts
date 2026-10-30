@@ -19,12 +19,12 @@ import {
 import type { MissionStatus } from "../orchestration/types.ts";
 import { discoverMissionHandover } from "./host/missionHandover.ts";
 
-/** Mission statuses after which a mission never touches its worktrees again. */
-const TERMINAL_MISSION_STATUSES: ReadonlySet<MissionStatus> = new Set<MissionStatus>([
-  "COMPLETE",
-  "CANCELED",
-  "FAILED",
-]);
+/**
+ * Mission statuses after which a mission never touches its worktrees again.
+ * FAILED is deliberately absent: a failed mission can be reopened and resumed
+ * in the same worktree, so its checkout is never reclaimed.
+ */
+const TERMINAL_MISSION_STATUSES: ReadonlySet<MissionStatus> = new Set<MissionStatus>(["COMPLETE", "CANCELED"]);
 
 /** The slice of MissionStore the janitor needs; keeps the binding testable. */
 export interface MissionLookup {
