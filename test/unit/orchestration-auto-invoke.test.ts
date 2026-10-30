@@ -188,8 +188,18 @@ describe("missionToolReportedUnavailable (PR #106 review)", () => {
 });
 
 // ── Missionless Execution Fabric, phase 1 (O1 prompt corpus) ───────────────
-const MISSIONLESS = { preference: "adaptive", legacy_auto_invoke: false, hold_mission_model: true } as const;
-const LEGACY = { preference: "adaptive", legacy_auto_invoke: true, hold_mission_model: true } as const;
+const MISSIONLESS = {
+  preference: "adaptive",
+  legacy_auto_invoke: false,
+  hold_mission_model: true,
+  strict_completion: true,
+} as const;
+const LEGACY = {
+  preference: "adaptive",
+  legacy_auto_invoke: true,
+  hold_mission_model: true,
+  strict_completion: true,
+} as const;
 
 /** The spec's O1 corpus: hello, question, fix, retry, continue, print, implement, plan. */
 const O1_CORPUS: { name: string; prompt: string; mode?: string }[] = [
@@ -229,7 +239,7 @@ describe("decideMissionDirective (MEF phase 1)", () => {
   it("explains why a legacy-eligible prompt was left to the foreground agent", () => {
     const d = decideMissionDirective(
       { ...base, prompt: "implement pagination for the users list endpoint with tests" },
-      { preference: "direct", legacy_auto_invoke: false, hold_mission_model: true },
+      { preference: "direct", legacy_auto_invoke: false, hold_mission_model: true, strict_completion: true },
     );
     assert.equal(d.invoke, false);
     assert.match(d.reason, /missionless \(direct\)/);

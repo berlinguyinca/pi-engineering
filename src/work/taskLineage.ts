@@ -34,6 +34,7 @@ const RUN_STATE: Record<RunHealth, LineageState> = {
   active: "running",
   waiting: "pending",
   stalled: "blocked",
+  unknown: "blocked",
   recovering: "running",
   failed: "failed",
   finished: "done",

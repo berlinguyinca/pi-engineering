@@ -22,6 +22,7 @@ export type EventType =
   | "agent.started"
   | "agent.completed"
   | "agent.failed"
+  | "agent.heartbeat"
   | "incident.detected"
   | "candidate.created"
   | "candidate.changed"
@@ -155,6 +156,8 @@ export interface WorkItem {
   updated_at: string;
   current_candidate_id: string | null;
   incumbent_candidate_id: string | null;
+  /** Why completion was refused (set with status BLOCKED by the completion gate); cleared by a later status change. */
+  blocked_reason?: string | null;
 }
 
 export type CandidateStatus =
@@ -172,6 +175,10 @@ export interface Candidate {
   parent_id: string | null;
   status: CandidateStatus;
   base_commit: string;
+  /** Commit the candidate was last verified at; evidence recorded for another commit is stale. */
+  head_commit?: string;
+  /** Tree of `head_commit`, when the writer knows it. */
+  tree?: string;
   branch: string;
   worktree_path: string | null;
   producer_run_id: string | null;
@@ -199,6 +206,8 @@ export interface Task {
   risk: RiskLevel;
   /** Work item produced when this task was executed (via the engineer pipeline). */
   result_work_item_id: string | null;
+  /** Why the task was blocked, when a gate (not just a failed dependency) refused it. */
+  blocked_reason?: string | null;
 }
 
 export type EvidenceTrust = "authoritative" | "deterministic" | "observed" | "reviewed" | "unverified";
