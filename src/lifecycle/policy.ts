@@ -198,6 +198,14 @@ export interface ExecutionConfig {
    * run through the `mission` tool (the pre-MEF behaviour). Default false.
    */
   legacy_auto_invoke: boolean;
+  /**
+   * A mission stays on its pinned model (the one its session started on, or the
+   * operator's choice). When that model is unavailable the task fails with its
+   * real error instead of moving to a model nobody chose; the independent
+   * reviewer is the one role that must use a different model. Set false to
+   * restore automatic failover to the next eligible model. Default true.
+   */
+  hold_mission_model: boolean;
 }
 
 export interface EngineeringPolicy {
@@ -244,7 +252,7 @@ export interface EngineeringPolicy {
 
 export const DEFAULT_POLICY: EngineeringPolicy = {
   version: 1,
-  execution: { preference: "adaptive", legacy_auto_invoke: false },
+  execution: { preference: "adaptive", legacy_auto_invoke: false, hold_mission_model: true },
   limits: {
     worker_inactivity_ms: 3_600_000,
   },
@@ -438,6 +446,7 @@ const BOOLEAN_FIELDS = [
   "lifecycle.telemetry",
   "lifecycle.notify",
   "execution.legacy_auto_invoke",
+  "execution.hold_mission_model",
   "routing.mode",
   "policies.review.require_independent_review",
   "policies.review.independent_reviewer",
