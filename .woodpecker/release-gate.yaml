@@ -95,8 +95,9 @@ steps:
       # guard in `variables`).
       - *venv_resolve
       # Delete only what is provably a venv of ours: an existing path with
-      # the owned name but no pyvenv.cfg is not touched (refuse, exit 1).
-      - 'if [ -e "$VENV" ]; then if [ -d "$VENV" ] && [ -f "$VENV/pyvenv.cfg" ]; then rm -rf -- "$VENV"; else echo "refusing: $VENV exists and is not a venv" >&2; exit 1; fi; fi'
+      # the owned name but no regular-file pyvenv.cfg (a symlink does not
+      # count) is not touched (refuse, exit 1).
+      - 'if [ -e "$VENV" ]; then if [ -d "$VENV" ] && [ -f "$VENV/pyvenv.cfg" ] && [ ! -L "$VENV/pyvenv.cfg" ]; then rm -rf -- "$VENV"; else echo "refusing: $VENV exists and is not a venv" >&2; exit 1; fi; fi'
       - 'python3 -m venv "$VENV"'
       - '"$VENV/bin/pip" install -q pytest'
       - '"$VENV/bin/python" -m pytest --version'
@@ -129,4 +130,4 @@ steps:
       # that path is left alone with a warning (exit 0: leaking over
       # deleting). A failed rm is deliberately NOT masked (no `|| true`):
       # a cleanup that cannot clean must be visible in the pipeline.
-      - 'if [ -d "$VENV" ] && [ -f "$VENV/pyvenv.cfg" ]; then rm -rf -- "$VENV"; echo "removed $VENV"; elif [ -e "$VENV" ]; then echo "warning: $VENV exists and is not a venv; leaving it (leaked)" >&2; else echo "no venv at $VENV"; fi'
+      - 'if [ -d "$VENV" ] && [ -f "$VENV/pyvenv.cfg" ] && [ ! -L "$VENV/pyvenv.cfg" ]; then rm -rf -- "$VENV"; echo "removed $VENV"; elif [ -e "$VENV" ]; then echo "warning: $VENV exists and is not a venv; leaving it (leaked)" >&2; else echo "no venv at $VENV"; fi'
