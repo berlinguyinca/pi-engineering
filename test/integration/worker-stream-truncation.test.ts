@@ -470,3 +470,52 @@ test("worker: a model_not_found failure names the model the attempt ran on", asy
     assert.deepEqual(run.result.details.model, { provider: "probe", id: "probe-model" });
   });
 });
+
+// A reply cut at the output limit (finish_reason "length") is never a result.
+const cutAt =
+  (delta: Record<string, unknown>): Reply =>
+  (res) =>
+    sse(res, [chunk({ role: "assistant", ...delta }), chunk({}, "length")]);
+const LENGTH_SHAPES: Record<string, Reply> = {
+  "partial text": cutAt({ content: "ANSWER: the half-written worker summary that never reaches" }),
+  "no text": cutAt({ content: "" }),
+  "reasoning only": cutAt({ reasoning_content: "Let me think about this at great length..." }),
+};
+const allowance = (body: string | undefined): number | undefined => {
+  const b = JSON.parse(body ?? "{}") as { max_tokens?: number; max_completion_tokens?: number };
+  return b.max_tokens ?? b.max_completion_tokens;
+};
+const run = (executor: PiWorkerExecutor, cwd: string) =>
+  executor.run({
+    role: "implementer",
+    task: "t",
+    tools: [],
+    cwd,
+    modelOverride: { provider: "probe", id: "probe-model" },
+  });
+
+for (const [shape, reply] of Object.entries(LENGTH_SHAPES)) {
+  test(`worker: a length-stopped reply (${shape}) is retried ONCE with a larger allowance, then fails as truncated`, async () => {
+    const requests = await withProbe([reply, reply, reply], async (executor, cwd, bodies) => {
+      const out = await run(executor, cwd);
+      assert.equal(out.result.status, "failed");
+      assert.equal(out.result.error, "truncated");
+      assert.match(out.result.summary, /truncated at the output limit/);
+      assert.doesNotMatch(out.result.summary, /^Worker returned no worker_result/);
+      const [first, second] = [allowance(bodies[0]), allowance(bodies[1])];
+      assert.ok(first && second && second > first, `retry allowance ${second} exceeds first ${first}`);
+    });
+    assert.equal(requests, 2, "the retry is capped at one");
+  });
+}
+
+test("worker: a length stop followed by a complete answer on the larger allowance completes", async () => {
+  const requests = await withProbe(
+    [LENGTH_SHAPES["partial text"]!, toolCalls([{ name: "worker_result", args: WORKER_RESULT }])],
+    async (executor, cwd) => {
+      const out = await run(executor, cwd);
+      assert.equal(out.result.status, "completed", out.result.summary);
+    },
+  );
+  assert.equal(requests, 2);
+});

@@ -24,6 +24,8 @@ import {
   applyThinkingOff,
   describeHiddenReasoningTruncation,
   isSummarizationRequest,
+  isTruncatedReply,
+  raisedAllowance,
   resolveThinkingOffConfig,
   streamWithThinkingPolicy,
   thinkingOffReason,
@@ -259,6 +261,7 @@ test("a 'length' stop that spent the WHOLE allowance with almost no visible text
   const explained = describeHiddenReasoningTruncation(cut, 32_768);
   assert.ok(explained);
   assert.match(explained, /hidden reasoning/i);
+  assert.ok(isTruncatedReply(explained), "the executor recognises it as a truncation");
   assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: explained } as never), false);
   assert.doesNotMatch(explained, /\d{3}/, "no digit runs Pi's retry matcher could catch");
 
@@ -380,4 +383,13 @@ test("override: the 27B model on a non-policy gateway is also never touched", as
       undefined,
     );
   });
+});
+
+test("a retry after a length stop doubles the allowance within half the window, and only if that is more", () => {
+  assert.equal(raisedAllowance({ maxTokens: 4_096, contextWindow: 100_000 }), 8_192);
+  assert.equal(raisedAllowance({ maxTokens: 4_096 }), 8_192);
+  assert.equal(raisedAllowance({ maxTokens: 40_000, contextWindow: 100_000 }), 50_000);
+  assert.equal(raisedAllowance({ maxTokens: 50_000, contextWindow: 100_000 }), undefined, "already at the bound");
+  assert.equal(raisedAllowance({}), undefined, "unknown allowance");
+  assert.equal(isTruncatedReply("Worker returned no worker_result."), false);
 });

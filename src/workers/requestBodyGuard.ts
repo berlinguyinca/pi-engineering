@@ -32,12 +32,13 @@ export function guardRuntimeRequestBody(
   const unclamped = runtime.streamSimple.bind(runtime);
   // The invocation's output cap keeps prompt budget + max_tokens within the slot.
   const provider = ((model: { maxTokens?: number }, context: unknown, options?: { maxTokens?: number }) => {
-    const cap = currentInferenceInvocation()?.maxOutputTokens;
-    const wanted = options?.maxTokens ?? model.maxTokens;
+    const { maxOutputTokens: cap, maxTokens: raised } = currentInferenceInvocation() ?? {};
+    const wanted = raised ?? options?.maxTokens ?? model.maxTokens;
+    const maxTokens = cap !== undefined && wanted !== undefined && wanted > cap ? cap : raised;
     return (unclamped as (...a: unknown[]) => unknown)(
       model,
       context,
-      cap !== undefined && wanted !== undefined && wanted > cap ? { ...options, maxTokens: cap } : options,
+      maxTokens !== undefined ? { ...options, maxTokens } : options,
     );
   }) as unknown as StreamSimple;
   const base = thinking ? streamWithThinkingPolicy(provider as never, thinking) : provider;

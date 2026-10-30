@@ -94,7 +94,13 @@ import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { missionDepthSpawnHook } from "../orchestration/missionMode.ts";
 import { NO_CHANGE_LOOP_PREVENTED_MARKER } from "../orchestration/recovery.ts";
 import { type RequestBodyBudgetConfig, resolveRequestBodyBudgetConfig } from "../request/bodyBudget.ts";
-import { type ThinkingOffConfig, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
+import {
+  TRUNCATED_REPLY,
+  type ThinkingOffConfig,
+  isTruncatedReply,
+  raisedAllowance,
+  resolveThinkingOffConfig,
+} from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "../runtime/isolation/stateDir.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
@@ -751,6 +757,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
     const admission = this.admission;
     const gatewayConfig = this.gatewayConfig;
     let gatewayRetries = 0;
+    // A reply cut at the output limit gets ONE retry with a larger allowance.
+    let lengthRetried = false;
+    let allowance: number | undefined;
     // Cut-stream resumes spent by this execution (cap: streamResumeMax).
     const streamResumes = { count: 0 };
     // Scope every hold to the model actually called, then route it the same way
@@ -930,20 +939,26 @@ export class PiWorkerExecutor implements WorkerExecutor {
         transientOutcome = await withTransientRetry({
           fn: async () => {
             try {
-              return await this.runSingleAttempt(
-                req,
-                model,
-                // A retry of a generation that already ran tool calls carries the
-                // evidence block: the executed edits/commits are LISTED, never
-                // replayed (spec §6). Nothing is re-executed by the runtime.
-                attempt === 0 ? systemPrompt : withIdempotencyEvidence(systemPrompt, this.trackerFor(req)),
-                modelRuntime,
-                customTools,
-                tools,
-                attempt,
-                guardConfig,
-                streamResumes,
-              );
+              const inv = currentInferenceInvocation();
+              const attemptRun = () =>
+                this.runSingleAttempt(
+                  req,
+                  model,
+                  // A retry of a generation that already ran tool calls carries the
+                  // evidence block: the executed edits/commits are LISTED, never
+                  // replayed (spec §6). Nothing is re-executed by the runtime.
+                  attempt === 0 ? systemPrompt : withIdempotencyEvidence(systemPrompt, this.trackerFor(req)),
+                  modelRuntime,
+                  customTools,
+                  tools,
+                  attempt,
+                  guardConfig,
+                  streamResumes,
+                );
+              // The raised allowance of a length-stop retry rides the invocation.
+              return await (allowance && inv
+                ? runWithInferenceInvocation({ ...inv, maxTokens: allowance }, attemptRun)
+                : attemptRun());
             } catch (error) {
               // A pinned gate role is waited on, except when its host refuses
               // connections or does not resolve: that is not retried in-session.
@@ -1282,8 +1297,26 @@ export class PiWorkerExecutor implements WorkerExecutor {
         return { ...overflow, usage: this.collectUsage(this.asMessages(session.messages)) };
       }
 
+      // A reply cut at the output limit: retry once in a fresh session with a
+      // larger allowance; the second cut fails visibly below as "truncated".
+      if (!guardAborted && !budgetExhausted && !timedOut && !lengthRetried && isTruncatedReply(lastAssistantError)) {
+        const maxTokens = raisedAllowance(model);
+        if (maxTokens) {
+          lengthRetried = true;
+          allowance = maxTokens;
+          emitTelemetry({
+            level: "warning",
+            key: "worker:truncated-retry",
+            text: `${req.role} reply cut at the output limit; retrying once with a ${maxTokens}-token allowance`,
+          });
+          lastAssistantError = undefined;
+          continue;
+        }
+      }
+
       if (!guardAborted || !this.guardConfig.enabled) {
         // Non-guard failure (timeout, budget, gateway, no-result) — no recovery ladder.
+        const truncated = isTruncatedReply(lastAssistantError);
         const gateway = lastAssistantError ? parseGatewayWait({ text: lastAssistantError }) : null;
         // A 404 model_not_found usually arrives as an assistant-message error,
         // not a throw, so the transient layer never saw it. Give it the same
@@ -1297,22 +1330,26 @@ export class PiWorkerExecutor implements WorkerExecutor {
           ? "Worker exceeded the hard context-token budget."
           : timedOut
             ? "Worker timed out."
-            : gateway
-              ? `Model gateway refused the request after ${gatewayRetries} honoured wait(s): ${lastAssistantError}`
-              : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
+            : truncated
+              ? `Worker reply truncated at the output limit${lengthRetried ? " (again after a retry with a larger allowance)" : ""}; no worker_result. ${lastAssistantError}`
+              : gateway
+                ? `Model gateway refused the request after ${gatewayRetries} honoured wait(s): ${lastAssistantError}`
+                : `Worker returned no worker_result.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
         const error = budgetExhausted
           ? "budget-exhausted"
           : timedOut
             ? "timeout"
-            : gateway
-              ? gatewayFailureMarker(gateway)
-              : modelGone
-                ? "transient:model_unavailable"
-                : isTruncatedStream(lastAssistantError)
-                  ? "truncated_after_progress"
-                  : isStalledStream(lastAssistantError)
-                    ? "transient:network"
-                    : (lastAssistantError ?? "no-result");
+            : truncated
+              ? "truncated"
+              : gateway
+                ? gatewayFailureMarker(gateway)
+                : modelGone
+                  ? "transient:model_unavailable"
+                  : isTruncatedStream(lastAssistantError)
+                    ? "truncated_after_progress"
+                    : isStalledStream(lastAssistantError)
+                      ? "transient:network"
+                      : (lastAssistantError ?? "no-result");
         return {
           result: {
             status: "failed",
@@ -1786,6 +1823,10 @@ ${recovery.recoveryPrompt}`;
         // limit from a degeneration.
         if (msg.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
           assistantError = msg.errorMessage;
+        }
+        // Cut at the output limit, whatever partial text it carries: not a result.
+        if (msg.role === "assistant" && msg.stopReason === "length") {
+          assistantError = `${TRUNCATED_REPLY}: stop reason length.`;
         }
         // `event.message` is the ACCUMULATED partial message; charge the guard
         // the incremental delta the stream event carries (see guardFeedFor).

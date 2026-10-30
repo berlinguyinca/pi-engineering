@@ -295,6 +295,25 @@ const VISIBLE_CHAR_LIMIT = 40;
 const MIN_HIDDEN_OUTPUT_TOKENS = 256;
 
 /**
+ * Lead of every error that reports a reply cut at the output limit (stop reason
+ * "length"). A cut reply is never a result, whatever partial text it carries.
+ * No digits: Pi's retry matcher, lacking word boundaries, could catch them.
+ */
+export const TRUNCATED_REPLY = "Reply truncated at the output limit";
+
+export function isTruncatedReply(text: string | undefined): boolean {
+  return text?.startsWith(TRUNCATED_REPLY) === true;
+}
+
+/** One retry's allowance: double the current one, within half the window. Undefined when that is no more. */
+export function raisedAllowance(model: { maxTokens?: number; contextWindow?: number }): number | undefined {
+  const { maxTokens: cur, contextWindow: win } = model;
+  if (!cur || cur <= 0) return undefined;
+  const next = Math.min(cur * 2, win ? Math.floor(win / 2) : cur * 2);
+  return next > cur ? next : undefined;
+}
+
+/**
  * Explain a reply cut at "length" that shows almost nothing because the model
  * spent its WHOLE output allowance (`maxTokens`) on hidden reasoning.
  * Undefined for anything else — in particular for a length stop below
@@ -319,7 +338,7 @@ export function describeHiddenReasoningTruncation(
   const output = message.usage?.output ?? 0;
   if (output < Math.max(MIN_HIDDEN_OUTPUT_TOKENS, Math.ceil(visible.length / 4) * 8)) return undefined;
   const shown = visible ? `"${visible}"` : "nothing";
-  return `The model was cut off after ${shown}: it spent its whole output allowance on hidden reasoning before answering, so the reply is out of budget as sent. Thinking is switched off automatically for summaries and near-full contexts on gateways that support it; compact the conversation (/compact) or start a new session, then ask again.`;
+  return `${TRUNCATED_REPLY}. The model was cut off after ${shown}: it spent its whole output allowance on hidden reasoning before answering, so the reply is out of budget as sent. Thinking is switched off automatically for summaries and near-full contexts on gateways that support it; compact the conversation (/compact) or start a new session, then ask again.`;
 }
 
 interface AttemptLike<E, R> extends AsyncIterable<E> {
