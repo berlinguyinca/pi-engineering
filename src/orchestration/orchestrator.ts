@@ -4072,6 +4072,17 @@ export class Orchestrator {
 
   /** Create and run one validation task over the integrated result. */
   private async runValidationGate(mission: Mission, signal?: AbortSignal): Promise<boolean> {
+    // Validation can legally follow EXECUTING / INTEGRATING / REPAIRING, but a
+    // re-entrant validation (a repair round after a review, or the concurrent
+    // gate path racing the review) can find the mission in REVIEWING or
+    // FINAL_VALIDATION. The state machine deliberately forbids a direct
+    // backward move (`illegal mission transition REVIEWING -> VALIDATING` dead-
+    // ended MSN-b4owRR after its review had already run). Route through
+    // REPAIRING — the legal, durably-recorded recovery state — before running.
+    const cur = this.store.getMission(mission.mission_id)!.status;
+    if (cur !== "VALIDATING" && !canTransitionMission(cur, "VALIDATING") && cur !== "REPAIRING") {
+      this.store.transitionMission(mission.mission_id, "REPAIRING");
+    }
     this.store.transitionMission(mission.mission_id, "VALIDATING");
     const task = this.store.createTask({
       mission_id: mission.mission_id,
@@ -4108,11 +4119,17 @@ export class Orchestrator {
           `\n\nRecovered work — verify task ${t.task_id} objective is fully met (its commits were recovered after a wall-clock timeout, so it may be incomplete; report a blocking finding for anything missing). Objective: ${t.objective}`,
       )
       .join("");
+    // A read-only mission's deliverable is a findings report, not a diff: tell
+    // the reviewer so it judges the report instead of rejecting the change for
+    // having no code to review.
+    const readOnlyNote = workflowMutatesRepo(mission.workflow_class)
+      ? ""
+      : "\n\nThis is a read-only mission: no code diff is expected. Review the findings report / investigation outcome for correctness and completeness.";
     const task = this.store.createTask({
       mission_id: mission.mission_id,
       kind: "review",
       role,
-      objective: `Fresh independent review of the integrated change. Mission: ${mission.goal}${recoveryNote}`,
+      objective: `Fresh independent review of the integrated change. Mission: ${mission.goal}${recoveryNote}${readOnlyNote}`,
       mutates_repo: false,
       isolation: "none",
       depends_on: opts.concurrentWithValidation ? [] : this.lastValidationTaskId(mission.mission_id),
@@ -4299,30 +4316,44 @@ export class Orchestrator {
                 this.store.listTasks(mission.mission_id),
                 this.store.listExecutions(mission.mission_id),
               );
+          // A read-only mission's deliverable is a findings report, not a code
+          // diff: an empty integration is EXPECTED (its workers never edit the
+          // repo), so record it as a non-blocking note and proceed to the gates.
+          // A mutating mission with an empty integration stays BLOCKING — that
+          // is a worker that produced nothing and must not complete silently.
+          const readOnly = !workflowMutatesRepo(mission.workflow_class);
           this.store.addFinding({
             mission_id: mission.mission_id,
             task_id: integ.task_id,
-            severity: "blocking",
+            severity: readOnly ? "minor" : "blocking",
             category: "integration",
             file: null,
             line: null,
             summary: committed
               ? "Integration merged but the base checkout is unchanged despite committed worker work — a merge/harvest bug; the worker branches are preserved and must be inspected"
-              : `Integration produced no change: the worker branches held no committed work${
-                  asserted ? alreadySatisfiedClause(asserted) : ""
-                }`,
+              : readOnly
+                ? `Integration produced no change (expected for a read-only mission; the deliverable is a report, not a diff)${asserted ? alreadySatisfiedClause(asserted) : ""}`
+                : `Integration produced no change: the worker branches held no committed work${
+                    asserted ? alreadySatisfiedClause(asserted) : ""
+                  }`,
             evidence: null,
             recommended_action: committed
               ? "Inspect the preserved worker branches (git branch | grep pi-eng-orch) and the merge result; the worker's committed work must be recovered and integrated manually."
               : asserted
                 ? "A worker concluded the objective needs no change and carried proof; nothing here can verify that. Confirm the assertion or restate the objective — do NOT dispatch another implementer to rediscover the same fact."
-                : "The implementer must actually edit files; harvested worktrees were empty.",
+                : readOnly
+                  ? "None — this is a read-only investigation; the review judges the findings report, not a diff."
+                  : "The implementer must actually edit files; harvested worktrees were empty.",
           });
         }
       }
       // A conflicted or failed integration means the change is not in the tree;
       // report it so the caller does not complete on top of an unchanged repo.
-      if (!integrationOk)
+      // A READ-ONLY mission has nothing to integrate — its empty integration is
+      // already recorded as a non-blocking note above — so the gates (which
+      // judge the findings report) must still run. Only a MUTATING mission
+      // whose change is not in the tree stops here.
+      if (!integrationOk && workflowMutatesRepo(mission.workflow_class))
         return {
           validationAttempted,
           validationOk,

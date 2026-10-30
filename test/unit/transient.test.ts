@@ -392,3 +392,58 @@ test("classify: a 429 or 503 body that mentions context stays retryable", () => 
     assert.equal(cls.retryable, true, msg);
   }
 });
+
+// ─── structured TransientError passthrough ──────────────────────────────────
+//
+// Regression (live missions MSN-b4owRR / MSN-T7iUn0 / MSN-MTrG8w): the stall
+// watchdog (src/workers/streamStall.ts) throws
+// TransientError("network", "model stream stalled: no data for 300000ms") so
+// the existing retry ladder handles it. classifyError re-derived the category
+// from the MESSAGE TEXT, which matches no keyword rule, so the one failure
+// class the stall path throws specifically to be retried was classified
+// permanent and the ladder gave up after exactly one attempt ("Worker failed
+// after 1 attempt(s)").
+
+test("classify: a structured TransientError keeps its classified category (stall wording is not re-read as permanent)", () => {
+  const cls = classifyError(new TransientError("network", "model stream stalled: no data for 300000ms", 1));
+  assert.equal(cls.category, "network");
+  assert.equal(cls.retryable, true);
+});
+
+test("classify: the plain stall message is a retryable network failure", () => {
+  const cls = classifyError(new Error("model stream stalled: no data for 300000ms"));
+  assert.equal(cls.category, "network");
+  assert.equal(cls.retryable, true);
+});
+
+test("classify: non-retryable structured categories stay non-retryable", () => {
+  for (const category of ["context_overflow", "permanent"] as const) {
+    const cls = classifyError(new TransientError(category, `boom (${category})`, 2));
+    assert.equal(cls.category, category);
+    assert.equal(cls.retryable, false);
+  }
+});
+
+test("classify: a structured model_unavailable TransientError keeps its one-retry cap", () => {
+  const cls = classifyError(new TransientError("model_unavailable", "model_not_found", 1));
+  assert.equal(cls.category, "model_unavailable");
+  assert.equal(cls.retryable, true);
+  assert.equal(cls.maxRetries, 1);
+});
+
+test("withTransientRetry: a stalled model stream is retried, not reported after one attempt", async () => {
+  let calls = 0;
+  const out = await withTransientRetry({
+    fn: async () => {
+      calls++;
+      if (calls < 3) throw new TransientError("network", "model stream stalled: no data for 300000ms", calls);
+      return "delivered";
+    },
+    sleep: async () => {},
+    rand: () => 0,
+  });
+  assert.equal(out.error, undefined);
+  assert.equal(out.value, "delivered");
+  assert.equal(out.attempts, 3);
+  assert.equal(calls, 3);
+});

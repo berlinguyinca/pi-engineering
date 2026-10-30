@@ -1622,3 +1622,114 @@ describe("a late failure is never masked by an earlier success", () => {
     );
   });
 });
+
+describe("validation re-entry from REVIEWING — illegal-transition regression (MSN-b4owRR)", () => {
+  it("a validation gate re-run while the mission is REVIEWING routes through REPAIRING instead of throwing", async () => {
+    const h = harness();
+    const { orchestrator, store } = h;
+    const mission = store.createMission({
+      title: "review then revalidate",
+      goal: "revalidate after a review round",
+      user_request: "revalidate after a review round",
+      repository: "/repo",
+      base_ref: "main",
+      risk_profile: "medium",
+      workflow_class: "engineering",
+    });
+    // Drive the mission through the legal forward path to REVIEWING — the
+    // state the concurrent gate path leaves behind when the review task owns
+    // the latest transition, and the state a re-gating pass can find it in.
+    for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING", "VALIDATING", "REVIEWING"] as const) {
+      store.transitionMission(mission.mission_id, status);
+    }
+    const internals = orchestrator as unknown as {
+      runValidationGate: (mission: unknown, signal?: AbortSignal) => Promise<boolean>;
+    };
+    // Before the fix this threw `illegal mission transition REVIEWING ->
+    // VALIDATING` and dead-ended a mission whose review had already run.
+    await assert.doesNotReject(async () =>
+      internals.runValidationGate(store.getMission(mission.mission_id)!, undefined),
+    );
+    assert.equal(store.getMission(mission.mission_id)!.status, "VALIDATING");
+    assert.equal(h.calls.validation.length, 1, "the validation backend runs exactly once");
+  });
+});
+
+describe("read-only missions complete with a report deliverable (no diff expected)", () => {
+  it("empty integration on a read-only mission is a non-blocking finding and the review judges the report, not a diff", async () => {
+    const h = harness();
+    const { orchestrator, store } = h;
+    const mission = store.createMission({
+      title: "read-only investigation",
+      goal: "Investigate where the error comes from and report the findings",
+      user_request: "Investigate where the error comes from and report the findings",
+      repository: "/repo",
+      base_ref: "main",
+      risk_profile: "medium",
+      workflow_class: "research",
+    });
+    for (const status of ["CLASSIFYING", "PLANNING", "READY", "EXECUTING"] as const) {
+      store.transitionMission(mission.mission_id, status);
+    }
+    store.updateMission(mission.mission_id, { required_gates: ["validation", "independent_review"] });
+    store.addAcceptanceCriterion(mission.mission_id, "Goal achieved: the findings are reported with references");
+
+    // The deterministic harness has no git provider, so stub just the broker
+    // inventory the integration block needs: one pending integration whose
+    // merge lands no changes and whose worker branches hold no committed work
+    // (the exact shape of a read-only mission whose workers produced a
+    // report, not a diff). The integration task itself runs on the real
+    // broker via the process backend so execution records stay consistent.
+    const broker = orchestrator.broker;
+    const stubBroker = Object.create(broker) as typeof broker;
+    stubBroker.pendingIntegrations = () => 1;
+    stubBroker.strandedWorkerWork = async () => ({ eligible: 1, stranded: [] });
+    stubBroker.changedFilesSinceBase = async () => [];
+    stubBroker.hasCommittedWorkerWork = () => false;
+    stubBroker.validationWillReuse = async () => false;
+    stubBroker.execute = async (input: Parameters<typeof broker.execute>[0]) =>
+      broker.execute({ ...input, kind: input.kind === "integration" ? "process" : input.kind });
+    (orchestrator as unknown as { broker: typeof broker }).broker = stubBroker;
+
+    const internals = orchestrator as unknown as {
+      postExecution: (
+        mission: unknown,
+        signal?: AbortSignal,
+      ) => Promise<{
+        validationAttempted: boolean;
+        validationOk: boolean;
+        reviewAttempted: boolean;
+        reviewOk: boolean;
+        integrationOk: boolean;
+      }>;
+    };
+    try {
+      const post = await internals.postExecution(store.getMission(mission.mission_id)!);
+      assert.equal(post.validationOk, true, "validation ran and passed");
+      assert.equal(post.reviewOk, true, "review ran and passed");
+      assert.equal(store.getMission(mission.mission_id)!.status, "FINAL_VALIDATION");
+
+      // The empty integration is EXPECTED on a read-only mission: it must be
+      // recorded, but it must not block completion (before the fix it was a
+      // blocking finding, which parked the mission and sent a reviewer after
+      // a diff that a read-only mission is not supposed to produce).
+      const emptyIntegration = store
+        .listFindings(mission.mission_id)
+        .find((finding) => finding.summary.includes("Integration produced no change"));
+      assert.ok(emptyIntegration, "the empty integration is still recorded");
+      assert.equal(emptyIntegration!.severity, "minor", "a read-only mission's empty integration is not blocking");
+
+      // The review request must tell the reviewer that a diff is not expected.
+      const reviewTask = store
+        .listTasks(mission.mission_id)
+        .filter((t) => t.kind === "review")
+        .at(-1)!;
+      assert.ok(
+        /no code diff is expected|read-only/i.test(reviewTask.objective),
+        `review objective must name the report as the deliverable, got: ${reviewTask.objective.slice(0, 120)}`,
+      );
+    } finally {
+      (orchestrator as unknown as { broker: typeof broker }).broker = broker;
+    }
+  });
+});
