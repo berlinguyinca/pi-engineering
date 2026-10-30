@@ -2449,6 +2449,9 @@ export class GitRepo {
     const busy = admin === null ? null : await this.inProgressReason(admin, path);
     if (busy !== null) throw new Error(`refusing to move ${path} aside (kept): ${busy}`);
     const trash = join(dirname(path), ".pi-eng-trash");
+    if ((await lstat(trash).catch(() => null))?.isSymbolicLink()) {
+      throw new Error(`${trash} is a symbolic link; refusing to move ${path} into it (kept)`);
+    }
     await mkdir(trash, { recursive: true });
     const stamp = new Date()
       .toISOString()

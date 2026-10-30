@@ -28,7 +28,7 @@ export interface TrashMarker {
   creator: "pi-engineering";
   kind: "worktree" | "rust-cache";
   movedAt: string;
-  items: Array<{ name: string; from: string; branch?: string | null }>;
+  items: Array<{ name: string; from: string; branch?: string | null; adminId?: string; commonDir?: string }>;
 }
 
 export interface TrashEntry {
@@ -130,6 +130,19 @@ export async function createTrashEntry(
     return { dir, dest: join(dir, item.name) };
   }
   throw new Error(`could not allocate a trash entry under ${trashRoot}`);
+}
+
+/** POSIX single-quote escaping, so a path can be pasted into a shell whatever characters it holds. */
+export function shellQuote(text: string): string {
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+/** Record where the worktree's git registration came from, so the entry can be restored exactly. */
+export async function recordTrashAdmin(entryDir: string, admin: { adminId: string; commonDir: string }): Promise<void> {
+  const marker = await readTrashMarker(entryDir);
+  if (!marker?.items[0]) return;
+  marker.items[0] = { ...marker.items[0], ...admin };
+  await writeFile(join(entryDir, TRASH_MARKER_FILE), `${JSON.stringify(marker, null, 2)}\n`);
 }
 
 /** Undo `createTrashEntry` when the move failed: drops only the marker and the (empty) entry directory. */
@@ -285,7 +298,7 @@ export async function listOrphanTrash(
     const recent = await hasRecentFile(path, now - opts.olderThanDays * 86_400_000);
     skip(
       `no marker (made before markers existed): never deleted by housekeeping${recent ? `; holds files modified within ${opts.olderThanDays} d` : ""}. ` +
-        `After looking inside, you may remove it yourself: rm -rf ${JSON.stringify(path)}`,
+        `After looking inside, you may remove it yourself: rm -rf ${shellQuote(path)}`,
     );
   }
   return report;

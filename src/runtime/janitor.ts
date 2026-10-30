@@ -25,6 +25,7 @@ import {
   defaultTrashRoot,
   listOrphanTrash,
   purgeTrash,
+  shellQuote,
   symlinkedRootProblem,
   trashRootInsideProblem,
 } from "../git/trashStore.ts";
@@ -238,7 +239,7 @@ export async function runAdoptPreview(opts: { cwd: string; missions?: MissionLoo
       path: k.path,
       idleDays: k.idleDays,
       reason: k.reason,
-      command: k.idleDays >= maxIdle ? `rm -rf ${JSON.stringify(k.path)}` : null,
+      command: k.idleDays >= maxIdle ? `rm -rf ${shellQuote(k.path)}` : null,
     }));
   return { worktrees, rustCache };
 }
