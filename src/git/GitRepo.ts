@@ -1,16 +1,33 @@
 import { createHash, randomUUID } from "node:crypto";
 import { type Dirent, existsSync, realpathSync } from "node:fs";
-import { access, lstat, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  appendFile,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  rmdir,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
+import { compactStamp } from "../runtime/rotateFile.ts";
+import { emitTelemetry } from "../telemetry/sink.ts";
+import { readOwnerMarker, writeOwnerMarker } from "./ownerMarker.ts";
 import { safeGit } from "./safeGit.ts";
+import { shortHash } from "./shortHash.ts";
+import { removalBlockers } from "./worktreeSafety.ts";
 
-/** Short, stable, filesystem-safe hash of a path for unique worktree dirs. */
-export function shortHash(input: string): string {
-  let h = 0;
-  for (let i = 0; i < input.length; i++) h = (h * 31 + input.charCodeAt(i)) | 0;
-  return Math.abs(h).toString(36);
-}
+export { shortHash };
+
+/** Cap on distinct paths in the kept-worktrees list; beyond it new ones are only reported. */
+const MAX_KEPT_RECORDS = 1000;
 
 export interface WorktreeInfo {
   path: string;
@@ -313,21 +330,43 @@ export class GitRepo {
     return { stdout: opts.preserveStdout ? r.stdout : r.stdout.trim(), stderr: r.stderr.trim(), code: r.code };
   }
 
-  private identityFallback: Promise<string[]> | undefined;
+  /**
+   * Whether `path` exists. Only ENOENT/ENOTDIR mean gone; any other error (EACCES, ESTALE, EIO...)
+   * is unknown, so it throws rather than let a live worktree's administration be treated as vanished.
+   */
+  private async pathExists(path: string): Promise<boolean> {
+    try {
+      await lstat(path);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
+      throw new Error(`cannot tell whether ${path} exists (${code ?? String(error)}); nothing was changed`);
+    }
+  }
+
+  private readonly identityFallbacks = new Map<string, Promise<string[]>>();
 
   /**
-   * `-c` options giving merge commits an identity ONLY when git has none
-   * configured (CI runners, fresh containers); a configured identity is kept.
+   * `-c` options giving commits an identity ONLY for the key git lacks (CI runners, fresh containers);
+   * a configured name or email is kept. Read in `cwd` (the worktree that commits).
    */
-  private fallbackIdentityArgs(): Promise<string[]> {
-    this.identityFallback ??= (async () => {
-      const name = await this.git(["config", "--get", "user.name"]);
-      const email = await this.git(["config", "--get", "user.email"]);
-      return name.code === 0 && name.stdout && email.code === 0 && email.stdout
-        ? []
-        : ["-c", "user.name=pi-engineering", "-c", "user.email=lanes@pi-engineering.local"];
-    })();
-    return this.identityFallback;
+  private fallbackIdentityArgs(cwd: string = this.repoRoot): Promise<string[]> {
+    let cached = this.identityFallbacks.get(cwd);
+    if (!cached) {
+      cached = (async () => {
+        const configured = async (key: string): Promise<boolean> => {
+          const r = await this.git(["-C", cwd, "config", "--get", key]);
+          return r.code === 0 && r.stdout !== "";
+        };
+        return [
+          ...((await configured("user.name")) ? [] : ["-c", "user.name=pi-engineering"]),
+          ...((await configured("user.email")) ? [] : ["-c", "user.email=lanes@pi-engineering.local"]),
+        ];
+      })();
+      this.identityFallbacks.set(cwd, cached);
+    }
+    return cached;
   }
 
   private requireQuery(result: GitResult, operation: string, args: readonly string[]): GitResult {
@@ -1290,6 +1329,7 @@ export class GitRepo {
       guard?.assertAuthoritative();
       const add = await this.git(["worktree", "add", record.path, record.branch]);
       if (add.code !== 0) return null;
+      await this.stampWorktreeOwner(record.path, record.branch).catch(() => {});
       guard?.assertAuthoritative();
       return (await this.headCommitIn(record.path)) === record.candidateSha
         ? { path: record.path, branch: record.branch }
@@ -1511,7 +1551,12 @@ export class GitRepo {
    *
    * The worktree path is derived from the repo root so that multiple repos (or
    * parallel test fixtures) never collide. A stale leftover at the path is
-   * removed first (crash recovery).
+   * replaced only when it is a registered, clean worktree (plain
+   * `git worktree remove`, never `--force`); a dirty or unregistered leftover
+   * makes creation fail with an operator-facing error. A leftover branch is
+   * deleted only when its tip is contained in another local branch or tag
+   * (compare-and-swap), else renamed to `superseded/<branch>-<ts>` so its
+   * commits stay reachable.
    */
   async createWorktree(baseCommit: string, branch: string, guard?: GitMutationGuard): Promise<WorktreeInfo> {
     return this.serialize(() =>
@@ -1527,22 +1572,389 @@ export class GitRepo {
         // a path outside this repo's worktree namespace (see assertSafeWorktreePath).
         this.assertSafeWorktreePath(path);
         await mkdir(parent, { recursive: true }).catch(() => {});
-        // Crash recovery: clear any stale worktree or leftover directory at the path.
+        // Crash recovery, fail closed: a leftover at the path or branch is only
+        // replaced when it provably holds nothing; otherwise the data is kept.
         guard?.assertAuthoritative();
-        await this.git(["worktree", "remove", "--force", path]).catch(() => {});
-        guard?.assertAuthoritative();
-        await this.git(["branch", "-D", branch]).catch(() => {});
-        guard?.assertAuthoritative();
-        await this.forgetWorktreeAdmin(path);
-        guard?.assertAuthoritative();
-        await rm(path, { recursive: true, force: true }).catch(() => {});
+        await this.clearStaleWorktreeTarget(path, branch, guard);
         guard?.assertAuthoritative();
         const add = await this.git(["worktree", "add", path, "-b", branch, baseCommit]);
         if (add.code !== 0) throw new Error(`git worktree add failed: ${add.stderr}`);
+        try {
+          await this.stampWorktreeOwner(path, branch);
+        } catch (error) {
+          // Never leave an unmarked pi-engineering worktree behind: it is brand new, so remove it
+          // with a plain remove (and drop its still-empty branch) and fail.
+          await this.git(["worktree", "remove", path]).catch(() => {});
+          await this.git(["update-ref", "-d", `refs/heads/${branch}`, baseCommit]).catch(() => {});
+          throw new Error(
+            `cannot write the ownership marker for ${path}: ${error instanceof Error ? error.message : error}`,
+          );
+        }
         await this.linkSharedNodeModules(path);
         return { path, branch };
       }),
     );
+  }
+
+  /** Write the `pi-eng-owner.json` ownership marker (see ownerMarker.ts). */
+  private async stampWorktreeOwner(path: string, branch: string | null): Promise<void> {
+    await writeOwnerMarker(path, { repoRoot: this.repoRoot, repoRootHash: shortHash(this.repoRoot), branch });
+  }
+
+  /** True when `<worktree>/node_modules` is the symlink `linkSharedNodeModules` created for this repo. */
+  private async isOwnNodeModulesLink(worktreePath: string): Promise<boolean> {
+    const target = join(worktreePath, "node_modules");
+    try {
+      if (!(await lstat(target)).isSymbolicLink()) return false;
+      return (await realpath(target)) === (await realpath(join(this.repoRoot, "node_modules")));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Remove a worktree with a plain `git worktree remove`, after checking that
+   * nothing user-owned would be lost. git refuses modified/untracked files but
+   * silently deletes IGNORED ones (`.env`, ...), so ignored files other than the
+   * derived root dirs (node_modules, target, .next, dist, coverage) also block.
+   * Our own `node_modules` link is unlinked only after every check passed.
+   * Returns a refusal reason, or null once the worktree is gone.
+   */
+  private async removeWorktreeChecked(path: string, guard?: GitMutationGuard): Promise<string | null> {
+    const refusal = await this.refusalFor(path);
+    if (refusal !== null) {
+      await this.recordKeptWorktree(path, refusal);
+      return refusal;
+    }
+    guard?.assertAuthoritative();
+    // Authoritative admin dir (a live worktree names it itself); without one we cannot save a detached
+    // HEAD or see an in-progress rebase, so the worktree stays.
+    const admin = await this.adminDirFor(path);
+    const unsafe = admin === null ? await this.unidentifiedAdminReason(path) : await this.inProgressReason(admin, path);
+    if (unsafe !== null) {
+      await this.recordKeptWorktree(path, unsafe);
+      return unsafe;
+    }
+    await this.preserveDetachedHead(admin as string, basename(path));
+    const ownLink = await this.isOwnNodeModulesLink(path);
+    if (ownLink) await unlink(join(path, "node_modules")).catch(() => {});
+    // Re-check immediately before the remove: shrinks the window in which a worker could write.
+    const again = await this.refusalFor(path);
+    if (again === null) {
+      const removed = await this.git(["worktree", "remove", path]);
+      if (removed.code === 0) return null;
+      await this.relinkNodeModules(ownLink, path);
+      const reason = removed.stderr || removed.stdout || "git worktree remove failed";
+      await this.recordKeptWorktree(path, reason);
+      return reason;
+    }
+    await this.relinkNodeModules(ownLink, path);
+    await this.recordKeptWorktree(path, again);
+    return again;
+  }
+
+  /** `; a rebase/merge may be in progress in <path> (...)` when the worktree's admin dir shows one, else "". */
+  private async inProgressHint(path: string): Promise<string> {
+    const admin = await this.adminDirFor(path).catch(() => null);
+    const busy = admin === null ? null : await this.inProgressReason(admin, path);
+    return busy === null ? "" : `; a rebase/merge may be in progress in ${path}: ${busy}`;
+  }
+
+  private async unidentifiedAdminReason(path: string): Promise<string> {
+    const matches = await this.adminMatches(path);
+    return matches.length > 1
+      ? `several administrative directories claim ${path} (${matches.join(", ")}); remove the stale one(s) yourself`
+      : `the administrative directory of ${path} cannot be identified; inspect it yourself`;
+  }
+
+  private async refusalFor(path: string): Promise<string | null> {
+    const ownLink = await this.isOwnNodeModulesLink(path);
+    const blockers = await removalBlockers(path, { ownNodeModulesLink: ownLink });
+    if (blockers === null) return "the worktree cannot be inspected";
+    if (blockers.length > 0) {
+      return `it holds files removal would lose (${blockers.length}): ${blockers.slice(0, 5).join(", ")}${await this.inProgressHint(path)}`;
+    }
+    return null;
+  }
+
+  private async relinkNodeModules(wasLinked: boolean, path: string): Promise<void> {
+    if (!wasLinked) return;
+    await this.linkSharedNodeModules(path);
+    if (!(await this.isOwnNodeModulesLink(path))) {
+      emitTelemetry({ level: "warning", text: `could not restore the node_modules link in kept worktree ${path}` });
+    }
+  }
+
+  /**
+   * Durable list of worktrees that cleanup refused to remove (`kept-scratch-worktrees.jsonl` in the
+   * candidate state dir): nobody else reclaims them, so a later janitor can adopt this list. Also the
+   * place where the ownership marker is read (for the record only, never as a gate).
+   */
+  private async recordKeptWorktree(path: string, reason: string): Promise<void> {
+    try {
+      let marker: unknown = null;
+      try {
+        const gitdir = (await this.git(["-C", path, "rev-parse", "--absolute-git-dir"])).stdout;
+        const read = readOwnerMarker(gitdir, { repoRoot: this.repoRoot });
+        marker = read.ok ? read.marker : { invalid: read.reason };
+      } catch {
+        marker = { invalid: "unreadable" };
+      }
+      const file = join(await this.candidateStateDir(), "kept-scratch-worktrees.jsonl");
+      const record = { path, reason, ts: new Date().toISOString(), marker };
+      // Bounded: one line per path (a repeat updates it, an identical repeat is skipped) and a hard cap.
+      const lines = (await readFile(file, "utf8").catch(() => ""))
+        .split("\n")
+        .filter(Boolean)
+        .filter((line) => {
+          try {
+            const p = (JSON.parse(line) as { path?: string }).path;
+            return p === path || (typeof p === "string" && existsSync(p)); // drop entries whose worktree is gone
+          } catch {
+            return false;
+          }
+        });
+      const index = lines.findIndex((line) => {
+        try {
+          return (JSON.parse(line) as { path?: string }).path === path;
+        } catch {
+          return false;
+        }
+      });
+      if (index >= 0) {
+        if ((JSON.parse(lines[index] as string) as { reason?: string }).reason === reason) return;
+        lines[index] = JSON.stringify(record);
+      } else if (lines.length >= MAX_KEPT_RECORDS) {
+        emitTelemetry({
+          level: "warning",
+          text: `kept-worktrees list is full (${MAX_KEPT_RECORDS}); not recording ${path}`,
+        });
+        return;
+      } else {
+        lines.push(JSON.stringify(record));
+      }
+      const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+      await writeFile(tmp, `${lines.join("\n")}\n`, "utf8");
+      await rename(tmp, file);
+      emitTelemetry({ level: "warning", text: `worktree kept (not removed): ${path}: ${reason}` });
+    } catch {
+      // Reporting must never turn a refusal into a failure of the caller.
+    }
+  }
+
+  private async registeredWorktrees(): Promise<Array<{ path: string; branch: string | null }>> {
+    const listed = await this.git(["worktree", "list", "--porcelain"], { preserveStdout: true });
+    if (listed.code !== 0) throw new Error(`cannot list worktrees: ${listed.stderr}`);
+    const out: Array<{ path: string; branch: string | null }> = [];
+    for (const block of listed.stdout.split(/\n\n+/)) {
+      const lines = block.split("\n");
+      const wt = lines.find((l) => l.startsWith("worktree "));
+      if (!wt) continue;
+      const br = lines.find((l) => l.startsWith("branch refs/heads/"));
+      out.push({ path: wt.slice("worktree ".length), branch: br ? br.slice("branch refs/heads/".length) : null });
+    }
+    return out;
+  }
+
+  /** Refuse (loudly: thrown and reported as a warning) instead of replacing something we cannot prove disposable. */
+  private refuseReplace(message: string): never {
+    emitTelemetry({ level: "warning", text: `worktree creation refused, existing data kept: ${message}` });
+    throw new Error(message);
+  }
+
+  /**
+   * Make `path` and `branch` free for `worktree add` without destroying data.
+   * Never uses `--force`, `rm -rf` or `branch -D`.
+   */
+  private async clearStaleWorktreeTarget(path: string, branch: string, guard?: GitMutationGuard): Promise<void> {
+    const present = await this.pathExists(path);
+    const real = present ? await realpath(path).catch(() => path) : path;
+    const registered = (await this.registeredWorktrees()).find((w) => w.path === path || w.path === real);
+    if (registered) {
+      if (present) {
+        const refusal = await this.removeWorktreeChecked(path, guard);
+        if (refusal !== null) {
+          this.refuseReplace(
+            `refusing to replace the existing worktree at ${path} (kept; inspect it and remove it yourself): ${refusal}`,
+          );
+        }
+      } else {
+        const claims = await this.adminMatches(path);
+        if (claims.length !== 1) {
+          this.refuseReplace(
+            `refusing to replace the registered worktree at ${path}: ${
+              claims.length > 1
+                ? `several administrative directories claim it (${claims.join(", ")}); remove the stale one(s) yourself`
+                : "its administrative directory cannot be found; run `git worktree prune` after checking it"
+            }`,
+          );
+        }
+        const kept = await this.forgetWorktreeAdmin(path); // metadata only: the working directory is already gone
+        if (kept !== null) {
+          this.refuseReplace(`refusing to replace the registered worktree at ${path} (admin data kept): ${kept}`);
+        }
+      }
+    } else if (present) {
+      const entries = await readdir(path).catch(() => null);
+      if (entries === null || entries.length > 0) {
+        this.refuseReplace(
+          `refusing to replace ${path}: it exists but is not a registered worktree of this repository; move or remove it yourself`,
+        );
+      }
+      await rmdir(path);
+    }
+    const holder = (await this.registeredWorktrees()).find((w) => w.branch === branch);
+    if (holder) throw new Error(`branch ${branch} is checked out at ${holder.path}; refusing to reuse it`);
+    await this.deleteOrPreserveBranchLocked(branch, guard);
+  }
+
+  /** Path of the worktree (primary included) that has `branch` checked out, or null. */
+  private async checkedOutAt(branch: string): Promise<string | null> {
+    const listed = (await this.registeredWorktrees()).find((w) => w.branch === branch)?.path;
+    if (listed) return listed;
+    // A worktree mid-rebase/bisect has a DETACHED HEAD but still owns the branch it will move.
+    const common = await this.commonGitDir();
+    if (common === null) return null;
+    const dirs = [common];
+    for (const name of await readdir(join(common, "worktrees")).catch(() => [] as string[])) {
+      dirs.push(join(common, "worktrees", name));
+    }
+    for (const dir of dirs) {
+      for (const file of ["rebase-merge/head-name", "rebase-apply/head-name", "BISECT_START"]) {
+        const value = (await readFile(join(dir, file), "utf8").catch(() => "")).trim();
+        if (value === `refs/heads/${branch}` || value === branch) return `${dir} (rebase/bisect in progress)`;
+      }
+      // `rebase --update-refs` will move every branch listed here.
+      const updates = await readFile(join(dir, "rebase-merge/update-refs"), "utf8").catch(() => "");
+      for (const line of updates.split("\n")) {
+        const ref = line.trim().split(/\s+/)[0];
+        if (ref === `refs/heads/${branch}`) return `${dir} (rebase --update-refs in progress)`;
+      }
+    }
+    return null;
+  }
+
+  /** The tip of `refs/heads/<branch>`, or null. */
+  private async branchTip(branch: string): Promise<string | null> {
+    const tip = await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`]);
+    return tip.code === 0 && tip.stdout ? tip.stdout : null;
+  }
+
+  /**
+   * Delete `branch` only when provably contained elsewhere, never `-D`:
+   * its tip is reachable from ANOTHER local branch or a tag (compare-and-swap `update-ref -d`).
+   * Not `git branch -d` (it also trusts the upstream), not remote-tracking refs (`fetch --prune` /
+   * lease pushes can drop them), not a detached HEAD (it moves). HEAD's own branch is in refs/heads.
+   * Returns null when it was not deleted.
+   */
+  private async deleteIfContained(branch: string): Promise<GitResult | null> {
+    const tip = await this.branchTip(branch);
+    if (tip === null) return null;
+    if ((await this.checkedOutAt(branch)) !== null) return null;
+    const others = await this.git([
+      "for-each-ref",
+      "--contains",
+      tip,
+      "--format=%(refname) %(symref)",
+      "refs/heads",
+      "refs/tags",
+    ]);
+    // A symbolic alias under refs/heads that points AT this branch is not an independent copy.
+    const elsewhere = others.stdout
+      .split("\n")
+      .filter((line) => line && !line.endsWith(` refs/heads/${branch}`))
+      .map((line) => line.split(" ")[0] as string)
+      .filter((ref) => ref !== `refs/heads/${branch}`);
+    if (others.code !== 0 || elsewhere.length === 0) return null;
+    const cas = await this.git(["update-ref", "-d", `refs/heads/${branch}`, tip]);
+    return cas.code === 0 ? cas : null;
+  }
+
+  /**
+   * Delete `branch` when contained elsewhere (see `deleteIfContained`), otherwise rename it to
+   * `superseded/<branch>-<ts>` so its commits stay reachable. Never `-D`. `renamedTo` is set
+   * when the branch was preserved. Returns null when the branch does not exist.
+   */
+  async deleteOrPreserveBranch(
+    branch: string,
+    guard?: GitMutationGuard,
+  ): Promise<(GitResult & { renamedTo?: string; kept?: string }) | null> {
+    // Repo-wide worktree lock: two instances deleting branches at the same unique tip must not
+    // each see the other as "elsewhere".
+    return this.serialize(() =>
+      this.withWorktreeSection(guard, () => this.deleteOrPreserveBranchLocked(branch, guard)),
+    );
+  }
+
+  /**
+   * For a throwaway review branch: when every non-merge commit on it is already contained in
+   * another local branch/tag, only reproducible test merges are unique to it, so it is deleted
+   * (compare-and-swap); otherwise it goes through `deleteOrPreserveBranch` (renamed, never lost).
+   */
+  async deleteScratchBranch(
+    branch: string,
+    guard?: GitMutationGuard,
+  ): Promise<(GitResult & { renamedTo?: string; kept?: string }) | null> {
+    return this.serialize(() =>
+      this.withWorktreeSection(guard, async () => {
+        const tip = await this.branchTip(branch);
+        if (tip === null) return null;
+        if ((await this.checkedOutAt(branch)) === null && (await this.onlyReproducibleHere(branch, tip))) {
+          const cas = await this.git(["update-ref", "-d", `refs/heads/${branch}`, tip]);
+          if (cas.code === 0) return cas;
+        }
+        return this.deleteOrPreserveBranchLocked(branch, guard);
+      }),
+    );
+  }
+
+  /**
+   * True when everything unique to `branch` can be rebuilt: every non-merge commit is contained in
+   * another local branch/tag, and every unique merge commit's tree equals a fresh merge of its own
+   * two parents (so it carries no hand-made resolution or amended content).
+   */
+  private async onlyReproducibleHere(branch: string, tip: string): Promise<boolean> {
+    const notElsewhere = ["--not", `--exclude=${branch}`, "--branches", "--tags"]; // exclude is relative to refs/heads/
+    const unique = await this.git(["rev-list", "--no-merges", tip, ...notElsewhere]);
+    if (unique.code !== 0 || unique.stdout !== "") return false;
+    const merges = await this.git(["rev-list", "--merges", "--parents", tip, ...notElsewhere]);
+    if (merges.code !== 0) return false;
+    const mergeLines = merges.stdout.split("\n").filter(Boolean);
+    if (mergeLines.length > 50) return false; // too many to re-merge cheaply: preserve instead
+    for (const line of mergeLines) {
+      const [commit, ...parents] = line.split(" ");
+      if (parents.length !== 2) return false;
+      const fresh = await this.git(["merge-tree", "--write-tree", parents[0] as string, parents[1] as string]);
+      const actual = await this.git(["rev-parse", `${commit}^{tree}`]);
+      if (fresh.code !== 0 || fresh.stdout.split("\n")[0] !== actual.stdout) return false;
+    }
+    return true;
+  }
+
+  private async deleteOrPreserveBranchLocked(
+    branch: string,
+    guard?: GitMutationGuard,
+  ): Promise<(GitResult & { renamedTo?: string; kept?: string }) | null> {
+    if ((await this.branchTip(branch)) === null) return null;
+    guard?.assertAuthoritative();
+    const holder = await this.checkedOutAt(branch);
+    if (holder !== null) {
+      // Neither deleting nor renaming a branch another worktree has checked out is safe: keep it as is.
+      emitTelemetry({ level: "warning", text: `branch ${branch} kept: it is checked out at ${holder}` });
+      return { stdout: "", stderr: `branch ${branch} is checked out at ${holder}; kept`, code: 0, kept: holder };
+    }
+    const deleted = await this.deleteIfContained(branch);
+    if (deleted) return deleted;
+    const stamp = compactStamp();
+    for (let n = 0; ; n++) {
+      const target = `superseded/${branch}-${stamp}${n === 0 ? "" : `.${n}`}`;
+      if ((await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${target}`])).code === 0) continue;
+      const renamed = await this.git(["branch", "-m", branch, target]);
+      if (renamed.code !== 0) {
+        throw new Error(`cannot preserve branch ${branch}: ${renamed.stderr || renamed.stdout}`);
+      }
+      return { ...renamed, renamedTo: target };
+    }
   }
 
   /**
@@ -1631,15 +2043,150 @@ export class GitRepo {
    * protecting — candidates stopped overlapping at all. Removing only this
    * path's entry needs no lock, because every caller owns a distinct path.
    */
-  private async forgetWorktreeAdmin(path: string): Promise<void> {
+  private async forgetWorktreeAdmin(path: string): Promise<string | null> {
+    // Metadata only: while the directory exists it may be a copy or another spelling of a LIVE worktree.
+    if (await this.pathExists(path)) {
+      return `${path} still exists; only the administration of a vanished worktree is forgotten`;
+    }
+    const admin = await this.adminDirFor(path);
+    if (admin === null) return null;
+    const busy = await this.inProgressReason(admin, path);
+    if (busy !== null) return busy;
+    const lock = await readFile(join(admin, "locked"), "utf8").then(
+      (text) => text.trim(),
+      () => null,
+    );
+    if (lock !== null) {
+      emitTelemetry({ level: "warning", text: `worktree admin ${admin} is locked; left untouched` });
+      return `the worktree is locked (${lock || "no reason given"}); run \`git worktree unlock ${path}\` if that is intended`;
+    }
+    // Save detached-HEAD commits that no branch/tag holds BEFORE the admin dir (and its HEAD) goes.
+    await this.preserveDetachedHead(admin, basename(path));
+    await rm(admin, { recursive: true, force: true }).catch(() => {});
+    return null;
+  }
+
+  /** Why this admin dir must not be dropped (an operation holds state in it), naming the command that ends it. */
+  private async inProgressReason(adminDir: string, path: string): Promise<string | null> {
+    const fixes: Array<[string, string]> = [
+      ["rebase-merge", "rebase --abort"],
+      ["rebase-apply", "rebase --abort"],
+      ["MERGE_HEAD", "merge --abort"],
+      ["MERGE_AUTOSTASH", "merge --abort"],
+      ["CHERRY_PICK_HEAD", "cherry-pick --abort (or --quit)"],
+      ["REVERT_HEAD", "revert --abort (or --quit)"],
+      ["sequencer", "cherry-pick --quit (or revert --quit)"],
+      ["BISECT_LOG", "bisect reset"],
+    ];
+    for (const [entry, command] of fixes) {
+      if (
+        await lstat(join(adminDir, entry)).then(
+          () => true,
+          () => false,
+        )
+      ) {
+        return `an operation is in progress in ${path} (${entry}); finish it or run \`git -C ${path} ${command}\``;
+      }
+    }
+    return null;
+  }
+
+  /** The admin dir of the worktree at `path`: asked of git when the directory exists, else matched by pointer. */
+  private async adminDirFor(path: string): Promise<string | null> {
+    const common = await this.commonGitDir();
+    if (common === null) return null;
+    const present = await this.pathExists(path);
+    if (present) {
+      const own = await this.git(["-C", path, "rev-parse", "--absolute-git-dir"]);
+      if (own.code === 0 && own.stdout) {
+        const abs = await realpath(own.stdout).catch(() => own.stdout);
+        const root = await realpath(join(common, "worktrees")).catch(() => join(common, "worktrees"));
+        if (dirname(abs) === root) {
+          const admin = join(common, "worktrees", basename(abs));
+          // Git answers for a COPY or another spelling of a live worktree too: accept only the admin dir
+          // that points back at exactly this directory.
+          const real = await realpath(path).catch(() => path);
+          const raw = (await readFile(join(admin, "gitdir"), "utf8").catch(() => "")).trim();
+          const pointer = raw && !isAbsolute(raw) ? resolve(admin, raw) : raw;
+          const pointed = pointer ? await realpath(pointer).catch(() => pointer) : "";
+          if (pointed !== join(real, ".git")) return null;
+          // A symlink onto a registered worktree is that worktree under another name.
+          const leafLink = (await lstat(path)).isSymbolicLink();
+          if (real !== path && leafLink && (await this.registeredWorktrees()).some((w) => w.path === real)) return null;
+          return admin;
+        }
+      }
+    }
+    return this.findAdminDir(path);
+  }
+
+  private async commonGitDir(): Promise<string | null> {
     const common = await this.git(["rev-parse", "--git-common-dir"]);
-    if (common.code !== 0) return;
-    const gitDir = common.stdout.trim();
-    if (!gitDir) return;
-    const absolute = gitDir.startsWith("/") ? gitDir : join(this.repoRoot, gitDir);
-    // `git worktree add` names the administrative directory after the leaf of
-    // the worktree path.
-    await rm(join(absolute, "worktrees", basename(path)), { recursive: true, force: true }).catch(() => {});
+    if (common.code !== 0 || !common.stdout) return null;
+    return common.stdout.startsWith("/") ? common.stdout : join(this.repoRoot, common.stdout);
+  }
+
+  /**
+   * The administrative directory of the worktree at `path`, found by the `gitdir` pointer each admin
+   * dir records (never by guessing from the leaf name: git suffixes the name when the leaf is taken).
+   * Null (and a telemetry note) when there is no single unambiguous match.
+   */
+  private async findAdminDir(path: string): Promise<string | null> {
+    const matches = await this.adminMatches(path);
+    if (matches.length > 1) {
+      emitTelemetry({
+        level: "warning",
+        text: `ambiguous worktree admin dirs for ${path}; left untouched: ${matches.join(", ")}`,
+      });
+    }
+    return matches.length === 1 ? (matches[0] as string) : null;
+  }
+
+  /** Every admin dir whose `gitdir` pointer names `path`. */
+  private async adminMatches(path: string): Promise<string[]> {
+    const common = await this.commonGitDir();
+    if (common === null) return [];
+    const root = join(common, "worktrees");
+    const names = await readdir(root).catch(() => [] as string[]);
+    const wanted = new Set([join(path, ".git"), join(await realpath(path).catch(() => path), ".git")]);
+    const matches: string[] = [];
+    for (const name of names) {
+      const raw = (await readFile(join(root, name, "gitdir"), "utf8").catch(() => "")).trim();
+      // git >= 2.48 (`worktree.useRelativePaths`) may record the pointer relative to the admin dir.
+      const pointer = raw && !isAbsolute(raw) ? resolve(join(root, name), raw) : raw;
+      if (pointer && wanted.has(pointer)) matches.push(join(root, name));
+    }
+    return matches;
+  }
+
+  /**
+   * A DETACHED worktree HEAD whose commit no local branch/tag contains would be orphaned when the
+   * worktree or its admin dir goes: keep it as `superseded/detached-<leaf>-<ts>` first.
+   */
+  private async preserveDetachedHead(adminDir: string, leaf: string): Promise<void> {
+    const head = (await readFile(join(adminDir, "HEAD"), "utf8").catch(() => "")).trim();
+    if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(head)) return; // symbolic ref or unreadable
+    if ((await this.git(["cat-file", "-e", `${head}^{commit}`])).code !== 0) return;
+    const held = await this.git(["for-each-ref", "--contains", head, "--format=%(refname)", "refs/heads", "refs/tags"]);
+    if (held.code === 0 && held.stdout !== "") return;
+    const clean =
+      leaf
+        .replace(/[^A-Za-z0-9._-]/g, "_")
+        .replace(/\.{2,}/g, ".")
+        .replace(/^[.-]+|[.-]+$/g, "")
+        .slice(0, 60) || "wt";
+    const base = `superseded/detached-${clean}-${shortHash(leaf)}-${compactStamp()}`;
+    for (let n = 0; ; n++) {
+      const name = n === 0 ? base : `${base}.${n}`;
+      if ((await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`])).code === 0) continue;
+      const made = await this.git(["branch", name, head]);
+      if (made.code !== 0 && (await this.git(["rev-parse", "--verify", "--quiet", `refs/heads/${name}`])).code === 0) {
+        continue; // a concurrent creator took this name between the check and the branch
+      }
+      if (made.code !== 0) throw new Error(`cannot preserve detached HEAD ${head} of ${leaf}: ${made.stderr}`);
+      emitTelemetry({ level: "warning", text: `detached worktree HEAD ${head} kept as ${name}` });
+      return;
+    }
   }
 
   /**
@@ -1700,7 +2247,9 @@ export class GitRepo {
             }
           }
           if (inventory.records.length > 0 && !pending) {
-            throw new Error("cleanup ownership does not match the requested repository worktree path and branch");
+            throw new Error(
+              `cleanup ownership does not match the requested repository worktree path and branch${await this.inProgressHint(info.path)}`,
+            );
           }
           if (!pending) {
             pending = {
@@ -1744,22 +2293,44 @@ export class GitRepo {
               ) {
                 this.assertSafeWorktreePath(info.path);
                 guard?.assertAuthoritative();
-                await rm(info.path, { recursive: true, force: true }).catch(() => {});
+                // No git metadata left to judge it by: move it aside (data kept)
+                // instead of deleting it.
+                await this.moveAsideOrphan(info.path);
               }
             } else if (!pathEntry.split("\n").includes(`branch ${expectedBranch}`)) {
-              throw new Error("cleanup ownership does not match an exact repository worktree path and branch mapping");
+              throw new Error(
+                `cleanup ownership does not match an exact repository worktree path and branch mapping${await this.inProgressHint(info.path)}`,
+              );
             } else {
               guard?.assertAuthoritative();
-              const removed = await this.git(["worktree", "remove", "--force", info.path]);
-              if (removed.code !== 0) {
-                throw new Error(`git worktree remove failed for ${info.path}: ${removed.stderr || removed.stdout}`);
+              // Plain remove after checking for ignored user files too (git deletes those
+              // silently); a refusal surfaces so the worktree (and its branch) is kept.
+              const refusal = await this.removeWorktreeChecked(info.path, guard);
+              if (refusal !== null) {
+                throw new Error(
+                  `git worktree remove failed for ${info.path} (refused; worktree and branch ${info.branch} kept): ${refusal}`,
+                );
               }
             }
           }
           // Targeted, for the same reason creation is: a global prune here would
           // be able to delete a concurrently-created sibling's administration.
           guard?.assertAuthoritative();
-          await this.forgetWorktreeAdmin(info.path);
+          // Skipped while the directory is still there (a foreign worktree-shaped checkout was left alone):
+          // its admin dir, if any, belongs to a live worktree.
+          if (
+            !(await lstat(info.path).then(
+              () => true,
+              () => false,
+            ))
+          ) {
+            const keptAdmin = await this.forgetWorktreeAdmin(info.path);
+            if (keptAdmin !== null) {
+              throw new Error(
+                `worktree administration of ${info.path} kept (branch ${info.branch} kept): ${keptAdmin}`,
+              );
+            }
+          }
           if (pending) {
             pending = { ...pending, state: "worktree_removed", updatedAt: new Date().toISOString() };
             await this.persistPendingBranchCleanup(pending, guard);
@@ -1772,7 +2343,7 @@ export class GitRepo {
             guard?.assertAuthoritative();
             const deleted = hooks.deleteBranch
               ? await hooks.deleteBranch()
-              : await this.git(["branch", "-D", info.branch]);
+              : ((await this.deleteOrPreserveBranchLocked(info.branch, guard)) ?? { stdout: "", stderr: "", code: 0 });
             if (deleted.code !== 0) {
               throw new Error(`git branch delete failed for ${info.branch}: ${deleted.stderr || deleted.stdout}`);
             }
@@ -1857,10 +2428,33 @@ export class GitRepo {
     return out;
   }
 
-  async deleteBranch(branch: string, guard?: GitMutationGuard): Promise<void> {
+  async deleteBranch(branch: string, guard?: GitMutationGuard, expectedSha?: string): Promise<void> {
     await this.assertPromotionUnlocked();
     guard?.assertAuthoritative();
-    await this.git(["branch", "-D", branch]).catch(() => {});
+    if (expectedSha) {
+      const holder = await this.checkedOutAt(branch);
+      if (holder !== null) throw new Error(`branch ${branch} not deleted: it is checked out at ${holder}`);
+      // Compare-and-swap: fails (and the branch stays) if the tip moved since the caller looked.
+      const r = await this.git(["update-ref", "-d", `refs/heads/${branch}`, expectedSha]);
+      if (r.code !== 0) throw new Error(`branch ${branch} not deleted (tip moved or ref busy): ${r.stderr}`);
+      return;
+    }
+    // Never `-D`: only a branch contained elsewhere is deleted; anything else is kept.
+    await this.serialize(() => this.withWorktreeSection(guard, () => this.deleteIfContained(branch))).catch(() => null);
+  }
+
+  /** Move an orphaned worktree directory to `<parent>/.pi-eng-trash/<ts>-<name>`; never deletes. */
+  private async moveAsideOrphan(path: string): Promise<void> {
+    const admin = await this.findAdminDir(path);
+    const busy = admin === null ? null : await this.inProgressReason(admin, path);
+    if (busy !== null) throw new Error(`refusing to move ${path} aside (kept): ${busy}`);
+    const trash = join(dirname(path), ".pi-eng-trash");
+    await mkdir(trash, { recursive: true });
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace(/\.\d+Z$/, "Z");
+    await rename(path, join(trash, `${stamp}-${basename(path)}`));
   }
 
   /**
@@ -1960,7 +2554,14 @@ export class GitRepo {
       };
     }
     guard?.assertAuthoritative();
-    const args = ["-C", worktree.path, "rebase", "--quiet", ...(await this.fallbackIdentityArgs()), ontoSha];
+    const args = [
+      "-C",
+      worktree.path,
+      ...(await this.fallbackIdentityArgs(worktree.path)),
+      "rebase",
+      "--quiet",
+      ontoSha,
+    ];
     const r = await this.git(args);
     if (r.code !== 0) {
       const text = `${r.stderr}\n${r.stdout}`;
