@@ -175,6 +175,11 @@ export function createIngestFromConnection(
     url: `${conn.baseUrl}/`,
     host: { hostId },
     fetch: fetchImpl,
+    defaultScope: {
+      ...(conn.roomId ? { roomId: conn.roomId } : {}),
+      ...(conn.workspaceId ? { workspaceId: conn.workspaceId } : {}),
+      ...(conn.instanceId ? { agentInstanceId: conn.instanceId } : {}),
+    },
     ...(opts.envelopeStore ? { envelopeStore: opts.envelopeStore } : {}),
   });
 }

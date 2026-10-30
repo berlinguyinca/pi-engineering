@@ -41,7 +41,16 @@ export function deterministicEventId(prefix: string, parts: unknown): string {
  */
 export function scopeIdsFromPayload(payload: Record<string, unknown>): EnvelopeIds {
   const out: EnvelopeIds = {};
-  for (const key of ["org_id", "project_id", "room_id", "workspace_id", "mission_id", "task_id", "agent_id"] as const) {
+  for (const key of [
+    "org_id",
+    "project_id",
+    "room_id",
+    "workspace_id",
+    "mission_id",
+    "task_id",
+    "agent_id",
+    "agent_instance_id",
+  ] as const) {
     const v = str(payload[key]);
     if (v) out[key] = v;
   }
