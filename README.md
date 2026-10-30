@@ -442,16 +442,16 @@ dependencies are shared safely through `sccache` instead: install it
 `RUSTC_WRAPPER`, so a second worktree's dependency build is a cache hit rather
 than a recompile. Values the operator already set (`CARGO_TARGET_DIR`,
 `RUSTC_WRAPPER`, `SCCACHE_DIR`) are never overridden. Everything under the
-cache root is derived output: housekeeping removes a worktree's target dir
-with the worktree and expires the rest by age, and you can delete the root at
-any time. Size is bounded by age (`PI_RUST_CACHE_MAX_AGE_DAYS`) and by
-removal with the worktree; there is no byte cap.
+cache root is derived output you can delete yourself at any time. Housekeeping
+never deletes it: idle, marked generations whose worktree is gone are moved to
+`<cache root>/.trash` (see Housekeeping), and only `/gc --purge-trash` removes
+them. There is no byte cap.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_RUST_CACHE_DIR` | `~/.rust/cache` | Cache root (`~` is expanded) |
+| `PI_RUST_CACHE_DIR` | `~/.rust/cache` | Cache root (`~` is expanded). Must be empty, an older cache, or carry `.pi-eng-rust-cache-root`; any other directory is refused |
 | `PI_RUST_CACHE` | `1` | `0` disables the managed cache |
-| `PI_RUST_CACHE_MAX_AGE_DAYS` | `30` | Target dirs no build touched for this long are removed by housekeeping |
+| `PI_RUST_CACHE_MAX_AGE_DAYS` | `30` | Marked target dirs no build touched for this long (and whose worktree is gone) are moved to the cache trash by housekeeping |
 
 ## Housekeeping
 
@@ -467,7 +467,14 @@ start, every six hours while a session stays open, and on demand with `/gc`
   runtime's own namespace (`pi-eng-<hash(repoRoot)>-*` siblings of the repo
   root) are ever reclaimed, and only when their mission is durably `COMPLETE`
   or `CANCELED` (`FAILED` missions can be reopened, so they are never reclaimed; read from the orchestration event log, so missions run
-  by other pi processes count). A worktree on any other branch is yours: it is
+  by other pi processes count) **and** the worktree carries the runtime's
+  ownership marker `pi-eng-owner.json` in its git dir
+  (`.git/worktrees/<id>/`; JSON `{version:1, creator:"pi-engineering",
+  repoRootHash, repoRootSha256?, branch, createdAt}`, written when the runtime
+  creates the worktree). A missing, unparseable or mismatching marker (different
+  repository, different `repoRootSha256`, different branch) means "not provably
+  ours": kept and reported as "no ownership marker". Worktrees created before the
+  marker existed therefore stay kept until you remove them yourself. A worktree on any other branch is yours: it is
   kept and reported, however idle. A mission this process cannot prove terminal
   is kept, as is any worktree a durable candidate, cleanup or quarantined record
   still names. Nothing younger than `PI_WORKTREE_MIN_AGE_HOURS` (default and
@@ -487,8 +494,13 @@ start, every six hours while a session stays open, and on demand with `/gc`
   an untracked derived folder would block a plain remove; assume-unchanged or
   skip-worktree index entries could hide edits; its HEAD is detached and dirty or
   unreachable from every local branch and tag (remote-tracking refs and a stash
-  do not count); changes would remain after staging; or its Rust cache key is
-  the shared `_shared` fallback.
+  do not count); changes would remain after staging; its Rust cache key is
+  the shared `_shared` fallback; an unreadable directory exists under it; or a
+  root derived folder holds any file or folder newer than the owning mission's
+  terminal timestamp (`completed_at`, else `updated_at`, the earlier of the
+  in-process store and the durable event log), or such a folder exists and no
+  terminal timestamp is known: something used the checkout after the mission
+  ended.
 - **Disposable derived folders** are exactly these, and only at the worktree
   root: `node_modules/`, `target/`, `.next/`, `dist/`, `coverage/`, and only when
   the folder itself is git-ignored and nothing named `.git` lives beneath it.
@@ -504,15 +516,20 @@ start, every six hours while a session stays open, and on demand with `/gc`
   restaging would lose the staged version. The repo's own `node_modules`
   symlink that `createWorktree` provisions is never staged; on reclaim only the
   link is unlinked.
-- Removal is guarded as follows. Every keep check runs, the checkout is moved
+- **A sweep never deletes.** Every keep check runs, the checkout is moved
   with `git worktree move` to a `reclaim-` quarantine name beside it, every
   check runs again there (plus a comparison of the tree's newest mtime), and
-  only then does a plain (never `--force`d) `git worktree remove` run. If any
-  check fails the checkout is moved back. A writer that only knows the original
-  path can no longer reach the files. Accepted residual (not fixed in this
-  wave; wave 2 should delete a quarantined checkout only on a later sweep after
-  the minimum age and a fresh re-check, and `/gc` therefore previews by
-  default): a process with its
+  only then is it renamed into the trash,
+  `<state-dir>/trash/<ISO-ts>/<name>` (state dir: `PI_ENGINEERING_STATE_DIR`,
+  else `$XDG_STATE_HOME/pi-engineering`, else `~/.local/state/pi-engineering`),
+  next to a `.pi-eng-trash.json` marker. The rename needs the trash on the same
+  filesystem as the repository; if it is not, the checkout is moved back, kept
+  and reported. Its git registration is then pruned with `git worktree prune`,
+  but only when that would not also drop another worktree whose directory is
+  currently missing (an unmounted disk); otherwise the stale registration is
+  left and reported. If any check fails the checkout is moved back. A writer
+  that only knows the original path can no longer reach the files. Accepted
+  residual: a process with its
   working directory already inside the checkout, or one that follows the
   quarantine path, can still add an ignored file or a file in a root derived
   folder between the final re-check and git's own removal; git itself refuses
@@ -520,12 +537,28 @@ start, every six hours while a session stays open, and on demand with `/gc`
   namespace directory git no longer lists is reported as a stray and its files
   are never removed (`git worktree repair` may re-register it first, which only
   rewrites git metadata); delete it yourself if you do not want it.
-- A reclaimed worktree's cargo target dir goes with it, and target dirs (see
-  above) that no build touched for `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
+- **Purging the trash is a separate, explicit act**:
+  `/gc --purge-trash [--older-than <days>] --apply` (default 14 days, minimum 7;
+  without `--apply` it only lists what it would purge, and it never sweeps).
+  It deletes only entries directly under a trash root that are regular
+  directories carrying a valid `.pi-eng-trash.json` written by housekeeping,
+  at least `<days>` old, and it never follows symlinks; everything else is
+  skipped and reported. It covers `<state-dir>/trash` and `<rust-cache>/.trash`.
+- Rust cache: the runtime writes `.pi-eng-rust-cache.json` into every
+  generation dir (`<cache>/target/<repo>/<worktree>`) it assigns. The sweep moves
+  (never deletes) a generation to `<cache>/.trash/<ts>/` only when that marker is
+  valid, no build touched it for `PI_RUST_CACHE_MAX_AGE_DAYS`, and its worktree
+  is gone and not a live worktree's target dir. Unmarked generations (created
+  before the marker, or by anything else) are kept and reported. The cache root
+  must carry `.pi-eng-rust-cache-root`, written on first use of an empty cache or
+  an older one holding only `target/` and `sccache/`; a `PI_RUST_CACHE_DIR`
+  naming any other directory is refused (no shared cache is used, nothing is
+  written or swept in it). A reclaimed worktree's cargo target dir is left to
+  this sweep.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_HOUSEKEEPING` | dry-run | Automatic housekeeping only reports by default (owner rule 2026-10-30: nothing is deleted by a sweep unless you opt in); `1`/`true`/`on`/`yes` lets it act, `0`/`false`/`off`/`no` disables it. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` previews by default and lists what it kept and why; `/gc --apply` is the explicit action |
+| `PI_HOUSEKEEPING` | dry-run | Automatic housekeeping only reports by default; `1`/`true`/`on`/`yes` lets it act (moving to the trash, never deleting), `0`/`false`/`off`/`no` disables it. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` previews by default and lists what it kept and why; `/gc --apply` moves to the trash; `/gc --purge-trash --older-than <days> --apply` is the only deletion |
 | `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
 | `PI_WORKTREE_IDLE_HOURS` | `24` | Retained for compatibility; governs nothing now. A worktree with no parsable mission/task owner is kept, never reclaimed by age. `PI_WORKTREE_MIN_AGE_HOURS` still sets the minimum age for a terminal-owner reclaim |
 

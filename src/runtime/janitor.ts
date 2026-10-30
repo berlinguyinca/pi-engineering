@@ -7,8 +7,22 @@
  * session stays open, and on demand through `/gc`.
  */
 
+import { join } from "node:path";
 import { GitRepo } from "../git/GitRepo.ts";
-import { type RustCacheSweepReport, sweepRustCache } from "../git/rustBuildCache.ts";
+import {
+  type RustCacheSweepReport,
+  prepareRustCacheRoot,
+  rustCacheEnabled,
+  rustCacheRoot,
+  rustTargetDir,
+  sweepRustCache,
+} from "../git/rustBuildCache.ts";
+import {
+  DEFAULT_PURGE_OLDER_THAN_DAYS,
+  MIN_PURGE_OLDER_THAN_DAYS,
+  type TrashPurgeReport,
+  purgeTrash,
+} from "../git/trashStore.ts";
 import {
   type JanitorReport,
   type OwnerLiveness,
@@ -18,6 +32,7 @@ import {
 } from "../git/worktreeJanitor.ts";
 import type { MissionStatus } from "../orchestration/types.ts";
 import { discoverMissionHandover } from "./host/missionHandover.ts";
+import { resolveStateRoot } from "./isolation/stateDir.ts";
 
 /**
  * Mission statuses after which a mission never touches its worktrees again.
@@ -28,7 +43,9 @@ const TERMINAL_MISSION_STATUSES: ReadonlySet<MissionStatus> = new Set<MissionSta
 
 /** The slice of MissionStore the janitor needs; keeps the binding testable. */
 export interface MissionLookup {
-  getMission(missionId: string): { status: MissionStatus } | undefined;
+  getMission(
+    missionId: string,
+  ): { status: MissionStatus; completed_at?: string | null; updated_at?: string } | undefined;
   getTask(taskId: string): { mission_id: string } | undefined;
 }
 
@@ -67,24 +84,76 @@ export function housekeepingMode(env: Record<string, string | undefined> = proce
 }
 
 /**
+ * When the owning mission durably ended (epoch ms): the EARLIEST of the sources that know it, so a
+ * disagreement keeps more worktrees, never fewer. null when no source has a timestamp.
+ */
+export function missionTerminalAt(
+  store: MissionLookup | null | undefined,
+  durableEndedAt: Readonly<Record<string, string>> = {},
+): (owner: WorktreeOwner) => number | null {
+  return (owner) => {
+    const missionId = owner.missionId ?? (owner.taskId ? store?.getTask(owner.taskId)?.mission_id : undefined);
+    if (!missionId) return null;
+    const mission = store?.getMission(missionId);
+    const times = [mission?.completed_at ?? mission?.updated_at, durableEndedAt[missionId]]
+      .filter((t): t is string => typeof t === "string")
+      .map((t) => Date.parse(t))
+      .filter(Number.isFinite);
+    return times.length > 0 ? Math.min(...times) : null;
+  };
+}
+
+export interface GcPlan {
+  dryRun: boolean;
+  /** Present for `--purge-trash`: purge trash instead of sweeping. */
+  purge?: { olderThanDays: number };
+  note?: string;
+}
+
+/**
  * `/gc` arguments. It previews by default; only an explicit `--apply` acts.
- * `--dry-run` is accepted as a no-op alias and wins over `--apply`. Any other
+ * `--dry-run` is accepted as a no-op alias and wins over `--apply`.
+ * `--purge-trash [--older-than <days>]` lists (or, with `--apply`, permanently deletes) trashed
+ * worktrees and Rust caches older than <days> (default 14, minimum 7); it never sweeps. Any other
  * token is unknown and makes the command fall back to a preview, with a note.
  */
-export function gcPlan(args: string): { dryRun: boolean; note?: string } {
+export function gcPlan(args: string): GcPlan {
   const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
-  const unknown = argv.filter((a) => a !== "--apply" && a !== "--dry-run");
+  const unknown: string[] = [];
+  let purge = false;
+  let days: number = DEFAULT_PURGE_OLDER_THAN_DAYS;
+  let daysProblem: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i] as string;
+    if (a === "--apply" || a === "--dry-run") continue;
+    if (a === "--purge-trash") purge = true;
+    else if (a === "--older-than" || a.startsWith("--older-than=")) {
+      const raw = a === "--older-than" ? argv[++i] : a.slice("--older-than=".length);
+      const n = Number(raw);
+      if (raw === undefined || raw === "" || !Number.isFinite(n) || n < MIN_PURGE_OLDER_THAN_DAYS) {
+        daysProblem = `--older-than needs at least ${MIN_PURGE_OLDER_THAN_DAYS} days (got ${raw ?? "nothing"}): nothing will be purged`;
+      } else days = n;
+    } else unknown.push(a);
+  }
+  const apply = argv.includes("--apply") && !argv.includes("--dry-run");
   if (unknown.length > 0) {
     return {
       dryRun: true,
       note: `unknown argument(s) ${unknown.join(", ")}: showing a preview instead; use \`/gc --apply\` alone to act`,
     };
   }
-  return { dryRun: !argv.includes("--apply") || argv.includes("--dry-run") };
-}
-
-export function gcDryRun(args: string): boolean {
-  return gcPlan(args).dryRun;
+  if (daysProblem) return { dryRun: true, note: daysProblem };
+  if (!purge && argv.includes("--older-than")) {
+    return { dryRun: true, note: "--older-than only applies to --purge-trash: showing a preview instead" };
+  }
+  if (purge && !apply) {
+    return {
+      dryRun: true,
+      purge: { olderThanDays: days },
+      note: "purging trash needs --apply; listing what it would purge",
+    };
+  }
+  return purge ? { dryRun: false, purge: { olderThanDays: days } } : { dryRun: !apply };
 }
 
 export interface HousekeepingResult {
@@ -109,12 +178,58 @@ export async function runHousekeeping(opts: {
     ? await sweepWorktrees({
         repo,
         ownerLiveness: missionOwnerLiveness(opts.missions, durable?.statuses),
+        ownerTerminalAt: missionTerminalAt(opts.missions, durable?.endedAt),
         dryRun: opts.dryRun,
       })
     : null;
   signal?.throwIfAborted();
-  const rustCache = await sweepRustCache({ dryRun: opts.dryRun });
+  // Target dirs of every worktree still registered (and the primary checkout) are never swept.
+  const liveTargetDirs = new Set<string>();
+  if (repo) {
+    for (const path of [repo.root, ...(await repo.listLinkedWorktrees()).map((w) => w.path)]) {
+      const dir = await rustTargetDir(path).catch(() => null);
+      if (dir) liveTargetDirs.add(dir);
+    }
+  }
+  const rustCache = await sweepRustCache({ dryRun: opts.dryRun, liveTargetDirs });
   return { worktrees, rustCache };
+}
+
+export interface TrashPurgeResult {
+  worktreeTrash: TrashPurgeReport;
+  rustCacheTrash: TrashPurgeReport | null;
+  rustCacheRefused?: string;
+}
+
+/** `/gc --purge-trash`: the only code path that deletes anything a sweep moved to the trash. */
+export async function runTrashPurge(opts: {
+  olderThanDays: number;
+  apply: boolean;
+  env?: Record<string, string | undefined>;
+}): Promise<TrashPurgeResult> {
+  const env = opts.env ?? process.env;
+  const worktreeTrash = await purgeTrash(join(resolveStateRoot(env), "trash"), opts);
+  if (!rustCacheEnabled(env)) return { worktreeTrash, rustCacheTrash: null };
+  const root = rustCacheRoot(env);
+  const check = await prepareRustCacheRoot(root);
+  if (!check.ok) return { worktreeTrash, rustCacheTrash: null, rustCacheRefused: check.reason };
+  return { worktreeTrash, rustCacheTrash: await purgeTrash(join(root, ".trash"), opts) };
+}
+
+export function describeTrashPurge(result: TrashPurgeResult, dryRun: boolean): string[] {
+  const verb = dryRun ? "would purge" : "purged";
+  const lines: string[] = [];
+  for (const [label, r] of [
+    ["worktree trash", result.worktreeTrash],
+    ["Rust cache trash", result.rustCacheTrash],
+  ] as const) {
+    if (!r) continue;
+    lines.push(`${label}: ${verb} ${r.purged.length}, skipped ${r.skipped.length}`);
+    for (const p of r.purged) lines.push(`  ${verb} ${p.path} (trashed ${p.ageDays} d ago)`);
+    for (const k of r.skipped) lines.push(`  skipped ${k.path} — ${k.reason}`);
+  }
+  if (result.rustCacheRefused) lines.push(`Rust cache trash not touched: ${result.rustCacheRefused}`);
+  return lines;
 }
 
 /** Lines worth telling the operator; empty when nothing happened. */
@@ -125,18 +240,22 @@ export function describeHousekeeping(result: HousekeepingResult, opts: { verbose
     lines.push(describeJanitorReport(wt));
     if (opts.verbose) {
       for (const r of wt.reclaimed)
-        lines.push(`  ${wt.dryRun ? "would reclaim" : "reclaimed"} ${r.path} — ${r.reason}`);
+        lines.push(`  ${wt.dryRun ? "would move to the trash" : "moved to the trash"} ${r.path} — ${r.reason}`);
       for (const k of wt.kept) lines.push(`  kept ${k.path} — ${k.reason}`);
     }
     for (const f of wt.failed) lines.push(`  failed ${f.path}: ${f.error}`);
   }
   const rc = result.rustCache;
-  if (rc.removed.length > 0 || (opts.verbose && rc.kept.length > 0)) {
-    const verb = rc.dryRun ? "would remove" : "removed";
+  if (rc.refused) lines.push(`Rust cache sweep refused: ${rc.refused}`);
+  if (rc.trashed.length > 0 || (opts.verbose && rc.kept.length > 0)) {
+    const verb = rc.dryRun ? "would move to the trash" : "moved to the trash";
     lines.push(
-      `${verb} ${rc.removed.length} unused Rust target cache${rc.removed.length === 1 ? "" : "s"}, ${rc.kept.length} kept`,
+      `${verb} ${rc.trashed.length} unused Rust target cache${rc.trashed.length === 1 ? "" : "s"}, ${rc.kept.length} kept`,
     );
-    if (opts.verbose) for (const r of rc.removed) lines.push(`  ${verb} ${r.path} (idle ${r.idleDays} d)`);
+    if (opts.verbose) {
+      for (const r of rc.trashed) lines.push(`  ${verb} ${r.path} (idle ${r.idleDays} d)`);
+      for (const k of rc.kept) lines.push(`  kept ${k.path} — ${k.reason}`);
+    }
   }
   return lines;
 }

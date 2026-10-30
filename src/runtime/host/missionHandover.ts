@@ -39,6 +39,8 @@ export interface MissionHandoverFacts {
   pending: string[];
   inferenceWaits: string[];
   statuses: Record<string, string>;
+  /** ISO time each mission last changed (`completed_at`, else `updated_at`); for terminal missions this is when it ended. */
+  endedAt?: Record<string, string>;
 }
 
 /** Complete JSONL events of a legacy single-writer file; [] when there is none. */
@@ -100,6 +102,8 @@ export async function readMissionFacts(events: StoredEvent[]): Promise<MissionHa
   const store = MissionStore.open(backend);
   for (const mission of store.listMissions()) {
     facts.statuses[mission.mission_id] = mission.status;
+    facts.endedAt ??= {};
+    facts.endedAt[mission.mission_id] = mission.completed_at ?? mission.updated_at;
     if (TERMINAL.has(mission.status)) continue;
     if (INFERENCE_WAIT_STATES.has(mission.status)) facts.inferenceWaits.push(mission.mission_id);
     if (PENDING.has(mission.status)) facts.pending.push(mission.mission_id);

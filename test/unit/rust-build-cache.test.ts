@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -155,7 +155,11 @@ test("withRustBuildEnv merges in place and touches nothing on disk", async () =>
     assert.equal(same, env);
     assert.equal(env.CARGO_TARGET_DIR, join(root, "target", UNSCOPED_TARGET_KEY));
     const { stdout } = await exec("ls", ["-A", root]);
-    assert.equal(stdout.trim(), "", "cargo creates the target dir itself; the runtime only guarantees the root");
+    assert.equal(
+      stdout.trim(),
+      ".pi-eng-rust-cache-root",
+      "cargo creates the target dir itself; the runtime only guarantees the (marked) root",
+    );
     assert.equal((await stat(root)).mode & 0o777, 0o700, "cache root is private to the user");
     const fresh = join(root, "nested", "cache");
     await withRustBuildEnv(bareEnv({ PI_RUST_CACHE_DIR: fresh }), dir);
@@ -228,49 +232,147 @@ test("verification stages run with the shared Rust cache in their environment", 
   }
 });
 
-test("sweepRustCache removes target dirs idle past the threshold and keeps active ones", async () => {
-  const { sweepRustCache, rustCacheMaxAgeMs } = await import("../../src/git/rustBuildCache.ts");
+const MARKER = ".pi-eng-rust-cache.json";
+const ROOT_MARKER = ".pi-eng-rust-cache-root";
+
+/** A generation dir the runtime would have created: marked, with a build lock file, aged `days` days. */
+async function makeGeneration(
+  root: string,
+  repoKey: string,
+  name: string,
+  days: number,
+  opts: { marker?: boolean; worktreePath?: string | null } = {},
+): Promise<string> {
   const { utimes } = await import("node:fs/promises");
+  const dir = join(root, "target", repoKey, name);
+  await mkdir(join(dir, "debug"), { recursive: true });
+  await writeFile(join(dir, "debug", ".cargo-lock"), "");
+  if (opts.marker !== false) {
+    await writeFile(
+      join(dir, MARKER),
+      JSON.stringify({
+        version: 1,
+        creator: "pi-engineering",
+        worktreePath: opts.worktreePath ?? null,
+        createdAt: "x",
+      }),
+    );
+  }
+  const old = new Date(Date.now() - days * 86_400_000);
+  for (const p of [join(dir, "debug", ".cargo-lock"), join(dir, "debug"), join(dir, MARKER), dir]) {
+    await utimes(p, old, old).catch(() => {});
+  }
+  return dir;
+}
+
+test("sweepRustCache MOVES marked, idle, worktree-less generations to <cache>/.trash and keeps the rest", async () => {
+  const { sweepRustCache, rustCacheMaxAgeMs } = await import("../../src/git/rustBuildCache.ts");
   const root = await mkdtemp(join(tmpdir(), "pi-rust-sweep-"));
   try {
     assert.equal(rustCacheMaxAgeMs({}), 30 * 86_400_000);
     assert.equal(rustCacheMaxAgeMs({ PI_RUST_CACHE_MAX_AGE_DAYS: "7" }), 7 * 86_400_000);
-    const stale = join(root, "target", "old-repo-abc", "wt1");
-    const active = join(root, "target", "busy-repo-def", "wt2");
-    await mkdir(join(stale, "debug"), { recursive: true });
-    await mkdir(join(active, "debug"), { recursive: true });
-    await writeFile(join(stale, "debug", ".cargo-lock"), "");
-    await writeFile(join(active, "debug", ".cargo-lock"), "");
-    const old = new Date(Date.now() - 40 * 86_400_000);
-    for (const p of [stale, join(stale, "debug"), join(stale, "debug", ".cargo-lock")]) await utimes(p, old, old);
-    // The active dir itself is old, but a recent build touched its lock file.
-    await utimes(active, old, old);
+    await writeFile(join(root, ROOT_MARKER), JSON.stringify({ version: 1, creator: "pi-engineering" }));
+    const stale = await makeGeneration(root, "old-repo-abc", "wt1", 40);
+    const active = await makeGeneration(root, "busy-repo-def", "wt2", 1);
+    const unmarked = await makeGeneration(root, "legacy-repo-ghi", "wt3", 90, { marker: false });
+    const live = await makeGeneration(root, "live-repo-jkl", "wt4", 90, { worktreePath: root });
+    const referenced = await makeGeneration(root, "ref-repo-mno", "wt5", 90);
     const env = { HOME: root, PATH: "", PI_RUST_CACHE_DIR: root };
-    const dry = await sweepRustCache({ env, dryRun: true });
+    const liveTargetDirs = new Set([referenced]);
+
+    const dry = await sweepRustCache({ env, dryRun: true, liveTargetDirs });
     assert.deepEqual(
-      dry.removed.map((r) => r.path),
+      dry.trashed.map((r) => r.path),
       [stale],
     );
-    const { stdout: still } = await exec("ls", [join(root, "target")]);
-    assert.match(still, /old-repo-abc/, "dry run removes nothing");
-    const report = await sweepRustCache({ env });
+    assert.equal((await stat(stale)).isDirectory(), true, "dry run moves nothing");
+
+    const report = await sweepRustCache({ env, liveTargetDirs });
     assert.deepEqual(
-      report.removed.map((r) => r.path),
+      report.trashed.map((r) => r.path),
       [stale],
     );
-    assert.deepEqual(
-      report.kept.map((r) => r.path),
-      [active],
+    const reasons = Object.fromEntries(report.kept.map((k) => [k.path, k.reason]));
+    assert.match(reasons[active] ?? "", /active/);
+    assert.match(reasons[unmarked] ?? "", /no \.pi-eng-rust-cache\.json ownership marker/);
+    assert.match(reasons[live] ?? "", /its worktree .* still exists/);
+    assert.match(reasons[referenced] ?? "", /referenced by a live worktree/);
+    assert.equal(await stat(stale).catch(() => null), null, "moved out of target/");
+    const moved = report.trashed[0]!.trashedTo!;
+    assert.ok(moved.startsWith(join(root, ".trash")), moved);
+    assert.equal((await stat(join(moved, "debug", ".cargo-lock"))).isFile(), true, "contents are intact in the trash");
+    assert.equal((await stat(unmarked)).isDirectory(), true, "unmarked generation untouched");
+    assert.equal(
+      await stat(join(root, "target", "old-repo-abc")).catch(() => null),
+      null,
+      "emptied repo dir removed with rmdir",
     );
-    const { stdout } = await exec("ls", [join(root, "target")]);
-    assert.equal(stdout.trim(), "busy-repo-def", "an emptied repository dir is removed too");
     assert.deepEqual(await sweepRustCache({ env: { ...env, PI_RUST_CACHE: "0" } }), {
-      removed: [],
+      trashed: [],
       kept: [],
       dryRun: false,
     });
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sweepRustCache refuses a PI_RUST_CACHE_DIR that is not a pi-engineering cache and touches nothing in it", async () => {
+  const { sweepRustCache } = await import("../../src/git/rustBuildCache.ts");
+  const root = await mkdtemp(join(tmpdir(), "pi-rust-foreign-"));
+  try {
+    // Looks like a user directory that happens to hold a `target/<x>/<y>` tree with an old marker-like file.
+    await writeFile(join(root, "notes.txt"), "mine\n");
+    const dir = await makeGeneration(root, "proj-1", "build", 400);
+    const report = await sweepRustCache({ env: { HOME: root, PATH: "", PI_RUST_CACHE_DIR: root } });
+    assert.match(report.refused ?? "", new RegExp(`${ROOT_MARKER}`));
+    assert.deepEqual(report.trashed, []);
+    assert.equal((await stat(dir)).isDirectory(), true);
+    assert.equal(await stat(join(root, ".trash")).catch(() => null), null);
+    assert.equal(await stat(join(root, ROOT_MARKER)).catch(() => null), null, "a refused root is not marked");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("withRustBuildEnv marks the root and each generation on first use, adopts an older cache, and refuses a foreign dir", async () => {
+  resetRustTargetKeys();
+  const rust = await makeFixtureRepo();
+  const fresh = await mkdtemp(join(tmpdir(), "pi-rust-fresh-"));
+  const legacy = await mkdtemp(join(tmpdir(), "pi-rust-legacy-"));
+  const foreign = await mkdtemp(join(tmpdir(), "pi-rust-foreign-"));
+  try {
+    await makeRust(rust.root);
+    // fresh (empty) root: marker created, generation dir marked with the checkout path.
+    const env: Record<string, string | undefined> = { HOME: fresh, PATH: "", PI_RUST_CACHE_DIR: fresh };
+    await withRustBuildEnv(env, rust.root);
+    assert.ok(env.CARGO_TARGET_DIR?.startsWith(join(fresh, "target")));
+    assert.equal(JSON.parse(await readFile(join(fresh, ROOT_MARKER), "utf8")).creator, "pi-engineering");
+    const marker = JSON.parse(await readFile(join(env.CARGO_TARGET_DIR!, MARKER), "utf8"));
+    assert.equal(marker.creator, "pi-engineering");
+    assert.equal(marker.worktreePath, await realpath(rust.root));
+
+    // an older cache holding only target/ and sccache/ is adopted
+    await mkdir(join(legacy, "target"), { recursive: true });
+    const legacyEnv: Record<string, string | undefined> = { HOME: legacy, PATH: "", PI_RUST_CACHE_DIR: legacy };
+    await withRustBuildEnv(legacyEnv, rust.root);
+    assert.ok(legacyEnv.CARGO_TARGET_DIR);
+    assert.equal((await stat(join(legacy, ROOT_MARKER))).isFile(), true);
+
+    // a directory holding anything else is refused: no target dir is assigned, nothing is written or chmod-ed
+    await writeFile(join(foreign, "family-photos.zip"), "x");
+    await chmod(foreign, 0o755);
+    const foreignEnv: Record<string, string | undefined> = { HOME: foreign, PATH: "", PI_RUST_CACHE_DIR: foreign };
+    await withRustBuildEnv(foreignEnv, rust.root);
+    assert.equal(foreignEnv.CARGO_TARGET_DIR, undefined);
+    assert.equal(await stat(join(foreign, ROOT_MARKER)).catch(() => null), null);
+    assert.equal(await stat(join(foreign, "target")).catch(() => null), null);
+    assert.equal((await stat(foreign)).mode & 0o777, 0o755, "permissions untouched");
+  } finally {
+    await rm(fresh, { recursive: true, force: true });
+    await rm(legacy, { recursive: true, force: true });
+    await rm(foreign, { recursive: true, force: true });
+    await rust.cleanup();
   }
 });
 

@@ -14,6 +14,7 @@ import { captureChangeSnapshot } from "../../src/lifecycle/changeObserver.ts";
 import { gitPostMerge } from "../../src/merge/postMerge.ts";
 import { gitHead, gitRunner, sshCommandConfigured, trackedChanges } from "../../src/runtime/host/sourceWatch.ts";
 import { hasNoChangesVsBase } from "../../src/workers/workerResultTool.ts";
+import { writeOwnerMarker } from "../support/janitorFixtures.ts";
 
 const CLEAN_ENV = { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 const sh = (cmd: string, cwd: string) =>
@@ -44,6 +45,7 @@ before(async () => {
   assert.ok(repo);
   janitorWt = join(root, `${repo.worktreeNamespacePrefix()}stale`);
   sh(`git worktree add -q -b pi-eng-candidate-AAA-1-x ${janitorWt} HEAD`, primary);
+  await writeOwnerMarker(repo, janitorWt, "pi-eng-candidate-AAA-1-x");
   const fake = join(root, "fake");
   writeFileSync(fake, `#!/bin/sh\ntouch ${marks}/gpg\nexit 1\n`);
   chmodSync(fake, 0o755);

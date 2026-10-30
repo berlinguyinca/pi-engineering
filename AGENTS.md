@@ -152,9 +152,13 @@ worktree reuse another's build of the repository's own crates. Set
 Worktrees the runtime creates are reclaimed by housekeeping
 (`src/git/worktreeJanitor.ts`, README "Housekeeping") once their mission is
 durably `COMPLETE`/`CANCELED` (never `FAILED`; only on `pi-eng-candidate-*`/`pi-eng-orch-*` branches with a parsable mission/task owner, never by age alone, and
-only when `PI_HOUSEKEEPING=1` or `/gc --apply` opts in; the default and plain `/gc` are previews); uncommitted
+only when `PI_HOUSEKEEPING=1` or `/gc --apply` opts in; the default and plain `/gc` are previews, and only
+worktrees carrying the `pi-eng-owner.json` ownership marker in their git dir); uncommitted
 work is committed to the worktree's branch first, and anything that cannot be
-preserved is kept and reported. Hand-made worktrees like the one above live outside
+preserved is kept and reported. A sweep never deletes: the checkout is moved to
+`<state-dir>/trash/<ts>/`, and only `/gc --purge-trash --older-than <days> --apply`
+(default 14, minimum 7) deletes trash. Idle Rust cache generations
+(`.pi-eng-rust-cache.json` marker required) go to `<rust-cache>/.trash` the same way. Hand-made worktrees like the one above live outside
 the `pi-eng-*` namespace and are never touched, so remove them yourself when
 the branch has merged.
 
