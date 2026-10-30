@@ -220,7 +220,12 @@ function seedFromStartingModel(
   baseline: ModelRef | undefined,
 ): OperatorModelPin | null {
   if (current || mission.operator_model_decided_at || !baseline) return current;
-  const pin: OperatorModelPin = { provider: baseline.provider, id: baseline.id, set_at: new Date().toISOString() };
+  const pin: OperatorModelPin = {
+    provider: baseline.provider,
+    id: baseline.id,
+    set_at: new Date().toISOString(),
+    implicit: true,
+  };
   opts.store.updateMission(opts.missionId, { operator_model_pin: { ...pin }, operator_model_decided_at: pin.set_at });
   try {
     opts.onTransition?.({ missionId: opts.missionId, from: null, to: modelKey(pin), reason: "session starting model" });

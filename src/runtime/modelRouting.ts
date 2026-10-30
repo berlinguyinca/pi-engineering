@@ -112,7 +112,7 @@ export function createRouteModel(opts: {
   unavailable: UnavailableModels;
   reviewFallbackModel?: ModelRef;
   /** The operator pin a mission dispatches with (adopted at this boundary). */
-  operatorPin?: (missionId: string) => ModelRef | null | undefined;
+  operatorPin?: (missionId: string) => (ModelRef & { implicit?: boolean }) | null | undefined;
   /**
    * Keep a mission on its pin (`execution.hold_mission_model`). A pin that was
    * tried or is marked unavailable is retried on its next dispatch, and no
@@ -143,7 +143,7 @@ export function createRouteModel(opts: {
     if (exclude.some((model) => modelKey(model) === modelKey(pin))) {
       const independent = ROLE_REQUIREMENTS[routerRoleFor(role) ?? "implementer"].independent;
       if (opts.holdPin && !independent) {
-        return routeOpts?.replacement ? undefined : { provider: pin.provider, id: pin.id, operatorPin: true };
+        return routeOpts?.replacement ? undefined : { provider: pin.provider, id: pin.id, operatorPin: !pin.implicit };
       }
       const routed = await routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude, taskQuery);
       return routed && { ...routed, pinRefused: modelKey(pin) };
@@ -152,7 +152,7 @@ export function createRouteModel(opts: {
       ...(requester ? { requester } : {}),
       ...(exclude.length > 0 ? { exclude } : {}),
     });
-    if (!refusal) return { provider: pin.provider, id: pin.id, operatorPin: true } satisfies ModelRoute;
+    if (!refusal) return { provider: pin.provider, id: pin.id, operatorPin: !pin.implicit } satisfies ModelRoute;
     const routed = await routeRole(opts.router, role, true, requester, exclude, taskQuery);
     if (!routed) return undefined;
     return {

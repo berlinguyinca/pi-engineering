@@ -4544,6 +4544,7 @@ function validateMissionUpdatePatch(patch: MissionUpdatePatch): MissionUpdatePat
                 provider: String(patch.operator_model_pin.provider),
                 id: String(patch.operator_model_pin.id),
                 set_at: String(patch.operator_model_pin.set_at),
+                ...(patch.operator_model_pin.implicit === true ? { implicit: true as const } : {}),
               }
             : null,
         }
