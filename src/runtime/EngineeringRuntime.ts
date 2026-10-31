@@ -3062,7 +3062,17 @@ export class EngineeringRuntime {
       run.result.status === "completed" ? "agent.completed" : "agent.failed",
       opts.wi.id,
       { ...this.actor(runId, role), model: run.usage?.model },
-      { role, status: run.result.status },
+      {
+        role,
+        status: run.result.status,
+        // Why a run failed, so the ledger says more than "failed" (e.g. error "tool-loop" + tool/count/last args).
+        ...(run.result.status === "completed"
+          ? {}
+          : {
+              ...(run.result.error ? { error: run.result.error } : {}),
+              ...(run.result.details?.tool_loop ? { tool_loop: run.result.details.tool_loop } : {}),
+            }),
+      },
       { ...runMeta, idempotency_key: `${runId}:ended` },
     );
     // After a completed worker, record the outcome into the session store and

@@ -311,6 +311,7 @@ test("execution defaults to adaptive with no implicit Mission directive", async 
     heartbeat_interval_ms: 30_000,
     status_refresh_interval_ms: 15_000,
     stale_after_ms: 300_000,
+    tool_loop_limit: 3,
   });
   const cwd = await temp("pi-eng-exec-");
   const agentDir = await temp("pi-eng-exec-agent-");
@@ -346,6 +347,28 @@ test("liveness knobs load from yaml and out-of-range values are rejected", async
   }
 });
 
+test("tool_loop_limit loads from yaml; out-of-range values are rejected and fall back to 3", async () => {
+  const cwd = await temp("pi-eng-exec-");
+  const agentDir = await temp("pi-eng-exec-agent-");
+  try {
+    await mkdir(join(cwd, ".pi"), { recursive: true });
+    await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  tool_loop_limit: 5\n");
+    assert.equal((await loadExecutionConfig(cwd, agentDir)).tool_loop_limit, 5);
+    for (const bad of ["1", "101", "0", "many"]) {
+      await writeFile(join(cwd, ".pi", "engineering.yaml"), `execution:\n  tool_loop_limit: ${bad}\n`);
+      assert.equal((await loadExecutionConfig(cwd, agentDir)).tool_loop_limit, 3, `limit ${bad}`);
+      const { issues } = await loadPolicy({ cwd, agentDir });
+      assert.ok(
+        issues.some((i) => i.path === "execution.tool_loop_limit" && i.severity === "error"),
+        bad,
+      );
+    }
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
 test("execution preference and legacy opt-in load from repo yaml", async () => {
   const cwd = await temp("pi-eng-exec-");
   const agentDir = await temp("pi-eng-exec-agent-");
@@ -363,6 +386,7 @@ test("execution preference and legacy opt-in load from repo yaml", async () => {
       heartbeat_interval_ms: 30_000,
       status_refresh_interval_ms: 15_000,
       stale_after_ms: 300_000,
+      tool_loop_limit: 3,
     });
   } finally {
     await rm(cwd, { recursive: true, force: true });

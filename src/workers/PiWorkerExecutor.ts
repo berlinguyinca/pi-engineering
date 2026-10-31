@@ -92,6 +92,7 @@ import {
   isCutStreamError,
   resolveStreamResumeMax,
 } from "../inference/streamResume.ts";
+import { DEFAULT_POLICY, loadExecutionConfig } from "../lifecycle/policy.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { missionDepthSpawnHook } from "../orchestration/missionMode.ts";
 import { NO_CHANGE_LOOP_PREVENTED_MARKER } from "../orchestration/recovery.ts";
@@ -140,6 +141,7 @@ import { createQuarantinedBashOperations } from "./quarantinedBash.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
+import { ToolLoopDetector, type ToolLoopTrip, toolResultText } from "./toolLoopGuard.ts";
 import { TranscriptWriter, transcriptPath, transcriptsEnabled } from "./transcriptStore.ts";
 import {
   DEFAULT_BUDGET_NOTICE_EVERY,
@@ -240,6 +242,8 @@ export interface PiWorkerExecutorOptions {
    * (default 3, PI_STREAM_RESUME_MAX). 0 disables resuming.
    */
   streamResumeMax?: number;
+  /** Overrides `execution.tool_loop_limit` (consecutive identical tool calls that stop a worker). */
+  toolLoopLimit?: number;
   /**
    * APS loop-detection for worker sessions (Phase 2, detect-only): tool-call
    * activity is turned into AgentAction records and fed to an
@@ -318,6 +322,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly transientRand: () => number;
   private readonly clock: WorkerClock;
   private readonly streamResumeMax: number;
+  /** Test/embedding override of `execution.tool_loop_limit`. */
+  private readonly toolLoopLimit: number | undefined;
   /** APS loop-detection options for worker sessions (`false` disables). */
   private readonly aps: AgentProgressSupervisorOptions | false | undefined;
   /** APS loop-prevention options (`false` disables enforcement). */
@@ -366,6 +372,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.transientRand = opts.transientRand ?? Math.random;
     this.clock = opts.clock ?? realClock;
     this.streamResumeMax = opts.streamResumeMax ?? resolveStreamResumeMax();
+    this.toolLoopLimit = opts.toolLoopLimit;
     this.aps = opts.aps;
     this.loopPrevention = opts.loopPrevention;
     this.escalation = opts.escalation;
@@ -1095,6 +1102,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
         loopPrevented,
         loopPreventedEvent,
         unknownToolLoop,
+        toolLoop,
       } = transientOutcome.value!;
       account.useAllowance(allowance ?? sentAllowance(model, currentInferenceInvocation()?.maxOutputTokens));
       if (assistantError) lastAssistantError = assistantError;
@@ -1153,6 +1161,36 @@ export class PiWorkerExecutor implements WorkerExecutor {
           },
           usage: account.usage(streamResumes.count),
           error: "unknown_tool_loop",
+          toolCalls,
+        };
+      }
+
+      // The worker re-sent the same tool call, with the same result, over and
+      // over: a fresh session would only repeat it. Fail with a typed error so
+      // the mission can retry or re-route (details name the tool, the count and
+      // the last arguments).
+      if (toolLoop !== undefined) {
+        const summary = `Worker stopped: ${toolLoop.count} consecutive identical ${toolLoop.tool} calls with identical results and no file change in between (limit ${toolLoop.limit}). Last args: ${toolLoop.lastArgs}`;
+        return {
+          result: {
+            status: "failed",
+            summary,
+            claims: [],
+            evidence_refs: [],
+            new_hypotheses: [],
+            proposed_tasks: [],
+            details: {
+              tool_loop: {
+                tool: toolLoop.tool,
+                count: toolLoop.count,
+                limit: toolLoop.limit,
+                last_args: toolLoop.lastArgs,
+              },
+            },
+            error: "tool-loop",
+          },
+          usage: account.usage(streamResumes.count),
+          error: "tool-loop",
           toolCalls,
         };
       }
@@ -1537,6 +1575,8 @@ ${recovery.recoveryPrompt}`;
     loopPreventedEvent?: AgentLoopPreventedEvent;
     /** The tool the model kept calling although the session does not offer it. */
     unknownToolLoop?: string;
+    /** The worker repeated the same tool call with the same result `execution.tool_loop_limit` times. */
+    toolLoop?: ToolLoopTrip;
     guardDiagnostics: Record<string, unknown>;
     captured?: WorkerResult;
     structured?: unknown;
@@ -1612,6 +1652,15 @@ ${recovery.recoveryPrompt}`;
     // MAX_UNKNOWN_TOOL_CALLS). Set once the bound is hit and the attempt aborted.
     let unknownToolStreak = 0;
     let unknownToolLoop: string | undefined;
+    // Cross-turn repeated-identical-call guard (src/workers/toolLoopGuard.ts).
+    let toolLoop: ToolLoopTrip | undefined;
+    const toolLoopLimit =
+      this.toolLoopLimit ??
+      (await loadExecutionConfig(req.cwd, this.agentDir)).tool_loop_limit ??
+      DEFAULT_POLICY.execution.tool_loop_limit ??
+      3;
+    const toolLoopDetector = new ToolLoopDetector(toolLoopLimit);
+    const pendingToolArgs = new Map<string, unknown>();
     // Two distinct error channels, both needed: `assistantError` is the
     // assistant MESSAGE's error (stopReason "error" — where a gateway 429 body
     // arrives), `promptError` is a THROWN transport failure.
@@ -1861,6 +1910,18 @@ ${recovery.recoveryPrompt}`;
           unknownToolStreak = 0;
         }
       }
+      if (event.type === "tool_execution_start") pendingToolArgs.set(event.toolCallId, event.args);
+      if (event.type === "tool_execution_end") {
+        const args = pendingToolArgs.get(event.toolCallId);
+        pendingToolArgs.delete(event.toolCallId);
+        if (event.toolName !== terminatingName && toolLoop === undefined) {
+          const trip = toolLoopDetector.observe(event.toolName, args, toolResultText(event.result), !!event.isError);
+          if (trip) {
+            toolLoop = trip;
+            void session.abort();
+          }
+        }
+      }
       // Count tool executions and feed progress to the guard.
       if (event.type === "tool_execution_start" && event.toolName !== terminatingName) {
         toolCalls++;
@@ -2024,6 +2085,7 @@ ${recovery.recoveryPrompt}`;
         !stalled &&
         !loopPrevented &&
         unknownToolLoop === undefined &&
+        toolLoop === undefined &&
         assistantError === undefined &&
         !req.signal?.aborted
       ) {
@@ -2036,7 +2098,15 @@ ${recovery.recoveryPrompt}`;
       // EXPECTED (session.abort()) and not a transport failure. A rejection
       // with none of those flags set is a real provider/transport error (503,
       // 429, network, timeout) that the transient-recovery layer retries.
-      if (!guardAborted && !budgetExhausted && !timedOut && !ownerAborted && !stalled && !unknownToolLoop) {
+      if (
+        !guardAborted &&
+        !budgetExhausted &&
+        !timedOut &&
+        !ownerAborted &&
+        !stalled &&
+        !unknownToolLoop &&
+        !toolLoop
+      ) {
         promptError = err;
       }
     } finally {
@@ -2127,6 +2197,7 @@ ${recovery.recoveryPrompt}`;
       loopPrevented,
       loopPreventedEvent,
       unknownToolLoop,
+      toolLoop,
       captured,
       structured,
       toolCalls,

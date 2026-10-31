@@ -966,6 +966,22 @@ on by default):
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
 
+### Worker tool-loop guard
+
+Mission workers have their own cross-turn guard (`src/workers/toolLoopGuard.ts`).
+When `execution.tool_loop_limit` (YAML, default 3, range 2..100) consecutive
+completed tool calls are the *same call*, the worker is stopped and fails with
+`error: "tool-loop"` (summary and `details.tool_loop` give the tool, the count and
+the truncated last arguments; the ledger's `agent.failed` event carries both), so
+the mission can retry or re-route. "Same" means: same tool, same arguments after
+whitespace collapsing and key sorting, AND the same result text and error flag.
+For `bash`, a short scratch file the command itself creates (bare name, stem of
+at most 4 characters, target of `>`, `>>` or `tee`; e.g. `cat > pa.mjs <<EOF`) is
+masked, so commands differing only in that name compare equal. Any file-changing
+tool call (`edit`, `write`, ...), a different tool, different arguments or a
+different result resets the count, so polling with changing output, re-running
+tests after an edit and reading different files never trip it.
+
 ## Primary worktree guard
 
 The extension enforces the one-agent-one-worktree rule (AGENTS.md: each agent
