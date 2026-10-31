@@ -422,6 +422,35 @@ test("an open superseded by session shutdown cannot repopulate the cache and the
   }
 });
 
+test("concurrent first requests for one repository share a single runtime open, and shutdown closes it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-single-open-"));
+  const originalOpen = EngineeringRuntime.open;
+  const opened: EngineeringRuntime[] = [];
+  let calls = 0;
+  try {
+    EngineeringRuntime.open = async (options) => {
+      calls++;
+      const runtime = await originalOpen.call(EngineeringRuntime, options);
+      opened.push(runtime);
+      return runtime;
+    };
+    const { commands, handlers } = loadHarness();
+    const first = commandContext(root);
+    const second = commandContext(root);
+    // Two callers race to the cold cache (at session start the panel and a session-control request do exactly this).
+    await Promise.all([
+      commands.get("mission-status")!.handler("", first.ctx),
+      commands.get("mission-status")!.handler("", second.ctx),
+    ]);
+    assert.equal(calls, 1, "the second caller must join the open already in flight, not start a duplicate runtime");
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, first.ctx);
+    assert.equal(opened.length, 1);
+  } finally {
+    EngineeringRuntime.open = originalOpen;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("persistent mission surfaces always pair a static percentage or zero workers with an actionable explanation", () => {
   const format = (extensionModule as Record<string, unknown>).formatMissionActivity;
   assert.equal(typeof format, "function", "the persistent panel and footer need one shared detailed formatter");
