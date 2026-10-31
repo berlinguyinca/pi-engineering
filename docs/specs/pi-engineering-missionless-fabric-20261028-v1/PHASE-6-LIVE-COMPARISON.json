@@ -1,0 +1,1472 @@
+{
+ "per_task": {
+  "t1": {
+   "default": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 3,
+    "wall_median": 34.1,
+    "wall_min": 24.5,
+    "wall_max": 39.5,
+    "timeouts": 0,
+    "blocked": 0,
+    "tool_calls_median": 6,
+    "first_tool_median": 8.4,
+    "tok_in_median": 4226,
+    "tok_out_median": 835,
+    "mission_calls_total": 0,
+    "directive_injected": 0,
+    "wilson95": [
+     0.4384939195509822,
+     1.0
+    ]
+   },
+   "legacy": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 3,
+    "wall_median": 591.4,
+    "wall_min": 474.9,
+    "wall_max": 758.1,
+    "timeouts": 0,
+    "blocked": 0,
+    "tool_calls_median": 6,
+    "first_tool_median": 13.1,
+    "tok_in_median": 1719,
+    "tok_out_median": 952,
+    "mission_calls_total": 5,
+    "directive_injected": 3,
+    "wilson95": [
+     0.4384939195509822,
+     1.0
+    ]
+   }
+  },
+  "t2": {
+   "default": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 3,
+    "wall_median": 221.7,
+    "wall_min": 157.7,
+    "wall_max": 247.1,
+    "timeouts": 0,
+    "blocked": 0,
+    "tool_calls_median": 22,
+    "first_tool_median": 15.0,
+    "tok_in_median": 30001,
+    "tok_out_median": 6583,
+    "mission_calls_total": 0,
+    "directive_injected": 0,
+    "wilson95": [
+     0.4384939195509822,
+     1.0
+    ]
+   },
+   "legacy": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 2,
+    "wall_median": 3286.0,
+    "wall_min": 2750.4,
+    "wall_max": 5400.6,
+    "timeouts": 1,
+    "blocked": 1,
+    "tool_calls_median": 18,
+    "first_tool_median": 11.4,
+    "tok_in_median": 45367,
+    "tok_out_median": 7680,
+    "mission_calls_total": 7,
+    "directive_injected": 3,
+    "wilson95": [
+     0.20765495512648788,
+     0.9385096847238393
+    ]
+   }
+  },
+  "t3": {
+   "default": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 3,
+    "wall_median": 141.3,
+    "wall_min": 76.5,
+    "wall_max": 235.0,
+    "timeouts": 0,
+    "blocked": 0,
+    "tool_calls_median": 13,
+    "first_tool_median": 25.8,
+    "tok_in_median": 10024,
+    "tok_out_median": 3461,
+    "mission_calls_total": 0,
+    "directive_injected": 0,
+    "wilson95": [
+     0.4384939195509822,
+     1.0
+    ]
+   },
+   "legacy": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 3,
+    "wall_median": 2085.0,
+    "wall_min": 1539.3,
+    "wall_max": 4740.7,
+    "timeouts": 0,
+    "blocked": 0,
+    "tool_calls_median": 6,
+    "first_tool_median": 10.0,
+    "tok_in_median": 9332,
+    "tok_out_median": 1159,
+    "mission_calls_total": 7,
+    "directive_injected": 3,
+    "wilson95": [
+     0.4384939195509822,
+     1.0
+    ]
+   }
+  },
+  "t4": {
+   "default": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 2,
+    "wall_median": 143.6,
+    "wall_min": 79.8,
+    "wall_max": 2400.2,
+    "timeouts": 1,
+    "blocked": 0,
+    "tool_calls_median": 11,
+    "first_tool_median": 14.9,
+    "tok_in_median": 10781,
+    "tok_out_median": 3404,
+    "mission_calls_total": 1,
+    "directive_injected": 0,
+    "wilson95": [
+     0.20765495512648788,
+     0.9385096847238393
+    ]
+   },
+   "legacy": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 3,
+    "wall_median": 631.2,
+    "wall_min": 544.7,
+    "wall_max": 670.9,
+    "timeouts": 0,
+    "blocked": 0,
+    "tool_calls_median": 5,
+    "first_tool_median": 13.1,
+    "tok_in_median": 3156,
+    "tok_out_median": 803,
+    "mission_calls_total": 6,
+    "directive_injected": 3,
+    "wilson95": [
+     0.4384939195509822,
+     1.0
+    ]
+   }
+  },
+  "t5": {
+   "default": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 3,
+    "wall_median": 91.0,
+    "wall_min": 68.2,
+    "wall_max": 182.2,
+    "timeouts": 0,
+    "blocked": 0,
+    "tool_calls_median": 12,
+    "first_tool_median": 6.1,
+    "tok_in_median": 4296,
+    "tok_out_median": 2597,
+    "mission_calls_total": 0,
+    "directive_injected": 0,
+    "wilson95": [
+     0.4384939195509822,
+     1.0
+    ]
+   },
+   "legacy": {
+    "n_total": 3,
+    "contaminated": 0,
+    "n_clean": 3,
+    "correct": 2,
+    "wall_median": 994.4,
+    "wall_min": 681.5,
+    "wall_max": 5400.1,
+    "timeouts": 1,
+    "blocked": 0,
+    "tool_calls_median": 7,
+    "first_tool_median": 9.9,
+    "tok_in_median": 4547,
+    "tok_out_median": 1229,
+    "mission_calls_total": 9,
+    "directive_injected": 3,
+    "wilson95": [
+     0.20765495512648788,
+     0.9385096847238393
+    ]
+   }
+  }
+ },
+ "overall": {
+  "default": {
+   "n_total": 15,
+   "contaminated": 0,
+   "n_clean": 15,
+   "correct": 14,
+   "wall_median": 141.3,
+   "wall_min": 24.5,
+   "wall_max": 2400.2,
+   "timeouts": 1,
+   "blocked": 0,
+   "tool_calls_median": 12,
+   "first_tool_median": 14.5,
+   "tok_in_median": 9313,
+   "tok_out_median": 3404,
+   "mission_calls_total": 1,
+   "directive_injected": 0,
+   "wilson95": [
+    0.70182922447576,
+    0.9881334113938052
+   ]
+  },
+  "legacy": {
+   "n_total": 15,
+   "contaminated": 0,
+   "n_clean": 15,
+   "correct": 13,
+   "wall_median": 994.4,
+   "wall_min": 474.9,
+   "wall_max": 5400.6,
+   "timeouts": 2,
+   "blocked": 1,
+   "tool_calls_median": 6,
+   "first_tool_median": 11.4,
+   "tok_in_median": 4547,
+   "tok_out_median": 1134,
+   "mission_calls_total": 34,
+   "directive_injected": 15,
+   "wilson95": [
+    0.6211750079348376,
+    0.9626395301086408
+   ]
+  }
+ },
+ "runs": [
+  {
+   "arm": "default",
+   "task": "t1",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 34.1,
+   "first_event_s": 1.0,
+   "first_tool_s": 8.6,
+   "tool_calls": 6,
+   "tool_names": [
+    "bash",
+    "edit",
+    "read",
+    "repo_search"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 14288,
+    "output": 835,
+    "cacheRead": 17396,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t1",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 24.5,
+   "first_event_s": 0.9,
+   "first_tool_s": 5.4,
+   "tool_calls": 5,
+   "tool_names": [
+    "bash",
+    "edit"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 4226,
+    "output": 763,
+    "cacheRead": 76578,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t1",
+   "rep": 3,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 39.5,
+   "first_event_s": 0.9,
+   "first_tool_s": 8.4,
+   "tool_calls": 6,
+   "tool_names": [
+    "bash",
+    "edit",
+    "read",
+    "repo_search"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 2359,
+    "output": 892,
+    "cacheRead": 69428,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t2",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 221.7,
+   "first_event_s": 0.9,
+   "first_tool_s": 11.9,
+   "tool_calls": 26,
+   "tool_names": [
+    "bash",
+    "edit",
+    "ledger_claim",
+    "ledger_read",
+    "read"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 34762,
+    "output": 9341,
+    "cacheRead": 148190,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t2",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 157.7,
+   "first_event_s": 6.9,
+   "first_tool_s": 21.2,
+   "tool_calls": 20,
+   "tool_names": [
+    "bash",
+    "edit",
+    "read"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 30001,
+    "output": 5102,
+    "cacheRead": 133512,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t2",
+   "rep": 3,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 247.1,
+   "first_event_s": 3.6,
+   "first_tool_s": 15.0,
+   "tool_calls": 22,
+   "tool_names": [
+    "bash",
+    "edit",
+    "ledger_read",
+    "read"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 5196,
+    "output": 6583,
+    "cacheRead": 159932,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t3",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 76.5,
+   "first_event_s": 3.2,
+   "first_tool_s": 14.5,
+   "tool_calls": 7,
+   "tool_names": [
+    "bash",
+    "edit",
+    "read",
+    "tests_for"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 10024,
+    "output": 2042,
+    "cacheRead": 23007,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t3",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 141.3,
+   "first_event_s": 4.5,
+   "first_tool_s": 37.0,
+   "tool_calls": 13,
+   "tool_names": [
+    "bash",
+    "read",
+    "tests_for",
+    "write"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 19642,
+    "output": 3461,
+    "cacheRead": 149384,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t3",
+   "rep": 3,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 235.0,
+   "first_event_s": 3.7,
+   "first_tool_s": 25.8,
+   "tool_calls": 21,
+   "tool_names": [
+    "bash",
+    "edit",
+    "read",
+    "tests_for",
+    "write"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 9313,
+    "output": 6987,
+    "cacheRead": 329637,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t4",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 79.8,
+   "first_event_s": 0.8,
+   "first_tool_s": 5.0,
+   "tool_calls": 11,
+   "tool_names": [
+    "bash",
+    "edit",
+    "ledger_claim",
+    "read",
+    "repo_search"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 2459,
+    "output": 3404,
+    "cacheRead": 72961,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t4",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 143.6,
+   "first_event_s": 0.8,
+   "first_tool_s": 24.0,
+   "tool_calls": 12,
+   "tool_names": [
+    "bash",
+    "edit",
+    "ledger_claim",
+    "ledger_read",
+    "read"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 12427,
+    "output": 4557,
+    "cacheRead": 160566,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t4",
+   "rep": 3,
+   "correct": false,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "fail",
+    "correct": false
+   },
+   "state": "timeout",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 2400.2,
+   "first_event_s": 3.5,
+   "first_tool_s": 14.9,
+   "tool_calls": 1,
+   "tool_names": [
+    "mission"
+   ],
+   "mission_calls": 1,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 10781,
+    "output": 157,
+    "cacheRead": 0,
+    "cacheWrite": 0
+   },
+   "exit": 124
+  },
+  {
+   "arm": "default",
+   "task": "t5",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 68.2,
+   "first_event_s": 0.8,
+   "first_tool_s": 4.5,
+   "tool_calls": 12,
+   "tool_names": [
+    "bash",
+    "edit",
+    "ledger_claim",
+    "read"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 8528,
+    "output": 2597,
+    "cacheRead": 69477,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t5",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 91.0,
+   "first_event_s": 12.2,
+   "first_tool_s": 28.9,
+   "tool_calls": 11,
+   "tool_names": [
+    "bash",
+    "edit",
+    "ledger_claim",
+    "read"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 2932,
+    "output": 1956,
+    "cacheRead": 89185,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "default",
+   "task": "t5",
+   "rep": 3,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 182.2,
+   "first_event_s": 1.1,
+   "first_tool_s": 6.1,
+   "tool_calls": 12,
+   "tool_names": [
+    "bash",
+    "edit",
+    "ledger_claim",
+    "ledger_read",
+    "read"
+   ],
+   "mission_calls": 0,
+   "subagent_like_calls": 0,
+   "directive_injected": false,
+   "tokens": {
+    "input": 4296,
+    "output": 8612,
+    "cacheRead": 175890,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t1",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 591.4,
+   "first_event_s": 0.9,
+   "first_tool_s": 12.4,
+   "tool_calls": 8,
+   "tool_names": [
+    "bash",
+    "ledger_claim",
+    "mission",
+    "read",
+    "repo_search"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 1521,
+    "output": 1532,
+    "cacheRead": 44130,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t1",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 474.9,
+   "first_event_s": 0.7,
+   "first_tool_s": 13.1,
+   "tool_calls": 6,
+   "tool_names": [
+    "bash",
+    "mission"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 34225,
+    "output": 952,
+    "cacheRead": 46577,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t1",
+   "rep": 3,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 758.1,
+   "first_event_s": 3.0,
+   "first_tool_s": 19.7,
+   "tool_calls": 4,
+   "tool_names": [
+    "bash",
+    "mission"
+   ],
+   "mission_calls": 1,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 1719,
+    "output": 719,
+    "cacheRead": 55517,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t2",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "timeout",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 5400.6,
+   "first_event_s": 0.8,
+   "first_tool_s": 11.4,
+   "tool_calls": 18,
+   "tool_names": [
+    "artifact_read",
+    "bash",
+    "ledger_claim",
+    "mission",
+    "read"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 128484,
+    "output": 7680,
+    "cacheRead": 502705,
+    "cacheWrite": 0
+   },
+   "exit": 124
+  },
+  {
+   "arm": "legacy",
+   "task": "t2",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 2750.4,
+   "first_event_s": 11.6,
+   "first_tool_s": 34.5,
+   "tool_calls": 6,
+   "tool_names": [
+    "bash",
+    "mission",
+    "read"
+   ],
+   "mission_calls": 1,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 1964,
+    "output": 1134,
+    "cacheRead": 57562,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t2",
+   "rep": 3,
+   "correct": false,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "fail",
+    "correct": false
+   },
+   "state": "blocked",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 3286.0,
+   "first_event_s": 0.7,
+   "first_tool_s": 11.0,
+   "tool_calls": 59,
+   "tool_names": [
+    "bash",
+    "ledger_claim",
+    "ledger_read",
+    "mission"
+   ],
+   "mission_calls": 4,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 45367,
+    "output": 34196,
+    "cacheRead": 2657723,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t3",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 1539.3,
+   "first_event_s": 1.0,
+   "first_tool_s": 10.0,
+   "tool_calls": 6,
+   "tool_names": [
+    "bash",
+    "mission",
+    "read"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 9332,
+    "output": 1159,
+    "cacheRead": 28738,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t3",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 2085.0,
+   "first_event_s": 2.1,
+   "first_tool_s": 9.8,
+   "tool_calls": 3,
+   "tool_names": [
+    "bash",
+    "mission"
+   ],
+   "mission_calls": 1,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 893,
+    "output": 574,
+    "cacheRead": 44311,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t3",
+   "rep": 3,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 4740.7,
+   "first_event_s": 2.3,
+   "first_tool_s": 17.3,
+   "tool_calls": 78,
+   "tool_names": [
+    "artifact_read",
+    "bash",
+    "ledger_claim",
+    "ledger_read",
+    "mission",
+    "read"
+   ],
+   "mission_calls": 4,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 249389,
+    "output": 49533,
+    "cacheRead": 4394204,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t4",
+   "rep": 1,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 631.2,
+   "first_event_s": 2.0,
+   "first_tool_s": 13.1,
+   "tool_calls": 4,
+   "tool_names": [
+    "bash",
+    "mission"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 3156,
+    "output": 790,
+    "cacheRead": 26379,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t4",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 544.7,
+   "first_event_s": 0.9,
+   "first_tool_s": 8.5,
+   "tool_calls": 5,
+   "tool_names": [
+    "bash",
+    "mission"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 2015,
+    "output": 820,
+    "cacheRead": 68188,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t4",
+   "rep": 3,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 670.9,
+   "first_event_s": 3.7,
+   "first_tool_s": 19.0,
+   "tool_calls": 6,
+   "tool_names": [
+    "bash",
+    "ledger_read",
+    "mission"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 25072,
+    "output": 803,
+    "cacheRead": 45162,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t5",
+   "rep": 1,
+   "correct": false,
+   "judge": {
+    "own_visible": "fail",
+    "orig_visible": "fail",
+    "hidden": "fail",
+    "correct": false
+   },
+   "state": "timeout",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 5400.1,
+   "first_event_s": 0.7,
+   "first_tool_s": 8.5,
+   "tool_calls": 22,
+   "tool_names": [
+    "bash",
+    "ledger_claim",
+    "ledger_read",
+    "mission",
+    "read"
+   ],
+   "mission_calls": 5,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 25414,
+    "output": 7227,
+    "cacheRead": 475489,
+    "cacheWrite": 0
+   },
+   "exit": 124
+  },
+  {
+   "arm": "legacy",
+   "task": "t5",
+   "rep": 2,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 994.4,
+   "first_event_s": 0.8,
+   "first_tool_s": 10.6,
+   "tool_calls": 7,
+   "tool_names": [
+    "bash",
+    "ledger_read",
+    "mission"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 1752,
+    "output": 974,
+    "cacheRead": 68351,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  },
+  {
+   "arm": "legacy",
+   "task": "t5",
+   "rep": 3,
+   "correct": true,
+   "judge": {
+    "own_visible": "pass",
+    "orig_visible": "pass",
+    "hidden": "pass",
+    "correct": true
+   },
+   "state": "finished",
+   "contaminated": false,
+   "fallback_switches": 0,
+   "fallback_targets": [],
+   "models_seen": [
+    "qwen3.8-27b-modality-vision-quant-q8_k_xl"
+   ],
+   "wall_s": 681.5,
+   "first_event_s": 0.7,
+   "first_tool_s": 9.9,
+   "tool_calls": 5,
+   "tool_names": [
+    "bash",
+    "mission"
+   ],
+   "mission_calls": 2,
+   "subagent_like_calls": 0,
+   "directive_injected": true,
+   "tokens": {
+    "input": 4547,
+    "output": 1229,
+    "cacheRead": 66639,
+    "cacheWrite": 0
+   },
+   "exit": 0
+  }
+ ],
+ "finished_and_correct": {
+  "default": {
+   "k": 14,
+   "n": 15,
+   "wilson95": [
+    0.702,
+    0.988
+   ]
+  },
+  "legacy": {
+   "k": 12,
+   "n": 15,
+   "wilson95": [
+    0.548,
+    0.93
+   ]
+  }
+ },
+ "meta": {
+  "model": "metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl",
+  "pi_engineering_commit": "278c7468",
+  "concurrency": 1,
+  "reps": 3,
+  "real_models_json_md5_before": "30fd3d7f9f4f4e72f65b7686e40c28b8",
+  "real_models_json_md5_after": "30fd3d7f9f4f4e72f65b7686e40c28b8",
+  "caps_s": {
+   "default": 2400,
+   "legacy": 5400
+  },
+  "notes": [
+   "tokens are the foreground session events only; Mission worker tokens are not in the foreground events, so legacy token figures are undercounts",
+   "correct = hidden test passes AND the agent-visible suite passes AND the original visible tests (restored from the task commit) pass against the final src"
+  ],
+  "archived_attempt1": {
+   "model": "qwen3.8-flash_next-modality-text-quant-w3a8",
+   "status": "abandoned, not mixed in",
+   "reason": "gateway returned HTTP 429 (Retry-After 20) on every request; 3 of 3 completed runs after the first two recorded gateway-fallback to the 27b"
+  },
+  "interrupted": [
+   "attempt1 default t4 r1",
+   "attempt1 legacy t3 r1",
+   "attempt2 legacy t2 r2 (ENOSPC) - rerun, result in runs"
+  ]
+ }
+}
