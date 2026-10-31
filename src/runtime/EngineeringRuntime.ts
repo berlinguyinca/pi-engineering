@@ -933,6 +933,7 @@ export class EngineeringRuntime {
             classifications: this.missionStore!.listFailureClassifications(m.mission_id),
             verifierStages: buildVerifierStages(this.missionStore!.listValidationEvidence(m.mission_id)),
             lifecycle: this.missionStore!.getCanonicalLifecycle(m.mission_id),
+            routingDecisions: this.missionStore!.listRoutingDecisions(m.mission_id),
           }));
           // FR-04: after recovery is granted, the republish finalizes the stale
           // tag before the file is built so the freshly written file is clean;
@@ -1670,6 +1671,7 @@ export class EngineeringRuntime {
         onModelUnavailable: (model, context) => rt.unavailableModels.mark(model, context, { confirmed: true }),
         onModelServed: (model) => rt.unavailableModels.clear(model),
         isModelUnavailable: (model) => rt.unavailableModels.has(model),
+        recordRoutingDecision: (decision) => rt.missionStore?.recordRoutingDecision(decision),
         reviewFallbackModel,
         // Gate roles routing cannot place (no repo policy, candidates dead) are
         // placed from the session's model registry.

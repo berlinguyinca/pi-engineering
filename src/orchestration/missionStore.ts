@@ -34,6 +34,12 @@ import {
 } from "./evidence.ts";
 import { type HandoffVerification, type HandoffVerifyDeps, verifyHandoffCheckpoint } from "./handoffProtocol.ts";
 import { failureFingerprint } from "./recovery.ts";
+import {
+  ROUTING_REASONS,
+  type RoutingDecision,
+  normalizeRoutingDecision,
+  sameRoutingDecision,
+} from "./routingDecision.ts";
 import { assertMissionTransition, assertTaskTransition } from "./state.ts";
 import type {
   CandidateEvidenceIdentity,
@@ -122,6 +128,7 @@ export type OrchestrationEventType =
   | "workspace.rebind_failed"
   | "task.checkpointed"
   | "task.model_switched"
+  | "task.routing_decided"
   | "task.split"
   | "task.superseded"
   | "failure.classified"
@@ -209,6 +216,7 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "workspace.rebind_failed",
   "task.checkpointed",
   "task.model_switched",
+  "task.routing_decided",
   "task.split",
   "task.superseded",
   "failure.classified",
@@ -433,6 +441,28 @@ function persistenceErrorMessage(error: unknown): string {
   return "Unknown persistence error";
 }
 
+/** Rebuild a routing decision from its event; malformed payloads are ignored. */
+function decisionFromPayload(e: OrchestrationEvent): RoutingDecision | undefined {
+  const p = e.payload;
+  if (typeof p.task_id !== "string" || typeof p.role !== "string" || !ROUTING_REASONS.has(p.reason as string)) {
+    return undefined;
+  }
+  const text = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
+  return normalizeRoutingDecision({
+    missionId: e.mission_id,
+    taskId: p.task_id,
+    role: p.role,
+    pin: text(p.pin) ?? null,
+    chosen: text(p.chosen) ?? null,
+    reason: p.reason as RoutingDecision["reason"],
+    ...(text(p.refusal) ? { refusal: text(p.refusal) } : {}),
+    ...(text(p.from) ? { from: text(p.from) } : {}),
+    ...(text(p.to) ? { to: text(p.to) } : {}),
+    ...(text(p.error_class) ? { errorClass: text(p.error_class) } : {}),
+    at: e.timestamp,
+  });
+}
+
 /** Maps a platform StoredEvent back to an orchestration event. */
 function fromStored(e: StoredEvent): OrchestrationEvent {
   return {
@@ -479,6 +509,8 @@ export class MissionStore {
   private readonly tasks = new Map<string, OrchestrationTask>();
   /** Tasks currently waiting for another mission's repository lease (informational, in-memory). */
   private readonly repositoryWaits = new Map<string, RepositoryWait>();
+  /** Latest model-routing decision per `taskId|role`; rebuilt on replay from task.routing_decided. */
+  private readonly routingDecisions = new Map<string, RoutingDecision>();
   private readonly executions = new Map<string, Execution>();
   private readonly findings = new Map<string, ReviewFinding>();
   private readonly handoffRecords = new Map<string, HandoffRecord>();
@@ -803,7 +835,7 @@ export class MissionStore {
       worker_id: null,
       payload: durablePayload,
     };
-    this.advanceMissionRevision(missionId);
+    if (type !== "task.routing_decided") this.advanceMissionRevision(missionId);
     this.pendingWrites.push({ event, stored });
     this.scheduleDrain();
     return event;
@@ -1047,6 +1079,12 @@ export class MissionStore {
         const checkpoint = e.payload.checkpoint as TaskCheckpoint;
         if (checkpoint) this.recordTaskCheckpoint(checkpoint);
         break;
+      }
+      case "task.routing_decided": {
+        const decision = decisionFromPayload(e);
+        if (decision) this.routingDecisions.set(`${decision.taskId}|${decision.role}`, decision);
+        // Observability only: it must not advance the mission revision, which fences resumption and settlement.
+        return;
       }
       case "task.model_switched": {
         this.applyTaskModelSwitch(
@@ -2780,6 +2818,44 @@ export class MissionStore {
   getWorkspaceManifest(missionId: string): WorkspaceManifest | undefined {
     const manifest = this.workspaceManifests.get(missionId);
     return manifest ? copyWorkspaceManifest(manifest) : undefined;
+  }
+
+  /**
+   * Durably record a model-routing decision (why a worker ran on a model). One event per change: a decision identical
+   * to the latest one for the same task+role writes nothing. Best-effort: never throws, so a failure to persist can
+   * never fail dispatch. Returns whether an event was written.
+   */
+  recordRoutingDecision(decision: RoutingDecision): boolean {
+    try {
+      if (!ROUTING_REASONS.has(decision.reason)) return false;
+      const mission = this.tasks.get(decision.taskId)?.mission_id ?? decision.missionId;
+      if (!mission || !this.missions.has(mission)) return false;
+      const next = normalizeRoutingDecision({ ...decision, missionId: mission });
+      const key = `${next.taskId}|${next.role}`;
+      const current = this.routingDecisions.get(key);
+      if (current && sameRoutingDecision(current, next)) return false;
+      const event = this.emit("task.routing_decided", mission, {
+        actor: "system",
+        task_id: next.taskId,
+        role: next.role,
+        pin: next.pin,
+        chosen: next.chosen,
+        reason: next.reason,
+        ...(next.refusal ? { refusal: next.refusal } : {}),
+        ...(next.from ? { from: next.from } : {}),
+        ...(next.to ? { to: next.to } : {}),
+        ...(next.errorClass ? { error_class: next.errorClass } : {}),
+      });
+      this.apply(event);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Latest routing decision per task+role of a mission, oldest first. */
+  listRoutingDecisions(missionId: string): RoutingDecision[] {
+    return [...this.routingDecisions.values()].filter((d) => d.missionId === missionId).map((d) => ({ ...d }));
   }
 
   private applyTaskModelSwitch(taskId: string, model: string | undefined, resumeFromSha: string | undefined): void {
