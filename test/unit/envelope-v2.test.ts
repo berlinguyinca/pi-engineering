@@ -113,7 +113,9 @@ console.log(JSON.stringify(out));`,
       p.stdout.on("data", (d) => {
         out += d;
       });
-      p.on("exit", (code) => (code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`exit ${code}`))));
+      // "close", not "exit": "exit" may fire before the last stdout chunk has been read, which on a loaded host made
+      // JSON.parse see a truncated (or empty) line. "close" comes after the child's stdout has ended.
+      p.on("close", (code) => (code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`exit ${code}`))));
     });
   const all = (await Promise.all([run(), run(), run()])).flat();
   assert.equal(new Set(all).size, 45);

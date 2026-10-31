@@ -389,65 +389,74 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   // set, blackhole is enabled with the openviking durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
-  const lineage = await lineageEmitter();
-  const attentionIngest = await resolveAttentionIngest(process.env, getAgentDir());
-  const attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
+  //
+  // The open is published in `runtimeOpens` in the same synchronous step as the `pending` check above. The lineage and
+  // attention lookups are real I/O (seconds under load); awaiting them BEFORE publishing left a window in which a
+  // second caller (the panel start and a session-control request both run at session start) saw no open in flight and
+  // started a duplicate runtime for the same repository, and in which a session shutdown found nothing to wait for so
+  // the open ran on after it and was never closed.
+  let attention: MissionAttentionReporter | null = null;
   let attentionReady = false;
-  const opening = EngineeringRuntime.open({
-    cwd,
-    verifier: new CommandVerifier(),
-    model,
-    ...(lineage ? { lineage } : {}),
-    // Autonomous stop (roadmap spec §13, §33): when this repository's Roadmap
-    // 1.0 is complete, /engineer refuses to invent new work. The gate is derived
-    // from the roadmap engine (completion is never declared). If the repo has no
-    // roadmap, the gate is open.
-    roadmapComplete: roadmapCompleteFor(key),
-    onMissionSnapshotError: (message) => {
-      const notice: TelemetryNotice = {
-        level: "warning",
-        text: message,
-        key: `mission-snapshot-write:${key}`,
-      };
-      if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
-    },
-    onMissionActivity: (event, meta) => {
-      publishMissionActivity(key, event);
-      // The runtime's open-time re-emission of stored missions sets presence's
-      // baseline instead of notifying; real transitions during open still do.
-      presence?.update(event, undefined, meta?.replay ? "replay" : "activity");
-      if (attentionReady) void attention?.update(event).catch(() => {});
-    },
-    // The quiet heartbeat: observability composes a human-readable sentence when
-    // nothing has changed for a while, and presence is the only surface that can
-    // carry it. Without this wiring a mission that goes silent looks identical to
-    // a mission that has stopped.
-    onMissionObservabilityUpdate: (missionId, message) => {
-      presence?.noteSentence(missionId, message);
-    },
-    // Pipeline progress -> status footer. Best-effort and read-only: the
-    // runtime swallows anything thrown here, and the footer is the only
-    // consumer today (the panel will subscribe to the same events).
-    onPhase: (event) => {
-      // One event source, two surfaces: the footer summarises, the panel details.
-      panels.get(key)?.ledger.onPhase(event);
-      const footer = activeFooter;
-      if (!footer) return;
-      if (event.phase === "settled") {
-        // Guarded: concurrent runs (tournament legs, DAG waves) each settle.
-        footer.clearTask(event.workItemId);
-        footer.setProducingModel(undefined);
-        return;
-      }
-      footer.setTask({
-        workItemId: event.workItemId,
-        phase: event.phase,
-        ...(event.goal ? { label: event.goal } : {}),
-      });
-      if (event.model) footer.setProducingModel(event.model);
-    },
-    ...(blackhole ? { blackhole } : {}),
-  }).then((runtime) => {
+  const opening = (async () => {
+    const lineage = await lineageEmitter();
+    const attentionIngest = await resolveAttentionIngest(process.env, getAgentDir());
+    attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
+    return EngineeringRuntime.open({
+      cwd,
+      verifier: new CommandVerifier(),
+      model,
+      ...(lineage ? { lineage } : {}),
+      // Autonomous stop (roadmap spec §13, §33): when this repository's Roadmap
+      // 1.0 is complete, /engineer refuses to invent new work. The gate is derived
+      // from the roadmap engine (completion is never declared). If the repo has no
+      // roadmap, the gate is open.
+      roadmapComplete: roadmapCompleteFor(key),
+      onMissionSnapshotError: (message) => {
+        const notice: TelemetryNotice = {
+          level: "warning",
+          text: message,
+          key: `mission-snapshot-write:${key}`,
+        };
+        if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
+      },
+      onMissionActivity: (event, meta) => {
+        publishMissionActivity(key, event);
+        // The runtime's open-time re-emission of stored missions sets presence's
+        // baseline instead of notifying; real transitions during open still do.
+        presence?.update(event, undefined, meta?.replay ? "replay" : "activity");
+        if (attentionReady) void attention?.update(event).catch(() => {});
+      },
+      // The quiet heartbeat: observability composes a human-readable sentence when
+      // nothing has changed for a while, and presence is the only surface that can
+      // carry it. Without this wiring a mission that goes silent looks identical to
+      // a mission that has stopped.
+      onMissionObservabilityUpdate: (missionId, message) => {
+        presence?.noteSentence(missionId, message);
+      },
+      // Pipeline progress -> status footer. Best-effort and read-only: the
+      // runtime swallows anything thrown here, and the footer is the only
+      // consumer today (the panel will subscribe to the same events).
+      onPhase: (event) => {
+        // One event source, two surfaces: the footer summarises, the panel details.
+        panels.get(key)?.ledger.onPhase(event);
+        const footer = activeFooter;
+        if (!footer) return;
+        if (event.phase === "settled") {
+          // Guarded: concurrent runs (tournament legs, DAG waves) each settle.
+          footer.clearTask(event.workItemId);
+          footer.setProducingModel(undefined);
+          return;
+        }
+        footer.setTask({
+          workItemId: event.workItemId,
+          phase: event.phase,
+          ...(event.goal ? { label: event.goal } : {}),
+        });
+        if (event.model) footer.setProducingModel(event.model);
+      },
+      ...(blackhole ? { blackhole } : {}),
+    });
+  })().then((runtime) => {
     // Reconnect establishes a baseline; old terminal/stalled missions must not alert again.
     for (const mission of runtime.missionStore?.listMissions() ?? []) {
       const summary = runtime.missionObservability?.summary(mission.mission_id);
