@@ -57,6 +57,7 @@ import {
 import { normalizeReviewSeverity, validateAcceptanceResults } from "./evidence.ts";
 import { INVALID_WORKER_OUTPUT_PREFIX } from "./recovery.ts";
 import { guardReviewWorktree } from "./reviewGuard.ts";
+import type { RoutingDecision, RoutingReason } from "./routingDecision.ts";
 
 /** What a verification run concluded, in the shape the result cache stores. */
 interface JudgedVerification {
@@ -101,6 +102,11 @@ export interface RealBackendsOptions {
    * handed to the next eligible model right away (see runWithModelTakeover).
    */
   onModelUnavailable?: (model: ModelRef, context: { missionId?: string; taskId?: string; reason: string }) => void;
+  /**
+   * Persist a routing decision that relied on, or left, the mission's pin (why a worker runs where it
+   * runs). Best-effort observer: it is called inside a try/catch and may drop the record.
+   */
+  recordRoutingDecision?: (decision: RoutingDecision) => void;
   /** Called when an attempt succeeded on a model: it is served again. */
   onModelServed?: (model: ModelRef) => void;
   /** True for a model currently recorded as unavailable (never a reviewer fallback). */
@@ -144,6 +150,10 @@ export interface ModelRoute extends ModelRef {
   pinRefused?: string;
   /** Operator-visible reason the pin could not place this role. */
   pinNotice?: string;
+  /** How the router related to the mission's pin for this placement (recorded as a routing decision). */
+  pinOutcome?: "pin_honoured" | "pin_refused" | "pin_excluded_held" | "pin_excluded_rerouted";
+  /** The router's refusal text when `pinOutcome` is pin_refused. */
+  pinRefusal?: string;
   /** Why this role was placed from the model registry instead of by routing. */
   registryNotice?: string;
 }
@@ -732,6 +742,39 @@ export function realBackends(opts: RealBackendsOptions) {
         // Activity consumers are observers, never participants.
       }
     };
+    const recordDecision = (decision: Omit<RoutingDecision, "missionId" | "taskId" | "role" | "pin">): void => {
+      const { missionId, taskId } = plan.context;
+      if (!opts.recordRoutingDecision || !missionId || !taskId) return;
+      try {
+        opts.recordRoutingDecision({
+          missionId,
+          taskId,
+          role: req.role,
+          pin: pinKeyOf(missionId),
+          ...decision,
+        });
+      } catch {
+        // Recording is an observer: a persistence failure never fails dispatch.
+      }
+    };
+    /** Record how the router related to the pin for this placement. No pin, no routing decision to explain. */
+    const recordPlacement = (placed: ModelRoute | undefined): void => {
+      if (!placed || !pinKeyOf(plan.context.missionId)) return;
+      const chosen = modelKey(placed);
+      const independent = !!routerRoleFor(req.role) && ROLE_REQUIREMENTS[routerRoleFor(req.role)!].independent;
+      let reason: RoutingReason;
+      if (placed.pinOutcome === "pin_excluded_rerouted" && independent) reason = "reviewer_separation";
+      else if (placed.pinOutcome) reason = placed.pinOutcome;
+      else if (chosen === pinKeyOf(plan.context.missionId)) reason = "pin_honoured";
+      else reason = independent ? "reviewer_separation" : "pin_refused";
+      recordDecision({
+        chosen,
+        reason,
+        ...(reason === "pin_refused"
+          ? { refusal: placed.pinRefusal ?? "routing placed this role on another model" }
+          : {}),
+      });
+    };
     let route = plan.initial;
     const memoryKey =
       plan.context.missionId && plan.context.taskId
@@ -746,6 +789,7 @@ export function realBackends(opts: RealBackendsOptions) {
       if (alternative) route = alternative;
     }
     if (!route && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route };
+    recordPlacement(route);
     if (plan.announceWarnings && route?.warning) announce(route.warning);
     if (route?.pinNotice) announce(route.pinNotice);
     const switches: string[] = [];
@@ -782,6 +826,7 @@ export function realBackends(opts: RealBackendsOptions) {
         announce(notice);
         if (plan.announceWarnings && next?.warning) announce(next.warning);
         if (next?.pinNotice) announce(next.pinNotice);
+        recordPlacement(next);
         if (model && next) plan.onSwitch?.(model, next);
         // Routing could not place the role on the new pin (the placement did
         // not change): run where routing says, and do not supersede again for
@@ -864,6 +909,13 @@ export function realBackends(opts: RealBackendsOptions) {
         reason: `${error}:${modelKey(failed)}`,
         next: "failover",
         owner: "model-takeover",
+      });
+      recordDecision({
+        chosen: modelKey(next),
+        reason: "takeover_after_failure",
+        from: failed === UNNAMED_MODEL ? "(unnamed)" : modelKey(failed),
+        to: modelKey(next),
+        errorClass: error || "unknown",
       });
       plan.onSwitch?.(failed, next);
       route = next;

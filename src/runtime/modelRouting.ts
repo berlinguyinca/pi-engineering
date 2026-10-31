@@ -143,21 +143,32 @@ export function createRouteModel(opts: {
     if (exclude.some((model) => modelKey(model) === modelKey(pin))) {
       const independent = ROLE_REQUIREMENTS[routerRoleFor(role) ?? "implementer"].independent;
       if (opts.holdPin && !independent) {
-        return routeOpts?.replacement ? undefined : { provider: pin.provider, id: pin.id, operatorPin: !pin.implicit };
+        return routeOpts?.replacement
+          ? undefined
+          : { provider: pin.provider, id: pin.id, operatorPin: !pin.implicit, pinOutcome: "pin_excluded_held" };
       }
       const routed = await routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude, taskQuery);
-      return routed && { ...routed, pinRefused: modelKey(pin) };
+      return routed && { ...routed, pinRefused: modelKey(pin), pinOutcome: "pin_excluded_rerouted" };
     }
     const refusal = await pinRefusal(opts.router, routerRoleFor(role) ?? "implementer", pin, {
       ...(requester ? { requester } : {}),
       ...(exclude.length > 0 ? { exclude } : {}),
     });
-    if (!refusal) return { provider: pin.provider, id: pin.id, operatorPin: !pin.implicit } satisfies ModelRoute;
+    if (!refusal) {
+      return {
+        provider: pin.provider,
+        id: pin.id,
+        operatorPin: !pin.implicit,
+        pinOutcome: "pin_honoured",
+      } satisfies ModelRoute;
+    }
     const routed = await routeRole(opts.router, role, true, requester, exclude, taskQuery);
     if (!routed) return undefined;
     return {
       ...routed,
       pinRefused: modelKey(pin),
+      pinOutcome: "pin_refused",
+      pinRefusal: refusal,
       pinNotice: `operator pin ${modelKey(pin)} cannot serve ${role} (${refusal}); using ${modelKey(routed)} for this role`,
     };
   };
