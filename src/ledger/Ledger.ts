@@ -11,6 +11,7 @@ import type {
   RiskLevel,
   Task,
   WorkItem,
+  WorkItemPrLink,
   WorkItemStatus,
   WorkerRole,
 } from "../core/types.ts";
@@ -50,6 +51,27 @@ export interface LedgerWriteOptions {
  * of requirements, facts, hypotheses, decisions, findings, tasks, candidates,
  * evidence, and promotions. It survives crashes by replaying events.
  */
+function prLinkOf(p: Record<string, unknown>): WorkItemPrLink | undefined {
+  const { host, owner, repo, number, url_canonical } = p;
+  if (typeof host !== "string" || typeof owner !== "string" || typeof repo !== "string") return undefined;
+  if (typeof number !== "number" || !Number.isInteger(number) || number < 1) return undefined;
+  if (!host || !owner || !repo) return undefined;
+  return {
+    host,
+    owner,
+    repo,
+    number,
+    url_canonical:
+      typeof url_canonical === "string" ? url_canonical : `https://${host}/${owner}/${repo}/pull/${number}`,
+  };
+}
+
+const samePr = (a: WorkItemPrLink, b: WorkItemPrLink): boolean =>
+  a.number === b.number &&
+  a.host.toLowerCase() === b.host.toLowerCase() &&
+  a.owner.toLowerCase() === b.owner.toLowerCase() &&
+  a.repo.toLowerCase() === b.repo.toLowerCase();
+
 export class Ledger {
   private readonly store: EventStore;
 
@@ -64,6 +86,8 @@ export class Ledger {
   private revisions = new Map<string, number>();
   /** Highest `authority_generation` recorded per work item; lower generations are fenced off. */
   private authorities = new Map<string, number>();
+  /** PRs linked to a work item by `work_item.pr_linked`, in first-seen order and de-duplicated by PR. */
+  private prLinks = new Map<string, WorkItemPrLink[]>();
 
   private constructor(store: EventStore) {
     this.store = store;
@@ -287,6 +311,15 @@ export class Ledger {
         }
         break;
       }
+      case "work_item.pr_linked": {
+        const link = prLinkOf(p);
+        const id = event.work_item_id;
+        if (link && id) {
+          const list = this.prLinks.get(id) ?? [];
+          if (!list.some((l) => samePr(l, link))) this.prLinks.set(id, [...list, link]);
+        }
+        break;
+      }
       case "candidate.created": {
         const c = p.candidate as Candidate;
         this.candidates.set(c.id, c);
@@ -393,6 +426,30 @@ export class Ledger {
     write?: LedgerWriteOptions,
   ): Promise<void> {
     await this.emitWith("work_item.updated", id, actor, changes as Record<string, unknown>, write);
+  }
+
+  /**
+   * Record that `workItemId` produced or was handed this pull request. Idempotent: a PR already linked writes
+   * nothing. Additive: it changes no WorkItem field, so projections of work state are unaffected.
+   */
+  async recordPrLink(
+    workItemId: string,
+    link: Pick<WorkItemPrLink, "host" | "owner" | "repo" | "number">,
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<boolean> {
+    const full = prLinkOf({
+      ...link,
+      url_canonical: `https://${link.host}/${link.owner}/${link.repo}/pull/${link.number}`,
+    });
+    if (!full || !this.workItems.has(workItemId)) return false;
+    if (this.listPrLinks(workItemId).some((l) => samePr(l, full))) return false;
+    await this.emitWith("work_item.pr_linked", workItemId, actor, { ...full }, write);
+    return true;
+  }
+
+  listPrLinks(workItemId: string): WorkItemPrLink[] {
+    return [...(this.prLinks.get(workItemId) ?? [])];
   }
 
   getWorkItem(id: string): WorkItem | undefined {

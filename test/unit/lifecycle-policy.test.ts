@@ -309,6 +309,7 @@ test("execution defaults to adaptive with no implicit Mission directive", async 
     hold_mission_model: true,
     strict_completion: true,
     heartbeat_interval_ms: 30_000,
+    status_refresh_interval_ms: 15_000,
     stale_after_ms: 300_000,
   });
   const cwd = await temp("pi-eng-exec-");
@@ -335,6 +336,10 @@ test("liveness knobs load from yaml and out-of-range values are rejected", async
     assert.equal(cfg.stale_after_ms, 60_000);
     await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  stale_after_ms: 5\n");
     assert.equal((await loadExecutionConfig(cwd, agentDir)).stale_after_ms, 300_000);
+    await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  status_refresh_interval_ms: 20000\n");
+    assert.equal((await loadExecutionConfig(cwd, agentDir)).status_refresh_interval_ms, 20_000);
+    await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  status_refresh_interval_ms: 5\n");
+    assert.equal((await loadExecutionConfig(cwd, agentDir)).status_refresh_interval_ms, 15_000);
   } finally {
     await rm(cwd, { recursive: true, force: true });
     await rm(agentDir, { recursive: true, force: true });
@@ -356,6 +361,7 @@ test("execution preference and legacy opt-in load from repo yaml", async () => {
       hold_mission_model: true,
       strict_completion: true,
       heartbeat_interval_ms: 30_000,
+      status_refresh_interval_ms: 15_000,
       stale_after_ms: 300_000,
     });
   } finally {

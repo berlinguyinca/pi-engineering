@@ -144,6 +144,7 @@ function setup(
     promote?: boolean;
     limits?: Partial<{ maxTotal: number; maxPerOrigin: number; minFreeMb: number; retentionWarn: number }>;
     git?: (g: ForkGit) => ForkGit;
+    onPrLinked?: ConstructorParameters<typeof ForkManager>[0]["onPrLinked"];
   } = {},
 ) {
   const r = mkRepo();
@@ -174,6 +175,7 @@ function setup(
     lineage,
     limits: { maxTotal: 6, maxPerOrigin: 3, minFreeMb: 0, retentionWarn: 20, ...opts.limits },
     promote,
+    ...(opts.onPrLinked ? { onPrLinked: opts.onPrLinked } : {}),
   });
   const origin: ForkOrigin = { nodeId: "task:t1", missionId: "m1", taskId: "t1", repoRoot: r.root, baseBranch: "main" };
   return { ...r, bare: r.origin, state, lineage, store, client, registry, mgr, origin };
@@ -452,6 +454,23 @@ describe("promotion", () => {
         ...extra,
       }),
     );
+
+  it("tells the host which task a promoted PR belongs to, and a failing hook never fails the promotion", async () => {
+    const calls: Array<[string, number]> = [];
+    const s = setup({
+      promote: true,
+      onPrLinked: (taskId, pr) => {
+        calls.push([taskId, pr.number]);
+        throw new Error("ledger down");
+      },
+    });
+    const f = await fork(s, 1);
+    const head = commit(f.rec.worktreePath, "b.txt", "feature\n");
+    const a = await promote(s, f, head);
+    assert.equal(a.outcome, "applied", a.note);
+    assert.deepEqual(calls, [["t1", 7]]);
+    assert.equal(s.registry.get(f.id)?.status, "selected");
+  });
 
   it("pushes exactly the confirmed commit, opens a DRAFT PR, links it and merges nothing", async () => {
     const { s, f, head } = await prep();

@@ -50,6 +50,13 @@ export interface InferenceInvocation {
    * single retry to this owner (see src/inference/retryTrace.ts).
    */
   gatewayWaitOwner?: "worker-gateway-hold";
+  /**
+   * The caller that already retries transient faults (5xx, network, timeout) for
+   * this invocation (a worker's `withTransientRetry`). The in-call ladder settles
+   * on those same-model faults and records a `defer`; callers without a worker
+   * (this unset) keep the ladder's own retries.
+   */
+  transientRetryOwner?: "worker-transient-retry";
 }
 
 const storage = new AsyncLocalStorage<InferenceInvocation>();

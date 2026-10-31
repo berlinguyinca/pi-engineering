@@ -226,6 +226,11 @@ export interface ExecutionConfig {
    * but records no meaningful progress for this long is `stalled` (ms). Default 5 min.
    */
   stale_after_ms?: number;
+  /**
+   * How often the compact work status row re-evaluates run liveness while a run is non-terminal (ms). The timer
+   * is not running when nothing is live. Default 15s.
+   */
+  status_refresh_interval_ms?: number;
 }
 
 export interface EngineeringPolicy {
@@ -279,6 +284,7 @@ export const DEFAULT_POLICY: EngineeringPolicy = {
     strict_completion: true,
     heartbeat_interval_ms: 30_000,
     stale_after_ms: 300_000,
+    status_refresh_interval_ms: 15_000,
   },
   limits: {
     worker_inactivity_ms: 3_600_000,
@@ -462,6 +468,7 @@ const NUMBER_RANGE_FIELDS: Record<string, [number, number]> = {
   "limits.worker_inactivity_ms": [60_000, 2_147_483_647],
   "execution.heartbeat_interval_ms": [5_000, 3_600_000],
   "execution.stale_after_ms": [10_000, 86_400_000],
+  "execution.status_refresh_interval_ms": [1_000, 3_600_000],
   "lifecycle.max_remediation_rounds": [0, 20],
   "lifecycle.budget_ms": [10_000, 7_200_000],
   "lifecycle.max_concurrency": [1, 16],
