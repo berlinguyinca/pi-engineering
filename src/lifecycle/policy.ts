@@ -231,6 +231,12 @@ export interface ExecutionConfig {
    * is not running when nothing is live. Default 15s.
    */
   status_refresh_interval_ms?: number;
+  /**
+   * A worker is stopped (failed, `error: "tool-loop"`) when this many consecutive completed tool calls are the
+   * same call with the same result and no file-changing call in between (see src/workers/toolLoopGuard.ts).
+   * Default 3; range 2..100.
+   */
+  tool_loop_limit?: number;
 }
 
 export interface EngineeringPolicy {
@@ -285,6 +291,7 @@ export const DEFAULT_POLICY: EngineeringPolicy = {
     heartbeat_interval_ms: 30_000,
     stale_after_ms: 300_000,
     status_refresh_interval_ms: 15_000,
+    tool_loop_limit: 3,
   },
   limits: {
     worker_inactivity_ms: 3_600_000,
@@ -469,6 +476,7 @@ const NUMBER_RANGE_FIELDS: Record<string, [number, number]> = {
   "execution.heartbeat_interval_ms": [5_000, 3_600_000],
   "execution.stale_after_ms": [10_000, 86_400_000],
   "execution.status_refresh_interval_ms": [1_000, 3_600_000],
+  "execution.tool_loop_limit": [2, 100],
   "lifecycle.max_remediation_rounds": [0, 20],
   "lifecycle.budget_ms": [10_000, 7_200_000],
   "lifecycle.max_concurrency": [1, 16],
