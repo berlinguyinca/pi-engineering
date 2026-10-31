@@ -175,6 +175,13 @@ async function pinRefusal(
     const decision = await router.select(role, { ...query, taskOverride: modelKey(pin) });
     if (decision.selected && modelKey(decision.selected) === modelKey(pin)) return undefined;
     const rejection = decision.rejected.find((entry) => modelKey(entry.model) === modelKey(pin));
+    // A working role is never "the reviewer of its own work". The router's
+    // configured role pairs (implementer vs reviewer/verifier) reserve the
+    // counterpart's configured model, which is the pin itself whenever every
+    // role is configured onto one model. The independent roles still route away
+    // from the pin (above), so that reservation is no reason to move the
+    // implementer off the operator's model.
+    if (rejection?.stage === "separation_of_duties" && !ROLE_REQUIREMENTS[role].independent) return undefined;
     // A model the router never discovered is the operator's word against no
     // evidence: honour the pin.
     return rejection ? rejection.reason : undefined;
