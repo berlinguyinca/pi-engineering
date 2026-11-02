@@ -52,12 +52,14 @@ function fakeHerdr(opts: FakeHerdrOpts = {}): { herdr: HerdrCli; calls: Call[] }
       return ret;
     };
   let n = 0;
+  /** Like herdr: an agent started with a name answers to it; maps name -> pane id. */
+  const names = new Map<string, string>();
   const herdr: HerdrCli = {
     status: async () => ({ ok: true, serverVersion: "0.9.1", protocol: 22 }),
     listAgents: async () => [],
     getAgent: async (target: string) => {
       calls.push({ method: "getAgent", args: [target] });
-      return opts.getAgent ? opts.getAgent(target) : liveAgent(target);
+      return opts.getAgent ? opts.getAgent(target) : liveAgent(names.get(target) ?? target);
     },
     readAgent: async () => "",
     prompt: rec("prompt") as HerdrCli["prompt"],
@@ -68,6 +70,7 @@ function fakeHerdr(opts: FakeHerdrOpts = {}): { herdr: HerdrCli; calls: Call[] }
         throw new Error(`agent name already in use: ${String(args[2])}`);
       }
       calls.push({ method: "startAgent", args });
+      names.set(String(args[2]), String(args[0]));
       if (opts.failStart) throw opts.failStart;
     },
     sendKeys: rec("sendKeys") as HerdrCli["sendKeys"],
@@ -553,7 +556,12 @@ test("a throwing getAgent is not a dead pane and does not end the wait", async (
 test("two delegations in the same session use different agent names", async () => {
   // The first pane is gone by the second image, so a second agent is started (no reuse).
   let firstDone = false;
-  const s = setup({}, { getAgent: async (t) => (firstDone && t === "vision-pane-1" ? null : liveAgent(t)) });
+  // Agents are looked up by name (R22): req-1's agent lives in vision-pane-1, req-2's in vision-pane-2.
+  const paneOf = (t: string) => (t === "vision-session--req-1" ? "vision-pane-1" : "vision-pane-2");
+  const s = setup(
+    {},
+    { getAgent: async (t) => (firstDone && t === "vision-session--req-1" ? null : liveAgent(paneOf(t))) },
+  );
   try {
     s.clock.at(1000, () => writeResult(s.reqDir("req-1"), "req-1"));
     assert.match(transformText(await s.delegator.handle(input())), /STATUS: ok/);

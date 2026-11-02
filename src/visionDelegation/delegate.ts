@@ -1,8 +1,9 @@
 /**
  * Vision delegation: hand pasted images to a vision model in a herdr pane,
  * wait for its result file, and return the analysis as text. The first image
- * of a session starts a new pane; later ones prompt the same registered pane
- * (after `getAgent` confirms it is alive) with file paths only. Calls for one
+ * of a session starts a new pane; later ones prompt the same registered agent
+ * by its unique name (after `getAgent(name)` confirms it still answers from the
+ * registered pane id, R22) with file paths only. Calls for one
  * session queue behind each other; a reused session that fails is dropped.
  *
  * Every outcome other than "no images" becomes explicit text; nothing throws
@@ -119,20 +120,22 @@ export class VisionDelegator {
       entry = undefined; // an unreadable registry only costs reuse
     }
     if (entry) {
+      // R22: ask by the unique agent name and require it to answer from the registered pane. Anything
+      // else (unknown name, a different pane) is a stale entry: never prompt it, never close it.
       let agent: HerdrAgent | null;
       try {
-        agent = await herdr.getAgent(entry.paneId);
+        agent = await herdr.getAgent(entry.agentName);
       } catch (err) {
-        // Not proof the pane is gone: keep the entry, start nothing, fail this one explicitly.
-        const why = `the open vision session is unavailable (herdr could not check pane ${entry.paneId}: ${errText(err)})`;
+        // Not proof the session is gone: keep the entry, start nothing, fail this one explicitly.
+        const why = `the open vision session is unavailable (herdr could not check vision agent ${entry.agentName}: ${errText(err)})`;
         return this.failure(input, images, why);
       }
-      if (agent !== null) {
+      if (agent !== null && agent.pane_id === entry.paneId) {
         const { paneId, agentName, sessionDir } = entry;
         const model = entry.model ?? { provider: "unknown", id: "the open vision session" };
         const request = newRequest();
         const d: Delegation = { input, request, reqDir, model, agentName, sessionDir, reused: true, restarted, paneId };
-        return this.delegate(d, () => promptReusedPane(herdr, paneId, reqDir, request));
+        return this.delegate(d, () => promptReusedPane(herdr, agentName, paneId, reqDir, request));
       }
       this.forget(input.sessionId);
       restarted = true;
@@ -192,7 +195,8 @@ export class VisionDelegator {
         toModel: `${model.provider}/${model.id}`,
         outcome,
       });
-    // Every non-ok outcome: record state first, then close the pane best effort.
+    // Every non-ok outcome: record state first, then close the pane best effort. `d.paneId` is only ever a
+    // pane this call created or whose identity it confirmed (R22); a stale entry's pane never reaches here.
     // A reused session that failed is no longer trusted: drop it so the next image starts clean.
     const fail = async (
       status: RequestStateRecord["status"],
@@ -229,7 +233,8 @@ export class VisionDelegator {
       request,
       paneGone: async () => {
         try {
-          return (await herdr.getAgent(paneId)) === null;
+          const agent = await herdr.getAgent(d.agentName);
+          return agent === null || agent.pane_id !== paneId;
         } catch {
           return false; // transient herdr error: not proof the pane is gone
         }

@@ -84,13 +84,15 @@ function setup(ids: string[], opts: Opts = {}, over: Partial<VisionDelegatorDeps
     if (delay !== null) clock.at(clock.now() + delay, () => writeResult(reqDir));
   };
   let panes = 0;
+  /** Like herdr: an agent started with a name answers to it; maps name -> pane id. */
+  const names = new Map<string, string>();
   const rec = (method: string, args: unknown[]) => calls.push({ method, args, at: clock.now() });
   const herdr: HerdrCli = {
     status: async () => ({ ok: true, serverVersion: "0.9.1", protocol: 22 }),
     listAgents: async () => [],
     getAgent: async (target: string) => {
       rec("getAgent", [target]);
-      return opts.getAgent ? opts.getAgent(target) : liveAgent(target);
+      return opts.getAgent ? opts.getAgent(target) : liveAgent(names.get(target) ?? target);
     },
     readAgent: async () => "",
     prompt: async (target: string, text: string, timeoutMs?: number) => {
@@ -102,6 +104,7 @@ function setup(ids: string[], opts: Opts = {}, over: Partial<VisionDelegatorDeps
     wait: async () => liveAgent("x"),
     startAgent: async (paneId: string, kind: string, name: string, args: readonly string[] = []) => {
       rec("startAgent", [paneId, kind, name, args]);
+      names.set(name, paneId);
       const instr = args.find((a) => a.endsWith("instructions.md"));
       if (instr) answer(dirname(instr.slice(1)));
     },
@@ -135,6 +138,7 @@ function setup(ids: string[], opts: Opts = {}, over: Partial<VisionDelegatorDeps
   return {
     clock,
     calls,
+    names,
     registry,
     deps,
     reqDir: (id: string) => join(deps.artifactDir, id),
@@ -174,10 +178,11 @@ test("a second image reuses the registered pane and prompts it instead of starti
     assert.equal(s.of("splitPane").length, 1);
     const prompts = s.of("prompt");
     assert.equal(prompts.length, 1);
-    assert.equal(prompts[0]?.args[0], "vision-pane-1");
+    // R22: the reused agent is addressed by its unique name, and its pane id is checked first.
+    assert.equal(prompts[0]?.args[0], "vision-session--req-1");
     assert.ok(
-      s.of("getAgent").some((c) => c.args[0] === "vision-pane-1"),
-      "checks the pane before reuse",
+      s.of("getAgent").some((c) => c.args[0] === "vision-session--req-1"),
+      "checks the agent by name before reuse",
     );
     assert.equal(s.of("closePane").length, 0, "the reused pane stays open");
     assert.equal(s.registry.get(SESSION)?.paneId, "vision-pane-1");
@@ -219,7 +224,8 @@ test("the prompt names the new requestId and the result file path", async () => 
 test("a dead pane (getAgent returns null) starts a new session and the handback says earlier images are not in its context", async () => {
   let dead = false;
   const s = setup(["req-1", "req-2"], {
-    getAgent: async (t) => (dead && t === "vision-pane-1" ? null : liveAgent(t)),
+    // Looked up by name (R22); the fake maps each started name to its pane.
+    getAgent: async (t) => (dead && t === "vision-session--req-1" ? null : liveAgent(s.names.get(t) ?? t)),
   });
   try {
     await s.delegator.handle(input());
@@ -381,11 +387,86 @@ test("R12: a result written just before the pane exits is still delivered", asyn
         writeResult(s.reqDir("req-1"), { description: "written just before exit" });
         gone = true;
       }
-      return gone ? null : liveAgent(t);
+      return gone ? null : liveAgent(s.names.get(t) ?? t);
     };
     const out = text(await s.delegator.handle(input()));
     assert.match(out, /written just before exit/);
     assert.equal(state(s.reqDir("req-1")).status, "done");
+  } finally {
+    s.cleanup();
+  }
+});
+
+// --- C1 (R22): a reused pane is addressed by its unique agent name, and its pane id must match ---
+
+const NAME1 = "vision-session--req-1";
+
+test("C1: a registered name now answering from a different pane is never prompted or closed; a new session starts", async () => {
+  let imposter = false;
+  const s = setup(["req-1", "req-2"], {
+    getAgent: async (t) => {
+      if (t === NAME1) return liveAgent(imposter ? "user-pane-9" : "vision-pane-1");
+      return liveAgent(s.names.get(t) ?? t);
+    },
+  });
+  try {
+    await s.delegator.handle(input());
+    assert.equal(s.registry.get(SESSION)?.agentName, NAME1);
+    imposter = true;
+    const out = text(await s.delegator.handle(input({ images: [IMG2] })));
+    assert.ok(
+      s.of("getAgent").some((c) => c.args[0] === NAME1),
+      "the reuse check asks by agent name",
+    );
+    assert.equal(s.of("prompt").length, 0, "nothing is typed into the pane or the imposter");
+    assert.equal(s.of("closePane").length, 0, "the unconfirmed pane is never closed");
+    assert.equal(s.of("startAgent").length, 2, "a new vision session is started");
+    assert.match(out, /analysis of req-2/);
+    assert.match(out, /earlier images .*no longer in the vision session's context/i);
+    const entry = s.registry.get(SESSION);
+    assert.equal(entry?.paneId, "vision-pane-2");
+    assert.equal(entry?.agentName, "vision-session--req-2");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("C1: a registered name that herdr no longer knows starts a new session, and a later failure closes only the new pane", async () => {
+  let gone = false;
+  const s = setup(["req-1", "req-2"], {
+    answerAfter: (id) => (id === "req-2" ? null : 1000),
+    getAgent: async (t) => {
+      if (t === NAME1) return gone ? null : liveAgent("vision-pane-1");
+      return liveAgent(s.names.get(t) ?? t);
+    },
+  });
+  try {
+    await s.delegator.handle(input());
+    gone = true;
+    const out = text(await s.delegator.handle(input()));
+    assert.match(out, /analysis timed out/);
+    assert.match(out, /earlier images .*no longer in the vision session's context/i);
+    assert.equal(s.of("prompt").length, 0);
+    assert.deepEqual(
+      s.of("closePane").map((c) => c.args[0]),
+      ["vision-pane-2"],
+      "only the pane this call created is closed, never vision-pane-1",
+    );
+    assert.equal(s.registry.get(SESSION), undefined, "the stale entry is gone and the failed new one never registered");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("C1: a confirmed reuse prompts the agent by name, never by bare pane id", async () => {
+  const s = setup(["req-1", "req-2"]);
+  try {
+    await s.delegator.handle(input());
+    await s.delegator.handle(input({ images: [IMG2] }));
+    const prompts = s.of("prompt");
+    assert.equal(prompts.length, 1);
+    assert.equal(prompts[0]?.args[0], NAME1);
+    assert.ok(!s.of("getAgent").some((c) => c.args[0] === "vision-pane-1"), "never looked up by bare pane id");
   } finally {
     s.cleanup();
   }

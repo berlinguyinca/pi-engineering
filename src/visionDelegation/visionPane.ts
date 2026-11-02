@@ -1,7 +1,7 @@
 /**
  * Delivering one request to a vision pane over herdr: either split a new pane
  * and start a `pi` agent on the vision model with the request files as `@file`
- * arguments, or prompt an already-registered pane with file paths only.
+ * arguments, or prompt an already-registered agent (by name) with file paths only.
  * Both resolve with the pane id once delivery is submitted; the result file,
  * not herdr state, says when the analysis is done.
  */
@@ -60,13 +60,18 @@ export async function startNewPane(
   return paneId;
 }
 
-/** Hands the request to the registered pane with file paths only. */
+/**
+ * Hands the request to the registered vision agent with file paths only. It is addressed by its unique
+ * agent NAME, never by bare pane id (R22): a pane id can be reused by another agent after a restart.
+ * The caller must already have confirmed that `agentName` answers from `paneId` in this same call.
+ */
 export async function promptReusedPane(
   herdr: HerdrCli,
+  agentName: string,
   paneId: string,
   reqDir: string,
   request: VisionRequest,
 ): Promise<string> {
-  await herdr.prompt(paneId, reusePrompt(reqDir, request), PROMPT_TIMEOUT_MS);
+  await herdr.prompt(agentName, reusePrompt(reqDir, request), PROMPT_TIMEOUT_MS);
   return paneId;
 }
