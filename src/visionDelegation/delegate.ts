@@ -77,9 +77,20 @@ type WaitOutcome =
   | { kind: "result"; result: VisionResult }
   | { kind: "invalid"; reason: string }
   | { kind: "timeout" }
-  | { kind: "cancelled" };
+  | { kind: "cancelled" }
+  | { kind: "pane_dead" };
 
 const POLL_MS = 500;
+/** Every Nth poll asks herdr whether the vision pane still exists. */
+const PANE_CHECK_EVERY = 5;
+
+/** `vision-<session8>-<request8>`, lowercased, [a-z0-9-] only, at most 32 chars (R9). */
+export function visionAgentName(sessionId: string, requestId: string): string {
+  return `vision-${sessionId.slice(0, 8)}-${requestId.slice(0, 8)}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .slice(0, 32);
+}
 
 const errText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
@@ -130,7 +141,8 @@ export class VisionDelegator {
       return this.failure(input, images, `no vision model was available (${errText(err)})`);
     }
 
-    const agentName = `vision-${input.sessionId.slice(0, 8)}`;
+    const agentName = visionAgentName(input.sessionId, requestId);
+    const sessionDir = join(reqDir, "session");
     const request: VisionRequest = {
       requestId,
       sessionId: input.sessionId,
@@ -148,18 +160,40 @@ export class VisionDelegator {
         toModel: `${model.provider}/${model.id}`,
         outcome,
       });
+    let paneId: string | undefined;
+    // Every non-ok outcome: record state first, then close the pane best effort.
+    const fail = async (
+      status: RequestState,
+      outcome: LineageOutcome,
+      why: string,
+      reason?: string,
+    ): Promise<VisionDelegateOutput> => {
+      lineage("back", outcome);
+      await this.writeState(reqDir, { requestId, status, paneId, reason });
+      if (paneId !== undefined) {
+        try {
+          await herdr.closePane(paneId);
+        } catch {
+          // Best effort: a pane that will not close never changes the answer.
+        }
+      }
+      return this.failure(input, images, why);
+    };
 
-    let paneId: string;
     try {
       await this.writeRequestFiles(reqDir, request, input);
-      await this.writeState(reqDir, requestId, "waiting");
+      await mkdir(sessionDir, { recursive: true });
+      await this.writeState(reqDir, { requestId, status: "waiting" });
       lineage("out", "ok");
       paneId = (await herdr.splitPane({ paneId: originPaneId, cwd: input.cwd, direction: "right" })).paneId;
+      await this.writeState(reqDir, { requestId, status: "waiting", paneId });
       await herdr.startAgent(paneId, "pi", agentName, [
         "--provider",
         model.provider,
         "--model",
         model.id,
+        "--session-dir",
+        sessionDir,
         "--append-system-prompt",
         join(reqDir, "role-prompt.md"),
         `@${join(reqDir, "instructions.md")}`,
@@ -167,15 +201,13 @@ export class VisionDelegator {
         ...images.map((i) => `@${i.path}`),
       ]);
     } catch (err) {
-      lineage("back", "failed");
-      await this.writeState(reqDir, requestId, "failed", errText(err));
-      return this.failure(input, images, `starting the vision pane failed (${errText(err)})`);
+      return fail("failed", "failed", `starting the vision pane failed (${errText(err)})`, errText(err));
     }
 
     input.status?.("analyzing image…");
     let outcome: WaitOutcome;
     try {
-      outcome = await this.waitForResult(reqDir, request, input.signal);
+      outcome = await this.waitForResult(reqDir, request, paneId, input.signal);
     } catch (err) {
       outcome = { kind: "invalid", reason: errText(err) };
     } finally {
@@ -185,42 +217,38 @@ export class VisionDelegator {
     if (outcome.kind === "result") {
       const { result } = outcome;
       lineage("back", result.status);
-      await this.writeState(reqDir, requestId, "done", undefined, result.status);
+      await this.writeState(reqDir, { requestId, status: "done", paneId, resultStatus: result.status });
       try {
-        this.deps.registry.set(input.sessionId, {
-          paneId,
-          agentName,
-          sessionDir: reqDir,
-          startedAt: request.createdAt,
-        });
+        this.deps.registry.set(input.sessionId, { paneId, agentName, sessionDir, startedAt: request.createdAt });
       } catch {
         // Registry failure only costs reuse later; the analysis is still delivered.
       }
       return { action: "transform", text: renderHandback(input.text, result, model.id, images), images: [] };
     }
     if (outcome.kind === "timeout") {
-      lineage("back", "timeout");
-      await this.writeState(reqDir, requestId, "timed_out");
-      return this.failure(
-        input,
-        images,
-        `the analysis timed out after ${this.deps.settings.waitSeconds} seconds (vision model ${model.id})`,
-      );
+      const secs = this.deps.settings.waitSeconds;
+      return fail("timed_out", "timeout", `the analysis timed out after ${secs} seconds (vision model ${model.id})`);
     }
     if (outcome.kind === "cancelled") {
-      lineage("back", "failed");
-      await this.writeState(reqDir, requestId, "cancelled");
-      return this.failure(input, images, "the delegation was cancelled before the vision model answered");
+      return fail("cancelled", "failed", "the delegation was cancelled before the vision model answered");
     }
-    lineage("back", "failed");
-    await this.writeState(reqDir, requestId, "failed", outcome.reason);
-    return this.failure(input, images, `the vision result was rejected and the delegation failed (${outcome.reason})`);
+    if (outcome.kind === "pane_dead") {
+      const why = "the vision pane exited before writing a result";
+      return fail("failed", "failed", why, why);
+    }
+    const why = `the vision result was rejected and the delegation failed (${outcome.reason})`;
+    return fail("failed", "failed", why, outcome.reason);
   }
 
-  private async waitForResult(reqDir: string, request: VisionRequest, signal?: AbortSignal): Promise<WaitOutcome> {
+  private async waitForResult(
+    reqDir: string,
+    request: VisionRequest,
+    paneId: string,
+    signal?: AbortSignal,
+  ): Promise<WaitOutcome> {
     const file = resultPath(reqDir, request.requestId);
     const deadline = this.deps.now() + this.deps.settings.waitSeconds * 1000;
-    for (;;) {
+    for (let poll = 1; ; poll++) {
       if (signal?.aborted) return { kind: "cancelled" };
       const seen = await readResult(file);
       if (seen !== undefined && isRecord(seen) && seen.request_id === request.requestId) {
@@ -228,6 +256,15 @@ export class VisionDelegator {
         return parsed.ok ? { kind: "result", result: parsed.result } : { kind: "invalid", reason: parsed.reason };
       }
       // Missing, half-written, unparseable, or for another request: keep waiting.
+      if (poll % PANE_CHECK_EVERY === 0) {
+        let agent: unknown;
+        try {
+          agent = await this.deps.herdr.getAgent(paneId);
+        } catch {
+          agent = undefined; // transient herdr error: not proof the pane is gone
+        }
+        if (agent === null) return { kind: "pane_dead" };
+      }
       if (this.deps.now() >= deadline) return { kind: "timeout" };
       await this.deps.sleep(POLL_MS);
     }
@@ -262,19 +299,17 @@ export class VisionDelegator {
 
   private async writeState(
     reqDir: string,
-    requestId: string,
-    status: RequestState,
-    reason?: string,
-    resultStatus?: string,
+    s: { requestId: string; status: RequestState; paneId?: string; reason?: string; resultStatus?: string },
   ): Promise<void> {
     const body: Record<string, unknown> = {
-      request_id: requestId,
-      status,
-      injected: status === "done",
+      request_id: s.requestId,
+      status: s.status,
+      injected: s.status === "done",
       updated_at: new Date(this.deps.now()).toISOString(),
     };
-    if (reason !== undefined) body.reason = reason;
-    if (resultStatus !== undefined) body.result_status = resultStatus;
+    if (s.paneId !== undefined) body.pane_id = s.paneId;
+    if (s.reason !== undefined) body.reason = s.reason;
+    if (s.resultStatus !== undefined) body.result_status = s.resultStatus;
     try {
       await atomicWrite(join(reqDir, "state.json"), `${JSON.stringify(body, null, 2)}\n`);
     } catch {

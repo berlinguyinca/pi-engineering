@@ -5,9 +5,9 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type { ProbeResult } from "../../src/resilience/probe.ts";
-import type { HerdrCli } from "../../src/runtime/herdr/HerdrCli.ts";
+import type { HerdrAgent, HerdrCli } from "../../src/runtime/herdr/HerdrCli.ts";
 import type { VisionDelegateSettings } from "../../src/visionDelegation/config.ts";
-import { VisionDelegator, type VisionDelegatorDeps } from "../../src/visionDelegation/delegate.ts";
+import { VisionDelegator, type VisionDelegatorDeps, visionAgentName } from "../../src/visionDelegation/delegate.ts";
 import { resultPath } from "../../src/visionDelegation/protocol.ts";
 import { VisionRegistry } from "../../src/visionDelegation/registry.ts";
 import { VISION_ROLE_PROMPT } from "../../src/visionDelegation/rolePrompt.ts";
@@ -26,7 +26,24 @@ interface Call {
   args: unknown[];
 }
 
-function fakeHerdr(opts: { split?: boolean; failStart?: Error } = {}): { herdr: HerdrCli; calls: Call[] } {
+interface FakeHerdrOpts {
+  split?: boolean;
+  failStart?: Error;
+  /** Answer for `getAgent`; default: a live agent. */
+  getAgent?: (target: string) => Promise<HerdrAgent | null>;
+  failClose?: Error;
+}
+
+const liveAgent = (paneId: string): HerdrAgent => ({
+  agent_status: "working",
+  cwd: "/work/repo",
+  pane_id: paneId,
+  workspace_id: "w1",
+  revision: 1,
+  state_change_seq: 1,
+});
+
+function fakeHerdr(opts: FakeHerdrOpts = {}): { herdr: HerdrCli; calls: Call[] } {
   const calls: Call[] = [];
   const rec =
     (method: string, ret?: unknown) =>
@@ -38,16 +55,26 @@ function fakeHerdr(opts: { split?: boolean; failStart?: Error } = {}): { herdr: 
   const herdr: HerdrCli = {
     status: async () => ({ ok: true, serverVersion: "0.9.1", protocol: 22 }),
     listAgents: async () => [],
-    getAgent: async () => null,
+    getAgent: async (target: string) => {
+      calls.push({ method: "getAgent", args: [target] });
+      return opts.getAgent ? opts.getAgent(target) : liveAgent(target);
+    },
     readAgent: async () => "",
     prompt: rec("prompt") as HerdrCli["prompt"],
     wait: rec("wait") as HerdrCli["wait"],
     startAgent: async (...args: unknown[]) => {
+      // Like herdr, refuse a second agent with a name that is already taken.
+      if (calls.some((c) => c.method === "startAgent" && c.args[2] === args[2])) {
+        throw new Error(`agent name already in use: ${String(args[2])}`);
+      }
       calls.push({ method: "startAgent", args });
       if (opts.failStart) throw opts.failStart;
     },
     sendKeys: rec("sendKeys") as HerdrCli["sendKeys"],
-    closePane: rec("closePane") as HerdrCli["closePane"],
+    closePane: async (target: string) => {
+      calls.push({ method: "closePane", args: [target] });
+      if (opts.failClose) throw opts.failClose;
+    },
     createWorkspace: rec("createWorkspace") as HerdrCli["createWorkspace"],
     createWorktree: rec("createWorktree") as HerdrCli["createWorktree"],
   };
@@ -198,7 +225,13 @@ test("ok result becomes a transform that removes the images and carries the anal
     assert.equal(state(s.reqDir("req-1")).injected, true);
     const entry = s.registry.get("session-abcdef123456");
     assert.equal(entry?.paneId, "vision-pane-1");
-    assert.equal(entry?.agentName, "vision-session-");
+    assert.equal(entry?.agentName, "vision-session--req-1");
+    assert.equal(entry?.sessionDir, join(s.reqDir("req-1"), "session"));
+    assert.equal(
+      s.calls.some((c) => c.method === "closePane"),
+      false,
+      "an ok result keeps its pane open",
+    );
   } finally {
     s.cleanup();
   }
@@ -382,11 +415,15 @@ test("the vision pane is started with --provider, --model, @handoff.md, @image a
     const [paneId, kind, name, args] = start.args as [string, string, string, string[]];
     assert.equal(paneId, "vision-pane-1");
     assert.equal(kind, "pi");
-    assert.equal(name, "vision-session-");
+    assert.equal(name, "vision-session--req-1");
     const dir = s.reqDir("req-1");
     const flag = (f: string) => args[args.indexOf(f) + 1];
     assert.equal(flag("--provider"), "lab");
     assert.equal(flag("--model"), "qwen3.8-vision");
+    assert.equal(flag("--session-dir"), join(dir, "session"));
+    assert.ok(existsSync(join(dir, "session")), "session dir is created");
+    assert.equal(args.indexOf("--session-dir"), args.indexOf("--model") + 2);
+    assert.equal(args.indexOf("--append-system-prompt"), args.indexOf("--session-dir") + 2);
     const rolePath = flag("--append-system-prompt");
     assert.ok(rolePath);
     assert.equal(readFileSync(rolePath, "utf8"), VISION_ROLE_PROMPT);
@@ -463,12 +500,106 @@ test("lineage reports a timeout as phase back, outcome timeout", async () => {
       phase: "back",
       requestId: "req-1",
       fromSession: "session-abcdef123456",
-      toSession: "vision-session-",
+      toSession: "vision-session--req-1",
       fromModel: "text-model",
       toModel: "lab/qwen3.8-vision",
       outcome: "timeout",
     });
   } finally {
     s.cleanup();
+  }
+});
+
+test("a dead vision pane fails the delegation at once, not at the deadline", async () => {
+  const s = setup({}, { getAgent: async () => (s.clock.now() >= 3000 ? null : liveAgent("vision-pane-1")) });
+  try {
+    const events: string[] = [];
+    s.deps.lineage = (e) => events.push(`${e.phase}:${e.outcome}`);
+    const text = transformText(await new VisionDelegator(s.deps).handle(input()));
+    assert.match(text, /the vision pane exited before writing a result/);
+    assert.match(text, /\/images\/[0-9a-f]{64}\.png/);
+    assert.ok(s.clock.now() < 10_000, `failed at ${s.clock.now()}ms, well before the 30s deadline`);
+    assert.deepEqual(events, ["out:ok", "back:failed"]);
+    const st = state(s.reqDir("req-1"));
+    assert.equal(st.status, "failed");
+    assert.equal(st.injected, false);
+    assert.equal(st.pane_id, "vision-pane-1");
+    assert.ok(s.calls.some((c) => c.method === "closePane" && c.args[0] === "vision-pane-1"));
+    assert.equal(s.registry.get("session-abcdef123456"), undefined);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a throwing getAgent is not a dead pane and does not end the wait", async () => {
+  const s = setup(
+    {},
+    {
+      getAgent: async () => {
+        throw new Error("herdr socket hiccup");
+      },
+    },
+  );
+  try {
+    s.clock.at(12_000, () => writeResult(s.reqDir("req-1"), "req-1"));
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /STATUS: ok/);
+    assert.ok(s.calls.filter((c) => c.method === "getAgent").length >= 2, "pane checks ran");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("two delegations in the same session use different agent names", async () => {
+  const s = setup();
+  try {
+    s.clock.at(1000, () => writeResult(s.reqDir("req-1"), "req-1"));
+    assert.match(transformText(await s.delegator.handle(input())), /STATUS: ok/);
+    s.clock.at(s.clock.now() + 1000, () => writeResult(s.reqDir("req-2"), "req-2"));
+    assert.match(transformText(await s.delegator.handle(input())), /STATUS: ok/);
+    const names = s.calls.filter((c) => c.method === "startAgent").map((c) => c.args[2]);
+    assert.deepEqual(names, ["vision-session--req-1", "vision-session--req-2"]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("agent names are lowercased, sanitized and at most 32 chars", () => {
+  const name = visionAgentName("Sess/ion:ABCDEFG", "Req_ID.12345678");
+  assert.equal(name, "vision-sess-ion-req-id-1");
+  assert.match(name, /^[a-z0-9-]+$/);
+  assert.ok(visionAgentName("x".repeat(80), "y".repeat(80)).length <= 32);
+});
+
+test("a timeout closes its pane, and a throwing closePane does not break the transform", async () => {
+  for (const failClose of [undefined, new Error("close refused")]) {
+    const s = setup({}, { failClose });
+    try {
+      const text = transformText(await s.delegator.handle(input()));
+      assert.match(text, /analysis timed out/);
+      assert.ok(s.calls.some((c) => c.method === "closePane" && c.args[0] === "vision-pane-1"));
+      const st = state(s.reqDir("req-1"));
+      assert.equal(st.status, "timed_out");
+      assert.equal(st.pane_id, "vision-pane-1");
+    } finally {
+      s.cleanup();
+    }
+  }
+});
+
+test("cancel and a rejected result also close the pane", async () => {
+  const ac = new AbortController();
+  const c = setup();
+  const r = setup();
+  try {
+    c.clock.at(1000, () => ac.abort());
+    assert.match(transformText(await c.delegator.handle(input({ signal: ac.signal }))), /cancelled/);
+    assert.ok(c.calls.some((x) => x.method === "closePane"));
+    r.clock.at(1000, () => writeResult(r.reqDir("req-1"), "req-1", { images: [] }));
+    assert.match(transformText(await r.delegator.handle(input())), /image missing from echo/);
+    assert.ok(r.calls.some((x) => x.method === "closePane"));
+  } finally {
+    c.cleanup();
+    r.cleanup();
   }
 });
