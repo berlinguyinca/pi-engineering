@@ -74,16 +74,20 @@ export class VisionDelegator {
     if (queued) safeStatus(input, "waiting for earlier image…");
     return this.chains.run(input.sessionId, async () => {
       if (queued) safeStatus(input, undefined);
+      // Filled by handleOne once the images are on disk, so the catch-all below can still name them.
+      const saved: { images?: SavedImage[] } = {};
       try {
-        return await this.handleOne(input);
+        return await this.handleOne(input, saved);
       } catch (err) {
-        return this.failure({ ...input, text: "" }, [], `vision delegation failed unexpectedly (${errText(err)})`);
+        // R25: keep the user's text; name the saved images when known, otherwise say they may not exist.
+        const why = `vision delegation failed unexpectedly (${errText(err)})`;
+        return this.failure(input, saved.images ?? [], why, false, saved.images === undefined);
       }
     });
   }
 
   /** Routing: reuse a live registered pane, else start a new one. */
-  private async handleOne(input: VisionDelegateInput): Promise<VisionDelegateOutput> {
+  private async handleOne(input: VisionDelegateInput, saved: { images?: SavedImage[] }): Promise<VisionDelegateOutput> {
     let requestId: string;
     let reqDir: string;
     try {
@@ -97,6 +101,7 @@ export class VisionDelegator {
     let images: SavedImage[];
     try {
       images = uniqueByPath(await saveImages(input.images, reqDir));
+      saved.images = images;
     } catch (err) {
       return this.failure(input, [], `the image(s) could not be saved (${errText(err)})`);
     }
@@ -307,9 +312,12 @@ export class VisionDelegator {
     images: SavedImage[],
     why: string,
     restarted = false,
+    /** The failure happened before it was known whether the images were saved. */
+    imagesUnknown = false,
   ): VisionDelegateOutput {
     const n = input.images.length;
-    const ask = input.text.trim();
+    // Never throws, even on a malformed input: this is also the catch-all's last word.
+    const ask = typeof input.text === "string" ? input.text.trim() : "";
     const lines = [
       ask
         ? `The user attached ${n} image(s) with this message: ${ask}`
@@ -322,6 +330,8 @@ export class VisionDelegator {
         "The image(s) are saved here; tell the user, who can paste them again or open them:",
         ...images.map((i) => `- ${i.path} (${i.mimeType})`),
       );
+    } else if (imagesUnknown) {
+      lines.push("The image(s) may not have been saved; ask the user to paste them again.");
     } else {
       lines.push("The image(s) could not be saved to disk; ask the user to paste them again.");
     }

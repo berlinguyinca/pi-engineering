@@ -631,3 +631,21 @@ test("I1: the same image pasted twice is sent once, an ok result echoing it once
     s.cleanup();
   }
 });
+
+test("I2: an unexpected throw inside the queue wrapper keeps the user's text and names the saved images", async () => {
+  const s = setup({
+    now: () => {
+      throw new Error("clock broke");
+    },
+  });
+  try {
+    const text = transformText(await s.delegator.handle(input({ text: "Please check the chart legend" })));
+    assert.match(text, /failed unexpectedly \(clock broke\)/);
+    assert.match(text, /Please check the chart legend/);
+    assert.doesNotMatch(text, /no accompanying text/);
+    assert.match(text, /\/images\/[0-9a-f]{64}\.png/, "the already-saved image is named");
+    assert.doesNotMatch(text, /could not be saved/);
+  } finally {
+    s.cleanup();
+  }
+});

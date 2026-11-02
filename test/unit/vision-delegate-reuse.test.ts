@@ -323,7 +323,8 @@ test("a failed or rejected earlier call does not block the next", async () => {
   const s = setup(["req-1", "req-2", "req-3"], { answerAfter: (id) => (id === "req-1" ? null : 1000) });
   try {
     const timedOut = s.delegator.handle(input());
-    // A non-string text makes the failure path itself throw: the call must still settle.
+    // A non-string text breaks the request write; the failure path is total (R25), so the call settles
+    // with an explicit failure rather than reaching the catch-all.
     const broken = s.delegator.handle(input({ text: undefined, status: () => {} }));
     const third = s.delegator.handle(
       input({
@@ -333,7 +334,7 @@ test("a failed or rejected earlier call does not block the next", async () => {
       }),
     );
     assert.match(text(await timedOut), /analysis timed out/);
-    assert.match(text(await broken), /failed unexpectedly/);
+    assert.match(text(await broken), /Vision delegation did not complete/);
     assert.match(text(await third), /analysis of req-3/);
     assert.equal(chains(s.delegator).size, 0);
   } finally {
