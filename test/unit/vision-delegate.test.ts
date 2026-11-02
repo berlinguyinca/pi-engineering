@@ -614,3 +614,20 @@ test("cancel and a rejected result also close the pane", async () => {
     r.cleanup();
   }
 });
+
+test("I1: the same image pasted twice is sent once, an ok result echoing it once is accepted, and the handback names it once", async () => {
+  const s = setup();
+  try {
+    s.clock.at(1000, () => writeResult(s.reqDir("req-1"), "req-1"));
+    const text = transformText(await s.delegator.handle(input({ images: [IMG, IMG] })));
+    const req = readRequest(s.reqDir("req-1"));
+    assert.equal(req.images.length, 1, "request.json lists the distinct image once");
+    assert.match(text, /STATUS: ok/);
+    assert.match(text, /misaligned submit button/);
+    const path = req.images[0]?.path ?? "";
+    assert.equal(text.split(path).length - 1, 1, "the handback names the image once");
+    assert.equal(state(s.reqDir("req-1")).status, "done");
+  } finally {
+    s.cleanup();
+  }
+});

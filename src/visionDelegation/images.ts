@@ -60,3 +60,16 @@ export async function saveImages(
   }
   return saved;
 }
+
+/**
+ * R24: one entry per distinct saved file, first occurrence order. The same picture pasted twice saves to
+ * the same path; sending it twice would make an obedient model echo it twice, which `parseResult` rejects.
+ */
+export function uniqueByPath(images: SavedImage[]): SavedImage[] {
+  const seen = new Set<string>();
+  return images.filter((i) => {
+    if (seen.has(i.path)) return false;
+    seen.add(i.path);
+    return true;
+  });
+}

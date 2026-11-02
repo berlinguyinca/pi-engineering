@@ -18,7 +18,7 @@ import { join } from "node:path";
 import type { HerdrAgent } from "../runtime/herdr/HerdrCli.ts";
 import { awaitResult } from "./awaitResult.ts";
 import { chooseVisionModel } from "./chooseModel.ts";
-import { saveImages } from "./images.ts";
+import { saveImages, uniqueByPath } from "./images.ts";
 import { type SavedImage, type VisionRequest, renderHandback, resultPath } from "./protocol.ts";
 import type { RegistryEntry } from "./registry.ts";
 import { type RequestStateRecord, writeRequestFiles, writeState } from "./requestFiles.ts";
@@ -96,7 +96,7 @@ export class VisionDelegator {
 
     let images: SavedImage[];
     try {
-      images = await saveImages(input.images, reqDir);
+      images = uniqueByPath(await saveImages(input.images, reqDir));
     } catch (err) {
       return this.failure(input, [], `the image(s) could not be saved (${errText(err)})`);
     }
