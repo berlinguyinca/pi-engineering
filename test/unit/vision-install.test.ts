@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstatSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -565,6 +574,39 @@ test("R18 fix: an injected open that throws never makes readPastedImages reject"
   const out = await readPastedImages([path], { open });
   assert.equal(out.images.length, 0);
   assert.match(out.problem ?? "", /could not be read/);
+});
+
+test("R29: a herdr clipboard path (sandbox tmpdir) for a text-only model is delegated as [pasted image 1]", async () => {
+  const root = mkdtempSync(join(tmpdir(), "vision-install-herdr-"));
+  try {
+    const uid = process.getuid?.() as number;
+    const herdr = join(root, `herdr-clipboard-images-${uid}`);
+    mkdirSync(herdr, { mode: 0o700 });
+    chmodSync(herdr, 0o700);
+    const path = join(herdr, "client-20-clipboard-1793659534374099000-0.png");
+    writeFileSync(path, "herdr-shot", { mode: 0o600 });
+    const pi = fakePi();
+    const d = fakeDelegator();
+    installVisionDelegation(pi, {
+      loadSettings: async () => SETTINGS,
+      makeDelegator: async () => d.delegator,
+      pasted: { tmpdir: root, uid },
+    });
+    const { ctx, notes } = fakeCtx();
+    const out = await pi.input()(event({ text: `what is wrong? ${path}`, images: undefined }), ctx);
+    assert.equal(out, TRANSFORM);
+    assert.equal(notes.length, 0);
+    assert.deepEqual(d.calls[0]?.images, [{ data: b64("herdr-shot"), mimeType: "image/png" }]);
+    assert.equal(d.calls[0]?.text, "what is wrong? [pasted image 1]");
+    assert.ok(!d.calls[0]?.text.includes(herdr), "the private path does not reach the delegated text");
+
+    // A vision-capable model leaves the same path as plain text.
+    const v = fakeCtx({ model: VISION_MODEL });
+    assert.deepEqual(await pi.input()(event({ text: path, images: [] }), v.ctx), { action: "continue" });
+    assert.equal(d.calls.length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // --- the live extension -----------------------------------------------------------------------------

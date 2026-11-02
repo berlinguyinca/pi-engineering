@@ -1,17 +1,22 @@
 /**
  * Ruling R18: Pi's TUI paste (Ctrl+V) does not send an image. It writes the clipboard image to
- * `os.tmpdir()/pi-clipboard-<uuid>.<ext>` and inserts that PATH into the editor text. This module finds such
- * paths in the input text and reads them as images, under strict rules so a typed path can never make Pi read
- * an arbitrary file:
+ * `os.tmpdir()/pi-clipboard-<uuid>.<ext>` and inserts that PATH into the editor text. Ruling R29: inside a
+ * herdr pane, HERDR writes the pasted image to `os.tmpdir()/herdr-clipboard-images-<uid>/client-<n>-clipboard-
+ * <digits>-<k>.<ext>` and types that PATH. This module finds both families of paths in the input text and reads
+ * them as images, under strict rules so a typed path can never make Pi read an arbitrary file:
  *
- * - the basename must be exactly Pi's clipboard name (uuid, png/jpg/jpeg/gif/webp);
- * - the file's real path must be DIRECTLY inside the real path of `os.tmpdir()`;
+ * - the basename must be exactly the family's clipboard name (png/jpg/jpeg/gif/webp);
+ * - Pi family: the file's real path must be DIRECTLY inside the real path of `os.tmpdir()`;
+ * - herdr family: the file's real directory must be DIRECTLY inside the real `os.tmpdir()` and be named
+ *   `herdr-clipboard-images-<uid>` for the current uid (no uid, no herdr family); that directory must be a real
+ *   directory (not a symlink), owned by the current uid, with no group/other permission bits; the file must be
+ *   owned by the current uid;
  * - it must be a regular file itself (a symlink is rejected even if it points to a file);
  * - its size must be > 0 and <= 20 MiB, enforced on the bytes actually read;
  * - the read goes through a handle opened with O_NOFOLLOW | O_NONBLOCK whose dev/ino match the lstat.
  *
- * Failing the name, location, file-type or existence check means "not an image": the path stays plain text.
- * An empty or oversized clipboard file is reported (`problem`) so the caller can tell the user.
+ * Failing the name, location, directory, owner, file-type or existence check means "not an image": the path
+ * stays plain text. An empty or oversized clipboard file is reported (`problem`) so the caller can tell the user.
  */
 
 import { constants } from "node:fs";
@@ -23,15 +28,38 @@ export const MAX_PASTED_IMAGE_BYTES = 20 * 1024 * 1024;
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const CLIPBOARD_NAME = new RegExp(`^pi-clipboard-${UUID}\\.(png|jpe?g|gif|webp)$`);
+/** herdr's clipboard file name (R29), inside `herdr-clipboard-images-<uid>`. */
+const HERDR_NAME = /^client-\d+-clipboard-\d+-\d+\.(png|jpe?g|gif|webp)$/;
+const HERDR_DIR_PREFIX = "herdr-clipboard-images-";
+const PI_TAIL = `pi-clipboard-${UUID}\\.(?:png|jpe?g|gif|webp)`;
+const HERDR_TAIL = `${HERDR_DIR_PREFIX}\\d+/client-\\d+-clipboard-\\d+-\\d+\\.(?:png|jpe?g|gif|webp)`;
 /**
- * An absolute path ending in a clipboard name. Before it: start, whitespace, a quote or a backtick (or an
- * opening bracket). After it: end, whitespace, a quote, a backtick, a closing bracket, or sentence punctuation
- * that is itself followed by whitespace or the end (so `x.png.bak` or `x.png/y` never match).
+ * An absolute path ending in a clipboard name of either family. Before it: start, whitespace, a quote or a
+ * backtick (or an opening bracket). After it: end, whitespace, a quote, a backtick, a closing bracket, or
+ * sentence punctuation that is itself followed by whitespace or the end (so `x.png.bak` or `x.png/y` never match).
  */
 const PASTED_PATH = new RegExp(
-  `(?<=^|[\\s"'\`(\\[<])(/(?:[^\\s"'\`]*/)?pi-clipboard-${UUID}\\.(?:png|jpe?g|gif|webp))(?=$|[\\s"'\`)\\]>]|[.,;:!?](?:$|\\s))`,
+  `(?<=^|[\\s"'\`(\\[<])(/(?:[^\\s"'\`]*/)?(?:${PI_TAIL}|${HERDR_TAIL}))(?=$|[\\s"'\`)\\]>]|[.,;:!?](?:$|\\s))`,
   "g",
 );
+
+/**
+ * Injectable environment (tests use a sandbox). `tmpdir` defaults to the real `os.tmpdir()`, `uid` to
+ * `process.getuid()` (`null` or no `getuid` means the herdr family is not recognized), `lstat` to fs's.
+ */
+export interface PastedEnv {
+  tmpdir?: string;
+  uid?: number | null;
+  lstat?: typeof lstat;
+}
+
+function currentUid(env: PastedEnv): number | null {
+  if ("uid" in env) return env.uid ?? null;
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+
+const isHerdrPath = (p: string, uid: number | null): boolean =>
+  uid !== null && HERDR_NAME.test(basename(p)) && basename(dirname(p)) === `${HERDR_DIR_PREFIX}${uid}`;
 
 const MIME: Record<string, string> = {
   ".png": "image/png",
@@ -41,13 +69,14 @@ const MIME: Record<string, string> = {
   ".webp": "image/webp",
 };
 
-/** Candidate clipboard paths in `text`, in order of first appearance, deduplicated. Purely textual. */
-export function pastedPaths(text: string): string[] {
-  if (!text.includes("pi-clipboard-")) return [];
+/** Candidate clipboard paths of both families in `text`, in order of first appearance, deduplicated. Textual. */
+export function pastedPaths(text: string, env: PastedEnv = {}): string[] {
+  if (!text.includes("pi-clipboard-") && !text.includes(HERDR_DIR_PREFIX)) return [];
+  const uid = currentUid(env);
   const out: string[] = [];
   for (const m of text.matchAll(PASTED_PATH)) {
     const p = m[1] as string;
-    if (CLIPBOARD_NAME.test(basename(p)) && !out.includes(p)) out.push(p);
+    if ((CLIPBOARD_NAME.test(basename(p)) || isHerdrPath(p, uid)) && !out.includes(p)) out.push(p);
   }
   return out;
 }
@@ -79,16 +108,52 @@ const OPEN_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBL
 /** Errors from `open` that mean "not a regular file at the final component": treated as plain text. */
 const NOT_REGULAR = new Set(["ELOOP", "EMLINK", "ENXIO", "EISDIR", "ENOENT", "ENOTDIR"]);
 
-async function readOne(path: string, tmpReal: string, openFile: OpenPasted): Promise<One> {
+/**
+ * The location rule for `real` (a realpath): Pi family directly in the tmpdir; herdr family in herdr's private
+ * per-uid directory directly in the tmpdir, which must be a real directory (the given path's own directory too),
+ * owned by `uid`, with no group/other bits, and the file owned by `uid`.
+ */
+async function placedSafely(
+  path: string,
+  real: string,
+  info: { uid: number },
+  tmpReal: string,
+  uid: number | null,
+  lstatFn: typeof lstat,
+): Promise<boolean> {
+  if (CLIPBOARD_NAME.test(basename(real))) return dirname(real) === tmpReal;
+  if (uid === null || !HERDR_NAME.test(basename(real))) return false;
+  const dirReal = dirname(real);
+  if (dirname(dirReal) !== tmpReal || basename(dirReal) !== `${HERDR_DIR_PREFIX}${uid}`) return false;
+  if (info.uid !== uid) return false;
+  try {
+    const typed = await lstatFn(dirname(path)); // the directory as typed: a symlink there is rejected
+    const dir = await lstatFn(dirReal);
+    if (typed.isSymbolicLink() || !typed.isDirectory() || typed.dev !== dir.dev || typed.ino !== dir.ino) {
+      return false;
+    }
+    return dir.isDirectory() && !dir.isSymbolicLink() && dir.uid === uid && (dir.mode & 0o077) === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function readOne(
+  path: string,
+  tmpReal: string,
+  openFile: OpenPasted,
+  uid: number | null,
+  lstatFn: typeof lstat,
+): Promise<One> {
   let real: string;
   let info: Awaited<ReturnType<typeof lstat>>;
   try {
     real = await realpath(path);
-    info = await lstat(path);
+    info = await lstatFn(path);
   } catch {
     return null; // missing (or the path cannot be resolved): just text
   }
-  if (dirname(real) !== tmpReal || !info.isFile() || !CLIPBOARD_NAME.test(basename(real))) return null;
+  if (!info.isFile() || !(await placedSafely(path, real, info, tmpReal, uid, lstatFn))) return null;
   const name = basename(path);
   const empty = { problem: `the pasted file ${name} is empty` };
   const tooLarge = { problem: `the pasted file ${name} is larger than 20 MiB` };
@@ -138,12 +203,17 @@ async function readOne(path: string, tmpReal: string, openFile: OpenPasted): Pro
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 /** Read the candidate paths that pass every safety check, in order. Stops at the first `problem`. */
-export async function readPastedImages(paths: string[], io: { open?: OpenPasted } = {}): Promise<PastedImages> {
+export async function readPastedImages(
+  paths: string[],
+  io: { open?: OpenPasted } & PastedEnv = {},
+): Promise<PastedImages> {
   const openFile: OpenPasted = io.open ?? ((p, flags) => open(p, flags));
+  const lstatFn = io.lstat ?? lstat;
+  const uid = currentUid(io);
   if (paths.length === 0) return { images: [] };
   let tmpReal: string;
   try {
-    tmpReal = await realpath(tmpdir());
+    tmpReal = await realpath(io.tmpdir ?? tmpdir());
   } catch {
     return { images: [] };
   }
@@ -151,7 +221,7 @@ export async function readPastedImages(paths: string[], io: { open?: OpenPasted 
   for (const p of paths) {
     let one: One;
     try {
-      one = await readOne(p, tmpReal, openFile);
+      one = await readOne(p, tmpReal, openFile, uid, lstatFn);
     } catch (err) {
       one = { problem: `the pasted file ${basename(p)} could not be read (${errMessage(err)})` };
     }

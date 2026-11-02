@@ -6,14 +6,15 @@
  * `ctx.signal` is undefined while the agent is idle, so it is passed through only when Pi has one.
  * Input that arrives while the agent streams (`streamingBehavior` set) is not delegated (ruling R17):
  * the image is not analyzed and the user is told so. Only the `interactive` source is handled (R16).
- * Pi's TUI paste inserts a temp-file PATH instead of an image; such paths are read as images (R18, see
- * `pastedImages.ts`) and replaced in the text by `[pasted image N]`.
+ * Pi's TUI paste inserts a temp-file PATH instead of an image, and so does herdr's paste inside a herdr pane
+ * (R29); such paths are read as images (R18, see `pastedImages.ts`) and replaced in the text by
+ * `[pasted image N]`.
  */
 
 import { type SessionHandoffMessage, sessionBranchMessages } from "../plannerWorker/sessionHandoff.ts";
 import type { VisionDelegateSettings } from "./config.ts";
 import type { VisionDelegator } from "./delegate.ts";
-import { pastedPaths, readPastedImages, rewritePastedText } from "./pastedImages.ts";
+import { type PastedEnv, pastedPaths, readPastedImages, rewritePastedText } from "./pastedImages.ts";
 import type { VisionDelegateOutput } from "./types.ts";
 
 /** The part of `VisionDelegator` the handler calls. */
@@ -65,11 +66,11 @@ function notify(ctx: InputContext, message: string): void {
  * True when this input may need a vision model: interactive input for a model that cannot read images, with
  * images or with pasted clipboard paths (textual check only; the files are checked later).
  */
-function needsVision(event: InputEvent, ctx: InputContext): boolean {
+function needsVision(event: InputEvent, ctx: InputContext, env: PastedEnv = {}): boolean {
   if (event.source !== "interactive") return false;
   const model = ctx.model;
   if (!model || (model.input ?? []).includes("image")) return false;
-  return !!event.images?.length || pastedPaths(event.text ?? "").length > 0;
+  return !!event.images?.length || pastedPaths(event.text ?? "", env).length > 0;
 }
 
 function readSignal(ctx: InputContext): AbortSignal | undefined {
@@ -83,10 +84,13 @@ function readSignal(ctx: InputContext): AbortSignal | undefined {
 type InputResult = VisionDelegateOutput | typeof CONTINUE;
 type BuildDelegator = (ctx: InputContext) => Promise<VisionHandler | null>;
 
-function inputHandler(build: BuildDelegator): (event: InputEvent, ctx: InputContext) => Promise<InputResult> {
+function inputHandler(
+  build: BuildDelegator,
+  env: PastedEnv = {},
+): (event: InputEvent, ctx: InputContext) => Promise<InputResult> {
   return async (event, ctx) => {
-    if (!needsVision(event, ctx)) return CONTINUE;
-    const pasted = await readPastedImages(pastedPaths(event.text ?? ""));
+    if (!needsVision(event, ctx, env)) return CONTINUE;
+    const pasted = await readPastedImages(pastedPaths(event.text ?? "", env), env);
     if (pasted.problem) {
       notify(ctx, notAnalyzed(pasted.problem));
       return CONTINUE;
@@ -144,8 +148,9 @@ function inputHandler(build: BuildDelegator): (event: InputEvent, ctx: InputCont
   };
 }
 
-export function registerVisionDelegation(pi: PiOn, deps: { build: BuildDelegator }): void {
-  pi.on("input", inputHandler(deps.build) as never);
+/** `pasted` overrides the paste-recognition environment (tmpdir, uid); tests use a sandbox. */
+export function registerVisionDelegation(pi: PiOn, deps: { build: BuildDelegator; pasted?: PastedEnv }): void {
+  pi.on("input", inputHandler(deps.build, deps.pasted) as never);
 }
 
 /**
@@ -161,6 +166,8 @@ export function installVisionDelegation(
   deps: {
     loadSettings: () => Promise<VisionDelegateSettings>;
     makeDelegator: (settings: VisionDelegateSettings, current: () => InputContext) => Promise<VisionHandler>;
+    /** The paste-recognition environment (tmpdir, uid); defaults to the real ones. Tests use a sandbox. */
+    pasted?: PastedEnv;
   },
 ): void {
   let settings: VisionDelegateSettings | undefined;
@@ -177,9 +184,9 @@ export function installVisionDelegation(
         throw err;
       });
     return delegator;
-  });
+  }, deps.pasted);
   const gated = async (event: InputEvent, ctx: InputContext): Promise<InputResult> => {
-    if (!needsVision(event, ctx)) return CONTINUE;
+    if (!needsVision(event, ctx, deps.pasted)) return CONTINUE;
     try {
       settings ??= await deps.loadSettings();
     } catch (err) {
