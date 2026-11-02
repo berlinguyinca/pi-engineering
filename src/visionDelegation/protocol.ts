@@ -60,6 +60,7 @@ export function buildRequestFile(req: VisionRequest): string {
 
 /** `<dir>/results/<requestId>.json` */
 export function resultPath(dir: string, requestId: string): string {
+  if (!/^[A-Za-z0-9_-]+$/.test(requestId)) throw new Error(`unsafe requestId: ${JSON.stringify(requestId)}`);
   return `${dir.replace(/\/+$/, "")}/results/${requestId}.json`;
 }
 
@@ -89,6 +90,10 @@ export function parseResult(raw: unknown, req: VisionRequest): ParsedResult {
   for (const entry of raw.images) {
     if (!isRecord(entry) || typeof entry.path !== "string" || typeof entry.sha256 !== "string") {
       return { ok: false, reason: "each images entry needs string path and sha256" };
+    }
+    if (echoed.has(entry.path)) return { ok: false, reason: `duplicate echoed image: ${entry.path}` };
+    if (!req.images.some((i) => i.path === entry.path)) {
+      return { ok: false, reason: `echoed image was not sent: ${entry.path}` };
     }
     echoed.set(entry.path, entry.sha256);
   }

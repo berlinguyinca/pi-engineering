@@ -127,3 +127,32 @@ test("buildRequestFile emits snake_case JSON and resultPath joins results/<id>.j
   assert.equal(parsed.images[0].sha256, A.sha256);
   assert.equal(resultPath("/d", "req-1"), "/d/results/req-1.json");
 });
+
+test("resultPath throws on unsafe request ids and accepts a uuid", () => {
+  for (const id of ["../x", "a/b", "a.b", ""]) assert.throws(() => resultPath("/d", id));
+  const id = "123e4567-e89b-12d3-a456-426614174000";
+  assert.equal(resultPath("/d", id), `/d/results/${id}.json`);
+});
+
+test("parseResult rejects duplicate echoed paths in either order", () => {
+  const wrong = { path: A.path, sha256: "c".repeat(64) };
+  const right = { path: A.path, sha256: A.sha256 };
+  const b = { path: B.path, sha256: B.sha256 };
+  for (const images of [
+    [wrong, right, b],
+    [right, wrong, b],
+  ]) {
+    const r = parseResult(raw({ images }), req);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.reason, /duplicate/);
+  }
+});
+
+test("parseResult rejects an echoed path that was not sent", () => {
+  const r = parseResult(
+    raw({ images: [...(raw().images as object[]), { path: "/x/other.png", sha256: "d".repeat(64) }] }),
+    req,
+  );
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.reason, /not sent/);
+});
