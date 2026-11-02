@@ -16,6 +16,13 @@ import { reusePrompt } from "./requestFiles.ts";
 /** `agent prompt` only submits (the result file is the completion signal), so this is short. */
 const PROMPT_TIMEOUT_MS = 30_000;
 
+/**
+ * Pi `--thinking` level for the vision session (R30). Reasoning is off: a reasoning vision model
+ * (thinking "medium") spent its whole turn looping in its thinking while transcribing a dense
+ * screenshot and never wrote the result file. A pane started before this change keeps its level.
+ */
+export const VISION_THINKING_LEVEL = "off";
+
 /** `vision-<session8>-<request8>`, lowercased, [a-z0-9-] only, at most 32 chars (R9). */
 export function visionAgentName(sessionId: string, requestId: string): string {
   return `vision-${sessionId.slice(0, 8)}-${requestId.slice(0, 8)}`
@@ -53,6 +60,8 @@ export async function startNewPane(
     o.sessionDir,
     "--append-system-prompt",
     join(o.reqDir, "role-prompt.md"),
+    "--thinking",
+    VISION_THINKING_LEVEL,
     `@${join(o.reqDir, "instructions.md")}`,
     `@${join(o.reqDir, "handoff.md")}`,
     ...o.images.map((i) => `@${i.path}`),

@@ -11,6 +11,7 @@ import { VisionDelegator, type VisionDelegatorDeps, visionAgentName } from "../.
 import { resultPath } from "../../src/visionDelegation/protocol.ts";
 import { VisionRegistry } from "../../src/visionDelegation/registry.ts";
 import { VISION_ROLE_PROMPT } from "../../src/visionDelegation/rolePrompt.ts";
+import { VISION_THINKING_LEVEL } from "../../src/visionDelegation/visionPane.ts";
 
 const IMG = { data: Buffer.from("fake png bytes").toString("base64"), mimeType: "image/png" };
 const IMG2 = { data: Buffer.from("second image bytes").toString("base64"), mimeType: "image/jpeg" };
@@ -430,6 +431,11 @@ test("the vision pane is started with --provider, --model, @handoff.md, @image a
     const rolePath = flag("--append-system-prompt");
     assert.ok(rolePath);
     assert.equal(readFileSync(rolePath, "utf8"), VISION_ROLE_PROMPT);
+    // R30: reasoning off, and the flag sits before the @file arguments.
+    assert.equal(args.filter((a) => a === "--thinking").length, 1);
+    assert.equal(flag("--thinking"), "off");
+    assert.equal(flag("--thinking"), VISION_THINKING_LEVEL);
+    assert.ok(args.indexOf("--thinking") < args.findIndex((a) => a.startsWith("@")));
     assert.ok(args.includes(`@${join(dir, "handoff.md")}`));
     assert.ok(args.includes(`@${join(dir, "instructions.md")}`));
     const req = readRequest(dir);
