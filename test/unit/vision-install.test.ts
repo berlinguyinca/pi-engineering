@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +14,7 @@ import {
   installVisionDelegation,
   registerVisionDelegation,
 } from "../../src/visionDelegation/install.ts";
+import { MAX_PASTED_IMAGE_BYTES, readPastedImages } from "../../src/visionDelegation/pastedImages.ts";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
 
@@ -470,6 +472,98 @@ test("R18: the install gate loads settings for a pasted path", async () => {
   assert.equal(await pi.input()(event({ text: path, images: [] }), fakeCtx().ctx), TRANSFORM);
   assert.equal(counts.load, 1);
   assert.equal(d.calls[0]?.text, "[pasted image 1]");
+});
+
+test("R18 fix: a FIFO named like a clipboard file is rejected without hanging", { timeout: 3000 }, async () => {
+  const { pi, d } = setup();
+  const fifo = join(tmpdir(), `pi-clipboard-${randomUUID()}.png`);
+  execFileSync("mkfifo", [fifo]);
+  cleanup.push(fifo);
+  const { ctx, notes } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: fifo, images: [] }), ctx), { action: "continue" });
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 0);
+  assert.deepEqual(await readPastedImages([fifo]), { images: [] });
+});
+
+test("R18 fix: a clipboard-named symlink to a regular file INSIDE tmpdir is rejected (every symlink)", async () => {
+  const { pi, d } = setup();
+  const target = clipboardFile("real-bytes");
+  const link = join(tmpdir(), `pi-clipboard-${randomUUID()}.png`);
+  symlinkSync(target, link);
+  cleanup.push(link);
+  const { ctx, notes } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: link, images: [] }), ctx), { action: "continue" });
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 0);
+});
+
+/** A fake open handle over a real file's identity: `stat` and `read` are scripted. */
+function scriptedOpen(path: string, opts: { size: number; ino?: number; bytesPerRead?: number; endless?: boolean }) {
+  const real = lstatSync(path);
+  const seen = { requestEnd: 0, maxEnd: 0, closed: false, flags: 0 };
+  const open = async (_p: string, flags: number) => {
+    seen.flags = flags;
+    return {
+      stat: async () => ({ isFile: () => true, size: opts.size, dev: real.dev, ino: opts.ino ?? real.ino }),
+      read: async (buf: Buffer, offset: number, length: number) => {
+        seen.requestEnd = Math.max(seen.requestEnd, offset + length);
+        // Ends at `size` unless `endless` (a file that keeps growing past what stat said).
+        const left = opts.endless ? length : Math.max(0, opts.size - offset);
+        const n = Math.min(length, left, opts.bytesPerRead ?? length);
+        buf.fill(0x41, offset, offset + n);
+        seen.maxEnd = Math.max(seen.maxEnd, offset + n);
+        return { bytesRead: n, buffer: buf };
+      },
+      close: async () => {
+        seen.closed = true;
+      },
+    };
+  };
+  return { open: open as never, seen };
+}
+
+test("R18 fix: the byte bound holds on the bytes read, not on stat", async () => {
+  const path = clipboardFile("tiny");
+  const { open, seen } = scriptedOpen(path, { size: 4, bytesPerRead: 1024 * 1024, endless: true });
+  const out = await readPastedImages([path], { open });
+  assert.equal(out.images.length, 0);
+  assert.match(out.problem ?? "", /20 MiB/);
+  assert.ok(seen.maxEnd <= MAX_PASTED_IMAGE_BYTES + 1, `read past cap + 1 (${seen.maxEnd})`);
+  assert.ok(seen.requestEnd <= MAX_PASTED_IMAGE_BYTES + 1, `asked past cap + 1 (${seen.requestEnd})`);
+  assert.equal(seen.closed, true);
+});
+
+test("R18 fix: the file is opened read-only, without following symlinks, non-blocking", async () => {
+  const { constants } = await import("node:fs");
+  const path = clipboardFile("abcd");
+  const { open, seen } = scriptedOpen(path, { size: 4, bytesPerRead: 4 });
+  const out = await readPastedImages([path], { open });
+  assert.equal(seen.flags, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  assert.deepEqual(
+    out.images.map((i) => i.data),
+    [b64("AAAA")],
+    "exactly the bytes read through the handle",
+  );
+});
+
+test("R18 fix: a dev/ino mismatch between lstat and the open handle notifies and continues", async () => {
+  const path = clipboardFile("abcd");
+  const { open, seen } = scriptedOpen(path, { size: 4, ino: lstatSync(path).ino + 1 });
+  const out = await readPastedImages([path], { open });
+  assert.equal(out.images.length, 0);
+  assert.match(out.problem ?? "", /changed/i);
+  assert.equal(seen.closed, true);
+});
+
+test("R18 fix: an injected open that throws never makes readPastedImages reject", async () => {
+  const path = clipboardFile("abcd");
+  const open = (async () => {
+    throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+  }) as never;
+  const out = await readPastedImages([path], { open });
+  assert.equal(out.images.length, 0);
+  assert.match(out.problem ?? "", /could not be read/);
 });
 
 // --- the live extension -----------------------------------------------------------------------------
