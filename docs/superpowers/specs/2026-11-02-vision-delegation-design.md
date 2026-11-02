@@ -92,9 +92,13 @@ regular file, 0 < size <= 20 MiB, and it is read race-safely (`pastedImages.ts`)
 streams is not delegated; the user is told the image was not analyzed.
 
 **Choosing the vision model.** **(call)** An alias from `models.json` whose `input` includes `"image"`,
-preferring the `qwen3.8-vision` family, checked with the alias-aware probe. If none is live, Pi tells the
-user plainly, keeps the image on disk, and continues in text with a visible note. It never falls back
-silently.
+preferring the `qwen3.8-vision` family, checked with the alias-aware probe. The `alias_preference` ids are
+tried first; when none of them is healthy, Pi falls through to any other `models.json` model whose `input`
+includes `"image"`, in file order, and uses the first healthy one. The probe accepts an alias whose members
+are live without an admission entry, but rejects a concrete id that has no fresh admission entry (live
+evidence: "The production probe" in `docs/evidence/vision-delegation-acceptance.md`). If none is healthy,
+Pi tells the user plainly, naming every model and why it was not used, keeps the image on disk, and
+continues in text with a visible note. It never falls back silently.
 
 **Keeping the image.** Each request owns `<agentDir>/vision-delegation/requests/<requestId>/`; the image
 is saved there as `images/<sha256>.<ext>`, so it survives the transform and can be re-examined later.
@@ -108,7 +112,8 @@ the original session's cwd, then `herdr agent start vision-<session8>-<request8>
 --provider <p> --model <m> --session-dir <reqDir>/session --append-system-prompt <reqDir>/role-prompt.md
 @<reqDir>/instructions.md @<reqDir>/handoff.md @<image>...`. The agent name is unique per request (at most
 32 chars, `[a-z0-9-]`). The role prompt tells it to analyze, to report uncertainty, and to write the result
-file below. Later images use `herdr agent prompt <paneId> <text>` with file paths only.
+file below. Later images use `herdr agent prompt <agentName> <text>` with file paths only, addressed by
+the agent's unique name, never by bare pane id (ruling R22).
 
 **Result channel.** **(call)** The vision session writes `<reqDir>/results/<request_id>.json` atomically
 (temp file, then rename). The original session waits for that file with a bounded timeout. Pane output
@@ -120,12 +125,21 @@ is never parsed for the result. Fields: `request_id`, `status` (`ok`, `partial`,
 **Handback.** The handler returns `transform`: the images are removed (so no placeholder is sent), and
 the validated result is appended to the user's text as an explicit "vision analysis from <model>" block
 that states the status and the uncertainties and lists the image paths. `partial` and `failed` are
-stated as such. The text agent is told not to claim detail beyond the block and that the user can ask
+stated as such. Every line of every model-written field (description, text in image, findings, each
+uncertainty) is prefixed with `| ` (a lone `|` for an empty line), the block says only those lines are the
+vision model's words, Pi's own lines never start with `|`, and the status is repeated as the last line, so
+model text cannot forge a status or note line (ruling R23). The same image pasted twice is sent once
+(images are deduplicated by saved path, R24). The text agent is told not to claim detail beyond the block and that the user can ask
 for a second look.
 
 **Reuse.** A registry (`<agentDir>/vision-delegation/registry.json`, lock-protected) maps the original
-session id to the vision pane, agent name, session directory and model. Before reuse, Pi checks the pane is alive (`herdr agent get`). If it is gone, Pi starts a new
-vision session and says so, because earlier images are no longer in its context. Images that arrive while
+session id to the vision pane, agent name, session directory and model. Before reuse, Pi asks for the agent
+by its unique name (`herdr agent get <agentName>`) and requires the answer's `pane_id` to equal the
+registered pane id (ruling R22): the registry is durable, and after a herdr or machine restart, or once the
+vision Pi has exited, the same pane id can hold another agent. On any mismatch (unknown name, different pane)
+the entry is dropped and Pi starts a new vision session and says so, because earlier images are no longer in
+its context; the unconfirmed pane is never prompted and never closed. A herdr error during the check keeps
+the entry and fails that one image explicitly. Images that arrive while
 one is being analyzed queue behind it.
 
 **Lineage.** Two events per delegation through `LineageEmitter.handoff`: out, id
@@ -170,12 +184,16 @@ Settled by the author. They do not change what gets built, and the user can over
   that arrives after the deadline is left on disk and never injected. The `rpc` source is not handled in the first version (it continues
   as today). The builder checks how Pi serializes a second message that arrives while the handler waits;
   the rule is that images queue behind the one in flight.
-- **Reuse mechanism.** Later images use `herdr agent prompt <paneId> <text>` (submit only, no `--wait`);
+- **Reuse mechanism.** Later images use `herdr agent prompt <agentName> <text>` (submit only, no `--wait`);
   the result file is the completion signal (`docs/evidence/vision-delegation-prompt-spike.md`).
-- **Failure semantics.** Pane dead mid-analysis: fail at once. Result for a different `request_id`: ignore
+- **Failure semantics.** Pane dead mid-analysis: fail at once. Agent idle or done on 4 consecutive pane
+  checks, at least 30 s after delivery, with no result file: fail at once as "the vision agent stopped
+  without writing a result" (ruling R26). Result for a different `request_id`: ignore
   it and keep waiting. No automatic retry in the first version; the user is told and can paste again.
-  Every outcome without an accepted result (start failure, pane dead, rejected result, timeout) closes the
-  vision pane best effort, and a reused session that failed is dropped from the registry.
+  Every outcome without an accepted result (start failure, pane dead, agent stopped, rejected result,
+  timeout) closes the vision pane best effort, and a reused session that failed is dropped from the
+  registry. Pi only closes a pane this call created or whose identity (name and pane id) it confirmed at the
+  start of this call.
 - **Registry.** Keyed by the original Pi session id. The builder confirms where Pi exposes that id to an
   extension and whether it survives resume or fork. The registry lives at
   `<agentDir>/vision-delegation/registry.json`, and a stale entry is detected with `herdr agent get`.
@@ -250,13 +268,22 @@ live vision alias is the acceptance check.
 
 ## Known limits
 
-- No cancel: a delegation runs until a result, a dead pane or `wait_seconds`.
-- No cleanup: request directories under `<agentDir>/vision-delegation/requests/` are never removed.
+- No cancel: a delegation runs until a result, a dead pane, an idle agent (R26) or `wait_seconds`.
+- No cleanup: request directories under `<agentDir>/vision-delegation/requests/` are kept until the user
+  deletes them. Each keeps its `handoff.md`, a copy of recent session context that may contain secrets,
+  next to the saved images and the vision session's transcript.
+- No lifetime hook: vision panes and their Pi processes are not closed when the text session ends, the user
+  quits Pi, or the session is switched. A reused session's pane stays open until a delegation in it fails or
+  the user closes it.
+- Orphan panes: if a reused vision Pi exits between requests, its shell pane is left behind. Pi never
+  auto-closes a pane whose identity it has not confirmed in the same call (ruling R22), so that pane, or any
+  pane where another agent now runs, is left for the user to close.
 - A TMPDIR containing spaces is not supported: a pasted clipboard path with a space is not recognized and
   stays plain text.
 - Streaming input (an image pasted while the agent streams) is not delegated, and that path was checked
   from source only, never live.
-- A vision agent that stays alive but never answers (for example on a model id the gateway does not serve)
-  is reported only at `wait_seconds`. A dead pane is detected at once since ruling R21: herdr 0.9.1 answers
-  `agent_not_found` (JSON on stderr, exit 1) and `RealHerdrCli.getAgent` maps exactly that to `null`.
+- A vision agent that keeps `working` but never answers is reported only at `wait_seconds`. One that sits
+  idle without a result (for example on a model id the gateway does not serve) is reported after about 30 s
+  (ruling R26). A dead pane is detected at once since ruling R21: herdr 0.9.1 answers `agent_not_found`
+  (JSON on stderr, exit 1) and `RealHerdrCli.getAgent` maps exactly that to `null`.
 - Acceptance run and the gaps found there: `docs/evidence/vision-delegation-acceptance.md`.

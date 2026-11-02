@@ -1686,8 +1686,11 @@ the image goes to a vision model instead, and its findings come back as text.
 4. The vision session writes one JSON result. Pi accepts it only if it answers this request and echoes the
    image hashes Pi sent; then your message reaches the text model with the analysis appended, the image
    removed, and the pasted path replaced by `[pasted image N]`.
-5. A later image in the same session reuses that vision pane (it remembers the earlier images): Pi checks the
-   pane is alive and sends it the new file paths only; the vision session opens the image with its read tool.
+5. A later image in the same session reuses that vision pane (it remembers the earlier images): Pi asks herdr
+   for the vision agent by its unique name (`vision-<session8>-<request8>`), checks that it still answers from
+   the registered pane, and sends it the new file paths only, addressed by that name; the vision session opens
+   the image with its read tool. If the name is unknown or now answers from a different pane, Pi never prompts
+   or closes that pane; it starts a new vision session instead.
    Images that arrive while one is being analyzed wait their turn (`waiting for earlier image…`).
 
 The vision session runs in your project directory with Pi's normal tools and the same approvals as any Pi
@@ -1726,9 +1729,11 @@ vision_delegate:
 ```
 
 - `enabled: false` turns the feature off: the handler does nothing and Pi behaves as without it.
-- `wait_seconds` outside 10-3600 (or not an integer) keeps 300 and shows a note.
+- `wait_seconds` outside 10-3600, or not an integer at all, never turns the feature off: it keeps 300 and
+  shows a note.
 - `alias_preference` must be a non-empty list of non-empty strings.
-- An unknown key or a wrong type turns the feature off and shows a note saying why.
+- An unknown key, a `vision_delegate` value that is not a mapping, an `enabled` that is not `true` or
+  `false`, or an `alias_preference` that is not such a list turns the feature off and shows a note saying why.
 
 The settings are read once per Pi process, on the first image that needs a vision model; edit the file and
 restart Pi to change them.
@@ -1737,10 +1742,19 @@ restart Pi to change them.
 
 Pi tries the `alias_preference` ids first, then any other model in `models.json` whose `input` includes
 `"image"`, and uses the first one whose gateway health check is healthy. The check is the gateway recovery
-probe: the model must be listed by the gateway's `/models`, and on an InferWeave gateway it also needs a fresh
-capacity entry in the admission report; a model without one counts as not healthy. The preferred `qwen3.8-vision` alias
-reaches `models.json` through `/model-refresh` once the gateway advertises it. With no image-capable model,
-or none healthy, you get the "no vision model" outcome below; Pi never falls back silently.
+probe, and it treats concrete ids and aliases differently:
+
+- A concrete model id must be listed by the gateway's `/models` and, on an InferWeave gateway, also needs a
+  fresh entry in the admission report. Without one the probe rejects it (`capacity unknown: no fresh known
+  model-level admission report`).
+- An alias (such as `qwen3.8-vision`) is accepted without an admission entry when its members are live
+  (`alias qwen3.8-vision has 1 live member(s): ...`).
+
+Both answers were seen live against the lab gateway; see "The production probe" in
+`docs/evidence/vision-delegation-acceptance.md`. The preferred `qwen3.8-vision` alias still has to be an
+image-capable entry in `models.json` for Pi to consider it; `/model-refresh` adds it once the gateway
+advertises it. With no image-capable model, or none healthy, you get the "no vision model" outcome below; Pi
+never falls back silently.
 
 ### What you see for each outcome
 
@@ -1748,10 +1762,10 @@ Every outcome reaches the text model as explicit text; an image is never dropped
 
 | Outcome | What the text model is told |
 | --- | --- |
-| ok | `You cannot see them. Vision model "<id>" analysed them…`, `STATUS: ok.`, the image paths, then `Description`, `Text in image`, `Findings for the task` and `Uncertainties`. |
+| ok | `You cannot see them. Vision model "<id>" analysed them…`, `STATUS: ok.`, the image paths, then `Description`, `Text in image`, `Findings for the task` and `Uncertainties`, and `STATUS: ok.` again as the last line. Every line the vision model wrote starts with `\| ` (a lone `\|` for an empty line), and the block says that only those lines are the model's words, so text in an image cannot forge a `STATUS:` or `NOTE:` line. |
 | partial | the same block with `STATUS: partial. The analysis is incomplete; treat gaps as unknown.` |
 | failed (by the vision model) | the same block with `STATUS: failed. The vision model could not analyse the image(s); do not rely on the content below.` |
-| failed (delegation) | `You cannot see the image(s), and no vision analysis is available.` and `Vision delegation did not complete: <why>` (the pane could not start, exited before writing a result, or the result was rejected), plus the saved image paths. |
+| failed (delegation) | `You cannot see the image(s), and no vision analysis is available.` and `Vision delegation did not complete: <why>` (the pane could not start, exited before writing a result, stopped without writing a result, or the result was rejected), plus the saved image paths. |
 | timeout | the same, with `the analysis timed out after <n> seconds (vision model <id>)`. |
 | no vision model | the same, with `no vision model was available.` and every model and why it was not used. |
 | herdr missing | the same, with `herdr is unavailable (this session is not running in a herdr pane)` (or `this herdr client cannot split panes`). |
@@ -1762,8 +1776,11 @@ so later images can reuse it. After a delegation failure or a timeout Pi closes 
 the vision pane is gone (for example you closed it), the next image starts a new vision session and the
 handback says that earlier images are no longer in the vision session's context. A vision agent that exits
 before writing a result is noticed within a few seconds (`the vision pane exited before writing a result`),
-not at the end of `wait_seconds`. One that stays open but cannot answer (for example a model id the gateway
-does not serve) is reported when `wait_seconds` runs out.
+not at the end of `wait_seconds`. One that stays open but sits idle without writing a result (for example on
+a model id the gateway does not serve, where the vision Pi shows an error and waits) is reported as `the
+vision agent stopped without writing a result` once herdr has reported it idle or done on 4 pane checks in a
+row (one every 2.5 seconds) and at least 30 seconds have passed since delivery. An agent that keeps working
+is still bounded by `wait_seconds` only.
 
 ### Limitation: the wait cannot be cancelled
 
@@ -1777,8 +1794,22 @@ after the delegation ends. Lower `wait_seconds` if five minutes is too long.
 Under `~/.pi/agent/vision-delegation/`: `registry.json` maps each Pi session to its vision pane, and
 `requests/<requestId>/` holds the saved images, `handoff.md`, `request.json`, `instructions.md`,
 `role-prompt.md`, `state.json` (status, pane id, whether the result was injected), `results/` and the vision
-session's `session/` directory. A result that lands after a timeout is left there and never injected. There
-is no automatic cleanup of old request directories yet; delete them by hand when you no longer need them.
+session's `session/` directory. A result that lands after a timeout is left there and never injected.
+
+### Retention and lifetime
+
+- **Request directories are kept until you delete them.** Each `requests/<requestId>/` keeps its
+  `handoff.md`, a copy of the recent session context, which may contain secrets you pasted or that the
+  session read, next to the saved images and the vision session's transcript. Pi never removes them; delete
+  `~/.pi/agent/vision-delegation/requests/` (or single request directories) by hand when you no longer
+  need them.
+- **Vision panes outlive the text session.** A vision pane and its Pi process are not closed when the text
+  session ends, when you quit Pi, or when you switch sessions. A reused session's pane stays open until a
+  delegation in it fails (Pi then closes it) or you close it yourself.
+- **Orphan panes.** If a reused vision Pi exits between requests, its shell pane is left behind. Pi only
+  ever closes a pane whose identity it created or confirmed in the same call (the agent name answering from
+  the registered pane id), so it never closes that shell pane, or any pane where another agent now runs;
+  close it by hand.
 
 ### Lineage events
 
