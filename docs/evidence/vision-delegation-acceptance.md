@@ -395,3 +395,20 @@ stale entry. Phase c, which timed out at 45 s in runs 3 and 5, now fails about 3
 before its 120 s bound. No `getAgent threw` line appeared. The handbacks of a, b and d show the R23 format:
 `Only lines starting with "| " are the vision model's words ...`, every model line prefixed with `| `, and
 `STATUS: ok.` repeated as the last line.
+
+## Found in a real session (2026-11-02): herdr's paste files were not recognized (ruling R29)
+
+A user session running in a herdr pane, with a text-only model, pasted a screenshot. herdr, not Pi, wrote
+the image to `<tmpdir>/herdr-clipboard-images-501/client-20-clipboard-1793659534374099000-0.png` (directory
+`drwx------`, file `-rw-------`, both owned by the user) and typed that path into the pane. The shipped
+recognizer only knew Pi's own `pi-clipboard-<uuid>` names, so `pastedPaths` returned `[]` and the feature
+never fired: the text model got the bare path, its `read` tool answered "Current model does not support
+images", and it improvised a manual nested `pi --print` call with the vision alias.
+
+The fix (commit `864167d8`) recognizes herdr's family with the same race-safe read as Pi's, plus checks for
+herdr's private directory (a real directory directly inside the real tmpdir, named for the current uid, owned
+by it, with no group/other bits) and the file's owner. Tests build a sandbox tmpdir
+(`test/unit/vision-pasted-herdr.test.ts`, one install-level test in `test/unit/vision-install.test.ts`).
+
+Read-only recognition probe on the real file (only metadata printed, never the bytes): at the old HEAD
+`e6964093`, recognized no, accepted no; with the fix, recognized yes, accepted yes, 314997 bytes, `image/png`.

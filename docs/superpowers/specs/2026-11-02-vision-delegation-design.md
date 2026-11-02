@@ -85,10 +85,17 @@ Calls marked **(call)** are the author's, not the user's.
 
 **Interceptor.** One `input` handler, always registered. It acts only on `interactive` input when
 `ctx.model` lacks image input and the input carries an image; otherwise it returns `continue`. Images arrive
-two ways: `event.images` (CLI `pi @img`, SDK callers) and, for a TUI paste, as text: Pi's Ctrl+V writes
-`<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the PATH, never an image. A path counts as an image only
-when the basename is exactly Pi's clipboard name, its real path is directly inside the real tmpdir, it is a
-regular file, 0 < size <= 20 MiB, and it is read race-safely (`pastedImages.ts`). Input sent while the agent
+two ways: `event.images` (CLI `pi @img`, SDK callers) and, for a paste, as text. Two families of paste
+files are recognized: Pi's Ctrl+V writes `<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts the PATH, never an
+image; inside a herdr pane, herdr writes `<tmpdir>/herdr-clipboard-images-<uid>/client-<n>-clipboard-<d>-<k>.<ext>`
+and types that PATH (ruling R29). A path counts as an image only when the basename is exactly its family's
+clipboard name (png/jpg/jpeg/gif/webp); for Pi's family its real path is directly inside the real tmpdir; for
+herdr's family its real directory is directly inside the real tmpdir and named `herdr-clipboard-images-<uid>`
+for the current `process.getuid()` (no `getuid`, no herdr family), that directory is a real directory (lstat,
+not a symlink) owned by the current uid with `(mode & 0o077) === 0`, and the file is owned by the current uid;
+in both families the file is a regular file (not a symlink), 0 < size <= 20 MiB, and it is read race-safely
+(realpath, lstat, open with O_RDONLY|O_NOFOLLOW|O_NONBLOCK, same dev/ino on the handle, bounded read;
+`pastedImages.ts`). Accepted paths become `[pasted image N]` in the delegated text. Input sent while the agent
 streams is not delegated; the user is told the image was not analyzed.
 
 **Choosing the vision model.** **(call)** An alias from `models.json` whose `input` includes `"image"`,

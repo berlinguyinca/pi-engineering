@@ -1703,17 +1703,30 @@ sent again when the agent is idle.
 
 ### How pasted screenshots are recognized
 
-Pi's TUI does not attach a pasted image to the message. Ctrl+V writes the clipboard to
-`<tmpdir>/pi-clipboard-<uuid>.<ext>` and inserts that path as text. The handler treats a path in your message
-as an image only when all of these hold, so a typed path can never make Pi read an arbitrary file:
+A pasted screenshot reaches the message as a file path, not as an attachment, from one of two sources:
 
-- the file name is exactly Pi's clipboard name (`pi-clipboard-<uuid>` with `.png`, `.jpg`, `.jpeg`, `.gif`
-  or `.webp`);
-- its real path is directly inside the real temp directory (no subdirectory, no symlink);
-- it is a regular file larger than 0 bytes and at most 20 MiB, read through a handle that is checked against
-  the file that was inspected.
+- **Pi's own paste.** Pi's TUI Ctrl+V writes the clipboard to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and
+  inserts that path as text.
+- **herdr's paste.** Inside a herdr pane, herdr (not Pi) writes the image to
+  `<tmpdir>/herdr-clipboard-images-<uid>/client-<n>-clipboard-<digits>-<k>.<ext>` and types that path into
+  the pane.
 
-Anything else stays plain text. An empty or oversized clipboard file gives a warning instead. Images given on
+The handler finds such paths anywhere in your message (bare, quoted or in backticks, several, in order) and
+treats one as an image only when all of these hold, so a typed path can never make Pi read an arbitrary file:
+
+- the file name is exactly the clipboard name of its family: `pi-clipboard-<uuid>`, or
+  `client-<digits>-clipboard-<digits>-<digits>`, with `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp` and nothing
+  after it;
+- for Pi's files, the real path is directly inside the real temp directory (no subdirectory);
+- for herdr's files, the real directory is directly inside the real temp directory and is named exactly
+  `herdr-clipboard-images-<uid>` for your own user id; that directory is a real directory (not a symlink),
+  owned by you, and readable by nobody else (no group or other permission bits); the file is owned by you.
+  Where the user id is unavailable, herdr's files are not recognized;
+- the file itself is not a symlink, and it is a regular file larger than 0 bytes and at most 20 MiB, read
+  through a handle that is checked against the file that was inspected.
+
+Anything else stays plain text. An empty or oversized clipboard file gives a warning instead. A recognized path
+is replaced by `[pasted image N]` in the text sent on, so the file's location is not repeated. Images given on
 the command line or by an SDK caller arrive as real attachments and are delegated the same way.
 
 ### Settings and the kill switch
