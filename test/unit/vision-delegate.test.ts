@@ -551,10 +551,13 @@ test("a throwing getAgent is not a dead pane and does not end the wait", async (
 });
 
 test("two delegations in the same session use different agent names", async () => {
-  const s = setup();
+  // The first pane is gone by the second image, so a second agent is started (no reuse).
+  let firstDone = false;
+  const s = setup({}, { getAgent: async (t) => (firstDone && t === "vision-pane-1" ? null : liveAgent(t)) });
   try {
     s.clock.at(1000, () => writeResult(s.reqDir("req-1"), "req-1"));
     assert.match(transformText(await s.delegator.handle(input())), /STATUS: ok/);
+    firstDone = true;
     s.clock.at(s.clock.now() + 1000, () => writeResult(s.reqDir("req-2"), "req-2"));
     assert.match(transformText(await s.delegator.handle(input())), /STATUS: ok/);
     const names = s.calls.filter((c) => c.method === "startAgent").map((c) => c.args[2]);

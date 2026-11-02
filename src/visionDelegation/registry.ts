@@ -16,6 +16,8 @@ export interface RegistryEntry {
   agentName: string;
   sessionDir: string;
   startedAt: string;
+  /** Model the pane runs (absent in entries written before reuse existed). */
+  model?: { provider: string; id: string };
 }
 
 export interface RegistryOptions {

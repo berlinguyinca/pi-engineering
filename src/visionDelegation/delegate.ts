@@ -1,6 +1,9 @@
 /**
- * First vision delegation: hand pasted images to a vision model in a new herdr
- * pane, wait for its result file, and return the analysis as text.
+ * Vision delegation: hand pasted images to a vision model in a herdr pane,
+ * wait for its result file, and return the analysis as text. The first image
+ * of a session starts a new pane; later ones prompt the same registered pane
+ * (after `getAgent` confirms it is alive) with file paths only. Calls for one
+ * session queue behind each other; a reused session that fails is dropped.
  *
  * Every outcome other than "no images" becomes explicit text; nothing throws
  * out of `handle`, and every failure names the saved image paths so the
@@ -14,7 +17,7 @@ import { join } from "node:path";
 
 import { type SessionHandoffMessage, buildSessionHandoff } from "../plannerWorker/sessionHandoff.ts";
 import type { ProbeResult } from "../resilience/probe.ts";
-import type { HerdrCli } from "../runtime/herdr/HerdrCli.ts";
+import type { HerdrAgent, HerdrCli } from "../runtime/herdr/HerdrCli.ts";
 import { chooseVisionModel } from "./chooseModel.ts";
 import type { VisionDelegateSettings } from "./config.ts";
 import { saveImages } from "./images.ts";
@@ -27,7 +30,7 @@ import {
   renderHandback,
   resultPath,
 } from "./protocol.ts";
-import type { VisionRegistry } from "./registry.ts";
+import type { RegistryEntry, VisionRegistry } from "./registry.ts";
 import { VISION_ROLE_PROMPT } from "./rolePrompt.ts";
 
 export type LineageOutcome = "ok" | "partial" | "failed" | "timeout";
@@ -81,6 +84,10 @@ type WaitOutcome =
   | { kind: "pane_dead" };
 
 const POLL_MS = 500;
+/** `agent prompt` only submits (the result file is the completion signal), so this is short. */
+const PROMPT_TIMEOUT_MS = 30_000;
+const RESTART_NOTE =
+  "Note: the earlier vision session had closed, so a new one was started. Earlier images from this conversation are no longer in the vision session's context.";
 /** Every Nth poll asks herdr whether the vision pane still exists. */
 const PANE_CHECK_EVERY = 5;
 
@@ -96,13 +103,40 @@ const errText = (err: unknown): string => (err instanceof Error ? err.message : 
 
 export class VisionDelegator {
   private readonly deps: VisionDelegatorDeps;
+  /** Tail of each session's queue; dropped once that session is idle. */
+  private readonly chains = new Map<string, Promise<void>>();
 
   constructor(deps: VisionDelegatorDeps) {
     this.deps = deps;
   }
 
+  /** Calls for one session run strictly one after another, in call order; sessions run independently. */
   async handle(input: VisionDelegateInput): Promise<VisionDelegateOutput> {
     if (input.images.length === 0) return { action: "continue" };
+    const { sessionId } = input;
+    const prev = this.chains.get(sessionId);
+    if (prev) safeStatus(input, "waiting for earlier image…");
+    const run = (prev ?? Promise.resolve()).then(async () => {
+      if (prev) safeStatus(input, undefined);
+      try {
+        return await this.handleOne(input);
+      } catch (err) {
+        return this.failure({ ...input, text: "" }, [], `vision delegation failed unexpectedly (${errText(err)})`);
+      }
+    });
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.chains.set(sessionId, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.chains.get(sessionId) === tail) this.chains.delete(sessionId);
+    }
+  }
+
+  private async handleOne(input: VisionDelegateInput): Promise<VisionDelegateOutput> {
     let requestId: string;
     let reqDir: string;
     try {
@@ -119,13 +153,41 @@ export class VisionDelegator {
     } catch (err) {
       return this.failure(input, [], `the image(s) could not be saved (${errText(err)})`);
     }
+    if (input.signal?.aborted) {
+      return this.failure(input, images, "the delegation was cancelled before the vision model answered");
+    }
 
-    const { herdr, originPaneId } = this.deps;
+    const { herdr, originPaneId, registry } = this.deps;
+    let restarted = false;
+    let entry: RegistryEntry | undefined;
+    try {
+      entry = registry.get(input.sessionId);
+    } catch {
+      entry = undefined; // an unreadable registry only costs reuse
+    }
+    if (entry) {
+      let agent: HerdrAgent | null;
+      try {
+        agent = await herdr.getAgent(entry.paneId);
+      } catch (err) {
+        // Not proof the pane is gone: keep the entry, start nothing, fail this one explicitly.
+        const why = `the open vision session is unavailable (herdr could not check pane ${entry.paneId}: ${errText(err)})`;
+        return this.failure(input, images, why);
+      }
+      if (agent !== null) {
+        const model = entry.model ?? { provider: "unknown", id: "the open vision session" };
+        return this.delegate(input, requestId, reqDir, images, model, { reuse: entry });
+      }
+      this.forget(input.sessionId);
+      restarted = true;
+    }
+    const failure = (why: string) => this.failure(input, images, why, restarted);
+
     if (!herdr.splitPane || !originPaneId) {
       const why = !herdr.splitPane
         ? "this herdr client cannot split panes"
         : "this session is not running in a herdr pane";
-      return this.failure(input, images, `herdr is unavailable (${why})`);
+      return failure(`herdr is unavailable (${why})`);
     }
 
     let model: { provider: string; id: string };
@@ -135,14 +197,28 @@ export class VisionDelegator {
         preference: this.deps.settings.aliasPreference,
         probeFor: this.deps.probeFor,
       });
-      if ("none" in chosen) return this.failure(input, images, `no vision model was available.\n${chosen.reason}`);
-      model = chosen;
+      if ("none" in chosen) return failure(`no vision model was available.\n${chosen.reason}`);
+      model = { provider: chosen.provider, id: chosen.id };
     } catch (err) {
-      return this.failure(input, images, `no vision model was available (${errText(err)})`);
+      return failure(`no vision model was available (${errText(err)})`);
     }
+    return this.delegate(input, requestId, reqDir, images, model, { originPaneId, restarted });
+  }
 
-    const agentName = visionAgentName(input.sessionId, requestId);
-    const sessionDir = join(reqDir, "session");
+  /** Delivers one request (new pane, or a prompt to the reused one), waits, and hands back. */
+  private async delegate(
+    input: VisionDelegateInput,
+    requestId: string,
+    reqDir: string,
+    images: SavedImage[],
+    model: { provider: string; id: string },
+    via: { reuse: RegistryEntry } | { originPaneId: string; restarted: boolean },
+  ): Promise<VisionDelegateOutput> {
+    const { herdr } = this.deps;
+    const reuse = "reuse" in via ? via.reuse : undefined;
+    const restarted = "restarted" in via && via.restarted;
+    const agentName = reuse?.agentName ?? visionAgentName(input.sessionId, requestId);
+    const sessionDir = reuse?.sessionDir ?? join(reqDir, "session");
     const request: VisionRequest = {
       requestId,
       sessionId: input.sessionId,
@@ -160,8 +236,9 @@ export class VisionDelegator {
         toModel: `${model.provider}/${model.id}`,
         outcome,
       });
-    let paneId: string | undefined;
+    let paneId: string | undefined = reuse?.paneId;
     // Every non-ok outcome: record state first, then close the pane best effort.
+    // A reused session that failed is no longer trusted: drop it so the next image starts clean.
     const fail = async (
       status: RequestState,
       outcome: LineageOutcome,
@@ -170,6 +247,7 @@ export class VisionDelegator {
     ): Promise<VisionDelegateOutput> => {
       lineage("back", outcome);
       await this.writeState(reqDir, { requestId, status, paneId, reason });
+      if (reuse) this.forget(input.sessionId);
       if (paneId !== undefined) {
         try {
           await herdr.closePane(paneId);
@@ -177,53 +255,70 @@ export class VisionDelegator {
           // Best effort: a pane that will not close never changes the answer.
         }
       }
-      return this.failure(input, images, why);
+      return this.failure(input, images, why, restarted);
     };
 
     try {
       await this.writeRequestFiles(reqDir, request, input);
-      await mkdir(sessionDir, { recursive: true });
-      await this.writeState(reqDir, { requestId, status: "waiting" });
-      lineage("out", "ok");
-      paneId = (await herdr.splitPane({ paneId: originPaneId, cwd: input.cwd, direction: "right" })).paneId;
       await this.writeState(reqDir, { requestId, status: "waiting", paneId });
-      await herdr.startAgent(paneId, "pi", agentName, [
-        "--provider",
-        model.provider,
-        "--model",
-        model.id,
-        "--session-dir",
-        sessionDir,
-        "--append-system-prompt",
-        join(reqDir, "role-prompt.md"),
-        `@${join(reqDir, "instructions.md")}`,
-        `@${join(reqDir, "handoff.md")}`,
-        ...images.map((i) => `@${i.path}`),
-      ]);
+      lineage("out", "ok");
+      if (reuse) {
+        await herdr.prompt(reuse.paneId, reusePrompt(reqDir, request), PROMPT_TIMEOUT_MS);
+      } else if ("originPaneId" in via) {
+        await mkdir(sessionDir, { recursive: true });
+        const split = await herdr.splitPane?.({ paneId: via.originPaneId, cwd: input.cwd, direction: "right" });
+        if (!split) throw new Error("this herdr client cannot split panes");
+        paneId = split.paneId;
+        await this.writeState(reqDir, { requestId, status: "waiting", paneId });
+        await herdr.startAgent(paneId, "pi", agentName, [
+          "--provider",
+          model.provider,
+          "--model",
+          model.id,
+          "--session-dir",
+          sessionDir,
+          "--append-system-prompt",
+          join(reqDir, "role-prompt.md"),
+          `@${join(reqDir, "instructions.md")}`,
+          `@${join(reqDir, "handoff.md")}`,
+          ...images.map((i) => `@${i.path}`),
+        ]);
+      }
     } catch (err) {
-      return fail("failed", "failed", `starting the vision pane failed (${errText(err)})`, errText(err));
+      const step = reuse ? "prompting the open vision session" : "starting the vision pane";
+      return fail("failed", "failed", `${step} failed (${errText(err)})`, errText(err));
     }
+    if (paneId === undefined) return fail("failed", "failed", "no vision pane was available");
 
-    input.status?.("analyzing image…");
+    safeStatus(input, "analyzing image…");
     let outcome: WaitOutcome;
     try {
       outcome = await this.waitForResult(reqDir, request, paneId, input.signal);
     } catch (err) {
       outcome = { kind: "invalid", reason: errText(err) };
     } finally {
-      input.status?.(undefined);
+      safeStatus(input, undefined);
     }
 
     if (outcome.kind === "result") {
       const { result } = outcome;
       lineage("back", result.status);
       await this.writeState(reqDir, { requestId, status: "done", paneId, resultStatus: result.status });
-      try {
-        this.deps.registry.set(input.sessionId, { paneId, agentName, sessionDir, startedAt: request.createdAt });
-      } catch {
-        // Registry failure only costs reuse later; the analysis is still delivered.
+      if (!reuse) {
+        try {
+          this.deps.registry.set(input.sessionId, {
+            paneId,
+            agentName,
+            sessionDir,
+            startedAt: request.createdAt,
+            model,
+          });
+        } catch {
+          // Registry failure only costs reuse later; the analysis is still delivered.
+        }
       }
-      return { action: "transform", text: renderHandback(input.text, result, model.id, images), images: [] };
+      const handback = renderHandback(input.text, result, model.id, images);
+      return { action: "transform", text: restarted ? `${handback}\n\n${RESTART_NOTE}` : handback, images: [] };
     }
     if (outcome.kind === "timeout") {
       const secs = this.deps.settings.waitSeconds;
@@ -240,6 +335,14 @@ export class VisionDelegator {
     return fail("failed", "failed", why, outcome.reason);
   }
 
+  private forget(sessionId: string): void {
+    try {
+      this.deps.registry.remove(sessionId);
+    } catch {
+      // A locked registry only risks one more stale check later (getAgent catches it).
+    }
+  }
+
   private async waitForResult(
     reqDir: string,
     request: VisionRequest,
@@ -248,14 +351,17 @@ export class VisionDelegator {
   ): Promise<WaitOutcome> {
     const file = resultPath(reqDir, request.requestId);
     const deadline = this.deps.now() + this.deps.settings.waitSeconds * 1000;
+    // Missing, half-written, unparseable, or for another request: undefined, keep waiting.
+    const check = async (): Promise<WaitOutcome | undefined> => {
+      const seen = await readResult(file);
+      if (seen === undefined || !isRecord(seen) || seen.request_id !== request.requestId) return undefined;
+      const parsed = parseResult(seen, request);
+      return parsed.ok ? { kind: "result", result: parsed.result } : { kind: "invalid", reason: parsed.reason };
+    };
     for (let poll = 1; ; poll++) {
       if (signal?.aborted) return { kind: "cancelled" };
-      const seen = await readResult(file);
-      if (seen !== undefined && isRecord(seen) && seen.request_id === request.requestId) {
-        const parsed = parseResult(seen, request);
-        return parsed.ok ? { kind: "result", result: parsed.result } : { kind: "invalid", reason: parsed.reason };
-      }
-      // Missing, half-written, unparseable, or for another request: keep waiting.
+      const seen = await check();
+      if (seen) return seen;
       if (poll % PANE_CHECK_EVERY === 0) {
         let agent: unknown;
         try {
@@ -263,7 +369,8 @@ export class VisionDelegator {
         } catch {
           agent = undefined; // transient herdr error: not proof the pane is gone
         }
-        if (agent === null) return { kind: "pane_dead" };
+        // R12: a result written just before the pane exited still counts.
+        if (agent === null) return (await check()) ?? { kind: "pane_dead" };
       }
       if (this.deps.now() >= deadline) return { kind: "timeout" };
       await this.deps.sleep(POLL_MS);
@@ -325,7 +432,12 @@ export class VisionDelegator {
     }
   }
 
-  private failure(input: VisionDelegateInput, images: SavedImage[], why: string): VisionDelegateOutput {
+  private failure(
+    input: VisionDelegateInput,
+    images: SavedImage[],
+    why: string,
+    restarted = false,
+  ): VisionDelegateOutput {
     const n = input.images.length;
     const ask = input.text.trim();
     const lines = [
@@ -343,7 +455,27 @@ export class VisionDelegator {
     } else {
       lines.push("The image(s) could not be saved to disk; ask the user to paste them again.");
     }
+    if (restarted) lines.push(RESTART_NOTE);
     return { action: "transform", text: lines.join("\n"), images: [] };
+  }
+}
+
+/** Short instructions and absolute paths only: never the handoff body or image data. */
+function reusePrompt(reqDir: string, request: VisionRequest): string {
+  return [
+    `New vision request ${request.requestId}.`,
+    `Read ${join(reqDir, "instructions.md")}, ${join(reqDir, "request.json")} and ${join(reqDir, "handoff.md")},`,
+    `then examine the image(s) with your read tool: ${request.images.map((i) => i.path).join(", ")}.`,
+    `Write the result for request ${request.requestId} to ${resultPath(reqDir, request.requestId)}`,
+    "(temporary file, then rename). Earlier requests are finished; do not rewrite their results.",
+  ].join(" ");
+}
+
+function safeStatus(input: VisionDelegateInput, text: string | undefined): void {
+  try {
+    input.status?.(text);
+  } catch {
+    // A broken status line must never break the delegation.
   }
 }
 
