@@ -16,6 +16,22 @@ export interface DurableMemoryRecord {
   evidenceIds: string[];
   promotedAt: string;
   promotedBy: string;
+  /** Optional Hindsight-era metadata; legacy providers ignore these. */
+  scope?: string; // project | global | infra | mission:<id>
+  bankId?: string;
+  revision?: number;
+  status?: "candidate" | "verified" | "superseded" | "retracted";
+  kind?: string; // verified_fact | decision | preference | hypothesis | failure | procedure
+  provenance?: Record<string, unknown>;
+}
+
+export type RetainOutcome = "persisted" | "queued_durable" | "rejected";
+
+export interface RetainResult {
+  outcome: RetainOutcome;
+  memoryId?: string;
+  bankId?: string;
+  revision?: number;
 }
 
 export interface DurableMemoryProvider {
@@ -24,6 +40,10 @@ export interface DurableMemoryProvider {
   recallAll(): Promise<DurableMemoryRecord[]>;
   /** Search promoted durable memory (simple substring match by default). */
   search(query: string): Promise<DurableMemoryRecord[]>;
+  /** Optional: store with an explicit outcome (never "persisted" unless acknowledged). */
+  retain?(record: DurableMemoryRecord): Promise<RetainResult>;
+  /** Optional: stable cache-key component (scopes + revision epoch) for recall caching. */
+  cacheScope?(): string;
 }
 
 /** Dependency-free in-memory durable store (default provider). */
