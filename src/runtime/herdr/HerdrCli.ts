@@ -50,6 +50,15 @@ export interface HerdrWorkspace {
   path: string;
 }
 
+/** Validate env vars against the safe key/value shapes and return `KEY=value` pairs. */
+function safeEnvPairs(vars: Record<string, string>): string[] {
+  const safe = /^[A-Za-z0-9._:@/-]{1,128}$/;
+  return Object.entries(vars).map(([k, v]) => {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(k) || !safe.test(v)) throw new Error(`refusing to export unsafe value for ${k}`);
+    return `${k}=${v}`;
+  });
+}
+
 /** Thin contract over the Herdr CLI. */
 export interface HerdrCli {
   status(): Promise<HerdrStatus>;
@@ -60,7 +69,15 @@ export interface HerdrCli {
   prompt(target: string, text: string, timeoutMs?: number): Promise<void>;
   /** Wait until the agent reaches one of `until` states or times out. */
   wait(target: string, until: string[], timeoutMs?: number): Promise<HerdrAgent>;
-  startAgent(paneId: string, kind: string, name: string): Promise<void>;
+  /** Start an agent in a pane; `args` are passed after `--` as separate argv entries (never shell-joined). */
+  startAgent(paneId: string, kind: string, name: string, args?: readonly string[]): Promise<void>;
+  /** Split a pane without stealing focus and return the new pane id. Optional: older clients lack it. */
+  splitPane?(opts: {
+    paneId: string;
+    cwd: string;
+    direction?: "right" | "down";
+    env?: Record<string, string>;
+  }): Promise<{ paneId: string }>;
   /** Export environment variables into a pane's shell (before an agent starts there). Optional: older clients lack it. */
   exportEnv?(paneId: string, vars: Record<string, string>): Promise<void>;
   sendKeys(target: string, keys: string): Promise<void>;
@@ -156,17 +173,37 @@ export class RealHerdrCli implements HerdrCli {
   }
 
   async exportEnv(paneId: string, vars: Record<string, string>): Promise<void> {
-    const safe = /^[A-Za-z0-9._:@/-]{1,128}$/;
-    const parts = Object.entries(vars).map(([k, v]) => {
-      if (!/^[A-Z][A-Z0-9_]*$/.test(k) || !safe.test(v)) throw new Error(`refusing to export unsafe value for ${k}`);
-      return `${k}=${v}`;
-    });
+    const parts = safeEnvPairs(vars);
     if (parts.length) await this.run(["pane", "run", paneId, `export ${parts.join(" ")}`]);
   }
 
-  async startAgent(paneId: string, kind: string, name: string): Promise<void> {
+  async startAgent(paneId: string, kind: string, name: string, args: readonly string[] = []): Promise<void> {
     // herdr 0.9.1: the name is positional and the pane flag is --pane
-    await this.run(["agent", "start", name, "--kind", kind, "--pane", paneId]);
+    await this.run(["agent", "start", name, "--kind", kind, "--pane", paneId, ...(args.length ? ["--", ...args] : [])]);
+  }
+
+  async splitPane(opts: {
+    paneId: string;
+    cwd: string;
+    direction?: "right" | "down";
+    env?: Record<string, string>;
+  }): Promise<{ paneId: string }> {
+    const envArgs = safeEnvPairs(opts.env ?? {}).flatMap((pair) => ["--env", pair]);
+    const out = await this.run([
+      "pane",
+      "split",
+      "--pane",
+      opts.paneId,
+      "--direction",
+      opts.direction ?? "right",
+      "--no-focus",
+      "--cwd",
+      opts.cwd,
+      ...envArgs,
+    ]);
+    const paneId = (JSON.parse(out) as { result?: { pane?: { pane_id?: string } } }).result?.pane?.pane_id;
+    if (!paneId) throw new HerdrError("pane_split_no_pane", "pane.split returned no pane");
+    return { paneId };
   }
 
   async sendKeys(target: string, keys: string): Promise<void> {
