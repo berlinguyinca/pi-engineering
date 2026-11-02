@@ -1751,24 +1751,19 @@ Every outcome reaches the text model as explicit text; an image is never dropped
 | ok | `You cannot see them. Vision model "<id>" analysed them…`, `STATUS: ok.`, the image paths, then `Description`, `Text in image`, `Findings for the task` and `Uncertainties`. |
 | partial | the same block with `STATUS: partial. The analysis is incomplete; treat gaps as unknown.` |
 | failed (by the vision model) | the same block with `STATUS: failed. The vision model could not analyse the image(s); do not rely on the content below.` |
-| failed (delegation) | `You cannot see the image(s), and no vision analysis is available.` and `Vision delegation did not complete: <why>` (the pane could not start, exited before writing a result, or the result was rejected; a dead pane is currently only reported as a timeout, see below), plus the saved image paths. |
+| failed (delegation) | `You cannot see the image(s), and no vision analysis is available.` and `Vision delegation did not complete: <why>` (the pane could not start, exited before writing a result, or the result was rejected), plus the saved image paths. |
 | timeout | the same, with `the analysis timed out after <n> seconds (vision model <id>)`. |
 | no vision model | the same, with `no vision model was available.` and every model and why it was not used. |
 | herdr missing | the same, with `herdr is unavailable (this session is not running in a herdr pane)` (or `this herdr client cannot split panes`). |
 | build failure | a warning `The pasted image was not analyzed: vision delegation could not start (<why>)…`; the message goes on unchanged, so the text model sees only Pi's placeholder. Unreadable settings give the same kind of warning. |
 
 The vision pane stays open after an accepted result (`ok`, `partial`, or `failed` reported by the vision model)
-so later images can reuse it. After a delegation failure or a timeout Pi closes it, and a reused session that failed is forgotten, so the next image starts a new one. The design
-is that a vision pane that is gone is replaced by a new one, with a note that earlier images are no longer in
-the vision session's context.
-
-Known gap (found in the acceptance run, `docs/evidence/vision-delegation-acceptance.md`): with herdr 0.9.1,
-`herdr agent get` on a pane that no longer exists exits non-zero with `agent_not_found`, and Pi reads that as
-"herdr could not check the pane", not as "gone". So a vision agent that exits early is reported only when
-`wait_seconds` runs out, and if you close the vision pane yourself every later image in that Pi session fails
-with `the open vision session is unavailable (herdr could not check pane …)`, even after a restart, because the
-registry is kept on disk. Start a new Pi session in that case. Until this is fixed, leave the vision pane open, or delete the session's entry from
-`~/.pi/agent/vision-delegation/registry.json`.
+so later images can reuse it. After a delegation failure or a timeout Pi closes it, and a reused session that failed is forgotten, so the next image starts a new one. If
+the vision pane is gone (for example you closed it), the next image starts a new vision session and the
+handback says that earlier images are no longer in the vision session's context. A vision agent that exits
+before writing a result is noticed within a few seconds (`the vision pane exited before writing a result`),
+not at the end of `wait_seconds`. One that stays open but cannot answer (for example a model id the gateway
+does not serve) is reported when `wait_seconds` runs out.
 
 ### Limitation: the wait cannot be cancelled
 

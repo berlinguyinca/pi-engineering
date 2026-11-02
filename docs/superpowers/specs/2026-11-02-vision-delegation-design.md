@@ -256,7 +256,7 @@ live vision alias is the acceptance check.
   stays plain text.
 - Streaming input (an image pasted while the agent streams) is not delegated, and that path was checked
   from source only, never live.
-- Dead-pane detection does not work against real herdr 0.9.1: `RealHerdrCli.getAgent` throws on
-  `agent_not_found` instead of returning null, so a dead vision pane reads as "could not check". An early exit
-  surfaces only as a timeout, and a closed reused pane makes every later image of that session fail.
+- A vision agent that stays alive but never answers (for example on a model id the gateway does not serve)
+  is reported only at `wait_seconds`. A dead pane is detected at once since ruling R21: herdr 0.9.1 answers
+  `agent_not_found` (JSON on stderr, exit 1) and `RealHerdrCli.getAgent` maps exactly that to `null`.
 - Acceptance run and the gaps found there: `docs/evidence/vision-delegation-acceptance.md`.

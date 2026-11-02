@@ -13,10 +13,11 @@
  *   c. error path: a delegator pointed at a model id the gateway does not
  *      serve (probe bypassed) gives an explicit "did not complete" handback
  *      and its pane is closed;
- *   c2. error path: a provider Pi does not know (probe bypassed): the same,
- *      and shows whether the pane's death is noticed before the deadline;
- *   d. dead pane: the vision pane from a/b is closed, then a third image is
- *      sent in the same session; prints what the delegator does.
+ *   c2. error path: a provider Pi does not know (probe bypassed): Pi exits,
+ *      and the delegation fails at once with "the vision pane exited" (R21);
+ *   d. dead pane: the vision pane from a/b is closed by hand, then a third
+ *      image in the same session starts a NEW vision session, the handback
+ *      says earlier images are gone, and the registry points at the new pane.
  *
  * Safety: one throwaway herdr workspace (created with --no-focus, its root
  * pane is the origin pane) is closed in `finally`, even on failure. No user
@@ -416,9 +417,13 @@ async function main(): Promise<void> {
         messages: [],
         status: status("c2"),
       });
-      log(`phase c2 took ${((Date.now() - started) / 1000).toFixed(1)}s`);
+      const tookC2 = (Date.now() - started) / 1000;
+      log(`phase c2 took ${tookC2.toFixed(1)}s`);
       const textC2 = printOutcome("c2", outC2);
       check(/Vision delegation did not complete/.test(textC2), "c2: explicit 'did not complete' handback");
+      // R21: herdr's agent_not_found reads as "gone", so the exit is noticed at once, not at the deadline.
+      check(/the vision pane exited before writing a result/.test(textC2), "c2: says the vision pane exited");
+      check(tookC2 < ERROR_WAIT_SECONDS - 15, `c2: failed well before the ${ERROR_WAIT_SECONDS}s deadline`);
       const badPane = herdr.calls.filter((c) => c.op === "startAgent")[startsBefore]?.target;
       if (badPane) {
         const panes = (await exec("herdr", ["pane", "list", "--workspace", ws.workspaceId])).stdout;
@@ -430,6 +435,7 @@ async function main(): Promise<void> {
     if (!skip.has("d") && entryB?.paneId) {
       log(`phase d: closing vision pane ${entryB.paneId} by hand, then a third image (yellow square)`);
       await exec("herdr", ["pane", "close", entryB.paneId]);
+      const startsBeforeD = herdr.count("startAgent");
       started = Date.now();
       const outD = await delegator.handle({
         sessionId,
@@ -440,8 +446,15 @@ async function main(): Promise<void> {
         status: status("d"),
       });
       log(`phase d took ${((Date.now() - started) / 1000).toFixed(1)}s`);
-      printOutcome("d", outD);
-      log(`registry entry after d: ${JSON.stringify(registry.get(sessionId) ?? null)}`);
+      const textD = printOutcome("d", outD);
+      const entryD = registry.get(sessionId);
+      log(`registry entry after d: ${JSON.stringify(entryD ?? null)}`);
+      // R21: the stale entry is dropped and a NEW vision session analyses the image, with the restart note.
+      check(/STATUS: ok\./.test(textD), "d: handback status ok (a new vision session)");
+      check(/yellow/i.test(textD), "d: handback names yellow");
+      check(/no longer in the vision session's context/.test(textD), "d: handback says earlier images are gone");
+      check(herdr.count("startAgent") === startsBeforeD + 1, "d: exactly one new startAgent");
+      check(!!entryD && entryD.paneId !== entryB.paneId, `d: registry now points at a new pane (${entryD?.paneId})`);
     }
   } finally {
     console.log("----- herdr calls made by the delegator -----");

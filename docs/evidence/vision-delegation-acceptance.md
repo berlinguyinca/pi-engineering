@@ -267,5 +267,102 @@ this run. One observation, not a guarantee.
    `vision_return` lineage events (needs `herdr:` with `lineage: true`).
 
 Before (1) can pass, the user needs a served, image-capable model that `models.json` lists
-(`/model-refresh metabolomics`) and a gateway admission report the probe accepts. The dead-pane gap
-(c2, d) should be fixed before release.
+(`/model-refresh metabolomics`) and a gateway admission report the probe accepts (or an image-capable
+`qwen3.8-vision` entry, see "After R21"). The dead-pane gap (c2, d) is fixed, see "After R21".
+
+## After R21 (2026-11-02): `getAgent` returns null for a missing agent
+
+Ruling R21: `RealHerdrCli.getAgent` returns `null` when herdr says the target does not exist, and throws for
+every other error. The delegator is unchanged.
+
+### Which codes herdr really gives (throwaway workspace `wM`, closed afterwards)
+
+```sh
+herdr workspace create --cwd <scratch>/r21ws --no-focus      # -> wM, root pane wM:p1
+herdr pane split --pane wM:p1 --direction right --no-focus   # -> wM:p2 (a shell, no agent)
+herdr agent get wM:p2          # {"error":{"code":"agent_not_found","message":"agent target wM:p2 not found"},"id":"cli:agent:get"}  exit 1
+herdr pane close wM:p2
+herdr agent get wM:p2          # same agent_not_found, exit 1   (closed pane)
+herdr agent get vision-nonexistent-zz   # same agent_not_found, exit 1   (unknown name)
+herdr agent get wZZZ:p1        # same agent_not_found, exit 1   (unknown workspace)
+herdr workspace close wM
+herdr agent get wZZ:p99 2>/dev/null     # prints nothing: the error JSON is on STDERR
+```
+
+There is only one not-found code, `agent_not_found`. No `pane_not_found` was seen.
+
+### Two defects in `RealHerdrCli.run`, found while fixing
+
+The first fix (map `agent_not_found` to null) still failed live in run 4: phase c2 timed out after 45 s, and
+phase d failed with `herdr could not check pane wN:p2: Error: Command failed: herdr agent get wN:p2
+{"error":{"code":"agent_not_found",...}}`. `run()` had never surfaced herdr's error code:
+
+1. It read `e.stdout ?? e.stderr`. herdr prints errors on stderr and leaves stdout empty (`""`, not
+   undefined), so it parsed the empty stdout and fell back to `herdr_cli_error`. It now uses stdout when it
+   is non-empty, otherwise stderr.
+2. Inside `catch { if (err instanceof HerdrError) throw err; }`, `err` was the OUTER exec error, not the
+   parsed one, so a parsed code was swallowed even when the JSON arrived on stdout. It now parses first and
+   throws outside the try.
+
+As a result, every `RealHerdrCli` error now carries herdr's own code and message, not `herdr_cli_error` plus
+the raw JSON. Nothing in the repo matches on `herdr_cli_error` or on the message text. The only check by code
+is `HerdrAgentRuntime`'s `agent_start_failed`, which that class throws itself.
+
+Other callers of `getAgent`: `HerdrAgentRuntime.resumeOrReconcile` and `sync` already use
+`.catch(() => null)`, so null and throw were the same for them before and after. Everything else that
+calls `getAgent` is a test fake. Nothing relied on the old throw for a missing agent.
+
+### Run 5: the spike after R21
+
+```sh
+node scripts/vision-delegation-spike.ts --model qwen3.8-flash-modality-vision-quant-iq4_xs
+# exit 0, "ALL CHECKS PASSED", 190.3 s; workspace wP closed
+```
+
+| Phase | Result | Time |
+| --- | --- | --- |
+| a | ok, "Left half = red ... Right half = blue", pane wP:p2 | 41.1 s |
+| b | ok, "one square ... solid green square ... on a pure white background", same pane wP:p2, one prompt (agent `working` again when prompted) | 48.6 s |
+| c (unknown model id) | `the analysis timed out after 45 seconds`, pane wP:p3 closed (unchanged: Pi stays open) | 49.3 s |
+| c2 (unknown provider) | **`Vision delegation did not complete: the vision pane exited before writing a result`**, pane wP:p4 closed, lineage kind `vision_failed`, `state.json` `"status":"failed","reason":"the vision pane exited before writing a result"` | **8.5 s** (startAgent 3.9 s, then the first pane check) |
+| d (wP:p2 closed by hand, third image: yellow 128x128) | **new** split `wP:p1 -> wP:p5` and one new `startAgent vision-589484f9-8aa1892b`; ok, "it is yellow ... #F0DC14 / RGB(240, 220, 20)"; the handback ends `Note: the earlier vision session had closed, so a new one was started. Earlier images from this conversation are no longer in the vision session's context.`; the registry entry now points at `wP:p5` (the stale `wP:p2` entry was removed and replaced) | 42.2 s |
+
+Ten lineage handoffs, five out (`vision_delegate`) and five back (`vision_return`): `vision` committed for
+a, b and d, `vision_timeout` failed for c, and `vision_failed` failed for c2. No `getAgent threw` line
+appeared in the recorded herdr calls.
+
+The vision model sampled the yellow image's pixels (it reported the exact RGB). That is allowed by the role
+prompt and uses Pi's normal tools.
+
+### The production probe, one read-only call each (2026-11-02T20:46:55Z)
+
+`CatalogRecoveryProbe` against the live gateway, base URL and key read from `~/.pi/agent/models.json` in
+memory and not printed:
+
+```
+qwen3.8-flash-modality-vision-quant-iq4_xs  {"healthy":false,"authoritative":false,"reason":"model qwen3.8-flash-modality-vision-quant-iq4_xs capacity unknown: no fresh known model-level admission report"}
+qwen3.8-vision                              {"healthy":true,"authoritative":true,"reason":"alias qwen3.8-vision has 1 live member(s): qwen3.8-flash-modality-vision-quant-iq4_xs"}
+```
+
+So the concrete id is rejected (the admission report has no entry for it), but the default preference alias
+`qwen3.8-vision` passes through the alias-aware path. The gateway's `/models` does not list that alias; the
+probe derives it from the member's name. A real session would still need `qwen3.8-vision` as an
+image-capable entry in `models.json` for the delegator to consider it. The probe was not changed.
+
+### Integration failures are the same on the base commit
+
+Each file was run on its own with `--test-timeout=60000`, on this branch (with the R21 change in the tree)
+and in a detached worktree of the base commit `ebe1f074`:
+
+| File | this branch | ebe1f074 |
+| --- | --- | --- |
+| test/unit/autospec-dag-ingest.test.ts | 21 pass / 0 fail | 21 / 0 |
+| test/unit/autospec-plan-cli.test.ts | 4 / 3 | 4 / 3 |
+| test/unit/autospec-optional-integration.test.ts | 18 / 0 | 18 / 0 |
+| test/unit/quota-fallback-config.test.ts | 17 / 0 | 17 / 0 |
+| test/integration/planner-worker-commands.test.ts | 2 / 1 | 2 / 1 |
+| test/integration/quota-switch-handoff.test.ts | 0 / 13 | 0 / 13 |
+
+That is 17 failures on both. `test/unit/herdr-forks.test.ts` fails 30 of 48 both with and without the
+R21 change (`could not create the worktree: refused: the repository at this path is not usable (broken
+.git)`), which is the sandbox's git environment, not this change.
