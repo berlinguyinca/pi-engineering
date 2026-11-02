@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -332,6 +333,143 @@ test("install: a failed build is retried on the next image", async () => {
   assert.deepEqual(await pi.input()(event(), a.ctx), { action: "continue" });
   assert.equal(a.notes.length, 1);
   assert.equal(await pi.input()(event(), fakeCtx().ctx), TRANSFORM);
+});
+
+// --- R18: a pasted clipboard temp file referenced in the text is an image -------------------------------
+
+const cleanup: string[] = [];
+test.after(() => {
+  for (const p of cleanup) rmSync(p, { recursive: true, force: true });
+});
+
+/** A file named like Pi's clipboard paste, directly in the REAL os.tmpdir(). */
+function clipboardFile(content: string | Buffer = "png-bytes", ext = "png", dir = tmpdir()): string {
+  const path = join(dir, `pi-clipboard-${randomUUID()}.${ext}`);
+  writeFileSync(path, content);
+  cleanup.push(path);
+  return path;
+}
+const b64 = (s: string) => Buffer.from(s).toString("base64");
+
+test("R18: a pasted path for a text-only model is delegated with the file's bytes and the text rewritten", async () => {
+  const { pi, d } = setup();
+  const path = clipboardFile("first-image");
+  const { ctx } = fakeCtx();
+  const out = await pi.input()(event({ text: `what is wrong here? ${path}`, images: undefined }), ctx);
+  assert.equal(out, TRANSFORM);
+  assert.equal(d.calls.length, 1);
+  assert.deepEqual(d.calls[0]?.images, [{ data: b64("first-image"), mimeType: "image/png" }]);
+  assert.equal(d.calls[0]?.text, "what is wrong here? [pasted image 1]");
+});
+
+test("R18: two pasted paths keep their order, dedupe, and follow event.images", async () => {
+  const { pi, d } = setup();
+  const a = clipboardFile("aaa");
+  const b = clipboardFile("bbb", "jpg");
+  const { ctx } = fakeCtx();
+  const text = `compare "${a}" with \`${b}\` and again ${a}`;
+  await pi.input()(event({ text }), ctx);
+  assert.deepEqual(d.calls[0]?.images, [
+    { data: "aW1n", mimeType: "image/png" },
+    { data: b64("aaa"), mimeType: "image/png" },
+    { data: b64("bbb"), mimeType: "image/jpeg" },
+  ]);
+  assert.equal(d.calls[0]?.text, 'compare "[pasted image 1]" with `[pasted image 2]` and again [pasted image 1]');
+});
+
+test("R18: a path that is not Pi's clipboard name is ignored", async () => {
+  const { pi, d, builds } = setup();
+  const path = join(tmpdir(), `pi-clipboard-not-a-uuid-${randomUUID().slice(0, 4)}.png`);
+  writeFileSync(path, "x");
+  cleanup.push(path);
+  const { ctx, notes } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: `look ${path}`, images: [] }), ctx), { action: "continue" });
+  assert.equal(builds(), 0);
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 0);
+});
+
+test("R18: a correctly named file in a different directory is ignored", async () => {
+  const { pi, d } = setup();
+  const dir = mkdtempSync(join(tmpdir(), "vision-install-sub-"));
+  cleanup.push(dir);
+  const path = clipboardFile("x", "png", dir);
+  const { ctx, notes } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: path, images: [] }), ctx), { action: "continue" });
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 0);
+});
+
+test("R18: a clipboard-named symlink in os.tmpdir() pointing outside it is ignored", async () => {
+  const { pi, d } = setup();
+  const link = join(tmpdir(), `pi-clipboard-${randomUUID()}.png`);
+  symlinkSync("/etc/hosts", link);
+  cleanup.push(link);
+  const { ctx, notes } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: link, images: [] }), ctx), { action: "continue" });
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 0);
+});
+
+test("R18: a missing clipboard file is ignored", async () => {
+  const { pi, d } = setup();
+  const path = join(tmpdir(), `pi-clipboard-${randomUUID()}.png`);
+  const { ctx, notes } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: path, images: [] }), ctx), { action: "continue" });
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 0);
+});
+
+test("R18: an empty clipboard file notifies and continues", async () => {
+  const { pi, d } = setup();
+  const path = clipboardFile("");
+  const { ctx, notes } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: path, images: [] }), ctx), { action: "continue" });
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0]?.[1], "warning");
+  assert.match(notes[0]?.[0] ?? "", /not analyzed/i);
+  assert.match(notes[0]?.[0] ?? "", /empty/i);
+});
+
+test("R18: a clipboard file over 20 MiB notifies and continues", async () => {
+  const { pi, d } = setup();
+  const path = clipboardFile("");
+  truncateSync(path, 20 * 1024 * 1024 + 1); // sparse
+  const { ctx, notes } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: path, images: [] }), ctx), { action: "continue" });
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0]?.[0] ?? "", /not analyzed/i);
+  assert.match(notes[0]?.[0] ?? "", /20 MiB/);
+});
+
+test("R18: a vision-capable model leaves a pasted path as plain text", async () => {
+  const { pi, d, builds } = setup();
+  const path = clipboardFile();
+  const { ctx, notes } = fakeCtx({ model: VISION_MODEL });
+  assert.deepEqual(await pi.input()(event({ text: path, images: [] }), ctx), { action: "continue" });
+  assert.equal(builds(), 0);
+  assert.equal(d.calls.length, 0);
+  assert.equal(notes.length, 0);
+});
+
+test("R18: a continue outcome from the delegator leaves the original text untouched", async () => {
+  const pi = fakePi();
+  const d = fakeDelegator(async () => ({ action: "continue" }));
+  registerVisionDelegation(pi, { build: async () => d.delegator });
+  const path = clipboardFile();
+  const { ctx } = fakeCtx();
+  assert.deepEqual(await pi.input()(event({ text: `see ${path}`, images: [] }), ctx), { action: "continue" });
+  assert.equal(d.calls.length, 1);
+});
+
+test("R18: the install gate loads settings for a pasted path", async () => {
+  const { pi, d, counts } = install(SETTINGS);
+  const path = clipboardFile();
+  assert.equal(await pi.input()(event({ text: path, images: [] }), fakeCtx().ctx), TRANSFORM);
+  assert.equal(counts.load, 1);
+  assert.equal(d.calls[0]?.text, "[pasted image 1]");
 });
 
 // --- the live extension -----------------------------------------------------------------------------

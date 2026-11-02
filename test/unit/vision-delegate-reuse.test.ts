@@ -291,7 +291,7 @@ test("a second image arriving during an analysis waits for the first and is hand
     const prompt = s.of("prompt")[0];
     assert.ok(start && prompt);
     assert.ok(prompt.at >= 25_000, "the second is delivered only after the first's result");
-    assert.ok(statuses.includes("analyzing image…"));
+    assert.ok(statuses.includes("analyzing image (up to 30s)…"));
     assert.equal(statuses.at(-1), undefined);
     assert.equal(chains(s.delegator).size, 0, "idle session chains are dropped");
   } finally {

@@ -3,7 +3,7 @@
  * accepts only a file for this request id, and stops on a valid or invalid
  * result, the abort signal, the deadline (`waitSeconds` from when the wait
  * starts), or a pane that is definitely gone. Never throws: an unexpected
- * error becomes an `invalid` outcome. Shows "analyzing image…" meanwhile.
+ * error becomes an `invalid` outcome. Shows "analyzing image (up to <waitSeconds>s)…" meanwhile.
  */
 
 import { readFile } from "node:fs/promises";
@@ -35,7 +35,7 @@ const POLL_MS = 500;
 const PANE_CHECK_EVERY = 5;
 
 export async function awaitResult(o: AwaitResultOptions): Promise<WaitOutcome> {
-  o.status?.("analyzing image…");
+  o.status?.(`analyzing image (up to ${o.waitSeconds}s)…`);
   try {
     return await poll(o);
   } catch (err) {

@@ -219,7 +219,7 @@ test("ok result becomes a transform that removes the images and carries the anal
     assert.match(text, /misaligned submit button/);
     assert.match(text, /Why does this look broken\?/);
     assert.match(text, /qwen3\.8-vision/);
-    assert.equal(statuses[0], "analyzing image…");
+    assert.equal(statuses[0], "analyzing image (up to 30s)…");
     assert.equal(statuses.at(-1), undefined);
     assert.equal(state(s.reqDir("req-1")).status, "done");
     assert.equal(state(s.reqDir("req-1")).injected, true);

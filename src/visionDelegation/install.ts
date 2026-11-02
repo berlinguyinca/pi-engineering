@@ -6,11 +6,14 @@
  * `ctx.signal` is undefined while the agent is idle, so it is passed through only when Pi has one.
  * Input that arrives while the agent streams (`streamingBehavior` set) is not delegated (ruling R17):
  * the image is not analyzed and the user is told so. Only the `interactive` source is handled (R16).
+ * Pi's TUI paste inserts a temp-file PATH instead of an image; such paths are read as images (R18, see
+ * `pastedImages.ts`) and replaced in the text by `[pasted image N]`.
  */
 
 import { type SessionHandoffMessage, sessionBranchMessages } from "../plannerWorker/sessionHandoff.ts";
 import type { VisionDelegateSettings } from "./config.ts";
 import type { VisionDelegator } from "./delegate.ts";
+import { pastedPaths, readPastedImages, rewritePastedText } from "./pastedImages.ts";
 import type { VisionDelegateOutput } from "./types.ts";
 
 /** The part of `VisionDelegator` the handler calls. */
@@ -58,12 +61,15 @@ function notify(ctx: InputContext, message: string): void {
   }
 }
 
-/** True when this input needs a vision model: interactive images for a model that cannot read images. */
+/**
+ * True when this input may need a vision model: interactive input for a model that cannot read images, with
+ * images or with pasted clipboard paths (textual check only; the files are checked later).
+ */
 function needsVision(event: InputEvent, ctx: InputContext): boolean {
   if (event.source !== "interactive") return false;
-  if (!event.images?.length) return false;
   const model = ctx.model;
-  return !!model && !(model.input ?? []).includes("image");
+  if (!model || (model.input ?? []).includes("image")) return false;
+  return !!event.images?.length || pastedPaths(event.text ?? "").length > 0;
 }
 
 function readSignal(ctx: InputContext): AbortSignal | undefined {
@@ -80,6 +86,16 @@ type BuildDelegator = (ctx: InputContext) => Promise<VisionHandler | null>;
 function inputHandler(build: BuildDelegator): (event: InputEvent, ctx: InputContext) => Promise<InputResult> {
   return async (event, ctx) => {
     if (!needsVision(event, ctx)) return CONTINUE;
+    const pasted = await readPastedImages(pastedPaths(event.text ?? ""));
+    if (pasted.problem) {
+      notify(ctx, notAnalyzed(pasted.problem));
+      return CONTINUE;
+    }
+    const images = [
+      ...(event.images ?? []).map((i) => ({ data: i.data, mimeType: i.mimeType })),
+      ...pasted.images.map((i) => ({ data: i.data, mimeType: i.mimeType })),
+    ];
+    if (images.length === 0) return CONTINUE; // the pasted-looking paths were not clipboard files: plain text
     if (event.streamingBehavior) {
       notify(
         ctx,
@@ -105,15 +121,20 @@ function inputHandler(build: BuildDelegator): (event: InputEvent, ctx: InputCont
       } catch {
         messages = [];
       }
-      return await delegator.handle({
+      const out = await delegator.handle({
         sessionId: ctx.sessionManager.getSessionId(),
         cwd: ctx.cwd,
-        text: event.text,
-        images: (event.images ?? []).map((i) => ({ data: i.data, mimeType: i.mimeType })),
+        text: rewritePastedText(
+          event.text,
+          pasted.images.map((i) => i.path),
+        ),
+        images,
         messages,
         signal: readSignal(ctx),
         status: (t) => ctx.ui.setStatus(VISION_STATUS_KEY, t),
       });
+      // Any non-delegation outcome leaves the original input (and its text) untouched.
+      return out.action === "transform" ? out : CONTINUE;
     } catch (err) {
       notify(ctx, notAnalyzed(`vision delegation failed (${errText(err)})`));
       return CONTINUE;
