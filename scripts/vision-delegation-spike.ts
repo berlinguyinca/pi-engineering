@@ -11,8 +11,9 @@
  *   b. second image (green square on white) in the same session: the SAME pane
  *      is prompted (no second `startAgent`) and the handback describes it;
  *   c. error path: a delegator pointed at a model id the gateway does not
- *      serve (probe bypassed) gives an explicit "did not complete" handback
- *      and its pane is closed;
+ *      serve (probe bypassed): Pi errors and sits idle, and the delegation
+ *      fails as "the vision agent stopped without writing a result" well
+ *      before its wait_seconds (R26); its pane is closed;
  *   c2. error path: a provider Pi does not know (probe bypassed): Pi exits,
  *      and the delegation fails at once with "the vision pane exited" (R21);
  *   d. dead pane: the vision pane from a/b is closed by hand, then a third
@@ -74,6 +75,8 @@ const VISION_PROVIDER = "metabolomics";
 const BAD_MODEL_ID = "no-such-vision-model-spike";
 const BAD_PROVIDER = "no-such-provider-spike";
 const ERROR_WAIT_SECONDS = 45;
+/** Phase c's wait: long enough that an R26 idle stop (about 30 s) is clearly not the deadline. */
+const IDLE_WAIT_SECONDS = 120;
 
 const t0 = Date.now();
 const stamp = (): string => `+${((Date.now() - t0) / 1000).toFixed(1)}s`;
@@ -359,6 +362,8 @@ async function main(): Promise<void> {
     check(/square/i.test(textB), "b: handback names a square");
     check(herdr.count("startAgent") === 1, "b: still one startAgent (no second start)");
     check(herdr.count("prompt") === 1, "b: the reused pane was prompted once");
+    const promptB = herdr.calls.find((c) => c.op === "prompt");
+    check(promptB?.target === entryA?.agentName, `b: prompted by agent name (${promptB?.target}), not pane id (R22)`);
     check(entryB?.paneId === entryA?.paneId, `b: same pane id (${entryA?.paneId})`);
 
     // (c) error path: a model the gateway does not serve ----------------------
@@ -368,7 +373,7 @@ async function main(): Promise<void> {
       const bad = new VisionDelegator({
         ...base,
         registry: new VisionRegistry(join(root, "registry-c.json")),
-        settings: settings(ERROR_WAIT_SECONDS),
+        settings: settings(IDLE_WAIT_SECONDS),
         models: [{ provider: VISION_PROVIDER, id: BAD_MODEL_ID, input: ["text", "image"] }],
         probeFor: async () => ({ healthy: true, authoritative: true }),
       });
@@ -381,9 +386,12 @@ async function main(): Promise<void> {
         messages: [],
         status: status("c"),
       });
-      log(`phase c took ${((Date.now() - started) / 1000).toFixed(1)}s`);
+      const tookC = (Date.now() - started) / 1000;
+      log(`phase c took ${tookC.toFixed(1)}s`);
       const textC = printOutcome("c", outC);
       check(/Vision delegation did not complete/.test(textC), "c: explicit 'did not complete' handback");
+      check(/the vision agent stopped without writing a result/.test(textC), "c: says the vision agent stopped (R26)");
+      check(tookC < IDLE_WAIT_SECONDS / 2, `c: failed well before the ${IDLE_WAIT_SECONDS}s deadline`);
       const startCall = herdr.calls.filter((c) => c.op === "startAgent")[startsBefore];
       const badPane = startCall?.target;
       check(!!badPane, "c: a vision pane was started for the bad model");

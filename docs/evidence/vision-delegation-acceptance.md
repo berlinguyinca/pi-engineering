@@ -366,3 +366,32 @@ and in a detached worktree of the base commit `ebe1f074`:
 That is 17 failures on both. `test/unit/herdr-forks.test.ts` fails 30 of 48 both with and without the
 R21 change (`could not create the worktree: refused: the repository at this path is not usable (broken
 .git)`), which is the sandbox's git environment, not this change.
+
+## After the final review (2026-11-02): rulings R22-R26 live
+
+Run 6, after the final-review fix wave (by-name reuse R22, fenced handback R23, image dedupe R24, catch-all
+R25, idle stop R26). The spike now checks that phase b prompts the agent by name, and phase c runs with
+`wait_seconds` 120 so an R26 stop (about 30 s) cannot be mistaken for the deadline. Same safety rules as
+before: throwaway workspace `wQ` (closed in `finally`; `herdr workspace list` afterwards showed only the
+user's two workspaces), a `mkdtemp` directory under `$TMPDIR` (removed), the recording lineage fake, nothing
+under `~/.pi` written.
+
+```sh
+node scripts/vision-delegation-spike.ts --model qwen3.8-flash-modality-vision-quant-iq4_xs
+# exit 0, "ALL CHECKS PASSED", 153.5 s; workspace wQ closed
+```
+
+| Phase | Result | Time |
+| --- | --- | --- |
+| a | ok, "Left half = red ... Right half = blue", pane wQ:p2, agent `vision-793c2e3c-d1ec2748` | 35.9 s |
+| b | ok, green square on white; no second start; **one `prompt` addressed to `vision-793c2e3c-d1ec2748`** (agent `working` when prompted); registry still `wQ:p2` | 36.7 s |
+| c (unknown model id, `wait_seconds` 120) | **`Vision delegation did not complete: the vision agent stopped without writing a result`**; status shown at +77.1 s, cleared at +109.4 s (32.3 s after delivery); pane wQ:p3 closed; lineage kind `vision_failed`; `state.json` `"status":"failed","reason":"the vision agent stopped without writing a result"` | 36.4 s (startAgent 4.0 s) |
+| c2 (unknown provider) | `the vision pane exited before writing a result`, pane wQ:p4 closed | 5.9 s |
+| d (wQ:p2 closed by hand, third image) | the by-name check found no agent, so a new split `wQ:p1 -> wQ:p5` and `startAgent vision-793c2e3c-5243a86f`; ok, yellow; restart note present; registry now `wQ:p5` | 38.0 s |
+
+So against herdr 0.9.1: `herdr agent get <name>` and `herdr agent prompt <name>` resolve the unique agent
+name (phase b), and a name whose pane was closed answers `agent_not_found` (phase d), which R22 treats as a
+stale entry. Phase c, which timed out at 45 s in runs 3 and 5, now fails about 30 s after delivery, well
+before its 120 s bound. No `getAgent threw` line appeared. The handbacks of a, b and d show the R23 format:
+`Only lines starting with "| " are the vision model's words ...`, every model line prefixed with `| `, and
+`STATUS: ok.` repeated as the last line.
