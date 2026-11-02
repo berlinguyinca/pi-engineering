@@ -28,7 +28,7 @@ import type { GatewayModelEntry } from "./gatewayCatalog.ts";
 const SHORT_MODALITIES = new Set(["text", "vision", "audio", "video"]);
 const KEYS = new Set(["arch", "variant", "modality", "ctx", "quant", "src"]);
 
-interface IdFacts {
+export interface IdFacts {
   family: string;
   size: string;
   modality?: string;
@@ -37,7 +37,7 @@ interface IdFacts {
 }
 
 /** Parse a canonical id; `undefined` when it is not `<family>-<size>-<key>-<value>…`. */
-function factsOf(id: string): IdFacts | undefined {
+export function factsOf(id: string): IdFacts | undefined {
   const parts = id.split("-");
   if (parts.length < 4) return undefined;
   const [family, size, ...rest] = parts as [string, string, ...string[]];

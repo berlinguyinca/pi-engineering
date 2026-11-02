@@ -76,6 +76,8 @@ export interface RefreshResult {
   plan: CatalogPlan;
   gateway: GatewayModelEntry[];
   baseUrl: string;
+  /** True when the provider was configured with aliases rather than concrete ids. */
+  aliasOnly: boolean;
   /** Written only when the plan was dirty and this was not a dry run. */
   backupPath?: string;
   written: boolean;
@@ -488,7 +490,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
       .map((model) => `  route: ${model.id}${model.backingModel ? ` → ${model.backingModel}` : ""} (gateway alias)`),
     ...planLines,
   ];
-  return { plan, gateway, baseUrl, written: false, lines };
+  return { plan, gateway, baseUrl, aliasOnly: aliased, written: false, lines };
 }
 
 /**
