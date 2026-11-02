@@ -472,3 +472,24 @@ test("C1: a confirmed reuse prompts the agent by name, never by bare pane id", a
     s.cleanup();
   }
 });
+
+test("I3: a reused agent that stays idle without a result ends early, drops the session and closes its pane", async () => {
+  let reused = false;
+  const s = setup(["req-1", "req-2"], {
+    answerAfter: (id) => (id === "req-2" ? null : 1000),
+    getAgent: async (t) => ({ ...liveAgent(s.names.get(t) ?? t), agent_status: reused ? "idle" : "working" }),
+  });
+  s.deps.settings = { ...s.deps.settings, waitSeconds: 300 };
+  try {
+    await new VisionDelegator(s.deps).handle(input());
+    reused = true;
+    const started = s.clock.now();
+    const out = text(await new VisionDelegator(s.deps).handle(input()));
+    assert.match(out, /the vision agent stopped without writing a result/);
+    assert.ok(s.clock.now() - started < 40_000, "well before the 300 s deadline");
+    assert.equal(s.registry.get(SESSION), undefined);
+    assert.ok(s.of("closePane").some((c) => c.args[0] === "vision-pane-1"));
+  } finally {
+    s.cleanup();
+  }
+});

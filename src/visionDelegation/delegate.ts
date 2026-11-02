@@ -236,13 +236,15 @@ export class VisionDelegator {
     const outcome = await awaitResult({
       file: resultPath(reqDir, request.requestId),
       request,
-      paneGone: async () => {
+      agentState: async () => {
+        let agent: HerdrAgent | null;
         try {
-          const agent = await herdr.getAgent(d.agentName);
-          return agent === null || agent.pane_id !== paneId;
+          agent = await herdr.getAgent(d.agentName);
         } catch {
-          return false; // transient herdr error: not proof the pane is gone
+          return "unknown"; // transient herdr error: not proof the pane is gone
         }
+        if (agent === null || agent.pane_id !== paneId) return "gone";
+        return agent.agent_status === "idle" || agent.agent_status === "done" ? "stopped" : "busy";
       },
       waitSeconds: this.deps.settings.waitSeconds,
       now: () => this.deps.now(),
@@ -278,6 +280,10 @@ export class VisionDelegator {
     }
     if (outcome.kind === "cancelled") {
       return fail("cancelled", "failed", "the delegation was cancelled before the vision model answered");
+    }
+    if (outcome.kind === "stopped") {
+      const why = "the vision agent stopped without writing a result";
+      return fail("failed", "failed", why, why);
     }
     if (outcome.kind === "pane_dead") {
       const why = "the vision pane exited before writing a result";

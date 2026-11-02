@@ -649,3 +649,111 @@ test("I2: an unexpected throw inside the queue wrapper keeps the user's text and
     s.cleanup();
   }
 });
+
+// --- I3 (R26): a vision agent that goes idle without writing a result ends the wait early ---
+
+const withStatus = (status: HerdrAgent["agent_status"]): HerdrAgent => ({
+  ...liveAgent("vision-pane-1"),
+  agent_status: status,
+});
+const longWait = (waitSeconds: number): Partial<VisionDelegatorDeps> => ({
+  settings: { enabled: true, waitSeconds, aliasPreference: ["qwen3.8-vision"], notes: [] },
+});
+
+test("I3: an agent idle on 4 consecutive checks past 30 s ends the wait at once as a failure", async () => {
+  for (const idle of ["idle", "done"] as const) {
+    const events: string[] = [];
+    const s = setup(
+      { ...longWait(300), lineage: (e) => events.push(`${e.phase}:${e.outcome}`) },
+      {
+        getAgent: async () => withStatus(idle),
+      },
+    );
+    try {
+      const text = transformText(await s.delegator.handle(input()));
+      assert.match(text, /the vision agent stopped without writing a result/);
+      assert.match(text, /\/images\/[0-9a-f]{64}\.png/);
+      assert.ok(s.clock.now() >= 30_000, `not before 30 s (${s.clock.now()}ms)`);
+      assert.ok(s.clock.now() < 40_000, `ended early (${s.clock.now()}ms), not at the 300 s deadline`);
+      assert.deepEqual(events, ["out:ok", "back:failed"]);
+      const st = state(s.reqDir("req-1"));
+      assert.equal(st.status, "failed");
+      assert.equal(st.reason, "the vision agent stopped without writing a result");
+      assert.ok(s.calls.some((c) => c.method === "closePane" && c.args[0] === "vision-pane-1"));
+    } finally {
+      s.cleanup();
+    }
+  }
+});
+
+test("I3: idle on fewer than 4 consecutive checks (working in between) does not end the wait", async () => {
+  let n = 0;
+  const s = setup(longWait(60), { getAgent: async () => withStatus(++n % 4 === 0 ? "working" : "idle") });
+  try {
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /analysis timed out after 60 seconds/);
+    assert.ok(s.clock.now() >= 60_000);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("I3: an agent idle before 30 s does not end the wait", async () => {
+  const s = setup(longWait(300), { getAgent: async () => withStatus("idle") });
+  try {
+    s.clock.at(29_000, () => writeResult(s.reqDir("req-1"), "req-1", { description: "slow but fine" }));
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /slow but fine/);
+    assert.equal(state(s.reqDir("req-1")).status, "done");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("I3: a result file that appears on the re-read wins over the idle verdict", async () => {
+  const s = setup(longWait(300), {
+    getAgent: async () => {
+      // The check that would reach the idle verdict is the one where the result lands.
+      if (s.clock.now() >= 30_000 && !existsSync(resultPath(s.reqDir("req-1"), "req-1"))) {
+        writeResult(s.reqDir("req-1"), "req-1", { description: "written as it went idle" });
+      }
+      return withStatus("idle");
+    },
+  });
+  try {
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /written as it went idle/);
+    assert.equal(state(s.reqDir("req-1")).status, "done");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("I3: an agent working for the whole wait still times out at waitSeconds", async () => {
+  const s = setup(longWait(60), { getAgent: async () => withStatus("working") });
+  try {
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /analysis timed out after 60 seconds/);
+    assert.ok(s.clock.now() >= 60_000);
+    assert.equal(state(s.reqDir("req-1")).status, "timed_out");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("I3: a throwing getAgent neither counts as idle nor ends the wait", async () => {
+  let n = 0;
+  const s = setup(longWait(60), {
+    getAgent: async () => {
+      n += 1;
+      if (n % 2 === 0) throw new Error("herdr socket hiccup");
+      return withStatus(n % 4 === 1 ? "idle" : "working");
+    },
+  });
+  try {
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /analysis timed out after 60 seconds/);
+  } finally {
+    s.cleanup();
+  }
+});
