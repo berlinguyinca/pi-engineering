@@ -24,9 +24,11 @@
  * pane is the origin pane) is closed in `finally`, even on failure. No user
  * pane or workspace is touched. `~/.pi/agent/models.json` is read READ-ONLY
  * for the vision model's provider/id/input and, for the gateway probe, its
- * baseUrl and key, which are never printed. Test images are generated here.
+ * baseUrl and key, which are never printed. Test images are generated here,
+ * unless `--image` names one file explicitly.
  *
  *   node scripts/vision-delegation-spike.ts [--model <id>] [--probe listed|catalog] [--wait <seconds>] [--skip c,c2,d] [--keep]
+ *   node scripts/vision-delegation-spike.ts --image <path> [--question <text>] [--model <id>] [--wait <seconds>] [--keep]
  *
  * --model  vision model id under provider `metabolomics` (default: the image
  *          model listed in models.json). An id that models.json does not list
@@ -39,6 +41,14 @@
  * --wait   wait_seconds for phases a/b (default 300)
  * --skip   comma list of phases to skip (c, c2, d)
  * --keep   keep the temp directory (request files, state.json) for inspection
+ * --image  OPTIONAL (R30): instead of phases a-d, delegate ONE real image file
+ *          (png, jpeg, webp or gif) once. The handback and result text are NEVER
+ *          printed (the image may be private): only the status word, whether the
+ *          result validated, the result fields' character lengths, the duration,
+ *          and the vision session's turn shape (stop reason, tokens, thinking
+ *          level, content part types and sizes). On failure the temp directory
+ *          is kept for inspection (it holds a copy of the image; delete it after).
+ * --question  the user's message for --image (default: a generic question)
  *
  * Exit 0 when every check passes.
  */
@@ -69,6 +79,15 @@ const flag = (name: string): string | undefined => {
 const waitSeconds = Number(flag("--wait") ?? 300);
 const skip = new Set((flag("--skip") ?? "").split(",").filter(Boolean));
 const keep = argv.includes("--keep");
+const imageFile = flag("--image");
+const IMAGE_QUESTION = flag("--question") ?? "What does this screenshot show, and what in it matters?";
+const MIME_BY_EXT: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+};
 
 const VISION_MODEL_ID = flag("--model") ?? "qwen3.8-27b-modality-vision-quant-q8_k_xl";
 const VISION_PROVIDER = "metabolomics";
@@ -249,6 +268,99 @@ function printState(artifactDir: string): void {
   }
 }
 
+/** The vision session's turns, by shape only: never the text of any part. */
+function printSessionShape(reqDir: string): void {
+  const dir = join(reqDir, "session");
+  let files: string[] = [];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+  } catch {
+    console.log(`session: no session directory under ${reqDir}`);
+    return;
+  }
+  for (const f of files) {
+    for (const line of readFileSync(join(dir, f), "utf8").split("\n").filter(Boolean)) {
+      const e = JSON.parse(line) as {
+        type?: string;
+        thinkingLevel?: string;
+        message?: {
+          role?: string;
+          stopReason?: string;
+          durationMs?: number;
+          thinkingLevel?: string;
+          usage?: { output?: number };
+          content?: unknown;
+        };
+      };
+      if (e.type === "thinking_level_change") console.log(`session: thinking_level_change -> ${e.thinkingLevel}`);
+      const m = e.message;
+      if (e.type !== "message" || m?.role !== "assistant") continue;
+      const parts = Array.isArray(m.content)
+        ? (m.content as Array<Record<string, unknown>>).map((p) => `${p.type}:${JSON.stringify(p).length}`).join(" ")
+        : typeof m.content;
+      console.log(
+        `session: assistant turn stopReason=${m.stopReason} output=${m.usage?.output} thinkingLevel=${m.thinkingLevel} durationMs=${m.durationMs} parts=[${parts}]`,
+      );
+    }
+  }
+}
+
+/** One real image, delegated once (R30). Prints no image-derived text. Returns whether it validated. */
+async function runImagePhase(
+  delegator: VisionDelegator,
+  artifactDir: string,
+  file: string,
+  project: string,
+): Promise<boolean> {
+  const ext = file.split(".").pop()?.toLowerCase() ?? "";
+  const mimeType = MIME_BY_EXT[ext];
+  if (!mimeType) throw new Error(`--image: unsupported extension .${ext}`);
+  const bytes = readFileSync(file);
+  log(`phase i: one real image (${bytes.length} bytes, ${mimeType}); handback text is not printed`);
+  const started = Date.now();
+  const out = await delegator.handle({
+    sessionId: randomUUID(),
+    cwd: project,
+    text: IMAGE_QUESTION,
+    images: [{ data: bytes.toString("base64"), mimeType }],
+    messages: [],
+    status: (t) => log(`  [status i] ${t === undefined ? "(cleared)" : "(set)"}`),
+  });
+  const took = (Date.now() - started) / 1000;
+  const text = out.action === "transform" ? out.text : "";
+  const statusWord = /STATUS: (\w+)\./.exec(text)?.[1] ?? (/did not complete/.test(text) ? "did-not-complete" : "none");
+  log(
+    `phase i took ${took.toFixed(1)}s; handback action ${out.action}, ${text.length} chars, status word: ${statusWord}`,
+  );
+  let validated = false;
+  for (const id of readdirSync(artifactDir)) {
+    const reqDir = join(artifactDir, id);
+    let state: { status?: string; reason?: string; result_status?: string } = {};
+    try {
+      state = JSON.parse(readFileSync(join(reqDir, "state.json"), "utf8"));
+    } catch {
+      // no state
+    }
+    validated = state.status === "done";
+    console.log(
+      `state: status=${state.status} result_status=${state.result_status ?? "-"} reason=${state.reason ?? "-"}`,
+    );
+    try {
+      const r = JSON.parse(readFileSync(join(reqDir, "results", `${id}.json`), "utf8")) as Record<string, unknown>;
+      const len = (v: unknown) => (typeof v === "string" ? v.length : Array.isArray(v) ? JSON.stringify(v).length : -1);
+      console.log(
+        `result fields (chars): description=${len(r.description)} text_in_image=${len(r.text_in_image)} findings_for_task=${len(r.findings_for_task)} uncertainties=${len(r.uncertainties)} (${Array.isArray(r.uncertainties) ? r.uncertainties.length : "?"} items) status=${r.status}`,
+      );
+    } catch {
+      console.log("result file: none");
+    }
+    printSessionShape(reqDir);
+  }
+  check(validated, "i: the result validated (state.json status done)");
+  check(statusWord === "ok" || statusWord === "partial", `i: handback status ok or partial (${statusWord})`);
+  return validated;
+}
+
 async function main(): Promise<void> {
   const { model, baseUrl, apiKey } = readVisionModel();
   log(`vision model from models.json: ${model.provider}/${model.id} input=${model.input.join("+")}`);
@@ -292,6 +404,7 @@ async function main(): Promise<void> {
   await exec("mkdir", ["-p", project]);
   log(`temp root: ${root}`);
 
+  let keepRoot = keep;
   const herdr = new RecordingHerdr();
   const ws = await herdr.createWorkspace(project);
   log(`throwaway workspace ${ws.workspaceId}, origin (root) pane ${ws.paneId}`);
@@ -319,160 +432,172 @@ async function main(): Promise<void> {
       models: [model],
       probeFor,
     });
-    const sessionId = randomUUID();
-    log(`session ${sessionId}`);
+    if (imageFile) {
+      if (!(await runImagePhase(delegator, artifactDir, imageFile, project))) keepRoot = true;
+    } else {
+      const sessionId = randomUUID();
+      log(`session ${sessionId}`);
 
-    // (a) first image ----------------------------------------------------------
-    log("phase a: first image (left half red, right half blue)");
-    let started = Date.now();
-    const outA = await delegator.handle({
-      sessionId,
-      cwd: project,
-      text: "What colours are the left half and the right half of this image?",
-      images: image(RED_BLUE),
-      messages: [],
-      status: status("a"),
-    });
-    log(`phase a took ${((Date.now() - started) / 1000).toFixed(1)}s`);
-    const textA = printOutcome("a", outA);
-    const entryA = registry.get(sessionId);
-    log(`registry entry: ${JSON.stringify(entryA)}`);
-    check(/STATUS: ok\./.test(textA), "a: handback status ok");
-    check(/red/i.test(textA) && /blue/i.test(textA), "a: handback names red and blue");
-    check(/left[^\n]*red|red[^\n]*left/i.test(textA), "a: handback ties red to the left half");
-    check(herdr.count("startAgent") === 1, "a: one startAgent");
-    check(!!entryA?.paneId, "a: session registered with a pane");
-
-    // (b) second image, same session: reuse ------------------------------------
-    log("phase b: second image (green square on white), same session");
-    started = Date.now();
-    const outB = await delegator.handle({
-      sessionId,
-      cwd: project,
-      text: "Here is another image. What shape and colours does it show?",
-      images: image(GREEN_ON_WHITE),
-      messages: [],
-      status: status("b"),
-    });
-    log(`phase b took ${((Date.now() - started) / 1000).toFixed(1)}s`);
-    const textB = printOutcome("b", outB);
-    const entryB = registry.get(sessionId);
-    check(/STATUS: ok\./.test(textB), "b: handback status ok");
-    check(/green/i.test(textB) && /white/i.test(textB), "b: handback describes the green square on white");
-    check(/square/i.test(textB), "b: handback names a square");
-    check(herdr.count("startAgent") === 1, "b: still one startAgent (no second start)");
-    check(herdr.count("prompt") === 1, "b: the reused pane was prompted once");
-    const promptB = herdr.calls.find((c) => c.op === "prompt");
-    check(promptB?.target === entryA?.agentName, `b: prompted by agent name (${promptB?.target}), not pane id (R22)`);
-    check(entryB?.paneId === entryA?.paneId, `b: same pane id (${entryA?.paneId})`);
-
-    // (c) error path: a model the gateway does not serve ----------------------
-    if (!skip.has("c")) {
-      log(`phase c: delegator pointed at ${VISION_PROVIDER}/${BAD_MODEL_ID} (probe bypassed)`);
-      const startsBefore = herdr.count("startAgent");
-      const bad = new VisionDelegator({
-        ...base,
-        registry: new VisionRegistry(join(root, "registry-c.json")),
-        settings: settings(IDLE_WAIT_SECONDS),
-        models: [{ provider: VISION_PROVIDER, id: BAD_MODEL_ID, input: ["text", "image"] }],
-        probeFor: async () => ({ healthy: true, authoritative: true }),
-      });
-      started = Date.now();
-      const outC = await bad.handle({
-        sessionId: randomUUID(),
-        cwd: project,
-        text: "What colours are in this image?",
-        images: image(RED_BLUE),
-        messages: [],
-        status: status("c"),
-      });
-      const tookC = (Date.now() - started) / 1000;
-      log(`phase c took ${tookC.toFixed(1)}s`);
-      const textC = printOutcome("c", outC);
-      check(/Vision delegation did not complete/.test(textC), "c: explicit 'did not complete' handback");
-      check(/the vision agent stopped without writing a result/.test(textC), "c: says the vision agent stopped (R26)");
-      check(tookC < IDLE_WAIT_SECONDS / 2, `c: failed well before the ${IDLE_WAIT_SECONDS}s deadline`);
-      const startCall = herdr.calls.filter((c) => c.op === "startAgent")[startsBefore];
-      const badPane = startCall?.target;
-      check(!!badPane, "c: a vision pane was started for the bad model");
-      if (badPane) {
-        check(
-          herdr.calls.some((c) => c.op === "closePane" && c.target === badPane),
-          `c: closePane(${badPane}) called`,
-        );
-        const panes = (await exec("herdr", ["pane", "list", "--workspace", ws.workspaceId])).stdout;
-        check(!panes.includes(`"${badPane}"`), `c: pane ${badPane} no longer listed`);
-      }
-    }
-
-    // (c2) error path: a provider Pi does not know ----------------------------
-    if (!skip.has("c2")) {
-      log(`phase c2: delegator pointed at ${BAD_PROVIDER}/${BAD_MODEL_ID} (probe bypassed)`);
-      const startsBefore = herdr.count("startAgent");
-      const bad = new VisionDelegator({
-        ...base,
-        registry: new VisionRegistry(join(root, "registry-c2.json")),
-        settings: settings(ERROR_WAIT_SECONDS),
-        models: [{ provider: BAD_PROVIDER, id: BAD_MODEL_ID, input: ["text", "image"] }],
-        probeFor: async () => ({ healthy: true, authoritative: true }),
-      });
-      started = Date.now();
-      const outC2 = await bad.handle({
-        sessionId: randomUUID(),
-        cwd: project,
-        text: "What colours are in this image?",
-        images: image(RED_BLUE),
-        messages: [],
-        status: status("c2"),
-      });
-      const tookC2 = (Date.now() - started) / 1000;
-      log(`phase c2 took ${tookC2.toFixed(1)}s`);
-      const textC2 = printOutcome("c2", outC2);
-      check(/Vision delegation did not complete/.test(textC2), "c2: explicit 'did not complete' handback");
-      // R21: herdr's agent_not_found reads as "gone", so the exit is noticed at once, not at the deadline.
-      check(/the vision pane exited before writing a result/.test(textC2), "c2: says the vision pane exited");
-      check(tookC2 < ERROR_WAIT_SECONDS - 15, `c2: failed well before the ${ERROR_WAIT_SECONDS}s deadline`);
-      const badPane = herdr.calls.filter((c) => c.op === "startAgent")[startsBefore]?.target;
-      if (badPane) {
-        const panes = (await exec("herdr", ["pane", "list", "--workspace", ws.workspaceId])).stdout;
-        check(!panes.includes(`"${badPane}"`), `c2: pane ${badPane} no longer listed`);
-      }
-    }
-
-    // (d) dead pane: close the reused pane, then send a third image -----------
-    if (!skip.has("d") && entryB?.paneId) {
-      log(`phase d: closing vision pane ${entryB.paneId} by hand, then a third image (yellow square)`);
-      await exec("herdr", ["pane", "close", entryB.paneId]);
-      const startsBeforeD = herdr.count("startAgent");
-      started = Date.now();
-      const outD = await delegator.handle({
+      // (a) first image ----------------------------------------------------------
+      log("phase a: first image (left half red, right half blue)");
+      let started = Date.now();
+      const outA = await delegator.handle({
         sessionId,
         cwd: project,
-        text: "One more: what colour is this?",
-        images: image(YELLOW),
+        text: "What colours are the left half and the right half of this image?",
+        images: image(RED_BLUE),
         messages: [],
-        status: status("d"),
+        status: status("a"),
       });
-      log(`phase d took ${((Date.now() - started) / 1000).toFixed(1)}s`);
-      const textD = printOutcome("d", outD);
-      const entryD = registry.get(sessionId);
-      log(`registry entry after d: ${JSON.stringify(entryD ?? null)}`);
-      // R21: the stale entry is dropped and a NEW vision session analyses the image, with the restart note.
-      check(/STATUS: ok\./.test(textD), "d: handback status ok (a new vision session)");
-      check(/yellow/i.test(textD), "d: handback names yellow");
-      check(/no longer in the vision session's context/.test(textD), "d: handback says earlier images are gone");
-      check(herdr.count("startAgent") === startsBeforeD + 1, "d: exactly one new startAgent");
-      check(!!entryD && entryD.paneId !== entryB.paneId, `d: registry now points at a new pane (${entryD?.paneId})`);
+      log(`phase a took ${((Date.now() - started) / 1000).toFixed(1)}s`);
+      const textA = printOutcome("a", outA);
+      const entryA = registry.get(sessionId);
+      log(`registry entry: ${JSON.stringify(entryA)}`);
+      check(/STATUS: ok\./.test(textA), "a: handback status ok");
+      check(/red/i.test(textA) && /blue/i.test(textA), "a: handback names red and blue");
+      check(/left[^\n]*red|red[^\n]*left/i.test(textA), "a: handback ties red to the left half");
+      check(herdr.count("startAgent") === 1, "a: one startAgent");
+      check(!!entryA?.paneId, "a: session registered with a pane");
+
+      // (b) second image, same session: reuse ------------------------------------
+      log("phase b: second image (green square on white), same session");
+      started = Date.now();
+      const outB = await delegator.handle({
+        sessionId,
+        cwd: project,
+        text: "Here is another image. What shape and colours does it show?",
+        images: image(GREEN_ON_WHITE),
+        messages: [],
+        status: status("b"),
+      });
+      log(`phase b took ${((Date.now() - started) / 1000).toFixed(1)}s`);
+      const textB = printOutcome("b", outB);
+      const entryB = registry.get(sessionId);
+      check(/STATUS: ok\./.test(textB), "b: handback status ok");
+      check(/green/i.test(textB) && /white/i.test(textB), "b: handback describes the green square on white");
+      check(/square/i.test(textB), "b: handback names a square");
+      check(herdr.count("startAgent") === 1, "b: still one startAgent (no second start)");
+      check(herdr.count("prompt") === 1, "b: the reused pane was prompted once");
+      const promptB = herdr.calls.find((c) => c.op === "prompt");
+      check(promptB?.target === entryA?.agentName, `b: prompted by agent name (${promptB?.target}), not pane id (R22)`);
+      check(entryB?.paneId === entryA?.paneId, `b: same pane id (${entryA?.paneId})`);
+
+      // (c) error path: a model the gateway does not serve ----------------------
+      if (!skip.has("c")) {
+        log(`phase c: delegator pointed at ${VISION_PROVIDER}/${BAD_MODEL_ID} (probe bypassed)`);
+        const startsBefore = herdr.count("startAgent");
+        const bad = new VisionDelegator({
+          ...base,
+          registry: new VisionRegistry(join(root, "registry-c.json")),
+          settings: settings(IDLE_WAIT_SECONDS),
+          models: [{ provider: VISION_PROVIDER, id: BAD_MODEL_ID, input: ["text", "image"] }],
+          probeFor: async () => ({ healthy: true, authoritative: true }),
+        });
+        started = Date.now();
+        const outC = await bad.handle({
+          sessionId: randomUUID(),
+          cwd: project,
+          text: "What colours are in this image?",
+          images: image(RED_BLUE),
+          messages: [],
+          status: status("c"),
+        });
+        const tookC = (Date.now() - started) / 1000;
+        log(`phase c took ${tookC.toFixed(1)}s`);
+        const textC = printOutcome("c", outC);
+        check(/Vision delegation did not complete/.test(textC), "c: explicit 'did not complete' handback");
+        check(
+          /the vision agent stopped without writing a result/.test(textC),
+          "c: says the vision agent stopped (R26)",
+        );
+        check(tookC < IDLE_WAIT_SECONDS / 2, `c: failed well before the ${IDLE_WAIT_SECONDS}s deadline`);
+        const startCall = herdr.calls.filter((c) => c.op === "startAgent")[startsBefore];
+        const badPane = startCall?.target;
+        check(!!badPane, "c: a vision pane was started for the bad model");
+        if (badPane) {
+          check(
+            herdr.calls.some((c) => c.op === "closePane" && c.target === badPane),
+            `c: closePane(${badPane}) called`,
+          );
+          const panes = (await exec("herdr", ["pane", "list", "--workspace", ws.workspaceId])).stdout;
+          check(!panes.includes(`"${badPane}"`), `c: pane ${badPane} no longer listed`);
+        }
+      }
+
+      // (c2) error path: a provider Pi does not know ----------------------------
+      if (!skip.has("c2")) {
+        log(`phase c2: delegator pointed at ${BAD_PROVIDER}/${BAD_MODEL_ID} (probe bypassed)`);
+        const startsBefore = herdr.count("startAgent");
+        const bad = new VisionDelegator({
+          ...base,
+          registry: new VisionRegistry(join(root, "registry-c2.json")),
+          settings: settings(ERROR_WAIT_SECONDS),
+          models: [{ provider: BAD_PROVIDER, id: BAD_MODEL_ID, input: ["text", "image"] }],
+          probeFor: async () => ({ healthy: true, authoritative: true }),
+        });
+        started = Date.now();
+        const outC2 = await bad.handle({
+          sessionId: randomUUID(),
+          cwd: project,
+          text: "What colours are in this image?",
+          images: image(RED_BLUE),
+          messages: [],
+          status: status("c2"),
+        });
+        const tookC2 = (Date.now() - started) / 1000;
+        log(`phase c2 took ${tookC2.toFixed(1)}s`);
+        const textC2 = printOutcome("c2", outC2);
+        check(/Vision delegation did not complete/.test(textC2), "c2: explicit 'did not complete' handback");
+        // R21: herdr's agent_not_found reads as "gone", so the exit is noticed at once, not at the deadline.
+        check(/the vision pane exited before writing a result/.test(textC2), "c2: says the vision pane exited");
+        check(tookC2 < ERROR_WAIT_SECONDS - 15, `c2: failed well before the ${ERROR_WAIT_SECONDS}s deadline`);
+        const badPane = herdr.calls.filter((c) => c.op === "startAgent")[startsBefore]?.target;
+        if (badPane) {
+          const panes = (await exec("herdr", ["pane", "list", "--workspace", ws.workspaceId])).stdout;
+          check(!panes.includes(`"${badPane}"`), `c2: pane ${badPane} no longer listed`);
+        }
+      }
+
+      // (d) dead pane: close the reused pane, then send a third image -----------
+      if (!skip.has("d") && entryB?.paneId) {
+        log(`phase d: closing vision pane ${entryB.paneId} by hand, then a third image (yellow square)`);
+        await exec("herdr", ["pane", "close", entryB.paneId]);
+        const startsBeforeD = herdr.count("startAgent");
+        started = Date.now();
+        const outD = await delegator.handle({
+          sessionId,
+          cwd: project,
+          text: "One more: what colour is this?",
+          images: image(YELLOW),
+          messages: [],
+          status: status("d"),
+        });
+        log(`phase d took ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        const textD = printOutcome("d", outD);
+        const entryD = registry.get(sessionId);
+        log(`registry entry after d: ${JSON.stringify(entryD ?? null)}`);
+        // R21: the stale entry is dropped and a NEW vision session analyses the image, with the restart note.
+        check(/STATUS: ok\./.test(textD), "d: handback status ok (a new vision session)");
+        check(/yellow/i.test(textD), "d: handback names yellow");
+        check(/no longer in the vision session's context/.test(textD), "d: handback says earlier images are gone");
+        check(herdr.count("startAgent") === startsBeforeD + 1, "d: exactly one new startAgent");
+        check(!!entryD && entryD.paneId !== entryB.paneId, `d: registry now points at a new pane (${entryD?.paneId})`);
+      }
     }
   } finally {
     console.log("----- herdr calls made by the delegator -----");
     for (const c of herdr.calls) console.log(`${c.at} ${c.op} ${c.target}${c.detail ? ` ${c.detail}` : ""}`);
-    console.log("----- recorded lineage handoffs (fake emitter; nothing sent) -----");
-    for (const h of lineage) console.log(JSON.stringify(h));
-    try {
-      printState(artifactDir);
-    } catch {
-      // no request directory
+    if (imageFile) {
+      // Lineage and state.json may carry image-derived text; print kinds only.
+      console.log(`----- recorded lineage (fake emitter; nothing sent): ${lineage.map((h) => h.cause).join(", ")}`);
+    } else {
+      console.log("----- recorded lineage handoffs (fake emitter; nothing sent) -----");
+      for (const h of lineage) console.log(JSON.stringify(h));
+      try {
+        printState(artifactDir);
+      } catch {
+        // no request directory
+      }
     }
     try {
       await exec("herdr", ["workspace", "close", ws.workspaceId]);
@@ -480,13 +605,14 @@ async function main(): Promise<void> {
     } catch (err) {
       log(`WARNING: could not close workspace ${ws.workspaceId}: ${(err as Error).message}`);
     }
-    if (keep) log(`kept ${root}`);
+    if (keepRoot) log(`kept ${root}`);
     else rmSync(root, { recursive: true, force: true });
   }
 
   const outs = lineage.filter((h) => h.cause === "vision_delegate").length;
   const backs = lineage.filter((h) => h.cause === "vision_return").length;
-  check(outs >= 2 && backs >= 2, `lineage: ${outs} vision_delegate and ${backs} vision_return events recorded`);
+  const want = imageFile ? 1 : 2;
+  check(outs >= want && backs >= want, `lineage: ${outs} vision_delegate and ${backs} vision_return events recorded`);
   console.log(failures.length ? `FAILED (${failures.length}): ${failures.join("; ")}` : "ALL CHECKS PASSED");
   process.exitCode = failures.length ? 1 : 0;
 }
