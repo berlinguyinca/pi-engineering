@@ -7,6 +7,7 @@
     "scripts/planner-worker-benchmark.ts",
     "scripts/pi-session-auto-resume.ts",
     "scripts/install-session-auto-resume.ts",
-    "scripts/pi-session-report.ts"
+    "scripts/pi-session-report.ts",
+    "scripts/vision-delegation-spike.ts"
   ]
 }
