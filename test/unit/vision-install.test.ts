@@ -376,7 +376,8 @@ test("R18: two pasted paths keep their order, dedupe, and follow event.images", 
     { data: b64("aaa"), mimeType: "image/png" },
     { data: b64("bbb"), mimeType: "image/jpeg" },
   ]);
-  assert.equal(d.calls[0]?.text, 'compare "[pasted image 1]" with `[pasted image 2]` and again [pasted image 1]');
+  // event.images come first in the image list, so pasted files are numbered after them (image 1 is attached).
+  assert.equal(d.calls[0]?.text, 'compare "[pasted image 2]" with `[pasted image 3]` and again [pasted image 2]');
 });
 
 test("R18: a path that is not Pi's clipboard name is ignored", async () => {

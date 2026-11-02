@@ -162,11 +162,14 @@ export async function readPastedImages(paths: string[], io: { open?: OpenPasted 
   return { images };
 }
 
-/** Replace every occurrence of each accepted path with `[pasted image N]` (N from 1, in the given order). */
-export function rewritePastedText(text: string, accepted: string[]): string {
+/**
+ * Replace every occurrence of each accepted path with `[pasted image N]`, N counting from `first` in the given
+ * order. Callers that list other images before the pasted ones pass `first` so the numbers match that list.
+ */
+export function rewritePastedText(text: string, accepted: string[], first = 1): string {
   if (accepted.length === 0) return text;
   return text.replace(PASTED_PATH, (match) => {
     const n = accepted.indexOf(match);
-    return n < 0 ? match : `[pasted image ${n + 1}]`;
+    return n < 0 ? match : `[pasted image ${n + first}]`;
   });
 }

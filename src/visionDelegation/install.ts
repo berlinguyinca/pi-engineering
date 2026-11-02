@@ -124,9 +124,11 @@ function inputHandler(build: BuildDelegator): (event: InputEvent, ctx: InputCont
       const out = await delegator.handle({
         sessionId: ctx.sessionManager.getSessionId(),
         cwd: ctx.cwd,
+        // `images` lists event.images first, so pasted files are numbered after them.
         text: rewritePastedText(
           event.text,
           pasted.images.map((i) => i.path),
+          (event.images?.length ?? 0) + 1,
         ),
         images,
         messages,
