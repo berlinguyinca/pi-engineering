@@ -197,8 +197,10 @@ generically. `handoffs.py` builds the rows, and the dashboard views are `package
 `packages/agents-lineage.js`, each with tests. The contract is `docs/contracts/lineage-events.md`.
 
 Scope in herdr-engineering **(call on shape; the scope is the user's)**:
-- Contract: document the `vision_delegate` and `vision_return` causes, and the fields a delegation
-  carries (request id, image count, status, duration), in `lineage-events.md`.
+- Contract: document the `vision_delegate` and `vision_return` causes, and what a delegation carries
+  (request id in the handoff id, outcome in the handoff kind, duration from the control plane's receive
+  times), in `lineage-events.md`. An image count is not carried: Pi's lineage handoff input has no free
+  fields, and adding some is out of scope.
 - Backend: readable `CAUSE_TEXT` entries and a correct model-change reading for both causes (the model
   does change on purpose, so it must not read as `unknown`).
 - Dashboard: vision delegations visible in the agent flows as a round trip (out and back, linked), with
