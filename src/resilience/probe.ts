@@ -113,6 +113,9 @@ export class HttpRecoveryProbe implements RecoveryProbe {
 }
 
 /** Where the catalogue probe asks, and for which model. */
+import { aliasView } from "../models/aliasCatalog.ts";
+import { parseGatewayModels } from "../models/gatewayCatalog.ts";
+
 export interface CatalogProbeTarget {
   /** The provider's OpenAI-compatible base URL, e.g. https://llm.example/v1. */
   baseUrl: string;
@@ -185,6 +188,13 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
       if (!target.modelId) return { healthy: true, authoritative: true };
       const rows = Array.isArray(body?.data) ? (body.data as Array<Record<string, unknown>>) : [];
       const row = rows.find((r) => r && typeof r === "object" && r.id === target.modelId);
+      // An alias is served by whichever of its members is live, so its health is
+      // theirs. Neither a listed alias row nor a derived prefix alias has an
+      // admission entry of its own, and a derived one is not listed at all.
+      const members = aliasMembers(target.modelId, row, body);
+      if (members) {
+        return this.aliasHealth(target.modelId, members, rows, target, controller.signal);
+      }
       if (!row) {
         return {
           healthy: false,
@@ -268,6 +278,89 @@ export class CatalogRecoveryProbe implements RecoveryProbe {
       clearTimeout(timer);
     }
   }
+
+  /**
+   * Health of an alias: healthy when any member is listed with slots and is not
+   * known to be saturated. Admission is read when the gateway has it and its
+   * absence is not held against the member: the gateway's own probes already
+   * decide `slots` and `x_state`, and an alias must not be blocked for a
+   * member whose node has not reported capacity.
+   */
+  private async aliasHealth(
+    alias: string,
+    memberIds: readonly string[],
+    rows: Array<Record<string, unknown>>,
+    target: CatalogProbeTarget,
+    signal: AbortSignal,
+  ): Promise<ProbeResult> {
+    const live = memberIds
+      .map((id) => rows.find((r) => r && typeof r === "object" && r.id === id))
+      .filter((r): r is Record<string, unknown> => !!r && !(typeof r.slots === "number" && r.slots <= 0));
+    if (live.length === 0) {
+      return {
+        healthy: false,
+        authoritative: true,
+        reason: `alias ${alias} has no live member with capacity (${memberIds.length} member(s) listed)`,
+        model_id: alias,
+        ...(target.provider ? { model_provider: target.provider } : {}),
+      };
+    }
+    const saturated = await this.saturatedMembers(target, signal);
+    const open = live.filter((r) => !saturated.has(String(r.id)));
+    if (open.length === 0) {
+      return {
+        healthy: false,
+        authoritative: true,
+        reason: `alias ${alias}: every live member is at its admission limit`,
+      };
+    }
+    return {
+      healthy: true,
+      authoritative: true,
+      reason: `alias ${alias} has ${open.length} live member(s): ${open.map((r) => String(r.id)).join(", ")}`,
+    };
+  }
+
+  /** Members the gateway reports as full. An unreadable or unfamiliar report names none. */
+  private async saturatedMembers(target: CatalogProbeTarget, signal: AbortSignal): Promise<Set<string>> {
+    const full = new Set<string>();
+    try {
+      const headers = {
+        ...(target.apiKey ? { Authorization: `Bearer ${target.apiKey}` } : {}),
+        ...(target.headers ?? {}),
+      };
+      const url = `${target.baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "")}/iw/v1/admission`;
+      const res = await this.fetchImpl(url, { headers, signal });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return full;
+      }
+      const report = (await res.json().catch(() => null)) as { closed?: unknown; models?: unknown } | null;
+      const models = report?.models;
+      if (!models || typeof models !== "object" || Array.isArray(models)) return full;
+      for (const [id, entry] of Object.entries(models as Record<string, Record<string, unknown>>)) {
+        const { active, queued, active_limit: limit } = entry ?? {};
+        const atLimit = typeof active === "number" && typeof limit === "number" && limit > 0 && active >= limit;
+        if (atLimit || (typeof queued === "number" && queued > 0)) full.add(id);
+      }
+    } catch {
+      // The catalogue already said the members are live.
+    }
+    return full;
+  }
+}
+
+/** The concrete members an alias currently resolves to, or `undefined` when `modelId` is not an alias. */
+function aliasMembers(modelId: string, row: Record<string, unknown> | undefined, body: unknown): string[] | undefined {
+  if (row) {
+    if (row.x_alias !== true || !Array.isArray(row.x_members)) return undefined;
+    return row.x_members
+      .map((m) => (typeof m === "string" ? m : (m as { id?: unknown } | null)?.id))
+      .filter((m): m is string => typeof m === "string" && m.length > 0);
+  }
+  // Not listed: the gateway still resolves prefix aliases (`qwen3.8-vision`), by the same rules Pi
+  // configures them with.
+  return aliasView(parseGatewayModels(body)).entries.find((entry) => entry.id === modelId)?.members;
 }
 
 /** Read the deployed Go gateway's model-keyed admission snapshot. */
