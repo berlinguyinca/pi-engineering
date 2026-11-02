@@ -115,16 +115,19 @@ export class RealHerdrCli implements HerdrCli {
       return stdout.trim();
     } catch (err) {
       const e = err as { code?: number; stdout?: string; stderr?: string; message?: string };
-      // Herdr returns JSON errors on stdout with a non-zero exit for API methods.
-      const raw = e.stdout ?? e.stderr ?? e.message ?? "";
+      // Herdr 0.9.1 prints API errors as JSON on STDERR with exit 1 (observed for `agent get`); stdout is
+      // still checked first in case a command answers there. An empty stdout must not hide stderr.
+      const raw = (e.stdout?.trim() ? e.stdout : e.stderr?.trim() ? e.stderr : e.message) ?? "";
       const trimmed = raw.trim();
       if (trimmed.startsWith("{")) {
+        // The thrown code must be herdr's own (e.g. `agent_not_found`): parse first, throw outside the try.
+        let parsed: { error?: { code?: string; message?: string } } | undefined;
         try {
-          const parsed = JSON.parse(trimmed) as { error?: { code?: string; message?: string } };
-          if (parsed.error?.code) throw new HerdrError(parsed.error.code, parsed.error.message ?? trimmed);
+          parsed = JSON.parse(trimmed) as { error?: { code?: string; message?: string } };
         } catch {
-          if (err instanceof HerdrError) throw err;
+          parsed = undefined;
         }
+        if (parsed?.error?.code) throw new HerdrError(parsed.error.code, parsed.error.message ?? trimmed);
       }
       throw new HerdrError("herdr_cli_error", trimmed || String(err));
     }
@@ -143,8 +146,19 @@ export class RealHerdrCli implements HerdrCli {
     return parsed.result?.agents ?? [];
   }
 
+  /**
+   * `null` only when herdr says the target does not exist. herdr 0.9.1 answers `agent_not_found` (exit 1) for
+   * a closed pane, a pane without an agent and an unknown name alike. Every other error still throws, so a
+   * transient failure is never read as "gone" (ruling R21).
+   */
   async getAgent(target: string): Promise<HerdrAgent | null> {
-    const out = await this.run(["agent", "get", target]);
+    let out: string;
+    try {
+      out = await this.run(["agent", "get", target]);
+    } catch (err) {
+      if (err instanceof HerdrError && err.code === "agent_not_found") return null;
+      throw err;
+    }
     const parsed = JSON.parse(out) as { result?: { agent?: HerdrAgent }; error?: { code?: string } };
     if (parsed.error) return null;
     return parsed.result?.agent ?? null;
