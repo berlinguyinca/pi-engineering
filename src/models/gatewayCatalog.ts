@@ -41,6 +41,8 @@ export interface GatewayModelEntry {
   backingModel?: string;
   /** Logical routes a concrete model currently serves (`x_aliases`). */
   aliases?: string[];
+  /** Concrete models an alias row currently resolves to (`x_members`). */
+  members?: string[];
   /** Capabilities the gateway advertises for the model (`x_capabilities` / `capabilities`). */
   capabilities?: string[];
   /** Model family (`x_family`); independent reviewers must differ in family. */
@@ -100,6 +102,12 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
     const aliases = Array.isArray(row.x_aliases)
       ? row.x_aliases.filter((a): a is string => typeof a === "string" && a.length > 0)
       : [];
+    // Members are ids, or `{id}` objects on gateways that report seats too.
+    const members = Array.isArray(row.x_members)
+      ? row.x_members
+          .map((m) => (typeof m === "string" ? m : str((m as { id?: unknown } | null)?.id)))
+          .filter((m): m is string => typeof m === "string" && m.length > 0)
+      : [];
     // Per-request first: `ctx_total` is the gateway's aggregate across slots and
     // would over-state what one call may send.
     // A route row with no size of its own is bounded by the model behind it.
@@ -129,6 +137,7 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
       ...(alias ? { alias } : {}),
       ...(backingModel ? { backingModel } : {}),
       ...(aliases.length > 0 ? { aliases } : {}),
+      ...(members.length > 0 ? { members } : {}),
       ...(capabilities.length > 0 ? { capabilities } : {}),
       ...(family ? { family } : {}),
       ...(tools !== undefined ? { tools } : {}),

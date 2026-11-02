@@ -20,6 +20,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { refreshConfiguredProviders, refreshProviderModels } from "../../src/models/refresh.ts";
 
+// These tests exercise the concrete-id verification pipeline (backing models,
+// per-model 404 handling). Refresh configures aliases only by default, so they
+// opt out; the alias-only behavior is covered in test/unit/model-alias-catalog.test.ts.
+process.env.PI_MODEL_REFRESH_CONCRETE = "1";
+
 const VISION = (ctx: string) => `qwen3.8-27b-modality-vision-ctx-${ctx}-quant-q4_k_m`;
 const DEEPSEEK = "deepseek_v4-flash-modality-text-quant-mxfp4";
 const GLM = "glm5.3-flash-modality-vision-quant-q6_k_xl";

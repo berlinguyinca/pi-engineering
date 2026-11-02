@@ -7,6 +7,11 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { type RefreshProgress, refreshConfiguredProviders, refreshProviderModels } from "../../src/models/refresh.ts";
 
+// These tests exercise the concrete-id verification pipeline (backing models,
+// per-model 404 handling). Refresh configures aliases only by default, so they
+// opt out; the alias-only behavior is covered in test/unit/model-alias-catalog.test.ts.
+process.env.PI_MODEL_REFRESH_CONCRETE = "1";
+
 async function fixture(
   delayMs: number,
   rows: Record<string, unknown>[] = [{ id: "flash-next", ctx_per_request: 131072 }],
