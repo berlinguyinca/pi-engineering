@@ -68,7 +68,12 @@ export class TaskDiscipline {
       d = this.failClosed(contract, call, err);
     }
     this.track(d);
-    void Promise.resolve(this.o.record?.(d)).catch(() => undefined);
+    try {
+      // recording is best-effort and must never change or break a verdict
+      void Promise.resolve(this.o.record?.(d)).catch(() => undefined);
+    } catch {
+      /* a synchronous recorder failure is ignored */
+    }
     return d;
   }
 

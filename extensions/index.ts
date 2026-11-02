@@ -147,6 +147,8 @@ import { renderStatus } from "../src/status/layout.ts";
 import { type PresenceSeedScope, seedPresence } from "../src/status/presenceSeed.ts";
 import { StatusSurfaceBus } from "../src/status/surfaceBus.ts";
 import { WorkingStatusController } from "../src/status/working.ts";
+import { disciplineFromEnv } from "../src/taskDiscipline/config.ts";
+import { registerTaskDiscipline } from "../src/taskDiscipline/hook.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
@@ -1190,6 +1192,11 @@ export default function (pi: ExtensionAPI) {
     // Identical-tool-call loops and unbounded bash test/build runs
     // (src/guard/toolCallGuard.ts; knobs in docs/usage.md, "Tool-call guard").
     registerToolCallGuard(pi as never);
+    // Task Contract gate (src/taskDiscipline; off unless PI_TASK_DISCIPLINE is set).
+    // Registered as its own tool_call/user_bash handlers so it never depends on
+    // the lifecycle controller's mutating-tool filter or its unattended auto-allow.
+    const discipline = disciplineFromEnv();
+    if (discipline) registerTaskDiscipline(pi as never, discipline);
     // One agent, one worktree (AGENTS.md), enforced: block this session's own
     // mutating calls against a repository's PRIMARY checkout so concurrent
     // sessions cannot destroy each other's uncommitted work there. Production

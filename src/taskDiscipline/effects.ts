@@ -63,6 +63,8 @@ const READ_UTILS = new Set(
     " ",
   ),
 );
+/** Read utilities that operate on the working directory when given no path. */
+const IMPLICIT_CWD = new Set(["ls", "du", "tree", "rg", "ag", "stat"]);
 const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag"]);
 const PROGRAM_FIRST = new Set(["awk", "gawk", "sed", "jq", "yq"]);
 const NOOP_BUILTINS = new Set([
@@ -559,6 +561,11 @@ function runCommandInner(cmd: SimpleCommand, ctx: Ctx, whole: string) {
       if (/system\s*\(|\|\s*getline|\|\s*"|print[^;]*>|\bw\s+\S|\be\b\s*$|\/e\b/.test(prog))
         add(ctx, { ...base, kind: "unknown", detail: `${name} program can run commands or write files` });
     }
+    // commands that default to the working directory still read it
+    const recursiveGrep =
+      (name === "grep" || name === "egrep" || name === "fgrep") &&
+      cmd.argv.some((x) => /^-[a-zA-Z]*[rR]/.test(x) || x === "--recursive");
+    if (pos.length === 0 && (IMPLICIT_CWD.has(name) || recursiveGrep)) pos = ["."];
     const dyn = new Set(dynamicIn(cmd));
     const bad = pos.filter((p) => dyn.has(p));
     add(ctx, { ...base, kind: "read", detail: name, paths: pos, unresolved: bad.length ? bad : undefined });
