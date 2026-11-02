@@ -6,8 +6,8 @@
  * broken image must fail the delegation, never be sent on.
  */
 
-import { createHash } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { SavedImage } from "./protocol.ts";
@@ -48,9 +48,14 @@ export async function saveImages(
   for (const { bytes, mimeType } of decoded) {
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     const path = join(imagesDir, `${sha256}.${extensionFor(mimeType)}`);
-    const tmp = `${path}.${process.pid}.tmp`;
-    await writeFile(tmp, bytes);
-    await rename(tmp, path);
+    const tmp = `${path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(tmp, bytes);
+      await rename(tmp, path);
+    } catch (err) {
+      await rm(tmp, { force: true });
+      throw err;
+    }
     saved.push({ path, sha256, mimeType });
   }
   return saved;

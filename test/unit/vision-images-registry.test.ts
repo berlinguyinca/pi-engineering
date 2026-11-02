@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -124,6 +124,82 @@ test("a corrupt registry file reads as empty instead of throwing", () => {
     writeFileSync(file, JSON.stringify([1, 2]));
     assert.equal(new VisionRegistry(file).get("s1"), undefined);
     assert.equal(new VisionRegistry(join(dir, "missing.json")).get("x"), undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("two registry instances on one file keep both sessions", () => {
+  const dir = tmp();
+  try {
+    const file = join(dir, "registry.json");
+    const a = new VisionRegistry(file);
+    const b = new VisionRegistry(file);
+    a.set("s1", entry("1"));
+    b.set("s2", entry("2"));
+    a.set("s3", entry("3"));
+    const r = new VisionRegistry(file);
+    assert.deepEqual([r.get("s1"), r.get("s2"), r.get("s3")], [entry("1"), entry("2"), entry("3")]);
+    assert.ok(!existsSync(`${file}.lock`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("registry remove of one session leaves the others", () => {
+  const dir = tmp();
+  try {
+    const file = join(dir, "registry.json");
+    const r = new VisionRegistry(file);
+    r.set("s1", entry("1"));
+    r.set("s2", entry("2"));
+    new VisionRegistry(file).remove("s1");
+    assert.equal(r.get("s1"), undefined);
+    assert.deepEqual(r.get("s2"), entry("2"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stale registry lock is taken over", () => {
+  const dir = tmp();
+  try {
+    const file = join(dir, "registry.json");
+    const lock = `${file}.lock`;
+    writeFileSync(lock, "");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+    new VisionRegistry(file).set("s1", entry("1"));
+    assert.deepEqual(new VisionRegistry(file).get("s1"), entry("1"));
+    assert.ok(!existsSync(lock));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a held registry lock makes set throw after the bounded wait", () => {
+  const dir = tmp();
+  try {
+    const file = join(dir, "registry.json");
+    writeFileSync(`${file}.lock`, "");
+    const started = Date.now();
+    assert.throws(() => new VisionRegistry(file, { lockTimeoutMs: 150 }).set("s1", entry("1")), /locked/);
+    assert.ok(Date.now() - started < 3000);
+    assert.ok(existsSync(`${file}.lock`), "a lock we did not take is left alone");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent saveImages with identical bytes both succeed and leave one file", async () => {
+  const dir = tmp();
+  try {
+    const img = [{ data: B64, mimeType: "image/png" }];
+    const [a, b] = await Promise.all([saveImages(img, dir), saveImages(img, dir)]);
+    assert.equal(a?.[0]?.sha256, HASH);
+    assert.equal(b?.[0]?.sha256, HASH);
+    const files = readdirSync(join(dir, "images"));
+    assert.deepEqual(files, [`${HASH}.png`]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
