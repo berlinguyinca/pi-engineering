@@ -82,14 +82,19 @@ export class VisionRegistry {
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        let retryNow = false;
         try {
           if (Date.now() - statSync(lock).mtimeMs > this.lockStaleMs) {
             unlinkSync(lock);
-            continue;
+            retryNow = true;
           }
-        } catch {
-          continue; // lock vanished between open and stat; retry
+        } catch (e) {
+          // ENOENT: the lock vanished between open and stat (or unlink); retry at once. Any other error
+          // (EACCES on unlink, a stat failure) falls through to the deadline and the sleep, so a persistent
+          // error can never spin.
+          retryNow = (e as NodeJS.ErrnoException).code === "ENOENT";
         }
+        if (retryNow) continue;
         if (Date.now() >= deadline) {
           throw new Error(`vision registry is locked (${lock}); gave up after ${this.lockTimeoutMs}ms`);
         }

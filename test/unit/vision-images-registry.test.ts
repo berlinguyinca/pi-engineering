@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -187,6 +187,27 @@ test("a held registry lock makes set throw after the bounded wait", () => {
     assert.ok(Date.now() - started < 3000);
     assert.ok(existsSync(`${file}.lock`), "a lock we did not take is left alone");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a persistent non-ENOENT error on a stale lock still hits the deadline instead of spinning", () => {
+  const dir = tmp();
+  const ro = join(dir, "ro");
+  try {
+    mkdirSync(ro);
+    const file = join(ro, "registry.json");
+    writeFileSync(`${file}.lock`, "");
+    // A read-only directory: the lock is stale (lockStaleMs 0) but unlinking it fails with EACCES every time.
+    chmodSync(ro, 0o555);
+    const started = Date.now();
+    assert.throws(
+      () => new VisionRegistry(file, { lockTimeoutMs: 150, lockStaleMs: 0 }).set("s1", entry("1")),
+      /locked/,
+    );
+    assert.ok(Date.now() - started < 3000);
+  } finally {
+    chmodSync(ro, 0o755);
     rmSync(dir, { recursive: true, force: true });
   }
 });
