@@ -63,17 +63,16 @@ function load(cwd: string) {
 }
 
 test("full extension saves over HTTP and recalls in a fresh chat without persisting automatic notes", async () => {
-  // @ts-expect-error standalone JS service has no declaration file
-  const { startServer } = await import("../../services/openviking/src/server.mjs");
-  const server = await startServer({ port: 0, token: "everyday-test" });
+  const { startHindsight } = await import("../support/hindsightServer.ts");
+  const server = await startHindsight({ port: 0, token: "everyday-test" });
   const profile = await mkdtemp(join(tmpdir(), "everyday-memory-"));
   const previous = { ...process.env };
   let second: ReturnType<typeof load> | undefined;
   try {
     process.env.PI_CODING_AGENT_DIR = profile;
-    process.env.PI_OPENVIKING_BASE_URL = server.url;
-    process.env.PI_OPENVIKING_TOKEN = "everyday-test";
-    process.env.PI_OPENVIKING_ENABLED = "1";
+    process.env.PI_HINDSIGHT_BASE_URL = server.url;
+    process.env.PI_HINDSIGHT_TOKEN = "everyday-test";
+    process.env.PI_HINDSIGHT_ENABLED = "1";
     const first = load(profile);
     await first.emit("session_start");
     await first.commands.get("remember").handler("Calibration reports use metric units.", first.ctx);
@@ -94,7 +93,7 @@ test("full extension saves over HTTP and recalls in a fresh chat without persist
     assert.match(context.messages[0].content, /Calibration reports use metric units/);
     assert.equal(second.sent.length, 0);
     assert.match(second.footer()!.render(100).join("\n"), /Memory: ready/);
-    process.env.PI_OPENVIKING_TOKEN = "revoked-test-key";
+    process.env.PI_HINDSIGHT_TOKEN = "revoked-test-key";
     await second.emit("before_agent_start", { prompt: "calibration reports", systemPrompt: "" });
     assert.match(second.statuses.at(-1)!, /invalid or revoked/);
     assert.match(second.footer()!.render(100).join("\n"), /invalid or revoked/);

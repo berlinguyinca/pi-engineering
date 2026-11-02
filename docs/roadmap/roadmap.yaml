@@ -320,7 +320,7 @@ milestones:
         description: Optional per-session memory provider (pi-blackhole pinned to 0.5.4, builtin fallback), strict candidate/reviewer/challenger isolation keyed by full session identity, and EventStore-authoritative lifecycle events.
         evidence: { required: [ { type: unit, id: blackhole-session-isolation } ] }
       - id: M23-A2
-        description: Memory-promotion workflow with evidence + audit events through the OpenViking durable-memory abstraction; no auto-promotion of speculative memory.
+        description: Memory-promotion workflow with evidence + audit events through the Hindsight durable-memory abstraction; no auto-promotion of speculative memory.
         evidence: { required: [ { type: unit, id: blackhole-promotion } ] }
       - id: M23-A3
         description: Background Observer/Reflector/Dropper workers routed via ModelRouter at P3/P4 and scheduled with backpressure so they never preempt engineering work.

@@ -13,10 +13,10 @@ import type { ModelProvider, ModelRouter } from "../routing/ModelRouter.ts";
 import { Scheduler } from "../sched/Scheduler.ts";
 import type { BlackholeAdapter } from "./BlackholeAdapter.ts";
 import { MemoryStore } from "./MemoryStore.ts";
-import { type DurableMemoryProvider, type DurableMemoryRecord, InMemoryDurableMemory } from "./OpenViking.ts";
 import { type SessionContext, newSessionIdentity } from "./SessionStore.ts";
 import { resolveBlackholeConfig } from "./config.ts";
-import { OpenVikingProvider, SharedFileDurableMemory } from "./durable.ts";
+import { HindsightProvider, SharedFileDurableMemory } from "./durable.ts";
+import { type DurableMemoryProvider, type DurableMemoryRecord, InMemoryDurableMemory } from "./durableProvider.ts";
 import {
   type MemoryStoreFactory,
   type MemoryWorkerOptions,
@@ -346,8 +346,8 @@ export function buildDurableProvider(cfg: import("./types.ts").DurableStoreConfi
   switch (cfg.kind) {
     case "shared-file":
       return new SharedFileDurableMemory(cfg.file);
-    case "openviking":
-      return new OpenVikingProvider({ baseUrl: cfg.baseUrl, token: cfg.token });
+    case "hindsight":
+      return new HindsightProvider({ baseUrl: cfg.baseUrl, token: cfg.token, project: cfg.project });
     default:
       return new InMemoryDurableMemory();
   }

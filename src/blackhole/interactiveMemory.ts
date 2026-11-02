@@ -4,10 +4,10 @@ import { join } from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
-import type { DurableMemoryProvider, DurableMemoryRecord } from "./OpenViking.ts";
 import { ensureMemorySetup, resolveMemoryEnvironment } from "./connectionSetup.ts";
-import { OpenVikingProvider, OpenVikingRequestError } from "./durable.ts";
-import { type OpenVikingEnvConfig, resolveOpenVikingFromEnv } from "./envConfig.ts";
+import { HindsightProvider, HindsightRequestError } from "./durable.ts";
+import type { DurableMemoryProvider, DurableMemoryRecord } from "./durableProvider.ts";
+import { type HindsightEnvConfig, resolveHindsightFromEnv } from "./envConfig.ts";
 
 const MEMORY_CONTEXT = "pi-engineering-memory";
 const MAX_CONTEXT = 6000;
@@ -24,7 +24,7 @@ const STOPWORDS = new Set(
 
 export interface InteractiveMemoryOptions {
   env?: () => NodeJS.ProcessEnv;
-  provider?: (config: OpenVikingEnvConfig) => DurableMemoryProvider;
+  provider?: (config: HindsightEnvConfig) => DurableMemoryProvider;
   setup?: (ctx: ExtensionContext, force?: boolean) => Promise<void>;
   now?: () => number;
   /**
@@ -112,7 +112,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const makeProvider =
     options.provider ??
     ((config) =>
-      new OpenVikingProvider({ ...config, strict: true, timeoutMs: Math.min(config.providerTimeoutMs, 5000) }));
+      new HindsightProvider({ ...config, strict: true, timeoutMs: Math.min(config.providerTimeoutMs, 5000) }));
   const setup = options.setup ?? ((ctx, force) => ensureMemorySetup(ctx, { force }));
   const now = options.now ?? Date.now;
   let generation = 0;
@@ -136,17 +136,17 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       return await Promise.race([
         work,
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new OpenVikingRequestError("timeout")), AUTOMATIC_LOOKUP_MS);
+          timer = setTimeout(() => reject(new HindsightRequestError("timeout")), AUTOMATIC_LOOKUP_MS);
         }),
       ]);
     } finally {
       clearTimeout(timer);
     }
   };
-  const fingerprint = (config: OpenVikingEnvConfig) =>
+  const fingerprint = (config: HindsightEnvConfig) =>
     createHash("sha256").update(`${config.baseUrl}\0${config.token}`).digest("hex");
   const setStatus = (ctx: ExtensionContext, text: string) => {
-    if (ctx.hasUI) ctx.ui.setStatus("openviking", `Memory: ${text}`);
+    if (ctx.hasUI) ctx.ui.setStatus("hindsight", `Memory: ${text}`);
   };
   const reply = (ctx: ExtensionContext, text: string, error = false) => {
     if (ctx.hasUI) ctx.ui.notify(text, error ? "error" : "info");
@@ -165,7 +165,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       // Headless (pi -p): an automatic status line is not part of the answer.
       // Writing it into the transcript polluted every print-mode session, so
       // log it to telemetry/stderr once per memory host per day instead.
-      const baseUrl = resolveOpenVikingFromEnv(environment())?.baseUrl ?? "unconfigured";
+      const baseUrl = resolveHindsightFromEnv(environment())?.baseUrl ?? "unconfigured";
       if (lastFailure !== code && firstNoticeToday(noticeDir(), baseUrl)) {
         emitTelemetry({ level: "warning", key: `memory:${code}`, text: `Memory: ${text}` });
       }
@@ -173,7 +173,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     lastFailure = code;
   };
   const handleError = (ctx: ExtensionContext, error: unknown, explicit = false) => {
-    const code = error instanceof OpenVikingRequestError ? error.code : "unreachable";
+    const code = error instanceof HindsightRequestError ? error.code : "unreachable";
     clearRecall();
     retryAfter = now() + (code === "auth" || code === "forbidden" ? AUTH_BACKOFF_MS : FAILURE_BACKOFF_MS);
     const messages = {
@@ -195,7 +195,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
   const connection = (ctx: ExtensionContext, explicit = false, auto = false) => {
     const env = environment();
-    const config = resolveOpenVikingFromEnv(env);
+    const config = resolveHindsightFromEnv(env);
     if (!config) {
       clearRecall();
       activeFingerprint = "";
@@ -204,8 +204,8 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       if (explicit)
         reply(
           ctx,
-          env.PI_OPENVIKING_ENABLED === "0" || env.PI_OPENVIKING_ENABLED === "false"
-            ? "Memory is disabled by PI_OPENVIKING_ENABLED. Remove that override or set it to 1, then run /memory setup."
+          env.PI_HINDSIGHT_ENABLED === "0" || env.PI_HINDSIGHT_ENABLED === "false"
+            ? "Memory is disabled by PI_HINDSIGHT_ENABLED. Remove that override or set it to 1, then run /memory setup."
             : "Memory is not configured. Use /memory setup.",
           true,
         );
@@ -239,7 +239,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
   const current = (id: number, identity: string) => {
     if (id !== generation) return false;
-    const config = resolveOpenVikingFromEnv(environment());
+    const config = resolveHindsightFromEnv(environment());
     return !!config?.token && fingerprint(config) === identity;
   };
   const check = async (ctx: ExtensionContext, explicit: boolean) => {
@@ -249,17 +249,19 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     const epoch = automaticLookupEpoch;
     setStatus(ctx, "checking");
     try {
+      // Hindsight has no list endpoint: recallAll() is a best-effort semantic
+      // recall, so this count is what the bank recalled, not a literal total.
       const request = conn.client.recallAll();
       const records = await (explicit ? request : automatic(request));
       if (!current(id, conn.identity) || (!explicit && epoch !== automaticLookupEpoch)) return;
       lastFailure = "";
       retryAfter = 0;
       if (explicit) clearRecall();
-      setStatus(ctx, `ready · ${records.length} saved`);
+      setStatus(ctx, `ready · ${records.length} recalled`);
       if (explicit)
         reply(
           ctx,
-          `Memory connection verified: ${records.length} saved note(s). /remember <text> saves an explicit note; /memory <query> searches.`,
+          `Memory connection verified: ${records.length} note(s) recalled. /remember <text> saves an explicit note; /memory <query> searches.`,
         );
     } catch (error) {
       if (current(id, conn.identity) && (explicit || epoch === automaticLookupEpoch)) handleError(ctx, error, explicit);
@@ -267,7 +269,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
 
   pi.registerCommand("remember", {
-    description: "Save an explicit private note to Viking: /remember <text> (up to 4,000 characters).",
+    description: "Save an explicit private note to Hindsight: /remember <text> (up to 4,000 characters).",
     handler: async (args, ctx) => {
       const text = args.trim();
       if (!text || text.length > 4000) {
@@ -305,14 +307,14 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     },
   });
   pi.registerCommand("memory", {
-    description: "Check Viking connection, search notes, or configure with /memory setup.",
+    description: "Check Hindsight connection, search notes, or configure with /memory setup.",
     handler: async (args, ctx) => {
       const query = args.trim();
       if (query === "setup") {
         if (!ctx.hasUI || ctx.mode !== "tui") {
           reply(
             ctx,
-            "Run /memory setup in an interactive Pi terminal to configure the host and enter a hidden key. Headless sessions use the saved profile or PI_OPENVIKING_BASE_URL and PI_OPENVIKING_TOKEN_FILE.",
+            "Run /memory setup in an interactive Pi terminal to configure the host and enter a hidden key. Headless sessions use the saved profile or PI_HINDSIGHT_BASE_URL and PI_HINDSIGHT_TOKEN_FILE.",
           );
           return;
         }
@@ -412,7 +414,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   });
   pi.on("context", (event, ctx) => {
     const messages = event.messages.filter((m) => !(m.role === "custom" && m.customType === MEMORY_CONTEXT));
-    const config = resolveOpenVikingFromEnv(environment());
+    const config = resolveHindsightFromEnv(environment());
     if (!config) {
       recalled = "";
       setStatus(ctx, "off");

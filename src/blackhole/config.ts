@@ -74,8 +74,15 @@ export function resolveBlackholeConfig(input?: PartialBlackholeConfig): ConfigRe
   if (durable.kind === "shared-file" && !durable.file) {
     throw new Error("durable.kind='shared-file' requires a `file` path");
   }
-  if (durable.kind === "openviking" && !durable.baseUrl) {
-    throw new Error("durable.kind='openviking' requires a `baseUrl`");
+  if (durable.kind === "hindsight" && !durable.baseUrl) {
+    throw new Error("durable.kind='hindsight' requires a `baseUrl`");
+  }
+  if (
+    durable.kind === "hindsight" &&
+    durable.project !== undefined &&
+    !/^[a-z0-9][a-z0-9_-]{0,95}$/.test(durable.project)
+  ) {
+    throw new Error("durable.kind='hindsight' project must be a canonical lowercase identifier");
   }
   const providerTimeoutMs = input?.providerTimeoutMs ?? DEFAULTS.providerTimeoutMs;
   if (providerTimeoutMs < 1) {

@@ -22,7 +22,7 @@ test("engineering commands use changed profile host and rotated key rather than 
       JSON.stringify({ baseUrl: "https://first.example", tokenFile: key, lastConfirmedRevision: "test" }),
     );
     process.env.PI_CODING_AGENT_DIR = profile;
-    process.env.PI_OPENVIKING_ENABLED = "1";
+    process.env.PI_HINDSIGHT_ENABLED = "1";
     globalThis.fetch = async (input, options) => {
       seen.push({ url: String(input), auth: (options?.headers as Record<string, string> | undefined)?.authorization });
       return new Response("[]");
@@ -42,7 +42,8 @@ test("engineering commands use changed profile host and rotated key rather than 
       JSON.stringify({ baseUrl: "https://second.example", tokenFile: key, lastConfirmedRevision: "test" }),
     );
     await commands.get("blackhole")!.handler("--dashboard", ctx);
-    assert.equal(seen.at(-1)!.url, "https://second.example/memory");
+    // recallAll() is a semantic recall against the project's facts bank
+    assert.equal(seen.at(-1)!.url, "https://second.example/v1/default/banks/pi-facts/memories/recall");
     assert.equal(seen.at(-1)!.auth, "Bearer rotated-key");
   } finally {
     globalThis.fetch = oldFetch;

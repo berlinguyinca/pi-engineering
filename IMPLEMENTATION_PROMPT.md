@@ -12,7 +12,7 @@ Read:
 1. `docs/specs/pi-engineering-herdr-runtime/00-master.md`
 2. its `README.md`
 3. every numbered spec 01–16
-4. existing source/specs/tests for sessions, workers, subagents, processes, worktrees, events, Pi-Web, InferWeave and OpenViking.
+4. existing source/specs/tests for sessions, workers, subagents, processes, worktrees, events, Pi-Web, InferWeave and Hindsight.
 
 HARD RULES:
 - This is a staged migration, NOT a rewrite.
@@ -23,7 +23,7 @@ HARD RULES:
 - Pi-Engineering owns work/DAG/policy/review/repair.
 - Herdr owns persistent process/agent runtime concerns.
 - InferWeave owns model/runtime/GPU scheduling. Never add static model-to-GPU assignments.
-- OpenViking remains semantic shared memory; PostgreSQL remains operational history.
+- Hindsight remains semantic shared memory; PostgreSQL remains operational history.
 - All Herdr access must be behind AgentRuntime.
 - Inspect actual current Herdr/pi-herdr source/API/version before relying on commands.
 - Keep the legacy runtime until parity, recovery, canary and rollback gates pass.

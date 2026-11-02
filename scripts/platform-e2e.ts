@@ -4,12 +4,12 @@
  *
  *   plan -> Plannotator approval OR explicit autonomous bypass
  *        -> implementation workers -> tests -> fresh independent review
- *        -> fixes -> revalidation -> completion -> durable OpenViking memory
+ *        -> fixes -> revalidation -> completion -> durable Hindsight memory
  *
  * Deterministic: uses the platform primitives + an in-memory store, a fake
  * Plannotator transport (interactive) and an autonomous-bypass leg, simulated
  * implementation/test/review workers, structural reviewer isolation, and a
- * MemoryOutbox commit to OpenViking. Prints a control-plane snapshot at the end.
+ * MemoryOutbox commit to Hindsight. Prints a control-plane snapshot at the end.
  *
  * Run: node --experimental-strip-types scripts/platform-e2e.ts
  */
@@ -89,12 +89,12 @@ async function main(): Promise<void> {
   platform.graph.complete(reviewer.id);
   ok("fresh independent review passed isolation gate");
 
-  // 5. Completion + durable OpenViking memory via the offline outbox.
+  // 5. Completion + durable Hindsight memory via the offline outbox.
   platform.graph.setRunStatus(run.id, "COMPLETED");
   const outbox = new MemoryOutbox({
     transport: {
       push: async (c) => {
-        ok(`OpenViking committed ${c.kind} (${c.id})`);
+        ok(`Hindsight committed ${c.kind} (${c.id})`);
       },
     },
   });

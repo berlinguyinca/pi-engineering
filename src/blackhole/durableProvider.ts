@@ -1,11 +1,11 @@
 /**
- * OpenViking — promoted durable cross-session memory provider abstraction.
+ * Durable memory provider abstraction for promoted cross-session memory.
  *
- * Promoted durable memory flows through this seam. OpenViking itself is external
- * infrastructure; core provides the abstraction and a dependency-free in-memory
- * durable store so promotion is testable end-to-end without the external system.
- * A real implementation can be supplied by wiring a provider that persists
- * elsewhere (the interface is the contract).
+ * Promoted durable memory flows through this seam. The shared backend is
+ * Hindsight (the herdr-memory service); core provides the abstraction and a
+ * dependency-free in-memory durable store so promotion is testable end-to-end
+ * without the external system. Other backends can be supplied by wiring a
+ * provider that persists elsewhere (the interface is the contract).
  */
 
 export interface DurableMemoryRecord {
@@ -25,6 +25,13 @@ export interface DurableMemoryProvider {
   /** Search promoted durable memory (simple substring match by default). */
   search(query: string): Promise<DurableMemoryRecord[]>;
 }
+
+/**
+ * Hindsight recall does not expose a list-all endpoint: `recallAll()` is the
+ * whole-bank read used by connection checks, which Hindsight answers as a
+ * best-effort semantic recall rather than a literal enumeration.
+ */
+export const HINDSIGHT_RECALL_ALL_QUERY = "saved memory notes";
 
 /** Dependency-free in-memory durable store (default provider). */
 export class InMemoryDurableMemory implements DurableMemoryProvider {

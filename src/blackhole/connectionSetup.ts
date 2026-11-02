@@ -1,4 +1,4 @@
-/** Profile-owned Viking connection; independent of repositories and shell startup files. */
+/** Profile-owned Hindsight connection; independent of repositories and shell startup files. */
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -16,8 +16,8 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Input, truncateToWidth } from "@earendil-works/pi-tui";
-import { OpenVikingProvider, OpenVikingRequestError } from "./durable.ts";
-import { resolveOpenVikingFromEnv } from "./envConfig.ts";
+import { HindsightProvider, HindsightRequestError } from "./durable.ts";
+import { resolveHindsightFromEnv } from "./envConfig.ts";
 
 interface ConnectionProfile {
   baseUrl: string;
@@ -72,9 +72,9 @@ export function resolveMemoryEnvironment(
   const result = { ...env };
   const profile = readProfile(profilePath(env, options));
   if (profile) {
-    result.PI_OPENVIKING_BASE_URL = profile.baseUrl;
-    result.PI_OPENVIKING_TOKEN_FILE = profile.tokenFile;
-    delete result.PI_OPENVIKING_TOKEN;
+    result.PI_HINDSIGHT_BASE_URL = profile.baseUrl;
+    result.PI_HINDSIGHT_TOKEN_FILE = profile.tokenFile;
+    delete result.PI_HINDSIGHT_TOKEN;
   }
   return result;
 }
@@ -91,11 +91,11 @@ function connectionFingerprint(env: NodeJS.ProcessEnv, options: MemorySetupOptio
   const effective = resolveMemoryEnvironment(env, options);
   hash.update(
     JSON.stringify({
-      enabled: effective.PI_OPENVIKING_ENABLED,
-      baseUrl: effective.PI_OPENVIKING_BASE_URL,
-      tokenFile: effective.PI_OPENVIKING_TOKEN_FILE,
-      token: effective.PI_OPENVIKING_TOKEN,
-      connection: resolveOpenVikingFromEnv(effective),
+      enabled: effective.PI_HINDSIGHT_ENABLED,
+      baseUrl: effective.PI_HINDSIGHT_BASE_URL,
+      tokenFile: effective.PI_HINDSIGHT_TOKEN_FILE,
+      token: effective.PI_HINDSIGHT_TOKEN,
+      connection: resolveHindsightFromEnv(effective),
     }),
   );
   return hash.digest("hex");
@@ -148,7 +148,7 @@ async function promptKey(ctx: ExtensionContext): Promise<string | undefined> {
       render(width: number) {
         // Never render Input itself: the native widget has no password mode.
         return [
-          "Viking access key (hidden)",
+          "Hindsight access key (hidden)",
           `> ${"*".repeat(Math.min(input?.getValue().length ?? 0, Math.max(0, width - 2)))}`,
           "Enter to save · Esc to cancel",
         ].map((line) => truncateToWidth(line, Math.max(1, width)));
@@ -180,13 +180,16 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
   const env = options.env ?? process.env;
   if (!ctx.hasUI || ctx.mode !== "tui") {
     if (options.force)
-      ctx.ui.notify("Run /memory setup in an interactive terminal to enter your Viking host and key securely.", "info");
+      ctx.ui.notify(
+        "Run /memory setup in an interactive terminal to enter your Hindsight host and key securely.",
+        "info",
+      );
     return;
   }
-  if (env.PI_OPENVIKING_ENABLED === "0" || env.PI_OPENVIKING_ENABLED === "false") {
+  if (env.PI_HINDSIGHT_ENABLED === "0" || env.PI_HINDSIGHT_ENABLED === "false") {
     if (options.force)
       ctx.ui.notify(
-        "OpenViking is disabled by PI_OPENVIKING_ENABLED. Remove that override before running /memory setup.",
+        "Hindsight is disabled by PI_HINDSIGHT_ENABLED. Remove that override before running /memory setup.",
         "info",
       );
     return;
@@ -197,7 +200,7 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
     const initialFingerprint = connectionFingerprint(env, options);
     const profile = readProfile(path);
     const effective = resolveMemoryEnvironment(env, options);
-    const current = resolveOpenVikingFromEnv(effective);
+    const current = resolveHindsightFromEnv(effective);
     const revision = options.revision ?? memorySetupRevision();
     // A connection that works needs no confirmation. This used to re-ask on
     // every revision bump — i.e. after every install or update — which trains
@@ -226,28 +229,28 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
       /* Invalid host is corrected in setup. */
     }
     const action = await ctx.ui.select(
-      `OpenViking memory — confirm connection after install/update (${hostLabel})`,
+      `Hindsight memory — confirm connection after install/update (${hostLabel})`,
       configured ? ["Keep current connection", "Change connection", "Later"] : ["Set up connection", "Later"],
     );
     if (!action || action === "Later") return;
-    let baseUrl = current?.baseUrl ?? "https://viking.example.com";
+    let baseUrl = current?.baseUrl ?? "https://hindsight.example.com";
     let token = current?.token;
-    let tokenFile = effective.PI_OPENVIKING_TOKEN?.trim() ? undefined : effective.PI_OPENVIKING_TOKEN_FILE;
+    let tokenFile = effective.PI_HINDSIGHT_TOKEN?.trim() ? undefined : effective.PI_HINDSIGHT_TOKEN_FILE;
     if (action !== "Keep current connection") {
-      const host = await ctx.ui.input("Viking host URL (HTTPS)", baseUrl);
+      const host = await ctx.ui.input("Hindsight host URL (HTTPS)", baseUrl);
       if (host === undefined) return;
       baseUrl = host.trim() || baseUrl;
       // Validate the destination before asking for a credential.
-      new OpenVikingProvider({ baseUrl, strict: true });
+      new HindsightProvider({ baseUrl, strict: true });
       token = await promptKey(ctx);
       if (!token) return;
       tokenFile = undefined;
     }
     if (!token) return;
-    await new OpenVikingProvider({ baseUrl, token, strict: true, timeoutMs: 5000, fetch: options.fetch }).recallAll();
+    await new HindsightProvider({ baseUrl, token, strict: true, timeoutMs: 5000, fetch: options.fetch }).recallAll();
     if (connectionFingerprint(env, options) !== initialFingerprint) {
       ctx.ui.notify(
-        "OpenViking settings or credentials changed during setup. Run /memory setup to retry with the current connection.",
+        "Hindsight settings or credentials changed during setup. Run /memory setup to retry with the current connection.",
         "warning",
       );
       return;
@@ -257,7 +260,7 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
     chmodSync(dirname(path), 0o700);
     if (!tokenFile) {
       // Unique secret avoids replacing a working credential before settings commit.
-      newTokenFile = join(dirname(path), `viking-${randomUUID()}.key`);
+      newTokenFile = join(dirname(path), `hindsight-${randomUUID()}.key`);
       atomicWrite(newTokenFile, `${token}\n`);
       tokenFile = newTokenFile;
     }
@@ -268,7 +271,7 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
       profile &&
       profile.tokenFile !== saved.tokenFile &&
       dirname(profile.tokenFile) === resolve(dirname(path)) &&
-      /^viking-[a-f0-9-]{36}\.key$/.test(basename(profile.tokenFile))
+      /^hindsight-[a-f0-9-]{36}\.key$/.test(basename(profile.tokenFile))
     ) {
       try {
         unlinkSync(profile.tokenFile);
@@ -277,7 +280,7 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
       }
     }
     ctx.ui.notify(
-      "OpenViking connection verified and saved for this Pi profile. Use /memory status to check it or /memory setup to change it.",
+      "Hindsight connection verified and saved for this Pi profile. Use /memory status to check it or /memory setup to change it.",
       "info",
     );
   } catch (error) {
@@ -289,9 +292,9 @@ export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySe
       }
     }
     ctx.ui.notify(
-      error instanceof OpenVikingRequestError
+      error instanceof HindsightRequestError
         ? `${error.message} Previous settings are unchanged. Run /memory setup to retry.`
-        : "OpenViking setup could not be completed. Previous settings are unchanged. Run /memory setup in an interactive terminal to retry.",
+        : "Hindsight setup could not be completed. Previous settings are unchanged. Run /memory setup in an interactive terminal to retry.",
       "warning",
     );
   }

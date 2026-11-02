@@ -204,11 +204,11 @@ test("notice: an endpoint is reported by origin, never with its credentials", as
   // A base URL may carry userinfo, and this warning is now SHOWN to the
   // operator rather than buried in stderr — a surface is exactly where a token
   // must not be repeated back.
-  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
+  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
   const seen: string[] = [];
   const restore = setTelemetrySink((n) => seen.push(n.text));
   try {
-    const provider = new OpenVikingProvider({
+    const provider = new HindsightProvider({
       baseUrl: "https://user:s3cr3t-token@ov.example:8443/api",
       fetch: (async () => ({ ok: false, status: 401, json: async () => [] })) as never,
     });

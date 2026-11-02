@@ -17,11 +17,11 @@ behaving exactly as before when omitted or disabled (backward compatible).
   - `MemoryStore.ts` — per-session store (observe/reflect/drop, priority recall,
     compaction with audit trail, promotion candidates).
   - `BlackholeAdapter.ts` — provider seam (builtin default; optional pi-blackhole).
-  - `OpenViking.ts` — durable cross-session memory abstraction + in-memory default.
+  - `durableProvider.ts` — durable cross-session memory abstraction + in-memory default.
   - `durable.ts` — **shared durable-memory providers** so several pi workers share
     promoted knowledge: `SharedFileDurableMemory` (dependency-free append-only JSONL,
-    cross-process on one host / CI) and `OpenVikingProvider` (HTTP adapter for the
-    external cross-machine OpenViking service), plus `buildDurableProvider`. Config
+    cross-process on one host / CI) and `HindsightProvider` (HTTP adapter for the
+    external cross-machine Hindsight service), plus `buildDurableProvider`. Config
     `durable.kind` selects the backing store.
   - `promotion.ts` — evidence-gated promotion; **no auto-promotion**.
   - `memoryWorkers.ts` — Observer/Reflector/Dropper at P3/P4 via ModelRouter +
@@ -47,15 +47,16 @@ behaving exactly as before when omitted or disabled (backward compatible).
 ## Evidence
 
 - Deterministic unit + integration tests: `test/unit/blackhole*.test.ts`,
-  `test/integration/blackhole.test.ts`, `test/integration/openviking.test.ts`.
+  `test/integration/blackhole.test.ts`, `test/integration/everyday-memory.test.ts`
+  (HTTP end-to-end against an in-process herdr-memory contract server in
+  `test/support/hindsightServer.ts`).
 - A/B benchmark artifacts: `docs/evidence/blackhole/` (report.md, 12 plots,
   raw.jsonl, raw.csv).
-- **Tier-1 OpenViking service** (`services/openviking/`): a containerized, stateless
-  HTTP durable-memory service (PostgreSQL backing store; in-memory mode for dev/test)
-  serving the exact `DurableMemoryProvider` contract. `docker compose up` deploys it
-  on a single host; `test/integration/openviking.test.ts` validates the contract
-  end-to-end (store/recall/search/auth via the real `OpenVikingProvider`, plus an
-  opt-in Postgres round-trip test gated on `TEST_DATABASE_URL`).
+- **Hindsight (herdr-memory) is external infrastructure.** This repository no
+  longer ships a memory service: the former in-repo durable-memory service was
+  retired in favor of the herdr-memory project, and `HindsightProvider` targets
+  the herdr-memory bank contract directly (retain/recall over
+  `/v1/default/banks/{project}-facts`).
 - Fresh-context review (`scripts/fresh-review-blackhole.ts`) found 6 material
   findings; a focused re-review (`scripts/fresh-review-blackhole-fixes.ts`)
   confirmed all RESOLVED with 0 critical / 0 high.
@@ -65,7 +66,7 @@ behaving exactly as before when omitted or disabled (backward compatible).
   calls, so a hang could stall a worker). Both fixed — hydration is now gated to
   non-independent roles (implementer/scout/planner) and provider calls are bounded
   by `providerTimeoutMs`. Round 2 confirmed 0 critical / 0 high. Known accepted
-  limitations: the `OpenVikingProvider` is an adapter seam for external infra whose
+  limitations: the `HindsightProvider` is an adapter seam for external infra whose
   wire contract must be reconciled with the real service (its CONTRACT NOTE says
   so), and shared-file memory is a plain JSONL that a worker already holding
   bash/write tools could edit directly (same boundary as editing any source file).

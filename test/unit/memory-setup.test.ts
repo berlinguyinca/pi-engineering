@@ -11,7 +11,7 @@ import {
 } from "../../src/blackhole/connectionSetup.ts";
 
 function fixture(t: test.TestContext) {
-  const profileDir = mkdtempSync(join(tmpdir(), "viking setup "));
+  const profileDir = mkdtempSync(join(tmpdir(), "hindsight setup "));
   t.after(() => rmSync(profileDir, { recursive: true, force: true }));
   const notices: string[] = [];
   const prompts: string[] = [];
@@ -48,10 +48,19 @@ function fixture(t: test.TestContext) {
       },
     },
   } as unknown as ExtensionContext;
+  // The herdr-memory recall contract: {results: [...]}, not a bare array.
   const fetchFn = async (_url: any, init: any) => {
     assert.equal(init.headers.authorization, `Bearer ${key}`);
-    return new Response("[]", { status: 200 });
+    return new Response(JSON.stringify({ results: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   };
+  const recallResponse = (body?: unknown) =>
+    new Response(JSON.stringify(body ?? { results: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   const options = { profileDir, env: {}, revision: "v1", fetch: fetchFn as typeof fetch };
   return {
     ctx,
@@ -61,6 +70,7 @@ function fixture(t: test.TestContext) {
     selections,
     hosts,
     profileDir,
+    recallResponse,
     setKey: (v: string) => {
       key = v;
     },
@@ -74,17 +84,17 @@ test("onboarding stores verified connection privately, masks keys, and saved set
   const f = fixture(t);
   await ensureMemorySetup(f.ctx, f.options);
   const env = resolveMemoryEnvironment(
-    { PI_OPENVIKING_TOKEN: "old", PI_OPENVIKING_BASE_URL: "https://old.test" },
+    { PI_HINDSIGHT_TOKEN: "old", PI_HINDSIGHT_BASE_URL: "https://old.test" },
     f.options,
   );
-  assert.equal(env.PI_OPENVIKING_BASE_URL, "https://memory.example.test");
-  assert.equal(env.PI_OPENVIKING_TOKEN, undefined);
-  assert.equal(readFileSync(env.PI_OPENVIKING_TOKEN_FILE!, "utf8").trim(), "personal-test-key");
-  assert.equal(statSync(env.PI_OPENVIKING_TOKEN_FILE!).mode & 0o777, 0o600);
+  assert.equal(env.PI_HINDSIGHT_BASE_URL, "https://memory.example.test");
+  assert.equal(env.PI_HINDSIGHT_TOKEN, undefined);
+  assert.equal(readFileSync(env.PI_HINDSIGHT_TOKEN_FILE!, "utf8").trim(), "personal-test-key");
+  assert.equal(statSync(env.PI_HINDSIGHT_TOKEN_FILE!).mode & 0o777, 0o600);
   const configFile = join(f.profileDir, "engineering-memory", "connection.json");
   assert.equal(statSync(configFile).mode & 0o777, 0o600);
   assert.equal(readFileSync(configFile, "utf8").includes("personal-test-key"), false);
-  assert.equal(resolveMemoryEnvironment({ PI_OPENVIKING_ENABLED: "false" }, f.options).PI_OPENVIKING_ENABLED, "false");
+  assert.equal(resolveMemoryEnvironment({ PI_HINDSIGHT_ENABLED: "false" }, f.options).PI_HINDSIGHT_ENABLED, "false");
   const promptCount = f.prompts.length;
   await ensureMemorySetup(f.ctx, f.options);
   assert.equal(f.prompts.length, promptCount, "same update should not prompt again");
@@ -112,9 +122,9 @@ test("keep current reuses external key file and does not rewrite it", async (t) 
   await ensureMemorySetup(f.ctx, {
     ...f.options,
     force: true,
-    env: { PI_OPENVIKING_BASE_URL: "https://old.test", PI_OPENVIKING_TOKEN_FILE: external },
+    env: { PI_HINDSIGHT_BASE_URL: "https://old.test", PI_HINDSIGHT_TOKEN_FILE: external },
   });
-  assert.equal(resolveMemoryEnvironment({}, f.options).PI_OPENVIKING_TOKEN_FILE, external);
+  assert.equal(resolveMemoryEnvironment({}, f.options).PI_HINDSIGHT_TOKEN_FILE, external);
   assert.equal(statSync(external).mode & 0o777, 0o640);
   assert.equal(readFileSync(external, "utf8"), "external-key\n");
 });
@@ -124,7 +134,7 @@ for (const scenario of ["headless", "disabled", "later", "cancel-key", "invalid-
     const f = fixture(t);
     const opts = { ...f.options };
     if (scenario === "headless") f.ctx.hasUI = false;
-    if (scenario === "disabled") opts.env = { PI_OPENVIKING_ENABLED: "0" };
+    if (scenario === "disabled") opts.env = { PI_HINDSIGHT_ENABLED: "0" };
     if (scenario === "later") f.selections.splice(0, 1, "Later");
     if (scenario === "cancel-key") f.cancel();
     if (scenario === "invalid-host") f.hosts.splice(0, 1, "http://insecure.test");
@@ -149,7 +159,7 @@ test("failed replacement keeps the previous working profile and key intact", asy
     fetch: async () => new Response("bad-new-key", { status: 403 }),
   });
   assert.deepEqual(resolveMemoryEnvironment({}, f.options), before);
-  assert.equal(readFileSync(before.PI_OPENVIKING_TOKEN_FILE!, "utf8").trim(), "personal-test-key");
+  assert.equal(readFileSync(before.PI_HINDSIGHT_TOKEN_FILE!, "utf8").trim(), "personal-test-key");
 });
 
 test("revision remains stable across sessions and changes on packaged source updates", (t) => {
@@ -167,15 +177,15 @@ test("revision remains stable across sessions and changes on packaged source upd
 test("successful replacement removes only the previous profile-owned secret", async (t) => {
   const f = fixture(t);
   await ensureMemorySetup(f.ctx, f.options);
-  const previous = resolveMemoryEnvironment({}, f.options).PI_OPENVIKING_TOKEN_FILE!;
+  const previous = resolveMemoryEnvironment({}, f.options).PI_HINDSIGHT_TOKEN_FILE!;
   f.setKey("new-good-key");
   f.selections.push("Change connection");
   f.hosts.push("https://replacement.test");
   await ensureMemorySetup(f.ctx, { ...f.options, force: true });
   assert.throws(() => readFileSync(previous), { code: "ENOENT" });
   const updated = resolveMemoryEnvironment({}, f.options);
-  assert.equal(updated.PI_OPENVIKING_BASE_URL, "https://replacement.test");
-  assert.equal(readFileSync(updated.PI_OPENVIKING_TOKEN_FILE!, "utf8").trim(), "new-good-key");
+  assert.equal(updated.PI_HINDSIGHT_BASE_URL, "https://replacement.test");
+  assert.equal(readFileSync(updated.PI_HINDSIGHT_TOKEN_FILE!, "utf8").trim(), "new-good-key");
 });
 
 test("automatic RPC setup does not ask questions; manual setup explains using a terminal", async (t) => {
@@ -195,8 +205,8 @@ test("confirmation identifies the current host without exposing URL userinfo or 
     ...f.options,
     force: true,
     env: {
-      PI_OPENVIKING_BASE_URL: "https://user:secret@memory.test/path?q=secret",
-      PI_OPENVIKING_TOKEN: "personal-test-key",
+      PI_HINDSIGHT_BASE_URL: "https://user:secret@memory.test/path?q=secret",
+      PI_HINDSIGHT_TOKEN: "personal-test-key",
     },
   });
   assert.match(f.prompts[0]!, /https:\/\/memory.test/);
@@ -223,7 +233,7 @@ test("stale setup cannot overwrite a connection saved by another session during 
     fetch: async () => {
       started();
       await pending;
-      return new Response("[]");
+      return f.recallResponse();
     },
   });
   await waiting;
@@ -238,7 +248,7 @@ test("stale setup cannot overwrite a connection saved by another session during 
   await stale;
   assert.equal(readFileSync(join(directory, "connection.json"), "utf8"), saved);
   assert.deepEqual(readdirSync(directory), files, "stale setup must not leave an orphan credential");
-  assert.equal(resolveMemoryEnvironment({}, f.options).PI_OPENVIKING_BASE_URL, "https://fresh.test");
+  assert.equal(resolveMemoryEnvironment({}, f.options).PI_HINDSIGHT_BASE_URL, "https://fresh.test");
   assert.match(f.notices.at(-1)!, /changed.*setup.*retry/i);
 });
 
@@ -250,10 +260,10 @@ test("external key rotation during validation aborts setup without storing stale
   await ensureMemorySetup(f.ctx, {
     ...f.options,
     force: true,
-    env: { PI_OPENVIKING_BASE_URL: "https://memory.test", PI_OPENVIKING_TOKEN_FILE: external },
+    env: { PI_HINDSIGHT_BASE_URL: "https://memory.test", PI_HINDSIGHT_TOKEN_FILE: external },
     fetch: async () => {
       writeFileSync(external, "rotated-key\n");
-      return new Response("[]");
+      return f.recallResponse();
     },
   });
   assert.deepEqual(readdirSync(f.profileDir), ["external.key"]);
@@ -268,8 +278,8 @@ test("environment changes during validation abort setup", async (t) => {
     ...f.options,
     env,
     fetch: async () => {
-      env.PI_OPENVIKING_ENABLED = "0";
-      return new Response("[]");
+      env.PI_HINDSIGHT_ENABLED = "0";
+      return f.recallResponse();
     },
   });
   assert.deepEqual(readdirSync(f.profileDir), []);

@@ -50,15 +50,15 @@ pi install /absolute/path/to/pi-engineering-runtime
 | `/context`        | Show context budget, sources, and worker usage                 |
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository |
 | `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (disabled by default) |
-| `/remember <text>` | Explicitly save a private Viking note (up to 4,000 characters) |
+| `/remember <text>` | Explicitly save a private Hindsight note (up to 4,000 characters) |
 | `/memory [query]` | Verify the memory connection, or search saved notes |
-| `/memory setup` | Configure or change the Viking host and access key |
+| `/memory setup` | Configure or change the Hindsight host and access key |
 
 ### Everyday memory
 
-When no Viking connection is configured, interactive Pi offers a setup dialog.
-An existing connection is preserved across updates; use `/memory setup` to
-change it. Existing environment/token-file settings can be kept. Changed credentials are entered
+When no Hindsight connection is configured, interactive Pi offers a setup
+dialog. An existing connection is preserved across updates; use `/memory setup`
+to change it. Existing environment/token-file settings can be kept. Changed credentials are entered
 in a masked field and verified before they are saved. Settings and private key
 files live under `~/.pi/agent/engineering-memory/` (or the active
 `PI_CODING_AGENT_DIR`), outside the extension checkout. Updates preserve them.
@@ -97,7 +97,7 @@ claims were machine-verified. Independent review/challenge workers do not load
 these interactive hooks. Existing engineering-worker hydration is preserved.
 
 Confirmed profile settings override old shell host/key defaults. Set
-`PI_OPENVIKING_ENABLED=0` to disable all memory access for a launcher. A token
+`PI_HINDSIGHT_ENABLED=0` to disable all memory access for a launcher. A token
 file rotation is picked up by subsequent memory operations; changing host/key
 also refreshes the cached engineering runtime on the next engineering command.
 See [the feature design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits
@@ -111,7 +111,7 @@ behaves exactly as before (no sessions, no events). When enabled, each worker se
 an isolated session-local memory store; prior memory is recalled into worker context for
 context-efficiency; background Observer/Reflector/Dropper workers run at lower priority
 (P3/P4) via the model router + scheduler; and promoted durable memory flows through the
-OpenViking abstraction with an **evidence-gated promotion workflow** (never auto-promoted)
+Hindsight abstraction with an **evidence-gated promotion workflow** (never auto-promoted)
 that emits audit events to the authoritative EventStore.
 
 CLI: `pi-engineering blackhole status|validate|benchmark`. A native-vs-Blackhole A/B
@@ -120,7 +120,7 @@ benchmark generates a report + **12 SVG plots** and preserves raw JSONL/CSV unde
 
 **Sharing memory across workers:** the `durable` config selects the backing store for
 *evidence-promoted* knowledge (`memory` default, `shared-file` for several workers on
-one host / CI, `openviking` for the external cross-machine service). Each worker
+one host / CI, `hindsight` for the external cross-machine herdr-memory service). Each worker
 hydrates its context from shared durable memory on run, so promoted knowledge is
 consumed by later/other workers while session-local working memory stays isolated:
 
@@ -747,7 +747,7 @@ src/bench/           engineering benchmark with baseline gate
 src/adapters/        optional AutoSpec/InferWeave seams (empty by default)
 src/telemetry/       deterministic telemetry export for external control planes
 src/blackhole/       optional per-session memory provider (pinned 0.5.4, builtin default)
-src/blackhole/durable.ts  shared durable-memory providers (shared-file, OpenViking HTTP)
+src/blackhole/durable.ts  shared durable-memory providers (shared-file, Hindsight HTTP)
 src/benchmark/       native-vs-Blackhole A/B benchmark (report + 12 SVG plots + raw data)
 src/workers/         role prompts + bounded worker_result tool + executors
 src/runtime/         EngineeringRuntime facade (plan/engineer/tournament/review/challenge)

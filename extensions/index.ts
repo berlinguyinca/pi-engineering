@@ -13,7 +13,7 @@ import { formatMissionInspection, missionActivityAge } from "../src/tools/missio
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { type ExtensionAPI, type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
-import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
+import { hindsightBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
@@ -371,7 +371,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   if (openGeneration !== runtimeShutdownGeneration) {
     throw new Error("Runtime request was superseded by session shutdown");
   }
-  const blackhole = openVikingBlackholeOption(resolveMemoryEnvironment());
+  const blackhole = hindsightBlackholeOption(resolveMemoryEnvironment());
   const memoryIdentity = createHash("sha256")
     .update(JSON.stringify(blackhole ?? null))
     .digest("hex");
@@ -385,8 +385,8 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     }
     return opened.runtime;
   }
-  // OpenViking connection from the environment. If PI_OPENVIKING_BASE_URL is
-  // set, blackhole is enabled with the openviking durable store for EVERY repo
+  // Hindsight connection from the environment. If PI_HINDSIGHT_BASE_URL is
+  // set, blackhole is enabled with the hindsight durable store for EVERY repo
   // this extension runs in — set it once per install and all repos share the
   // deployed durable memory. Absent the env, blackhole stays off (unchanged).
   //

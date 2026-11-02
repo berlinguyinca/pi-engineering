@@ -19,7 +19,7 @@ const SCOPE = [
   "src/blackhole/versioning.ts (package validation, builtin fallback, fail-closed on drifted version)",
   "src/blackhole/SessionStore.ts + MemoryStore.ts (strict session isolation, recall, compaction)",
   "src/blackhole/BlackholeAdapter.ts (provider seam, builtin default, optional pi-blackhole)",
-  "src/blackhole/OpenViking.ts + promotion.ts (durable memory abstraction, evidence-gated promotion, no auto-promotion)",
+  "src/blackhole/durableProvider.ts + promotion.ts (durable memory abstraction, evidence-gated promotion, no auto-promotion)",
   "src/blackhole/memoryWorkers.ts (Observer/Reflector/Dropper at P3/P4 via ModelRouter + Scheduler backpressure)",
   "src/blackhole/BlackholeManager.ts (lifecycle orchestration, EventStore-authoritative events)",
   "src/blackhole/telemetry.ts + dashboard.ts (telemetry + dashboard panels)",

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type DurableMemoryRecord, InMemoryDurableMemory } from "../../src/blackhole/OpenViking.ts";
-import { OpenVikingRequestError } from "../../src/blackhole/durable.ts";
+import { HindsightRequestError } from "../../src/blackhole/durable.ts";
+import { type DurableMemoryRecord, InMemoryDurableMemory } from "../../src/blackhole/durableProvider.ts";
 import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory.ts";
 
 type Handler = (event: any, ctx: ExtensionContext) => any;
@@ -28,8 +28,8 @@ function fixture(
     options.configured === false
       ? {}
       : {
-          PI_OPENVIKING_BASE_URL: options.baseUrl ?? "https://memory.example",
-          PI_OPENVIKING_TOKEN: options.token ?? "test-key",
+          PI_HINDSIGHT_BASE_URL: options.baseUrl ?? "https://memory.example",
+          PI_HINDSIGHT_TOKEN: options.token ?? "test-key",
         };
   if (options.stateDir) env.PI_ENGINEERING_STATE_DIR = options.stateDir;
   const store = new InMemoryDurableMemory();
@@ -230,7 +230,7 @@ test("session reset and credential rotation clear stale memory and pending resul
   f.override(undefined);
   await f.store.store(record("calibration new"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
-  f.env.PI_OPENVIKING_TOKEN = "rotated";
+  f.env.PI_HINDSIGHT_TOKEN = "rotated";
   assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
 });
 
@@ -412,7 +412,7 @@ for (const action of ["save", "check", "search"] as const) {
       const statuses = f.statuses.length;
       const notices = f.notices.length;
       if (outcome === "success") resolve([record("calibration obsolete snapshot")]);
-      else reject(new OpenVikingRequestError("auth", 401));
+      else reject(new HindsightRequestError("auth", 401));
       await pending;
       assert.equal(f.statuses.length, statuses, "stale work must preserve explicit command status");
       assert.equal(f.notices.length, notices, "stale failure must not publish a notice");
@@ -475,7 +475,7 @@ for (const action of ["save", "check", "search"] as const) {
       const statuses = f.statuses.length;
       const notices = f.notices.length;
       if (outcome === "success") resolve([record("calibration obsolete snapshot")]);
-      else reject(new OpenVikingRequestError("auth", 401));
+      else reject(new HindsightRequestError("auth", 401));
       await lookup;
       assert.equal(f.statuses.length, statuses);
       assert.equal(f.notices.length, notices);
@@ -503,7 +503,7 @@ for (const replacement of ["session", "credential"] as const) {
     };
     const save = f.command("remember", "calibration from the retired connection");
     if (replacement === "session") await f.emit("session_before_switch");
-    else f.env.PI_OPENVIKING_TOKEN = "rotated-key";
+    else f.env.PI_HINDSIGHT_TOKEN = "rotated-key";
     await f.emit("before_agent_start", { prompt: "calibration" });
     const statuses = f.statuses.length;
     const notices = f.notices.length;
@@ -537,13 +537,13 @@ test("late setup errors do not touch a session closed while setup was pending", 
 
 test("authentication failures back off automatic search and credential rotation bypasses the backoff", async () => {
   const f = fixture();
-  f.fail(new OpenVikingRequestError("auth", 401));
+  f.fail(new HindsightRequestError("auth", 401));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
   await f.emit("before_agent_start", { prompt: "different calibration", systemPrompt: "" });
   assert.equal(f.queries.length, 1, "a rejected key is not sent on each turn");
   assert.match(f.statuses.at(-1)!, /invalid|revoked/);
   f.fail();
-  f.env.PI_OPENVIKING_TOKEN = "rotated-key";
+  f.env.PI_HINDSIGHT_TOKEN = "rotated-key";
   await f.store.store(record("calibration available"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
   assert.equal(f.queries.length, 2);
@@ -557,7 +557,8 @@ test("real HTTP authentication failures are not retried on every prompt", async 
     requests++;
     res.statusCode = req.headers.authorization === "Bearer rotated-key" ? 200 : 401;
     res.setHeader("content-type", "application/json");
-    res.end("[]");
+    // herdr-memory recall contract: {results: [...]}, not a bare array
+    res.end(JSON.stringify({ results: [] }));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -569,7 +570,7 @@ test("real HTTP authentication failures are not retried on every prompt", async 
     await f.emit("before_agent_start", prompt);
     assert.equal(requests, 1);
     assert.match(f.notices.at(-1)!.text, /invalid or revoked/);
-    f.env.PI_OPENVIKING_TOKEN = "rotated-key";
+    f.env.PI_HINDSIGHT_TOKEN = "rotated-key";
     await f.emit("before_agent_start", prompt);
     assert.equal(requests, 2);
     assert.match(f.statuses.at(-1)!, /ready/);
@@ -582,7 +583,7 @@ test("real HTTP authentication failures are not retried on every prompt", async 
 test("temporary memory failures retry after backoff and explicit status bypasses it", async () => {
   let now = 1000;
   const f = fixture({ now: () => now });
-  f.fail(new OpenVikingRequestError("unreachable"));
+  f.fail(new HindsightRequestError("unreachable"));
   const prompt = { prompt: "calibration", systemPrompt: "" };
   await f.emit("before_agent_start", prompt);
   f.fail();
@@ -591,7 +592,7 @@ test("temporary memory failures retry after backoff and explicit status bypasses
   now += 61_000;
   await f.emit("before_agent_start", prompt);
   assert.equal(f.queries.length, 2);
-  f.fail(new OpenVikingRequestError("auth", 401));
+  f.fail(new HindsightRequestError("auth", 401));
   await f.emit("before_agent_start", { prompt: "different calibration", systemPrompt: "" });
   f.fail();
   await f.command("memory");
@@ -707,8 +708,8 @@ test("slow memory server cannot hold startup or a prompt for seconds", async () 
     } as unknown as ExtensionAPI,
     {
       env: () => ({
-        PI_OPENVIKING_BASE_URL: `http://127.0.0.1:${address.port}`,
-        PI_OPENVIKING_TOKEN: "local-test-key",
+        PI_HINDSIGHT_BASE_URL: `http://127.0.0.1:${address.port}`,
+        PI_HINDSIGHT_TOKEN: "local-test-key",
       }),
       setup: async () => {},
     },

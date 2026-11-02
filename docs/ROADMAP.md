@@ -326,7 +326,7 @@ M23 adds an **optional** per-session memory/context provider (`src/blackhole/`,
 implements: pinned Blackhole version **0.5.4** with fail-closed drift detection;
 strict candidate/reviewer/challenger isolation keyed on candidate scope;
 EventStore-authoritative lifecycle events; evidence-gated promotion through the
-OpenViking durable-memory abstraction (no auto-promotion); background
+Hindsight durable-memory abstraction (no auto-promotion); background
 Observer/Reflector/Dropper workers at P3/P4 via the model router + scheduler;
 recall into worker context; session TTL GC; and a native-vs-Blackhole A/B
 benchmark that generates a report + **12 SVG plots** and preserves raw JSONL/CSV

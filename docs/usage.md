@@ -1261,7 +1261,7 @@ milestones as `IMPLEMENTED`; run `/mission` on a fixture repo by hand and read
 `pi-blackhole` is an **optional** per-session memory/context provider, pinned to
 **0.5.4**. It is disabled by default and backward compatible. When enabled it
 provides session-local memory with strict candidate isolation, recall into worker
-context, evidence-gated promotion through the OpenViking durable-memory
+context, evidence-gated promotion through the Hindsight durable-memory
 abstraction (never auto-promoted), and lower-priority background memory workers.
 
 ```sh
@@ -1286,8 +1286,9 @@ the backing store for shared durable memory (default `memory` = single process):
 // Several workers on one host / CI share promoted memory via an append-only JSONL file.
 blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/shared/durable.jsonl" } } }
 
-// Cross-machine sharing via the external OpenViking service.
-blackhole: { config: { enabled: true, durable: { kind: "openviking", baseUrl: "https://openviking.example", token } } }
+// Cross-machine sharing via the Hindsight (herdr-memory) service; durable
+// memory lives in the `{project}-facts` bank (project defaults to "pi").
+blackhole: { config: { enabled: true, durable: { kind: "hindsight", baseUrl: "https://memory.example", token, project: "pi" } } }
 ```
 
 Each `runWorker` hydrates its context from shared durable memory on run, so a
@@ -1296,52 +1297,45 @@ later/other worker consumes knowledge promoted by any earlier worker (spec:
 outage degrades hydration to an empty result and never fails the worker.
 `pi-engineering blackhole status` reports the active `durable` kind.
 
-### Running the OpenViking service (tier-1)
+### Hindsight (herdr-memory) service
 
-The `openviking` durable kind points workers at a shared HTTP service. A minimal
-containerized implementation lives at `services/openviking/` — a thin,
-stateless HTTP layer over a PostgreSQL backing store that serves exactly the
-contract `OpenVikingProvider` speaks (POST `/memory`, GET `/memory`,
-`GET /memory/search?q=`). Deploy on a single host (e.g. a lab box):
+The `hindsight` durable kind points workers at the Hindsight memory service
+(the `herdr-memory` project). The runtime's `HindsightProvider` targets the
+herdr-memory bank contract with Bearer-token auth:
 
-```sh
-cd services/openviking
-cp .env.example .env     # set OPENVIKING_TOKEN + POSTGRES_PASSWORD
-# run the service standalone (in-memory, zero deps) for a quick check:
-node src/index.mjs
-# or run the durable Postgres-backed deployment:
-docker compose up -d --build
-```
+* retain — `POST /v1/default/banks/{project}-facts/memories`
+* recall — `POST /v1/default/banks/{project}-facts/memories/recall`
 
-Because the service is stateless (all memory lives in the Postgres volume), you
-can later move it to AWS/Fly.io and keep the data. See
-`services/openviking/README.md`. The production deployment runs on the lab's
-your-host server as an Apptainer container behind an nginx virtual host — see
-`docs/deployments/openviking-deployment.md`.
+The service is external infrastructure owned by the herdr-memory project; this
+repository no longer ships a memory service of its own. Hindsight is semantic:
+there is no list-all endpoint, so whole-bank reads (`recallAll`) are
+best-effort semantic recalls. HTTPS is required except loopback.
 
 ### Installing the connection anywhere pi is installed (no code edits)
 
-Any pi installation that loads this package's **extension** connects to a shared
-OpenViking automatically when the environment is set — no per-repo code. Set
+Any pi installation that loads this package's **extension** connects to shared
+Hindsight automatically when the environment is set — no per-repo code. Set
 these once (e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process
 loads):
 
 ```sh
-export PI_OPENVIKING_BASE_URL=https://viking.example.com
+export PI_HINDSIGHT_BASE_URL=https://memory.example.com
 # Bearer token for the service — either inline, or from a file (secret hygiene):
-export PI_OPENVIKING_TOKEN=<token>
-# or: export PI_OPENVIKING_TOKEN_FILE=/path/to/token.txt
+export PI_HINDSIGHT_TOKEN=<token>
+# or: export PI_HINDSIGHT_TOKEN_FILE=/path/to/token.txt
+# Optional: bank prefix (default "pi"; durable memory uses {project}-facts):
+# export PI_HINDSIGHT_PROJECT=pi
 # Optional: bounded wait for the provider (default 10000ms):
-export PI_OPENVIKING_PROVIDER_TIMEOUT_MS=10000
+export PI_HINDSIGHT_PROVIDER_TIMEOUT_MS=10000
 # Optional: explicitly force the connection off:
-# export PI_OPENVIKING_ENABLED=0
+# export PI_HINDSIGHT_ENABLED=0
 ```
 
-When `PI_OPENVIKING_BASE_URL` is set, the extension passes
-`blackhole: { config: { enabled: true, durable: { kind: "openviking", ... } } }`
+When `PI_HINDSIGHT_BASE_URL` is set, the extension passes
+`blackhole: { config: { enabled: true, durable: { kind: "hindsight", ... } } }`
 into every `EngineeringRuntime` it opens, so all repos in that install share the
 deployed durable memory. Absent the env vars, blackhole stays off (backward
-compatible). Verify a connection with `/blackhole` in a pi session, or:
+compatible). Verify a connection with `/memory status` in a pi session, or:
 
 ```sh
 node scripts/pi-engineering.ts blackhole status
