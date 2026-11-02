@@ -91,9 +91,9 @@ export function parseResult(raw: unknown, req: VisionRequest): ParsedResult {
     if (!isRecord(entry) || typeof entry.path !== "string" || typeof entry.sha256 !== "string") {
       return { ok: false, reason: "each images entry needs string path and sha256" };
     }
-    if (echoed.has(entry.path)) return { ok: false, reason: `duplicate echoed image: ${entry.path}` };
+    if (echoed.has(entry.path)) return { ok: false, reason: `duplicate echoed image: ${JSON.stringify(entry.path)}` };
     if (!req.images.some((i) => i.path === entry.path)) {
-      return { ok: false, reason: `echoed image was not sent: ${entry.path}` };
+      return { ok: false, reason: `echoed image was not sent: ${JSON.stringify(entry.path)}` };
     }
     echoed.set(entry.path, entry.sha256);
   }

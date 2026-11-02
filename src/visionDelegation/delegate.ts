@@ -56,6 +56,12 @@ interface Delegation {
 const RESTART_NOTE =
   "Note: the earlier vision session had closed, so a new one was started. Earlier images from this conversation are no longer in the vision session's context.";
 
+/** R28: a rejection reason may carry model-controlled text; make it one bounded line before the text agent reads it. */
+export function oneLineReason(reason: string, max = 300): string {
+  const flat = reason.replace(/\r\n|[\r\n\u0085\u2028\u2029]/g, " ");
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
 const errText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 export class VisionDelegator {
@@ -289,7 +295,7 @@ export class VisionDelegator {
       const why = "the vision pane exited before writing a result";
       return fail("failed", "failed", why, why);
     }
-    const why = `the vision result was rejected and the delegation failed (${outcome.reason})`;
+    const why = `the vision result was rejected and the delegation failed (${oneLineReason(outcome.reason)})`;
     return fail("failed", "failed", why, outcome.reason);
   }
 
