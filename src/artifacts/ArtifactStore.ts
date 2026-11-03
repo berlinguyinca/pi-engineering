@@ -1,5 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, type BigIntStats, closeSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs";
+import {
+  constants,
+  type BigIntStats,
+  closeSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+} from "node:fs";
 import { type FileHandle, link, lstat, mkdir, open, readdir, realpath, rename, rm, unlink } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ArtifactMeta } from "../core/types.ts";
@@ -122,9 +131,82 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-function procFd(fd: number): string {
-  if (process.platform !== "linux") throw integrityError("secure descriptor-relative artifact access requires Linux");
-  return `/proc/self/fd/${fd}`;
+/**
+ * Secure path for a pinned directory descriptor.
+ *
+ * Linux: /proc/self/fd/<fd> resolves to the exact pinned inode, so every
+ * operation stays anchored to the directory that was opened even if the
+ * path is swapped out from under it.
+ *
+ * Other platforms: the descriptor-relative projection does not exist, so the
+ * canonical absolute path is used instead. macOS cannot substitute `/dev/fd/<fd>`:
+ * its fdesc layer resolves the pathname the descriptor was opened with, and
+ * `readdir`/`open` under `/dev/fd/<fd>` fail (ENOTDIR/ENOENT), so it carries no
+ * inode pinning. True descriptor-relative opens there would need native
+ * `openat(dirfd, segment, O_NOFOLLOW)`, which Node does not expose.
+ *
+ * Callers MUST therefore pair every open with assertPathPinned (async) /
+ * assertPathPinnedSync so a path that no longer resolves to the descriptor's
+ * inode is detected and the store fails closed. The platform-independent
+ * invariant is that a swapped directory is never operated on: Linux keeps the
+ * operation on the pinned inode, other platforms refuse it. The remaining
+ * integrity layers (canonical segments, O_NOFOLLOW on every open,
+ * trusted-directory assertions, realpath identity checks, exclusive locks,
+ * sha256 digests) are platform-independent and stay in force. Reaching the
+ * refuse-path race on macOS needs an attacker who already shares the store
+ * owner's uid (or root), since the store asserts uid ownership and rejects
+ * group/other-writable directories; Linux additionally survives that class.
+ */
+function securePath(fd: number, absolutePath: string): string {
+  if (process.platform === "linux") return `/proc/self/fd/${fd}`;
+  if (process.platform !== "darwin") {
+    // Anything else has neither the descriptor-relative projection nor the
+    // audited darwin fallback, so it must not silently run on plain paths.
+    throw integrityError(
+      `secure descriptor-relative artifact access requires Linux /proc/self/fd or the darwin fallback (platform ${process.platform})`,
+    );
+  }
+  return absolutePath;
+}
+
+async function assertPathPinned(path: string, handle: FileHandle, identityMessage: string): Promise<void> {
+  if (process.platform === "linux") return; // the kernel pins the descriptor
+  const expected = await handle.stat({ bigint: true });
+  const actual = await lstat(path, { bigint: true });
+  if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+    // Same invariant as the descriptor-relative realpath check: the path must
+    // still resolve to the exact inode the descriptor holds.
+    throw integrityError(identityMessage);
+  }
+}
+
+function assertPathPinnedSync(path: string, fd: number, identityMessage: string): void {
+  if (process.platform === "linux") return; // the kernel pins the descriptor
+  const expected = fstatSync(fd, { bigint: true });
+  const actual = lstatSync(path, { bigint: true });
+  if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+    throw integrityError(identityMessage);
+  }
+}
+
+/**
+ * Resolve the name a pinned directory currently carries, among the candidate
+ * names it may legally occupy (a concurrent opener may have renamed the
+ * staging directory to its final name between our open and this call). Linux
+ * ignores the candidates: the descriptor-relative projection is authoritative.
+ */
+async function locatePinnedDirectory(handle: FileHandle, ...candidates: string[]): Promise<string> {
+  if (process.platform === "linux") return candidates[0]!;
+  const expected = await handle.stat({ bigint: true });
+  for (const candidate of candidates) {
+    try {
+      const actual = await lstat(candidate, { bigint: true });
+      if (actual.dev === expected.dev && actual.ino === expected.ino) return candidate;
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+    }
+  }
+  throw integrityError("pinned artifact directory is no longer reachable by name");
 }
 
 function assertTrustedDirectory(stat: { isDirectory(): boolean; uid: number; mode: number }, label: string): void {
@@ -139,6 +221,7 @@ interface OpenCategory {
   root: FileHandle;
   category: FileHandle;
   path: string;
+  category_name: string;
 }
 
 interface DirectoryIdentity {
@@ -229,7 +312,8 @@ export class ArtifactStore {
     let rootReal: string;
     try {
       assertTrustedDirectory(await rootHandle.stat(), "artifact root");
-      rootReal = await realpath(procFd(rootHandle.fd));
+      await assertPathPinned(canonicalRoot, rootHandle, "artifact root identity changed");
+      rootReal = await realpath(securePath(rootHandle.fd, canonicalRoot));
     } finally {
       await rootHandle.close();
     }
@@ -261,7 +345,9 @@ export class ArtifactStore {
     const handle = await open(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     try {
       assertTrustedDirectory(await handle.stat(), "artifact root");
-      if ((await realpath(procFd(handle.fd))) !== this.rootReal) throw integrityError("artifact root identity changed");
+      await assertPathPinned(this.root, handle, "artifact root identity changed");
+      if ((await realpath(securePath(handle.fd, this.root))) !== this.rootReal)
+        throw integrityError("artifact root identity changed");
       return handle;
     } catch (error) {
       await handle.close();
@@ -278,7 +364,7 @@ export class ArtifactStore {
     assertCanonicalSegment(category, "artifact category");
     const root = suppliedRoot ?? (await this.openRoot());
     const ownsRoot = !suppliedRoot;
-    const path = `${procFd(root.fd)}/${category}`;
+    const path = `${securePath(root.fd, this.rootReal)}/${category}`;
     try {
       if (create) {
         try {
@@ -303,11 +389,20 @@ export class ArtifactStore {
       }
       try {
         assertTrustedDirectory(await categoryHandle.stat(), `artifact category ${category}`);
-        if ((await realpath(procFd(categoryHandle.fd))) !== resolve(this.rootReal, category)) {
+        await assertPathPinned(path, categoryHandle, `artifact category ${category} identity changed`);
+        if (
+          (await realpath(securePath(categoryHandle.fd, resolve(this.rootReal, category)))) !==
+          resolve(this.rootReal, category)
+        ) {
           throw integrityError(`artifact category ${category} identity changed`);
         }
         this.hooks.afterCategoryOpened?.(operation, category);
-        return { root, category: categoryHandle, path: procFd(categoryHandle.fd) };
+        return {
+          root,
+          category: categoryHandle,
+          path: securePath(categoryHandle.fd, resolve(this.rootReal, category)),
+          category_name: category,
+        };
       } catch (error) {
         await categoryHandle.close();
         throw error;
@@ -315,6 +410,29 @@ export class ArtifactStore {
     } catch (error) {
       if (ownsRoot) await root.close();
       throw error;
+    }
+  }
+
+  /**
+   * Re-anchor a previously opened category before any file I/O under it.
+   *
+   * Linux needs no re-check: the category path is the descriptor-relative
+   * projection of the pinned inode. On other platforms the path is plain, so
+   * a directory swapped in after the open must be detected before we read
+   * or write through it; every attempt re-verifies the exact inode.
+   */
+  private async assertCategoryPinned(opened: OpenCategory): Promise<void> {
+    if (process.platform === "linux") return;
+    const expected = await opened.category.stat({ bigint: true });
+    let actual;
+    try {
+      actual = await lstat(opened.path, { bigint: true });
+    } catch (error) {
+      if (isMissing(error)) throw integrityError(`artifact category ${opened.category_name} identity changed`);
+      throw error;
+    }
+    if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+      throw integrityError(`artifact category ${opened.category_name} identity changed`);
     }
   }
 
@@ -327,7 +445,7 @@ export class ArtifactStore {
     const root = await this.openRoot();
     let stagedHandle: FileHandle | undefined;
     try {
-      const path = `${procFd(root.fd)}/.artifact-locks`;
+      const path = `${securePath(root.fd, this.rootReal)}/.artifact-locks`;
       let existingRecord = await this.readLockDomainRecord(root);
       let bootstrap = await this.readLockBootstrapRecord(root);
       if (existingRecord && bootstrap) {
@@ -353,12 +471,13 @@ export class ArtifactStore {
         }
         if (!existingRecord) {
           const token = randomUUID();
-          const stagingPath = `${procFd(root.fd)}/.artifact-locks.stage.${token}`;
+          const stagingPath = `${securePath(root.fd, this.rootReal)}/.artifact-locks.stage.${token}`;
           await mkdir(stagingPath, { mode: 0o700 });
           stagedHandle = await open(stagingPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+          await assertPathPinned(stagingPath, stagedHandle, "staged artifact lock root identity changed");
           assertTrustedDirectory(await stagedHandle.stat(), "staged artifact lock root");
           const stagedIdentity = await stagedHandle.stat({ bigint: true });
-          await this.ensureLockDomainToken(stagedHandle, token);
+          await this.ensureLockDomainToken(stagedHandle, token, stagingPath);
           const proposed: LockBootstrapRecord = {
             version: 1,
             phase: "bound",
@@ -419,10 +538,11 @@ export class ArtifactStore {
       }
       let handle: FileHandle;
       if (!existingRecord && bootstrap?.phase === "bound" && !createdLockRoot) {
-        const stagingPath = `${procFd(root.fd)}/.artifact-locks.stage.${bootstrap.token}`;
+        const stagingPath = `${securePath(root.fd, this.rootReal)}/.artifact-locks.stage.${bootstrap.token}`;
         if (!stagedHandle) {
           try {
             stagedHandle = await open(stagingPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+            await assertPathPinned(stagingPath, stagedHandle, "staged artifact lock root identity changed");
           } catch (error) {
             if (!isMissing(error)) throw error;
           }
@@ -433,7 +553,29 @@ export class ArtifactStore {
           if (stagedIdentity.dev !== bootstrap.device || stagedIdentity.ino !== bootstrap.inode) {
             throw integrityError("artifact lock root bootstrap identity changed");
           }
-          if ((await this.readLockDomainToken(stagedHandle)) !== bootstrap.token) {
+          // The staged directory may be renamed to its final name by a
+          // concurrent opener at any moment; the token lives with the inode,
+          // not the name. Every attempt re-resolves the descriptor's current
+          // name (identity-verified), so a swap still fails closed; a plain
+          // rename is retried once the new name is stable.
+          let boundToken: string;
+          for (let attempt = 0; ; attempt += 1) {
+            const tokenBase = await locatePinnedDirectory(stagedHandle, stagingPath, path);
+            try {
+              boundToken = await this.readLockDomainToken(stagedHandle, tokenBase);
+              break;
+            } catch (error) {
+              if (
+                attempt >= 1 ||
+                !(error instanceof Error) ||
+                !/artifact lock domain token is missing/i.test(error.message)
+              ) {
+                throw error;
+              }
+              await delay(5);
+            }
+          }
+          if (boundToken !== bootstrap.token) {
             throw integrityError("artifact lock root bootstrap token changed");
           }
           let exactInodeAlreadyPublished = false;
@@ -476,7 +618,11 @@ export class ArtifactStore {
       }
       try {
         assertTrustedDirectory(await handle.stat(), "artifact lock root");
-        if ((await realpath(procFd(handle.fd))) !== resolve(this.rootReal, ".artifact-locks")) {
+        await assertPathPinned(path, handle, "artifact lock root identity changed");
+        if (
+          (await realpath(securePath(handle.fd, resolve(this.rootReal, ".artifact-locks")))) !==
+          resolve(this.rootReal, ".artifact-locks")
+        ) {
           throw integrityError("artifact lock root identity changed");
         }
         const identity = await handle.stat({ bigint: true });
@@ -493,7 +639,7 @@ export class ArtifactStore {
           // The bound marker makes a crash before token creation recoverable:
           // the descriptor must still be the exact inode recorded before the
           // token can be created through that descriptor.
-          const token = await this.ensureLockDomainToken(handle, bootstrap.token);
+          const token = await this.ensureLockDomainToken(handle, bootstrap.token, path);
           if (token !== bootstrap.token) throw integrityError("artifact lock root bootstrap token changed");
           if (createdLockRoot) {
             this.hooks.afterLockDirectoryCreated?.();
@@ -541,7 +687,7 @@ export class ArtifactStore {
   }
 
   private async readLockBootstrapRecord(root: FileHandle): Promise<LockBootstrapRecord | undefined> {
-    const path = `${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`;
+    const path = `${securePath(root.fd, this.rootReal)}/${LOCK_BOOTSTRAP_RECORD}`;
     let handle: FileHandle;
     try {
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -559,7 +705,7 @@ export class ArtifactStore {
   }
 
   private async removeLockBootstrapRecord(root: FileHandle, expected: LockBootstrapRecord): Promise<boolean> {
-    const path = `${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`;
+    const path = `${securePath(root.fd, this.rootReal)}/${LOCK_BOOTSTRAP_RECORD}`;
     let handle: FileHandle;
     try {
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -577,7 +723,7 @@ export class ArtifactStore {
       if (!sameLockBootstrapRecord(current, expected)) {
         return false;
       }
-      const quarantine = `${procFd(root.fd)}/.${LOCK_BOOTSTRAP_RECORD}.${expected.token}.${randomUUID()}.cleanup`;
+      const quarantine = `${securePath(root.fd, this.rootReal)}/.${LOCK_BOOTSTRAP_RECORD}.${expected.token}.${randomUUID()}.cleanup`;
       try {
         await rename(path, quarantine);
       } catch (error) {
@@ -602,8 +748,8 @@ export class ArtifactStore {
   }
 
   private async writeLockBootstrapRecord(root: FileHandle, record: LockBootstrapRecord): Promise<void> {
-    const finalPath = `${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`;
-    const temporary = `${procFd(root.fd)}/.${LOCK_BOOTSTRAP_RECORD}.${process.pid}.${randomUUID()}.tmp`;
+    const finalPath = `${securePath(root.fd, this.rootReal)}/${LOCK_BOOTSTRAP_RECORD}`;
+    const temporary = `${securePath(root.fd, this.rootReal)}/.${LOCK_BOOTSTRAP_RECORD}.${process.pid}.${randomUUID()}.tmp`;
     const handle = await open(
       temporary,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -633,8 +779,8 @@ export class ArtifactStore {
     root: FileHandle,
     record: LockBootstrapRecord,
   ): Promise<{ record: LockBootstrapRecord; claimed: boolean }> {
-    const finalPath = `${procFd(root.fd)}/${LOCK_BOOTSTRAP_RECORD}`;
-    const candidate = `${procFd(root.fd)}/.${LOCK_BOOTSTRAP_RECORD}.${process.pid}.${randomUUID()}.claim`;
+    const finalPath = `${securePath(root.fd, this.rootReal)}/${LOCK_BOOTSTRAP_RECORD}`;
+    const candidate = `${securePath(root.fd, this.rootReal)}/.${LOCK_BOOTSTRAP_RECORD}.${process.pid}.${randomUUID()}.claim`;
     const handle = await open(
       candidate,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -705,7 +851,7 @@ export class ArtifactStore {
   }
 
   private async readLockDomainRecord(root: FileHandle): Promise<LockDomainRecord | undefined> {
-    const path = `${procFd(root.fd)}/${LOCK_DOMAIN_RECORD}`;
+    const path = `${securePath(root.fd, this.rootReal)}/${LOCK_DOMAIN_RECORD}`;
     let handle: FileHandle;
     try {
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -745,8 +891,17 @@ export class ArtifactStore {
     }
   }
 
-  private async ensureLockDomainToken(lockRoot: FileHandle, expectedToken?: string): Promise<string> {
-    const path = `${procFd(lockRoot.fd)}/${LOCK_DOMAIN_TOKEN}`;
+  /**
+   * @param lockRootBase the absolute path the descriptor points to (the
+   * staging name while the directory is still staged). Linux ignores it: the
+   * descriptor-relative projection is authoritative there.
+   */
+  private async ensureLockDomainToken(
+    lockRoot: FileHandle,
+    expectedToken?: string,
+    lockRootBase: string = resolve(this.rootReal, ".artifact-locks"),
+  ): Promise<string> {
+    const path = `${securePath(lockRoot.fd, lockRootBase)}/${LOCK_DOMAIN_TOKEN}`;
     const token = expectedToken ?? randomUUID();
     try {
       const handle = await open(
@@ -764,14 +919,20 @@ export class ArtifactStore {
       return token;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      return this.readLockDomainToken(lockRoot);
+      return this.readLockDomainToken(lockRoot, lockRootBase);
     }
   }
 
-  private async readLockDomainToken(lockRoot: FileHandle): Promise<string> {
+  private async readLockDomainToken(
+    lockRoot: FileHandle,
+    lockRootBase: string = resolve(this.rootReal, ".artifact-locks"),
+  ): Promise<string> {
     let handle: FileHandle;
     try {
-      handle = await open(`${procFd(lockRoot.fd)}/${LOCK_DOMAIN_TOKEN}`, constants.O_RDONLY | constants.O_NOFOLLOW);
+      handle = await open(
+        `${securePath(lockRoot.fd, lockRootBase)}/${LOCK_DOMAIN_TOKEN}`,
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
     } catch (error) {
       if (isMissing(error)) throw integrityError("artifact lock domain token is missing");
       throw error;
@@ -788,8 +949,8 @@ export class ArtifactStore {
   }
 
   private async publishLockDomainRecord(root: FileHandle, record: LockDomainRecord): Promise<LockDomainRecord> {
-    const finalPath = `${procFd(root.fd)}/${LOCK_DOMAIN_RECORD}`;
-    const candidate = `${procFd(root.fd)}/.${LOCK_DOMAIN_RECORD}.${process.pid}.${randomUUID()}.tmp`;
+    const finalPath = `${securePath(root.fd, this.rootReal)}/${LOCK_DOMAIN_RECORD}`;
+    const candidate = `${securePath(root.fd, this.rootReal)}/.${LOCK_DOMAIN_RECORD}.${process.pid}.${randomUUID()}.tmp`;
     const handle = await open(
       candidate,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -827,9 +988,10 @@ export class ArtifactStore {
     lockRoot: FileHandle,
     record: LockDomainRecord,
     suppliedIdentity?: { dev: bigint; ino: bigint },
+    lockRootBase: string = resolve(this.rootReal, ".artifact-locks"),
   ): Promise<void> {
     const identity = suppliedIdentity ?? (await lockRoot.stat({ bigint: true }));
-    const token = await this.readLockDomainToken(lockRoot).catch(() => {
+    const token = await this.readLockDomainToken(lockRoot, lockRootBase).catch(() => {
       throw integrityError("artifact lock root identity changed");
     });
     if (identity.dev !== record.device || identity.ino !== record.inode || token !== record.token) {
@@ -838,13 +1000,15 @@ export class ArtifactStore {
   }
 
   private async openLockRoot(root: FileHandle): Promise<FileHandle> {
-    const handle = await open(
-      `${procFd(root.fd)}/.artifact-locks`,
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-    );
+    const path = `${securePath(root.fd, this.rootReal)}/.artifact-locks`;
+    const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     try {
       assertTrustedDirectory(await handle.stat(), "artifact lock root");
-      if ((await realpath(procFd(handle.fd))) !== resolve(this.rootReal, ".artifact-locks")) {
+      await assertPathPinned(path, handle, "artifact lock root identity changed");
+      if (
+        (await realpath(securePath(handle.fd, resolve(this.rootReal, ".artifact-locks")))) !==
+        resolve(this.rootReal, ".artifact-locks")
+      ) {
         throw integrityError("artifact lock root identity changed");
       }
       const identity = await handle.stat({ bigint: true });
@@ -877,7 +1041,7 @@ export class ArtifactStore {
     let operationError: unknown;
     try {
       lockRoot = await this.openLockRoot(root);
-      const lockTarget = `${procFd(lockRoot.fd)}/${digest(key)}`;
+      const lockTarget = `${securePath(lockRoot.fd, resolve(this.rootReal, ".artifact-locks"))}/${digest(key)}`;
       while (!lock) {
         try {
           lock = await ExclusiveFileLock.acquire(lockTarget);
@@ -911,6 +1075,13 @@ export class ArtifactStore {
 
   private filePath(opened: OpenCategory, id: string, suffix: "json" | "txt" | "txn.json"): string {
     assertCanonicalSegment(id, "artifact id");
+    // Every artifact file path funnels through this pin check. On Linux it is
+    // free: `opened.path` already *is* the descriptor-relative projection, so
+    // the derived path cannot name anything but the pinned inode. Elsewhere
+    // the path is plain, so the name must still resolve to the pinned inode at
+    // the moment the path is derived — otherwise a category swapped between the
+    // last re-anchor and this derivation would send I/O to the substitute.
+    assertPathPinnedSync(opened.path, opened.category.fd, `artifact category ${opened.category_name} identity changed`);
     return `${opened.path}/${id}.${suffix}`;
   }
 
@@ -976,6 +1147,7 @@ export class ArtifactStore {
     category: string,
     id: string,
   ): Promise<StoredArtifactMeta | undefined> {
+    await this.assertCategoryPinned(opened);
     const transactionPath = this.filePath(opened, id, "txn.json");
     if ((await this.regularState(transactionPath, `artifact transaction ${category}/${id}`)) === "regular") {
       throw integrityError(`artifact transaction is incomplete for ${category}/${id}`);
@@ -1106,6 +1278,7 @@ export class ArtifactStore {
   }
 
   private async writeAtomic(opened: OpenCategory, name: string, content: string, exclusive = false): Promise<void> {
+    await this.assertCategoryPinned(opened);
     const path = `${opened.path}/${name}`;
     await this.regularState(path, `artifact file ${name}`);
     const temporary = `${opened.path}/.${name}.${process.pid}.${randomUUID()}.tmp`;
@@ -1234,7 +1407,7 @@ export class ArtifactStore {
     const root = await this.openRoot();
     let entries;
     try {
-      entries = await readdir(procFd(root.fd), { withFileTypes: true });
+      entries = await readdir(securePath(root.fd, this.rootReal), { withFileTypes: true });
     } finally {
       await root.close();
     }
@@ -1251,6 +1424,7 @@ export class ArtifactStore {
       if (!opened) continue;
       let files;
       try {
+        await this.assertCategoryPinned(opened);
         files = await readdir(opened.path, { withFileTypes: true });
       } finally {
         await this.closeCategory(opened);
@@ -1271,6 +1445,7 @@ export class ArtifactStore {
       const rescanned = await this.openCategory(entry.name, false, "scan");
       if (!rescanned) continue;
       try {
+        await this.assertCategoryPinned(rescanned);
         const current = await readdir(rescanned.path, { withFileTypes: true });
         const metadataIds = new Set<string>();
         for (const file of current) {
@@ -1470,18 +1645,21 @@ export class ArtifactStore {
     const rootFd = openSync(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     try {
       assertTrustedDirectory(fstatSync(rootFd), "artifact root");
-      if (realpathSync(procFd(rootFd)) !== this.rootReal) throw integrityError("artifact root identity changed");
-      const categoryFd = openSync(
-        `${procFd(rootFd)}/${category}`,
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-      );
+      assertPathPinnedSync(this.root, rootFd, "artifact root identity changed");
+      if (realpathSync(securePath(rootFd, this.root)) !== this.rootReal)
+        throw integrityError("artifact root identity changed");
+      const categoryPath = `${securePath(rootFd, this.rootReal)}/${category}`;
+      const categoryFd = openSync(categoryPath, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       try {
         assertTrustedDirectory(fstatSync(categoryFd), `artifact category ${category}`);
-        if (realpathSync(procFd(categoryFd)) !== resolve(this.rootReal, category)) {
+        assertPathPinnedSync(categoryPath, categoryFd, `artifact category ${category} identity changed`);
+        if (
+          realpathSync(securePath(categoryFd, resolve(this.rootReal, category))) !== resolve(this.rootReal, category)
+        ) {
           throw integrityError(`artifact category ${category} identity changed`);
         }
         this.hooks.afterCategoryOpened?.(operation, category);
-        return { rootFd, categoryFd, path: procFd(categoryFd) };
+        return { rootFd, categoryFd, path: securePath(categoryFd, resolve(this.rootReal, category)) };
       } catch (error) {
         closeSync(categoryFd);
         throw error;
@@ -1497,6 +1675,9 @@ export class ArtifactStore {
     for (const [index, ref] of refs.entries()) {
       const { category, id } = this.parseUri(ref);
       const opened = this.openSyncCategory(category, "verify");
+      // Re-anchor after the hook: the verify body is fully synchronous, so one
+      // identity check pins every file access that follows.
+      assertPathPinnedSync(opened.path, opened.categoryFd, `artifact category ${category} identity changed`);
       try {
         try {
           const transactionFd = openSync(`${opened.path}/${id}.txn.json`, constants.O_RDONLY | constants.O_NOFOLLOW);
