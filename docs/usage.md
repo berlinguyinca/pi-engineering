@@ -1139,6 +1139,125 @@ The runtime's own in-process git operations (mission workers run in candidate
 worktrees; integration, janitor) do not go through the tool-call hook and are
 unaffected.
 
+## Task Contract gate (task discipline)
+
+A **Task Contract** is a trusted, versioned snapshot of what one task is allowed
+to touch: its objective, the roots it may read, the roots it may write, the
+remote hosts it may contact, the external effects (push, CI dispatch, deploy,
+restart) it may cause, and its acceptance criteria. It is written by the
+operator or the control plane — never by the model — and the gate in
+`src/taskDiscipline/` judges every tool call against it **before** the call
+executes.
+
+The gate registers its own `tool_call` and `user_bash` handlers, so it does not
+inherit the lifecycle controller's two gaps: that controller skips non-mutating
+tools (reads, MCP/custom tools) and auto-allows when the session is unattended.
+Here every call is judged, reads included, and `!bash` typed by the operator
+goes through the same engine (a blocked `!bash` returns a synthetic failed
+result instead of running).
+
+Knobs (set before starting the session):
+
+- `PI_TASK_DISCIPLINE` — `off` (default) | `audit_only` | `enforce_diagnostic` |
+  `enforce_all`. A value that is not one of those is treated as `enforce_all`:
+  a typo must not weaken enforcement.
+- `PI_TASK_CONTRACT_FILE` — path to the contract JSON. In an enforcing mode a
+  missing, unreadable or invalid contract **locks the session down** (nothing
+  readable, nothing writable) rather than falling back to "allow everything".
+- `PI_TASK_DISCIPLINE_LOG` — append-only JSONL of every decision (allow, deny,
+  would-deny) with the task id, contract revision, contract hash, rule and a
+  secret-redacted command. Defaults to `decisions.jsonl` next to the contract.
+
+The contract file and the decision log are always added to the contract's
+`protectedPaths`, and so is the contract's directory — unless it overlaps a
+`writeRoots` or `scratchRoots` entry (as in the example above, where the scratch
+root sits inside the contract directory), because protecting it there would
+swallow the whole tree the task may write in. The agent therefore cannot rewrite
+its own authorization or its own record — a write to a protected path is denied
+with `write.protected`.
+The file is re-read when its mtime or size changes, so an operator amendment
+takes effect on the next tool call and the new `policyRevision` appears in the
+log; a rewrite that tries to *widen* an investigation contract is rejected at
+parse time and the provider substitutes the lockdown contract immediately, so
+self-approval is impossible even with filesystem access — the agent loses access
+instead of gaining scope.
+
+What each mode enforces:
+
+- `audit_only` — nothing is blocked; a call the contract forbids is logged as
+  `would_deny` and the agent is told it is not protected. Use it to learn a
+  contract's false-block rate before turning it on.
+- `enforce_diagnostic` — blocks only while the **contract's** mode is
+  `investigation` or `review`, which is the tier the spec calls strict
+  diagnostic: read-only work must not deploy or ship data anywhere.
+- `enforce_all` — blocks in every contract mode.
+
+Rules the engine can deny with (each decision names its rule id): `read.outside_roots`,
+`write.outside_roots`, `write.protected`, `write.readonly_mode`,
+`exec.outside_roots`, `host.not_allowed`, `host.unresolved`,
+`effect.container.not_granted`, `effect.privileged`, `command.unclassified`,
+`path.unresolved`, `tool.not_allowed`, `shell.no_command`, `shell.powershell`,
+`write.no_path`, `engine.error`. Commands are classified, not pattern-matched:
+the classifier expands `sh -c`, `bash -c`, `eval`, `$(…)`/backticks, pipes,
+`xargs`, `find -exec`, `sudo`, `make` targets, `npm run` scripts, Python/Node
+scripts, `docker`/`podman` runs, and the remote verbs `ssh`, `scp`, `sftp`,
+`rsync`, `curl`/`wget` with a write verb, `git push`, `gh workflow run`,
+`kubectl`, `terraform`. Paths are canonicalised before comparison, so `..`,
+`~`, unexpanded `$VAR` and symlinks that walk out of a read or write root are
+caught (`path.unresolved`, `write.outside_roots`). An effect the classifier
+cannot identify is denied in an enforcing mode (`command.unclassified`) instead
+of being waved through.
+
+Denials are also loop-aware: more than three enforced denials of the same rule
+inside ten calls marks a policy incident, and further block messages tell the
+agent to stop retrying and report what is blocking it — the route out is an
+operator amendment, never another path around the rule.
+
+Enabling it for one mission, end to end:
+
+```sh
+mkdir -p ~/task-contracts
+cat > ~/task-contracts/peak-picking.json <<'JSON'
+{
+  "taskId": "demo-peak-picking-001",
+  "objective": "Diagnose the local LC-MS peak-picking discrepancy from code, fixtures and logs; report root cause with reproducible evidence.",
+  "mode": "investigation",
+  "policyRevision": 1,
+  "readRoots": ["/Users/me/IdeaProjects/cdf2ms"],
+  "writeRoots": [],
+  "scratchRoots": ["/private/tmp/peak-picking"],
+  "allowedHosts": [],
+  "externalEffects": [],
+  "acceptanceCriteria": ["Reproduce locally or name the blocker", "Name the defect with file and test evidence"]
+}
+JSON
+PI_TASK_DISCIPLINE=enforce_diagnostic \
+PI_TASK_CONTRACT_FILE="$HOME/task-contracts/peak-picking.json" \
+  pi --no-extensions --extension /absolute/path/to/checkout/extensions/index.ts
+```
+
+(One runtime per session, as above: `--no-extensions` plus the checkout, or the
+installed package with the two variables in the environment — not both.)
+
+In that session `scp ./peaks.mzML strange-host:/data/` — and the `rsync`,
+`curl -T`, `git push` and `gh workflow run` equivalents — is denied before
+execution, the denial lands in `decisions.jsonl`, and the agent is told to
+continue with local reads; the investigation does not stop. `write` anywhere is
+denied (`write.readonly_mode`, because the contract has no `writeRoots`). To let
+it patch the fix, the operator raises `policyRevision`, adds `writeRoots` and
+the mode changes to `implementation` — the model cannot do that itself.
+
+**What the gate cannot promise** (see `docs/operations/task-discipline.md`):
+it is a preflight check inside the Pi process, so it covers calls that come
+through Pi's `tool_call` / `user_bash`. A shell the agent reaches outside those
+hooks, a compiled binary that opens its own socket, or a local root shell
+bypass it. Defence in depth for indirect exfiltration in strict diagnostic mode
+relies on the Linux sandbox the control plane can start (`collab-sandbox.sh`
+profile `task-restricted-v1` with `--unshare-net` plus the
+`collab-egress.py` host allowlist); **macOS has no equivalent today**, so a
+local macOS session gets preflight gating only and must not be described as
+isolated.
+
 ## Recovering an interactive turn after the gateway wait is spent
 
 Pi retries a failed turn three times, and the gateway wrapper waits a short transient out for about five minutes (fifteen with alternate-model advice). Before this, a turn that failed before any output after that ended and sat until the operator typed "retry".
