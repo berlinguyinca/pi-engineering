@@ -16,6 +16,7 @@ import { redactSecrets } from "../platform/redact.ts";
 import { type TaskContract, parseContract } from "./contract.ts";
 import type { Decision, EnforcementMode } from "./engine.ts";
 import type { ContractProvider, DisciplineOptions } from "./hook.ts";
+import { isWithin, resolvePath } from "./pathScope.ts";
 
 const MODES: EnforcementMode[] = ["off", "audit_only", "enforce_diagnostic", "enforce_all"];
 
@@ -54,12 +55,7 @@ export class FileContractProvider implements ContractProvider {
       if (this.cached && this.cached.mtimeMs === st.mtimeMs && this.cached.size === st.size)
         return this.cached.contract;
       const parsed = parseContract(JSON.parse(readFileSync(this.file, "utf8")));
-      const contract: TaskContract = {
-        ...parsed,
-        protectedPaths: [
-          ...new Set([...(parsed.protectedPaths ?? []), this.file, dirname(this.file), ...this.extraProtected]),
-        ],
-      };
+      const contract: TaskContract = { ...parsed, protectedPaths: this.protected(parsed) };
       this.cached = { mtimeMs: st.mtimeMs, size: st.size, contract };
       this.lastError = undefined;
       return contract;
@@ -67,6 +63,28 @@ export class FileContractProvider implements ContractProvider {
       this.lastError = err instanceof Error ? err.message : String(err);
       return lockdown(this.lastError);
     }
+  }
+
+  /**
+   * The contract file and the decision log are always protected. The directory
+   * is protected too — editors drop temp copies next to the file, and a stray
+   * `contract.json.bak` should not be agent-writable — except when that
+   * directory *is* a writable root: protecting it would then swallow the whole
+   * tree the task is allowed to write in, which is exactly what a scratch root
+   * colocated with the contract means. There, only the files themselves are
+   * protected.
+   */
+  private protected(parsed: TaskContract): string[] {
+    const dir = dirname(this.file);
+    const real = (p: string) => {
+      const r = resolvePath(p, dir);
+      return r.ok ? r.path : p;
+    };
+    const dirReal = real(dir);
+    const writable = [...parsed.writeRoots, ...(parsed.scratchRoots ?? [])].map(real);
+    const dirIsWritable = writable.some((root) => isWithin(dirReal, root) || isWithin(root, dirReal));
+    const roots = dirIsWritable ? [] : [dirReal];
+    return [...new Set([...(parsed.protectedPaths ?? []), this.file, ...this.extraProtected, ...roots])];
   }
 }
 

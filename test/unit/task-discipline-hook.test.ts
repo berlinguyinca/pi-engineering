@@ -157,6 +157,21 @@ test("a deny-everything contract edit that tries to widen an investigation is re
   assert.equal(f.call("bash", { command: "cat peaks.py" })?.block, true, "invalid contract fails closed");
 });
 
+test("scratch colocated with the contract stays writable; the contract and log do not", () => {
+  const f = fixture();
+  f.write({ scratchRoots: [f.state] });
+  // The contract directory *is* the scratch root here. Protecting the directory
+  // would make the task's own diagnostics space unwritable — a live session
+  // reproduced exactly that, denying notes.md inside the scratch root — so only
+  // the host-owned files are protected in that layout.
+  assert.equal(f.call("write", { path: join(f.state, "notes.md"), content: "finding\n" }), undefined);
+  assert.equal(f.call("bash", { command: `echo finding > ${join(f.state, "run.log")}` }), undefined);
+  assert.equal(f.call("write", { path: f.contractFile, content: "{}" })?.block, true);
+  // With scratch elsewhere, the contract directory is protected again.
+  f.write({ scratchRoots: [join(f.base, "scratch")] });
+  assert.equal(f.call("write", { path: join(f.state, "other.md"), content: "x" })?.block, true);
+});
+
 test("audit_only records would-deny and never blocks", () => {
   const f = fixture();
   const handlers = new Map<string, Handler>();

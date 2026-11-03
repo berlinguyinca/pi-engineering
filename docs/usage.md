@@ -1139,9 +1139,13 @@ Knobs (set before starting the session):
   would-deny) with the task id, contract revision, contract hash, rule and a
   secret-redacted command. Defaults to `decisions.jsonl` next to the contract.
 
-The contract file, its directory and the decision log are added to the
-contract's `protectedPaths`, so the agent cannot rewrite its own authorization
-or its own record — a write to any of them is denied with `write.protected`.
+The contract file and the decision log are always added to the contract's
+`protectedPaths`, and so is the contract's directory — unless it overlaps a
+`writeRoots` or `scratchRoots` entry (as in the example above, where the scratch
+root sits inside the contract directory), because protecting it there would
+swallow the whole tree the task may write in. The agent therefore cannot rewrite
+its own authorization or its own record — a write to a protected path is denied
+with `write.protected`.
 The file is re-read when its mtime or size changes, so an operator amendment
 takes effect on the next tool call and the new `policyRevision` appears in the
 log; a rewrite that tries to *widen* an investigation contract is rejected at
