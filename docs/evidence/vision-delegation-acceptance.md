@@ -441,7 +441,7 @@ node scripts/vision-delegation-spike.ts --model qwen3.8-flash-vision --probe cat
 | 0 | real | not a model attempt: `--probe listed` (default) does not list the alias `qwen3.8-flash-vision`, so the delegator declined before any pane | - | 0 s | - |
 | 1 | real | `ok`; fields description 1258, text_in_image 1338, findings 1818, uncertainties 1253 chars (6 items) | yes | 103.3 s | `thinking_level_change -> off`; 6 assistant turns, all `thinkingLevel: off`, all `toolUse`; largest output 2611 tokens |
 | 2 | real | `ok`; fields description 1392, text_in_image **2402**, findings 2209, uncertainties 823 chars (5 items) | yes | 111.7 s | `off`; 3 assistant turns, all `toolUse`; largest output 2134 tokens |
-| 3 | generated a-d | a, b, c failed at `startAgent` 0.1 s after the split: herdr `agent target pane wX:p2 is not an available shell` (herdr had not started the new pane's shell yet; Pi never ran); c2 passed | - | 13.2 s | - |
+| 3 | generated a-d | a, b, c failed at `startAgent` 0.1 s after the split: herdr `agent target pane wW:p2 is not an available shell` (herdr had not started the new pane's shell yet; Pi never ran); c2 passed | - | 13.2 s | - |
 | 4 | generated a-d | ALL CHECKS PASSED (a 37.2 s, b 28.8 s reuse by name, c R26 stop 36.3 s, c2 8.5 s, d 33.3 s new pane) | yes | 144.9 s | - |
 
 Observations:
