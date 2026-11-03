@@ -29,6 +29,35 @@ roadmap evidence). When the repository's Roadmap 1.0 is complete,
 `/engineer`, `/plan`, `/tournament`, and `/execute` refuse to invent new work
 (autonomous stop) — the runtime does not keep manufacturing work past "done".
 
+## Platform support
+
+Linux is the reference platform: the durable single-writer lock and the
+artifact store pin directory descriptors and address them through
+`/proc/self/fd`, so every operation stays anchored to the exact inode that was
+opened even if a path is swapped out from under it.
+
+macOS (darwin) is supported with a documented, weaker fallback:
+
+- **Process incarnation** (writer-lock owner identity) is derived from
+  `sysctl kern.boottime` (hashed into a UUID) plus the process start time
+  parsed from `ps -o lstart=` under the C locale, instead of
+  `/proc/sys/kernel/random/boot_id` and `/proc/<pid>/stat`.
+- **Artifact paths** use the canonical absolute path instead of the
+  descriptor-relative `/proc/self/fd/<fd>` projection. Every open is paired
+  with a path-identity re-check (the path must still resolve to the exact
+  inode the descriptor holds), file I/O re-anchors the category before each
+  operation, and the lock-domain token is located by inode among its legal
+  names. A directory that is swapped for a symlink or a different inode is
+  detected and the store fails closed; a lock whose directory was swapped
+  mid-critical-section cannot be released by name and fails closed instead of
+  touching whatever now occupies the path.
+
+The remaining integrity layers (canonical path segments, `O_NOFOLLOW` on
+every open, trusted-directory ownership/mode assertions, exclusive locks,
+sha256 content digests, immutable key binding) are platform-independent and
+stay in force on both. Other platforms are unsupported and fail closed at the
+first durable operation.
+
 ## Install as a pi extension
 
 ```bash
