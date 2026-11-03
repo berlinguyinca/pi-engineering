@@ -184,10 +184,16 @@ export class VisionDelegator {
       restarted,
     };
     return this.delegate(d, () =>
-      startNewPane(herdr, split, { ...d, originPaneId, cwd: input.cwd, images: d.request.images }, async (paneId) => {
-        d.paneId = paneId;
-        await this.state(d, { status: "waiting" });
-      }),
+      startNewPane(
+        herdr,
+        split,
+        { ...d, originPaneId, cwd: input.cwd, images: d.request.images },
+        async (paneId) => {
+          d.paneId = paneId;
+          await this.state(d, { status: "waiting" });
+        },
+        (ms) => this.deps.sleep(ms),
+      ),
     );
   }
 

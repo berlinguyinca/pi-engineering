@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type { ProbeResult } from "../../src/resilience/probe.ts";
-import type { HerdrAgent, HerdrCli } from "../../src/runtime/herdr/HerdrCli.ts";
+import { type HerdrAgent, type HerdrCli, HerdrError } from "../../src/runtime/herdr/HerdrCli.ts";
 import type { VisionDelegateSettings } from "../../src/visionDelegation/config.ts";
 import { VisionDelegator, type VisionDelegatorDeps, visionAgentName } from "../../src/visionDelegation/delegate.ts";
 import { resultPath } from "../../src/visionDelegation/protocol.ts";
@@ -30,6 +30,8 @@ interface Call {
 interface FakeHerdrOpts {
   split?: boolean;
   failStart?: Error;
+  /** One error per successive `startAgent` attempt (a failed attempt registers no name); then it succeeds. */
+  startErrors?: Error[];
   /** Answer for `getAgent`; default: a live agent. */
   getAgent?: (target: string) => Promise<HerdrAgent | null>;
   failClose?: Error;
@@ -67,10 +69,12 @@ function fakeHerdr(opts: FakeHerdrOpts = {}): { herdr: HerdrCli; calls: Call[] }
     wait: rec("wait") as HerdrCli["wait"],
     startAgent: async (...args: unknown[]) => {
       // Like herdr, refuse a second agent with a name that is already taken.
-      if (calls.some((c) => c.method === "startAgent" && c.args[2] === args[2])) {
+      if (names.has(String(args[2]))) {
         throw new Error(`agent name already in use: ${String(args[2])}`);
       }
       calls.push({ method: "startAgent", args });
+      const failing = opts.startErrors?.shift();
+      if (failing) throw failing;
       names.set(String(args[2]), String(args[0]));
       if (opts.failStart) throw opts.failStart;
     },
@@ -787,6 +791,67 @@ test("I3: a throwing getAgent neither counts as idle nor ends the wait", async (
   try {
     const text = transformText(await s.delegator.handle(input()));
     assert.match(text, /analysis timed out after 60 seconds/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+const NOT_READY = () => new HerdrError("agent_pane_unavailable", "agent target pane w1:p2 is not an available shell");
+
+test("startAgent retries the not-ready-shell race with backoff and the same pane and argv", async () => {
+  const sleeps: number[] = [];
+  const s = setup({}, { startErrors: [NOT_READY(), NOT_READY()] });
+  const baseSleep = s.deps.sleep;
+  s.deps.sleep = async (ms) => {
+    sleeps.push(ms);
+    await baseSleep(ms);
+  };
+  try {
+    s.clock.at(5000, () => writeResult(s.reqDir("req-1"), "req-1"));
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /STATUS: ok/);
+    const starts = s.calls.filter((c) => c.method === "startAgent");
+    assert.equal(starts.length, 3);
+    assert.deepEqual(starts[1]?.args, starts[0]?.args);
+    assert.deepEqual(starts[2]?.args, starts[0]?.args);
+    assert.deepEqual(sleeps.slice(0, 2), [200, 400]);
+    assert.equal(s.calls.filter((c) => c.method === "splitPane").length, 1);
+    assert.equal(starts[2]?.args[0], "vision-pane-1");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("startAgent gives up after 6 not-ready attempts: explicit failure, pane closed, last error", async () => {
+  const sleeps: number[] = [];
+  const s = setup({}, { startErrors: Array.from({ length: 6 }, NOT_READY) });
+  const baseSleep = s.deps.sleep;
+  s.deps.sleep = async (ms) => {
+    sleeps.push(ms);
+    await baseSleep(ms);
+  };
+  try {
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /is not an available shell/);
+    assert.equal(s.calls.filter((c) => c.method === "startAgent").length, 6);
+    assert.deepEqual(sleeps, [200, 400, 800, 1000, 1000]);
+    assert.equal(s.calls.filter((c) => c.method === "splitPane").length, 1);
+    assert.deepEqual(
+      s.calls.filter((c) => c.method === "closePane").map((c) => c.args[0]),
+      ["vision-pane-1"],
+    );
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a start error that is not the not-ready race is not retried", async () => {
+  const s = setup({}, { startErrors: [new HerdrError("invalid_agent_name", "agent name is bad")] });
+  try {
+    const text = transformText(await s.delegator.handle(input()));
+    assert.match(text, /agent name is bad/);
+    assert.equal(s.calls.filter((c) => c.method === "startAgent").length, 1);
+    assert.equal(s.calls.filter((c) => c.method === "splitPane").length, 1);
   } finally {
     s.cleanup();
   }
