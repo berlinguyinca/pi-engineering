@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
 import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
@@ -11,7 +11,12 @@ import { formatMissionActivity } from "../src/status/missionActivity.ts";
 import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
-import { type ExtensionAPI, type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  getAgentDir,
+} from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
 import { hindsightBlackholeOption } from "../src/blackhole/envConfig.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
@@ -58,6 +63,7 @@ import { admissionIdentityHeaders } from "../src/inference/admissionTransport.ts
 import { loadExecutionConfig } from "../src/lifecycle/policy.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig } from "../src/models/modelsConfig.ts";
+import { migrateConfiguredPins } from "../src/models/pinMigration.ts";
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
 import { DEFAULT_PROBE_TIMEOUT_MS, refreshConfiguredProviders } from "../src/models/refresh.ts";
 import { registerModelTabs } from "../src/models/registerModelTabs.ts";
@@ -93,8 +99,10 @@ import {
   isSummarizationRequest,
   resolveThinkingOffConfig,
 } from "../src/request/thinkingPolicy.ts";
+import { CatalogRecoveryProbe, resolveCatalogProbeTarget } from "../src/resilience/probe.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
+import { RealHerdrCli } from "../src/runtime/herdr/HerdrCli.ts";
 import { attachInspectorWhenReady, createInspectorSlot } from "../src/runtime/herdr/attachInspector.ts";
 import type { LineageEmitter } from "../src/runtime/herdr/lineage.ts";
 import { loadLineageEmitter } from "../src/runtime/herdr/lineageConfig.ts";
@@ -146,6 +154,11 @@ import { runtimeUpdateBridge } from "../src/update/hostBridge.ts";
 import { type SelfUpdateResult, checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
+import { loadVisionDelegateSettings } from "../src/visionDelegation/config.ts";
+import { VisionDelegator } from "../src/visionDelegation/delegate.ts";
+import { installVisionDelegation } from "../src/visionDelegation/install.ts";
+import { makeVisionLineageHook } from "../src/visionDelegation/lineage.ts";
+import { VisionRegistry } from "../src/visionDelegation/registry.ts";
 import { LedgerWorkProjection } from "../src/work/ledgerProjection.ts";
 import { projectLegacyMissions } from "../src/work/legacyMissionAdapter.ts";
 import { StatusRowRefresher } from "../src/work/statusRowRefresher.ts";
@@ -1582,7 +1595,33 @@ ${RECOVERY_PROMPT}`;
     if (result.results.length === 0) {
       throw new Error(result.failures.map(({ providerId, error }) => `${providerId}: ${error.message}`).join("; "));
     }
-    return { written: result.written, lines: result.lines, failed: result.failures.length > 0 };
+    // Pins to concrete ids would dangle once those ids leave the catalogue, so
+    // the same refresh moves them onto aliases: nothing is edited by hand when a
+    // model is preempted or renamed.
+    const pins = migrateConfiguredPins({
+      agentDir: dirname(defaultModelsPath()),
+      ...(ctx.cwd ? { extraFiles: [join(ctx.cwd, ".pi", "engineering.yaml")] } : {}),
+      providers: new Map(
+        result.results.map(({ providerId, result: r }) => [
+          providerId,
+          {
+            ids: new Set(r.plan.next.map((m) => m.id)),
+            aliasOnly: r.aliasOnly,
+            // A pin may only move onto an alias that still answers as the model it
+            // named, so the migrator needs to know what runs behind each alias.
+            members: Object.fromEntries(
+              r.gateway.filter((m) => m.alias && m.members?.length).map((m) => [m.id, m.members!]),
+            ),
+          },
+        ]),
+      ),
+      dryRun: opts.dryRun,
+    });
+    return {
+      written: result.written || pins.written,
+      lines: [...result.lines, ...pins.lines],
+      failed: result.failures.length > 0,
+    };
   }
 
   // ─── /model-refresh: make the configured catalogue match the gateway ─────
@@ -2227,6 +2266,44 @@ ${RECOVERY_PROMPT}`;
     pi.on("session_shutdown", () => {
       // Ephemeral fallback state must not leak across a session boundary.
       fallbackCoordinator.onSessionShutdown();
+    });
+  }
+
+  // Vision delegation: an image pasted for a text-only model is analyzed by a vision session in a new herdr
+  // pane and handed back as text. Settings are read lazily on the first such image; `vision_delegate.enabled:
+  // false` keeps the handler inert. One delegator per process; `current()` is the call in flight's ctx.
+  if (typeof pi.on === "function") {
+    installVisionDelegation(pi as never, {
+      loadSettings: () => loadVisionDelegateSettings(dirname(defaultModelsPath())),
+      makeDelegator: async (settings, current) => {
+        const agentDir = dirname(defaultModelsPath());
+        const registry = () => (current() as unknown as ExtensionContext).modelRegistry;
+        const runtime = {
+          getModel: (provider: string, id: string) => registry().find(provider, id),
+          getAuth: (m: { provider: string }) => registry().getProviderAuth(m.provider),
+        };
+        return new VisionDelegator({
+          herdr: new RealHerdrCli(),
+          settings,
+          get models() {
+            return registry()
+              .getAvailable()
+              .map((m) => ({ provider: m.provider, id: m.id, input: [...m.input] }));
+          },
+          probeFor: (m) => new CatalogRecoveryProbe({ resolve: () => resolveCatalogProbeTarget(runtime, m) }).probe(),
+          registry: new VisionRegistry(join(agentDir, "vision-delegation", "registry.json")),
+          artifactDir: join(agentDir, "vision-delegation", "requests"),
+          now: Date.now,
+          sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+          newId: () => randomUUID(),
+          get textModel() {
+            return current().model?.id ?? "unknown";
+          },
+          lineage: makeVisionLineageHook(await lineageEmitter()),
+          // herdr sets HERDR_PANE_ID in every pane it runs (spike evidence); absent means herdr is unavailable.
+          originPaneId: process.env.HERDR_PANE_ID || undefined,
+        });
+      },
     });
   }
 

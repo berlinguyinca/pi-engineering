@@ -15,8 +15,9 @@ import type { BlackholeAdapter } from "./BlackholeAdapter.ts";
 import { MemoryStore } from "./MemoryStore.ts";
 import { type SessionContext, newSessionIdentity } from "./SessionStore.ts";
 import { resolveBlackholeConfig } from "./config.ts";
-import { HindsightProvider, SharedFileDurableMemory } from "./durable.ts";
+import { SharedFileDurableMemory } from "./durable.ts";
 import { type DurableMemoryProvider, type DurableMemoryRecord, InMemoryDurableMemory } from "./durableProvider.ts";
+import { HindsightDurableMemory } from "./hindsight.ts";
 import {
   type MemoryStoreFactory,
   type MemoryWorkerOptions,
@@ -347,7 +348,7 @@ export function buildDurableProvider(cfg: import("./types.ts").DurableStoreConfi
     case "shared-file":
       return new SharedFileDurableMemory(cfg.file);
     case "hindsight":
-      return new HindsightProvider({ baseUrl: cfg.baseUrl, token: cfg.token, project: cfg.project });
+      return new HindsightDurableMemory({ cli: cfg.cli, scopes: cfg.scopes, timeoutMs: cfg.timeoutMs });
     default:
       return new InMemoryDurableMemory();
   }

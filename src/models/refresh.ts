@@ -10,6 +10,7 @@
 
 import { sharedAdmissionController } from "../gateway/config.ts";
 import { acceptsThinkingOff, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
+import { aliasAmbiguity, aliasView } from "./aliasCatalog.ts";
 import { type CatalogPlan, type ConfiguredModel, describeCatalogPlan, planCatalogUpdate } from "./catalogPlan.ts";
 import {
   DEFAULT_GATEWAY_BASE_URL,
@@ -50,6 +51,14 @@ export interface RefreshOptions {
   dryRun?: boolean;
   /** Remove configured models the gateway no longer lists. Off by default. */
   pruneMissing?: boolean;
+  /**
+   * Configure aliases only (the gateway's `x_alias` rows plus the prefix
+   * aliases derived from its canonical ids), never concrete model ids, so a
+   * preempted or renamed model never needs a reconfiguration. On by default;
+   * `false` or `PI_MODEL_REFRESH_CONCRETE=1` restores the concrete list. A
+   * gateway that offers nothing to alias keeps the concrete list either way.
+   */
+  aliasesOnly?: boolean;
   /** Generate a tiny completion with every advertised model and keep only successful ones. */
   probeModels?: boolean;
   /** Deadline for one inference probe. */
@@ -67,6 +76,8 @@ export interface RefreshResult {
   plan: CatalogPlan;
   gateway: GatewayModelEntry[];
   baseUrl: string;
+  /** True when the provider was configured with aliases rather than concrete ids. */
+  aliasOnly: boolean;
   /** Written only when the plan was dirty and this was not a dry run. */
   backupPath?: string;
   written: boolean;
@@ -419,20 +430,27 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
   opts.onProgress?.({ providerId: opts.providerId, phase: "listing", completed: 0, total: 0, elapsedMs: 0 });
-  const advertised = await listing();
-  const capacity = gatewayCapacityTotal(advertised);
+  const listed = await listing();
+  // Capacity comes from the concrete rows: alias rows carry no slots.
+  const capacity = gatewayCapacityTotal(listed);
+  const aliasMode = opts.aliasesOnly ?? process.env.PI_MODEL_REFRESH_CONCRETE !== "1";
+  const view = aliasMode ? aliasView(listed) : undefined;
+  const aliased = view !== undefined && view.entries.length > 0;
+  const advertised = aliased ? view.entries : listed;
+  // A re-read for verification must look at the same alias view.
+  const relisting = aliased ? () => listing().then((entries) => aliasView(entries).entries) : listing;
   if (capacity !== undefined && !opts.dryRun) sharedAdmissionController().applyGatewayCapacity(capacity);
   const reasoningIds = new Set(existing.filter((model) => model.reasoning === true).map((model) => model.id));
 
   const canProbe = opts.probeModels && api === "openai-completions";
   const disableThinking = supportsThinkingOff(opts.providerId, api, baseUrl);
   const verified: Verification = canProbe
-    ? await verifiedGatewayModels(advertised, baseUrl, opts, disableThinking, reasoningIds, listing)
+    ? await verifiedGatewayModels(advertised, baseUrl, opts, disableThinking, reasoningIds, relisting)
     : { working: advertised, excluded: [], held: [], notes: [] };
   const gateway = verified.working;
   const configuredIds = new Set(existing.map((model) => model.id));
   const plan = planCatalogUpdate(existing, gateway, {
-    ...(opts.pruneMissing || canProbe ? { pruneMissing: true } : {}),
+    ...(opts.pruneMissing || canProbe || aliased ? { pruneMissing: true } : {}),
     // A model that was not verified this time keeps its configured entry
     // exactly as it was; only a definitive "not served" removes one.
     keep: verified.held.map(({ id }) => id),
@@ -446,6 +464,23 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
   );
   const lines = [
     `${opts.providerId} — ${gateway.length} ${canProbe ? "working" : "advertised"} model(s) on ${baseUrl}`,
+    ...(aliased
+      ? [
+          `Alias-only: ${advertised.length} alias(es), ${view.droppedConcrete.length} concrete id(s) not configured.`,
+          ...advertised.flatMap((model) => {
+            const memberIds = model.members ?? [];
+            const sizes = model.sizes && model.sizes.length > 0 ? ` [${model.sizes.join("/")}]` : "";
+            const lines = [
+              `  alias: ${model.id} → ${memberIds.join(", ") || "(gateway-resolved)"}${sizes} (${model.contextWindow} tokens)`,
+            ];
+            // The name is what a session selects, so say out loud when it does
+            // not name the weights it currently runs.
+            const ambiguous = aliasAmbiguity(model);
+            if (ambiguous) lines.push(`  ambiguous: ${model.id} — ${ambiguous}`);
+            return lines;
+          }),
+        ]
+      : []),
     ...(canProbe
       ? [
           `Inference-tested ${advertised.length}; excluded ${verified.excluded.length}; not verified ${verified.held.length}.`,
@@ -458,12 +493,16 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
         `  ${verdict}: ${id} — ${reason} (${configuredIds.has(id) ? "kept as configured" : "not added"})`,
     ),
     ...verified.notes.map(({ id, note }) => `  note: ${id} — ${note}`),
-    ...gateway
-      .filter((model) => model.alias)
-      .map((model) => `  route: ${model.id}${model.backingModel ? ` → ${model.backingModel}` : ""} (gateway alias)`),
+    // In alias-only mode the `alias:` lines above already name the members, the
+    // sizes they run, and the window, so repeating each route adds noise.
+    ...(aliased
+      ? []
+      : gateway
+          .filter((model) => model.alias)
+          .map((model) => `  route: ${model.id}${model.backingModel ? ` → ${model.backingModel}` : ""} (gateway alias)`)),
     ...planLines,
   ];
-  return { plan, gateway, baseUrl, written: false, lines };
+  return { plan, gateway, baseUrl, aliasOnly: aliased, written: false, lines };
 }
 
 /**
