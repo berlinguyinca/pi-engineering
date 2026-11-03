@@ -558,6 +558,34 @@ nothing of the sort. Pin the concrete id, or a name carrying the class
 Which class a route answers with is the gateway's decision and can change between
 runs; the report reflects `x_members` at the moment it ran.
 
+Because refresh configures aliases only, it also moves pins that still name a
+concrete id — otherwise they would dangle the moment that id leaves the catalogue.
+It rewrites `provider/id` references in `~/.pi/agent/settings.json`,
+`~/.pi/agent/engineering.yaml` and the repository's `.pi/engineering.yaml`, plus a
+`defaultModel` paired with `defaultProvider`. Edits are textual, so comments and
+layout survive; each changed file is copied to `<file>.bak-<timestamp>-model-refresh`
+first, file modes are kept, a `--dry-run` writes nothing, and a second pass changes
+nothing. A glob such as `metabolomics/*` is not a pin and is never touched.
+
+**A pin only moves onto an alias that answers as the model it named.** Membership
+decides this when the gateway publishes `x_members`: the pinned model must be a
+member, or every member must be of the pinned size class. Where membership is
+unpublished, the alias name must carry the class. So a pin on
+`metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl` moves to
+`qwen3.8-27b-vision`, never to `qwen3.8`, whose members also include Flash — the
+move that would quietly change which model runs. When nothing covers the pin
+faithfully it is left exactly as written and reported:
+
+```
+pin not moved: …/engineering.yaml names metabolomics/qwen3.8-27b-…, which no served
+alias covers (metabolomics/qwen3.8 its members are flash, flash_next, not 27b)
+```
+
+That is deliberate: a pin that names no configured model fails visibly, while a
+pin widened to a family alias runs a different model without saying so. Pick a
+route whose members are the class you meant, or configure the concrete id with
+`PI_MODEL_REFRESH_CONCRETE=1 /model-refresh`.
+
 `/model-refresh` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
 once without the optional parameters (`temperature`, `reasoning_effort`). Each

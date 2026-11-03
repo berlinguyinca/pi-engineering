@@ -86,6 +86,11 @@ export function parseCatalog(payload: unknown): CatalogModel[] {
  * row (`x_members`) and advertises no `x_aliases` on concrete rows. Without the
  * reverse direction `resolveRole` cannot see which concrete models serve an
  * alias, and a route row without its own size has no context window at all.
+ *
+ * This parser is deliberately independent of `src/models/gatewayCatalog.ts` — the
+ * planner worker keeps its own tolerant read of the contract, as it does for every
+ * extended field — so both must accept the same row shape. Change one, change the
+ * other.
  */
 function resolveMembership(models: CatalogModel[]): CatalogModel[] {
   const byId = new Map(models.map((model) => [model.id, model]));

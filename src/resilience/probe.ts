@@ -10,6 +10,9 @@
  * it. Implementations must be fast and must not consume inference quota.
  */
 
+import { aliasView } from "../models/aliasCatalog.ts";
+import { parseGatewayModels } from "../models/gatewayCatalog.ts";
+
 /** Structured probe result. */
 export interface ProbeResult {
   healthy: boolean;
@@ -113,9 +116,6 @@ export class HttpRecoveryProbe implements RecoveryProbe {
 }
 
 /** Where the catalogue probe asks, and for which model. */
-import { aliasView } from "../models/aliasCatalog.ts";
-import { parseGatewayModels } from "../models/gatewayCatalog.ts";
-
 export interface CatalogProbeTarget {
   /** The provider's OpenAI-compatible base URL, e.g. https://llm.example/v1. */
   baseUrl: string;

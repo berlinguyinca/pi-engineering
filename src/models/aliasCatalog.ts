@@ -36,7 +36,15 @@ export interface IdFacts {
   listable: boolean;
 }
 
-/** Parse a canonical id; `undefined` when it is not `<family>-<size>-<key>-<value>…`. */
+/**
+ * Parse a canonical id; `undefined` when it is not `<family>-<size>-<key>-<value>…`.
+ *
+ * Deliberately stricter than `sizeClassOf`, which only describes members of an
+ * alias the gateway already named. This one mints names: a name derived from a
+ * mis-parsed id is a route the gateway cannot resolve, so an id whose shape is in
+ * any doubt yields no alias at all. A wrong answer from `sizeClassOf` only
+ * mislabels a model that exists; a wrong answer here configures one that 404s.
+ */
 export function factsOf(id: string): IdFacts | undefined {
   const parts = id.split("-");
   if (parts.length < 4) return undefined;
