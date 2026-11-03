@@ -122,18 +122,27 @@ function inferInput(id: string): { input: string[]; inferred: boolean } {
  */
 function generatedName(id: string, entry: GatewayModelEntry): string {
   const memberIds = entry.members ?? [];
-  if (memberIds.length === 1) return `${id} → ${memberIds[0]} (gateway alias)`;
+  // A route nothing advertises must say so in the name: the listing is not
+  // vouching for it, only the probe that answered is, and a reader judging the
+  // configuration from the gateway has to know which evidence behinds it.
+  const suffix = entry.origin === "probed" ? "gateway route; answers, not advertised" : "gateway alias";
+  if (memberIds.length === 1) return `${id} → ${memberIds[0]} (${suffix})`;
   if (memberIds.length > 1) {
     const sizes = entry.sizes && entry.sizes.length > 0 ? entry.sizes.join("/") : "gateway-resolved";
-    return `${id} → ${sizes} ×${memberIds.length} (gateway alias)`;
+    return `${id} → ${sizes} ×${memberIds.length} (${suffix})`;
   }
-  return `${id} (gateway)`;
+  return entry.origin === "probed" ? `${id} (${suffix})` : `${id} (gateway)`;
 }
+
+/** Suffixes this tool writes, so it can recognise and rewrite its own names. */
+const GENERATED_SUFFIXES = ["gateway alias", "gateway route; answers, not advertised"];
 
 /** True when `name` is one this tool wrote, and so is safe to rewrite. */
 function isGeneratedName(id: string, name: unknown): boolean {
   if (typeof name !== "string") return false;
-  return name === `${id} (gateway)` || (name.startsWith(`${id} → `) && name.endsWith(" (gateway alias)"));
+  if (name === `${id} (gateway)`) return true;
+  if (!name.startsWith(`${id} → `)) return false;
+  return GENERATED_SUFFIXES.some((suffix) => name.endsWith(` (${suffix})`));
 }
 
 /**

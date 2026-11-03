@@ -10,7 +10,7 @@
 
 import { sharedAdmissionController } from "../gateway/config.ts";
 import { acceptsThinkingOff, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
-import { aliasAmbiguity, aliasView } from "./aliasCatalog.ts";
+import { aliasAmbiguity, aliasView, isRouteName, unadvertisedRouteCandidates } from "./aliasCatalog.ts";
 import { type CatalogPlan, type ConfiguredModel, describeCatalogPlan, planCatalogUpdate } from "./catalogPlan.ts";
 import {
   DEFAULT_GATEWAY_BASE_URL,
@@ -436,24 +436,40 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
   const aliasMode = opts.aliasesOnly ?? process.env.PI_MODEL_REFRESH_CONCRETE !== "1";
   const view = aliasMode ? aliasView(listed) : undefined;
   const aliased = view !== undefined && view.entries.length > 0;
-  const advertised = aliased ? view.entries : listed;
+  const canProbe = opts.probeModels && api === "openai-completions";
+  // Names the listing cannot vouch for: route combinations it omits although
+  // they answer, and configured ids it stopped mentioning. They reach the
+  // configuration only through a probe that answers, and leave only through one
+  // that refuses, because the live listing is wrong in both directions.
+  const unadvertised =
+    aliased && canProbe && view
+      ? unadvertisedRouteCandidates(listed, view, existing)
+      : { entries: [] as GatewayModelEntry[], configuredOnly: [] as string[] };
+  const advertised = aliased ? [...view.entries, ...unadvertised.entries] : listed;
   // A re-read for verification must look at the same alias view.
   const relisting = aliased ? () => listing().then((entries) => aliasView(entries).entries) : listing;
   if (capacity !== undefined && !opts.dryRun) sharedAdmissionController().applyGatewayCapacity(capacity);
   const reasoningIds = new Set(existing.filter((model) => model.reasoning === true).map((model) => model.id));
 
-  const canProbe = opts.probeModels && api === "openai-completions";
   const disableThinking = supportsThinkingOff(opts.providerId, api, baseUrl);
   const verified: Verification = canProbe
     ? await verifiedGatewayModels(advertised, baseUrl, opts, disableThinking, reasoningIds, relisting)
     : { working: advertised, excluded: [], held: [], notes: [] };
   const gateway = verified.working;
   const configuredIds = new Set(existing.map((model) => model.id));
+  // Configured ids the listing does not mention at all, in either direction.
+  // Without a probe there is no evidence about them, and the live listing is
+  // known to omit routes that answer, so they are kept rather than deleted.
+  // A listed concrete id is still pruned in alias mode: that is the contract of
+  // configuring the route instead of the build.
+  const listedIds = new Set(listed.map((entry) => entry.id));
+  const unevidenced =
+    aliased && !canProbe ? existing.filter((model) => isRouteName(model.id) && !listedIds.has(model.id)) : [];
   const plan = planCatalogUpdate(existing, gateway, {
     ...(opts.pruneMissing || canProbe || aliased ? { pruneMissing: true } : {}),
     // A model that was not verified this time keeps its configured entry
     // exactly as it was; only a definitive "not served" removes one.
-    keep: verified.held.map(({ id }) => id),
+    keep: [...verified.held.map(({ id }) => id), ...unevidenced.map((model) => model.id)],
   });
   const planLines = describeCatalogPlan(plan).map((line) =>
     canProbe
@@ -466,12 +482,22 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
     `${opts.providerId} — ${gateway.length} ${canProbe ? "working" : "advertised"} model(s) on ${baseUrl}`,
     ...(aliased
       ? [
-          `Alias-only: ${advertised.length} alias(es), ${view.droppedConcrete.length} concrete id(s) not configured.`,
+          [
+            `Alias-only: ${view.entries.length} advertised alias(es), ${view.droppedConcrete.length} concrete id(s) not configured`,
+            unadvertised.entries.length > 0
+              ? `; probing ${unadvertised.entries.length} route name(s) the listing omits`
+              : "",
+            unadvertised.configuredOnly.length > 0
+              ? ` (${unadvertised.configuredOnly.length} already configured, kept only if they answer)`
+              : "",
+            ".",
+          ].join(""),
           ...advertised.flatMap((model) => {
             const memberIds = model.members ?? [];
             const sizes = model.sizes && model.sizes.length > 0 ? ` [${model.sizes.join("/")}]` : "";
+            const marker = model.origin === "probed" ? " [not advertised; probe decides]" : "";
             const lines = [
-              `  alias: ${model.id} → ${memberIds.join(", ") || "(gateway-resolved)"}${sizes} (${model.contextWindow} tokens)`,
+              `  alias: ${model.id} → ${memberIds.join(", ") || "(gateway-resolved)"}${sizes} (${model.contextWindow} tokens)${marker}`,
             ];
             // The name is what a session selects, so say out loud when it does
             // not name the weights it currently runs.
@@ -493,13 +519,22 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
         `  ${verdict}: ${id} — ${reason} (${configuredIds.has(id) ? "kept as configured" : "not added"})`,
     ),
     ...verified.notes.map(({ id, note }) => `  note: ${id} — ${note}`),
+    ...(unevidenced.length > 0
+      ? [
+          `  kept without evidence: ${unevidenced
+            .map((model) => model.id)
+            .join(", ")} — the listing does not mention them and no probe was run`,
+        ]
+      : []),
     // In alias-only mode the `alias:` lines above already name the members, the
     // sizes they run, and the window, so repeating each route adds noise.
     ...(aliased
       ? []
       : gateway
           .filter((model) => model.alias)
-          .map((model) => `  route: ${model.id}${model.backingModel ? ` → ${model.backingModel}` : ""} (gateway alias)`)),
+          .map(
+            (model) => `  route: ${model.id}${model.backingModel ? ` → ${model.backingModel}` : ""} (gateway alias)`,
+          )),
     ...planLines,
   ];
   return { plan, gateway, baseUrl, aliasOnly: aliased, written: false, lines };

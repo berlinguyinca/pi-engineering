@@ -538,15 +538,44 @@ reasoning, output limit, cost and compatibility
 settings from their configured backing model when available, bounded by the
 alias's advertised context window. Other additions report inferred settings.
 Existing model names and settings survive refresh, and identical IDs in two
-providers remain separate entries. Aliases only listed as `x_aliases` on a
-concrete model are descriptive metadata; refresh does not invent route entries
-that the gateway has not separately advertised.
+providers remain separate entries.
+
+**The probe decides which routes exist; the listing alone never does.**
+`GET /v1/models` is not authoritative on a real gateway. Recorded live on
+2026-11-03 against `llm.metabolomics.us/v1`, it returned seven rows while eleven
+routes answered `/v1/chat/completions` — and two of those seven advertised rows,
+`laya` and `laya-text`, produced no completion at all (a plain request got 404
+`Model laya is not served here`; an hour later the same route returned HTTP 200
+with an empty message). A refresh that trusted the listing
+therefore deleted working models (the operator report that opened this was "I
+still don't see the `qwen3.8-27b` alias", and a refresh really had pruned it)
+while adding routes that cannot serve a request. With probing on, which is what
+`/model-refresh` does, refresh gathers route names from three sources:
+
+- aliases the gateway advertises with `x_alias`;
+- the family / size / modality combinations implied by the concrete rows it
+  lists, in **both** modalities — `qwen3.8-27b-text` answers even though the
+  only listed 27B build is a vision one;
+- every configured route name the listing no longer covers.
+
+Each candidate is configured **only if a completion answers for it**, and is
+removed only if a completion refuses it *and* no listing claims it. A name
+nothing advertises is written as
+`qwen3.8-27b-text → … (gateway route; answers, not advertised)`, so the weaker
+evidence is visible exactly where the model gets chosen. Where probing cannot
+run — a library caller, or a provider API that cannot be probed — nothing is
+added from a name alone and nothing is deleted for being unlisted; those entries
+are reported as `kept without evidence`. An id that follows the concrete
+`<family>-<size>-modality-…-quant-…` grammar names a build rather than a route:
+alias mode replaces builds with their routes, so a build the listing no longer
+shows is retired without needing a probe.
 
 A written alias name says what answers behind it, so `/model` and the status line
 never leave that ambiguous: `qwen3.8-text →
 qwen3.8-flash_next-modality-text-quant-w3a8 (gateway alias)`, or
-`qwen3.8 → a, b, c (gateway alias; 27b/flash/flash_next)` when several members
-share the route and a failover between them changes the model. Canonical ids carry
+`qwen3.8 → 27b/flash/flash_next ×4 (gateway alias)` when several members
+share the route and a failover between them changes the model — the size classes
+are named, and the member ids are in the report rather than the picker label. Canonical ids carry
 their size class (`<family>-<size>-modality-…`), so `qwen3.8-27b-…` is the 27B build
 and `qwen3.8-flash_next-…` is Flash-Next; an id outside that grammar has no size
 class and none is invented. Where an alias's own name says nothing about what it
