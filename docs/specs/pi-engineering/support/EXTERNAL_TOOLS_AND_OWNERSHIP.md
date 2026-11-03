@@ -31,6 +31,7 @@ Never silently recreate it in `pi-engineering`.
 | InferWeave | EXTERNAL SYSTEM / PROVIDER | InferWeave repositories/services | provider adapter, capability discovery, session metadata, backpressure handling | GPU scheduler, model placement engine, InferWeave gateway/node runtime |
 | AutoSpec | EXTERNAL SIBLING PROJECT | AutoSpec repository | adapter/integration contracts where local harness must call it | copy AutoSpec into pi-engineering; duplicate its spec/work-item engine |
 | MCP servers | EXTERNAL SERVICES/TOOLS | individual MCP projects/services | registry, configuration, auth, capability/permission policy | reimplement domain MCP servers |
+| priorart | **REQUIRED EXTERNAL MCP TOOL** | github.com/berlinguyinca/pi-priorart | register/configure/ensure-present via `src/platform/priorartDependency.ts` (binary + config + `~/.pi/agent/mcp.json`), on every session start | reimplement the search backends, ranking, or decision ledger |
 | Git | EXTERNAL TOOL | system | invoke/manage worktrees through safe abstraction | implement VCS |
 | Docker/Compose | EXTERNAL TOOLING | system | Compose/configuration for local integration services | container runtime |
 | PostgreSQL | EXTERNAL SERVICE | packaged dependency | schema/migrations/client for pi-engineering-owned runtime state | database server |

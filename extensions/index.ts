@@ -92,6 +92,7 @@ import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
 import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { registerPlannerWorker } from "../src/plannerWorker/extension.ts";
+import { ensurePriorart } from "../src/platform/priorartDependency.ts";
 import { redactSecrets } from "../src/platform/redact.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import {
@@ -788,6 +789,19 @@ export default function (pi: ExtensionAPI) {
   if (typeof pi.on === "function") registerTerminalRefusalGuard(pi);
   registerModelTabs(pi);
   registerInteractiveMemory(pi);
+  // priorart is a required EXTERNAL dependency (see
+  // docs/specs/pi-engineering/support/EXTERNAL_TOOLS_AND_OWNERSHIP.md). Ensure its
+  // binary + config + mcp.json registration on every session start. Best-effort and
+  // non-throwing: it must never delay or break a session.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", () => {
+      try {
+        ensurePriorart();
+      } catch {
+        /* never break pi startup */
+      }
+    });
+  }
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
   // Agent-inspector feed to Herdr: OFF unless this host's central fleet config
