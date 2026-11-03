@@ -1,0 +1,22 @@
+{
+  "taskId": "demo-peak-picking-001",
+  "objective": "Diagnose local LC-MS peak picking discrepancy using code, test fixtures and logs; report root cause and reproducible evidence.",
+  "mode": "investigation",
+  "policyRevision": 1,
+  "workspace": "/home/analyst/work/cdf2ms",
+  "readRoots": ["/home/analyst/work/cdf2ms", "/home/analyst/work/lcms-common"],
+  "writeRoots": [],
+  "scratchRoots": ["/home/analyst/scratch/peak-picking"],
+  "protectedPaths": [],
+  "allowedHosts": [],
+  "externalEffects": [],
+  "allowedTools": [],
+  "allowedCommands": [],
+  "acceptanceCriteria": [
+    "Reproduce the discrepancy locally or name the exact blocker",
+    "Identify the likely defect with file and test evidence",
+    "No data modification, no deployment, no outbound transfer"
+  ],
+  "owner": "gert",
+  "createdAt": "2026-11-03T14:00:00Z"
+}

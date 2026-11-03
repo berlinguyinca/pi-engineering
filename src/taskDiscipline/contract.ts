@@ -3,7 +3,9 @@
  *
  * Pure data and pure functions. The contract is created and amended by the
  * host/operator, never by the model; this module only validates, hashes and
- * narrows. Wire shape is `task-contract.schema.json` (Herdr Task Discipline v1).
+ * narrows. Wire shape:
+ * `docs/specs/task-discipline-v1/task-contract.schema.json`, kept in step with
+ * this parser by `test/unit/task-discipline-schema.test.ts`.
  */
 import { createHash } from "node:crypto";
 
@@ -21,6 +23,44 @@ export const EXTERNAL_EFFECTS = [
   "destructive_operation",
 ] as const;
 export type ExternalEffect = (typeof EXTERNAL_EFFECTS)[number];
+
+/** Every field a contract may carry — anything else is a parse error, so a
+ * contract cannot smuggle in authority by inventing a key. */
+export const CONTRACT_FIELDS = [
+  "taskId",
+  "missionId",
+  "parentTaskId",
+  "objective",
+  "mode",
+  "policyRevision",
+  "workspace",
+  "readRoots",
+  "writeRoots",
+  "scratchRoots",
+  "protectedPaths",
+  "allowedHosts",
+  "externalEffects",
+  "allowedTools",
+  "allowedCommands",
+  "acceptanceCriteria",
+  "owner",
+  "createdAt",
+  "approvedAmendmentIds",
+] as const;
+
+/** Fields that must be present (an empty array is present; an absent one is not).
+ * `parseContract` enforces each individually; the parity test proves it. */
+export const CONTRACT_REQUIRED = [
+  "taskId",
+  "objective",
+  "mode",
+  "policyRevision",
+  "readRoots",
+  "writeRoots",
+  "allowedHosts",
+  "externalEffects",
+  "acceptanceCriteria",
+] as const;
 
 export interface TaskContract {
   taskId: string;
@@ -65,27 +105,7 @@ const strArray = (v: unknown, name: string, required = true): string[] => {
 export function parseContract(raw: unknown): TaskContract {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ContractError("contract must be an object");
   const r = raw as Record<string, unknown>;
-  const allowedKeys = new Set([
-    "taskId",
-    "missionId",
-    "parentTaskId",
-    "objective",
-    "mode",
-    "policyRevision",
-    "workspace",
-    "readRoots",
-    "writeRoots",
-    "scratchRoots",
-    "protectedPaths",
-    "allowedHosts",
-    "externalEffects",
-    "allowedTools",
-    "allowedCommands",
-    "acceptanceCriteria",
-    "owner",
-    "createdAt",
-    "approvedAmendmentIds",
-  ]);
+  const allowedKeys = new Set<string>(CONTRACT_FIELDS);
   for (const k of Object.keys(r)) if (!allowedKeys.has(k)) throw new ContractError(`unknown contract field: ${k}`);
   if (!isStr(r.taskId) || !r.taskId) throw new ContractError("taskId is required");
   if (!isStr(r.objective) || !r.objective) throw new ContractError("objective is required");
