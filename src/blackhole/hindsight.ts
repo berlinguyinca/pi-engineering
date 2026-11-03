@@ -63,9 +63,14 @@ export function resolveHindsightFromEnv(
   };
 }
 
+// herdr-memory accepts --timeout-ms only on these actions; on retain/correct/forget argparse rejects it.
+const TIMEOUT_FLAG_ACTIONS = new Set(["recall", "get"]);
+
 export const defaultRunner: HindsightRunner = (cli, args, timeoutMs) =>
   new Promise((resolve, reject) => {
-    execFile(cli, args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout) => {
+    // herdr-memory picks the credential and provenance harness from HERDR_HARNESS (default "codex"): Pi must say it is Pi.
+    const env = { ...process.env, HERDR_HARNESS: process.env.HERDR_HARNESS?.trim() || "pi" };
+    execFile(cli, args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env }, (error, stdout) => {
       if (!error) return resolve({ stdout, exitCode: 0 });
       const code = (error as { code?: unknown }).code;
       if (typeof code === "number") return resolve({ stdout: String(stdout ?? ""), exitCode: code });
@@ -116,7 +121,7 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   private async call(args: string[]): Promise<Record<string, unknown>> {
     let res: HindsightRunResult;
     try {
-      res = await this.run(this.cli, [...args, "--timeout-ms", String(this.timeoutMs)], this.timeoutMs + 250);
+      res = await this.run(this.cli, [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(this.timeoutMs)] : [])], this.timeoutMs + 250);
     } catch (error) {
       const e = error as { killed?: boolean; code?: unknown };
       throw new HindsightError(e?.killed || e?.code === "ETIMEDOUT" ? "timeout" : "unavailable");
@@ -202,6 +207,8 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
       ...(record.provenance ?? {}),
     };
     const args = ["retain", record.text, "--scope", scope, "--provenance", JSON.stringify(provenance)];
+    // herdr-memory gates durable facts on --evidence flags (refs only inside --provenance do not count).
+    for (const ref of record.evidenceIds) args.push("--evidence", ref);
     try {
       const out = await this.call(args);
       this.epoch++;
