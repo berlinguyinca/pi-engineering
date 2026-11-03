@@ -50,6 +50,15 @@ export interface HerdrWorkspace {
   path: string;
 }
 
+/** Validate env vars against the safe key/value shapes and return `KEY=value` pairs. */
+function safeEnvPairs(vars: Record<string, string>): string[] {
+  const safe = /^[A-Za-z0-9._:@/-]{1,128}$/;
+  return Object.entries(vars).map(([k, v]) => {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(k) || !safe.test(v)) throw new Error(`refusing to export unsafe value for ${k}`);
+    return `${k}=${v}`;
+  });
+}
+
 /** Thin contract over the Herdr CLI. */
 export interface HerdrCli {
   status(): Promise<HerdrStatus>;
@@ -60,7 +69,15 @@ export interface HerdrCli {
   prompt(target: string, text: string, timeoutMs?: number): Promise<void>;
   /** Wait until the agent reaches one of `until` states or times out. */
   wait(target: string, until: string[], timeoutMs?: number): Promise<HerdrAgent>;
-  startAgent(paneId: string, kind: string, name: string): Promise<void>;
+  /** Start an agent in a pane; `args` are passed after `--` as separate argv entries (never shell-joined). */
+  startAgent(paneId: string, kind: string, name: string, args?: readonly string[]): Promise<void>;
+  /** Split a pane without stealing focus and return the new pane id. Optional: older clients lack it. */
+  splitPane?(opts: {
+    paneId: string;
+    cwd: string;
+    direction?: "right" | "down";
+    env?: Record<string, string>;
+  }): Promise<{ paneId: string }>;
   /** Export environment variables into a pane's shell (before an agent starts there). Optional: older clients lack it. */
   exportEnv?(paneId: string, vars: Record<string, string>): Promise<void>;
   sendKeys(target: string, keys: string): Promise<void>;
@@ -98,16 +115,19 @@ export class RealHerdrCli implements HerdrCli {
       return stdout.trim();
     } catch (err) {
       const e = err as { code?: number; stdout?: string; stderr?: string; message?: string };
-      // Herdr returns JSON errors on stdout with a non-zero exit for API methods.
-      const raw = e.stdout ?? e.stderr ?? e.message ?? "";
+      // Herdr 0.9.1 prints API errors as JSON on STDERR with exit 1 (observed for `agent get`); stdout is
+      // still checked first in case a command answers there. An empty stdout must not hide stderr.
+      const raw = (e.stdout?.trim() ? e.stdout : e.stderr?.trim() ? e.stderr : e.message) ?? "";
       const trimmed = raw.trim();
       if (trimmed.startsWith("{")) {
+        // The thrown code must be herdr's own (e.g. `agent_not_found`): parse first, throw outside the try.
+        let parsed: { error?: { code?: string; message?: string } } | undefined;
         try {
-          const parsed = JSON.parse(trimmed) as { error?: { code?: string; message?: string } };
-          if (parsed.error?.code) throw new HerdrError(parsed.error.code, parsed.error.message ?? trimmed);
+          parsed = JSON.parse(trimmed) as { error?: { code?: string; message?: string } };
         } catch {
-          if (err instanceof HerdrError) throw err;
+          parsed = undefined;
         }
+        if (parsed?.error?.code) throw new HerdrError(parsed.error.code, parsed.error.message ?? trimmed);
       }
       throw new HerdrError("herdr_cli_error", trimmed || String(err));
     }
@@ -126,8 +146,19 @@ export class RealHerdrCli implements HerdrCli {
     return parsed.result?.agents ?? [];
   }
 
+  /**
+   * `null` only when herdr says the target does not exist. herdr 0.9.1 answers `agent_not_found` (exit 1) for
+   * a closed pane, a pane without an agent and an unknown name alike. Every other error still throws, so a
+   * transient failure is never read as "gone" (ruling R21).
+   */
   async getAgent(target: string): Promise<HerdrAgent | null> {
-    const out = await this.run(["agent", "get", target]);
+    let out: string;
+    try {
+      out = await this.run(["agent", "get", target]);
+    } catch (err) {
+      if (err instanceof HerdrError && err.code === "agent_not_found") return null;
+      throw err;
+    }
     const parsed = JSON.parse(out) as { result?: { agent?: HerdrAgent }; error?: { code?: string } };
     if (parsed.error) return null;
     return parsed.result?.agent ?? null;
@@ -156,17 +187,37 @@ export class RealHerdrCli implements HerdrCli {
   }
 
   async exportEnv(paneId: string, vars: Record<string, string>): Promise<void> {
-    const safe = /^[A-Za-z0-9._:@/-]{1,128}$/;
-    const parts = Object.entries(vars).map(([k, v]) => {
-      if (!/^[A-Z][A-Z0-9_]*$/.test(k) || !safe.test(v)) throw new Error(`refusing to export unsafe value for ${k}`);
-      return `${k}=${v}`;
-    });
+    const parts = safeEnvPairs(vars);
     if (parts.length) await this.run(["pane", "run", paneId, `export ${parts.join(" ")}`]);
   }
 
-  async startAgent(paneId: string, kind: string, name: string): Promise<void> {
+  async startAgent(paneId: string, kind: string, name: string, args: readonly string[] = []): Promise<void> {
     // herdr 0.9.1: the name is positional and the pane flag is --pane
-    await this.run(["agent", "start", name, "--kind", kind, "--pane", paneId]);
+    await this.run(["agent", "start", name, "--kind", kind, "--pane", paneId, ...(args.length ? ["--", ...args] : [])]);
+  }
+
+  async splitPane(opts: {
+    paneId: string;
+    cwd: string;
+    direction?: "right" | "down";
+    env?: Record<string, string>;
+  }): Promise<{ paneId: string }> {
+    const envArgs = safeEnvPairs(opts.env ?? {}).flatMap((pair) => ["--env", pair]);
+    const out = await this.run([
+      "pane",
+      "split",
+      "--pane",
+      opts.paneId,
+      "--direction",
+      opts.direction ?? "right",
+      "--no-focus",
+      "--cwd",
+      opts.cwd,
+      ...envArgs,
+    ]);
+    const paneId = (JSON.parse(out) as { result?: { pane?: { pane_id?: string } } }).result?.pane?.pane_id;
+    if (!paneId) throw new HerdrError("pane_split_no_pane", "pane.split returned no pane");
+    return { paneId };
   }
 
   async sendKeys(target: string, keys: string): Promise<void> {

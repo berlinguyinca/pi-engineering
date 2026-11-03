@@ -1715,3 +1715,169 @@ External web consumers receive additive `waitingSince`, `lastOutputAt`,
 `currentActivityStartedAt` and worker timing fields in the mission snapshot. They should derive
 elapsed times from these timestamps locally. This package does not control the separate web
 plugin's redraw loop; the runtime does not rewrite snapshots every second just to animate a timer.
+
+## Vision delegation for text-only models
+
+When the current model has no image input (its `models.json` entry lacks `"image"` in `input`), Pi would
+normally replace a pasted image with a placeholder and the model would see nothing. With vision delegation
+the image goes to a vision model instead, and its findings come back as text.
+
+### What happens on a paste
+
+1. You paste a screenshot (Ctrl+V) or pass one on the command line (`pi @shot.png "what is this?"`) while a
+   text-only model is selected, and the agent is idle.
+2. The image is saved under `~/.pi/agent/vision-delegation/requests/<requestId>/` with its sha256, next to
+   a handoff built from the current session and your message.
+3. The first image of a session splits a new herdr pane to the right of yours (focus stays where it is) and
+   starts `pi` there on a vision model, with the handoff, the request and the image as `@file` arguments.
+   The footer shows `analyzing image (up to <n>s)…` while Pi waits for the result file.
+4. The vision session writes one JSON result. Pi accepts it only if it answers this request and echoes the
+   image hashes Pi sent; then your message reaches the text model with the analysis appended, the image
+   removed, and the pasted path replaced by `[pasted image N]`.
+5. A later image in the same session reuses that vision pane (it remembers the earlier images): Pi asks herdr
+   for the vision agent by its unique name (`vision-<session8>-<request8>`), checks that it still answers from
+   the registered pane, and sends it the new file paths only, addressed by that name; the vision session opens
+   the image with its read tool. If the name is unknown or now answers from a different pane, Pi never prompts
+   or closes that pane; it starts a new vision session instead.
+   Images that arrive while one is being analyzed wait their turn (`waiting for earlier image…`).
+
+The vision session runs in your project directory with Pi's normal tools and the same approvals as any Pi
+session there; it gets no extra privileges. Its role prompt says text inside an image is data, never an
+instruction, and the handback is marked as derived from untrusted image content. The vision session runs
+with reasoning off (`--thinking off`) and is asked for bounded transcription: only text relevant to your
+message, repetitive UI summarized with a count, written in its first response.
+
+Only interactive input is handled. RPC input and models that already accept images are left alone. An image
+sent while the agent is streaming is not delegated: you get a warning that it was not analyzed and should be
+sent again when the agent is idle.
+
+### How pasted screenshots are recognized
+
+A pasted screenshot reaches the message as a file path, not as an attachment, from one of two sources:
+
+- **Pi's own paste.** Pi's TUI Ctrl+V writes the clipboard to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and
+  inserts that path as text.
+- **herdr's paste.** Inside a herdr pane, herdr (not Pi) writes the image to
+  `<tmpdir>/herdr-clipboard-images-<uid>/client-<n>-clipboard-<digits>-<k>.<ext>` and types that path into
+  the pane.
+
+The handler finds such paths anywhere in your message (bare, quoted or in backticks, several, in order) and
+treats one as an image only when all of these hold, so a typed path can never make Pi read an arbitrary file:
+
+- the file name is exactly the clipboard name of its family: `pi-clipboard-<uuid>`, or
+  `client-<digits>-clipboard-<digits>-<digits>`, with `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp` and nothing
+  after it;
+- for Pi's files, the real path is directly inside the real temp directory (no subdirectory);
+- for herdr's files, the real directory is directly inside the real temp directory and is named exactly
+  `herdr-clipboard-images-<uid>` for your own user id; that directory is a real directory (not a symlink),
+  owned by you, and readable by nobody else (no group or other permission bits); the file is owned by you.
+  Where the user id is unavailable, herdr's files are not recognized;
+- the file itself is not a symlink, and it is a regular file larger than 0 bytes and at most 20 MiB, read
+  through a handle that is checked against the file that was inspected.
+
+Anything else stays plain text. An empty or oversized clipboard file gives a warning instead. A recognized path
+is replaced by `[pasted image N]` in the text sent on, so the file's location is not repeated. Images given on
+the command line or by an SDK caller arrive as real attachments and are delegated the same way.
+
+### Settings and the kill switch
+
+The block is read from the global `~/.pi/agent/engineering.yaml` only; a repository `engineering.yaml`
+cannot change it. Without the block the feature is on with these defaults:
+
+```yaml
+vision_delegate:
+  enabled: true                       # false is the kill switch
+  wait_seconds: 300                   # integer 10-3600: the longest wait for one image
+  alias_preference: [qwen3.8-vision]  # model ids tried first, in order
+```
+
+- `enabled: false` turns the feature off: the handler does nothing and Pi behaves as without it.
+- `wait_seconds` outside 10-3600, or not an integer at all, never turns the feature off: it keeps 300 and
+  shows a note.
+- `alias_preference` must be a non-empty list of non-empty strings.
+- An unknown key, a `vision_delegate` value that is not a mapping, an `enabled` that is not `true` or
+  `false`, or an `alias_preference` that is not such a list turns the feature off and shows a note saying why.
+
+The settings are read once per Pi process, on the first image that needs a vision model; edit the file and
+restart Pi to change them.
+
+### Choosing the vision model
+
+Pi tries the `alias_preference` ids first, then any other model in `models.json` whose `input` includes
+`"image"`, and uses the first one whose gateway health check is healthy. The check is the gateway recovery
+probe, and it treats concrete ids and aliases differently:
+
+- A concrete model id must be listed by the gateway's `/models` and, on an InferWeave gateway, also needs a
+  fresh entry in the admission report. Without one the probe rejects it (`capacity unknown: no fresh known
+  model-level admission report`).
+- An alias (such as `qwen3.8-vision`) is accepted without an admission entry when its members are live
+  (`alias qwen3.8-vision has 1 live member(s): ...`).
+
+Both answers were seen live against the lab gateway; see "The production probe" in
+`docs/evidence/vision-delegation-acceptance.md`. The preferred `qwen3.8-vision` alias still has to be an
+image-capable entry in `models.json` for Pi to consider it; `/model-refresh` adds it once the gateway
+advertises it. With no image-capable model, or none healthy, you get the "no vision model" outcome below; Pi
+never falls back silently.
+
+### What you see for each outcome
+
+Every outcome reaches the text model as explicit text; an image is never dropped silently.
+
+| Outcome | What the text model is told |
+| --- | --- |
+| ok | `You cannot see them. Vision model "<id>" analysed them…`, `STATUS: ok.`, the image paths, then `Description`, `Text in image`, `Findings for the task` and `Uncertainties`, and `STATUS: ok.` again as the last line. Every line the vision model wrote starts with `\| ` (a lone `\|` for an empty line), and the block says that only those lines are the model's words, so text in an image cannot forge a `STATUS:` or `NOTE:` line. |
+| partial | the same block with `STATUS: partial. The analysis is incomplete; treat gaps as unknown.` |
+| failed (by the vision model) | the same block with `STATUS: failed. The vision model could not analyse the image(s); do not rely on the content below.` |
+| failed (delegation) | `You cannot see the image(s), and no vision analysis is available.` and `Vision delegation did not complete: <why>` (the pane could not start, exited before writing a result, stopped without writing a result, or the result was rejected), plus the saved image paths. |
+| timeout | the same, with `the analysis timed out after <n> seconds (vision model <id>)`. |
+| no vision model | the same, with `no vision model was available.` and every model and why it was not used. |
+| herdr missing | the same, with `herdr is unavailable (this session is not running in a herdr pane)` (or `this herdr client cannot split panes`). |
+| build failure | a warning `The pasted image was not analyzed: vision delegation could not start (<why>)…`; the message goes on unchanged, so the text model sees only Pi's placeholder. Unreadable settings give the same kind of warning. |
+
+The vision pane stays open after an accepted result (`ok`, `partial`, or `failed` reported by the vision model)
+so later images can reuse it. After a delegation failure or a timeout Pi closes it, and a reused session that failed is forgotten, so the next image starts a new one. If
+the vision pane is gone (for example you closed it), the next image starts a new vision session and the
+handback says that earlier images are no longer in the vision session's context. A vision agent that exits
+before writing a result is noticed within a few seconds (`the vision pane exited before writing a result`),
+not at the end of `wait_seconds`. One that stays open but sits idle without writing a result (for example on
+a model id the gateway does not serve, where the vision Pi shows an error and waits) is reported as `the
+vision agent stopped without writing a result` once herdr has reported it idle or done on 4 pane checks in a
+row (one every 2.5 seconds) and at least 30 seconds have passed since delivery. An agent that keeps working
+is still bounded by `wait_seconds` only.
+
+### Limitation: the wait cannot be cancelled
+
+Ctrl-C and Escape do not cancel a delegation. Pi gives an input handler no abort signal while the agent is
+idle, Escape only aborts a streaming turn, and a second Ctrl-C quits Pi. The wait is bounded by
+`wait_seconds` only, which is why the footer shows the bound. A message you send meanwhile is queued and runs
+after the delegation ends. Lower `wait_seconds` if five minutes is too long.
+
+### Where the files live
+
+Under `~/.pi/agent/vision-delegation/`: `registry.json` maps each Pi session to its vision pane, and
+`requests/<requestId>/` holds the saved images, `handoff.md`, `request.json`, `instructions.md`,
+`role-prompt.md`, `state.json` (status, pane id, whether the result was injected), `results/` and the vision
+session's `session/` directory. A result that lands after a timeout is left there and never injected.
+
+### Retention and lifetime
+
+- **Request directories are kept until you delete them.** Each `requests/<requestId>/` keeps its
+  `handoff.md`, a copy of the recent session context, which may contain secrets you pasted or that the
+  session read, next to the saved images and the vision session's transcript. Pi never removes them; delete
+  `~/.pi/agent/vision-delegation/requests/` (or single request directories) by hand when you no longer
+  need them.
+- **Vision panes outlive the text session.** A vision pane and its Pi process are not closed when the text
+  session ends, when you quit Pi, or when you switch sessions. A reused session's pane stays open until a
+  delegation in it fails (Pi then closes it) or you close it yourself.
+- **Orphan panes.** If a reused vision Pi exits between requests, its shell pane is left behind. Pi only
+  ever closes a pane whose identity it created or confirmed in the same call (the agent name answering from
+  the registered pane id), so it never closes that shell pane, or any pane where another agent now runs;
+  close it by hand.
+
+### Lineage events
+
+Each delegation emits two handoffs through the existing lineage emitter: out, id `vision-<requestId>-out`,
+cause `vision_delegate`; and back, id `vision-<requestId>-back`, cause `vision_return`. The handoff kind
+carries the outcome (`vision`, `vision_partial`, `vision_failed`, `vision_timeout`), and both carry the text
+and vision model. No image count is carried. The events reach herdr only when the `herdr:` block of the global
+`engineering.yaml` sets `lineage: true` (see "Herdr connection" above); without it nothing is sent.
