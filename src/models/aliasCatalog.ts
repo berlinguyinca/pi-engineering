@@ -23,7 +23,7 @@
  * Pure, like the rest of the catalogue handling: no I/O.
  */
 
-import type { GatewayModelEntry } from "./gatewayCatalog.ts";
+import { type GatewayModelEntry, memberSizes, sizeClassOf } from "./gatewayCatalog.ts";
 
 const SHORT_MODALITIES = new Set(["text", "vision", "audio", "video"]);
 const KEYS = new Set(["arch", "variant", "modality", "ctx", "quant", "src"]);
@@ -64,6 +64,42 @@ function isUsable(entry: GatewayModelEntry): boolean {
 
 function smallest(entries: readonly GatewayModelEntry[]): number {
   return Math.min(...entries.map((entry) => entry.contextWindow));
+}
+
+/** What exactly one member behind an alias resolves to, for naming and reporting. */
+function soleMember(memberIds: readonly string[]): string | undefined {
+  return memberIds.length === 1 ? memberIds[0] : undefined;
+}
+
+/**
+ * Why an alias's name does not tell you which model answers, or `undefined`
+ * when the name says it.
+ *
+ * An alias is a name, not a promise about weights: `qwen3.8-text` is whatever
+ * text-modality `qwen3.8` is live, which today is Flash-Next and after a swap
+ * could be the 27B. Selecting such a name for a session — or reporting on one —
+ * has to reveal what stands behind it now, or "which model am I on?" becomes
+ * unanswerable from the configuration.
+ */
+export function aliasAmbiguity(entry: GatewayModelEntry): string | undefined {
+  const members = entry.members ?? [];
+  // Read from the members, not from the deduplicated `sizes`: two members can
+  // share a class (the q4 and w3a8 quants of one model), and then "every member"
+  // is a claim worth making even though one class name covers them.
+  const classes = members.map(sizeClassOf);
+  const unnamed = classes.filter((c) => c === undefined).length;
+  const known = [...new Set(classes.filter((c): c is string => c !== undefined))].sort();
+  if (known.length === 0) return undefined;
+  if (known.length > 1 || unnamed > 0) {
+    const extra = unnamed > 0 ? ` plus ${unnamed} whose id names no class` : "";
+    return `its ${members.length} members run ${known.join(", ")}${extra}, so the name cannot say which one answers`;
+  }
+  const size = known[0]!;
+  if (entry.id.toLowerCase().includes(size.toLowerCase())) return undefined;
+  const runs = soleMember(members);
+  return runs
+    ? `it runs ${runs} (${size}), which the name does not say`
+    : `every member is ${size}, which the name does not say`;
 }
 
 /**
@@ -122,12 +158,19 @@ export function aliasView(advertised: readonly GatewayModelEntry[]): AliasView {
   // Aliases the gateway lists. A listed alias reports the best member's window;
   // the safe window is the smallest one across the members we can see.
   for (const entry of advertised.filter((e) => e.alias)) {
-    const members = (entry.members ?? []).map((id) => byId.get(id)).filter((m): m is GatewayModelEntry => !!m);
+    const memberIds = entry.members ?? [];
+    const members = memberIds.map((id) => byId.get(id)).filter((m): m is GatewayModelEntry => !!m);
     const contextWindow = members.length > 0 ? Math.min(entry.contextWindow, smallest(members)) : entry.contextWindow;
+    const backingModel = soleMember(memberIds);
+    const sizes = memberSizes(memberIds);
     out.set(entry.id, {
       ...entry,
       contextWindow,
       ...(members.length > 0 ? { members: members.map((m) => m.id) } : {}),
+      // One member is a definite answer; several means the gateway picks per
+      // request and no single model may be claimed.
+      ...(backingModel ? { backingModel } : {}),
+      ...(sizes.length > 0 ? { sizes } : {}),
     });
   }
 
@@ -135,12 +178,17 @@ export function aliasView(advertised: readonly GatewayModelEntry[]): AliasView {
   for (const [name, members] of derivedAliases(concrete.filter(isUsable))) {
     if (out.has(name)) continue;
     const best = members.find((m) => m.state === "warm") ?? members[0]!;
+    const memberIds = members.map((m) => m.id).sort();
+    const backingModel = soleMember(memberIds);
+    const sizes = memberSizes(memberIds);
     out.set(name, {
       id: name,
       contextWindow: smallest(members),
       ...(best.state ? { state: best.state } : {}),
       alias: true,
-      members: members.map((m) => m.id).sort(),
+      members: memberIds,
+      ...(backingModel ? { backingModel } : {}),
+      ...(sizes.length > 0 ? { sizes } : {}),
     });
   }
 

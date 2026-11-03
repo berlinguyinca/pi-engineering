@@ -21,6 +21,8 @@ export interface CatalogModel {
   alias: boolean;
   /** Concrete model currently backing an alias, when advertised. */
   backing?: string;
+  /** Concrete models currently behind an alias (`x_members`, or `x_backing_model`). */
+  members?: string[];
   /** Logical aliases a concrete model currently serves. */
   aliases: string[];
   capabilities: string[];
@@ -67,13 +69,47 @@ export type CatalogModelUpdate = Pick<CatalogModel, "id"> & Partial<Omit<Catalog
 
 /** Parse a `/models` listing, keeping every extended field the gateway offers. */
 export function parseCatalog(payload: unknown): CatalogModel[] {
-  return parseCatalogUpdates(payload).map((model) => ({
+  const models = parseCatalogUpdates(payload).map((model) => ({
     alias: false,
     aliases: [],
     capabilities: [],
     modalities: [],
     ...model,
   }));
+  return resolveMembership(models);
+}
+
+/**
+ * Fill in what a single row cannot state on its own.
+ *
+ * The deployed gateway (revision `b5f62ec2`) names membership ONLY on the route
+ * row (`x_members`) and advertises no `x_aliases` on concrete rows. Without the
+ * reverse direction `resolveRole` cannot see which concrete models serve an
+ * alias, and a route row without its own size has no context window at all.
+ */
+function resolveMembership(models: CatalogModel[]): CatalogModel[] {
+  const byId = new Map(models.map((model) => [model.id, model]));
+  for (const model of models) {
+    if (model.contextWindow === undefined) {
+      const inherited = (model.members ?? [])
+        .map((member) => byId.get(member)?.contextWindow)
+        .find((w) => w !== undefined);
+      if (inherited !== undefined) model.contextWindow = inherited;
+    }
+  }
+  const declared = new Map(models.map((model) => [model.id, model.aliases]));
+  const servedBy = new Map<string, string[]>();
+  for (const route of models) {
+    if (!route.alias) continue;
+    for (const member of route.members ?? []) {
+      if ((declared.get(member) ?? []).length > 0) continue;
+      servedBy.set(member, [...(servedBy.get(member) ?? []), route.id]);
+    }
+  }
+  for (const model of models) {
+    if (model.aliases.length === 0) model.aliases = servedBy.get(model.id) ?? [];
+  }
+  return models;
 }
 
 function parseCatalogUpdates(payload: unknown): CatalogModelUpdate[] {
@@ -85,18 +121,29 @@ function parseCatalogUpdates(payload: unknown): CatalogModelUpdate[] {
     const row = raw as Record<string, unknown>;
     const id = str(row.id);
     if (!id) continue;
-    const backing = str(row.x_backing_model);
+    // Members are ids, or `{id}` objects on gateways that report seats too.
+    const members = Array.isArray(row.x_members)
+      ? row.x_members
+          .map((m) => (typeof m === "string" ? m : str((m as { id?: unknown } | null)?.id)))
+          .filter((m): m is string => typeof m === "string" && m.length > 0)
+      : [];
+    const declaredBacking = str(row.x_backing_model);
+    const named = declaredBacking && !members.includes(declaredBacking) ? [declaredBacking, ...members] : members;
+    // Exactly one model behind a route is a fact; several means the gateway picks
+    // per request and no single backing may be claimed.
+    const backing = named.length === 1 ? named[0] : undefined;
     const contextWindow = num(row.ctx_per_request) ?? num(row.x_context_window) ?? num(row.context_length);
     const model: CatalogModelUpdate = { id };
-    if (typeof row.x_alias === "boolean" || backing !== undefined) {
-      model.alias = row.x_alias === true || backing !== undefined;
+    if (typeof row.x_alias === "boolean" || declaredBacking !== undefined || named.length > 0) {
+      model.alias = row.x_alias === true || declaredBacking !== undefined || named.length > 0;
     }
     if ("x_aliases" in row) model.aliases = strs(row.x_aliases);
+    if (named.length > 0) model.members = named;
     if ("x_capabilities" in row || "capabilities" in row) {
       model.capabilities = strs(row.x_capabilities ?? row.capabilities);
     }
     if ("x_modalities" in row) model.modalities = strs(row.x_modalities);
-    if ("x_backing_model" in row || model.alias === false) model.backing = backing;
+    if ("x_backing_model" in row || "x_members" in row || model.alias === false) model.backing = backing;
     const family = str(row.x_family);
     if (family) model.family = family;
     const sizeClass = str(row.x_size_class);

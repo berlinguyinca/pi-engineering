@@ -528,15 +528,35 @@ remain at 20% while a slow model answers. The panel clears on completion,
 failure or cancellation.
 
 Gateway aliases are kept and probed under their advertised route ID; a working
-backing model does not prove that its aliases work. The progress panel and final
-report show `alias → backing-model` when the gateway supplies that relationship.
-New aliases inherit input, reasoning, output limit, cost and compatibility
+backing model does not prove that its aliases work. The gateway names what answers
+behind a route with `x_members` on the route row — the concrete ids that serve it,
+and nothing else. The progress panel and final report show
+`alias → member[, member…]`; a route with one member records it as the backing
+model, a route with several (failover) records them all and names none as "the"
+backing model, because choosing one would guess. New aliases inherit input,
+reasoning, output limit, cost and compatibility
 settings from their configured backing model when available, bounded by the
 alias's advertised context window. Other additions report inferred settings.
 Existing model names and settings survive refresh, and identical IDs in two
 providers remain separate entries. Aliases only listed as `x_aliases` on a
 concrete model are descriptive metadata; refresh does not invent route entries
 that the gateway has not separately advertised.
+
+A written alias name says what answers behind it, so `/model` and the status line
+never leave that ambiguous: `qwen3.8-text →
+qwen3.8-flash_next-modality-text-quant-w3a8 (gateway alias)`, or
+`qwen3.8 → a, b, c (gateway alias; 27b/flash/flash_next)` when several members
+share the route and a failover between them changes the model. Canonical ids carry
+their size class (`<family>-<size>-modality-…`), so `qwen3.8-27b-…` is the 27B build
+and `qwen3.8-flash_next-…` is Flash-Next; an id outside that grammar has no size
+class and none is invented. Where an alias's own name says nothing about what it
+runs, refresh reports it — `ambiguous: qwen3.8-text — it runs
+qwen3.8-flash_next-modality-text-quant-w3a8 (flash_next), which the name does not
+say` — because a session on that name is on Flash-Next while the name implies
+nothing of the sort. Pin the concrete id, or a name carrying the class
+(`qwen3.8-flash_next-text`), when cost or quality depends on which model answers.
+Which class a route answers with is the gateway's decision and can change between
+runs; the report reflects `x_members` at the moment it ran.
 
 `/model-refresh` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried

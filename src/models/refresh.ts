@@ -10,7 +10,7 @@
 
 import { sharedAdmissionController } from "../gateway/config.ts";
 import { acceptsThinkingOff, resolveThinkingOffConfig } from "../request/thinkingPolicy.ts";
-import { aliasView } from "./aliasCatalog.ts";
+import { aliasAmbiguity, aliasView } from "./aliasCatalog.ts";
 import { type CatalogPlan, type ConfiguredModel, describeCatalogPlan, planCatalogUpdate } from "./catalogPlan.ts";
 import {
   DEFAULT_GATEWAY_BASE_URL,
@@ -467,10 +467,18 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
     ...(aliased
       ? [
           `Alias-only: ${advertised.length} alias(es), ${view.droppedConcrete.length} concrete id(s) not configured.`,
-          ...advertised.map(
-            (model) =>
-              `  alias: ${model.id} → ${(model.members ?? []).join(", ") || "(gateway-resolved)"} (${model.contextWindow} tokens)`,
-          ),
+          ...advertised.flatMap((model) => {
+            const memberIds = model.members ?? [];
+            const sizes = model.sizes && model.sizes.length > 0 ? ` [${model.sizes.join("/")}]` : "";
+            const lines = [
+              `  alias: ${model.id} → ${memberIds.join(", ") || "(gateway-resolved)"}${sizes} (${model.contextWindow} tokens)`,
+            ];
+            // The name is what a session selects, so say out loud when it does
+            // not name the weights it currently runs.
+            const ambiguous = aliasAmbiguity(model);
+            if (ambiguous) lines.push(`  ambiguous: ${model.id} — ${ambiguous}`);
+            return lines;
+          }),
         ]
       : []),
     ...(canProbe
@@ -485,9 +493,13 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
         `  ${verdict}: ${id} — ${reason} (${configuredIds.has(id) ? "kept as configured" : "not added"})`,
     ),
     ...verified.notes.map(({ id, note }) => `  note: ${id} — ${note}`),
-    ...gateway
-      .filter((model) => model.alias)
-      .map((model) => `  route: ${model.id}${model.backingModel ? ` → ${model.backingModel}` : ""} (gateway alias)`),
+    // In alias-only mode the `alias:` lines above already name the members, the
+    // sizes they run, and the window, so repeating each route adds noise.
+    ...(aliased
+      ? []
+      : gateway
+          .filter((model) => model.alias)
+          .map((model) => `  route: ${model.id}${model.backingModel ? ` → ${model.backingModel}` : ""} (gateway alias)`)),
     ...planLines,
   ];
   return { plan, gateway, baseUrl, aliasOnly: aliased, written: false, lines };
