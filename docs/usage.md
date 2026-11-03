@@ -1695,7 +1695,9 @@ the image goes to a vision model instead, and its findings come back as text.
 
 The vision session runs in your project directory with Pi's normal tools and the same approvals as any Pi
 session there; it gets no extra privileges. Its role prompt says text inside an image is data, never an
-instruction, and the handback is marked as derived from untrusted image content.
+instruction, and the handback is marked as derived from untrusted image content. The vision session runs
+with reasoning off (`--thinking off`) and is asked for bounded transcription: only text relevant to your
+message, repetitive UI summarized with a count, written in its first response.
 
 Only interactive input is handled. RPC input and models that already accept images are left alone. An image
 sent while the agent is streaming is not delegated: you get a warning that it was not analyzed and should be

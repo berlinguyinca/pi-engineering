@@ -412,3 +412,44 @@ by it, with no group/other bits) and the file's owner. Tests build a sandbox tmp
 
 Read-only recognition probe on the real file (only metadata printed, never the bytes): at the old HEAD
 `e6964093`, recognized no, accepted no; with the fix, recognized yes, accepted yes, 314997 bytes, `image/png`.
+
+## After the thinking-off fix (2026-11-02, ruling R30)
+
+The failing real session (request `9015a758`): the vision agent on `metabolomics/qwen3.8-flash-vision`
+(thinking `medium`) spent one 61 s turn (3809 output tokens, `stopReason: "stop"`) on a single thinking part
+that looped while transcribing a dense 1885x2135 screenshot, with no text and no tool call; R26 then ended the
+delegation correctly ("the vision agent stopped without writing a result"). Fix (commit `cedefc43`): the
+vision pane starts with `--thinking off`, and the role prompt and `instructions.md` bound transcription
+(relevant text only, about 1500 characters, repetitive UI as a one-line summary with a count, never repeat an
+item, `partial` when too dense) and ask for the result in the first response. Validation, the idle detector
+and failure semantics are unchanged; no retries.
+
+The spike gained `--image <path>` (commit `3c6195ac`): one real image, delegated once; it prints no
+image-derived text, only the status word, validation, result field lengths, duration and the vision
+session's turn shape. Same safety rules: one throwaway workspace closed in `finally` (`herdr workspace list`
+afterwards showed only the user's `w8`, `wD`, `wR` each time), `mkdtemp` artifacts and registry, the recording
+lineage fake, nothing under `~/.pi` written. The image is the saved copy of the failing screenshot (contents
+not recorded here).
+
+```sh
+node scripts/vision-delegation-spike.ts --model qwen3.8-flash-vision --probe catalog --wait 180 --image <saved screenshot>
+node scripts/vision-delegation-spike.ts --model qwen3.8-flash-vision --probe catalog --wait 120
+```
+
+| Run | Image | Outcome | Validated | Time | Vision session |
+| --- | --- | --- | --- | --- | --- |
+| 0 | real | not a model attempt: `--probe listed` (default) does not list the alias `qwen3.8-flash-vision`, so the delegator declined before any pane | - | 0 s | - |
+| 1 | real | `ok`; fields description 1258, text_in_image 1338, findings 1818, uncertainties 1253 chars (6 items) | yes | 103.3 s | `thinking_level_change -> off`; 6 assistant turns, all `thinkingLevel: off`, all `toolUse`; largest output 2611 tokens |
+| 2 | real | `ok`; fields description 1392, text_in_image **2402**, findings 2209, uncertainties 823 chars (5 items) | yes | 111.7 s | `off`; 3 assistant turns, all `toolUse`; largest output 2134 tokens |
+| 3 | generated a-d | a, b, c failed at `startAgent` 0.1 s after the split: herdr `agent target pane wX:p2 is not an available shell` (herdr had not started the new pane's shell yet; Pi never ran); c2 passed | - | 13.2 s | - |
+| 4 | generated a-d | ALL CHECKS PASSED (a 37.2 s, b 28.8 s reuse by name, c R26 stop 36.3 s, c2 8.5 s, d 33.3 s new pane) | yes | 144.9 s | - |
+
+Observations:
+
+- `--thinking off` takes effect: the session records `thinking_level_change -> off` and every assistant
+  message carries `thinkingLevel: "off"`. The served model still emits short thinking parts (110 to 3562
+  characters per turn), so "off" reduces but does not fully remove reasoning on this gateway; no turn looped.
+- The 1500-character cap on `text_in_image` is a prompt request, not validated: run 2 wrote 2402 characters.
+  Harmless (bounded, validated, delivered), and `parseResult` is deliberately unchanged.
+- Run 3's `not an available shell` is a herdr race between `pane split` and `agent start` on a loaded machine
+  (startAgent took 13.6 s in run 2); it did not recur in run 4 and is unrelated to R30.
