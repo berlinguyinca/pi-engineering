@@ -36,6 +36,28 @@ test("blackhole config: rejects invalid concurrency and compaction thresholds", 
   assert.throws(() => resolveBlackholeConfig({ compactionThreshold: 1 }), /compactionThreshold/);
 });
 
+test("blackhole config: a retired or unknown durable kind is refused, not silently made in-process", () => {
+  // `openviking` was a real config value before Hindsight became the durable
+  // backend. Config reaches this function from YAML untyped, so a retired value
+  // is a runtime reality, not a type error: passing it through would reach
+  // buildDurableProvider's default branch and return an in-process provider,
+  // so memory would stop being shared while every status still looked healthy.
+  const stale = (kind: string, extra: Record<string, unknown> = {}) =>
+    ({ durable: { kind, ...extra } }) as Parameters<typeof resolveBlackholeConfig>[0];
+  assert.throws(() => resolveBlackholeConfig(stale("openviking", { baseUrl: "http://mem:8080" })), /not supported/i);
+  assert.throws(() => resolveBlackholeConfig(stale("typos")), /known kinds/);
+  // Supported kinds still resolve, and a hindsight entry without its endpoint
+  // stays the loud, specific error rather than the generic one.
+  assert.equal(
+    resolveBlackholeConfig({ durable: { kind: "hindsight", baseUrl: "https://m" } }).config.durable.kind,
+    "hindsight",
+  );
+  assert.throws(
+    () => resolveBlackholeConfig(stale("hindsight", { cli: "hindsight" })),
+    /hindsight.*requires a `baseUrl`/,
+  );
+});
+
 // ------------------------------------------------------------- session store
 
 test("session store: strict isolation — a foreign identity cannot access a store", () => {

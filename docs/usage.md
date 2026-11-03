@@ -1291,6 +1291,12 @@ blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/sh
 blackhole: { config: { enabled: true, durable: { kind: "hindsight", baseUrl: "https://memory.example", token, project: "pi" } } }
 ```
 
+Any other `kind` — including `openviking`, which was the shared store before
+Hindsight — is refused at config resolution rather than accepted and served by
+the in-process default, because silently stopping sharing is worse than
+refusing to start. Re-point such a config at Hindsight (its data lives in the
+`{project}-facts` bank).
+
 Each `runWorker` hydrates its context from shared durable memory on run, so a
 later/other worker consumes knowledge promoted by any earlier worker (spec:
 *"accepted promoted memories can be consumed by later sessions"*). Provider

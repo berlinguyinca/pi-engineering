@@ -26,6 +26,15 @@ export interface PartialBlackholeConfig {
   providerTimeoutMs?: number;
 }
 
+/**
+ * Every `durable.kind` `buildDurableProvider` can build. A kind outside this set
+ * must be refused at config resolution: `buildDurableProvider`'s default branch
+ * returns an in-process provider, so an unknown or retired kind (e.g. the
+ * `openviking` value configs carried before Hindsight became the durable backend)
+ * would silently stop sharing memory across sessions instead of failing.
+ */
+export const DURABLE_KINDS = ["memory", "shared-file", "hindsight"] as const;
+
 const DEFAULTS: Omit<BlackholeConfig, "version"> & { version: string } = {
   enabled: false,
   version: PINNED_BLACKHOLE_VERSION,
@@ -83,6 +92,12 @@ export function resolveBlackholeConfig(input?: PartialBlackholeConfig): ConfigRe
     !/^[a-z0-9][a-z0-9_-]{0,95}$/.test(durable.project)
   ) {
     throw new Error("durable.kind='hindsight' project must be a canonical lowercase identifier");
+  }
+  if (!(DURABLE_KINDS as readonly string[]).includes(durable.kind)) {
+    throw new Error(
+      `durable.kind='${String(durable.kind)}' is not supported; known kinds: ${DURABLE_KINDS.join(", ")}. ` +
+        "Refusing to continue, because an unsupported kind would fall back to in-process memory and silently stop sharing durable memory.",
+    );
   }
   const providerTimeoutMs = input?.providerTimeoutMs ?? DEFAULTS.providerTimeoutMs;
   if (providerTimeoutMs < 1) {
