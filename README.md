@@ -45,9 +45,10 @@ macOS (darwin) is supported with a documented, weaker fallback:
 - **Artifact paths** use the canonical absolute path instead of the
   descriptor-relative `/proc/self/fd/<fd>` projection. Every open is paired
   with a path-identity re-check (the path must still resolve to the exact
-  inode the descriptor holds), file I/O re-anchors the category before each
-  operation, and the lock-domain token is located by inode among its legal
-  names. A directory that is swapped for a symlink or a different inode is
+  inode the descriptor holds), every artifact file path re-anchors the pinned
+  category inode before it is derived, and the bootstrap binding resolves the
+  pinned lock-root's current name (staging or final) by inode before reading
+  the domain token. A directory that is swapped for a symlink or a different inode is
   detected and the store fails closed; a lock whose directory was swapped
   mid-critical-section cannot be released by name and fails closed instead of
   touching whatever now occupies the path.
