@@ -17,6 +17,7 @@ import { type DurableMemoryProvider, type DurableMemoryRecord, InMemoryDurableMe
 import { type SessionContext, newSessionIdentity } from "./SessionStore.ts";
 import { resolveBlackholeConfig } from "./config.ts";
 import { OpenVikingProvider, SharedFileDurableMemory } from "./durable.ts";
+import { HindsightDurableMemory } from "./hindsight.ts";
 import {
   type MemoryStoreFactory,
   type MemoryWorkerOptions,
@@ -348,6 +349,8 @@ export function buildDurableProvider(cfg: import("./types.ts").DurableStoreConfi
       return new SharedFileDurableMemory(cfg.file);
     case "openviking":
       return new OpenVikingProvider({ baseUrl: cfg.baseUrl, token: cfg.token });
+    case "hindsight":
+      return new HindsightDurableMemory({ cli: cfg.cli, scopes: cfg.scopes, timeoutMs: cfg.timeoutMs });
     default:
       return new InMemoryDurableMemory();
   }

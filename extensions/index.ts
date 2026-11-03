@@ -1604,7 +1604,15 @@ ${RECOVERY_PROMPT}`;
       providers: new Map(
         result.results.map(({ providerId, result: r }) => [
           providerId,
-          { ids: new Set(r.plan.next.map((m) => m.id)), aliasOnly: r.aliasOnly },
+          {
+            ids: new Set(r.plan.next.map((m) => m.id)),
+            aliasOnly: r.aliasOnly,
+            // A pin may only move onto an alias that still answers as the model it
+            // named, so the migrator needs to know what runs behind each alias.
+            members: Object.fromEntries(
+              r.gateway.filter((m) => m.alias && m.members?.length).map((m) => [m.id, m.members!]),
+            ),
+          },
         ]),
       ),
       dryRun: opts.dryRun,

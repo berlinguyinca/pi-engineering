@@ -86,7 +86,8 @@ export type MemoryWorkerRole = keyof typeof MEMORY_WORKER_PRIORITIES;
 export type DurableStoreConfig =
   | { kind: "memory" }
   | { kind: "shared-file"; file: string }
-  | { kind: "openviking"; baseUrl: string; token?: string };
+  | { kind: "openviking"; baseUrl: string; token?: string }
+  | { kind: "hindsight"; cli?: string; scopes?: string[]; timeoutMs?: number };
 
 export type PromotionState = "proposed" | "accepted" | "rejected" | "promoted" | "superseded";
 

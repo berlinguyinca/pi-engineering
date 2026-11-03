@@ -528,15 +528,63 @@ remain at 20% while a slow model answers. The panel clears on completion,
 failure or cancellation.
 
 Gateway aliases are kept and probed under their advertised route ID; a working
-backing model does not prove that its aliases work. The progress panel and final
-report show `alias → backing-model` when the gateway supplies that relationship.
-New aliases inherit input, reasoning, output limit, cost and compatibility
+backing model does not prove that its aliases work. The gateway names what answers
+behind a route with `x_members` on the route row — the concrete ids that serve it,
+and nothing else. The progress panel and final report show
+`alias → member[, member…]`; a route with one member records it as the backing
+model, a route with several (failover) records them all and names none as "the"
+backing model, because choosing one would guess. New aliases inherit input,
+reasoning, output limit, cost and compatibility
 settings from their configured backing model when available, bounded by the
 alias's advertised context window. Other additions report inferred settings.
 Existing model names and settings survive refresh, and identical IDs in two
 providers remain separate entries. Aliases only listed as `x_aliases` on a
 concrete model are descriptive metadata; refresh does not invent route entries
 that the gateway has not separately advertised.
+
+A written alias name says what answers behind it, so `/model` and the status line
+never leave that ambiguous: `qwen3.8-text →
+qwen3.8-flash_next-modality-text-quant-w3a8 (gateway alias)`, or
+`qwen3.8 → a, b, c (gateway alias; 27b/flash/flash_next)` when several members
+share the route and a failover between them changes the model. Canonical ids carry
+their size class (`<family>-<size>-modality-…`), so `qwen3.8-27b-…` is the 27B build
+and `qwen3.8-flash_next-…` is Flash-Next; an id outside that grammar has no size
+class and none is invented. Where an alias's own name says nothing about what it
+runs, refresh reports it — `ambiguous: qwen3.8-text — it runs
+qwen3.8-flash_next-modality-text-quant-w3a8 (flash_next), which the name does not
+say` — because a session on that name is on Flash-Next while the name implies
+nothing of the sort. Pin the concrete id, or a name carrying the class
+(`qwen3.8-flash_next-text`), when cost or quality depends on which model answers.
+Which class a route answers with is the gateway's decision and can change between
+runs; the report reflects `x_members` at the moment it ran.
+
+Because refresh configures aliases only, it also moves pins that still name a
+concrete id — otherwise they would dangle the moment that id leaves the catalogue.
+It rewrites `provider/id` references in `~/.pi/agent/settings.json`,
+`~/.pi/agent/engineering.yaml` and the repository's `.pi/engineering.yaml`, plus a
+`defaultModel` paired with `defaultProvider`. Edits are textual, so comments and
+layout survive; each changed file is copied to `<file>.bak-<timestamp>-model-refresh`
+first, file modes are kept, a `--dry-run` writes nothing, and a second pass changes
+nothing. A glob such as `metabolomics/*` is not a pin and is never touched.
+
+**A pin only moves onto an alias that answers as the model it named.** Membership
+decides this when the gateway publishes `x_members`: the pinned model must be a
+member, or every member must be of the pinned size class. Where membership is
+unpublished, the alias name must carry the class. So a pin on
+`metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl` moves to
+`qwen3.8-27b-vision`, never to `qwen3.8`, whose members also include Flash — the
+move that would quietly change which model runs. When nothing covers the pin
+faithfully it is left exactly as written and reported:
+
+```
+pin not moved: …/engineering.yaml names metabolomics/qwen3.8-27b-…, which no served
+alias covers (metabolomics/qwen3.8 its members are flash, flash_next, not 27b)
+```
+
+That is deliberate: a pin that names no configured model fails visibly, while a
+pin widened to a family alias runs a different model without saying so. Pick a
+route whose members are the class you meant, or configure the concrete id with
+`PI_MODEL_REFRESH_CONCRETE=1 /model-refresh`.
 
 `/model-refresh` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried

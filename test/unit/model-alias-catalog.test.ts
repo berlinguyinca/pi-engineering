@@ -6,6 +6,13 @@
  * without reconfiguration, so the catalogue it writes holds only aliases, and an
  * alias's window is the smallest of its members' because the gateway may fail
  * over to any of them.
+ *
+ * An alias being selectable by name is only safe if it says what it resolves to:
+ * `qwen3.8-text` is whatever text-modality `qwen3.8` is live, which was
+ * Flash-Next and could become the 27B after a swap. Anything that reads the name
+ * — the `/model` picker, a status line, a summary — has to be able to answer
+ * "which weights answer?", so the members and their size classes travel with the
+ * alias and a name that hides them is reported as ambiguous.
  */
 
 import assert from "node:assert/strict";
@@ -13,7 +20,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { aliasView } from "../../src/models/aliasCatalog.ts";
+import { aliasAmbiguity, aliasView } from "../../src/models/aliasCatalog.ts";
 import { type GatewayModelEntry, parseGatewayModels } from "../../src/models/gatewayCatalog.ts";
 import { refreshProviderModels } from "../../src/models/refresh.ts";
 
@@ -145,4 +152,100 @@ test("refresh writes aliases only and prunes the concrete ids it used to hold", 
     fetchImpl: (async () => new Response(JSON.stringify(liveListing()))) as typeof fetch,
   });
   assert.ok(concrete.gateway.some((m) => m.id === NEXT_W3));
+});
+
+/** The gateway as deployed (revision `b5f62ec2`): membership on the ROUTE row only. */
+function deployedListing() {
+  return {
+    data: [
+      { id: V27, ctx_per_request: 262_144, x_state: "warm", slots: 1 },
+      { id: NEXT_W3, ctx_per_request: 131_072, x_state: "warm", slots: 3 },
+      // `qwen3.8-text` names no backing and no size: only its member does.
+      { id: "qwen3.8-text", ctx_per_request: 131_072, slots: 3, x_alias: true, x_members: [NEXT_W3] },
+      { id: "laya", ctx_per_request: 131_072, slots: 2, x_alias: true, x_members: [NEXT_W3, V27] },
+    ],
+  };
+}
+
+test("an alias says which size its members run", () => {
+  const view = aliasView(parseGatewayModels(deployedListing()));
+  assert.deepEqual(byId(view.entries, "qwen3.8-text")!.sizes, ["flash_next"]);
+  assert.deepEqual(byId(view.entries, "laya")!.sizes, ["27b", "flash_next"]);
+  assert.equal(byId(view.entries, "qwen3.8-text")!.backingModel, NEXT_W3);
+});
+
+test("an alias whose name hides the model it runs is reported as ambiguous", () => {
+  const view = aliasView(parseGatewayModels(deployedListing()));
+  // The question this answers: a session on `qwen3.8-text` is on Flash-Next, and
+  // nothing in the name says so.
+  assert.equal(
+    aliasAmbiguity(byId(view.entries, "qwen3.8-text")!),
+    `it runs ${NEXT_W3} (flash_next), which the name does not say`,
+  );
+  // Failover between two sizes: the name cannot say which one answers.
+  assert.match(aliasAmbiguity(byId(view.entries, "laya")!)!, /its 2 members run 27b, flash_next, so the name cannot say which one answers/);
+  // A name that says the size needs no warning.
+  assert.equal(aliasAmbiguity(byId(view.entries, "qwen3.8-flash_next")!), undefined);
+});
+
+test("members sharing one class are still one answer, and an unnamed id is not", () => {
+  // The q4 and w3a8 quants of Flash-Next are the same class: "every member is
+  // flash_next" is a claim the alias may make even though two models back it.
+  const shared = aliasView(
+    parseGatewayModels({
+      data: [
+        { id: NEXT_Q4, ctx_per_request: 262_144, slots: 3 },
+        { id: NEXT_W3, ctx_per_request: 131_072, slots: 3 },
+      ],
+    }),
+  );
+  assert.equal(
+    aliasAmbiguity(byId(shared.entries, "qwen3.8-text")!),
+    "every member is flash_next, which the name does not say",
+  );
+  // The same members under a name that does say the class need no warning.
+  assert.equal(aliasAmbiguity(byId(shared.entries, "qwen3.8-flash_next-text")!), undefined);
+  // An id outside the grammar names no class, so nothing may be claimed about it.
+  const mixed = aliasView(
+    parseGatewayModels({
+      data: [
+        { id: NEXT_W3, ctx_per_request: 131_072, slots: 3 },
+        { id: "qwen3.8-modality-text-quant-nvfp4", ctx_per_request: 262_144, slots: 2 },
+        { id: "qwen3.8-text", x_members: [NEXT_W3, "qwen3.8-modality-text-quant-nvfp4"] },
+      ],
+    }),
+  );
+  assert.match(
+    aliasAmbiguity(byId(mixed.entries, "qwen3.8-text")!)!,
+    /plus 1 whose id names no class, so the name cannot say which one answers/,
+  );
+});
+
+test("the report and the written name both say what an alias resolves to", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-alias-truth-"));
+  const modelsPath = join(dir, "models.json");
+  writeFileSync(
+    modelsPath,
+    JSON.stringify({
+      providers: {
+        gw: { baseUrl: "https://gw.example/v1", api: "openai-completions", apiKey: "k", models: [] },
+      },
+    }),
+  );
+  const result = await refreshProviderModels({
+    modelsPath,
+    providerId: "gw",
+    fetchImpl: (async () => new Response(JSON.stringify(deployedListing()))) as typeof fetch,
+    now: () => new Date("2026-11-02T00:00:00Z"),
+  });
+  assert.ok(
+    result.lines.some((l) => l.includes(`ambiguous: qwen3.8-text — it runs ${NEXT_W3} (flash_next)`)),
+    result.lines.join("\n"),
+  );
+  const written = JSON.parse(readFileSync(modelsPath, "utf8")).providers.gw.models as Array<{
+    id: string;
+    name?: string;
+  }>;
+  // The /model picker shows `name`; it has to carry the answer.
+  assert.equal(written.find((m) => m.id === "qwen3.8-text")!.name, `qwen3.8-text → ${NEXT_W3} (gateway alias)`);
 });
