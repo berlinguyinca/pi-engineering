@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
 import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
@@ -58,6 +58,7 @@ import { admissionIdentityHeaders } from "../src/inference/admissionTransport.ts
 import { loadExecutionConfig } from "../src/lifecycle/policy.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig } from "../src/models/modelsConfig.ts";
+import { migrateConfiguredPins } from "../src/models/pinMigration.ts";
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
 import { DEFAULT_PROBE_TIMEOUT_MS, refreshConfiguredProviders } from "../src/models/refresh.ts";
 import { registerModelTabs } from "../src/models/registerModelTabs.ts";
@@ -1582,7 +1583,33 @@ ${RECOVERY_PROMPT}`;
     if (result.results.length === 0) {
       throw new Error(result.failures.map(({ providerId, error }) => `${providerId}: ${error.message}`).join("; "));
     }
-    return { written: result.written, lines: result.lines, failed: result.failures.length > 0 };
+    // Pins to concrete ids would dangle once those ids leave the catalogue, so
+    // the same refresh moves them onto aliases: nothing is edited by hand when a
+    // model is preempted or renamed.
+    const pins = migrateConfiguredPins({
+      agentDir: dirname(defaultModelsPath()),
+      ...(ctx.cwd ? { extraFiles: [join(ctx.cwd, ".pi", "engineering.yaml")] } : {}),
+      providers: new Map(
+        result.results.map(({ providerId, result: r }) => [
+          providerId,
+          {
+            ids: new Set(r.plan.next.map((m) => m.id)),
+            aliasOnly: r.aliasOnly,
+            // A pin may only move onto an alias that still answers as the model it
+            // named, so the migrator needs to know what runs behind each alias.
+            members: Object.fromEntries(
+              r.gateway.filter((m) => m.alias && m.members?.length).map((m) => [m.id, m.members!]),
+            ),
+          },
+        ]),
+      ),
+      dryRun: opts.dryRun,
+    });
+    return {
+      written: result.written || pins.written,
+      lines: [...result.lines, ...pins.lines],
+      failed: result.failures.length > 0,
+    };
   }
 
   // ─── /model-refresh: make the configured catalogue match the gateway ─────

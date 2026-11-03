@@ -387,3 +387,103 @@ test("new aliases use their configured backing model metadata while retaining th
   assert.equal(alias.baseUrl, undefined, "alias requests must continue through the provider gateway");
   assert.equal(alias.headers, undefined);
 });
+
+/**
+ * The gateway as actually deployed (revision `b5f62ec2`, measured 2026-11-02).
+ *
+ * The contract describes `x_backing_model` on a route row and `x_aliases` on a
+ * concrete row; this gateway states membership the other way round — `x_members`
+ * on the ROUTE row — and never advertises `x_aliases`. A parser that reads only
+ * the documented direction leaves a route looking like a model with no parent.
+ */
+const DEPLOYED_PAYLOAD = {
+  data: [
+    { id: "qwen3.8-27b-modality-vision-quant-q8_k_xl", ctx_per_request: 262_144, x_state: "warm", slots: 1 },
+    { id: "qwen3.8-flash_next-modality-text-quant-w3a8", ctx_per_request: 131_072, x_state: "warm", slots: 3 },
+    // One member: the route has a definite answer behind it.
+    { id: "qwen3.8-text", ctx_per_request: 131_072, slots: 3, x_alias: true, x_members: ["qwen3.8-flash_next-modality-text-quant-w3a8"] },
+    // Several members: the gateway picks per request, so no single model is THE backing.
+    {
+      id: "laya",
+      ctx_per_request: 131_072,
+      slots: 2,
+      x_alias: true,
+      x_members: ["qwen3.8-flash_next-modality-text-quant-w3a8", "qwen3.8-27b-modality-vision-quant-q8_k_xl"],
+    },
+    // A route with no size of its own is bounded by what stands behind it.
+    { id: "coding-implementation", slots: 3, x_alias: true, x_members: ["qwen3.8-flash_next-modality-text-quant-w3a8"] },
+  ],
+};
+
+const TEXT = "qwen3.8-flash_next-modality-text-quant-w3a8";
+const VISION = "qwen3.8-27b-modality-vision-quant-q8_k_xl";
+
+test("membership named only on the route row still resolves", () => {
+  const entries = parseGatewayModels(DEPLOYED_PAYLOAD);
+  const find = (id: string) => entries.find((e) => e.id === id)!;
+
+  assert.equal(find("qwen3.8-text").alias, true);
+  assert.equal(find("qwen3.8-text").backingModel, TEXT);
+  assert.equal(find("laya").backingModel, undefined, "several members name no single backing");
+  // The reverse direction: which routes serve a concrete model, though it says none.
+  assert.deepEqual(find(TEXT).aliases, ["qwen3.8-text", "laya", "coding-implementation"]);
+  assert.deepEqual(find(VISION).aliases, ["laya"]);
+});
+
+test("a route row without its own size inherits its member's window", () => {
+  const entries = parseGatewayModels(DEPLOYED_PAYLOAD);
+  assert.equal(entries.find((e) => e.id === "coding-implementation")!.contextWindow, 131_072);
+});
+
+test("a route row is a route even when the gateway sets no x_alias flag", () => {
+  const entries = parseGatewayModels({
+    data: [{ id: TEXT, ctx_per_request: 131_072 }, { id: "solo", x_members: [TEXT] }],
+  });
+  assert.equal(entries.find((e) => e.id === "solo")!.alias, true);
+});
+
+test("an alias is named for the model it resolves to", () => {
+  const entries = parseGatewayModels(DEPLOYED_PAYLOAD);
+  const plan = planCatalogUpdate([], entries);
+  const byId = new Map(plan.next.map((m) => [m.id, m]));
+  // One member names the model outright.
+  assert.equal(byId.get("qwen3.8-text")!.name, `qwen3.8-text → ${TEXT} (gateway alias)`);
+  // Several members name the sizes it can land on.
+  assert.equal(byId.get("laya")!.name, "laya → 27b/flash_next ×2 (gateway alias)");
+  // A concrete model keeps the plain name.
+  assert.equal(byId.get(TEXT)!.name, `${TEXT} (gateway)`);
+});
+
+test("a refresh repairs a stale alias name but never an operator's own", () => {
+  const configured = (name: string): ConfiguredModel => ({
+    id: "qwen3.8-text",
+    name,
+    api: "openai-completions",
+    provider: "metabolomics",
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 131_072,
+    maxTokens: 32_768,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  });
+  const entry = parseGatewayModels(DEPLOYED_PAYLOAD).find((e) => e.id === "qwen3.8-text")!;
+
+  // Written by an earlier refresh, when Flash-Next's q4 quant was the member and
+  // the w3a8 quant had not been loaded yet.
+  const stale = planCatalogUpdate(
+    [configured("qwen3.8-text → qwen3.8-flash_next-modality-text-quant-q4_k_xl (gateway alias)")],
+    [entry],
+  );
+  assert.equal(stale.dirty, true);
+  assert.equal(stale.next[0]!.name, `qwen3.8-text → ${TEXT} (gateway alias)`);
+  assert.ok(stale.changes[0]!.details.some((d) => d.startsWith("name \"")));
+
+  // The name written before members were known is generated too, so it is updated.
+  const plain = planCatalogUpdate([configured("qwen3.8-text (gateway)")], [entry]);
+  assert.equal(plain.next[0]!.name, `qwen3.8-text → ${TEXT} (gateway alias)`);
+
+  // A name someone typed is theirs.
+  const custom = planCatalogUpdate([configured("Qwen 3.8 (27B, vision)")], [entry]);
+  assert.equal(custom.next[0]!.name, "Qwen 3.8 (27B, vision)");
+  assert.equal(custom.dirty, false);
+});

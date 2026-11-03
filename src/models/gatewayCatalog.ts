@@ -37,10 +37,23 @@ export interface GatewayModelEntry {
   maxRequestBytes?: number;
   /** True when `id` is a logical route (`x_alias`) rather than a concrete model. */
   alias?: boolean;
-  /** Concrete model currently backing a route, when advertised. */
+  /**
+   * The one concrete model behind a route, when exactly one is named — by
+   * `x_backing_model` or, on gateways that name membership only on the route
+   * row, by a sole `x_members` entry.
+   */
   backingModel?: string;
-  /** Logical routes a concrete model currently serves (`x_aliases`). */
+  /** Logical routes a concrete model currently serves (`x_aliases`, or derived). */
   aliases?: string[];
+  /** Concrete models an alias row currently resolves to (`x_members`). */
+  members?: string[];
+  /**
+   * Distinct size classes among this model's members, derived from the canonical
+   * member ids. Never advertised: an alias is selected by NAME, so what it
+   * currently runs has to be computed and shown, or "which model am I on?" is
+   * unanswerable from the configuration.
+   */
+  sizes?: string[];
   /** Capabilities the gateway advertises for the model (`x_capabilities` / `capabilities`). */
   capabilities?: string[];
   /** Model family (`x_family`); independent reviewers must differ in family. */
@@ -73,33 +86,104 @@ function strs(value: unknown): string[] {
 }
 
 /**
+ * The size class a canonical id names, per the gateway's prefix-alias spec
+ * (`<family>-<size>-modality-<m>-quant-<q>`): `qwen3.8-flash_next-modality-text-quant-w3a8`
+ * → `flash_next`.
+ *
+ * An id that does not follow the grammar has no size class, and none is invented
+ * — an alias claiming a size it never said is worse than saying nothing.
+ */
+export function sizeClassOf(id: string): string | undefined {
+  const parts = id.split("-");
+  // The size class is everything between the family and the first marker key. It
+  // may be hyphenated — `laya-typed-decisions-modality-text-quant-fp16` is the
+  // `typed-decisions` build of family `laya` — so the marker is located rather
+  // than assumed to sit at `parts[2]`. An id with no marker ("deepseek-v4-flash")
+  // has no size class, and none is invented.
+  const isMarker = (part: string) => part === "modality" || part === "quant";
+  const marker = parts.findIndex((part, index) => index >= 2 && isMarker(part));
+  // Everything before the marker is family + size, so a marker word there means
+  // the id has no size class (`qwen3.8-modality-text-quant-nvfp4` names no size
+  // at all) and none is invented from its shifting tokens.
+  if (marker < 2 || parts.length <= marker + 1 || parts.slice(0, marker).some(isMarker)) return undefined;
+  return parts.slice(1, marker).join("-");
+}
+
+/** The size classes an alias's members can land on, deduplicated and sorted. */
+export function memberSizes(memberIds: readonly string[]): string[] {
+  const sizes = new Set<string>();
+  for (const id of memberIds) {
+    const size = sizeClassOf(id);
+    if (size) sizes.add(size);
+  }
+  return [...sizes].sort();
+}
+
+/**
  * Parse a `/models` response.
  *
  * Skips entries with no id or no usable context size rather than inventing one:
  * a fabricated context window is how a session gets configured to overflow. A
  * malformed payload yields an empty list, never a throw.
+ *
+ * Membership is read in whichever direction the gateway states it. The contract
+ * (`docs/specs/planner-worker-inferweave-contract.md` §2) describes
+ * `x_backing_model` on a route row and `x_aliases` on a concrete row; the
+ * deployed gateway (revision `b5f62ec2`, measured 2026-11-02) instead names the
+ * members on the ROUTE row as `x_members` and advertises no `x_aliases` at all.
+ * Reading only the documented direction leaves a route looking like a model with
+ * no parent, which is how `qwen3.8-text` could sit in `models.json` looking like
+ * the 27B while running Flash-Next.
  */
 export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
   const data = (payload as { data?: unknown })?.data;
   if (!Array.isArray(data)) return [];
+  const rows = data.filter((raw): raw is Record<string, unknown> => raw !== null && typeof raw === "object");
   const out: GatewayModelEntry[] = [];
   const windows = new Map<string, number>();
+  /** Route id → concrete models it names, in the gateway's own order. */
+  const membersOf = new Map<string, string[]>();
+  /** Concrete model → routes IT declares serving it (`x_aliases`). */
+  const declaredAliases = new Map<string, string[]>();
   for (const raw of data) {
     const row = raw as Record<string, unknown> | null;
     const id = row && typeof row === "object" ? str(row.id) : undefined;
     const w = row ? (num(row.ctx_per_request) ?? num(row.x_context_window) ?? num(row.context_length)) : undefined;
     if (id && w !== undefined) windows.set(id, w);
+    if (!id || !row || typeof row !== "object") continue;
+    const declared = strs(row.x_aliases);
+    if (declared.length > 0) declaredAliases.set(id, declared);
+    // Members are ids, or `{id}` objects on gateways that report seats too.
+    const members = Array.isArray(row.x_members)
+      ? row.x_members
+          .map((m) => (typeof m === "string" ? m : str((m as { id?: unknown } | null)?.id)))
+          .filter((m): m is string => typeof m === "string" && m.length > 0)
+      : [];
+    const backing = str(row.x_backing_model);
+    const named = backing && !members.includes(backing) ? [backing, ...members] : members;
+    if (named.length > 0) membersOf.set(id, named);
+  }
+  // The reverse direction, for gateways that state membership only one way.
+  // A concrete model that already declares its routes keeps its own words.
+  const servedBy = new Map<string, string[]>();
+  for (const [route, members] of membersOf) {
+    for (const member of members) {
+      if ((declaredAliases.get(member) ?? []).length > 0) continue;
+      servedBy.set(member, [...(servedBy.get(member) ?? []), route]);
+    }
   }
   for (const raw of data) {
     if (!raw || typeof raw !== "object") continue;
     const row = raw as Record<string, unknown>;
     const id = str(row.id);
     if (!id) continue;
-    const backingModel = str(row.x_backing_model);
-    const alias = row.x_alias === true || backingModel !== undefined;
-    const aliases = Array.isArray(row.x_aliases)
-      ? row.x_aliases.filter((a): a is string => typeof a === "string" && a.length > 0)
-      : [];
+    const members = membersOf.get(id) ?? [];
+    const alias = row.x_alias === true || members.length > 0;
+    // Exactly one model behind a route is a fact worth naming. Several means the
+    // gateway chooses per request, so no single backing may be claimed.
+    const backingModel = members.length === 1 ? members[0] : undefined;
+    const aliases = declaredAliases.get(id) ?? servedBy.get(id) ?? [];
+    const sizes = memberSizes(members);
     // Per-request first: `ctx_total` is the gateway's aggregate across slots and
     // would over-state what one call may send.
     // A route row with no size of its own is bounded by the model behind it.
@@ -107,7 +191,7 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
       num(row.ctx_per_request) ??
       num(row.x_context_window) ??
       num(row.context_length) ??
-      (backingModel ? windows.get(backingModel) : undefined);
+      members.map((member) => windows.get(member)).find((w) => w !== undefined);
     if (contextWindow === undefined) continue;
     const contextTotal = num(row.ctx_total);
     const state = str(row.x_state) ?? str(row.state);
@@ -129,6 +213,8 @@ export function parseGatewayModels(payload: unknown): GatewayModelEntry[] {
       ...(alias ? { alias } : {}),
       ...(backingModel ? { backingModel } : {}),
       ...(aliases.length > 0 ? { aliases } : {}),
+      ...(members.length > 0 ? { members } : {}),
+      ...(sizes.length > 0 ? { sizes } : {}),
       ...(capabilities.length > 0 ? { capabilities } : {}),
       ...(family ? { family } : {}),
       ...(tools !== undefined ? { tools } : {}),
