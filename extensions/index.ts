@@ -1196,7 +1196,7 @@ export default function (pi: ExtensionAPI) {
     // Registered as its own tool_call/user_bash handlers so it never depends on
     // the lifecycle controller's mutating-tool filter or its unattended auto-allow.
     const discipline = disciplineFromEnv();
-    if (discipline) registerTaskDiscipline(pi as never, discipline);
+    if (discipline) registerTaskDiscipline(pi, discipline);
     // One agent, one worktree (AGENTS.md), enforced: block this session's own
     // mutating calls against a repository's PRIMARY checkout so concurrent
     // sessions cannot destroy each other's uncommitted work there. Production

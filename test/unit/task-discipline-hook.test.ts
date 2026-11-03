@@ -3,8 +3,9 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, utimesSync, writeFi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { disciplineFromEnv, resolveMode } from "../../src/taskDiscipline/config.ts";
-import { registerTaskDiscipline } from "../../src/taskDiscipline/hook.ts";
+import { type DisciplineHost, registerTaskDiscipline } from "../../src/taskDiscipline/hook.ts";
 
 type Handler = (event: never, ctx?: never) => unknown;
 
@@ -40,10 +41,13 @@ function fixture(mode = "enforce_diagnostic") {
   const pi = { on: (event: string, h: Handler) => void handlers.set(event, h) };
   const incidents: unknown[] = [];
   const opts = disciplineFromEnv(env)!;
-  const gate = registerTaskDiscipline(pi as never, { ...opts, onIncident: (i) => incidents.push(i) });
+  const gate = registerTaskDiscipline(pi as unknown as DisciplineHost, {
+    ...opts,
+    onIncident: (i) => incidents.push(i),
+  });
   const call = (toolName: string, input: unknown, id = "tc") =>
     handlers.get("tool_call")!({ toolName, input, toolCallId: id } as never, { cwd: repo } as never) as
-      | { block?: boolean; reason?: string }
+      | { block?: boolean; reason?: string; terminate?: boolean }
       | undefined;
   return {
     base,
@@ -158,7 +162,7 @@ test("audit_only records would-deny and never blocks", () => {
   const handlers = new Map<string, Handler>();
   const decisions: { wouldDeny: boolean; enforced: boolean }[] = [];
   const opts = disciplineFromEnv({ ...f.env, PI_TASK_DISCIPLINE: "audit_only" })!;
-  registerTaskDiscipline({ on: (e: string, h: Handler) => void handlers.set(e, h) } as never, {
+  registerTaskDiscipline({ on: (e: string, h: Handler) => void handlers.set(e, h) } as unknown as DisciplineHost, {
     ...opts,
     record: (d) => void decisions.push(d),
   });
@@ -182,6 +186,9 @@ test("repeated blocks of one rule raise a policy incident and tell the agent to 
   assert.equal(f.gate.halted, true);
   assert.match(replies[4]?.reason ?? "", /policy incident/);
   assert.doesNotMatch(replies[0]?.reason ?? "", /policy incident/);
+  // Pi stops the batch only when a blocked result asks it to; the incident reply does.
+  assert.equal(replies[4]?.terminate, true);
+  assert.equal(replies[0]?.terminate, undefined);
 });
 
 test("secrets in logged commands are redacted; the verdict is unaffected by log failures", () => {
@@ -191,7 +198,7 @@ test("secrets in logged commands are redacted; the verdict is unaffected by log 
   });
   assert.doesNotMatch(readFileSync(f.log, "utf8"), /sk-ant-abcdefghijklmnopqrstuvwxyz/);
   const handlers = new Map<string, Handler>();
-  registerTaskDiscipline({ on: (e: string, h: Handler) => void handlers.set(e, h) } as never, {
+  registerTaskDiscipline({ on: (e: string, h: Handler) => void handlers.set(e, h) } as unknown as DisciplineHost, {
     mode: "enforce_all",
     provider: { current: () => JSON.parse(readFileSync(f.contractFile, "utf8")) },
     record: () => {
@@ -211,7 +218,7 @@ test("subagents and model handoffs: the gate depends only on the contract file, 
   // a "model switch" / new session re-registers the extension against the same trusted file
   const f2handlers = new Map<string, Handler>();
   registerTaskDiscipline(
-    { on: (e: string, h: Handler) => void f2handlers.set(e, h) } as never,
+    { on: (e: string, h: Handler) => void f2handlers.set(e, h) } as unknown as DisciplineHost,
     disciplineFromEnv(f.env)!,
   );
   const after = f2handlers.get("tool_call")!(

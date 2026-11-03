@@ -1,3 +1,4 @@
+import type { ExtensionAPI, ToolCallEventResult, UserBashEventResult } from "@earendil-works/pi-coding-agent";
 import type { TaskContract } from "./contract.ts";
 /**
  * Pi wiring for the Task Contract gate.
@@ -29,10 +30,8 @@ export interface DisciplineOptions {
   incidentWindow?: number;
 }
 
-export interface Verdict {
-  block?: boolean;
-  reason?: string;
-}
+/** What a blocked `tool_call` handler returns to Pi. */
+export type Verdict = ToolCallEventResult;
 
 export function blockMessage(d: Decision): string {
   const head = d.enforced
@@ -131,28 +130,29 @@ export class TaskDiscipline {
     const suffix = this.halted
       ? " Repeated blocks: the policy incident has been surfaced to the operator; stop and report what is blocking you."
       : "";
-    return { block: true, reason: blockMessage(d) + suffix };
+    // Once the incident threshold is crossed the point is an operator decision,
+    // not another call in this batch: ask Pi to end the batch after it.
+    return this.halted
+      ? { block: true, reason: blockMessage(d) + suffix, terminate: true }
+      : { block: true, reason: blockMessage(d) + suffix };
   }
 
-  userBash(event: { command: string; cwd: string }):
-    | { result: { output: string; exitCode: number; cancelled: boolean; truncated: boolean } }
-    | undefined {
+  userBash(event: { command: string; cwd: string }): UserBashEventResult | undefined {
     const d = this.check({ toolName: "bash", input: { command: event.command }, cwd: event.cwd });
     if (!d || !d.enforced) return undefined;
     return { result: { output: `${blockMessage(d)}\n`, exitCode: 126, cancelled: false, truncated: false } };
   }
 }
 
-interface HookHost {
-  on(
-    event: "tool_call",
-    handler: (event: { toolName: string; toolCallId?: string; input: unknown }, ctx: { cwd: string }) => unknown,
-  ): unknown;
-  on(event: "user_bash", handler: (event: { command: string; cwd: string }) => unknown): unknown;
-}
+/**
+ * Typed against Pi's own API, so a signature drift (event fields, result shape,
+ * the context argument) is a compile error rather than a silently unchecked
+ * cast. Only `on` is needed.
+ */
+export type DisciplineHost = Pick<ExtensionAPI, "on">;
 
 /** Attach the gate to a live Pi session. Order-independent: it never defers to other handlers. */
-export function registerTaskDiscipline(pi: HookHost, opts: DisciplineOptions): TaskDiscipline {
+export function registerTaskDiscipline(pi: DisciplineHost, opts: DisciplineOptions): TaskDiscipline {
   const gate = new TaskDiscipline(opts);
   if (opts.mode === "off") return gate;
   pi.on("tool_call", (event, ctx) => gate.toolCall(event, ctx.cwd));
