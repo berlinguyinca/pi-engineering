@@ -310,6 +310,7 @@ test("execution defaults to adaptive with no implicit Mission directive", async 
     strict_completion: true,
     heartbeat_interval_ms: 30_000,
     status_refresh_interval_ms: 15_000,
+    status_idle_sessions: 3,
     stale_after_ms: 300_000,
     tool_loop_limit: 3,
   });
@@ -341,6 +342,10 @@ test("liveness knobs load from yaml and out-of-range values are rejected", async
     assert.equal((await loadExecutionConfig(cwd, agentDir)).status_refresh_interval_ms, 20_000);
     await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  status_refresh_interval_ms: 5\n");
     assert.equal((await loadExecutionConfig(cwd, agentDir)).status_refresh_interval_ms, 15_000);
+    await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  status_idle_sessions: 7\n");
+    assert.equal((await loadExecutionConfig(cwd, agentDir)).status_idle_sessions, 7);
+    await writeFile(join(cwd, ".pi", "engineering.yaml"), "execution:\n  status_idle_sessions: 99\n");
+    assert.equal((await loadExecutionConfig(cwd, agentDir)).status_idle_sessions, 3);
   } finally {
     await rm(cwd, { recursive: true, force: true });
     await rm(agentDir, { recursive: true, force: true });
@@ -385,6 +390,7 @@ test("execution preference and legacy opt-in load from repo yaml", async () => {
       strict_completion: true,
       heartbeat_interval_ms: 30_000,
       status_refresh_interval_ms: 15_000,
+      status_idle_sessions: 3,
       stale_after_ms: 300_000,
       tool_loop_limit: 3,
     });
