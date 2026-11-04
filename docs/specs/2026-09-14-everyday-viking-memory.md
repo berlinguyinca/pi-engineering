@@ -6,7 +6,7 @@
 > the `OpenVikingProvider` HTTP client, its interactive `/memory setup` dialog,
 > the device-key profile under `PI_CODING_AGENT_DIR` and the `services/openviking`
 > service were retired. Interactive memory now shells out to `herdr-memory`
-> (`PI_HINDSIGHT_*`, configured in the environment; the CLI holds the credential),
+> (configured in `engineering.yaml` under `memory.hindsight`; the CLI holds the credential),
 > and `openviking` is no longer an accepted `durable.kind`. See
 > [README: Everyday memory](../../README.md#everyday-memory) and
 > [usage: sharing memory](../usage.md#sharing-memory-across-several-workers).

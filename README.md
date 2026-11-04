@@ -89,16 +89,27 @@ Interactive memory is opt-in and reaches **Hindsight through the
 `herdr-memory` CLI**. Pi never talks to a memory service itself and holds no
 memory credential: the CLI carries its own configuration and credentials
 (`herdr-memory doctor` checks them), and nothing under `PI_CODING_AGENT_DIR`
-stores a host, token or profile. A leftover OpenViking profile or
-`PI_OPENVIKING_*` variable is detected by existence only — never read — and warns
-once at load. Enable it in the environment:
+stores a host, token or profile. Configuration is YAML only; environment
+variables are not read. A leftover OpenViking profile or `PI_OPENVIKING_*` /
+`PI_HINDSIGHT_*` variable is detected by name or existence only — never read —
+and warns once at load with the YAML key to use. Enable it in the global
+`engineering.yaml` (`~/.pi/agent/engineering.yaml`):
 
-```text
-export PI_HINDSIGHT_ENABLED=1          # opt-in; anything else leaves memory off
-export PI_HINDSIGHT_CLI=herdr-memory   # the executable to shell out to
-export PI_HINDSIGHT_SCOPES=project     # project,global,infra,mission:<id>
-export PI_HINDSIGHT_TIMEOUT_MS=5000    # per-call CLI timeout
+```yaml
+# ~/.pi/agent/engineering.yaml (global). `cli` is honored only here.
+memory:
+  hindsight:
+    enabled: true                 # opt-in; default false
+    cli: herdr-memory             # executable to shell out to (global config only)
+    scopes: [project]             # project, global, infra, mission:<id>
+    timeout_ms: 5000              # per-call CLI timeout, 100..60000
+    harness: pi                   # provenance/credential harness name the CLI sees
+    failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
+    unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
 ```
+
+Ranges, defaults and the repo-level rules are in
+[docs/usage.md](docs/usage.md#turning-the-connection-on-anywhere-pi-is-installed-no-code-edits).
 
 ```text
 /remember Calibration reports should use metric units.
@@ -118,11 +129,11 @@ Automatic startup recall and per-prompt searches wait at most 250 ms, so a slow
 lookup adds no notes to that turn. Successful searches, including empty results,
 are cached for 60 seconds with at most 32 query entries. Saving a note, a
 successful explicit memory check/search, session replacement, or a changed
-connection (a different CLI or scope set in the environment) clears the cache.
+connection (a different CLI or scope set in the config) clears the cache.
 A CLI that timed out or exited badly pauses automatic requests for 60 seconds;
 a missing CLI or a refused write pauses them for five minutes, because neither
 fixes itself between turns. `/memory` remains available during that pause, and
-changing the environment retries immediately. Explicit commands retain their
+changing the config retries immediately. Explicit commands retain their
 longer, bounded verification wait.
 Starting another turn does not cancel a pending explicit memory command. A
 completed save/check/search invalidates older automatic lookups; replacing the
@@ -133,8 +144,7 @@ write says so instead of claiming success. Treat saved notes as user-provided
 reference information, not proof that claims were machine-verified. Independent review/challenge workers do not load
 these interactive hooks. Existing engineering-worker hydration is preserved.
 
-Set `PI_HINDSIGHT_ENABLED=0` to keep one launcher memory-free even when the
-variable is set elsewhere. Reads stay fail-open — a memory that cannot be
+Set `memory.hindsight.enabled: false` (or omit it) to keep memory off. Reads stay fail-open — a memory that cannot be
 recalled costs that turn its notes and nothing else — while writes report the
 outcome they actually got. See [the feature
 design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits and

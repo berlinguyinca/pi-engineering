@@ -9,9 +9,15 @@
  * Validation returns actionable errors instead of silently coercing values.
  */
 
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import {
+  DEFAULT_HINDSIGHT_SETTINGS,
+  type HindsightSettings,
+  validateHindsightSettings,
+} from "../blackhole/hindsightSettings.ts";
 import type { AdmissionRetrySettings } from "../inference/admissionConfig.ts";
 import { normalizeAdmissionConfig, validateAdmissionConfig } from "../inference/admissionConfig.ts";
 import type { LifecycleRisk } from "./types.ts";
@@ -251,6 +257,8 @@ export interface EngineeringPolicy {
   execution: ExecutionConfig;
   /** Mission time limits (opt-in caps + the hung-worker window). */
   limits: MissionLimitsConfig;
+  /** Durable memory (Hindsight over the herdr-memory CLI). YAML only; off by default. */
+  memory: { hindsight: HindsightSettings };
   /** Dotted keys from the global layer that repository config cannot weaken. */
   mandatory: string[];
   lifecycle: LifecycleConfig;
@@ -303,6 +311,7 @@ export const DEFAULT_POLICY: EngineeringPolicy = {
   limits: {
     worker_inactivity_ms: 3_600_000,
   },
+  memory: { hindsight: { ...DEFAULT_HINDSIGHT_SETTINGS, scopes: [...DEFAULT_HINDSIGHT_SETTINGS.scopes] } },
   mandatory: [
     "policies.review.require_independent_review",
     "policies.review.independent_reviewer",
@@ -618,6 +627,7 @@ export function validatePolicy(policy: EngineeringPolicy): PolicyIssue[] {
       severity: "warning",
     });
   }
+  issues.push(...validateHindsightSettings(policy.memory?.hindsight));
   if (policy.inference?.retry?.admission !== undefined) {
     issues.push(...validateAdmissionConfig(normalizeAdmissionConfig(policy.inference.retry.admission)));
   }
@@ -754,6 +764,67 @@ export async function loadExecutionConfig(cwd: string, agentDir?: string): Promi
     return { ...DEFAULT_POLICY.execution, ...policy.execution };
   } catch {
     return { ...DEFAULT_POLICY.execution };
+  }
+}
+
+export interface HindsightLoadResult {
+  settings: HindsightSettings;
+  issues: PolicyIssue[];
+}
+
+/**
+ * The effective `memory.hindsight` settings for a directory: defaults, then the
+ * global `engineering.yaml`, then the repository's `.pi/engineering.yaml`. A
+ * repository cannot choose the executable (`cli` is global-only), because that
+ * would let a cloned repo run an arbitrary program. Any invalid value fails
+ * closed: memory stays off and the issues say which key to fix. Never throws.
+ */
+export function loadHindsightSettings(cwd: string, agentDir?: string): HindsightLoadResult {
+  const off = (issues: PolicyIssue[]): HindsightLoadResult => ({
+    settings: { ...DEFAULT_HINDSIGHT_SETTINGS, scopes: [...DEFAULT_HINDSIGHT_SETTINGS.scopes] },
+    issues,
+  });
+  const issues: PolicyIssue[] = [];
+  try {
+    const dir = agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? "~", ".pi", "agent");
+    // Synchronous on purpose: two tiny files, and the interactive hooks rely on
+    // their first step running before they yield.
+    const read = (path: string): unknown => {
+      try {
+        return getPath(parseYaml(readFileSync(path, "utf-8")), "memory.hindsight");
+      } catch (err) {
+        // A cwd that is not a directory has no repository config; anything else unreadable fails closed.
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === "ENOTDIR" || code === "ENOENT") return undefined;
+        issues.push({ path, message: `unreadable: ${(err as Error).message}`, severity: "error" });
+        return undefined;
+      }
+    };
+    const globalLayer = read(join(dir, "engineering.yaml"));
+    let repoLayer = read(join(cwd, ".pi", "engineering.yaml"));
+    if (isPlain(repoLayer) && "cli" in repoLayer) {
+      const { cli: _ignored, ...rest } = repoLayer;
+      repoLayer = rest;
+      issues.push({
+        path: "memory.hindsight.cli",
+        message: "ignored in repository config; set it in the global engineering.yaml",
+        severity: "warning",
+      });
+    }
+    let merged: unknown = off([]).settings;
+    for (const layer of [globalLayer, repoLayer]) {
+      if (layer === undefined || layer === null) continue;
+      if (!isPlain(layer)) {
+        issues.push({ path: "memory.hindsight", message: "expected a mapping of settings", severity: "error" });
+        continue;
+      }
+      merged = deepMerge(merged, layer);
+    }
+    issues.push(...validateHindsightSettings(merged));
+    if (issues.some((i) => i.severity === "error")) return off(issues);
+    return { settings: merged as HindsightSettings, issues };
+  } catch (err) {
+    return off([...issues, { path: "memory.hindsight", message: (err as Error).message, severity: "error" }]);
   }
 }
 

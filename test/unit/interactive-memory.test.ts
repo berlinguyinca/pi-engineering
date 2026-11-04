@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type DurableMemoryRecord, InMemoryDurableMemory } from "../../src/blackhole/durableProvider.ts";
@@ -21,12 +24,17 @@ function fixture(
   const statuses: string[] = [];
   const notices: Array<{ text: string; type: string }> = [];
   const sent: any[] = [];
-  // Hindsight is the only durable backend and it is opt-in: the env surface is
-  // the whole configuration, and the herdr-memory CLI holds its own credentials.
-  const env: Record<string, string | undefined> =
-    options.configured === false
-      ? {}
-      : { PI_HINDSIGHT_ENABLED: "1", PI_HINDSIGHT_CLI: options.cli ?? "herdr-memory", PI_HINDSIGHT_SCOPES: "project" };
+  // Hindsight is the only durable backend and it is opt-in: `memory.hindsight` in
+  // the global engineering.yaml is the whole configuration, and the herdr-memory
+  // CLI holds its own credentials.
+  const agentDir = mkdtempSync(join(tmpdir(), "im-agent-"));
+  const writeConfig = (scopes: string[], extra = "") =>
+    writeFileSync(
+      join(agentDir, "engineering.yaml"),
+      `memory:\n  hindsight:\n    enabled: true\n    cli: ${JSON.stringify(options.cli ?? "herdr-memory")}\n    scopes: ${JSON.stringify(scopes)}\n${extra}`,
+    );
+  if (options.configured !== false) writeConfig(["project"]);
+  const env: Record<string, string | undefined> = { PI_CODING_AGENT_DIR: agentDir };
   if (options.stateDir) env.PI_ENGINEERING_STATE_DIR = options.stateDir;
   const store = new InMemoryDurableMemory();
   const queries: string[] = [];
@@ -77,6 +85,7 @@ function fixture(
     sent,
     ctx,
     env,
+    writeConfig,
     store,
     queries,
     get saves() {
@@ -223,7 +232,9 @@ test("session reset and credential rotation clear stale memory and pending resul
   f.override(undefined);
   await f.store.store(record("calibration new"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
-  f.env.PI_HINDSIGHT_SCOPES = "global";
+  f.writeConfig(["global"]);
+  // The new scope set is picked up at the next turn start (a prompt with no search terms recalls nothing).
+  await f.emit("before_agent_start", { prompt: "the", systemPrompt: "" });
   assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
 });
 
@@ -280,16 +291,16 @@ test("context preserves the off status", async () => {
   assert.equal(f.statuses.at(-1), status);
 });
 
-test("the retired /memory setup names the environment it replaced, and still checks", async () => {
+test("the retired /memory setup names the YAML keys that replaced it, and still checks", async () => {
   const f = fixture({ hasUI: false });
   await f.command("memory", "setup");
   const said = f.sent.map((m: any) => m.message.content).join("\n");
   assert.match(
     said,
-    /PI_HINDSIGHT_ENABLED=1.*PI_HINDSIGHT_CLI.*PI_HINDSIGHT_SCOPES/s,
+    /engineering\.yaml.*memory\.hindsight.*enabled.*cli.*scopes/s,
     "no dialog: the answer must say which knobs configure memory now",
   );
-  assert.doesNotMatch(said, /PI_OPENVIKING|hidden key/i);
+  assert.doesNotMatch(said, /PI_OPENVIKING|PI_HINDSIGHT|hidden key/i);
 });
 
 test("headless automatic memory failures stay out of the transcript and log once per connection per day", async () => {
@@ -503,7 +514,7 @@ for (const replacement of ["session", "credential"] as const) {
     };
     const save = f.command("remember", "calibration from the retired connection");
     if (replacement === "session") await f.emit("session_before_switch");
-    else f.env.PI_HINDSIGHT_SCOPES = "global";
+    else f.writeConfig(["global"]);
     await f.emit("before_agent_start", { prompt: "calibration" });
     const statuses = f.statuses.length;
     const notices = f.notices.length;
@@ -552,7 +563,7 @@ test("refused writes back off automatic search and a connection change bypasses 
   assert.equal(f.queries.length, 1, "a refused backend is not queried on each turn");
   assert.match(f.statuses.at(-1)!, /refused/);
   f.fail();
-  f.env.PI_HINDSIGHT_SCOPES = "global";
+  f.writeConfig(["global"]);
   await f.store.store(record("calibration available"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
   assert.equal(f.queries.length, 2);
@@ -671,6 +682,11 @@ test("a slow herdr-memory call cannot hold startup or a prompt for seconds", asy
   // The real CLI provider, driven through an injected runner that answers far
   // outside the automatic budget: what is under test is the deadline, not HTTP.
   let requests = 0;
+  const slowAgentDir = mkdtempSync(join(tmpdir(), "im-slow-"));
+  writeFileSync(
+    join(slowAgentDir, "engineering.yaml"),
+    "memory:\n  hindsight:\n    enabled: true\n    timeout_ms: 1500\n",
+  );
   const slowRunner: HindsightRunner = async () => {
     requests++;
     await new Promise<void>((resolve) => {
@@ -699,7 +715,7 @@ test("a slow herdr-memory call cannot hold startup or a prompt for seconds", asy
       on: (name: string, handler: Handler) => events.set(name, handler),
     } as unknown as ExtensionAPI,
     {
-      env: () => ({ PI_HINDSIGHT_ENABLED: "1", PI_HINDSIGHT_TIMEOUT_MS: "1500" }),
+      env: () => ({ PI_CODING_AGENT_DIR: slowAgentDir }),
       provider: (config) =>
         new HindsightDurableMemory({
           cli: config.cli,
