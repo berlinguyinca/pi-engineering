@@ -127,7 +127,7 @@ function guidance(status: Extract<HindsightProbe, { ok: false }>): string {
           : status.reason === "response"
             ? "the client did not return readable status"
             : "the client rejected the request (usually a missing or revoked credential)";
-  return `Durable memory is on but not usable: ${problem}.\nRun herdr-memory doctor --json to see the client profile behind this directory, fix what it reports, then run /memory status.\nNever put a key or an endpoint in a repository or in Pi settings — the client stores its own profile at 0600.`;
+  return `Durable memory is on but not usable: ${problem}.\nRun herdr-memory doctor (it takes no flags) to see the client profile behind this directory, fix what it reports, then run /memory status.\nNever put a key or an endpoint in a repository or in Pi settings — the client stores its own profile at 0600.`;
 }
 
 const DISCLOSURE =

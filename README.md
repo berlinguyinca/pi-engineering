@@ -82,56 +82,62 @@ pi install /absolute/path/to/pi-engineering-runtime
 | `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (disabled by default) |
 | `/remember <text>` | Explicitly save a private Hindsight note (up to 4,000 characters) |
 | `/memory [query]` | Verify the memory connection, or search saved notes |
-| `/memory setup` | Configure or change the Hindsight host and access key |
+| `/memory setup` | Check the `herdr-memory` client on this machine and enable durable memory |
 
 ### Everyday memory
 
-When no Hindsight connection is configured, interactive Pi offers a setup
-dialog. An existing connection is preserved across updates; use `/memory setup`
-to change it. Existing environment/token-file settings can be kept. Changed credentials are entered
-in a masked field and verified before they are saved. Settings and private key
-files live under `~/.pi/agent/engineering-memory/` (or the active
-`PI_CODING_AGENT_DIR`), outside the extension checkout. Updates preserve them.
-Cancelled setup can be retried with `/memory setup`; headless sessions never
-block for a dialog. The update command itself does not need an interactive
-credential hook: the check runs when Pi next loads the updated extension.
+Durable notes live in a Hindsight bank reached through the **`herdr-memory`
+client**. Pi holds no endpoint, token or bank: the client keeps its own project
+profile, credentials, offline queue and cache (`~/.config/herdr-memory`, mode
+0600), installed and checked with `herdr-eng memory install` and
+`herdr-eng memory doctor`. `/memory setup` asks the client one question —
+`herdr-memory status` — and records only that answer under
+`~/.pi/agent/engineering-memory/` (or the active `PI_CODING_AGENT_DIR`), outside
+the extension checkout. Setup is opt-in: without `PI_HINDSIGHT_ENABLED=1` there is
+no memory and nothing to set up. Headless sessions never block for a dialog; they
+use the client profile on the machine plus `PI_HINDSIGHT_ENABLED=1`.
+
+| Setting | Meaning |
+| --- | --- |
+| `PI_HINDSIGHT_ENABLED` | `1`/`true` opts in (default off); `0` disables memory access for that launcher |
+| `PI_HINDSIGHT_CLI` | the client executable (default `herdr-memory`) |
+| `PI_HINDSIGHT_SCOPES` | comma list of `project`, `global`, `infra`, `mission:<id>` (default `project`) |
+| `PI_HINDSIGHT_TIMEOUT_MS` | per-call client timeout for explicit commands (default 5000) |
+| `PI_HINDSIGHT_AUTOMATIC_MS` | in-turn recall budget, clamped 100–5000 (default 1200 interactive, 5000 headless) |
 
 ```text
 /remember Calibration reports should use metric units.
 /memory calibration
 ```
 
-Ordinary chat prompts automatically recall a small set of keyword-matching
-notes. The footer shows `Memory: ready`, match counts, or a specific connection
-failure. `/memory` distinguishes a healthy empty store from a rejected key.
-Automatic recall is ephemeral model context, inserted before the current user
-request; it is not copied into the saved transcript. Only `/remember` writes
-notes—normal conversations are not automatically uploaded or promoted.
+Ordinary chat prompts automatically recall a small set of keyword-matching notes,
+injected as untrusted reference data and never as instructions. The footer shows
+`Memory: ready`, match counts, or the specific failure (client not installed,
+unhealthy, did not answer in time, unreadable status). Automatic recall is
+ephemeral model context inserted before the current user request; it is not
+copied into the saved transcript. Only `/remember` writes — normal conversations
+are neither uploaded nor promoted.
 
-Automatic startup recall and per-prompt searches wait at most 250 ms, so a slow
-memory service does not hold up the model turn for seconds. A timed-out lookup
-adds no notes to that turn. Successful searches, including empty results, are
-cached for 60 seconds with at most 32 query entries. Saving a note, a successful
-explicit memory check/search, session replacement, or a changed host/key clears
-the cache. Transient failures pause automatic requests for 60 seconds; rejected
-or forbidden keys pause them for five minutes. `/memory` and `/memory setup`
-remain available during that pause, and changing the host or key retries
-immediately. Explicit commands retain their longer, bounded verification wait.
-Starting another turn does not cancel a pending explicit memory command. A
-completed save/check/search invalidates older automatic lookups; replacing the
-session or connection still fences results from the retired context.
+Timing: the first lookup of a session — the connection check — gets 5000 ms. After
+that a turn waits at most 1200 ms in an interactive session, or 5000 ms in a
+headless one (`pi -p` has no spinner and its single model call is the only chance
+to carry memory). A late answer is still used: it is injected at the next model
+call of the same turn, fenced so a retired turn, an explicit command or a replaced
+session can never inject it. A turn that gets no memory says why — "could not be
+read this turn … unavailable, not empty" — instead of going silent, because
+silence reads as an empty bank. Successful searches, including empty results, are
+cached for 60 seconds with at most 32 query entries; saving a note, an explicit
+check or search, a new session, or a changed client profile clears the cache. A
+timed-out lookup retries after 10 seconds, a refused one after 60; `/memory` and
+`/memory setup` stay available during the pause and re-running setup retries
+immediately.
 
-Saving requires a read/write device key. Read-only keys can recall but cannot
-save. Treat saved notes as user-provided reference information, not proof that
-claims were machine-verified. Independent review/challenge workers do not load
-these interactive hooks. Existing engineering-worker hydration is preserved.
-
-Confirmed profile settings override old shell host/key defaults. Set
-`PI_HINDSIGHT_ENABLED=0` to disable all memory access for a launcher. A token
-file rotation is picked up by subsequent memory operations; changing host/key
-also refreshes the cached engineering runtime on the next engineering command.
-See [the feature design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits
-and verification boundaries.
+Treat saved notes as user-provided reference information, not proof that claims
+were machine-verified. Independent review/challenge workers do not load these
+interactive hooks; engineering-worker hydration is preserved. See
+[the memory integration status](docs/integration/HINDSIGHT-MEMORY-STATUS.md) for
+the client contract and live measurements. The OpenViking-era design
+([2026-09-14](docs/specs/2026-09-14-everyday-viking-memory.md)) is superseded.
 
 ### Blackhole session memory (optional, off by default)
 

@@ -121,7 +121,7 @@ test("an unusable client explains the reported reason and never collects a secre
     const f = fixture(t, { status: scenario.status, answers: ["Set up now"] });
     assert.equal(await ensureMemorySetup(f.ctx, f.setup), "unconfigured");
     assert.match(f.notices.join(" "), scenario.want);
-    assert.match(f.notices.join(" "), /herdr-memory doctor --json/);
+    assert.match(f.notices.join(" "), /herdr-memory doctor(?! --json)/);
     assert.match(f.notices.join(" "), /Never put a key/);
     assert.equal(f.prompts.length, 1, "the operator is asked once");
     assert.equal(f.state().lastConfirmedRevision, "", "an unusable connection is never marked confirmed");
@@ -159,7 +159,7 @@ for (const scenario of ["headless", "rpc"]) {
     assert.equal(await ensureMemorySetup(f.ctx, f.setup), "headless");
     assert.equal(f.prompts.length, 0);
     assert.match(f.notices.join(" "), /terminal/);
-    assert.match(f.notices.join(" "), /herdr-memory doctor --json/);
+    assert.match(f.notices.join(" "), /herdr-memory doctor(?! --json)/);
   });
 }
 

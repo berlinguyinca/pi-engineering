@@ -2225,7 +2225,6 @@ export const RAW_GIT_EXCEPTIONS: Readonly<Record<string, RawSpawnException>> = {
     why: "runs a caller-supplied deterministic test command; env scrubbed with workerCommandEnv",
   },
   "src/bar/scope.ts": { kind: "git-plumbing", why: "rev-parse HEAD only" },
-  "src/blackhole/connectionSetup.ts": { kind: "git-plumbing", why: "rev-parse HEAD only" },
   "src/git/rustBuildCache.ts": { kind: "git-plumbing", why: "rev-parse --show-toplevel / --git-common-dir only" },
   "src/integrations/autospec/provider.ts": {
     kind: "git-plumbing",

@@ -1,54 +1,78 @@
+/**
+ * The client profile, not a cached connection, decides where memory goes.
+ *
+ * Pi keeps no endpoint and no token, so there is nothing to rotate inside Pi: the
+ * `herdr-memory` client re-reads its own profile on every call. What Pi does hold
+ * is the client executable built into each provider — so the guarantee that still
+ * matters is that a changed client is used by the next operation rather than a
+ * memoised one. (A `blackhole` config that still names the retired HTTP fields is
+ * refused at config resolution; that guard lives in test/unit/blackhole.test.ts.)
+ *
+ * No EngineeringRuntime here on purpose: opening one needs the artifact store,
+ * which needs Linux, and this guarantee lives entirely in the client seam.
+ */
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { test } from "node:test";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import extension from "../../extensions/index.ts";
-import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+import {
+  HindsightDurableMemory,
+  type HindsightRunner,
+  probeHindsightStatus,
+  resolveHindsightFromEnv,
+} from "../../src/blackhole/hindsight.ts";
 
-test("engineering commands use changed profile host and rotated key rather than cached credentials", async () => {
-  const fixture = await makeFixtureRepo();
-  const profile = join(fixture.root, "profile");
-  const key = join(profile, "key");
-  const oldEnv = { ...process.env };
-  const oldFetch = globalThis.fetch;
-  const seen: Array<{ url: string; auth: string | undefined }> = [];
-  try {
-    await mkdir(join(profile, "engineering-memory"), { recursive: true });
-    await writeFile(key, "first-key");
-    const settings = join(profile, "engineering-memory", "connection.json");
-    await writeFile(
-      settings,
-      JSON.stringify({ baseUrl: "https://first.example", tokenFile: key, lastConfirmedRevision: "test" }),
-    );
-    process.env.PI_CODING_AGENT_DIR = profile;
-    process.env.PI_HINDSIGHT_ENABLED = "1";
-    globalThis.fetch = async (input, options) => {
-      seen.push({ url: String(input), auth: (options?.headers as Record<string, string> | undefined)?.authorization });
-      return new Response("[]");
-    };
-    const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
-    extension({
-      registerCommand: (name: string, c: any) => commands.set(name, c),
-      registerTool: () => {},
-      on: () => {},
-    } as unknown as ExtensionAPI);
-    const ctx = { cwd: fixture.root, model: undefined, ui: { notify: () => {} } } as unknown as ExtensionCommandContext;
-    await commands.get("blackhole")!.handler("--dashboard", ctx);
-    assert.equal(seen.at(-1)!.auth, "Bearer first-key");
-    await writeFile(key, "rotated-key");
-    await writeFile(
-      settings,
-      JSON.stringify({ baseUrl: "https://second.example", tokenFile: key, lastConfirmedRevision: "test" }),
-    );
-    await commands.get("blackhole")!.handler("--dashboard", ctx);
-    // recallAll() is a semantic recall against the project's facts bank
-    assert.equal(seen.at(-1)!.url, "https://second.example/v1/default/banks/pi-facts/memories/recall");
-    assert.equal(seen.at(-1)!.auth, "Bearer rotated-key");
-  } finally {
-    globalThis.fetch = oldFetch;
-    for (const name of Object.keys(process.env)) if (!(name in oldEnv)) delete process.env[name];
-    Object.assign(process.env, oldEnv);
-    await fixture.cleanup();
-  }
+const ALPHA = "/profiles/alpha/herdr-memory";
+const BETA = "/profiles/beta/herdr-memory";
+
+/** A client whose answers depend on which executable was called. */
+function clientAwareRunner(calls: string[]): HindsightRunner {
+  return async (cli, args) => {
+    calls.push(`${cli} ${args.join(" ")}`);
+    if (args[0] === "status") {
+      return { stdout: JSON.stringify({ healthy: true, project: cli === BETA ? "beta" : "alpha" }), exitCode: 0 };
+    }
+    if (args[0] === "recall") {
+      return {
+        stdout: JSON.stringify({
+          results: [
+            { memory_id: cli === BETA ? "beta-1" : "alpha-1", text: cli === BETA ? "beta note" : "alpha note" },
+          ],
+        }),
+        exitCode: 0,
+      };
+    }
+    return { stdout: "{}", exitCode: 0 };
+  };
+}
+
+test("the next operation uses the client Pi just recorded, not a cached one", async () => {
+  const calls: string[] = [];
+  const run = clientAwareRunner(calls);
+
+  const first = await probeHindsightStatus({ cli: ALPHA, run });
+  assert.equal(first.ok && first.project, "alpha");
+
+  // A changed profile is a different executable: nothing about the client's
+  // identity is memoised, so the very next check already asks the new one.
+  const second = await probeHindsightStatus({ cli: BETA, run });
+  assert.equal(second.ok && second.project, "beta");
+
+  // A provider built from the changed client recalls through the changed client.
+  const durable = new HindsightDurableMemory({ cli: BETA, scopes: ["project"], run });
+  assert.deepEqual(
+    (await durable.search("deploy notes")).map((note) => [note.id, note.text]),
+    [["beta-1", "beta note"]],
+  );
+  const recalls = calls.filter((call) => call.includes(" recall "));
+  assert.ok(recalls.length > 0, "the search should have reached the client");
+  assert.ok(
+    recalls.every((call) => call.startsWith(`${BETA} `)),
+    `a recall went to a retired client: ${recalls.join(" | ")}`,
+  );
+});
+
+test("the environment names only the client, never an endpoint or a key", () => {
+  const resolved = resolveHindsightFromEnv({ PI_HINDSIGHT_ENABLED: "1", PI_HINDSIGHT_CLI: BETA });
+  assert.deepEqual(resolved, { cli: BETA, scopes: ["project"], timeoutMs: 5000 });
+  // Opt-out is total: without the opt-in there is no memory configuration at all.
+  assert.equal(resolveHindsightFromEnv({ PI_HINDSIGHT_ENABLED: "0", PI_HINDSIGHT_CLI: BETA }), null);
 });

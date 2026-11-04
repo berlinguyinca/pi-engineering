@@ -1517,53 +1517,47 @@ later/other worker consumes knowledge promoted by any earlier worker (spec:
 outage degrades hydration to an empty result and never fails the worker.
 `pi-engineering blackhole status` reports the active `durable` kind.
 
-### Hindsight (herdr-memory) service
+### Hindsight through the `herdr-memory` client
 
-The `hindsight` durable kind points workers at the Hindsight memory service
-(the `herdr-memory` project). The runtime's `HindsightProvider` targets the
-herdr-memory bank contract with Bearer-token auth:
+The `hindsight` durable kind reaches Hindsight **only** through the
+`herdr-memory` client. There is no HTTP adapter in this repository: no endpoint,
+token, bank or project prefix is configurable in Pi, and no memory service ships
+here. The client owns its project profile, credentials, offline queue and cache
+(`~/.config/herdr-memory`, mode 0600) and is the only thing that talks to the
+service; promoted memory lives in the `{project}-facts` bank.
 
-* retain — `POST /v1/default/banks/{project}-facts/memories`
-* recall — `POST /v1/default/banks/{project}-facts/memories/recall`
+Because that service is semantic, there is no list-all endpoint. Whole-bank reads
+(`recallAll`) are bounded best-effort overview recalls, and every surface that
+counts them says the count is a probe rather than a bank total. A refused scope
+fails the whole recall instead of being skipped, which is why the default scope
+list is `project` alone.
 
-The service is external infrastructure owned by the herdr-memory project; this
-repository no longer ships a memory service of its own. Hindsight is semantic:
-there is no list-all endpoint, so whole-bank reads (`recallAll`) are
-best-effort semantic recalls. HTTPS is required except loopback.
-
-### Installing the connection anywhere pi is installed (no code edits)
-
-Any pi installation that loads this package's **extension** connects to shared
-Hindsight automatically when the environment is set — no per-repo code. Set
-these once (e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process
-loads):
+Any pi installation that loads this package's **extension** can use it with no
+per-repo code. Set these once (e.g. in `~/.bashrc`, a systemd unit, or a `.env`
+the pi process loads):
 
 ```sh
-export PI_HINDSIGHT_BASE_URL=https://memory.example.com
-# Bearer token for the service — either inline, or from a file (secret hygiene):
-export PI_HINDSIGHT_TOKEN=<token>
-# or: export PI_HINDSIGHT_TOKEN_FILE=/path/to/token.txt
-# Optional: bank prefix (default "pi"; durable memory uses {project}-facts):
-# export PI_HINDSIGHT_PROJECT=pi
-# Optional: bounded wait for the provider (default 10000ms):
-export PI_HINDSIGHT_PROVIDER_TIMEOUT_MS=10000
-# Optional: explicitly force the connection off:
-# export PI_HINDSIGHT_ENABLED=0
+export PI_HINDSIGHT_ENABLED=1          # opt-in; unset or 0 keeps memory off
+export PI_HINDSIGHT_CLI=herdr-memory   # the client executable (default)
+export PI_HINDSIGHT_SCOPES=project     # project | global | infra | mission:<id>
+export PI_HINDSIGHT_TIMEOUT_MS=5000    # per-call client timeout for explicit commands
+# export PI_HINDSIGHT_AUTOMATIC_MS=1200  # in-turn recall budget, clamped 100-5000
 ```
 
-When `PI_HINDSIGHT_BASE_URL` is set, the extension passes
-`blackhole: { config: { enabled: true, durable: { kind: "hindsight", ... } } }`
-into every `EngineeringRuntime` it opens, so all repos in that install share the
-deployed durable memory. Absent the env vars, blackhole stays off (backward
-compatible). Verify a connection with `/memory status` in a pi session, or:
+The client itself is installed and checked outside Pi:
 
 ```sh
-node scripts/pi-engineering.ts blackhole status
+herdr-eng memory plan      # what install would change (read-only)
+herdr-eng memory install   # managed client config for the detected harnesses
+herdr-eng memory doctor    # drift, config validity, credential permissions, server health
+herdr-memory status        # the one connection check Pi makes (`doctor` takes no flags)
 ```
 
-The resolver is `src/blackhole/envConfig.ts`; it is fail-closed (a malformed
-timeout falls back to the default; a missing token degrades recall to empty
-rather than crash).
+Without `PI_HINDSIGHT_ENABLED` memory stays off and behaviour is exactly as before
+(backward compatible). Verify from a pi session with `/memory` or `/memory setup`,
+or from the shell with `herdr-memory --project <project> status`.
+`pi-engineering blackhole status` reports the active `durable` kind; its Hindsight
+counts are overview probes, and `shared-file` counts a local JSONL file.
 
 ## Durable state
 
