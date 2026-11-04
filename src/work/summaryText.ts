@@ -3,6 +3,7 @@
  * `/summary` timeline, the compact status row, `/task <id>` and `/team`. Pure text, bounded, derived from a
  * `WorkGraph` plus a few event facts. No store, no I/O, no clock except the injected `now`.
  */
+import { type SessionSummary, getSessionSummary, listActiveSessions } from "./sessionSummary.ts";
 import type { WorkGraph, WorkRun, WorkTask } from "./types.ts";
 
 /** The slice of a Ledger event the timeline needs. */
@@ -84,11 +85,32 @@ export function formatWorkSummary(
   return out.join("\n");
 }
 
+/** Default number of idle sessions the status row names before collapsing the rest into `+K idle`. */
+export const DEFAULT_STATUS_IDLE_SESSIONS = 3;
+
+const shortId = (id: string): string => (id.length > 12 ? `${id.slice(0, 11)}…` : id);
+
+/**
+ * Session part of the row: every session with a live run is shown (never hidden); idle sessions with unresolved
+ * work are the `maxIdleSessions` most recently active, then a `+K idle` tail.
+ */
+function sessionParts(graph: WorkGraph, maxIdleSessions: number): string[] {
+  const sessions = listActiveSessions(graph);
+  const byRecent = (a: { last: string | null }, b: { last: string | null }): number =>
+    (b.last ?? "").localeCompare(a.last ?? "");
+  const active = sessions.filter((s) => s.live).sort(byRecent);
+  const idle = sessions.filter((s) => !s.live).sort(byRecent);
+  const shown = idle.slice(0, Math.max(0, maxIdleSessions));
+  const parts = [...active.map((s) => `${shortId(s.id)} live`), ...shown.map((s) => `${shortId(s.id)} idle`)];
+  if (idle.length > shown.length) parts.push(`+${idle.length - shown.length} idle`);
+  return parts;
+}
+
 /**
  * One status row, never multi-line. `undefined` when there is nothing live or unresolved to say, so the status
  * bar stays empty instead of showing "0 tasks".
  */
-export function formatWorkStatusRow(graph: WorkGraph): string | undefined {
+export function formatWorkStatusRow(graph: WorkGraph, opts: { maxIdleSessions?: number } = {}): string | undefined {
   const open = graph.tasks.filter((t) => t.state !== "done" && t.state !== "cancelled");
   if (open.length === 0) return undefined;
   const live = liveRuns(graph);
@@ -98,8 +120,26 @@ export function formatWorkStatusRow(graph: WorkGraph): string | undefined {
   if (live.length)
     parts.push(`${live.length} run${live.length === 1 ? "" : "s"}${unknown ? ` (${unknown} unknown)` : ""}`);
   if (blocked) parts.push(`${blocked} blocked`);
+  parts.push(...sessionParts(graph, opts.maxIdleSessions ?? DEFAULT_STATUS_IDLE_SESSIONS));
   return parts.join(" | ");
 }
+
+/** `/summary <session id>`: one session's work from {@link getSessionSummary}. */
+export function formatSessionSummary(s: SessionSummary): string {
+  if (!s.known) return `No tracked work for session ${clip(s.session_id, 60)}.`;
+  const out = [
+    `Session ${clip(s.session_id, 60)}: ${s.tasks.length} task(s) — ${s.done} done, ${s.counts.working} working, ${s.blocked} blocked/needs input, ${s.counts.open} open, ${s.counts.cancelled} cancelled`,
+    `  live runs ${s.live_runs} · last activity ${s.last_activity_at ?? "unknown"}`,
+    `  retries ${s.retry.retries} · failed attempts ${s.retry.failed_attempts}${s.retry.tasks_awaiting_retry.length ? ` · awaiting retry: ${s.retry.tasks_awaiting_retry.join(", ")}` : ""}`,
+    `  PRs: ${s.linked_prs.length ? s.linked_prs.join(", ") : "none linked"}`,
+  ];
+  for (const t of s.tasks.slice(-MAX_TASKS))
+    out.push(clip(`  ${t.id} [${t.state}] ${t.title} — attempts ${t.attempts} (${t.session_attempts} here)`));
+  if (s.tasks.length > MAX_TASKS) out.push(`  … ${s.tasks.length - MAX_TASKS} earlier task(s)`);
+  return out.join("\n");
+}
+
+export { getSessionSummary };
 
 /** `/task <id>`: one task with its runs, verification, blocked reason and handoffs. */
 export function formatTaskView(graph: WorkGraph, id: string): string {

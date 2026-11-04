@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { newCandidateId, newEntityId, newEventId, newEvidenceId, newTaskId, newWorkItemId } from "../core/ids.ts";
 import type {
   Actor,
@@ -8,6 +9,8 @@ import type {
   Evidence,
   LedgerEntity,
   LedgerEvent,
+  LedgerPlan,
+  LedgerPlanStep,
   RiskLevel,
   Task,
   WorkItem,
@@ -66,11 +69,58 @@ function prLinkOf(p: Record<string, unknown>): WorkItemPrLink | undefined {
   };
 }
 
+export const MAX_PLAN_STEPS = 50;
+const MAX_PLAN_TITLE = 120;
+const MAX_ID = 128;
+
+const cleanSteps = (raw: unknown): LedgerPlanStep[] => {
+  const out: LedgerPlanStep[] = [];
+  if (!Array.isArray(raw)) return out;
+  for (const r of raw) {
+    if (!r || typeof r !== "object") continue;
+    const { task_id, title } = r as Record<string, unknown>;
+    if (typeof task_id !== "string" || !task_id || task_id.length > MAX_ID || typeof title !== "string") continue;
+    out.push({ task_id, title: title.slice(0, MAX_PLAN_TITLE) });
+  }
+  return out;
+};
+
+const planDigestOf = (steps: readonly LedgerPlanStep[]): string =>
+  createHash("sha256")
+    .update(JSON.stringify(steps.map((s) => [s.task_id, s.title])))
+    .digest("hex");
+
+function planOf(p: Record<string, unknown>, workItemId: string | null, at: string): LedgerPlan | undefined {
+  const { plan_id, revision, digest, supersedes, artifact, total_steps } = p;
+  if (!workItemId || typeof plan_id !== "string" || plan_id.length > 2 * MAX_ID) return undefined;
+  if (typeof revision !== "number" || !Number.isInteger(revision) || revision < 1) return undefined;
+  if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) return undefined;
+  const steps = cleanSteps(p.steps).slice(0, MAX_PLAN_STEPS);
+  if (steps.length === 0) return undefined;
+  const art = artifact as Record<string, unknown> | undefined;
+  return {
+    id: plan_id,
+    work_item_id: workItemId,
+    revision,
+    digest,
+    steps,
+    total_steps: typeof total_steps === "number" && total_steps >= steps.length ? total_steps : steps.length,
+    ...(art && typeof art.id === "string" && typeof art.version === "string"
+      ? { artifact: { id: art.id.slice(0, MAX_ID), version: art.version.slice(0, MAX_ID) } }
+      : {}),
+    ...(typeof supersedes === "string" ? { supersedes } : {}),
+    recorded_at: at,
+  };
+}
+
 const samePr = (a: WorkItemPrLink, b: WorkItemPrLink): boolean =>
   a.number === b.number &&
   a.host.toLowerCase() === b.host.toLowerCase() &&
   a.owner.toLowerCase() === b.owner.toLowerCase() &&
   a.repo.toLowerCase() === b.repo.toLowerCase();
+
+/** Retries of a plan record that lost a revision race; each retry means another process recorded in between. */
+const MAX_PLAN_RETRIES = 100;
 
 export class Ledger {
   private readonly store: EventStore;
@@ -88,6 +138,9 @@ export class Ledger {
   private authorities = new Map<string, number>();
   /** PRs linked to a work item by `work_item.pr_linked`, in first-seen order and de-duplicated by PR. */
   private prLinks = new Map<string, WorkItemPrLink[]>();
+
+  /** Plans recorded per work item by `plan.recorded`, oldest first. */
+  private plans = new Map<string, LedgerPlan[]>();
 
   private constructor(store: EventStore) {
     this.store = store;
@@ -320,6 +373,18 @@ export class Ledger {
         }
         break;
       }
+      case "plan.recorded": {
+        const plan = planOf(p, event.work_item_id, event.timestamp);
+        if (plan) {
+          const list = this.plans.get(plan.work_item_id) ?? [];
+          if (!list.some((l) => l.id === plan.id)) {
+            const prior = plan.supersedes ? list.find((l) => l.id === plan.supersedes) : undefined;
+            if (prior && !prior.superseded_by) prior.superseded_by = plan.id;
+            this.plans.set(plan.work_item_id, [...list, plan]);
+          }
+        }
+        break;
+      }
       case "candidate.created": {
         const c = p.candidate as Candidate;
         this.candidates.set(c.id, c);
@@ -450,6 +515,85 @@ export class Ledger {
 
   listPrLinks(workItemId: string): WorkItemPrLink[] {
     return [...(this.prLinks.get(workItemId) ?? [])];
+  }
+
+  /**
+   * Record the plan a work item decomposed into: ordered Ledger task ids and titles (capped at {@link MAX_PLAN_STEPS}).
+   * Idempotent: the same steps as the latest revision write nothing and return it. Different steps mint the next
+   * revision, which supersedes the latest. Honors `write.guard` and `write.authority_generation` like every helper.
+   * Returns undefined for an unknown work item or no usable steps.
+   */
+  async recordPlan(
+    workItemId: string,
+    input: { steps: readonly LedgerPlanStep[]; artifact?: { id: string; version: string } },
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<LedgerPlan | undefined> {
+    if (!this.workItems.has(workItemId)) return undefined;
+    const all = cleanSteps(input.steps);
+    const steps = all.slice(0, MAX_PLAN_STEPS);
+    if (steps.length === 0) return undefined;
+    const digest = planDigestOf(steps);
+    const art = input.artifact;
+    // The revision is derived from this process's view of the log, which another process may have extended. The
+    // append is therefore fenced on the work item's revision as seen when the plan was chosen: under the lock a stale
+    // view is rejected (after the store folds in the other writer's events), and the plan is re-derived from the
+    // true tail. A caller-supplied guard is the caller's own fence and is never retried.
+    for (let attempt = 0; ; attempt++) {
+      const latest = this.latestPlan(workItemId);
+      if (latest?.digest === digest) return latest;
+      const revision = (latest?.revision ?? 0) + 1;
+      const plan_id = `${workItemId}/${revision}`;
+      try {
+        await this.emit(
+          "plan.recorded",
+          workItemId,
+          actor,
+          {
+            plan_id,
+            revision,
+            digest,
+            steps,
+            total_steps: all.length,
+            ...(art?.id && art.version ? { artifact: { id: art.id, version: art.version } } : {}),
+            ...(latest ? { supersedes: latest.id } : {}),
+          },
+          {
+            idempotency_key: `plan:${plan_id}:${digest}`,
+            ...(write?.authority_generation !== undefined ? { authority_generation: write.authority_generation } : {}),
+          },
+          write?.guard ?? { expected_revision: this.revision(workItemId) },
+        );
+      } catch (err) {
+        if (write?.guard || !(err instanceof LedgerRevisionConflictError) || attempt >= MAX_PLAN_RETRIES) throw err;
+        continue;
+      }
+      return this.listPlans(workItemId).find((l) => l.id === plan_id);
+    }
+  }
+
+  /** Plans of a work item, oldest first (copies). */
+  listPlans(workItemId: string): LedgerPlan[] {
+    return (this.plans.get(workItemId) ?? []).map((p) => ({ ...p, steps: [...p.steps] }));
+  }
+
+  private latestPlan(workItemId: string): LedgerPlan | undefined {
+    const list = this.plans.get(workItemId);
+    return list?.[list.length - 1];
+  }
+
+  /**
+   * The plan a work item or task belongs to: the newest revision that lists the task as a step (so a task dropped
+   * by a later revision still reports the plan it was last part of), or a work item's own newest plan.
+   */
+  planFor(id: string): LedgerPlan | undefined {
+    const wiId = this.tasks.get(id)?.work_item_id ?? id;
+    const list = this.plans.get(wiId);
+    if (!list?.length) return undefined;
+    const found = this.tasks.has(id)
+      ? [...list].reverse().find((p) => p.steps.some((s) => s.task_id === id))
+      : list[list.length - 1];
+    return found ? { ...found, steps: [...found.steps] } : undefined;
   }
 
   getWorkItem(id: string): WorkItem | undefined {

@@ -11,7 +11,9 @@ import type { MissionStatus, TaskStatus } from "./types.ts";
 
 /** Canonical mission lifecycle (spec 00 §4) plus exceptional states. */
 const MISSION_TRANSITIONS: Record<MissionStatus, ReadonlyArray<MissionStatus>> = {
-  NEW: ["CLASSIFYING"],
+  // A mission that never started may be abandoned: NEW -> CANCELED is audited like any
+  // other transition. Additive; replay of older logs is unaffected.
+  NEW: ["CLASSIFYING", "CANCELED"],
   CLASSIFYING: ["PLANNING", "READY", "WAITING_FOR_USER", "BLOCKED", "FAILED", "CANCELED"],
   PLANNING: ["READY", "QUEUED", "WAITING_FOR_USER", "BLOCKED", "FAILED", "CANCELED"],
   READY: ["QUEUED", "STARTING", "EXECUTING", "WAITING_FOR_USER", "BLOCKED", "FAILED", "CANCELED"],

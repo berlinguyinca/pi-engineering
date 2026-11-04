@@ -356,8 +356,13 @@ never loaded: while a tracked file has uncommitted changes, a new commit is
 not reloaded either (the handover would copy the half-edit); you are told
 once, and the reload happens as soon as the tree is clean, or at once with
 `/pie reload`. Summary and compaction calls, which have no turn to continue,
-wait out a gateway hold instead of switching models. `/pie update` does the same immediately (and, when the checkout
-has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
+wait out a gateway hold instead of switching models. `/pie update` does the same immediately, and it always asks the update remote
+first: if the checkout's HEAD is behind the channel tip, the tip is installed
+instead of the checkout being reloaded (a checkout 463 commits behind main used
+to hot-reload itself and report success). A checkout that carries the tip — a
+merge you just made, or unpushed development work on top of it — is still
+reloaded, because that is the update you meant. `--check` reports both, and
+`--channel`/`--commit` always go to the remote. `PI_ENGINEERING_AUTO_RELOAD=0`
 turns the automatic reload off.
 
 A session on another host, loading pi-engineering from a clone that tracks
@@ -1042,6 +1047,16 @@ on by default):
   calls. A user abort (Esc) never blocks a re-run.
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
+
+### Work status row: idle-session limit
+
+The compact work status row names every session with a live run, then at most
+`execution.status_idle_sessions` idle sessions (unresolved work, no live run),
+most recently active first, and collapses the rest into `+K idle`. YAML only
+(`.pi/engineering.yaml`), default 3, range 0..50; an out-of-range value falls
+back to the default. Live sessions are never hidden. `/summary <session id>`
+shows one session's tasks, attempts/retries, live runs and last activity (PRs
+appear once a PR source is wired; the work projection itself carries none).
 
 ### Worker tool-loop guard
 

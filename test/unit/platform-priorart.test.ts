@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { PRIORART_REMOTE, defaultPriorartPaths, ensurePriorart } from "../../src/platform/priorartDependency.ts";
 
+/** The cold-start rebuild is a detached `git clone` that keeps writing into the sandbox while it is deleted. */
+const NO_REBUILD = { rebuild: false } as const;
+
 function makeSandbox() {
   const dir = mkdtempSync(join(tmpdir(), "priorart-dep-"));
   return {
@@ -23,7 +26,7 @@ describe("priorartDependency", () => {
   it("creates config and registers priorart in mcp.json when absent", () => {
     const { dir, paths } = makeSandbox();
     try {
-      const res = ensurePriorart(paths);
+      const res = ensurePriorart(paths, NO_REBUILD);
       assert.equal(res.configPresent, true);
       assert.equal(res.mcpRegistered, true);
       assert.ok(existsSync(paths.config));
@@ -39,7 +42,7 @@ describe("priorartDependency", () => {
     const { dir, paths } = makeSandbox();
     try {
       writeFileSync(paths.mcp, JSON.stringify({ mcpServers: { other: { command: "x" } } }));
-      const res = ensurePriorart(paths);
+      const res = ensurePriorart(paths, NO_REBUILD);
       assert.equal(res.mcpRegistered, true);
       const doc = JSON.parse(readFileSync(paths.mcp, "utf8"));
       assert.ok(doc.mcpServers.other);
@@ -54,9 +57,21 @@ describe("priorartDependency", () => {
     try {
       mkdirSync(join(dir, "bin"), { recursive: true });
       writeFileSync(paths.bin, "fake-binary");
-      const res = ensurePriorart(paths);
+      const res = ensurePriorart(paths, NO_REBUILD);
       assert.equal(res.binaryPresent, true);
       assert.equal(res.rebuildStarted, false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuild:false never spawns the detached clone, so nothing writes into the source dir", () => {
+    const { dir, paths } = makeSandbox();
+    try {
+      const res = ensurePriorart(paths, NO_REBUILD);
+      assert.equal(res.binaryPresent, false);
+      assert.equal(res.rebuildStarted, false);
+      assert.equal(existsSync(paths.source), false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -69,7 +84,7 @@ describe("priorartDependency", () => {
       const blocker = join(dir, "blocker");
       writeFileSync(blocker, "x");
       const broken = { ...paths, mcp: join(blocker, "mcp.json"), config: join(blocker, "c.json") };
-      const res = ensurePriorart(broken); // must not throw
+      const res = ensurePriorart(broken, NO_REBUILD); // must not throw
       assert.equal(typeof res, "object");
     } finally {
       rmSync(dir, { recursive: true, force: true });

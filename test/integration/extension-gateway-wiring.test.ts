@@ -733,6 +733,43 @@ test("wiring: refresh rejects invalid timeout and unknown arguments before acces
   }
 });
 
+test("wiring: refresh progress counts alias routes only, never the concrete rows behind them", async () => {
+  const cmd = loadWithCommands().get("refresh-models")!;
+  const dir = mkdtempSync(join(tmpdir(), "refresh-denominator-"));
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const previousFetch = globalThis.fetch;
+  writeFileSync(
+    join(dir, "models.json"),
+    JSON.stringify({ providers: { remote: { baseUrl: "https://refresh.example/v1", models: [] } } }),
+  );
+  process.env.PI_AGENT_DIR = dir;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) =>
+    init?.method === "POST"
+      ? Response.json({ choices: [{ message: { content: "OK" } }] })
+      : Response.json({
+          data: [
+            { id: "fast", x_alias: true, x_backing_model: "qwen" },
+            { id: "qwen", ctx_per_request: 8192 },
+            { id: "qwen-b", ctx_per_request: 8192 },
+          ],
+        })) as typeof fetch;
+  const { ctx } = notifyingCtx();
+  const statuses: string[] = [];
+  try {
+    await cmd.handler("remote --dry-run", {
+      ...ctx,
+      ui: { ...ctx.ui, setStatus: (_k: string, v: string | undefined) => v && statuses.push(v) },
+    });
+    const totals = new Set(statuses.map((value) => value.match(/\((\d+)\/(\d+) probed\)/)?.[2]).filter(Boolean));
+    assert.deepEqual([...totals], ["1"], "one alias row means one probe; concrete rows are not probe targets");
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 for (const cancel of [false, true]) {
   test(`wiring: refresh progress ${cancel ? "clears on cancellation" : "shows 0, 50 and 100 percent with alias identity"}`, async () => {
     const cmd = loadWithCommands().get("refresh-models")!;
@@ -748,7 +785,11 @@ for (const cancel of [false, true]) {
         ? Response.json({ choices: [{ message: { content: "OK" } }] })
         : Response.json({
             data: [
+              // Refresh is alias-only (#557): the concrete row is never probed or
+              // configured, so the progress denominator is the number of ALIAS rows.
+              // Two aliases are what make a 50% step exist.
               { id: "fast", x_alias: true, x_backing_model: "qwen" },
+              { id: "steady", x_alias: true, x_backing_model: "qwen" },
               { id: "qwen", ctx_per_request: 8192 },
             ],
           })) as typeof fetch;

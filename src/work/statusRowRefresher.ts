@@ -20,6 +20,8 @@ export interface StatusRowRefresherOptions {
   getGraph: () => WorkGraph | undefined | Promise<WorkGraph | undefined>;
   setStatus: (text: string | undefined) => void;
   intervalMs: number;
+  /** `execution.status_idle_sessions`. */
+  maxIdleSessions?: number;
   setTimer?: (fn: () => void, ms: number) => TimerHandle;
   clearTimer?: (handle: TimerHandle) => void;
 }
@@ -51,7 +53,7 @@ export class StatusRowRefresher {
         return; // keep the last row and the current timer state; the next tick retries
       }
       if (this.disposed || !graph) return;
-      const text = formatWorkStatusRow(graph);
+      const text = formatWorkStatusRow(graph, { maxIdleSessions: this.o.maxIdleSessions });
       if (text !== this.last) {
         this.last = text;
         try {
