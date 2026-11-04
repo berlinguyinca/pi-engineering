@@ -2,6 +2,8 @@
  * B03: diff-scope and size guard for bootstrap microtasks. Pure and read-only — it consumes
  * `git status --porcelain` / `git diff --numstat` metadata, never runs git and never touches the
  * tree. Path grants come from the B02 policy, so scope semantics cannot drift between the two.
+ * Scope is the union of working-tree paths and committed paths: the handoff gate stamps a *clean*
+ * worktree, so porcelain alone would make every path grant and file budget vacuous.
  */
 import { createPathPolicy } from "./pathPolicy.ts";
 import type { TaskManifest } from "./taskManifest.ts";
@@ -44,8 +46,10 @@ function numstatRows(numstat: string): { rows: DiffRow[]; added: number; deleted
 }
 
 export function evaluateDiffScope(manifest: TaskManifest, meta: DiffMetadata, symlinks: readonly string[] = []): DiffGuardReport {
-  const changedPaths = porcelainPaths(meta.porcelain);
   const { rows, added, deleted } = numstatRows(meta.numstat);
+  // Committed paths must join the scope set: at the stamping commit the tree is clean, so porcelain
+  // is empty while numstat still names every file the task actually changed.
+  const changedPaths = [...new Set([...porcelainPaths(meta.porcelain), ...rows.map((row) => row.path)])].sort();
   const built = createPathPolicy({ allowPaths: manifest.allowPaths, denyPaths: manifest.denyPaths, symlinks });
   const violations: DiffViolation[] = [];
   const push = (kind: DiffViolationKind, path: string | null, detail: string): void => { violations.push({ kind, path, detail }); };
