@@ -37,20 +37,25 @@ test("handoff mismatch is rejected and no model, scheduler or inference path is 
 
 // FIX-2: the parent chain the record asserts must be verified where the handoff is STAMPED, not only in a plan-only run at the base commit.
 type StampKind = "valid" | "absent" | "tampered" | "sequence";
+/** FIX-3C additions to the stamp run: `schema` is the content written to `fixtures/schema.json` (a string verbatim, anything else as JSON; the default is the permissive `{ "type": "object" }`, so the FIX-2 assertions stay about the parent chain), `schemaArg` is the `--handoff-schema` value (`null` omits the flag, a path never written is the unreadable case), `record` replaces the stamped record. */
+type Stamp3 = { schema?: unknown; schemaArg?: string | null; record?: Record<string, unknown> };
 /** A committed-clean temp repo (fixtures/ is git-ignored, so porcelain stays empty) whose HEAD is a task commit on its own approved base, plus one `--emit-handoff` run in it. */
-function stampRun(t: { after(fn: () => void): void }, kind: StampKind): { status: number | null; stdout: string; written: string[]; declared: string } {
+function stampRun(t: { after(fn: () => void): void }, kind: StampKind, fix3: Stamp3 = {}): { status: number | null; stdout: string; written: string[]; declared: string } {
   const dir = mkdtempSync(join(tmpdir(), "fix2-stamp-")); const out = mkdtempSync(join(tmpdir(), "fix2-out-"));
   t.after(() => { rmSync(dir, { recursive: true, force: true }); rmSync(out, { recursive: true, force: true }); });
   const git = (args: string[]): string => execFileSync("git", ["-C", dir, "-c", "user.name=fix2", "-c", "user.email=fix2@example.test", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], { encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: join(dir, "absent-global-config"), GIT_CONFIG_NOSYSTEM: "1" } });
   git(["init", "-q"]); mkdirSync(join(dir, "fixtures/logs"), { recursive: true }); writeFileSync(join(dir, ".gitignore"), "fixtures/\n"); git(["add", ".gitignore"]); git(["commit", "-q", "-m", "approved base"]);
   const baseSha = git(["rev-parse", "HEAD"]).trim(); mkdirSync(join(dir, "src"), { recursive: true }); writeFileSync(join(dir, "src/x.ts"), "export const x = 1;\nexport const y = 2;\n"); git(["add", "src/x.ts"]); git(["commit", "-q", "-m", "task"]);
   const fx = (rel: string, data: unknown): void => { writeFileSync(join(dir, "fixtures", rel), typeof data === "string" ? data : JSON.stringify(data)); };
-  fx("logs/01.txt", "ok\n"); fx("proofs.json", [{ command: "true", exitCode: 0, outputArtifact: "fixtures/logs/01.txt" }]); fx("record.json", { taskId: "T1", status: "PASS", evidence: [], nextTaskId: "T2", nextBaseSha: git(["rev-parse", "HEAD"]).trim() });
+  fx("logs/01.txt", "ok\n"); fx("proofs.json", [{ command: "true", exitCode: 0, outputArtifact: "fixtures/logs/01.txt" }]); fx("record.json", fix3.record ?? { taskId: "T1", status: "PASS", evidence: [], nextTaskId: "T2", nextBaseSha: git(["rev-parse", "HEAD"]).trim() });
+  fx("schema.json", fix3.schema ?? { type: "object" });
   const parent: Record<string, unknown> = { specVersion: "1.2.0", taskId: "E01", status: "PASS", repo: "pi", baseSha, resultSha: baseSha, evidence: [], nextTaskId: kind === "sequence" ? "OTHER" : "T1", nextBaseSha: baseSha };
   const declared = protocolHash(parent); if (kind === "tampered") parent.status = "BLOCKED"; // the stored checksum below is then stale, exactly as an edited handoff would be
   fx("parent.json", { ...parent, handoffHash: declared }); fx("manifest.json", { ...MANIFEST, taskId: "T1", baseSha, allowPaths: ["src/**"], denyPaths: [], commands: [{ argv: ["true"], cwd: "." }], limits: { maxProductionFiles: 1, maxTestFiles: 1, maxChangedLines: 100 }, expectedOutputs: ["src/x.ts"], parentHandoffHash: declared });
   const argv = [join(process.cwd(), "scripts/bootstrap-one.ts"), "--cwd", dir, "--manifest", "fixtures/manifest.json", "--proofs", "fixtures/proofs.json", "--handoff-record", "fixtures/record.json", "--emit-handoff", out];
-  if (kind !== "absent") argv.push("--parent-handoff", "fixtures/parent.json"); const run = spawnSync(process.execPath, argv, { encoding: "utf8" });
+  if (kind !== "absent") argv.push("--parent-handoff", "fixtures/parent.json");
+  if (fix3.schemaArg !== null) argv.push("--handoff-schema", fix3.schemaArg ?? "fixtures/schema.json"); // FIX-3C: --emit-handoff requires the schema
+  const run = spawnSync(process.execPath, argv, { encoding: "utf8" });
   return { status: run.status, stdout: `${run.stdout}${run.stderr}`, written: readdirSync(out), declared };
 }
 
@@ -75,4 +80,35 @@ test("FIX-2: a correctly hashed parent pointing at the wrong next task is reject
 test("FIX-2: a valid parent chain stamps, and the stamping run itself prints the verification", (t) => {
   const run = stampRun(t, "valid"); assert.equal(run.status, 0, run.stdout); assert.match(run.stdout, /gate=accepted/u); assert.deepEqual(run.written, ["T1.handoff.json"]);
   assert.equal(run.stdout.includes(`parent=E01 accepted ${run.declared.slice(0, 18)}`), true, "the verification is visible in the stamping log");
+});
+
+// FIX-3C: `--emit-handoff` must schema-validate the record against the REAL protocol schema before anything is stamped.
+// The flag resolves against --cwd, so the real templates/handoff.schema.json is copied byte-for-byte into the fixture repo.
+const REAL_SCHEMA = (): string => readFileSync(join(process.cwd(), "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json"), "utf8");
+const CONFORMING: Record<string, unknown> = { specVersion: "1.2.0", taskId: "T1", status: "PASS", repo: "pi", baseSha: "a".repeat(40), resultSha: "b".repeat(40), taskAuthorityHash: `sha256:${"c".repeat(64)}`, changedFiles: ["src/x.ts"], commands: [{ command: "npm run typecheck", exitCode: 0, outputArtifact: "fixtures/logs/01.txt" }], evidence: ["fixtures/logs/01.txt"], blockedReasons: [], nextTaskId: "T2", nextBaseSha: "d".repeat(40), operatorApproval: { required: false, approved: false, approvedBy: null, approvedAt: null } };
+const NO_TRACE = /\n\s{2,}at\s+\S+/u; // node renders an uncaught exception as "    at frame" lines on stderr
+
+test("FIX-3C: --emit-handoff without --handoff-schema is a gate blocker, exit 5, nothing written", (t) => {
+  const run = stampRun(t, "valid", { schemaArg: null }); assert.equal(run.status, 5, run.stdout);
+  assert.match(run.stdout, /REJECT gate: --emit-handoff requires --handoff-schema/u); assert.doesNotMatch(run.stdout, /gate=accepted/u); assert.deepEqual(run.written, [], "the output directory holds no <taskId>.handoff.json");
+});
+
+test("FIX-3C: a record violating the real handoff schema is rejected with the validator's path-named blocker", (t) => {
+  const badStatus = stampRun(t, "valid", { schema: REAL_SCHEMA(), record: { ...CONFORMING, status: "DONE" } });
+  assert.equal(badStatus.status, 5, badStatus.stdout); assert.match(badStatus.stdout, /REJECT gate: \$\.status: "DONE" is not one of enum \["PASS","ALREADY_SATISFIED","BLOCKED"\]/u); assert.deepEqual(badStatus.written, []);
+  const noExit = stampRun(t, "valid", { schema: REAL_SCHEMA(), record: { ...CONFORMING, commands: [{ command: "npm run typecheck", outputArtifact: "fixtures/logs/01.txt" }] } }); // commands[].exitCode missing
+  assert.equal(noExit.status, 5, noExit.stdout); assert.match(noExit.stdout, /REJECT gate: \$\.commands\[0\]\.exitCode: required property missing/u); assert.deepEqual(noExit.written, []);
+});
+
+test("FIX-3C: an unreadable or non-JSON --handoff-schema fails closed — blocker, exit 5, no stack trace, nothing written", (t) => {
+  const unreadable = stampRun(t, "valid", { schemaArg: "fixtures/nope.schema.json" }); assert.equal(unreadable.status, 5, unreadable.stdout); assert.match(unreadable.stdout, /REJECT gate: handoff schema fixtures\/nope\.schema\.json is unreadable/u);
+  const nonJson = stampRun(t, "valid", { schema: "not json" }); assert.equal(nonJson.status, 5, nonJson.stdout); assert.match(nonJson.stdout, /REJECT gate: handoff schema fixtures\/schema\.json is not valid JSON/u);
+  for (const run of [unreadable, nonJson]) { assert.doesNotMatch(run.stdout, NO_TRACE, "must fail closed as a blocker, never as an uncaught exception"); assert.doesNotMatch(run.stdout, /gate=accepted/u); assert.deepEqual(run.written, []); }
+});
+
+test("FIX-3C: a record conforming to the real schema stamps, and the log proves validation ran", (t) => {
+  const run = stampRun(t, "valid", { schema: REAL_SCHEMA(), record: CONFORMING }); assert.equal(run.status, 0, run.stdout);
+  assert.match(run.stdout, /schema=T1 conforms fixtures\/schema\.json/u); assert.match(run.stdout, /gate=accepted/u); assert.deepEqual(run.written, ["T1.handoff.json"]);
+  const stamped = run.stdout.match(/handoff=(\S+) checksum=/u)?.[1]; assert.ok(stamped !== undefined, run.stdout); // the stamped file carries the checksum the writer computed
+  assert.match(readFileSync(stamped, "utf8"), /"handoffHash": "sha256:[0-9a-f]{64}"/u);
 });
