@@ -83,6 +83,8 @@ NEW -> CLASSIFYING -> PLANNING -> READY -> EXECUTING
 ```
 
 Exceptional: `WAITING_FOR_USER | BLOCKED | CANCELING | CANCELED | FAILED`.
+A mission that never started may be canceled directly (`NEW -> CANCELED`); the
+transition is recorded like any other and takes the same lease guard.
 Illegal transitions are rejected by `src/orchestration/state.ts`.
 
 ## Broker backends

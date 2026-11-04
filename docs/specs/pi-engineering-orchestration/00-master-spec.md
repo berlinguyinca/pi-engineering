@@ -162,6 +162,8 @@ Exceptional states:
 - `CANCELED`
 - `FAILED`
 
+`NEW` may also move directly to `CANCELED` (a never-started mission is abandoned).
+
 The runtime controls state transitions.
 
 ## 5. Workflow classes
