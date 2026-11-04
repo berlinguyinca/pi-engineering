@@ -166,15 +166,34 @@ function canonical(value: unknown): string {
 }
 
 /** Stable content hash; bound into approvals, handoffs and audit records. */
+/** Absent and empty grant the same thing, so they fingerprint the same. */
+function sortedSet(xs: readonly string[] | undefined): string[] | undefined {
+  return xs ? [...xs].sort() : undefined;
+}
+
 export function contractHash(c: TaskContract): string {
-  const normalized = {
-    ...c,
-    readRoots: [...c.readRoots].sort(),
-    writeRoots: [...c.writeRoots].sort(),
-    allowedHosts: [...c.allowedHosts].sort(),
-    externalEffects: [...c.externalEffects].sort(),
+  // Authorization only: what the contract permits, not who holds it.
+  // Hashing the whole object would fold in host-injected state
+  // (`protectedPaths`) and identity (`taskId`, `objective`, `owner`), so an
+  // operator — or a handoff/approval record that binds
+  // `revision + contractHash` — could not reproduce the value from the contract
+  // file alone, and two unrelated tasks with identical scope would look
+  // different. `canonical` drops undefined keys, so absent allowlists cost
+  // nothing.
+  const authorization = {
+    policyRevision: c.policyRevision,
+    mode: c.mode,
+    workspace: c.workspace,
+    readRoots: sortedSet(c.readRoots),
+    writeRoots: sortedSet(c.writeRoots),
+    scratchRoots: sortedSet(c.scratchRoots),
+    allowedHosts: sortedSet(c.allowedHosts),
+    externalEffects: sortedSet(c.externalEffects),
+    allowedTools: sortedSet(c.allowedTools),
+    allowedCommands: sortedSet(c.allowedCommands),
+    acceptanceCriteria: c.acceptanceCriteria, // order is meaningful; kept as written
   };
-  return createHash("sha256").update(canonical(normalized)).digest("hex");
+  return createHash("sha256").update(canonical(authorization)).digest("hex");
 }
 
 const MODE_RANK: Record<TaskMode, number> = { investigation: 0, review: 0, implementation: 1, deployment: 2 };

@@ -14,6 +14,12 @@ import { type Decision, type EnforcementMode, type EngineDeps, evaluate, nodeDep
 export interface ContractProvider {
   /** The current trusted contract, or undefined when the session has none. */
   current(): TaskContract | undefined;
+  /**
+   * Why the provider substituted a lockdown contract for the operator's file
+   * (unreadable, unparseable), if that is happening right now. Without it a
+   * whole session can lose its scope while the agent sees only "(none)" roots.
+   */
+  lastError?: string;
 }
 
 export interface DisciplineOptions {
@@ -147,15 +153,57 @@ export class TaskDiscipline {
 /**
  * Typed against Pi's own API, so a signature drift (event fields, result shape,
  * the context argument) is a compile error rather than a silently unchecked
- * cast. Only `on` is needed.
+ * cast. Only `on` is needed; the operator-facing notice rides the handler's
+ * context (`ctx.ui`), which is where Pi puts the UI surface.
  */
 export type DisciplineHost = Pick<ExtensionAPI, "on">;
+
+/** Presentation surface, narrowed to what the gate uses. */
+type Notifier = (message: string, level: "info" | "error") => void;
 
 /** Attach the gate to a live Pi session. Order-independent: it never defers to other handlers. */
 export function registerTaskDiscipline(pi: DisciplineHost, opts: DisciplineOptions): TaskDiscipline {
   const gate = new TaskDiscipline(opts);
   if (opts.mode === "off") return gate;
-  pi.on("tool_call", (event, ctx) => gate.toolCall(event, ctx.cwd));
-  pi.on("user_bash", (event) => gate.userBash(event));
+  // A provider that cannot honour the operator's file substitutes a lockdown
+  // contract: the agent then sees no roots, and the journal says
+  // `contract.read_failed`, but nothing the OPERATOR reads explains why the
+  // session lost its scope. Say it once per distinct failure (and once when it
+  // clears) — and never let presentation change a verdict.
+  let reported: string | undefined;
+  const reportProviderState = (notify: Notifier) => {
+    const failure = opts.provider.lastError;
+    if (failure && failure !== reported) {
+      reported = failure;
+      notify(
+        `Task Contract is not in force: ${failure}. This session runs in lockdown — no writes, no external effects, no hosts. Fix the contract file, or unset PI_TASK_CONTRACT_FILE to run ungated.`,
+        "error",
+      );
+    } else if (!failure && reported !== undefined) {
+      reported = undefined;
+      notify("Task Contract is readable again; its authorization is in force.", "info");
+    }
+  };
+  const notifier =
+    (ctx: { ui?: { notify?(m: string, l?: string): void } }): Notifier =>
+    (message, level) => {
+      try {
+        ctx.ui?.notify?.(message, level);
+      } catch {
+        /* presentation is best-effort */
+      }
+    };
+  // Reported after the check, because the check is what discovers the failure —
+  // announcing it before would always describe the previous call's state.
+  pi.on("tool_call", (event, ctx) => {
+    const result = gate.toolCall(event, ctx.cwd);
+    reportProviderState(notifier(ctx as never));
+    return result;
+  });
+  pi.on("user_bash", (event, ctx) => {
+    const result = gate.userBash(event);
+    reportProviderState(notifier(ctx as never));
+    return result;
+  });
   return gate;
 }

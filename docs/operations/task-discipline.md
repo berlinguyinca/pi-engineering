@@ -26,7 +26,11 @@ If an enforcing mode starts with a missing, unreadable, unparseable or invalid
 contract, the session runs under a **lockdown** contract (`readRoots: []`,
 `writeRoots: []`, `allowedHosts: []`, mode `investigation`): nothing readable,
 nothing writable, nothing remote. The gate never degrades to "allow everything",
-and the objective field says why (`contract unavailable: <error>`).
+and the objective field says why (`contract unavailable: <error>`). The operator
+is told out loud, once per distinct failure — `Task Contract is not in force:
+ENOENT … This session runs in lockdown …` — and again, reassuringly, when the
+file becomes readable again. Without that notice the agent just reports "read
+scope is (none)" and the reason is invisible from the outside.
 
 ## Write a contract
 
@@ -65,7 +69,10 @@ and the objective field says why (`contract unavailable: <error>`).
   rewrites the file to widen itself, the parse fails and the provider substitutes
   the **lockdown** contract immediately — the session loses read, write and
   remote access at once (fail closed) rather than keeping the wider scope, and
-  the reason names the parse error. Restoring service is the operator's edit.
+  the reason names the parse error (`unknown contract field: …`,
+  `investigation contracts cannot have writeRoots; use scratchRoots for
+  diagnostics`, …). Restoring service is the operator's
+  edit.
 - `readRoots` is deliberately broad (the repo plus the dependent repos needed to
   understand a defect); `writeRoots` is deliberately narrow; `scratchRoots` is
   writable diagnostics space and must never be a repository root.
@@ -138,10 +145,51 @@ showed:
   contract-directory protection described above. That was a defect and is fixed;
   the same probe now allows the scratch write and still denies the contract file.
 
-`contractHash(contract)` is a stable sha256 over the sorted authorization sets.
+`contractHash(contract)` is a sha256 over the **authorization** the contract
+grants: `policyRevision`, `mode`, `workspace`, the sorted `readRoots`,
+`writeRoots`, `scratchRoots`, `allowedHosts`, `externalEffects`, `allowedTools`
+and `allowedCommands`, plus `acceptanceCriteria` in the order written. Identity
+(`taskId`, `objective`, `owner`) and host-injected state (`protectedPaths`) are
+deliberately excluded, so the operator can recompute the value from the contract
+file alone and two unrelated tasks with identical scope share a fingerprint.
 Every decision record carries `revision` + `contractHash`, so a log line says
 which exact authorization was in force; handoffs and approvals bind the same
 hash.
+
+## Workers and subagents
+
+A mission worker is a second agent, and by default it would have had **no
+contract at all** — `roleResourceLoader` gave `createAgentSession` an empty
+extension list, so the parent's gate did not apply to it. Now a worker of a
+gated session is dispatched with its **own** contract, derived from the parent's
+by narrowing (`src/taskDiscipline/worker.ts`) and loaded as an inline extension
+in that worker's session:
+
+| Worker permission | Where it comes from |
+| --- | --- |
+| Write roots | only the worktree the scheduler allocated it, and only if the parent's write roots already cover it |
+| Mode | never above the parent's; a read-only role (`reviewer`, `explorer`, `researcher`, `verifier`) caps at `review` and gets no write roots |
+| External effects | always `[]` — a worker proposes, the host executes |
+| Allowed hosts | the parent's hosts, and only when the parent holds the `remote_read` effect; otherwise `[]` |
+| Read roots | the parent's (reading is not a side effect) |
+| Tool / bash allowlists | inherited from the parent — `narrowContract` rejects any widening; the role's own tool schemas still decide which tools the worker is even offered |
+
+The derived contract is written by the **host** to
+`<state root>/task-discipline/<worktree+taskId hash>/task-contract.json` and is
+itself in that contract's protected paths, along with the parent contract and the
+decision log — a worker reads its scope, it does not edit it.
+
+When narrowing cannot produce a contract inside the parent's scope, the worker
+is **refused before any model call** and the run fails with
+`error: task-scope-refused`. Two cases, both deliberate:
+
+- the role intends to write but the parent is `investigation`/`review` —
+  silently demoting it would hand it write tools its contract then denies;
+- the allocated worktree is outside the parent's write roots.
+
+The fix is always operator-side: widen the parent contract (raise
+`policyRevision`), or dispatch a read-only role. An ungated parent gates nothing,
+which is the default; a gated parent never produces an ungated worker.
 
 ## What it does not protect (say this out loud in reports)
 
@@ -168,8 +216,14 @@ hash.
 
 ## Open work (v1 scope, not yet built)
 
-- Contract binding for subagents in `PiWorkerExecutor` / `orchestration/scheduler`
-  (`narrowContract` exists and is tested; the spawn path does not call it yet).
+- Contract binding for the **scheduler** path (`orchestration/scheduler`) and
+  for agents spawned outside `PiWorkerExecutor`. Mission workers now get a
+  narrowed contract (`src/taskDiscipline/worker.ts`); the remaining gap is
+  adapters that start a Pi session by other routes.
+- Structured scope-expansion: the agent asks in chat and the operator edits the
+  contract. A request record + amendment flow (`amendContract()` exists and is
+  tested, nothing calls it) is still open, as is emitting contract/approval
+  events to the control plane (`POST /api/v1/tasks/:id/contracts`).
 - Handoff and model-switch revalidation: handoff should carry
   `contractId + revision + contractHash` and the receiving session should refuse
   a mismatch rather than copy prose constraints.
