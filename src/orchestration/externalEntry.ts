@@ -373,9 +373,7 @@ export async function runExternalEntry(
       return 0;
     }
 
-    // cancel. A mission still in NEW has no cancel edge in the lifecycle, so it
-    // passes through CLASSIFYING (recorded) on its way to CANCELED.
-    if (mission.status === "NEW") store.transitionMission(missionId, "CLASSIFYING", `external:${ownerId}`);
+    // cancel. A mission still in NEW cancels directly (NEW -> CANCELED).
     // The caller IS the controller (identity checked above), so the live-lease
     // refusal meant for other operators does not apply.
     let status = mission.status;

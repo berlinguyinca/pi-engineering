@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import { cancelStaleMission, listMissions } from "../../src/orchestration/missionCancel.ts";
 import { runMissionsCommand } from "../../src/orchestration/missionCancelCli.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
+import { canTransitionMission } from "../../src/orchestration/state.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
 function createBlocked(store: MissionStore, missionId: string, repoId: string | null): void {
@@ -187,10 +188,9 @@ describe("offline stale-mission cancellation", () => {
     assert.equal(store.getMission("MSN-garbled")!.status, "BLOCKED");
   });
 
-  it("refuses a mission the lifecycle cannot cancel before changing any of its work", () => {
-    const store = MissionStore.open(JsonlEventStore.inMemory());
+  function createNew(store: MissionStore, id: string): void {
     store.createMission({
-      mission_id: "MSN-new",
+      mission_id: id,
       title: "new",
       goal: "g",
       user_request: "g",
@@ -199,6 +199,12 @@ describe("offline stale-mission cancellation", () => {
       risk_profile: "medium",
       workflow_class: "engineering",
     });
+  }
+
+  it("cancels a never-started NEW mission, audited, with its tasks, idempotently", async () => {
+    const backend = JsonlEventStore.inMemory();
+    const store = MissionStore.open(backend);
+    createNew(store, "MSN-new");
     const task = store.createTask({
       task_id: "TSK-new",
       mission_id: "MSN-new",
@@ -207,8 +213,34 @@ describe("offline stale-mission cancellation", () => {
       objective: "o",
     });
     assert.equal(store.getMission("MSN-new")!.status, "NEW");
-    assert.throws(() => cancelStaleMission(store, "MSN-new"), /cannot transition NEW -> CANCELED/);
-    assert.equal(store.getTask(task.task_id)!.status, task.status, "no task was canceled");
+    const result = cancelStaleMission(store, "MSN-new");
+    assert.equal(result.fromStatus, "NEW");
+    assert.equal(result.status, "CANCELED");
+    assert.equal(store.getMission("MSN-new")!.status, "CANCELED");
+    assert.equal(store.getTask(task.task_id)!.status, "CANCELED");
+    await store.flush();
+    const replayed = MissionStore.open(backend);
+    assert.equal(replayed.getMission("MSN-new")!.status, "CANCELED", "audit log replays to CANCELED");
+    assert.equal(canTransitionMission("NEW", "CANCELED"), true);
+    assert.equal(canTransitionMission("NEW", "COMPLETE"), false);
+    assert.throws(() => cancelStaleMission(store, "MSN-new"), /terminal/);
+    assert.equal(store.getMission("MSN-new")!.status, "CANCELED");
+  });
+
+  it("a NEW mission with a live controller lease still cannot be canceled", () => {
+    const store = MissionStore.open(JsonlEventStore.inMemory());
+    createNew(store, "MSN-new-live");
+    const now = Date.parse("2026-10-07T00:00:10.000Z");
+    store.transitionMissionLease("acquired", {
+      missionId: "MSN-new-live",
+      generation: 1,
+      ownerId: "runtime-live",
+      acquiredAt: "2026-10-07T00:00:00.000Z",
+      renewBy: "2026-10-07T00:00:30.000Z",
+      fencingToken: 1,
+    });
+    assert.throws(() => cancelStaleMission(store, "MSN-new-live", { now }), /live controller lease/);
+    assert.equal(store.getMission("MSN-new-live")!.status, "NEW");
   });
 
   it("rejects a store path without an orchestration store instead of creating an empty one", async () => {

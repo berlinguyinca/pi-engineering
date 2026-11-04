@@ -4079,6 +4079,16 @@ Goal: "${goal}"`;
         .map((d) => created[d]!.id);
       if (deps.length) await this.ledger.updateTask(created[i]!.id, { depends_on: deps }, wi.id, actor);
     }
+    // The durable plan record behind the Work Graph's plan edges. Observational: it never fails or fails the plan.
+    try {
+      await this.transitions.recordPlan(
+        wi.id,
+        created.map((t) => ({ task_id: t.id, title: t.title })),
+        actor,
+      );
+    } catch (error) {
+      console.error(`plan record not written for ${wi.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
     await this.ledger.recordEntity(
       "decision",
       `plan: ${created.length} tasks decomposed for "${goal}" (${run.result.summary.slice(0, 160)})`,

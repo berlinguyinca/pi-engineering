@@ -22,6 +22,9 @@ Updated: 2026-10-30. Update this file at every phase boundary.
 
 Also merged: Mission pins to the session starting model (#524) with an implicit-pin give-up (#528) and `hold_mission_model` (#525); Ledger lock + fencing (#529, #533); neutral ForkRuntimeSources (#530); task lineage + plan artifact ref (#532); assistant task read (herdr-engineering #519); dashboard model-use (#506, #514).
 
+## Ledger plan record and Work Graph plan edges
+`plan.recorded` (payload `{plan_id, revision, digest, steps:[{task_id,title}] (max 50, titles max 120), total_steps, artifact?:{id,version}, supersedes?}`, scope = the plan work item, `plan_id` = `<work_item_id>/<n>`) is written by `Ledger.recordPlan` / `LedgerTransitions.recordPlan` (revision + authority-generation guarded, idempotency key `plan:<plan_id>:<digest>`). Identical steps are a no-op; changed steps mint the next revision which supersedes the last. `EngineeringRuntime.plan()` records it after the tasks exist; a failure is logged and never fails the plan. Old logs replay unchanged (the event is ignored when absent or malformed). Projection (`ledgerTaskRefs` -> `emitTaskRefEdges`): node `plan:<work_item_id>/<n>` (state `open`, or `superseded`), edge `dependency` task -> plan (the contract has no `plans` kind; this is the same edge the Mission side uses), `supersession` new plan -> old plan, and PRs from `work_item.pr_linked` stay `issue_link` task -> pr. Read back through Herdr `getTaskGraph`. Not done: attempt -> pr edges (a PR is linked to a work item, not a run) and a producer for `artifact` (the runtime has no plan artifact ref to pass yet).
+
 ## Standing rules
 - One branch + one PR per phase. No merge or deploy without the user's OK (flipping a default for every Pi session is sensitive; the user deploys themselves).
 - No new `PI_*` env flags (YAML config only). No Pi Forge / Pi-Bolt.

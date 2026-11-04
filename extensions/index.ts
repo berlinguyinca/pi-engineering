@@ -164,9 +164,17 @@ import { makeVisionLineageHook } from "../src/visionDelegation/lineage.ts";
 import { VisionRegistry } from "../src/visionDelegation/registry.ts";
 import { LedgerWorkProjection } from "../src/work/ledgerProjection.ts";
 import { projectLegacyMissions } from "../src/work/legacyMissionAdapter.ts";
+import { ledgerLinkedPrs } from "../src/work/linkedPrs.ts";
+import { getSessionSummary } from "../src/work/sessionSummary.ts";
 import { StatusRowRefresher } from "../src/work/statusRowRefresher.ts";
 import { formatWorkStatus } from "../src/work/statusText.ts";
-import { formatTaskView, formatTeamView, formatWorkStatusRow, formatWorkSummary } from "../src/work/summaryText.ts";
+import {
+  formatSessionSummary,
+  formatTaskView,
+  formatTeamView,
+  formatWorkStatusRow,
+  formatWorkSummary,
+} from "../src/work/summaryText.ts";
 import { mergeWorkGraphs } from "../src/work/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
@@ -555,6 +563,7 @@ async function refreshWorkStatus(
     const staleAfterMs = execution.stale_after_ms;
     workRefresher = new StatusRowRefresher({
       intervalMs: execution.status_refresh_interval_ms ?? 15_000,
+      maxIdleSessions: execution.status_idle_sessions,
       setStatus: (text) => ui.setStatus?.("work", text),
       getGraph: async () => {
         const open = await repoKeys.lookup(cwd, runtimes).catch(() => undefined);
@@ -2900,9 +2909,20 @@ ${RECOVERY_PROMPT}`;
     return mergeWorkGraphs(...graphs);
   };
   pi.registerCommand("summary", {
-    description: "Deterministic work timeline from the work read model: tasks, runs, verification, blockers, handoffs.",
-    handler: async (_args, ctx) => {
+    description:
+      "Deterministic work timeline from the work read model: tasks, runs, verification, blockers, handoffs. /summary <session id> shows one session.",
+    handler: async (args, ctx) => {
       const rt = await getRuntime(ctx);
+      const sessionId = String(args ?? "").trim();
+      if (sessionId) {
+        ctx.ui.notify(
+          formatSessionSummary(
+            getSessionSummary(workGraphOf(rt), sessionId, { linkedPrs: ledgerLinkedPrs(rt.ledger) }),
+          ),
+          "info",
+        );
+        return;
+      }
       ctx.ui.notify(formatWorkSummary(workGraphOf(rt), rt.ledger.events()), "info");
     },
   });

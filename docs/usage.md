@@ -1048,6 +1048,16 @@ on by default):
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
 
+### Work status row: idle-session limit
+
+The compact work status row names every session with a live run, then at most
+`execution.status_idle_sessions` idle sessions (unresolved work, no live run),
+most recently active first, and collapses the rest into `+K idle`. YAML only
+(`.pi/engineering.yaml`), default 3, range 0..50; an out-of-range value falls
+back to the default. Live sessions are never hidden. `/summary <session id>`
+shows one session's tasks, attempts/retries, live runs and last activity (PRs
+appear once a PR source is wired; the work projection itself carries none).
+
 ### Worker tool-loop guard
 
 Mission workers have their own cross-turn guard (`src/workers/toolLoopGuard.ts`).
