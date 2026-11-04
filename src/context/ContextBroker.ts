@@ -15,6 +15,16 @@ export interface ContextItem {
   truncated?: boolean;
 }
 
+/** An indispensable (required) file the package could not deliver whole (spec §10.5). */
+export interface RequiredContextOmission {
+  path: string;
+  kind: "unavailable" | "truncated";
+  reason: string;
+  /** For `truncated`: tokens the required slice needed, and tokens actually delivered. */
+  requestedTokens?: number;
+  providedTokens?: number;
+}
+
 /** A bounded context package assembled for a task (spec §10, §17.2). */
 export interface ContextPackage {
   id: string;
@@ -23,6 +33,24 @@ export interface ContextPackage {
   items: ContextItem[];
   totalTokens: number;
   sources: string[];
+  /** Required files delivered unavailable or partial; absent when nothing is missing. */
+  omissions?: RequiredContextOmission[];
+}
+
+/**
+ * Pure worker-launch gate over required-context omissions: `unavailable` evidence blocks launch by default,
+ * and only `allowBlockedInvestigation: true` launches — with the reason still returned for the caller to
+ * surface. A `truncated` omission alone never blocks. Not wired yet: the launch path in
+ * `src/runtime/EngineeringRuntime.ts` (~line 4283) consumes it in a later unit.
+ */
+export function requiredContextGate(
+  pkg: ContextPackage,
+  policy: { allowBlockedInvestigation?: boolean } = {},
+): { canLaunch: boolean; reason?: string } {
+  const missing = (pkg.omissions ?? []).filter((o) => o.kind === "unavailable");
+  if (missing.length === 0) return { canLaunch: true };
+  const reason = `indispensable evidence is missing (paths: ${missing.map((o) => o.path).join(", ")})`;
+  return policy.allowBlockedInvestigation ? { canLaunch: true, reason } : { canLaunch: false, reason };
 }
 
 export interface SearchHit {
@@ -271,25 +299,36 @@ export class ContextBroker {
       return true;
     };
 
-    // Required files first. If a required file's slice would exceed the
-    // remaining budget it is TRUNCATED (not silently dropped) so the
-    // "required context" guarantee holds even for large files.
+    // Required files first. If a required file's slice would exceed the remaining budget it is TRUNCATED
+    // (not silently dropped) so the "required context" guarantee holds even for large files, and one that
+    // cannot be read at all is reported rather than skipped. Either way the shortfall lands in the package's
+    // `omissions` (with token counts when partial), so a reader sees the hole instead of assuming
+    // completeness, and `requiredContextGate` refuses worker launch on `unavailable` evidence unless the
+    // launch policy explicitly allows blocked investigation.
+    const omissions: RequiredContextOmission[] = [];
     for (const rel of required) {
       const text = await this.readSlice(rel, 0, 300);
-      if (text === null) continue;
+      if (text === null) {
+        const reason = `required file could not be read from the repository: ${rel}`;
+        omissions.push({ path: rel, kind: "unavailable", reason });
+        continue;
+      }
       const remaining = targetTokens - total;
       const est = estimateTokens(text);
       if (est > remaining && remaining > 0) {
         const slice = text.slice(0, Math.max(0, Math.floor(remaining * 4)));
+        const provided = estimateTokens(slice);
         push({
           id: `file:${rel}`,
           kind: "file",
           path: rel,
           summary: slice,
-          estimatedTokens: estimateTokens(slice),
+          estimatedTokens: provided,
           required: true,
           truncated: true,
         });
+        const reason = `required file arrived only partially within the token budget: ${rel}`;
+        omissions.push({ path: rel, kind: "truncated", reason, requestedTokens: est, providedTokens: provided });
       } else {
         push({
           id: `file:${rel}`,
@@ -346,6 +385,7 @@ export class ContextBroker {
       items,
       totalTokens: total,
       sources: ["git grep", "file reads", "git ls-files"],
+      ...(omissions.length > 0 ? { omissions } : {}),
     };
   }
 
