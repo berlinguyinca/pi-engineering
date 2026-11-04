@@ -9,7 +9,7 @@
  */
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { stateHooks as safeGitStateHooks, testHooks as safeGitTestHooks } from "../../src/git/safeGit.ts";
 
 // Memory setup can write a revision marker, and model commands write models.json.
@@ -19,13 +19,29 @@ const profileDir =
 if (!process.env.PI_CODING_AGENT_DIR) process.env.PI_CODING_AGENT_DIR = profileDir;
 if (!process.env.PI_AGENT_DIR) process.env.PI_AGENT_DIR = profileDir;
 
+// Resolve the agent directory the way the product does (loadHindsightSettings reads PI_CODING_AGENT_DIR) and refuse
+// to run when it, or the models profile, is outside the temp directory: durable memory is on by default, so a real
+// ~/.pi/agent/engineering.yaml would make the suite call a real herdr-memory CLI. This also covers a developer who
+// has only PI_AGENT_DIR pointing at a real directory (it is copied into PI_CODING_AGENT_DIR above).
+for (const [name, dir] of [
+  ["PI_CODING_AGENT_DIR", process.env.PI_CODING_AGENT_DIR],
+  ["PI_AGENT_DIR", process.env.PI_AGENT_DIR],
+] as const) {
+  const rel = relative(resolve(tmpdir()), resolve(dir ?? ""));
+  if (!dir || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error(
+      `test isolation: ${name}=${dir} is outside ${tmpdir()}. Tests must not read a real Pi profile (durable memory is on by default); unset it or point it at a temporary directory.`,
+    );
+  }
+}
+
 // Durable memory (memory.hindsight) is ON by default, so a test process must not shell out to a real herdr-memory
 // CLI. The hermetic profile states `enabled: false` in its own global YAML (no environment variable). Tests of the
 // default or of a live provider pass their own agent directory or write their own engineering.yaml.
 {
   const yamlPath = join(profileDir, "engineering.yaml");
-  // Only a profile this module just created is written to; a caller-supplied directory is left alone.
-  if (profileDir.startsWith(join(tmpdir(), "pi-eng-test-profile-")) && !existsSync(yamlPath))
+  // Only a temporary directory without a YAML of its own is written to (checked above).
+  if (existsSync(profileDir) && !existsSync(yamlPath))
     writeFileSync(yamlPath, "memory:\n  hindsight:\n    enabled: false\n");
 }
 

@@ -113,6 +113,11 @@ and scopes, but each of those harnesses must be wired once with
 `herdr-eng memory install` before its notes reach Pi. If the CLI is absent or has
 no credential, Pi starts normally and shows at most one notice per session.
 
+Each turn the CLI receives up to 12 keywords of your prompt, and each worker run the
+first 120 characters of the task, both secret-redacted. A repository's
+`.pi/engineering.yaml` can only opt out (`enabled: false`) or narrow `scopes`; it
+cannot opt in or choose `harness`, `cli` or timeouts (global config only).
+
 Ranges, defaults and the repo-level rules are in
 [docs/usage.md](docs/usage.md#turning-the-connection-on-anywhere-pi-is-installed-no-code-edits).
 

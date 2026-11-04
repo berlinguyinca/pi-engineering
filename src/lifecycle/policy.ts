@@ -806,24 +806,46 @@ export function loadHindsightSettings(cwd: string, agentDir?: string): Hindsight
       }
     };
     const globalLayer = read(join(dir, "engineering.yaml"));
-    let repoLayer = read(join(cwd, ".pi", "engineering.yaml"));
-    if (isPlain(repoLayer) && "cli" in repoLayer) {
-      const { cli: _ignored, ...rest } = repoLayer;
-      repoLayer = rest;
-      issues.push({
-        path: "memory.hindsight.cli",
-        message: "ignored in repository config; set it in the global engineering.yaml",
-        severity: "warning",
-      });
-    }
+    const repoLayer = read(join(cwd, ".pi", "engineering.yaml"));
+    // The global file is authoritative. A cloned repository is untrusted input, so its layer may only
+    // opt OUT (`enabled: false`) or NARROW `scopes` to a subset of the global scopes. `cli` and `harness`
+    // (which picks the CLI's credential identity), and the timeouts/backoffs, are ignored with a warning.
     let merged: unknown = defaults();
-    for (const layer of [globalLayer, repoLayer]) {
-      if (layer === undefined || layer === null) continue;
-      if (!isPlain(layer)) {
+    if (globalLayer !== undefined && globalLayer !== null) {
+      if (isPlain(globalLayer)) merged = deepMerge(merged, globalLayer);
+      else issues.push({ path: "memory.hindsight", message: "expected a mapping of settings", severity: "error" });
+    }
+    if (repoLayer !== undefined && repoLayer !== null) {
+      if (!isPlain(repoLayer)) {
         issues.push({ path: "memory.hindsight", message: "expected a mapping of settings", severity: "error" });
-        continue;
+      } else {
+        // Type/range errors in the repository layer still fail closed, whether or not the key is honoured.
+        issues.push(...validateHindsightSettings(deepMerge(merged, repoLayer)));
+        const base = merged as HindsightSettings;
+        const next: Record<string, unknown> = { ...(base as unknown as Record<string, unknown>) };
+        const ignore = (key: string, why: string) =>
+          issues.push({
+            path: `memory.hindsight.${key}`,
+            message: `ignored in repository config; ${why}`,
+            severity: "warning",
+          });
+        for (const [key, value] of Object.entries(repoLayer)) {
+          if (key === "enabled") {
+            if (value === false) next.enabled = false;
+            else if (value === true && base.enabled === false)
+              ignore(key, "a repository cannot turn memory on over the global setting");
+          } else if (key === "scopes") {
+            if (Array.isArray(value) && value.every((x) => typeof x === "string" && base.scopes.includes(x))) {
+              next.scopes = value;
+            } else if (Array.isArray(value)) {
+              ignore(key, "a repository may only narrow the global scopes");
+            }
+          } else if (key in DEFAULT_HINDSIGHT_SETTINGS) {
+            ignore(key, "set it in the global engineering.yaml");
+          }
+        }
+        merged = next;
       }
-      merged = deepMerge(merged, layer);
     }
     issues.push(...validateHindsightSettings(merged));
     if (issues.some((i) => i.severity === "error")) return off(issues);

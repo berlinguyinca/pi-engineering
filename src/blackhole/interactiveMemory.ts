@@ -12,6 +12,7 @@ import {
   HindsightDurableMemory,
   HindsightError,
   connectionFromSettings,
+  redactQuery,
 } from "./hindsight.ts";
 import type { HindsightSettings } from "./hindsightSettings.ts";
 import { warnLegacyMemoryEnv, warnLegacyOpenViking } from "./legacyOpenViking.ts";
@@ -88,15 +89,10 @@ function firstNoticeToday(dir: string, identity: string): boolean {
 }
 
 function queryTokens(prompt: string): string[] {
+  // Redact BEFORE lowercasing (secret patterns are case-sensitive); tokens that were secrets are dropped.
+  const safe = (redactQuery(prompt.slice(0, 4096)) ?? "").replace(/\[REDACTED\]/g, " ");
   return [
-    ...new Set(
-      (
-        prompt
-          .slice(0, 4096)
-          .toLowerCase()
-          .match(/[\p{L}\p{N}_-]{3,64}/gu) ?? []
-      ).filter((t) => !STOPWORDS.has(t)),
-    ),
+    ...new Set((safe.toLowerCase().match(/[\p{L}\p{N}_-]{3,64}/gu) ?? []).filter((t) => !STOPWORDS.has(t))),
   ].slice(0, 12);
 }
 
@@ -165,6 +161,8 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         scopes: config.scopes,
         timeoutMs: Math.min(config.timeoutMs, 5000),
         harness: config.harness,
+        failureBackoffMs: config.failureBackoffMs,
+        unavailableBackoffMs: config.unavailableBackoffMs,
       }));
   const now = options.now ?? Date.now;
   let generation = 0;
@@ -468,7 +466,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     recalls.delete(cacheKey);
     setStatus(ctx, "checking");
     try {
-      const records = await automatic(conn.client.search(query));
+      const records = await automatic(conn.client.search(query, { deadlineMs: AUTOMATIC_LOOKUP_MS }));
       if (!current(id, conn.identity) || epoch !== automaticLookupEpoch) return;
       const block = memoryBlock(records, terms, conn.client.kind === "hindsight");
       // Re-key after the call: observed revisions are part of the scope.

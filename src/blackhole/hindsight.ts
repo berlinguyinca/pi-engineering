@@ -107,6 +107,27 @@ export interface HindsightOptions {
   /** Harness name exported to the CLI (default "pi"). Ignored when `run` is given. */
   harness?: string;
   run?: HindsightRunner;
+  /** Pause searches this long after a timeout or bad exit (default 60 s). */
+  failureBackoffMs?: number;
+  /** Pause searches this long after a missing CLI (default 5 min). */
+  unavailableBackoffMs?: number;
+}
+
+/**
+ * Per-CLI pause after a failed search, shared by every provider instance in the
+ * process (the interactive hooks build a provider per call and each worker run
+ * builds its own). While paused a search returns [] without spawning the CLI.
+ */
+const searchPausedUntil = new Map<string, number>();
+export function resetHindsightBackoff(): void {
+  searchPausedUntil.clear();
+}
+
+/** Drop anything secret-looking from a recall query; null when nothing usable is left. */
+export function redactQuery(query: string): string | null {
+  const whole = redactSecrets(query);
+  const kept = whole.split(/\s+/).filter((t) => t && !t.includes("[REDACTED]") && redactSecrets(t) === t);
+  return kept.length ? kept.join(" ") : null;
 }
 
 const STATUSES = new Set(["candidate", "verified", "superseded", "retracted"]);
@@ -117,6 +138,8 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   private readonly scopes: string[];
   private readonly timeoutMs: number;
   private readonly run: HindsightRunner;
+  private readonly failureBackoffMs: number;
+  private readonly unavailableBackoffMs: number;
   private epoch = 0;
   private revisionWatermark = 0;
 
@@ -125,6 +148,8 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
     this.scopes = opts.scopes?.length ? opts.scopes.filter((s) => SCOPE_RE.test(s)) : ["project"];
     if (!this.scopes.length) this.scopes = ["project"];
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.failureBackoffMs = opts.failureBackoffMs ?? 60_000;
+    this.unavailableBackoffMs = opts.unavailableBackoffMs ?? 300_000;
     this.run = opts.run ?? (opts.harness ? makeRunner(opts.harness) : defaultRunner);
   }
 
@@ -211,8 +236,38 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
     return (await this.recallStrict("*", 50)).length;
   }
 
-  search(query: string): Promise<DurableMemoryRecord[]> {
-    return this.recall(query);
+  /**
+   * Best-effort search. The query is redacted before it reaches argv, a failure
+   * pauses further searches (so a hung or absent CLI costs one wait, not one per
+   * turn or worker run), and `deadlineMs` bounds how long the caller waits.
+   */
+  async search(query: string, opts: { deadlineMs?: number } = {}): Promise<DurableMemoryRecord[]> {
+    const safe = redactQuery(query);
+    if (!safe) return [];
+    if ((searchPausedUntil.get(this.cli) ?? 0) > Date.now()) return [];
+    const pause = (code: string) => {
+      const ms = code === "unavailable" ? this.unavailableBackoffMs : this.failureBackoffMs;
+      searchPausedUntil.set(this.cli, Date.now() + ms);
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const work = this.recallStrict(safe, 20).catch((error: unknown) => {
+      pause(error instanceof HindsightError ? error.code : "unavailable");
+      return [] as DurableMemoryRecord[];
+    });
+    if (!opts.deadlineMs) return work;
+    try {
+      return await Promise.race([
+        work,
+        new Promise<DurableMemoryRecord[]>((resolve) => {
+          timer = setTimeout(() => {
+            pause("timeout");
+            resolve([]);
+          }, opts.deadlineMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   recallAll(): Promise<DurableMemoryRecord[]> {

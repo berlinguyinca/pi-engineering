@@ -6,7 +6,12 @@ import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildDurableProvider } from "../../src/blackhole/BlackholeManager.ts";
 import type { DurableMemoryRecord } from "../../src/blackhole/durableProvider.ts";
-import { HindsightDurableMemory, type HindsightRunner, connectionFromSettings } from "../../src/blackhole/hindsight.ts";
+import {
+  HindsightDurableMemory,
+  type HindsightRunner,
+  connectionFromSettings,
+  resetHindsightBackoff,
+} from "../../src/blackhole/hindsight.ts";
 import { DEFAULT_HINDSIGHT_SETTINGS } from "../../src/blackhole/hindsightSettings.ts";
 import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory.ts";
 
@@ -153,6 +158,7 @@ test("correct without evidence is rejected locally", async () => {
 
 // ---- interactive integration ----
 function interactive(provider: HindsightDurableMemory) {
+  resetHindsightBackoff(); // the search pause is process-wide per CLI name
   const events = new Map<string, (e: any, c: ExtensionContext) => any>();
   const commands = new Map<string, { handler: (a: string, c: ExtensionCommandContext) => Promise<void> }>();
   const notices: string[] = [];

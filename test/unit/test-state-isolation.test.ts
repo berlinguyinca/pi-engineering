@@ -32,19 +32,19 @@ for (const empty of [false, true]) {
 
 for (const overrides of [
   {
-    coding: "/explicit-coding-profile",
-    models: "/explicit-model-profile",
-    want: { coding: "/explicit-coding-profile", models: "/explicit-model-profile" },
+    coding: `${tmpdir()}/explicit-coding-profile`,
+    models: `${tmpdir()}/explicit-model-profile`,
+    want: { coding: `${tmpdir()}/explicit-coding-profile`, models: `${tmpdir()}/explicit-model-profile` },
   },
   {
-    coding: "/explicit-coding-profile",
+    coding: `${tmpdir()}/explicit-coding-profile`,
     models: "",
-    want: { coding: "/explicit-coding-profile", models: "/explicit-coding-profile" },
+    want: { coding: `${tmpdir()}/explicit-coding-profile`, models: `${tmpdir()}/explicit-coding-profile` },
   },
   {
     coding: "",
-    models: "/explicit-model-profile",
-    want: { coding: "/explicit-model-profile", models: "/explicit-model-profile" },
+    models: `${tmpdir()}/explicit-model-profile`,
+    want: { coding: `${tmpdir()}/explicit-model-profile`, models: `${tmpdir()}/explicit-model-profile` },
   },
 ]) {
   test(`the test preload preserves explicit profiles ${JSON.stringify(overrides)}`, () => {
@@ -63,5 +63,25 @@ for (const overrides of [
     );
     assert.equal(child.status, 0, child.stderr);
     assert.deepEqual(JSON.parse(child.stdout.trim()), overrides.want);
+  });
+}
+
+for (const real of [
+  { PI_CODING_AGENT_DIR: "/home/someone/.pi/agent", PI_AGENT_DIR: "" },
+  { PI_CODING_AGENT_DIR: "", PI_AGENT_DIR: "/home/someone/.pi/agent" },
+  { PI_CODING_AGENT_DIR: `${tmpdir()}/ok`, PI_AGENT_DIR: "/home/someone/.pi/agent" },
+]) {
+  test(`the test preload fails loudly on a profile outside the temp dir ${JSON.stringify(real)}`, () => {
+    const preload = new URL("../support/isolatedState.ts", import.meta.url).href;
+    const child = spawnSync(
+      process.execPath,
+      ["--input-type=module", "-e", `await import(${JSON.stringify(preload)});`],
+      {
+        env: { ...process.env, ...real },
+        encoding: "utf8",
+      },
+    );
+    assert.notEqual(child.status, 0);
+    assert.match(child.stderr, /test isolation/);
   });
 }

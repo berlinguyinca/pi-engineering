@@ -1578,8 +1578,19 @@ when headless), then automatic recall and saves stay silent best-effort until th
 `unavailable_backoff_ms` window passes. Startup waits at most 250 ms for the
 connection check. Run `/memory` (or `herdr-memory doctor`) to see what is wrong.
 
-A repository's `.pi/engineering.yaml` may set everything except `cli` (a cloned
-repo must not choose which program runs; the key is ignored with a warning). Any
+**What is sent.** Each turn Pi sends the CLI a recall query of up to 12 keywords from
+your prompt, and each worker run sends the first 120 characters of the task. Both are
+passed through secret redaction first and secret-looking tokens are dropped (a query
+that is only a secret makes no call). Notes are only written by `/remember`.
+After a timeout or failure, searches pause (`failure_backoff_ms`, or
+`unavailable_backoff_ms` for a missing CLI) for the interactive hooks and worker runs
+alike; worker runs wait at most 250 ms for memory.
+
+**Repository config is untrusted.** The global `engineering.yaml` is authoritative. A
+repository's `.pi/engineering.yaml` can only opt **out** (`enabled: false`) or **narrow**
+`scopes` to a subset of the global scopes. It cannot turn memory on over a global
+`false`, and `cli`, `harness`, `timeout_ms` and the backoffs are ignored there with a
+warning (`harness` selects the CLI's credential identity). Any
 invalid value fails closed: memory is turned off and `/memory` names the key to fix.
 Unknown keys under `memory.hindsight` are reported as warnings. The file is
 re-read at session start, at each turn and by `/memory`, so an edit takes effect

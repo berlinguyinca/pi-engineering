@@ -191,7 +191,14 @@ export class BlackholeManager {
     // an empty hydration. Spec: provider outage must not block engineering work.
     const timeoutMs = this.config.providerTimeoutMs;
     try {
-      const results = await withTimeout(this.durable.search(query), timeoutMs, []);
+      // A CLI-backed store is also held to the interactive lookup cap, and pauses itself after a failure.
+      const hindsight = this.durable.kind === "hindsight";
+      const deadlineMs = hindsight ? Math.min(timeoutMs, HYDRATE_CAP_MS) : undefined;
+      const results = await withTimeout(
+        this.durable.search(query, { deadlineMs }),
+        deadlineMs !== undefined ? deadlineMs + 100 : timeoutMs,
+        [],
+      );
       return results.slice(0, limit);
     } catch {
       return [];
@@ -342,6 +349,9 @@ async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T
     if (timer) clearTimeout(timer);
   }
 }
+
+/** Longest a worker run waits for CLI-backed durable memory (matches the interactive lookup cap). */
+const HYDRATE_CAP_MS = 250;
 
 export function buildDurableProvider(cfg: import("./types.ts").DurableStoreConfig): DurableMemoryProvider {
   switch (cfg.kind) {

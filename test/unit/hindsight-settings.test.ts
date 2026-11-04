@@ -87,18 +87,105 @@ test("global YAML enables memory and sets every key", () => {
   }
 });
 
-test("repo YAML may tune scopes but can never choose the executable", () => {
+test("repo YAML can never choose the executable", () => {
   const l = layout(
     "memory:\n  hindsight:\n    enabled: true\n    cli: /opt/bin/herdr-memory\n",
-    "memory:\n  hindsight:\n    cli: ./evil.sh\n    scopes: [global]\n",
+    "memory:\n  hindsight:\n    cli: ./evil.sh\n",
   );
   try {
     const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
     assert.equal(settings.cli, "/opt/bin/herdr-memory");
-    assert.deepEqual(settings.scopes, ["global"]);
     assert.ok(issues.some((i) => i.path === "memory.hindsight.cli" && i.severity === "warning"));
   } finally {
     l.done();
+  }
+});
+
+test("repo enabled: true never overrides a global enabled: false", () => {
+  const l = layout(
+    "memory:\n  hindsight:\n    enabled: false\n",
+    "memory:\n  hindsight:\n    enabled: true\n    harness: codex\n    scopes: [global, infra]\n",
+  );
+  try {
+    const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
+    assert.equal(settings.enabled, false);
+    assert.equal(settings.harness, "pi");
+    assert.deepEqual(settings.scopes, ["project"]);
+    assert.deepEqual(
+      issues.filter((i) => i.severity === "error"),
+      [],
+    );
+    assert.equal(hindsightBlackholeOption(l.cwd, l.agentDir), undefined);
+  } finally {
+    l.done();
+  }
+});
+
+test("repo harness is ignored with a warning", () => {
+  const l = layout(undefined, "memory:\n  hindsight:\n    harness: codex\n");
+  try {
+    const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
+    assert.equal(settings.harness, "pi");
+    assert.ok(issues.some((i) => i.path === "memory.hindsight.harness" && i.severity === "warning"));
+  } finally {
+    l.done();
+  }
+});
+
+test("repo scopes may narrow the global scopes but never widen them", () => {
+  const g = "memory:\n  hindsight:\n    scopes: [project, global]\n";
+  const narrow = layout(g, "memory:\n  hindsight:\n    scopes: [global]\n");
+  const widen = layout(g, "memory:\n  hindsight:\n    scopes: [project, infra]\n");
+  const widenDefault = layout(undefined, "memory:\n  hindsight:\n    scopes: [project, global]\n");
+  try {
+    assert.deepEqual(loadHindsightSettings(narrow.cwd, narrow.agentDir).settings.scopes, ["global"]);
+    const w = loadHindsightSettings(widen.cwd, widen.agentDir);
+    assert.deepEqual(w.settings.scopes, ["project", "global"]);
+    assert.ok(w.issues.some((i) => i.path === "memory.hindsight.scopes" && i.severity === "warning"));
+    assert.deepEqual(loadHindsightSettings(widenDefault.cwd, widenDefault.agentDir).settings.scopes, ["project"]);
+  } finally {
+    narrow.done();
+    widen.done();
+    widenDefault.done();
+  }
+});
+
+test("repo timeouts and backoffs are ignored with a warning; repo opt-out is honoured", () => {
+  const l = layout(
+    "memory:\n  hindsight:\n    timeout_ms: 1500\n",
+    "memory:\n  hindsight:\n    enabled: false\n    timeout_ms: 60000\n    failure_backoff_ms: 1000\n",
+  );
+  try {
+    const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
+    assert.equal(settings.enabled, false);
+    assert.equal(settings.timeout_ms, 1500);
+    assert.equal(settings.failure_backoff_ms, 60_000);
+    assert.ok(issues.some((i) => i.path === "memory.hindsight.timeout_ms" && i.severity === "warning"));
+  } finally {
+    l.done();
+  }
+});
+
+test("a non-mapping or invalid repo layer still fails closed", () => {
+  const nonMapping = layout(undefined, "memory:\n  hindsight: [1, 2]\n");
+  const invalid = layout(undefined, "memory:\n  hindsight:\n    scopes: [bogus]\n");
+  const unreadable = layout(undefined, "memory:\n  hindsight:\n    enabled: false\n");
+  try {
+    for (const l of [nonMapping, invalid]) {
+      const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
+      assert.equal(settings.enabled, false);
+      assert.ok(issues.some((i) => i.severity === "error"));
+    }
+    // A repo config path that is a directory is unreadable, not absent.
+    rmSync(join(unreadable.cwd, ".pi", "engineering.yaml"));
+    mkdirSync(join(unreadable.cwd, ".pi", "engineering.yaml"));
+    const u = loadHindsightSettings(unreadable.cwd, unreadable.agentDir);
+    assert.equal(u.settings.enabled, false);
+    assert.ok(u.issues.some((i) => i.severity === "error"));
+  } finally {
+    nonMapping.done();
+    invalid.done();
+    unreadable.done();
   }
 });
 
