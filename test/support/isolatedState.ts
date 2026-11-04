@@ -7,7 +7,7 @@
  * `~/.pi/pi-engineering`. Tests that need their own roots set
  * PI_ENGINEERING_STATE_DIR / PI_ENGINEERING_HOME themselves.
  */
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stateHooks as safeGitStateHooks, testHooks as safeGitTestHooks } from "../../src/git/safeGit.ts";
@@ -18,6 +18,16 @@ const profileDir =
   process.env.PI_CODING_AGENT_DIR || process.env.PI_AGENT_DIR || mkdtempSync(join(tmpdir(), "pi-eng-test-profile-"));
 if (!process.env.PI_CODING_AGENT_DIR) process.env.PI_CODING_AGENT_DIR = profileDir;
 if (!process.env.PI_AGENT_DIR) process.env.PI_AGENT_DIR = profileDir;
+
+// Durable memory (memory.hindsight) is ON by default, so a test process must not shell out to a real herdr-memory
+// CLI. The hermetic profile states `enabled: false` in its own global YAML (no environment variable). Tests of the
+// default or of a live provider pass their own agent directory or write their own engineering.yaml.
+{
+  const yamlPath = join(profileDir, "engineering.yaml");
+  // Only a profile this module just created is written to; a caller-supplied directory is left alone.
+  if (profileDir.startsWith(join(tmpdir(), "pi-eng-test-profile-")) && !existsSync(yamlPath))
+    writeFileSync(yamlPath, "memory:\n  hindsight:\n    enabled: false\n");
+}
 
 if (!process.env.PI_ENGINEERING_STATE_DIR) {
   process.env.PI_ENGINEERING_STATE_DIR = mkdtempSync(join(tmpdir(), "pi-eng-test-state-"));

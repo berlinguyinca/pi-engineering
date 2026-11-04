@@ -23,7 +23,7 @@ type MemoryConfig = HindsightConnectionConfig & {
   unavailableBackoffMs: number;
 };
 
-/** Opt-in only: null keeps memory off. It never resolves to a silent in-process store. */
+/** Null when memory is switched off. It never resolves to a silent in-process store. */
 function resolveMemoryConfig(settings: HindsightSettings | null): MemoryConfig | null {
   const h = settings ? connectionFromSettings(settings) : null;
   if (!settings || !h) return null;
@@ -211,7 +211,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const failure = (ctx: ExtensionContext, code: string, description: string, explicit = false) => {
     recalled = "";
     setStatus(ctx, description);
-    const text = `${description}. Run /memory to check; memory is enabled with memory.hindsight.enabled in engineering.yaml.`;
+    const text = `${description}. Run /memory to check; set memory.hindsight.enabled: false in engineering.yaml to turn memory off.`;
     if (!ctx.hasUI && !explicit) {
       // Headless (pi -p): an automatic status line is not part of the answer.
       // Writing it into the transcript polluted every print-mode session, so
@@ -264,7 +264,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           ctx,
           errors.length
             ? `Memory is off because engineering.yaml has invalid settings: ${errors.map((i) => `${i.path} (${i.message})`).join("; ")}. Fix them, then run /memory.`
-            : "Memory is off. Set memory.hindsight.enabled: true in engineering.yaml (the herdr-memory CLI), then run /memory.",
+            : "Memory is off (memory.hindsight.enabled is false in engineering.yaml). Set it to true to turn memory back on, then run /memory.",
           true,
         );
       }

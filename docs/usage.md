@@ -1480,7 +1480,9 @@ milestones as `IMPLEMENTED`; run `/mission` on a fixture repo by hand and read
 ## Optional Blackhole session memory
 
 `pi-blackhole` is an **optional** per-session memory/context provider, pinned to
-**0.5.4**. It is disabled by default and backward compatible. When enabled it
+**0.5.4**. The standalone provider is disabled unless configured; the Pi extension
+enables it with the Hindsight store because durable memory is on by default
+(`memory.hindsight.enabled: false` turns it off). When enabled it
 provides session-local memory with strict candidate isolation, recall into worker
 context, evidence-gated promotion through the durable-memory abstraction
 (`HindsightDurableMemory` for the cross-machine store; never auto-promoted), and
@@ -1527,8 +1529,9 @@ memoryless on a multi-host run.
 
 ### Turning the connection on anywhere pi is installed (no code edits)
 
-Any pi installation that loads this package's **extension** uses Hindsight when
-`engineering.yaml` opts in — no per-repo code. Configuration is YAML only; **no
+Durable memory is **on by default**. Any pi installation that loads this package's
+**extension** uses Hindsight with no configuration at all, so what is remembered in
+another harness is recalled in Pi too. Configuration is YAML only; **no
 environment variables are read** (the old `PI_HINDSIGHT_*` variables are
 ignored, with a one-time warning naming the key to use instead). Pi shells out to
 `herdr-memory` and holds no memory credential of its own: the CLI resolves its own
@@ -1540,7 +1543,7 @@ no secret belongs in YAML. Add this to the global `~/.pi/agent/engineering.yaml`
 # ~/.pi/agent/engineering.yaml (global). `cli` is honored only here.
 memory:
   hindsight:
-    enabled: true                 # opt-in; default false
+    enabled: true                 # default true; set false to turn durable memory off
     cli: herdr-memory             # executable to shell out to (global config only)
     scopes: [project]             # project, global, infra, mission:<id>
     timeout_ms: 5000              # per-call CLI timeout, 100..60000
@@ -1551,7 +1554,7 @@ memory:
 
 | Key | Default | Range / values |
 | --- | --- | --- |
-| `enabled` | `false` | `true` / `false` |
+| `enabled` | `true` | `true` / `false` (`false` turns durable memory off) |
 | `cli` | `herdr-memory` | non-empty executable name or path; global config only |
 | `scopes` | `[project]` | non-empty list of `project`, `global`, `infra`, `mission:<id>` |
 | `timeout_ms` | `5000` | 100..60000 |
@@ -1559,18 +1562,33 @@ memory:
 | `failure_backoff_ms` | `60000` | 1000..3600000 |
 | `unavailable_backoff_ms` | `300000` | 1000..86400000 |
 
+**Turning it off.** Put `memory: { hindsight: { enabled: false } }` in the global
+`engineering.yaml` (or a repository's `.pi/engineering.yaml` to opt a single repo out).
+Pi then makes no `herdr-memory` call and `/memory` reports `off`.
+
+**Cross-harness recall.** Pi and the other harnesses (Claude, Codex, OpenCode) talk
+to the same Hindsight server through the same `herdr-memory` CLI, but each harness
+has to be wired up once with `herdr-eng memory install`. Notes are shared by scope:
+`scopes` defaults to `[project]`, so only project notes cross harnesses; add
+`scopes: [project, global]` to also share global notes.
+
+**When the CLI is missing or has no credential.** Pi starts normally and degrades
+quietly: at most one concise notice per session (and one telemetry line per day
+when headless), then automatic recall and saves stay silent best-effort until the
+`unavailable_backoff_ms` window passes. Startup waits at most 250 ms for the
+connection check. Run `/memory` (or `herdr-memory doctor`) to see what is wrong.
+
 A repository's `.pi/engineering.yaml` may set everything except `cli` (a cloned
 repo must not choose which program runs; the key is ignored with a warning). Any
-invalid value fails closed: memory stays off and `/memory` names the key to fix.
+invalid value fails closed: memory is turned off and `/memory` names the key to fix.
 Unknown keys under `memory.hindsight` are reported as warnings. The file is
 re-read at session start, at each turn and by `/memory`, so an edit takes effect
 without restarting.
 
-When `memory.hindsight.enabled` is true, the extension passes
+Unless `memory.hindsight.enabled` is false, the extension passes
 `blackhole: { config: { enabled: true, durable: { kind: "hindsight", ... } } }`
 into every `EngineeringRuntime` it opens, so all repos in that install share the
-same durable backend. Absent the config, blackhole stays off (backward
-compatible). Verify a connection with `/blackhole` (or `/memory` for the
+same durable backend. With `enabled: false`, blackhole stays off. Verify a connection with `/blackhole` (or `/memory` for the
 interactive notes) in a pi session, or:
 
 ```sh
@@ -1582,68 +1600,6 @@ Artifacts are written under `docs/evidence/blackhole/`. The benchmark is a
 deterministic, model-free simulator (see the report methodology note) — it
 validates the measurement pipeline and shows the expected direction of effect,
 not a measured model claim.
-
-### Sharing memory across several workers
-
-Only *evidence-promoted* knowledge is shared; session-local working memory stays
-strictly isolated per candidate/reviewer/challenger. The `durable` config selects
-the backing store for shared durable memory (default `memory` = single process):
-
-```ts
-// Several workers on one host / CI share promoted memory via an append-only JSONL file.
-blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/shared/durable.jsonl" } } }
-
-// Cross-machine sharing through the herdr-memory CLI (Hindsight).
-blackhole: { config: { enabled: true, durable: { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] } } }
-```
-
-Each `runWorker` hydrates its context from shared durable memory on run, so a
-later/other worker consumes knowledge promoted by any earlier worker (spec:
-*"accepted promoted memories can be consumed by later sessions"*). Provider
-outage degrades hydration to an empty result and never fails the worker.
-`pi-engineering blackhole status` reports the active `durable` kind.
-
-`openviking` is **not** a valid kind any more. The HTTP transport and the
-`services/openviking` service it spoke to were retired, and the `herdr-memory`
-CLI replaced them as the cross-machine store. A configuration that still names
-the retired kind fails validation with a message naming the kinds that work,
-rather than falling back to an in-process store and quietly leaving every worker
-memoryless on a multi-host run.
-
-### Turning the connection on anywhere pi is installed (no code edits)
-
-Any pi installation that loads this package's **extension** uses Hindsight when
-the environment opts in — no per-repo code. Pi shells out to `herdr-memory` and
-holds no memory credential of its own: the CLI resolves its own configuration
-and token, so there is no host, key or key file for pi to store. Set these once
-(e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process loads):
-
-```sh
-export PI_HINDSIGHT_ENABLED=1          # opt-in; anything else leaves memory off
-export PI_HINDSIGHT_CLI=herdr-memory   # executable to shell out to
-export PI_HINDSIGHT_SCOPES=project     # comma list: project, global, infra, mission:<id>
-export PI_HINDSIGHT_TIMEOUT_MS=5000    # bounded per-call wait (default 5000)
-```
-
-When `PI_HINDSIGHT_ENABLED=1` is set, the extension passes
-`blackhole: { config: { enabled: true, durable: { kind: "hindsight", ... } } }`
-into every `EngineeringRuntime` it opens, so all repos in that install share the
-same durable backend. Absent the env vars, blackhole stays off (backward
-compatible). Verify a connection with `/blackhole` (or `/memory` for the
-interactive notes) in a pi session, or:
-
-```sh
-node scripts/pi-engineering.ts blackhole status
-herdr-memory doctor        # the CLI's own credential/config check
-```
-
-Leftover `PI_HINDSIGHT_*` / `PI_OPENVIKING_*` environment variables and saved
-OpenViking connection profiles are detected by name or existence only — values and
-file contents are never read or printed — and produce a single load-time warning
-(`src/blackhole/legacyOpenViking.ts`) that maps each variable to its YAML key
-(`PI_HINDSIGHT_ENABLED` -> `memory.hindsight.enabled`, `_CLI` -> `cli`, `_SCOPES`
--> `scopes`, `_TIMEOUT_MS` -> `timeout_ms`). The warning never fails startup.
-Remove the variables once migrated; nothing reads them.
 
 The loader is `loadHindsightSettings()` in `src/lifecycle/policy.ts` (schema and
 validation in `src/blackhole/hindsightSettings.ts`): configuration is fail-closed

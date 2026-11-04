@@ -41,8 +41,9 @@ function recorder(handler: (args: string[]) => unknown | Promise<unknown>) {
   return { calls, run };
 }
 
-test("opt-in: disabled unless memory.hindsight.enabled", () => {
-  assert.equal(connectionFromSettings(DEFAULT_HINDSIGHT_SETTINGS), null);
+test("on by default; disabled only by memory.hindsight.enabled: false", () => {
+  assert.equal(connectionFromSettings(DEFAULT_HINDSIGHT_SETTINGS)?.cli, "herdr-memory");
+  assert.equal(connectionFromSettings({ ...DEFAULT_HINDSIGHT_SETTINGS, enabled: false }), null);
   const c = connectionFromSettings({ ...DEFAULT_HINDSIGHT_SETTINGS, enabled: true, scopes: ["global", "mission:abc"] });
   assert.deepEqual(c?.scopes, ["global", "mission:abc"]);
   assert.equal(c?.harness, "pi");

@@ -79,34 +79,39 @@ pi install /absolute/path/to/pi-engineering-runtime
 | `/ledger [k]`     | Show work items, candidates, and ledger entities (optionally filtered) |
 | `/context`        | Show context budget, sources, and worker usage                 |
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository |
-| `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (disabled by default) |
+| `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (on with the extension's durable memory; off with `memory.hindsight.enabled: false`) |
 | `/remember <text>` | Explicitly save a private note through Hindsight (up to 4,000 characters) |
 | `/memory [query]` | Verify the memory connection, or search saved notes |
 
 ### Everyday memory
 
-Interactive memory is opt-in and reaches **Hindsight through the
+Interactive memory is **on by default** and reaches **Hindsight through the
 `herdr-memory` CLI**. Pi never talks to a memory service itself and holds no
 memory credential: the CLI carries its own configuration and credentials
 (`herdr-memory doctor` checks them), and nothing under `PI_CODING_AGENT_DIR`
 stores a host, token or profile. Configuration is YAML only; environment
 variables are not read. A leftover OpenViking profile or `PI_OPENVIKING_*` /
 `PI_HINDSIGHT_*` variable is detected by name or existence only — never read —
-and warns once at load with the YAML key to use. Enable it in the global
-`engineering.yaml` (`~/.pi/agent/engineering.yaml`):
+and warns once at load with the YAML key to use. No setup is needed; to change
+or turn it off, edit the global `engineering.yaml` (`~/.pi/agent/engineering.yaml`):
 
 ```yaml
 # ~/.pi/agent/engineering.yaml (global). `cli` is honored only here.
 memory:
   hindsight:
-    enabled: true                 # opt-in; default false
+    enabled: true                 # default true; set false to turn durable memory off
     cli: herdr-memory             # executable to shell out to (global config only)
-    scopes: [project]             # project, global, infra, mission:<id>
+    scopes: [project]             # default [project]; use [project, global] to also share global notes
     timeout_ms: 5000              # per-call CLI timeout, 100..60000
     harness: pi                   # provenance/credential harness name the CLI sees
     failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
     unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
 ```
+
+Memory is shared with Claude, Codex and OpenCode through the same Hindsight server
+and scopes, but each of those harnesses must be wired once with
+`herdr-eng memory install` before its notes reach Pi. If the CLI is absent or has
+no credential, Pi starts normally and shows at most one notice per session.
 
 Ranges, defaults and the repo-level rules are in
 [docs/usage.md](docs/usage.md#turning-the-connection-on-anywhere-pi-is-installed-no-code-edits).
@@ -151,7 +156,7 @@ design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits and
 verification boundaries; the HTTP transport described there has since been
 retired in favour of the CLI, and the durable kinds below no longer accept it.
 
-### Blackhole session memory (optional, off by default)
+### Blackhole session memory (optional)
 
 `pi-blackhole` can act as an **optional per-session memory/context provider** (pinned to
 version **0.5.4**). It is fully backward compatible: when omitted or disabled the runtime

@@ -257,7 +257,7 @@ export interface EngineeringPolicy {
   execution: ExecutionConfig;
   /** Mission time limits (opt-in caps + the hung-worker window). */
   limits: MissionLimitsConfig;
-  /** Durable memory (Hindsight over the herdr-memory CLI). YAML only; off by default. */
+  /** Durable memory (Hindsight over the herdr-memory CLI). YAML only; on by default (`enabled: false` turns it off). */
   memory: { hindsight: HindsightSettings };
   /** Dotted keys from the global layer that repository config cannot weaken. */
   mandatory: string[];
@@ -780,8 +780,13 @@ export interface HindsightLoadResult {
  * closed: memory stays off and the issues say which key to fix. Never throws.
  */
 export function loadHindsightSettings(cwd: string, agentDir?: string): HindsightLoadResult {
+  const defaults = (): HindsightSettings => ({
+    ...DEFAULT_HINDSIGHT_SETTINGS,
+    scopes: [...DEFAULT_HINDSIGHT_SETTINGS.scopes],
+  });
+  // Fail closed: invalid configuration turns memory off even though it is on by default.
   const off = (issues: PolicyIssue[]): HindsightLoadResult => ({
-    settings: { ...DEFAULT_HINDSIGHT_SETTINGS, scopes: [...DEFAULT_HINDSIGHT_SETTINGS.scopes] },
+    settings: { ...defaults(), enabled: false },
     issues,
   });
   const issues: PolicyIssue[] = [];
@@ -811,7 +816,7 @@ export function loadHindsightSettings(cwd: string, agentDir?: string): Hindsight
         severity: "warning",
       });
     }
-    let merged: unknown = off([]).settings;
+    let merged: unknown = defaults();
     for (const layer of [globalLayer, repoLayer]) {
       if (layer === undefined || layer === null) continue;
       if (!isPlain(layer)) {

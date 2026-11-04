@@ -18,17 +18,45 @@ function layout(global?: string, repo?: string) {
   return { root, agentDir, cwd, done: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-test("defaults: memory is off with documented defaults", () => {
+test("defaults: memory is on with documented defaults", () => {
   const l = layout();
   try {
     const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
     assert.deepEqual(settings, DEFAULT_HINDSIGHT_SETTINGS);
-    assert.equal(settings.enabled, false);
+    assert.equal(settings.enabled, true);
     assert.equal(settings.cli, "herdr-memory");
     assert.deepEqual(settings.scopes, ["project"]);
     assert.equal(settings.timeout_ms, 5000);
     assert.equal(settings.harness, "pi");
     assert.deepEqual(issues, []);
+    assert.equal(hindsightBlackholeOption(l.cwd, l.agentDir)?.config.enabled, true);
+  } finally {
+    l.done();
+  }
+});
+
+test("explicit enabled: false in YAML turns memory off (global or repository)", () => {
+  const g = layout("memory:\n  hindsight:\n    enabled: false\n");
+  const r = layout(undefined, "memory:\n  hindsight:\n    enabled: false\n");
+  try {
+    for (const l of [g, r]) {
+      const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
+      assert.equal(settings.enabled, false);
+      assert.deepEqual(issues, []);
+      assert.equal(hindsightBlackholeOption(l.cwd, l.agentDir), undefined);
+    }
+  } finally {
+    g.done();
+    r.done();
+  }
+});
+
+test("an invalid value fails closed: memory is off even though it is on by default", () => {
+  const l = layout("memory:\n  hindsight:\n    timeout_ms: 1\n");
+  try {
+    const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
+    assert.equal(settings.enabled, false);
+    assert.ok(issues.some((i) => i.path === "memory.hindsight.timeout_ms" && i.severity === "error"));
     assert.equal(hindsightBlackholeOption(l.cwd, l.agentDir), undefined);
   } finally {
     l.done();
