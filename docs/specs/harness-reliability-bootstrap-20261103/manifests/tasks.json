@@ -924,7 +924,7 @@
       "dependsOn": [
         "R08"
       ],
-      "mode": "read-only",
+      "mode": "herdr-ui",
       "maxChangedLines": 120,
       "maxProductionFiles": 2,
       "maxTestFiles": 2,
@@ -948,7 +948,7 @@
       "dependsOn": [
         "H01"
       ],
-      "mode": "isolated-change",
+      "mode": "herdr-ui",
       "maxChangedLines": 120,
       "maxProductionFiles": 2,
       "maxTestFiles": 2,
@@ -972,7 +972,7 @@
       "dependsOn": [
         "H02"
       ],
-      "mode": "isolated-change",
+      "mode": "herdr-ui",
       "maxChangedLines": 120,
       "maxProductionFiles": 2,
       "maxTestFiles": 2,
@@ -996,7 +996,7 @@
       "dependsOn": [
         "H03"
       ],
-      "mode": "isolated-change",
+      "mode": "herdr-ui",
       "maxChangedLines": 120,
       "maxProductionFiles": 2,
       "maxTestFiles": 2,
@@ -1020,7 +1020,7 @@
       "dependsOn": [
         "H04"
       ],
-      "mode": "isolated-change",
+      "mode": "herdr-ui",
       "maxChangedLines": 120,
       "maxProductionFiles": 2,
       "maxTestFiles": 2,
@@ -1044,7 +1044,7 @@
       "dependsOn": [
         "H05"
       ],
-      "mode": "isolated-change",
+      "mode": "herdr-ui",
       "maxChangedLines": 120,
       "maxProductionFiles": 2,
       "maxTestFiles": 2,
@@ -1068,7 +1068,7 @@
       "dependsOn": [
         "H06"
       ],
-      "mode": "isolated-change",
+      "mode": "herdr-ui",
       "maxChangedLines": 120,
       "maxProductionFiles": 2,
       "maxTestFiles": 2,

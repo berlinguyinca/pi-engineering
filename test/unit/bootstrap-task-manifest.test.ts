@@ -24,8 +24,23 @@ test("B01: invalid fixtures are rejected with deterministic, sorted, deduplicate
     [{ ...VALID, limits: { ...DEFAULT_LIMITS, maxTestFiles: 3 } }, "limits.maxTestFiles: 3 exceeds bootstrap ceiling 2"],
     [{ ...VALID, limits: { ...DEFAULT_LIMITS, maxDocs: 1 } }, "unknown field: limits.maxDocs"],
     [{ ...VALID, parentHandoffHash: "sha256:deadbeef" }, "parentHandoffHash: expected null or sha256:<64 hex>"],
-    [{ ...VALID, mode: "yolo" }, "mode: expected one of read-only, isolated-change"],
+    [{ ...VALID, mode: "yolo" }, "mode: expected one of read-only, isolated-change, herdr-ui"],
   ];
   for (const [fixture, expected] of cases) assert.ok(reject(fixture).includes(expected), `expected a rejection containing "${expected}"`);
   assert.deepEqual(reject({ ...VALID, zzzUnknown: 1, aaaUnknown: 2 }), ["unknown field: aaaUnknown", "unknown field: zzzUnknown"]);
+});
+// FIX-4B: the line ceiling is mode-aware (03-TEST-AND-RELEASE-GATES.md rule 3); the 2-file caps are not.
+test("FIX-4B: herdr-ui is accepted as a mode with a 120-line ceiling", () => {
+  const ui = { ...VALID, mode: "herdr-ui", limits: { maxProductionFiles: 2, maxTestFiles: 2, maxChangedLines: 120 } };
+  assert.equal(accept(ui).mode, "herdr-ui");
+  assert.ok(reject({ ...ui, limits: { ...ui.limits, maxChangedLines: 121 } }).includes("limits.maxChangedLines: 121 exceeds bootstrap ceiling 120 for mode herdr-ui"));
+});
+test("FIX-4B: 120 changed lines is rejected against the 100 ceiling for every non-herdr-ui mode", () => {
+  for (const mode of ["isolated-change", "read-only"]) assert.ok(reject({ ...VALID, mode, limits: { ...DEFAULT_LIMITS, maxChangedLines: 120 } }).includes(`limits.maxChangedLines: 120 exceeds bootstrap ceiling 100 for mode ${mode}`), mode);
+});
+test("FIX-4B: an unknown mode is still rejected and herdr-ui keeps the 2-file caps", () => {
+  const uiLimits = { maxProductionFiles: 2, maxTestFiles: 2, maxChangedLines: 120 };
+  assert.ok(reject({ ...VALID, mode: "herdr" }).includes("mode: expected one of read-only, isolated-change, herdr-ui"));
+  assert.ok(reject({ ...VALID, mode: "herdr-ui", limits: { ...uiLimits, maxProductionFiles: 3 } }).includes("limits.maxProductionFiles: 3 exceeds bootstrap ceiling 2"));
+  assert.ok(reject({ ...VALID, mode: "herdr-ui", limits: { ...uiLimits, maxTestFiles: 3 } }).includes("limits.maxTestFiles: 3 exceeds bootstrap ceiling 2"));
 });
