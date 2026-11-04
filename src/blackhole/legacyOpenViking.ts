@@ -59,7 +59,7 @@ export function warnLegacyOpenViking(
     emit({
       level: "warning",
       key: "memory:legacy-openviking",
-      text: "Memory: OpenViking is retired and its saved settings are ignored; memory is now Hindsight-only. Install the herdr-memory CLI and set memory.hindsight.enabled: true in engineering.yaml, then run /memory.",
+      text: "Memory: OpenViking is retired and its saved settings are ignored; memory is now Hindsight-only. Memory is on by default: install the herdr-memory CLI (herdr-eng memory install), then run /memory.",
     });
   } catch {
     /* a warning must never fail startup */

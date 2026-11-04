@@ -12,6 +12,7 @@ import {
   HindsightDurableMemory,
   HindsightError,
   connectionFromSettings,
+  redactQuery,
 } from "./hindsight.ts";
 import type { HindsightSettings } from "./hindsightSettings.ts";
 import { warnLegacyMemoryEnv, warnLegacyOpenViking } from "./legacyOpenViking.ts";
@@ -23,7 +24,7 @@ type MemoryConfig = HindsightConnectionConfig & {
   unavailableBackoffMs: number;
 };
 
-/** Opt-in only: null keeps memory off. It never resolves to a silent in-process store. */
+/** Null when memory is switched off. It never resolves to a silent in-process store. */
 function resolveMemoryConfig(settings: HindsightSettings | null): MemoryConfig | null {
   const h = settings ? connectionFromSettings(settings) : null;
   if (!settings || !h) return null;
@@ -88,15 +89,10 @@ function firstNoticeToday(dir: string, identity: string): boolean {
 }
 
 function queryTokens(prompt: string): string[] {
+  // Redact BEFORE lowercasing (secret patterns are case-sensitive); tokens that were secrets are dropped.
+  const safe = (redactQuery(prompt.slice(0, 4096)) ?? "").replace(/\[REDACTED\]/g, " ");
   return [
-    ...new Set(
-      (
-        prompt
-          .slice(0, 4096)
-          .toLowerCase()
-          .match(/[\p{L}\p{N}_-]{3,64}/gu) ?? []
-      ).filter((t) => !STOPWORDS.has(t)),
-    ),
+    ...new Set((safe.toLowerCase().match(/[\p{L}\p{N}_-]{3,64}/gu) ?? []).filter((t) => !STOPWORDS.has(t))),
   ].slice(0, 12);
 }
 
@@ -165,6 +161,8 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         scopes: config.scopes,
         timeoutMs: Math.min(config.timeoutMs, 5000),
         harness: config.harness,
+        failureBackoffMs: config.failureBackoffMs,
+        unavailableBackoffMs: config.unavailableBackoffMs,
       }));
   const now = options.now ?? Date.now;
   let generation = 0;
@@ -211,7 +209,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const failure = (ctx: ExtensionContext, code: string, description: string, explicit = false) => {
     recalled = "";
     setStatus(ctx, description);
-    const text = `${description}. Run /memory to check; memory is enabled with memory.hindsight.enabled in engineering.yaml.`;
+    const text = `${description}. Run /memory to check; set memory.hindsight.enabled: false in engineering.yaml to turn memory off.`;
     if (!ctx.hasUI && !explicit) {
       // Headless (pi -p): an automatic status line is not part of the answer.
       // Writing it into the transcript polluted every print-mode session, so
@@ -264,7 +262,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           ctx,
           errors.length
             ? `Memory is off because engineering.yaml has invalid settings: ${errors.map((i) => `${i.path} (${i.message})`).join("; ")}. Fix them, then run /memory.`
-            : "Memory is off. Set memory.hindsight.enabled: true in engineering.yaml (the herdr-memory CLI), then run /memory.",
+            : "Memory is off (memory.hindsight.enabled is false in engineering.yaml). Set it to true to turn memory back on, then run /memory.",
           true,
         );
       }
@@ -468,7 +466,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     recalls.delete(cacheKey);
     setStatus(ctx, "checking");
     try {
-      const records = await automatic(conn.client.search(query));
+      const records = await automatic(conn.client.search(query, { deadlineMs: AUTOMATIC_LOOKUP_MS }));
       if (!current(id, conn.identity) || epoch !== automaticLookupEpoch) return;
       const block = memoryBlock(records, terms, conn.client.kind === "hindsight");
       // Re-key after the call: observed revisions are part of the scope.

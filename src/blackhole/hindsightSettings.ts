@@ -6,11 +6,14 @@
  * variables. Pure module: it must not import `lifecycle/policy.ts`, which
  * embeds these defaults in `DEFAULT_POLICY`.
  *
+ * Durable memory is ON by default so what other harnesses remember (Claude,
+ * Codex, OpenCode via `herdr-eng memory install`) is recalled in Pi. When the
+ * CLI is absent or has no credential Pi degrades quietly (see interactiveMemory).
  * The herdr-memory CLI owns every credential. Nothing secret belongs here.
  */
 
 export interface HindsightSettings {
-  /** Opt-in. Memory is off unless this is true. */
+  /** On by default. Set false to turn durable memory off. */
   enabled: boolean;
   /** Executable to shell out to (global config only; a repository cannot choose it). */
   cli: string;
@@ -36,7 +39,7 @@ export const HINDSIGHT_SCOPE_RE = /^(project|global|infra|mission:[a-z0-9][a-z0-
 export const HINDSIGHT_HARNESS_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
 export const DEFAULT_HINDSIGHT_SETTINGS: HindsightSettings = {
-  enabled: false,
+  enabled: true,
   cli: "herdr-memory",
   scopes: ["project"],
   timeout_ms: 5000,

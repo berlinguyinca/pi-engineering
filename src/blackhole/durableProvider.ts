@@ -43,7 +43,7 @@ export interface DurableMemoryProvider {
   store(record: DurableMemoryRecord): Promise<void>;
   recallAll(): Promise<DurableMemoryRecord[]>;
   /** Search promoted durable memory (simple substring match by default). */
-  search(query: string): Promise<DurableMemoryRecord[]>;
+  search(query: string, opts?: { deadlineMs?: number }): Promise<DurableMemoryRecord[]>;
   /** Optional: store with an explicit outcome (never "persisted" unless acknowledged). */
   retain?(record: DurableMemoryRecord): Promise<RetainResult>;
   /** Optional: stable cache-key component (scopes + revision epoch) for recall caching. */

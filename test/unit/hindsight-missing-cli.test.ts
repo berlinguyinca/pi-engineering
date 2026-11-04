@@ -118,7 +118,7 @@ test("legacy OpenViking config: warns once on presence, silent otherwise, never 
     );
     assert.equal(viaEnv.length, 1);
     assert.match(viaEnv[0]!.text, /Hindsight/);
-    assert.match(viaEnv[0]!.text, /memory\.hindsight\.enabled/);
+    assert.match(viaEnv[0]!.text, /herdr-eng memory install/);
     assert.doesNotMatch(viaEnv[0]!.text, /PI_HINDSIGHT_ENABLED=1/);
     assert.doesNotMatch(JSON.stringify(viaEnv), /secret-host/);
 
@@ -175,13 +175,111 @@ test("set PI_HINDSIGHT_* env vars do not enable memory (YAML only)", async () =>
   const h = harness(true);
   const saved = { ...process.env };
   try {
-    writeFileSync(join(h.dir, "engineering.yaml"), "");
+    writeFileSync(join(h.dir, "engineering.yaml"), "memory:\n  hindsight:\n    enabled: false\n");
     process.env.PI_HINDSIGHT_ENABLED = "1";
     process.env.PI_HINDSIGHT_CLI = CLI;
     await h.commands.get("memory").handler("", h.ctx);
     assert.match(h.notices.join("\n"), /Memory is off/);
   } finally {
     process.env = saved;
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+/** Default settings (no YAML at all) with the real provider pointed at a CLI path that does not exist. */
+function defaultHarness(hasUI: boolean) {
+  const events = new Map<string, any>();
+  const statuses: string[] = [];
+  const notices: string[] = [];
+  const pi = {
+    registerCommand: () => {},
+    on: (n: string, f: any) => events.set(n, f),
+    sendMessage: (m: any) => notices.push(m.content),
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd: "/tmp/p",
+    hasUI,
+    ui: { setStatus: (_k: string, t?: string) => statuses.push(t ?? ""), notify: (t: string) => notices.push(t) },
+  } as unknown as ExtensionCommandContext;
+  const dir = mkdtempSync(join(tmpdir(), "hs-default-"));
+  let clock = 1_000_000;
+  const providers: string[] = [];
+  registerInteractiveMemory(pi, {
+    env: () => ({ PI_CODING_AGENT_DIR: dir, PI_ENGINEERING_STATE_DIR: dir }),
+    headlessNoticeDir: join(dir, "n"),
+    now: () => clock,
+    // The only override: the default executable name is swapped for a path that cannot exist.
+    provider: (config) => {
+      providers.push(config.cli);
+      return new HindsightDurableMemory({
+        cli: CLI,
+        scopes: config.scopes,
+        timeoutMs: config.timeoutMs,
+        harness: config.harness,
+      });
+    },
+  });
+  return {
+    events,
+    statuses,
+    notices,
+    ctx,
+    dir,
+    providers,
+    advance: (ms: number) => {
+      clock += ms;
+    },
+  };
+}
+
+test("default settings, CLI unreachable: starts, shows at most one notice, never spams per turn", async () => {
+  const h = defaultHarness(true);
+  try {
+    const started = Date.now();
+    await h.events.get("session_start")({}, h.ctx);
+    for (let i = 0; i < 4; i++) {
+      await h.events.get("before_agent_start")({ prompt: "metric units please" }, h.ctx);
+    }
+    // Past the unavailable backoff the retry fails again: same failure class, still no second notice.
+    h.advance(400_000);
+    await h.events.get("before_agent_start")({ prompt: "metric units again" }, h.ctx);
+    assert.ok(Date.now() - started < 5000, "no hang beyond the automatic lookup cap");
+    assert.equal(h.providers[0], "herdr-memory", "default settings (no YAML) enable memory with the default CLI name");
+    assert.equal(h.notices.length, 1);
+    assert.match(h.notices[0]!, /unavailable/);
+    assert.match(h.notices[0]!, /enabled: false/);
+    assert.ok(h.statuses.some((t) => /unavailable/.test(t)));
+  } finally {
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test("default settings, CLI unreachable, headless: one telemetry warning, no transcript message", async () => {
+  const h = defaultHarness(false);
+  const seen: TelemetryNotice[] = [];
+  setTelemetrySink((n) => seen.push(n));
+  try {
+    await h.events.get("session_start")({}, h.ctx);
+    await h.events.get("before_agent_start")({ prompt: "metric units please" }, h.ctx);
+    await h.events.get("before_agent_start")({ prompt: "metric units again" }, h.ctx);
+  } finally {
+    resetTelemetrySinks();
+    rmSync(h.dir, { recursive: true, force: true });
+  }
+  assert.equal(seen.filter((n) => n.key === "memory:unavailable").length, 1);
+  assert.deepEqual(h.notices, []);
+});
+
+test("explicit enabled: false in YAML makes no provider call and reports off", async () => {
+  const h = defaultHarness(true);
+  try {
+    writeFileSync(join(h.dir, "engineering.yaml"), "memory:\n  hindsight:\n    enabled: false\n");
+    await h.events.get("session_start")({}, h.ctx);
+    await h.events.get("before_agent_start")({ prompt: "metric units please" }, h.ctx);
+    assert.deepEqual(h.providers, []);
+    assert.deepEqual(h.notices, []);
+    assert.equal(h.statuses.at(-1), "Memory: off");
+  } finally {
     rmSync(h.dir, { recursive: true, force: true });
   }
 });

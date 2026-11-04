@@ -166,7 +166,7 @@ test("owner report: a /model switch moves the out-of-capacity mission and it com
   );
   writeFileSync(
     join(agentDir, "engineering.yaml"),
-    `routing:\n  roles:\n    implementer:\n      model: gw/${GLM}\n    reviewer:\n      model: gw/${QWEN}\n`,
+    `memory:\n  hindsight:\n    enabled: false\nrouting:\n  roles:\n    implementer:\n      model: gw/${GLM}\n    reviewer:\n      model: gw/${QWEN}\n`,
   );
   const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;

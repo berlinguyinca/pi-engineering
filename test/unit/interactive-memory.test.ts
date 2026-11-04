@@ -24,7 +24,7 @@ function fixture(
   const statuses: string[] = [];
   const notices: Array<{ text: string; type: string }> = [];
   const sent: any[] = [];
-  // Hindsight is the only durable backend and it is opt-in: `memory.hindsight` in
+  // Hindsight is the only durable backend and it is on by default: `memory.hindsight` in
   // the global engineering.yaml is the whole configuration, and the herdr-memory
   // CLI holds its own credentials.
   const agentDir = mkdtempSync(join(tmpdir(), "im-agent-"));
@@ -33,7 +33,9 @@ function fixture(
       join(agentDir, "engineering.yaml"),
       `memory:\n  hindsight:\n    enabled: true\n    cli: ${JSON.stringify(options.cli ?? "herdr-memory")}\n    scopes: ${JSON.stringify(scopes)}\n${extra}`,
     );
+  // Memory is on by default, so "not configured" states the opt-out explicitly.
   if (options.configured !== false) writeConfig(["project"]);
+  else writeFileSync(join(agentDir, "engineering.yaml"), "memory:\n  hindsight:\n    enabled: false\n");
   const env: Record<string, string | undefined> = { PI_CODING_AGENT_DIR: agentDir };
   if (options.stateDir) env.PI_ENGINEERING_STATE_DIR = options.stateDir;
   const store = new InMemoryDurableMemory();
