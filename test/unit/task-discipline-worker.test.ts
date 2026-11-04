@@ -4,7 +4,7 @@
  * narrowing, never the parent's own — and the gate is loaded into its session.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -19,6 +19,7 @@ import {
   workerSessionGate,
   workerTaskId,
 } from "../../src/taskDiscipline/worker.ts";
+import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 
 function fixture(parentOver: Record<string, unknown> = {}) {
   const base = realpathSync(mkdtempSync(join(tmpdir(), "tdw-")));
@@ -147,9 +148,9 @@ test("the worker session loads only the gate, and it enforces the narrowed scope
     handlers[0]!({ toolName, toolCallId: "tc", input } as never, { cwd: f.worktree } as never) as
       | { block?: boolean; reason?: string }
       | undefined;
-  const escape = call("read", { path: join(f.outside, "secret.txt") });
-  assert.equal(escape?.block, true);
-  assert.match(escape?.reason ?? "", /outside the permitted read roots/);
+  const escapeRead = call("read", { path: join(f.outside, "secret.txt") });
+  assert.equal(escapeRead?.block, true);
+  assert.match(escapeRead?.reason ?? "", /outside the permitted read roots/);
   assert.equal(call("read", { path: join(f.repo, "peaks.py") }), undefined);
 });
 
@@ -177,4 +178,68 @@ test("workerSessionGate: off in an ungated parent, narrowed contract when gated"
     (err: unknown) => err instanceof WorkerScopeError,
   );
   assert.equal(await workerSessionGate(worker(f.worktree), f.agentDir, {} as NodeJS.ProcessEnv), undefined);
+});
+
+// The acceptance sentence for slice 1 of #563: "a worker spawned by the
+// scheduler provably cannot write outside the narrowed root, with a test that
+// fails if the parent's contract file is inherited". The parent may write its
+// whole repository; the worker may write only the worktree the scheduler gave
+// it — so a write to a path the PARENT could write is the case that would pass
+// under inheritance and must fail under narrowing.
+test("a worker cannot write where only its parent may write", async () => {
+  const f = fixture();
+  const child = childContractForWorker(f.parent, worker(f.worktree));
+  assert.deepEqual(f.parent.writeRoots, [f.repo]);
+  assert.deepEqual(child.writeRoots, [f.worktree]);
+  const file = materializeWorkerContract(child, workerContractFile(f.state, f.worktree, "worker:implementer:abc"));
+  const result = await workerGateExtensions(file, { mode: "enforce_all" }, [f.parentFile], f.worktree, f.agentDir);
+  assert.deepEqual(result.errors, []);
+  const handlers = result.extensions[0]!.handlers.get("tool_call")!;
+  const call = (toolName: string, input: unknown) =>
+    handlers[0]!({ toolName, toolCallId: "tc", input } as never, { cwd: f.worktree } as never) as
+      | { block?: boolean; reason?: string }
+      | undefined;
+  assert.equal(
+    call("write", { path: join(f.worktree, "peak.py"), content: "x\n" }),
+    undefined,
+    "its worktree is writable",
+  );
+  const escapeWrite = call("write", { path: join(f.repo, "peaks.py"), content: "boom\n" });
+  assert.equal(escapeWrite?.block, true, "a path inside the parent's write roots is not writable by the worker");
+  assert.match(escapeWrite?.reason ?? "", /write\.outside_roots/);
+  assert.equal(readFileSync(join(f.repo, "peaks.py"), "utf8"), "x = 1\n", "the file was never touched");
+  // And the gate the worker session loaded is the child's file, not the parent's.
+  assert.notEqual(file, f.parentFile);
+  assert.match(readFileSync(file, "utf8"), /"parentTaskId": "peak-picking"/);
+});
+
+test("PiWorkerExecutor refuses an out-of-scope worker before any model call", async () => {
+  const f = fixture();
+  const envKeys = ["PI_TASK_DISCIPLINE", "PI_TASK_CONTRACT_FILE", "PI_TASK_DISCIPLINE_LOG", "PI_ENGINEERING_STATE_DIR"];
+  const saved = envKeys.map((k) => [k, process.env[k]] as const);
+  try {
+    process.env.PI_TASK_DISCIPLINE = "enforce_all";
+    process.env.PI_TASK_CONTRACT_FILE = f.parentFile;
+    process.env.PI_TASK_DISCIPLINE_LOG = f.log;
+    process.env.PI_ENGINEERING_STATE_DIR = f.state;
+    const executor = new PiWorkerExecutor({ agentDir: f.agentDir, allowModelNetwork: false });
+    // The worker's cwd is outside the parent's write roots: narrowing cannot
+    // express it, so the run fails here rather than running ungated. No model
+    // runtime is created, so this also proves the gate runs before any call.
+    const run = await executor.run({ role: "implementer", task: "touch a file", tools: [], cwd: f.outside });
+    assert.equal(run.error, "task-scope-refused");
+    assert.match(run.result.summary, /Task contract narrowing refused this worker/);
+    assert.equal(existsSync(join(f.state, "task-discipline")), false, "no child contract was published for a refusal");
+    // A worker inside the parent's write scope is not refused (it gets a child
+    // contract); prove the refusal above was about scope, not about the setup.
+    const gated = await workerSessionGate(worker(f.worktree), f.agentDir);
+    assert.ok(gated);
+    assert.ok(existsSync(gated.file), "the in-scope worker's child contract was published");
+    assert.notEqual(gated.file, f.parentFile);
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });
