@@ -12,6 +12,7 @@ import {
   HindsightError,
   resolveHindsightFromEnv,
 } from "./hindsight.ts";
+import { warnLegacyOpenViking } from "./legacyOpenViking.ts";
 
 /** Durable memory backend: the opt-in Hindsight provider over the herdr-memory CLI. */
 type MemoryConfig = HindsightEnvConfig & { identity: string };
@@ -128,6 +129,7 @@ function memoryBlock(
 
 /** Interactive-only registration: never include these hooks in worker resource loaders. */
 export function registerInteractiveMemory(pi: ExtensionAPI, options: InteractiveMemoryOptions = {}): void {
+  warnLegacyOpenViking(options.env ? options.env() : process.env);
   const environment = options.env ?? (() => ({ ...process.env }));
   const makeProvider: (config: MemoryConfig) => DurableMemoryProvider =
     options.provider ??
@@ -266,17 +268,18 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     const epoch = automaticLookupEpoch;
     setStatus(ctx, "checking");
     try {
-      const request = conn.client.recallAll();
-      const records = await (explicit ? request : automatic(request));
+      // Strict probe when the provider has one: best-effort recallAll swallows a missing CLI as "0 saved".
+      const request = conn.client.probe ? conn.client.probe() : conn.client.recallAll().then((r) => r.length);
+      const saved = await (explicit ? request : automatic(request));
       if (!current(id, conn.identity) || (!explicit && epoch !== automaticLookupEpoch)) return;
       lastFailure = "";
       retryAfter = 0;
       if (explicit) clearRecall();
-      setStatus(ctx, `ready · ${records.length} saved`);
+      setStatus(ctx, `ready · ${saved} saved`);
       if (explicit)
         reply(
           ctx,
-          `Memory connection verified: ${records.length} saved note(s). /remember <text> saves an explicit note; /memory <query> searches.`,
+          `Memory connection verified: ${saved} saved note(s). /remember <text> saves an explicit note; /memory <query> searches.`,
         );
     } catch (error) {
       if (current(id, conn.identity) && (explicit || epoch === automaticLookupEpoch)) handleError(ctx, error, explicit);
@@ -321,7 +324,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
             // status stuck on "saving", which reads as a save still in flight.
             // Route it through the same path a throw takes, so the status, the
             // reply and the backoff all name what happened.
-            throw new HindsightError("rejected");
+            throw new HindsightError(
+              (["unavailable", "timeout", "exit", "response"] as const).find((c) => c === result.error) ?? "rejected",
+            );
           }
         } else {
           await conn.client.store(record);

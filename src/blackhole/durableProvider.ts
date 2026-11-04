@@ -34,6 +34,8 @@ export interface RetainResult {
   memoryId?: string;
   bankId?: string;
   revision?: number;
+  /** Why a rejected outcome happened when it was a transport failure (e.g. "unavailable"), not a policy refusal. */
+  error?: string;
 }
 
 export interface DurableMemoryProvider {
@@ -46,6 +48,8 @@ export interface DurableMemoryProvider {
   retain?(record: DurableMemoryRecord): Promise<RetainResult>;
   /** Optional: stable cache-key component (scopes + revision epoch) for recall caching. */
   cacheScope?(): string;
+  /** Optional strict health probe: resolves to the saved count, rethrows transport failures (unlike best-effort reads). */
+  probe?(): Promise<number>;
 }
 
 /** Dependency-free in-memory durable store (default provider). */

@@ -7,7 +7,8 @@
 # EXTERNAL tools are NOT built here; they plug in beside these services:
 #   - Pi Web        : external operator UI; point it at the control API below.
 #   - Plannotator   : external plan gate; run its own container near the plane.
-#   - OpenViking    : external shared durable memory (viking.example.com).
+#   - Hindsight     : external durable memory, reached via the herdr-memory CLI on the
+#                     worker host (OpenViking was retired); no service here depends on it.
 #   - InferWeave    : external inference placement/seats.
 #
 # Docker-first surrounding stack; remote workers connect OUTBOUND (no public
