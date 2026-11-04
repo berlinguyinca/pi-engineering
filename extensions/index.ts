@@ -164,6 +164,7 @@ import { makeVisionLineageHook } from "../src/visionDelegation/lineage.ts";
 import { VisionRegistry } from "../src/visionDelegation/registry.ts";
 import { LedgerWorkProjection } from "../src/work/ledgerProjection.ts";
 import { projectLegacyMissions } from "../src/work/legacyMissionAdapter.ts";
+import { ledgerLinkedPrs } from "../src/work/linkedPrs.ts";
 import { getSessionSummary } from "../src/work/sessionSummary.ts";
 import { StatusRowRefresher } from "../src/work/statusRowRefresher.ts";
 import { formatWorkStatus } from "../src/work/statusText.ts";
@@ -2913,7 +2914,12 @@ ${RECOVERY_PROMPT}`;
       const rt = await getRuntime(ctx);
       const sessionId = String(args ?? "").trim();
       if (sessionId) {
-        ctx.ui.notify(formatSessionSummary(getSessionSummary(workGraphOf(rt), sessionId)), "info");
+        ctx.ui.notify(
+          formatSessionSummary(
+            getSessionSummary(workGraphOf(rt), sessionId, { linkedPrs: ledgerLinkedPrs(rt.ledger) }),
+          ),
+          "info",
+        );
         return;
       }
       ctx.ui.notify(formatWorkSummary(workGraphOf(rt), rt.ledger.events()), "info");
