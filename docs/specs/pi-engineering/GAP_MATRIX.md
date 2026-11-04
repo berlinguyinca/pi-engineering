@@ -3,6 +3,9 @@
 **Spec package:** `pi-engineering-implementation-spec-2026-09-15-v3`
 **Revision date:** 2026-09-15
 **Target repository:** `pi-engineering-runtime` (the local `pi-engineering` integration/policy harness)
+**Amended files:** [AMENDMENTS.md](AMENDMENTS.md) - two pack files deviate from `MANIFEST.json`
+because the durable-memory transport named in section 07 is retired; the role is filled by
+**Hindsight through the `herdr-memory` CLI**. Requirements and classifications below are unchanged.
 
 ## Classification legend
 
