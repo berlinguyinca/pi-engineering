@@ -1497,10 +1497,19 @@ the backing store for shared durable memory (default `memory` = single process):
 // Several workers on one host / CI share promoted memory via an append-only JSONL file.
 blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/shared/durable.jsonl" } } }
 
-// Cross-machine sharing via the Hindsight (herdr-memory) service; durable
-// memory lives in the `{project}-facts` bank (project defaults to "pi").
-blackhole: { config: { enabled: true, durable: { kind: "hindsight", baseUrl: "https://memory.example", token, project: "pi" } } }
+// Cross-machine sharing through the Hindsight (herdr-memory) client. Pi names only
+// the executable: the client owns its endpoint, token and project profile, and
+// durable memory lives in the `{project}-facts` bank.
+blackhole: { config: { enabled: true, durable: { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] } } }
 ```
+
+Any other `kind` — including `openviking`, which was the shared store before
+Hindsight — is refused at config resolution rather than accepted and served by
+the in-process default, because silently stopping sharing is worse than
+refusing to start. A `hindsight` entry that still names the retired HTTP adapter
+(`baseUrl`, `token`, `project`, `bank`) is refused too: Pi no longer holds those,
+the client does (`herdr-memory setup`, and the bank keeps the data promoted while
+the old adapter was in use).
 
 Each `runWorker` hydrates its context from shared durable memory on run, so a
 later/other worker consumes knowledge promoted by any earlier worker (spec:

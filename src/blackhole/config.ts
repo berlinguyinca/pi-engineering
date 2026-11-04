@@ -27,6 +27,15 @@ export interface PartialBlackholeConfig {
   providerTimeoutMs?: number;
 }
 
+/**
+ * Every `durable.kind` `buildDurableProvider` can build. A kind outside this set
+ * must be refused at config resolution: `buildDurableProvider`'s default branch
+ * returns an in-process provider, so an unknown or retired kind (e.g. the
+ * `openviking` value configs carried before Hindsight became the durable backend)
+ * would silently stop sharing memory across sessions instead of failing.
+ */
+export const DURABLE_KINDS = ["memory", "shared-file", "hindsight"] as const;
+
 const DEFAULTS: Omit<BlackholeConfig, "version"> & { version: string } = {
   enabled: false,
   version: PINNED_BLACKHOLE_VERSION,
@@ -78,6 +87,14 @@ export function resolveBlackholeConfig(input?: PartialBlackholeConfig): ConfigRe
   if (durable.kind === "hindsight") {
     // Pi reaches Hindsight only through the herdr-memory client, so the config
     // names an executable and scopes — never a URL, token or bank.
+    const legacy = (["baseUrl", "token", "project", "bank"] as const).filter(
+      (key) => (durable as unknown as Record<string, unknown>)[key] !== undefined,
+    );
+    if (legacy.length) {
+      throw new Error(
+        `durable.kind='hindsight' no longer takes ${legacy.join(", ")}: Pi reaches Hindsight through the herdr-memory client, which owns its endpoint, token and project profile (\`herdr-memory setup\`); Pi configures only \`cli\`, \`scopes\` and \`timeoutMs\`.`,
+      );
+    }
     if (durable.cli !== undefined && !durable.cli.trim()) {
       throw new Error("durable.kind='hindsight' requires a non-empty `cli` executable when set");
     }
@@ -91,6 +108,11 @@ export function resolveBlackholeConfig(input?: PartialBlackholeConfig): ConfigRe
     if (durable.timeoutMs !== undefined && (!Number.isFinite(durable.timeoutMs) || durable.timeoutMs < 1)) {
       throw new Error("durable.kind='hindsight' timeoutMs must be >= 1");
     }
+  }
+  if (!(DURABLE_KINDS as readonly string[]).includes(durable.kind)) {
+    throw new Error(
+      `durable.kind='${String(durable.kind)}' is not supported; known kinds: ${DURABLE_KINDS.join(", ")}. Refusing to continue, because an unsupported kind would fall back to in-process memory and silently stop sharing durable memory.`,
+    );
   }
   const providerTimeoutMs = input?.providerTimeoutMs ?? DEFAULTS.providerTimeoutMs;
   if (providerTimeoutMs < 1) {
