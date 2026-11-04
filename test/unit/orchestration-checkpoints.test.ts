@@ -403,7 +403,7 @@ describe("CheckpointManager handoff context", () => {
           { ref: "unit", outcome: "passed" },
           { ref: "e2e", outcome: "failed" },
         ],
-        memoryRefs: ["viking://project/notes/1"],
+        memoryRefs: ["hindsight://project/notes/1"],
         untracked: [{ path: "scratch/plot.py", sha256: sha }],
       },
     });
@@ -476,11 +476,11 @@ describe("CheckpointManager handoff context", () => {
     const checkpoint = await new CheckpointManager({ store }).persist({
       taskId: task.task_id,
       executionId: execution.execution_id,
-      handoff: { memoryRefs: ["viking://a"] },
+      handoff: { memoryRefs: ["hindsight://a"] },
     });
-    checkpoint.handoff?.memoryRefs.push("viking://tampered");
+    checkpoint.handoff?.memoryRefs.push("hindsight://tampered");
     const again = store.listTaskCheckpoints(execution.mission_id, task.task_id).at(-1);
-    assert.deepEqual(again?.handoff?.memoryRefs, ["viking://a"]);
+    assert.deepEqual(again?.handoff?.memoryRefs, ["hindsight://a"]);
   });
 });
 
@@ -493,12 +493,12 @@ describe("CheckpointManager handoff context bounds", () => {
       last = await mgr.persist({
         taskId: task.task_id,
         executionId: execution.execution_id,
-        handoff: { memoryRefs: [`viking://m/${i}`], decisions: [{ id: `D${i}`, summary: "s", rationale: "r" }] },
+        handoff: { memoryRefs: [`hindsight://m/${i}`], decisions: [{ id: `D${i}`, summary: "s", rationale: "r" }] },
       });
     }
     assert.equal(last.handoff?.memoryRefs.length, 50);
-    assert.equal(last.handoff?.memoryRefs[0], "viking://m/2");
-    assert.equal(last.handoff?.memoryRefs.at(-1), "viking://m/51");
+    assert.equal(last.handoff?.memoryRefs[0], "hindsight://m/2");
+    assert.equal(last.handoff?.memoryRefs.at(-1), "hindsight://m/51");
     assert.equal(last.handoff?.decisions.length, 50);
     assert.equal(last.handoff?.decisions.at(-1)?.id, "D51");
   });

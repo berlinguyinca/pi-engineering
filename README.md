@@ -80,21 +80,25 @@ pi install /absolute/path/to/pi-engineering-runtime
 | `/context`        | Show context budget, sources, and worker usage                 |
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository |
 | `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (disabled by default) |
-| `/remember <text>` | Explicitly save a private Viking note (up to 4,000 characters) |
+| `/remember <text>` | Explicitly save a private note through Hindsight (up to 4,000 characters) |
 | `/memory [query]` | Verify the memory connection, or search saved notes |
-| `/memory setup` | Configure or change the Viking host and access key |
 
 ### Everyday memory
 
-When no Viking connection is configured, interactive Pi offers a setup dialog.
-An existing connection is preserved across updates; use `/memory setup` to
-change it. Existing environment/token-file settings can be kept. Changed credentials are entered
-in a masked field and verified before they are saved. Settings and private key
-files live under `~/.pi/agent/engineering-memory/` (or the active
-`PI_CODING_AGENT_DIR`), outside the extension checkout. Updates preserve them.
-Cancelled setup can be retried with `/memory setup`; headless sessions never
-block for a dialog. The update command itself does not need an interactive
-credential hook: the check runs when Pi next loads the updated extension.
+Interactive memory is opt-in and reaches **Hindsight through the
+`herdr-memory` CLI**. Pi never talks to a memory service itself and holds no
+memory credential: the CLI carries its own configuration and credentials
+(`herdr-memory doctor` checks them), and nothing under `PI_CODING_AGENT_DIR`
+stores a host, token or profile. A leftover OpenViking profile or
+`PI_OPENVIKING_*` variable is detected by existence only — never read — and warns
+once at load. Enable it in the environment:
+
+```text
+export PI_HINDSIGHT_ENABLED=1          # opt-in; anything else leaves memory off
+export PI_HINDSIGHT_CLI=herdr-memory   # the executable to shell out to
+export PI_HINDSIGHT_SCOPES=project     # project,global,infra,mission:<id>
+export PI_HINDSIGHT_TIMEOUT_MS=5000    # per-call CLI timeout
+```
 
 ```text
 /remember Calibration reports should use metric units.
@@ -103,35 +107,39 @@ credential hook: the check runs when Pi next loads the updated extension.
 
 Ordinary chat prompts automatically recall a small set of keyword-matching
 notes. The footer shows `Memory: ready`, match counts, or a specific connection
-failure. `/memory` distinguishes a healthy empty store from a rejected key.
+failure. `/memory` distinguishes a healthy empty store from a CLI that cannot
+answer.
 Automatic recall is ephemeral model context, inserted before the current user
 request; it is not copied into the saved transcript. Only `/remember` writes
 notes—normal conversations are not automatically uploaded or promoted.
 
 Automatic startup recall and per-prompt searches wait at most 250 ms, so a slow
-memory service does not hold up the model turn for seconds. A timed-out lookup
-adds no notes to that turn. Successful searches, including empty results, are
-cached for 60 seconds with at most 32 query entries. Saving a note, a successful
-explicit memory check/search, session replacement, or a changed host/key clears
-the cache. Transient failures pause automatic requests for 60 seconds; rejected
-or forbidden keys pause them for five minutes. `/memory` and `/memory setup`
-remain available during that pause, and changing the host or key retries
-immediately. Explicit commands retain their longer, bounded verification wait.
+`herdr-memory` call does not hold up the model turn for seconds. A timed-out
+lookup adds no notes to that turn. Successful searches, including empty results,
+are cached for 60 seconds with at most 32 query entries. Saving a note, a
+successful explicit memory check/search, session replacement, or a changed
+connection (a different CLI or scope set in the environment) clears the cache.
+A CLI that timed out or exited badly pauses automatic requests for 60 seconds;
+a missing CLI or a refused write pauses them for five minutes, because neither
+fixes itself between turns. `/memory` remains available during that pause, and
+changing the environment retries immediately. Explicit commands retain their
+longer, bounded verification wait.
 Starting another turn does not cancel a pending explicit memory command. A
 completed save/check/search invalidates older automatic lookups; replacing the
 session or connection still fences results from the retired context.
 
-Saving requires a read/write device key. Read-only keys can recall but cannot
-save. Treat saved notes as user-provided reference information, not proof that
-claims were machine-verified. Independent review/challenge workers do not load
+Only a CLI that answers `persisted` is reported as saved; a queued or refused
+write says so instead of claiming success. Treat saved notes as user-provided
+reference information, not proof that claims were machine-verified. Independent review/challenge workers do not load
 these interactive hooks. Existing engineering-worker hydration is preserved.
 
-Confirmed profile settings override old shell host/key defaults. Set
-`PI_OPENVIKING_ENABLED=0` to disable all memory access for a launcher. A token
-file rotation is picked up by subsequent memory operations; changing host/key
-also refreshes the cached engineering runtime on the next engineering command.
-See [the feature design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits
-and verification boundaries.
+Set `PI_HINDSIGHT_ENABLED=0` to keep one launcher memory-free even when the
+variable is set elsewhere. Reads stay fail-open — a memory that cannot be
+recalled costs that turn its notes and nothing else — while writes report the
+outcome they actually got. See [the feature
+design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits and
+verification boundaries; the HTTP transport described there has since been
+retired in favour of the CLI, and the durable kinds below no longer accept it.
 
 ### Blackhole session memory (optional, off by default)
 
@@ -140,8 +148,8 @@ version **0.5.4**). It is fully backward compatible: when omitted or disabled th
 behaves exactly as before (no sessions, no events). When enabled, each worker session gets
 an isolated session-local memory store; prior memory is recalled into worker context for
 context-efficiency; background Observer/Reflector/Dropper workers run at lower priority
-(P3/P4) via the model router + scheduler; and promoted durable memory flows through the
-OpenViking abstraction with an **evidence-gated promotion workflow** (never auto-promoted)
+(P3/P4) via the model router + scheduler; and promoted durable memory flows through the durable-memory abstraction
+(`HindsightDurableMemory`) with an **evidence-gated promotion workflow** (never auto-promoted)
 that emits audit events to the authoritative EventStore.
 
 CLI: `pi-engineering blackhole status|validate|benchmark`. A native-vs-Blackhole A/B
@@ -150,7 +158,10 @@ benchmark generates a report + **12 SVG plots** and preserves raw JSONL/CSV unde
 
 **Sharing memory across workers:** the `durable` config selects the backing store for
 *evidence-promoted* knowledge (`memory` default, `shared-file` for several workers on
-one host / CI, `openviking` for the external cross-machine service). Each worker
+one host / CI, `hindsight` for the `herdr-memory` CLI, which is the only store
+that crosses machines). A kind the runtime no longer implements — `openviking`
+was retired — fails configuration validation instead of silently running
+memoryless. Each worker
 hydrates its context from shared durable memory on run, so promoted knowledge is
 consumed by later/other workers while session-local working memory stays isolated:
 
@@ -777,7 +788,8 @@ src/bench/           engineering benchmark with baseline gate
 src/adapters/        optional AutoSpec/InferWeave seams (empty by default)
 src/telemetry/       deterministic telemetry export for external control planes
 src/blackhole/       optional per-session memory provider (pinned 0.5.4, builtin default)
-src/blackhole/durable.ts  shared durable-memory providers (shared-file, OpenViking HTTP)
+src/blackhole/durableProvider.ts + durable.ts  durable-memory providers (in-memory, shared-file)
+src/blackhole/hindsight.ts  the herdr-memory CLI provider (the only cross-machine store)
 src/benchmark/       native-vs-Blackhole A/B benchmark (report + 12 SVG plots + raw data)
 src/workers/         role prompts + bounded worker_result tool + executors
 src/runtime/         EngineeringRuntime facade (plan/engineer/tournament/review/challenge)

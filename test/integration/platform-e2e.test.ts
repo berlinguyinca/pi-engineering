@@ -6,7 +6,7 @@ import { MemoryOutbox } from "../../src/platform/memoryOutbox.ts";
 import { briefIsIsolated, buildReviewerBrief } from "../../src/platform/review.ts";
 
 describe("platform end-to-end workflow", () => {
-  it("plan -> Plannotator -> workers -> review -> complete -> OpenViking", async () => {
+  it("plan -> Plannotator -> workers -> review -> complete -> durable memory", async () => {
     const platform = new Platform();
     const project = platform.registry.registerProject({
       name: "alpha",

@@ -1482,8 +1482,9 @@ milestones as `IMPLEMENTED`; run `/mission` on a fixture repo by hand and read
 `pi-blackhole` is an **optional** per-session memory/context provider, pinned to
 **0.5.4**. It is disabled by default and backward compatible. When enabled it
 provides session-local memory with strict candidate isolation, recall into worker
-context, evidence-gated promotion through the OpenViking durable-memory
-abstraction (never auto-promoted), and lower-priority background memory workers.
+context, evidence-gated promotion through the durable-memory abstraction
+(`HindsightDurableMemory` for the cross-machine store; never auto-promoted), and
+lower-priority background memory workers.
 
 ```sh
 node scripts/pi-engineering.ts blackhole status        # show manager state
@@ -1507,8 +1508,8 @@ the backing store for shared durable memory (default `memory` = single process):
 // Several workers on one host / CI share promoted memory via an append-only JSONL file.
 blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/shared/durable.jsonl" } } }
 
-// Cross-machine sharing via the external OpenViking service.
-blackhole: { config: { enabled: true, durable: { kind: "openviking", baseUrl: "https://openviking.example", token } } }
+// Cross-machine sharing through the herdr-memory CLI (Hindsight).
+blackhole: { config: { enabled: true, durable: { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] } } }
 ```
 
 Each `runWorker` hydrates its context from shared durable memory on run, so a
@@ -1517,60 +1518,51 @@ later/other worker consumes knowledge promoted by any earlier worker (spec:
 outage degrades hydration to an empty result and never fails the worker.
 `pi-engineering blackhole status` reports the active `durable` kind.
 
-### Running the OpenViking service (tier-1)
+`openviking` is **not** a valid kind any more. The HTTP transport and the
+`services/openviking` service it spoke to were retired, and the `herdr-memory`
+CLI replaced them as the cross-machine store. A configuration that still names
+the retired kind fails validation with a message naming the kinds that work,
+rather than falling back to an in-process store and quietly leaving every worker
+memoryless on a multi-host run.
 
-The `openviking` durable kind points workers at a shared HTTP service. A minimal
-containerized implementation lives at `services/openviking/` — a thin,
-stateless HTTP layer over a PostgreSQL backing store that serves exactly the
-contract `OpenVikingProvider` speaks (POST `/memory`, GET `/memory`,
-`GET /memory/search?q=`). Deploy on a single host (e.g. a lab box):
+### Turning the connection on anywhere pi is installed (no code edits)
 
-```sh
-cd services/openviking
-cp .env.example .env     # set OPENVIKING_TOKEN + POSTGRES_PASSWORD
-# run the service standalone (in-memory, zero deps) for a quick check:
-node src/index.mjs
-# or run the durable Postgres-backed deployment:
-docker compose up -d --build
-```
-
-Because the service is stateless (all memory lives in the Postgres volume), you
-can later move it to AWS/Fly.io and keep the data. See
-`services/openviking/README.md`. The production deployment runs on the lab's
-your-host server as an Apptainer container behind an nginx virtual host — see
-`docs/deployments/openviking-deployment.md`.
-
-### Installing the connection anywhere pi is installed (no code edits)
-
-Any pi installation that loads this package's **extension** connects to a shared
-OpenViking automatically when the environment is set — no per-repo code. Set
-these once (e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process
-loads):
+Any pi installation that loads this package's **extension** uses Hindsight when
+the environment opts in — no per-repo code. Pi shells out to `herdr-memory` and
+holds no memory credential of its own: the CLI resolves its own configuration
+and token, so there is no host, key or key file for pi to store. Set these once
+(e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process loads):
 
 ```sh
-export PI_OPENVIKING_BASE_URL=https://viking.example.com
-# Bearer token for the service — either inline, or from a file (secret hygiene):
-export PI_OPENVIKING_TOKEN=<token>
-# or: export PI_OPENVIKING_TOKEN_FILE=/path/to/token.txt
-# Optional: bounded wait for the provider (default 10000ms):
-export PI_OPENVIKING_PROVIDER_TIMEOUT_MS=10000
-# Optional: explicitly force the connection off:
-# export PI_OPENVIKING_ENABLED=0
+export PI_HINDSIGHT_ENABLED=1          # opt-in; anything else leaves memory off
+export PI_HINDSIGHT_CLI=herdr-memory   # executable to shell out to
+export PI_HINDSIGHT_SCOPES=project     # comma list: project, global, infra, mission:<id>
+export PI_HINDSIGHT_TIMEOUT_MS=5000    # bounded per-call wait (default 5000)
 ```
 
-When `PI_OPENVIKING_BASE_URL` is set, the extension passes
-`blackhole: { config: { enabled: true, durable: { kind: "openviking", ... } } }`
+When `PI_HINDSIGHT_ENABLED=1` is set, the extension passes
+`blackhole: { config: { enabled: true, durable: { kind: "hindsight", ... } } }`
 into every `EngineeringRuntime` it opens, so all repos in that install share the
-deployed durable memory. Absent the env vars, blackhole stays off (backward
-compatible). Verify a connection with `/blackhole` in a pi session, or:
+same durable backend. Absent the env vars, blackhole stays off (backward
+compatible). Verify a connection with `/blackhole` (or `/memory` for the
+interactive notes) in a pi session, or:
 
 ```sh
 node scripts/pi-engineering.ts blackhole status
+herdr-memory doctor        # the CLI's own credential/config check
 ```
 
-The resolver is `src/blackhole/envConfig.ts`; it is fail-closed (a malformed
-timeout falls back to the default; a missing token degrades recall to empty
-rather than crash).
+A leftover OpenViking environment variable or saved connection profile is
+detected by existence only — its contents are never read and no value is ever
+printed — and produces a single load-time warning pointing at `herdr-memory`
+(`src/blackhole/legacyOpenViking.ts`). Delete those files once migrated; nothing
+reads them for configuration.
+
+The resolver is `resolveHindsightFromEnv()` in `src/blackhole/hindsight.ts`:
+configuration is fail-closed (an unknown scope or a malformed timeout falls back
+to the default), reads are fail-open (a CLI that cannot answer yields no notes
+rather than a failed turn), and writes only report the outcome the CLI actually
+acknowledged.
 
 ## Durable state
 

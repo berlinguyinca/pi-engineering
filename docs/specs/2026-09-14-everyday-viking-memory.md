@@ -1,5 +1,16 @@
 # Everyday Pi memory in the engineering harness
 
+> **Status (transport retired).** The behaviour below — explicit `/remember`,
+> scoped recall as untrusted context, visible footer state, bounded lookups and
+> the write-must-be-acknowledged rule — still holds. The transport does not:
+> the `OpenVikingProvider` HTTP client, its interactive `/memory setup` dialog,
+> the device-key profile under `PI_CODING_AGENT_DIR` and the `services/openviking`
+> service were retired. Interactive memory now shells out to `herdr-memory`
+> (`PI_HINDSIGHT_*`, configured in the environment; the CLI holds the credential),
+> and `openviking` is no longer an accepted `durable.kind`. See
+> [README: Everyday memory](../../README.md#everyday-memory) and
+> [usage: sharing memory](../usage.md#sharing-memory-across-several-workers).
+
 The operator requested everyday memory in the existing engineering harness:
 explicit save, relevant recall in ordinary chats, and a visible connection state.
 The repository is named `pi-engineering-runtime` and is already installed in the

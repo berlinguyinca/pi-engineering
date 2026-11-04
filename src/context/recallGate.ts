@@ -2,7 +2,7 @@
  * Recall gate — filters and shapes promoted durable memory before it can enter a
  * context package.
  *
- * OpenViking recall returns raw `DurableMemoryRecord`s carrying no freshness,
+ * Hindsight recall returns raw `DurableMemoryRecord`s carrying no freshness,
  * confidence, secret-redaction or provenance. This pure module scores each
  * candidate with `scoreMemory`, drops stale / low-confidence / missing-ref /
  * redacted-empty / duplicate / over-limit records, and emits a `GatedRecall`
@@ -11,7 +11,7 @@
  * Pure: no I/O, no `Date.now`; the redactor and the "now" instant are injected.
  */
 
-import type { DurableMemoryRecord } from "../blackhole/OpenViking.ts";
+import type { DurableMemoryRecord } from "../blackhole/durableProvider.ts";
 import { type Freshness, type FreshnessMemory, type FreshnessScore, scoreMemory } from "../blackhole/freshness.ts";
 
 /** A candidate memory as recalled from durable store, with optional extra fields. */

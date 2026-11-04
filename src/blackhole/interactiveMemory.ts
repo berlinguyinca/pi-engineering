@@ -4,28 +4,25 @@ import { join } from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
-import type { DurableMemoryProvider, DurableMemoryRecord } from "./OpenViking.ts";
-import { ensureMemorySetup, resolveMemoryEnvironment } from "./connectionSetup.ts";
-import { OpenVikingProvider, OpenVikingRequestError } from "./durable.ts";
-import { type OpenVikingEnvConfig, resolveOpenVikingFromEnv } from "./envConfig.ts";
-import { HINDSIGHT_UNTRUSTED_HEADER, HindsightDurableMemory, resolveHindsightFromEnv } from "./hindsight.ts";
+import type { DurableMemoryProvider, DurableMemoryRecord } from "./durableProvider.ts";
+import {
+  HINDSIGHT_UNTRUSTED_HEADER,
+  HindsightDurableMemory,
+  type HindsightEnvConfig,
+  HindsightError,
+  resolveHindsightFromEnv,
+} from "./hindsight.ts";
+import { warnLegacyOpenViking } from "./legacyOpenViking.ts";
 
-/** Memory connection: OpenViking (default) or opt-in Hindsight via the herdr-memory CLI. */
-type MemoryConfig = OpenVikingEnvConfig & { hindsight?: { cli: string; scopes: string[]; timeoutMs: number } };
+/** Durable memory backend: the opt-in Hindsight provider over the herdr-memory CLI. */
+type MemoryConfig = HindsightEnvConfig & { identity: string };
 
-/** Hindsight is opt-in (PI_HINDSIGHT_ENABLED) and wins only when enabled; otherwise unchanged. */
+/** Opt-in only: null keeps memory off. It never resolves to a silent in-process store. */
 function resolveMemoryConfig(env: Record<string, string | undefined>): MemoryConfig | null {
   const h = resolveHindsightFromEnv(env);
-  if (h) {
-    // Synthetic identity: the CLI holds its own credentials; nothing secret here.
-    return {
-      baseUrl: `hindsight:${h.cli}:${h.scopes.join(",")}`,
-      token: "cli",
-      providerTimeoutMs: h.timeoutMs,
-      hindsight: h,
-    };
-  }
-  return resolveOpenVikingFromEnv(env);
+  if (!h) return null;
+  // Synthetic identity: the CLI holds its own credentials; nothing secret here.
+  return { ...h, identity: `hindsight:${h.cli}:${h.scopes.join(",")}` };
 }
 
 const MEMORY_CONTEXT = "pi-engineering-memory";
@@ -44,10 +41,9 @@ const STOPWORDS = new Set(
 export interface InteractiveMemoryOptions {
   env?: () => NodeJS.ProcessEnv;
   provider?: (config: MemoryConfig) => DurableMemoryProvider;
-  setup?: (ctx: ExtensionContext, force?: boolean) => Promise<void>;
   now?: () => number;
   /**
-   * Where headless failure notices are stamped (once per host per day).
+   * Where headless failure notices are stamped (once per memory connection per day).
    * Default: `<state root>/memory-notices` (PI_ENGINEERING_STATE_DIR,
    * $XDG_STATE_HOME/pi-engineering or ~/.local/state/pi-engineering), private
    * to the user, never a shared /tmp directory another local user could seed.
@@ -56,26 +52,21 @@ export interface InteractiveMemoryOptions {
 }
 
 /**
- * True the first time today this host's failure is noted on this machine.
+ * True the first time today this memory connection's failure is noted on this machine.
  * Headless runs are separate processes, so the stamp lives on disk; any
  * filesystem error errs on the side of logging.
  */
-function firstNoticeToday(dir: string, baseUrl: string): boolean {
-  const host = (() => {
-    try {
-      return new URL(baseUrl).host;
-    } catch {
-      return baseUrl;
-    }
-  })();
+function firstNoticeToday(dir: string, identity: string): boolean {
   const day = new Date().toISOString().slice(0, 10);
-  // Only a hash of the memory host is stored: the marker never names it.
-  const hostHash = createHash("sha256").update(host).digest("hex").slice(0, 16);
-  const name = `${hostHash}-${day}`;
+  // Only a hash of the connection identity is stored: the marker never names the
+  // CLI or scopes. It keys on the whole identity — keying on a URL host, as the
+  // retired HTTP transport did, collapsed every non-URL identity into one day.
+  const identityHash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
+  const name = `${identityHash}-${day}`;
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     chmodSync(dir, 0o700);
-    writeFileSync(join(dir, name), hostHash, { flag: "wx", mode: 0o600 });
+    writeFileSync(join(dir, name), identityHash, { flag: "wx", mode: 0o600 });
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "EEXIST";
@@ -138,14 +129,16 @@ function memoryBlock(
 
 /** Interactive-only registration: never include these hooks in worker resource loaders. */
 export function registerInteractiveMemory(pi: ExtensionAPI, options: InteractiveMemoryOptions = {}): void {
-  const environment = options.env ?? (() => resolveMemoryEnvironment());
+  warnLegacyOpenViking(options.env ? options.env() : process.env);
+  const environment = options.env ?? (() => ({ ...process.env }));
   const makeProvider: (config: MemoryConfig) => DurableMemoryProvider =
     options.provider ??
     ((config) =>
-      config.hindsight
-        ? new HindsightDurableMemory({ ...config.hindsight, timeoutMs: Math.min(config.hindsight.timeoutMs, 5000) })
-        : new OpenVikingProvider({ ...config, strict: true, timeoutMs: Math.min(config.providerTimeoutMs, 5000) }));
-  const setup = options.setup ?? ((ctx, force) => ensureMemorySetup(ctx, { force }));
+      new HindsightDurableMemory({
+        cli: config.cli,
+        scopes: config.scopes,
+        timeoutMs: Math.min(config.timeoutMs, 5000),
+      }));
   const now = options.now ?? Date.now;
   let generation = 0;
   // Explicit refreshes retire automatic work without retiring their command context.
@@ -168,17 +161,16 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       return await Promise.race([
         work,
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new OpenVikingRequestError("timeout")), AUTOMATIC_LOOKUP_MS);
+          timer = setTimeout(() => reject(new HindsightError("timeout")), AUTOMATIC_LOOKUP_MS);
         }),
       ]);
     } finally {
       clearTimeout(timer);
     }
   };
-  const fingerprint = (config: MemoryConfig) =>
-    createHash("sha256").update(`${config.baseUrl}\0${config.token}`).digest("hex");
+  const fingerprint = (config: MemoryConfig) => createHash("sha256").update(config.identity).digest("hex");
   const setStatus = (ctx: ExtensionContext, text: string) => {
-    if (ctx.hasUI) ctx.ui.setStatus("openviking", `Memory: ${text}`);
+    if (ctx.hasUI) ctx.ui.setStatus("hindsight", `Memory: ${text}`);
   };
   const reply = (ctx: ExtensionContext, text: string, error = false) => {
     if (ctx.hasUI) ctx.ui.notify(text, error ? "error" : "info");
@@ -192,31 +184,33 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const failure = (ctx: ExtensionContext, code: string, description: string, explicit = false) => {
     recalled = "";
     setStatus(ctx, description);
-    const text = `${description}. Use /memory setup to check your host and key.`;
+    const text = `${description}. Run /memory to check; memory is enabled with PI_HINDSIGHT_ENABLED=1.`;
     if (!ctx.hasUI && !explicit) {
       // Headless (pi -p): an automatic status line is not part of the answer.
       // Writing it into the transcript polluted every print-mode session, so
       // log it to telemetry/stderr once per memory host per day instead.
-      const baseUrl = resolveMemoryConfig(environment())?.baseUrl ?? "unconfigured";
-      if (lastFailure !== code && firstNoticeToday(noticeDir(), baseUrl)) {
+      const identity = resolveMemoryConfig(environment())?.identity ?? "unconfigured";
+      if (lastFailure !== code && firstNoticeToday(noticeDir(), identity)) {
         emitTelemetry({ level: "warning", key: `memory:${code}`, text: `Memory: ${text}` });
       }
     } else if (explicit || lastFailure !== code) reply(ctx, text, true);
     lastFailure = code;
   };
   const handleError = (ctx: ExtensionContext, error: unknown, explicit = false) => {
-    const code = error instanceof OpenVikingRequestError ? error.code : "unreachable";
+    const code = error instanceof HindsightError ? error.code : "unavailable";
     clearRecall();
-    retryAfter = now() + (code === "auth" || code === "forbidden" ? AUTH_BACKOFF_MS : FAILURE_BACKOFF_MS);
-    const messages = {
-      auth: "key invalid or revoked",
-      forbidden: "access denied",
-      timeout: "request timed out",
-      response: "invalid server response",
-      http: "server error",
-      unreachable: "service unavailable",
+    // A missing CLI or a refused write will not fix itself between turns; a
+    // timeout or a bad exit code might. That distinction is the two backoffs.
+    retryAfter = now() + (code === "unavailable" || code === "rejected" ? AUTH_BACKOFF_MS : FAILURE_BACKOFF_MS);
+    const messages: Record<string, string> = {
+      unavailable: "herdr-memory is unavailable (not installed, or its own config is missing)",
+      timeout: "herdr-memory timed out",
+      exit: "herdr-memory exited unsuccessfully",
+      response: "herdr-memory returned unreadable output",
+      rejected: "Hindsight refused the write",
+      queued: "Hindsight queued the write without confirming it",
     };
-    failure(ctx, code, messages[code], explicit);
+    failure(ctx, code, messages[code] ?? "memory unavailable", explicit);
   };
   const reset = () => {
     generation++;
@@ -236,16 +230,11 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       if (explicit)
         reply(
           ctx,
-          env.PI_OPENVIKING_ENABLED === "0" || env.PI_OPENVIKING_ENABLED === "false"
-            ? "Memory is disabled by PI_OPENVIKING_ENABLED. Remove that override or set it to 1, then run /memory setup."
-            : "Memory is not configured. Use /memory setup.",
+          env.PI_HINDSIGHT_ENABLED === "0" || env.PI_HINDSIGHT_ENABLED === "false"
+            ? "Memory is disabled by PI_HINDSIGHT_ENABLED. Remove that override or set it to 1, then run /memory."
+            : "Memory is off. Enable it with PI_HINDSIGHT_ENABLED=1 (the herdr-memory CLI), then run /memory.",
           true,
         );
-      return;
-    }
-    if (!config.token) {
-      failure(ctx, "missing", "key missing", explicit);
-      activeFingerprint = "";
       return;
     }
     const identity = fingerprint(config);
@@ -259,9 +248,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     if (auto && now() < retryAfter) return;
     try {
       return {
-        client: makeProvider(
-          auto ? { ...config, providerTimeoutMs: Math.min(config.providerTimeoutMs, AUTOMATIC_LOOKUP_MS) } : config,
-        ),
+        client: makeProvider(auto ? { ...config, timeoutMs: Math.min(config.timeoutMs, AUTOMATIC_LOOKUP_MS) } : config),
         identity,
       };
     } catch (error) {
@@ -272,7 +259,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const current = (id: number, identity: string) => {
     if (id !== generation) return false;
     const config = resolveMemoryConfig(environment());
-    return !!config?.token && fingerprint(config) === identity;
+    return !!config && fingerprint(config) === identity;
   };
   const check = async (ctx: ExtensionContext, explicit: boolean) => {
     const conn = connection(ctx, explicit, !explicit);
@@ -281,17 +268,18 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     const epoch = automaticLookupEpoch;
     setStatus(ctx, "checking");
     try {
-      const request = conn.client.recallAll();
-      const records = await (explicit ? request : automatic(request));
+      // Strict probe when the provider has one: best-effort recallAll swallows a missing CLI as "0 saved".
+      const request = conn.client.probe ? conn.client.probe() : conn.client.recallAll().then((r) => r.length);
+      const saved = await (explicit ? request : automatic(request));
       if (!current(id, conn.identity) || (!explicit && epoch !== automaticLookupEpoch)) return;
       lastFailure = "";
       retryAfter = 0;
       if (explicit) clearRecall();
-      setStatus(ctx, `ready · ${records.length} saved`);
+      setStatus(ctx, `ready · ${saved} saved`);
       if (explicit)
         reply(
           ctx,
-          `Memory connection verified: ${records.length} saved note(s). /remember <text> saves an explicit note; /memory <query> searches.`,
+          `Memory connection verified: ${saved} saved note(s). /remember <text> saves an explicit note; /memory <query> searches.`,
         );
     } catch (error) {
       if (current(id, conn.identity) && (explicit || epoch === automaticLookupEpoch)) handleError(ctx, error, explicit);
@@ -299,7 +287,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
 
   pi.registerCommand("remember", {
-    description: "Save an explicit private note to Viking: /remember <text> (up to 4,000 characters).",
+    description: "Save an explicit private note to Hindsight: /remember <text> (up to 4,000 characters).",
     handler: async (args, ctx) => {
       const text = args.trim();
       if (!text || text.length > 4000) {
@@ -332,8 +320,13 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
             return;
           }
           if (result.outcome !== "persisted") {
-            reply(ctx, "Memory save was rejected or not confirmed. Check /memory before retrying.", true);
-            return;
+            // A rejected write used to fall into a bare reply and leave the
+            // status stuck on "saving", which reads as a save still in flight.
+            // Route it through the same path a throw takes, so the status, the
+            // reply and the backoff all name what happened.
+            throw new HindsightError(
+              (["unavailable", "timeout", "exit", "response"] as const).find((c) => c === result.error) ?? "rejected",
+            );
           }
         } else {
           await conn.client.store(record);
@@ -353,25 +346,19 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     },
   });
   pi.registerCommand("memory", {
-    description: "Check Viking connection, search notes, or configure with /memory setup.",
+    description: "Check the Hindsight memory connection or search notes: /memory <query>.",
     handler: async (args, ctx) => {
       const query = args.trim();
       if (query === "setup") {
-        if (!ctx.hasUI || ctx.mode !== "tui") {
-          reply(
-            ctx,
-            "Run /memory setup in an interactive Pi terminal to configure the host and enter a hidden key. Headless sessions use the saved profile or PI_OPENVIKING_BASE_URL and PI_OPENVIKING_TOKEN_FILE.",
-          );
-          return;
-        }
-        reset();
-        const id = generation;
-        try {
-          await setup(ctx, true);
-        } catch (error) {
-          if (id === generation) handleError(ctx, error, true);
-        }
-        if (id === generation) await check(ctx, true);
+        // The retired /memory setup dialog configured an HTTP memory service and
+        // stored a host + token profile. The herdr-memory CLI carries its own
+        // config and credentials, so the remaining knobs are plain environment
+        // variables: say so instead of opening a dialog that configures nothing.
+        reply(
+          ctx,
+          "Memory is configured by the environment, not a saved profile: PI_HINDSIGHT_ENABLED=1 enables it; PI_HINDSIGHT_CLI names the executable and PI_HINDSIGHT_SCOPES the scopes. The CLI holds its own credentials (herdr-memory doctor checks them).",
+        );
+        await check(ctx, true);
         return;
       }
       if (!query || query === "status") {
@@ -411,11 +398,6 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   pi.on("session_start", async (_event, ctx) => {
     reset();
     const id = generation;
-    try {
-      await setup(ctx);
-    } catch (error) {
-      if (id === generation) handleError(ctx, error);
-    }
     if (id === generation) await check(ctx, false);
   });
   pi.on("session_before_switch", () => reset());
@@ -469,9 +451,6 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     if (!config) {
       recalled = "";
       setStatus(ctx, "off");
-    } else if (!config.token) {
-      recalled = "";
-      setStatus(ctx, "key missing");
     } else if (activeFingerprint && fingerprint(config) !== activeFingerprint) {
       recalled = "";
       setStatus(ctx, "connection changed; check /memory");

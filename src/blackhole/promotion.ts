@@ -3,13 +3,13 @@
  *
  * No auto-promotion of speculative candidate memory: a candidate must be
  * explicitly proposed, then explicitly accepted with evidence, then promoted
- * through the OpenViking abstraction. Every transition emits an audit event
+ * through the Hindsight abstraction. Every transition emits an audit event
  * (recorded by the caller into the ledger).
  */
 
 import { id } from "../core/ids.ts";
 import type { MemoryStore } from "./MemoryStore.ts";
-import type { DurableMemoryProvider, DurableMemoryRecord } from "./OpenViking.ts";
+import type { DurableMemoryProvider, DurableMemoryRecord } from "./durableProvider.ts";
 
 export interface PromotionDecision {
   action: "promote" | "reject" | "supersede";

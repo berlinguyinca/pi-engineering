@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MemoryStore } from "../../src/blackhole/MemoryStore.ts";
-import { InMemoryDurableMemory } from "../../src/blackhole/OpenViking.ts";
 import { newSessionIdentity } from "../../src/blackhole/SessionStore.ts";
 import { resolveBlackholeConfig } from "../../src/blackhole/config.ts";
+import { InMemoryDurableMemory } from "../../src/blackhole/durableProvider.ts";
 import { decidePromotion } from "../../src/blackhole/promotion.ts";
 import { blackholeTelemetry, formatBlackholeTelemetry } from "../../src/blackhole/telemetry.ts";
 import { PINNED_BLACKHOLE_VERSION, sessionKey } from "../../src/blackhole/types.ts";
@@ -131,7 +131,7 @@ test("promotion: evidence-gated — cannot promote without machine evidence", as
   assert.equal(store.getPromotion(c.id)!.state, "proposed", "rejected promotion leaves candidate proposed");
 });
 
-test("promotion: promote with evidence stores durable record through OpenViking", async () => {
+test("promotion: promote with evidence stores durable record through the durable provider", async () => {
   const store = new MemoryStore(newSessionIdentity({ project: "p", workItem: "wi", role: "implementer" }));
   const durable = new InMemoryDurableMemory();
   const c = store.proposePromotion("durable fact", ["commit:abc"], "reviewer", ["EVID-1"]);
@@ -276,119 +276,6 @@ test("shared-file durable: session-local working memory is NOT shared (only prom
   }
 });
 
-test("openviking provider: maps DurableMemoryProvider onto an HTTP contract", async () => {
-  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
-  const calls: string[] = [];
-  const fetchFn = async (url: string, init?: { method?: string; body?: string; headers?: Record<string, string> }) => {
-    calls.push(`${init?.method ?? "GET"} ${url}`);
-    if (init?.method === "POST") return { ok: true, status: 201, text: async () => "" };
-    // recall/search return the stored records
-    return {
-      ok: true,
-      status: 200,
-      json: async () => [
-        {
-          id: "dur-1",
-          text: "shared fact",
-          sourceRefs: ["e1"],
-          promotedFrom: "c1",
-          evidenceIds: ["e1"],
-          promotedAt: "t",
-          promotedBy: "op",
-        },
-      ],
-    };
-  };
-  const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
-  await prov.store({
-    id: "x",
-    text: "t",
-    sourceRefs: [],
-    promotedFrom: "c",
-    evidenceIds: ["e"],
-    promotedAt: "t",
-    promotedBy: "op",
-  });
-  const all = await prov.recallAll();
-  assert.equal(all.length, 1);
-  const hits = await prov.search("fact");
-  assert.equal(hits.length, 1);
-  assert.ok(calls.some((c) => c.includes("/memory") && c.includes("POST")));
-  assert.ok(calls.some((c) => c.includes("/memory/search?q=")));
-});
-
-test("openviking provider: fails closed when unconfigured", async () => {
-  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
-  assert.throws(() => new OpenVikingProvider({ baseUrl: "" }), /baseUrl/);
-});
-
-test("openviking provider: warns once on auth failure but still fail-closes to empty", async () => {
-  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
-  const warns: string[] = [];
-  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
-  // Pi they become a wrapped, severity-coloured notice instead of a raw line
-  // written under the TUI's own frame.
-  const restore = setTelemetrySink((notice) => warns.push(notice.text));
-  try {
-    const fetchFn = async () => ({ ok: false, status: 401, json: async () => [] }) as never;
-    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
-    // repeated failures warn once per op+status, and always return [] (fail-closed)
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.deepEqual(await prov.recallAll(), []);
-    const recallWarns = warns.filter((w) => w.includes("recall"));
-    assert.equal(recallWarns.length, 1, "recall warns once");
-    assert.match(recallWarns[0]!, /401/);
-    assert.match(recallWarns[0]!, /token/i);
-    assert.deepEqual(await prov.search("x"), []);
-    const searchWarns = warns.filter((w) => w.includes("search"));
-    assert.equal(searchWarns.length, 1, "search warns once");
-  } finally {
-    restore();
-  }
-});
-
-test("openviking provider: warns once on network unreachable (fetch throws) and fail-closes", async () => {
-  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
-  const warns: string[] = [];
-  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
-  // Pi they become a wrapped, severity-coloured notice instead of a raw line
-  // written under the TUI's own frame.
-  const restore = setTelemetrySink((notice) => warns.push(notice.text));
-  try {
-    const fetchFn = async () => {
-      throw new Error("ECONNREFUSED");
-    };
-    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.equal(warns.length, 1, "warns once per unreachable outcome");
-    assert.match(warns[0]!, /unreachable/i);
-    assert.match(warns[0]!, /recall/);
-  } finally {
-    restore();
-  }
-});
-
-test("openviking provider: warns once on a 200 with a non-array body and fail-closes", async () => {
-  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
-  const warns: string[] = [];
-  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
-  // Pi they become a wrapped, severity-coloured notice instead of a raw line
-  // written under the TUI's own frame.
-  const restore = setTelemetrySink((notice) => warns.push(notice.text));
-  try {
-    // e.g. an SSO/captive-portal proxy answering 200 with HTML, not a JSON array
-    const fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ not: "an array" }) }) as never;
-    const prov = new OpenVikingProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.equal(warns.length, 1, "warns once per unexpected-body outcome");
-    assert.match(warns[0]!, /non-array body/i);
-  } finally {
-    restore();
-  }
-});
-
 test("blackhole manager: provider outage degrades hydration to empty (never fails worker)", async () => {
   const { BlackholeManager } = await import("../../src/blackhole/BlackholeManager.ts");
   const { Ledger } = await import("../../src/ledger/Ledger.ts");
@@ -417,9 +304,34 @@ test("blackhole config: durable store kind is validated and defaulted", async ()
   const { resolveBlackholeConfig } = await import("../../src/blackhole/config.ts");
   assert.deepEqual(resolveBlackholeConfig().config.durable, { kind: "memory" });
   assert.throws(() => resolveBlackholeConfig({ durable: { kind: "shared-file", file: "" } }), /file/);
-  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "openviking", baseUrl: "" } }), /baseUrl/);
   const ok = resolveBlackholeConfig({ durable: { kind: "shared-file", file: "/tmp/x.jsonl" } }).config.durable;
   assert.deepEqual(ok, { kind: "shared-file", file: "/tmp/x.jsonl" });
+  assert.deepEqual(
+    resolveBlackholeConfig({ durable: { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] } }).config.durable,
+    { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] },
+  );
+});
+
+test("blackhole config: a retired or unknown durable kind is refused, not silently served in-process", async () => {
+  const { resolveBlackholeConfig, DURABLE_KINDS } = await import("../../src/blackhole/config.ts");
+  const { buildDurableProvider } = await import("../../src/blackhole/BlackholeManager.ts");
+
+  // Why the guard exists: the provider builder's default branch hands back an
+  // in-process store. Without config-level refusal, a config still carrying a
+  // retired kind keeps every status "configured" while sharing nothing.
+  assert.equal(buildDurableProvider({ kind: "openviking" } as never).kind, "in-memory");
+
+  for (const kind of ["openviking", "viking", "postgres", ""]) {
+    assert.throws(
+      () => resolveBlackholeConfig({ durable: { kind } as never }),
+      new RegExp(`durable.kind='${kind || ""}' is not supported; known kinds: ${DURABLE_KINDS.join(", ")}`),
+    );
+  }
+  const validPayloads = { memory: {}, "shared-file": { file: "/tmp/x.jsonl" }, hindsight: {} };
+  for (const kind of DURABLE_KINDS) {
+    const durable = { ...validPayloads[kind as keyof typeof validPayloads], kind } as never;
+    assert.equal(resolveBlackholeConfig({ durable }).config.durable.kind, kind);
+  }
 });
 
 test("blackhole hydrate: a hanging provider is bounded by the timeout (never stalls a worker)", async () => {

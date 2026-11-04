@@ -14,7 +14,8 @@
  */
 import { execFile } from "node:child_process";
 import { redactSecrets } from "../platform/redact.ts";
-import type { DurableMemoryProvider, DurableMemoryRecord, RetainResult } from "./OpenViking.ts";
+import type { PartialBlackholeConfig } from "./config.ts";
+import type { DurableMemoryProvider, DurableMemoryRecord, RetainResult } from "./durableProvider.ts";
 
 export interface HindsightRunResult {
   stdout: string;
@@ -60,6 +61,26 @@ export function resolveHindsightFromEnv(
     cli: env[HINDSIGHT_ENV.cli]?.trim() || "herdr-memory",
     scopes: parseScopes(env[HINDSIGHT_ENV.scopes]),
     timeoutMs: Number.isFinite(t) && t >= 1 ? t : DEFAULT_TIMEOUT_MS,
+  };
+}
+
+/**
+ * Build the `blackhole` option for `EngineeringRuntime` from the environment, or
+ * `undefined` when Hindsight is not opted in. This is the whole activation
+ * surface: the CLI holds its own config and credentials, so Pi resolves nothing
+ * but the executable, the scopes and the per-call timeout.
+ */
+export function hindsightBlackholeOption(
+  env: Record<string, string | undefined> = process.env,
+): { config: PartialBlackholeConfig } | undefined {
+  const h = resolveHindsightFromEnv(env);
+  if (!h) return undefined;
+  return {
+    config: {
+      enabled: true,
+      durable: { kind: "hindsight", cli: h.cli, scopes: h.scopes, timeoutMs: h.timeoutMs },
+      providerTimeoutMs: h.timeoutMs,
+    },
   };
 }
 
@@ -121,7 +142,11 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   private async call(args: string[]): Promise<Record<string, unknown>> {
     let res: HindsightRunResult;
     try {
-      res = await this.run(this.cli, [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(this.timeoutMs)] : [])], this.timeoutMs + 250);
+      res = await this.run(
+        this.cli,
+        [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(this.timeoutMs)] : [])],
+        this.timeoutMs + 250,
+      );
     } catch (error) {
       const e = error as { killed?: boolean; code?: unknown };
       throw new HindsightError(e?.killed || e?.code === "ETIMEDOUT" ? "timeout" : "unavailable");
@@ -168,16 +193,28 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   }
 
   /** Fail-open read: any failure or unauthorized scope yields []. */
-  private async recall(query: string, max = 20): Promise<DurableMemoryRecord[]> {
+  private async recallStrict(query: string, max: number): Promise<DurableMemoryRecord[]> {
     const args = ["recall", query.slice(0, 512), "--max-results", String(max)];
     for (const s of this.scopes) args.push("--scope", s);
+    const out = await this.call(args);
+    const rows = Array.isArray(out.results) ? out.results : [];
+    return rows.map((r) => this.toRecord(r)).filter((r): r is DurableMemoryRecord => r !== null);
+  }
+
+  private async recall(query: string, max = 20): Promise<DurableMemoryRecord[]> {
     try {
-      const out = await this.call(args);
-      const rows = Array.isArray(out.results) ? out.results : [];
-      return rows.map((r) => this.toRecord(r)).filter((r): r is DurableMemoryRecord => r !== null);
+      return await this.recallStrict(query, max);
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Strict health probe for /memory and startup status: unlike the best-effort
+   * reads it rethrows the HindsightError, so a missing CLI is not "0 saved".
+   */
+  async probe(): Promise<number> {
+    return (await this.recallStrict("*", 50)).length;
   }
 
   search(query: string): Promise<DurableMemoryRecord[]> {
@@ -220,9 +257,9 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
         revision: typeof out.revision === "number" ? out.revision : undefined,
       };
       return result;
-    } catch {
+    } catch (error) {
       this.epoch++; // outcome unknown: do not trust cached recalls
-      return { outcome: "rejected" };
+      return { outcome: "rejected", ...(error instanceof HindsightError ? { error: error.code } : {}) };
     }
   }
 
@@ -230,7 +267,9 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   async store(record: DurableMemoryRecord): Promise<void> {
     const result = await this.retain(record);
     if (result.outcome === "persisted") return;
-    throw new HindsightError(result.outcome === "queued_durable" ? "queued" : "rejected");
+    if (result.outcome === "queued_durable") throw new HindsightError("queued");
+    const transport = (["unavailable", "timeout", "exit", "response"] as const).find((c) => c === result.error);
+    throw new HindsightError(transport ?? "rejected");
   }
 
   async correct(memoryId: string, text: string, evidenceRef: string): Promise<RetainResult> {

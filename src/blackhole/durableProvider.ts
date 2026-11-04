@@ -1,11 +1,13 @@
 /**
- * OpenViking — promoted durable cross-session memory provider abstraction.
+ * Durable memory provider abstraction — the seam promoted cross-session memory
+ * flows through.
  *
- * Promoted durable memory flows through this seam. OpenViking itself is external
- * infrastructure; core provides the abstraction and a dependency-free in-memory
- * durable store so promotion is testable end-to-end without the external system.
- * A real implementation can be supplied by wiring a provider that persists
- * elsewhere (the interface is the contract).
+ * The interface is the contract; the backends live beside it (`durable.ts` for
+ * the shared-file store, `hindsight.ts` for the `herdr-memory` CLI backend).
+ * This module stays dependency-free and holds the in-process store used as the
+ * default and by tests, so promotion is exercisable end to end with no external
+ * service. A retired backend is not silently mapped onto this interface: an
+ * unknown `durable.kind` is refused by `config.ts` rather than falling back here.
  */
 
 export interface DurableMemoryRecord {
@@ -32,6 +34,8 @@ export interface RetainResult {
   memoryId?: string;
   bankId?: string;
   revision?: number;
+  /** Why a rejected outcome happened when it was a transport failure (e.g. "unavailable"), not a policy refusal. */
+  error?: string;
 }
 
 export interface DurableMemoryProvider {
@@ -44,6 +48,8 @@ export interface DurableMemoryProvider {
   retain?(record: DurableMemoryRecord): Promise<RetainResult>;
   /** Optional: stable cache-key component (scopes + revision epoch) for recall caching. */
   cacheScope?(): string;
+  /** Optional strict health probe: resolves to the saved count, rethrows transport failures (unlike best-effort reads). */
+  probe?(): Promise<number>;
 }
 
 /** Dependency-free in-memory durable store (default provider). */

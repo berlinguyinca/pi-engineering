@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildDurableProvider } from "../../src/blackhole/BlackholeManager.ts";
-import type { DurableMemoryRecord } from "../../src/blackhole/OpenViking.ts";
+import type { DurableMemoryRecord } from "../../src/blackhole/durableProvider.ts";
 import {
   HindsightDurableMemory,
   type HindsightRunner,
@@ -168,7 +168,6 @@ function interactive(provider: HindsightDurableMemory) {
   registerInteractiveMemory(pi, {
     env: () => ({ PI_HINDSIGHT_ENABLED: "1" }),
     provider: () => provider,
-    setup: async () => {},
   });
   const injected = async () => {
     const out = await events.get("context")!({ messages: [{ role: "user", content: "q" }] }, ctx);
