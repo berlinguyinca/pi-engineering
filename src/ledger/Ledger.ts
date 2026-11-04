@@ -119,6 +119,9 @@ const samePr = (a: WorkItemPrLink, b: WorkItemPrLink): boolean =>
   a.owner.toLowerCase() === b.owner.toLowerCase() &&
   a.repo.toLowerCase() === b.repo.toLowerCase();
 
+/** Retries of a plan record that lost a revision race; each retry means another process recorded in between. */
+const MAX_PLAN_RETRIES = 100;
+
 export class Ledger {
   private readonly store: EventStore;
 
@@ -531,31 +534,42 @@ export class Ledger {
     const steps = all.slice(0, MAX_PLAN_STEPS);
     if (steps.length === 0) return undefined;
     const digest = planDigestOf(steps);
-    const latest = this.latestPlan(workItemId);
-    if (latest?.digest === digest) return latest;
-    const revision = (latest?.revision ?? 0) + 1;
-    const plan_id = `${workItemId}/${revision}`;
     const art = input.artifact;
-    await this.emit(
-      "plan.recorded",
-      workItemId,
-      actor,
-      {
-        plan_id,
-        revision,
-        digest,
-        steps,
-        total_steps: all.length,
-        ...(art?.id && art.version ? { artifact: { id: art.id, version: art.version } } : {}),
-        ...(latest ? { supersedes: latest.id } : {}),
-      },
-      {
-        idempotency_key: `plan:${plan_id}:${digest}`,
-        ...(write?.authority_generation !== undefined ? { authority_generation: write.authority_generation } : {}),
-      },
-      write?.guard,
-    );
-    return this.listPlans(workItemId).find((l) => l.id === plan_id);
+    // The revision is derived from this process's view of the log, which another process may have extended. The
+    // append is therefore fenced on the work item's revision as seen when the plan was chosen: under the lock a stale
+    // view is rejected (after the store folds in the other writer's events), and the plan is re-derived from the
+    // true tail. A caller-supplied guard is the caller's own fence and is never retried.
+    for (let attempt = 0; ; attempt++) {
+      const latest = this.latestPlan(workItemId);
+      if (latest?.digest === digest) return latest;
+      const revision = (latest?.revision ?? 0) + 1;
+      const plan_id = `${workItemId}/${revision}`;
+      try {
+        await this.emit(
+          "plan.recorded",
+          workItemId,
+          actor,
+          {
+            plan_id,
+            revision,
+            digest,
+            steps,
+            total_steps: all.length,
+            ...(art?.id && art.version ? { artifact: { id: art.id, version: art.version } } : {}),
+            ...(latest ? { supersedes: latest.id } : {}),
+          },
+          {
+            idempotency_key: `plan:${plan_id}:${digest}`,
+            ...(write?.authority_generation !== undefined ? { authority_generation: write.authority_generation } : {}),
+          },
+          write?.guard ?? { expected_revision: this.revision(workItemId) },
+        );
+      } catch (err) {
+        if (write?.guard || !(err instanceof LedgerRevisionConflictError) || attempt >= MAX_PLAN_RETRIES) throw err;
+        continue;
+      }
+      return this.listPlans(workItemId).find((l) => l.id === plan_id);
+    }
   }
 
   /** Plans of a work item, oldest first (copies). */
