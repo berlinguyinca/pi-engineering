@@ -2,7 +2,7 @@
  * Mission planner (spec 06 + planner-worker contract): turns a non-trivial goal
  * into a bounded task DAG with real write domains by reusing the planner-worker
  * PLANNER_PROMPT and tolerant parser. Trivial or unparsable plans fall back to
- * the single-task path; a malformed plan never blocks a mission.
+ * the single-task path clamped to the manifest envelope; with no safe domain it blocks.
  */
 
 import { DIRECTORY_DENY, extractStructured, parsePlannerOutput, scopeConflict } from "../plannerWorker/contract.ts";
@@ -34,7 +34,7 @@ export function isNonTrivialGoal(goal: string): boolean {
 
 export interface MissionPlanResult {
   tasks: PlanTaskInput[];
-  /** Why the single-task fallback was used for a planner that was attempted. */
+  /** Why the single-task fallback was used, or (with no tasks) why the mission is blocked. Always visible. */
   fallbackReason?: string;
   /**
    * The planner explicitly reported the goal as ambiguous (blocked, with a
@@ -117,7 +117,7 @@ const under = (path: string, root: string): boolean => root === "" || path === r
  * writable domains. Returns the kept domains and what was rejected.
  */
 export function scopeTaskDomains(
-  c: TaskContract,
+  c: Pick<TaskContract, "scope">,
   opts: { writableDomains?: string[]; readOnlyPrefixes?: string[] },
 ): { kept: string[]; rejected: string[] } {
   const rejected: string[] = [];
@@ -212,10 +212,27 @@ function toTasks(contracts: TaskContract[], acceptanceIds: string[], domains: Ma
   }));
 }
 
+/**
+ * The fallback for EVERY planner failure: `single()` with write domains clamped by
+ * `scopeTaskDomains`'s own rules (planner text is never consulted), carrying the mission's
+ * acceptance and `single()`'s budget, each removal named in the visible reason. Reachable only
+ * for a mutating mission, so a task with no surviving writable domain is BLOCKED: no tasks.
+ */
+function clampedFallback(input: MissionPlanInput, reason: string): MissionPlanResult {
+  const base = input.single();
+  // One reuse of `scopeTaskDomains`, which reads only `scope`, so the clamp is the same.
+  const { kept, rejected } = scopeTaskDomains({ scope: { allowed: [...base.write_domains], forbidden: [] } }, input);
+  const why = rejected.length > 0 ? `${reason}; clamped write_domains: ${rejected.join(", ")}` : reason;
+  const acceptance_ids = input.acceptanceIds.length > 0 ? [...input.acceptanceIds] : [...(base.acceptance_ids ?? [])];
+  if (kept.length === 0)
+    return { tasks: [], fallbackReason: `${why}; mission blocked: no writable domain survives the envelope` };
+  return { tasks: [{ ...base, write_domains: kept, acceptance_ids }], fallbackReason: why };
+}
+
 export async function planMission(input: MissionPlanInput): Promise<MissionPlanResult> {
   const attempt = input.mode === "on" || (input.mode === "auto" && isNonTrivialGoal(input.goal));
   if (!attempt || !input.mutates) return { tasks: [input.single()] };
-  const fallback = (reason: string): MissionPlanResult => ({ tasks: [input.single()], fallbackReason: reason });
+  const fallback = (reason: string): MissionPlanResult => clampedFallback(input, reason);
   let output: PlannerRunOutput = "";
   for (let attemptNo = 0; ; attemptNo++) {
     try {
