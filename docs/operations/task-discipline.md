@@ -26,7 +26,11 @@ If an enforcing mode starts with a missing, unreadable, unparseable or invalid
 contract, the session runs under a **lockdown** contract (`readRoots: []`,
 `writeRoots: []`, `allowedHosts: []`, mode `investigation`): nothing readable,
 nothing writable, nothing remote. The gate never degrades to "allow everything",
-and the objective field says why (`contract unavailable: <error>`).
+and the objective field says why (`contract unavailable: <error>`). The operator
+is told out loud, once per distinct failure — `Task Contract is not in force:
+ENOENT … This session runs in lockdown …` — and again, reassuringly, when the
+file becomes readable again. Without that notice the agent just reports "read
+scope is (none)" and the reason is invisible from the outside.
 
 ## Write a contract
 
@@ -65,7 +69,10 @@ and the objective field says why (`contract unavailable: <error>`).
   rewrites the file to widen itself, the parse fails and the provider substitutes
   the **lockdown** contract immediately — the session loses read, write and
   remote access at once (fail closed) rather than keeping the wider scope, and
-  the reason names the parse error. Restoring service is the operator's edit.
+  the reason names the parse error (`unknown contract field: …`,
+  `investigation contracts cannot have writeRoots; use scratchRoots for
+  diagnostics`, …). Restoring service is the operator's
+  edit.
 - `readRoots` is deliberately broad (the repo plus the dependent repos needed to
   understand a defect); `writeRoots` is deliberately narrow; `scratchRoots` is
   writable diagnostics space and must never be a repository root.

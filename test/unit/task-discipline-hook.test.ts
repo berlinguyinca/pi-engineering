@@ -243,3 +243,58 @@ test("subagents and model handoffs: the gate depends only on the contract file, 
   assert.equal(before?.block, true);
   assert.equal(after?.block, true);
 });
+
+test("an unreadable contract is announced to the operator once, and again when it heals", () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "tdn-")));
+  const state = join(base, "state");
+  mkdirSync(state);
+  const contractFile = join(state, "contract.json");
+  const notices: { message: string; level?: string }[] = [];
+  const handlers = new Map<string, Handler>();
+  const pi = { on: (event: string, h: Handler) => void handlers.set(event, h) };
+  const opts = disciplineFromEnv({
+    PI_TASK_DISCIPLINE: "enforce_all",
+    PI_TASK_CONTRACT_FILE: contractFile,
+  } as NodeJS.ProcessEnv)!;
+  registerTaskDiscipline(pi as unknown as DisciplineHost, opts);
+  const notify = (message: string, level?: string) => void notices.push({ message, level });
+  const call = (toolName: string, input: unknown, id: string) =>
+    handlers.get("tool_call")!({ toolName, input, toolCallId: id } as never, { cwd: base, ui: { notify } } as never) as
+      | { block?: boolean; reason?: string }
+      | undefined;
+  // No file yet: the session runs on the substituted lockdown contract, and the
+  // operator is told why — once, not on every tool call.
+  const denied = call("write", { path: join(base, "y.txt"), content: "x" }, "tc-1");
+  assert.equal(denied?.block, true, "lockdown still denies writes");
+  call("read", { path: join(base, "x.txt") }, "tc-2");
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!.message, /Task Contract is not in force/);
+  assert.match(notices[0]!.message, /lockdown/);
+  assert.equal(notices[0]!.level, "error");
+  // A malformed file is a distinct failure, so it is reported too.
+  writeFileSync(contractFile, "{ not json");
+  call("read", { path: join(base, "x.txt") }, "tc-3");
+  assert.equal(notices.length, 2);
+  // Heal it: the operator hears that the real authorization is back in force.
+  writeFileSync(
+    contractFile,
+    JSON.stringify({
+      taskId: "healed",
+      objective: "read only",
+      mode: "investigation",
+      policyRevision: 2,
+      workspace: base,
+      readRoots: [base],
+      writeRoots: [],
+      allowedHosts: [],
+      externalEffects: [],
+      acceptanceCriteria: ["done"],
+    }),
+  );
+  assert.equal(call("read", { path: join(base, "x.txt") }, "tc-4"), undefined);
+  assert.equal(notices.length, 3);
+  assert.match(notices[2]!.message, /readable again/);
+  assert.equal(notices[2]!.level, "info");
+  call("read", { path: join(base, "x.txt") }, "tc-5");
+  assert.equal(notices.length, 3, "no repetition once reported");
+});
