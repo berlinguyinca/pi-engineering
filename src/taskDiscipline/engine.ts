@@ -115,7 +115,8 @@ const globRe = (g: string) =>
   );
 const matchesAny = (name: string, globs: readonly string[]) => globs.some((g) => globRe(g).test(name));
 
-function enforces(mode: EnforcementMode, c: TaskContract): boolean {
+/** Whether a denial in this mode actually blocks the call (as opposed to being logged as `wouldDeny`). */
+export function enforces(mode: EnforcementMode, c: TaskContract): boolean {
   if (mode === "enforce_all") return true;
   if (mode === "enforce_diagnostic") return c.mode === "investigation" || c.mode === "review";
   return false;

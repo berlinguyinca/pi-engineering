@@ -1,5 +1,6 @@
+import { randomBytes } from "node:crypto";
 import type { ExtensionAPI, ToolCallEventResult, UserBashEventResult } from "@earendil-works/pi-coding-agent";
-import type { TaskContract } from "./contract.ts";
+import { type TaskContract, contractHash } from "./contract.ts";
 /**
  * Pi wiring for the Task Contract gate.
  *
@@ -9,7 +10,7 @@ import type { TaskContract } from "./contract.ts";
  * provider on every call, so an approved amendment takes effect immediately and
  * the model has no tool that can change it.
  */
-import { type Decision, type EnforcementMode, type EngineDeps, evaluate, nodeDeps } from "./engine.ts";
+import { type Decision, type EnforcementMode, type EngineDeps, enforces, evaluate, nodeDeps } from "./engine.ts";
 
 export interface ContractProvider {
   /** The current trusted contract, or undefined when the session has none. */
@@ -166,12 +167,16 @@ export function registerTaskDiscipline(pi: DisciplineHost, opts: DisciplineOptio
   const gate = new TaskDiscipline(opts);
   if (opts.mode === "off") return gate;
   // A provider that cannot honour the operator's file substitutes a lockdown
-  // contract: the agent then sees no roots, and the journal says
-  // `contract.read_failed`, but nothing the OPERATOR reads explains why the
-  // session lost its scope. Say it once per distinct failure (and once when it
-  // clears) — and never let presentation change a verdict.
+  // contract: the agent then sees no roots and every call is denied. Two things
+  // must say why, because neither surface reaches both readers:
+  //   * the session UI (`ctx.ui.notify`) — interactive and RPC only; JSON and
+  //     print modes have no UI, so they get the log alone;
+  //   * the decision log — a `contract.unavailable` line, because the denials it
+  //     produces are indistinguishable from an over-tight contract.
+  // Said once per distinct failure (and once when it clears), and presentation
+  // never changes a verdict.
   let reported: string | undefined;
-  const reportProviderState = (notify: Notifier) => {
+  const reportProviderState = (notify: Notifier, toolName: string) => {
     const failure = opts.provider.lastError;
     if (failure && failure !== reported) {
       reported = failure;
@@ -179,9 +184,45 @@ export function registerTaskDiscipline(pi: DisciplineHost, opts: DisciplineOptio
         `Task Contract is not in force: ${failure}. This session runs in lockdown — no writes, no external effects, no hosts. Fix the contract file, or unset PI_TASK_CONTRACT_FILE to run ungated.`,
         "error",
       );
+      recordContractState("contract.unavailable", "deny", failure, toolName);
     } else if (!failure && reported !== undefined) {
       reported = undefined;
       notify("Task Contract is readable again; its authorization is in force.", "info");
+      recordContractState("contract.available", "allow", "contract file is readable and valid again", toolName);
+    }
+  };
+  /**
+   * The provider hands out the lockdown contract when the file fails, so its
+   * identity fields are the ones the surrounding denials were recorded under —
+   * the pair reads as one story in the log.
+   */
+  const recordContractState = (rule: string, verdict: "allow" | "deny", reason: string, toolName: string) => {
+    if (!opts.record) return;
+    try {
+      const c = opts.provider.current();
+      if (!c) return;
+      const enforcing = enforces(opts.mode, c);
+      void opts.record({
+        id: `dec_${randomBytes(10).toString("hex")}`,
+        taskId: c.taskId,
+        revision: c.policyRevision,
+        contractHash: contractHash(c),
+        toolName,
+        verdict,
+        enforced: verdict === "deny" ? enforcing : true,
+        wouldDeny: verdict === "deny" && !enforcing,
+        rule,
+        reason,
+        next:
+          verdict === "deny"
+            ? "fix or replace the contract file (the operator's edit), or unset PI_TASK_CONTRACT_FILE to run ungated"
+            : "continue within the contract as written",
+        effects: [],
+        coverage: "full",
+        at: new Date().toISOString(),
+      });
+    } catch {
+      /* logging must never change a verdict */
     }
   };
   const notifier =
@@ -197,12 +238,12 @@ export function registerTaskDiscipline(pi: DisciplineHost, opts: DisciplineOptio
   // announcing it before would always describe the previous call's state.
   pi.on("tool_call", (event, ctx) => {
     const result = gate.toolCall(event, ctx.cwd);
-    reportProviderState(notifier(ctx as never));
+    reportProviderState(notifier(ctx as never), event.toolName);
     return result;
   });
   pi.on("user_bash", (event, ctx) => {
     const result = gate.userBash(event);
-    reportProviderState(notifier(ctx as never));
+    reportProviderState(notifier(ctx as never), "user_bash");
     return result;
   });
   return gate;
