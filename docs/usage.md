@@ -1247,6 +1247,16 @@ denied (`write.readonly_mode`, because the contract has no `writeRoots`). To let
 it patch the fix, the operator raises `policyRevision`, adds `writeRoots` and
 the mode changes to `implementation` — the model cannot do that itself.
 
+Mission workers of a gated session are gated too, under a **narrowed child
+contract** rather than the parent's: their write roots are the worktree the
+scheduler allocated them, their external effects are empty (they propose, the
+host executes), they may reach an allowed host only if the parent itself had
+`remote_read`, and a read-only role is capped at `review`. A worker whose
+request cannot be expressed inside the parent's scope — an implementer under a
+`review` contract, or a worktree outside the parent's write roots — is refused
+before any model call (`error: task-scope-refused`) instead of being handed the
+parent's wider scope.
+
 **What the gate cannot promise** (see `docs/operations/task-discipline.md`):
 it is a preflight check inside the Pi process, so it covers calls that come
 through Pi's `tool_call` / `user_bash`. A shell the agent reaches outside those
