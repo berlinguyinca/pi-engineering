@@ -337,6 +337,7 @@ export class EngineeringHostExtension {
   readonly lock: RuntimeMutationLock;
   recovery: RecoveryOutcome | undefined;
   readonly updates: UpdateManager;
+  private readonly sourceCache: SourceCache;
   private bridgeRef: RuntimeUpdateBridge | undefined;
   private pi: ExtensionAPI | undefined;
   private readonly hostCommit: string | null;
@@ -353,12 +354,13 @@ export class EngineeringHostExtension {
     // prune a directory this one is still importing from.
     this.generationsDir = join(config.installRoot, "generations", `${process.pid}-${randomBytes(3).toString("hex")}`);
     this.telemetry = new RuntimeTelemetry(join(config.installRoot, "telemetry", "runtime-events.jsonl"));
+    this.sourceCache = new SourceCache(this.layout.cacheRepo);
     this.updates = new UpdateManager({
       layout: this.layout,
       journal: this.journal,
       lock: this.lock,
       telemetry: this.telemetry,
-      cache: new SourceCache(this.layout.cacheRepo),
+      cache: this.sourceCache,
       source: () => this.trustedSource(),
       activation: this,
       running: () => {
@@ -1340,6 +1342,41 @@ export class EngineeringHostExtension {
     return { root: source.root, from: active.source.commit, to: source.commit };
   }
 
+  /**
+   * Is this checkout at or ahead of the channel tip? `check` performs the fetch,
+   * so this is where the local-checkout workflow asks the remote: a checkout that
+   * carries the tip is development work worth reloading, one that does not is
+   * stale code that must not be installed just because its HEAD moved.
+   * `undefined` means the source could not be consulted (offline, no remote,
+   * unreachable host) — the caller then keeps the historical behaviour and says
+   * so, rather than failing an update the operator can finish offline.
+   */
+  protected async checkoutCarriesChannel(localSha: string): Promise<{ carries: boolean; tip: string } | undefined> {
+    let tip: string | undefined;
+    try {
+      tip = (await this.updates.check({})).target?.sha;
+    } catch {
+      return undefined;
+    }
+    if (!tip) return undefined;
+    if (tip === localSha) return { carries: true, tip };
+    // Ask the checkout, the only place the local commit exists. The update
+    // source's own cache cannot answer this: an unpushed development commit is
+    // by definition absent from it, and a stale local merge looks identical.
+    // A checkout that has never fetched the tip cannot contain it.
+    const root = this.reloadSource().root;
+    const holds = async (args: string[]) => {
+      try {
+        await safeGitOrThrow(args, { cwd: root, trust: "operator", timeoutMs: 10_000 });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (!(await holds(["cat-file", "-e", `${tip}^{commit}`]))) return { carries: false, tip };
+    return { carries: await holds(["merge-base", "--is-ancestor", tip, localSha]), tip };
+  }
+
   protected async update(argv: string[], ctx: Ctx): Promise<void> {
     const parsed = parseUpdateArgs(argv);
     if (!parsed.ok) {
@@ -1357,16 +1394,37 @@ export class EngineeringHostExtension {
     if (parsed.check) {
       // --check still asks the remote; a local move is reported alongside.
       const check = await this.updates.check(parsed.request);
-      const lines = [...(movedLine ? [`${movedLine}; /pie update reloads it (remote not consulted then).`] : [])];
+      const lines = [
+        ...(movedLine
+          ? [`${movedLine}; /pie update installs the channel tip when the checkout is behind it, else reloads it.`]
+          : []),
+      ];
       return notify(ctx, [...lines, formatCheck(check)].join("\n"), check.failure ? "warning" : "info");
     }
     if (moved && !parsed.request.commit && !parsed.request.channel) {
-      notify(
-        ctx,
-        `${movedLine} — hot-reloading the local checkout (remote not consulted; --channel/--commit for that).`,
-      );
-      await this.reload(ctx);
-      return;
+      // Always ask the remote first: reloading a checkout whose HEAD moved is
+      // only right when that HEAD is not behind the channel. Measured in the
+      // field: a checkout 463 commits behind main hot-reloaded itself and
+      // reported success, because "the checkout moved" was treated as the whole
+      // answer.
+      const where = await this.checkoutCarriesChannel(moved.to);
+      if (where && !where.carries) {
+        notify(
+          ctx,
+          `${movedLine}, but the checkout is behind the channel tip ${short(where.tip)} — installing the tip instead of reloading it.`,
+        );
+      } else {
+        notify(
+          ctx,
+          `${movedLine} — hot-reloading the local checkout${
+            where
+              ? "(it carries the channel tip " + short(where.tip) + ")"
+              : " (the update source could not be consulted)"
+          }.`,
+        );
+        await this.reload(ctx);
+        return;
+      }
     }
     const progress: string[] = [];
     const report = updateProgressReporter(ctx.ui);

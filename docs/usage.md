@@ -356,8 +356,13 @@ never loaded: while a tracked file has uncommitted changes, a new commit is
 not reloaded either (the handover would copy the half-edit); you are told
 once, and the reload happens as soon as the tree is clean, or at once with
 `/pie reload`. Summary and compaction calls, which have no turn to continue,
-wait out a gateway hold instead of switching models. `/pie update` does the same immediately (and, when the checkout
-has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
+wait out a gateway hold instead of switching models. `/pie update` does the same immediately, and it always asks the update remote
+first: if the checkout's HEAD is behind the channel tip, the tip is installed
+instead of the checkout being reloaded (a checkout 463 commits behind main used
+to hot-reload itself and report success). A checkout that carries the tip — a
+merge you just made, or unpushed development work on top of it — is still
+reloaded, because that is the update you meant. `--check` reports both, and
+`--channel`/`--commit` always go to the remote. `PI_ENGINEERING_AUTO_RELOAD=0`
 turns the automatic reload off.
 
 A session on another host, loading pi-engineering from a clone that tracks
