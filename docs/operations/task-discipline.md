@@ -27,10 +27,14 @@ contract, the session runs under a **lockdown** contract (`readRoots: []`,
 `writeRoots: []`, `allowedHosts: []`, mode `investigation`): nothing readable,
 nothing writable, nothing remote. The gate never degrades to "allow everything",
 and the objective field says why (`contract unavailable: <error>`). The operator
-is told out loud, once per distinct failure — `Task Contract is not in force:
+is told, once per distinct failure — `Task Contract is not in force:
 ENOENT … This session runs in lockdown …` — and again, reassuringly, when the
-file becomes readable again. Without that notice the agent just reports "read
-scope is (none)" and the reason is invisible from the outside.
+file becomes readable again. That notice rides the session UI, which exists only
+in interactive and RPC sessions: `pi --print` and JSON mode have no UI, so the
+same event is written to the decision log as `rule: "contract.unavailable"`, and
+`"contract.available"` with the real task id when it clears. Without one of these
+the agent just reports "read scope is (none)" and the reason is invisible from
+the outside.
 
 ## Write a contract
 
@@ -103,8 +107,14 @@ its own contract file in its own environment (see *Open work* below).
 ## Read the decisions
 
 ```sh
-jq -r '[.at,.verdict,.rule,.toolName,.taskId,.revision]|@tsv' "${PI_TASK_DISCIPLINE_LOG:-$HOME/task-contracts/decisions.jsonl}"
+jq -r '[.at,.verdict,.rule,.toolName,.taskId,.revision]|@tsv' \
+  "${PI_TASK_DISCIPLINE_LOG:-$(dirname "$PI_TASK_CONTRACT_FILE")/decisions.jsonl}"
 ```
+
+The log defaults to `decisions.jsonl` beside the contract file. With
+`PI_TASK_CONTRACT_FILE` unset the session locks down and there is no contract
+directory to put a log in, so nothing is recorded — set `PI_TASK_DISCIPLINE_LOG`
+if you need a record of that session.
 
 Every line: `id`, `taskId`, `revision`, `contractHash`, `toolName`,
 `toolCallId`, `verdict` (`allow`/`deny`), `enforced`, `wouldDeny`, `rule`,
@@ -120,6 +130,11 @@ the log; a recorder that throws cannot change a verdict.
   script whose contents were not readable, a wrapper whose target the classifier
   could not resolve). The decision is still made, but read those lines first
   when auditing a contract.
+- `rule=contract.unavailable` — the contract file itself could not be used
+  (missing, unreadable, unparseable, invalid), so this call ran under the
+  substituted lockdown contract; `taskId` is `lockdown` and `reason` is the
+  provider's error. `rule=contract.available` marks where the real contract came
+  back. Both are written once per state change, not once per call.
 
 Repeated enforcement of the same rule (more than three enforced denials within
 ten calls) raises a policy incident: the gate marks the session halted and the

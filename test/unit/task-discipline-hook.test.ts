@@ -297,4 +297,24 @@ test("an unreadable contract is announced to the operator once, and again when i
   assert.equal(notices[2]!.level, "info");
   call("read", { path: join(base, "x.txt") }, "tc-5");
   assert.equal(notices.length, 3, "no repetition once reported");
+  // The log tells the same story, because print and JSON modes have no UI: a
+  // reader of decisions.jsonl must be able to tell "the file is broken" from
+  // "the operator wrote a contract with no roots".
+  const records = readFileSync(join(state, "decisions.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l) as { rule: string; taskId: string; verdict: string; enforced: boolean; reason: string });
+  assert.deepEqual(
+    records.filter((r) => r.rule.startsWith("contract.")).map((r) => r.rule),
+    ["contract.unavailable", "contract.unavailable", "contract.available"],
+    "one record per distinct failure, one for the healing, no repeats",
+  );
+  const broken = records.find((r) => r.rule === "contract.unavailable")!;
+  assert.equal(broken.taskId, "lockdown");
+  assert.equal(broken.verdict, "deny");
+  assert.equal(broken.enforced, true, "enforce_all means the denial is real");
+  assert.match(broken.reason, /ENOENT|no such file/i);
+  const healed = records.find((r) => r.rule === "contract.available")!;
+  assert.equal(healed.taskId, "healed");
+  assert.equal(healed.verdict, "allow");
 });
