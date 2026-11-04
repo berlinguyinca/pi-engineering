@@ -34,7 +34,7 @@ import type { WorkerActivity, WorkerExecutor, WorkerRequest, WorkerRun } from ".
 import { WAITING_FOR_INFERENCE_SUMMARY, safeToolCommandLabel } from "../workers/activity.ts";
 import { PlannerActivity, type PlannerLiveSnapshot } from "./activity.ts";
 import { planTransition } from "./compatibility.ts";
-import { dagLayers, scopeConflict } from "./contract.ts";
+import { dagLayers, matchesGlob, scopeConflict } from "./contract.ts";
 import { ConvergenceTracker, nextLadderAction, observeAttempt } from "./convergence.ts";
 import {
   type AvailabilityError,
@@ -63,6 +63,7 @@ import { assertTransition, isTerminal } from "./stateMachine.ts";
 import { RoleModelTelemetry } from "./telemetry.ts";
 import { TransitionLog } from "./transitions.ts";
 import {
+  type ContractScope,
   type ContractState,
   type ContractStatus,
   type ConvergenceConfig,
@@ -205,6 +206,34 @@ export async function runVerification(
 let persistTempSeq = 0;
 export function plannerStateTempPath(stateDir: string): string {
   return join(stateDir, `state.json.tmp-${process.pid}-${persistTempSeq++}`);
+}
+
+export const PROTECTED_TASK_AUTHORITY_GLOBS: readonly string[] = [
+  "docs/specs/**/manifests/**", "docs/specs/**/*.handoff.json", "docs/specs/**/fixtures/**",
+  "docs/specs/**/templates/**", "templates/**", "scripts/bootstrap-*.ts",
+];
+
+const stringsOf = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+
+export const scopeGateBlockedReason = (refs: string): string => `evidence: scope gate: ${refs}`;
+
+export function scopeIntegrityCheck(input: {
+  changed: readonly string[];
+  scope: ContractScope;
+  authorityProtected?: readonly string[];
+  refs: { taskId: string; branch: string; base: string; head: string };
+}): { ok: true; refs: string } | { ok: false; violations: string[]; protectedHits: string[]; refs: string } {
+  const changed = [...new Set(stringsOf(input.changed))];
+  const scope = { allowed: stringsOf(input.scope?.allowed), forbidden: stringsOf(input.scope?.forbidden) };
+  const protectedGlobs = input.authorityProtected === undefined ? PROTECTED_TASK_AUTHORITY_GLOBS : stringsOf(input.authorityProtected);
+  const violations = scopeViolations(changed, scope);
+  const protectedHits = changed.filter((p) => protectedGlobs.some((g) => matchesGlob(p, g)));
+  const first = violations.length > 0 ? violations : protectedHits;
+  const shown = first.slice(0, 20);
+  const hidden = first.length - shown.length;
+  const refs = `task=${input.refs.taskId} branch=${input.refs.branch} base=${input.refs.base} head=${input.refs.head} paths=${shown.join(",")}${hidden > 0 ? ` …(+${hidden} more)` : ""}`;
+  if (violations.length + protectedHits.length === 0) return { ok: true, refs };
+  return { ok: false, violations: violations.slice(0, 20), protectedHits: protectedHits.slice(0, 20), refs };
 }
 
 export class PlannerWorkerExecutor {
@@ -740,6 +769,14 @@ export class PlannerWorkerExecutor {
     // Snapshot the attempt as a commit in the contract worktree.
     const changed = await this.commitAttempt(rt);
     const outOfScope = scopeViolations(changed, c.scope);
+    const gate = await this.scopeGate(rt);
+    if (gate !== null) {
+      const keep = await this.keepSuperseded(rt, gate.head);
+      rt.state.blocked_reason = scopeGateBlockedReason(gate.refs);
+      this.emit({ type: "phase", text: `scope gate: ${gate.refs} (attempt kept as ${keep})` });
+      this.setStatus(rt, "blocked", `unauthorized diff; attempt kept as ${keep}`);
+      return "done";
+    }
     rt.verification = [];
     if (run.result.status !== "failed") {
       for (const cmd of rt.state.correction?.verification ?? c.verification) {
@@ -885,6 +922,22 @@ export class PlannerWorkerExecutor {
     this.telemetry.count(role, model, "retry");
     this.setStatus(rt, "running", `attempt ${rt.state.attempt + 1} (${rt.state.rung})`);
     return "again";
+  }
+
+  private async scopeGate(rt: Runtime): Promise<{ refs: string; head: string } | null> {
+    const head = (await checkedGit(rt.worktree!.path, ["rev-parse", "HEAD"])).stdout.trim();
+    const committed = (await checkedGit(rt.worktree!.path, ["diff", "--name-only", rt.baseCommit, head])).stdout;
+    const untracked = (await checkedGit(rt.worktree!.path, ["ls-files", "--others", "--exclude-standard"])).stdout;
+    const check = scopeIntegrityCheck({ changed: `${committed}\n${untracked}`.split("\n").filter(Boolean), scope: rt.state.contract.scope, refs: { taskId: rt.state.contract.task_id, branch: rt.worktree!.branch, base: rt.baseCommit, head } });
+    return check.ok ? null : { refs: check.refs, head };
+  }
+
+  private async keepSuperseded(rt: Runtime, head: string): Promise<string> {
+    const base = `superseded/${rt.worktree!.branch}-${compactStamp()}`;
+    let keep = base;
+    for (let n = 1; (await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${keep}`])).code === 0; n++) keep = `${base}.${n}`;
+    await checkedGit(this.opts.repoRoot, ["branch", keep, head]);
+    return keep;
   }
 
   /** Integrate a reviewed contract; "again" when a merge conflict needs another attempt. */
