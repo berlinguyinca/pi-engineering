@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DiffGuardReport } from "./diffGuard.ts";
+import type { TaskManifest } from "./taskManifest.ts";
 export interface Proof { command: string; exitCode: number; outputArtifact: string }
 export interface GateObservations { requiredCommands: readonly string[]; proofs: readonly Proof[]; artifactSha256: Readonly<Record<string, string | null>>; expectedArtifactSha256?: Readonly<Record<string, string>>; diff: DiffGuardReport; commitParentSha: string; approvedBaseSha: string }
 export interface GateResult { ok: boolean; blockers: string[] }
@@ -16,6 +17,14 @@ export function canonicalHash(record: unknown): string {
     ? Object.fromEntries(Object.keys(value as Record<string, unknown>).sort().map((key) => [key, sort((value as Record<string, unknown>)[key])])) : value;
   const clone = { ...(record as Record<string, unknown>) }; delete clone.handoffHash; return `sha256:${createHash("sha256").update(JSON.stringify(sort(clone)), "utf8").digest("hex")}`;
 }
+
+/**
+ * FIX-4A: the authority of a task IS the canonical hash of the *parsed* manifest — the normalized object
+ * `parseTaskManifest` returns (defaults applied, unknown keys dropped from it), so two manifest files that differ
+ * only by defaults or unknown keys carry the same authority. An unknown top-level key never reaches the hash by
+ * another route: the parser rejects such a manifest before anything is hashed or stamped.
+ */
+export const taskAuthorityHash = (manifest: TaskManifest): string => canonicalHash(manifest);
 
 export function hashArtifact(path: string): string | null { try { return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`; } catch { return null; } }
 export function evaluateResultGate(obs: GateObservations): GateResult {

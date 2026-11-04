@@ -5,6 +5,7 @@
  * and no scheduler/orchestration/planner import (asserted by the unit test). Read-only: it reads files and
  * asks git only for HEAD and porcelain status. Exit codes: 0 plan, 2 manifest invalid, 3 baseline rejected, 4 handoff rejected, 5 gate rejected, 64 usage, 66 unreadable input.
  * FIX-3C: `--emit-handoff` REQUIRES `--handoff-schema <path>` (resolved against `--cwd` exactly like `--proofs`/`--handoff-record`): the record is schema-validated in the CLI, before anything is written.
+ * FIX-4A: `--emit-handoff` derives the task authority from the parsed manifest (`taskAuthorityHash`) and blocks a record that names a different one; the accepted run prints `authority=<taskId> <derived hash>`.
  * Usage: node scripts/bootstrap-one.ts --manifest <path> [--parent-handoff <path>] [--cwd <path>] [--proofs <path>] [--handoff-record <path>] [--handoff-schema <path>] [--emit-handoff <dir>]
  */
 import { execFileSync } from "node:child_process";
@@ -12,7 +13,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseTaskManifest, type TaskManifest } from "../src/bootstrap/taskManifest.ts";
 import { evaluateDiffScope } from "../src/bootstrap/diffGuard.ts";
-import { canonicalHash, evaluateResultGate, hashArtifact, type Proof } from "../src/bootstrap/resultGate.ts";
+import { canonicalHash, evaluateResultGate, hashArtifact, taskAuthorityHash, type Proof } from "../src/bootstrap/resultGate.ts";
 import { validateHandoffSchema, writeHandoff } from "../src/bootstrap/handoffWriter.ts"; // FIX-3C: the CLI stamps through the validating writer, not resultGate's raw one
 export { canonicalHash };
 
@@ -55,6 +56,13 @@ function preStampSchema(cwd: string, schemaPath: string | null, recordPath: stri
   return { blockers: validateHandoffSchema(record.value as Record<string, unknown>, schema.value), record: record.value as Record<string, unknown> };
 }
 
+/** FIX-4A: derive the authority the manifest carries and check the record's claim against it — a record may not name (or invent) its own task authority. Total: an unparsed manifest or an absent/unreadable record leaves no claim to check, which the existing blockers already report. */
+function taskAuthority(manifest: TaskManifest | null, record: Record<string, unknown> | null): { hash: string | null; blockers: string[] } {
+  if (manifest === null || record === null) return { hash: null, blockers: [] };
+  const hash = taskAuthorityHash(manifest); const claimed = record.taskAuthorityHash;
+  return { hash, blockers: claimed === hash ? [] : [`$.taskAuthorityHash: the record says ${String(claimed)} but manifest ${manifest.taskId} derives ${hash}`] };
+}
+
 export function bootstrapOne(obs: Observations): Plan {
   let raw: unknown; try { raw = JSON.parse(obs.manifestText); } catch (error) { return { exitCode: 2, lines: [`REJECT manifest: not valid JSON (${(error as Error).message})`] }; }
   const parsed = parseTaskManifest(raw);
@@ -87,9 +95,10 @@ if (process.argv[1]?.endsWith("bootstrap-one.ts")) {
       const parentBlockers = parsed.ok ? validateParentHandoff(parsed.manifest, parentText) : [];
       if (parsed.ok && parentBlockers.length === 0 && plan.exitCode !== 0) for (const line of parentAcceptance(parsed.manifest, parentText)) console.log(line); // the plan already printed it when it validated
       const schema = preStampSchema(cwd, schemaPath, recordPath); // FIX-3C: validated HERE, before anything is written, whatever the gate's own verdict is
-      const blockers = [...(plan.exitCode === 2 || plan.exitCode === 4 ? [`plan exited ${plan.exitCode}; no handoff written`] : porcelain.trim() !== "" ? ["worktree is not clean: the gate stamps only a committed, clean task commit"] : recordPath === null ? ["--emit-handoff requires --handoff-record: the tool stamps checksums, it never invents handoff content"] : parsed.ok === false ? parsed.errors : evaluateResultGate({ requiredCommands: parsed.manifest.commands.map((command) => command.argv.join(" ")), proofs, artifactSha256: Object.fromEntries(proofs.map((proof) => [proof.outputArtifact, hashArtifact(resolve(cwd, proof.outputArtifact))])), diff: evaluateDiffScope(parsed.manifest, { porcelain, numstat: git(["diff", "--numstat", "HEAD^1", "HEAD"]) }), commitParentSha: git(["rev-parse", "HEAD^1"]).trim(), approvedBaseSha: parsed.manifest.baseSha }).blockers), ...parentBlockers, ...schema.blockers];
+      const authority = taskAuthority(parsed.ok ? parsed.manifest : null, schema.record); // FIX-4A: the authority is DERIVED from the manifest here, never taken from the record
+      const blockers = [...(plan.exitCode === 2 || plan.exitCode === 4 ? [`plan exited ${plan.exitCode}; no handoff written`] : porcelain.trim() !== "" ? ["worktree is not clean: the gate stamps only a committed, clean task commit"] : recordPath === null ? ["--emit-handoff requires --handoff-record: the tool stamps checksums, it never invents handoff content"] : parsed.ok === false ? parsed.errors : evaluateResultGate({ requiredCommands: parsed.manifest.commands.map((command) => command.argv.join(" ")), proofs, artifactSha256: Object.fromEntries(proofs.map((proof) => [proof.outputArtifact, hashArtifact(resolve(cwd, proof.outputArtifact))])), diff: evaluateDiffScope(parsed.manifest, { porcelain, numstat: git(["diff", "--numstat", "HEAD^1", "HEAD"]) }), commitParentSha: git(["rev-parse", "HEAD^1"]).trim(), approvedBaseSha: parsed.manifest.baseSha }).blockers), ...parentBlockers, ...schema.blockers, ...authority.blockers];
       if (blockers.length > 0) { for (const blocker of blockers) console.log(`REJECT gate: ${blocker}`); process.exitCode = porcelain.trim() !== "" ? 3 : parsed.ok === false ? 2 : 5; }
-      else if (parsed.ok) { process.exitCode = 0; console.log(`schema=${parsed.manifest.taskId} conforms ${schemaPath}`); const written = writeHandoff(outDir, parsed.manifest.taskId, schema.record as Record<string, unknown>); console.log(`handoff=${written.path} checksum=${written.handoffHash} gate=accepted (clean tree + proofs + diff scope + HEAD^1 == approved base; the plan baseline line above describes the pre-task state)`); }
+      else if (parsed.ok) { process.exitCode = 0; console.log(`authority=${parsed.manifest.taskId} ${authority.hash}`); console.log(`schema=${parsed.manifest.taskId} conforms ${schemaPath}`); const written = writeHandoff(outDir, parsed.manifest.taskId, schema.record as Record<string, unknown>); console.log(`handoff=${written.path} checksum=${written.handoffHash} gate=accepted (clean tree + proofs + diff scope + HEAD^1 == approved base; the plan baseline line above describes the pre-task state)`); }
     }
   } catch (error) { console.log(`REJECT input: ${(error as Error).message}`); process.exitCode = 66; }
 }
