@@ -2,8 +2,7 @@
  * Live status-bar configuration.
  *
  * Follows the harness's existing configuration convention (env-var driven with
- * safe defaults, mirroring the Generation Guard `PI_GUARD_*` and Hindsight
- * `PI_HINDSIGHT_*` config). The footer is enabled by default; set
+ * safe defaults, mirroring the Generation Guard `PI_GUARD_*` config). The footer is enabled by default; set
  * `PI_STATUS_BAR_ENABLED=0` to disable it entirely.
  */
 

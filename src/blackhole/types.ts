@@ -88,7 +88,7 @@ export type MemoryWorkerRole = keyof typeof MEMORY_WORKER_PRIORITIES;
 export type DurableStoreConfig =
   | { kind: "memory" }
   | { kind: "shared-file"; file: string }
-  | { kind: "hindsight"; cli?: string; scopes?: string[]; timeoutMs?: number };
+  | { kind: "hindsight"; cli?: string; scopes?: string[]; timeoutMs?: number; harness?: string };
 
 export type PromotionState = "proposed" | "accepted" | "rejected" | "promoted" | "superseded";
 

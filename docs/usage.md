@@ -1528,6 +1528,91 @@ memoryless on a multi-host run.
 ### Turning the connection on anywhere pi is installed (no code edits)
 
 Any pi installation that loads this package's **extension** uses Hindsight when
+`engineering.yaml` opts in — no per-repo code. Configuration is YAML only; **no
+environment variables are read** (the old `PI_HINDSIGHT_*` variables are
+ignored, with a one-time warning naming the key to use instead). Pi shells out to
+`herdr-memory` and holds no memory credential of its own: the CLI resolves its own
+configuration and token, so there is no host, key or key file for pi to store, and
+no secret belongs in YAML. Add this to the global `~/.pi/agent/engineering.yaml`
+(or `$PI_CODING_AGENT_DIR/engineering.yaml`):
+
+```yaml
+# ~/.pi/agent/engineering.yaml (global). `cli` is honored only here.
+memory:
+  hindsight:
+    enabled: true                 # opt-in; default false
+    cli: herdr-memory             # executable to shell out to (global config only)
+    scopes: [project]             # project, global, infra, mission:<id>
+    timeout_ms: 5000              # per-call CLI timeout, 100..60000
+    harness: pi                   # provenance/credential harness name the CLI sees
+    failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
+    unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
+```
+
+| Key | Default | Range / values |
+| --- | --- | --- |
+| `enabled` | `false` | `true` / `false` |
+| `cli` | `herdr-memory` | non-empty executable name or path; global config only |
+| `scopes` | `[project]` | non-empty list of `project`, `global`, `infra`, `mission:<id>` |
+| `timeout_ms` | `5000` | 100..60000 |
+| `harness` | `pi` | `[a-z][a-z0-9_-]{0,31}` |
+| `failure_backoff_ms` | `60000` | 1000..3600000 |
+| `unavailable_backoff_ms` | `300000` | 1000..86400000 |
+
+A repository's `.pi/engineering.yaml` may set everything except `cli` (a cloned
+repo must not choose which program runs; the key is ignored with a warning). Any
+invalid value fails closed: memory stays off and `/memory` names the key to fix.
+Unknown keys under `memory.hindsight` are reported as warnings. The file is
+re-read at session start, at each turn and by `/memory`, so an edit takes effect
+without restarting.
+
+When `memory.hindsight.enabled` is true, the extension passes
+`blackhole: { config: { enabled: true, durable: { kind: "hindsight", ... } } }`
+into every `EngineeringRuntime` it opens, so all repos in that install share the
+same durable backend. Absent the config, blackhole stays off (backward
+compatible). Verify a connection with `/blackhole` (or `/memory` for the
+interactive notes) in a pi session, or:
+
+```sh
+node scripts/pi-engineering.ts blackhole status
+herdr-memory doctor        # the CLI's own credential/config check
+```
+
+Artifacts are written under `docs/evidence/blackhole/`. The benchmark is a
+deterministic, model-free simulator (see the report methodology note) — it
+validates the measurement pipeline and shows the expected direction of effect,
+not a measured model claim.
+
+### Sharing memory across several workers
+
+Only *evidence-promoted* knowledge is shared; session-local working memory stays
+strictly isolated per candidate/reviewer/challenger. The `durable` config selects
+the backing store for shared durable memory (default `memory` = single process):
+
+```ts
+// Several workers on one host / CI share promoted memory via an append-only JSONL file.
+blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/shared/durable.jsonl" } } }
+
+// Cross-machine sharing through the herdr-memory CLI (Hindsight).
+blackhole: { config: { enabled: true, durable: { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] } } }
+```
+
+Each `runWorker` hydrates its context from shared durable memory on run, so a
+later/other worker consumes knowledge promoted by any earlier worker (spec:
+*"accepted promoted memories can be consumed by later sessions"*). Provider
+outage degrades hydration to an empty result and never fails the worker.
+`pi-engineering blackhole status` reports the active `durable` kind.
+
+`openviking` is **not** a valid kind any more. The HTTP transport and the
+`services/openviking` service it spoke to were retired, and the `herdr-memory`
+CLI replaced them as the cross-machine store. A configuration that still names
+the retired kind fails validation with a message naming the kinds that work,
+rather than falling back to an in-process store and quietly leaving every worker
+memoryless on a multi-host run.
+
+### Turning the connection on anywhere pi is installed (no code edits)
+
+Any pi installation that loads this package's **extension** uses Hindsight when
 the environment opts in — no per-repo code. Pi shells out to `herdr-memory` and
 holds no memory credential of its own: the CLI resolves its own configuration
 and token, so there is no host, key or key file for pi to store. Set these once
@@ -1552,15 +1637,17 @@ node scripts/pi-engineering.ts blackhole status
 herdr-memory doctor        # the CLI's own credential/config check
 ```
 
-A leftover OpenViking environment variable or saved connection profile is
-detected by existence only — its contents are never read and no value is ever
-printed — and produces a single load-time warning pointing at `herdr-memory`
-(`src/blackhole/legacyOpenViking.ts`). Delete those files once migrated; nothing
-reads them for configuration.
+Leftover `PI_HINDSIGHT_*` / `PI_OPENVIKING_*` environment variables and saved
+OpenViking connection profiles are detected by name or existence only — values and
+file contents are never read or printed — and produce a single load-time warning
+(`src/blackhole/legacyOpenViking.ts`) that maps each variable to its YAML key
+(`PI_HINDSIGHT_ENABLED` -> `memory.hindsight.enabled`, `_CLI` -> `cli`, `_SCOPES`
+-> `scopes`, `_TIMEOUT_MS` -> `timeout_ms`). The warning never fails startup.
+Remove the variables once migrated; nothing reads them.
 
-The resolver is `resolveHindsightFromEnv()` in `src/blackhole/hindsight.ts`:
-configuration is fail-closed (an unknown scope or a malformed timeout falls back
-to the default), reads are fail-open (a CLI that cannot answer yields no notes
+The loader is `loadHindsightSettings()` in `src/lifecycle/policy.ts` (schema and
+validation in `src/blackhole/hindsightSettings.ts`): configuration is fail-closed
+(an invalid value turns memory off and says which key), reads are fail-open (a CLI that cannot answer yields no notes
 rather than a failed turn), and writes only report the outcome the CLI actually
 acknowledged.
 

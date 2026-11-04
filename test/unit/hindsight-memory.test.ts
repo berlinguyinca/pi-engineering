@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildDurableProvider } from "../../src/blackhole/BlackholeManager.ts";
 import type { DurableMemoryRecord } from "../../src/blackhole/durableProvider.ts";
-import {
-  HindsightDurableMemory,
-  type HindsightRunner,
-  resolveHindsightFromEnv,
-} from "../../src/blackhole/hindsight.ts";
+import { HindsightDurableMemory, type HindsightRunner, connectionFromSettings } from "../../src/blackhole/hindsight.ts";
+import { DEFAULT_HINDSIGHT_SETTINGS } from "../../src/blackhole/hindsightSettings.ts";
 import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory.ts";
 
 const row = (id: string, text: string, extra: Record<string, unknown> = {}) => ({
@@ -41,11 +41,11 @@ function recorder(handler: (args: string[]) => unknown | Promise<unknown>) {
   return { calls, run };
 }
 
-test("opt-in: disabled unless PI_HINDSIGHT_ENABLED", () => {
-  assert.equal(resolveHindsightFromEnv({}), null);
-  assert.equal(resolveHindsightFromEnv({ PI_HINDSIGHT_ENABLED: "0" }), null);
-  const c = resolveHindsightFromEnv({ PI_HINDSIGHT_ENABLED: "1", PI_HINDSIGHT_SCOPES: "global,bogus,mission:abc" });
+test("opt-in: disabled unless memory.hindsight.enabled", () => {
+  assert.equal(connectionFromSettings(DEFAULT_HINDSIGHT_SETTINGS), null);
+  const c = connectionFromSettings({ ...DEFAULT_HINDSIGHT_SETTINGS, enabled: true, scopes: ["global", "mission:abc"] });
   assert.deepEqual(c?.scopes, ["global", "mission:abc"]);
+  assert.equal(c?.harness, "pi");
   assert.equal(buildDurableProvider({ kind: "hindsight" }).kind, "hindsight");
 });
 
@@ -165,8 +165,10 @@ function interactive(provider: HindsightDurableMemory) {
     hasUI: true,
     ui: { setStatus: () => {}, notify: (t: string) => notices.push(t) },
   } as unknown as ExtensionCommandContext;
+  const agentDir = mkdtempSync(join(tmpdir(), "hs-mem-"));
+  writeFileSync(join(agentDir, "engineering.yaml"), "memory:\n  hindsight:\n    enabled: true\n");
   registerInteractiveMemory(pi, {
-    env: () => ({ PI_HINDSIGHT_ENABLED: "1" }),
+    env: () => ({ PI_CODING_AGENT_DIR: agentDir }),
     provider: () => provider,
   });
   const injected = async () => {

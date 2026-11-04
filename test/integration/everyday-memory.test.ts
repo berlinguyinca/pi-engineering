@@ -92,8 +92,10 @@ test("explicit /remember survives into another session through the herdr-memory 
   try {
     process.env.PI_CODING_AGENT_DIR = dir;
     process.env.MEMORY_STUB_DB = join(dir, "hindsight.jsonl");
-    process.env.PI_HINDSIGHT_ENABLED = "1";
-    process.env.PI_HINDSIGHT_CLI = cli;
+    writeFileSync(
+      join(dir, "engineering.yaml"),
+      `memory:\n  hindsight:\n    enabled: true\n    cli: ${JSON.stringify(cli)}\n`,
+    );
     const first = load(dir);
     await first.emit("session_start");
     await first.commands.get("remember")!.handler("Calibration reports use metric units.", first.ctx);

@@ -348,7 +348,12 @@ export function buildDurableProvider(cfg: import("./types.ts").DurableStoreConfi
     case "shared-file":
       return new SharedFileDurableMemory(cfg.file);
     case "hindsight":
-      return new HindsightDurableMemory({ cli: cfg.cli, scopes: cfg.scopes, timeoutMs: cfg.timeoutMs });
+      return new HindsightDurableMemory({
+        cli: cfg.cli,
+        scopes: cfg.scopes,
+        timeoutMs: cfg.timeoutMs,
+        harness: cfg.harness,
+      });
     default:
       return new InMemoryDurableMemory();
   }

@@ -5,7 +5,7 @@
 > recall, visible footer state, no credential in diagnostics), which still holds.
 > The transport it exercised no longer exists: the OpenViking HTTP client, the
 > interactive setup dialog, the saved connection profile and the local HTTP
-> service were retired in favour of the `herdr-memory` CLI (`PI_HINDSIGHT_*`).
+> service were retired in favour of the `herdr-memory` CLI (`memory.hindsight` in `engineering.yaml`).
 > Do not re-run the HTTP steps below; the equivalent CLI proof is
 > `test/integration/everyday-memory.test.ts` with
 > `test/fixtures/herdr-memory-stub.sh`.

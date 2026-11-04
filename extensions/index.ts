@@ -394,7 +394,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   if (openGeneration !== runtimeShutdownGeneration) {
     throw new Error("Runtime request was superseded by session shutdown");
   }
-  const blackhole = hindsightBlackholeOption();
+  const blackhole = hindsightBlackholeOption(cwd, process.env.PI_CODING_AGENT_DIR?.trim() || undefined);
   const memoryIdentity = createHash("sha256")
     .update(JSON.stringify(blackhole ?? null))
     .digest("hex");
@@ -408,10 +408,11 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     }
     return opened.runtime;
   }
-  // Hindsight connection from the environment. If PI_HINDSIGHT_ENABLED=1 is
-  // set, blackhole is enabled with the hindsight durable store for EVERY repo
-  // this extension runs in — set it once per install and all repos share the
-  // deployed durable memory. Absent the env, blackhole stays off (unchanged).
+  // Hindsight connection from YAML (`memory.hindsight` in engineering.yaml). If
+  // `memory.hindsight.enabled` is true in the global config, blackhole is enabled
+  // with the hindsight durable store for EVERY repo this extension runs in — set
+  // it once per install and all repos share the deployed durable memory. Absent
+  // the config, blackhole stays off (unchanged).
   //
   // The open is published in `runtimeOpens` in the same synchronous step as the `pending` check above. The lineage and
   // attention lookups are real I/O (seconds under load); awaiting them BEFORE publishing left a window in which a

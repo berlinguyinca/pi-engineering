@@ -2,27 +2,38 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type PolicyIssue, loadHindsightSettings } from "../lifecycle/policy.ts";
 import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import type { DurableMemoryProvider, DurableMemoryRecord } from "./durableProvider.ts";
 import {
   HINDSIGHT_UNTRUSTED_HEADER,
+  type HindsightConnectionConfig,
   HindsightDurableMemory,
-  type HindsightEnvConfig,
   HindsightError,
-  resolveHindsightFromEnv,
+  connectionFromSettings,
 } from "./hindsight.ts";
-import { warnLegacyOpenViking } from "./legacyOpenViking.ts";
+import type { HindsightSettings } from "./hindsightSettings.ts";
+import { warnLegacyMemoryEnv, warnLegacyOpenViking } from "./legacyOpenViking.ts";
 
 /** Durable memory backend: the opt-in Hindsight provider over the herdr-memory CLI. */
-type MemoryConfig = HindsightEnvConfig & { identity: string };
+type MemoryConfig = HindsightConnectionConfig & {
+  identity: string;
+  failureBackoffMs: number;
+  unavailableBackoffMs: number;
+};
 
 /** Opt-in only: null keeps memory off. It never resolves to a silent in-process store. */
-function resolveMemoryConfig(env: Record<string, string | undefined>): MemoryConfig | null {
-  const h = resolveHindsightFromEnv(env);
-  if (!h) return null;
+function resolveMemoryConfig(settings: HindsightSettings | null): MemoryConfig | null {
+  const h = settings ? connectionFromSettings(settings) : null;
+  if (!settings || !h) return null;
   // Synthetic identity: the CLI holds its own credentials; nothing secret here.
-  return { ...h, identity: `hindsight:${h.cli}:${h.scopes.join(",")}` };
+  return {
+    ...h,
+    identity: `hindsight:${h.cli}:${h.harness}:${h.scopes.join(",")}`,
+    failureBackoffMs: settings.failure_backoff_ms,
+    unavailableBackoffMs: settings.unavailable_backoff_ms,
+  };
 }
 
 const MEMORY_CONTEXT = "pi-engineering-memory";
@@ -30,8 +41,6 @@ const MAX_CONTEXT = 6000;
 const AUTOMATIC_LOOKUP_MS = 250;
 const RECALL_TTL_MS = 60_000;
 const MAX_CACHED_QUERIES = 32;
-const FAILURE_BACKOFF_MS = 60_000;
-const AUTH_BACKOFF_MS = 5 * 60_000;
 const STOPWORDS = new Set(
   "the and that this what with from can could should please how are was will have has for you your our about into using want need help know remember memory tell some there these those".split(
     " ",
@@ -39,6 +48,11 @@ const STOPWORDS = new Set(
 );
 
 export interface InteractiveMemoryOptions {
+  /**
+   * Process environment, used ONLY for the state root, the agent directory
+   * (where the global engineering.yaml lives) and the one-time warning about
+   * retired PI_HINDSIGHT_* variables. Memory itself is configured in YAML.
+   */
   env?: () => NodeJS.ProcessEnv;
   provider?: (config: MemoryConfig) => DurableMemoryProvider;
   now?: () => number;
@@ -130,7 +144,19 @@ function memoryBlock(
 /** Interactive-only registration: never include these hooks in worker resource loaders. */
 export function registerInteractiveMemory(pi: ExtensionAPI, options: InteractiveMemoryOptions = {}): void {
   warnLegacyOpenViking(options.env ? options.env() : process.env);
+  warnLegacyMemoryEnv(options.env ? options.env() : process.env);
   const environment = options.env ?? (() => ({ ...process.env }));
+  // `memory.hindsight` from YAML, loaded at session start and by each /memory and
+  // /remember command (so an edit takes effect without restarting). Null until loaded.
+  let settings: HindsightSettings | null = null;
+  let configIssues: PolicyIssue[] = [];
+  const refreshSettings = (ctx: ExtensionContext) => {
+    const dir = environment().PI_CODING_AGENT_DIR?.trim();
+    const loaded = loadHindsightSettings(ctx.cwd || process.cwd(), dir || undefined);
+    settings = loaded.settings;
+    configIssues = loaded.issues;
+  };
+  const resolve = () => resolveMemoryConfig(settings);
   const makeProvider: (config: MemoryConfig) => DurableMemoryProvider =
     options.provider ??
     ((config) =>
@@ -138,6 +164,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         cli: config.cli,
         scopes: config.scopes,
         timeoutMs: Math.min(config.timeoutMs, 5000),
+        harness: config.harness,
       }));
   const now = options.now ?? Date.now;
   let generation = 0;
@@ -184,12 +211,12 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const failure = (ctx: ExtensionContext, code: string, description: string, explicit = false) => {
     recalled = "";
     setStatus(ctx, description);
-    const text = `${description}. Run /memory to check; memory is enabled with PI_HINDSIGHT_ENABLED=1.`;
+    const text = `${description}. Run /memory to check; memory is enabled with memory.hindsight.enabled in engineering.yaml.`;
     if (!ctx.hasUI && !explicit) {
       // Headless (pi -p): an automatic status line is not part of the answer.
       // Writing it into the transcript polluted every print-mode session, so
       // log it to telemetry/stderr once per memory host per day instead.
-      const identity = resolveMemoryConfig(environment())?.identity ?? "unconfigured";
+      const identity = resolve()?.identity ?? "unconfigured";
       if (lastFailure !== code && firstNoticeToday(noticeDir(), identity)) {
         emitTelemetry({ level: "warning", key: `memory:${code}`, text: `Memory: ${text}` });
       }
@@ -201,7 +228,12 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     clearRecall();
     // A missing CLI or a refused write will not fix itself between turns; a
     // timeout or a bad exit code might. That distinction is the two backoffs.
-    retryAfter = now() + (code === "unavailable" || code === "rejected" ? AUTH_BACKOFF_MS : FAILURE_BACKOFF_MS);
+    const cfg = resolve();
+    retryAfter =
+      now() +
+      (code === "unavailable" || code === "rejected"
+        ? (cfg?.unavailableBackoffMs ?? 300_000)
+        : (cfg?.failureBackoffMs ?? 60_000));
     const messages: Record<string, string> = {
       unavailable: "herdr-memory is unavailable (not installed, or its own config is missing)",
       timeout: "herdr-memory timed out",
@@ -220,21 +252,22 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     retryAfter = 0;
   };
   const connection = (ctx: ExtensionContext, explicit = false, auto = false) => {
-    const env = environment();
-    const config = resolveMemoryConfig(env);
+    const config = resolve();
     if (!config) {
       clearRecall();
       activeFingerprint = "";
       retryAfter = 0;
       setStatus(ctx, "off");
-      if (explicit)
+      if (explicit) {
+        const errors = configIssues.filter((i) => i.severity === "error");
         reply(
           ctx,
-          env.PI_HINDSIGHT_ENABLED === "0" || env.PI_HINDSIGHT_ENABLED === "false"
-            ? "Memory is disabled by PI_HINDSIGHT_ENABLED. Remove that override or set it to 1, then run /memory."
-            : "Memory is off. Enable it with PI_HINDSIGHT_ENABLED=1 (the herdr-memory CLI), then run /memory.",
+          errors.length
+            ? `Memory is off because engineering.yaml has invalid settings: ${errors.map((i) => `${i.path} (${i.message})`).join("; ")}. Fix them, then run /memory.`
+            : "Memory is off. Set memory.hindsight.enabled: true in engineering.yaml (the herdr-memory CLI), then run /memory.",
           true,
         );
+      }
       return;
     }
     const identity = fingerprint(config);
@@ -258,7 +291,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
   const current = (id: number, identity: string) => {
     if (id !== generation) return false;
-    const config = resolveMemoryConfig(environment());
+    const config = resolve();
     return !!config && fingerprint(config) === identity;
   };
   const check = async (ctx: ExtensionContext, explicit: boolean) => {
@@ -294,6 +327,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         reply(ctx, "Use /remember <text> with 1–4,000 characters. Only the supplied text is saved.", true);
         return;
       }
+      refreshSettings(ctx);
       const conn = connection(ctx, true);
       if (!conn) return;
       const id = generation;
@@ -349,14 +383,15 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     description: "Check the Hindsight memory connection or search notes: /memory <query>.",
     handler: async (args, ctx) => {
       const query = args.trim();
+      refreshSettings(ctx);
       if (query === "setup") {
         // The retired /memory setup dialog configured an HTTP memory service and
         // stored a host + token profile. The herdr-memory CLI carries its own
-        // config and credentials, so the remaining knobs are plain environment
-        // variables: say so instead of opening a dialog that configures nothing.
+        // config and credentials, so the remaining knobs are YAML: say so
+        // instead of opening a dialog that configures nothing.
         reply(
           ctx,
-          "Memory is configured by the environment, not a saved profile: PI_HINDSIGHT_ENABLED=1 enables it; PI_HINDSIGHT_CLI names the executable and PI_HINDSIGHT_SCOPES the scopes. The CLI holds its own credentials (herdr-memory doctor checks them).",
+          "Memory is configured in engineering.yaml, not a saved profile or environment variables. Under memory.hindsight: enabled: true turns it on; cli names the executable (global config only); scopes, timeout_ms, harness, failure_backoff_ms and unavailable_backoff_ms tune it. See docs/usage.md (Everyday memory). The CLI holds its own credentials (herdr-memory doctor checks them).",
         );
         await check(ctx, true);
         return;
@@ -397,6 +432,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   if (typeof pi.on !== "function") return;
   pi.on("session_start", async (_event, ctx) => {
     reset();
+    refreshSettings(ctx);
     const id = generation;
     if (id === generation) await check(ctx, false);
   });
@@ -409,6 +445,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     // in this session. Session/connection replacement owns generation changes.
     automaticLookupEpoch++;
     recalled = "";
+    refreshSettings(ctx); // cheap; a changed config retires the old connection immediately
     const conn = connection(ctx, false, true);
     if (!conn) return;
     const id = generation;
@@ -447,7 +484,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   });
   pi.on("context", (event, ctx) => {
     const messages = event.messages.filter((m) => !(m.role === "custom" && m.customType === MEMORY_CONTEXT));
-    const config = resolveMemoryConfig(environment());
+    const config = resolve();
     if (!config) {
       recalled = "";
       setStatus(ctx, "off");

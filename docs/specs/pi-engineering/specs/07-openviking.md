@@ -8,7 +8,7 @@
 > `PI_OPENVIKING_*` configuration, the interactive setup dialog and the
 > `services/openviking` service were deleted. Durable memory is **Hindsight,
 > reached through the `herdr-memory` CLI** (`durable.kind: hindsight`,
-> `PI_HINDSIGHT_*`); `openviking` fails configuration validation. See
+> `memory.hindsight` in `engineering.yaml`); `openviking` fails configuration validation. See
 > [GAP_MATRIX §07](../GAP_MATRIX.md) for the scored status
 > and [usage: sharing memory](../../../usage.md#sharing-memory-across-several-workers)
 > for the current configuration. Requirements below are kept verbatim as the
