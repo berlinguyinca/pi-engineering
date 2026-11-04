@@ -1,4 +1,4 @@
-import type { DurableMemoryRecord } from "./OpenViking.ts";
+import type { DurableMemoryRecord } from "./durableProvider.ts";
 /**
  * Dashboard panels — deterministic, machine-readable data a control plane /
  * dashboard (B-105) can render. Pure + dependency-free.

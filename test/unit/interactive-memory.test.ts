@@ -1,22 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type DurableMemoryRecord, InMemoryDurableMemory } from "../../src/blackhole/OpenViking.ts";
-import { OpenVikingRequestError } from "../../src/blackhole/durable.ts";
+import { type DurableMemoryRecord, InMemoryDurableMemory } from "../../src/blackhole/durableProvider.ts";
+import { HindsightDurableMemory, HindsightError, type HindsightRunner } from "../../src/blackhole/hindsight.ts";
 import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory.ts";
 
 type Handler = (event: any, ctx: ExtensionContext) => any;
 function fixture(
   options: {
     configured?: boolean;
-    token?: string;
     hasUI?: boolean;
     noticeDir?: string;
-    baseUrl?: string;
+    cli?: string;
     stateDir?: string;
     now?: () => number;
-    realProvider?: boolean;
-    setup?: (ctx: ExtensionContext, force?: boolean) => Promise<void>;
   } = {},
 ) {
   const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
@@ -24,13 +21,12 @@ function fixture(
   const statuses: string[] = [];
   const notices: Array<{ text: string; type: string }> = [];
   const sent: any[] = [];
+  // Hindsight is the only durable backend and it is opt-in: the env surface is
+  // the whole configuration, and the herdr-memory CLI holds its own credentials.
   const env: Record<string, string | undefined> =
     options.configured === false
       ? {}
-      : {
-          PI_OPENVIKING_BASE_URL: options.baseUrl ?? "https://memory.example",
-          PI_OPENVIKING_TOKEN: options.token ?? "test-key",
-        };
+      : { PI_HINDSIGHT_ENABLED: "1", PI_HINDSIGHT_CLI: options.cli ?? "herdr-memory", PI_HINDSIGHT_SCOPES: "project" };
   if (options.stateDir) env.PI_ENGINEERING_STATE_DIR = options.stateDir;
   const store = new InMemoryDurableMemory();
   const queries: string[] = [];
@@ -69,8 +65,7 @@ function fixture(
   } as unknown as ExtensionCommandContext;
   registerInteractiveMemory(pi, {
     env: () => env,
-    ...(options.realProvider ? {} : { provider: () => provider }),
-    setup: options.setup ?? (async () => {}),
+    provider: () => provider,
     ...(options.now ? { now: options.now } : {}),
     ...(options.noticeDir ? { headlessNoticeDir: options.noticeDir } : {}),
   });
@@ -155,16 +150,14 @@ test("valid empty response reports ready, failures report error and recover", as
   assert.match(f.statuses.at(-1)!, /ready/i);
 });
 
-test("configuration off or empty key causes no provider calls", async () => {
-  for (const options of [{ configured: false }, { token: "" }]) {
-    const f = fixture(options);
-    await f.emit("session_start");
-    await f.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
-    await f.command("remember", "note");
-    assert.equal(f.saves, 0);
-    assert.equal(f.queries.length, 0);
-    assert.match(f.statuses.at(-1)!, /off|key/i);
-  }
+test("memory disabled causes no provider calls", async () => {
+  const f = fixture({ configured: false });
+  await f.emit("session_start");
+  await f.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
+  await f.command("remember", "note");
+  assert.equal(f.saves, 0);
+  assert.equal(f.queries.length, 0);
+  assert.match(f.statuses.at(-1)!, /off/i);
 });
 
 test("recall is ephemeral, relevant and replaced on each prompt", async () => {
@@ -230,7 +223,7 @@ test("session reset and credential rotation clear stale memory and pending resul
   f.override(undefined);
   await f.store.store(record("calibration new"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
-  f.env.PI_OPENVIKING_TOKEN = "rotated";
+  f.env.PI_HINDSIGHT_SCOPES = "global";
   assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
 });
 
@@ -279,24 +272,27 @@ test("current user request follows recalled notes in model context", async () =>
   assert.equal(result.messages.at(-1), user);
 });
 
-test("context preserves off and missing-key status", async () => {
-  for (const options of [{ configured: false }, { token: "" }]) {
-    const f = fixture(options);
-    await f.emit("session_start");
-    const status = f.statuses.at(-1);
-    await f.emit("context", { messages: [] });
-    assert.equal(f.statuses.at(-1), status);
-  }
+test("context preserves the off status", async () => {
+  const f = fixture({ configured: false });
+  await f.emit("session_start");
+  const status = f.statuses.at(-1);
+  await f.emit("context", { messages: [] });
+  assert.equal(f.statuses.at(-1), status);
 });
 
-test("headless manual setup provides actionable visible instructions", async () => {
+test("the retired /memory setup names the environment it replaced, and still checks", async () => {
   const f = fixture({ hasUI: false });
   await f.command("memory", "setup");
-  assert.match(f.sent.at(-1).message.content, /interactive.*terminal/i);
-  assert.doesNotMatch(f.sent.at(-1).message.content, /connection verified/i);
+  const said = f.sent.map((m: any) => m.message.content).join("\n");
+  assert.match(
+    said,
+    /PI_HINDSIGHT_ENABLED=1.*PI_HINDSIGHT_CLI.*PI_HINDSIGHT_SCOPES/s,
+    "no dialog: the answer must say which knobs configure memory now",
+  );
+  assert.doesNotMatch(said, /PI_OPENVIKING|hidden key/i);
 });
 
-test("headless automatic memory failures stay out of the transcript and log once per host per day", async () => {
+test("headless automatic memory failures stay out of the transcript and log once per connection per day", async () => {
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
@@ -310,19 +306,19 @@ test("headless automatic memory failures stay out of the transcript and log once
     await first.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
     await first.emit("before_agent_start", { prompt: "imperial units", systemPrompt: "" });
     assert.equal(first.sent.length, 0, "no memory-status message is written into the session transcript");
-    assert.equal(logged.filter((t) => /service unavailable/.test(t)).length, 1, "logged once");
+    assert.equal(logged.filter((t) => /unavailable/.test(t)).length, 1, "logged once");
 
-    // A second headless run (a new `pi -p` process) on the same day and host stays quiet.
+    // A second headless run (a new `pi -p` process) on the same day and connection stays quiet.
     const second = fixture({ hasUI: false, noticeDir });
     second.fail(new Error("unavailable"));
     await second.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
     assert.equal(second.sent.length, 0);
-    assert.equal(logged.filter((t) => /service unavailable/.test(t)).length, 1, "once per host per day");
+    assert.equal(logged.filter((t) => /unavailable/.test(t)).length, 1, "once per connection per day");
 
-    const other = fixture({ hasUI: false, noticeDir, baseUrl: "https://other-memory.example" });
+    const other = fixture({ hasUI: false, noticeDir, cli: "other-herdr-memory" });
     other.fail(new Error("unavailable"));
     await other.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
-    assert.equal(logged.filter((t) => /service unavailable/.test(t)).length, 2, "a different host logs");
+    assert.equal(logged.filter((t) => /unavailable/.test(t)).length, 2, "a different connection logs");
 
     // An explicit command still answers in headless mode.
     await other.command("memory");
@@ -341,7 +337,7 @@ test("headless notice markers live in the per-user state dir, private, without t
   const stateDir = mkdtempSync(join(tmpdir(), "pi-eng-memory-state-"));
   const uninstall = setTelemetrySink(() => {});
   try {
-    const f = fixture({ hasUI: false, stateDir, baseUrl: "https://private-memory.example" });
+    const f = fixture({ hasUI: false, stateDir, cli: "private-memory.example" });
     f.fail(new Error("unavailable"));
     await f.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
     const dir = join(stateDir, "memory-notices");
@@ -350,7 +346,11 @@ test("headless notice markers live in the per-user state dir, private, without t
     assert.equal(markers.length, 1);
     const marker = join(dir, markers[0]!);
     assert.equal(statSync(marker).mode & 0o777, 0o600, "marker is private to the user");
-    assert.doesNotMatch(readFileSync(marker, "utf8"), /private-memory/, "the memory host is not written in clear");
+    assert.doesNotMatch(
+      readFileSync(marker, "utf8"),
+      /private-memory/,
+      "the memory connection identity is not written in clear",
+    );
   } finally {
     uninstall();
     rmSync(stateDir, { recursive: true, force: true });
@@ -412,7 +412,7 @@ for (const action of ["save", "check", "search"] as const) {
       const statuses = f.statuses.length;
       const notices = f.notices.length;
       if (outcome === "success") resolve([record("calibration obsolete snapshot")]);
-      else reject(new OpenVikingRequestError("auth", 401));
+      else reject(new HindsightError("rejected"));
       await pending;
       assert.equal(f.statuses.length, statuses, "stale work must preserve explicit command status");
       assert.equal(f.notices.length, notices, "stale failure must not publish a notice");
@@ -475,7 +475,7 @@ for (const action of ["save", "check", "search"] as const) {
       const statuses = f.statuses.length;
       const notices = f.notices.length;
       if (outcome === "success") resolve([record("calibration obsolete snapshot")]);
-      else reject(new OpenVikingRequestError("auth", 401));
+      else reject(new HindsightError("rejected"));
       await lookup;
       assert.equal(f.statuses.length, statuses);
       assert.equal(f.notices.length, notices);
@@ -503,7 +503,7 @@ for (const replacement of ["session", "credential"] as const) {
     };
     const save = f.command("remember", "calibration from the retired connection");
     if (replacement === "session") await f.emit("session_before_switch");
-    else f.env.PI_OPENVIKING_TOKEN = "rotated-key";
+    else f.env.PI_HINDSIGHT_SCOPES = "global";
     await f.emit("before_agent_start", { prompt: "calibration" });
     const statuses = f.statuses.length;
     const notices = f.notices.length;
@@ -514,75 +514,57 @@ for (const replacement of ["session", "credential"] as const) {
   });
 }
 
-test("late setup errors do not touch a session closed while setup was pending", async () => {
+test("late provider errors do not touch a session closed while the lookup was pending", async () => {
   for (const manual of [false, true]) {
     let reject!: (error: Error) => void;
-    const f = fixture({
-      setup: () =>
-        new Promise((_resolve, rejectSetup) => {
-          reject = rejectSetup;
-        }),
-    });
+    const f = fixture();
+    // The retired setup dialog was one async hand-off at session start; the
+    // equivalent risk now is a CLI recall/search still in flight at shutdown.
+    if (manual)
+      f.override(
+        () =>
+          new Promise((_resolve, rejectSearch) => {
+            reject = rejectSearch;
+          }),
+      );
+    else
+      f.store.recallAll = () =>
+        new Promise((_resolve, rejectRecall) => {
+          reject = rejectRecall;
+        });
     Object.assign(f.ctx, { mode: "tui" });
-    const pending = manual ? f.command("memory", "setup") : f.emit("session_start");
+    const pending = manual ? f.command("memory", "calibration") : f.emit("session_start");
     await f.emit("session_shutdown");
     const statuses = f.statuses.length;
     const notices = f.notices.length;
-    reject(new Error("setup failed after shutdown"));
+    reject(new HindsightError("unavailable"));
     await pending;
     assert.equal(f.statuses.length, statuses);
     assert.equal(f.notices.length, notices);
   }
 });
 
-test("authentication failures back off automatic search and credential rotation bypasses the backoff", async () => {
+test("refused writes back off automatic search and a connection change bypasses the backoff", async () => {
   const f = fixture();
-  f.fail(new OpenVikingRequestError("auth", 401));
+  f.fail(new HindsightError("rejected"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
   await f.emit("before_agent_start", { prompt: "different calibration", systemPrompt: "" });
-  assert.equal(f.queries.length, 1, "a rejected key is not sent on each turn");
-  assert.match(f.statuses.at(-1)!, /invalid|revoked/);
+  assert.equal(f.queries.length, 1, "a refused backend is not queried on each turn");
+  assert.match(f.statuses.at(-1)!, /refused/);
   f.fail();
-  f.env.PI_OPENVIKING_TOKEN = "rotated-key";
+  f.env.PI_HINDSIGHT_SCOPES = "global";
   await f.store.store(record("calibration available"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
   assert.equal(f.queries.length, 2);
   assert.match((await f.emit("context", { messages: [] })).messages[0].content, /available/);
 });
 
-test("real HTTP authentication failures are not retried on every prompt", async () => {
-  const { createServer } = await import("node:http");
-  let requests = 0;
-  const server = createServer((req, res) => {
-    requests++;
-    res.statusCode = req.headers.authorization === "Bearer rotated-key" ? 200 : 401;
-    res.setHeader("content-type", "application/json");
-    res.end("[]");
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-  const f = fixture({ realProvider: true, baseUrl: `http://127.0.0.1:${address.port}` });
-  try {
-    const prompt = { prompt: "calibration", systemPrompt: "" };
-    await f.emit("before_agent_start", prompt);
-    await f.emit("before_agent_start", prompt);
-    assert.equal(requests, 1);
-    assert.match(f.notices.at(-1)!.text, /invalid or revoked/);
-    f.env.PI_OPENVIKING_TOKEN = "rotated-key";
-    await f.emit("before_agent_start", prompt);
-    assert.equal(requests, 2);
-    assert.match(f.statuses.at(-1)!, /ready/);
-  } finally {
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
-});
-
 test("temporary memory failures retry after backoff and explicit status bypasses it", async () => {
   let now = 1000;
   const f = fixture({ now: () => now });
-  f.fail(new OpenVikingRequestError("unreachable"));
+  // A CLI that timed out is a blip; one that is simply absent is not, and that
+  // distinction is what the two backoff lengths are for.
+  f.fail(new HindsightError("timeout"));
   const prompt = { prompt: "calibration", systemPrompt: "" };
   await f.emit("before_agent_start", prompt);
   f.fail();
@@ -591,12 +573,27 @@ test("temporary memory failures retry after backoff and explicit status bypasses
   now += 61_000;
   await f.emit("before_agent_start", prompt);
   assert.equal(f.queries.length, 2);
-  f.fail(new OpenVikingRequestError("auth", 401));
+  f.fail(new HindsightError("rejected"));
   await f.emit("before_agent_start", { prompt: "different calibration", systemPrompt: "" });
   f.fail();
   await f.command("memory");
   await f.emit("before_agent_start", prompt);
   assert.equal(f.queries.length, 4, "explicit success clears cached recall and the failure backoff");
+});
+
+test("an absent herdr-memory CLI backs off longer than a blip", async () => {
+  let now = 1000;
+  const f = fixture({ now: () => now });
+  f.fail(new HindsightError("unavailable"));
+  const prompt = { prompt: "calibration", systemPrompt: "" };
+  await f.emit("before_agent_start", prompt);
+  f.fail();
+  now += 61_000;
+  await f.emit("before_agent_start", prompt);
+  assert.equal(f.queries.length, 1, "a missing CLI is not re-probed every minute");
+  now += 5 * 60_000;
+  await f.emit("before_agent_start", prompt);
+  assert.equal(f.queries.length, 2, "it is probed again once the longer backoff passes");
 });
 
 test("automatic recall bounds cached queries and discards results arriving after its deadline", async () => {
@@ -670,22 +667,18 @@ test("automatic recall deadline is exactly 250 ms and fences late results from a
   assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
 });
 
-test("slow memory server cannot hold startup or a prompt for seconds", async () => {
-  const { createServer } = await import("node:http");
-  const timers = new Set<NodeJS.Timeout>();
+test("a slow herdr-memory call cannot hold startup or a prompt for seconds", async () => {
+  // The real CLI provider, driven through an injected runner that answers far
+  // outside the automatic budget: what is under test is the deadline, not HTTP.
   let requests = 0;
-  const server = createServer((_req, res) => {
+  const slowRunner: HindsightRunner = async () => {
     requests++;
-    const timer = setTimeout(() => {
-      timers.delete(timer);
-      res.setHeader("content-type", "application/json");
-      res.end("[]");
-    }, 1500);
-    timers.add(timer);
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 1500);
+      timer.unref?.(); // a test that timed out must not hold the process open
+    });
+    return { stdout: "{}", exitCode: 0 };
+  };
   const events = new Map<string, Handler>();
   let stale = false;
   let staleAccesses = 0;
@@ -706,29 +699,26 @@ test("slow memory server cannot hold startup or a prompt for seconds", async () 
       on: (name: string, handler: Handler) => events.set(name, handler),
     } as unknown as ExtensionAPI,
     {
-      env: () => ({
-        PI_OPENVIKING_BASE_URL: `http://127.0.0.1:${address.port}`,
-        PI_OPENVIKING_TOKEN: "local-test-key",
-      }),
-      setup: async () => {},
+      env: () => ({ PI_HINDSIGHT_ENABLED: "1", PI_HINDSIGHT_TIMEOUT_MS: "1500" }),
+      provider: (config) =>
+        new HindsightDurableMemory({
+          cli: config.cli,
+          scopes: config.scopes,
+          timeoutMs: config.timeoutMs,
+          run: slowRunner,
+        }),
     },
   );
-  try {
-    const start = performance.now();
-    await events.get("session_start")!({}, ctx);
-    assert.ok(performance.now() - start < 1000, "startup recall has a short automatic deadline");
-    await events.get("session_before_switch")!({}, ctx);
-    const turnStart = performance.now();
-    await events.get("before_agent_start")!({ prompt: "calibration", systemPrompt: "" }, ctx);
-    assert.ok(performance.now() - turnStart < 1000, "automatic search has a short deadline");
-    assert.equal(requests, 2);
-    stale = true;
-    await events.get("session_shutdown")!({}, ctx);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.equal(staleAccesses, 0, "timed-out work does not touch a retired context");
-  } finally {
-    for (const timer of timers) clearTimeout(timer);
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
+  const start = performance.now();
+  await events.get("session_start")!({}, ctx);
+  assert.ok(performance.now() - start < 1000, "startup recall has a short automatic deadline");
+  await events.get("session_before_switch")!({}, ctx);
+  const turnStart = performance.now();
+  await events.get("before_agent_start")!({ prompt: "calibration", systemPrompt: "" }, ctx);
+  assert.ok(performance.now() - turnStart < 1000, "automatic search has a short deadline");
+  assert.equal(requests, 2);
+  stale = true;
+  await events.get("session_shutdown")!({}, ctx);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(staleAccesses, 0, "timed-out work does not touch a retired context");
 });

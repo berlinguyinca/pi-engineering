@@ -57,7 +57,7 @@ deliberately NOT listed in `package.json` `pi.extensions`; only `split-view.ts` 
 - UI surfaces: split-view uses `ctx.ui.setWidget("split-view", ...)` and, only when panels are
   on, a fullscreen layout layer / overlay. It never calls `setFooter`, `setHeader` or `setStatus`,
   so `src/status/footer.ts` (the only `setFooter` caller) and the status keys
-  (`openviking`, `pi-engineering:*`, `inference-admission`, widgets `engineering`, admission
+  (`hindsight`, `pi-engineering:*`, `inference-admission`, widgets `engineering`, admission
   widget) are untouched. Residual (cosmetic, only after the operator enables `/split`): its
   layout layer shares the screen with pi-engineering's widgets above/below the editor.
 

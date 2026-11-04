@@ -26,6 +26,15 @@ export interface PartialBlackholeConfig {
   providerTimeoutMs?: number;
 }
 
+/**
+ * Every `durable.kind` `buildDurableProvider` can build. A kind outside this set
+ * must be refused at config resolution, because `buildDurableProvider`'s default
+ * branch returns an in-process provider: an unknown or retired kind would
+ * silently stop sharing memory across sessions while every status still
+ * reported the store as configured.
+ */
+export const DURABLE_KINDS = ["memory", "shared-file", "hindsight"] as const;
+
 const DEFAULTS: Omit<BlackholeConfig, "version"> & { version: string } = {
   enabled: false,
   version: PINNED_BLACKHOLE_VERSION,
@@ -74,8 +83,11 @@ export function resolveBlackholeConfig(input?: PartialBlackholeConfig): ConfigRe
   if (durable.kind === "shared-file" && !durable.file) {
     throw new Error("durable.kind='shared-file' requires a `file` path");
   }
-  if (durable.kind === "openviking" && !durable.baseUrl) {
-    throw new Error("durable.kind='openviking' requires a `baseUrl`");
+  if (!(DURABLE_KINDS as readonly string[]).includes(durable.kind)) {
+    // An unsupported kind must not fall back to in-process memory: that reads as
+    // a working configuration while silently stopping shared durable memory on
+    // every host but one, so the configuration fails loudly instead.
+    throw new Error(`durable.kind='${durable.kind}' is not supported; known kinds: ${DURABLE_KINDS.join(", ")}`);
   }
   const providerTimeoutMs = input?.providerTimeoutMs ?? DEFAULTS.providerTimeoutMs;
   if (providerTimeoutMs < 1) {

@@ -14,7 +14,8 @@
  */
 import { execFile } from "node:child_process";
 import { redactSecrets } from "../platform/redact.ts";
-import type { DurableMemoryProvider, DurableMemoryRecord, RetainResult } from "./OpenViking.ts";
+import type { PartialBlackholeConfig } from "./config.ts";
+import type { DurableMemoryProvider, DurableMemoryRecord, RetainResult } from "./durableProvider.ts";
 
 export interface HindsightRunResult {
   stdout: string;
@@ -60,6 +61,26 @@ export function resolveHindsightFromEnv(
     cli: env[HINDSIGHT_ENV.cli]?.trim() || "herdr-memory",
     scopes: parseScopes(env[HINDSIGHT_ENV.scopes]),
     timeoutMs: Number.isFinite(t) && t >= 1 ? t : DEFAULT_TIMEOUT_MS,
+  };
+}
+
+/**
+ * Build the `blackhole` option for `EngineeringRuntime` from the environment, or
+ * `undefined` when Hindsight is not opted in. This is the whole activation
+ * surface: the CLI holds its own config and credentials, so Pi resolves nothing
+ * but the executable, the scopes and the per-call timeout.
+ */
+export function hindsightBlackholeOption(
+  env: Record<string, string | undefined> = process.env,
+): { config: PartialBlackholeConfig } | undefined {
+  const h = resolveHindsightFromEnv(env);
+  if (!h) return undefined;
+  return {
+    config: {
+      enabled: true,
+      durable: { kind: "hindsight", cli: h.cli, scopes: h.scopes, timeoutMs: h.timeoutMs },
+      providerTimeoutMs: h.timeoutMs,
+    },
   };
 }
 
@@ -121,7 +142,11 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   private async call(args: string[]): Promise<Record<string, unknown>> {
     let res: HindsightRunResult;
     try {
-      res = await this.run(this.cli, [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(this.timeoutMs)] : [])], this.timeoutMs + 250);
+      res = await this.run(
+        this.cli,
+        [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(this.timeoutMs)] : [])],
+        this.timeoutMs + 250,
+      );
     } catch (error) {
       const e = error as { killed?: boolean; code?: unknown };
       throw new HindsightError(e?.killed || e?.code === "ETIMEDOUT" ? "timeout" : "unavailable");

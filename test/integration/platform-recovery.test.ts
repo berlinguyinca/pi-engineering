@@ -55,12 +55,12 @@ describe("platform recovery + isolation", () => {
     assert.equal(platform.graph.pendingApprovals().length, 1);
   });
 
-  it("OpenViking outage uses a durable outbox and recovers when back online", async () => {
+  it("Hindsight outage uses a durable outbox and recovers when back online", async () => {
     let online = false;
     const pushed: string[] = [];
     const transport = {
       push: async (c: { id: string; kind: string }) => {
-        if (!online) throw new Error("openviking down");
+        if (!online) throw new Error("hindsight down");
         pushed.push(c.id);
       },
     };
