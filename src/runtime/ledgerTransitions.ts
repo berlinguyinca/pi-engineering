@@ -1,4 +1,4 @@
-import type { Actor, Task, WorkItemStatus } from "../core/types.ts";
+import type { Actor, LedgerPlan, LedgerPlanStep, Task, WorkItemStatus } from "../core/types.ts";
 import type { Ledger, LedgerWriteOptions } from "../ledger/Ledger.ts";
 import { LedgerAuthorityStaleError, LedgerRevisionConflictError } from "../ledger/errors.ts";
 import { evaluateWorkCompletion } from "../work/completionPolicy.ts";
@@ -111,6 +111,18 @@ export class LedgerTransitions {
   ): Promise<boolean> {
     return this.fenced(workItemId, `work item ${workItemId} pr link`, (write) =>
       this.ledger.recordPrLink(workItemId, pr, actor, write),
+    );
+  }
+
+  /** Record a plan's steps on its plan work item through the same guarded write. Idempotent per step list. */
+  async recordPlan(
+    workItemId: string,
+    steps: readonly LedgerPlanStep[],
+    actor: Actor,
+    artifact?: { id: string; version: string },
+  ): Promise<LedgerPlan | undefined> {
+    return this.fenced(workItemId, `work item ${workItemId} plan record`, (write) =>
+      this.ledger.recordPlan(workItemId, { steps, ...(artifact ? { artifact } : {}) }, actor, write),
     );
   }
 

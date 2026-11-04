@@ -79,6 +79,36 @@ export function emitTaskRefEdges(
   }
   for (const plan of refs.plans) {
     const node = planNode(plan.missionId, plan.revision);
+    const own = plan.ledger;
+    if (own) {
+      once(`node:${node}`, `${own.superseded}|${own.steps}|${plan.digest ?? ""}`, () => {
+        lineage.nodeUpsert(
+          node,
+          {
+            label: own.title,
+            state: own.superseded ? "superseded" : "open",
+            attrs: {
+              kind: "plan",
+              source: "ledger",
+              steps: own.steps,
+              ...(plan.digest ? { plan_digest: plan.digest } : {}),
+            },
+          },
+          `plan:${plan.digest ?? plan.revision}:${own.superseded ? "superseded" : "current"}`,
+          scope,
+        );
+        if (own.supersedes) {
+          lineage.edgeAdd(
+            "supersession",
+            node,
+            planNode(own.supersedes.missionId, own.supersedes.revision),
+            `plan-supersedes:${plan.revision}`,
+            { source: "ledger" },
+            scope,
+          );
+        }
+      });
+    }
     once(`edge:dependency:${taskNode}:${node}`, plan.digest ?? "", () =>
       lineage.edgeAdd(
         "dependency",
