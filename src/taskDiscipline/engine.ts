@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 /**
  * Policy engine: (trusted contract, tool call) -> Decision.
  *
@@ -9,6 +8,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import { safeGitSync } from "../git/safeGit.ts";
 import { type ExternalEffect, type TaskContract, contractHash } from "./contract.ts";
 import { type ClassifyDeps, type Effect, classifyShell, hostOf, isLoopback } from "./effects.ts";
 import { canonicalRoots, resolvePath, withinAny } from "./pathScope.ts";
@@ -33,13 +33,8 @@ export function nodeDeps(): EngineDeps {
     },
     resolveGitRemote(name, cwd) {
       try {
-        return (
-          execFileSync("git", ["-C", cwd, "remote", "get-url", name], {
-            encoding: "utf8",
-            timeout: 2000,
-            stdio: ["ignore", "pipe", "ignore"],
-          }).trim() || undefined
-        );
+        const r = safeGitSync(["remote", "get-url", name], { cwd, timeoutMs: 2000 });
+        return r.code === 0 ? r.stdout.trim() || undefined : undefined;
       } catch {
         return undefined;
       }
