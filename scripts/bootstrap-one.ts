@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * B04: single-task bootstrap CLI wrapper. Loads ONE task manifest, verifies the clean baseline commit,
- * validates the declared parent handoff (FIX-2: `--emit-handoff` re-validates it before it writes), prints a deterministic execution plan and STOPS — no model call
+ * validates the declared parent handoff (FIX-2: `--emit-handoff` re-validates it before it writes; FIX-5: only a parent whose `status` is PASS or ALREADY_SATISFIED may be a base), prints a deterministic execution plan and STOPS — no model call
  * and no scheduler/orchestration/planner import (asserted by the unit test). Read-only: it reads files and
  * asks git only for HEAD and porcelain status. Exit codes: 0 plan, 2 manifest invalid, 3 baseline rejected, 4 handoff rejected, 5 gate rejected, 64 usage, 66 unreadable input.
  * FIX-3C: `--emit-handoff` REQUIRES `--handoff-schema <path>` (resolved against `--cwd` exactly like `--proofs`/`--handoff-record`): the record is schema-validated in the CLI, before anything is written.
@@ -26,7 +26,7 @@ export function executionPlan(manifest: TaskManifest): string[] {
     ...manifest.commands.map((command) => `command=${command.cwd} :: ${command.argv.join(" ")}`)];
 }
 
-/** FIX-2: the declared parent handoff as a pure check, so BOTH the plan path and the stamping path can verify it. Returns blockers ([] means valid; a manifest that declares no parent is valid). */
+/** FIX-2: the declared parent handoff as a pure check, so BOTH the plan path and the stamping path can verify it. Returns blockers ([] means valid; a manifest that declares no parent is valid). FIX-5: a parent whose `status` is not an accepted result (PASS or ALREADY_SATISFIED), or is absent, is a blocker — a failed or blocked unit may never be a base. */
 export function validateParentHandoff(manifest: TaskManifest, parentHandoffText: string | null): string[] {
   if (manifest.parentHandoffHash === null) return [];
   if (parentHandoffText === null) return [`manifest declares parentHandoffHash ${manifest.parentHandoffHash} but no parent handoff was supplied`];
@@ -37,13 +37,15 @@ export function validateParentHandoff(manifest: TaskManifest, parentHandoffText:
   if (recomputed !== manifest.parentHandoffHash) return [`canonical hash ${recomputed} != manifest parentHandoffHash ${manifest.parentHandoffHash}`];
   if (parent.nextTaskId !== manifest.taskId) return [`parent nextTaskId ${String(parent.nextTaskId)} != ${manifest.taskId}`];
   if (typeof parent.nextBaseSha === "string" && parent.nextBaseSha !== manifest.baseSha) return [`parent nextBaseSha ${parent.nextBaseSha} != manifest baseSha ${manifest.baseSha}`];
+  const status = String(parent.status); // FIX-5: a handoff records its unit's outcome; an absent status reports as "undefined" and is rejected the same way.
+  if (status !== "PASS" && status !== "ALREADY_SATISFIED") return [`parent handoff ${String(parent.taskId)} reports status ${status}; only PASS or ALREADY_SATISFIED may be a base`];
   return [];
 }
 
-/** The `parent=<taskId> accepted <prefix>…` line; only meaningful once validateParentHandoff returned no blocker. */
+/** The `parent=<taskId> accepted <prefix>…` line; only meaningful once validateParentHandoff returned no blocker. FIX-5: it asserts acceptance, so it prints only for a parent whose status IS an accepted result. */
 function parentAcceptance(manifest: TaskManifest, parentHandoffText: string | null): string[] {
   if (manifest.parentHandoffHash === null || parentHandoffText === null) return [];
-  try { const parent = JSON.parse(parentHandoffText) as Record<string, unknown>; return [`parent=${String(parent.taskId)} accepted ${canonicalHash(parent).slice(0, 18)}…`]; } catch { return []; }
+  try { const parent = JSON.parse(parentHandoffText) as Record<string, unknown>; if (parent.status !== "PASS" && parent.status !== "ALREADY_SATISFIED") return []; return [`parent=${String(parent.taskId)} accepted ${canonicalHash(parent).slice(0, 18)}…`]; } catch { return []; }
 }
 
 /** FIX-3C: the pre-stamp schema gate, total by construction — an absent, unreadable or non-JSON schema, and an unreadable or non-JSON record, are blockers, never exceptions. A missing `--handoff-record` is left to the existing gate blocker. */

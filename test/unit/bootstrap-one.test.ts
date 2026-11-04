@@ -51,6 +51,8 @@ function stampRun(t: { after(fn: () => void): void }, kind: StampKind, fix3: Sta
   fx("logs/01.txt", "ok\n"); fx("proofs.json", [{ command: "true", exitCode: 0, outputArtifact: "fixtures/logs/01.txt" }]);
   fx("schema.json", fix3.schema ?? { type: "object" });
   const parent: Record<string, unknown> = { specVersion: "1.2.0", taskId: "E01", status: "PASS", repo: "pi", baseSha, resultSha: baseSha, evidence: [], nextTaskId: kind === "sequence" ? "OTHER" : "T1", nextBaseSha: baseSha };
+  const parentStatus = (fix3 as StampParentStatus).parentStatus; // FIX-5: written before the checksum below, so a parent on an accept path hashes exactly as the CLI reads it (`null` = no status key at all)
+  if (parentStatus === null) delete parent.status; else if (parentStatus !== undefined) parent.status = parentStatus;
   const declared = protocolHash(parent); if (kind === "tampered") parent.status = "BLOCKED"; // the stored checksum below is then stale, exactly as an edited handoff would be
   fx("parent.json", { ...parent, handoffHash: declared });
   // FIX-4A: the fixture manifest is written BEFORE the record, so every record on an accept path can carry the authority that manifest derives instead of a placeholder.
@@ -87,6 +89,41 @@ test("FIX-2: a correctly hashed parent pointing at the wrong next task is reject
 test("FIX-2: a valid parent chain stamps, and the stamping run itself prints the verification", (t) => {
   const run = stampRun(t, "valid"); assert.equal(run.status, 0, run.stdout); assert.match(run.stdout, /gate=accepted/u); assert.deepEqual(run.written, ["T1.handoff.json"]);
   assert.equal(run.stdout.includes(`parent=E01 accepted ${run.declared.slice(0, 18)}`), true, "the verification is visible in the stamping log");
+});
+
+// FIX-5: a parent handoff is only a valid base if its own `status` records an accepted result — the schema allows BLOCKED, so the chain must read it.
+/** FIX-5: the one extra knob the FIX-5 parent fixtures need. The pre-existing `Stamp3` fixtures are untouched (their assertions may only be extended), so the knob rides on the same options object and is read back inside `stampRun`. */
+type StampParentStatus = { parentStatus?: string | null };
+const stampStatus = (status: string | null): Stamp3 => { const knob: Stamp3 & StampParentStatus = { parentStatus: status }; return knob; };
+
+test("FIX-5: validateParentHandoff reads the parent's status — BLOCKED and absent are blockers, ALREADY_SATISFIED is a base", () => {
+  const rehash = (parent: Record<string, unknown>): Record<string, unknown> => ({ ...parent, handoffHash: canonicalHash(parent) }); // recomputed over the mutated parent, so only the status can reject it
+  const blocked = rehash({ ...PARENT, status: "BLOCKED" });
+  assert.deepEqual(validateParentHandoff({ ...MANIFEST, parentHandoffHash: canonicalHash(blocked) }, JSON.stringify(blocked)), ["parent handoff B03 reports status BLOCKED; only PASS or ALREADY_SATISFIED may be a base"]);
+  const absent: Record<string, unknown> = { ...PARENT }; delete absent.status; absent.handoffHash = canonicalHash(absent); // the status-less parent, hashed without its status
+  assert.deepEqual(validateParentHandoff({ ...MANIFEST, parentHandoffHash: canonicalHash(absent) }, JSON.stringify(absent)), ["parent handoff B03 reports status undefined; only PASS or ALREADY_SATISFIED may be a base"]);
+  const satisfied = rehash({ ...PARENT, status: "ALREADY_SATISFIED" });
+  assert.deepEqual(validateParentHandoff({ ...MANIFEST, parentHandoffHash: canonicalHash(satisfied) }, JSON.stringify(satisfied)), [], "an already-satisfied unit is a legitimate base");
+  assert.equal(bootstrapOne(obs({ manifestText: JSON.stringify({ ...MANIFEST, parentHandoffHash: canonicalHash(blocked) }), parentHandoffText: JSON.stringify(blocked) })).exitCode, 4, "the plan path rejects it too, at the base commit");
+});
+
+test("FIX-5: a parent whose status is BLOCKED blocks the gate, exits 5, is never logged accepted, writes no handoff", (t) => {
+  const run = stampRun(t, "valid", stampStatus("BLOCKED")); assert.equal(run.status, 5, run.stdout);
+  assert.match(run.stdout, /REJECT gate: parent handoff E01 reports status BLOCKED; only PASS or ALREADY_SATISFIED may be a base/u);
+  assert.doesNotMatch(run.stdout, /parent=E01 accepted/u, "a blocked parent may not be stamped as accepted"); assert.doesNotMatch(run.stdout, /gate=accepted/u);
+  assert.deepEqual(run.written, [], "the output directory holds no <taskId>.handoff.json");
+});
+
+test("FIX-5: a parent with no status key is rejected the same way, and the run fails closed rather than throwing", (t) => {
+  const run = stampRun(t, "valid", stampStatus(null)); assert.equal(run.status, 5, run.stdout);
+  assert.match(run.stdout, /REJECT gate: parent handoff E01 reports status undefined; only PASS or ALREADY_SATISFIED may be a base/u);
+  assert.doesNotMatch(run.stdout, NO_TRACE, "must fail closed as a blocker, never as an uncaught exception"); assert.doesNotMatch(run.stdout, /parent=E01 accepted/u); assert.deepEqual(run.written, []);
+});
+
+test("FIX-5: a parent whose status is ALREADY_SATISFIED is accepted, stamped, exit 0, and the acceptance line is unchanged", (t) => {
+  const run = stampRun(t, "valid", stampStatus("ALREADY_SATISFIED")); assert.equal(run.status, 0, run.stdout);
+  assert.match(run.stdout, /gate=accepted/u); assert.deepEqual(run.written, ["T1.handoff.json"]); assert.doesNotMatch(run.stdout, /REJECT gate/u);
+  assert.equal(run.stdout.includes(`parent=E01 accepted ${run.declared.slice(0, 18)}`), true, "worded exactly as the PASS parent's acceptance line");
 });
 
 // FIX-3C: `--emit-handoff` must schema-validate the record against the REAL protocol schema before anything is stamped.
