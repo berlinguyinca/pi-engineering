@@ -64,14 +64,27 @@ function flipper(l: Lab, evilExtra: string) {
       "-c",
       `cp ${l.cfg} ${l.root}/good.cfg; cp ${l.cfg} ${l.root}/evil.cfg; printf '%s' '${evilExtra}' >> ${l.root}/evil.cfg; while :; do cp ${l.root}/evil.cfg ${l.cfg}.n && mv ${l.cfg}.n ${l.cfg}; cp ${l.root}/good.cfg ${l.cfg}.n && mv ${l.cfg}.n ${l.cfg}; done`,
     ],
-    { stdio: "ignore" },
+    // detached: the flipper leads its own process group, so stop() can kill its in-flight cp/mv children too.
+    { stdio: "ignore", detached: true },
   );
 }
 
-/** Kill the flipper and wait until it is really gone, so it cannot recreate files while the lab is removed. */
+function killGroup(f: ReturnType<typeof flipper>): void {
+  try {
+    if (f.pid !== undefined) process.kill(-f.pid, "SIGKILL");
+  } catch {
+    f.kill("SIGKILL");
+  }
+}
+
+/**
+ * Kill the flipper's whole process group and wait until the shell is gone, so nothing can recreate files while the
+ * lab is removed. Killing only the shell leaves its in-flight `cp`/`mv` child alive; under load that orphan writes
+ * `config.n` into `prim/.git` after rmSync has listed it (ENOTEMPTY).
+ */
 async function stop(f: ReturnType<typeof flipper>, l: Lab): Promise<void> {
   const gone = new Promise<void>((done) => f.once("close", () => done()));
-  f.kill("SIGKILL");
+  killGroup(f);
   await gone;
   rmSync(l.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 }

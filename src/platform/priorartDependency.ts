@@ -63,6 +63,15 @@ export interface EnsurePriorartResult {
   error?: string;
 }
 
+export interface EnsurePriorartOptions {
+  /**
+   * Set false to never spawn the detached clone+build. The rebuild is fire-and-forget and keeps writing into
+   * `paths.source` after this call returns, so callers that own a throwaway directory (tests) must opt out or they
+   * race their own cleanup.
+   */
+  rebuild?: boolean;
+}
+
 /** Create the priorart config (with own_roots so own-repo search works) if missing. */
 function ensureConfig(config: string, sourceRoot: string): boolean {
   try {
@@ -127,7 +136,10 @@ function maybeRebuildBinary(p: PriorartPaths): boolean {
  * Ensure the priorart dependency is satisfied. Idempotent and non-throwing: safe to
  * call on every pi session start.
  */
-export function ensurePriorart(paths: PriorartPaths = defaultPriorartPaths()): EnsurePriorartResult {
+export function ensurePriorart(
+  paths: PriorartPaths = defaultPriorartPaths(),
+  options: EnsurePriorartOptions = {},
+): EnsurePriorartResult {
   const result: EnsurePriorartResult = {
     binaryPresent: false,
     rebuildStarted: false,
@@ -137,7 +149,7 @@ export function ensurePriorart(paths: PriorartPaths = defaultPriorartPaths()): E
   try {
     result.configPresent = ensureConfig(paths.config, dirname(paths.source));
     result.mcpRegistered = ensureMcp(paths.mcp, paths.bin, paths.config);
-    result.rebuildStarted = maybeRebuildBinary(paths);
+    result.rebuildStarted = options.rebuild === false ? false : maybeRebuildBinary(paths);
     result.binaryPresent = existsSync(paths.bin);
   } catch (e) {
     result.error = e instanceof Error ? e.message : String(e);
