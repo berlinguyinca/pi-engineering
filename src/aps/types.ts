@@ -67,6 +67,18 @@ export interface NormalizedToolCall {
 }
 
 /**
+ * Task attribution (T06). `known` carries the T01 canonical original-task hash from `deriveTaskAuthority()`
+ * (`src/bootstrap/taskAuthority.ts`); `unknown` RECORDS failed attribution — distinct from the field being absent.
+ */
+export type TaskProvenance =
+  | { state: "known"; authority: string; taskId: string }
+  | { state: "unknown"; reason: string };
+/** Model provenance (T06): a null part was not recorded; quantization is whatever the model id names. */
+export type ModelProvenance = { provider: string | null; model: string | null; quantization: string | null };
+const AUTHORITY_HASH = /^sha256:[0-9a-f]{64}$/; // deriveTaskAuthority() output shape
+const QUANTIZATION = /[-_]quant[-_]([a-z0-9._]+)/i; // the worker seam's own convention
+
+/**
  * One observed agent action, fully normalized.
  *
  * This is the unit of progress instrumentation. Everything that can vary
@@ -108,6 +120,10 @@ export interface AgentAction {
   inputTokens?: number;
   /** Configured context budget in tokens for the session, when configured. */
   maxContextTokens?: number;
+  /** Original-task attribution, to be filled by the action-classification seam; absent = not recorded (≠ unknown). */
+  taskProvenance?: TaskProvenance;
+  /** Model provenance, to be filled by the worker dispatch seam; absent = not recorded. */
+  modelProvenance?: ModelProvenance;
 }
 
 /**
@@ -213,6 +229,27 @@ export function isMutatingTool(tool: string): boolean {
   return MUTATING_TOOLS.has(tool);
 }
 
+/** Task provenance from whatever the action-classification seam holds: pure, never throws, never coerces. */
+export function describeTaskProvenance(input: { authority?: unknown; taskId?: unknown }): TaskProvenance {
+  const a = input.authority;
+  if (a === undefined || a === null || a === "") return { state: "unknown", reason: "missing authority hash" };
+  if (typeof a !== "string") return { state: "unknown", reason: "malformed authority hash (not a string)" };
+  if (!AUTHORITY_HASH.test(a)) return { state: "unknown", reason: "malformed authority hash (want sha256:<64 hex>)" };
+  const taskId = typeof input.taskId === "string" ? input.taskId.trim() : "";
+  return taskId === "" ? { state: "unknown", reason: "missing task id" } : { state: "known", authority: a, taskId };
+}
+/** True only for recorded, well-formed attribution; narrows the union. */
+export function isKnownTaskProvenance(p: TaskProvenance | undefined): p is Extract<TaskProvenance, { state: "known" }> {
+  return p !== undefined && p.state === "known";
+}
+/** Model provenance from whatever the worker dispatch seam holds: pure, never throws; blank or non-string → null. */
+export function describeModelProvenance(input: { provider?: unknown; modelId?: unknown }): ModelProvenance {
+  const keep = (v: unknown): string | null => (typeof v === "string" && v.trim() !== "" ? v.trim() : null);
+  const model = keep(input.modelId);
+  const quant = model === null ? null : (QUANTIZATION.exec(model)?.[1] ?? null);
+  return { provider: keep(input.provider), model, quantization: quant };
+}
+
 /**
  * The structured event the supervisor emits when a loop is detected.
  * Detect-only: emitting this event changes nothing about the agent's run.
@@ -235,6 +272,9 @@ export interface AgentLoopCandidateEvent {
   tool: string;
   /** The model producing the action when the loop completed, or null when unknown. */
   model: { provider: string; id: string } | null;
+  /** Provenance inherited from the action that completed the loop; absent until a producer records it (T06 wires none). */
+  taskProvenance?: TaskProvenance;
+  modelProvenance?: ModelProvenance;
   /**
    * Context utilization at loop completion: input tokens / configured
    * max_context_tokens, in [0, 1]. null when usage data or the configured
