@@ -210,13 +210,18 @@ function interactive(provider: HindsightDurableMemory) {
   return { events, commands, ctx, notices, injected };
 }
 
-test("interactive: automatic recall hangs -> fail-open within budget, nothing injected", async () => {
+test("interactive: automatic recall hangs -> the turn waits only its budget and says memory is unavailable", async () => {
   const p = new HindsightDurableMemory({ run: () => new Promise(() => {}) });
   const f = interactive(p);
   const t0 = Date.now();
   await f.events.get("before_agent_start")!({ prompt: "gradle jdk question" }, f.ctx);
-  assert.ok(Date.now() - t0 < 1500);
-  assert.equal(await f.injected(), undefined);
+  assert.ok(Date.now() - t0 < 1500, "an interactive turn must not wait on a hung client");
+  // Silence was read as "the bank is empty", which is a different claim from "it could
+  // not be read", so the turn now carries the reason instead of nothing.
+  const text = await f.injected();
+  assert.match(text!, /could not be read this turn/);
+  assert.match(text!, /timed out/);
+  assert.doesNotMatch(text!, /gradle/);
 });
 
 test("interactive: recalled hindsight memory is labeled untrusted and carries revision", async () => {

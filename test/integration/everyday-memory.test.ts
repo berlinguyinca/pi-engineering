@@ -106,13 +106,19 @@ test("full extension saves through the herdr-memory client and recalls in a fres
       "one write, from the explicit command only",
     );
 
-    // The client stops working (its own profile lost the credential): the surface
-    // says so, and the turn proceeds with no memory.
+    // The client stops working (its own profile lost the credential): the surface says
+    // so, and so does the turn — silence was read as "the bank is empty".
     stub.setMode("fail");
     await second.emit("before_agent_start", { prompt: "calibration reports", systemPrompt: "" });
     assert.match(second.statuses.at(-1)!, /herdr-memory reported a failure/);
     assert.match(second.footer()!.render(100).join("\n"), /herdr-memory reported a failure/);
-    assert.deepEqual((await second.emit("context", { messages: input })).messages, input);
+    const stalled = (await second.emit("context", { messages: input })).messages;
+    assert.equal(input.length, 1, "the caller's array is never mutated");
+    assert.equal(stalled.length, 2, "the failed turn carries a notice instead of recalled notes");
+    assert.deepEqual(stalled.slice(1), input, "the conversation itself is untouched");
+    assert.match(stalled[0].content, /could not be read this turn \(herdr-memory reported a failure\)/);
+    assert.match(stalled[0].content, /unavailable, not empty/);
+    assert.doesNotMatch(stalled[0].content, /Calibration reports use metric/);
   } finally {
     await second?.emit("session_shutdown");
     for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];

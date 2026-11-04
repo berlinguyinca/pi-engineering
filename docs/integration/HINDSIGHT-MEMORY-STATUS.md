@@ -1,8 +1,10 @@
 # Hindsight memory integration status (OpenViking retired)
 
 Branch `rebase/retire-openviking`, work tree
-`.worktrees/pi-retire`, base commit `4e8834d3` ("WIP: reconcile #554 … tree does NOT
-typecheck yet"). Nothing here is committed, pushed, or merged.
+`~/IdeaProjects/worktrees/pi-retire-rebuild`, base commit `4e8834d3` ("WIP: reconcile
+#554 … tree does NOT typecheck yet"). The retirement is committed as `de3f2e64` and
+pushed to `origin/rebase/retire-openviking`; the recall-delivery fix below is the
+follow-up commit on the same branch.
 
 ## Where it stands
 
@@ -13,11 +15,11 @@ typecheck yet"). Nothing here is committed, pushed, or merged.
 | `/memory`, `/memory setup`, `/remember` | done | `src/blackhole/interactiveMemory.ts`, `test/unit/interactive-memory.test.ts` |
 | Recall labelling (untrusted reference data, never instructions) | done | `memoryBlock()` header |
 | `/blackhole` status truthfulness | done | `extensions/index.ts` `/blackhole` caveats: `shared-file` counts a local JSONL file; Hindsight rows are an overview probe, not a bank total |
-| Typecheck (`npm run typecheck`) | passes | core + scripts |
-| Lint (`npx biome check` on touched files) | passes | 27 files, no diagnostics |
-| Memory test batch | 115/115 pass | `node --test` over `hindsight-memory`, `interactive-memory`, `memory-setup`, `blackhole`, `telemetry-sink`, `mission-memory`, `engineering-ledger`, `inspector-redaction`, `config`, `hindsight-harness-env`, `integration/everyday-memory` |
+| Typecheck (`npm run typecheck`) | passes | core + scripts, 0 errors |
+| Lint (`npm run lint` = `biome check .`) | touched files clean | 7 paths fail format/JSON at the base commit too (`docs/specs/…PHASE-6-LIVE-COMPARISON.json`, `src/models/pinMigration.ts`, `src/models/refresh.ts`, `test/unit/hindsight-harness-env.test.ts`, `model-alias-catalog`, `model-pin-migration`, `models-catalog`); none is touched here |
+| Memory test set (`node --test --import ./test/support/isolatedState.ts`) | 139 tests, 128 pass, 11 fail | the 11 failures are the Linux-only `ARTIFACT INTEGRITY` error (see "Not done"); the same 11 fail on the base commit, which runs 135 tests / 124 pass |
 | Live client/service round-trip (read-only) | passes | see "Live verification" |
-| **Automatic per-turn recall reaching the model in a real session** | **not working** | see "Open defect" |
+| Automatic per-turn recall reaching the model in a real session | works | live `pi -p` runs below; `test/unit/interactive-memory.test.ts`, `test/integration/everyday-memory.test.ts` |
 
 ## Live verification (2026-11-04, macOS, `~/.local/bin/herdr-memory`)
 
@@ -51,36 +53,71 @@ project `canary`). No memory was written or deleted; only `status`, `doctor`, `r
    Guidance text must not tell operators to run `herdr-memory doctor --json`.
 4. **Normalised rows differ from raw rows** — the CLI returns both `data.results[]` (raw)
    and `results[]` (contract-normalised). Pi reads `results` only.
-5. **A healthy call takes 0.4–4.9 s**, which no in-turn budget can absorb reliably.
+5. **A healthy call takes 0.4–4.9 s**, longer than a turn may stall in front of a human.
+   That is what the budgets below are built around: wait 1.2 s interactively (5 s
+   headless), use a late answer in the same turn if it arrives, and tell the model when
+   the turn got nothing.
 
-## Open defect (blocking "everyday memory" acceptance)
+## Fixed: automatic recall never reached the model (2026-11-04)
 
-In four real `pi --no-extensions -e extensions/index.ts --no-tools -p …` sessions with
-`PI_HINDSIGHT_ENABLED=1`, `PI_HINDSIGHT_SCOPES=project` and a wrapper CLI, the model
-reported no recalled notes; per-turn budgets of 250 ms (default) and
-`PI_HINDSIGHT_AUTOMATIC_MS=5000` both produced nothing, while the same
-`HindsightDurableMemory.search()` call outside Pi returned 20 rows in ~1 s. No failure
-notice was written to `~/.local/state/pi-engineering/memory-notices`, so the turn simply
-proceeds with no memory and no explanation — silence where the surface should be explicit.
+In real `pi -p -nt -ne -e extensions/index.ts --no-session` sessions with
+`PI_HINDSIGHT_ENABLED=1` and a wrapper CLI pinning `--project canary --harness pi`, the
+model answered as though the bank were empty. A trace observer on `session_start`,
+`before_agent_start` and `context` showed why:
 
-Fixed during verification (unit tests green, live sessions still show the defect):
+```
+{"ev":"before_agent_start:search-error","code":"timeout","message":"Hindsight memory timeout"}
+{"ev":"context","n":2,"roles":["user"],"memoryBytes":0}
+```
 
-- `automatic()` raced against a hard-coded 250 ms while the provider's own timeout was
-  5 s, so the once-per-session readiness check always lost the race. Readiness now gets
-  `READINESS_LOOKUP_MS` (5 s) and in-turn lookups get `PI_HINDSIGHT_AUTOMATIC_MS`
-  (default 250 ms, clamped 100–5000 ms).
-- `recallAll()` no longer sends `*`.
+Root causes, all in `src/blackhole/interactiveMemory.ts`:
 
-Next step: instrument `before_agent_start` → `context` in one real `-p` session (row count,
-block length, whether the custom `pi-engineering-memory` message survives into
-`event.messages`), then fix the delivery path — or make injection non-blocking (recall
-during a turn, inject on the next) and say so in the status line, because a 1–5 s
-subprocess cannot be awaited inside a turn at a 250 ms budget.
+1. `automatic()` raced every lookup against **250 ms** while the measured client takes
+   **390–4900 ms**. Automatic recall could therefore only ever time out.
+2. The once-per-session readiness check shared that same race, so the status line
+   reported "timed out" for a healthy service.
+3. A timed-out read left `recalled` empty and the `context` hook injected nothing:
+   the model saw silence and reported "no records", which is a different claim from
+   "the bank could not be read".
+
+The fix:
+
+- `AUTOMATIC_LOOKUP_MS` is 1200 ms (still overridable with
+  `PI_HINDSIGHT_AUTOMATIC_MS`, clamped 100–5000 ms). A headless run (`pi -p`, no UI) gets
+  `HEADLESS_LOOKUP_MS` = 5000 ms and the provider timeout is raised to match, because
+  nobody is waiting on a spinner there and its single model call is the only chance to
+  carry memory.
+- Readiness keeps `READINESS_LOOKUP_MS` = 5000 ms and is no longer raced at 250 ms.
+- A result that lands after the in-turn budget is still used: `adopt()` installs it and
+  the next `context` emit in the **same turn** carries it. It is fenced by the turn
+  counter, the automatic-lookup epoch (explicit commands and new turns retire pending
+  work), and the session generation (a closed session must not touch context or UI).
+- A turn that gets no memory now says why. `context` injects one custom
+  `pi-engineering-memory` message — "Durable memory for this project could not be read
+  this turn (…); treat it as unavailable, not empty." — on timeout, refusal and
+  backoff-skipped turns. Recall and the notice never appear together.
+- A timeout means slow, not refused: the retry backoff after a timeout is 10 s
+  (`TIMEOUT_BACKOFF_MS`) instead of the 60 s used for hard failures.
+
+Live proof, same command as the failing runs:
+
+- Default budgets: `context` shows `roles:["custom/pi-engineering-memory","user"]`,
+  `memoryBytes:3737`; the answer cites `mem-096e5bef…`, scope `canary-facts`,
+  `status verified`, source PR #580, and reproduces the `--project`/`--harness` rule —
+  in 4 s total.
+- `PI_HINDSIGHT_AUTOMATIC_MS=250` (client forced to miss the budget): the model refuses
+  to guess — "durable memory for this project failed to load this turn (memory request
+  timed out), and an unavailable memory is not the same as an empty one".
+
+Two tests asserted the old silent-fail contract and now assert the notice:
+`test/unit/hindsight-memory.test.ts` ("automatic recall hangs") and
+`test/integration/everyday-memory.test.ts` (client loses its credential mid-scenario).
+Both still assert that the caller's `messages` array is never mutated.
 
 ## Not done
 
-- Commit, push, PR merge: **not authorised, not performed**.
-- PR #569 (`docs/handoff-554`) merge: still open, needs explicit authorisation.
+- PR merge for #554 and PR #569 (`docs/handoff-554`) merge: still open, needs explicit
+  authorisation. `origin/rebase/retire-openviking` carries the work.
 - Write-path (`retain`/`remember`/`correct`/`forget`) has **not** been exercised against
   the live service — only reads. Any live write test must name a throwaway project.
 - macOS-only environmental failures remain in `test/integration/blackhole.test.ts` and

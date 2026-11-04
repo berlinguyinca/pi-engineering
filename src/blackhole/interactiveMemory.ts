@@ -33,20 +33,30 @@ function resolveMemoryConfig(env: Record<string, string | undefined>): MemoryCon
 
 const MEMORY_CONTEXT = "pi-engineering-memory";
 const MAX_CONTEXT = 6000;
-// Measured against the live memory service (2026-11-04): one `herdr-memory recall`
-// subprocess takes 0.39-4.9 s wall clock (python start + TLS + embedding), so no
-// in-turn budget is large enough for automatic recall to be reliable. The per-turn
-// budget only bounds how long a slow service may stall a turn; raise it with
-// PI_HINDSIGHT_AUTOMATIC_MS (100-5000 ms) and accept slower turns.
-const AUTOMATIC_LOOKUP_MS = 250;
+// Measured against the live memory service (2026-11-04, project `canary`): one
+// `herdr-memory recall` subprocess takes 0.39-4.9 s wall clock (python start + TLS +
+// embedding), and the once-per-session readiness call measured 1.03 s. This budget is
+// how long a turn may stall waiting for memory, so it has to sit above the observed
+// floor — at 250 ms automatic recall could only ever time out. An answer that lands
+// after it is still used (see `adopt`), so a slow client is late rather than lost.
+// Override with PI_HINDSIGHT_AUTOMATIC_MS (100-5000 ms).
+const AUTOMATIC_LOOKUP_MS = 1200;
 const AUTOMATIC_LOOKUP_MIN_MS = 100;
 const AUTOMATIC_LOOKUP_MAX_MS = 5000;
 // The once-per-session readiness check is not in a turn's critical path and must
 // be given a real budget, or a healthy-but-slow client reports "timed out".
 const READINESS_LOOKUP_MS = 5000;
+// A headless run (`pi -p`) has nobody waiting on a spinner, and its single model call
+// is the only chance to carry memory — so it waits for the client instead of losing it.
+// PI_HINDSIGHT_AUTOMATIC_MS still overrides this.
+const HEADLESS_LOOKUP_MS = 5000;
 const RECALL_TTL_MS = 60_000;
 const MAX_CACHED_QUERIES = 32;
+// A client that answered "no" is not asked again for a minute. A client that answered
+// late is healthy — only the turn's budget was too small — so it gets another chance
+// soon instead of falling silent for a minute.
 const FAILURE_BACKOFF_MS = 60_000;
+const TIMEOUT_BACKOFF_MS = 10_000;
 const STOPWORDS = new Set(
   "the and that this what with from can could should please how are was will have has for you your our about into using want need help know remember memory tell some there these those".split(
     " ",
@@ -157,6 +167,13 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   // Explicit refreshes retire automatic work without retiring their command context.
   let automaticLookupEpoch = 0;
   let recalled = "";
+  // Why this turn has no memory, in one sentence the model can read. Silence was read
+  // as "the bank is empty", which is a different claim from "it could not be read".
+  let unavailable = "";
+  // Identifies which turn an automatic lookup belongs to. `generation` retires a closed
+  // session and `automaticLookupEpoch` retires superseded work; neither may fence a
+  // same-turn answer that arrives after its budget, so the turn counts separately.
+  let turnSequence = 0;
   let activeFingerprint = "";
   let lastFailure = "";
   let retryAfter = 0;
@@ -164,16 +181,20 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   // automatic lookup is in a turn's path and gets the tight budget.
   let readinessDone = false;
   const recalls = new Map<string, { block: { text: string; count: number }; expiresAt: number }>();
-  const clearRecall = () => {
-    automaticLookupEpoch++;
+  const clearRecall = (retirePending = true): void => {
+    // `retirePending` is false only on the automatic failure path: this turn's own
+    // lookup may still answer after its budget, and an explicit command or a new turn
+    // retires pending work through the epoch as before.
+    if (retirePending) automaticLookupEpoch++;
     recalled = "";
+    unavailable = "";
     recalls.clear();
   };
   // Keep automatic hooks bounded even for an injected provider. A late result
   // has no callback into ctx and cannot inject notes after this turn starts.
-  const autoBudgetMs = (): number => {
+  const autoBudgetMs = (headless = false): number => {
     const configured = Number(environment().PI_HINDSIGHT_AUTOMATIC_MS);
-    if (!Number.isFinite(configured) || configured <= 0) return AUTOMATIC_LOOKUP_MS;
+    if (!Number.isFinite(configured) || configured <= 0) return headless ? HEADLESS_LOOKUP_MS : AUTOMATIC_LOOKUP_MS;
     return Math.min(Math.max(Math.trunc(configured), AUTOMATIC_LOOKUP_MIN_MS), AUTOMATIC_LOOKUP_MAX_MS);
   };
   // The race budget is the real ceiling on an automatic lookup: the provider's own
@@ -230,7 +251,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     unreachable: "memory service unavailable",
   } as const;
   type FailureCode = keyof typeof failureMessages;
-  const handleError = (ctx: ExtensionContext, error: unknown, explicit = false) => {
+  const unavailableNotice = (description: string): string =>
+    `Durable memory for this project could not be read this turn (${description}); treat it as unavailable, not empty.`;
+  const handleError = (ctx: ExtensionContext, error: unknown, explicit = false): string => {
     const code: FailureCode =
       error instanceof HindsightError
         ? error.code === "timeout"
@@ -241,9 +264,11 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
               ? "http"
               : "unreachable"
         : "unreachable";
-    clearRecall();
-    retryAfter = now() + FAILURE_BACKOFF_MS;
-    failure(ctx, code, failureMessages[code], explicit);
+    clearRecall(explicit);
+    retryAfter = now() + (code === "timeout" ? TIMEOUT_BACKOFF_MS : FAILURE_BACKOFF_MS);
+    const description = failureMessages[code];
+    failure(ctx, code, description, explicit);
+    return description;
   };
   const reset = () => {
     generation++;
@@ -252,7 +277,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     lastFailure = "";
     retryAfter = 0;
   };
-  const connection = (ctx: ExtensionContext, explicit = false, auto = false) => {
+  const connection = (ctx: ExtensionContext, explicit = false, auto = false, headless = false) => {
     const env = environment();
     const config = resolveMemoryConfig(env);
     if (!config) {
@@ -280,10 +305,16 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     }
     if (auto && now() < retryAfter) return;
     try {
-      // Readiness gets the unhurried budget; in-turn lookups get the tight one.
-      const budget = auto ? (readinessDone ? autoBudgetMs() : READINESS_LOOKUP_MS) : config.providerTimeoutMs;
+      // Readiness gets the unhurried budget; interactive turns get the in-turn one.
+      const budget = auto ? (readinessDone ? autoBudgetMs(headless) : READINESS_LOOKUP_MS) : config.providerTimeoutMs;
       return {
-        client: makeProvider({ ...config, providerTimeoutMs: Math.min(config.providerTimeoutMs, budget) }),
+        client: makeProvider({
+          ...config,
+          // A headless turn may wait the whole budget, so the client must not be cut off
+          // by a shorter timeout of its own.
+          providerTimeoutMs:
+            auto && headless ? Math.max(config.providerTimeoutMs, budget) : Math.min(config.providerTimeoutMs, budget),
+        }),
         identity,
       };
     } catch (error) {
@@ -456,9 +487,19 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     // A new turn retires older automatic work, not commands still completing
     // in this session. Session/connection replacement owns generation changes.
     automaticLookupEpoch++;
+    const turn = ++turnSequence;
     recalled = "";
-    const conn = connection(ctx, false, true);
-    if (!conn) return;
+    unavailable = "";
+    const headless = !ctx.hasUI;
+    const conn = connection(ctx, false, true, headless);
+    if (!conn) {
+      // Skipped because of a recent failure: the model is told memory could not be read,
+      // because silence reads as "the bank is empty". Unconfigured memory is a different
+      // state and the context hook already reports it as off.
+      if (lastFailure && now() < retryAfter)
+        unavailable = unavailableNotice(failureMessages[lastFailure as FailureCode]);
+      return;
+    }
     const id = generation;
     const epoch = automaticLookupEpoch;
     const terms = queryTokens(event.prompt);
@@ -478,19 +519,38 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     }
     recalls.delete(cacheKey);
     setStatus(ctx, "checking");
-    try {
-      const records = await automatic(conn.client.search(query), autoBudgetMs());
-      if (!current(id, conn.identity) || epoch !== automaticLookupEpoch) return;
+    let adopted = false;
+    const adopt = (records: DurableMemoryRecord[]): void => {
+      // A result that lands after the budget still answers this turn's prompt: pi emits
+      // `context` before every model call, so the next call in the same turn can carry
+      // it. A new turn, a replaced connection or a closed session fences it.
+      if (adopted || turn !== turnSequence || epoch !== automaticLookupEpoch || !current(id, conn.identity)) return;
+      adopted = true;
       const block = memoryBlock(records, terms, conn.client.kind === "hindsight");
       // Re-key after the call: observed revisions are part of the scope.
       recalls.set(keyFor(), { block, expiresAt: now() + RECALL_TTL_MS });
       while (recalls.size > MAX_CACHED_QUERIES) recalls.delete(recalls.keys().next().value!);
       recalled = block.text;
+      unavailable = "";
       lastFailure = "";
       retryAfter = 0;
       setStatus(ctx, `ready · ${block.count} recalled`);
+    };
+    const request = conn.client.search(query);
+    // The budget bounds the turn; it does not abandon the lookup. Failures stay with
+    // the race below, so the parked continuation only ever consumes successes.
+    void request.then(
+      (records) => {
+        adopt(records);
+      },
+      () => {},
+    );
+    try {
+      adopt(await automatic(request, autoBudgetMs(headless)));
     } catch (error) {
-      if (current(id, conn.identity) && epoch === automaticLookupEpoch) handleError(ctx, error);
+      if (current(id, conn.identity) && epoch === automaticLookupEpoch) {
+        unavailable = unavailableNotice(handleError(ctx, error));
+      }
     }
   });
   pi.on("context", (event, ctx) => {
@@ -498,16 +558,19 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     const config = resolveMemoryConfig(environment());
     if (!config) {
       recalled = "";
+      unavailable = "";
       setStatus(ctx, "off");
     } else if (activeFingerprint && fingerprint(config) !== activeFingerprint) {
       recalled = "";
+      unavailable = "";
       setStatus(ctx, "connection changed; check /memory");
     }
-    if (recalled) {
+    const payload = recalled || unavailable;
+    if (payload) {
       const message: ContextEvent["messages"][number] = {
         role: "custom",
         customType: MEMORY_CONTEXT,
-        content: recalled,
+        content: payload,
         display: false,
         timestamp: Date.now(),
       };

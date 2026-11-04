@@ -113,6 +113,10 @@ const record = (text: string, id = text): DurableMemoryRecord => ({
   promotedBy: "user",
 });
 
+/** The messages the memory extension injected into a context build. */
+const notes = (result: { messages: any[] }): any[] =>
+  result.messages.filter((m: any) => m.role === "custom" && m.customType === "pi-engineering-memory");
+
 test("explicit remember persists only supplied text with honest user provenance", async () => {
   const f = fixture();
   await f.command("remember", "  Use metric units.  ");
@@ -198,7 +202,11 @@ test("recall is ephemeral, relevant and replaced on each prompt", async () => {
   f.fail(new Error("gone"));
   await f.emit("before_agent_start", { prompt: "Python", systemPrompt: "" });
   const third = await f.emit("context", { messages: first.messages });
-  assert.deepEqual(third.messages, original);
+  // A turn that could not read memory says so: silence was read as "the bank is empty".
+  assert.equal(third.messages.length, 2, "the failed turn carries one notice instead of recalled notes");
+  assert.deepEqual(third.messages[1], original[0], "the conversation itself is untouched");
+  assert.match(notes(third)[0].content, /could not be read this turn/);
+  assert.doesNotMatch(notes(third)[0].content, /Use metric|Python formatting/);
 });
 
 test("recall has a bounded query, result count and complete context budget", async () => {
@@ -604,8 +612,28 @@ test("temporary memory failures retry after backoff and explicit status bypasses
   assert.equal(f.queries.length, 4, "explicit success clears cached recall and the failure backoff");
 });
 
+test("a client that answered late is asked again soon, a client that refused waits a minute", async () => {
+  let now = 1000;
+  const f = fixture({ now: () => now });
+  f.fail(new HindsightError("timeout"));
+  const prompt = { prompt: "calibration", systemPrompt: "" };
+  await f.emit("before_agent_start", prompt);
+  f.fail();
+  await f.emit("before_agent_start", prompt);
+  assert.equal(f.queries.length, 1, "one spent budget per backoff window");
+  now += 11_000;
+  await f.emit("before_agent_start", prompt);
+  assert.equal(
+    f.queries.length,
+    2,
+    "a timeout means slow, not refused: the next turn asks again after 10 s rather than 60 s",
+  );
+});
+
 test("automatic recall bounds cached queries and discards results arriving after its deadline", async () => {
-  const f = fixture();
+  // A tight budget keeps this test's wall-clock assertion meaningful; the default is
+  // deliberately larger because the live client answers in 0.39-4.9 s.
+  const f = fixture({ env: { PI_HINDSIGHT_AUTOMATIC_MS: "250" } });
   for (let i = 0; i < 33; i++) {
     await f.emit("before_agent_start", { prompt: `calibration-${i}`, systemPrompt: "" });
   }
@@ -629,7 +657,7 @@ test("automatic recall bounds cached queries and discards results arriving after
   assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
 });
 
-test("automatic recall deadline is exactly 250 ms and fences late results from a retired context", async (t) => {
+test("automatic recall holds the turn for exactly the in-turn budget and fences late results from a retired context", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture();
   let resolve!: (rows: DurableMemoryRecord[]) => void;
@@ -656,12 +684,12 @@ test("automatic recall deadline is exactly 250 ms and fences late results from a
   const pending = f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" }).then(() => {
     settled = true;
   });
-  t.mock.timers.tick(249);
+  t.mock.timers.tick(1_199);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settled, false, "automatic lookup is still pending before its deadline");
   t.mock.timers.tick(1);
   await pending;
-  assert.equal(settled, true, "automatic lookup settles at 250 ms without a provider response");
+  assert.equal(settled, true, "automatic lookup settles at the default 1200 ms without a provider response");
   assert.match(f.statuses.at(-1)!, /timed out/);
   await f.emit("session_shutdown");
   stale = true;
@@ -673,6 +701,96 @@ test("automatic recall deadline is exactly 250 ms and fences late results from a
   assert.equal(f.statuses.length, statuses);
   assert.equal(f.notices.length, notices);
   assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
+});
+
+test("an answer that lands after the in-turn budget is injected at the next model call of the same turn", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture({ env: { PI_HINDSIGHT_AUTOMATIC_MS: "300" } });
+  let resolve!: (rows: DurableMemoryRecord[]) => void;
+  f.override(
+    () =>
+      new Promise((resolveSearch) => {
+        resolve = resolveSearch;
+      }),
+  );
+  const pending = f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
+  t.mock.timers.tick(299);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(
+    notes(await f.emit("context", { messages: [{ role: "user", content: "calibration" }] })),
+    [],
+    "nothing is injected while the lookup is still inside its budget",
+  );
+  t.mock.timers.tick(1);
+  await pending;
+  const stalled = notes(await f.emit("context", { messages: [{ role: "user", content: "calibration" }] }));
+  assert.equal(stalled.length, 1, "the turn says memory is unavailable instead of proceeding in silence");
+  assert.match(stalled[0].content, /could not be read this turn/);
+  assert.match(stalled[0].content, /timed out/);
+  resolve([record("calibration answered late")]);
+  await new Promise((r) => setImmediate(r));
+  const delivered = notes(await f.emit("context", { messages: [{ role: "user", content: "calibration" }] }));
+  assert.equal(delivered.length, 1, "the late answer replaces the notice rather than adding to it");
+  assert.match(delivered[0].content, /answered late/);
+  assert.match(f.statuses.at(-1)!, /ready/);
+});
+
+test("a headless prompt waits longer for memory than an interactive turn", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const stall = () => new Promise<DurableMemoryRecord[]>(() => {});
+  const interactive = fixture({ hasUI: true });
+  interactive.override(stall);
+  const headless = fixture({ hasUI: false });
+  headless.override(stall);
+  const prompt = { prompt: "calibration", systemPrompt: "" };
+  let uiDone = false;
+  let cliDone = false;
+  const pending = [
+    interactive.emit("before_agent_start", prompt).then(() => {
+      uiDone = true;
+    }),
+    headless.emit("before_agent_start", prompt).then(() => {
+      cliDone = true;
+    }),
+  ];
+  t.mock.timers.tick(1_199);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(uiDone, false);
+  assert.equal(cliDone, false);
+  t.mock.timers.tick(1);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(uiDone, true, "an interactive turn gives memory the in-turn budget");
+  assert.equal(cliDone, false, "a headless run keeps waiting: its one model call is the only chance");
+  t.mock.timers.tick(3_799);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(cliDone, false, "the headless deadline is 5000 ms");
+  t.mock.timers.tick(1);
+  await Promise.all(pending);
+  assert.equal(cliDone, true, "a headless prompt waits the full 5000 ms");
+});
+
+test("a late answer stays usable in its own turn and is fenced by the next turn", async () => {
+  let release: ((rows: DurableMemoryRecord[]) => void) | undefined;
+  const f = fixture();
+  f.override(
+    () =>
+      new Promise((resolveSearch) => {
+        release = resolveSearch;
+      }),
+  );
+  const pending = f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
+  await new Promise((r) => setTimeout(r, 5));
+  release?.([record("calibration arrived after the budget")]);
+  await pending;
+  const sameTurn = notes(await f.emit("context", { messages: [{ role: "user", content: "calibration" }] }));
+  assert.match(sameTurn.map((m) => m.content).join("\n"), /calibration arrived after the budget/);
+  await f.emit("before_agent_start", { prompt: "another question", systemPrompt: "" });
+  const nextTurn = notes(await f.emit("context", { messages: [{ role: "user", content: "another question" }] }));
+  assert.doesNotMatch(
+    nextTurn.map((m) => m.content).join("\n"),
+    /calibration arrived after the budget/,
+    "an answer to a retired prompt is never injected into a new turn",
+  );
 });
 
 test("a slow herdr-memory client cannot hold startup or a prompt for seconds", async () => {
@@ -694,7 +812,9 @@ test("a slow herdr-memory client cannot hold startup or a prompt for seconds", a
     const turn = performance.now() - start;
     assert.ok(startup < 1000, `startup waited ${startup.toFixed(0)} ms for memory`);
     assert.ok(turn < 1000, `the prompt waited ${turn.toFixed(0)} ms for memory`);
-    assert.deepEqual((await f.emit("context", { messages: [] })).messages, [], "a timed out read injects nothing");
+    const stalled = notes(await f.emit("context", { messages: [{ role: "user", content: "calibration" }] }));
+    assert.equal(stalled.length, 1, "a timed out read injects no recall, only the notice");
+    assert.match(stalled[0].content, /could not be read this turn/);
     assert.match(f.statuses.at(-1)!, /timed out/);
     await f.emit("session_shutdown");
   } finally {
