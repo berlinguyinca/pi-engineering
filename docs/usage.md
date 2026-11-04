@@ -1552,6 +1552,12 @@ node scripts/pi-engineering.ts blackhole status
 herdr-memory doctor        # the CLI's own credential/config check
 ```
 
+A leftover OpenViking environment variable or saved connection profile is
+detected by existence only — its contents are never read and no value is ever
+printed — and produces a single load-time warning pointing at `herdr-memory`
+(`src/blackhole/legacyOpenViking.ts`). Delete those files once migrated; nothing
+reads them for configuration.
+
 The resolver is `resolveHindsightFromEnv()` in `src/blackhole/hindsight.ts`:
 configuration is fail-closed (an unknown scope or a malformed timeout falls back
 to the default), reads are fail-open (a CLI that cannot answer yields no notes

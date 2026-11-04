@@ -24,6 +24,7 @@ HARD RULES:
 - Herdr owns persistent process/agent runtime concerns.
 - InferWeave owns model/runtime/GPU scheduling. Never add static model-to-GPU assignments.
 - Hindsight (herdr-memory CLI) is the semantic shared memory; OpenViking is retired; PostgreSQL remains operational history.
+  `openviking` is not an accepted `durable.kind` (configuration validation refuses it): do not reintroduce the HTTP transport.
 - All Herdr access must be behind AgentRuntime.
 - Inspect actual current Herdr/pi-herdr source/API/version before relying on commands.
 - Keep the legacy runtime until parity, recovery, canary and rollback gates pass.

@@ -89,7 +89,9 @@ Interactive memory is opt-in and reaches **Hindsight through the
 `herdr-memory` CLI**. Pi never talks to a memory service itself and holds no
 memory credential: the CLI carries its own configuration and credentials
 (`herdr-memory doctor` checks them), and nothing under `PI_CODING_AGENT_DIR`
-stores a host, token or profile. Enable it in the environment:
+stores a host, token or profile. A leftover OpenViking profile or
+`PI_OPENVIKING_*` variable is detected by existence only — never read — and warns
+once at load. Enable it in the environment:
 
 ```text
 export PI_HINDSIGHT_ENABLED=1          # opt-in; anything else leaves memory off
