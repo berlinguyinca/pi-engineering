@@ -1,0 +1,59 @@
+{
+ "taskId": "FIX-3C",
+ "baseSha": "0ddf27714f80a8e98d01d4662c0242b789de15c7",
+ "repoId": "pi",
+ "objective": "The emit path validates the handoff record against templates/handoff.schema.json before it stamps.",
+ "allowPaths": [
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "denyPaths": [
+  "src/bootstrap/**",
+  "docs/specs/**",
+  "package.json"
+ ],
+ "commands": [
+  {
+   "id": "02-conductor-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "03-conductor-unit-one",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-one.test.ts"
+   ]
+  },
+  {
+   "id": "04-conductor-unit-all",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-*.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 1,
+  "maxTestFiles": 1,
+  "maxChangedLines": 85
+ },
+ "parentHandoffHash": "sha256:d2435ac27847bd8f2354d0db9211dd12489d8e4be21dcd1ab75be3e0512f5a8a",
+ "expectedOutputs": [
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "mode": "isolated-change"
+}

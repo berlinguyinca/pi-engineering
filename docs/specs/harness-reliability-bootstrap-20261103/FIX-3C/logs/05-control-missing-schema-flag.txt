@@ -1,0 +1,4 @@
+REJECT baseline: HEAD 3881178f963d01cad1e6fcedb95c696f27d3ac5d != manifest baseSha 0ddf27714f80a8e98d01d4662c0242b789de15c7
+plan exit=3; no model invoked (B04 stops here)
+parent=FIX-3B2 accepted sha256:d2435ac2784…
+REJECT gate: --emit-handoff requires --handoff-schema: the gate schema-validates the record before it stamps
