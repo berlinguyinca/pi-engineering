@@ -1,0 +1,17 @@
+✔ canonical hashing agrees with the handoff protocol's Python canonicalization (1.41775ms)
+✔ one accepted manifest yields a deterministic plan and touches nothing (1.476ms)
+✔ malformed manifests and baseline drift are rejected before any planning (0.409625ms)
+✔ handoff mismatch is rejected and no model, scheduler or inference path is reachable (0.755291ms)
+✔ validateParentHandoff is pure: a manifest with no parent and a correct parent both yield no blockers (0.142916ms)
+✔ FIX-2: a declared parent that is absent at stamp time blocks the gate, exits 5 and writes no handoff (306.712792ms)
+✔ FIX-2: a parent whose stored hash is not its canonical hash is rejected at stamp time (302.283709ms)
+✔ FIX-2: a correctly hashed parent pointing at the wrong next task is rejected at stamp time (313.828417ms)
+✔ FIX-2: a valid parent chain stamps, and the stamping run itself prints the verification (308.926208ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1460.881292

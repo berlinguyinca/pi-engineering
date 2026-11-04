@@ -1,0 +1,12 @@
+embedded   = sha256:99e3b5f7fc8de7b767df4e5d5293b4332df06a64c470a16adf54ecaf92c92884
+recomputed = sha256:99e3b5f7fc8de7b767df4e5d5293b4332df06a64c470a16adf54ecaf92c92884
+MATCH
+schema errors: 8
+E01.handoff.json: missing required 'specVersion'
+E01.handoff.json: additional property 'schemaVersion'
+E01.handoff.json/status: 'complete' not in enum
+E01.handoff.json/changedFiles[0]: type string vs dict
+E01.handoff.json/commands[0]: missing required 'command'
+E01.handoff.json/commands[0]: missing required 'outputArtifact'
+resultSha=0cc5b21cb68caacd44bb09cb7a9674c616f02d9b
+nextTaskId=E02 nextBaseSha=0cc5b21cb68caacd44bb09cb7a9674c616f02d9b

@@ -1,0 +1,17 @@
+[
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/01-typecheck.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-one.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/02-unit-bootstrap-one.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-diff-guard.test.ts test/unit/bootstrap-result-gate.test.ts test/unit/bootstrap-package.test.ts test/unit/bootstrap-path-policy.test.ts test/unit/bootstrap-task-manifest.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/03-unit-bootstrap-regression.txt"
+ }
+]

@@ -1,0 +1,12 @@
+✔ accepts a fully attributed occurrence; absent optionals stay null (2.248792ms)
+✔ an occurrence with no session is refused — unattributable errors are not recordable (0.157209ms)
+✔ rejects unredacted secrets, control characters and unsafe artifact refs (0.160209ms)
+✔ requires correlation and validates layer, severity, version, timestamp (0.4515ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 138.274042

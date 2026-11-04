@@ -1,0 +1,32 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "B00",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "<actual-verified-sha>",
+  "resultSha": "<actual-verified-sha>",
+  "taskAuthorityHash": "<computed-sha256>",
+  "changedFiles": [
+    "docs/specs/harness-reliability-bootstrap/BASELINE.md"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "<local-log-path>"
+    }
+  ],
+  "evidence": [
+    "Baseline file contains actual HEAD and environment versions"
+  ],
+  "nextTaskId": "B01",
+  "nextBaseSha": "<actual-next-base-sha>",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": false,
+    "approvedBy": null,
+    "approvedAt": null
+  },
+  "handoffHash": "<canonical-content-sha256-without-self>"
+}

@@ -1,0 +1,51 @@
+01 B00 Capture exact baseline -> START
+02 B01 Define static microtask manifest schema -> B00
+03 B02 Implement path allowlist matcher -> B01
+04 B03 Implement diff-scope and size validator -> B02
+05 B04 Create single-task bootstrap CLI wrapper -> B03
+06 B05 Add result gate and immutable handoff writer -> B04
+07 E01 Inventory all existing error sources -> B05
+08 E02 Define normalized error event types -> E01
+09 E03 Build deterministic error normalization -> E02
+10 E04 Add sanitization before durable error capture -> E03
+11 E05 Record normalized error occurrences per session -> E04
+12 E06 Capture worker/tool failures at single stable seam -> E05
+13 E07 Capture gateway and inference failures -> E06
+14 D01 Read-only merged host error reader -> E07
+15 D02 Stable cross-session error fingerprint -> D01
+16 D03 Aggregate occurrences into issue clusters -> D02
+17 D04 Classify recovery outcome accurately -> D03
+18 D05 Read-only diagnose-errors CLI -> D04
+19 D06 Register /diagnose-errors Pi command -> D05
+20 D07 Produce bounded diagnostic evidence bundle -> D06
+21 D08 Add bounded local-model diagnostic adapter -> D07
+22 T01 Persist canonical original task identity -> D08
+23 T02 Fail closed on dropped deny patterns -> T01
+24 T03 Constrain malformed-plan fallback -> T02
+25 T04 Improve goal keyword extraction -> T03
+26 T05 Surface required context omissions -> T04
+27 T06 Attach task authority to APS actions -> T05
+28 T07 Detect deterministic goal deviation signals -> T06
+29 T08 Carry authority through context handoff -> T07
+30 T09 Add scope-integrity result gate -> T08
+31 R01 Catalog current retry ownership by failure -> T09
+32 R02 Expose retry correlation ID across layers -> R01
+33 R03 Implement retry budget evaluator pure function -> R02
+34 R04 Add endpoint circuit-breaker state machine -> R03
+35 R05 Define idempotency classifier for recovery -> R04
+36 R06 Add read-only recovery recommendation engine -> R05
+37 R07 Enable one safe recovery behind opt-in -> R06
+38 R08 Record final resolution and regression evidence -> R07
+39 H01 Inventory existing Herdr telemetry surfaces -> R08
+40 H02 Define normalized diagnostics view model -> H01
+41 H03 Add read-only host diagnostics transport adapter -> H02
+42 H04 Render error issue list -> H03
+43 H05 Render per-session error timeline -> H04
+44 H06 Render task drift comparison -> H05
+45 H07 Integrate diagnostics route into existing UI -> H06
+46 V01 Create benchmark task fixtures -> H07
+47 V02 Create drift detector evaluation runner -> V01
+48 V03 Create quantization benchmark recording schema -> V02
+49 V04 Add isolated live benchmark command -> V03
+50 V05 Add feature flag and rollback checklist -> V04
+51 V06 Final cross-repo acceptance audit -> V05

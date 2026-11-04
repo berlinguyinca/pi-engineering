@@ -1,0 +1,50 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "E01",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "36cab891c696ff709d09fb2c4066186e5201c5d9",
+ "resultSha": "0cc5b21cb68caacd44bb09cb7a9674c616f02d9b",
+ "taskAuthorityHash": "sha256:5dd2176930904126c7969a734bd0cac49dfece2f3421c40eebcddbc3b68e620e",
+ "changedFiles": [
+  "docs/specs/harness-reliability-bootstrap/ERROR_SOURCES.md"
+ ],
+ "commands": [
+  {
+   "command": "git diff --check",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/01-verify-git-diff-check.txt"
+  },
+  {
+   "command": "git diff --numstat HEAD^1 HEAD (scope/budget: 100 insertions, 1 production file, 0 test files)",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/02-scope-and-budget.txt"
+  },
+  {
+   "command": "node --experimental-strip-types scripts/bootstrap-one.ts --manifest <E01 manifest> --parent-handoff <B05 handoff> --proofs <proofs> --handoff-record <record> --emit-handoff <out> --cwd <clean worktree at 0cc5b21c>",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/05-cli-accepted.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/01-verify-git-diff-check.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/02-scope-and-budget.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/03-cli-accepted-first-record.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/04-handoff-hash-and-schema.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/05-cli-accepted.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/logs/06-handoff-hash-and-schema.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/fixtures/manifest-e01.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/fixtures/proofs-e01.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/E01/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "E02",
+ "nextBaseSha": "0cc5b21cb68caacd44bb09cb7a9674c616f02d9b",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-04T00:00:00Z",
+  "notes": "B05 handoff sha256:21bae9f5a1c1231b992b3909ca3d754f0426a1f2c618a03c37c0083329750cb7 verified by the CLI before this handoff was emitted. Two earlier record attempts violated templates/handoff.schema.json (logs/03, logs/04); this record conforms (logs/06)."
+ }
+}

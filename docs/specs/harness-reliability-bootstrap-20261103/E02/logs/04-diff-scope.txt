@@ -1,0 +1,12 @@
+command: git -C /Users/wohlgemuth/IdeaProjects/worktrees/pi-e02-error-event-20261103 diff --numstat  (intent-to-add for the two new files; base 0cc5b21cb68caacd44bb09cb7a9674c616f02d9b)
+base_sha=0cc5b21cb68caacd44bb09cb7a9674c616f02d9b
+58	0	src/incidents/errorEvent.ts
+40	0	test/unit/error-event.test.ts
+total_insertions=98
+total_deletions=0
+files=2
+note: files touched = 2 (src/incidents/errorEvent.ts, test/unit/error-event.test.ts); budget <= 2 files / <100 lines
+untracked:
+ A src/incidents/errorEvent.ts
+ A test/unit/error-event.test.ts
+?? docs/specs/harness-reliability-bootstrap-20261103/

@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bootstrap handoff record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "specVersion",
+    "taskId",
+    "status",
+    "repo",
+    "baseSha",
+    "resultSha",
+    "taskAuthorityHash",
+    "changedFiles",
+    "commands",
+    "evidence",
+    "nextTaskId",
+    "nextBaseSha",
+    "blockedReasons",
+    "operatorApproval",
+    "handoffHash"
+  ],
+  "properties": {
+    "specVersion": {
+      "const": "1.2.0"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "PASS",
+        "ALREADY_SATISFIED",
+        "BLOCKED"
+      ]
+    },
+    "repo": {
+      "type": "string"
+    },
+    "baseSha": {
+      "type": "string"
+    },
+    "resultSha": {
+      "type": "string"
+    },
+    "taskAuthorityHash": {
+      "type": "string"
+    },
+    "changedFiles": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "command",
+          "exitCode",
+          "outputArtifact"
+        ],
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "exitCode": {
+            "type": "integer"
+          },
+          "outputArtifact": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "nextTaskId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nextBaseSha": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "blockedReasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "operatorApproval": {
+      "type": "object",
+      "required": [
+        "required",
+        "approved"
+      ],
+      "properties": {
+        "required": {
+          "type": "boolean"
+        },
+        "approved": {
+          "type": "boolean"
+        },
+        "approvedBy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approvedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "handoffHash": {
+      "type": "string"
+    }
+  }
+}

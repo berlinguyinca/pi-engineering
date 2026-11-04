@@ -1,0 +1,6 @@
+embedded   = sha256:2077162a05a98d11dc110bd63c59415aa86b033378843b41934ad18e297bcd89
+recomputed = sha256:2077162a05a98d11dc110bd63c59415aa86b033378843b41934ad18e297bcd89
+MATCH
+schema errors: 0
+status=PASS resultSha=0cc5b21cb68caacd44bb09cb7a9674c616f02d9b
+next=E02 @ 0cc5b21cb68caacd44bb09cb7a9674c616f02d9b
