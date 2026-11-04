@@ -401,7 +401,13 @@ const DEPLOYED_PAYLOAD = {
     { id: "qwen3.8-27b-modality-vision-quant-q8_k_xl", ctx_per_request: 262_144, x_state: "warm", slots: 1 },
     { id: "qwen3.8-flash_next-modality-text-quant-w3a8", ctx_per_request: 131_072, x_state: "warm", slots: 3 },
     // One member: the route has a definite answer behind it.
-    { id: "qwen3.8-text", ctx_per_request: 131_072, slots: 3, x_alias: true, x_members: ["qwen3.8-flash_next-modality-text-quant-w3a8"] },
+    {
+      id: "qwen3.8-text",
+      ctx_per_request: 131_072,
+      slots: 3,
+      x_alias: true,
+      x_members: ["qwen3.8-flash_next-modality-text-quant-w3a8"],
+    },
     // Several members: the gateway picks per request, so no single model is THE backing.
     {
       id: "laya",
@@ -411,7 +417,12 @@ const DEPLOYED_PAYLOAD = {
       x_members: ["qwen3.8-flash_next-modality-text-quant-w3a8", "qwen3.8-27b-modality-vision-quant-q8_k_xl"],
     },
     // A route with no size of its own is bounded by what stands behind it.
-    { id: "coding-implementation", slots: 3, x_alias: true, x_members: ["qwen3.8-flash_next-modality-text-quant-w3a8"] },
+    {
+      id: "coding-implementation",
+      slots: 3,
+      x_alias: true,
+      x_members: ["qwen3.8-flash_next-modality-text-quant-w3a8"],
+    },
   ],
 };
 
@@ -437,7 +448,10 @@ test("a route row without its own size inherits its member's window", () => {
 
 test("a route row is a route even when the gateway sets no x_alias flag", () => {
   const entries = parseGatewayModels({
-    data: [{ id: TEXT, ctx_per_request: 131_072 }, { id: "solo", x_members: [TEXT] }],
+    data: [
+      { id: TEXT, ctx_per_request: 131_072 },
+      { id: "solo", x_members: [TEXT] },
+    ],
   });
   assert.equal(entries.find((e) => e.id === "solo")!.alias, true);
 });
@@ -476,7 +490,7 @@ test("a refresh repairs a stale alias name but never an operator's own", () => {
   );
   assert.equal(stale.dirty, true);
   assert.equal(stale.next[0]!.name, `qwen3.8-text → ${TEXT} (gateway alias)`);
-  assert.ok(stale.changes[0]!.details.some((d) => d.startsWith("name \"")));
+  assert.ok(stale.changes[0]!.details.some((d) => d.startsWith('name "')));
 
   // The name written before members were known is generated too, so it is updated.
   const plain = planCatalogUpdate([configured("qwen3.8-text (gateway)")], [entry]);

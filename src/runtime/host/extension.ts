@@ -1417,9 +1417,7 @@ export class EngineeringHostExtension {
         notify(
           ctx,
           `${movedLine} — hot-reloading the local checkout${
-            where
-              ? "(it carries the channel tip " + short(where.tip) + ")"
-              : " (the update source could not be consulted)"
+            where ? ` (it carries the channel tip ${short(where.tip)})` : " (the update source could not be consulted)"
           }.`,
         );
         await this.reload(ctx);

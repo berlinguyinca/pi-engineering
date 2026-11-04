@@ -97,8 +97,7 @@ export function childContractForWorker(parent: TaskContract, req: WorkerScopeReq
   // operator sees one clear reason instead of a stream of blocked tool calls.
   if (req.mutating && mode !== "implementation" && mode !== "deployment")
     throw new WorkerScopeError(
-      `role ${JSON.stringify(req.role)} intends to write but the parent contract is ${parent.mode}; ` +
-        "the operator must widen the parent, or dispatch a read-only role",
+      `role ${JSON.stringify(req.role)} intends to write but the parent contract is ${parent.mode}; the operator must widen the parent, or dispatch a read-only role`,
     );
   const writes = mode === "implementation" || mode === "deployment" ? [worktree] : [];
   if (writes.length > 0 && !covered(worktree, parent.writeRoots))
