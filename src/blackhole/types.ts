@@ -89,6 +89,12 @@ export type DurableStoreConfig =
   | { kind: "shared-file"; file: string }
   | { kind: "hindsight"; cli?: string; scopes?: string[]; timeoutMs?: number };
 
+/**
+ * Canonical Hindsight scope a Pi session may read or write. Pi never invents a
+ * scope: it is one of the four the herdr-memory client accepts.
+ */
+export const HINDSIGHT_SCOPE_PATTERN = /^(project|global|infra|mission:[a-z0-9][a-z0-9_-]{0,63})$/;
+
 export type PromotionState = "proposed" | "accepted" | "rejected" | "promoted" | "superseded";
 
 export interface PromotionCandidate {

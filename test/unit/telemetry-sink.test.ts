@@ -200,24 +200,43 @@ test("notice: durations read the way a person would say them", () => {
   assert.equal(formatDuration(-1), "0s", "a negative wait is a bug upstream, not a crash here");
 });
 
-test("notice: an endpoint is reported by origin, never with its credentials", async () => {
-  // A base URL may carry userinfo, and this warning is now SHOWN to the
-  // operator rather than buried in stderr — a surface is exactly where a token
-  // must not be repeated back.
-  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
+test("notice: a memory outage names the client, never its configuration", async () => {
+  // The client (or a proxy in front of it) may repeat a credential in its own
+  // error text, and this warning is SHOWN to the operator rather than buried in
+  // stderr — a surface is exactly where a token must not be repeated back.
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { registerInteractiveMemory } = await import("../../src/blackhole/interactiveMemory.ts");
+  const { makeHerdrStub } = await import("../support/herdrMemoryStub.ts");
+  const dir = mkdtempSync(join(tmpdir(), "memory-leak-"));
+  const noticeDir = mkdtempSync(join(tmpdir(), "memory-leak-notices-"));
+  const stub = makeHerdrStub(dir, "leaky");
   const seen: string[] = [];
   const restore = setTelemetrySink((n) => seen.push(n.text));
   try {
-    const provider = new HindsightProvider({
-      baseUrl: "https://user:s3cr3t-token@ov.example:8443/api",
-      fetch: (async () => ({ ok: false, status: 401, json: async () => [] })) as never,
+    const events = new Map<string, (event: never, ctx: never) => unknown>();
+    const pi = {
+      registerCommand: () => undefined,
+      on: (name: string, fn: (event: never, ctx: never) => unknown) => events.set(name, fn),
+      sendMessage: () => undefined,
+    };
+    const ctx = { cwd: "/tmp/project", hasUI: false, ui: { setStatus: () => undefined, notify: () => undefined } };
+    registerInteractiveMemory(pi as never, {
+      env: () => ({ PI_HINDSIGHT_ENABLED: "1", PI_HINDSIGHT_CLI: stub.cli }),
+      setup: async () => undefined,
+      headlessNoticeDir: noticeDir,
     });
-    assert.deepEqual(await provider.recallAll(), []);
+    await events.get("session_start")?.({} as never, ctx as never);
+    await events.get("before_agent_start")?.({ prompt: "metric units", systemPrompt: "" } as never, ctx as never);
   } finally {
     restore();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(noticeDir, { recursive: true, force: true });
   }
-  assert.equal(seen.length, 1);
+  assert.equal(seen.length, 1, "a headless outage is logged once");
   assert.ok(!seen[0]?.includes("s3cr3t-token"), "the credential must not reach the surface");
   assert.ok(!seen[0]?.includes("user:"), "nor the userinfo around it");
-  assert.match(seen[0] ?? "", /https:\/\/ov\.example:8443/, "the origin still identifies the endpoint");
+  assert.ok(!seen[0]?.includes("8443"), "nor the endpoint it was talking to");
+  assert.match(seen[0] ?? "", /herdr-memory reported a failure/, "the canned message still identifies the client");
 });

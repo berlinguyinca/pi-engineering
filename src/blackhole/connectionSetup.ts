@@ -1,301 +1,205 @@
-/** Profile-owned Hindsight connection; independent of repositories and shell startup files. */
-import { execFileSync } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+/**
+ * First-run memory setup for the `herdr-memory` client.
+ *
+ * There is no endpoint, bank or token for Pi to collect. The client keeps its own
+ * project profile, credentials, offline queue and cache in `~/.config/herdr-memory`
+ * (0600) and refuses to store a fact without evidence or explicit save intent. Pi
+ * asks the client one question — `herdr-memory status`, the same check `/memory
+ * status` uses — tells the operator once per packaged revision what that means, and
+ * never collects or stores a secret, because a stored copy would be one more leak.
+ */
+import { createHash } from "node:crypto";
+import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Input, truncateToWidth } from "@earendil-works/pi-tui";
-import { HindsightProvider, HindsightRequestError } from "./durable.ts";
-import { resolveHindsightFromEnv } from "./envConfig.ts";
+import { type HindsightProbe, probeHindsightStatus, resolveHindsightFromEnv } from "./hindsight.ts";
 
-interface ConnectionProfile {
-  baseUrl: string;
-  tokenFile: string;
-  lastConfirmedRevision: string;
-}
+const DIRECTORY = "engineering-memory";
+const FILE = "connection.json";
+
+export type MemorySetupOutcome = "configured" | "unconfigured" | "disabled" | "headless";
 
 export interface MemorySetupOptions {
-  /** Agent profile root, not the directory of the current repository. */
   profileDir?: string;
-  env?: NodeJS.ProcessEnv;
+  env?: Record<string, string | undefined>;
   revision?: string;
+  /** Re-run the dialog even when this revision is already confirmed. */
   force?: boolean;
-  fetch?: typeof globalThis.fetch;
+  /** The one connection check; tests replace it. Defaults to `herdr-memory status`. */
+  probe?: (options: { cli?: string }) => Promise<HindsightProbe>;
 }
 
-function profilePath(env: NodeJS.ProcessEnv, options: MemorySetupOptions): string {
-  return join(
-    options.profileDir ?? env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
-    "engineering-memory",
-    "connection.json",
-  );
+export interface MemorySetupState {
+  lastConfirmedRevision: string;
+  /** The revision this question was already asked for ("" when none was given). */
+  lastAskedRevision: string;
+  /** The client this session probed; empty when nothing usable was found. */
+  client: string;
+  updatedAt: string;
 }
 
-function readProfile(path: string): ConnectionProfile | undefined {
-  try {
-    const data: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (
-      data &&
-      typeof data === "object" &&
-      "baseUrl" in data &&
-      typeof data.baseUrl === "string" &&
-      "tokenFile" in data &&
-      typeof data.tokenFile === "string" &&
-      isAbsolute(data.tokenFile) &&
-      "lastConfirmedRevision" in data &&
-      typeof data.lastConfirmedRevision === "string"
-    ) {
-      return data as ConnectionProfile;
-    }
-  } catch {
-    // Missing/invalid settings should fall back to the existing environment.
-  }
-  return undefined;
+function defaultProfileDir(): string {
+  const home = process.env.PI_CODING_AGENT_DIR || process.env.HOME || process.env.USERPROFILE || ".";
+  return join(home, "pi-engineering");
 }
 
-/** Explicitly saved connection choices win over stale shell defaults. Disable always wins. */
-export function resolveMemoryEnvironment(
-  env: NodeJS.ProcessEnv = process.env,
-  options: MemorySetupOptions = {},
-): NodeJS.ProcessEnv {
-  const result = { ...env };
-  const profile = readProfile(profilePath(env, options));
-  if (profile) {
-    result.PI_HINDSIGHT_BASE_URL = profile.baseUrl;
-    result.PI_HINDSIGHT_TOKEN_FILE = profile.tokenFile;
-    delete result.PI_HINDSIGHT_TOKEN;
-  }
-  return result;
+function configPath(profileDir: string): string {
+  return join(profileDir, DIRECTORY, FILE);
 }
 
-/** Detect changes while dialogs or credential verification yielded to another session. */
-function connectionFingerprint(env: NodeJS.ProcessEnv, options: MemorySetupOptions): string {
-  const path = profilePath(env, options);
-  const hash = createHash("sha256").update(path);
-  try {
-    hash.update(readFileSync(path));
-  } catch (error) {
-    hash.update(String((error as NodeJS.ErrnoException).code));
-  }
-  const effective = resolveMemoryEnvironment(env, options);
-  hash.update(
-    JSON.stringify({
-      enabled: effective.PI_HINDSIGHT_ENABLED,
-      baseUrl: effective.PI_HINDSIGHT_BASE_URL,
-      tokenFile: effective.PI_HINDSIGHT_TOKEN_FILE,
-      token: effective.PI_HINDSIGHT_TOKEN,
-      connection: resolveHindsightFromEnv(effective),
-    }),
-  );
-  return hash.digest("hex");
-}
-
-/** Stable across chats, sensitive to both git updates and packaged source changes. */
-export function memorySetupRevision(packageRoot = fileURLToPath(new URL("../../", import.meta.url))): string {
+/** Deterministic packaged-source revision, so an update never looks like a stale prompt. */
+export function memorySetupRevision(profileDir = defaultProfileDir()): string {
+  const root = join(profileDir, "..");
   const hash = createHash("sha256");
-  if (existsSync(join(packageRoot, ".git"))) {
+  let seen = 0;
+  for (const relative of ["package.json", "src/index.ts", "extensions/index.ts"]) {
     try {
-      hash.update(
-        execFileSync("git", ["rev-parse", "HEAD"], {
-          cwd: packageRoot,
-          timeout: 1000,
-          maxBuffer: 1024,
-          stdio: ["ignore", "pipe", "ignore"],
-        }),
-      );
+      hash.update(readFileSync(join(root, relative)));
+      seen++;
     } catch {
-      // Packaged content below remains sufficient when git is unavailable.
+      /* An installed bundle may omit sources; the recorded version still anchors it. */
     }
   }
-  function add(path: string): void {
-    for (const entry of readdirSync(path, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      const full = join(path, entry.name);
-      if (entry.isDirectory()) add(full);
-      else if (entry.isFile() && /\.[cm]?[jt]s$/.test(entry.name)) {
-        hash.update(full.slice(packageRoot.length));
-        hash.update(readFileSync(full));
-      }
+  if (!seen) {
+    try {
+      hash.update(readFileSync(join(root, "package.json")));
+    } catch {
+      hash.update("pi-engineering");
     }
   }
-  hash.update(readFileSync(join(packageRoot, "package.json")));
-  for (const directory of ["src", "extensions"]) {
-    if (existsSync(join(packageRoot, directory))) add(join(packageRoot, directory));
-  }
-  return hash.digest("hex");
+  return hash.digest("hex").slice(0, 16);
 }
 
-async function promptKey(ctx: ExtensionContext): Promise<string | undefined> {
-  return ctx.ui.custom<string | undefined>((tui, _theme, _keys, done) => {
-    let input: Input | undefined = new Input();
-    input.onSubmit = (value) => done(value.trim() || undefined);
-    input.onEscape = () => done(undefined);
+/**
+ * The environment a session runs with. The client resolves its own project,
+ * endpoint and credentials, so Pi passes through only the opt-in and the client
+ * location — there is no URL, bank, or key in here.
+ */
+export function resolveMemoryEnvironment(
+  env: Record<string, string | undefined> = process.env,
+  _options: { profileDir?: string } = {},
+): Record<string, string | undefined> {
+  return { ...env };
+}
+
+function readState(profileDir: string): MemorySetupState | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(configPath(profileDir), "utf8")) as Partial<MemorySetupState>;
     return {
-      handleInput(data: string) {
-        input?.handleInput(data);
-        tui.requestRender();
-      },
-      render(width: number) {
-        // Never render Input itself: the native widget has no password mode.
-        return [
-          "Hindsight access key (hidden)",
-          `> ${"*".repeat(Math.min(input?.getValue().length ?? 0, Math.max(0, width - 2)))}`,
-          "Enter to save · Esc to cancel",
-        ].map((line) => truncateToWidth(line, Math.max(1, width)));
-      },
-      invalidate() {},
-      dispose() {
-        input = undefined;
-      },
+      lastConfirmedRevision: typeof parsed.lastConfirmedRevision === "string" ? parsed.lastConfirmedRevision : "",
+      lastAskedRevision: typeof parsed.lastAskedRevision === "string" ? parsed.lastAskedRevision : "",
+      client: typeof parsed.client === "string" ? parsed.client : "",
+      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "",
     };
-  });
-}
-
-function atomicWrite(path: string, content: string): void {
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temporary, content, { mode: 0o600, flag: "wx" });
-    renameSync(temporary, path);
-  } finally {
-    try {
-      unlinkSync(temporary);
-    } catch {
-      /* Renamed or never created. */
-    }
+  } catch {
+    return undefined;
   }
 }
 
-/** Ask once after each extension update, or explicitly through /memory setup. */
-export async function ensureMemorySetup(ctx: ExtensionContext, options: MemorySetupOptions = {}): Promise<void> {
+function writeState(profileDir: string, state: MemorySetupState): void {
+  const directory = join(profileDir, DIRECTORY);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try {
+    if ((statSync(directory).mode & 0o777) !== 0o700) chmodSync(directory, 0o700);
+  } catch {
+    /* best-effort on filesystems without POSIX modes */
+  }
+  const temporary = `${configPath(profileDir)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  renameSync(temporary, configPath(profileDir));
+  try {
+    if ((statSync(configPath(profileDir)).mode & 0o777) !== 0o600) chmodSync(configPath(profileDir), 0o600);
+  } catch {
+    /* best-effort on filesystems without POSIX modes */
+  }
+}
+
+/** What the operator must do, phrased for the failure the client actually reported. */
+function guidance(status: Extract<HindsightProbe, { ok: false }>): string {
+  const client = status.detail ?? "herdr-memory";
+  const problem =
+    status.reason === "not_installed"
+      ? `${client} is not installed, so nothing can be recalled or saved`
+      : status.reason === "unhealthy"
+        ? "the service is reachable but unhealthy"
+        : status.reason === "timeout"
+          ? "the client did not answer in time"
+          : status.reason === "response"
+            ? "the client did not return readable status"
+            : "the client rejected the request (usually a missing or revoked credential)";
+  return `Durable memory is on but not usable: ${problem}.\nRun herdr-memory doctor --json to see the client profile behind this directory, fix what it reports, then run /memory status.\nNever put a key or an endpoint in a repository or in Pi settings — the client stores its own profile at 0600.`;
+}
+
+const DISCLOSURE =
+  "Durable memory is on: private notes are recalled into this session as untrusted reference data, " +
+  "never as instructions. /memory status and /memory search show them; /memory forget removes one.";
+
+export async function ensureMemorySetup(
+  ctx: ExtensionContext,
+  options: MemorySetupOptions = {},
+): Promise<MemorySetupOutcome> {
   const env = options.env ?? process.env;
-  if (!ctx.hasUI || ctx.mode !== "tui") {
-    if (options.force)
-      ctx.ui.notify(
-        "Run /memory setup in an interactive terminal to enter your Hindsight host and key securely.",
-        "info",
-      );
-    return;
+  // Opt-in only: without PI_HINDSIGHT_ENABLED there is no memory and nothing to set up.
+  const connection = resolveHindsightFromEnv(env);
+  if (!connection) return "disabled";
+  const profileDir = options.profileDir ?? defaultProfileDir();
+  const revision = options.revision ?? "";
+  const cli = connection.cli;
+  const probe = options.probe ?? probeHindsightStatus;
+  const before = readState(profileDir);
+  const status = await probe({ cli });
+
+  // Another session may have answered while this probe was running; that answer
+  // wins, and a stale result must not overwrite it.
+  const current = readState(profileDir);
+  if (JSON.stringify(current) !== JSON.stringify(before)) {
+    ctx.ui.notify("Memory connection changed during setup; run /memory setup again.", "info");
+    return current?.client ? "configured" : "unconfigured";
   }
-  if (env.PI_HINDSIGHT_ENABLED === "0" || env.PI_HINDSIGHT_ENABLED === "false") {
-    if (options.force)
-      ctx.ui.notify(
-        "Hindsight is disabled by PI_HINDSIGHT_ENABLED. Remove that override before running /memory setup.",
-        "info",
-      );
-    return;
+
+  const confirmed = Boolean(revision) && before?.lastConfirmedRevision === revision;
+  const headless = !ctx.hasUI || (ctx as { mode?: string }).mode === "rpc";
+
+  if (status.ok) {
+    writeState(profileDir, {
+      lastConfirmedRevision: revision,
+      lastAskedRevision: revision,
+      client: cli,
+      updatedAt: new Date().toISOString(),
+    });
+    // There is nothing to re-collect: no endpoint, no bank, no token. An explicit
+    // /memory setup on a working client is answered with the truth, not a question.
+    if (!headless) {
+      if (options.force)
+        ctx.ui.notify(
+          `Memory is already set up: ${cli}${status.project ? ` (project ${status.project})` : ""}. The client keeps its own profile; change it with herdr-memory, not here.`,
+          "info",
+        );
+      else if (!confirmed) ctx.ui.notify(DISCLOSURE, "info");
+    }
+    return "configured";
   }
-  let newTokenFile: string | undefined;
-  try {
-    const path = profilePath(env, options);
-    const initialFingerprint = connectionFingerprint(env, options);
-    const profile = readProfile(path);
-    const effective = resolveMemoryEnvironment(env, options);
-    const current = resolveHindsightFromEnv(effective);
-    const revision = options.revision ?? memorySetupRevision();
-    // A connection that works needs no confirmation. This used to re-ask on
-    // every revision bump — i.e. after every install or update — which trains
-    // the operator to dismiss a dialog rather than read it, and asks a question
-    // whose answer is already on disk and demonstrably working.
-    //
-    // The prompt is now for the case it was written for: nothing configured.
-    // Changing a working connection is `/memory setup`, which passes `force`.
-    if (!options.force && current?.baseUrl && current.token) {
-      // Still record that this revision has been seen, so the profile does not
-      // look stale to anything else reading it.
-      if (profile && profile.lastConfirmedRevision !== revision) {
-        try {
-          atomicWrite(path, `${JSON.stringify({ ...profile, lastConfirmedRevision: revision }, null, 2)}\n`);
-        } catch {
-          /* A bookkeeping write is never worth failing startup for. */
-        }
-      }
-      return;
-    }
-    const configured = Boolean(current?.baseUrl && current.token);
-    let hostLabel = "not configured";
-    try {
-      if (current?.baseUrl) hostLabel = new URL(current.baseUrl).origin;
-    } catch {
-      /* Invalid host is corrected in setup. */
-    }
-    const action = await ctx.ui.select(
-      `Hindsight memory — confirm connection after install/update (${hostLabel})`,
-      configured ? ["Keep current connection", "Change connection", "Later"] : ["Set up connection", "Later"],
-    );
-    if (!action || action === "Later") return;
-    let baseUrl = current?.baseUrl ?? "https://hindsight.example.com";
-    let token = current?.token;
-    let tokenFile = effective.PI_HINDSIGHT_TOKEN?.trim() ? undefined : effective.PI_HINDSIGHT_TOKEN_FILE;
-    if (action !== "Keep current connection") {
-      const host = await ctx.ui.input("Hindsight host URL (HTTPS)", baseUrl);
-      if (host === undefined) return;
-      baseUrl = host.trim() || baseUrl;
-      // Validate the destination before asking for a credential.
-      new HindsightProvider({ baseUrl, strict: true });
-      token = await promptKey(ctx);
-      if (!token) return;
-      tokenFile = undefined;
-    }
-    if (!token) return;
-    await new HindsightProvider({ baseUrl, token, strict: true, timeoutMs: 5000, fetch: options.fetch }).recallAll();
-    if (connectionFingerprint(env, options) !== initialFingerprint) {
-      ctx.ui.notify(
-        "Hindsight settings or credentials changed during setup. Run /memory setup to retry with the current connection.",
-        "warning",
-      );
-      return;
-    }
-    // Keep the check and writes synchronous: another session cannot interleave here.
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    chmodSync(dirname(path), 0o700);
-    if (!tokenFile) {
-      // Unique secret avoids replacing a working credential before settings commit.
-      newTokenFile = join(dirname(path), `hindsight-${randomUUID()}.key`);
-      atomicWrite(newTokenFile, `${token}\n`);
-      tokenFile = newTokenFile;
-    }
-    const saved: ConnectionProfile = { baseUrl, tokenFile: resolve(tokenFile), lastConfirmedRevision: revision };
-    atomicWrite(path, `${JSON.stringify(saved, null, 2)}\n`);
-    newTokenFile = undefined;
-    if (
-      profile &&
-      profile.tokenFile !== saved.tokenFile &&
-      dirname(profile.tokenFile) === resolve(dirname(path)) &&
-      /^hindsight-[a-f0-9-]{36}\.key$/.test(basename(profile.tokenFile))
-    ) {
-      try {
-        unlinkSync(profile.tokenFile);
-      } catch {
-        /* Connection is saved; cleanup is best effort. */
-      }
-    }
-    ctx.ui.notify(
-      "Hindsight connection verified and saved for this Pi profile. Use /memory status to check it or /memory setup to change it.",
-      "info",
-    );
-  } catch (error) {
-    if (newTokenFile) {
-      try {
-        unlinkSync(newTokenFile);
-      } catch {
-        /* Best effort after a failed settings commit. */
-      }
-    }
-    ctx.ui.notify(
-      error instanceof HindsightRequestError
-        ? `${error.message} Previous settings are unchanged. Run /memory setup to retry.`
-        : "Hindsight setup could not be completed. Previous settings are unchanged. Run /memory setup in an interactive terminal to retry.",
-      "warning",
-    );
+
+  if (headless) {
+    // Workers and RPC callers must not be interrupted, and silence is never a
+    // false "ready" — the reason is still stated once.
+    ctx.ui.notify(`${guidance(status)}\nOn a machine with a terminal, run /memory setup there.`, "info");
+    return "headless";
   }
+
+  // One question per packaged revision per client: a dialog that reappears every
+  // session teaches the operator to dismiss it without reading.
+  if ((confirmed || before?.lastAskedRevision === revision) && !options.force) return "unconfigured";
+
+  const choices = ["Set up now", "Later"] as const;
+  const answer = await ctx.ui.select("Hindsight durable memory is not usable yet", [...choices]);
+  if (answer === "Later") return "unconfigured"; // asked again next session; nothing written
+  writeState(profileDir, {
+    lastConfirmedRevision: "",
+    lastAskedRevision: revision,
+    client: "",
+    updatedAt: new Date().toISOString(),
+  });
+  ctx.ui.notify(guidance(status), "info");
+  return "unconfigured";
 }

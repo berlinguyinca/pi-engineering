@@ -237,8 +237,17 @@ export { newSessionIdentity, memoryWorkerIdentity } from "./blackhole/SessionSto
 export type { SessionIdentity, SessionContext } from "./blackhole/SessionStore.ts";
 export { InMemoryDurableMemory } from "./blackhole/durableProvider.ts";
 export type { DurableMemoryProvider, DurableMemoryRecord } from "./blackhole/durableProvider.ts";
-export { SharedFileDurableMemory, HindsightProvider } from "./blackhole/durable.ts";
-export type { HindsightProviderOptions } from "./blackhole/durable.ts";
+export { SharedFileDurableMemory } from "./blackhole/durable.ts";
+export {
+  HindsightDurableMemory,
+  HindsightError,
+  hindsightBlackholeOption,
+  probeHindsightStatus,
+  resolveHindsightFromEnv,
+  HINDSIGHT_ENV,
+  HINDSIGHT_UNTRUSTED_HEADER,
+} from "./blackhole/hindsight.ts";
+export type { HindsightEnvConfig, HindsightProbe, HindsightOptions, HindsightRunner } from "./blackhole/hindsight.ts";
 export { buildDurableProvider } from "./blackhole/BlackholeManager.ts";
 export { decidePromotion } from "./blackhole/promotion.ts";
 export type { PromotionDecision, PromotionOutcome } from "./blackhole/promotion.ts";

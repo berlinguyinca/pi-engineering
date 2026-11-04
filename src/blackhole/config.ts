@@ -9,6 +9,7 @@ import {
   BLACKHOLE_ALLOWLIST,
   type BlackholeConfig,
   type DurableStoreConfig,
+  HINDSIGHT_SCOPE_PATTERN,
   type MemoryWorkerRole,
   PINNED_BLACKHOLE_VERSION,
 } from "./types.ts";
@@ -74,15 +75,22 @@ export function resolveBlackholeConfig(input?: PartialBlackholeConfig): ConfigRe
   if (durable.kind === "shared-file" && !durable.file) {
     throw new Error("durable.kind='shared-file' requires a `file` path");
   }
-  if (durable.kind === "hindsight" && !durable.baseUrl) {
-    throw new Error("durable.kind='hindsight' requires a `baseUrl`");
-  }
-  if (
-    durable.kind === "hindsight" &&
-    durable.project !== undefined &&
-    !/^[a-z0-9][a-z0-9_-]{0,95}$/.test(durable.project)
-  ) {
-    throw new Error("durable.kind='hindsight' project must be a canonical lowercase identifier");
+  if (durable.kind === "hindsight") {
+    // Pi reaches Hindsight only through the herdr-memory client, so the config
+    // names an executable and scopes — never a URL, token or bank.
+    if (durable.cli !== undefined && !durable.cli.trim()) {
+      throw new Error("durable.kind='hindsight' requires a non-empty `cli` executable when set");
+    }
+    if (durable.scopes !== undefined) {
+      if (!durable.scopes.length || durable.scopes.some((scope) => !HINDSIGHT_SCOPE_PATTERN.test(scope))) {
+        throw new Error(
+          "durable.kind='hindsight' scopes must be non-empty and canonical (project | global | infra | mission:<id>)",
+        );
+      }
+    }
+    if (durable.timeoutMs !== undefined && (!Number.isFinite(durable.timeoutMs) || durable.timeoutMs < 1)) {
+      throw new Error("durable.kind='hindsight' timeoutMs must be >= 1");
+    }
   }
   const providerTimeoutMs = input?.providerTimeoutMs ?? DEFAULTS.providerTimeoutMs;
   if (providerTimeoutMs < 1) {

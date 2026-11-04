@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildDurableProvider } from "../../src/blackhole/BlackholeManager.ts";
-import type { DurableMemoryRecord } from "../../src/blackhole/OpenViking.ts";
+import type { DurableMemoryRecord } from "../../src/blackhole/durableProvider.ts";
 import {
   HindsightDurableMemory,
+  HindsightError,
+  type HindsightProbe,
   type HindsightRunner,
+  hindsightBlackholeOption,
+  probeHindsightStatus,
   resolveHindsightFromEnv,
 } from "../../src/blackhole/hindsight.ts";
 import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory.ts";
@@ -21,6 +25,12 @@ const row = (id: string, text: string, extra: Record<string, unknown> = {}) => (
   ...extra,
 });
 const ok = (obj: unknown) => ({ stdout: JSON.stringify(obj), exitCode: 0 });
+
+/** Narrow a probe result to its failure half without lying to the compiler. */
+function failure(result: HindsightProbe): { reason: string; detail?: string } {
+  assert.equal(result.ok, false, "the probe must report the failure");
+  return result as { ok: false; reason: string; detail?: string };
+}
 const promoted = (over: Partial<DurableMemoryRecord> = {}): DurableMemoryRecord => ({
   id: "p1",
   text: "Gradle build needs JDK 21",
@@ -77,17 +87,40 @@ test("superseded/retracted results are never surfaced", async () => {
   );
 });
 
-for (const [name, run] of [
-  ["missing CLI", async () => Promise.reject(Object.assign(new Error("x"), { code: "ENOENT" }))],
-  ["killed on timeout", async () => Promise.reject(Object.assign(new Error("x"), { killed: true }))],
-  ["nonzero exit", async () => ({ stdout: "", exitCode: 2 })],
-  ["bad json", async () => ({ stdout: "not json", exitCode: 0 })],
-  ["unauthorized scope (empty)", async () => ok({ results: [], degraded: true, offline: false, timing_ms: 1 })],
-] as Array<[string, HindsightRunner]>) {
-  test(`recall degrades to no memory without throwing: ${name}`, async () => {
+for (const [name, run, surfacesFailure] of [
+  [
+    "missing CLI",
+    async () => {
+      throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+    },
+    true,
+  ],
+  ["killed on timeout", async () => Promise.reject(Object.assign(new Error("x"), { killed: true })), true],
+  ["nonzero exit", async () => ({ stdout: "", exitCode: 2 }), true],
+  ["bad json", async () => ({ stdout: "not json", exitCode: 0 }), true],
+  ["unauthorized scope (empty)", async () => ok({ results: [], degraded: true, offline: false, timing_ms: 1 }), false],
+] as Array<[string, HindsightRunner, boolean]>) {
+  test(`a broken recall is a typed failure the caller can fail open on: ${name}`, async () => {
     const p = new HindsightDurableMemory({ run });
-    assert.deepEqual(await p.search("q"), []);
-    assert.deepEqual(await p.recallAll(), []);
+    if (surfacesFailure) {
+      // Surfaced as a typed code, never a raw spawn error that could carry the
+      // command line, the profile path, or a credential the client echoed. Callers
+      // (the context injector, /memory, /memory status) catch this and continue
+      // with no memories - see interactive-memory.test.ts.
+      for (const read of [() => p.search("q"), () => p.recallAll()]) {
+        await assert.rejects(read(), (error: unknown) => {
+          assert.ok(error instanceof HindsightError, "typed memory failure");
+          assert.ok(
+            !/spawn|ENOENT|ETIMEDOUT|Traceback|at .*hindsight/.test(String(error)),
+            "no raw runner detail leaks",
+          );
+          return true;
+        });
+      }
+    } else {
+      assert.deepEqual(await p.search("q"), [], "an unauthorized scope is empty, not an error");
+      assert.deepEqual(await p.recallAll(), []);
+    }
   });
 }
 
@@ -233,4 +266,89 @@ test("interactive: /remember persisted reports saved; rejected does not", async 
   f.notices.length = 0;
   await f.commands.get("remember")!.handler("note two", f.ctx);
   assert.ok(!f.notices.some((n) => /^Saved/.test(n)));
+});
+
+test("probe: herdr-memory status is the one connection check", async () => {
+  const healthy = recorder(() =>
+    ok({ project: "canary", harness: "pi", pending: 2, contract: 1, healthy: true, server_version: "1.0.0" }),
+  );
+  assert.deepEqual(await probeHindsightStatus({ cli: "herdr-memory", run: healthy.run }), {
+    ok: true,
+    project: "canary",
+    pending: 2,
+  });
+  assert.deepEqual(healthy.calls[0], ["status"], "status takes no project or credential flags");
+
+  // The client exits 0 even when it reports a problem, so the body decides.
+  const noProject = recorder(() => ok({ error: "Current directory has no configured project; use --project" }));
+  assert.equal(failure(await probeHindsightStatus({ run: noProject.run })).reason, "unhealthy");
+
+  const sick = recorder(() => ok({ project: "canary", healthy: false, server_version: null }));
+  assert.equal(failure(await probeHindsightStatus({ run: sick.run })).reason, "unhealthy");
+
+  const portal = recorder(() => ({ stdout: "<html>proxy</html>", exitCode: 0 }));
+  assert.equal(failure(await probeHindsightStatus({ run: portal.run })).reason, "response");
+
+  const denied = recorder(() => ({ stdout: "", exitCode: 1 }));
+  assert.equal(failure(await probeHindsightStatus({ run: denied.run })).reason, "exit");
+
+  const absent = recorder(() => {
+    throw Object.assign(new Error("spawn herdr-memory ENOENT"), { code: "ENOENT" });
+  });
+  assert.equal(failure(await probeHindsightStatus({ run: absent.run })).reason, "not_installed");
+  assert.equal(failure(await probeHindsightStatus({ run: absent.run })).detail, "herdr-memory");
+
+  const hung = recorder(() => {
+    throw Object.assign(new Error("killed"), { killed: true });
+  });
+  assert.equal(failure(await probeHindsightStatus({ run: hung.run })).reason, "timeout");
+
+  // A client that never answers must not hold the session open.
+  const slow = recorder(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return ok({ healthy: true });
+  });
+  const started = Date.now();
+  assert.equal(failure(await probeHindsightStatus({ run: slow.run, timeoutMs: 1 })).reason, "timeout");
+  assert.ok(Date.now() - started < 400, "the probe returns on its own deadline");
+});
+
+test("blackhole option: only the opt-in turns memory on, and never carries a credential", () => {
+  assert.equal(hindsightBlackholeOption({}), undefined);
+  assert.equal(hindsightBlackholeOption({ PI_HINDSIGHT_ENABLED: "0", PI_HINDSIGHT_CLI: "herdr-memory" }), undefined);
+  const option = hindsightBlackholeOption({
+    PI_HINDSIGHT_ENABLED: "1",
+    PI_HINDSIGHT_CLI: "/opt/herdr/bin/herdr-memory",
+    PI_HINDSIGHT_SCOPES: "project,global",
+    PI_HINDSIGHT_TIMEOUT_MS: "3000",
+  });
+  assert.deepEqual(option, {
+    config: {
+      enabled: true,
+      durable: {
+        kind: "hindsight",
+        cli: "/opt/herdr/bin/herdr-memory",
+        scopes: ["project", "global"],
+        timeoutMs: 3000,
+      },
+    },
+  });
+  // There is no URL, token or bank in the option to leak into a session or a repo.
+  assert.equal(JSON.stringify(option).match(/token|key|secret|baseurl|http:/i), null);
+});
+
+test("durable config: hindsight accepts a client path and canonical scopes only", async () => {
+  const { resolveBlackholeConfig } = await import("../../src/blackhole/config.ts");
+  assert.deepEqual(
+    resolveBlackholeConfig({ durable: { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] } }).config.durable,
+    { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] },
+  );
+  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "hindsight", cli: "  " } }), /cli/);
+  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "hindsight", scopes: [] } }), /scopes/);
+  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "hindsight", scopes: ["Project"] } }), /scopes/);
+  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "hindsight", timeoutMs: 0 } }), /timeoutMs/);
+  // A REST-shaped config is no longer a thing anyone can write.
+  const restShape: { kind: "hindsight"; baseUrl?: string } = { kind: "hindsight" };
+  delete restShape.baseUrl;
+  assert.deepEqual(resolveBlackholeConfig({ durable: restShape }).config.durable, { kind: "hindsight" });
 });

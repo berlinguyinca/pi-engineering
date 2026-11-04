@@ -62,17 +62,20 @@ function load(cwd: string) {
   };
 }
 
-test("full extension saves over HTTP and recalls in a fresh chat without persisting automatic notes", async () => {
-  const { startHindsight } = await import("../support/hindsightServer.ts");
-  const server = await startHindsight({ port: 0, token: "everyday-test" });
+test("full extension saves through the herdr-memory client and recalls in a fresh chat", async () => {
+  // The client owns its own project profile, endpoint, credentials and queue, so
+  // the fixture is a working `herdr-memory` and the state that survives a fresh
+  // chat is the client's state file - never anything Pi writes.
+  const { makeHerdrStub } = await import("../support/herdrMemoryStub.ts");
+  const clientDir = await mkdtemp(join(tmpdir(), "everyday-memory-client-"));
+  const stub = makeHerdrStub(clientDir, "ok");
   const profile = await mkdtemp(join(tmpdir(), "everyday-memory-"));
   const previous = { ...process.env };
   let second: ReturnType<typeof load> | undefined;
   try {
     process.env.PI_CODING_AGENT_DIR = profile;
-    process.env.PI_HINDSIGHT_BASE_URL = server.url;
-    process.env.PI_HINDSIGHT_TOKEN = "everyday-test";
     process.env.PI_HINDSIGHT_ENABLED = "1";
+    process.env.PI_HINDSIGHT_CLI = stub.cli;
     const first = load(profile);
     await first.emit("session_start");
     await first.commands.get("remember").handler("Calibration reports use metric units.", first.ctx);
@@ -90,19 +93,31 @@ test("full extension saves over HTTP and recalls in a fresh chat without persist
     const context = await second.emit("context", { messages: input });
     assert.equal(input.length, 1);
     assert.equal(context.messages.length, 2);
+    assert.match(context.messages[0].content, /untrusted reference data/i);
     assert.match(context.messages[0].content, /Calibration reports use metric units/);
     assert.equal(second.sent.length, 0);
     assert.match(second.footer()!.render(100).join("\n"), /Memory: ready/);
-    process.env.PI_HINDSIGHT_TOKEN = "revoked-test-key";
+
+    // The automatic note was never written back: only the explicit /remember left
+    // the session, and it is the client that holds it.
+    assert.deepEqual(
+      stub.calls().filter((call: { argv: string[] }) => call.argv[0] === "retain").length,
+      1,
+      "one write, from the explicit command only",
+    );
+
+    // The client stops working (its own profile lost the credential): the surface
+    // says so, and the turn proceeds with no memory.
+    stub.setMode("fail");
     await second.emit("before_agent_start", { prompt: "calibration reports", systemPrompt: "" });
-    assert.match(second.statuses.at(-1)!, /invalid or revoked/);
-    assert.match(second.footer()!.render(100).join("\n"), /invalid or revoked/);
+    assert.match(second.statuses.at(-1)!, /herdr-memory reported a failure/);
+    assert.match(second.footer()!.render(100).join("\n"), /herdr-memory reported a failure/);
     assert.deepEqual((await second.emit("context", { messages: input })).messages, input);
   } finally {
     await second?.emit("session_shutdown");
     for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
     Object.assign(process.env, previous);
-    await server.close();
+    await rm(clientDir, { recursive: true, force: true });
     await rm(profile, { recursive: true, force: true });
   }
 });

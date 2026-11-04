@@ -276,149 +276,13 @@ test("shared-file durable: session-local working memory is NOT shared (only prom
   }
 });
 
-test("hindsight provider: maps DurableMemoryProvider onto the herdr-memory bank contract", async () => {
-  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
-  const calls: string[] = [];
-  const fetchFn = async (url: string, init?: { method?: string; body?: string; headers?: Record<string, string> }) => {
-    calls.push(`${init?.method ?? "GET"} ${url}`);
-    if (url.endsWith("/memories")) {
-      // retain: echo the body so the test can assert the item contract
-      const body = JSON.parse(init?.body ?? "{}");
-      return { ok: true, status: 201, text: async () => "", json: async () => body };
-    }
-    // recall returns herdr-memory results: {results: [{document_id, content}]}
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ results: [{ document_id: "dur-1", content: "shared fact" }] }),
-    };
-  };
-  const prov = new HindsightProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
-  await prov.store({
-    id: "x",
-    text: "t",
-    sourceRefs: [],
-    promotedFrom: "c",
-    evidenceIds: ["e"],
-    promotedAt: "t",
-    promotedBy: "op",
-  });
-  const all = await prov.recallAll();
-  assert.equal(all.length, 1);
-  assert.equal(all[0]!.id, "dur-1");
-  assert.equal(all[0]!.text, "shared fact");
-  const hits = await prov.search("fact");
-  assert.equal(hits.length, 1);
-  assert.ok(calls.some((c) => c === "POST http://ov.example/v1/default/banks/pi-facts/memories"));
-  assert.ok(calls.some((c) => c === "POST http://ov.example/v1/default/banks/pi-facts/memories/recall"));
-});
-
-test("hindsight provider: honor a custom project bank and harness tag", async () => {
-  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
-  const bodies: string[] = [];
-  const fetchFn = async (_url: string, init?: { body?: string }) => {
-    if (init?.body) bodies.push(init.body);
-    return { ok: true, status: 201, text: async () => "" };
-  };
-  const prov = new HindsightProvider({
-    baseUrl: "http://h.example",
-    project: "lab",
-    harness: "claude",
-    fetch: fetchFn as never,
-  });
-  await prov.store({
-    id: "d1",
-    text: "t",
-    sourceRefs: [],
-    promotedFrom: "c",
-    evidenceIds: [],
-    promotedAt: "t",
-    promotedBy: "op",
-  });
-  const item = JSON.parse(bodies[0]!);
-  assert.equal(item.items[0].document_id, "d1");
-  assert.equal(item.items[0].metadata.project, "lab");
-  assert.equal(item.items[0].metadata.harness, "claude");
-  assert.deepEqual(item.items[0].tags, ["herdr:fact", "harness:claude"]);
-  assert.equal(item.async, false);
-});
-
-test("hindsight provider: rejects a malformed project or harness", async () => {
-  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
-  assert.throws(() => new HindsightProvider({ baseUrl: "http://h.example", project: "Bad Project" }), /invalid/);
-  assert.throws(() => new HindsightProvider({ baseUrl: "http://h.example", harness: "vim" as never }), /invalid/);
-});
-
-test("hindsight provider: fails closed when unconfigured", async () => {
-  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
-  assert.throws(() => new HindsightProvider({ baseUrl: "" }), /baseUrl/);
-});
-
-test("hindsight provider: warns once on auth failure but still fail-closes to empty", async () => {
-  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
-  const warns: string[] = [];
-  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
-  // Pi they become a wrapped, severity-coloured notice instead of a raw line
-  // written under the TUI's own frame.
-  const restore = setTelemetrySink((notice) => warns.push(notice.text));
-  try {
-    const fetchFn = async () => ({ ok: false, status: 401, json: async () => [] }) as never;
-    const prov = new HindsightProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
-    // repeated failures warn once per op+status, and always return [] (fail-closed).
-    // recallAll() is a semantic recall, so both reads warn under the search op.
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.deepEqual(await prov.recallAll(), []);
-    const searchWarns = warns.filter((w) => w.includes("search"));
-    assert.equal(searchWarns.length, 1, "recall+search warn once");
-    assert.match(searchWarns[0]!, /401/);
-    assert.match(searchWarns[0]!, /token/i);
-    assert.deepEqual(await prov.search("x"), []);
-    assert.equal(warns.filter((w) => w.includes("search")).length, 1, "search still warns once");
-  } finally {
-    restore();
-  }
-});
-
-test("hindsight provider: warns once on network unreachable (fetch throws) and fail-closes", async () => {
-  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
-  const warns: string[] = [];
-  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
-  // Pi they become a wrapped, severity-coloured notice instead of a raw line
-  // written under the TUI's own frame.
-  const restore = setTelemetrySink((notice) => warns.push(notice.text));
-  try {
-    const fetchFn = async () => {
-      throw new Error("ECONNREFUSED");
-    };
-    const prov = new HindsightProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.equal(warns.length, 1, "warns once per unreachable outcome");
-    assert.match(warns[0]!, /unreachable/i);
-    assert.match(warns[0]!, /search/);
-  } finally {
-    restore();
-  }
-});
-
-test("hindsight provider: warns once on a 200 with a non-array body and fail-closes", async () => {
-  const { HindsightProvider } = await import("../../src/blackhole/durable.ts");
-  const warns: string[] = [];
-  // Diagnostics moved off `console.warn` onto the telemetry sink, so that inside
-  // Pi they become a wrapped, severity-coloured notice instead of a raw line
-  // written under the TUI's own frame.
-  const restore = setTelemetrySink((notice) => warns.push(notice.text));
-  try {
-    // e.g. an SSO/captive-portal proxy answering 200 with HTML, not a recall object
-    const fetchFn = async () => ({ ok: true, status: 200, json: async () => ({ not: "a recall" }) }) as never;
-    const prov = new HindsightProvider({ baseUrl: "http://ov.example", fetch: fetchFn as never });
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.deepEqual(await prov.recallAll(), []);
-    assert.equal(warns.length, 1, "warns once per unexpected-body outcome");
-    assert.match(warns[0]!, /unexpected recall body/i);
-  } finally {
-    restore();
-  }
+test("durable module: no HTTP adapter survives — the client contract is the only path", async () => {
+  const durable = await import("../../src/blackhole/durable.ts");
+  assert.deepEqual(Object.keys(durable).sort(), ["SharedFileDurableMemory"]);
+  // Nothing left to configure per repository: no URL, no token, no bank name.
+  const fs = await import("node:fs");
+  const source = fs.readFileSync(new URL("../../src/blackhole/durable.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /fetch\(|baseUrl|Authorization|\/v1\/default\/banks/);
 });
 
 test("blackhole manager: provider outage degrades hydration to empty (never fails worker)", async () => {
@@ -449,7 +313,7 @@ test("blackhole config: durable store kind is validated and defaulted", async ()
   const { resolveBlackholeConfig } = await import("../../src/blackhole/config.ts");
   assert.deepEqual(resolveBlackholeConfig().config.durable, { kind: "memory" });
   assert.throws(() => resolveBlackholeConfig({ durable: { kind: "shared-file", file: "" } }), /file/);
-  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "hindsight", baseUrl: "" } }), /baseUrl/);
+  assert.throws(() => resolveBlackholeConfig({ durable: { kind: "hindsight", scopes: ["Nope"] } }), /scopes/);
   const ok = resolveBlackholeConfig({ durable: { kind: "shared-file", file: "/tmp/x.jsonl" } }).config.durable;
   assert.deepEqual(ok, { kind: "shared-file", file: "/tmp/x.jsonl" });
 });

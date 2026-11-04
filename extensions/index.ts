@@ -18,7 +18,7 @@ import {
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
-import { hindsightBlackholeOption } from "../src/blackhole/envConfig.ts";
+import { hindsightBlackholeOption } from "../src/blackhole/hindsight.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
@@ -398,10 +398,11 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     }
     return opened.runtime;
   }
-  // Hindsight connection from the environment. If PI_HINDSIGHT_BASE_URL is
-  // set, blackhole is enabled with the hindsight durable store for EVERY repo
-  // this extension runs in — set it once per install and all repos share the
-  // deployed durable memory. Absent the env, blackhole stays off (unchanged).
+  // Hindsight durable memory from the environment. With PI_HINDSIGHT_ENABLED=1,
+  // blackhole is enabled with the hindsight durable store for EVERY repo this
+  // extension runs in — the herdr-memory client profile decides the endpoint and
+  // the project, so one machine-wide opt-in shares durable memory across repos.
+  // Absent the opt-in, blackhole stays off (unchanged).
   //
   // The open is published in `runtimeOpens` in the same synchronous step as the `pending` check above. The lineage and
   // attention lookups are real I/O (seconds under load); awaiting them BEFORE publishing left a window in which a
@@ -3208,9 +3209,24 @@ ${RECOVERY_PROMPT}`;
       const { formatBlackholeTelemetry, blackholeTelemetry } = await import("../src/blackhole/telemetry.ts");
       const { panelHealth, panelPromotion, panelDurable, panelEntries } = await import("../src/blackhole/dashboard.ts");
       const t = blackholeTelemetry(rt.blackhole.state());
-      const durable = await rt.blackhole.durable.recallAll();
+      // Status must not depend on the backend answering: an unusable memory client
+      // is a line in the report, not a command that throws.
+      let durable: import("../src/blackhole/durableProvider.ts").DurableMemoryRecord[] = [];
+      const caveats: string[] = [];
+      try {
+        durable = await rt.blackhole.durable.recallAll();
+      } catch {
+        caveats.push("durable memory did not answer — counts below are the local store only");
+      }
+      if (rt.blackhole.durable.kind === "shared-file") {
+        // The adapter's name promises a shared service. Say what it actually is.
+        caveats.push("the shared-file adapter counts a JSONL file under this machine's state dir — not Hindsight");
+      } else if (rt.blackhole.durable.kind === "hindsight") {
+        // The client has no list endpoint; the overview recall is a probe, not a total.
+        caveats.push("durable rows shown are what an overview recall returned, not a count of the bank");
+      }
       const panels = [panelHealth(t), panelPromotion(t), panelDurable(durable)];
-      const head = formatBlackholeTelemetry(t);
+      const head = `${formatBlackholeTelemetry(t)}${caveats.length ? `\n${caveats.map((line) => `! ${line}`).join("\n")}` : ""}`;
       if (args.includes("--dashboard")) {
         ctx.ui.notify(`${head}\n\n${panels.map((p) => `${p.title}: ${p.rows.length} row(s)`).join("\n")}`, "info");
       } else {

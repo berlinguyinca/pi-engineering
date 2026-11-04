@@ -4,15 +4,19 @@ import { join } from "node:path";
 import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
-import { ensureMemorySetup, resolveMemoryEnvironment } from "./connectionSetup.ts";
-import { HINDSIGHT_UNTRUSTED_HEADER, HindsightDurableMemory, HindsightError, resolveHindsightFromEnv } from "./hindsight.ts";
+import { ensureMemorySetup, memorySetupRevision, resolveMemoryEnvironment } from "./connectionSetup.ts";
 import type { DurableMemoryProvider, DurableMemoryRecord } from "./durableProvider.ts";
+import {
+  HINDSIGHT_UNTRUSTED_HEADER,
+  HindsightDurableMemory,
+  HindsightError,
+  resolveHindsightFromEnv,
+} from "./hindsight.ts";
 
 /** Memory connection: Hindsight through the herdr-memory CLI (opt-in via PI_HINDSIGHT_ENABLED; unconfigured = off). */
 interface MemoryConfig {
-  /** Synthetic identity (the CLI holds its own credentials); nothing secret here. */
-  baseUrl: string;
-  token: string;
+  /** Synthetic identity for fingerprints and notices; the CLI holds its own credentials. */
+  label: string;
   providerTimeoutMs: number;
   hindsight: { cli: string; scopes: string[]; timeoutMs: number };
 }
@@ -20,16 +24,29 @@ interface MemoryConfig {
 function resolveMemoryConfig(env: Record<string, string | undefined>): MemoryConfig | null {
   const h = resolveHindsightFromEnv(env);
   if (!h) return null;
-  return { baseUrl: `hindsight:${h.cli}:${h.scopes.join(",")}`, token: "cli", providerTimeoutMs: h.timeoutMs, hindsight: h };
+  return {
+    label: `hindsight:cli:${h.cli}:scopes:${h.scopes.join(",")}`,
+    providerTimeoutMs: h.timeoutMs,
+    hindsight: h,
+  };
 }
 
 const MEMORY_CONTEXT = "pi-engineering-memory";
 const MAX_CONTEXT = 6000;
+// Measured against the live memory service (2026-11-04): one `herdr-memory recall`
+// subprocess takes 0.39-4.9 s wall clock (python start + TLS + embedding), so no
+// in-turn budget is large enough for automatic recall to be reliable. The per-turn
+// budget only bounds how long a slow service may stall a turn; raise it with
+// PI_HINDSIGHT_AUTOMATIC_MS (100-5000 ms) and accept slower turns.
 const AUTOMATIC_LOOKUP_MS = 250;
+const AUTOMATIC_LOOKUP_MIN_MS = 100;
+const AUTOMATIC_LOOKUP_MAX_MS = 5000;
+// The once-per-session readiness check is not in a turn's critical path and must
+// be given a real budget, or a healthy-but-slow client reports "timed out".
+const READINESS_LOOKUP_MS = 5000;
 const RECALL_TTL_MS = 60_000;
 const MAX_CACHED_QUERIES = 32;
 const FAILURE_BACKOFF_MS = 60_000;
-const AUTH_BACKOFF_MS = 5 * 60_000;
 const STOPWORDS = new Set(
   "the and that this what with from can could should please how are was will have has for you your our about into using want need help know remember memory tell some there these those".split(
     " ",
@@ -55,17 +72,10 @@ export interface InteractiveMemoryOptions {
  * Headless runs are separate processes, so the stamp lives on disk; any
  * filesystem error errs on the side of logging.
  */
-function firstNoticeToday(dir: string, baseUrl: string): boolean {
-  const host = (() => {
-    try {
-      return new URL(baseUrl).host;
-    } catch {
-      return baseUrl;
-    }
-  })();
+function firstNoticeToday(dir: string, identity: string): boolean {
   const day = new Date().toISOString().slice(0, 10);
-  // Only a hash of the memory host is stored: the marker never names it.
-  const hostHash = createHash("sha256").update(host).digest("hex").slice(0, 16);
+  // Only a hash of the memory identity is stored: the marker never names the host or path.
+  const hostHash = createHash("sha256").update(identity).digest("hex").slice(0, 16);
   const name = `${hostHash}-${day}`;
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -138,7 +148,10 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     options.provider ??
     ((config) =>
       new HindsightDurableMemory({ ...config.hindsight, timeoutMs: Math.min(config.hindsight.timeoutMs, 5000) }));
-  const setup = options.setup ?? ((ctx, force) => ensureMemorySetup(ctx, { force }));
+  const setup =
+    options.setup ??
+    ((ctx: ExtensionContext, force?: boolean) =>
+      ensureMemorySetup(ctx, { env: environment(), force, revision: memorySetupRevision() }));
   const now = options.now ?? Date.now;
   let generation = 0;
   // Explicit refreshes retire automatic work without retiring their command context.
@@ -147,6 +160,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   let activeFingerprint = "";
   let lastFailure = "";
   let retryAfter = 0;
+  // True once the session has had its one unhurried readiness check; every later
+  // automatic lookup is in a turn's path and gets the tight budget.
+  let readinessDone = false;
   const recalls = new Map<string, { block: { text: string; count: number }; expiresAt: number }>();
   const clearRecall = () => {
     automaticLookupEpoch++;
@@ -155,21 +171,28 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   };
   // Keep automatic hooks bounded even for an injected provider. A late result
   // has no callback into ctx and cannot inject notes after this turn starts.
-  const automatic = async <T>(work: Promise<T>): Promise<T> => {
+  const autoBudgetMs = (): number => {
+    const configured = Number(environment().PI_HINDSIGHT_AUTOMATIC_MS);
+    if (!Number.isFinite(configured) || configured <= 0) return AUTOMATIC_LOOKUP_MS;
+    return Math.min(Math.max(Math.trunc(configured), AUTOMATIC_LOOKUP_MIN_MS), AUTOMATIC_LOOKUP_MAX_MS);
+  };
+  // The race budget is the real ceiling on an automatic lookup: the provider's own
+  // timeout only bounds the subprocess. Readiness and in-turn lookups need
+  // different budgets, so the caller passes one.
+  const automatic = async <T>(work: Promise<T>, budgetMs: number): Promise<T> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
         work,
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new HindsightError("timeout")), AUTOMATIC_LOOKUP_MS);
+          timer = setTimeout(() => reject(new HindsightError("timeout")), budgetMs);
         }),
       ]);
     } finally {
       clearTimeout(timer);
     }
   };
-  const fingerprint = (config: MemoryConfig) =>
-    createHash("sha256").update(`${config.baseUrl}\0${config.token}`).digest("hex");
+  const fingerprint = (config: MemoryConfig) => createHash("sha256").update(config.label).digest("hex");
   const setStatus = (ctx: ExtensionContext, text: string) => {
     if (ctx.hasUI) ctx.ui.setStatus("hindsight", `Memory: ${text}`);
   };
@@ -185,33 +208,41 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const failure = (ctx: ExtensionContext, code: string, description: string, explicit = false) => {
     recalled = "";
     setStatus(ctx, description);
-    const text = `${description}. Use /memory setup to check your host and key.`;
+    const text = `${description}. Use /memory setup to check the herdr-memory client on this machine.`;
     if (!ctx.hasUI && !explicit) {
       // Headless (pi -p): an automatic status line is not part of the answer.
       // Writing it into the transcript polluted every print-mode session, so
-      // log it to telemetry/stderr once per memory host per day instead.
-      const baseUrl = resolveMemoryConfig(environment())?.baseUrl ?? "unconfigured";
-      if (lastFailure !== code && firstNoticeToday(noticeDir(), baseUrl)) {
+      // log it to telemetry/stderr once per memory identity per day instead.
+      const identity = resolveMemoryConfig(environment())?.label ?? "unconfigured";
+      if (lastFailure !== code && firstNoticeToday(noticeDir(), identity)) {
         emitTelemetry({ level: "warning", key: `memory:${code}`, text: `Memory: ${text}` });
       }
     } else if (explicit || lastFailure !== code) reply(ctx, text, true);
     lastFailure = code;
   };
+  // What the operator may be told, and what the backoff keys off. The CLI reports
+  // failures as HindsightError codes; there is no HTTP status and no key state to
+  // distinguish here (the herdr-memory client owns credentials).
+  const failureMessages = {
+    timeout: "memory request timed out",
+    response: "unreadable memory answer",
+    http: "herdr-memory reported a failure",
+    unreachable: "memory service unavailable",
+  } as const;
+  type FailureCode = keyof typeof failureMessages;
   const handleError = (ctx: ExtensionContext, error: unknown, explicit = false) => {
-    const code: keyof typeof failureMessages =
+    const code: FailureCode =
       error instanceof HindsightError
-        ? error.code === "timeout" ? "timeout" : error.code === "response" ? "response" : error.code === "exit" ? "http" : "unreachable"
+        ? error.code === "timeout"
+          ? "timeout"
+          : error.code === "response"
+            ? "response"
+            : error.code === "exit"
+              ? "http"
+              : "unreachable"
         : "unreachable";
     clearRecall();
-    retryAfter = now() + (code === "auth" || code === "forbidden" ? AUTH_BACKOFF_MS : FAILURE_BACKOFF_MS);
-    const failureMessages = {
-      auth: "key invalid or revoked",
-      forbidden: "access denied",
-      timeout: "request timed out",
-      response: "invalid server response",
-      http: "server error",
-      unreachable: "service unavailable",
-    };
+    retryAfter = now() + FAILURE_BACKOFF_MS;
     failure(ctx, code, failureMessages[code], explicit);
   };
   const reset = () => {
@@ -239,11 +270,6 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         );
       return;
     }
-    if (!config.token) {
-      failure(ctx, "missing", "key missing", explicit);
-      activeFingerprint = "";
-      return;
-    }
     const identity = fingerprint(config);
     if (identity !== activeFingerprint) {
       clearRecall();
@@ -254,10 +280,10 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     }
     if (auto && now() < retryAfter) return;
     try {
+      // Readiness gets the unhurried budget; in-turn lookups get the tight one.
+      const budget = auto ? (readinessDone ? autoBudgetMs() : READINESS_LOOKUP_MS) : config.providerTimeoutMs;
       return {
-        client: makeProvider(
-          auto ? { ...config, providerTimeoutMs: Math.min(config.providerTimeoutMs, AUTOMATIC_LOOKUP_MS) } : config,
-        ),
+        client: makeProvider({ ...config, providerTimeoutMs: Math.min(config.providerTimeoutMs, budget) }),
         identity,
       };
     } catch (error) {
@@ -268,7 +294,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const current = (id: number, identity: string) => {
     if (id !== generation) return false;
     const config = resolveMemoryConfig(environment());
-    return !!config?.token && fingerprint(config) === identity;
+    return !!config && fingerprint(config) === identity;
   };
   const check = async (ctx: ExtensionContext, explicit: boolean) => {
     const conn = connection(ctx, explicit, !explicit);
@@ -280,11 +306,14 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       // Hindsight has no list endpoint: recallAll() is a best-effort semantic
       // recall, so this count is what the bank recalled, not a literal total.
       const request = conn.client.recallAll();
-      const records = await (explicit ? request : automatic(request));
+      const records = await (explicit
+        ? request
+        : automatic(request, readinessDone ? autoBudgetMs() : READINESS_LOOKUP_MS));
       if (!current(id, conn.identity) || (!explicit && epoch !== automaticLookupEpoch)) return;
       lastFailure = "";
       retryAfter = 0;
       if (explicit) clearRecall();
+      readinessDone = true;
       setStatus(ctx, `ready · ${records.length} recalled`);
       if (explicit)
         reply(
@@ -292,6 +321,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           `Memory connection verified: ${records.length} note(s) recalled. /remember <text> saves an explicit note; /memory <query> searches.`,
         );
     } catch (error) {
+      // A failed readiness check still counts as having been attempted: the next
+      // automatic lookup must not pay the unhurried budget again.
+      readinessDone = true;
       if (current(id, conn.identity) && (explicit || epoch === automaticLookupEpoch)) handleError(ctx, error, explicit);
     }
   };
@@ -358,7 +390,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         if (!ctx.hasUI || ctx.mode !== "tui") {
           reply(
             ctx,
-            "Run /memory setup in an interactive Pi terminal to configure the host and enter a hidden key. Headless sessions use the saved profile or PI_HINDSIGHT_BASE_URL and PI_HINDSIGHT_TOKEN_FILE.",
+            "Run /memory setup in an interactive Pi terminal to enable and verify memory. Headless sessions use the herdr-memory profile on this machine (`herdr-eng memory install`) plus PI_HINDSIGHT_ENABLED=1.",
           );
           return;
         }
@@ -447,7 +479,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     recalls.delete(cacheKey);
     setStatus(ctx, "checking");
     try {
-      const records = await automatic(conn.client.search(query));
+      const records = await automatic(conn.client.search(query), autoBudgetMs());
       if (!current(id, conn.identity) || epoch !== automaticLookupEpoch) return;
       const block = memoryBlock(records, terms, conn.client.kind === "hindsight");
       // Re-key after the call: observed revisions are part of the scope.
@@ -467,9 +499,6 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
     if (!config) {
       recalled = "";
       setStatus(ctx, "off");
-    } else if (!config.token) {
-      recalled = "";
-      setStatus(ctx, "key missing");
     } else if (activeFingerprint && fingerprint(config) !== activeFingerprint) {
       recalled = "";
       setStatus(ctx, "connection changed; check /memory");

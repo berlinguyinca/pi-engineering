@@ -1,21 +1,23 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { HindsightRequestError } from "../../src/blackhole/durable.ts";
 import { type DurableMemoryRecord, InMemoryDurableMemory } from "../../src/blackhole/durableProvider.ts";
+import { HindsightError } from "../../src/blackhole/hindsight.ts";
 import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory.ts";
 
 type Handler = (event: any, ctx: ExtensionContext) => any;
 function fixture(
   options: {
     configured?: boolean;
-    token?: string;
+    /** Which client executable the session is configured to call. */
+    cli?: string;
     hasUI?: boolean;
     noticeDir?: string;
-    baseUrl?: string;
     stateDir?: string;
     now?: () => number;
+    /** Wire the real opt-in path instead of the injected fake provider. */
     realProvider?: boolean;
+    env?: Record<string, string>;
     setup?: (ctx: ExtensionContext, force?: boolean) => Promise<void>;
   } = {},
 ) {
@@ -28,8 +30,9 @@ function fixture(
     options.configured === false
       ? {}
       : {
-          PI_HINDSIGHT_BASE_URL: options.baseUrl ?? "https://memory.example",
-          PI_HINDSIGHT_TOKEN: options.token ?? "test-key",
+          PI_HINDSIGHT_ENABLED: "1",
+          PI_HINDSIGHT_CLI: options.cli ?? "herdr-memory",
+          ...(options.env ?? {}),
         };
   if (options.stateDir) env.PI_ENGINEERING_STATE_DIR = options.stateDir;
   const store = new InMemoryDurableMemory();
@@ -46,6 +49,9 @@ function fixture(
     },
     recallAll: async () => {
       if (failure) throw failure;
+      // Mirror the real client: `HindsightDurableMemory.recallAll()` is a bounded
+      // overview recall, so it reaches the service as a query like any other.
+      queries.push("project memory decision");
       return store.recallAll();
     },
     search: async (q: string) => {
@@ -132,11 +138,11 @@ for (const input of ["", "   ", "x".repeat(4001)]) {
 
 test("save errors do not report success or leak raw errors", async () => {
   const f = fixture();
-  f.fail(new Error("secret credential test-key"));
+  f.fail(new Error("secret value herdr-token-live"));
   await f.command("remember", "valid note");
   assert.ok(f.notices.some((n) => n.type === "error"));
   assert.ok(!f.notices.some((n) => /saved/i.test(n.text)));
-  assert.ok(!JSON.stringify(f.notices).includes("test-key"));
+  assert.ok(!JSON.stringify(f.notices).includes("herdr-token-live"));
 });
 
 test("valid empty response reports ready, failures report error and recover", async () => {
@@ -155,8 +161,8 @@ test("valid empty response reports ready, failures report error and recover", as
   assert.match(f.statuses.at(-1)!, /ready/i);
 });
 
-test("configuration off or empty key causes no provider calls", async () => {
-  for (const options of [{ configured: false }, { token: "" }]) {
+test("configuration off causes no provider calls", async () => {
+  for (const options of [{ configured: false }]) {
     const f = fixture(options);
     await f.emit("session_start");
     await f.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
@@ -213,7 +219,7 @@ test("stopword-only and blank prompts do not retrieve the entire store", async (
   assert.deepEqual(f.queries, []);
 });
 
-test("session reset and credential rotation clear stale memory and pending results", async () => {
+test("session reset and replacing the memory client clear stale memory and pending results", async () => {
   const f = fixture();
   let resolve!: (rows: DurableMemoryRecord[]) => void;
   f.override(
@@ -230,7 +236,7 @@ test("session reset and credential rotation clear stale memory and pending resul
   f.override(undefined);
   await f.store.store(record("calibration new"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
-  f.env.PI_HINDSIGHT_TOKEN = "rotated";
+  f.env.PI_HINDSIGHT_CLI = "/opt/rotated/herdr-memory";
   assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
 });
 
@@ -279,8 +285,8 @@ test("current user request follows recalled notes in model context", async () =>
   assert.equal(result.messages.at(-1), user);
 });
 
-test("context preserves off and missing-key status", async () => {
-  for (const options of [{ configured: false }, { token: "" }]) {
+test("context preserves off status", async () => {
+  for (const options of [{ configured: false }]) {
     const f = fixture(options);
     await f.emit("session_start");
     const status = f.statuses.at(-1);
@@ -319,7 +325,7 @@ test("headless automatic memory failures stay out of the transcript and log once
     assert.equal(second.sent.length, 0);
     assert.equal(logged.filter((t) => /service unavailable/.test(t)).length, 1, "once per host per day");
 
-    const other = fixture({ hasUI: false, noticeDir, baseUrl: "https://other-memory.example" });
+    const other = fixture({ hasUI: false, noticeDir, cli: "/opt/other/herdr-memory" });
     other.fail(new Error("unavailable"));
     await other.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
     assert.equal(logged.filter((t) => /service unavailable/.test(t)).length, 2, "a different host logs");
@@ -341,7 +347,7 @@ test("headless notice markers live in the per-user state dir, private, without t
   const stateDir = mkdtempSync(join(tmpdir(), "pi-eng-memory-state-"));
   const uninstall = setTelemetrySink(() => {});
   try {
-    const f = fixture({ hasUI: false, stateDir, baseUrl: "https://private-memory.example" });
+    const f = fixture({ hasUI: false, stateDir, cli: "/opt/private/herdr-memory" });
     f.fail(new Error("unavailable"));
     await f.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
     const dir = join(stateDir, "memory-notices");
@@ -412,7 +418,7 @@ for (const action of ["save", "check", "search"] as const) {
       const statuses = f.statuses.length;
       const notices = f.notices.length;
       if (outcome === "success") resolve([record("calibration obsolete snapshot")]);
-      else reject(new HindsightRequestError("auth", 401));
+      else reject(new HindsightError("exit"));
       await pending;
       assert.equal(f.statuses.length, statuses, "stale work must preserve explicit command status");
       assert.equal(f.notices.length, notices, "stale failure must not publish a notice");
@@ -475,7 +481,7 @@ for (const action of ["save", "check", "search"] as const) {
       const statuses = f.statuses.length;
       const notices = f.notices.length;
       if (outcome === "success") resolve([record("calibration obsolete snapshot")]);
-      else reject(new HindsightRequestError("auth", 401));
+      else reject(new HindsightError("unavailable"));
       await lookup;
       assert.equal(f.statuses.length, statuses);
       assert.equal(f.notices.length, notices);
@@ -489,7 +495,7 @@ for (const action of ["save", "check", "search"] as const) {
   }
 }
 
-for (const replacement of ["session", "credential"] as const) {
+for (const replacement of ["session", "client"] as const) {
   test(`an explicit save remains fenced after real ${replacement} replacement`, async () => {
     const f = fixture();
     const store = f.store.store.bind(f.store);
@@ -503,7 +509,7 @@ for (const replacement of ["session", "credential"] as const) {
     };
     const save = f.command("remember", "calibration from the retired connection");
     if (replacement === "session") await f.emit("session_before_switch");
-    else f.env.PI_HINDSIGHT_TOKEN = "rotated-key";
+    else f.env.PI_HINDSIGHT_CLI = "/opt/rotated/herdr-memory";
     await f.emit("before_agent_start", { prompt: "calibration" });
     const statuses = f.statuses.length;
     const notices = f.notices.length;
@@ -535,55 +541,54 @@ test("late setup errors do not touch a session closed while setup was pending", 
   }
 });
 
-test("authentication failures back off automatic search and credential rotation bypasses the backoff", async () => {
+test("rejected requests back off automatic search and a new client bypasses the backoff", async () => {
   const f = fixture();
-  f.fail(new HindsightRequestError("auth", 401));
-  await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
+  f.fail(new HindsightError("exit"));
   await f.emit("before_agent_start", { prompt: "different calibration", systemPrompt: "" });
-  assert.equal(f.queries.length, 1, "a rejected key is not sent on each turn");
-  assert.match(f.statuses.at(-1)!, /invalid|revoked/);
+  assert.equal(f.queries.length, 1, "a rejected client is not called on each turn");
+  assert.match(f.statuses.at(-1)!, /failure|unavailable/i);
   f.fail();
-  f.env.PI_HINDSIGHT_TOKEN = "rotated-key";
+  f.env.PI_HINDSIGHT_CLI = "/opt/rotated/herdr-memory";
   await f.store.store(record("calibration available"));
   await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
   assert.equal(f.queries.length, 2);
   assert.match((await f.emit("context", { messages: [] })).messages[0].content, /available/);
 });
 
-test("real HTTP authentication failures are not retried on every prompt", async () => {
-  const { createServer } = await import("node:http");
-  let requests = 0;
-  const server = createServer((req, res) => {
-    requests++;
-    res.statusCode = req.headers.authorization === "Bearer rotated-key" ? 200 : 401;
-    res.setHeader("content-type", "application/json");
-    // herdr-memory recall contract: {results: [...]}, not a bare array
-    res.end(JSON.stringify({ results: [] }));
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-  const f = fixture({ realProvider: true, baseUrl: `http://127.0.0.1:${address.port}` });
+test("a rejected client is not called on every prompt, and switching client bypasses the backoff", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { makeHerdrStub } = await import("../support/herdrMemoryStub.ts");
+  const deniedDir = mkdtempSync(join(tmpdir(), "memory-client-denied-"));
+  const workingDir = mkdtempSync(join(tmpdir(), "memory-client-working-"));
+  const denied = makeHerdrStub(deniedDir, "fail");
+  const working = makeHerdrStub(workingDir, "ok");
+  const f = fixture({ realProvider: true, cli: denied.cli });
+  const recalls = (stub: ReturnType<typeof makeHerdrStub>) =>
+    stub.calls().filter((call: { argv: string[] }) => call.argv[0] === "recall").length;
   try {
     const prompt = { prompt: "calibration", systemPrompt: "" };
     await f.emit("before_agent_start", prompt);
     await f.emit("before_agent_start", prompt);
-    assert.equal(requests, 1);
-    assert.match(f.notices.at(-1)!.text, /invalid or revoked/);
-    f.env.PI_HINDSIGHT_TOKEN = "rotated-key";
+    assert.equal(recalls(denied), 1, "a client the service rejects is not called on each turn");
+    assert.match(f.statuses.at(-1)!, /failure/i);
+    // The operator points the session at a working client: that is a new identity.
+    f.env.PI_HINDSIGHT_CLI = working.cli;
     await f.emit("before_agent_start", prompt);
-    assert.equal(requests, 2);
+    assert.equal(recalls(working), 1, "a changed client bypasses the failure backoff");
     assert.match(f.statuses.at(-1)!, /ready/);
+    assert.equal(recalls(denied), 1, "the retired client is never called again");
   } finally {
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(deniedDir, { recursive: true, force: true });
+    rmSync(workingDir, { recursive: true, force: true });
   }
 });
 
 test("temporary memory failures retry after backoff and explicit status bypasses it", async () => {
   let now = 1000;
   const f = fixture({ now: () => now });
-  f.fail(new HindsightRequestError("unreachable"));
+  f.fail(new HindsightError("unavailable"));
   const prompt = { prompt: "calibration", systemPrompt: "" };
   await f.emit("before_agent_start", prompt);
   f.fail();
@@ -592,8 +597,7 @@ test("temporary memory failures retry after backoff and explicit status bypasses
   now += 61_000;
   await f.emit("before_agent_start", prompt);
   assert.equal(f.queries.length, 2);
-  f.fail(new HindsightRequestError("auth", 401));
-  await f.emit("before_agent_start", { prompt: "different calibration", systemPrompt: "" });
+  f.fail(new HindsightError("exit"));
   f.fail();
   await f.command("memory");
   await f.emit("before_agent_start", prompt);
@@ -671,65 +675,29 @@ test("automatic recall deadline is exactly 250 ms and fences late results from a
   assert.deepEqual((await f.emit("context", { messages: [] })).messages, []);
 });
 
-test("slow memory server cannot hold startup or a prompt for seconds", async () => {
-  const { createServer } = await import("node:http");
-  const timers = new Set<NodeJS.Timeout>();
-  let requests = 0;
-  const server = createServer((_req, res) => {
-    requests++;
-    const timer = setTimeout(() => {
-      timers.delete(timer);
-      res.setHeader("content-type", "application/json");
-      res.end("[]");
-    }, 1500);
-    timers.add(timer);
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-  const events = new Map<string, Handler>();
-  let stale = false;
-  let staleAccesses = 0;
-  const ctx = {
-    hasUI: true,
-    ui: {
-      setStatus: () => {
-        if (stale) staleAccesses++;
-      },
-      notify: () => {
-        if (stale) staleAccesses++;
-      },
-    },
-  } as unknown as ExtensionContext;
-  registerInteractiveMemory(
-    {
-      registerCommand: () => {},
-      on: (name: string, handler: Handler) => events.set(name, handler),
-    } as unknown as ExtensionAPI,
-    {
-      env: () => ({
-        PI_HINDSIGHT_BASE_URL: `http://127.0.0.1:${address.port}`,
-        PI_HINDSIGHT_TOKEN: "local-test-key",
-      }),
-      setup: async () => {},
-    },
-  );
+test("a slow herdr-memory client cannot hold startup or a prompt for seconds", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { makeHerdrStub } = await import("../support/herdrMemoryStub.ts");
+  const dir = mkdtempSync(join(tmpdir(), "memory-client-slow-"));
+  // The stub sleeps 1.5 s per action and ignores --timeout-ms, exactly like a
+  // client wedged on a hung service: only the provider's own deadline saves us.
+  const slow = makeHerdrStub(dir, "slow");
+  const f = fixture({ realProvider: true, cli: slow.cli, env: { PI_HINDSIGHT_TIMEOUT_MS: "120" } });
   try {
-    const start = performance.now();
-    await events.get("session_start")!({}, ctx);
-    assert.ok(performance.now() - start < 1000, "startup recall has a short automatic deadline");
-    await events.get("session_before_switch")!({}, ctx);
-    const turnStart = performance.now();
-    await events.get("before_agent_start")!({ prompt: "calibration", systemPrompt: "" }, ctx);
-    assert.ok(performance.now() - turnStart < 1000, "automatic search has a short deadline");
-    assert.equal(requests, 2);
-    stale = true;
-    await events.get("session_shutdown")!({}, ctx);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.equal(staleAccesses, 0, "timed-out work does not touch a retired context");
+    let start = performance.now();
+    await f.emit("session_start");
+    const startup = performance.now() - start;
+    start = performance.now();
+    await f.emit("before_agent_start", { prompt: "calibration", systemPrompt: "" });
+    const turn = performance.now() - start;
+    assert.ok(startup < 1000, `startup waited ${startup.toFixed(0)} ms for memory`);
+    assert.ok(turn < 1000, `the prompt waited ${turn.toFixed(0)} ms for memory`);
+    assert.deepEqual((await f.emit("context", { messages: [] })).messages, [], "a timed out read injects nothing");
+    assert.match(f.statuses.at(-1)!, /timed out/);
+    await f.emit("session_shutdown");
   } finally {
-    for (const timer of timers) clearTimeout(timer);
-    server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
   }
 });

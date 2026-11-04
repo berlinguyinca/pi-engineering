@@ -5,283 +5,229 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  type MemorySetupOptions,
   ensureMemorySetup,
   memorySetupRevision,
   resolveMemoryEnvironment,
 } from "../../src/blackhole/connectionSetup.ts";
+import type { HindsightProbe } from "../../src/blackhole/hindsight.ts";
 
-function fixture(t: test.TestContext) {
-  const profileDir = mkdtempSync(join(tmpdir(), "hindsight setup "));
+/**
+ * Setup asks the client one question — `herdr-memory status` — so the fixture
+ * injects the answer instead of a service. Nothing here can hold a credential:
+ * the client owns its own profile, and asserting that no file or notice contains a
+ * secret is the point of several of these tests.
+ */
+function fixture(t: test.TestContext, options: { status?: HindsightProbe; answers?: string[] } = {}) {
+  const profileDir = mkdtempSync(join(tmpdir(), "memory setup "));
   t.after(() => rmSync(profileDir, { recursive: true, force: true }));
   const notices: string[] = [];
   const prompts: string[] = [];
-  const selections: (string | undefined)[] = ["Set up connection"];
-  const hosts: (string | undefined)[] = ["https://memory.example.test"];
-  let key = "personal-test-key";
-  let cancelled = false;
+  const probes: Array<{ cli?: string }> = [];
+  const answers = [...(options.answers ?? [])];
+  let status: HindsightProbe = options.status ?? { ok: true, project: "canary", pending: 0 };
+  let releaseProbe: (() => void) | undefined;
+  let holdFirstProbe = false;
   const ctx = {
     hasUI: true,
     mode: "tui",
     ui: {
       select: async (title: string) => {
         prompts.push(title);
-        return selections.shift();
-      },
-      input: async (title: string) => {
-        prompts.push(title);
-        return hosts.shift();
+        return answers.shift();
       },
       notify: (message: string) => notices.push(message),
-      custom: async (factory: any) => {
-        let answer: string | undefined;
-        const widget = await factory({ requestRender() {} }, {}, {}, (value: string | undefined) => {
-          answer = value;
-        });
-        widget.handleInput(`\x1b[200~${key}\x1b[201~`);
-        for (const width of [1, 10, 80]) {
-          const rendered = widget.render(width).join("\n");
-          assert.equal(rendered.includes(key), false, "secret must never be rendered");
-        }
-        widget.handleInput(cancelled ? "\x1b" : "\r");
-        widget.dispose?.();
-        return answer;
-      },
     },
   } as unknown as ExtensionContext;
-  // The herdr-memory recall contract: {results: [...]}, not a bare array.
-  const fetchFn = async (_url: any, init: any) => {
-    assert.equal(init.headers.authorization, `Bearer ${key}`);
-    return new Response(JSON.stringify({ results: [] }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+  const setup: MemorySetupOptions = {
+    profileDir,
+    env: { PI_HINDSIGHT_ENABLED: "1", PI_HINDSIGHT_CLI: "/opt/herdr/herdr-memory" },
+    revision: "rev-1",
+    probe: async (probeOptions) => {
+      probes.push(probeOptions);
+      if (holdFirstProbe)
+        await new Promise<void>((resolve) => {
+          releaseProbe = resolve;
+        });
+      return status;
+    },
   };
-  const recallResponse = (body?: unknown) =>
-    new Response(JSON.stringify(body ?? { results: [] }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  const options = { profileDir, env: {}, revision: "v1", fetch: fetchFn as typeof fetch };
   return {
     ctx,
-    options,
+    setup,
     notices,
     prompts,
-    selections,
-    hosts,
+    probes,
     profileDir,
-    recallResponse,
-    setKey: (v: string) => {
-      key = v;
+    answers,
+    setStatus: (next: HindsightProbe) => {
+      status = next;
     },
-    cancel: () => {
-      cancelled = true;
+    /** Make the next probe wait until release() is called. */
+    hold: () => {
+      holdFirstProbe = true;
     },
+    release: () => releaseProbe?.(),
+    state: () => JSON.parse(readFileSync(join(profileDir, "engineering-memory", "connection.json"), "utf8")),
   };
 }
 
-test("onboarding stores verified connection privately, masks keys, and saved settings beat old shell defaults", async (t) => {
+test("a working client is confirmed once per revision and disclosed to the operator", async (t) => {
   const f = fixture(t);
-  await ensureMemorySetup(f.ctx, f.options);
-  const env = resolveMemoryEnvironment(
-    { PI_HINDSIGHT_TOKEN: "old", PI_HINDSIGHT_BASE_URL: "https://old.test" },
-    f.options,
-  );
-  assert.equal(env.PI_HINDSIGHT_BASE_URL, "https://memory.example.test");
-  assert.equal(env.PI_HINDSIGHT_TOKEN, undefined);
-  assert.equal(readFileSync(env.PI_HINDSIGHT_TOKEN_FILE!, "utf8").trim(), "personal-test-key");
-  assert.equal(statSync(env.PI_HINDSIGHT_TOKEN_FILE!).mode & 0o777, 0o600);
-  const configFile = join(f.profileDir, "engineering-memory", "connection.json");
-  assert.equal(statSync(configFile).mode & 0o777, 0o600);
-  assert.equal(readFileSync(configFile, "utf8").includes("personal-test-key"), false);
-  assert.equal(resolveMemoryEnvironment({ PI_HINDSIGHT_ENABLED: "false" }, f.options).PI_HINDSIGHT_ENABLED, "false");
-  const promptCount = f.prompts.length;
-  await ensureMemorySetup(f.ctx, f.options);
-  assert.equal(f.prompts.length, promptCount, "same update should not prompt again");
-  // A new revision no longer re-asks. Confirming a connection that is on disk
-  // and demonstrably working teaches the operator to dismiss the dialog rather
-  // than read it; the revision is still recorded so nothing reads as stale.
-  await ensureMemorySetup(f.ctx, { ...f.options, revision: "v2" });
-  assert.equal(f.prompts.length, promptCount, "a working connection is not re-confirmed after an update");
-  assert.equal(JSON.parse(readFileSync(configFile, "utf8")).lastConfirmedRevision, "v2");
+  assert.equal(await ensureMemorySetup(f.ctx, f.setup), "configured");
+  assert.deepEqual(f.probes, [{ cli: "/opt/herdr/herdr-memory" }], "status is the only connection check");
+  assert.equal(f.prompts.length, 0, "a working connection is not a question");
+  assert.match(f.notices.join(" "), /untrusted/);
+  const file = join(f.profileDir, "engineering-memory", "connection.json");
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.equal(statSync(join(f.profileDir, "engineering-memory")).mode & 0o777, 0o700);
+  assert.deepEqual(Object.keys(f.state()).sort(), [
+    "client",
+    "lastAskedRevision",
+    "lastConfirmedRevision",
+    "updatedAt",
+  ]);
+  assert.equal(f.state().lastConfirmedRevision, "rev-1");
+  assert.equal(f.state().client, "/opt/herdr/herdr-memory");
 
-  // Changing it is still possible — that is what /memory setup does.
-  f.selections.push("Keep current connection");
-  await ensureMemorySetup(f.ctx, { ...f.options, revision: "v2", force: true });
-  assert.ok(f.prompts.length > promptCount, "an explicit setup still prompts");
+  // Next session on the same revision: quiet, no re-confirmation.
+  const notices = f.notices.length;
+  await ensureMemorySetup(f.ctx, f.setup);
+  assert.equal(f.notices.length, notices);
+
+  // A packaged update records the new revision without re-asking: a dialog the
+  // operator can only dismiss teaches them to dismiss dialogs.
+  await ensureMemorySetup(f.ctx, { ...f.setup, revision: "rev-2" });
+  assert.equal(f.state().lastConfirmedRevision, "rev-2");
+  assert.equal(f.prompts.length, 0);
+
+  // An explicit /memory setup on a working client answers instead of asking: there
+  // is no endpoint, bank, or token left to collect.
+  await ensureMemorySetup(f.ctx, { ...f.setup, force: true });
+  assert.equal(f.prompts.length, 0, "a working connection is not a question");
+  assert.match(f.notices.at(-1)!, /already set up/);
+  assert.match(f.notices.at(-1)!, /project canary/);
+  assert.match(f.notices.at(-1)!, /herdr-memory/);
 });
 
-test("keep current reuses external key file and does not rewrite it", async (t) => {
-  const f = fixture(t);
-  const external = join(f.profileDir, "external key");
-  writeFileSync(external, "external-key\n", { mode: 0o640 });
-  f.setKey("external-key");
-  f.selections.splice(0, 1, "Keep current connection");
-  // `force`, because a working connection is no longer re-confirmed on its
-  // own: this exercises the dialog, which is what /memory setup opens.
-  await ensureMemorySetup(f.ctx, {
-    ...f.options,
-    force: true,
-    env: { PI_HINDSIGHT_BASE_URL: "https://old.test", PI_HINDSIGHT_TOKEN_FILE: external },
-  });
-  assert.equal(resolveMemoryEnvironment({}, f.options).PI_HINDSIGHT_TOKEN_FILE, external);
-  assert.equal(statSync(external).mode & 0o777, 0o640);
-  assert.equal(readFileSync(external, "utf8"), "external-key\n");
+test("an unusable client explains the reported reason and never collects a secret", async (t) => {
+  for (const scenario of [
+    { status: { ok: false, reason: "not_installed", detail: "herdr-memory" } as HindsightProbe, want: /not installed/ },
+    { status: { ok: false, reason: "unhealthy" } as HindsightProbe, want: /unhealthy/ },
+    { status: { ok: false, reason: "exit" } as HindsightProbe, want: /missing or revoked/ },
+    { status: { ok: false, reason: "timeout" } as HindsightProbe, want: /did not answer in time/ },
+    { status: { ok: false, reason: "response" } as HindsightProbe, want: /readable status/ },
+  ]) {
+    const f = fixture(t, { status: scenario.status, answers: ["Set up now"] });
+    assert.equal(await ensureMemorySetup(f.ctx, f.setup), "unconfigured");
+    assert.match(f.notices.join(" "), scenario.want);
+    assert.match(f.notices.join(" "), /herdr-memory doctor --json/);
+    assert.match(f.notices.join(" "), /Never put a key/);
+    assert.equal(f.prompts.length, 1, "the operator is asked once");
+    assert.equal(f.state().lastConfirmedRevision, "", "an unusable connection is never marked confirmed");
+    assert.equal(f.state().client, "");
+    assert.deepEqual(readdirSync(f.profileDir), ["engineering-memory"]);
+    assert.doesNotMatch(
+      readFileSync(join(f.profileDir, "engineering-memory", "connection.json"), "utf8"),
+      /token|secret|key|http/i,
+    );
+  }
 });
 
-for (const scenario of ["headless", "disabled", "later", "cancel-key", "invalid-host", "authentication-fails"]) {
-  test(`${scenario} does not persist a connection or leak credentials`, async (t) => {
-    const f = fixture(t);
-    const opts = { ...f.options };
+test("later leaves no state and is asked again next session", async (t) => {
+  const f = fixture(t, { status: { ok: false, reason: "exit" }, answers: ["Later"] });
+  assert.equal(await ensureMemorySetup(f.ctx, f.setup), "unconfigured");
+  assert.deepEqual(readdirSync(f.profileDir), [], "nothing is written when the operator defers");
+  assert.equal(f.notices.length, 0);
+});
+
+test("a declined question does not repeat every session", async (t) => {
+  const f = fixture(t, { status: { ok: false, reason: "exit" }, answers: ["Set up now"] });
+  await ensureMemorySetup(f.ctx, f.setup);
+  const prompts = f.prompts.length;
+  await ensureMemorySetup(f.ctx, f.setup);
+  assert.equal(f.prompts.length, prompts, "the same broken client is not re-asked on the same revision");
+  await ensureMemorySetup(f.ctx, { ...f.setup, revision: "rev-3" });
+  assert.equal(f.prompts.length, prompts + 1, "a packaged update asks once again");
+});
+
+for (const scenario of ["headless", "rpc"]) {
+  test(`${scenario} setup never asks questions and still states the reason`, async (t) => {
+    const f = fixture(t, { status: { ok: false, reason: "exit" } });
     if (scenario === "headless") f.ctx.hasUI = false;
-    if (scenario === "disabled") opts.env = { PI_HINDSIGHT_ENABLED: "0" };
-    if (scenario === "later") f.selections.splice(0, 1, "Later");
-    if (scenario === "cancel-key") f.cancel();
-    if (scenario === "invalid-host") f.hosts.splice(0, 1, "http://insecure.test");
-    if (scenario === "authentication-fails")
-      opts.fetch = async () => new Response("personal-test-key", { status: 401 });
-    await ensureMemorySetup(f.ctx, opts);
-    assert.deepEqual(readdirSync(f.profileDir), []);
-    assert.equal(f.notices.join(" ").includes("personal-test-key"), false);
+    else (f.ctx as { mode: string }).mode = "rpc";
+    assert.equal(await ensureMemorySetup(f.ctx, f.setup), "headless");
+    assert.equal(f.prompts.length, 0);
+    assert.match(f.notices.join(" "), /terminal/);
+    assert.match(f.notices.join(" "), /herdr-memory doctor --json/);
   });
 }
 
-test("failed replacement keeps the previous working profile and key intact", async (t) => {
+test("headless setup with a working client stays silent", async (t) => {
   const f = fixture(t);
-  await ensureMemorySetup(f.ctx, f.options);
-  const before = resolveMemoryEnvironment({}, f.options);
-  f.setKey("bad-new-key");
-  f.selections.push("Change connection");
-  f.hosts.push("https://replacement.test");
-  await ensureMemorySetup(f.ctx, {
-    ...f.options,
-    force: true,
-    fetch: async () => new Response("bad-new-key", { status: 403 }),
-  });
-  assert.deepEqual(resolveMemoryEnvironment({}, f.options), before);
-  assert.equal(readFileSync(before.PI_HINDSIGHT_TOKEN_FILE!, "utf8").trim(), "personal-test-key");
+  f.ctx.hasUI = false;
+  assert.equal(await ensureMemorySetup(f.ctx, f.setup), "configured");
+  assert.equal(f.notices.length, 0, "a worker is not interrupted by a memory notice");
+  assert.equal(f.state().lastConfirmedRevision, "rev-1");
 });
 
-test("revision remains stable across sessions and changes on packaged source updates", (t) => {
+test("disabled memory does not probe, prompt, or write", async (t) => {
   const f = fixture(t);
-  writeFileSync(join(f.profileDir, "package.json"), '{"version":"1.0.0"}');
-  mkdirSync(join(f.profileDir, "src"));
-  const source = join(f.profileDir, "src", "index.ts");
-  writeFileSync(source, "export const version = 1;");
-  const before = memorySetupRevision(f.profileDir);
-  assert.equal(memorySetupRevision(f.profileDir), before);
-  writeFileSync(source, "export const version = 2;");
-  assert.notEqual(memorySetupRevision(f.profileDir), before);
-});
-
-test("successful replacement removes only the previous profile-owned secret", async (t) => {
-  const f = fixture(t);
-  await ensureMemorySetup(f.ctx, f.options);
-  const previous = resolveMemoryEnvironment({}, f.options).PI_HINDSIGHT_TOKEN_FILE!;
-  f.setKey("new-good-key");
-  f.selections.push("Change connection");
-  f.hosts.push("https://replacement.test");
-  await ensureMemorySetup(f.ctx, { ...f.options, force: true });
-  assert.throws(() => readFileSync(previous), { code: "ENOENT" });
-  const updated = resolveMemoryEnvironment({}, f.options);
-  assert.equal(updated.PI_HINDSIGHT_BASE_URL, "https://replacement.test");
-  assert.equal(readFileSync(updated.PI_HINDSIGHT_TOKEN_FILE!, "utf8").trim(), "new-good-key");
-});
-
-test("automatic RPC setup does not ask questions; manual setup explains using a terminal", async (t) => {
-  const f = fixture(t);
-  f.ctx.mode = "rpc";
-  await ensureMemorySetup(f.ctx, f.options);
+  assert.equal(await ensureMemorySetup(f.ctx, { ...f.setup, env: { PI_HINDSIGHT_ENABLED: "0" } }), "disabled");
+  assert.equal(f.probes.length, 0);
   assert.equal(f.prompts.length, 0);
-  await ensureMemorySetup(f.ctx, { ...f.options, force: true });
-  assert.equal(f.prompts.length, 0);
-  assert.match(f.notices.join(" "), /interactive terminal/);
-});
-
-test("confirmation identifies the current host without exposing URL userinfo or query", async (t) => {
-  const f = fixture(t);
-  f.selections.splice(0, 1, "Later");
-  await ensureMemorySetup(f.ctx, {
-    ...f.options,
-    force: true,
-    env: {
-      PI_HINDSIGHT_BASE_URL: "https://user:secret@memory.test/path?q=secret",
-      PI_HINDSIGHT_TOKEN: "personal-test-key",
-    },
-  });
-  assert.match(f.prompts[0]!, /https:\/\/memory.test/);
-  assert.equal(f.prompts.join(" ").includes("secret"), false);
-});
-
-test("stale setup cannot overwrite a connection saved by another session during validation", async (t) => {
-  const f = fixture(t);
-  await ensureMemorySetup(f.ctx, f.options);
-  f.selections.push("Change connection");
-  f.hosts.push("https://stale.test");
-  f.setKey("stale-key");
-  let release!: () => void;
-  let started!: () => void;
-  const waiting = new Promise<void>((resolve) => {
-    started = resolve;
-  });
-  const pending = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const stale = ensureMemorySetup(f.ctx, {
-    ...f.options,
-    force: true,
-    fetch: async () => {
-      started();
-      await pending;
-      return f.recallResponse();
-    },
-  });
-  await waiting;
-  f.selections.push("Change connection");
-  f.hosts.push("https://fresh.test");
-  f.setKey("fresh-key");
-  await ensureMemorySetup(f.ctx, { ...f.options, force: true });
-  const directory = join(f.profileDir, "engineering-memory");
-  const saved = readFileSync(join(directory, "connection.json"), "utf8");
-  const files = readdirSync(directory);
-  release();
-  await stale;
-  assert.equal(readFileSync(join(directory, "connection.json"), "utf8"), saved);
-  assert.deepEqual(readdirSync(directory), files, "stale setup must not leave an orphan credential");
-  assert.equal(resolveMemoryEnvironment({}, f.options).PI_HINDSIGHT_BASE_URL, "https://fresh.test");
-  assert.match(f.notices.at(-1)!, /changed.*setup.*retry/i);
-});
-
-test("external key rotation during validation aborts setup without storing stale credentials", async (t) => {
-  const f = fixture(t);
-  const external = join(f.profileDir, "external.key");
-  writeFileSync(external, "original-key\n", { mode: 0o600 });
-  f.selections.splice(0, 1, "Keep current connection");
-  await ensureMemorySetup(f.ctx, {
-    ...f.options,
-    force: true,
-    env: { PI_HINDSIGHT_BASE_URL: "https://memory.test", PI_HINDSIGHT_TOKEN_FILE: external },
-    fetch: async () => {
-      writeFileSync(external, "rotated-key\n");
-      return f.recallResponse();
-    },
-  });
-  assert.deepEqual(readdirSync(f.profileDir), ["external.key"]);
-  assert.equal(readFileSync(external, "utf8"), "rotated-key\n");
-  assert.match(f.notices.at(-1)!, /changed.*setup.*retry/i);
-});
-
-test("environment changes during validation abort setup", async (t) => {
-  const f = fixture(t);
-  const env: NodeJS.ProcessEnv = {};
-  await ensureMemorySetup(f.ctx, {
-    ...f.options,
-    env,
-    fetch: async () => {
-      env.PI_HINDSIGHT_ENABLED = "0";
-      return f.recallResponse();
-    },
-  });
   assert.deepEqual(readdirSync(f.profileDir), []);
-  assert.match(f.notices.at(-1)!, /changed.*setup.*retry/i);
+});
+
+test("a connection saved by another session during the probe wins", async (t) => {
+  const f = fixture(t);
+  f.hold();
+  const stale = ensureMemorySetup(f.ctx, f.setup);
+  while (f.probes.length === 0) await new Promise((resolve) => setImmediate(resolve));
+  // Another session confirms a connection while this probe is in flight.
+  mkdirSync(join(f.profileDir, "engineering-memory"), { mode: 0o700 });
+  writeFileSync(
+    join(f.profileDir, "engineering-memory", "connection.json"),
+    JSON.stringify({
+      lastConfirmedRevision: "rev-other",
+      lastAskedRevision: "rev-other",
+      client: "/opt/herdr/herdr-memory",
+      updatedAt: "2026-11-09T00:00:00.000Z",
+    }),
+    { mode: 0o600 },
+  );
+  f.release();
+  assert.equal(await stale, "configured");
+  assert.equal(f.state().lastConfirmedRevision, "rev-other", "the newer answer is preserved");
+  assert.match(f.notices.join(" "), /changed during setup/i);
+});
+
+test("revision is stable across sessions and changes when packaged source changes", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "memory-revision-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const profileDir = join(root, "pi-engineering");
+  writeFileSync(join(root, "package.json"), '{"version":"1.0.0"}');
+  const before = memorySetupRevision(profileDir);
+  assert.equal(memorySetupRevision(profileDir), before, "the same source is the same revision");
+  writeFileSync(join(root, "package.json"), '{"version":"1.0.1"}');
+  assert.notEqual(memorySetupRevision(profileDir), before, "an update is a new revision");
+});
+
+test("resolveMemoryEnvironment passes the opt-in through and carries no credential", () => {
+  const env = resolveMemoryEnvironment({
+    PI_HINDSIGHT_ENABLED: "1",
+    PI_HINDSIGHT_CLI: "/opt/herdr/herdr-memory",
+    PI_HINDSIGHT_SCOPES: "project",
+    PI_HINDSIGHT_TIMEOUT_MS: "4000",
+    SOME_OTHER_VAR: "keep",
+  });
+  assert.deepEqual(env, {
+    PI_HINDSIGHT_ENABLED: "1",
+    PI_HINDSIGHT_CLI: "/opt/herdr/herdr-memory",
+    PI_HINDSIGHT_SCOPES: "project",
+    PI_HINDSIGHT_TIMEOUT_MS: "4000",
+    SOME_OTHER_VAR: "keep",
+  });
+  // Nothing to leak: no URL, bank, or key survives in the session environment.
+  assert.equal(JSON.stringify(env).match(/token|baseurl|bank|secret/i), null);
 });
