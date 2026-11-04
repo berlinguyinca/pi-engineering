@@ -173,6 +173,7 @@ export function aliasView(advertised: readonly GatewayModelEntry[]): AliasView {
     const sizes = memberSizes(memberIds);
     out.set(entry.id, {
       ...entry,
+      origin: "advertised",
       contextWindow,
       ...(members.length > 0 ? { members: members.map((m) => m.id) } : {}),
       // One member is a definite answer; several means the gateway picks per
@@ -191,6 +192,7 @@ export function aliasView(advertised: readonly GatewayModelEntry[]): AliasView {
     const sizes = memberSizes(memberIds);
     out.set(name, {
       id: name,
+      origin: "derived",
       contextWindow: smallest(members),
       ...(best.state ? { state: best.state } : {}),
       alias: true,
@@ -202,4 +204,136 @@ export function aliasView(advertised: readonly GatewayModelEntry[]): AliasView {
 
   const entries = [...out.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   return { entries, droppedConcrete: entries.length > 0 ? concrete.map((entry) => entry.id) : [] };
+}
+
+/** Modalities a route name can select, whatever builds the listing happens to show. */
+const ROUTE_MODALITIES = ["text", "vision"];
+
+/** Window assumed for a route nothing in the listing or the configuration describes. */
+export const UNKNOWN_ROUTE_WINDOW = 32768;
+
+export interface UnadvertisedRoutes {
+  /** Route names to probe; each is a name NO listing covers. */
+  entries: GatewayModelEntry[];
+  /** Already-configured ids the listing does not cover — probe before deleting. */
+  configuredOnly: string[];
+}
+
+/**
+ * Route names the listing cannot vouch for but the gateway may still serve.
+ *
+ * The live gateway's `/v1/models` is wrong in both directions: it omits routes
+ * that answer a completion (`qwen3.8-27b`, `qwen3.8-27b-text`, `qwen3.8-flash`)
+ * and advertises routes that return 404 (`laya`, `laya-text`). Listing-only
+ * discovery therefore deletes working models and installs broken ones, so these
+ * names are offered to the probe, which is the only evidence that settles it:
+ *
+ * - every family / size / modality combination the concrete rows imply, in both
+ *   modalities — a `-text` route answers even when the only listed build of
+ *   that class is a vision one, which is precisely how `qwen3.8-27b-text` was
+ *   lost;
+ * - every configured id the alias view does not cover, so a route is pruned
+ *   only on a probe that says it does not answer, never on a listing that
+ *   simply failed to mention it.
+ *
+ * Nothing here is invented from thin air: each name is built from families and
+ * size classes the gateway itself listed, and each is configured only after the
+ * gateway answers for it.
+ */
+export function unadvertisedRouteCandidates(
+  advertised: readonly GatewayModelEntry[],
+  view: AliasView,
+  configured: readonly { id: string; contextWindow?: number }[],
+): UnadvertisedRoutes {
+  const concrete = advertised.filter((entry) => !entry.alias && isUsable(entry));
+  const listedIds = new Set(advertised.map((entry) => entry.id));
+  const covered = new Set(view.entries.map((entry) => entry.id));
+  const out = new Map<string, GatewayModelEntry>();
+
+  const route = (name: string, want: { family: string; size?: string; modality?: string }): GatewayModelEntry => {
+    // `want` describes the NAME being probed, never the row it was derived from:
+    // `qwen3.8-flash_next-vision` must not inherit the text modality of the only
+    // flash_next builds that are listed, or it would name members it cannot
+    // vouch for and the name would claim weights the route may not run.
+    // Same class = same family, and same size when the name names one. Modality
+    // narrows the MEMBERS we are willing to name, never the window we read: the
+    // route may run a build the listing does not show.
+    const sameClass = concrete.filter((row) => {
+      const facts = factsOf(row.id);
+      return !!facts && facts.family === want.family && (!want.size || facts.size === want.size);
+    });
+    const members = want.modality ? sameClass.filter((row) => factsOf(row.id)?.modality === want.modality) : sameClass;
+    const configuredEntry = configured.find((model) => model.id === name);
+    const windows = (members.length > 0 ? members : sameClass).map((entry) => entry.contextWindow);
+    const memberIds = members.map((entry) => entry.id).sort();
+    const backingModel = memberIds.length === 1 ? memberIds[0] : undefined;
+    const sizes = memberSizes(memberIds);
+    return {
+      id: name,
+      alias: true,
+      origin: "probed",
+      // The smallest window in the class, then what was configured, then a
+      // deliberately small floor: over-claiming a window loses context silently.
+      contextWindow:
+        windows.length > 0 ? Math.min(...windows) : (configuredEntry?.contextWindow ?? UNKNOWN_ROUTE_WINDOW),
+      ...(memberIds.length > 0 ? { members: memberIds } : {}),
+      ...(backingModel ? { backingModel } : {}),
+      ...(sizes.length > 0 ? { sizes } : {}),
+    };
+  };
+
+  for (const entry of concrete) {
+    const facts = factsOf(entry.id);
+    if (!facts?.listable) continue;
+    // The names the gateway might resolve for this class, in both modalities.
+    const selectors: Array<{ name: string; want: { family: string; size?: string; modality?: string } }> = [
+      { name: facts.family, want: { family: facts.family } },
+      { name: `${facts.family}-${facts.size}`, want: { family: facts.family, size: facts.size } },
+      ...ROUTE_MODALITIES.flatMap((modality) => [
+        { name: `${facts.family}-${modality}`, want: { family: facts.family, modality } },
+        {
+          name: `${facts.family}-${facts.size}-${modality}`,
+          want: { family: facts.family, size: facts.size, modality },
+        },
+      ]),
+    ];
+    for (const { name, want } of selectors) {
+      // A listed row — alias or concrete — is already judged on its own terms.
+      if (covered.has(name) || listedIds.has(name) || out.has(name)) continue;
+      out.set(name, route(name, want));
+    }
+  }
+
+  const configuredOnly: string[] = [];
+  for (const model of configured) {
+    if (covered.has(model.id) || listedIds.has(model.id) || out.has(model.id)) continue;
+    // A configured BUILD id that left the listing is a retired model, not a
+    // hidden route: alias mode never configures builds, so it is not probed.
+    if (!isRouteName(model.id)) continue;
+    configuredOnly.push(model.id);
+    out.set(model.id, {
+      id: model.id,
+      alias: true,
+      origin: "probed",
+      contextWindow: model.contextWindow ?? UNKNOWN_ROUTE_WINDOW,
+    });
+  }
+
+  return {
+    entries: [...out.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+    configuredOnly,
+  };
+}
+
+/**
+ * True when `id` names a route rather than a build.
+ *
+ * A canonical concrete id (`family-size-modality-X-quant-Y`) names weights that
+ * either appear in the listing or do not, so its absence is a real answer. A
+ * route name is a handle the gateway may resolve without ever listing, so its
+ * absence proves nothing and the entry has to survive until something better
+ * than a listing says otherwise.
+ */
+export function isRouteName(id: string): boolean {
+  return factsOf(id) === undefined && /^[a-z0-9][a-z0-9._-]*$/.test(id);
 }

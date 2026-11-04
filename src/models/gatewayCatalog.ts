@@ -38,6 +38,16 @@ export interface GatewayModelEntry {
   /** True when `id` is a logical route (`x_alias`) rather than a concrete model. */
   alias?: boolean;
   /**
+   * How this route reached the candidate list. `advertised` is a row the gateway
+   * lists with `x_alias`; `derived` is a prefix name the gateway resolves for
+   * listed members; `probed` is a name **no listing covers** — only a successful
+   * inference probe vouches for it, so it must never be configured or deleted
+   * on the listing's authority. The live gateway hides routes that answer
+   * (`qwen3.8-27b-text`) and advertises routes that 404 (`laya`), so the two
+   * sources are not interchangeable.
+   */
+  origin?: "advertised" | "derived" | "probed";
+  /**
    * The one concrete model behind a route, when exactly one is named — by
    * `x_backing_model` or, on gateways that name membership only on the route
    * row, by a sole `x_members` entry.

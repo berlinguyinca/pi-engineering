@@ -356,8 +356,13 @@ never loaded: while a tracked file has uncommitted changes, a new commit is
 not reloaded either (the handover would copy the half-edit); you are told
 once, and the reload happens as soon as the tree is clean, or at once with
 `/pie reload`. Summary and compaction calls, which have no turn to continue,
-wait out a gateway hold instead of switching models. `/pie update` does the same immediately (and, when the checkout
-has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
+wait out a gateway hold instead of switching models. `/pie update` does the same immediately, and it always asks the update remote
+first: if the checkout's HEAD is behind the channel tip, the tip is installed
+instead of the checkout being reloaded (a checkout 463 commits behind main used
+to hot-reload itself and report success). A checkout that carries the tip — a
+merge you just made, or unpushed development work on top of it — is still
+reloaded, because that is the update you meant. `--check` reports both, and
+`--channel`/`--commit` always go to the remote. `PI_ENGINEERING_AUTO_RELOAD=0`
 turns the automatic reload off.
 
 A session on another host, loading pi-engineering from a clone that tracks
@@ -538,15 +543,44 @@ reasoning, output limit, cost and compatibility
 settings from their configured backing model when available, bounded by the
 alias's advertised context window. Other additions report inferred settings.
 Existing model names and settings survive refresh, and identical IDs in two
-providers remain separate entries. Aliases only listed as `x_aliases` on a
-concrete model are descriptive metadata; refresh does not invent route entries
-that the gateway has not separately advertised.
+providers remain separate entries.
+
+**The probe decides which routes exist; the listing alone never does.**
+`GET /v1/models` is not authoritative on a real gateway. Recorded live on
+2026-11-03 against `llm.metabolomics.us/v1`, it returned seven rows while eleven
+routes answered `/v1/chat/completions` — and two of those seven advertised rows,
+`laya` and `laya-text`, produced no completion at all (a plain request got 404
+`Model laya is not served here`; an hour later the same route returned HTTP 200
+with an empty message). A refresh that trusted the listing
+therefore deleted working models (the operator report that opened this was "I
+still don't see the `qwen3.8-27b` alias", and a refresh really had pruned it)
+while adding routes that cannot serve a request. With probing on, which is what
+`/model-refresh` does, refresh gathers route names from three sources:
+
+- aliases the gateway advertises with `x_alias`;
+- the family / size / modality combinations implied by the concrete rows it
+  lists, in **both** modalities — `qwen3.8-27b-text` answers even though the
+  only listed 27B build is a vision one;
+- every configured route name the listing no longer covers.
+
+Each candidate is configured **only if a completion answers for it**, and is
+removed only if a completion refuses it *and* no listing claims it. A name
+nothing advertises is written as
+`qwen3.8-27b-text → … (gateway route; answers, not advertised)`, so the weaker
+evidence is visible exactly where the model gets chosen. Where probing cannot
+run — a library caller, or a provider API that cannot be probed — nothing is
+added from a name alone and nothing is deleted for being unlisted; those entries
+are reported as `kept without evidence`. An id that follows the concrete
+`<family>-<size>-modality-…-quant-…` grammar names a build rather than a route:
+alias mode replaces builds with their routes, so a build the listing no longer
+shows is retired without needing a probe.
 
 A written alias name says what answers behind it, so `/model` and the status line
 never leave that ambiguous: `qwen3.8-text →
 qwen3.8-flash_next-modality-text-quant-w3a8 (gateway alias)`, or
-`qwen3.8 → a, b, c (gateway alias; 27b/flash/flash_next)` when several members
-share the route and a failover between them changes the model. Canonical ids carry
+`qwen3.8 → 27b/flash/flash_next ×4 (gateway alias)` when several members
+share the route and a failover between them changes the model — the size classes
+are named, and the member ids are in the report rather than the picker label. Canonical ids carry
 their size class (`<family>-<size>-modality-…`), so `qwen3.8-27b-…` is the 27B build
 and `qwen3.8-flash_next-…` is Flash-Next; an id outside that grammar has no size
 class and none is invented. Where an alias's own name says nothing about what it
@@ -1109,6 +1143,135 @@ mutating form is a gap to close when it bites, not a contract hole. `git -C`,
 The runtime's own in-process git operations (mission workers run in candidate
 worktrees; integration, janitor) do not go through the tool-call hook and are
 unaffected.
+
+## Task Contract gate (task discipline)
+
+A **Task Contract** is a trusted, versioned snapshot of what one task is allowed
+to touch: its objective, the roots it may read, the roots it may write, the
+remote hosts it may contact, the external effects (push, CI dispatch, deploy,
+restart) it may cause, and its acceptance criteria. It is written by the
+operator or the control plane — never by the model — and the gate in
+`src/taskDiscipline/` judges every tool call against it **before** the call
+executes.
+
+The gate registers its own `tool_call` and `user_bash` handlers, so it does not
+inherit the lifecycle controller's two gaps: that controller skips non-mutating
+tools (reads, MCP/custom tools) and auto-allows when the session is unattended.
+Here every call is judged, reads included, and `!bash` typed by the operator
+goes through the same engine (a blocked `!bash` returns a synthetic failed
+result instead of running).
+
+Knobs (set before starting the session):
+
+- `PI_TASK_DISCIPLINE` — `off` (default) | `audit_only` | `enforce_diagnostic` |
+  `enforce_all`. A value that is not one of those is treated as `enforce_all`:
+  a typo must not weaken enforcement.
+- `PI_TASK_CONTRACT_FILE` — path to the contract JSON. In an enforcing mode a
+  missing, unreadable or invalid contract **locks the session down** (nothing
+  readable, nothing writable) rather than falling back to "allow everything".
+- `PI_TASK_DISCIPLINE_LOG` — append-only JSONL of every decision (allow, deny,
+  would-deny) with the task id, contract revision, contract hash, rule and a
+  secret-redacted command. Defaults to `decisions.jsonl` next to the contract.
+
+The contract file and the decision log are always added to the contract's
+`protectedPaths`, and so is the contract's directory — unless it overlaps a
+`writeRoots` or `scratchRoots` entry (as in the example above, where the scratch
+root sits inside the contract directory), because protecting it there would
+swallow the whole tree the task may write in. The agent therefore cannot rewrite
+its own authorization or its own record — a write to a protected path is denied
+with `write.protected`.
+The file is re-read when its mtime or size changes, so an operator amendment
+takes effect on the next tool call and the new `policyRevision` appears in the
+log; a rewrite that tries to *widen* an investigation contract is rejected at
+parse time and the provider substitutes the lockdown contract immediately, so
+self-approval is impossible even with filesystem access — the agent loses access
+instead of gaining scope.
+
+What each mode enforces:
+
+- `audit_only` — nothing is blocked; a call the contract forbids is logged as
+  `would_deny` and the agent is told it is not protected. Use it to learn a
+  contract's false-block rate before turning it on.
+- `enforce_diagnostic` — blocks only while the **contract's** mode is
+  `investigation` or `review`, which is the tier the spec calls strict
+  diagnostic: read-only work must not deploy or ship data anywhere.
+- `enforce_all` — blocks in every contract mode.
+
+Rules the engine can deny with (each decision names its rule id): `read.outside_roots`,
+`write.outside_roots`, `write.protected`, `write.readonly_mode`,
+`exec.outside_roots`, `host.not_allowed`, `host.unresolved`,
+`effect.container.not_granted`, `effect.privileged`, `command.unclassified`,
+`path.unresolved`, `tool.not_allowed`, `shell.no_command`, `shell.powershell`,
+`write.no_path`, `engine.error`. Commands are classified, not pattern-matched:
+the classifier expands `sh -c`, `bash -c`, `eval`, `$(…)`/backticks, pipes,
+`xargs`, `find -exec`, `sudo`, `make` targets, `npm run` scripts, Python/Node
+scripts, `docker`/`podman` runs, and the remote verbs `ssh`, `scp`, `sftp`,
+`rsync`, `curl`/`wget` with a write verb, `git push`, `gh workflow run`,
+`kubectl`, `terraform`. Paths are canonicalised before comparison, so `..`,
+`~`, unexpanded `$VAR` and symlinks that walk out of a read or write root are
+caught (`path.unresolved`, `write.outside_roots`). An effect the classifier
+cannot identify is denied in an enforcing mode (`command.unclassified`) instead
+of being waved through.
+
+Denials are also loop-aware: more than three enforced denials of the same rule
+inside ten calls marks a policy incident, and further block messages tell the
+agent to stop retrying and report what is blocking it — the route out is an
+operator amendment, never another path around the rule.
+
+Enabling it for one mission, end to end:
+
+```sh
+mkdir -p ~/task-contracts
+cat > ~/task-contracts/peak-picking.json <<'JSON'
+{
+  "taskId": "demo-peak-picking-001",
+  "objective": "Diagnose the local LC-MS peak-picking discrepancy from code, fixtures and logs; report root cause with reproducible evidence.",
+  "mode": "investigation",
+  "policyRevision": 1,
+  "readRoots": ["/Users/me/IdeaProjects/cdf2ms"],
+  "writeRoots": [],
+  "scratchRoots": ["/private/tmp/peak-picking"],
+  "allowedHosts": [],
+  "externalEffects": [],
+  "acceptanceCriteria": ["Reproduce locally or name the blocker", "Name the defect with file and test evidence"]
+}
+JSON
+PI_TASK_DISCIPLINE=enforce_diagnostic \
+PI_TASK_CONTRACT_FILE="$HOME/task-contracts/peak-picking.json" \
+  pi --no-extensions --extension /absolute/path/to/checkout/extensions/index.ts
+```
+
+(One runtime per session, as above: `--no-extensions` plus the checkout, or the
+installed package with the two variables in the environment — not both.)
+
+In that session `scp ./peaks.mzML strange-host:/data/` — and the `rsync`,
+`curl -T`, `git push` and `gh workflow run` equivalents — is denied before
+execution, the denial lands in `decisions.jsonl`, and the agent is told to
+continue with local reads; the investigation does not stop. `write` anywhere is
+denied (`write.readonly_mode`, because the contract has no `writeRoots`). To let
+it patch the fix, the operator raises `policyRevision`, adds `writeRoots` and
+the mode changes to `implementation` — the model cannot do that itself.
+
+Mission workers of a gated session are gated too, under a **narrowed child
+contract** rather than the parent's: their write roots are the worktree the
+scheduler allocated them, their external effects are empty (they propose, the
+host executes), they may reach an allowed host only if the parent itself had
+`remote_read`, and a read-only role is capped at `review`. A worker whose
+request cannot be expressed inside the parent's scope — an implementer under a
+`review` contract, or a worktree outside the parent's write roots — is refused
+before any model call (`error: task-scope-refused`) instead of being handed the
+parent's wider scope.
+
+**What the gate cannot promise** (see `docs/operations/task-discipline.md`):
+it is a preflight check inside the Pi process, so it covers calls that come
+through Pi's `tool_call` / `user_bash`. A shell the agent reaches outside those
+hooks, a compiled binary that opens its own socket, or a local root shell
+bypass it. Defence in depth for indirect exfiltration in strict diagnostic mode
+relies on the Linux sandbox the control plane can start (`collab-sandbox.sh`
+profile `task-restricted-v1` with `--unshare-net` plus the
+`collab-egress.py` host allowlist); **macOS has no equivalent today**, so a
+local macOS session gets preflight gating only and must not be described as
+isolated.
 
 ## Recovering an interactive turn after the gateway wait is spent
 

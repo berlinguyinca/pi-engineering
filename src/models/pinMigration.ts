@@ -77,10 +77,7 @@ export interface PinMoveBlock {
 }
 
 /** The move for a stale pin: the alias to use, and the nearest miss when there is none. */
-export function pinMove(
-  stale: string,
-  catalog: PinCatalog,
-): { to?: string; blocked?: PinMoveBlock } {
+export function pinMove(stale: string, catalog: PinCatalog): { to?: string; blocked?: PinMoveBlock } {
   // An operator alias need not resemble the id behind it — `qwen3.8-text` routes
   // to a `-vision-` build, `laya` to `laya-typed-decisions-…` — so membership is
   // its own source of candidates, not merely a check on the derived names. Those
@@ -106,8 +103,7 @@ function whyNot(stale: string, alias: string, catalog: PinCatalog): string {
   const size = sizeClassOf(stale);
   const members = (catalog.members?.[alias] ?? []).map(sizeClassOf).filter((c): c is string => !!c);
   const others = [...new Set(members)].sort();
-  if (others.length > 0)
-    return `its members are ${others.join(", ")}${size ? `, not ${size}` : ""}`;
+  if (others.length > 0) return `its members are ${others.join(", ")}${size ? `, not ${size}` : ""}`;
   return size ? `neither its name nor its published members say ${size}` : "it names no model";
 }
 

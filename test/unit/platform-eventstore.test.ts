@@ -10,7 +10,7 @@ import { describe, it } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { EventStore } from "../../src/ledger/EventStore.ts";
 import { LedgerEventStoreBackend } from "../../src/platform/eventstore/adapters.ts";
-import { ExclusiveFileLock } from "../../src/platform/eventstore/fileLock.ts";
+import { ExclusiveFileLock, readBootId, readProcessStartTime } from "../../src/platform/eventstore/fileLock.ts";
 import { JsonlEventStore, repairTornTail } from "../../src/platform/eventstore/jsonl.ts";
 
 const evt = (i: number) => ({
@@ -64,13 +64,12 @@ async function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
 }
 
 async function currentProcessIncarnation(): Promise<{ bootId: string; processStartTime: string }> {
-  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
-  const statLine = await readFile(`/proc/${process.pid}/stat`, "utf8");
-  const processStartTime = statLine
-    .slice(statLine.lastIndexOf(")") + 2)
-    .trim()
-    .split(/\s+/)[19]!;
-  return { bootId, processStartTime };
+  const bootId = readBootId();
+  const start = readProcessStartTime(process.pid);
+  if (!bootId || start.state !== "present") {
+    throw new Error("test host cannot establish a process incarnation");
+  }
+  return { bootId, processStartTime: start.value };
 }
 
 async function deadLockOwner(ownerToken: string): Promise<Record<string, unknown>> {
@@ -802,13 +801,17 @@ describe("EventStore backends", () => {
   it("closes every pinned descriptor across repeated acquire and release cycles", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pie-store-descriptor-count-"));
     const file = join(dir, "events.jsonl");
-    const before = (await readdir("/proc/self/fd")).length;
+    // /proc/self/fd is the only reliable open-descriptor census on Linux; the
+    // cycle itself runs everywhere so a platform never skips the release path.
+    const before = process.platform === "linux" ? (await readdir("/proc/self/fd")).length : 0;
     for (let index = 0; index < 50; index += 1) {
       const lock = await ExclusiveFileLock.acquire(file);
       lock.release();
     }
-    const after = (await readdir("/proc/self/fd")).length;
-    assert.ok(after <= before + 2, `descriptor count grew from ${before} to ${after}`);
+    const after = process.platform === "linux" ? (await readdir("/proc/self/fd")).length : 0;
+    if (process.platform === "linux") {
+      assert.ok(after <= before + 2, `descriptor count grew from ${before} to ${after}`);
+    }
   });
 
   it("repairs a torn final record instead of swallowing the next event", async () => {

@@ -32,7 +32,13 @@ afterEach(async () => {
 
 let seq = 0;
 async function world(
-  opts: { updateRemote?: string; trusted?: string[]; shallow?: boolean; localCommit?: boolean } = {},
+  opts: {
+    updateRemote?: string;
+    trusted?: string[];
+    shallow?: boolean;
+    localCommit?: boolean;
+    autoReload?: boolean;
+  } = {},
 ) {
   const key = `__rt_git_${process.pid}_${++seq}`;
   const b = bag(key);
@@ -63,6 +69,7 @@ async function world(
     entry: "runtime.ts",
     baseline: true,
     autoUpdateCheck: false,
+    ...(opts.autoReload === undefined ? {} : { autoReload: opts.autoReload }),
     ...(opts.updateRemote ? { updateRemote: opts.updateRemote } : {}),
     ...(opts.trusted ? { trustedRemotes: opts.trusted } : {}),
   });
@@ -341,4 +348,46 @@ test("depth-1 install of a commit the source does not have fails loudly, with th
   await writePreferences(w.ext.layout.preferencesFile, { ...prefs, identityRoots: [root] });
   w.repo.publish({ version: "0.3.0", value: "B" });
   assert.equal((await w.ext.updates.check({})).failure, undefined);
+});
+
+/**
+ * `/engineering update` always asks the remote, even when the checkout it loads
+ * from moved: reloading that checkout is only right when its HEAD is not behind
+ * the channel. A checkout 463 commits behind main used to hot-reload itself and
+ * report success.
+ */
+test("a checkout that moved BEHIND the channel installs the tip instead of reloading itself", async () => {
+  const w = await world({ autoReload: false });
+  // The operator merges upstream into the checkout Pi loads from…
+  w.repo.publish({ version: "0.2.1", value: "B" });
+  git(w.packageRoot, "pull", "--ff-only", "--quiet", "origin", "main");
+  const moved = git(w.packageRoot, "rev-parse", "HEAD");
+  assert.equal(w.ext.checkoutMoved()?.to, moved, "the checkout moved; the running generation did not");
+  // …and then more lands upstream.
+  const tip = w.repo.publish({ version: "0.3.0", value: "C" });
+  assert.notEqual(tip, moved);
+
+  const outcome = await update(w, "");
+  assert.equal(outcome?.status, "handover", JSON.stringify(outcome));
+  assert.equal(w.host.lastHandover?.ok, true, w.host.lastHandover?.failure);
+  assert.equal(
+    w.ext.layout.readMeta(w.ext.layout.readPointer("current") as string)?.commit,
+    tip,
+    "the tip was installed",
+  );
+  assert.equal(await w.settle(), "C", "the stale checkout's code (B) is not what runs");
+});
+
+test("a checkout ahead of the channel still hot-reloads: development work wins", async () => {
+  const w = await world({ autoReload: false });
+  writeFileSync(join(w.packageRoot, "local-work.md"), "uncommitted-to-upstream\n");
+  git(w.packageRoot, "add", "-A");
+  git(w.packageRoot, "commit", "--quiet", "-m", "local work");
+  const local = git(w.packageRoot, "rev-parse", "HEAD");
+  assert.ok(w.ext.checkoutMoved(), "the checkout moved");
+
+  const outcome = await update(w, "");
+  assert.equal(outcome, undefined, "the reload path is not an update transaction");
+  assert.equal(w.host.lastHandover?.ok, true, w.host.lastHandover?.failure);
+  assert.equal(w.host.activeGeneration()?.source.commit, local, "the unpushed commit is what runs");
 });

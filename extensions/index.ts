@@ -92,6 +92,7 @@ import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
 import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { registerPlannerWorker } from "../src/plannerWorker/extension.ts";
+import { ensurePriorart } from "../src/platform/priorartDependency.ts";
 import { redactSecrets } from "../src/platform/redact.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import {
@@ -146,6 +147,8 @@ import { renderStatus } from "../src/status/layout.ts";
 import { type PresenceSeedScope, seedPresence } from "../src/status/presenceSeed.ts";
 import { StatusSurfaceBus } from "../src/status/surfaceBus.ts";
 import { WorkingStatusController } from "../src/status/working.ts";
+import { disciplineFromEnv } from "../src/taskDiscipline/config.ts";
+import { registerTaskDiscipline } from "../src/taskDiscipline/hook.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
@@ -789,6 +792,19 @@ export default function (pi: ExtensionAPI) {
   if (typeof pi.on === "function") registerTerminalRefusalGuard(pi);
   registerModelTabs(pi);
   registerInteractiveMemory(pi);
+  // priorart is a required EXTERNAL dependency (see
+  // docs/specs/pi-engineering/support/EXTERNAL_TOOLS_AND_OWNERSHIP.md). Ensure its
+  // binary + config + mcp.json registration on every session start. Best-effort and
+  // non-throwing: it must never delay or break a session.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", () => {
+      try {
+        ensurePriorart();
+      } catch {
+        /* never break pi startup */
+      }
+    });
+  }
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
   // Agent-inspector feed to Herdr: OFF unless this host's central fleet config
@@ -1177,6 +1193,11 @@ export default function (pi: ExtensionAPI) {
     // Identical-tool-call loops and unbounded bash test/build runs
     // (src/guard/toolCallGuard.ts; knobs in docs/usage.md, "Tool-call guard").
     registerToolCallGuard(pi as never);
+    // Task Contract gate (src/taskDiscipline; off unless PI_TASK_DISCIPLINE is set).
+    // Registered as its own tool_call/user_bash handlers so it never depends on
+    // the lifecycle controller's mutating-tool filter or its unattended auto-allow.
+    const discipline = disciplineFromEnv();
+    if (discipline) registerTaskDiscipline(pi, discipline);
     // One agent, one worktree (AGENTS.md), enforced: block this session's own
     // mutating calls against a repository's PRIMARY checkout so concurrent
     // sessions cannot destroy each other's uncommitted work there. Production

@@ -8,23 +8,30 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
+import { readBootId, readProcessStartTime } from "../../src/platform/eventstore/fileLock.ts";
 
 const exec = promisify(execFile);
+
+/**
+ * A category or lock directory swapped out after its descriptor was pinned must
+ * never be operated on. Linux keeps the operation on the pinned inode through
+ * /proc/self/fd; other platforms resolve plain paths, so they must detect the
+ * substitution and refuse. Both outcomes are safe, so the swap-escape tests run
+ * everywhere and assert the platform-specific half of that invariant.
+ */
+const NON_LINUX_ONLY = process.platform === "linux" ? "path-based fallback exists for non-Linux hosts" : false;
 
 function sha256(content: string): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
 async function processIncarnation(): Promise<{ bootId: string; processStartTime: string }> {
-  const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim();
-  const statLine = await readFile(`/proc/${process.pid}/stat`, "utf8");
-  return {
-    bootId,
-    processStartTime: statLine
-      .slice(statLine.lastIndexOf(")") + 2)
-      .trim()
-      .split(/\s+/)[19]!,
-  };
+  const bootId = readBootId();
+  const start = readProcessStartTime(process.pid);
+  if (!bootId || start.state !== "present") {
+    throw new Error("test host cannot establish a process incarnation");
+  }
+  return { bootId, processStartTime: start.value };
 }
 
 test("artifacts are stored on disk and read lazily by URI", async () => {
@@ -388,7 +395,79 @@ test("durable metadata binds every record to exact size and digest", async () =>
   }
 });
 
-test("pinned category descriptors prevent deterministic read write delete and verify swap escapes", async () => {
+test("path-based fallback round-trips artifacts without /proc", { skip: NON_LINUX_ONLY }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-fallback-roundtrip-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    const mutable = await store.put("logs", "fallback", "payload", "summary");
+    assert.equal(await store.readContentByUri(mutable.uri), "payload");
+    const immutable = await store.putImmutable("logs", "fallback-immutable", "sealed", "sealed summary");
+    store.verifyAndDispatch([immutable.uri], [`sha256:${sha256("sealed")}`], () => undefined);
+    await store.delete(mutable.uri);
+    const reopened = await ArtifactStore.create(root);
+    assert.equal(await reopened.readContentByUri(mutable.uri), undefined);
+    assert.equal(await reopened.readContentByUri(immutable.uri), "sealed");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test(
+  "path-based fallback fails closed when a category is swapped for a symlink",
+  { skip: NON_LINUX_ONLY },
+  async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-fallback-swap-"));
+    try {
+      const root = join(dir, "artifacts");
+      const outside = join(dir, "outside");
+      await mkdir(outside);
+      const seed = await ArtifactStore.create(root);
+      const artifact = await seed.put("safe", "item", "trusted", "proof");
+      await writeFile(join(outside, `${artifact.id}.txt`), "outside", "utf8");
+      await writeFile(
+        join(outside, `${artifact.id}.json`),
+        JSON.stringify({
+          id: artifact.id,
+          category: "safe",
+          uri: artifact.uri,
+          size: 7,
+          sha256: sha256("outside"),
+          created_at: "2026-09-27T00:00:00.000Z",
+          summary: "outside",
+        }),
+        "utf8",
+      );
+      let swapped = false;
+      const store = await ArtifactStore.create(root, {
+        afterCategoryOpened: (kind: string, category: string) => {
+          if (swapped || kind !== "write" || category !== "safe") return;
+          swapped = true;
+          renameSync(join(root, "safe"), join(root, "safe-pinned"));
+          symlinkSync(outside, join(root, "safe"), "dir");
+        },
+      });
+      await assert.rejects(
+        () => store.put("safe", "item", "updated", "updated"),
+        /artifact integrity|symlink|symbolic links|ELOOP/i,
+        "the fallback must refuse to write through a swapped category",
+      );
+      // The pinned original category keeps the seed artifact untouched.
+      const pinned = await readdir(join(root, "safe-pinned"));
+      assert.ok(
+        pinned.some((entry) => entry.startsWith(artifact.id)),
+        "seed artifact must survive in the pinned category",
+      );
+      assert.equal(swapped, true, "the deterministic swap hook must exercise the race window");
+      assert.equal(await readFile(join(outside, `${artifact.id}.txt`), "utf8"), "outside");
+      assert.equal(JSON.parse(await readFile(join(outside, `${artifact.id}.json`), "utf8")).summary, "outside");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("a swapped category is either survived on the pinned inode or refused, never written through", async () => {
   for (const operation of ["read", "write", "delete", "verify"] as const) {
     const dir = await mkdtemp(join(tmpdir(), `pi-eng-art-dir-race-${operation}-`));
     try {
@@ -425,11 +504,26 @@ test("pinned category descriptors prevent deterministic read write delete and ve
         },
       });
 
-      if (operation === "read") assert.equal(await store.readContentByUri(artifact.uri), "trusted");
-      if (operation === "write") await store.put("safe", "item", "updated", "updated");
-      if (operation === "delete") await store.delete(artifact.uri);
-      if (operation === "verify") {
-        store.verifyAndDispatch([artifact.uri], [`sha256:${sha256("trusted")}`], () => undefined);
+      const operate = async () => {
+        if (operation === "read") assert.equal(await store.readContentByUri(artifact.uri), "trusted");
+        if (operation === "write") await store.put("safe", "item", "updated", "updated");
+        if (operation === "delete") await store.delete(artifact.uri);
+        if (operation === "verify") {
+          store.verifyAndDispatch([artifact.uri], [`sha256:${sha256("trusted")}`], () => undefined);
+        }
+      };
+      if (process.platform === "linux") {
+        // The descriptor-relative projection keeps the operation on the pinned
+        // inode, so a swapped name cannot disturb it.
+        await operate();
+      } else {
+        // The path-based fallback cannot follow a swapped name: it must refuse
+        // rather than read or write whatever now occupies the path.
+        await assert.rejects(
+          operate(),
+          /artifact integrity|symlink|symbolic links|ELOOP/i,
+          `the fallback must refuse to ${operation} through a swapped category`,
+        );
       }
       assert.equal(swapped, true, "the deterministic swap hook must exercise the race window");
       assert.equal(await readFile(join(outside, `${artifact.id}.txt`), "utf8"), "outside");
@@ -706,7 +800,16 @@ test("a reopened store rejects a replaced lock directory while an older store ho
       await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root identity changed/i);
     } finally {
       releaseFirst();
-      await firstWrite;
+      if (process.platform === "linux") {
+        // On Linux the release travels through the pinned descriptor, so it
+        // completes even though the directory was swapped out from under it.
+        await firstWrite;
+      } else {
+        // The path-based fallback cannot safely release a lock whose
+        // directory was swapped mid-critical-section; it fails closed instead
+        // of touching whatever now occupies the path.
+        await assert.rejects(firstWrite, /FILE_LOCK_RELEASE_FAILED|writer lock/i);
+      }
     }
   } finally {
     await rm(dir, { recursive: true, force: true });
