@@ -121,7 +121,11 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   private async call(args: string[]): Promise<Record<string, unknown>> {
     let res: HindsightRunResult;
     try {
-      res = await this.run(this.cli, [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(this.timeoutMs)] : [])], this.timeoutMs + 250);
+      res = await this.run(
+        this.cli,
+        [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(this.timeoutMs)] : [])],
+        this.timeoutMs + 250,
+      );
     } catch (error) {
       const e = error as { killed?: boolean; code?: unknown };
       throw new HindsightError(e?.killed || e?.code === "ETIMEDOUT" ? "timeout" : "unavailable");
