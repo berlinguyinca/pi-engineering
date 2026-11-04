@@ -1,12 +1,14 @@
 /**
- * FIX-3B: validateHandoffSchema against the REAL protocol schema (read from templates/, never stubbed) and the real
- * committed example record, plus the defect classes the handoff names (totality and the writer land in FIX-3B2).
+ * FIX-3B + FIX-3B2: validateHandoffSchema against the REAL protocol schema (read from templates/, never stubbed)
+ * and the real committed example record, every defect class the handoff names, totality under hostile input,
+ * and writeHandoff into a missing directory (FIX-3B2).
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { validateHandoffSchema } from "../../src/bootstrap/handoffWriter.ts";
+import { validateHandoffSchema, writeHandoff } from "../../src/bootstrap/handoffWriter.ts";
 import { canonicalHash } from "../../src/bootstrap/resultGate.ts";
 
 const SCHEMA: unknown = JSON.parse(readFileSync(new URL("../../docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json", import.meta.url), "utf8"));
@@ -50,3 +52,16 @@ test("null is accepted exactly where the schema allows it, and nowhere else", ()
   assert.deepEqual(blocks({ ...RECORD, parentHandoffHash: null }), ["$.parentHandoffHash: disallowed additional property"], "parentHandoffHash is a task-manifest field: the handoff schema declares no such property and forbids additional ones");
 });
 
+test("hostile schema or record input yields blockers and never an exception", () => {
+  assert.deepEqual(blocks(RECORD, null), ["$: schema is not an object: null"]); assert.deepEqual(blocks(RECORD, "x"), ['$: schema is not an object: "x"']);
+  assert.deepEqual(blocks({ a: "x" }, objectSchema({ a: { items: { type: "string" } } })), ['$.a: items declared but value is "x", not an array']); assert.deepEqual(blocks({ a: [1] }, objectSchema({ a: { type: "array", items: "nope" } })), ['$.a.items: schema is not an object: "nope"']);
+  assert.deepEqual(blocks({ a: 1 }, { type: "object", required: [null] }), ["$.null: schema required entry is not a string"]);
+  noThrow(RECORD, []); noThrow(null); noThrow([]); noThrow({ ...RECORD, commands: { ...COMMAND } });
+});
+
+test("writeHandoff creates a missing nested directory and leaves exactly one immutable handoff", () => {
+  const dir = join(mkdtempSync(join(tmpdir(), "fix3b-write-")), "deep", "nested"); const written = writeHandoff(dir, "FIX-3B", RECORD);
+  assert.deepEqual(written, { path: join(dir, "FIX-3B.handoff.json"), handoffHash: canonicalHash(RECORD) }); assert.deepEqual(readdirSync(dir), ["FIX-3B.handoff.json"], "exactly one handoff, no .tmp left behind");
+  const stamped = JSON.parse(readFileSync(written.path, "utf8")) as Record<string, unknown>; const unsigned = { ...stamped }; delete unsigned.handoffHash;
+  assert.equal(stamped.handoffHash, canonicalHash(unsigned), "handoffHash == canonicalHash(parsed minus handoffHash)"); assert.deepEqual(blocks(stamped), [], "the stamped file itself still conforms");
+});

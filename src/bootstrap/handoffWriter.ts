@@ -8,6 +8,8 @@
  * rules the writer's own stamping breaks: it is not required, and it is never an "additional property". It is
  * still type-checked when present. Nothing else is exempt.
  */
+import { mkdirSync } from "node:fs";
+import { writeHandoff as writeHandoffAtomic } from "./resultGate.ts";
 
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const lit = (value: unknown): string => JSON.stringify(value) ?? String(value);
@@ -41,4 +43,9 @@ function walk(value: unknown, schema: unknown, path: string, top: boolean, block
 /** Blockers for `record` against `schema`; `[]` means it conforms. Pure, never throws — hostile input is a blocker. */
 export function validateHandoffSchema(record: Record<string, unknown>, schema: unknown): string[] {
   const blockers: string[] = []; walk(record, schema, "$", true, blockers); return blockers;
+}
+
+/** resultGate's writer with every rule intact (canonical hash excluding `handoffHash`, tmp + rename, never overwrite, same return value) plus mkdir -p, so `.<taskId>.handoff.<pid>.tmp` can no longer fail ENOENT in a missing directory. */
+export function writeHandoff(dir: string, taskId: string, record: Record<string, unknown>): { path: string; handoffHash: string } {
+  mkdirSync(dir, { recursive: true }); return writeHandoffAtomic(dir, taskId, record);
 }
