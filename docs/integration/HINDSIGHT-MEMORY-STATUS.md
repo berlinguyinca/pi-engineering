@@ -109,6 +109,14 @@ Live proof, same command as the failing runs:
   to guess — "durable memory for this project failed to load this turn (memory request
   timed out), and an unavailable memory is not the same as an empty one".
 
+Re-checked on the merged tree (main through #573) against the same client: readiness
+990 ms and one 4213-byte `pi-engineering-memory` block of `canary-facts` records reaching
+the model context. With `PI_HINDSIGHT_CLI=/nonexistent/herdr-memory` the same turn carries
+instead a 236-byte notice — "could not be read this turn (memory service unavailable);
+treat it as unavailable, not empty" — plus the headless warning "Memory: memory service
+unavailable. Use /memory setup to check the herdr-memory client on this machine.", which
+names the client rather than a host and key.
+
 Two tests asserted the old silent-fail contract and now assert the notice:
 `test/unit/hindsight-memory.test.ts` ("automatic recall hangs") and
 `test/integration/everyday-memory.test.ts` (client loses its credential mid-scenario).
