@@ -145,7 +145,13 @@ showed:
   contract-directory protection described above. That was a defect and is fixed;
   the same probe now allows the scratch write and still denies the contract file.
 
-`contractHash(contract)` is a stable sha256 over the sorted authorization sets.
+`contractHash(contract)` is a sha256 over the **authorization** the contract
+grants: `policyRevision`, `mode`, `workspace`, the sorted `readRoots`,
+`writeRoots`, `scratchRoots`, `allowedHosts`, `externalEffects`, `allowedTools`
+and `allowedCommands`, plus `acceptanceCriteria` in the order written. Identity
+(`taskId`, `objective`, `owner`) and host-injected state (`protectedPaths`) are
+deliberately excluded, so the operator can recompute the value from the contract
+file alone and two unrelated tasks with identical scope share a fingerprint.
 Every decision record carries `revision` + `contractHash`, so a log line says
 which exact authorization was in force; handoffs and approvals bind the same
 hash.

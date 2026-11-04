@@ -406,3 +406,57 @@ test("shell parser: chains, quotes, heredocs and redirects", () => {
 test("home directory is not implicitly readable", () => {
   assert.equal(bash(investigation(), `cat ${homedir()}/.zshrc`).verdict, "deny");
 });
+
+test("contractHash fingerprints authorization, so the operator can recompute it from the file", () => {
+  const written = {
+    taskId: "peak-picking",
+    objective: "Diagnose peak picking",
+    owner: "agent",
+    mode: "investigation",
+    policyRevision: 4,
+    workspace: repo,
+    readRoots: [repo, related],
+    writeRoots: [],
+    scratchRoots: [scratch],
+    allowedHosts: ["api.example.com"],
+    externalEffects: ["remote_read"],
+    allowedTools: ["read", "grep"],
+    acceptanceCriteria: ["root cause named", "reproduction attached"],
+  };
+  const asFile = contractHash(parseContract(written));
+  // What the runtime actually hashes: the same file plus the host's own
+  // injections and a different identity. The fingerprint must not move.
+  const asRuntime = contractHash(
+    parseContract({
+      ...written,
+      taskId: "another-task",
+      objective: "something else entirely",
+      missionId: "MSN-9",
+      protectedPaths: [join(scratch, "contract.json"), join(scratch, "decisions.jsonl")],
+    }),
+  );
+  assert.equal(asRuntime, asFile);
+  // Any change to what is permitted moves it.
+  for (const change of [
+    { policyRevision: 5 },
+    { mode: "implementation", writeRoots: [repo] },
+    { readRoots: [repo] },
+    { scratchRoots: [] },
+    { allowedHosts: [] },
+    { externalEffects: [] },
+    { allowedTools: ["read"] },
+    { workspace: related },
+    { acceptanceCriteria: ["root cause named"] },
+  ]) {
+    assert.notEqual(contractHash(parseContract({ ...written, ...change })), asFile, `change ${JSON.stringify(change)}`);
+  }
+  // Order of set-like fields is irrelevant; order of criteria is not.
+  assert.equal(
+    contractHash(parseContract({ ...written, readRoots: [related, repo], allowedTools: ["grep", "read"] })),
+    asFile,
+  );
+  assert.notEqual(
+    contractHash(parseContract({ ...written, acceptanceCriteria: ["reproduction attached", "root cause named"] })),
+    asFile,
+  );
+});
