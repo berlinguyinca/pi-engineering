@@ -127,9 +127,17 @@ In order — 1 and 2 are the gate; 3 is the audit that tells you whether the res
 
 ## Outstanding operator decisions (not mine to make)
 
-- **Nothing in this chain is pushed.** `origin` is `berlinguyinca/pi-engineering-runtime`, while
-  every record declares `repo=berlinguyinca/pi-engineering`. Confirm which repository is
-  authoritative before pushing or opening PRs — the review verdicts above assume local git only.
+- **There is no remote mismatch.** `origin` is `https://github.com/berlinguyinca/pi-engineering-runtime`
+  while every record declares `repo=berlinguyinca/pi-engineering`, which looked like two repositories
+  claiming to be authoritative. They are one: the repository was renamed, and GitHub redirects.
+  `gh repo view berlinguyinca/pi-engineering-runtime` now reports
+  `nameWithOwner=berlinguyinca/pi-engineering`, and a push to the old URL lands in the new one.
+  Nothing to decide — but records and docs should cite `pi-engineering`, since the old name only
+  survives as a redirect. **[now]**
+- This unit is pushed as `fix/handoff-lineage-reachability` with **PR #603** against
+  `harness-reliability-bootstrap-20261103`, the base PRs #600 and #601 use. `main` is untouched.
+  The rest of the chain still has **85 commits ahead of `origin/main`** and is unmerged, which is
+  consistent with the verdict above rather than an accident waiting to be fixed.
 - The tracked manifest carries **no `status` and no accepted-sha field** on any of its 51 tasks, so
   accepted/rejected state lives only in the conductor's working copy. Whether that state becomes
   tracked data is a design decision.
