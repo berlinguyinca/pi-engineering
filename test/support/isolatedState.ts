@@ -7,10 +7,24 @@
  * `~/.pi/pi-engineering`. Tests that need their own roots set
  * PI_ENGINEERING_STATE_DIR / PI_ENGINEERING_HOME themselves.
  */
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { stateHooks as safeGitStateHooks, testHooks as safeGitTestHooks } from "../../src/git/safeGit.ts";
+
+// Canonicalize the temp root once, for every test in the process. On macOS
+// `$TMPDIR` lives behind `/var` → `/private/var`, while Pi resolves repositories,
+// worktrees and its own git state with `realpathSync`. A test that hands out the
+// unresolved form hands out a second name for the same directory: scope checks
+// refuse it ("Explicit workspace path crosses a symlink boundary"), and git
+// resolves the two representations against each other into a doubled prefix
+// (`/private/private/var/…`) that fails every `mkdir` under a repository's
+// common dir. `os.tmpdir()` re-reads `TMPDIR` on every call, so this reaches
+// every `mkdtemp(join(tmpdir(), …))` in the suite — 700+ call sites, one line.
+const canonicalTmp = realpathSync(tmpdir());
+if (process.env.TMPDIR) process.env.TMPDIR = canonicalTmp;
+if (process.env.TMP) process.env.TMP = canonicalTmp;
+if (process.env.TEMP) process.env.TEMP = canonicalTmp;
 
 // Memory setup can write a revision marker, and model commands write models.json.
 // Neither profile convention may fall through to the developer's real ~/.pi/agent.
