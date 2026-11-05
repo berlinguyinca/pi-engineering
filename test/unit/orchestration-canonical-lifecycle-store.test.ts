@@ -137,12 +137,12 @@ describe("a journal written before this change (R-LIFE)", () => {
 });
 
 describe("snapshot canonicalState (R-LIFE)", () => {
-  it("adds canonicalState to mission entries and keeps contractVersion at 3", () => {
+  it("adds canonicalState to mission entries and is at contractVersion 4", () => {
     const store = MissionStore.open(JsonlEventStore.inMemory());
     const m = store.createMission(MISSION);
     const file = buildMissionSnapshotFile([{ mission: m, tasks: [], findings: [] }]);
-    assert.equal(file.contractVersion, 3);
-    assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 3);
+    assert.equal(file.contractVersion, 4);
+    assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 4);
     assert.equal(file.missions[0]?.canonicalState, "CREATED");
   });
 

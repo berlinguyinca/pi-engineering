@@ -93,7 +93,7 @@ describe("mission snapshot publisher (spec 08 §API boundary)", () => {
     });
 
     const file = buildMissionSnapshotFile([{ mission: current, tasks: [task], findings: [] }]);
-    assert.equal(file.contractVersion, 3);
+    assert.equal(file.contractVersion, 4);
     assert.deepEqual(file.missions[0]!.acceptanceCriteria, [
       { id: "AC-verified", criterion: "verified output", status: "pending" },
     ]);

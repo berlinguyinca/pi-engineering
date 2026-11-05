@@ -934,6 +934,7 @@ export class EngineeringRuntime {
             verifierStages: buildVerifierStages(this.missionStore!.listValidationEvidence(m.mission_id)),
             lifecycle: this.missionStore!.getCanonicalLifecycle(m.mission_id),
             routingDecisions: this.missionStore!.listRoutingDecisions(m.mission_id),
+            githubLinks: this.missionStore!.listGithubLinks(m.mission_id),
           }));
           // FR-04: after recovery is granted, the republish finalizes the stale
           // tag before the file is built so the freshly written file is clean;

@@ -13,6 +13,8 @@
 
 import { readFile } from "node:fs/promises";
 
+import { parseCanonicalId } from "../github/refs.ts";
+import type { GithubLinkRecord } from "../github/types.ts";
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import { type MissionModelSummary, summarizeMissionModels } from "./missionModels.ts";
 import type { CanonicalLifecycle } from "./missionStore.ts";
@@ -34,7 +36,8 @@ import type {
   ReviewFinding,
 } from "./types.ts";
 
-export const MISSION_SNAPSHOT_CONTRACT_VERSION = 3;
+export const MISSION_SNAPSHOT_CONTRACT_VERSION = 4;
+export const MISSION_SNAPSHOT_MAX_LINKS = 100;
 export const MISSION_SNAPSHOT_FILENAME = "orchestration-snapshot.json";
 
 /**
@@ -190,6 +193,27 @@ export interface MissionSnapshotMission {
    */
   ownerPid?: number;
   publishedAtMs?: number;
+  /**
+   * Additive v4: the Mission record's own timestamps, verbatim. Omitted when
+   * the record has none (a running mission has no `completed_at`); never
+   * defaulted or inferred.
+   */
+  created_at?: string;
+  completed_at?: string;
+  /**
+   * Additive v4: GitHub issues / pull requests linked to this mission, taken
+   * ONLY from stored active GithubLinkRecords (never parsed from title, goal or
+   * branch text). Omitted when the github layer holds none. Deduped, sorted by
+   * repository, kind, number, and bounded by MISSION_SNAPSHOT_MAX_LINKS.
+   */
+  links?: MissionSnapshotLink[];
+}
+
+export interface MissionSnapshotLink {
+  kind: "issue" | "pull_request";
+  /** `owner/name`, lowercase, github.com only. */
+  repository: string;
+  number: number;
 }
 
 export interface MissionSnapshotTask {
@@ -308,6 +332,30 @@ export interface MissionSpecInput {
   resumeCondition: string | null;
 }
 
+/** Project stored link records to the snapshot's link list; pure, honest, bounded. */
+export function snapshotLinksOf(
+  missionId: string,
+  records: ReadonlyArray<GithubLinkRecord> | undefined,
+): MissionSnapshotLink[] {
+  const byKey = new Map<string, MissionSnapshotLink>();
+  for (const rec of records ?? []) {
+    if (rec.missionId !== missionId || rec.status !== "active") continue;
+    const ref = parseCanonicalId(rec.target);
+    // Only github.com is projected: a bare owner/name would be ambiguous on another host.
+    if (!ref || ref.host !== "github.com" || ref.kind !== rec.targetKind) continue;
+    const link: MissionSnapshotLink = {
+      kind: ref.kind === "pr" ? "pull_request" : "issue",
+      repository: `${ref.owner}/${ref.repo}`,
+      number: ref.number,
+    };
+    byKey.set(`${link.repository}|${link.kind}|${link.number}`, link);
+  }
+  const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  return [...byKey.values()]
+    .sort((a, b) => cmp(a.repository, b.repository) || cmp(a.kind, b.kind) || a.number - b.number)
+    .slice(0, MISSION_SNAPSHOT_MAX_LINKS);
+}
+
 export function buildMissionSnapshot(
   mission: Mission,
   tasks: OrchestrationTask[],
@@ -322,12 +370,17 @@ export function buildMissionSnapshot(
   },
   lifecycle?: CanonicalLifecycle,
   routingDecisions?: ReadonlyArray<RoutingDecision>,
+  githubLinks?: ReadonlyArray<GithubLinkRecord>,
 ): MissionSnapshotMission {
+  const links = snapshotLinksOf(mission.mission_id, githubLinks);
   return {
     id: mission.mission_id,
     revision: mission.revision,
     title: mission.title,
     goal: mission.goal,
+    ...(mission.created_at ? { created_at: mission.created_at } : {}),
+    ...(mission.completed_at ? { completed_at: mission.completed_at } : {}),
+    ...(links.length ? { links } : {}),
     workflowClass: mission.workflow_class,
     status: mission.status,
     canonicalState: lifecycle?.canonicalState ?? toCanonical(mission.status),
@@ -444,6 +497,8 @@ export function buildMissionSnapshotFile(
     lifecycle?: CanonicalLifecycle;
     /** Latest model-routing decision per task+role; fills modelUse[].why. */
     routingDecisions?: ReadonlyArray<RoutingDecision>;
+    /** Stored GitHub link records for this mission; absent or empty means no `links`. */
+    githubLinks?: ReadonlyArray<GithubLinkRecord>;
   }>,
   /** Additive storage-pressure substate (disk-pressure recovery FR-04). */
   storagePressure?: StoragePressureSnapshot | null,
@@ -464,6 +519,7 @@ export function buildMissionSnapshotFile(
           : undefined,
         m.lifecycle,
         m.routingDecisions,
+        m.githubLinks,
       ),
     ),
     ...(storagePressure ? { storagePressure } : {}),

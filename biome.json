@@ -10,7 +10,8 @@
       "services",
       "extensions/split-view",
       "test/fixtures/backpressure-conformance-v1.json",
-      "test/fixtures/mission-snapshot-v3.golden.json"
+      "test/fixtures/mission-snapshot-v4.golden.json",
+      "test/fixtures/mission-snapshot-v3-legacy.json"
     ]
   },
   "formatter": {
