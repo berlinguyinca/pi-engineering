@@ -797,6 +797,30 @@ export class Ledger {
     return entity;
   }
 
+  /**
+   * Attach recorded evidence to an entity that already exists (issue #506). A
+   * reproduced finding used to land as a claim with nowhere to put the output
+   * that reproduced it, so it stayed indistinguishable from a guess. The claim
+   * text and status are untouched — attaching evidence says what the claim rests
+   * on, it does not certify the claim.
+   */
+  async attachEvidence(
+    entityId: string,
+    evidenceId: string,
+    workItemId: string | null,
+    actor: Actor,
+    write?: LedgerWriteOptions,
+  ): Promise<LedgerEntity | null> {
+    const entity = this.entities.get(entityId);
+    if (!entity) return null;
+    if (entity.evidence.includes(evidenceId)) return entity;
+    // One in-place event, applied once durable, so a fenced (rejected) write
+    // leaves no phantom attachment behind — same rule as updateEntityStatus.
+    const updated: LedgerEntity = { ...entity, evidence: [...entity.evidence, evidenceId] };
+    await this.emitWith("entity.updated", workItemId, actor, { entity: updated }, write);
+    return updated;
+  }
+
   async updateEntityStatus(
     id: string,
     status: EntityStatus,

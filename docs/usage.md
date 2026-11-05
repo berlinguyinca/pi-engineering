@@ -1711,6 +1711,17 @@ the SQLite registry is kept on a machine-local runtime directory automatically.
 - `/ledger hypothesis` — claims not yet promoted to facts.
 - `/verify` — run verification yourself and see the captured log artifact.
 
+`ledger_claim` refuses a claim that states a count (tests, commits, files, lines)
+unless the cited machine output reports that number. `ledger_evidence` is how you
+produce something citable: it stores the output of a command you ran as an
+`EVID-…` entity plus an artifact, derives status from the exit code and metrics
+(`tests`, `files`, `lines`, …) from the output text itself, and attaches the record
+to a finding when you name one. There is no parameter for a count, a status, or a
+trust level, because a number the caller asserts is not a measurement. Trust is
+always `observed`: the runtime did not run the command, so the record is attested
+output a reviewer can re-run, not proof of execution. Cite the id in `ledger_claim`
+and the claim reports how it is backed (`backedBy`).
+
 ## Risk-aware legacy verification and review
 
 For legacy `/engineer` and tournament candidates, a low risk label enables cheap
@@ -1758,8 +1769,8 @@ allowlist, plus its executor-owned terminal result tool. Supplying tools to the
 executor makes them available for selection; it does not grant them to every
 role. Custom callers must explicitly name safe retrieval tools they need, such as
 `ledger_read`, `artifact_read`, `repo_search`, `symbol`, and `tests_for`. Nested
-`mission` execution and `ledger_claim` are not implicitly granted to reviewers
-or scouts.
+`mission` execution, `ledger_claim` and `ledger_evidence` are not implicitly granted
+to reviewers or scouts.
 
 An explicit model-routing refusal stops planner-worker dispatch for every role;
 it cannot silently select the worker's default model. Standalone hosts with no

@@ -230,8 +230,8 @@ State persists under `<repoRoot>/.pi-eng/lifecycle/`. See
 ## Extension surface
 
 - Commands: `/engineer`, `/ledger`, `/context`, `/verify`, `/review`, `/challenge`.
-- Tools: `ledger_read`, `ledger_claim`, `artifact_read`, `repo_search`, `symbol`,
-  `tests_for` — resolved against the runtime for the calling cwd, so worker
+- Tools: `ledger_read`, `ledger_claim`, `ledger_evidence`, `artifact_read`, `repo_search`,
+  `symbol`, `tests_for` — resolved against the runtime for the calling cwd, so worker
   sessions and the interactive session share one durable ledger.
 
 ### git hardening: allow-list config, shadow common directory, remote pin
