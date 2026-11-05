@@ -30,7 +30,7 @@ control-plane foundation (new module `src/platform/`):
 | 8 — Pi Web control plane | `ControlPlane` normalized adapter exposing projects/runs/workers/events/tests/reviews/routing/memory/interventions + `scripts/control-server.ts` HTTP server | `src/platform/ControlPlane.ts`, `scripts/control-server.ts` |
 | 9 — MCP + security | project/role-scoped MCP registry (discovery ≠ permission, invocation audit, child ceiling); project auth, capability ceilings, high-risk approval gate, risk classification | `src/platform/McpRegistry.ts`, `src/platform/security.ts` |
 | 12 — remote workers | one Worker contract, outbound authenticated channels, idempotent generation-keyed commands, disconnect → reconnect recovery | `src/platform/RemoteWorker.ts` |
-| 4/7 — memory | durable OpenViking offline outbox with secret redaction (never silently memoryless) | `src/platform/memoryOutbox.ts` |
+| 4/7 — memory | durable-memory offline outbox (written for OpenViking, since retired) with secret redaction (never silently memoryless) | `src/platform/memoryOutbox.ts` |
 | 6 — review isolation | structural reviewer brief builder + isolation gate | `src/platform/review.ts` |
 | 14/17 — testing | 50-worker load test, worker-crash / parent-restart (replay) recovery, reviewer isolation, outbox recovery, Plannotator decision recovery, full E2E loop test | `test/unit/platform-*.test.ts`, `test/integration/platform-*.test.ts` |
 | 18 — deployment | reference Docker Compose (control API, PostgreSQL, MinIO, Prometheus/Grafana) + Dockerfile; documents where external Pi Web/Plannotator plug in | `deploy/compose/control-plane/*` |
@@ -51,11 +51,10 @@ New package scripts: `test:platform`, `platform:e2e`, `platform:serve`.
 - **Plannotator** — external plan gate; integrated via `PlannotatorAdapter`
   (transport seam), including interactive, explicit autonomous bypass, policy
   and disabled modes. No replacement Plannotator UI/service.
-- **OpenViking** — external shared durable memory; `OpenVikingProvider`
-  (`src/blackhole/durable.ts`) is the existing HTTP client; the new
-  `MemoryOutbox` covers offline recovery. `services/openviking` is a thin
-  local dev/test HTTP endpoint (Postgres-backed), distinct from the external
-  production service.
+- **OpenViking** — RETIRED. `OpenVikingProvider` and `services/openviking`
+  no longer exist; durable memory is Hindsight via the `herdr-memory` CLI
+  (`src/blackhole/hindsight.ts`). The text below describes the original
+  OpenViking-era design and is kept as history.
 - **InferWeave** — external; `InferWeaveAdapter` seam exists. Seat/backpressure
   semantics are follow-up (see gaps).
 - **AutoSpec** — external sibling; `AutoSpecAdapter` seam exists; the
@@ -101,7 +100,7 @@ No shared-Blackhole server / shared-filesystem memory design was implemented
   snapshot for the external Pi Web; production must sit behind the
   `ProjectAuth`/capability-ceiling layer (spec 11). Documented as glue, not a
   replacement UI.
-- **OpenViking offline outbox is local-first.** The outbox is pi-engineering-owned
+- **Memory offline outbox is local-first (historical: OpenViking, now retired).** The outbox is pi-engineering-owned
   durable state for its own memory commits; OpenViking itself stays external.
 
 ---
@@ -191,7 +190,7 @@ and `GET /control` (verified: workspace `eng`, projects 1, events 2 on boot).
 - **InferWeave seat/backpressure** — generic gateway admission (429/503) exists;
   InferWeave-specific seat/resource semantics and 503+Retry-After handling are
   follow-up (spec 09).
-- **OpenViking canonical project-session mapping + Git ingestion** — distinct
+- **(Retired: OpenViking) canonical project-session mapping + Git ingestion** — distinct
   per-parent/child OpenViking sessions tied to canonical project identity, and
   Git-ingestion/watch preference, are partial (follow-up, spec 07).
 - **AutoSpec live loop + policy commit/PR** — the loop is implemented against
@@ -217,9 +216,8 @@ and `GET /control` (verified: workspace `eng`, projects 1, events 2 on boot).
 3. Add InferWeave seat/backpressure adapter honoring 503+Retry-After and 429 on
    top of the gateway admission controller; remove any residual fixed-context
    assumptions (order 5/9/10).
-4. Map canonical project identity → distinct OpenViking sessions per
-   parent/child; add Git-ingestion preference; wire the outbox to the
-   `OpenVikingProvider` (order 4/7).
+4. (Obsolete: OpenViking and `OpenVikingProvider` were retired in favour of
+   Hindsight via the `herdr-memory` CLI; no longer planned.)
 5. Wire AutoSpec's public orchestration into the plan→implement→review→commit
    loop with policy-gated commit/PR (order 10/15).
 6. Point a real Pi Web deployment at `control-server.ts`; record any upstream

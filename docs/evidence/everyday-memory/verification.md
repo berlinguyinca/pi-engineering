@@ -1,5 +1,15 @@
 # Everyday memory verification — 2026-09-14
 
+> **Superseded transport — record kept as verified at the time.** This is the
+> evidence for the memory *behaviour* (explicit `/remember`, bounded ephemeral
+> recall, visible footer state, no credential in diagnostics), which still holds.
+> The transport it exercised no longer exists: the OpenViking HTTP client, the
+> interactive setup dialog, the saved connection profile and the local HTTP
+> service were retired in favour of the `herdr-memory` CLI (`memory.hindsight` in `engineering.yaml`).
+> Do not re-run the HTTP steps below; the equivalent CLI proof is
+> `test/integration/everyday-memory.test.ts` with
+> `test/fixtures/herdr-memory-stub.sh`.
+
 Scope: everyday private-memory commands/hooks and update-time connection setup
 in the engineering harness, initially based on upstream commit `1716585` and
 integrated with the subsequently accepted status-bar change `50ec1fb`. No portal,

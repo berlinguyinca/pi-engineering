@@ -91,7 +91,10 @@ test("policy: role pins move and the comments survive", () => {
   // alias covers 27B and text builds — moving a flash_next pin there would put a
   // different model behind a name chosen for quality, so it is refused and
   // reported rather than silently widened.
-  assert.match(plan.text, /reviewer:\n {6}model: development\/qwen3\.8-flash_next-modality-vision-quant-mxfp4_fp8_gptq\n/);
+  assert.match(
+    plan.text,
+    /reviewer:\n {6}model: development\/qwen3\.8-flash_next-modality-vision-quant-mxfp4_fp8_gptq\n/,
+  );
   const reviewer = plan.unresolved.find((u) => u.id.startsWith("qwen3.8-flash_next"));
   assert.ok(reviewer, "the flash_next pin is reported as not moved");
 });
@@ -167,7 +170,10 @@ test("a pin moves only onto an alias that answers as the model it named", () => 
     members: { "qwen3.8": [FLASH_V, NEXT_W3] },
   };
   assert.equal(aliasForPin(Q27B, onlyFamily), undefined);
-  const { changes, unresolved } = planPinMigration(`pin: metabolomics/${Q27B}\n`, new Map([["metabolomics", onlyFamily]]));
+  const { changes, unresolved } = planPinMigration(
+    `pin: metabolomics/${Q27B}\n`,
+    new Map([["metabolomics", onlyFamily]]),
+  );
   assert.equal(changes.length, 0);
   assert.equal(unresolved[0]!.id, Q27B);
   assert.match(unresolved[0]!.blocked!.because, /its members are flash, flash_next, not 27b/);
@@ -205,8 +211,5 @@ test("an operator alias that shares no name with the id still takes the pin", ()
   };
   assert.equal(aliasForPin(NEXT_W3, served), "qwen3.8-text");
   // Among aliases that all resolve to it, the most specific name wins.
-  assert.equal(
-    aliasForPin("laya-typed-decisions-modality-text-quant-fp16", served),
-    "laya-text",
-  );
+  assert.equal(aliasForPin("laya-typed-decisions-modality-text-quant-fp16", served), "laya-text");
 });

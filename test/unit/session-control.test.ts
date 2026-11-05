@@ -4,9 +4,12 @@ import { chmod, mkdir, mkdtemp, readdir, stat, symlink, writeFile } from "node:f
 import { rm } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, test } from "node:test";
 import {
+  ControlSocketLimitError,
+  SOCKET_PATH_LIMIT,
+  controlSocketPath,
   discoverSessions,
   queryAllSessions,
   requestSession,
@@ -236,7 +239,11 @@ test("discovery handles 48 concurrent sessions and reports an unreachable descri
     assert.equal(all.length, 48);
     assert.equal(all.filter((row) => row.reply?.ok).length, 48);
     const staleId = randomUUID();
-    const stale = { ...servers[0]!.descriptor, instanceId: staleId, socketPath: join(control, `${staleId}.sock`) };
+    const stale = {
+      ...servers[0]!.descriptor,
+      instanceId: staleId,
+      socketPath: controlSocketPath(control, staleId),
+    };
     await writeFile(join(control, `${stale.instanceId}.json`), JSON.stringify(stale), { mode: 0o600 });
     const again = await queryAllSessions(control, { concurrency: 8, timeoutMs: 250 });
     assert.equal(again.length, 49);
@@ -327,7 +334,7 @@ test("notes and status preserve UTF-8 characters split across socket frames", as
     assert.deepEqual(notes, ["Hello café"]);
 
     const fakeId = randomUUID();
-    const fakePath = join(control, `${fakeId}.sock`);
+    const fakePath = controlSocketPath(control, fakeId);
     const fake = (await import("node:net")).createServer((socket) => {
       socket.on("data", () => {
         const reply = Buffer.from(
@@ -366,7 +373,7 @@ test("discovery does not trust a socket that replies with the wrong ping nonce",
   const control = join(dir, "control");
   const server = await startSessionControl({ rootDir: control, cwd: dir, sessionId: "honest" });
   const impostorId = randomUUID();
-  const impostorPath = join(control, `${impostorId}.sock`);
+  const impostorPath = controlSocketPath(control, impostorId);
   const impostor = (await import("node:net")).createServer((socket) => {
     socket.on("data", () =>
       socket.end(
@@ -403,6 +410,58 @@ test("a symlinked control directory is rejected", async () => {
   );
 });
 
+test("a state dir too deep for sun_path still gets a working control socket (#583)", async () => {
+  const dir = await root();
+  // Any PI_ENGINEERING_STATE_DIR deep enough that `<root>/<instance>.sock` would not fit
+  // the kernel's sun_path — a nested project dir or a CI workspace path used to make the
+  // control socket uncreatable, and the failure was a bare Error.
+  const control = join(dir, ...Array.from({ length: 3 }, () => "a-deeply-nested-state-directory-segment"));
+  await mkdir(dirname(control), { recursive: true }); // the parent exists; Pi creates the control dir
+  assert.ok(
+    Buffer.byteLength(join(control, `${randomUUID()}.sock`)) > SOCKET_PATH_LIMIT,
+    "the fixture must overflow the limit on this platform",
+  );
+
+  const server = await startSessionControl({ rootDir: control, cwd: dir, sessionId: "deep-state" });
+  try {
+    assert.ok(Buffer.byteLength(server.socketPath) <= SOCKET_PATH_LIMIT);
+    assert.ok(!server.socketPath.startsWith(control), "the socket moved out of the state dir");
+    assert.match(server.socketPath, /pi-sc-hash-[0-9a-f]{12}/, "the path says why it is not under the state dir");
+    assert.equal((await stat(server.socketPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(dirname(server.socketPath))).mode & 0o777, 0o700);
+
+    const reply = await requestSession(server.descriptor, { version: 1, op: "ping", nonce: "deep-1" });
+    assert.ok(reply.ok);
+    assert.equal(reply.data.nonce, "deep-1");
+    // Discovery still reads the state dir; only the socket moved.
+    assert.equal((await discoverSessions(control)).length, 1);
+
+    // A descriptor may not point at a socket of the writer's choosing: discovery
+    // re-derives the path, so a forged one is skipped rather than connected to.
+    const forgedId = randomUUID();
+    await writeFile(
+      join(control, `${forgedId}.json`),
+      JSON.stringify({ ...server.descriptor, instanceId: forgedId, socketPath: join(dir, "someone-else.sock") }),
+      { mode: 0o600 },
+    );
+    assert.equal((await discoverSessions(control)).length, 1);
+  } finally {
+    await server.close();
+  }
+  // The hashed directory is Pi's to remove once the last session in it is gone.
+  await assert.rejects(stat(dirname(server.socketPath)));
+});
+
+test("when no socket path can fit, the error names the limit, the length and the setting (#583)", () => {
+  const message = new ControlSocketLimitError(join("/run/user/1000", "x".repeat(120)), "/very/deep/state/dir").message;
+  assert.match(message, /is \d+ bytes/);
+  assert.match(message, new RegExp(`${SOCKET_PATH_LIMIT}-byte Unix socket limit`));
+  assert.match(message, /sun_path/);
+  assert.match(message, /PI_ENGINEERING_CONTROL_DIR/);
+  assert.match(message, /PI_ENGINEERING_STATE_DIR/);
+  assert.match(message, /\/very\/deep\/state\/dir/);
+});
+
 test("Darwin default root stays below the socket limit despite a long GUI TMPDIR", () => {
   const env = {
     TMPDIR: "/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/",
@@ -410,7 +469,7 @@ test("Darwin default root stays below the socket limit despite a long GUI TMPDIR
   };
   const selected = sessionControlRoot(env, "darwin");
   assert.equal(selected, `/tmp/pi-engineering-${process.getuid?.() ?? "user"}`);
-  assert.ok(Buffer.byteLength(join(selected, `${randomUUID()}.sock`)) <= 100);
+  assert.ok(Buffer.byteLength(controlSocketPath(selected, randomUUID())) <= SOCKET_PATH_LIMIT);
   assert.equal(
     sessionControlRoot({ ...env, PI_ENGINEERING_CONTROL_DIR: "/explicit/private" }, "darwin"),
     "/explicit/private",

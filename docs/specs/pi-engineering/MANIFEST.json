@@ -112,5 +112,11 @@
       "sha256": "fea8aca62c460f519eaa1cc3230f75c3361422c6a0749096a7cef375c1e8a488",
       "bytes": 4771
     }
-  ]
+  ],
+  "amendments": {
+    "record": "AMENDMENTS.md",
+    "reason": "OpenViking HTTP transport retired; durable memory is Hindsight through the herdr-memory CLI (durable.kind: hindsight).",
+    "files": ["specs/07-openviking.md", "support/EXTERNAL_TOOLS_AND_OWNERSHIP.md"],
+    "note": "sha256/bytes above still describe revision 2026-09-15-v3; AMENDMENTS.md carries the working-copy hashes."
+  }
 }

@@ -2999,7 +2999,7 @@ export class EngineeringRuntime {
         req.context = effectiveContext;
       }
     }
-    // Hydrate from SHARED durable memory (OpenViking / shared file): surface
+    // Hydrate from SHARED durable memory (Hindsight / shared file): surface
     // evidence-promoted knowledge from OTHER workers/sessions so repeated or
     // parallel engineering work is not recomputed from scratch. This is the
     // cross-worker sharing read path. Provider failure degrades to nothing.
@@ -3013,7 +3013,7 @@ export class EngineeringRuntime {
       const query = `${opts.wi.id} ${role} ${task.slice(0, 120)}`;
       const shared = await this.blackhole.hydrate(query, 10);
       if (shared.length > 0) {
-        const block = `\n\n[openviking durable memory]\n${shared
+        const block = `\n\n[hindsight durable memory]\n${shared
           .map((r) => `[promoted ${r.promotedAt}] ${r.text}`)
           .join("\n")}`;
         effectiveContext = (effectiveContext ?? "") + block;
@@ -4078,6 +4078,16 @@ Goal: "${goal}"`;
         .filter((d) => Number.isInteger(d) && d >= 0 && d < created.length && d !== i)
         .map((d) => created[d]!.id);
       if (deps.length) await this.ledger.updateTask(created[i]!.id, { depends_on: deps }, wi.id, actor);
+    }
+    // The durable plan record behind the Work Graph's plan edges. Observational: it never fails or fails the plan.
+    try {
+      await this.transitions.recordPlan(
+        wi.id,
+        created.map((t) => ({ task_id: t.id, title: t.title })),
+        actor,
+      );
+    } catch (error) {
+      console.error(`plan record not written for ${wi.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
     await this.ledger.recordEntity(
       "decision",

@@ -9,9 +9,15 @@
  * Validation returns actionable errors instead of silently coercing values.
  */
 
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import {
+  DEFAULT_HINDSIGHT_SETTINGS,
+  type HindsightSettings,
+  validateHindsightSettings,
+} from "../blackhole/hindsightSettings.ts";
 import type { AdmissionRetrySettings } from "../inference/admissionConfig.ts";
 import { normalizeAdmissionConfig, validateAdmissionConfig } from "../inference/admissionConfig.ts";
 import type { LifecycleRisk } from "./types.ts";
@@ -232,6 +238,12 @@ export interface ExecutionConfig {
    */
   status_refresh_interval_ms?: number;
   /**
+   * How many idle sessions (unresolved work, no live run) the compact status row names, most recently active
+   * first, before collapsing the rest into `+K idle`. Sessions with a live run are always shown. Default 3;
+   * range 0..50.
+   */
+  status_idle_sessions?: number;
+  /**
    * A worker is stopped (failed, `error: "tool-loop"`) when this many consecutive completed tool calls are the
    * same call with the same result and no file-changing call in between (see src/workers/toolLoopGuard.ts).
    * Default 3; range 2..100.
@@ -245,6 +257,8 @@ export interface EngineeringPolicy {
   execution: ExecutionConfig;
   /** Mission time limits (opt-in caps + the hung-worker window). */
   limits: MissionLimitsConfig;
+  /** Durable memory (Hindsight over the herdr-memory CLI). YAML only; on by default (`enabled: false` turns it off). */
+  memory: { hindsight: HindsightSettings };
   /** Dotted keys from the global layer that repository config cannot weaken. */
   mandatory: string[];
   lifecycle: LifecycleConfig;
@@ -291,11 +305,13 @@ export const DEFAULT_POLICY: EngineeringPolicy = {
     heartbeat_interval_ms: 30_000,
     stale_after_ms: 300_000,
     status_refresh_interval_ms: 15_000,
+    status_idle_sessions: 3,
     tool_loop_limit: 3,
   },
   limits: {
     worker_inactivity_ms: 3_600_000,
   },
+  memory: { hindsight: { ...DEFAULT_HINDSIGHT_SETTINGS, scopes: [...DEFAULT_HINDSIGHT_SETTINGS.scopes] } },
   mandatory: [
     "policies.review.require_independent_review",
     "policies.review.independent_reviewer",
@@ -476,6 +492,7 @@ const NUMBER_RANGE_FIELDS: Record<string, [number, number]> = {
   "execution.heartbeat_interval_ms": [5_000, 3_600_000],
   "execution.stale_after_ms": [10_000, 86_400_000],
   "execution.status_refresh_interval_ms": [1_000, 3_600_000],
+  "execution.status_idle_sessions": [0, 50],
   "execution.tool_loop_limit": [2, 100],
   "lifecycle.max_remediation_rounds": [0, 20],
   "lifecycle.budget_ms": [10_000, 7_200_000],
@@ -610,6 +627,7 @@ export function validatePolicy(policy: EngineeringPolicy): PolicyIssue[] {
       severity: "warning",
     });
   }
+  issues.push(...validateHindsightSettings(policy.memory?.hindsight));
   if (policy.inference?.retry?.admission !== undefined) {
     issues.push(...validateAdmissionConfig(normalizeAdmissionConfig(policy.inference.retry.admission)));
   }
@@ -746,6 +764,94 @@ export async function loadExecutionConfig(cwd: string, agentDir?: string): Promi
     return { ...DEFAULT_POLICY.execution, ...policy.execution };
   } catch {
     return { ...DEFAULT_POLICY.execution };
+  }
+}
+
+export interface HindsightLoadResult {
+  settings: HindsightSettings;
+  issues: PolicyIssue[];
+}
+
+/**
+ * The effective `memory.hindsight` settings for a directory: defaults, then the
+ * global `engineering.yaml`, then the repository's `.pi/engineering.yaml`. A
+ * repository cannot choose the executable (`cli` is global-only), because that
+ * would let a cloned repo run an arbitrary program. Any invalid value fails
+ * closed: memory stays off and the issues say which key to fix. Never throws.
+ */
+export function loadHindsightSettings(cwd: string, agentDir?: string): HindsightLoadResult {
+  const defaults = (): HindsightSettings => ({
+    ...DEFAULT_HINDSIGHT_SETTINGS,
+    scopes: [...DEFAULT_HINDSIGHT_SETTINGS.scopes],
+  });
+  // Fail closed: invalid configuration turns memory off even though it is on by default.
+  const off = (issues: PolicyIssue[]): HindsightLoadResult => ({
+    settings: { ...defaults(), enabled: false },
+    issues,
+  });
+  const issues: PolicyIssue[] = [];
+  try {
+    const dir = agentDir ?? process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? "~", ".pi", "agent");
+    // Synchronous on purpose: two tiny files, and the interactive hooks rely on
+    // their first step running before they yield.
+    const read = (path: string): unknown => {
+      try {
+        return getPath(parseYaml(readFileSync(path, "utf-8")), "memory.hindsight");
+      } catch (err) {
+        // A cwd that is not a directory has no repository config; anything else unreadable fails closed.
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === "ENOTDIR" || code === "ENOENT") return undefined;
+        issues.push({ path, message: `unreadable: ${(err as Error).message}`, severity: "error" });
+        return undefined;
+      }
+    };
+    const globalLayer = read(join(dir, "engineering.yaml"));
+    const repoLayer = read(join(cwd, ".pi", "engineering.yaml"));
+    // The global file is authoritative. A cloned repository is untrusted input, so its layer may only
+    // opt OUT (`enabled: false`) or NARROW `scopes` to a subset of the global scopes. `cli` and `harness`
+    // (which picks the CLI's credential identity), and the timeouts/backoffs, are ignored with a warning.
+    let merged: unknown = defaults();
+    if (globalLayer !== undefined && globalLayer !== null) {
+      if (isPlain(globalLayer)) merged = deepMerge(merged, globalLayer);
+      else issues.push({ path: "memory.hindsight", message: "expected a mapping of settings", severity: "error" });
+    }
+    if (repoLayer !== undefined && repoLayer !== null) {
+      if (!isPlain(repoLayer)) {
+        issues.push({ path: "memory.hindsight", message: "expected a mapping of settings", severity: "error" });
+      } else {
+        // Type/range errors in the repository layer still fail closed, whether or not the key is honoured.
+        issues.push(...validateHindsightSettings(deepMerge(merged, repoLayer)));
+        const base = merged as HindsightSettings;
+        const next: Record<string, unknown> = { ...(base as unknown as Record<string, unknown>) };
+        const ignore = (key: string, why: string) =>
+          issues.push({
+            path: `memory.hindsight.${key}`,
+            message: `ignored in repository config; ${why}`,
+            severity: "warning",
+          });
+        for (const [key, value] of Object.entries(repoLayer)) {
+          if (key === "enabled") {
+            if (value === false) next.enabled = false;
+            else if (value === true && base.enabled === false)
+              ignore(key, "a repository cannot turn memory on over the global setting");
+          } else if (key === "scopes") {
+            if (Array.isArray(value) && value.every((x) => typeof x === "string" && base.scopes.includes(x))) {
+              next.scopes = value;
+            } else if (Array.isArray(value)) {
+              ignore(key, "a repository may only narrow the global scopes");
+            }
+          } else if (key in DEFAULT_HINDSIGHT_SETTINGS) {
+            ignore(key, "set it in the global engineering.yaml");
+          }
+        }
+        merged = next;
+      }
+    }
+    issues.push(...validateHindsightSettings(merged));
+    if (issues.some((i) => i.severity === "error")) return off(issues);
+    return { settings: merged as HindsightSettings, issues };
+  } catch (err) {
+    return off([...issues, { path: "memory.hindsight", message: (err as Error).message, severity: "error" }]);
   }
 }
 

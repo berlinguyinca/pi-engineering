@@ -4,7 +4,7 @@
  * Memory hierarchy (per the spec):
  *   1. Blackhole = local per-session working memory (ephemeral, session-scoped);
  *   2. EventStore/PostgreSQL = authoritative system-of-record (the ledger);
- *   3. OpenViking = promoted durable cross-session memory.
+ *   3. Hindsight (through the herdr-memory CLI) = promoted durable cross-session memory.
  *
  * The Blackhole store is deliberately NOT the system of record: every lifecycle
  * event and every promotion is emitted to the ledger so the EventStore remains
@@ -81,13 +81,14 @@ export type MemoryWorkerRole = keyof typeof MEMORY_WORKER_PRIORITIES;
  *  - `memory`       — single-process in-memory (default; no sharing).
  *  - `shared-file`  — append-only JSONL on a shared path; several workers on one
  *                     host share promoted memory (dependency-free, CI-friendly).
- *  - `openviking`   — the external OpenViking service for cross-machine sharing.
+ *  - `hindsight`    — the `herdr-memory` CLI backend for cross-machine sharing.
+ *                     The CLI owns its own config and credentials; Pi only names
+ *                     the executable, the scopes and a per-call timeout.
  */
 export type DurableStoreConfig =
   | { kind: "memory" }
   | { kind: "shared-file"; file: string }
-  | { kind: "openviking"; baseUrl: string; token?: string }
-  | { kind: "hindsight"; cli?: string; scopes?: string[]; timeoutMs?: number };
+  | { kind: "hindsight"; cli?: string; scopes?: string[]; timeoutMs?: number; harness?: string };
 
 export type PromotionState = "proposed" | "accepted" | "rejected" | "promoted" | "superseded";
 
@@ -134,7 +135,7 @@ export interface BlackholeManagerState {
   enabled: boolean;
   version: string;
   provider: "builtin" | "pi-blackhole" | "disabled";
-  /** Backing store for shared durable memory ("memory" | "shared-file" | "openviking"). */
+  /** Backing store for shared durable memory ("memory" | "shared-file" | "hindsight"). */
   durableKind: string;
   sessions: number;
   activeSessions: number;

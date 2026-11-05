@@ -17,8 +17,7 @@ import {
   type ExtensionContext,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
-import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
-import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
+import { hindsightBlackholeOption } from "../src/blackhole/hindsight.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
@@ -147,6 +146,8 @@ import { renderStatus } from "../src/status/layout.ts";
 import { type PresenceSeedScope, seedPresence } from "../src/status/presenceSeed.ts";
 import { StatusSurfaceBus } from "../src/status/surfaceBus.ts";
 import { WorkingStatusController } from "../src/status/working.ts";
+import { disciplineFromEnv } from "../src/taskDiscipline/config.ts";
+import { registerTaskDiscipline } from "../src/taskDiscipline/hook.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
@@ -162,9 +163,17 @@ import { makeVisionLineageHook } from "../src/visionDelegation/lineage.ts";
 import { VisionRegistry } from "../src/visionDelegation/registry.ts";
 import { LedgerWorkProjection } from "../src/work/ledgerProjection.ts";
 import { projectLegacyMissions } from "../src/work/legacyMissionAdapter.ts";
+import { ledgerLinkedPrs } from "../src/work/linkedPrs.ts";
+import { getSessionSummary } from "../src/work/sessionSummary.ts";
 import { StatusRowRefresher } from "../src/work/statusRowRefresher.ts";
 import { formatWorkStatus } from "../src/work/statusText.ts";
-import { formatTaskView, formatTeamView, formatWorkStatusRow, formatWorkSummary } from "../src/work/summaryText.ts";
+import {
+  formatSessionSummary,
+  formatTaskView,
+  formatTeamView,
+  formatWorkStatusRow,
+  formatWorkSummary,
+} from "../src/work/summaryText.ts";
 import { mergeWorkGraphs } from "../src/work/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
@@ -385,7 +394,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   if (openGeneration !== runtimeShutdownGeneration) {
     throw new Error("Runtime request was superseded by session shutdown");
   }
-  const blackhole = openVikingBlackholeOption(resolveMemoryEnvironment());
+  const blackhole = hindsightBlackholeOption(cwd, process.env.PI_CODING_AGENT_DIR?.trim() || undefined);
   const memoryIdentity = createHash("sha256")
     .update(JSON.stringify(blackhole ?? null))
     .digest("hex");
@@ -399,10 +408,11 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     }
     return opened.runtime;
   }
-  // OpenViking connection from the environment. If PI_OPENVIKING_BASE_URL is
-  // set, blackhole is enabled with the openviking durable store for EVERY repo
-  // this extension runs in — set it once per install and all repos share the
-  // deployed durable memory. Absent the env, blackhole stays off (unchanged).
+  // Hindsight connection from YAML (`memory.hindsight` in engineering.yaml). If
+  // `memory.hindsight.enabled` is true in the global config, blackhole is enabled
+  // with the hindsight durable store for EVERY repo this extension runs in — set
+  // it once per install and all repos share the deployed durable memory. Absent
+  // the config, blackhole stays off (unchanged).
   //
   // The open is published in `runtimeOpens` in the same synchronous step as the `pending` check above. The lineage and
   // attention lookups are real I/O (seconds under load); awaiting them BEFORE publishing left a window in which a
@@ -552,6 +562,7 @@ async function refreshWorkStatus(
     const staleAfterMs = execution.stale_after_ms;
     workRefresher = new StatusRowRefresher({
       intervalMs: execution.status_refresh_interval_ms ?? 15_000,
+      maxIdleSessions: execution.status_idle_sessions,
       setStatus: (text) => ui.setStatus?.("work", text),
       getGraph: async () => {
         const open = await repoKeys.lookup(cwd, runtimes).catch(() => undefined);
@@ -1190,6 +1201,11 @@ export default function (pi: ExtensionAPI) {
     // Identical-tool-call loops and unbounded bash test/build runs
     // (src/guard/toolCallGuard.ts; knobs in docs/usage.md, "Tool-call guard").
     registerToolCallGuard(pi as never);
+    // Task Contract gate (src/taskDiscipline; off unless PI_TASK_DISCIPLINE is set).
+    // Registered as its own tool_call/user_bash handlers so it never depends on
+    // the lifecycle controller's mutating-tool filter or its unattended auto-allow.
+    const discipline = disciplineFromEnv();
+    if (discipline) registerTaskDiscipline(pi, discipline);
     // One agent, one worktree (AGENTS.md), enforced: block this session's own
     // mutating calls against a repository's PRIMARY checkout so concurrent
     // sessions cannot destroy each other's uncommitted work there. Production
@@ -2892,9 +2908,20 @@ ${RECOVERY_PROMPT}`;
     return mergeWorkGraphs(...graphs);
   };
   pi.registerCommand("summary", {
-    description: "Deterministic work timeline from the work read model: tasks, runs, verification, blockers, handoffs.",
-    handler: async (_args, ctx) => {
+    description:
+      "Deterministic work timeline from the work read model: tasks, runs, verification, blockers, handoffs. /summary <session id> shows one session.",
+    handler: async (args, ctx) => {
       const rt = await getRuntime(ctx);
+      const sessionId = String(args ?? "").trim();
+      if (sessionId) {
+        ctx.ui.notify(
+          formatSessionSummary(
+            getSessionSummary(workGraphOf(rt), sessionId, { linkedPrs: ledgerLinkedPrs(rt.ledger) }),
+          ),
+          "info",
+        );
+        return;
+      }
       ctx.ui.notify(formatWorkSummary(workGraphOf(rt), rt.ledger.events()), "info");
     },
   });

@@ -65,10 +65,17 @@ export function metricEvidenceReports(evidence: Evidence, value: number): boolea
 }
 
 /** Count lines a command's own output printed: `# tests 12`, `12 tests`, `tests: 12`. */
+/** Adjectives that sit between a number and the noun it counts (`12 failing test cases`). */
+const COUNT_QUALIFIERS =
+  "(?:(?:unit|integration|e2e|smoke|failing|passing|failed|passed|skipped|pending|total|remaining|open|new|changed|broken)[ \t]+)*";
+
 const OUTPUT_COUNT_PATTERNS: RegExp[] = [
-  /#\s*(?:tests?|suites?|pass(?:ed)?|fail(?:ed)?|total|files?|lines?)\s+(\d[\d,]*)/gi,
-  /\b(\d[\d,]*)\s+(?:unit\s+|integration\s+)?(?:tests?|files?|lines?|commits?|requests?|cases?|assertions?)\b/gi,
-  /\b(?:tests?|files?|lines?|commits?|cases?|assertions?)\s*[:=]\s*(\d[\d,]*)/gi,
+  /#[ \t]*(?:tests?|suites?|pass(?:ed)?|fail(?:ed)?|total|files?|lines?)[ \t]+(\d[\d,]*)/gi,
+  new RegExp(
+    `\\b(\\d[\\d,]*)[ \\t]+${COUNT_QUALIFIERS}(?:(?:test|assertion)[ \\t]+)?(?:tests?|files?|lines?|commits?|requests?|cases?|assertions?)\\b`,
+    "gi",
+  ),
+  /\b(?:tests?|files?|lines?|commits?|cases?|assertions?)[ \t]*[:=][ \t]*(\d[\d,]*)/gi,
 ];
 
 /** The quantities a command's stored output reports. */
@@ -81,6 +88,49 @@ export function countValuesInOutput(output: string): number[] {
     }
   }
   return [...out];
+}
+
+/** A metric noun and the value the output printed for it. */
+/**
+ * A metric noun and the value the output printed for it. Separators are horizontal
+ * whitespace only: a number on one line and a noun on the next belong to different
+ * statements, and reading across the newline invents a metric the command never
+ * printed (`# tests 12` then `# suites 1` would otherwise report 12 suites).
+ */
+const METRIC_PATTERNS: RegExp[] = [
+  /#[ \t]*(?<noun>tests?|suites?|passed|pass|failed|fail|total|files?|lines?)[ \t]+(?<value>\d[\d,]*)/gi,
+  new RegExp(
+    `(?<value>\\b\\d[\\d,]*)[ \\t]+${COUNT_QUALIFIERS}(?:(?:test|assertion)[ \\t]+)?(?<noun>tests?|files?|lines?|commits?|requests?|cases?|assertions?|suites?)(?![\\w-])`,
+    "gi",
+  ),
+  /(?<noun>\btests?|files?|lines?|commits?|cases?|assertions?|suites?)[ \t]*[:=][ \t]*(?<value>\d[\d,]*)/gi,
+];
+
+/**
+ * The quantities a command's own output reports, keyed by the noun the output
+ * used (`# tests 12` -> `{ tests: 12 }`). This is the same reading the count
+ * guard applies, so a recorded metric and the guard that checks it cannot
+ * disagree about what the output said.
+ *
+ * When one noun is printed with two different values the first wins and the noun
+ * is listed as ambiguous: an output that says `# tests 12` and `13 tests` does
+ * not report a count, it reports a contradiction, and the reader must see that.
+ */
+export function metricsFromOutput(output: string): { metrics: Record<string, number>; ambiguous: string[] } {
+  const metrics: Record<string, number> = {};
+  const ambiguous = new Set<string>();
+  for (const pattern of METRIC_PATTERNS) {
+    for (const match of output.matchAll(new RegExp(pattern.source, pattern.flags))) {
+      const noun = match.groups?.noun?.toLowerCase();
+      const raw = match.groups?.value;
+      if (!noun || !raw) continue;
+      const value = Number(raw.replace(/,/g, ""));
+      if (!Number.isFinite(value)) continue;
+      if (metrics[noun] === undefined) metrics[noun] = value;
+      else if (metrics[noun] !== value) ambiguous.add(noun);
+    }
+  }
+  return { metrics, ambiguous: [...ambiguous] };
 }
 
 /**

@@ -1,10 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { type ToolDefinition, defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import type { ContextBroker } from "../context/ContextBroker.ts";
 import { type Actor, type Evidence, isMachineEvidence } from "../core/types.ts";
 import type { Ledger } from "../ledger/Ledger.ts";
-import { countClaims, countGuardMessage, countsAreBacked } from "../ledger/claimDiscipline.ts";
+import { countClaims, countGuardMessage, countsAreBacked, metricsFromOutput } from "../ledger/claimDiscipline.ts";
 import type { Orchestrator } from "../orchestration/orchestrator.ts";
 import type { Mission } from "../orchestration/types.ts";
 import { lookupMissionDurable } from "../runtime/host/durableMissionLookup.ts";
@@ -68,6 +69,23 @@ export async function hasRecordedEvidence(
 /** How much stored output the count guard reads from each end of an artifact. */
 const COUNT_GUARD_HEAD_CHARS = 8_000;
 const COUNT_GUARD_TAIL_CHARS = 24_000;
+
+/**
+ * The largest captured output `ledger_evidence` stores. A command that printed
+ * megabytes is not evidence of anything extra; the tail of a stack trace is what
+ * a reader needs, and an unbounded string in the ledger is a memory hazard.
+ */
+const MAX_EVIDENCE_OUTPUT_CHARS = 200_000;
+
+/** Evidence type labels are free-form but canonical: `repro`, `verify.unit`, `probe.api`. */
+const EVIDENCE_KIND_RE = /^[a-z][a-z0-9._-]{1,40}$/;
+
+/** The trust of the evidence entity behind a reference; an artifact:// URI carries no trust of its own. */
+function evidenceTrust(ref: string | undefined, services: Pick<CoreServices, "ledger">): Evidence["trust"] | null {
+  if (!ref || ref.startsWith("artifact://")) return null;
+  const id = ref.startsWith("test-run://") ? ref.slice("test-run://".length) : ref;
+  return services.ledger.getEvidence(id)?.trust ?? null;
+}
 
 /**
  * The stored output behind an evidence reference: both ends, because a test
@@ -275,18 +293,158 @@ export function buildCoreTools(
         services.currentWorkItemId(),
         { evidence: machine ? [String(params.evidence)] : [], severity: params.severity as never },
       );
+      // Saying *how* the evidence is backed is part of the answer: an `observed`
+      // record is output a caller supplied, which is inspectable but is not the
+      // runtime having run the command itself.
+      const trust = evidenceTrust(ref, services);
       return {
         content: [
           {
             type: "text",
             text: `Recorded ${entity.kind} ${entity.id} (status ${entity.status}). ${
               machine
-                ? "Evidence reference resolved; causal interpretations still require independent verification."
+                ? `Evidence reference resolved; causal interpretations still require independent verification.${
+                    trust === "observed"
+                      ? " That evidence is output its recorder supplied (trust observed): inspectable and immutable, but the runtime did not run the command."
+                      : ""
+                  }`
                 : "No recorded machine evidence; treat this as an unverified claim."
             }`,
           },
         ],
-        details: { id: entity.id, kind: entity.kind, status: entity.status, evidenceResolved: machine },
+        details: {
+          id: entity.id,
+          kind: entity.kind,
+          status: entity.status,
+          evidenceResolved: machine,
+          backedBy: trust,
+        },
+      };
+    },
+  });
+
+  const ledgerEvidence = defineTool({
+    name: "ledger_evidence",
+    label: "Ledger Evidence",
+    description:
+      "Record the output of a command you ran as durable ledger evidence, so a finding or claim can cite something inspectable instead of a paraphrase. The runtime derives everything it can from what you give it: status comes from the exit code, and metrics (tests, files, lines, commits) are parsed out of the output text itself — there is no parameter for a count, a status, or a trust level, because a number the caller asserts is not a measurement. Trust is always `observed`: the runtime did not run this command, so the record is attested output that a reviewer can re-run, not proof. Returns the EVID-… id to cite in ledger_claim, and can attach the record to an existing entity.",
+    parameters: Type.Object({
+      command: Type.String({ description: "The exact command line that produced the output" }),
+      output: Type.String({ description: "The captured stdout+stderr of that command" }),
+      exit_code: Type.Integer({ minimum: -1, description: "The process exit code (0 is what the command reported)" }),
+      kind: Type.Optional(
+        Type.String({ description: "Evidence type: repro | verify.unit | probe.api … (default repro)" }),
+      ),
+      entity: Type.Optional(Type.String({ description: "Ledger entity id to attach the record to (FND-…, FACT-…)" })),
+      candidate: Type.Optional(Type.String({ description: "Candidate id the record certifies (CND-…)" })),
+    }),
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const services = await servicesFor(ctx.cwd);
+      if (!services)
+        return {
+          content: [{ type: "text", text: notInitialized("Engineering runtime", ctx.cwd) }],
+          details: {},
+        };
+      const refuse = (text: string, refused: string) => ({
+        content: [{ type: "text" as const, text }],
+        details: { refused },
+        isError: true as const,
+      });
+      const command = String(params.command ?? "").trim();
+      if (!command)
+        return refuse("Refused: no command. Evidence without provenance is an anonymous blob.", "no_command");
+      const exitCode = Number(params.exit_code);
+      if (!Number.isInteger(exitCode))
+        return refuse(
+          "Refused: exit_code must be an integer — status is derived from it, never asserted.",
+          "bad_exit_code",
+        );
+      const kind = params.kind ? String(params.kind) : "repro";
+      if (!EVIDENCE_KIND_RE.test(kind))
+        return refuse(`Refused: kind "${kind}" must match ${EVIDENCE_KIND_RE.source}.`, "bad_kind");
+      const captured = typeof params.output === "string" ? params.output : "";
+      if (captured.trim().length === 0)
+        return refuse(
+          "Refused: empty output. Record what the command printed, not a summary of it — a paraphrase is the claim this tool exists to support.",
+          "empty_output",
+        );
+      const truncated = captured.length > MAX_EVIDENCE_OUTPUT_CHARS;
+      const content = truncated
+        ? `${captured.slice(0, MAX_EVIDENCE_OUTPUT_CHARS)}\n… [ledger_evidence truncated the capture at ${MAX_EVIDENCE_OUTPUT_CHARS} characters]\n`
+        : captured;
+      // The metrics are read out of the stored text here, so the number a later
+      // count guard looks for is the number this artifact actually contains.
+      const { metrics, ambiguous } = metricsFromOutput(content);
+      const artifact = await services.artifacts.put(
+        "evidence",
+        `evidence-${randomUUID()}`,
+        content,
+        `exit ${exitCode}: ${content.slice(0, 500)}`,
+      );
+      const recorded = await services.ledger.recordEvidence(
+        params.candidate ? String(params.candidate) : null,
+        kind,
+        command.split(/\s+/)[0]!,
+        command,
+        exitCode,
+        exitCode === 0 ? "passed" : "failed",
+        {
+          exitCode,
+          outputChars: content.length,
+          ...(truncated ? { truncated: true } : {}),
+          ...metrics,
+          ...(ambiguous.length > 0 ? { ambiguousMetrics: ambiguous } : {}),
+        },
+        [artifact.uri],
+        // The runtime did not run this command. Nothing in the parameters can
+        // raise that: `deterministic` and `authoritative` belong to verification
+        // the runtime performed itself (src/verify/Verifier.ts).
+        "observed",
+        services.currentWorkItemId(),
+        services.actor(),
+      );
+      let attached = false;
+      if (params.entity) {
+        const updated = await services.ledger.attachEvidence(
+          String(params.entity),
+          recorded.id,
+          services.currentWorkItemId(),
+          services.actor(),
+        );
+        attached = updated !== null;
+      }
+      const stated = Object.entries(metrics)
+        .map(([noun, value]) => `${noun}=${value}`)
+        .join(", ");
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Recorded ${recorded.id} (type ${kind}, trust observed, status ${recorded.status}, exit ${exitCode}) at ${artifact.uri}. ${
+              stated
+                ? `Metrics read from the output: ${stated}${ambiguous.length ? ` (ambiguous: ${ambiguous.join(", ")})` : ""}. `
+                : "No counts appear in the output. "
+            }${
+              params.entity
+                ? attached
+                  ? `Attached to ${String(params.entity)}. `
+                  : `Nothing attached: entity ${String(params.entity)} does not exist, though the evidence record stands. `
+                : ""
+            }Cite it in ledger_claim as evidence: "${recorded.id}". Attested output — re-run the command to prove it.`,
+          },
+        ],
+        details: {
+          id: recorded.id,
+          uri: artifact.uri,
+          kind,
+          trust: recorded.trust,
+          status: recorded.status,
+          exitCode,
+          metrics,
+          ...(ambiguous.length > 0 ? { ambiguousMetrics: ambiguous } : {}),
+          truncated,
+          attached,
+        },
       };
     },
   });
@@ -639,5 +797,5 @@ export function buildCoreTools(
     },
   });
 
-  return [ledgerRead, ledgerClaim, artifactRead, repoSearch, symbol, testsFor, mission];
+  return [ledgerRead, ledgerClaim, artifactRead, repoSearch, symbol, testsFor, mission, ledgerEvidence];
 }

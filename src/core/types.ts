@@ -13,6 +13,7 @@ export type EventType =
   | "work_item.updated"
   | "work_item.pr_linked"
   | "plan.created"
+  | "plan.recorded"
   | "task.created"
   | "task.ready"
   | "task.started"
@@ -155,6 +156,33 @@ export interface WorkItemPrLink {
   number: number;
   /** `https://<host>/<owner>/<repo>/pull/<n>`: the PR's canonical URL, derived from the four fields above. */
   url_canonical: string;
+}
+
+/** One ordered step of a recorded plan: the Ledger task it became and its title (bounded). */
+export interface LedgerPlanStep {
+  task_id: string;
+  title: string;
+}
+
+/**
+ * A durable plan record (`plan.recorded`): which Ledger tasks a plan work item decomposed into, in order. Additive;
+ * revisions of one work item chain through `supersedes`. `id` is `<work_item_id>/<revision>`.
+ */
+export interface LedgerPlan {
+  id: string;
+  work_item_id: string;
+  /** 1-based, contiguous per work item. */
+  revision: number;
+  /** Hex sha256 over the ordered steps. Identical steps never mint a new revision. */
+  digest: string;
+  steps: LedgerPlanStep[];
+  /** Steps beyond the cap are counted here, not stored. */
+  total_steps: number;
+  /** An existing artifact-registry entry holding the plan, when the caller has one. */
+  artifact?: { id: string; version: string };
+  supersedes?: string;
+  superseded_by?: string;
+  recorded_at: string;
 }
 
 export interface WorkItem {

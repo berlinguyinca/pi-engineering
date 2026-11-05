@@ -199,25 +199,3 @@ test("notice: durations read the way a person would say them", () => {
   assert.equal(formatDuration(125_000), "2m 05s");
   assert.equal(formatDuration(-1), "0s", "a negative wait is a bug upstream, not a crash here");
 });
-
-test("notice: an endpoint is reported by origin, never with its credentials", async () => {
-  // A base URL may carry userinfo, and this warning is now SHOWN to the
-  // operator rather than buried in stderr — a surface is exactly where a token
-  // must not be repeated back.
-  const { OpenVikingProvider } = await import("../../src/blackhole/durable.ts");
-  const seen: string[] = [];
-  const restore = setTelemetrySink((n) => seen.push(n.text));
-  try {
-    const provider = new OpenVikingProvider({
-      baseUrl: "https://user:s3cr3t-token@ov.example:8443/api",
-      fetch: (async () => ({ ok: false, status: 401, json: async () => [] })) as never,
-    });
-    assert.deepEqual(await provider.recallAll(), []);
-  } finally {
-    restore();
-  }
-  assert.equal(seen.length, 1);
-  assert.ok(!seen[0]?.includes("s3cr3t-token"), "the credential must not reach the surface");
-  assert.ok(!seen[0]?.includes("user:"), "nor the userinfo around it");
-  assert.match(seen[0] ?? "", /https:\/\/ov\.example:8443/, "the origin still identifies the endpoint");
-});

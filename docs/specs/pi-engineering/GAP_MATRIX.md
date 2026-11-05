@@ -3,6 +3,9 @@
 **Spec package:** `pi-engineering-implementation-spec-2026-09-15-v3`
 **Revision date:** 2026-09-15
 **Target repository:** `pi-engineering-runtime` (the local `pi-engineering` integration/policy harness)
+**Amended files:** [AMENDMENTS.md](AMENDMENTS.md) - two pack files deviate from `MANIFEST.json`
+because the durable-memory transport named in section 07 is retired; the role is filled by
+**Hindsight through the `herdr-memory` CLI**. Requirements and classifications below are unchanged.
 
 ## Classification legend
 
@@ -29,11 +32,11 @@ not re-implement the external system.
 | A4 | Pi Forge is OUT OF SCOPE | NOT-APPLICABLE | Not inspected, not integrated, not vendored. |
 | A5 | Plannotator is an external plan gate (integrate, do not build) | EXTERNAL / MISSING-adapter | No Plannotator adapter. pi-engineering must implement plan handoff, decision ingestion, persisted correlation and the 4 modes (interactive/autonomous/policy/disabled). |
 | A6 | AutoSpec consumes Pi; never supervises Pi | EXTERNAL / PARTIAL | `src/adapters/Adapters.ts` defines an `AutoSpecAdapter` seam (submit/observe/cancel, each call carrying the owner and its fencing token), never invoked by core. No plan→Plannotator→implement→test→review→fix→CI→commit loop that invokes AutoSpec's public orchestration. |
-| A7 | OpenViking is mandatory shared durable memory | EXTERNAL / PARTIAL | `OpenVikingProvider` (`src/blackhole/durable.ts`) + `services/openviking` (thin local HTTP endpoint over Postgres for dev/tests). No outbox-based emergency offline mode; no canonical project identity mapping for distinct per-parent/child sessions yet. |
+| A7 | OpenViking is mandatory shared durable memory | EXTERNAL / PARTIAL | `HindsightDurableMemory` (`src/blackhole/hindsight.ts`) shells out to the `herdr-memory` CLI, which holds the credential; the retired `OpenVikingProvider` HTTP client and the `services/openviking` dev endpoint were deleted, so the CLI is the only cross-machine store. No outbox-based emergency offline mode; no canonical project identity mapping for distinct per-parent/child sessions yet. |
 | A8 | Blackhole is local per session | EXISTING | Pinned `0.5.4`, session-local, never synchronized; promotion bridge to durable memory is evidence-gated (`src/blackhole/promotion.ts`). |
 | A9 | PostgreSQL/EventStore is authoritative runtime history | PARTIAL | `EventStore` (`src/ledger/EventStore.ts`) is append-only JSONL. No swappable backend interface / Postgres-compatible adapter seam yet. |
 | A10 | InferWeave owns GPU/model placement and seat admission | EXTERNAL / PARTIAL | `InferWeaveAdapter` seam exists (`src/adapters/Adapters.ts`, retrieve/record). No seat/resource semantics, no 503+Retry-After/429 handling specific to InferWeave beyond the generic gateway admission controller. |
-| A11 | Docker-first surrounding stack | PARTIAL | `deploy/` (Apptainer + AWS) and `services/openviking` compose. No reference Compose for the full control plane (control API, Pi Web, PostgreSQL, Plannotator, object storage, observability). |
+| A11 | Docker-first surrounding stack | PARTIAL | `deploy/compose/control-plane` only. The Apptainer definition and AWS scripts existed to host the retired OpenViking service and were deleted with it. No reference Compose for the full control plane (control API, Pi Web, PostgreSQL, Plannotator, object storage, observability). |
 | A12 | No shared-Blackhole server / filesystem design | SUPERSEDED | The package explicitly removes these; nothing in the repo implements a shared Blackhole server. `SharedFileDurableMemory` is a shared-file backing for evidence-promoted durable memory only, not Blackhole session memory. |
 
 ---
@@ -87,7 +90,7 @@ not re-implement the external system.
 ### 07 OpenViking
 | Requirement | Classification | Notes |
 |-------------|----------------|-------|
-| Mandatory shared durable memory; distinct session per parent/child, shared canonical project resource | PARTIAL | OpenVikingProvider exists; distinct session identity exists (`SessionStore`); canonical project identity mapping for multi-project not present. |
+| Mandatory shared durable memory; distinct session per parent/child, shared canonical project resource | PARTIAL | The Hindsight provider exists (`herdr-memory` CLI); distinct session identity exists (`SessionStore`); canonical project identity mapping for multi-project not present. |
 | Bootstrap ~4k–8k tokens, retrieve on demand, commit at phase/run boundaries | PARTIAL | Durable hydration exists; bootstrap-size policy is not enforced at the platform level. |
 | Search/recall/remember/status | EXISTING | `/memory`, `/remember`, recall, status. |
 | Explicit offline outbox | MISSING | No outbox. |
@@ -184,7 +187,7 @@ not re-implement the external system.
 | Child orchestration | pi-subagents | None (in-process executor fallback) | pi-subagents run/fanout/lanes/steering/background/worktree/output-schema primitives | Orchestration policy + adapter that prefers pi-subagents when installed, falls back to in-process executor | The pi-subagents package itself |
 | Operator UI | Pi Web | None | Pi Web supported APIs/extensions/deep-links | Control-plane adapter exposing projects/runs/workers/events/tests/reviews/routing/memory/interventions | Pi Web source/frontend/backend |
 | Plan gate | Plannotator | None | Plannotator CLI/API/server/container interfaces | Adapter (4 modes), decision ingestion, persisted correlation, policy; recovery of own pending state | Plannotator UI/service |
-| Shared durable memory | OpenViking (`viking.example.com`) | `OpenVikingProvider` HTTP client + local dev endpoint | OpenViking HTTP memory API (POST/GET `/memory`, `/search`, `/health`) | Canonical project-session mapping, bootstrap/retrieve policy, offline outbox | OpenViking server/vector DB |
+| Shared durable memory | Hindsight (through `herdr-memory`) | `HindsightDurableMemory` CLI client (`src/blackhole/hindsight.ts`) | `herdr-memory` contract v1: `recall`/`retain`/`correct`/`forget`, one JSON object on stdout; credential held by the CLI | Canonical project-session mapping, bootstrap/retrieve policy, offline outbox | Hindsight server/vector DB |
 | Local per-session memory | Blackhole / pi-blackhole | `BlackholeManager` pinned 0.5.4 | pi-blackhole package API | Promotion bridge (evidence-gated) | pi-blackhole package |
 | Inference placement/seats | InferWeave | `InferWeaveAdapter` seam (retrieve/record) | InferWeave gateway/node APIs; seat/resource semantics; 503/429 handling | Seat/backpressure adapter + capability discovery | InferWeave GPU scheduler/gateway/node runtime |
 | Spec/work-item policy | AutoSpec | `AutoSpecAdapter` seam | AutoSpec public orchestration API | Plan→Plannotator→implement→test→review→fix→commit loop calling AutoSpec orchestration | AutoSpec repo/engine |

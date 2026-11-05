@@ -323,7 +323,9 @@ test("session shutdown closes the runtime and stops its mission supervisor", asy
   let stops = 0;
   const previous = new Map<string, string | undefined>();
   const optionalProviderKeys = Object.keys(process.env).filter((key) =>
-    /METABOLOMICS|OPENVIKING|INFERWEAVE|PI_GATEWAY_HEALTH/.test(key),
+    // HINDSIGHT drives the durable-memory CLI this harness loads; OPENVIKING is
+    // retired but scrubbed too, so a stale shell variable cannot reach anything.
+    /METABOLOMICS|HINDSIGHT|OPENVIKING|INFERWEAVE|PI_GATEWAY_HEALTH/.test(key),
   );
   for (const key of optionalProviderKeys) {
     previous.set(key, process.env[key]);

@@ -125,7 +125,17 @@ if (existing.includes(marker) && execNode && existsSync(execNode)) {
   // A rewrite replaces the whole file: keep what was there, in case it held operator lines.
   if (!stat.isSymbolicLink() && existing.includes(marker)) copyFileSync(bin, `${bin}.pre-rewrite`);
   const temporary = `${bin}.session-auto-resume-${process.pid}`;
-  writeFileSync(temporary, `#!/bin/sh\n${marker}\nexec ${quote(process.execPath)} ${target}\n`, { mode: 0o755 });
+  // Reuse the existing owner-managed engineering overlay on every launch. A stale
+  // terminal must not reactivate its old provider after install or forced rewrite.
+  // Policy and credentials remain in that file; the installer invents neither.
+  const memoryOverlay = [
+    "# >>> herdr engineering memory environment >>>",
+    '[ ! -r "$HOME/.config/pi/viking-env.sh" ] || . "$HOME/.config/pi/viking-env.sh"',
+    "# <<< herdr engineering memory environment <<<",
+  ].join("\n");
+  writeFileSync(temporary, `#!/bin/sh\n${marker}\n${memoryOverlay}\nexec ${quote(process.execPath)} ${target}\n`, {
+    mode: 0o755,
+  });
   renameSync(temporary, bin);
   console.log(
     `Installed automatic safe session recovery at ${bin}\nOriginal CLI: ${originalCli}\nBackup launcher: ${bin}.before-session-auto-resume`,

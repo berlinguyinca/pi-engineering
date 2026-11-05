@@ -13,7 +13,7 @@
  *  - evidence `artifact:evidence/<id>`        (commons kind; the Ledger evidence row id)
  */
 
-import type { Candidate, Evidence, Task, WorkItem, WorkItemPrLink } from "../core/types.ts";
+import type { Candidate, Evidence, LedgerPlan, Task, WorkItem, WorkItemPrLink } from "../core/types.ts";
 import { canonicalId, parseCanonicalId } from "../github/refs.ts";
 import type { GithubLinkRecord } from "../github/types.ts";
 import type { PlanArtifactRef } from "../orchestration/planRecords.ts";
@@ -24,6 +24,8 @@ export interface TaskPlanRef {
   revision: number;
   digest?: string;
   artifact?: PlanArtifactRef;
+  /** Set for a plan the Ledger recorded itself (`plan.recorded`): its node is then ensured here, not by a Mission. */
+  ledger?: { title: string; steps: number; superseded: boolean; supersedes?: { missionId: string; revision: number } };
 }
 
 export interface TaskEvidenceRef {
@@ -64,6 +66,23 @@ export function prRefsFromLinks(links: readonly GithubLinkRecord[], taskId: stri
   return out;
 }
 
+/** A Ledger-recorded plan as a plan ref: node `plan:<work item>/<revision>`, so it never collides with a Mission's. */
+export function ledgerPlanRef(plan: LedgerPlan): TaskPlanRef {
+  const prior = plan.supersedes ? Number(plan.supersedes.slice(plan.supersedes.lastIndexOf("/") + 1)) : undefined;
+  return {
+    missionId: plan.work_item_id,
+    revision: plan.revision,
+    digest: plan.digest,
+    ...(plan.artifact ? { artifact: plan.artifact } : {}),
+    ledger: {
+      title: `plan r${plan.revision}`,
+      steps: plan.total_steps,
+      superseded: !!plan.superseded_by,
+      ...(prior && Number.isInteger(prior) ? { supersedes: { missionId: plan.work_item_id, revision: prior } } : {}),
+    },
+  };
+}
+
 /** The slice of the Ledger this needs. */
 export interface TaskRefsLedger {
   getWorkItem(id: string): WorkItem | undefined;
@@ -72,6 +91,8 @@ export interface TaskRefsLedger {
   listEvidence(candidateId?: string): Evidence[];
   /** PRs recorded on the work item (`work_item.pr_linked`). Absent on a ledger that predates them. */
   listPrLinks?(workItemId: string): WorkItemPrLink[];
+  /** The recorded plan a task or work item belongs to (`plan.recorded`). Absent on a ledger that predates plans. */
+  planFor?(id: string): LedgerPlan | undefined;
 }
 
 export interface LedgerTaskRefsOptions {
@@ -127,7 +148,10 @@ export function ledgerTaskRefs(ledger: TaskRefsLedger, opts: LedgerTaskRefsOptio
         if (id && parseCanonicalId(id) && !prs.includes(id)) prs.push(id);
       }
       refs.prs = prs.slice(0, MAX_PRS);
-      refs.plans = [...(opts.plans?.(task.id) ?? [])].slice(0, 5);
+      const recorded = ledger.planFor?.(task.id);
+      const plans = [...(opts.plans?.(task.id) ?? [])];
+      if (recorded) plans.push(ledgerPlanRef(recorded));
+      refs.plans = plans.slice(0, 5);
       return refs;
     } catch {
       return undefined;

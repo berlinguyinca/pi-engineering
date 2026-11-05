@@ -396,7 +396,7 @@ export class FooterController {
     const statuses = [...footerData.getExtensionStatuses()];
     if (statuses.length > 0) {
       // Keep connection failures visible first, then preserve other extensions' order.
-      statuses.sort(([a], [b]) => Number(b === "openviking") - Number(a === "openviking"));
+      statuses.sort(([a], [b]) => Number(b === "hindsight") - Number(a === "hindsight"));
       const extensions = statuses.map(([, text]) => text.replace(/[\r\n\t]+/g, " ")).join(" | ");
       lines.push(paint(theme, truncateToWidth(extensions, Math.max(0, width), "…")));
     }

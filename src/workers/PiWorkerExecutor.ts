@@ -4,6 +4,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import {
+  type LoadExtensionsResult,
   ModelRuntime,
   type ResourceLoader,
   SessionManager,
@@ -111,6 +112,7 @@ import {
 } from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "../runtime/isolation/stateDir.ts";
+import { workerSessionGate, workerTaskId } from "../taskDiscipline/worker.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { MODEL_SUPERSEDED } from "./WorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "./WorkerExecutor.ts";
@@ -193,9 +195,15 @@ function isToolNotFound(result: unknown): boolean {
 }
 
 /** A minimal resource loader that supplies only the role prompt (context firewall). */
-function roleResourceLoader(systemPrompt: string): ResourceLoader {
+/**
+ * A worker session runs no user extensions, skills, prompts or themes — only
+ * the role prompt and, when the parent session is gated, the Task Contract gate
+ * bound to the worker's OWN narrowed contract (`gateExtensions`; see
+ * src/taskDiscipline/worker.ts). With no parent gate the set stays empty.
+ */
+function roleResourceLoader(systemPrompt: string, gateExtensions?: LoadExtensionsResult): ResourceLoader {
   return {
-    getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+    getExtensions: () => gateExtensions ?? { extensions: [], errors: [], runtime: createExtensionRuntime() },
     getSkills: () => ({ skills: [], diagnostics: [] }),
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }),
@@ -562,6 +570,41 @@ export class PiWorkerExecutor implements WorkerExecutor {
         };
       }
     }
+    // Task Contract gate for THIS worker (src/taskDiscipline/worker.ts). A gated
+    // parent never hands a worker its own broad contract: the worker gets a
+    // derived one whose write scope is its allocated worktree and whose external
+    // effects are empty. A request that cannot be expressed inside the parent
+    // contract is refused here, before any model call is made.
+    let workerGate: LoadExtensionsResult | undefined;
+    try {
+      const gate = await workerSessionGate(
+        {
+          taskId: workerTaskId(req),
+          role: req.role,
+          cwd: req.cwd,
+          mutating: MUTATING_ROLES.has(req.role),
+          objective: req.task.slice(0, 200),
+        },
+        this.agentDir,
+      );
+      workerGate = gate?.extensions;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        result: {
+          status: "failed",
+          summary: `Task contract narrowing refused this worker: ${reason}`,
+          claims: [],
+          evidence_refs: [],
+          new_hypotheses: [],
+          proposed_tasks: [],
+          details: {},
+          error: "task-scope-refused",
+        },
+        usage: null,
+        error: "task-scope-refused",
+      };
+    }
     const modelRuntime = await this.getModelRuntime();
     let model = this.model;
     // The capability router places a role on a specific provider model. When a
@@ -677,9 +720,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
     const invocation = currentInferenceInvocation();
     const run = await (invocation && maxOutputTokens !== undefined
       ? runWithInferenceInvocation({ ...invocation, maxOutputTokens }, () =>
-          this.runWithGuard(sized, model, baseSystemPrompt, modelRuntime),
+          this.runWithGuard(sized, model, baseSystemPrompt, modelRuntime, workerGate),
         )
-      : this.runWithGuard(sized, model, baseSystemPrompt, modelRuntime));
+      : this.runWithGuard(sized, model, baseSystemPrompt, modelRuntime, workerGate));
     return {
       ...run,
       result: { ...run.result, details: { ...run.result.details, context_budget: budget } },
@@ -699,6 +742,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
     initialModel: Model<any>,
     initialPrompt: string,
     modelRuntime: ModelRuntime,
+    /** Gate extension narrowed for this worker (undefined when the parent is ungated). */
+    workerGate?: LoadExtensionsResult,
   ): Promise<WorkerRun> {
     // A mutating role with a known base may not report `completed` over an
     // untouched worktree (the tool answers isError and the session continues).
@@ -990,6 +1035,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
                   guardConfig,
                   streamResumes,
                   account,
+                  workerGate,
                 );
               // The raised allowance of a length-stop retry rides the invocation.
               // While gateway holds are enabled this worker owns the wait on an
@@ -1576,6 +1622,8 @@ ${recovery.recoveryPrompt}`;
     guardConfig: GenerationGuardConfig = this.guardConfig,
     streamResumes: { count: number } = { count: 0 },
     account: TokenAccount = new TokenAccount(),
+    /** Preloaded gate extension for this worker's narrowed contract, if gated. */
+    workerGate?: LoadExtensionsResult,
   ): Promise<{
     session: { dispose: () => void; messages: readonly unknown[] };
     guardAborted: boolean;
@@ -1595,7 +1643,7 @@ ${recovery.recoveryPrompt}`;
     /** Terminal provider/gateway error text, when the model call itself failed. */
     assistantError?: string;
   }> {
-    const resourceLoader = roleResourceLoader(systemPrompt);
+    const resourceLoader = roleResourceLoader(systemPrompt, workerGate);
     const sessionManager = SessionManager.inMemory(req.cwd);
     // Mission workers compact at a share of their context budget (default 60%,
     // PI_WORKER_COMPACT_AT), keeping the autotuned recent window; the summary

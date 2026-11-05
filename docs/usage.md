@@ -356,8 +356,13 @@ never loaded: while a tracked file has uncommitted changes, a new commit is
 not reloaded either (the handover would copy the half-edit); you are told
 once, and the reload happens as soon as the tree is clean, or at once with
 `/pie reload`. Summary and compaction calls, which have no turn to continue,
-wait out a gateway hold instead of switching models. `/pie update` does the same immediately (and, when the checkout
-has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
+wait out a gateway hold instead of switching models. `/pie update` does the same immediately, and it always asks the update remote
+first: if the checkout's HEAD is behind the channel tip, the tip is installed
+instead of the checkout being reloaded (a checkout 463 commits behind main used
+to hot-reload itself and report success). A checkout that carries the tip — a
+merge you just made, or unpushed development work on top of it — is still
+reloaded, because that is the update you meant. `--check` reports both, and
+`--channel`/`--commit` always go to the remote. `PI_ENGINEERING_AUTO_RELOAD=0`
 turns the automatic reload off.
 
 A session on another host, loading pi-engineering from a clone that tracks
@@ -1043,6 +1048,16 @@ on by default):
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
 
+### Work status row: idle-session limit
+
+The compact work status row names every session with a live run, then at most
+`execution.status_idle_sessions` idle sessions (unresolved work, no live run),
+most recently active first, and collapses the rest into `+K idle`. YAML only
+(`.pi/engineering.yaml`), default 3, range 0..50; an out-of-range value falls
+back to the default. Live sessions are never hidden. `/summary <session id>`
+shows one session's tasks, attempts/retries, live runs and last activity (PRs
+appear once a PR source is wired; the work projection itself carries none).
+
 ### Worker tool-loop guard
 
 Mission workers have their own cross-turn guard (`src/workers/toolLoopGuard.ts`).
@@ -1138,6 +1153,135 @@ mutating form is a gap to close when it bites, not a contract hole. `git -C`,
 The runtime's own in-process git operations (mission workers run in candidate
 worktrees; integration, janitor) do not go through the tool-call hook and are
 unaffected.
+
+## Task Contract gate (task discipline)
+
+A **Task Contract** is a trusted, versioned snapshot of what one task is allowed
+to touch: its objective, the roots it may read, the roots it may write, the
+remote hosts it may contact, the external effects (push, CI dispatch, deploy,
+restart) it may cause, and its acceptance criteria. It is written by the
+operator or the control plane — never by the model — and the gate in
+`src/taskDiscipline/` judges every tool call against it **before** the call
+executes.
+
+The gate registers its own `tool_call` and `user_bash` handlers, so it does not
+inherit the lifecycle controller's two gaps: that controller skips non-mutating
+tools (reads, MCP/custom tools) and auto-allows when the session is unattended.
+Here every call is judged, reads included, and `!bash` typed by the operator
+goes through the same engine (a blocked `!bash` returns a synthetic failed
+result instead of running).
+
+Knobs (set before starting the session):
+
+- `PI_TASK_DISCIPLINE` — `off` (default) | `audit_only` | `enforce_diagnostic` |
+  `enforce_all`. A value that is not one of those is treated as `enforce_all`:
+  a typo must not weaken enforcement.
+- `PI_TASK_CONTRACT_FILE` — path to the contract JSON. In an enforcing mode a
+  missing, unreadable or invalid contract **locks the session down** (nothing
+  readable, nothing writable) rather than falling back to "allow everything".
+- `PI_TASK_DISCIPLINE_LOG` — append-only JSONL of every decision (allow, deny,
+  would-deny) with the task id, contract revision, contract hash, rule and a
+  secret-redacted command. Defaults to `decisions.jsonl` next to the contract.
+
+The contract file and the decision log are always added to the contract's
+`protectedPaths`, and so is the contract's directory — unless it overlaps a
+`writeRoots` or `scratchRoots` entry (as in the example above, where the scratch
+root sits inside the contract directory), because protecting it there would
+swallow the whole tree the task may write in. The agent therefore cannot rewrite
+its own authorization or its own record — a write to a protected path is denied
+with `write.protected`.
+The file is re-read when its mtime or size changes, so an operator amendment
+takes effect on the next tool call and the new `policyRevision` appears in the
+log; a rewrite that tries to *widen* an investigation contract is rejected at
+parse time and the provider substitutes the lockdown contract immediately, so
+self-approval is impossible even with filesystem access — the agent loses access
+instead of gaining scope.
+
+What each mode enforces:
+
+- `audit_only` — nothing is blocked; a call the contract forbids is logged as
+  `would_deny` and the agent is told it is not protected. Use it to learn a
+  contract's false-block rate before turning it on.
+- `enforce_diagnostic` — blocks only while the **contract's** mode is
+  `investigation` or `review`, which is the tier the spec calls strict
+  diagnostic: read-only work must not deploy or ship data anywhere.
+- `enforce_all` — blocks in every contract mode.
+
+Rules the engine can deny with (each decision names its rule id): `read.outside_roots`,
+`write.outside_roots`, `write.protected`, `write.readonly_mode`,
+`exec.outside_roots`, `host.not_allowed`, `host.unresolved`,
+`effect.container.not_granted`, `effect.privileged`, `command.unclassified`,
+`path.unresolved`, `tool.not_allowed`, `shell.no_command`, `shell.powershell`,
+`write.no_path`, `engine.error`. Commands are classified, not pattern-matched:
+the classifier expands `sh -c`, `bash -c`, `eval`, `$(…)`/backticks, pipes,
+`xargs`, `find -exec`, `sudo`, `make` targets, `npm run` scripts, Python/Node
+scripts, `docker`/`podman` runs, and the remote verbs `ssh`, `scp`, `sftp`,
+`rsync`, `curl`/`wget` with a write verb, `git push`, `gh workflow run`,
+`kubectl`, `terraform`. Paths are canonicalised before comparison, so `..`,
+`~`, unexpanded `$VAR` and symlinks that walk out of a read or write root are
+caught (`path.unresolved`, `write.outside_roots`). An effect the classifier
+cannot identify is denied in an enforcing mode (`command.unclassified`) instead
+of being waved through.
+
+Denials are also loop-aware: more than three enforced denials of the same rule
+inside ten calls marks a policy incident, and further block messages tell the
+agent to stop retrying and report what is blocking it — the route out is an
+operator amendment, never another path around the rule.
+
+Enabling it for one mission, end to end:
+
+```sh
+mkdir -p ~/task-contracts
+cat > ~/task-contracts/peak-picking.json <<'JSON'
+{
+  "taskId": "demo-peak-picking-001",
+  "objective": "Diagnose the local LC-MS peak-picking discrepancy from code, fixtures and logs; report root cause with reproducible evidence.",
+  "mode": "investigation",
+  "policyRevision": 1,
+  "readRoots": ["/Users/me/IdeaProjects/cdf2ms"],
+  "writeRoots": [],
+  "scratchRoots": ["/private/tmp/peak-picking"],
+  "allowedHosts": [],
+  "externalEffects": [],
+  "acceptanceCriteria": ["Reproduce locally or name the blocker", "Name the defect with file and test evidence"]
+}
+JSON
+PI_TASK_DISCIPLINE=enforce_diagnostic \
+PI_TASK_CONTRACT_FILE="$HOME/task-contracts/peak-picking.json" \
+  pi --no-extensions --extension /absolute/path/to/checkout/extensions/index.ts
+```
+
+(One runtime per session, as above: `--no-extensions` plus the checkout, or the
+installed package with the two variables in the environment — not both.)
+
+In that session `scp ./peaks.mzML strange-host:/data/` — and the `rsync`,
+`curl -T`, `git push` and `gh workflow run` equivalents — is denied before
+execution, the denial lands in `decisions.jsonl`, and the agent is told to
+continue with local reads; the investigation does not stop. `write` anywhere is
+denied (`write.readonly_mode`, because the contract has no `writeRoots`). To let
+it patch the fix, the operator raises `policyRevision`, adds `writeRoots` and
+the mode changes to `implementation` — the model cannot do that itself.
+
+Mission workers of a gated session are gated too, under a **narrowed child
+contract** rather than the parent's: their write roots are the worktree the
+scheduler allocated them, their external effects are empty (they propose, the
+host executes), they may reach an allowed host only if the parent itself had
+`remote_read`, and a read-only role is capped at `review`. A worker whose
+request cannot be expressed inside the parent's scope — an implementer under a
+`review` contract, or a worktree outside the parent's write roots — is refused
+before any model call (`error: task-scope-refused`) instead of being handed the
+parent's wider scope.
+
+**What the gate cannot promise** (see `docs/operations/task-discipline.md`):
+it is a preflight check inside the Pi process, so it covers calls that come
+through Pi's `tool_call` / `user_bash`. A shell the agent reaches outside those
+hooks, a compiled binary that opens its own socket, or a local root shell
+bypass it. Defence in depth for indirect exfiltration in strict diagnostic mode
+relies on the Linux sandbox the control plane can start (`collab-sandbox.sh`
+profile `task-restricted-v1` with `--unshare-net` plus the
+`collab-egress.py` host allowlist); **macOS has no equivalent today**, so a
+local macOS session gets preflight gating only and must not be described as
+isolated.
 
 ## Recovering an interactive turn after the gateway wait is spent
 
@@ -1336,10 +1480,13 @@ milestones as `IMPLEMENTED`; run `/mission` on a fixture repo by hand and read
 ## Optional Blackhole session memory
 
 `pi-blackhole` is an **optional** per-session memory/context provider, pinned to
-**0.5.4**. It is disabled by default and backward compatible. When enabled it
+**0.5.4**. The standalone provider is disabled unless configured; the Pi extension
+enables it with the Hindsight store because durable memory is on by default
+(`memory.hindsight.enabled: false` turns it off). When enabled it
 provides session-local memory with strict candidate isolation, recall into worker
-context, evidence-gated promotion through the OpenViking durable-memory
-abstraction (never auto-promoted), and lower-priority background memory workers.
+context, evidence-gated promotion through the durable-memory abstraction
+(`HindsightDurableMemory` for the cross-machine store; never auto-promoted), and
+lower-priority background memory workers.
 
 ```sh
 node scripts/pi-engineering.ts blackhole status        # show manager state
@@ -1363,8 +1510,8 @@ the backing store for shared durable memory (default `memory` = single process):
 // Several workers on one host / CI share promoted memory via an append-only JSONL file.
 blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/shared/durable.jsonl" } } }
 
-// Cross-machine sharing via the external OpenViking service.
-blackhole: { config: { enabled: true, durable: { kind: "openviking", baseUrl: "https://openviking.example", token } } }
+// Cross-machine sharing through the herdr-memory CLI (Hindsight).
+blackhole: { config: { enabled: true, durable: { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] } } }
 ```
 
 Each `runWorker` hydrates its context from shared durable memory on run, so a
@@ -1373,60 +1520,129 @@ later/other worker consumes knowledge promoted by any earlier worker (spec:
 outage degrades hydration to an empty result and never fails the worker.
 `pi-engineering blackhole status` reports the active `durable` kind.
 
-### Running the OpenViking service (tier-1)
+`openviking` is **not** a valid kind any more. The HTTP transport and the
+`services/openviking` service it spoke to were retired, and the `herdr-memory`
+CLI replaced them as the cross-machine store. A configuration that still names
+the retired kind fails validation with a message naming the kinds that work,
+rather than falling back to an in-process store and quietly leaving every worker
+memoryless on a multi-host run.
 
-The `openviking` durable kind points workers at a shared HTTP service. A minimal
-containerized implementation lives at `services/openviking/` — a thin,
-stateless HTTP layer over a PostgreSQL backing store that serves exactly the
-contract `OpenVikingProvider` speaks (POST `/memory`, GET `/memory`,
-`GET /memory/search?q=`). Deploy on a single host (e.g. a lab box):
+### Listing and readiness
 
-```sh
-cd services/openviking
-cp .env.example .env     # set OPENVIKING_TOKEN + POSTGRES_PASSWORD
-# run the service standalone (in-memory, zero deps) for a quick check:
-node src/index.mjs
-# or run the durable Postgres-backed deployment:
-docker compose up -d --build
+The Hindsight provider lists documents with the canonical `herdr-memory documents`
+command, then hydrates their normalized `address` values with `get`. It does not
+interpret `recall "*"` or a made-up semantic query as enumeration. Listing uses
+20-document pages, at most three pages per scope and 50 hydrated records overall,
+within one operation deadline. Hidden, unknown and personal-bank records are
+excluded; candidate status is preserved. A failed read contributes no invented
+memory. Only the engineering scopes in the configured finite allowlist are read.
+
+Readiness uses document-list metadata separately from best-effort reads. Empty
+banks are healthy, and an empty project does not hide a subsequent configured
+scope. A degraded, offline, malformed or refused listing is not a healthy empty
+bank. Exact totals are shown when available; a truncated estimated listing shows
+`count unknown`, rather than claiming its cap is the saved total.
+
+### Turning the connection on anywhere pi is installed (no code edits)
+
+Durable memory is **on by default**. Any pi installation that loads this package's
+**extension** uses Hindsight with no configuration at all, so what is remembered in
+another harness is recalled in Pi too. Configuration is YAML only; **no
+environment variables are read** (the old `PI_HINDSIGHT_*` variables are
+ignored, with a one-time warning naming the key to use instead). Pi shells out to
+`herdr-memory` and holds no memory credential of its own: the CLI resolves its own
+configuration and token, so there is no host, key or key file for pi to store, and
+no secret belongs in YAML. Add this to the global `~/.pi/agent/engineering.yaml`
+(or `$PI_CODING_AGENT_DIR/engineering.yaml`):
+
+```yaml
+# ~/.pi/agent/engineering.yaml (global). `cli` is honored only here.
+memory:
+  hindsight:
+    enabled: true                 # default true; set false to turn durable memory off
+    cli: herdr-memory             # executable to shell out to (global config only)
+    scopes: [project]             # project, global, infra, mission:<id>
+    timeout_ms: 5000              # per-call CLI timeout, 100..60000
+    automatic_recall_ms: 1200     # in-turn recall budget, 100..5000
+    harness: pi                   # provenance/credential harness name the CLI sees
+    failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
+    unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
 ```
 
-Because the service is stateless (all memory lives in the Postgres volume), you
-can later move it to AWS/Fly.io and keep the data. See
-`services/openviking/README.md`. The production deployment runs on the lab's
-your-host server as an Apptainer container behind an nginx virtual host — see
-`docs/deployments/openviking-deployment.md`.
+| Key | Default | Range / values |
+| --- | --- | --- |
+| `enabled` | `true` | `true` / `false` (`false` turns durable memory off) |
+| `cli` | `herdr-memory` | non-empty executable name or path; global config only |
+| `scopes` | `[project]` | non-empty list of `project`, `global`, `infra`, `mission:<id>` |
+| `timeout_ms` | `5000` | 100..60000 |
+| `automatic_recall_ms` | `1200` | 100..5000 (interactive turn; a headless `pi -p` run waits 5000) |
+| `harness` | `pi` | `[a-z][a-z0-9_-]{0,31}` |
+| `failure_backoff_ms` | `60000` | 1000..3600000 |
+| `unavailable_backoff_ms` | `300000` | 1000..86400000 |
 
-### Installing the connection anywhere pi is installed (no code edits)
+**Turning it off.** Put `memory: { hindsight: { enabled: false } }` in the global
+`engineering.yaml` (or a repository's `.pi/engineering.yaml` to opt a single repo out).
+Pi then makes no `herdr-memory` call and `/memory` reports `off`.
 
-Any pi installation that loads this package's **extension** connects to a shared
-OpenViking automatically when the environment is set — no per-repo code. Set
-these once (e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process
-loads):
+**Cross-harness recall.** Pi and the other harnesses (Claude, Codex, OpenCode) talk
+to the same Hindsight server through the same `herdr-memory` CLI, but each harness
+has to be wired up once with `herdr-eng memory install`. Notes are shared by scope:
+`scopes` defaults to `[project]`, so only project notes cross harnesses; add
+`scopes: [project, global]` to also share global notes.
 
-```sh
-export PI_OPENVIKING_BASE_URL=https://viking.example.com
-# Bearer token for the service — either inline, or from a file (secret hygiene):
-export PI_OPENVIKING_TOKEN=<token>
-# or: export PI_OPENVIKING_TOKEN_FILE=/path/to/token.txt
-# Optional: bounded wait for the provider (default 10000ms):
-export PI_OPENVIKING_PROVIDER_TIMEOUT_MS=10000
-# Optional: explicitly force the connection off:
-# export PI_OPENVIKING_ENABLED=0
-```
+**When the CLI is missing or has no credential.** Pi starts normally and degrades
+quietly: at most one concise notice per session (and one telemetry line per day
+when headless), then automatic recall and saves stay silent best-effort until the
+`unavailable_backoff_ms` window passes. The once-per-session connection check waits
+up to 5 s (a healthy cold client takes seconds, and a status line that says "timed
+out" about a working service teaches people to ignore it), while an interactive turn
+waits `automatic_recall_ms` and a headless run 5 s. Run `/memory` (or
+`herdr-memory doctor`) to see what is wrong.
+A turn never proceeds in silence: if the budget expires the model is told memory
+"could not be read this turn … unavailable, not empty", and an answer that arrives
+late is used by the next model call of the same turn. The measurements behind these numbers are in
+[Hindsight memory status](integration/HINDSIGHT-MEMORY-STATUS.md).
 
-When `PI_OPENVIKING_BASE_URL` is set, the extension passes
-`blackhole: { config: { enabled: true, durable: { kind: "openviking", ... } } }`
+**What is sent.** Each turn Pi sends the CLI a recall query of up to 12 keywords from
+your prompt, and each worker run sends the first 120 characters of the task. Both are
+passed through secret redaction first and secret-looking tokens are dropped (a query
+that is only a secret makes no call). Notes are only written by `/remember`.
+After a timeout or failure, searches pause (`failure_backoff_ms`, or
+`unavailable_backoff_ms` for a missing CLI) for the interactive hooks and worker runs
+alike; worker runs wait at most 1200 ms for memory (the same budget as an
+interactive turn — the CLI's 0.4 s floor made a shorter cap unreachable).
+
+**Repository config is untrusted.** The global `engineering.yaml` is authoritative. A
+repository's `.pi/engineering.yaml` can only opt **out** (`enabled: false`) or **narrow**
+`scopes` to a subset of the global scopes. It cannot turn memory on over a global
+`false`, and `cli`, `harness`, `timeout_ms` and the backoffs are ignored there with a
+warning (`harness` selects the CLI's credential identity). Any
+invalid value fails closed: memory is turned off and `/memory` names the key to fix.
+Unknown keys under `memory.hindsight` are reported as warnings. The file is
+re-read at session start, at each turn and by `/memory`, so an edit takes effect
+without restarting.
+
+Unless `memory.hindsight.enabled` is false, the extension passes
+`blackhole: { config: { enabled: true, durable: { kind: "hindsight", ... } } }`
 into every `EngineeringRuntime` it opens, so all repos in that install share the
-deployed durable memory. Absent the env vars, blackhole stays off (backward
-compatible). Verify a connection with `/blackhole` in a pi session, or:
+same durable backend. With `enabled: false`, blackhole stays off. Verify a connection with `/blackhole` (or `/memory` for the
+interactive notes) in a pi session, or:
 
 ```sh
 node scripts/pi-engineering.ts blackhole status
+herdr-memory doctor        # the CLI's own credential/config check
 ```
 
-The resolver is `src/blackhole/envConfig.ts`; it is fail-closed (a malformed
-timeout falls back to the default; a missing token degrades recall to empty
-rather than crash).
+Artifacts are written under `docs/evidence/blackhole/`. The benchmark is a
+deterministic, model-free simulator (see the report methodology note) — it
+validates the measurement pipeline and shows the expected direction of effect,
+not a measured model claim.
+
+The loader is `loadHindsightSettings()` in `src/lifecycle/policy.ts` (schema and
+validation in `src/blackhole/hindsightSettings.ts`): configuration is fail-closed
+(an invalid value turns memory off and says which key), reads are fail-open (a CLI that cannot answer yields no notes
+rather than a failed turn), and writes only report the outcome the CLI actually
+acknowledged.
 
 ## Durable state
 
@@ -1511,6 +1727,17 @@ the SQLite registry is kept on a machine-local runtime directory automatically.
 - `/ledger hypothesis` — claims not yet promoted to facts.
 - `/verify` — run verification yourself and see the captured log artifact.
 
+`ledger_claim` refuses a claim that states a count (tests, commits, files, lines)
+unless the cited machine output reports that number. `ledger_evidence` is how you
+produce something citable: it stores the output of a command you ran as an
+`EVID-…` entity plus an artifact, derives status from the exit code and metrics
+(`tests`, `files`, `lines`, …) from the output text itself, and attaches the record
+to a finding when you name one. There is no parameter for a count, a status, or a
+trust level, because a number the caller asserts is not a measurement. Trust is
+always `observed`: the runtime did not run the command, so the record is attested
+output a reviewer can re-run, not proof of execution. Cite the id in `ledger_claim`
+and the claim reports how it is backed (`backedBy`).
+
 ## Risk-aware legacy verification and review
 
 For legacy `/engineer` and tournament candidates, a low risk label enables cheap
@@ -1558,8 +1785,8 @@ allowlist, plus its executor-owned terminal result tool. Supplying tools to the
 executor makes them available for selection; it does not grant them to every
 role. Custom callers must explicitly name safe retrieval tools they need, such as
 `ledger_read`, `artifact_read`, `repo_search`, `symbol`, and `tests_for`. Nested
-`mission` execution and `ledger_claim` are not implicitly granted to reviewers
-or scouts.
+`mission` execution, `ledger_claim` and `ledger_evidence` are not implicitly granted
+to reviewers or scouts.
 
 An explicit model-routing refusal stops planner-worker dispatch for every role;
 it cannot silently select the worker's default model. Standalone hosts with no

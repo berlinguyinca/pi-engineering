@@ -79,22 +79,50 @@ pi install /absolute/path/to/pi-engineering-runtime
 | `/ledger [k]`     | Show work items, candidates, and ledger entities (optionally filtered) |
 | `/context`        | Show context budget, sources, and worker usage                 |
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository |
-| `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (disabled by default) |
-| `/remember <text>` | Explicitly save a private Viking note (up to 4,000 characters) |
+| `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (on with the extension's durable memory; off with `memory.hindsight.enabled: false`) |
+| `/remember <text>` | Explicitly save a private note through Hindsight (up to 4,000 characters) |
 | `/memory [query]` | Verify the memory connection, or search saved notes |
-| `/memory setup` | Configure or change the Viking host and access key |
 
 ### Everyday memory
 
-When no Viking connection is configured, interactive Pi offers a setup dialog.
-An existing connection is preserved across updates; use `/memory setup` to
-change it. Existing environment/token-file settings can be kept. Changed credentials are entered
-in a masked field and verified before they are saved. Settings and private key
-files live under `~/.pi/agent/engineering-memory/` (or the active
-`PI_CODING_AGENT_DIR`), outside the extension checkout. Updates preserve them.
-Cancelled setup can be retried with `/memory setup`; headless sessions never
-block for a dialog. The update command itself does not need an interactive
-credential hook: the check runs when Pi next loads the updated extension.
+Interactive memory is **on by default** and reaches **Hindsight through the
+`herdr-memory` CLI**. Pi never talks to a memory service itself and holds no
+memory credential: the CLI carries its own configuration and credentials
+(`herdr-memory doctor` checks them), and nothing under `PI_CODING_AGENT_DIR`
+stores a host, token or profile. Configuration is YAML only; environment
+variables are not read. A leftover OpenViking profile or `PI_OPENVIKING_*` /
+`PI_HINDSIGHT_*` variable is detected by name or existence only — never read —
+and warns once at load with the YAML key to use. No setup is needed; to change
+or turn it off, edit the global `engineering.yaml` (`~/.pi/agent/engineering.yaml`):
+
+```yaml
+# ~/.pi/agent/engineering.yaml (global). `cli` is honored only here.
+memory:
+  hindsight:
+    enabled: true                 # default true; set false to turn durable memory off
+    cli: herdr-memory             # executable to shell out to (global config only)
+    scopes: [project]             # default [project]; use [project, global] to also share global notes
+    timeout_ms: 5000              # per-call CLI timeout, 100..60000
+    automatic_recall_ms: 1200     # in-turn recall budget, 100..5000 (see below)
+    harness: pi                   # provenance/credential harness name the CLI sees
+    failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
+    unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
+```
+
+Memory is shared with Claude, Codex and OpenCode through the same Hindsight server
+and scopes, but each of those harnesses must be wired once with
+`herdr-eng memory install` before its notes reach Pi. If the CLI is absent or has
+no credential, Pi starts normally and shows at most one notice per session.
+
+Each turn the CLI receives up to 12 keywords of your prompt, and each worker run the
+first 120 characters of the task, both secret-redacted. A repository's
+`.pi/engineering.yaml` can only opt out (`enabled: false`) or narrow `scopes`; it
+cannot opt in or choose `harness`, `cli` or timeouts (global config only).
+
+Ranges, defaults and the repo-level rules are in
+[docs/usage.md](docs/usage.md#turning-the-connection-on-anywhere-pi-is-installed-no-code-edits);
+why the budgets are what they are (with live measurements) is in
+[Hindsight memory status](docs/integration/HINDSIGHT-MEMORY-STATUS.md).
 
 ```text
 /remember Calibration reports should use metric units.
@@ -103,45 +131,56 @@ credential hook: the check runs when Pi next loads the updated extension.
 
 Ordinary chat prompts automatically recall a small set of keyword-matching
 notes. The footer shows `Memory: ready`, match counts, or a specific connection
-failure. `/memory` distinguishes a healthy empty store from a rejected key.
+failure. `/memory` distinguishes a healthy empty store from a CLI that cannot
+answer.
 Automatic recall is ephemeral model context, inserted before the current user
 request; it is not copied into the saved transcript. Only `/remember` writes
 notes—normal conversations are not automatically uploaded or promoted.
 
-Automatic startup recall and per-prompt searches wait at most 250 ms, so a slow
-memory service does not hold up the model turn for seconds. A timed-out lookup
-adds no notes to that turn. Successful searches, including empty results, are
-cached for 60 seconds with at most 32 query entries. Saving a note, a successful
-explicit memory check/search, session replacement, or a changed host/key clears
-the cache. Transient failures pause automatic requests for 60 seconds; rejected
-or forbidden keys pause them for five minutes. `/memory` and `/memory setup`
-remain available during that pause, and changing the host or key retries
-immediately. Explicit commands retain their longer, bounded verification wait.
+Automatic recall is bounded by a measured budget, not a guessed one: a healthy
+`herdr-memory` call takes 0.4–4.9 s, so an interactive turn waits up to
+`automatic_recall_ms` (default 1200) and a headless `pi -p` run waits 5000 ms —
+nobody is watching a spinner there, and its single model call is the only chance
+to carry memory. The once-per-session readiness check gets 5000 ms and is not cut
+at the turn budget. A turn does not abandon its lookup: an answer that lands after
+the budget is used by the next model call of the **same** turn, and a turn that
+gets nothing says so in the model context — "could not be read this turn …
+unavailable, not empty" — because silence reads to the model as an empty bank.
+Successful searches, including empty results,
+are cached for 60 seconds with at most 32 query entries. Saving a note, a
+successful explicit memory check/search, session replacement, or a changed
+connection (a different CLI or scope set in the config) clears the cache.
+A CLI that timed out pauses automatic requests for 10 seconds (slow is not
+broken); one that exited badly pauses them for `failure_backoff_ms` (default 60 s),
+and a missing CLI or a refused write for `unavailable_backoff_ms` (default 5 min),
+because neither fixes itself between turns. `/memory` remains available during that
+pause, and changing the config retries immediately. Explicit commands retain their
+longer, bounded verification wait.
 Starting another turn does not cancel a pending explicit memory command. A
 completed save/check/search invalidates older automatic lookups; replacing the
 session or connection still fences results from the retired context.
 
-Saving requires a read/write device key. Read-only keys can recall but cannot
-save. Treat saved notes as user-provided reference information, not proof that
-claims were machine-verified. Independent review/challenge workers do not load
+Only a CLI that answers `persisted` is reported as saved; a queued or refused
+write says so instead of claiming success. Treat saved notes as user-provided
+reference information, not proof that claims were machine-verified. Independent review/challenge workers do not load
 these interactive hooks. Existing engineering-worker hydration is preserved.
 
-Confirmed profile settings override old shell host/key defaults. Set
-`PI_OPENVIKING_ENABLED=0` to disable all memory access for a launcher. A token
-file rotation is picked up by subsequent memory operations; changing host/key
-also refreshes the cached engineering runtime on the next engineering command.
-See [the feature design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits
-and verification boundaries.
+Set `memory.hindsight.enabled: false` (or omit it) to keep memory off. Reads stay fail-open — a memory that cannot be
+recalled costs that turn its notes and nothing else — while writes report the
+outcome they actually got. See [the feature
+design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits and
+verification boundaries; the HTTP transport described there has since been
+retired in favour of the CLI, and the durable kinds below no longer accept it.
 
-### Blackhole session memory (optional, off by default)
+### Blackhole session memory (optional)
 
 `pi-blackhole` can act as an **optional per-session memory/context provider** (pinned to
 version **0.5.4**). It is fully backward compatible: when omitted or disabled the runtime
 behaves exactly as before (no sessions, no events). When enabled, each worker session gets
 an isolated session-local memory store; prior memory is recalled into worker context for
 context-efficiency; background Observer/Reflector/Dropper workers run at lower priority
-(P3/P4) via the model router + scheduler; and promoted durable memory flows through the
-OpenViking abstraction with an **evidence-gated promotion workflow** (never auto-promoted)
+(P3/P4) via the model router + scheduler; and promoted durable memory flows through the durable-memory abstraction
+(`HindsightDurableMemory`) with an **evidence-gated promotion workflow** (never auto-promoted)
 that emits audit events to the authoritative EventStore.
 
 CLI: `pi-engineering blackhole status|validate|benchmark`. A native-vs-Blackhole A/B
@@ -150,7 +189,10 @@ benchmark generates a report + **12 SVG plots** and preserves raw JSONL/CSV unde
 
 **Sharing memory across workers:** the `durable` config selects the backing store for
 *evidence-promoted* knowledge (`memory` default, `shared-file` for several workers on
-one host / CI, `openviking` for the external cross-machine service). Each worker
+one host / CI, `hindsight` for the `herdr-memory` CLI, which is the only store
+that crosses machines). A kind the runtime no longer implements — `openviking`
+was retired — fails configuration validation instead of silently running
+memoryless. Each worker
 hydrates its context from shared durable memory on run, so promoted knowledge is
 consumed by later/other workers while session-local working memory stays isolated:
 
@@ -777,7 +819,8 @@ src/bench/           engineering benchmark with baseline gate
 src/adapters/        optional AutoSpec/InferWeave seams (empty by default)
 src/telemetry/       deterministic telemetry export for external control planes
 src/blackhole/       optional per-session memory provider (pinned 0.5.4, builtin default)
-src/blackhole/durable.ts  shared durable-memory providers (shared-file, OpenViking HTTP)
+src/blackhole/durableProvider.ts + durable.ts  durable-memory providers (in-memory, shared-file)
+src/blackhole/hindsight.ts  the herdr-memory CLI provider (the only cross-machine store)
 src/benchmark/       native-vs-Blackhole A/B benchmark (report + 12 SVG plots + raw data)
 src/workers/         role prompts + bounded worker_result tool + executors
 src/runtime/         EngineeringRuntime facade (plan/engineer/tournament/review/challenge)
@@ -792,7 +835,12 @@ MIT
 
 ### Automatic recovery when reopening a session
 
-Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`.
+Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`. Fresh launchers and forced rewrites also source the existing
+owner-managed `~/.config/pi/viking-env.sh`, when readable, before starting Pi.
+This preserves an engineering provider switch over stale terminal environment
+variables. The installer does not create that overlay, select a provider, or
+rewrite credentials; normal refreshes preserve the operator's launcher lines.
+
 It preserves the original Pi CLI and saves a backup at `~/.local/bin/pi.before-session-auto-resume`.
 
 On a host whose Pi is a *managed install* (`~/.pi/agent/bin/pi` with `install/current-version`), run

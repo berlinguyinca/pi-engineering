@@ -183,7 +183,10 @@ test("an alias whose name hides the model it runs is reported as ambiguous", () 
     `it runs ${NEXT_W3} (flash_next), which the name does not say`,
   );
   // Failover between two sizes: the name cannot say which one answers.
-  assert.match(aliasAmbiguity(byId(view.entries, "laya")!)!, /its 2 members run 27b, flash_next, so the name cannot say which one answers/);
+  assert.match(
+    aliasAmbiguity(byId(view.entries, "laya")!)!,
+    /its 2 members run 27b, flash_next, so the name cannot say which one answers/,
+  );
   // A name that says the size needs no warning.
   assert.equal(aliasAmbiguity(byId(view.entries, "qwen3.8-flash_next")!), undefined);
 });
