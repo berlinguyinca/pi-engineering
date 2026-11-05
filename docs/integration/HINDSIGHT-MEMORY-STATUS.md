@@ -105,13 +105,34 @@ on `forget()` itself, because there is no caller to fix yet.
 the provider — so the first slow read silenced memory for a minute per process. It is now
 1200 ms, matching the interactive in-turn budget, and still bounded and fail-open.
 
+## Write path: proven end to end (2026-11-05)
+
+No sandbox project could be provisioned (`--project pi-write-probe` →
+`{"error":"Unknown configured project"}`; projects and per-harness credentials are
+server-side), so the round-trip ran against `canary-facts` with one self-describing,
+clearly-marked record and was verified gone afterwards — the record is not recallable and
+the bank total is back to the pre-probe 31. Driven through `HindsightDurableMemory` itself,
+so it is pi's argv under test, not the CLI's help text.
+
+| Step | Live answer | pi's parse |
+| --- | --- | --- |
+| `retain <text> --scope project --provenance {…} --evidence probe:<uuid>` | `{"state":"delivered","outcome":"persisted","memory_id":"mem-0ce8…","bank_id":"canary-facts","revision":1}` | `persisted` + id + bank + revision ✓ |
+| `get mem-0ce8…` | text byte-identical, `status: verified`, `revision: 1`, `kind: fact` | write is synchronous, not outbox-delayed ✓ |
+| `recall "WRITE-PATH PROBE 20261105"` | record present among 11 verified hits | searchable immediately ✓ |
+| `correct mem-0ce8… <text> --evidence probe-correct:<uuid>` | `outcome: persisted`, `revision: 2`, `supersedes_revision: 1` | revision 2 ✓ |
+| `forget mem-0ce8…` then `get` | `outcome: persisted`, then `{"error":"Memory not found"}` exit 1 | deleted for real ✓ |
+
+Two things this settles and one it sharpens:
+
+- `retain` does not need `--explicit` when `--evidence` is present, and the write is
+  readable by the next call — no outbox wait to design around.
+- A record retained without `--kind` lands as `kind: fact`, `status: verified`.
+- The tombstone gap is narrower than it looked: deleting an id that exists really deletes
+  it. What `forget()` cannot say is *which* happened, because an unknown id answers the
+  same `outcome: persisted`. A `/forget` command still needs the `get` pre-check; ordinary
+  deletion does not.
+
 ## Not covered here
 
-- **The write round-trip is still unproven live.** `--project pi-write-probe` is refused
-  with `{"error":"Unknown configured project"}`: projects and per-harness credentials are
-  provisioned server-side (`~/.config/herdr-memory/config.json` lists `canary` only), so
-  there is no sandbox to write into. `retain`/`correct` have been verified for argument
-  shape and rejection paths only — never for an accepted write and its read-back — because
-  doing that would write into a real bank other harnesses read.
-- `forget` cannot report "nothing with that id existed" through its `boolean` return; see
-  above. Resolving that is a prerequisite for a `/forget` command, not a bug on its own.
+- Nothing on the memory surface is unproven against the live service as of 2026-11-05.
+  The write round-trip above closed the last gap.

@@ -380,12 +380,12 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   /**
    * Ask for a tombstone.
    *
-   * NOT a confirmation that anything was deleted: the service accepts a tombstone for an id
+   * Not a confirmation that anything was deleted: the service accepts a tombstone for an id
    * it has never seen and answers `{"state":"delivered","outcome":"persisted",…}` with exit 0
-   * (observed live with `mem-0000…`). A future `/forget` must resolve "forgotten / nothing
-   * with that id / could not ask" before it reports anything to the user — `get <id>` answers
-   * `{"error":"Memory not found"}` with exit 1, so the three states are distinguishable, but
-   * this boolean is not.
+   * (observed live with `mem-0000…`), which is the same answer a real deletion gives — a real
+   * one does happen, and `get` then reports `{"error":"Memory not found"}`. So this boolean
+   * cannot distinguish "forgotten" from "nothing had that id"; a `/forget` command needs a
+   * `get` pre-check before it reports which.
    */
   async forget(memoryId: string): Promise<boolean> {
     try {
