@@ -10,6 +10,14 @@
  *     use and never interpolated into a command line.
  *   - TLS verification cannot be switched off from the environment
  *     (GIT_SSL_NO_VERIFY is stripped and http.sslVerify is forced on).
+ *   - The environment cannot inject git config: GIT_CONFIG_COUNT/KEY_n/VALUE_n,
+ *     GIT_CONFIG_PARAMETERS and GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR/
+ *     GIT_CEILING_DIRECTORIES are dropped before git runs (the same helper safeGit
+ *     uses). One `url.<x>.insteadOf` entry would otherwise turn an allow-listed
+ *     remote into another repository, and the identity root recorded on a fresh
+ *     install would then certify the wrong repository (#590). Because config files
+ *     this module does not own can rewrite a URL too, the fetch checks the URL git
+ *     would actually contact — `effectiveRemote` — against the same allow-list.
  *     Protocols are restricted to https, ssh and, only when a trusted entry is
  *     a local path, file.
  *   - Repository identity: the candidate commit must descend from the
@@ -24,6 +32,7 @@ import { execFile } from "node:child_process";
 import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
+import { withoutInjectedConfig } from "../git/gitEnvironment.ts";
 
 export type UpdateChannel = "stable" | "main";
 
@@ -50,7 +59,9 @@ export function runGit(
   args: string[],
   opts: { cwd?: string; gitDir?: string; timeoutMs?: number } = {},
 ): Promise<GitResult> {
-  const env = { ...process.env };
+  // Ambient config is not trusted: one injected `url.<x>.insteadOf` turns an
+  // allow-listed remote into another repository (issue #590). Same helper safeGit uses.
+  const env = withoutInjectedConfig({ ...process.env });
   delete env.GIT_SSL_NO_VERIFY;
   env.GIT_TERMINAL_PROMPT = "0";
   const prefix = ["-c", "http.sslVerify=true", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
@@ -130,6 +141,26 @@ function protocolArgs(source: TrustedSource): string[] {
   ];
 }
 
+/**
+ * The URL git would really contact for `remote`, after `url.<x>.insteadOf`.
+ *
+ * `assertTrusted` can only judge the string it is handed; git rewrites it afterwards,
+ * from config this module does not own — the user's global config, a system config, or
+ * (before #590 was fixed) an injected `GIT_CONFIG_KEY_n`. On a fresh install that is not
+ * a transient fetch from the wrong place: the identity root recorded on first fetch pins
+ * the wrong repository as the true one, so the check that is supposed to catch a hostile
+ * candidate then certifies it. `--get-url` asks git for the expansion and contacts
+ * nothing; the expanded form has to clear the same allow-list, and a failure to ask is
+ * fatal, because "unknown" and "redirected" must not be indistinguishable.
+ */
+export async function effectiveRemote(remote: string, gitDir?: string): Promise<string> {
+  const r = await runGit(["ls-remote", "--get-url", remote], { gitDir, timeoutMs: 15_000 });
+  const url = r.stdout.trim();
+  if (r.code !== 0 || !url)
+    throw new UpdateSourceError(`cannot resolve the update source ${remote} through git's own URL rewriting`);
+  return url;
+}
+
 /** The download cache: a bare repository private to the install root. */
 export class SourceCache {
   readonly gitDir: string;
@@ -147,6 +178,13 @@ export class SourceCache {
   /** Fetch branches and tags from the trusted remote into private namespaces. */
   async fetch(source: TrustedSource): Promise<void> {
     assertTrusted(source);
+    const effective = await effectiveRemote(source.remote, this.gitDir);
+    const want = normalizeRemote(effective);
+    if (!source.trusted.map(normalizeRemote).includes(want)) {
+      throw new UpdateSourceError(
+        `update source ${source.remote} resolves to ${effective} after git's URL rewriting, which is not a trusted source`,
+      );
+    }
     await this.ensure();
     await git(
       [
@@ -283,7 +321,7 @@ export class SourceCache {
 }
 
 async function gitEnv(args: string[], gitDir: string, extra: Record<string, string>): Promise<void> {
-  const env = { ...process.env, ...extra };
+  const env = withoutInjectedConfig({ ...process.env, ...extra });
   delete env.GIT_SSL_NO_VERIFY;
   await new Promise<void>((resolveRun, reject) => {
     execFile(

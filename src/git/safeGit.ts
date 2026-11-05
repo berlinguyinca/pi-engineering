@@ -84,6 +84,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import { withoutInjectedConfig } from "./gitEnvironment.ts";
 import { generateLfsAttributes } from "./safeGitAttrs.ts";
 import {
   forgetPinsForTests,
@@ -855,6 +856,9 @@ export function setConfigListLimitForTests(bytes: number): void {
   configListMax = bytes;
 }
 
+/** Moved to `gitEnvironment.ts` so the self-update path can harden its env without importing safeGit; re-exported for existing importers. */
+export { withoutInjectedConfig };
+
 /** Config overrides as environment (GIT_CONFIG_COUNT/KEY_n/VALUE_n): a key may contain `=`, `.`, spaces, quotes. */
 export function configEnv(pairs: readonly ConfigPair[]): Record<string, string> {
   const out: Record<string, string> = { GIT_CONFIG_COUNT: String(pairs.length) };
@@ -862,17 +866,6 @@ export function configEnv(pairs: readonly ConfigPair[]): Record<string, string> 
     out[`GIT_CONFIG_KEY_${i}`] = c.key;
     out[`GIT_CONFIG_VALUE_${i}`] = c.value;
   });
-  return out;
-}
-
-/** Variables through which a caller or the ambient environment could inject config or redirect the repository; removed before ours are set. */
-export function withoutInjectedConfig(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS" || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) continue;
-    if (k === "GIT_DIR" || k === "GIT_WORK_TREE" || k === "GIT_COMMON_DIR" || k === "GIT_CEILING_DIRECTORIES") continue;
-    out[k] = v;
-  }
   return out;
 }
 
