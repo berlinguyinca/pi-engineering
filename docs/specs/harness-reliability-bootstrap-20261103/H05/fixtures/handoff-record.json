@@ -1,0 +1,36 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "H05",
+ "status": "PASS",
+ "repo": "berlinguyinca/herdr-engineering",
+ "baseSha": "4c4f4c89b55ae5b492a381397a0a8b591b7d41bc",
+ "resultSha": "5e56bf43cc7ee67855f7e072f7d4bcddb78ec380",
+ "taskAuthorityHash": "sha256:35b2faa820f2b65bad89b5ae254db94ce1a108a4490272ec3aa049504971dc00",
+ "changedFiles": [
+  "packages/diagnostics-timeline.js",
+  "packages/diagnostics-timeline.test.js"
+ ],
+ "commands": [
+  {
+   "command": "git diff --check",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/H05/logs/01-node-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/H05/logs/01-node-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/H05/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H05/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H05/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "H06",
+ "nextBaseSha": "5e56bf43cc7ee67855f7e072f7d4bcddb78ec380",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Worker pane h05 (pane w8:p13, metabolomics/qwen3.8-flash_next) on base 4c4f4c89 (H04 result, berlinguyinca/herdr-engineering), herdr-ui mode, first pass, ~9 min. Exactly the two declared new files (git show --name-only HEAD), 118 changed lines against the 120 herdr-ui ceiling. Conductor verified independently at 5e56bf43: node --test packages/diagnostics-timeline.test.js 6 pass / 0 fail; node --check on both files exit 0; git diff --check 4c4f4c89..HEAD exit 0; token sweep for fetch(|readFileSync|writeFileSync|Date.now|Math.random|setTimeout|addEventListener|onclick|<button|<form returns 0 hits, so the delta's 'no control actions' holds structurally, not just by intent. Reuse verified in source: escapeHtml is imported from packages/herdr-web-components/util.js and the unavailable banner calls H03 describeUnavailable, so no private escaping or second unavailability vocabulary exists. Chronology keeps a single authority: the renderer does not import or re-implement H02's buildTimeline, it consumes the timeline H02 already ordered (instant with positional tiebreak) and documents that it never re-sorts within a session, so an event cannot be reordered twice; sessions themselves are ordered by first-event instant then id, which is what makes repeated renders byte-identical. Anti-fabrication: UNKNOWN is the only word for a missing step, type or instant and NO_SESSION is the bucket for an event reporting no sessionId, so neither an inferred step nor an invented session id can appear; the only date call formats the record's own instant (new Date(ms).toISOString), never the clock. Evidence clauses are covered by the test file (order with a same-instant tie, grouping asserted twice, 8 href/11 trace assertions including a quote-bearing href and the no-href unavailable line, and 'unknown' asserted 4 times). NOTE: the delta's 'link to retry trace' is satisfied by an escape-safe href only when the caller supplies traceHref; no trace endpoint was invented, so the view says the trace is unavailable until a transport provides one."
+ }
+}

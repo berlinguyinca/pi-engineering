@@ -1,0 +1,44 @@
+{
+ "taskId": "H04",
+ "baseSha": "b8378ffc37ae7169f42ab794cc62994c13614ca8",
+ "repoId": "herdr",
+ "objective": "Reuse existing Herdr visual tokens/components; show fingerprint, severity, occurrences, sessions, last seen and recovery state; read-only. Evidence: Escaped HTML and stable sorted incident cards. Evidence: Escaped HTML and stable sorted incident cards",
+ "allowPaths": [
+  "packages/diagnostics-view.js",
+  "packages/diagnostics-view.test.js"
+ ],
+ "denyPaths": [
+  "herdr_engineering/**",
+  "tests/**",
+  "deploy/**",
+  "pyproject.toml",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "AGENTS.md",
+  "README.md"
+ ],
+ "commands": [
+  {
+   "id": "diff-check",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 120000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 120
+ },
+ "parentHandoffHash": "sha256:606d052dca81acaac718b35c47b5999e912743b98801a40cd80fdb8b2506a2cb",
+ "expectedOutputs": [
+  "packages/diagnostics-view.js",
+  "packages/diagnostics-view.test.js"
+ ],
+ "mode": "herdr-ui"
+}

@@ -1,0 +1,37 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "H03",
+  "status": "PASS",
+  "repo": "berlinguyinca/herdr-engineering",
+  "baseSha": "ab96dc25bc2b672cc73923d648e683b0edc885b9",
+  "resultSha": "b8378ffc37ae7169f42ab794cc62994c13614ca8",
+  "taskAuthorityHash": "sha256:88962b04a8b19b9d9e351e36f6fc6315b50cf690edb38bab5ff51c9ab37493f8",
+  "changedFiles": [
+    "packages/diagnostics-source.js",
+    "packages/diagnostics-source.test.js"
+  ],
+  "commands": [
+    {
+      "command": "git diff --check",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/H03/logs/01-node-test.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/H03/logs/01-node-test.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/H03/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/H03/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/H03/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "H04",
+  "nextBaseSha": "b8378ffc37ae7169f42ab794cc62994c13614ca8",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Worker pane h03 (pane w8:p11, metabolomics/qwen3.8-flash_next) on base ab96dc25 (H02 result, berlinguyinca/herdr-engineering), herdr-ui mode, first pass, ~6 min. Exactly the two declared new files (git show --name-only HEAD), 52 + 65 = 117 changed lines against the 120 herdr-ui ceiling. Conductor verified independently at b8378ffc: node --test packages/diagnostics-source.test.js 8 pass / 0 fail; node --check on both files exit 0; git diff --check ab96dc25..HEAD exit 0. Conductor checks on the delta: the adapter imports only buildTimeline from ./diagnostics-model.js, so H02 stays the single normalization authority (decideDrift and the validators are untouched, and no existing file changed); a forbidden-token sweep (fetch|readFileSync|writeFileSync|Date.now|Math.random|setTimeout|XMLHttpRequest|WebSocket) matches only comments and the injected collaborator names fetchEvents/fetchHosts, so the module performs no I/O, no clock, no timer, no network - the caller injects the transport and the instant, and a source without an injected instant reports null rather than reading the clock. The evidence clause is met by a stronger posture than the brief asked for: a section is {read: false, items: [], partial: false} when its transport is missing, rejects, or yields null - distinguishable from a genuine empty read, which is {read: true, items: []} - and a truncated page keeps what arrived with partial true while loadDiagnostics never rejects, so an offline host cannot surface as a blank that looks like 'no incidents'; discarded records stay visible through buildTimeline's {dropped, invalid}. Exports: SECTIONS, createDiagnosticsSource, loadDiagnostics, describeUnavailable. NOTE: the worker began drafting an out-of-scope H04-SPEC.md; it was untracked, removed by the conductor before stamping, and the worker was told to stop - H04 ships as its own unit with its own worker."
+  },
+  "handoffHash": "sha256:606d052dca81acaac718b35c47b5999e912743b98801a40cd80fdb8b2506a2cb"
+}

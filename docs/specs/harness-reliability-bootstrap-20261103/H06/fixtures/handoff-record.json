@@ -1,0 +1,36 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "H06",
+ "status": "PASS",
+ "repo": "berlinguyinca/herdr-engineering",
+ "baseSha": "5e56bf43cc7ee67855f7e072f7d4bcddb78ec380",
+ "resultSha": "1466be76b49d6c6918ed25a4db5b8fb9ee849c32",
+ "taskAuthorityHash": "sha256:028b2f44572c2e88be9e0fd788d866c32aa488f69bc95022f82582a2aad6142b",
+ "changedFiles": [
+  "packages/task-drift-view.js",
+  "packages/task-drift-view.test.js"
+ ],
+ "commands": [
+  {
+   "command": "git diff --check",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/H06/logs/01-node-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/H06/logs/01-node-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/H06/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H06/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H06/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "H07",
+ "nextBaseSha": "1466be76b49d6c6918ed25a4db5b8fb9ee849c32",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Worker pane h06 (pane w8:p14, metabolomics/qwen3.8-flash_next) on base 5e56bf43 (H05 result, berlinguyinca/herdr-engineering), herdr-ui mode, first pass, ~8 min. Exactly the two declared new files (git show --name-only HEAD), 118 changed lines against the 120 herdr-ui ceiling. Conductor verified independently at 1466be76: node --test packages/task-drift-view.test.js 6 pass / 0 fail; node --check on both files exit 0; git diff --check 5e56bf43..HEAD exit 0. The plan's hard prohibition is tested, not merely asserted: the test file carries 2 assertions that the rendered HTML contains no '%' and no 'score' token, and the source calls H02 decideDrift exactly once (line 34) to render its boolean plus reason, so drift keeps a single authority and this view cannot invent a second verdict or a percentage. Relevance is visible without being invented: a record's own flag, else the classification list of the report it appears in, else the literal 'relevance unknown' rendered as a distinct <em> inside class drift-action - never defaulted to relevant - and UNKNOWN/'none reported' are the only renderings for fields the report does not carry. First violation cannot be guessed: when drift was decided but the report carries no first-violation record the view emits data-drift-violation=unknown with the text 'first violation unknown' rather than pointing at the first observed action. Reuse: escapeHtml comes from packages/herdr-web-components/util.js (packages/herdr-web-components/util.js:8) and no existing file changed."
+ }
+}

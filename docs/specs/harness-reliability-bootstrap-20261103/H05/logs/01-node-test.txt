@@ -1,0 +1,14 @@
+✔ events inside one session follow H02 chronologically, and a tie at one instant keeps H02 positional tiebreak (7.827ms)
+✔ sessions are grouped by reported id, ordered by first instant then id, and two runs render byte-identical HTML (4.598166ms)
+✔ a trace href carrying a quote or markup is escape-safe, and without one the trace says unavailable rather than linking to "#" (0.488125ms)
+✔ an event carrying no step reads "unknown" — a step is never invented from position, id or order (0.268625ms)
+✔ a payload input error is labelled as one, and a section that could not be read is stated instead of an empty timeline (0.305958ms)
+✔ rendering reads the events it is handed and changes neither them nor their own order (0.19675ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 337.376625

@@ -1,0 +1,46 @@
+{
+ "taskId": "H07",
+ "baseSha": "1466be76b49d6c6918ed25a4db5b8fb9ee849c32",
+ "repoId": "herdr",
+ "objective": "Add a discoverable navigation link using existing router pattern after confirming exact mount file; do not rewrite dashboard shell. Evidence: Route works, no navigation regressions. Evidence: Route works, no navigation regressions; screenshot after integration if available",
+ "allowPaths": [
+  "packages/app.js",
+  "packages/diagnostics-route.test.js",
+  "packages/hosts-view.js"
+ ],
+ "denyPaths": [
+  "herdr_engineering/**",
+  "tests/**",
+  "deploy/**",
+  "pyproject.toml",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "AGENTS.md",
+  "README.md"
+ ],
+ "commands": [
+  {
+   "id": "diff-check",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 120000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 120
+ },
+ "parentHandoffHash": "sha256:b6913d6323ee12f168511eba4c483e516ddd68fe0d6c3b439015ea87113f7b6a",
+ "expectedOutputs": [
+  "packages/app.js",
+  "packages/diagnostics-route.test.js",
+  "packages/hosts-view.js"
+ ],
+ "mode": "herdr-ui"
+}
