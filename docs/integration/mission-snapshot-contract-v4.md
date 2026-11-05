@@ -4,15 +4,26 @@
 every v3 field keeps its name, type and meaning. A v3 reader that ignores unknown
 keys keeps working; a v3 file on disk still parses (`test/fixtures/mission-snapshot-v3-legacy.json`).
 
+> **DEPLOY ORDER (required).** Herdr's previous mission-activity feed rejects any
+> `contractVersion` other than 3, so a Pi that emits v4 breaks the WHOLE feed of an
+> old Herdr. Deploy the Herdr build that accepts contract versions 3 AND 4 FIRST,
+> then deploy Pi. Rollback in the reverse order: roll Pi back to v3 first, then
+> Herdr.
+
 ## Diff (per mission entry, all optional)
 
 | Field | Type | Source | Omitted when |
 |---|---|---|---|
 | `created_at` | ISO string | `Mission.created_at`, verbatim | the record has none |
 | `completed_at` | ISO string | `Mission.completed_at`, verbatim | `null` (mission not finished) |
-| `links` | `{kind: 'issue'\|'pull_request', repository: 'owner/name', number: int}[]` | stored, `active` `GithubLinkRecord`s of that mission only | the github layer holds none |
+| `links` | `{kind: 'issue'\|'pull_request', repository: 'owner/name', number: int}[]` | stored, `active` `GithubLinkRecord`s of that mission only, provenance `operator` / `autospec` / `pr_create_output` / `confirmed_suggestion` | the github layer holds none |
 
-Rules for `links`: never derived from title, goal or branch text; deduped by
+Rules for `links`: never derived from title, goal or branch text. Only records
+whose provenance is an explicit operator/system action are projected: `operator`,
+`autospec`, `pr_create_output`, `confirmed_suggestion`. `explicit_ref` records are
+NOT projected: `discoverGithubLinks` creates them by regex extraction over goal,
+task, branch and PR-body text, and Herdr treats snapshot links as verified. Any
+other/unknown provenance is dropped. Further: deduped by
 (repository, kind, number) across subjects; sorted by repository, kind, number;
 capped at `MISSION_SNAPSHOT_MAX_LINKS` (100); `removed` / `not_found` links and
 links of other missions are skipped; only `github.com` targets are projected (a

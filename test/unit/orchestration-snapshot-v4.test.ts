@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { canonicalId, parseGithubRef } from "../../src/github/refs.ts";
-import { type GithubLinkRecord, linkIdFor } from "../../src/github/types.ts";
+import { type GithubLinkRecord, type LinkProvenance, linkIdFor } from "../../src/github/types.ts";
 import {
   MISSION_SNAPSHOT_CONTRACT_VERSION,
   MISSION_SNAPSHOT_MAX_LINKS,
@@ -134,6 +134,38 @@ describe("mission snapshot contract v4 (additive)", () => {
     );
     assert.equal(MISSION_SNAPSHOT_MAX_LINKS, 100);
     assert.equal(build(mission, many).links?.length, 100);
+  });
+
+  it("does not project explicit_ref records (regex-extracted from goal/task/branch/PR-body text)", () => {
+    const { mission } = newMission("Fix it", "Mentions org/repo#12 in passing");
+    const rec = {
+      ...link(mission.mission_id, "org/repo#12", "issue"),
+      provenance: "explicit_ref" as const,
+      source: "goal",
+    };
+    assert.equal("links" in build(mission, [rec]), false);
+  });
+
+  for (const provenance of [
+    "operator",
+    "autospec",
+    "pr_create_output",
+    "confirmed_suggestion",
+  ] as const satisfies readonly LinkProvenance[]) {
+    it(`projects an active ${provenance} record`, () => {
+      const { mission } = newMission();
+      const rec = { ...link(mission.mission_id, "org/repo#5", "issue"), provenance };
+      assert.deepEqual(build(mission, [rec]).links, [{ kind: "issue", repository: "org/repo", number: 5 }]);
+    });
+  }
+
+  it("drops a record whose provenance is not an explicit operator/system action (unknown/unconfirmed value)", () => {
+    const { mission } = newMission();
+    const rec = {
+      ...link(mission.mission_id, "org/repo#6", "issue"),
+      provenance: "suggested" as unknown as LinkProvenance,
+    };
+    assert.equal("links" in build(mission, [rec]), false);
   });
 
   it("never invents a link from title, goal or branch text", () => {

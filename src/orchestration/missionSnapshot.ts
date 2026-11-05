@@ -14,7 +14,7 @@
 import { readFile } from "node:fs/promises";
 
 import { parseCanonicalId } from "../github/refs.ts";
-import type { GithubLinkRecord } from "../github/types.ts";
+import type { GithubLinkRecord, LinkProvenance } from "../github/types.ts";
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
 import { type MissionModelSummary, summarizeMissionModels } from "./missionModels.ts";
 import type { CanonicalLifecycle } from "./missionStore.ts";
@@ -202,8 +202,9 @@ export interface MissionSnapshotMission {
   completed_at?: string;
   /**
    * Additive v4: GitHub issues / pull requests linked to this mission, taken
-   * ONLY from stored active GithubLinkRecords (never parsed from title, goal or
-   * branch text). Omitted when the github layer holds none. Deduped, sorted by
+   * ONLY from stored active GithubLinkRecords whose provenance is operator,
+   * autospec, pr_create_output or confirmed_suggestion (never explicit_ref, which
+   * is regex-extracted from goal/task/branch/PR-body text; never parsed from text). Omitted when the github layer holds none. Deduped, sorted by
    * repository, kind, number, and bounded by MISSION_SNAPSHOT_MAX_LINKS.
    */
   links?: MissionSnapshotLink[];
@@ -332,6 +333,18 @@ export interface MissionSpecInput {
   resumeCondition: string | null;
 }
 
+/**
+ * Provenances that record an explicit operator/system action. `explicit_ref` is
+ * excluded on purpose: those records come from regex extraction over goal, task,
+ * branch and PR-body text, and Herdr treats snapshot links as verified.
+ */
+const PROJECTED_PROVENANCES: ReadonlySet<LinkProvenance> = new Set<LinkProvenance>([
+  "operator",
+  "autospec",
+  "pr_create_output",
+  "confirmed_suggestion",
+]);
+
 /** Project stored link records to the snapshot's link list; pure, honest, bounded. */
 export function snapshotLinksOf(
   missionId: string,
@@ -340,6 +353,7 @@ export function snapshotLinksOf(
   const byKey = new Map<string, MissionSnapshotLink>();
   for (const rec of records ?? []) {
     if (rec.missionId !== missionId || rec.status !== "active") continue;
+    if (!PROJECTED_PROVENANCES.has(rec.provenance)) continue;
     const ref = parseCanonicalId(rec.target);
     // Only github.com is projected: a bare owner/name would be ambiguous on another host.
     if (!ref || ref.host !== "github.com" || ref.kind !== rec.targetKind) continue;
