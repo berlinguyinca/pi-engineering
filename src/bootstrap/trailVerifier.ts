@@ -18,6 +18,7 @@
  */
 import { validateHandoffSchema } from "./handoffWriter.ts";
 import { canonicalHash } from "./resultGate.ts";
+import { sep } from "node:path";
 
 export interface TrailRecord {
   readonly taskId: string;
@@ -109,6 +110,26 @@ export function verifyTrail(input: TrailInput): TrailVerdict {
 export interface TrailRecordGeneration extends TrailRecord {
   readonly generation: number;
 }
+
+/**
+ * Generation directories, oldest first; the newest generation present for a task is its canonical record. `""` is the
+ * protocol path (`<taskId>/<taskId>.handoff.json`), which `.gitignore` deliberately keeps untracked - a trail's
+ * committed records live in the generation directories, so this list, not the protocol path, is where a finished trail
+ * is actually found. A backfill ranks below every generation the run wrote itself: it is a reconstruction produced
+ * afterwards and must never silently outrank a record the run stamped at the time.
+ */
+export const GENERATION_ORDER: readonly string[] = ["", "out-backfill", "out", "out2", "out-corrected", "out-final"];
+
+/** The rank of a generation directory, or null when the reader does not know it. An unknown generation is reported, never guessed at. */
+export function generationRank(generation: string): number | null {
+  const rank = GENERATION_ORDER.indexOf(generation);
+  return rank < 0 ? null : rank;
+}
+
+/** Generation directories that hold records but are not read. Skipping one silently would hide a record from the audit. */
+export function unreadGenerations(dirNames: readonly string[]): string[] {
+  return [...new Set(dirNames)].filter((name) => name.startsWith("out") && generationRank(name) === null).sort();
+}
 /** One record per task: the highest `generation` wins; a tie at the top keeps the entry seen first (a tie is not a choice we make). */
 export function selectCanonical(records: readonly TrailRecordGeneration[]): TrailRecord[] {
   const best = new Map<string, TrailRecordGeneration>();
@@ -118,12 +139,61 @@ export function selectCanonical(records: readonly TrailRecordGeneration[]): Trai
   }
   return [...best.values()].map(({ taskId, record }) => ({ taskId, record }));
 }
+/** A process as the audit sees it: its command line, and the directory it was started in when that could be read. */
+export interface LiveProcess {
+  readonly pid: number;
+  readonly command: string;
+  /** Resolved working directory, or null when the platform would not say. An unreadable cwd is never attributed. */
+  readonly cwd: string | null;
+}
+
+export interface LiveRunnerMatch {
+  /** Command lines of processes still alive that are attributable to the audited checkout. */
+  readonly attributed: string[];
+  /** Processes that quoted a recorded command but belong elsewhere (another checkout, or an unreadable cwd). */
+  readonly unattributed: number;
+}
+
+/** Characters that may follow a command inside a command line: whitespace, a shell operator, or end of line. */
+const COMMAND_END = new Set(["", " ", "\t", "\n", "\r", ";", "&", "|", ">", "<", ")", "`"]);
+
 /**
- * Which live processes belong to the audited run: a process line counts when it contains a command the trail itself
- * recorded. The verifier's own invocation never counts. Empty means "nothing the run started is still running" - it
- * is not proof that nothing ever ran.
+ * Whether `command` appears in `line` AS a command being run - delimited by shell syntax - rather than merely being
+ * quoted inside another process's argument. A code-review prompt that says "You MAY run `npm test`" mentions the
+ * command without running it, and attributing that to the audited run makes the gate fail for a reason that has
+ * nothing to do with the trail.
  */
-export function matchLiveRunners(processLines: readonly string[], recordedCommands: readonly string[]): string[] {
-  const unique = [...new Set(processLines.map((line) => line.trim()))].filter((line) => line.length > 0 && !line.includes("verify-handoff-trail")).filter((line) => recordedCommands.some((command) => command.length > 0 && line.includes(command)));
-  return unique.sort();
+export function mentionsCommand(line: string, command: string): boolean {
+  if (command.length === 0) return false;
+  let from = 0;
+  for (;;) {
+    const at = line.indexOf(command, from);
+    if (at < 0) return false;
+    const before = at === 0 ? "" : (line[at - 1] as string);
+    const after = (line[at + command.length] ?? "") as string;
+    if ((before === "" || before === " " || before === "\t" || ";&|(".includes(before)) && COMMAND_END.has(after)) return true;
+    from = at + 1;
+  }
+}
+
+/**
+ * Which live processes belong to the audited run. Two things must hold, because either one alone has produced false
+ * positives on real trails: the process must RUN a command the trail recorded (not merely mention it), and it must
+ * have been started inside the audited checkout (its working directory is the root or below it). Processes that quote
+ * a recorded command from elsewhere are counted as `unattributed` so the audit can say so instead of silently
+ * ignoring them. An empty `attributed` list is not proof that nothing ever ran.
+ */
+export function matchLiveRunners(processes: readonly LiveProcess[], recordedCommands: readonly string[], root: string): LiveRunnerMatch {
+  const recorded = recordedCommands.filter((command) => command.trim().length > 0);
+  const boundary = root.endsWith(sep) ? root : root + sep;
+  const attributed = new Set<string>();
+  const elsewhere = new Set<string>();
+  for (const process of processes) {
+    const line = process.command.trim();
+    if (line.length === 0 || line.includes("verify-handoff-trail")) continue;
+    if (!recorded.some((command) => mentionsCommand(line, command))) continue;
+    const inside = process.cwd !== null && (process.cwd === root || process.cwd.startsWith(boundary));
+    (inside ? attributed : elsewhere).add(line);
+  }
+  return { attributed: [...attributed].sort(), unattributed: elsewhere.size };
 }

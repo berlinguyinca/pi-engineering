@@ -1,0 +1,41 @@
+trail verifier gaps, audited 2026-11-09 against HEAD of harness-reliability-bootstrap-20261103
+command: npx tsx scripts/verify-handoff-trail.ts --expect B00,B01,B02,B03,B04,B05
+
+Fixed by this change (38 issues -> 30):
+
+1. missing-record B00..B05 (6 issues) - NOT a missing run. `.gitignore` keeps the protocol path
+   (`<taskId>/<taskId>.handoff.json`) untracked on purpose, so a finished trail's committed records live in
+   generation directories. The reader's generation list was ["", "out", "out2", "out-corrected", "out-final"]
+   and did not know `out-backfill`, where the 2026-11-05 backfill put the six B-family records
+   (AUDIT/integrity-scan-20261105-backfill.txt: canonical_hash_ok=113, hash offenders none). The records were
+   complete, schema-conformant and hash-clean; only the reader could not see them. `GENERATION_ORDER` now ranks
+   `out-backfill` BELOW every generation the run wrote itself: a reconstruction made afterwards must never
+   silently outrank a record the run stamped at the time. A backfill is used only where nothing was written.
+
+2. live-runner (2 issues, now 0) - both matched processes belonged to other projects: one was a code review of
+   cartwright-spec whose prompt text contains "You MAY run `npm test`", one was a SectorDrivePrototype agent
+   running `git status --short`. The old matcher attributed any process whose command line CONTAINED a recorded
+   command, so an unrelated project could hold this trail's gate shut. Attribution now needs both: the process
+   RUNS a recorded command (delimited by shell syntax, not quoted in prose) and it was started INSIDE the audited
+   checkout. Processes that quote a recorded command from elsewhere are reported as `unattributedRunners`.
+
+Newly surfaced, deliberately unresolved:
+
+3. unreadGenerations: E02/out-negctl, E07/out-d01, X05/out-chain, X06/out-chain. Four real records sat in
+   purpose-named generation directories the reader did not rank, so they were invisible to every audit since
+   they were written. They are now reported instead of skipped. Ranking them is not decided here: a directory
+   name carries no chronology, and letting a name decide which record is canonical would be a guess dressed up
+   as a rule. Whoever owns those tasks should either move them to a ranked generation or make the record's own
+   completion timestamp the ordering key - a decision about which timestamp is authoritative, not a rename.
+
+4. unplanned-record (15): FIX-1..FIX-5, FIX-3B, FIX-3B2, FIX-3C, FIX-4A, FIX-4B, X01..X07 carry records the plan
+   manifest never ordered. The work happened and was recorded; manifests/tasks.json was never amended. Amending
+   the plan after the fact rewrites what was ordered, so it is left as a finding rather than a fix.
+
+5. evidence-absent / evidence-uncommitted (6 + 6): FIX-1 and FIX-2 name artifacts with no file and no blob at the
+   audited revision (e.g. FIX-1/01-typecheck.txt). Cannot be repaired without re-running those tasks; the audit
+   trail should keep the gap visible.
+
+6. lineage-break E03 (E02.nextBaseSha cc036f2f8c3b != E03.baseSha ba22f28a6b54) and next-pointer-mismatch E07,
+   T09: recorded pointers disagree with the plan/chain. Left as findings; rewriting a stamped record would
+   destroy the very accidental-modification detection the stamp exists to provide.
