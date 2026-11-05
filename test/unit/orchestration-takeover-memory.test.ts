@@ -2,7 +2,7 @@
  * A scheduler relaunch of the same task must not re-walk the takeover list
  * from scratch: models its earlier walks found dead are carried (bounded by a
  * TTL), reset when the operator pin changes, and never applied to an
- * explicitly pinned model. See RETRY-OWNERS.md.
+ * explicitly pinned model. See RETRY_OWNERS.md.
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
