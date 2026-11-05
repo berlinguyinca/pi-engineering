@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname } from "node:path";
 import { join } from "node:path";
@@ -13,7 +13,13 @@ const exec = promisify(execFile);
  * end-to-end test. Returns the repo root and a cleanup function.
  */
 export async function makeFixtureRepo(): Promise<{ root: string; cleanup: () => Promise<void> }> {
-  const root = await mkdtemp();
+  // Canonical path, because that is what a real repository root is to Pi: the
+  // runtime resolves repositories with `realpathSync`, and on macOS `$TMPDIR`
+  // lives behind `/var` → `/private/var`. Handing out the unresolved form makes
+  // every scope check see a symlink crossing it must refuse (`Explicit
+  // workspace path crosses a symlink boundary`), and mixes two representations
+  // of one directory into git's own path resolution.
+  const root = await realpath(await mkdtemp());
   await exec("git", ["init", "-q", root]);
   await exec("git", ["-C", root, "config", "user.email", "test@example.com"]);
   await exec("git", ["-C", root, "config", "user.name", "Test"]);

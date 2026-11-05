@@ -21,6 +21,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -60,7 +61,15 @@ function privateDir(path: string): string {
   const me = uid();
   if (me !== null && st.uid !== me) throw bad("it is not owned by this user");
   if ((st.mode & 0o077) !== 0) chmodSync(path, 0o700);
-  return path;
+  // Return the canonical path. `lstat` above only refuses a symlink *at* the
+  // last component, so an ancestor may still be one — on macOS every `mkdtemp`
+  // under `$TMPDIR` is (`/var` → `/private/var`) — and Pi discovers
+  // repositories through `realpathSync`, so a state dir kept in its unresolved
+  // form puts the shadow repository and the real one in different
+  // representations of the same directory. Git then resolves one against the
+  // other and produces a doubled prefix (`/private/private/var/…`), which fails
+  // every `mkdir` under the real common dir.
+  return realpathSync(path);
 }
 
 export function safeGitStateDir(): string {
