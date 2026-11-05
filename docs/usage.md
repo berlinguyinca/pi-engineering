@@ -1527,6 +1527,22 @@ the retired kind fails validation with a message naming the kinds that work,
 rather than falling back to an in-process store and quietly leaving every worker
 memoryless on a multi-host run.
 
+### Listing and readiness
+
+The Hindsight provider lists documents with the canonical `herdr-memory documents`
+command, then hydrates their normalized `address` values with `get`. It does not
+interpret `recall "*"` or a made-up semantic query as enumeration. Listing uses
+20-document pages, at most three pages per scope and 50 hydrated records overall,
+within one operation deadline. Hidden, unknown and personal-bank records are
+excluded; candidate status is preserved. A failed read contributes no invented
+memory. Only the engineering scopes in the configured finite allowlist are read.
+
+Readiness uses document-list metadata separately from best-effort reads. Empty
+banks are healthy, and an empty project does not hide a subsequent configured
+scope. A degraded, offline, malformed or refused listing is not a healthy empty
+bank. Exact totals are shown when available; a truncated estimated listing shows
+`count unknown`, rather than claiming its cap is the saved total.
+
 ### Turning the connection on anywhere pi is installed (no code edits)
 
 Durable memory is **on by default**. Any pi installation that loads this package's

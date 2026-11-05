@@ -1,5 +1,5 @@
 /**
- * Hindsight durable memory provider (opt-in).
+ * Canonical Hindsight durable memory provider.
  *
  * Shells out to the `herdr-memory` CLI (contract v1: recall/retain/correct/
  * forget, one JSON object on stdout). Pi never talks to Hindsight directly.
@@ -66,18 +66,31 @@ export function hindsightBlackholeOption(
 // herdr-memory accepts --timeout-ms only on these actions; on retain/correct/forget argparse rejects it.
 const TIMEOUT_FLAG_ACTIONS = new Set(["recall", "get"]);
 
-/**
- * Query for the "everything I have" reads.
- *
- * The service has no list endpoint and rejects a wildcard: `recall "*"` comes back as
- * `{"error":"Memory service rejected request (HTTP 422)"}` with exit 1, and an empty query
- * fails client-side (observed live, project `canary`, 2026-11-04). A readiness probe built
- * on `"*"` therefore reported "exited unsuccessfully" against a healthy service, backed
- * automatic recall off for a minute, and the bank looked empty. A bounded overview query is
- * the only way to ask, so every count built on it is a probe of what the bank recalls, never
- * a literal total — and surfaces that report it must say so.
- */
-const OVERVIEW_QUERY = "project memory decision";
+// Enumeration and hydration share one operation deadline, a finite page cap and a record cap.
+const DOCUMENT_PAGE_SIZE = 20;
+const MAX_DOCUMENT_PAGES = 3;
+const MAX_LIST_RECORDS = 50;
+const ADDRESS_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+function engineeringBank(bank: unknown, scope?: string): bank is string {
+  if (typeof bank !== "string" || /^(personal|rakazo|assistant)/i.test(bank)) return false;
+  if (scope === "global") return bank === "herdr-global";
+  if (scope === "infra") return bank === "herdr-infra";
+  if (scope?.startsWith("mission:"))
+    return bank.endsWith(`-mission-${scope.slice(8)}`) && /^[a-z0-9][a-z0-9_-]*-mission-[a-z0-9_-]+$/.test(bank);
+  if (scope === "project") return /^[a-z0-9][a-z0-9_-]*-facts$/.test(bank);
+  return (
+    bank === "herdr-global" ||
+    bank === "herdr-infra" ||
+    /^[a-z0-9][a-z0-9_-]*-(?:facts|mission-[a-z0-9_-]+)$/.test(bank)
+  );
+}
+
+interface DocumentPage {
+  bank: string;
+  items: Record<string, unknown>[];
+  exactTotal: number | null;
+}
 
 /**
  * herdr-memory picks the credential and provenance harness from HERDR_HARNESS
@@ -158,8 +171,15 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
 
   constructor(opts: HindsightOptions = {}) {
     this.cli = opts.cli ?? "herdr-memory";
-    this.scopes = opts.scopes?.length ? opts.scopes.filter((s) => SCOPE_RE.test(s)) : ["project"];
-    if (!this.scopes.length) this.scopes = ["project"];
+    if (
+      opts.scopes !== undefined &&
+      (!Array.isArray(opts.scopes) ||
+        !opts.scopes.length ||
+        opts.scopes.some((scope) => typeof scope !== "string" || !SCOPE_RE.test(scope)))
+    ) {
+      throw new HindsightError("rejected");
+    }
+    this.scopes = [...new Set(opts.scopes ?? ["project"])];
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.failureBackoffMs = opts.failureBackoffMs ?? 60_000;
     this.unavailableBackoffMs = opts.unavailableBackoffMs ?? 300_000;
@@ -171,13 +191,13 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
     return `${this.scopes.join(",")}#e${this.epoch}#r${this.revisionWatermark}`;
   }
 
-  private async call(args: string[]): Promise<Record<string, unknown>> {
+  private async call(args: string[], timeoutMs = this.timeoutMs): Promise<Record<string, unknown>> {
     let res: HindsightRunResult;
     try {
       res = await this.run(
         this.cli,
-        [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(this.timeoutMs)] : [])],
-        this.timeoutMs + 250,
+        [...args, ...(TIMEOUT_FLAG_ACTIONS.has(args[0] ?? "") ? ["--timeout-ms", String(timeoutMs)] : [])],
+        timeoutMs + 250,
       );
     } catch (error) {
       const e = error as { killed?: boolean; code?: unknown };
@@ -196,11 +216,11 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   private toRecord(row: unknown): DurableMemoryRecord | null {
     if (!row || typeof row !== "object") return null;
     const r = row as Record<string, unknown>;
-    if (typeof r.memory_id !== "string" || typeof r.text !== "string") return null;
+    if (typeof r.memory_id !== "string" || typeof r.text !== "string" || !engineeringBank(r.bank_id)) return null;
     const status =
       typeof r.status === "string" && STATUSES.has(r.status) ? (r.status as DurableMemoryRecord["status"]) : undefined;
     // Defensive: the CLI excludes these by default; never surface them anyway.
-    if (status === "superseded" || status === "retracted") return null;
+    if (status !== "candidate" && status !== "verified") return null;
     const revision = typeof r.revision === "number" ? r.revision : undefined;
     if (revision && revision > this.revisionWatermark) this.revisionWatermark = revision;
     const provenance =
@@ -233,42 +253,86 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
     return rows.map((r) => this.toRecord(r)).filter((r): r is DurableMemoryRecord => r !== null);
   }
 
-  private async recall(query: string, max = 20): Promise<DurableMemoryRecord[]> {
-    try {
-      return await this.recallStrict(query, max);
-    } catch {
-      return [];
-    }
+  private remaining(deadline: number): number {
+    const budget = Math.floor(deadline - Date.now());
+    if (budget <= 0) throw new HindsightError("timeout");
+    return budget;
   }
 
-  /**
-   * Exact count for one scope from the list endpoint, or null when it cannot be trusted.
-   *
-   * `documents` is the only honest count the service offers: it answers
-   * `{"total":28,"total_is_estimate":false,…}` (observed live, project `canary`), while a
-   * recall-based count is bounded by the query and the result cap. It takes a single
-   * `--scope`, so totals are summed across the configured scopes; a refused scope or an
-   * older client without the subcommand yields null and the caller falls back to the probe.
-   */
-  private async scopeTotal(scope: string): Promise<number | null> {
-    try {
-      const out = await this.call(["documents", "--kind", "fact", "--scope", scope, "--limit", "1"]);
-      return out.total_is_estimate === false && typeof out.total === "number" ? out.total : null;
-    } catch {
-      return null;
-    }
+  private async documentPage(scope: string, offset: number, limit: number, deadline: number): Promise<DocumentPage> {
+    const out = await this.call(
+      ["documents", "--kind", "fact", "--scope", scope, "--limit", String(limit), "--offset", String(offset)],
+      this.remaining(deadline),
+    );
+    if (
+      out.degraded ||
+      out.offline ||
+      out.error ||
+      !engineeringBank(out.bank_id, scope) ||
+      !Array.isArray(out.documents) ||
+      out.documents.length > limit ||
+      out.documents.some((r) => !r || typeof r !== "object" || Array.isArray(r)) ||
+      (out.scope !== undefined && out.scope !== scope) ||
+      (out.offset !== undefined && out.offset !== offset)
+    )
+      throw new HindsightError("response");
+    return {
+      bank: out.bank_id,
+      items: out.documents as Record<string, unknown>[],
+      exactTotal:
+        out.total_is_estimate === false && Number.isSafeInteger(out.total) && (out.total as number) >= 0
+          ? (out.total as number)
+          : null,
+    };
   }
 
-  /**
-   * Strict health probe for /memory and startup status: unlike the best-effort
-   * reads it rethrows the HindsightError, so a missing CLI is not "0 saved".
-   */
-  async probe(): Promise<number> {
-    const totals = await Promise.all(this.scopes.map((s) => this.scopeTotal(s)));
-    if (totals.every((t): t is number => t !== null)) return totals.reduce((a, b) => a + b, 0);
-    // No usable list count (older client, refused scope): fall back to what the bank
-    // recalls for the overview query. That number is a probe, not a total.
-    return (await this.recallStrict(OVERVIEW_QUERY, 50)).length;
+  private async documentsForScope(
+    scope: string,
+    deadline: number,
+    expectedBank?: string,
+  ): Promise<{ bank: string; addresses: string[]; complete: boolean }> {
+    const addresses = new Set<string>();
+    let offset = 0;
+    let bank = expectedBank ?? "";
+    let complete = false;
+    for (let page = 0; page < MAX_DOCUMENT_PAGES && addresses.size < MAX_LIST_RECORDS; page++) {
+      const data = await this.documentPage(scope, offset, DOCUMENT_PAGE_SIZE, deadline);
+      if (bank && bank !== data.bank) throw new HindsightError("response");
+      bank = data.bank;
+      for (const item of data.items) {
+        if (
+          typeof item.address === "string" &&
+          ADDRESS_RE.test(item.address) &&
+          (item.status === "candidate" || item.status === "verified")
+        )
+          addresses.add(item.address);
+        if (addresses.size >= MAX_LIST_RECORDS) break;
+      }
+      offset += data.items.length;
+      if (data.items.length < DOCUMENT_PAGE_SIZE || (data.exactTotal !== null && offset >= data.exactTotal)) {
+        complete = addresses.size < MAX_LIST_RECORDS;
+        break;
+      }
+    }
+    return { bank, addresses: [...addresses], complete };
+  }
+
+  /** Strict readiness: exact totals or complete enumeration counts, null for a truncated count.
+   * A refused/malformed scope is an error, not a healthy empty bank or semantic-query fallback. */
+  async probe(): Promise<number | null> {
+    const deadline = Date.now() + this.timeoutMs;
+    let count: number | null = 0;
+    for (const scope of this.scopes) {
+      const data = await this.documentPage(scope, 0, 1, deadline);
+      if (data.exactTotal !== null) {
+        if (count !== null) count += data.exactTotal;
+      } else {
+        const listed = await this.documentsForScope(scope, deadline, data.bank);
+        if (!listed.complete) count = null;
+        else if (count !== null) count += listed.addresses.length;
+      }
+    }
+    return count;
   }
 
   /**
@@ -305,8 +369,29 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
     }
   }
 
-  recallAll(): Promise<DurableMemoryRecord[]> {
-    return this.recall(OVERVIEW_QUERY, 50);
+  async recallAll(): Promise<DurableMemoryRecord[]> {
+    const deadline = Date.now() + this.timeoutMs;
+    const records: DurableMemoryRecord[] = [];
+    for (const scope of this.scopes) {
+      if (records.length >= MAX_LIST_RECORDS || Date.now() >= deadline) break;
+      try {
+        const listed = await this.documentsForScope(scope, deadline);
+        for (const address of listed.addresses) {
+          if (records.length >= MAX_LIST_RECORDS || Date.now() >= deadline) break;
+          try {
+            const raw = await this.call(["get", address, "--scope", scope], this.remaining(deadline));
+            if (raw.bank_id !== listed.bank || raw.degraded || raw.offline) continue;
+            const record = this.toRecord(raw);
+            if (record) records.push({ ...record, id: address, scope });
+          } catch {
+            /* A vanished/unavailable document never becomes an invented record. */
+          }
+        }
+      } catch {
+        /* Best-effort reads fail open per scope; strict readiness remains separate. */
+      }
+    }
+    return records;
   }
 
   async retain(record: DurableMemoryRecord): Promise<RetainResult> {
