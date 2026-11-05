@@ -1,4 +1,4 @@
-/** T07 deviation signals: irrelevant refactor flagged (all four kinds), read-only investigation silent. */
+/** T07 deviation signals: irrelevant refactor flagged (all five kinds), read-only investigation silent. */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { evaluateTaskAlignment, type TaskAction, type TaskAlignmentInput } from "../../src/aps/taskAlignment.ts";
@@ -27,6 +27,22 @@ test("scope is judged by the caller's mutating flag; in-scope writes and an empt
   assert.deepEqual(run({ actions: [act("write", "src/ui/theme.ts", 1, { mutating: false })] }), []); // caller override beats tool name
   assert.equal(run({ actions: [act("repo_search", "src/ui/theme.ts", 1, { mutating: true })] }).length, 1);
   assert.equal(empty[0]?.kind, "out_of_scope_write"); assert.match(empty[0]!.evidence, /none declared, so nothing is authorized/);
+});
+
+test("the declared artifact contract flags writes the task never promised and stays silent otherwise", () => {
+  const docsOnly = [{ kind: "docs" as const }];
+  const ledger = { allowedScope: ["src/ledger/**"] };
+  const offContract = run({ ...ledger, actions: [act("write", "src/ledger/claimDiscipline.ts", 3)], declaredArtifacts: docsOnly });
+  assert.deepEqual(pairs(offContract), [["undeclared_artifact", "src/ledger/claimDiscipline.ts"]]); // in scope, yet no source artifact was declared
+  assert.equal(offContract[0]?.iteration, 3);
+  assert.match(offContract[0]!.evidence, /produces a source artifact the task did not declare \(declared: docs\)/);
+  assert.deepEqual(run({ allowedScope: ["docs/**"], actions: [act("write", "docs/notes.md", 1)], declaredArtifacts: docsOnly }), []); // promised class
+  assert.deepEqual(run({ allowedScope: ["test/unit/**"], actions: [act("write", "test/unit/ledger-read.test.ts", 1)], declaredArtifacts: [{ kind: "test", pathPattern: "test/unit/ledger-*.test.ts" }] }), []);
+  assert.deepEqual(run({ ...ledger, actions: [act("read", "src/ledger/claimDiscipline.ts", 1)], declaredArtifacts: docsOnly }), []); // reads stay silent
+  assert.deepEqual(run({ ...ledger, actions: [act("write", "src/ledger/claimDiscipline.ts", 3, { mutating: false })], declaredArtifacts: docsOnly }), []);
+  assert.deepEqual(run({ ...ledger, actions: [act("write", "src/ledger/claimDiscipline.ts", 3)] }), []); // no contract declared -> no rule
+  const twice = { ...base, ...ledger, actions: [act("write", "src/ledger/claimDiscipline.ts", 3)], declaredArtifacts: docsOnly };
+  assert.deepEqual(evaluateTaskAlignment(twice), evaluateTaskAlignment(twice));
 });
 
 test("dependency compare is trimmed and case-insensitive; stagnation flags once, bad thresholds fall back to 10", () => {
