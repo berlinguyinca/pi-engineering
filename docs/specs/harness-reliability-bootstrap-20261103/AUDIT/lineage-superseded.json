@@ -383,5 +383,10 @@
       "replacementSubject": "docs(bootstrap): X04 handoff evidence tree",
       "annotatedBy": "5e1ebb8c67b492d5f77c92de4c1e7b6f726b0833"
     }
-  ]
+  ],
+  "defectKinds": {
+    "object_missing": "git cat-file -e fails: no such object in this repository",
+    "unreachable_from_any_ref": "the object exists but git for-each-ref --contains reports no ref at all",
+    "non_fetchable_ref_only": "the object exists and has a ref, but only one a clone never receives (refs/stash, refs/notes/*, refs/original/*, refs/bisect/*). Not declared here today; the gate reports carriers= so a future break can be told apart from the two above."
+  }
 }

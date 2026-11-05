@@ -21,6 +21,7 @@ const out = (...a) => { const r = spawnSync("git", ["-C", process.cwd(), ...a], 
 const sort = (v) => { if (Array.isArray(v)) return v.map(sort); if (v && typeof v === "object") { const o = {}; for (const k of Object.keys(v).sort()) o[k] = sort(v[k]); return o; } return v; };
 const canon = (r) => { const c = { ...r }; delete c.handoffHash; return `sha256:${createHash("sha256").update(JSON.stringify(sort(c)), "utf8").digest("hex")}`; };
 
+if (out("rev-parse", "--git-dir") === null) { console.error("not a git repository: run this from inside the repository"); process.exit(2); }
 if (out("rev-parse", "--verify", ref) === null) { console.error(`ref not found: ${ref}`); process.exit(2); }
 const tree = new Set((out("-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", ref) ?? "").split("\n"));
 const files = [...tree].filter((p) => /(^|\/)out[^/]*\/[^/]+\.handoff\.json$/.test(p));
