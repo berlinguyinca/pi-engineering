@@ -1,0 +1,197 @@
+{
+  "schema": "harness-reliability-lineage-superseded/v1",
+  "purpose": "Records whose nextBaseSha names a commit that a fresh clone cannot obtain. Evidence records are hash-bound (handoffHash covers every other field), so they are NOT rewritten; each broken pointer is recorded here with a live replacement, and AUDIT/lineage-scan.mjs re-verifies every entry on each run and fails if one goes stale.",
+  "defectKinds": {
+    "object_missing": "git cat-file -e fails: no such object in this repository",
+    "unreachable_from_any_ref": "the object exists but git for-each-ref --contains reports no ref that carries it"
+  },
+  "replacementRules": {
+    "sameSubjectRewrite": "a commit reachable from the audited ref with a byte-identical commit subject (the post-rewrite twin)",
+    "recordAddedBy": "the commit reachable from the audited ref that added this record file, used when the broken object is gone and has no subject to match"
+  },
+  "auditedRefDocumentationOnly": "harness-reliability-bootstrap-20261103",
+  "auditedShaDocumentationOnly": "4ffa82f33315c5e5a8620467c1a72a15f74b4ae3",
+  "count": 15,
+  "entries": [
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H01/out/H01.handoff.json",
+      "taskId": "H01",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/H01/out/",
+      "brokenNextBaseSha": "debcfeef2ed712bc75e3b702033a005e15646f89",
+      "defect": "object_missing",
+      "brokenSubject": null,
+      "rule": "recordAddedBy",
+      "replacement": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+      "replacementSubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
+      "replacementEvidence": "docs/specs/harness-reliability-bootstrap-20261103/H01/out/H01.handoff.json"
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H02/out/H02.handoff.json",
+      "taskId": "H02",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/H02/out/",
+      "brokenNextBaseSha": "ab96dc25bc2b672cc73923d648e683b0edc885b9",
+      "defect": "object_missing",
+      "brokenSubject": null,
+      "rule": "recordAddedBy",
+      "replacement": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+      "replacementSubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
+      "replacementEvidence": "docs/specs/harness-reliability-bootstrap-20261103/H02/out/H02.handoff.json"
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H03/out/H03.handoff.json",
+      "taskId": "H03",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/H03/out/",
+      "brokenNextBaseSha": "b8378ffc37ae7169f42ab794cc62994c13614ca8",
+      "defect": "object_missing",
+      "brokenSubject": null,
+      "rule": "recordAddedBy",
+      "replacement": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+      "replacementSubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
+      "replacementEvidence": "docs/specs/harness-reliability-bootstrap-20261103/H03/out/H03.handoff.json"
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H04/out/H04.handoff.json",
+      "taskId": "H04",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/H04/out/",
+      "brokenNextBaseSha": "4c4f4c89b55ae5b492a381397a0a8b591b7d41bc",
+      "defect": "object_missing",
+      "brokenSubject": null,
+      "rule": "recordAddedBy",
+      "replacement": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+      "replacementSubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
+      "replacementEvidence": "docs/specs/harness-reliability-bootstrap-20261103/H04/out/H04.handoff.json"
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H05/out/H05.handoff.json",
+      "taskId": "H05",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/H05/out/",
+      "brokenNextBaseSha": "5e56bf43cc7ee67855f7e072f7d4bcddb78ec380",
+      "defect": "object_missing",
+      "brokenSubject": null,
+      "rule": "recordAddedBy",
+      "replacement": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+      "replacementSubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
+      "replacementEvidence": "docs/specs/harness-reliability-bootstrap-20261103/H05/out/H05.handoff.json"
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H06/out/H06.handoff.json",
+      "taskId": "H06",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/H06/out/",
+      "brokenNextBaseSha": "1466be76b49d6c6918ed25a4db5b8fb9ee849c32",
+      "defect": "object_missing",
+      "brokenSubject": null,
+      "rule": "recordAddedBy",
+      "replacement": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+      "replacementSubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
+      "replacementEvidence": "docs/specs/harness-reliability-bootstrap-20261103/H06/out/H06.handoff.json"
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/R08/out-corrected/R08.handoff.json",
+      "taskId": "R08",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/R08/out-corrected/",
+      "brokenNextBaseSha": "b5e6903c2f49c462c3e91528c42b5547137921ab",
+      "defect": "object_missing",
+      "brokenSubject": null,
+      "rule": "recordAddedBy",
+      "replacement": "0a50cc482e039e69714536149d30fc4fc302816a",
+      "replacementSubject": "docs(bootstrap): correct R08 successor to H01 with the herdr base; first record superseded",
+      "replacementEvidence": "docs/specs/harness-reliability-bootstrap-20261103/R08/out-corrected/R08.handoff.json"
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/V02/out-corrected/V02.handoff.json",
+      "taskId": "V02",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/V02/out-corrected/",
+      "brokenNextBaseSha": "8ad5ce679933d9b406959e83a77ca634ce647bd0",
+      "defect": "unreachable_from_any_ref",
+      "brokenSubject": "docs(bootstrap): V02 handoff evidence tree",
+      "rule": "sameSubjectRewrite",
+      "replacement": "8c064b37dadce3f23876156b91863f510dd7f908",
+      "replacementSubject": "docs(bootstrap): V02 handoff evidence tree",
+      "replacementEvidence": null
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/V03/out-corrected/V03.handoff.json",
+      "taskId": "V03",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/V03/out-corrected/",
+      "brokenNextBaseSha": "89d941844c361178de64cf04ba4689d2f23e076a",
+      "defect": "unreachable_from_any_ref",
+      "brokenSubject": "docs(bootstrap): V03 handoff evidence tree",
+      "rule": "sameSubjectRewrite",
+      "replacement": "b11662eb88261c30c02bc78ec7fe556539b5681a",
+      "replacementSubject": "docs(bootstrap): V03 handoff evidence tree",
+      "replacementEvidence": null
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/V04/out-corrected/V04.handoff.json",
+      "taskId": "V04",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/V04/out-corrected/",
+      "brokenNextBaseSha": "c90a8e498685afaf46d1ee97edbd7d81806593ce",
+      "defect": "unreachable_from_any_ref",
+      "brokenSubject": "docs(bootstrap): V04 handoff evidence tree",
+      "rule": "sameSubjectRewrite",
+      "replacement": "fc4712252558dc438365094929b2071828c94b5c",
+      "replacementSubject": "docs(bootstrap): V04 handoff evidence tree",
+      "replacementEvidence": null
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/V05/out-corrected/V05.handoff.json",
+      "taskId": "V05",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/V05/out-corrected/",
+      "brokenNextBaseSha": "e6ad2208ad77a765056d00c414fce45b089f74ef",
+      "defect": "unreachable_from_any_ref",
+      "brokenSubject": "docs(bootstrap): V05 handoff evidence tree",
+      "rule": "sameSubjectRewrite",
+      "replacement": "d44672d4cfa77ad991866f417724313a12adf284",
+      "replacementSubject": "docs(bootstrap): V05 handoff evidence tree",
+      "replacementEvidence": null
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/X01/out-corrected/X01.handoff.json",
+      "taskId": "X01",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/X01/out-corrected/",
+      "brokenNextBaseSha": "0190139417777c60e98cf61bf313ef79676f37e4",
+      "defect": "unreachable_from_any_ref",
+      "brokenSubject": "docs(bootstrap): X01 handoff evidence tree",
+      "rule": "sameSubjectRewrite",
+      "replacement": "75a2c8e95be61ccbe74eb62314726a3ed10a2f0a",
+      "replacementSubject": "docs(bootstrap): X01 handoff evidence tree",
+      "replacementEvidence": null
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/X02/out-corrected/X02.handoff.json",
+      "taskId": "X02",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/X02/out-corrected/",
+      "brokenNextBaseSha": "bbbcdbb67dd5ba370b83e909063f64ccc796a0a3",
+      "defect": "unreachable_from_any_ref",
+      "brokenSubject": "docs(bootstrap): X02 handoff evidence tree",
+      "rule": "sameSubjectRewrite",
+      "replacement": "a4abbb7b0f7e2583a3446b6050f47bbe9a7093a4",
+      "replacementSubject": "docs(bootstrap): X02 handoff evidence tree",
+      "replacementEvidence": null
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/X03/out-corrected/X03.handoff.json",
+      "taskId": "X03",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/X03/out-corrected/",
+      "brokenNextBaseSha": "508d285db0704514c466051e5a4a4f6b55a3416a",
+      "defect": "unreachable_from_any_ref",
+      "brokenSubject": "docs(bootstrap): X03 handoff evidence tree",
+      "rule": "sameSubjectRewrite",
+      "replacement": "a6e500f6b1ccd2867097ae3f2ac839fa93b33e3c",
+      "replacementSubject": "docs(bootstrap): X03 handoff evidence tree",
+      "replacementEvidence": null
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/X04/out-corrected/X04.handoff.json",
+      "taskId": "X04",
+      "generation": "docs/specs/harness-reliability-bootstrap-20261103/X04/out-corrected/",
+      "brokenNextBaseSha": "79d3da95799c03f27c687f1ad8e27af0c4fe4ef1",
+      "defect": "unreachable_from_any_ref",
+      "brokenSubject": "docs(bootstrap): X04 handoff evidence tree",
+      "rule": "sameSubjectRewrite",
+      "replacement": "5e1ebb8c67b492d5f77c92de4c1e7b6f726b0833",
+      "replacementSubject": "docs(bootstrap): X04 handoff evidence tree",
+      "replacementEvidence": null
+    }
+  ]
+}
