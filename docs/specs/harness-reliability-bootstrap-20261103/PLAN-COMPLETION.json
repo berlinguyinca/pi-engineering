@@ -23,7 +23,12 @@
     "Conductor-written path rewrites inside worker commits: R06, H02. Conductor squash of two same-message worker commits: V06 (tree byte-identical).",
     "docs/specs/harness-reliability-bootstrap-20261103/BASELINE-unit-suite-at-c349613b.txt was untracked until the evidence-closure commit; it is a raw npm-test log (150 failure lines, 2180 pass lines), not a summary.",
     "R03-R08 resilience modules are shipped and tested; wiring into live runtime paths is tracked separately (see ROLLOUT.md known gaps).",
-    "`npm test` has never completed at any commit in this bootstrap: at the B-series base c2b75dc9 it ran ~20 min with no summary and had to be terminated (4615 pass / 1223 fail names in the partial capture); verification rests on each unit's declared targeted commands."
+    "`npm test` has never completed at any commit in this bootstrap: at the B-series base c2b75dc9 it ran ~20 min with no summary and had to be terminated (4615 pass / 1223 fail names in the partial capture); verification rests on each unit's declared targeted commands.",
+    "Chain-parent emission ordering: the conclude flow emits a unit's chain generation after amending the evidence commit that would carry it, so X01-X06 chain records reached only the working tree; X07's evidence commit carries them and AUDIT/integrity-scan.mjs reports the chain as broken without them.",
+    "E02's canonical record names E03@cc036f2f8c3b (its own resultSha) while E03 records base ba22f28a6b54 - a handoff pointer stamped from HEAD~1 rather than the handed-over commit; left unwritten because rewriting a PASS record changes its hash and its descendants.",
+    "T09's record names T10, a task the plan never contained; the T-series ends at T09.",
+    "test/unit/worker-commit-discipline.test.ts and test/unit/worker-request-plumbing.test.ts fail identically at 900bf8a3 and at the X-series tip (real-worktree allocation and broker fork-base assertions); they are excluded from recorded suite commands and named in the override reasons.",
+    "The whole-suite `npm test` does not terminate in this environment (session-*/orchestration-* files hold the runner past any bounded budget: 47 failures of 1367 within one 1800s budget at 900bf8a3, and an untimed run exceeded 3600s), so unit-suite gates are recorded as bounded globs with a base-vs-head comparison, never as a green whole-suite run."
   ],
   "concluded_with_records": [
     "B00",
@@ -76,7 +81,14 @@
     "V03",
     "V04",
     "V05",
-    "V06"
+    "V06",
+    "X01",
+    "X02",
+    "X03",
+    "X04",
+    "X05",
+    "X06",
+    "X07"
   ],
   "cross_repo_integration": {
     "main": "591264f9bd4fc2fc07d88d94febde4cd0e919448",
@@ -87,16 +99,113 @@
   "deliverables": {
     "audit": "docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md",
     "drift_fixtures": "test/fixtures/harness-drift/{tasks.json,README.md}",
+    "drift_live_wiring": "src/aps/workerActivity.ts + src/workers/PiWorkerExecutor.ts (PI_TASK_DRIFT_SIGNALS, default off)",
     "drift_runner": "scripts/bench-task-drift.ts (precision 1.0, recall 0.667, 0 false positives, 1 documented false negative)",
     "harness_role_bench": "scripts/bench-harness-roles.ts (offline dry run by default; both opt-ins required for serial replay)",
+    "integrity_scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261105-x-series.txt",
+    "integrity_scanner": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
     "quant_schema": "src/capability/quantBenchmark.ts",
     "runbook": "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
   },
-  "head": "43c65fd36719b16554cf375c3f7fd372aab8ca4a",
-  "next_action": "Operator review of FINAL_AUDIT.md + FINAL_AUDIT-ADDENDUM-BACKFILL.md; decide on the read-only-vs-new-file plan defect (B00/R01/H01/H03/V05/V06) and the R03-R08 live-path wiring.",
+  "head": "745acdfb9d6a2b710e679a14d2b3a7f6f4441881",
+  "next_action": "Re-run `node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs` after every unit; the two remaining canonical chain offenders (E02/E03 pointer drift, T09->T10) are recorded, not rewritten.",
   "no_handoff_record": [],
   "plan": "harness-reliability-bootstrap-20261103",
   "plan_scope_tasks": 51,
+  "post_plan_extension": {
+    "chain_note": "X01 joins V06 by prose reference (V06 is terminal, nextTaskId null); X05 and X06 each needed a later chain generation (out-chain) because the series continued after their out-final generation was emitted with nextTaskId null.",
+    "units": [
+      {
+        "base_sha": "900bf8a3b10decf0bbc7f7e46b04a29241741151",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X01/logs/01-typecheck.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X01/logs/02-unit-alignment.txt"
+        ],
+        "generation": "out-final",
+        "handoff_hash": "sha256:ffb504ff7a4042bc333605f3431091b68fd1c71e389d2f2eebecd7a0d1da2434",
+        "next": "X02@75a2c8e95be6",
+        "result_sha": "87f2b2c9c92c04c1522c2781f2c46555741af354",
+        "unit": "X01"
+      },
+      {
+        "base_sha": "75a2c8e95be61ccbe74eb62314726a3ed10a2f0a",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/01-npm-run-typecheck-.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/02-node-experimental-strip-type.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/03-node-test-import-test-suppor.txt"
+        ],
+        "generation": "out-final",
+        "handoff_hash": "sha256:3ebe37b54c39137fcf261526ed096f66bf12aaf9e8c5f4ed9d1fc592c9335990",
+        "next": "X03@a4abbb7b0f7e",
+        "result_sha": "d79f2e7fd4c3140cdc246dcb06ad01e7fb9de9d6",
+        "unit": "X02"
+      },
+      {
+        "base_sha": "a4abbb7b0f7e2583a3446b6050f47bbe9a7093a4",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X03/logs/01-npm-run-typecheck-.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X03/logs/02-node-test-import-test-suppor.txt"
+        ],
+        "generation": "out-final",
+        "handoff_hash": "sha256:2eff6f5edc7623b3eab44794d54a55279d21a20310597dd969e6fa26bdf90755",
+        "next": "X04@a6e500f6b1cc",
+        "result_sha": "8bf854e64d26c10021a20abdd40be194becb8990",
+        "unit": "X03"
+      },
+      {
+        "base_sha": "a6e500f6b1ccd2867097ae3f2ac839fa93b33e3c",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X04/logs/01-npm-run-typecheck-.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X04/logs/02-node-test-import-test-suppor.txt"
+        ],
+        "generation": "out-final",
+        "handoff_hash": "sha256:08d1fc2e8db239c0fc21ab03662f2bf7514d6d34d30c72a980794bf1d66b0b49",
+        "next": "X05@5e1ebb8c67b4",
+        "result_sha": "7f160212083e2d015b1a515325ffa1f984d1368f",
+        "unit": "X04"
+      },
+      {
+        "base_sha": "5e1ebb8c67b492d5f77c92de4c1e7b6f726b0833",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/01-npm-run-typecheck-.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/02-node-test-import-test-suppor.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/03-node-test-import-test-suppor.txt"
+        ],
+        "generation": "out-chain",
+        "handoff_hash": "sha256:1c0051a17177634a4e678319e3aa1aac8e8dc5f6387919fb11c1795d1ee93b7f",
+        "next": "X06@009837c32d9f",
+        "result_sha": "6a518c90fb148d2fb2c27b99b2c76cfa2a2826de",
+        "unit": "X05"
+      },
+      {
+        "base_sha": "009837c32d9f9a0ac543710d05efd9cd6da390b9",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/01-npm-run-typecheck-.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/02-node-test-import-test-suppor.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/03-node-test-import-test-suppor.txt"
+        ],
+        "generation": "out-chain",
+        "handoff_hash": "sha256:13df2c03d45f187b5c09eb66e376ef773f332fa76044207c90441cc79b52509f",
+        "next": "X07@10c93281eec5",
+        "result_sha": "141ca5dbba112d713f2fb459ba31392599db0a5f",
+        "unit": "X06"
+      },
+      {
+        "base_sha": "10c93281eec5fbf788919656a8d52d766ed34d9c",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/01-node-docs-specs-harness-rel.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/02-node-test-import-test-suppor.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/03-npm-run-typecheck-.txt"
+        ],
+        "generation": "out-final",
+        "handoff_hash": "sha256:3f4b9322241b2d1f9ccf99f7a3e312525f0a7fc411755ac5d950bbcac7f2939e",
+        "next": "None@None",
+        "result_sha": "548c2a83d041a888461cddcaec0ef0a236997ef2",
+        "unit": "X07"
+      }
+    ],
+    "why": "Filed after PLAN.json closed, from the completion audit: the drift detector could not see 'in-scope but undeclared' edits (drift-03), nothing called the detector at runtime, the observability counters had no producer, the contract never reached the worker, the intervention master switch defaulted ON against the security spec, and the chain parents of the X-series records were never committed."
+  },
   "pre_bootstrap_units_with_records": [
     "F01",
     "F02",
@@ -121,10 +230,15 @@
   "repo": "berlinguyinca/pi-engineering",
   "schema_conformance": {
     "additional_properties": false,
-    "canonical_hash_recomputed": 104,
-    "records_distinct": 104,
+    "canonical_hash_recomputed": 91,
+    "chain_canonical_offenders": 2,
+    "chain_forward_links_resolved": 56,
+    "records_distinct": 91,
     "required_fields": 15,
-    "required_fields_ok": 104,
+    "required_fields_ok": 91,
+    "scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261105-x-series.txt",
+    "scanned_at": "745acdfb9d6a2b710e679a14d2b3a7f6f4441881",
+    "scanner": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
     "schema": "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json"
   }
 }
