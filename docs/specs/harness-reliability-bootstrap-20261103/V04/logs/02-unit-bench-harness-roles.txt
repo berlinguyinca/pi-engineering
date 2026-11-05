@@ -1,0 +1,16 @@
+✔ the default path is a dry run: the injected replay spy is never called (2.770625ms)
+✔ an unavailable requested model is skipped with a reason naming that model id (0.163667ms)
+✔ a non-Flash/Lite model is skipped with reason 'not a Flash/Lite class model' (0.128458ms)
+✔ opt-in replay runs once per eligible entry, in plan order, and stores the requestId (0.218875ms)
+✔ a throwing callback marks that entry failed and the serial loop still runs the rest (0.282375ms)
+✔ main prints one deterministic JSON line whose counts match the entries, exit 0, no endpoint (2.59475ms)
+✔ every planned entry is V03-valid once provenance is completed, and comparable within one task (0.609667ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 250.399834
+unit exit=0
