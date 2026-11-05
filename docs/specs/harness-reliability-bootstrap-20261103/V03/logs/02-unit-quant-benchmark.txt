@@ -1,0 +1,12 @@
+✔ validateRunRecord is clean for the good record and names each broken one (2.549125ms)
+✔ a fully specified same-family same-quant pair is comparable (0.670541ms)
+✔ reasons name every failed check, in a stable order across calls (0.236625ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 223.069417
+unit exit=0
