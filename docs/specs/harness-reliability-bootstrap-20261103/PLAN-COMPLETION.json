@@ -1,14 +1,37 @@
 {
+  "backfill": {
+    "addendum": "docs/specs/harness-reliability-bootstrap/FINAL_AUDIT-ADDENDUM-BACKFILL.md",
+    "deviations": [
+      "B00 stamped isolated-change although the plan declares read-only, because diffGuard.ts:62 forbids any changed path under read-only while B00's declared production path is a new file",
+      "B00's result commit cf1aaf12 sits on branch backfill/b00-baseline-20261108 (a back-fill cannot be inserted into the landed B01 chain); the file also reached the lineage via cherry-pick 43c65fd3"
+    ],
+    "method": "each unit's landed commit checked out in a detached worktree; declared verify commands re-run there; record emitted against that commit; chain parents are the real commit parents; B05.nextBaseSha == E01.baseSha",
+    "records": "<unit>/out-backfill/<unit>.handoff.json",
+    "units": [
+      "B00",
+      "B01",
+      "B02",
+      "B03",
+      "B04",
+      "B05"
+    ]
+  },
   "branch": "harness-reliability-bootstrap-20261103",
   "caveats": [
     "operatorApproval.approved=true is written by the conductor under the operator's 2026-11-03 standing delegation; there is no independent signer, so the handoff hash detects accidental modification but is not cryptographic authorization (02-HANDOFF-PROTOCOL.md:19).",
-    "Full `npm test` has never been green at any commit in this bootstrap; every unit was verified by the targeted commands its manifest declares.",
     "Mode deviations where the plan declared read-only but the delta required creating a file: R01, H01, H03, V05, V06 (stamped isolated-change; manifests left unchanged).",
     "Conductor-written path rewrites inside worker commits: R06, H02. Conductor squash of two same-message worker commits: V06 (tree byte-identical).",
     "docs/specs/harness-reliability-bootstrap-20261103/BASELINE-unit-suite-at-c349613b.txt was untracked until the evidence-closure commit; it is a raw npm-test log (150 failure lines, 2180 pass lines), not a summary.",
-    "R03-R08 resilience modules are shipped and tested; wiring into live runtime paths is tracked separately (see ROLLOUT.md known gaps)."
+    "R03-R08 resilience modules are shipped and tested; wiring into live runtime paths is tracked separately (see ROLLOUT.md known gaps).",
+    "`npm test` has never completed at any commit in this bootstrap: at the B-series base c2b75dc9 it ran ~20 min with no summary and had to be terminated (4615 pass / 1223 fail names in the partial capture); verification rests on each unit's declared targeted commands."
   ],
   "concluded_with_records": [
+    "B00",
+    "B01",
+    "B02",
+    "B03",
+    "B04",
+    "B05",
     "E01",
     "E02",
     "E03",
@@ -69,16 +92,9 @@
     "quant_schema": "src/capability/quantBenchmark.ts",
     "runbook": "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
   },
-  "head": "ba6ef0d1484f185682e793af65f69ecc0f5f065e",
-  "next_action": "Operator review of FINAL_AUDIT.md; decide whether to back-fill B00-B05 records or accept them as pre-bootstrap work; R03-R08 wiring debt tracked separately.",
-  "no_handoff_record": [
-    "B00",
-    "B01",
-    "B02",
-    "B03",
-    "B04",
-    "B05"
-  ],
+  "head": "43c65fd36719b16554cf375c3f7fd372aab8ca4a",
+  "next_action": "Operator review of FINAL_AUDIT.md + FINAL_AUDIT-ADDENDUM-BACKFILL.md; decide on the read-only-vs-new-file plan defect (B00/R01/H01/H03/V05/V06) and the R03-R08 live-path wiring.",
+  "no_handoff_record": [],
   "plan": "harness-reliability-bootstrap-20261103",
   "plan_scope_tasks": 51,
   "pre_bootstrap_units_with_records": [
