@@ -193,6 +193,35 @@ above was avoidable, and none of it would have happened in separate worktrees.
 - Never `git reset --hard` a branch another agent may be on. Move your own
   commits to your own branch and leave theirs alone.
 
+## Which repository a git command reads
+
+Run git with `-C <worktree>`. Never point `--git-dir` or `--work-tree` at a
+repository from another working directory: `status`, `ls-files` and friends then
+read the wrong work tree and report phantom modifications. Observed once as
+`git --git-dir=<primary>/.git status --porcelain` with cwd `/tmp`, which listed
+the primary checkout's tracked files as deleted; the same repository addressed
+with `-C <primary>` reports 0 changes. A phantom finding of that shape almost
+went out as a fact.
+
+`-C` by itself is not the guarantee it looks like, because the environment
+outranks the working directory — `GIT_DIR` (and `GIT_WORK_TREE`,
+`GIT_COMMON_DIR`) choose the repository first:
+
+    $ git -C /tmp/probe/real rev-parse --absolute-git-dir
+    /tmp/probe/real/.git
+    $ GIT_DIR=/tmp/probe/other/.git git -C /tmp/probe/real rev-parse --absolute-git-dir
+    /tmp/probe/other/.git
+
+So when code spawns git, hand it a filtered environment —
+`withoutInjectedConfig(process.env)` from `src/git/gitEnvironment.ts` — instead
+of `process.env`. `safeGit` does this, the self-update path does it (#590), and
+so does every remaining git spawn in `src/` (#595). There is deliberately no
+`harnessGit(worktree, args)` wrapper: the repository is named at the call site
+with `-C`, and the one thing the environment must not be allowed to do is rename
+it. `safeGit` goes further and refuses `--git-dir`/`--work-tree` outright
+(`src/git/safeGit.ts`), because a command that may redirect the repository
+cannot be checked against the repository that was inspected.
+
 ## Completion
 
 Continue working until the requested milestone satisfies its acceptance criteria.
