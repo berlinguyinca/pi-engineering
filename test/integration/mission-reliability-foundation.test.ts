@@ -221,11 +221,11 @@ if (args.join(" ") === "--no-extensions list") { process.stdout.write(process.en
 await mkdir(join(process.cwd(), ".pi-eng"), { recursive: true });
 if (process.env.FAKE_SNAPSHOT_MODE === "missing") process.exit(0);
 if (process.env.FAKE_SNAPSHOT_MODE === "malformed") {
-  await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify({ contractVersion: 3, generatedAt: 42, missions: [{ id: "MSN-bad", revision: -1, status: "COMPLETE", observability: { acceptanceCoverage: { completed: "1", total: 1 } } }] }));
+  await writeFile(join(process.cwd(), ".pi-eng", "orchestration-snapshot.json"), JSON.stringify({ contractVersion: 4, generatedAt: 42, missions: [{ id: "MSN-bad", revision: -1, status: "COMPLETE", observability: { acceptanceCoverage: { completed: "1", total: 1 } } }] }));
   process.exit(0);
 }
 const snapshot = {
-  contractVersion: 3,
+  contractVersion: 4,
   generatedAt: new Date().toISOString(),
   missions: [{
     id: "MSN-fake-dogfood", revision: 7, title: "fake", goal: "fake", workflowClass: "engineering_review",
@@ -1325,7 +1325,7 @@ describe("mission reliability foundation — synthetic MSN-qSLaeM", () => {
       assert.equal(evidence.verificationMode, "installed-package");
       assert.equal(evidence.installedPackage, fake.installed);
       assert.equal(evidence.durableEvidence.missionId, "MSN-fake-dogfood");
-      assert.equal(evidence.durableEvidence.contractVersion, 3);
+      assert.equal(evidence.durableEvidence.contractVersion, 4);
       assert.equal(evidence.durableEvidence.acceptanceCoverage.completed, 1);
       assert.equal(evidence.durableEvidence.recoveryAttempt.attempt, 1);
       assert.equal(evidence.durableEvidence.lateResultRejected, true);
