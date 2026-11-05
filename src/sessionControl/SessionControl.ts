@@ -1,10 +1,10 @@
 /** Same-user, same-host status channel for one live PI process instance. */
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, lstat, mkdir, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { type Server, type Socket, createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { redactSecrets } from "../platform/redact.ts";
 import {
   MaintenanceOperations,
@@ -129,6 +129,62 @@ function defaultDiscoveryRoots(): string[] {
   return [...new Set(roots)];
 }
 
+/**
+ * The Unix socket path limit. `sun_path` is 104 bytes including the terminator on the
+ * platforms Pi runs on; the margin is for a filesystem that expands the path (macOS
+ * resolves `/tmp` through a symlink, and a future limit change should not be a surprise).
+ */
+export const SOCKET_PATH_LIMIT = 100;
+
+/** Thrown when no socket path can fit. Names the limit, the length, and what to change. */
+export class ControlSocketLimitError extends Error {
+  constructor(socketPath: string, rootDir: string) {
+    super(
+      `control socket path is ${Buffer.byteLength(socketPath)} bytes, over the ${SOCKET_PATH_LIMIT}-byte Unix socket limit ` +
+        `(the kernel's sun_path is 104 bytes including the terminator): ${socketPath}\n` +
+        `Shorten the control root — currently ${rootDir} — by setting PI_ENGINEERING_CONTROL_DIR ` +
+        `(or PI_ENGINEERING_STATE_DIR, which it is derived from) to a shorter path.`,
+    );
+    this.name = "ControlSocketLimitError";
+  }
+}
+
+/**
+ * A short directory to hang the socket off when the state dir is too deep.
+ *
+ * `os.tmpdir()` is useless for this: on macOS it *is* the long per-user temp dir that
+ * makes the path overflow. `$XDG_RUNTIME_DIR` is the right home where it exists (Linux:
+ * /run/user/uid, already per-user and per-boot); otherwise `/tmp`, which is short on
+ * every supported platform. The directory Pi creates inside it is 0700 and the socket
+ * 0600, so "short" does not mean "shared".
+ */
+function shortSocketRoot(): string {
+  // Capped so that the directory name below still fits: 30 + 23 + 41 is inside the limit,
+  // and anything longer is not a runtime dir worth trusting with the socket anyway.
+  const xdg = process.env.XDG_RUNTIME_DIR;
+  return xdg && xdg.startsWith("/") && !xdg.includes("\0") && Buffer.byteLength(xdg) <= 30 ? xdg : "/tmp";
+}
+
+/**
+ * Where the control socket for one session instance lives.
+ *
+ * Normally inside the state dir. When that would not fit `sun_path` — a deep
+ * `PI_ENGINEERING_STATE_DIR`, and every macOS test state dir — the socket moves to a
+ * short directory named after a hash of the state dir, with `hash-` in the name so a
+ * reader of `lsof` knows why it is there and not under the state dir. The descriptor is
+ * still discovered by reading the state dir (a regular file has no length limit), and
+ * discovery re-derives this path rather than trusting the descriptor, so a descriptor
+ * cannot point a client at somebody else's socket.
+ */
+export function controlSocketPath(rootDir: string, instanceId: string): string {
+  const natural = join(rootDir, `${instanceId}.sock`);
+  if (Buffer.byteLength(natural) <= SOCKET_PATH_LIMIT) return natural;
+  const hash = createHash("sha256").update(resolve(rootDir)).digest("hex").slice(0, 12);
+  const short = join(shortSocketRoot(), `pi-sc-hash-${hash}`, `${instanceId}.sock`);
+  if (Buffer.byteLength(short) > SOCKET_PATH_LIMIT) throw new ControlSocketLimitError(short, rootDir);
+  return short;
+}
+
 async function privateDirectory(path: string): Promise<void> {
   try {
     await mkdir(path, { mode: 0o700 });
@@ -212,6 +268,7 @@ export class SessionControlServer {
   readonly descriptorPath: string;
   readonly socketPath: string;
   readonly descriptor: SessionDescriptor;
+  private readonly stateRoot: string;
   private readonly server: Server;
   private readonly onNote?: (text: string) => void | Promise<void>;
   private readonly getMissions?: (missionIds: readonly string[]) => Promise<MissionBrief[] | null>;
@@ -239,8 +296,9 @@ export class SessionControlServer {
     getMissions?: (missionIds: readonly string[]) => Promise<MissionBrief[] | null>,
   ) {
     this.instanceId = randomUUID();
+    this.stateRoot = rootDir;
     this.descriptorPath = join(rootDir, `${this.instanceId}.json`);
-    this.socketPath = join(rootDir, `${this.instanceId}.sock`);
+    this.socketPath = controlSocketPath(rootDir, this.instanceId);
     this.server = server;
     this.onNote = onNote;
     this.getMissions = getMissions;
@@ -286,7 +344,11 @@ export class SessionControlServer {
               }
             : options.onMaintenance!(request),
       );
-    if (Buffer.byteLength(control.socketPath) > 100) throw new Error("control socket path exceeds Unix socket limit");
+    // The socket may live outside the state dir (see controlSocketPath); that directory
+    // is created to the same private standard, and a pre-existing one with other
+    // permissions or another owner is refused rather than used.
+    const socketDir = dirname(control.socketPath);
+    if (socketDir !== options.rootDir) await privateDirectory(socketDir);
     server.on("connection", (socket) => control.handle(socket));
     try {
       await new Promise<void>((resolve, reject) => {
@@ -481,6 +543,8 @@ export class SessionControlServer {
     for (const socket of this.sockets) socket.destroy();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
     await unlink(this.socketPath).catch(() => {});
+    // A hashed fallback dir is Pi's to leave behind only while a session runs in it.
+    if (dirname(this.socketPath) !== this.stateRoot) await rmdir(dirname(this.socketPath)).catch(() => {});
     try {
       const existing = JSON.parse(await readFile(this.descriptorPath, "utf8"));
       if (existing.instanceId === this.instanceId) await unlink(this.descriptorPath);
@@ -527,7 +591,7 @@ async function discoverSessionsInRoot(rootDir: string): Promise<SessionDescripto
       if (
         d.version !== VERSION ||
         d.instanceId !== name.slice(0, -5) ||
-        d.socketPath !== join(rootDir, `${d.instanceId}.sock`) ||
+        d.socketPath !== controlSocketPath(rootDir, d.instanceId) ||
         typeof d.sessionId !== "string" ||
         typeof d.cwd !== "string" ||
         !Number.isInteger(d.pid) ||

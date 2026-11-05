@@ -116,10 +116,7 @@
   "amendments": {
     "record": "AMENDMENTS.md",
     "reason": "OpenViking HTTP transport retired; durable memory is Hindsight through the herdr-memory CLI (durable.kind: hindsight).",
-    "files": [
-      "specs/07-openviking.md",
-      "support/EXTERNAL_TOOLS_AND_OWNERSHIP.md"
-    ],
+    "files": ["specs/07-openviking.md", "support/EXTERNAL_TOOLS_AND_OWNERSHIP.md"],
     "note": "sha256/bytes above still describe revision 2026-09-15-v3; AMENDMENTS.md carries the working-copy hashes."
   }
 }

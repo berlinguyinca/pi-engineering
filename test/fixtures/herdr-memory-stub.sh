@@ -7,8 +7,8 @@
 # shape), backed by one file so a second test session can read what the first
 # one wrote. It talks to no network and needs no credential.
 #
-# Shell rather than node on purpose: automatic recall races a 250 ms deadline,
-# and a node child process would spend most of that budget starting up.
+# Shell keeps the CLI boundary fast and deterministic under the automatic-recall budget.
+# documents/get use normalized addresses, just like the canonical client.
 #
 # Behaviour switches, set by the test through the environment (never a token):
 #   MEMORY_STUB_DB    file holding one stored note per line (required)
@@ -28,7 +28,7 @@ shift || true
 sanitize() { printf '%s' "$1" | tr -d '\\"'; }
 
 row() {
-  printf '{"memory_id":"m%s","text":"%s","status":"promoted","revision":%s,"provenance":{"evidence_refs":["stub:evidence"]}}' \
+  printf '{"memory_id":"m%s","text":"%s","bank_id":"canary-facts","status":"verified","revision":%s,"provenance":{"evidence_refs":["stub:evidence"]}}' \
     "$1" "$(sanitize "$2")" "$1"
 }
 
@@ -67,6 +67,42 @@ case "$action" in
       row "$i" "$line"
     done < "$db"
     printf ']}'
+    ;;
+  documents)
+    limit=100
+    offset=0
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --limit) limit=$2; shift 2 ;;
+        --offset) offset=$2; shift 2 ;;
+        --scope|--kind) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    total=0
+    [ ! -f "$db" ] || total=$(grep -c . "$db")
+    printf '{"bank_id":"canary-facts","scope":"project","total":%s,"total_is_estimate":false,"documents":[' "$total"
+    i=0
+    emitted=0
+    if [ -f "$db" ]; then
+      while IFS= read -r line; do
+        i=$((i + 1))
+        [ "$i" -gt "$offset" ] || continue
+        [ "$emitted" -lt "$limit" ] || break
+        [ "$emitted" = 0 ] || printf ','
+        printf '{"address":"m%s","status":"verified","revision":1}' "$i"
+        emitted=$((emitted + 1))
+      done < "$db"
+    fi
+    printf ']}'
+    ;;
+  get)
+    id=${1#m}
+    case "$id" in ''|*[!0-9]*) exit 2 ;; esac
+    [ -f "$db" ] || exit 1
+    text=$(sed -n "${id}p" "$db")
+    [ -n "$text" ] || exit 1
+    row "$id" "$text"
     ;;
   forget)
     printf '{"outcome":"forgotten"}'
