@@ -2478,19 +2478,23 @@ export class ExecutionBroker {
     const survivors: string[] = [];
     for (const branch of branches) {
       let count: number | null = null;
+      let tip: string | null = null;
       try {
-        count = await git.revListCount(`${base}..${branch}`);
+        tip = await git.resolveCommit(branch);
+        count = tip === null ? null : await git.revListCount(`${base}..${tip}`);
       } catch {
         count = null;
       }
       // "unknown" is not "no commits": when the count cannot be determined we
       // keep the branch preserved so unmerged work is never silently lost.
-      if (count === null || count > 0) {
+      if (count === null || count > 0 || tip === null) {
         survivors.push(branch);
         continue;
       }
       try {
-        await git.deleteBranch(branch);
+        // Compare-and-swap on the tip we counted: a preserve commit landing in
+        // between makes the delete fail and the branch is kept.
+        await git.deleteBranch(branch, undefined, tip);
       } catch {
         survivors.push(branch);
         continue;

@@ -26,11 +26,12 @@ Never silently recreate it in `pi-engineering`.
 | Pi Web | EXTERNAL / UPSTREAM TOOL | Pi Web project/package | configure, launch/connect, extension/plugin/integration if supported, deep links/API adapter | **Pi Web itself, a new Pi Web frontend/backend, a replacement web IDE** |
 | Pi Forge | **OUT OF SCOPE** | none | nothing | do not inspect, install, integrate, configure, vendor, fork, or implement |
 | Plannotator | EXTERNAL / UPSTREAM TOOL | Plannotator project/package | configuration, Docker deployment reference, API adapter, approval-policy integration | implement a replacement plan annotation UI/service |
-| OpenViking | EXTERNAL SERVICE | `viking.example.com` / OpenViking | client integration, project/session mapping, retrieval/promotion policy, offline outbox | OpenViking server, vector DB, custom shared-memory server |
+| OpenViking → **Hindsight** *(amended)* | EXTERNAL SERVICE | Hindsight, reached through the `herdr-memory` CLI (`durable.kind: hindsight`); the `viking.example.com` HTTP service and client were retired | client integration through the CLI contract, project/session mapping, retrieval/promotion policy, offline outbox | a memory server, vector DB, custom shared-memory service, or a second transport |
 | Blackhole / pi-blackhole | EXTERNAL / UPSTREAM PACKAGE | pi-blackhole package | pin/configure/integrate/benchmark, promotion bridge | fork/reimplement Blackhole; shared Blackhole server/filesystem |
 | InferWeave | EXTERNAL SYSTEM / PROVIDER | InferWeave repositories/services | provider adapter, capability discovery, session metadata, backpressure handling | GPU scheduler, model placement engine, InferWeave gateway/node runtime |
 | AutoSpec | EXTERNAL SIBLING PROJECT | AutoSpec repository | adapter/integration contracts where local harness must call it | copy AutoSpec into pi-engineering; duplicate its spec/work-item engine |
 | MCP servers | EXTERNAL SERVICES/TOOLS | individual MCP projects/services | registry, configuration, auth, capability/permission policy | reimplement domain MCP servers |
+| priorart | **REQUIRED EXTERNAL MCP TOOL** | github.com/berlinguyinca/pi-priorart | register/configure/ensure-present via `src/platform/priorartDependency.ts` (binary + config + `~/.pi/agent/mcp.json`), on every session start | reimplement the search backends, ranking, or decision ledger |
 | Git | EXTERNAL TOOL | system | invoke/manage worktrees through safe abstraction | implement VCS |
 | Docker/Compose | EXTERNAL TOOLING | system | Compose/configuration for local integration services | container runtime |
 | PostgreSQL | EXTERNAL SERVICE | packaged dependency | schema/migrations/client for pi-engineering-owned runtime state | database server |

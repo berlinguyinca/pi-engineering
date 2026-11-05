@@ -1,8 +1,8 @@
 /**
- * OpenViking emergency offline outbox (spec 07).
+ * Hindsight emergency offline outbox (spec 07).
  *
  * "Explicit emergency offline mode uses a durable outbox; autonomous runs do
- * not silently become memoryless." When OpenViking is unreachable, memory
+ * not silently become memoryless." When Hindsight is unreachable, memory
  * commits are enqueued durably (JSONL) instead of being dropped, and flushed
  * when the service returns. Redaction is applied before enqueue so secrets
  * never leave the process.
@@ -43,7 +43,7 @@ export interface MemoryCommit {
 }
 
 export interface OutboxTransport {
-  /** Attempt to push a commit to OpenViking. Throws on failure. */
+  /** Attempt to push a commit to Hindsight. Throws on failure. */
   push(commit: MemoryCommit): Promise<void>;
 }
 
@@ -61,7 +61,7 @@ export function redactMemoryText(text: string): string {
 /**
  * How many undelivered commits may be held before enqueue refuses.
  *
- * A bound is required — an outbox with OpenViking down for a day otherwise
+ * A bound is required — an outbox with Hindsight down for a day otherwise
  * grows without limit in both RAM and disk. Refusing is the explicit policy
  * rather than dropping the oldest: this module exists so that memory is not
  * silently lost, and a caller told "no" can react, where a caller whose commit
@@ -177,7 +177,7 @@ export class MemoryOutbox {
   async enqueue(commit: Omit<MemoryCommit, "id" | "enqueuedAt"> & { text: string }): Promise<MemoryCommit> {
     if (this.queue.length >= this.maxQueue) {
       throw new Error(
-        `memory outbox is full (${this.queue.length} undelivered commits); OpenViking has been unreachable for too long`,
+        `memory outbox is full (${this.queue.length} undelivered commits); Hindsight has been unreachable for too long`,
       );
     }
     const entry: MemoryCommit = {

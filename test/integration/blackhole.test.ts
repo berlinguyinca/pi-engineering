@@ -459,9 +459,9 @@ test("blackhole hydration is gated: reviewer never receives shared durable memor
     await rt.engineer("add an add function");
 
     // Implementer (allowed) receives the durable block; reviewer (excluded) does NOT.
-    assert.ok(received.implementer?.includes("[openviking durable memory]"), "implementer hydrates shared memory");
+    assert.ok(received.implementer?.includes("[hindsight durable memory]"), "implementer hydrates shared memory");
     assert.ok(
-      !received.reviewer?.includes("[openviking durable memory]"),
+      !received.reviewer?.includes("[hindsight durable memory]"),
       "reviewer must not inherit shared memory (INV-007)",
     );
   } finally {

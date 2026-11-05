@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Task Contract",
+  "description": "Authorization snapshot for one task, written by the operator or the control plane. The Pi-side parser (src/taskDiscipline/contract.ts) is authoritative; this schema is kept in step with it by test/unit/task-discipline-schema.test.ts. Paths are literal: ${VAR}, ~ and .. inside these arrays are not expanded by the schema or by the parser, and an unexpandable path appearing in an agent's command is resolved or refused at decision time.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "taskId",
+    "objective",
+    "mode",
+    "policyRevision",
+    "readRoots",
+    "writeRoots",
+    "allowedHosts",
+    "externalEffects",
+    "acceptanceCriteria"
+  ],
+  "properties": {
+    "taskId": { "type": "string", "minLength": 1 },
+    "missionId": { "type": "string" },
+    "parentTaskId": { "type": "string" },
+    "objective": { "type": "string", "minLength": 1 },
+    "mode": { "enum": ["investigation", "implementation", "review", "deployment"] },
+    "policyRevision": { "type": "integer", "minimum": 1 },
+    "workspace": { "type": "string" },
+    "readRoots": { "type": "array", "items": { "type": "string" } },
+    "writeRoots": { "type": "array", "items": { "type": "string" } },
+    "scratchRoots": {
+      "description": "Writable space for diagnostics (logs, repro scripts). Must not be a repository root; writes here are allowed in every mode.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "protectedPaths": {
+      "description": "Never writable. The runtime additionally protects the contract file, the decision log, and — unless it overlaps a writable root — the contract directory.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "allowedHosts": {
+      "description": "Hosts an effect may target. A host listed here still cannot carry an effect absent from externalEffects; investigation and review contracts may use hosts only for remote_read.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "externalEffects": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "remote_read",
+          "remote_write",
+          "artifact_upload",
+          "git_push",
+          "ci_dispatch",
+          "deploy",
+          "remote_restart",
+          "destructive_operation"
+        ]
+      }
+    },
+    "allowedTools": {
+      "description": "Optional tool allowlist; empty means the mode's default tool set.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "allowedCommands": {
+      "description": "Optional command allowlist; empty means classification decides.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "acceptanceCriteria": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "owner": { "type": "string" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "approvedAmendmentIds": { "type": "array", "items": { "type": "string" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "enum": ["investigation", "review"] } } },
+      "then": {
+        "properties": {
+          "writeRoots": { "maxItems": 0 },
+          "externalEffects": { "items": { "const": "remote_read" } }
+        },
+        "description": "The parser rejects these too; stated here so a validator catches it before a session starts."
+      }
+    }
+  ]
+}

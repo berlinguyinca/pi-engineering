@@ -6,8 +6,33 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import extension from "../../extensions/index.ts";
+import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { publishHostMaintenance } from "../../src/runtime/host/maintenance.ts";
-import { discoverSessions, requestSession } from "../../src/sessionControl/SessionControl.ts";
+import {
+  type ControlReply,
+  type SessionDescriptor,
+  discoverSessions,
+  requestSession,
+} from "../../src/sessionControl/SessionControl.ts";
+
+/**
+ * `status` lists the session's missions, which opens the repository's runtime the first time (git, SQLite, a registry
+ * session: seconds when the host is loaded, against a 1.5 s client / 2 s server request budget). The open is shared and
+ * keeps running when a request gives up, so ask until it has answered instead of assuming it is ready - a fixed budget
+ * made this test a measurement of host load. The deadline only bounds a genuinely stuck open; the fast path is one request.
+ */
+async function statusWhenReady(session: SessionDescriptor): Promise<ControlReply> {
+  const deadline = Date.now() + 120_000;
+  for (;;) {
+    try {
+      const reply = await requestSession(session, { version: 1, op: "status" }, 10_000);
+      if (reply.ok || Date.now() >= deadline) return reply;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
 
 type Handler = (event: Record<string, unknown>, context: Record<string, unknown>) => unknown;
 
@@ -85,7 +110,7 @@ test("extension publishes one live session, tool progress, UI-only note and life
         },
         ctx,
       );
-    const status = await requestSession(sessions[0]!, { version: 1, op: "status" });
+    const status = await statusWhenReady(sessions[0]!);
     assert.equal(status.ok, true);
     if (status.ok) {
       assert.ok(status.data.runtime?.capabilities.includes("mission.resume.selected-model.v1"));
@@ -94,11 +119,11 @@ test("extension publishes one live session, tool progress, UI-only note and life
       assert.equal(status.data.lastToolProgress, "repairing task TSK-1");
     }
     for (const handler of handlers.get("session_before_compact") ?? []) await handler({}, ctx);
-    const compacting = await requestSession(sessions[0]!, { version: 1, op: "status" });
+    const compacting = await statusWhenReady(sessions[0]!);
     assert.ok(compacting.ok);
     assert.equal(compacting.data.runtime?.interactiveIdle, false);
     for (const handler of handlers.get("session_compact_failed") ?? []) await handler({}, ctx);
-    const settled = await requestSession(sessions[0]!, { version: 1, op: "status" });
+    const settled = await statusWhenReady(sessions[0]!);
     assert.ok(settled.ok);
     assert.equal(settled.data.runtime?.interactiveIdle, true);
     const note = await requestSession(sessions[0]!, {
@@ -160,7 +185,7 @@ test("extension publishes one live session, tool progress, UI-only note and life
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
 
@@ -224,36 +249,37 @@ test("housekeeping is deferred past session_start and a shutdown cancels it befo
       onTerminalInput: () => () => {},
     },
   };
-  const handles = () =>
-    process.getActiveResourcesInfo().filter((r) => r === "Timeout" || r === "PipeWrap" || r === "ChildProcess");
+  // What a surviving housekeeping timer DOES is call housekeep(), whose first step opens the repository's runtime. Count
+  // opens that begin after shutdown has returned. (Counting process.getActiveResourcesInfo() "Timeout" entries before and
+  // after cannot see it - housekeeping's timers are unref'd, which that API does not list - and it did count unrelated
+  // ref'd timers of the runtime the session's own start-up opens, which under load is still finishing: the old flake.)
+  const originalOpen = EngineeringRuntime.open;
+  let shutdownReturned = false;
+  let opensAfterShutdown = 0;
+  EngineeringRuntime.open = ((...args: Parameters<typeof EngineeringRuntime.open>) => {
+    if (shutdownReturned) opensAfterShutdown++;
+    return originalOpen.apply(EngineeringRuntime, args);
+  }) as typeof EngineeringRuntime.open;
   try {
     extension(pi as never);
-    const before = handles();
     for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx);
     for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+    shutdownReturned = true;
     // Past both the first-run delay and several intervals: nothing may fire.
     await new Promise((r) => setTimeout(r, 500));
-    const after = handles();
-    // Unrelated child pipes may finish during shutdown. Compare each resource
-    // kind separately so their disappearance neither fails the check nor hides
-    // a leaked housekeeping timer or child process.
-    for (const kind of ["Timeout", "PipeWrap", "ChildProcess"]) {
-      assert.ok(
-        after.filter((resource) => resource === kind).length <= before.filter((resource) => resource === kind).length,
-        `no housekeeping ${kind} remains after shutdown`,
-      );
-    }
+    assert.equal(opensAfterShutdown, 0, "no housekeeping tick ran after shutdown (it would have reopened the runtime)");
     assert.equal(
       (existsSync(spawnLog) ? readFileSync(spawnLog, "utf8") : "").includes("sweep "),
       false,
       "housekeeping sweep started no worktree discovery before or after shutdown",
     );
   } finally {
+    EngineeringRuntime.open = originalOpen;
     process.env.PATH = oldPath;
     for (const [key, value] of Object.entries(old)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });

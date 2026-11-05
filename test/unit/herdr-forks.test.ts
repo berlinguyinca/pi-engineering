@@ -26,7 +26,7 @@ import {
   parseSteeringItem,
 } from "../../src/orchestration/steering.ts";
 import { loadForkSettings } from "../../src/runtime/herdr/forkSettings.ts";
-import { type ForkRuntimeSources, createForkRuntime } from "../../src/runtime/herdr/forkWiring.ts";
+import { type ForkRuntimeSources, createForkRuntime, missionForkSources } from "../../src/runtime/herdr/forkWiring.ts";
 import { FakeGithubClient } from "../support/fakeGithubClient.ts";
 
 const sh = (cwd: string, ...args: string[]): string =>
@@ -144,6 +144,7 @@ function setup(
     promote?: boolean;
     limits?: Partial<{ maxTotal: number; maxPerOrigin: number; minFreeMb: number; retentionWarn: number }>;
     git?: (g: ForkGit) => ForkGit;
+    onPrLinked?: ConstructorParameters<typeof ForkManager>[0]["onPrLinked"];
   } = {},
 ) {
   const r = mkRepo();
@@ -174,6 +175,7 @@ function setup(
     lineage,
     limits: { maxTotal: 6, maxPerOrigin: 3, minFreeMb: 0, retentionWarn: 20, ...opts.limits },
     promote,
+    ...(opts.onPrLinked ? { onPrLinked: opts.onPrLinked } : {}),
   });
   const origin: ForkOrigin = { nodeId: "task:t1", missionId: "m1", taskId: "t1", repoRoot: r.root, baseBranch: "main" };
   return { ...r, bare: r.origin, state, lineage, store, client, registry, mgr, origin };
@@ -452,6 +454,23 @@ describe("promotion", () => {
         ...extra,
       }),
     );
+
+  it("tells the host which task a promoted PR belongs to, and a failing hook never fails the promotion", async () => {
+    const calls: Array<[string, number]> = [];
+    const s = setup({
+      promote: true,
+      onPrLinked: (taskId, pr) => {
+        calls.push([taskId, pr.number]);
+        throw new Error("ledger down");
+      },
+    });
+    const f = await fork(s, 1);
+    const head = commit(f.rec.worktreePath, "b.txt", "feature\n");
+    const a = await promote(s, f, head);
+    assert.equal(a.outcome, "applied", a.note);
+    assert.deepEqual(calls, [["t1", 7]]);
+    assert.equal(s.registry.get(f.id)?.status, "selected");
+  });
 
   it("pushes exactly the confirmed commit, opens a DRAFT PR, links it and merges nothing", async () => {
     const { s, f, head } = await prep();
@@ -764,15 +783,20 @@ describe("forks settings: global YAML only, off unless valid", () => {
 });
 
 describe("production wiring (createForkRuntime)", () => {
-  const sources = (over: Partial<ForkRuntimeSources> = {}): ForkRuntimeSources => ({
-    getTask: (id) => (id === "t1" ? { task_id: "t1", mission_id: "m1" } : undefined),
-    getExecution: () => undefined,
-    getMission: (id) => (id === "m1" ? { mission_id: "m1", repository: "relative/repo", base_ref: "main" } : undefined),
-    boundRoot: () => null,
-    openRoot: async (p) => p,
-    links: new Store(),
-    ...over,
-  });
+  type Legacy = {
+    getMission: (id: string) => { mission_id: string; repository: string; base_ref: string } | undefined;
+  };
+  const sources = (over: Partial<Legacy> = {}): ForkRuntimeSources =>
+    missionForkSources(
+      {
+        getTask: (id) => (id === "t1" ? { task_id: "t1", mission_id: "m1" } : undefined),
+        getExecution: () => undefined,
+        getMission: (id) =>
+          id === "m1" ? { mission_id: "m1", repository: "relative/repo", base_ref: "main" } : undefined,
+        ...over,
+      },
+      { boundRoot: () => null, openRoot: async (p) => p, links: new Store() },
+    );
   const boot = async (yaml: string, src: ForkRuntimeSources) => {
     const agentDir = tmp();
     writeFileSync(join(agentDir, "engineering.yaml"), yaml);

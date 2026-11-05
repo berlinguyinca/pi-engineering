@@ -26,6 +26,7 @@ import { id } from "../core/ids.ts";
 import { ROLE_BUDGETS } from "../core/types.ts";
 import type { CandidateLifecycle, GitRepo, IntegrationRunRecord } from "../git/GitRepo.ts";
 import type { WorktreeInfo } from "../git/GitRepo.ts";
+import type { RetryTrace } from "../inference/retryTrace.ts";
 import {
   type CitationReport,
   citationSummary,
@@ -56,6 +57,7 @@ import {
 import { normalizeReviewSeverity, validateAcceptanceResults } from "./evidence.ts";
 import { INVALID_WORKER_OUTPUT_PREFIX } from "./recovery.ts";
 import { guardReviewWorktree } from "./reviewGuard.ts";
+import type { RoutingDecision, RoutingReason } from "./routingDecision.ts";
 
 /** What a verification run concluded, in the shape the result cache stores. */
 interface JudgedVerification {
@@ -100,6 +102,11 @@ export interface RealBackendsOptions {
    * handed to the next eligible model right away (see runWithModelTakeover).
    */
   onModelUnavailable?: (model: ModelRef, context: { missionId?: string; taskId?: string; reason: string }) => void;
+  /**
+   * Persist a routing decision that relied on, or left, the mission's pin (why a worker runs where it
+   * runs). Best-effort observer: it is called inside a try/catch and may drop the record.
+   */
+  recordRoutingDecision?: (decision: RoutingDecision) => void;
   /** Called when an attempt succeeded on a model: it is served again. */
   onModelServed?: (model: ModelRef) => void;
   /** True for a model currently recorded as unavailable (never a reviewer fallback). */
@@ -123,6 +130,13 @@ export interface RealBackendsOptions {
    * between inference requests re-dispatches it on the new choice.
    */
   currentOperatorPin?: (missionId: string) => ModelRef | null | undefined;
+  /**
+   * How long a model that failed a task's takeover walk stays excluded from that
+   * task's later relaunches (default 15 minutes). 0 disables the carry-over.
+   */
+  takeoverMemoryTtlMs?: number;
+  /** Clock for the takeover memory (tests). */
+  now?: () => number;
   /** Resolve the repository selected by the current mission's async binding. */
   repository?: (repoId?: string) => Promise<{ git: GitRepo; cwd: string }> | { git: GitRepo; cwd: string };
 }
@@ -136,6 +150,10 @@ export interface ModelRoute extends ModelRef {
   pinRefused?: string;
   /** Operator-visible reason the pin could not place this role. */
   pinNotice?: string;
+  /** How the router related to the mission's pin for this placement (recorded as a routing decision). */
+  pinOutcome?: "pin_honoured" | "pin_refused" | "pin_excluded_held" | "pin_excluded_rerouted";
+  /** The router's refusal text when `pinOutcome` is pin_refused. */
+  pinRefusal?: string;
   /** Why this role was placed from the model registry instead of by routing. */
   registryNotice?: string;
 }
@@ -280,6 +298,12 @@ const MAX_FAMILY_PROBES = 16;
 
 /** Bound a takeover even when refreshed discovery keeps returning new failing models. */
 const MAX_MODEL_TAKEOVER_ATTEMPTS = 16;
+
+/** Default lifetime of a task's remembered dead models across scheduler relaunches. */
+export const DEFAULT_TAKEOVER_MEMORY_TTL_MS = 15 * 60_000;
+
+/** Tasks whose takeover memory is kept (oldest dropped past the bound). */
+const MAX_TAKEOVER_MEMORY_TASKS = 512;
 
 /** Missions whose producing models are remembered for reviewer separation. */
 export const MAX_TRACKED_MISSIONS = 256;
@@ -442,8 +466,13 @@ function outcomeOf(result: Awaited<ReturnType<WorkerExecutor["run"]>>): Executio
     summary: result.result.summary,
     artifactRefs: result.result.evidence_refs ?? [],
     usage: {
-      input: result.usage?.input ?? 0,
-      output: result.usage?.output ?? 0,
+      // The task's one token record; null = not reported (a failed run has none).
+      input: result.usage?.input ?? null,
+      output: result.usage?.output ?? null,
+      thinking: result.usage?.thinking ?? null,
+      total: result.usage?.total ?? null,
+      compactions: result.usage?.compactions ?? null,
+      maxTokens: result.usage?.maxTokens ?? null,
       // A failed run has no usage; it still names the model it attempted.
       model: result.usage?.model ?? (ranOn(result) ? modelKey(ranOn(result) as ModelRef) : "unknown"),
     },
@@ -588,6 +617,44 @@ export function realBackends(opts: RealBackendsOptions) {
       if (oldest !== undefined) producedBy.delete(oldest);
     }
   };
+  /**
+   * Models a task's takeover walk already found dead, carried across scheduler
+   * relaunches of the same task so a relaunch starts after them instead of
+   * re-walking the list (RETRY-OWNERS.md). Held here, not in UnavailableModels
+   * (global, only for gateway-confirmed gone models, so a capacity-exhausted
+   * model would wrongly leave routing for every task) and not in the task
+   * record (this layer has no write access to it). In memory: a process restart
+   * only costs one re-walk. Bounded by TTL and MAX_TAKEOVER_MEMORY_TASKS.
+   */
+  const takeoverMemory = new Map<string, { pin: string | null; dead: Map<string, { ref: ModelRef; until: number }> }>();
+  const memoryTtl = opts.takeoverMemoryTtlMs ?? DEFAULT_TAKEOVER_MEMORY_TTL_MS;
+  const clock = (): number => (opts.now ? opts.now() : Date.now());
+  /** The task's live dead-model list; drops it when the operator pin changed. */
+  const memoryFor = (key: string | undefined, pin: string | null): ModelRef[] => {
+    if (!key || memoryTtl <= 0) return [];
+    const entry = takeoverMemory.get(key);
+    if (!entry) return [];
+    if (entry.pin !== pin) {
+      takeoverMemory.delete(key);
+      return [];
+    }
+    const now = clock();
+    for (const [k, v] of entry.dead) if (v.until <= now) entry.dead.delete(k);
+    if (entry.dead.size === 0) takeoverMemory.delete(key);
+    return [...entry.dead.values()].map((v) => v.ref);
+  };
+  const remember = (key: string | undefined, pin: string | null, model: ModelRef): void => {
+    if (!key || memoryTtl <= 0) return;
+    let entry = takeoverMemory.get(key);
+    if (!entry || entry.pin !== pin) entry = { pin, dead: new Map() };
+    entry.dead.set(modelKey(model), { ref: { provider: model.provider, id: model.id }, until: clock() + memoryTtl });
+    takeoverMemory.delete(key);
+    takeoverMemory.set(key, entry);
+    if (takeoverMemory.size > MAX_TAKEOVER_MEMORY_TASKS) {
+      const oldest = takeoverMemory.keys().next().value;
+      if (oldest !== undefined) takeoverMemory.delete(oldest);
+    }
+  };
   /** The operator pin a mission dispatches with right now (adopting a new choice). */
   const pinKeyOf = (missionId: string | undefined): string | null => {
     if (!missionId || !opts.currentOperatorPin) return null;
@@ -675,11 +742,58 @@ export function realBackends(opts: RealBackendsOptions) {
         // Activity consumers are observers, never participants.
       }
     };
+    const recordDecision = (decision: Omit<RoutingDecision, "missionId" | "taskId" | "role" | "pin">): void => {
+      const { missionId, taskId } = plan.context;
+      if (!opts.recordRoutingDecision || !missionId || !taskId) return;
+      try {
+        opts.recordRoutingDecision({
+          missionId,
+          taskId,
+          role: req.role,
+          pin: pinKeyOf(missionId),
+          ...decision,
+        });
+      } catch {
+        // Recording is an observer: a persistence failure never fails dispatch.
+      }
+    };
+    /** Record how the router related to the pin for this placement. No pin, no routing decision to explain. */
+    const recordPlacement = (placed: ModelRoute | undefined): void => {
+      if (!placed || !pinKeyOf(plan.context.missionId)) return;
+      const chosen = modelKey(placed);
+      const independent = !!routerRoleFor(req.role) && ROLE_REQUIREMENTS[routerRoleFor(req.role)!].independent;
+      let reason: RoutingReason;
+      if (placed.pinOutcome === "pin_excluded_rerouted" && independent) reason = "reviewer_separation";
+      else if (placed.pinOutcome) reason = placed.pinOutcome;
+      else if (chosen === pinKeyOf(plan.context.missionId)) reason = "pin_honoured";
+      else reason = independent ? "reviewer_separation" : "pin_refused";
+      recordDecision({
+        chosen,
+        reason,
+        ...(reason === "pin_refused"
+          ? { refusal: placed.pinRefusal ?? "routing placed this role on another model" }
+          : {}),
+      });
+    };
     let route = plan.initial;
+    const memoryKey =
+      plan.context.missionId && plan.context.taskId
+        ? `${plan.context.missionId}|${plan.context.taskId}|${req.role}`
+        : undefined;
+    const memoryPin = pinKeyOf(plan.context.missionId);
+    // A relaunch of the same task starts after the models its earlier walks found
+    // dead. An explicit operator pin is never excluded or replaced: it is waited on.
+    let carried = memoryFor(memoryKey, memoryPin);
+    if (route && !route.operatorPin && carried.some((known) => sameModel(known, route as ModelRef))) {
+      const alternative = await plan.next(carried);
+      if (alternative) route = alternative;
+    }
     if (!route && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route };
+    recordPlacement(route);
     if (plan.announceWarnings && route?.warning) announce(route.warning);
     if (route?.pinNotice) announce(route.pinNotice);
     const switches: string[] = [];
+    const failovers: RetryTrace[] = [];
     if (route?.registryNotice) {
       switches.push(route.registryNotice);
       announce(route.registryNotice);
@@ -693,6 +807,9 @@ export function realBackends(opts: RealBackendsOptions) {
     while (!input.signal.aborted) {
       const error = outcomeOf(run).error ?? "";
       if (error === MODEL_SUPERSEDED) {
+        // A new operator choice outranks everything learned under the old one.
+        if (memoryKey) takeoverMemory.delete(memoryKey);
+        carried = [];
         const next = await plan.repick(tried);
         if (!next && requiresReviewRoute(req.role)) return { run: unavailableReviewer(req.role), route: undefined };
         // The operator's choice resolves to the model already running: nothing
@@ -709,6 +826,7 @@ export function realBackends(opts: RealBackendsOptions) {
         announce(notice);
         if (plan.announceWarnings && next?.warning) announce(next.warning);
         if (next?.pinNotice) announce(next.pinNotice);
+        recordPlacement(next);
         if (model && next) plan.onSwitch?.(model, next);
         // Routing could not place the role on the new pin (the placement did
         // not change): run where routing says, and do not supersede again for
@@ -756,13 +874,21 @@ export function realBackends(opts: RealBackendsOptions) {
       if (gone && !REQUEST_SPECIFIC_REFUSAL.test(reason))
         opts.onModelUnavailable?.(failed, { ...plan.context, reason });
       tried.push(failed);
+      if (req.operatorPinned !== true && failed !== UNNAMED_MODEL) remember(memoryKey, memoryPin, failed);
       if (tried.length >= MAX_MODEL_TAKEOVER_ATTEMPTS) {
         const notice = `model takeover exhausted after ${tried.length} model attempts; last failure on ${modelKey(failed)}`;
         switches.push(notice);
         announce(notice);
         break;
       }
-      const next = await plan.next(tried);
+      let next = await plan.next([...carried, ...tried]);
+      // Everything the task remembered as dead is all that is left: forget it and
+      // walk afresh rather than starve the task until the TTL passes.
+      if (!next && carried.length > 0) {
+        if (memoryKey) takeoverMemory.delete(memoryKey);
+        carried = [];
+        next = await plan.next(tried);
+      }
       if (!next || tried.some((known) => sameModel(known, next))) break;
       const notice = providerFault
         ? `model ${modelKey(failed)} failed the request (${reason.slice(0, 200)}) — switched ${req.role} to ${modelKey(next)}`
@@ -775,6 +901,22 @@ export function realBackends(opts: RealBackendsOptions) {
         switches.push(next.registryNotice);
         announce(next.registryNotice);
       }
+      const previous = run.result.details?.retry_trace;
+      if (Array.isArray(previous)) failovers.push(...(previous as RetryTrace[]));
+      failovers.push({
+        layer: "model-takeover",
+        attempt: tried.length,
+        reason: `${error}:${modelKey(failed)}`,
+        next: "failover",
+        owner: "model-takeover",
+      });
+      recordDecision({
+        chosen: modelKey(next),
+        reason: "takeover_after_failure",
+        from: failed === UNNAMED_MODEL ? "(unnamed)" : modelKey(failed),
+        to: modelKey(next),
+        errorClass: error || "unknown",
+      });
       plan.onSwitch?.(failed, next);
       route = next;
       model = next;
@@ -784,6 +926,16 @@ export function realBackends(opts: RealBackendsOptions) {
     }
     // A model that serves an attempt again is no longer considered gone.
     if (model && run.result.status === "completed") opts.onModelServed?.(model);
+    if (failovers.length > 0) {
+      const earlier = run.result.details?.retry_trace;
+      run = {
+        ...run,
+        result: {
+          ...run.result,
+          details: { ...run.result.details, retry_trace: [...failovers, ...(Array.isArray(earlier) ? earlier : [])] },
+        },
+      };
+    }
     if (switches.length > 0) {
       run = { ...run, result: { ...run.result, summary: `${switches.join("; ")}. ${run.result.summary}` } };
     }

@@ -28,8 +28,9 @@ import { GitRepo } from "../git/GitRepo.ts";
 import { classifyError } from "../guard/transient.ts";
 import { MissionCapacityScheduler } from "../inference/missionCapacityScheduler.ts";
 import { Ledger } from "../ledger/Ledger.ts";
+import { claimAuthorityGeneration } from "../ledger/authority.ts";
 import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
-import { loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
+import { DEFAULT_POLICY, loadExecutionConfig, loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
@@ -102,12 +103,24 @@ import { emitTelemetry } from "../telemetry/sink.ts";
 import { buildCoreTools, hasRecordedEvidence } from "../tools/coreTools.ts";
 import { CommandVerifier, type VerificationProvider, type VerifyOutcome } from "../verify/Verifier.ts";
 import { TestQuarantine } from "../verify/testQuarantine.ts";
+import { LedgerWorkProjection } from "../work/ledgerProjection.ts";
+import { TaskLineageProjector } from "../work/taskLineage.ts";
+import { ledgerTaskRefs } from "../work/taskRefs.ts";
 import { PiWorkerExecutor } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest } from "../workers/WorkerExecutor.ts";
+import { WAITING_FOR_INFERENCE_SUMMARY } from "../workers/activity.ts";
 import { buildContinuityConfig } from "./continuityWiring.ts";
 import { type SteeringReceiver, createSteeringReceiver } from "./herdr/SteeringReceiver.ts";
 import { type ExternalBridge, startExternalBridge } from "./herdr/externalAgent.ts";
-import { type ForkRuntime, createForkRuntime, downstreamPrNodes } from "./herdr/forkWiring.ts";
+import {
+  type ForkRuntime,
+  type WorkScopeFacts,
+  createForkRuntime,
+  downstreamPrNodes,
+  missionForkSources,
+  withFallbackForkSources,
+  workForkSources,
+} from "./herdr/forkWiring.ts";
 import type { LineageEmitter } from "./herdr/lineage.ts";
 import { type RuntimeBinding, resolveRuntimeBinding, sessionBindingInfo } from "./isolation/RuntimeBinding.ts";
 import { RuntimeSession } from "./isolation/RuntimeSession.ts";
@@ -120,6 +133,7 @@ import {
 import { assessProcess } from "./isolation/processIdentity.ts";
 import { isReloadShutdown } from "./isolation/reloadCustody.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "./isolation/stateDir.ts";
+import { LedgerTransitions } from "./ledgerTransitions.ts";
 import { validateMaintenanceModel } from "./maintenanceModel.ts";
 import { UnavailableModels, createRouteModel, followUnavailableModels } from "./modelRouting.ts";
 import {
@@ -720,6 +734,10 @@ function describeSnapshotError(error: unknown): string {
 
 export class EngineeringRuntime {
   ledger: Ledger;
+  /** Guarded Ledger status transitions (completion policy, expected_revision, authority_generation); assigned by open(). */
+  transitions: LedgerTransitions;
+  /** Ledger task -> Herdr lineage; absent without a lineage emitter. */
+  taskLineage?: TaskLineageProjector;
   /**
    * Owned-resource journal for candidate worktrees and branches (issue #143).
    * Rooted in the runtime state dir; assigned by open().
@@ -790,6 +808,8 @@ export class EngineeringRuntime {
   > | null;
   private readonly onMissionActivity: ((event: RuntimeMissionActivityEvent, meta?: { replay: boolean }) => void) | null;
   /** Work item whose phases are currently being reported (status surfaces only). */
+  /** `execution.stale_after_ms` for work-run liveness; undefined = projection default. */
+  private livenessStaleMs: number | undefined;
   private missionActivityTicker: MissionActivityTicker | null = null;
   private readonly missionActivityClock = new ClockOnlyGate();
   private unsubscribeMissionActivity: (() => void) | null = null;
@@ -913,6 +933,7 @@ export class EngineeringRuntime {
             classifications: this.missionStore!.listFailureClassifications(m.mission_id),
             verifierStages: buildVerifierStages(this.missionStore!.listValidationEvidence(m.mission_id)),
             lifecycle: this.missionStore!.getCanonicalLifecycle(m.mission_id),
+            routingDecisions: this.missionStore!.listRoutingDecisions(m.mission_id),
           }));
           // FR-04: after recovery is granted, the republish finalizes the stale
           // tag before the file is built so the freshly written file is clean;
@@ -1349,6 +1370,7 @@ export class EngineeringRuntime {
     };
     // Assigned by open().
     this.ledger = undefined as unknown as Ledger;
+    this.transitions = undefined as unknown as LedgerTransitions;
     this.resourceRegistry = undefined as unknown as ResourceRegistry;
     this.testQuarantine = undefined as unknown as TestQuarantine;
     this.artifacts = undefined as unknown as ArtifactStore;
@@ -1409,6 +1431,26 @@ export class EngineeringRuntime {
     const broker = await ContextBroker.open(repoRoot);
     const rt = new EngineeringRuntime(opts);
     rt.ledger = ledger;
+    rt.livenessStaleMs = (await loadExecutionConfig(repoRoot, opts.agentDir)).stale_after_ms;
+    rt.transitions = new LedgerTransitions({
+      ledger,
+      authorityGeneration: await claimAuthorityGeneration(
+        join(workDir, "ledger.jsonl"),
+        ledger.highestAuthorityGeneration(),
+      ),
+      strictCompletion: (await loadExecutionConfig(repoRoot, opts.agentDir)).strict_completion,
+      staleAfterMs: rt.livenessStaleMs,
+    });
+    if (opts.lineage)
+      rt.taskLineage = new TaskLineageProjector(
+        new LedgerWorkProjection(ledger, {
+          staleAfterMs: rt.livenessStaleMs,
+          snapshotFile: join(workDir, "work-projection.snapshot.json"),
+        }),
+        opts.lineage,
+        undefined,
+        ledgerTaskRefs(ledger),
+      );
     rt.resourceRegistry = new ResourceRegistry(workDir, hostname());
     rt.testQuarantine = new TestQuarantine(workDir);
     // Records this host left in `releasing` (a crash between beginRelease and
@@ -1514,6 +1556,7 @@ export class EngineeringRuntime {
       // path. Degrades to the worker's construction-time default model when the
       // router cannot be built, so core never requires discovery or network.
       let routeModel: RouteModel | undefined;
+      const holdPin = (await loadExecutionConfig(repoRoot)).hold_mission_model;
       let reviewFallbackModel = opts.model ? { provider: opts.model.provider, id: opts.model.id } : undefined;
       // The operator's explicit model switch (Pi `/model`), adopted by this
       // session's missions at their next inference boundary and persisted on
@@ -1555,6 +1598,7 @@ export class EngineeringRuntime {
               unavailable: rt.unavailableModels,
               reviewFallbackModel,
               operatorPin: currentOperatorPin,
+              holdPin,
             })
           : undefined;
       } catch {
@@ -1564,6 +1608,7 @@ export class EngineeringRuntime {
           unavailable: rt.unavailableModels,
           reviewFallbackModel,
           operatorPin: currentOperatorPin,
+          holdPin,
         });
       }
       const maintenanceRouter = routerAdapter as RoleRouterAdapter | undefined;
@@ -1626,6 +1671,7 @@ export class EngineeringRuntime {
         onModelUnavailable: (model, context) => rt.unavailableModels.mark(model, context, { confirmed: true }),
         onModelServed: (model) => rt.unavailableModels.clear(model),
         isModelUnavailable: (model) => rt.unavailableModels.has(model),
+        recordRoutingDecision: (decision) => rt.missionStore?.recordRoutingDecision(decision),
         reviewFallbackModel,
         // Gate roles routing cannot place (no repo policy, candidates dead) are
         // placed from the session's model registry.
@@ -2047,6 +2093,18 @@ export class EngineeringRuntime {
   }
 
   /**
+   * Where Mission-less work lives: this session's checkout root and the branch it is on, read through GitRepo (the
+   * same helpers every other git fact uses). Undefined on a detached HEAD or outside a repository, which the fork
+   * wiring reports as an unresolvable origin rather than guessing a base.
+   */
+  private async sessionForkScope(): Promise<WorkScopeFacts | undefined> {
+    const git = this.git;
+    if (!git) return undefined;
+    const branch = await git.currentBranch();
+    return branch ? { repository: git.root, base_ref: branch } : undefined;
+  }
+
+  /**
    * T12. Start the steering poller only when the GLOBAL engineering YAML enables it and a Herdr control plane is
    * configured; otherwise nothing is constructed and no network call is ever made. The poller can reach exactly two
    * things: `MissionStore.steerTask` (labelled, untrusted text) and `Orchestrator.resume`.
@@ -2079,15 +2137,33 @@ export class EngineeringRuntime {
       stateDir: resolveStateRoot(),
       lineage: opts.lineage ?? null,
       log: (message) => console.error(message),
-      sources: {
-        getTask: (id) => store.getTask(id),
-        getExecution: (id) => store.getExecution(id),
-        getMission: (id) => store.getMission(id),
-        boundRoot: (repoId) => rt.repositoryRegistry.get(repoId).root,
-        openRoot: async (path) => (await GitRepo.open(path))?.root ?? null,
-        links: store,
-        downstreamPrs: (taskId) => downstreamPrNodes(store, taskId),
-      },
+      sources: (() => {
+        const host = {
+          boundRoot: (repoId: string) => rt.repositoryRegistry.get(repoId).root,
+          openRoot: async (path: string) => (await GitRepo.open(path))?.root ?? null,
+          links: store,
+          downstreamPrs: (taskId: string) => downstreamPrNodes(store, taskId),
+          // A PR opened for Ledger-native work is recorded on its work item; a Mission task id is not one, so it is skipped.
+          onPrLinked: async (taskId: string, pr: { host: string; owner: string; repo: string; number: number }) => {
+            const wiId = rt.ledger.getWorkItem(taskId) ? taskId : rt.ledger.getTask(taskId)?.result_work_item_id;
+            if (wiId) await rt.transitions.linkPullRequest(wiId, pr, rt.actor(newRunId()));
+          },
+        };
+        // Mission-less work (Ledger work items and the sessions that ran them) forks and hands off too: the work read
+        // model names the task, and the repository and base branch come from this session's own checkout.
+        const projection = new LedgerWorkProjection(rt.ledger, {
+          staleAfterMs: rt.livenessStaleMs,
+          snapshotFile: join(rt.workDir, "work-projection.snapshot.json"),
+        });
+        return withFallbackForkSources(
+          missionForkSources(store, host),
+          workForkSources(
+            () => projection.graph(),
+            () => rt.sessionForkScope(),
+            host,
+          ),
+        );
+      })(),
     });
     if (rt.forkRuntime) ports.forks = rt.forkRuntime.port;
     const receiver = await createSteeringReceiver({
@@ -2808,7 +2884,7 @@ export class EngineeringRuntime {
    * record, but a failed append must never fail or stall the engineering run.
    */
   private async recordAgentEvent(
-    type: "agent.started" | "agent.completed" | "agent.failed",
+    type: "agent.started" | "agent.completed" | "agent.failed" | "agent.heartbeat",
     workItemId: string,
     actor: Actor,
     payload: Record<string, unknown>,
@@ -2819,6 +2895,42 @@ export class EngineeringRuntime {
     } catch {
       // intentionally swallowed; see above
     }
+  }
+
+  /**
+   * While a worker runs, append an `agent.heartbeat` to the Ledger every `execution.heartbeat_interval_ms`,
+   * carrying the last meaningful-progress time the worker's own activity reported. Never fails the run: the
+   * timer is unref'd, appends are best-effort, and a key per interval slot makes a repeat a no-op.
+   * Returns the function that stops it.
+   */
+  private startRunHeartbeat(
+    workItemId: string,
+    actor: Actor,
+    meta: EventMeta,
+    state: { lastProgressAt: string; waiting: boolean },
+  ): () => void {
+    let stopped = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    void loadExecutionConfig(this.cwd)
+      .then((cfg) => {
+        const every = cfg.heartbeat_interval_ms ?? DEFAULT_POLICY.execution.heartbeat_interval_ms ?? 30_000;
+        if (stopped) return;
+        timer = setInterval(() => {
+          void this.recordAgentEvent(
+            "agent.heartbeat",
+            workItemId,
+            actor,
+            { last_progress_at: state.lastProgressAt, ...(state.waiting ? { phase: "waiting" } : {}) },
+            { ...meta, idempotency_key: `${meta.run_id}:hb:${Math.floor(Date.now() / every)}` },
+          );
+        }, every);
+        timer.unref?.();
+      })
+      .catch(() => {});
+    return () => {
+      stopped = true;
+      if (timer) clearInterval(timer);
+    };
   }
 
   private async runWorker(
@@ -2887,7 +2999,7 @@ export class EngineeringRuntime {
         req.context = effectiveContext;
       }
     }
-    // Hydrate from SHARED durable memory (OpenViking / shared file): surface
+    // Hydrate from SHARED durable memory (Hindsight / shared file): surface
     // evidence-promoted knowledge from OTHER workers/sessions so repeated or
     // parallel engineering work is not recomputed from scratch. This is the
     // cross-worker sharing read path. Provider failure degrades to nothing.
@@ -2901,7 +3013,7 @@ export class EngineeringRuntime {
       const query = `${opts.wi.id} ${role} ${task.slice(0, 120)}`;
       const shared = await this.blackhole.hydrate(query, 10);
       if (shared.length > 0) {
-        const block = `\n\n[openviking durable memory]\n${shared
+        const block = `\n\n[hindsight durable memory]\n${shared
           .map((r) => `[promoted ${r.promotedAt}] ${r.text}`)
           .join("\n")}`;
         effectiveContext = (effectiveContext ?? "") + block;
@@ -2910,6 +3022,18 @@ export class EngineeringRuntime {
     }
     const executor = opts.worker ?? this.worker;
     const runMeta = { task_id: opts.wi.id, session_id: sessionScope, run_id: runId };
+    // Liveness: remember when the worker last made meaningful progress; the heartbeat reports it.
+    const liveness = { lastProgressAt: new Date().toISOString(), waiting: false };
+    const callerActivity = req.onActivity;
+    req.onActivity = (event) => {
+      if (event.meaningfulProgress) {
+        liveness.lastProgressAt = new Date().toISOString();
+        liveness.waiting = false;
+      } else if (event.kind === "state" && event.summary === WAITING_FOR_INFERENCE_SUMMARY) {
+        liveness.waiting = true;
+      }
+      callerActivity?.(event);
+    };
     await this.recordAgentEvent(
       "agent.started",
       opts.wi.id,
@@ -2921,9 +3045,12 @@ export class EngineeringRuntime {
       },
     );
     let run: Awaited<ReturnType<WorkerExecutor["run"]>>;
+    const stopHeartbeat = this.startRunHeartbeat(opts.wi.id, this.actor(runId, role), runMeta, liveness);
     try {
       run = await executor.run(req);
+      stopHeartbeat();
     } catch (error) {
+      stopHeartbeat();
       await this.recordAgentEvent(
         "agent.failed",
         opts.wi.id,
@@ -2937,7 +3064,17 @@ export class EngineeringRuntime {
       run.result.status === "completed" ? "agent.completed" : "agent.failed",
       opts.wi.id,
       { ...this.actor(runId, role), model: run.usage?.model },
-      { role, status: run.result.status },
+      {
+        role,
+        status: run.result.status,
+        // Why a run failed, so the ledger says more than "failed" (e.g. error "tool-loop" + tool/count/last args).
+        ...(run.result.status === "completed"
+          ? {}
+          : {
+              ...(run.result.error ? { error: run.result.error } : {}),
+              ...(run.result.details?.tool_loop ? { tool_loop: run.result.details.tool_loop } : {}),
+            }),
+      },
       { ...runMeta, idempotency_key: `${runId}:ended` },
     );
     // After a completed worker, record the outcome into the session store and
@@ -2962,7 +3099,7 @@ export class EngineeringRuntime {
           phase,
           goal: this.currentPhaseGoal || undefined,
           model: run.usage.model,
-          usage: { input: run.usage.input, output: run.usage.output, cost: run.usage.cost },
+          usage: { input: run.usage.input ?? 0, output: run.usage.output ?? 0, cost: run.usage.cost },
         });
       }
     }
@@ -2972,8 +3109,8 @@ export class EngineeringRuntime {
     this.telemetry.toolCalls += run.toolCalls ?? 0;
     if (run.result.status !== "completed") this.telemetry.blockedOrFailedWorkers++;
     if (run.usage) {
-      this.telemetry.inputTokens += run.usage.input;
-      this.telemetry.outputTokens += run.usage.output;
+      this.telemetry.inputTokens += run.usage.input ?? 0;
+      this.telemetry.outputTokens += run.usage.output ?? 0;
       this.telemetry.contextTokens = Math.max(this.telemetry.contextTokens, run.usage.contextTokens);
       this.telemetry.turns += run.usage.turns;
     }
@@ -3118,6 +3255,8 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     }
     if (begun.status !== "ok" || begun.record.state === "released") return;
     try {
+      // removeWorktree is non-destructive: plain `worktree remove`, and the branch is deleted
+      // only when its tip is contained in another local branch/tag, else renamed to superseded/*.
       await this.git.removeWorktree({ path: begun.record.locator, branch: candidate.branch });
       await this.resourceRegistry.completeRelease(id);
     } catch (error) {
@@ -3234,7 +3373,7 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
         );
         await this.ledger.changeCandidate(
           candidate.id,
-          { diff: diff || null, diff_artifact_uri: diffArtifact.uri, changed_files: files },
+          { diff: diff || null, diff_artifact_uri: diffArtifact.uri, changed_files: files, head_commit: head },
           wi.id,
           this.actor(run.runId, "implementer"),
         );
@@ -3275,8 +3414,18 @@ Use repo_search, symbol, ledger_read, and artifact_read. Do not edit files.`;
     const actor = this.actor(newRunId(), "reviewer");
     this.telemetry.verifyStages += outcome.stages.length;
     const evidenceIds: string[] = [];
+    // Bind this verification to the commit it ran against, and say which stages the profile required, so the
+    // work read model can tell stale evidence and a skipped required gate from a pass.
+    const headCommit =
+      this.git && worktreePath ? await this.git.headCommitIn(runCwd).catch(() => undefined) : undefined;
+    const requiredStages = profile.stages.filter((s) => s.required).map((s) => s.name);
+    if (headCommit) {
+      await this.ledger.changeCandidate(candidate.id, { head_commit: headCommit }, wi.id, actor).catch(() => {});
+    }
     for (const ev of outcome.evidence) {
       this.telemetry.evidence++;
+      if (headCommit) ev.summary = { ...ev.summary, head_commit: headCommit };
+      ev.summary = { ...ev.summary, required_stages: requiredStages };
       const recorded = await this.ledger.recordEvidence(
         candidate.id,
         ev.type,
@@ -3803,7 +3952,7 @@ Return details.winner_candidate_id set to "${a.id}" or "${b.id}" for your pick.`
       await this.releaseCandidate(winner.candidate, wi);
     }
 
-    await this.ledger.updateWorkItem(wi.id, { status: incumbent ? "COMPLETED" : "FAILED" }, actor);
+    await this.transitions.settleWorkItem(wi.id, incumbent ? "COMPLETED" : "FAILED", actor);
     return {
       work_item: wi,
       risk,
@@ -3930,6 +4079,16 @@ Goal: "${goal}"`;
         .map((d) => created[d]!.id);
       if (deps.length) await this.ledger.updateTask(created[i]!.id, { depends_on: deps }, wi.id, actor);
     }
+    // The durable plan record behind the Work Graph's plan edges. Observational: it never fails or fails the plan.
+    try {
+      await this.transitions.recordPlan(
+        wi.id,
+        created.map((t) => ({ task_id: t.id, title: t.title })),
+        actor,
+      );
+    } catch (error) {
+      console.error(`plan record not written for ${wi.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
     await this.ledger.recordEntity(
       "decision",
       `plan: ${created.length} tasks decomposed for "${goal}" (${run.result.summary.slice(0, 160)})`,
@@ -3937,6 +4096,7 @@ Goal: "${goal}"`;
       actor,
       wi.id,
     );
+    this.taskLineage?.scheduleSync();
     return {
       plan_work_item: wi,
       tasks: created,
@@ -4051,23 +4211,34 @@ Goal: "${goal}"`;
       }
       // A dependency failed (or was blocked): this task cannot run.
       if (t.depends_on.some((d) => failedSet.has(d))) {
-        await this.ledger.setTaskStatus(t.id, "blocked", wi.id, actor);
+        await this.transitions.settleTask(t.id, "blocked", wi.id, actor);
+        this.taskLineage?.scheduleSync();
         failedSet.add(t.id);
         blocked.push(t.id);
         summaries.push(`${t.id} blocked (dependency failed)`);
         return;
       }
-      await this.ledger.setTaskStatus(t.id, "started", wi.id, actor);
+      await this.transitions.settleTask(t.id, "started", wi.id, actor);
+      this.taskLineage?.scheduleSync();
       summaries.push(`running ${t.id}: ${t.title}`);
       const report = await this.engineer(t.title);
       if (report.outcome === "promoted") {
-        await this.ledger.setTaskStatus(t.id, "completed", wi.id, actor);
+        const settled = await this.transitions.settleTask(t.id, "completed", wi.id, actor, report.work_item.id);
+        this.taskLineage?.scheduleSync();
         await this.ledger.updateTask(t.id, { result_work_item_id: report.work_item.id }, wi.id, actor);
-        completed.push(t.id);
-        summaries.push(`${t.id} completed -> ${report.work_item.id}`);
+        if (settled.applied) {
+          completed.push(t.id);
+          summaries.push(`${t.id} completed -> ${report.work_item.id}`);
+        } else {
+          // The completion policy refused: not done, and not a failed pipeline either.
+          failedSet.add(t.id);
+          blocked.push(t.id);
+          summaries.push(`${t.id} blocked, completion refused: ${settled.blockers.join("; ")}`);
+        }
       } else {
         // The task's own pipeline run failed (not dependency-blocked).
-        await this.ledger.setTaskStatus(t.id, "failed", wi.id, actor);
+        await this.transitions.settleTask(t.id, "failed", wi.id, actor);
+        this.taskLineage?.scheduleSync();
         failedSet.add(t.id);
         failed.push(t.id);
         summaries.push(`${t.id} failed (${report.outcome})`);
@@ -4093,9 +4264,14 @@ Goal: "${goal}"`;
 
     const status: WorkItemStatus =
       completed.length === tasks.length ? "COMPLETED" : completed.length === 0 ? "FAILED" : "PARTIAL";
-    await this.ledger.updateWorkItem(wi.id, { status }, actor);
-    const outcome: DagReport["outcome"] =
-      status === "COMPLETED" ? "completed" : status === "FAILED" ? "failed" : "partial";
+    const settledPlan = await this.transitions.settleWorkItem(wi.id, status, actor);
+    const outcome: DagReport["outcome"] = !settledPlan.applied
+      ? "blocked"
+      : status === "COMPLETED"
+        ? "completed"
+        : status === "FAILED"
+          ? "failed"
+          : "partial";
     return {
       plan_work_item: wi,
       tasks: this.ledger.listTasks(wi.id),
@@ -4134,9 +4310,11 @@ Goal: "${goal}"`;
       return await this.engineerInner(goal, (id, phaseGoal) => {
         workItemId = id;
         this.currentPhaseGoal = phaseGoal;
+        this.taskLineage?.scheduleSync();
       });
     } finally {
       if (workItemId) this.emitPhase({ workItemId, phase: "settled", goal });
+      this.taskLineage?.scheduleSync();
       this.currentWorkItemId = "";
       this.currentPhaseGoal = "";
     }
@@ -4338,11 +4516,7 @@ Risk level: ${risk}. Make the smallest coherent change. Use the provided context
       parentId = candidate.id;
     }
 
-    await this.ledger.updateWorkItem(
-      wi.id,
-      { status: incumbent ? "COMPLETED" : "FAILED" },
-      this.actor(newRunId(), "planner"),
-    );
+    await this.transitions.settleWorkItem(wi.id, incumbent ? "COMPLETED" : "FAILED", this.actor(newRunId(), "planner"));
 
     return {
       work_item: wi,

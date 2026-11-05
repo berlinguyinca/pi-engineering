@@ -17,6 +17,16 @@ export const PLAN_REVIEW_MODES: readonly PlanReviewMode[] = ["skip", "offer", "r
 
 export type PlanPolicySource = "risk_default" | "policy" | "override";
 
+/**
+ * An EXISTING artifact-registry entry that holds this plan (id + version). Pi only reads it from its caller; it never
+ * creates artifacts or calls Plannotator. It is a different identity from `planDigest` (content of the plan text):
+ * the digest binds decisions, the version names a stored rendering and never replaces the digest.
+ */
+export interface PlanArtifactRef {
+  id: string;
+  version: string;
+}
+
 export interface PlanRevisionRecord {
   missionId: string;
   /** 1-based, contiguous per mission. */
@@ -33,6 +43,8 @@ export interface PlanRevisionRecord {
   /** The exact tasks the digest covers, so a restart resumes the same plan. */
   tasks: PlanTaskInput[];
   createdAt: string;
+  /** Optional; absent on every record written before it existed. Not part of the digest. */
+  planArtifactRef?: PlanArtifactRef;
 }
 
 export interface PlanPolicyRecord {

@@ -1,13 +1,15 @@
 /**
  * Git operations for alternative-implementation forks (T13), deliberately separate from `GitRepo`.
  *
- * `GitRepo.createWorktree` is built for crash recovery of the runtime's OWN candidate worktrees: it force-removes
- * whatever sits at the path and runs `git branch -D <branch>` first. A fork must never do that, so this class has
+ * `GitRepo.createWorktree` is built for crash recovery of the runtime's OWN candidate worktrees: it replaces a
+ * clean leftover at the path and deletes or renames a stale branch first. A fork must never do that, so this class has
  * no delete, no prune, no reset, no force: every method either reads or refuses. Every call is argv-only (no shell),
  * with prompts disabled, and every ref or object name is validated before it reaches git.
  */
 import { lstatSync, statfsSync } from "node:fs";
 import { dirname } from "node:path";
+import { shortHash } from "./GitRepo.ts";
+import { writeOwnerMarker } from "./ownerMarker.ts";
 import { safeGit, tidyStderr } from "./safeGit.ts";
 
 export const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
@@ -125,6 +127,11 @@ export class CliForkGit implements ForkGit {
     if (!(await this.commitExists(base))) throw new Error("the base commit is not in this repository");
     const add = await this.run(["worktree", "add", "-b", branch, path, base]);
     if (add.code !== 0) throw new Error(`git worktree add failed: ${tidyStderr(add.stderr)}`);
+    // Fork worktrees live at `pi-fork-<shortHash(repoRoot)>-<id>`, OUTSIDE the `pi-eng-<hash>-`
+    // namespace the janitor sweeps, so today nothing reads this marker for forks. It is written for a
+    // future janitor: repoRootHash is the same shortHash(repoRoot), and the marker, not the directory
+    // name, is the proof of ownership.
+    await writeOwnerMarker(path, { repoRoot: this.repoRoot, repoRootHash: shortHash(this.repoRoot), branch });
   }
 
   async head(worktree: string): Promise<string> {

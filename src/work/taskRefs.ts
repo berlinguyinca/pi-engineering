@@ -1,0 +1,160 @@
+/**
+ * The durable ids a work task is linked to: commits, PRs, plans and verification evidence.
+ *
+ * Only ids read from durable data are ever returned, so a missing id means NO edge, never a guessed one. The Ledger
+ * holds commits (candidate `head_commit`) and evidence rows; PRs and plan revisions live in the Mission/GitHub stores,
+ * so they come in through the optional sources below. Everything is bounded and never throws into the caller.
+ *
+ * Node ids reuse the conventions the Mission side already emits, so the same PR/commit is ONE node whichever side
+ * mentioned it:
+ *  - PR       `pr:<host>/<owner>/<repo>#<n>`  (github/refs.ts canonicalId, as github/sync.ts)
+ *  - commit   `commit:<full sha>`             (missionStore review evidence)
+ *  - plan     `plan:<mission>/<revision>`     (orchestration/planReview.ts planNode)
+ *  - evidence `artifact:evidence/<id>`        (commons kind; the Ledger evidence row id)
+ */
+
+import type { Candidate, Evidence, LedgerPlan, Task, WorkItem, WorkItemPrLink } from "../core/types.ts";
+import { canonicalId, parseCanonicalId } from "../github/refs.ts";
+import type { GithubLinkRecord } from "../github/types.ts";
+import type { PlanArtifactRef } from "../orchestration/planRecords.ts";
+import type { WorkTask } from "./types.ts";
+
+export interface TaskPlanRef {
+  missionId: string;
+  revision: number;
+  digest?: string;
+  artifact?: PlanArtifactRef;
+  /** Set for a plan the Ledger recorded itself (`plan.recorded`): its node is then ensured here, not by a Mission. */
+  ledger?: { title: string; steps: number; superseded: boolean; supersedes?: { missionId: string; revision: number } };
+}
+
+export interface TaskEvidenceRef {
+  id: string;
+  type: string;
+  passed: boolean;
+  /** The exact commit the run verified; without one the evidence cannot be bound and no `validated` edge is made. */
+  commit?: string;
+}
+
+export interface TaskRefs {
+  commits: string[];
+  /** Canonical PR node ids. */
+  prs: string[];
+  plans: TaskPlanRef[];
+  evidence: TaskEvidenceRef[];
+}
+
+export type TaskRefsSource = (task: WorkTask) => TaskRefs | undefined;
+
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const MAX_COMMITS = 10;
+const MAX_EVIDENCE = 20;
+const MAX_PRS = 10;
+
+export const emptyTaskRefs = (): TaskRefs => ({ commits: [], prs: [], plans: [], evidence: [] });
+
+/** Active GitHub links of a task that point at a PR, as canonical node ids (the ids github/sync.ts emits). */
+export function prRefsFromLinks(links: readonly GithubLinkRecord[], taskId: string): string[] {
+  const out: string[] = [];
+  for (const l of links) {
+    if (l.status !== "active" || l.targetKind !== "pr") continue;
+    if (!(l.subject.kind === "task" && l.subject.id === taskId)) continue;
+    if (!parseCanonicalId(l.target) || out.includes(l.target)) continue;
+    out.push(l.target);
+    if (out.length >= MAX_PRS) break;
+  }
+  return out;
+}
+
+/** A Ledger-recorded plan as a plan ref: node `plan:<work item>/<revision>`, so it never collides with a Mission's. */
+export function ledgerPlanRef(plan: LedgerPlan): TaskPlanRef {
+  const prior = plan.supersedes ? Number(plan.supersedes.slice(plan.supersedes.lastIndexOf("/") + 1)) : undefined;
+  return {
+    missionId: plan.work_item_id,
+    revision: plan.revision,
+    digest: plan.digest,
+    ...(plan.artifact ? { artifact: plan.artifact } : {}),
+    ledger: {
+      title: `plan r${plan.revision}`,
+      steps: plan.total_steps,
+      superseded: !!plan.superseded_by,
+      ...(prior && Number.isInteger(prior) ? { supersedes: { missionId: plan.work_item_id, revision: prior } } : {}),
+    },
+  };
+}
+
+/** The slice of the Ledger this needs. */
+export interface TaskRefsLedger {
+  getWorkItem(id: string): WorkItem | undefined;
+  getTask(id: string): Task | undefined;
+  listCandidates(workItemId?: string): Candidate[];
+  listEvidence(candidateId?: string): Evidence[];
+  /** PRs recorded on the work item (`work_item.pr_linked`). Absent on a ledger that predates them. */
+  listPrLinks?(workItemId: string): WorkItemPrLink[];
+  /** The recorded plan a task or work item belongs to (`plan.recorded`). Absent on a ledger that predates plans. */
+  planFor?(id: string): LedgerPlan | undefined;
+}
+
+export interface LedgerTaskRefsOptions {
+  /** GitHub links recorded for a task (Mission store), when the caller has them. */
+  githubLinks?: (taskId: string) => readonly GithubLinkRecord[];
+  /** Plan revisions a task was planned under, when the caller has them. */
+  plans?: (taskId: string) => readonly TaskPlanRef[];
+}
+
+/** Refs for Ledger-sourced tasks. Legacy Mission tasks return undefined: github/sync.ts and missionStore emit theirs. */
+export function ledgerTaskRefs(ledger: TaskRefsLedger, opts: LedgerTaskRefsOptions = {}): TaskRefsSource {
+  return (task) => {
+    if (task.source !== "ledger") return undefined;
+    try {
+      const refs = emptyTaskRefs();
+      const wiId = ledger.getWorkItem(task.id) ? task.id : (ledger.getTask(task.id)?.result_work_item_id ?? null);
+      const wi = wiId ? ledger.getWorkItem(wiId) : undefined;
+      if (wi) {
+        const candidates = ledger.listCandidates(wi.id);
+        for (const c of candidates) {
+          const sha = c.head_commit?.toLowerCase();
+          if (sha && FULL_SHA.test(sha) && !refs.commits.includes(sha) && refs.commits.length < MAX_COMMITS) {
+            refs.commits.push(sha);
+          }
+        }
+        const currentId = wi.current_candidate_id ?? wi.incumbent_candidate_id ?? null;
+        const current = candidates.find((c) => c.id === currentId);
+        if (current) {
+          for (const e of ledger.listEvidence(current.id)) {
+            if (e.trust === "unverified" || refs.evidence.length >= MAX_EVIDENCE) continue;
+            const bound = (
+              typeof e.summary.head_commit === "string" ? e.summary.head_commit : current.head_commit
+            )?.toLowerCase();
+            refs.evidence.push({
+              id: e.id,
+              type: e.type,
+              passed: e.status === "passed",
+              ...(bound && FULL_SHA.test(bound) ? { commit: bound } : {}),
+            });
+          }
+        }
+      }
+      const prs = prRefsFromLinks(opts.githubLinks?.(task.id) ?? [], task.id);
+      // Durable Ledger-recorded PRs: the same canonical id github/sync.ts emits, so a PR is one node whoever linked it.
+      for (const l of wi ? (ledger.listPrLinks?.(wi.id) ?? []) : []) {
+        const id = canonicalId({
+          host: l.host,
+          owner: l.owner,
+          repo: l.repo,
+          number: l.number,
+          kind: "pr",
+        })?.toLowerCase();
+        if (id && parseCanonicalId(id) && !prs.includes(id)) prs.push(id);
+      }
+      refs.prs = prs.slice(0, MAX_PRS);
+      const recorded = ledger.planFor?.(task.id);
+      const plans = [...(opts.plans?.(task.id) ?? [])];
+      if (recorded) plans.push(ledgerPlanRef(recorded));
+      refs.plans = plans.slice(0, 5);
+      return refs;
+    } catch {
+      return undefined;
+    }
+  };
+}

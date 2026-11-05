@@ -159,7 +159,9 @@ export class PiRoleRunner implements RoleRunner {
           ok: !failed,
           durationMs,
           error: run.error,
-          usage: run.usage ? { input: run.usage.input, output: run.usage.output, cost: run.usage.cost } : null,
+          usage: run.usage
+            ? { input: run.usage.input ?? 0, output: run.usage.output ?? 0, cost: run.usage.cost }
+            : null,
         });
         if (!failed) {
           this.registry.clearPenalty(model);

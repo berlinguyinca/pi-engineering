@@ -93,6 +93,24 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
     }
     if (entry.auth !== `Bearer ${KEY}`) return json(401, { error: "unauthorized" });
     const p = url.pathname;
+    if (req.method === "GET" && p === "/api/v1/collab/rooms/room-1/events") {
+      const cursor = Number(new URL(req.url ?? "", "http://x").searchParams.get("cursor"));
+      const all = [
+        {
+          sequence: 4,
+          event_id: "e4",
+          event_type: "message",
+          created_at: "2026-10-29T10:15:00Z",
+          sender: { type: "user", id: "ann" },
+          text: "hello\u001b[31m RED",
+        },
+        { sequence: 9, event_id: "e9", event_type: "task_updated", task: { status: "running", text: "build" } },
+        { sequence: 12, event_id: "e12", event_type: "task_updated", task: { status: "completed", text: "build" } },
+      ];
+      const events = all.filter((e) => e.sequence > cursor).slice(0, 2);
+      const last = events[events.length - 1]?.sequence ?? cursor;
+      return json(200, { events, next_cursor: last, has_more: all.some((e) => e.sequence > last) });
+    }
     if (req.method === "GET" && p === "/api/v1/collab/rooms/room-1/state") return json(200, ROOM_STATE);
     if (req.method === "GET" && p === "/api/v1/collab/rooms/room-1/attention") return json(200, ATTENTION);
     if (req.method === "GET" && p === "/api/v1/collab/rooms/room-1/agents")
@@ -280,5 +298,23 @@ describe("/room over the authenticated Herdr API", () => {
     assert.ok(text.split("\n").length < 80);
     assert.match(text, /460 more task\(s\) in Herdr/);
     assert.match(text, /Attention: unavailable/);
+  });
+});
+
+describe("/room log", () => {
+  it("pages the events, hides task noise at simple, shows it at activity, and strips escapes", async () => {
+    const simple = await runRoomCommand("log", { agentDir: dir });
+    assert.equal(simple.level, "info");
+    assert.match(simple.text, /ann: hello RED/);
+    assert.match(simple.text, /task completed: build/);
+    assert.doesNotMatch(simple.text, /task running/);
+    assert.ok(!simple.text.includes("\u001b"));
+    assert.match(simple.text, /last sequence 12/);
+    const activity = await runRoomCommand("log activity", { agentDir: dir });
+    assert.match(activity.text, /task running: build/);
+    const after = await runRoomCommand("log activity --after 9", { agentDir: dir });
+    assert.doesNotMatch(after.text, /hello/);
+    assert.match(after.text, /task completed/);
+    assert.equal((await runRoomCommand("log --after nope", { agentDir: dir })).level, "error");
   });
 });

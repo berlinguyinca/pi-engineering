@@ -10,13 +10,13 @@ function failingTransport(): { push: (c: MemoryCommit) => Promise<void>; pushed:
   return {
     pushed,
     push: async (c) => {
-      if (c.kind === "decision") throw new Error("openviking down");
+      if (c.kind === "decision") throw new Error("hindsight down");
       pushed.push(c);
     },
   };
 }
 
-describe("MemoryOutbox (OpenViking offline mode)", () => {
+describe("MemoryOutbox (Hindsight offline mode)", () => {
   it("redacts secrets before enqueue", async () => {
     const outbox = new MemoryOutbox({ transport: { push: async () => {} } });
     const commit = await outbox.enqueue({
@@ -145,7 +145,7 @@ describe("MemoryOutbox durability (regressions found by a fresh-context review)"
       state,
       transport: {
         push: async (c: MemoryCommit) => {
-          if (!state.up) throw new Error("openviking down");
+          if (!state.up) throw new Error("hindsight down");
           pushed.push(c.text);
         },
       },

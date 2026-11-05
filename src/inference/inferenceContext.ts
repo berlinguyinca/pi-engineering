@@ -35,12 +35,28 @@ export interface InferenceInvocation {
   actions?: ExecutedActionTracker;
   /** Output cap that keeps prompt budget + max_tokens inside the model's slot (issue #180). */
   maxOutputTokens?: number;
+  /** Output allowance override (a retry after a reply was cut at the limit); still bounded by `maxOutputTokens`. */
+  maxTokens?: number;
   /**
    * True when this invocation is being driven by the unified resilient
    * runtime layer (spec: one canonical retry authority). Admission observes
    * (saturation + gate) but must not add a second retry loop when set.
    */
   resilient?: boolean;
+  /**
+   * The caller that already honours the gateway's advertised wait for this
+   * invocation (a worker's gateway hold). The in-call resilient ladder must not
+   * replay the same admission refusal as well: it settles at once and leaves the
+   * single retry to this owner (see src/inference/retryTrace.ts).
+   */
+  gatewayWaitOwner?: "worker-gateway-hold";
+  /**
+   * The caller that already retries transient faults (5xx, network, timeout) for
+   * this invocation (a worker's `withTransientRetry`). The in-call ladder settles
+   * on those same-model faults and records a `defer`; callers without a worker
+   * (this unset) keep the ladder's own retries.
+   */
+  transientRetryOwner?: "worker-transient-retry";
 }
 
 const storage = new AsyncLocalStorage<InferenceInvocation>();

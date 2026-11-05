@@ -32,6 +32,19 @@ describe("orchestration state machines", () => {
     assert.throws(() => assertMissionTransition("NEW", "REVIEWING"));
   });
 
+  it("validation re-run from REVIEWING routes through REPAIRING (no direct backward move)", () => {
+    // The canonical order validates before it reviews. Re-running validation
+    // after a review (a repair round) is a backward move the state machine
+    // does not allow directly; the legal route is through REPAIRING, which is
+    // what runMissingGates and the recovery loop use. runValidationGate must
+    // route the same way instead of throwing
+    // `illegal mission transition REVIEWING -> VALIDATING` (observed live:
+    // MSN-b4owRR dead-ended a finished mission on exactly this).
+    assert.equal(canTransitionMission("REVIEWING" as never, "VALIDATING" as never), false);
+    assert.ok(canTransitionMission("REVIEWING" as never, "REPAIRING" as never));
+    assert.ok(canTransitionMission("REPAIRING" as never, "VALIDATING" as never));
+  });
+
   it("allows cancellation and failure from active states", () => {
     assert.ok(canTransitionMission("EXECUTING", "CANCELING"));
     assert.ok(canTransitionMission("CANCELING", "CANCELED"));

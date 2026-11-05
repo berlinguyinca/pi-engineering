@@ -112,7 +112,15 @@ export function createRouteModel(opts: {
   unavailable: UnavailableModels;
   reviewFallbackModel?: ModelRef;
   /** The operator pin a mission dispatches with (adopted at this boundary). */
-  operatorPin?: (missionId: string) => ModelRef | null | undefined;
+  operatorPin?: (missionId: string) => (ModelRef & { implicit?: boolean }) | null | undefined;
+  /**
+   * Keep a mission on its pin (`execution.hold_mission_model`). A pin that was
+   * tried or is marked unavailable is retried on its next dispatch, and no
+   * replacement model is offered, so the task fails with the pinned model's own
+   * error instead of moving. Independent roles still avoid the pin: a reviewer
+   * must differ from the model that produced the work.
+   */
+  holdPin?: boolean;
 }): RouteModel {
   const requester = opts.reviewFallbackModel;
   return async (role, routeOpts) => {
@@ -133,19 +141,34 @@ export function createRouteModel(opts: {
     // reviewer of work the pin produced) is not forced back; the placement
     // records it so an operator-switch check does not restart the attempt.
     if (exclude.some((model) => modelKey(model) === modelKey(pin))) {
+      const independent = ROLE_REQUIREMENTS[routerRoleFor(role) ?? "implementer"].independent;
+      if (opts.holdPin && !independent) {
+        return routeOpts?.replacement
+          ? undefined
+          : { provider: pin.provider, id: pin.id, operatorPin: !pin.implicit, pinOutcome: "pin_excluded_held" };
+      }
       const routed = await routeRole(opts.router, role, !!routeOpts?.replacement, requester, exclude, taskQuery);
-      return routed && { ...routed, pinRefused: modelKey(pin) };
+      return routed && { ...routed, pinRefused: modelKey(pin), pinOutcome: "pin_excluded_rerouted" };
     }
     const refusal = await pinRefusal(opts.router, routerRoleFor(role) ?? "implementer", pin, {
       ...(requester ? { requester } : {}),
       ...(exclude.length > 0 ? { exclude } : {}),
     });
-    if (!refusal) return { provider: pin.provider, id: pin.id, operatorPin: true } satisfies ModelRoute;
+    if (!refusal) {
+      return {
+        provider: pin.provider,
+        id: pin.id,
+        operatorPin: !pin.implicit,
+        pinOutcome: "pin_honoured",
+      } satisfies ModelRoute;
+    }
     const routed = await routeRole(opts.router, role, true, requester, exclude, taskQuery);
     if (!routed) return undefined;
     return {
       ...routed,
       pinRefused: modelKey(pin),
+      pinOutcome: "pin_refused",
+      pinRefusal: refusal,
       pinNotice: `operator pin ${modelKey(pin)} cannot serve ${role} (${refusal}); using ${modelKey(routed)} for this role`,
     };
   };
@@ -163,6 +186,13 @@ async function pinRefusal(
     const decision = await router.select(role, { ...query, taskOverride: modelKey(pin) });
     if (decision.selected && modelKey(decision.selected) === modelKey(pin)) return undefined;
     const rejection = decision.rejected.find((entry) => modelKey(entry.model) === modelKey(pin));
+    // A working role is never "the reviewer of its own work". The router's
+    // configured role pairs (implementer vs reviewer/verifier) reserve the
+    // counterpart's configured model, which is the pin itself whenever every
+    // role is configured onto one model. The independent roles still route away
+    // from the pin (above), so that reservation is no reason to move the
+    // implementer off the operator's model.
+    if (rejection?.stage === "separation_of_duties" && !ROLE_REQUIREMENTS[role].independent) return undefined;
     // A model the router never discovered is the operator's word against no
     // evidence: honour the pin.
     return rejection ? rejection.reason : undefined;

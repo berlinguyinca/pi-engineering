@@ -14,7 +14,7 @@ export interface CompletionVerdict {
   blockers: string[];
 }
 
-const LIVE_RUN: ReadonlySet<RunHealth> = new Set(["active", "waiting", "stalled", "recovering"]);
+const LIVE_RUN: ReadonlySet<RunHealth> = new Set(["active", "waiting", "stalled", "recovering", "unknown"]);
 
 export function evaluateWorkCompletion(task: WorkTask, runs: readonly WorkRun[]): CompletionVerdict {
   const blockers: string[] = [];

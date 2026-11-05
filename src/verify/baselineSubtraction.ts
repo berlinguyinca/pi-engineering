@@ -95,9 +95,13 @@ async function computeBaseline(
   const timeoutMs = positiveInt(process.env.PI_ENGINEERING_BASELINE_TIMEOUT_MS, DEFAULT_BASELINE_TIMEOUT_MS);
   const timeout = AbortSignal.timeout(timeoutMs);
   const signal = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
-  // A stable name per base SHA lets createWorktree's crash recovery clear a
-  // worktree an earlier, killed run left behind.
-  const wt = await input.git.createWorktree(baseSha, `pi-eng-baseline-${baseSha.slice(0, 12)}`);
+  // A unique name per run: the baseline is rebuildable scratch, and a leftover from an earlier run
+  // (dirty with test artifacts such as junit.xml, or killed mid-run) is kept and reported rather
+  // than blocking every later baseline.
+  const wt = await input.git.createWorktree(
+    baseSha,
+    `pi-eng-baseline-${baseSha.slice(0, 12)}-${Date.now().toString(36)}${process.pid.toString(36)}`,
+  );
   try {
     // Detect on the base itself: the profile that describes the base, bound by hash.
     const baseProfile = await input.verifier.detect(wt.path);

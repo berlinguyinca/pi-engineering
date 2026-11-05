@@ -132,7 +132,7 @@ async function checkpointFor(
       committedChanges: [],
       preservedUncommittedChanges: [],
     },
-    ...(opts.handoff === false ? {} : { handoff: { memoryRefs: [`viking://m/${n}`] } }),
+    ...(opts.handoff === false ? {} : { handoff: { memoryRefs: [`hindsight://m/${n}`] } }),
   });
 }
 

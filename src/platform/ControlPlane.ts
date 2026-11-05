@@ -94,7 +94,7 @@ export interface ControlPlaneSnapshot {
     staleWorkers: number;
     missions: number;
     activeMissions: number;
-    memory: { openviking: boolean; blackhole: boolean };
+    memory: { hindsight: boolean; blackhole: boolean };
   };
 }
 
@@ -105,7 +105,7 @@ export interface ControlPlaneInputs {
   /** Optional orchestration MissionStore surfaced to the operator. */
   missionStore?: MissionStore | null;
   /** Optional external status flags reported by the adapter. */
-  memoryStatus?: { openviking: boolean; blackhole: boolean };
+  memoryStatus?: { hindsight: boolean; blackhole: boolean };
 }
 
 /** Bounds for the normalized event feed exposed to the operator client. */
@@ -117,14 +117,14 @@ export class ControlPlane {
   private readonly graph: WorkGraph;
   private readonly store: EventStoreBackend;
   private readonly missionStore: MissionStore | null;
-  private readonly memoryStatus: { openviking: boolean; blackhole: boolean };
+  private readonly memoryStatus: { hindsight: boolean; blackhole: boolean };
 
   constructor(inputs: ControlPlaneInputs) {
     this.registry = inputs.registry;
     this.graph = inputs.graph;
     this.store = inputs.store;
     this.missionStore = inputs.missionStore ?? null;
-    this.memoryStatus = inputs.memoryStatus ?? { openviking: true, blackhole: true };
+    this.memoryStatus = inputs.memoryStatus ?? { hindsight: true, blackhole: true };
   }
 
   snapshot(): ControlPlaneSnapshot {

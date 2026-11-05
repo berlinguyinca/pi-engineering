@@ -1,17 +1,23 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { MissionAttentionReporter } from "../src/runtime/herdr/MissionAttentionReporter.ts";
 import { resolveAttentionIngest } from "../src/runtime/herdr/attentionIngest.ts";
+import { createGraphReader, formatTaskGraph } from "../src/runtime/herdr/graphClient.ts";
+import { loadHerdrConnection } from "../src/runtime/herdr/herdrConnection.ts";
 import { runRoomCommand } from "../src/runtime/herdr/roomClient.ts";
 import { formatMissionActivity } from "../src/status/missionActivity.ts";
 import { formatMissionInspection, missionActivityAge } from "../src/tools/missionReport.ts";
 
 import type { Model } from "@earendil-works/pi-ai/compat";
-import { type ExtensionAPI, type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { resolveMemoryEnvironment } from "../src/blackhole/connectionSetup.ts";
-import { openVikingBlackholeOption } from "../src/blackhole/envConfig.ts";
+import {
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  getAgentDir,
+} from "@earendil-works/pi-coding-agent";
+import { hindsightBlackholeOption } from "../src/blackhole/hindsight.ts";
 import { registerInteractiveMemory } from "../src/blackhole/interactiveMemory.ts";
 import { registerAutoCompaction } from "../src/compaction/autoTune.ts";
 import { type InferweaveProvider, createInferweaveProvider, inferweaveConfigFromEnv } from "../src/context/provider.ts";
@@ -56,6 +62,7 @@ import { admissionIdentityHeaders } from "../src/inference/admissionTransport.ts
 import { loadExecutionConfig } from "../src/lifecycle/policy.ts";
 import { ModelHealthProvider } from "../src/models/health.ts";
 import { defaultModelsPath, providerBaseUrl, readModelsConfig, writeModelsConfig } from "../src/models/modelsConfig.ts";
+import { migrateConfiguredPins } from "../src/models/pinMigration.ts";
 import { describeProviderSync, parseCanonicalProviders, planProviderSync } from "../src/models/providerSync.ts";
 import { DEFAULT_PROBE_TIMEOUT_MS, refreshConfiguredProviders } from "../src/models/refresh.ts";
 import { registerModelTabs } from "../src/models/registerModelTabs.ts";
@@ -84,6 +91,7 @@ import { LedgerFeeder } from "../src/panel/feeders/LedgerFeeder.ts";
 import { DEFAULT_WORKSPACE_TTL_MS, WorkspaceFeeder } from "../src/panel/feeders/WorkspaceFeeder.ts";
 import { PanelRefreshLoop } from "../src/panel/refreshLoop.ts";
 import { registerPlannerWorker } from "../src/plannerWorker/extension.ts";
+import { ensurePriorart } from "../src/platform/priorartDependency.ts";
 import { redactSecrets } from "../src/platform/redact.ts";
 import { resolveRequestBodyBudgetConfig } from "../src/request/bodyBudget.ts";
 import {
@@ -91,8 +99,10 @@ import {
   isSummarizationRequest,
   resolveThinkingOffConfig,
 } from "../src/request/thinkingPolicy.ts";
+import { CatalogRecoveryProbe, resolveCatalogProbeTarget } from "../src/resilience/probe.ts";
 import { RoadmapEngine } from "../src/roadmap/RoadmapEngine.ts";
 import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../src/runtime/EngineeringRuntime.ts";
+import { RealHerdrCli } from "../src/runtime/herdr/HerdrCli.ts";
 import { attachInspectorWhenReady, createInspectorSlot } from "../src/runtime/herdr/attachInspector.ts";
 import type { LineageEmitter } from "../src/runtime/herdr/lineage.ts";
 import { loadLineageEmitter } from "../src/runtime/herdr/lineageConfig.ts";
@@ -105,7 +115,16 @@ import { formatDoctorReport, runDoctor } from "../src/runtime/isolation/doctor.t
 import { emitRuntimeEvent } from "../src/runtime/isolation/runtimeEvents.ts";
 import { resolveStateRoot } from "../src/runtime/isolation/stateDir.ts";
 import { formatRuntimeStatus, runtimeStatus } from "../src/runtime/isolation/status.ts";
-import { describeHousekeeping, housekeepingMode, runHousekeeping } from "../src/runtime/janitor.ts";
+import {
+  describeAdoptPreview,
+  describeHousekeeping,
+  describeTrashPurge,
+  gcPlan,
+  housekeepingMode,
+  runAdoptPreview,
+  runHousekeeping,
+  runTrashPurge,
+} from "../src/runtime/janitor.ts";
 import {
   clearOperatorModelPin,
   describeMissionControl,
@@ -127,6 +146,8 @@ import { renderStatus } from "../src/status/layout.ts";
 import { type PresenceSeedScope, seedPresence } from "../src/status/presenceSeed.ts";
 import { StatusSurfaceBus } from "../src/status/surfaceBus.ts";
 import { WorkingStatusController } from "../src/status/working.ts";
+import { disciplineFromEnv } from "../src/taskDiscipline/config.ts";
+import { registerTaskDiscipline } from "../src/taskDiscipline/hook.ts";
 import { type TelemetryNotice, emitTelemetry, setTelemetrySink } from "../src/telemetry/sink.ts";
 import { createRepeatThrottle } from "../src/telemetry/throttle.ts";
 import { type CoreServices, buildCoreTools, notInitializedText } from "../src/tools/coreTools.ts";
@@ -135,9 +156,24 @@ import { runtimeUpdateBridge } from "../src/update/hostBridge.ts";
 import { type SelfUpdateResult, checkForUpdate, shouldCheck } from "../src/update/selfUpdate.ts";
 import { describeUpdate } from "../src/update/versionCheck.ts";
 import { CommandVerifier } from "../src/verify/Verifier.ts";
+import { loadVisionDelegateSettings } from "../src/visionDelegation/config.ts";
+import { VisionDelegator } from "../src/visionDelegation/delegate.ts";
+import { installVisionDelegation } from "../src/visionDelegation/install.ts";
+import { makeVisionLineageHook } from "../src/visionDelegation/lineage.ts";
+import { VisionRegistry } from "../src/visionDelegation/registry.ts";
 import { LedgerWorkProjection } from "../src/work/ledgerProjection.ts";
 import { projectLegacyMissions } from "../src/work/legacyMissionAdapter.ts";
+import { ledgerLinkedPrs } from "../src/work/linkedPrs.ts";
+import { getSessionSummary } from "../src/work/sessionSummary.ts";
+import { StatusRowRefresher } from "../src/work/statusRowRefresher.ts";
 import { formatWorkStatus } from "../src/work/statusText.ts";
+import {
+  formatSessionSummary,
+  formatTaskView,
+  formatTeamView,
+  formatWorkStatusRow,
+  formatWorkSummary,
+} from "../src/work/summaryText.ts";
 import { mergeWorkGraphs } from "../src/work/types.ts";
 import { PiWorkerExecutor } from "../src/workers/PiWorkerExecutor.ts";
 
@@ -358,7 +394,7 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
   if (openGeneration !== runtimeShutdownGeneration) {
     throw new Error("Runtime request was superseded by session shutdown");
   }
-  const blackhole = openVikingBlackholeOption(resolveMemoryEnvironment());
+  const blackhole = hindsightBlackholeOption(cwd, process.env.PI_CODING_AGENT_DIR?.trim() || undefined);
   const memoryIdentity = createHash("sha256")
     .update(JSON.stringify(blackhole ?? null))
     .digest("hex");
@@ -372,69 +408,79 @@ async function getRuntimeByCwd(cwd: string, model?: Model<any>): Promise<Enginee
     }
     return opened.runtime;
   }
-  // OpenViking connection from the environment. If PI_OPENVIKING_BASE_URL is
-  // set, blackhole is enabled with the openviking durable store for EVERY repo
-  // this extension runs in — set it once per install and all repos share the
-  // deployed durable memory. Absent the env, blackhole stays off (unchanged).
-  const lineage = await lineageEmitter();
-  const attentionIngest = await resolveAttentionIngest(process.env, getAgentDir());
-  const attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
+  // Hindsight connection from YAML (`memory.hindsight` in engineering.yaml). If
+  // `memory.hindsight.enabled` is true in the global config, blackhole is enabled
+  // with the hindsight durable store for EVERY repo this extension runs in — set
+  // it once per install and all repos share the deployed durable memory. Absent
+  // the config, blackhole stays off (unchanged).
+  //
+  // The open is published in `runtimeOpens` in the same synchronous step as the `pending` check above. The lineage and
+  // attention lookups are real I/O (seconds under load); awaiting them BEFORE publishing left a window in which a
+  // second caller (the panel start and a session-control request both run at session start) saw no open in flight and
+  // started a duplicate runtime for the same repository, and in which a session shutdown found nothing to wait for so
+  // the open ran on after it and was never closed.
+  let attention: MissionAttentionReporter | null = null;
   let attentionReady = false;
-  const opening = EngineeringRuntime.open({
-    cwd,
-    verifier: new CommandVerifier(),
-    model,
-    ...(lineage ? { lineage } : {}),
-    // Autonomous stop (roadmap spec §13, §33): when this repository's Roadmap
-    // 1.0 is complete, /engineer refuses to invent new work. The gate is derived
-    // from the roadmap engine (completion is never declared). If the repo has no
-    // roadmap, the gate is open.
-    roadmapComplete: roadmapCompleteFor(key),
-    onMissionSnapshotError: (message) => {
-      const notice: TelemetryNotice = {
-        level: "warning",
-        text: message,
-        key: `mission-snapshot-write:${key}`,
-      };
-      if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
-    },
-    onMissionActivity: (event, meta) => {
-      publishMissionActivity(key, event);
-      // The runtime's open-time re-emission of stored missions sets presence's
-      // baseline instead of notifying; real transitions during open still do.
-      presence?.update(event, undefined, meta?.replay ? "replay" : "activity");
-      if (attentionReady) void attention?.update(event).catch(() => {});
-    },
-    // The quiet heartbeat: observability composes a human-readable sentence when
-    // nothing has changed for a while, and presence is the only surface that can
-    // carry it. Without this wiring a mission that goes silent looks identical to
-    // a mission that has stopped.
-    onMissionObservabilityUpdate: (missionId, message) => {
-      presence?.noteSentence(missionId, message);
-    },
-    // Pipeline progress -> status footer. Best-effort and read-only: the
-    // runtime swallows anything thrown here, and the footer is the only
-    // consumer today (the panel will subscribe to the same events).
-    onPhase: (event) => {
-      // One event source, two surfaces: the footer summarises, the panel details.
-      panels.get(key)?.ledger.onPhase(event);
-      const footer = activeFooter;
-      if (!footer) return;
-      if (event.phase === "settled") {
-        // Guarded: concurrent runs (tournament legs, DAG waves) each settle.
-        footer.clearTask(event.workItemId);
-        footer.setProducingModel(undefined);
-        return;
-      }
-      footer.setTask({
-        workItemId: event.workItemId,
-        phase: event.phase,
-        ...(event.goal ? { label: event.goal } : {}),
-      });
-      if (event.model) footer.setProducingModel(event.model);
-    },
-    ...(blackhole ? { blackhole } : {}),
-  }).then((runtime) => {
+  const opening = (async () => {
+    const lineage = await lineageEmitter();
+    const attentionIngest = await resolveAttentionIngest(process.env, getAgentDir());
+    attention = attentionIngest ? new MissionAttentionReporter(attentionIngest) : null;
+    return EngineeringRuntime.open({
+      cwd,
+      verifier: new CommandVerifier(),
+      model,
+      ...(lineage ? { lineage } : {}),
+      // Autonomous stop (roadmap spec §13, §33): when this repository's Roadmap
+      // 1.0 is complete, /engineer refuses to invent new work. The gate is derived
+      // from the roadmap engine (completion is never declared). If the repo has no
+      // roadmap, the gate is open.
+      roadmapComplete: roadmapCompleteFor(key),
+      onMissionSnapshotError: (message) => {
+        const notice: TelemetryNotice = {
+          level: "warning",
+          text: message,
+          key: `mission-snapshot-write:${key}`,
+        };
+        if (allowRuntimeDiagnostic(notice)) emitTelemetry(notice);
+      },
+      onMissionActivity: (event, meta) => {
+        publishMissionActivity(key, event);
+        // The runtime's open-time re-emission of stored missions sets presence's
+        // baseline instead of notifying; real transitions during open still do.
+        presence?.update(event, undefined, meta?.replay ? "replay" : "activity");
+        if (attentionReady) void attention?.update(event).catch(() => {});
+      },
+      // The quiet heartbeat: observability composes a human-readable sentence when
+      // nothing has changed for a while, and presence is the only surface that can
+      // carry it. Without this wiring a mission that goes silent looks identical to
+      // a mission that has stopped.
+      onMissionObservabilityUpdate: (missionId, message) => {
+        presence?.noteSentence(missionId, message);
+      },
+      // Pipeline progress -> status footer. Best-effort and read-only: the
+      // runtime swallows anything thrown here, and the footer is the only
+      // consumer today (the panel will subscribe to the same events).
+      onPhase: (event) => {
+        // One event source, two surfaces: the footer summarises, the panel details.
+        panels.get(key)?.ledger.onPhase(event);
+        const footer = activeFooter;
+        if (!footer) return;
+        if (event.phase === "settled") {
+          // Guarded: concurrent runs (tournament legs, DAG waves) each settle.
+          footer.clearTask(event.workItemId);
+          footer.setProducingModel(undefined);
+          return;
+        }
+        footer.setTask({
+          workItemId: event.workItemId,
+          phase: event.phase,
+          ...(event.goal ? { label: event.goal } : {}),
+        });
+        if (event.model) footer.setProducingModel(event.model);
+      },
+      ...(blackhole ? { blackhole } : {}),
+    });
+  })().then((runtime) => {
     // Reconnect establishes a baseline; old terminal/stalled missions must not alert again.
     for (const mission of runtime.missionStore?.listMissions() ?? []) {
       const summary = runtime.missionObservability?.summary(mission.mission_id);
@@ -499,6 +545,39 @@ function seedPresenceFrom(runtime: EngineeringRuntime): void {
   // Draw now. Waiting for the next clock tick would leave a session that opens
   // a runtime and immediately sits idle showing nothing at all.
   presence.tick();
+}
+
+/**
+ * Compact work status row (one line). Reads only an already-open runtime, never opens one, and writes only when
+ * the text changed, so an idle session causes no UI churn.
+ */
+let workRefresher: StatusRowRefresher | undefined;
+let workProjection: { ledger: unknown; projection: LedgerWorkProjection } | undefined;
+async function refreshWorkStatus(
+  ui: { setStatus?(key: string, text: string | undefined): void },
+  cwd: string,
+): Promise<void> {
+  if (!workRefresher) {
+    const execution = await loadExecutionConfig(runtimeCwd(cwd));
+    const staleAfterMs = execution.stale_after_ms;
+    workRefresher = new StatusRowRefresher({
+      intervalMs: execution.status_refresh_interval_ms ?? 15_000,
+      maxIdleSessions: execution.status_idle_sessions,
+      setStatus: (text) => ui.setStatus?.("work", text),
+      getGraph: async () => {
+        const open = await repoKeys.lookup(cwd, runtimes).catch(() => undefined);
+        if (!open) return undefined;
+        const rt = open.runtime;
+        // One projection per open runtime: later refreshes only apply new events.
+        if (workProjection?.ledger !== rt.ledger)
+          workProjection = { ledger: rt.ledger, projection: new LedgerWorkProjection(rt.ledger, { staleAfterMs }) };
+        const graphs = [workProjection.projection.graph()];
+        if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
+        return mergeWorkGraphs(...graphs);
+      },
+    });
+  }
+  await workRefresher.refresh();
 }
 
 async function refreshPresence(cwd: string): Promise<void> {
@@ -721,6 +800,19 @@ export default function (pi: ExtensionAPI) {
   if (typeof pi.on === "function") registerTerminalRefusalGuard(pi);
   registerModelTabs(pi);
   registerInteractiveMemory(pi);
+  // priorart is a required EXTERNAL dependency (see
+  // docs/specs/pi-engineering/support/EXTERNAL_TOOLS_AND_OWNERSHIP.md). Ensure its
+  // binary + config + mcp.json registration on every session start. Best-effort and
+  // non-throwing: it must never delay or break a session.
+  if (typeof pi.on === "function") {
+    pi.on("session_start", () => {
+      try {
+        ensurePriorart();
+      } catch {
+        /* never break pi startup */
+      }
+    });
+  }
   /** True while our own (opt-in) fallback switches the interactive model. */
   let automaticModelSwitch = false;
   // Agent-inspector feed to Herdr: OFF unless this host's central fleet config
@@ -742,9 +834,11 @@ export default function (pi: ExtensionAPI) {
   // so this is safe to run at session start and periodically while the
   // session stays open. Never awaited: a slow sweep must not delay a session.
   const housekeepingIntervalMs = Number(process.env.PI_HOUSEKEEPING_INTERVAL_MS ?? 6 * 60 * 60 * 1000);
-  // On by default (operator decision 2026-10-29): the janitor keeps any worktree
-  // with a live, unknown or durably referenced owner. PI_HOUSEKEEPING=dry-run
-  // reports only, =0 disables. `/gc` always acts.
+  // Dry-run by default. Owner rule 2026-10-30, superseding the 2026-10-29
+  // decision to default on: "we can't lose data due to sweeps". Automatic
+  // sweeps act only with an explicit PI_HOUSEKEEPING=1|true|on|yes; =0 disables.
+  // `/gc` previews by default; `/gc --apply` is the explicit operator action.
+  // Either way it lists what it kept and why.
   const hkMode = housekeepingMode(process.env);
   const housekeepingEnabled = hkMode !== "off";
   // First sweep waits this long so a session that reloads or exits at once
@@ -793,13 +887,34 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_shutdown", stopHousekeeping);
   }
   pi.registerCommand("gc", {
-    description: "Reclaim abandoned candidate worktrees and expired Rust build caches (--dry-run to preview).",
+    description:
+      "Preview which abandoned pi-eng candidate worktrees and idle Rust build caches housekeeping would move to the trash (<state-dir>/trash, <rust-cache>/.trash), and what it keeps and why. A sweep never deletes: without --apply nothing moves. `/gc --purge-trash --older-than <days> --apply` is the only command that deletes, and only trash entries housekeeping created that are at least <days> old (default 14, minimum 7); without --apply it lists them. Unmarked `.pi-eng-trash` orphans beside the repo are only listed, never deleted (the listing shows the command you may run yourself). `/gc --adopt-preview` is a read-only listing of legacy worktrees and Rust caches that lack ownership markers. --dry-run is the default and accepted as an alias.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
-      const dryRun = argv.includes("--dry-run");
+      const { dryRun, note, purge, adoptPreview } = gcPlan(args);
+      if (adoptPreview) {
+        const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
+        const preview = await runAdoptPreview({ cwd: ctx.cwd, missions: runtime?.missionStore });
+        ctx.ui.notify(describeAdoptPreview(preview).join("\n"), "info");
+        return;
+      }
+      if (purge) {
+        const purged = await runTrashPurge({
+          olderThanDays: purge.olderThanDays,
+          apply: !dryRun,
+          cwd: ctx.cwd,
+        });
+        const lines = describeTrashPurge(purged, dryRun);
+        if (note) lines.unshift(`[/gc] ${note}`);
+        if (dryRun) lines.push("Preview only: nothing was deleted. Add `--apply` to purge what is listed above.");
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
       const runtime = await getRuntimeByCwd(ctx.cwd).catch(() => null);
       const result = await runHousekeeping({ cwd: ctx.cwd, missions: runtime?.missionStore, dryRun });
       const lines = describeHousekeeping(result, { verbose: true });
+      if (note) lines.unshift(`[/gc] ${note}`);
+      if (dryRun)
+        lines.push("Preview only: nothing was moved. Run `/gc --apply` to move what is listed above to the trash.");
       ctx.ui.notify(
         lines.length > 0 ? lines.join("\n") : "Nothing to reclaim.",
         result.worktrees?.failed.length ? "warning" : "info",
@@ -1086,6 +1201,11 @@ export default function (pi: ExtensionAPI) {
     // Identical-tool-call loops and unbounded bash test/build runs
     // (src/guard/toolCallGuard.ts; knobs in docs/usage.md, "Tool-call guard").
     registerToolCallGuard(pi as never);
+    // Task Contract gate (src/taskDiscipline; off unless PI_TASK_DISCIPLINE is set).
+    // Registered as its own tool_call/user_bash handlers so it never depends on
+    // the lifecycle controller's mutating-tool filter or its unattended auto-allow.
+    const discipline = disciplineFromEnv();
+    if (discipline) registerTaskDiscipline(pi, discipline);
     // One agent, one worktree (AGENTS.md), enforced: block this session's own
     // mutating calls against a repository's PRIMARY checkout so concurrent
     // sessions cannot destroy each other's uncommitted work there. Production
@@ -1505,7 +1625,33 @@ ${RECOVERY_PROMPT}`;
     if (result.results.length === 0) {
       throw new Error(result.failures.map(({ providerId, error }) => `${providerId}: ${error.message}`).join("; "));
     }
-    return { written: result.written, lines: result.lines, failed: result.failures.length > 0 };
+    // Pins to concrete ids would dangle once those ids leave the catalogue, so
+    // the same refresh moves them onto aliases: nothing is edited by hand when a
+    // model is preempted or renamed.
+    const pins = migrateConfiguredPins({
+      agentDir: dirname(defaultModelsPath()),
+      ...(ctx.cwd ? { extraFiles: [join(ctx.cwd, ".pi", "engineering.yaml")] } : {}),
+      providers: new Map(
+        result.results.map(({ providerId, result: r }) => [
+          providerId,
+          {
+            ids: new Set(r.plan.next.map((m) => m.id)),
+            aliasOnly: r.aliasOnly,
+            // A pin may only move onto an alias that still answers as the model it
+            // named, so the migrator needs to know what runs behind each alias.
+            members: Object.fromEntries(
+              r.gateway.filter((m) => m.alias && m.members?.length).map((m) => [m.id, m.members!]),
+            ),
+          },
+        ]),
+      ),
+      dryRun: opts.dryRun,
+    });
+    return {
+      written: result.written || pins.written,
+      lines: [...result.lines, ...pins.lines],
+      failed: result.failures.length > 0,
+    };
   }
 
   // ─── /model-refresh: make the configured catalogue match the gateway ─────
@@ -2153,6 +2299,44 @@ ${RECOVERY_PROMPT}`;
     });
   }
 
+  // Vision delegation: an image pasted for a text-only model is analyzed by a vision session in a new herdr
+  // pane and handed back as text. Settings are read lazily on the first such image; `vision_delegate.enabled:
+  // false` keeps the handler inert. One delegator per process; `current()` is the call in flight's ctx.
+  if (typeof pi.on === "function") {
+    installVisionDelegation(pi as never, {
+      loadSettings: () => loadVisionDelegateSettings(dirname(defaultModelsPath())),
+      makeDelegator: async (settings, current) => {
+        const agentDir = dirname(defaultModelsPath());
+        const registry = () => (current() as unknown as ExtensionContext).modelRegistry;
+        const runtime = {
+          getModel: (provider: string, id: string) => registry().find(provider, id),
+          getAuth: (m: { provider: string }) => registry().getProviderAuth(m.provider),
+        };
+        return new VisionDelegator({
+          herdr: new RealHerdrCli(),
+          settings,
+          get models() {
+            return registry()
+              .getAvailable()
+              .map((m) => ({ provider: m.provider, id: m.id, input: [...m.input] }));
+          },
+          probeFor: (m) => new CatalogRecoveryProbe({ resolve: () => resolveCatalogProbeTarget(runtime, m) }).probe(),
+          registry: new VisionRegistry(join(agentDir, "vision-delegation", "registry.json")),
+          artifactDir: join(agentDir, "vision-delegation", "requests"),
+          now: Date.now,
+          sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+          newId: () => randomUUID(),
+          get textModel() {
+            return current().model?.id ?? "unknown";
+          },
+          lineage: makeVisionLineageHook(await lineageEmitter()),
+          // herdr sets HERDR_PANE_ID in every pane it runs (spike evidence); absent means herdr is unavailable.
+          originPaneId: process.env.HERDR_PANE_ID || undefined,
+        });
+      },
+    });
+  }
+
   // The native working indicator remains informative even with the custom
   // footer disabled. Split view retains Pi's native dock, so both layouts use
   // this same local-only activity surface.
@@ -2196,6 +2380,7 @@ ${RECOVERY_PROMPT}`;
       }
     });
     pi.on("agent_start", (_event, ctx) => {
+      if (ctx.hasUI) void refreshWorkStatus(ctx.ui, ctx.cwd).catch(() => {});
       workingSignal = ctx.signal;
       working?.onAgentStart();
       presence?.onAgentStart();
@@ -2205,7 +2390,8 @@ ${RECOVERY_PROMPT}`;
     pi.on("tool_execution_update", (event) => working?.onToolEvent(event));
     pi.on("tool_execution_end", (event) => working?.onToolEvent(event));
     pi.on("model_select", (event) => working?.onModelSelect(event.model));
-    pi.on("agent_settled", () => {
+    pi.on("agent_settled", (_event, ctx) => {
+      if (ctx?.hasUI) void refreshWorkStatus(ctx.ui, ctx.cwd).catch(() => {});
       workingSignal = undefined;
       working?.onAgentEnd();
       presence?.onAgentEnd();
@@ -2218,6 +2404,9 @@ ${RECOVERY_PROMPT}`;
       presencePoll = undefined;
       presence?.dispose();
       presence = undefined;
+      workRefresher?.dispose();
+      workRefresher = undefined;
+      workProjection = undefined;
     });
   }
 
@@ -2692,14 +2881,67 @@ ${RECOVERY_PROMPT}`;
   });
 
   pi.registerCommand("work", {
-    description: "Show tracked work (tasks, runs, verification) across the Ledger and existing Missions.",
-    handler: async (_args, ctx) => {
+    description:
+      "Show tracked work (tasks, runs, verification) across the Ledger and existing Missions; /work <task id> shows the task's Herdr graph.",
+    handler: async (args, ctx) => {
+      const taskId = String(args ?? "").trim();
+      if (taskId) {
+        // `/work <task id>`: read the task's neighbourhood back from the Herdr graph. Never throws; "unavailable" if Herdr is down.
+        const { connection } = await loadHerdrConnection(getAgentDir());
+        ctx.ui.notify(formatTaskGraph(await createGraphReader(connection).getTaskGraph(taskId), taskId), "info");
+        return;
+      }
       const rt = await getRuntime(ctx);
       const projection = new LedgerWorkProjection(rt.ledger);
       projection.catchUp();
       const graphs = [projection.graph()];
       if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
       ctx.ui.notify(formatWorkStatus(mergeWorkGraphs(...graphs)), "info");
+    },
+  });
+
+  // Deterministic, model-free views over the same work graph as /work. No new store, no model call.
+  const workGraphOf = (rt: EngineeringRuntime) => {
+    const projection = new LedgerWorkProjection(rt.ledger);
+    const graphs = [projection.graph()];
+    if (rt.missionStore) graphs.push(projectLegacyMissions(rt.missionStore));
+    return mergeWorkGraphs(...graphs);
+  };
+  pi.registerCommand("summary", {
+    description:
+      "Deterministic work timeline from the work read model: tasks, runs, verification, blockers, handoffs. /summary <session id> shows one session.",
+    handler: async (args, ctx) => {
+      const rt = await getRuntime(ctx);
+      const sessionId = String(args ?? "").trim();
+      if (sessionId) {
+        ctx.ui.notify(
+          formatSessionSummary(
+            getSessionSummary(workGraphOf(rt), sessionId, { linkedPrs: ledgerLinkedPrs(rt.ledger) }),
+          ),
+          "info",
+        );
+        return;
+      }
+      ctx.ui.notify(formatWorkSummary(workGraphOf(rt), rt.ledger.events()), "info");
+    },
+  });
+  pi.registerCommand("task", {
+    description: "Show one tracked task (alias view of /work): /task <task id>.",
+    handler: async (args, ctx) => {
+      const id = args.trim();
+      if (!id) {
+        ctx.ui.notify("Usage: /task <task id>. /work lists tracked work.", "info");
+        return;
+      }
+      ctx.ui.notify(formatTaskView(workGraphOf(await getRuntime(ctx)), id), "info");
+    },
+  });
+  pi.registerCommand("team", {
+    description: "Read-only: the execution (delegation) preference and live runs per task.",
+    handler: async (_args, ctx) => {
+      const rt = await getRuntime(ctx);
+      const execution = await loadExecutionConfig(runtimeCwd(ctx.cwd ?? process.cwd()));
+      ctx.ui.notify(formatTeamView(workGraphOf(rt), execution.preference), "info");
     },
   });
 

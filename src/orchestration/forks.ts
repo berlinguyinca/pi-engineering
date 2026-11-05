@@ -26,6 +26,7 @@ import {
   type GhPullRequest,
   type GithubClient,
   type GithubLinkStore,
+  type GithubRef,
   type RefConfig,
   type RepoKey,
   emitLinkRecorded,
@@ -231,6 +232,11 @@ export interface ForkManagerOptions {
    * `validated` edge (with the reason) and sets the gate back to pending. Evidence another writer left stays theirs.
    */
   downstreamPrs?: (taskId: string) => string[];
+  /**
+   * Called (best effort, never failing the promotion) once a promoted fork's PR is verified and linked, with the
+   * task the fork was made for. The host uses it to record the PR where that task's work lives.
+   */
+  onPrLinked?: (taskId: string, pr: GithubRef) => void | Promise<void>;
   now?: () => number;
   log?: (message: string) => void;
 }
@@ -655,6 +661,13 @@ export class ForkManager {
         provenance: "pr_create_output",
       });
       if (this.o.lineage) for (const l of links) emitLinkRecorded(this.o.lineage, l);
+      if (links.length > 0 && this.o.onPrLinked) {
+        try {
+          await this.o.onPrLinked(rec.taskId, pr.ref);
+        } catch (error) {
+          this.o.log?.(`pr link not recorded for ${rec.taskId}: ${(error as Error).message}`);
+        }
+      }
       const prNode = `pr:${pr.ref.host}/${pr.ref.owner}/${pr.ref.repo}#${pr.ref.number}`.toLowerCase();
       if (!(await beat())) return lost();
       const final = await this.o.registry.mutate((records) => {

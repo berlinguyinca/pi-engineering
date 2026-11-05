@@ -14,6 +14,7 @@
 import { readFile } from "node:fs/promises";
 
 import { type CanonicalLifecycleState, LIFECYCLE_SCHEMA_VERSION, toCanonical } from "./canonicalLifecycle.ts";
+import { type MissionModelSummary, summarizeMissionModels } from "./missionModels.ts";
 import type { CanonicalLifecycle } from "./missionStore.ts";
 import {
   type ModelErrorRollup,
@@ -23,6 +24,7 @@ import {
   buildTaskUsage,
 } from "./missionWhy.ts";
 import type { MissionProjection } from "./observability/types.ts";
+import type { RoutingDecision } from "./routingDecision.ts";
 import type {
   Execution,
   FailureClassification,
@@ -70,6 +72,8 @@ export interface StoragePressureSnapshot {
 }
 
 export interface MissionObservabilitySnapshot {
+  /** Additive: the model the mission is pinned to and each agent's model against it. */
+  modelUse?: MissionModelSummary;
   progress: {
     approximatePercent: number;
     verifiedComplete: boolean;
@@ -317,6 +321,7 @@ export function buildMissionSnapshot(
     verifierStages?: VerifierStageTiming[];
   },
   lifecycle?: CanonicalLifecycle,
+  routingDecisions?: ReadonlyArray<RoutingDecision>,
 ): MissionSnapshotMission {
   return {
     id: mission.mission_id,
@@ -382,7 +387,14 @@ export function buildMissionSnapshot(
           verifierStages: accounting.verifierStages ?? [],
         }
       : {}),
-    ...(observability ? { observability: toObservabilitySnapshot(observability) } : {}),
+    ...(observability
+      ? {
+          observability: {
+            ...toObservabilitySnapshot(observability),
+            modelUse: summarizeMissionModels(mission, tasks, observability.workers, routingDecisions),
+          },
+        }
+      : {}),
     ...(spec
       ? {
           specApproval: {
@@ -430,6 +442,8 @@ export function buildMissionSnapshotFile(
     verifierStages?: VerifierStageTiming[];
     /** The store's recorded lifecycle; absent means derive it from the status. */
     lifecycle?: CanonicalLifecycle;
+    /** Latest model-routing decision per task+role; fills modelUse[].why. */
+    routingDecisions?: ReadonlyArray<RoutingDecision>;
   }>,
   /** Additive storage-pressure substate (disk-pressure recovery FR-04). */
   storagePressure?: StoragePressureSnapshot | null,
@@ -449,6 +463,7 @@ export function buildMissionSnapshotFile(
           ? { executions: m.executions, classifications: m.classifications ?? [], verifierStages: m.verifierStages }
           : undefined,
         m.lifecycle,
+        m.routingDecisions,
       ),
     ),
     ...(storagePressure ? { storagePressure } : {}),

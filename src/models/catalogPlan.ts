@@ -111,6 +111,41 @@ function inferInput(id: string): { input: string[]; inferred: boolean } {
 }
 
 /**
+ * The name written for a gateway entry, so a later refresh can tell its own
+ * name from an operator's.
+ *
+ * For an alias the name carries what stands behind it right now, because an
+ * alias is a name and not a promise about weights: `qwen3.8-text` runs whatever
+ * text-modality `qwen3.8` is live. A picker showing only `qwen3.8-text` cannot
+ * answer "am I on the 27B or on Flash-Next?" — which is exactly the question
+ * this has to settle at a glance.
+ */
+function generatedName(id: string, entry: GatewayModelEntry): string {
+  const memberIds = entry.members ?? [];
+  // A route nothing advertises must say so in the name: the listing is not
+  // vouching for it, only the probe that answered is, and a reader judging the
+  // configuration from the gateway has to know which evidence behinds it.
+  const suffix = entry.origin === "probed" ? "gateway route; answers, not advertised" : "gateway alias";
+  if (memberIds.length === 1) return `${id} → ${memberIds[0]} (${suffix})`;
+  if (memberIds.length > 1) {
+    const sizes = entry.sizes && entry.sizes.length > 0 ? entry.sizes.join("/") : "gateway-resolved";
+    return `${id} → ${sizes} ×${memberIds.length} (${suffix})`;
+  }
+  return entry.origin === "probed" ? `${id} (${suffix})` : `${id} (gateway)`;
+}
+
+/** Suffixes this tool writes, so it can recognise and rewrite its own names. */
+const GENERATED_SUFFIXES = ["gateway alias", "gateway route; answers, not advertised"];
+
+/** True when `name` is one this tool wrote, and so is safe to rewrite. */
+function isGeneratedName(id: string, name: unknown): boolean {
+  if (typeof name !== "string") return false;
+  if (name === `${id} (gateway)`) return true;
+  if (!name.startsWith(`${id} → `)) return false;
+  return GENERATED_SUFFIXES.some((suffix) => name.endsWith(` (${suffix})`));
+}
+
+/**
  * Build the updated model list.
  *
  * Existing entries are spread forward, so every field the gateway does not know
@@ -150,7 +185,7 @@ export function planCatalogUpdate(
         // Reuse capability settings, never a backing model's routing/identity overrides.
         ...(backing?.compat !== undefined ? { compat: backing.compat } : {}),
         id: entry.id,
-        name: `${entry.id} (gateway)`,
+        name: generatedName(entry.id, entry),
         reasoning: backing?.reasoning ?? addReasoning,
         input: backing?.input ?? input,
         contextWindow: entry.contextWindow,
@@ -161,7 +196,11 @@ export function planCatalogUpdate(
       changes.push({
         kind: "add",
         id: entry.id,
-        details: [`context ${entry.contextWindow}`, ...(entry.state ? [`state ${entry.state}`] : [])],
+        details: [
+          `context ${entry.contextWindow}`,
+          ...(entry.state ? [`state ${entry.state}`] : []),
+          ...(entry.members?.length ? [`alias of ${entry.members.join(", ")}`] : []),
+        ],
         inferred: inferredFields,
       });
       continue;
@@ -178,6 +217,15 @@ export function planCatalogUpdate(
     if (typeof merged.maxTokens === "number" && merged.maxTokens > entry.contextWindow) {
       details.push(`maxTokens ${merged.maxTokens} → ${entry.contextWindow} (clamped to the window)`);
       merged.maxTokens = entry.contextWindow;
+    }
+    // An alias named for what stood behind it is stale the moment the gateway
+    // swaps a member — a quant replaced, a node preempted, flash renamed to
+    // vision — and a stale name answers "which model am I on?" wrongly. Only a
+    // name this tool wrote is rewritten; an operator's own name is left alone.
+    const wanted = generatedName(entry.id, entry);
+    if (merged.name !== wanted && (merged.name === undefined || isGeneratedName(entry.id, merged.name))) {
+      details.push(`name "${merged.name ?? "unset"}" → "${wanted}"`);
+      merged.name = wanted;
     }
     next.push(merged);
     changes.push({ kind: details.length > 0 ? "update" : "unchanged", id: entry.id, details });

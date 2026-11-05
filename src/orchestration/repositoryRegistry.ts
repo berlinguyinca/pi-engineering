@@ -7,6 +7,29 @@ import { GitRepo } from "../git/GitRepo.ts";
 import type { RepositoryBinding, WorkspaceManifest } from "./types.ts";
 import { WorkspaceScopeError } from "./workspaceManifest.ts";
 
+/** The per-root dependencies every repository binding shares. */
+export interface OpenedRepository {
+  git: GitRepo;
+  contextBroker: ContextBroker;
+}
+
+export type OpenRepoFn = (root: string) => Promise<OpenedRepository | null>;
+
+export interface RepositoryRegistryOptions {
+  /**
+   * Seam for tests and alternate hosts. Defaults to opening a real
+   * GitRepo + ContextBroker per canonical root.
+   */
+  openRepo?: OpenRepoFn;
+}
+
+async function defaultOpenRepo(root: string): Promise<OpenedRepository | null> {
+  const git = await GitRepo.open(root);
+  const contextBroker = await ContextBroker.open(root);
+  if (!git || !contextBroker) return null;
+  return { git, contextBroker };
+}
+
 export interface RepositoryExecutionContext {
   repoId: string;
   root: string;
@@ -62,6 +85,40 @@ export class RepositoryRegistry {
   private readonly contexts = new Map<string, Map<string, RepositoryExecutionContext>>();
   private readonly activeManifests = new Map<string, ManifestScope>();
   private readonly activeRepo = new AsyncLocalStorage<ManifestScope & { repoId: string }>();
+  /**
+   * Opened once per canonical root and shared across every manifest that
+   * binds it. A workspace with N missions all binding the same M repositories
+   * must pay M opens, not N*M: each open runs the full safeGit prepare
+   * (shadow + LFS scan) of synchronous git subprocesses, which on a
+   * multi-repo workspace measured ~10s of event-loop-blocking spawns per
+   * runtime open before this cache existed.
+   */
+  private readonly openedRepos = new Map<string, Promise<OpenedRepository | null>>();
+  private readonly openRepoFn: OpenRepoFn;
+
+  constructor(options: RepositoryRegistryOptions = {}) {
+    this.openRepoFn = options.openRepo ?? defaultOpenRepo;
+  }
+
+  private async openRepo(root: string): Promise<OpenedRepository | null> {
+    const cached = this.openedRepos.get(root);
+    if (cached) return cached;
+    const opening = (async () => {
+      try {
+        const result = await this.openRepoFn(root);
+        // A null result is not an answer for later binders (the repository
+        // may appear, or the failure may have been transient): drop the entry
+        // so the next register retries, while in-flight binders still see it.
+        if (!result) this.openedRepos.delete(root);
+        return result;
+      } catch (error) {
+        this.openedRepos.delete(root);
+        throw error;
+      }
+    })();
+    this.openedRepos.set(root, opening);
+    return opening;
+  }
 
   async register(manifest: WorkspaceManifest): Promise<void> {
     const staged = await this.stage(manifest);
@@ -111,13 +168,13 @@ export class RepositoryRegistry {
     target: Map<string, RepositoryExecutionContext>,
   ): Promise<void> {
     if (target.has(binding.repoId)) return;
-    const git = await GitRepo.open(binding.canonicalRoot);
-    const contextBroker = await ContextBroker.open(binding.canonicalRoot);
-    if (!git || !contextBroker) {
+    const opened = await this.openRepo(binding.canonicalRoot);
+    if (!opened) {
       throw new WorkspaceScopeError(
         `Repository binding cannot be opened: ${binding.repoId} (${binding.canonicalRoot})`,
       );
     }
+    const { git, contextBroker } = opened;
     const canonicalRoot = await realpath(git.root);
     if (canonicalRoot !== binding.canonicalRoot) {
       throw new WorkspaceScopeError(

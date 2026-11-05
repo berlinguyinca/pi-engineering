@@ -187,25 +187,43 @@ describe("HerdrPlannotatorTransport", () => {
   });
 
   it("a timeout kills the whole process group (the upstream grandchild too) before the plan dir is removed", async () => {
-    const pidFile = join(mkdtempSync(join(tmpdir(), "pi-gc-")), "grandchild.pid");
-    const cli = fakeCli(
-      `const cp = require("child_process");
+    // The transport's clock starts at spawn, and the fake bridge is a fresh `node` that must start, then spawn its own
+    // `node` grandchild and record its pid. On a loaded host that takes far longer than the 400 ms the transport is
+    // normally given, and a timeout that fires first kills a bridge that never had a grandchild - no pid file, nothing
+    // to assert on. So the timeout is only meaningful once the grandchild exists: when the pid file is missing, retry
+    // with a longer timeout. An unloaded host takes the first attempt unchanged.
+    let pid = 0;
+    for (let timeoutMs = 400; pid === 0 && timeoutMs <= 60_000; timeoutMs *= 3) {
+      const pidFile = join(mkdtempSync(join(tmpdir(), "pi-gc-")), "grandchild.pid");
+      const cli = fakeCli(
+        `const cp = require("child_process");
 const gc = cp.spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
 fs.writeFileSync(${JSON.stringify(pidFile)}, String(gc.pid));
 setInterval(() => {}, 1000);`,
-    );
-    await assert.rejects(
-      createHerdrPlannotatorTransport({ command: cli.bin, timeoutMs: 400 }).submitPlan(proposal),
-      /timed out/,
-    );
-    const pid = Number(readFileSync(pidFile, "utf8"));
-    assert.ok(pid > 0);
-    let alive = true;
-    try {
-      process.kill(pid, 0);
-    } catch {
-      alive = false;
+      );
+      await assert.rejects(
+        createHerdrPlannotatorTransport({ command: cli.bin, timeoutMs }).submitPlan(proposal),
+        /timed out/,
+      );
+      try {
+        pid = Number(readFileSync(pidFile, "utf8"));
+      } catch {
+        // the bridge was killed before it reached the grandchild: not a timeout this test can judge
+      }
     }
-    assert.equal(alive, false, "grandchild must be gone");
+    assert.ok(pid > 0, "the bridge never spawned its grandchild, even with a 60 s timeout");
+    // The group kill has been delivered by the time submitPlan rejects, but the kernel finishes tearing the process down
+    // (and init reaps it) asynchronously; a zombie still answers kill(pid, 0). Wait for it to disappear.
+    const isAlive = (): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const until = Date.now() + 15_000;
+    while (isAlive() && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(isAlive(), false, "grandchild must be gone");
   });
 });

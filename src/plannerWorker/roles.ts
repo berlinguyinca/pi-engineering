@@ -109,6 +109,18 @@ function identity(m: CatalogModel): string {
   return m.backing ?? m.id;
 }
 
+/**
+ * The concrete models a route row names, whichever side the gateway stated it on.
+ *
+ * `x_backing_model` names one. The deployed gateway (revision `b5f62ec2`) instead
+ * lists `x_members` on the ROUTE row, so a route can name several and none of
+ * them is a single backing. Decisions that depend on what actually answers — the
+ * differ-from rule, re-picking after a refusal — have to look at all of them.
+ */
+function memberIds(m: CatalogModel): string[] {
+  return m.members ?? (m.backing ? [m.backing] : []);
+}
+
 export interface ResolveContext {
   catalog: CatalogModel[];
   config: Readonly<Record<PlannerWorkerRole, RoleConfig>>;
@@ -153,12 +165,14 @@ export async function resolveRole(role: PlannerWorkerRole, ctx: ResolveContext):
   const aliasEntry = ctx.catalog.find((m) => m.id === alias && fits(m));
   const concrete = ctx.catalog.filter((m) => !m.alias && fits(m));
   if (aliasEntry) {
-    const clash = aliasEntry.backing !== undefined && avoid.has(aliasEntry.backing);
-    const alternative = clash && concrete.some((m) => !avoid.has(m.id) && m.capabilities.includes(cfg.capability));
+    const members = memberIds(aliasEntry);
+    const clashWith = members.find((id) => avoid.has(id));
+    const alternative =
+      clashWith !== undefined && concrete.some((m) => !avoid.has(m.id) && m.capabilities.includes(cfg.capability));
     if (!alternative) {
-      if (clash)
+      if (clashWith !== undefined)
         notes.push(
-          `alias ${alias} is backed by ${aliasEntry.backing}, which also serves a role it must differ from; no alternative`,
+          `alias ${alias} is backed by ${clashWith}, which also serves a role it must differ from; no alternative`,
         );
       return {
         role,
@@ -170,10 +184,16 @@ export async function resolveRole(role: PlannerWorkerRole, ctx: ResolveContext):
         notes,
       };
     }
-    notes.push(`alias ${alias} skipped: its backing model serves a role it must differ from`);
+    notes.push(`alias ${alias} skipped: its backing model ${clashWith} serves a role it must differ from`);
   }
-  // A concrete model may advertise serving the alias even when the alias itself is not listed.
-  const servingAlias = concrete.filter((m) => m.aliases.includes(alias));
+  // A concrete model serves the route when EITHER side names the relationship:
+  // `x_aliases` on the model row, or `x_members` on the route row — the direction
+  // the deployed gateway uses, which the model row never repeats.
+  const servingAlias = concrete.filter(
+    (m) =>
+      m.aliases.includes(alias) ||
+      ctx.catalog.some((route) => route.alias && route.id === alias && memberIds(route).includes(m.id)),
+  );
 
   // 2. Capability / family match on concrete models.
   const anyCapabilities = ctx.catalog.some((m) => m.capabilities.length > 0);

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   constants,
@@ -14,6 +15,25 @@ import {
 import { link, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
+
+const DARWIN_MONTH = {
+  Jan: 0,
+  Feb: 1,
+  Mar: 2,
+  Apr: 3,
+  May: 4,
+  Jun: 5,
+  Jul: 6,
+  Aug: 7,
+  Sep: 8,
+  Oct: 9,
+  Nov: 10,
+  Dec: 11,
+} as const;
+// C-locale `ps -o lstart=`: "Dow Mon DD HH:MM:SS" with the year omitted for
+// the current year (macOS ps prints the year only for other years).
+const DARWIN_LSTART =
+  /^\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})(?:\s+(\d{4}))?\s*$/;
 
 export interface FileLockOwner {
   pid: number;
@@ -94,7 +114,35 @@ async function closeOwnerRecord(record: OwnerRecord | undefined): Promise<void> 
   if (record) closeSync(record.descriptor);
 }
 
-function readBootId(): string | undefined {
+function darwinBootTimeSeconds(): number | undefined {
+  try {
+    const out = execFileSync("sysctl", ["-n", "kern.boottime"], { encoding: "utf8", timeout: 5_000 });
+    const seconds = Number(/\bsec\s*=\s*(\d+)/.exec(out)?.[1] ?? Number.NaN);
+    return Number.isFinite(seconds) ? seconds : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Process incarnation for the durable owner record, per platform.
+ *
+ * Linux reads /proc (boot uuid + jiffies-at-start). Darwin has no /proc; the
+ * equivalent incarnation is the per-boot `kern.boottime` epoch (hashed into a
+ * UUID so the durable owner-record format stays platform-independent) plus
+ * the process start time parsed from `ps -o lstart=` under the C locale
+ * (absolute epoch seconds, stable for the life of the process).
+ *
+ * Both values must keep the durable record's shapes: bootId is a UUID and
+ * processStartTime a positive digit string (see isFileLockOwner).
+ */
+export function readBootId(): string | undefined {
+  if (process.platform === "darwin") {
+    const bootSeconds = darwinBootTimeSeconds();
+    if (bootSeconds === undefined) return undefined;
+    const hex = createHash("sha256").update(`macos-kern.boottime-sec=${bootSeconds}`).digest("hex");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  }
   try {
     const value = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
     return value || undefined;
@@ -103,9 +151,32 @@ function readBootId(): string | undefined {
   }
 }
 
-function readProcessStartTime(
+export function readProcessStartTime(
   pid: number,
 ): { state: "present"; value: string } | { state: "missing" } | { state: "unknown" } {
+  if (process.platform === "darwin") {
+    let output: string;
+    try {
+      output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+        encoding: "utf8",
+        timeout: 5_000,
+        env: { ...process.env, LC_ALL: "C" },
+      });
+    } catch (error) {
+      // ps exits 1 when no process matches; anything else is a tooling failure
+      // and must fail closed as "unknown" (neither live nor stale).
+      return (error as { status?: number }).status === 1 ? { state: "missing" } : { state: "unknown" };
+    }
+    const match = DARWIN_LSTART.exec(output);
+    if (!match) return { state: "unknown" };
+    const month = DARWIN_MONTH[match[1] as keyof typeof DARWIN_MONTH];
+    const year = match[7] ? Number(match[7]) : new Date().getFullYear();
+    const start = new Date(year, month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]));
+    const seconds = Math.floor(start.getTime() / 1000);
+    return Number.isFinite(seconds) && seconds > 0
+      ? { state: "present", value: String(seconds) }
+      : { state: "unknown" };
+  }
   try {
     const line = readFileSync(`/proc/${pid}/stat`, "utf8");
     const close = line.lastIndexOf(")");

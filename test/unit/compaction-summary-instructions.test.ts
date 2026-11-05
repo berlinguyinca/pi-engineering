@@ -46,3 +46,10 @@ test("a bare continuation does not become the Goal anchor; the last substantive 
     "a session with only nudges has no request to anchor on",
   );
 });
+
+test("instructions keep the output format, the exact verify commands, and open decisions or failures", () => {
+  const text = summaryInstructions(entries, undefined);
+  assert.match(text, /required output format/i);
+  assert.match(text, /exact commands used to test or verify/i);
+  assert.match(text, /open decisions and unresolved failures/i);
+});

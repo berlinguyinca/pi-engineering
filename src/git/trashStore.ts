@@ -1,0 +1,380 @@
+/**
+ * Trash for housekeeping: sweeps MOVE what they reclaim here and never delete
+ * it (owner rule: "we can't lose data due to sweeps"). The only code that ever
+ * removes anything from a trash root is `purgeTrash`, reached through the
+ * explicit `/gc --purge-trash --older-than <days> --apply` command.
+ *
+ * Layout: `<trashRoot>/<ISO-ts>/` holds one `.pi-eng-trash.json` marker (proof
+ * that pi-engineering created the entry) and the moved item as `<ISO-ts>/<name>`.
+ * Purge only touches entries that are regular directories directly under the
+ * root, carry a valid marker as a regular file, and are old enough; it never
+ * follows symlinks.
+ */
+
+import { constants } from "node:fs";
+import {
+  access,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  rmdir,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
+
+export const TRASH_MARKER_FILE = ".pi-eng-trash.json";
+/** Marks a directory as a trash root; a non-empty directory without it is refused. */
+export const TRASH_ROOT_MARKER = ".pi-eng-trash-root";
+/** Relocates the worktree trash (default `<state-dir>/trash`), e.g. next to the repositories when the state dir is on another filesystem. */
+export const TRASH_DIR_ENV = "PI_TRASH_DIR";
+export const DEFAULT_PURGE_OLDER_THAN_DAYS = 14;
+export const MIN_PURGE_OLDER_THAN_DAYS = 7;
+
+export interface TrashMarker {
+  version: 1;
+  creator: "pi-engineering";
+  kind: "worktree" | "rust-cache";
+  movedAt: string;
+  items: Array<{ name: string; from: string; branch?: string | null; adminId?: string; commonDir?: string }>;
+}
+
+export interface TrashEntry {
+  /** `<trashRoot>/<ts>`: holds the marker and the moved item. */
+  dir: string;
+  /** Where the caller renames the item to. */
+  dest: string;
+}
+
+export function defaultTrashRoot(env: Record<string, string | undefined> = process.env): string {
+  const explicit = env[TRASH_DIR_ENV]?.trim();
+  if (explicit && !isAbsolute(explicit)) {
+    throw new Error(`${TRASH_DIR_ENV} must be an absolute path (got "${explicit}"); refusing to use it`);
+  }
+  return explicit ? resolve(explicit) : join(resolveStateRoot(env), "trash");
+}
+
+/** A trash root that is itself a symlink could point anywhere (including at user data): never used, purged or listed. */
+export async function symlinkedRootProblem(root: string): Promise<string | null> {
+  const l = await lstat(root).catch(() => null);
+  return l?.isSymbolicLink() ? `${root} is a symbolic link; refusing to use it as a trash root` : null;
+}
+
+/** Why `root` may not be a trash root because it lies inside one of `workingTrees` (checked by real path), else null. */
+export async function trashRootInsideProblem(root: string, workingTrees: readonly string[]): Promise<string | null> {
+  let probe = resolve(root);
+  const tail: string[] = [];
+  for (;;) {
+    const real = await realpath(probe).catch(() => null);
+    if (real) {
+      probe = join(real, ...tail);
+      break;
+    }
+    const up = dirname(probe);
+    if (up === probe) break;
+    tail.unshift(basename(probe));
+    probe = up;
+  }
+  for (const tree of workingTrees) {
+    const real = await realpath(tree).catch(() => resolve(tree));
+    if (probe === real || probe.startsWith(`${real}${sep}`)) {
+      return `${root} is inside the working tree ${tree}; refusing to use it as a trash root`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Why `root` cannot be used as a trash root, else null; changes nothing. Covers every refusal `ensureTrashRoot` would
+ * make, plus (when `sameFilesystemAs` is given) a root on another filesystem than that path, so a sweep can refuse
+ * BEFORE it preserves or moves anything instead of after.
+ */
+export async function trashRootProblem(
+  root: string,
+  opts: { sameFilesystemAs?: string; env?: Record<string, string | undefined> } = {},
+): Promise<string | null> {
+  const linked = await symlinkedRootProblem(root);
+  if (linked) return linked;
+  const marked = (await lstat(join(root, TRASH_ROOT_MARKER)).catch(() => null))?.isFile();
+  if (!marked) {
+    const entries = await readdir(root).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      return error;
+    });
+    if (entries instanceof Error)
+      return `${root} cannot be read (${entries.message.split("\n")[0]}); refusing to use it`;
+    for (const e of entries) {
+      if (!(await readTrashMarker(join(root, e)))) {
+        return `${root} is not a pi-engineering trash root (no ${TRASH_ROOT_MARKER} and it holds other files); refusing to use it`;
+      }
+    }
+  }
+  let existing = resolve(root);
+  for (;;) {
+    if (await lstat(existing).catch(() => null)) break;
+    const up = dirname(existing);
+    if (up === existing) break;
+    existing = up;
+  }
+  try {
+    await access(existing, constants.W_OK);
+  } catch {
+    return `${root} is not writable (${existing}); refusing to use it`;
+  }
+  if (opts.sameFilesystemAs) {
+    const [a, b] = await Promise.all([stat(existing).catch(() => null), stat(opts.sameFilesystemAs).catch(() => null)]);
+    if (a && b && a.dev !== b.dev) {
+      const configured = (opts.env ?? process.env)[TRASH_DIR_ENV]?.trim();
+      const base = `the trash root ${root} is on a different filesystem than ${opts.sameFilesystemAs} (a move into it would have to copy)`;
+      return configured && resolve(configured) === resolve(root)
+        ? `${base}: point ${TRASH_DIR_ENV} at a directory next to the repos`
+        : `${base}: set ${TRASH_DIR_ENV} to a directory next to the repos`;
+    }
+  }
+  return null;
+}
+
+/** A root is usable when marked, missing, empty, or holding only entries housekeeping created. */
+async function ensureTrashRoot(root: string): Promise<void> {
+  const problem = await trashRootProblem(root);
+  if (problem) throw new Error(problem);
+  const marker = join(root, TRASH_ROOT_MARKER);
+  if ((await lstat(marker).catch(() => null))?.isFile()) return;
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  await writeFile(marker, `${JSON.stringify({ version: 1, creator: "pi-engineering" })}\n`, { flag: "wx" }).catch(
+    (error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    },
+  );
+}
+
+/** Create a fresh trash entry for `item` (marker written, destination not yet occupied). */
+export async function createTrashEntry(
+  trashRoot: string,
+  kind: TrashMarker["kind"],
+  item: { name: string; from: string; branch?: string | null },
+  now: number = Date.now(),
+): Promise<TrashEntry> {
+  await ensureTrashRoot(trashRoot);
+  const stamp = new Date(now).toISOString().replace(/:/g, "-");
+  for (let n = 0; n < 1000; n++) {
+    const dir = join(trashRoot, n === 0 ? stamp : `${stamp}-${n}`);
+    try {
+      await mkdir(dir, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+    const marker: TrashMarker = {
+      version: 1,
+      creator: "pi-engineering",
+      kind,
+      movedAt: new Date(now).toISOString(),
+      items: [item],
+    };
+    await writeFile(join(dir, TRASH_MARKER_FILE), `${JSON.stringify(marker, null, 2)}\n`, { flag: "wx" });
+    return { dir, dest: join(dir, item.name) };
+  }
+  throw new Error(`could not allocate a trash entry under ${trashRoot}`);
+}
+
+/** POSIX single-quote escaping, so a path can be pasted into a shell whatever characters it holds. */
+export function shellQuote(text: string): string {
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+/** Record where the worktree's git registration came from, so the entry can be restored exactly. */
+export async function recordTrashAdmin(entryDir: string, admin: { adminId: string; commonDir: string }): Promise<void> {
+  const marker = await readTrashMarker(entryDir);
+  if (!marker?.items[0]) return;
+  marker.items[0] = { ...marker.items[0], ...admin };
+  // Temp file + rename: a crash never leaves a truncated marker (which would make the entry unpurgeable).
+  // `adminId` and `commonDir` are informational (restore hints) and nothing consumes them without validating them.
+  const tmp = join(entryDir, `${TRASH_MARKER_FILE}.tmp-${process.pid}`);
+  await writeFile(tmp, `${JSON.stringify(marker, null, 2)}\n`, { flag: "wx" });
+  await rename(tmp, join(entryDir, TRASH_MARKER_FILE));
+}
+
+/** Undo `createTrashEntry` when the move failed: drops only the marker and the (empty) entry directory. */
+export async function abandonTrashEntry(entry: TrashEntry): Promise<void> {
+  await unlink(join(entry.dir, TRASH_MARKER_FILE)).catch(() => {});
+  await rmdir(entry.dir).catch(() => {});
+}
+
+/** Move `from` into a new trash entry by rename. Throws (EXDEV across filesystems) after cleaning up its own entry. */
+export async function moveToTrash(
+  trashRoot: string,
+  kind: TrashMarker["kind"],
+  from: string,
+  name: string,
+  branch?: string | null,
+  now?: number,
+): Promise<string> {
+  const entry = await createTrashEntry(trashRoot, kind, { name, from, branch }, now);
+  try {
+    await rename(from, entry.dest);
+  } catch (error) {
+    await abandonTrashEntry(entry);
+    throw error;
+  }
+  return entry.dest;
+}
+
+async function readTrashMarker(dir: string): Promise<TrashMarker | null> {
+  const file = join(dir, TRASH_MARKER_FILE);
+  const l = await lstat(file).catch(() => null);
+  if (!l?.isFile()) return null;
+  try {
+    const parsed = JSON.parse(await readFile(file, "utf8")) as Partial<TrashMarker>;
+    if (parsed.version !== 1 || parsed.creator !== "pi-engineering") return null;
+    if (typeof parsed.movedAt !== "string" || !Number.isFinite(Date.parse(parsed.movedAt))) return null;
+    return parsed as TrashMarker;
+  } catch {
+    return null;
+  }
+}
+
+export interface TrashPurgeReport {
+  purged: Array<{ path: string; ageDays: number }>;
+  skipped: Array<{ path: string; reason: string }>;
+  dryRun: boolean;
+}
+
+/**
+ * Permanently delete trash entries older than `olderThanDays` (>= 7). Without
+ * `apply` it only lists what it would delete. Foreign or unmarked entries,
+ * symlinks and anything not a regular directory directly under the root are
+ * skipped and reported.
+ */
+export async function purgeTrash(
+  trashRoot: string,
+  opts: { olderThanDays: number; apply: boolean; now?: number },
+): Promise<TrashPurgeReport> {
+  if (!Number.isFinite(opts.olderThanDays) || opts.olderThanDays < MIN_PURGE_OLDER_THAN_DAYS) {
+    throw new Error(`--older-than must be at least ${MIN_PURGE_OLDER_THAN_DAYS} days`);
+  }
+  const now = opts.now ?? Date.now();
+  const report: TrashPurgeReport = { purged: [], skipped: [], dryRun: !opts.apply };
+  const linked = await symlinkedRootProblem(trashRoot);
+  if (linked) {
+    report.skipped.push({ path: trashRoot, reason: linked });
+    return report;
+  }
+  const realRoot = await realpath(trashRoot).catch(() => null);
+  if (!realRoot) return report;
+  for (const name of await readdir(trashRoot).catch(() => [] as string[])) {
+    if (name === TRASH_ROOT_MARKER) continue;
+    const path = join(trashRoot, name);
+    const skip = (reason: string) => report.skipped.push({ path, reason });
+    const l = await lstat(path).catch(() => null);
+    if (!l?.isDirectory() || l.isSymbolicLink()) {
+      skip("not a regular directory");
+      continue;
+    }
+    if ((await realpath(path).catch(() => null)) !== join(realRoot, name)) {
+      skip("does not resolve to a directory directly under the trash root");
+      continue;
+    }
+    const marker = await readTrashMarker(path);
+    if (!marker) {
+      skip("no valid pi-engineering trash marker; not created by housekeeping, left alone");
+      continue;
+    }
+    const ageDays = (now - Date.parse(marker.movedAt)) / 86_400_000;
+    if (ageDays < opts.olderThanDays) {
+      skip(`trashed ${Math.floor(ageDays)} d ago (< ${opts.olderThanDays} d)`);
+      continue;
+    }
+    if (opts.apply) {
+      // Re-check immediately before deleting; rm never follows symlinks.
+      const again = await lstat(path).catch(() => null);
+      if (!again?.isDirectory() || again.isSymbolicLink() || !(await readTrashMarker(path))) {
+        skip("changed while purging; left alone");
+        continue;
+      }
+      await rm(path, { recursive: true, force: false });
+    }
+    report.purged.push({ path, ageDays: Math.floor(ageDays) });
+  }
+  return report;
+}
+
+/** `<parent>/.pi-eng-trash/<yyyymmddThhmmssZ>-<name>`: where GitRepo.moveAsideOrphan parks a directory git no longer knows. */
+const ORPHAN_ENTRY = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-(.+)$/;
+
+/**
+ * Orphan entries carry no marker (and cannot get one retroactively), so they are NEVER deleted by any command here:
+ * this only lists them (as `skipped`, with the manual command an operator may run after looking inside). Entries whose
+ * original path is a registered worktree again, or that hold recent files, are listed with that reason instead.
+ */
+export async function listOrphanTrash(
+  parent: string,
+  opts: { olderThanDays: number; registeredPaths: ReadonlySet<string>; now?: number },
+): Promise<TrashPurgeReport> {
+  const root = join(parent, ".pi-eng-trash");
+  const now = opts.now ?? Date.now();
+  const report: TrashPurgeReport = { purged: [], skipped: [], dryRun: true };
+  const linked = await symlinkedRootProblem(root);
+  if (linked) {
+    report.skipped.push({ path: root, reason: linked });
+    return report;
+  }
+  const realRoot = await realpath(root).catch(() => null);
+  if (!realRoot) return report;
+  for (const name of await readdir(root).catch(() => [] as string[])) {
+    const path = join(root, name);
+    const skip = (reason: string) => report.skipped.push({ path, reason });
+    const m = ORPHAN_ENTRY.exec(name);
+    const l = await lstat(path).catch(() => null);
+    if (
+      !m ||
+      !l?.isDirectory() ||
+      l.isSymbolicLink() ||
+      (await realpath(path).catch(() => null)) !== join(realRoot, name)
+    ) {
+      skip("not a <timestamp>-<name> directory made by housekeeping; left alone");
+      continue;
+    }
+    const at = Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!, +m[4]!, +m[5]!, +m[6]!);
+    const ageDays = (now - at) / 86_400_000;
+    if (opts.registeredPaths.has(join(parent, m[7]!))) {
+      skip("its original path is a registered worktree again; left alone");
+      continue;
+    }
+    if (ageDays < opts.olderThanDays) {
+      skip(`orphaned ${Math.floor(ageDays)} d ago (< ${opts.olderThanDays} d); never deleted automatically`);
+      continue;
+    }
+    const recent = await hasRecentFile(path, now - opts.olderThanDays * 86_400_000);
+    skip(
+      `no marker (made before markers existed): never deleted by housekeeping${recent ? `; holds files modified within ${opts.olderThanDays} d` : ""}. ` +
+        `After looking inside, you may remove it yourself: rm -rf ${shellQuote(path)}`,
+    );
+  }
+  return report;
+}
+
+/** Any entry under `dir` modified after `since`; unreadable or oversized counts as yes. Never follows symlinks. */
+async function hasRecentFile(dir: string, since: number): Promise<boolean> {
+  let seen = 0;
+  const queue = [dir];
+  while (queue.length > 0) {
+    const current = queue.pop() as string;
+    const entries = await readdir(current, { withFileTypes: true }).catch(() => null);
+    if (!entries) return true;
+    for (const e of entries) {
+      if (++seen > 1_000_000) return true;
+      const full = join(current, e.name);
+      const s = await lstat(full).catch(() => null);
+      if (!s || s.mtimeMs > since) return true;
+      if (e.isDirectory()) queue.push(full);
+    }
+  }
+  return false;
+}

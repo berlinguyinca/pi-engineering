@@ -7,17 +7,57 @@
       "source": "PHASE-1-O1-CORPUS.json"
     },
     "projection_replay": {
-      "10k_events": { "events": 10100, "full_catch_up_ms": 6, "graph_ms": 2 },
-      "100k_events": { "events": 101000, "full_catch_up_ms": 27, "graph_ms": 13, "incremental_noop_ms": 1.2 },
+      "10k_events": {
+        "events": 10100,
+        "full_catch_up_ms": 6,
+        "graph_ms": 2
+      },
+      "100k_events": {
+        "events": 101000,
+        "full_catch_up_ms": 27,
+        "graph_ms": 13,
+        "incremental_noop_ms": 1.2
+      },
       "caveat": "In-memory events only: excludes JSONL parse from disk and 1M events. Not a production latency claim."
     },
-    "test_suite": { "tests": 6705, "pass": 6704, "fail": 0, "skipped": 1 }
+    "test_suite": {
+      "tests": 6705,
+      "pass": 6704,
+      "fail": 0,
+      "skipped": 1
+    }
   },
   "not_measured": [
-    "time to first tool call (needs live model)",
-    "subagent launches per prompt (needs live model)",
-    "token and cost deltas vs legacy",
-    "verification outcome rate vs legacy",
-    "disk replay at 1M events"
-  ]
+    "disk replay at 1M events",
+    "Mission output quality on complex tasks",
+    "cause of the 30+ minute pinned Mission on a trivial fix"
+  ],
+  "live_model_comparison": {
+    "measured_on": "2026-10-29/30, bender, gateway model qwen3.8-flash_next (the gateway fell back to deepseek_v4-flash mid-run in some runs; the model used is not controlled)",
+    "fixture": "4-line JS repo, 2 failing tests; prompts: fix, implement median(), add validation, explain (question)",
+    "arms": "default (no implicit Mission) vs legacy (execution.legacy_auto_invoke: true)",
+    "default_arm_wall_seconds": {
+      "fix": [92, 223],
+      "implement": [119],
+      "validate": [126],
+      "question": [57]
+    },
+    "default_arm_outcome": "all fix/implement/validate runs produced correct code, confirmed by an independent verifier and not only the agent's own tests; the question left the code untouched",
+    "legacy_arm": {
+      "capped_600s": "fix, implement, validate each hit the 600 s cap (the Mission tool never returned); question took 52 s with no Mission (classifier skips it)",
+      "uncapped_3h": {
+        "fix": "2h55m, ended BLOCKED. A correct fix (2/2 tests) existed in the preserved candidate but was never accepted: gate said 'no candidate recorded'. Blocked by flint/flint-40b 'Connection error' and a recovery stall, not by the work.",
+        "implement": "hit the 3 h limit, BLOCKED, no code produced; repair tasks failed with 'no routing candidate'."
+      },
+      "with_starting_model_pin": "fix, 30 min cap, sandboxed config: the Mission adopted the session model (MODEL_TRANSITION logged) and used only that model (270/270 model references); it did not finish in 30 min, still on its first implementer task with a live worker. Cause (Mission overhead vs worker looping) not determined."
+    },
+    "confounds": [
+      "single repetition per cell; second repetition incomplete",
+      "Missions chose their own models (flint-40b was failing) before the starting-model pin existed",
+      "gateway fallback changed the model mid-run",
+      "legacy arm shared the endpoint with other load",
+      "a Mission agent edited the user's real ~/.pi/agent/models.json (added the 27b model entry) in the uncapped implement run; later runs used a sandboxed config"
+    ],
+    "not_concluded": "Mission quality on complex work is NOT measured: these are tiny tasks where Mission overhead dominates."
+  }
 }

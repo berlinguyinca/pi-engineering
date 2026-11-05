@@ -18,6 +18,8 @@ behaving exactly as before when omitted or disabled (backward compatible).
     compaction with audit trail, promotion candidates).
   - `BlackholeAdapter.ts` — provider seam (builtin default; optional pi-blackhole).
   - `OpenViking.ts` — durable cross-session memory abstraction + in-memory default.
+    *(Since retired: renamed `durableProvider.ts`, HTTP provider deleted; durable
+    memory is the Hindsight `herdr-memory` CLI provider, `durable.kind: hindsight`.)*
   - `durable.ts` — **shared durable-memory providers** so several pi workers share
     promoted knowledge: `SharedFileDurableMemory` (dependency-free append-only JSONL,
     cross-process on one host / CI) and `OpenVikingProvider` (HTTP adapter for the

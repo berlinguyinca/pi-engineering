@@ -65,8 +65,6 @@ export { ModelRouter, ROLE_CAPABILITIES } from "./routing/ModelRouter.ts";
 export type { ModelProvider, RouteResult, Capability, WorkerRoleName } from "./routing/ModelRouter.ts";
 export { Scheduler } from "./sched/Scheduler.ts";
 export type { SchedulableTask, ScheduledOutcome } from "./sched/Scheduler.ts";
-export { BudgetManager, DEFAULT_BUDGETS } from "./budget/BudgetManager.ts";
-export type { BudgetSpec, BudgetState, BudgetRole } from "./budget/BudgetManager.ts";
 export {
   ToolPolicy,
   redactSecrets,
@@ -237,10 +235,11 @@ export type { PartialBlackholeConfig, ConfigResult } from "./blackhole/config.ts
 export { MemoryStore } from "./blackhole/MemoryStore.ts";
 export { newSessionIdentity, memoryWorkerIdentity } from "./blackhole/SessionStore.ts";
 export type { SessionIdentity, SessionContext } from "./blackhole/SessionStore.ts";
-export { InMemoryDurableMemory } from "./blackhole/OpenViking.ts";
-export type { DurableMemoryProvider, DurableMemoryRecord } from "./blackhole/OpenViking.ts";
-export { SharedFileDurableMemory, OpenVikingProvider } from "./blackhole/durable.ts";
-export type { OpenVikingProviderOptions } from "./blackhole/durable.ts";
+export { InMemoryDurableMemory } from "./blackhole/durableProvider.ts";
+export type { DurableMemoryProvider, DurableMemoryRecord } from "./blackhole/durableProvider.ts";
+export { SharedFileDurableMemory } from "./blackhole/durable.ts";
+export { HindsightDurableMemory } from "./blackhole/hindsight.ts";
+export type { HindsightOptions } from "./blackhole/hindsight.ts";
 export { buildDurableProvider } from "./blackhole/BlackholeManager.ts";
 export { decidePromotion } from "./blackhole/promotion.ts";
 export type { PromotionDecision, PromotionOutcome } from "./blackhole/promotion.ts";

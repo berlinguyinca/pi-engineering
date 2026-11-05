@@ -167,3 +167,18 @@ routing:
 #     reviewer: [metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl]
 #   default: [metabolomics/deepseek_v4-flash-modality-text-quant-mxfp4]
 # END quota_fallbacks example
+
+# ---------------------------------------------------------------------------
+# vision_delegate — images pasted into a session whose model is text-only.
+#
+# THIS BLOCK IS NOT READ FROM THIS FILE either: like quota_fallbacks it is read
+# ONLY from the GLOBAL engineering.yaml (~/.pi/agent/engineering.yaml), and a
+# repository file can never change it. Without the block the feature is ON with
+# the defaults below. Unknown keys or a wrong type turn the feature OFF with a
+# note; an out-of-range wait_seconds keeps 300 with a note. See docs/usage.md
+# "Vision delegation for text-only models".
+#
+# vision_delegate:
+#   enabled: true                       # false is the kill switch
+#   wait_seconds: 300                   # integer 10-3600: the longest wait for one image
+#   alias_preference: [qwen3.8-vision]  # model ids tried first, in order

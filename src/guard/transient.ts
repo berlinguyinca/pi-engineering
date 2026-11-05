@@ -145,6 +145,17 @@ function mapUnifiedToTransient(
   }
 }
 
+/** Categories that are safe to retry automatically. */
+const RETRYABLE_CATEGORIES: ReadonlySet<TransientErrorCategory> = new Set([
+  "rate_limit",
+  "server_unavailable",
+  "server_error",
+  "network",
+  "timeout",
+  "compaction",
+  "model_unavailable",
+]);
+
 /**
  * Classify an arbitrary thrown value into a transient-error class.
  * Message/status-based and host-agnostic: it does not depend on a particular
@@ -159,6 +170,25 @@ function mapUnifiedToTransient(
  * bare network codes as text).
  */
 export function classifyError(error: unknown): ErrorClass {
+  // A structured TransientError already carries a classified category (the
+  // thrower derived it from the richer provider context). Re-deriving the
+  // category from the MESSAGE TEXT loses that: the stall watchdog throws
+  // TransientError("network", "model stream stalled: no data for Nms"), and
+  // the text matches no keyword rule, so the one failure class the stall path
+  // throws specifically to be retried was classified PERMANENT and the retry
+  // ladder gave up after exactly one attempt ("Worker failed after 1
+  // attempt(s)" — observed live on MSN-b4owRR / MSN-T7iUn0 / MSN-MTrG8w).
+  if (error instanceof TransientError) {
+    return {
+      category: error.category,
+      retryable: RETRYABLE_CATEGORIES.has(error.category),
+      // Unknown-model stays a one-retry cap so a catalog resync clears it but a
+      // config typo never hides behind the infra window.
+      ...(error.category === "model_unavailable" ? { maxRetries: 1 } : {}),
+      reason: `structured ${error.category}`,
+    };
+  }
+
   const raw = error instanceof Error ? error.message : String(error ?? "");
   const msg = raw.toLowerCase();
   const status = extractStatus(error);
@@ -317,6 +347,12 @@ export function classifyError(error: unknown): ErrorClass {
       "socket hang up",
       "network",
       "undici",
+      // The model-stream stall watchdog wording, when it reaches the classifier
+      // as a plain text error rather than a structured TransientError. A
+      // gateway that held the connection open without data is a transient
+      // infrastructure failure, not a permanent one: it must retry, not fail
+      // the worker after one attempt.
+      "model stream stalled",
     )
   ) {
     return { category: "network", retryable: true, retryAfterMs, reason: "network failure" };

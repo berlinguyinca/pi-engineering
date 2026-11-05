@@ -29,6 +29,36 @@ roadmap evidence). When the repository's Roadmap 1.0 is complete,
 `/engineer`, `/plan`, `/tournament`, and `/execute` refuse to invent new work
 (autonomous stop) — the runtime does not keep manufacturing work past "done".
 
+## Platform support
+
+Linux is the reference platform: the durable single-writer lock and the
+artifact store pin directory descriptors and address them through
+`/proc/self/fd`, so every operation stays anchored to the exact inode that was
+opened even if a path is swapped out from under it.
+
+macOS (darwin) is supported with a documented, weaker fallback:
+
+- **Process incarnation** (writer-lock owner identity) is derived from
+  `sysctl kern.boottime` (hashed into a UUID) plus the process start time
+  parsed from `ps -o lstart=` under the C locale, instead of
+  `/proc/sys/kernel/random/boot_id` and `/proc/<pid>/stat`.
+- **Artifact paths** use the canonical absolute path instead of the
+  descriptor-relative `/proc/self/fd/<fd>` projection. Every open is paired
+  with a path-identity re-check (the path must still resolve to the exact
+  inode the descriptor holds), every artifact file path re-anchors the pinned
+  category inode before it is derived, and the bootstrap binding resolves the
+  pinned lock-root's current name (staging or final) by inode before reading
+  the domain token. A directory that is swapped for a symlink or a different inode is
+  detected and the store fails closed; a lock whose directory was swapped
+  mid-critical-section cannot be released by name and fails closed instead of
+  touching whatever now occupies the path.
+
+The remaining integrity layers (canonical path segments, `O_NOFOLLOW` on
+every open, trusted-directory ownership/mode assertions, exclusive locks,
+sha256 content digests, immutable key binding) are platform-independent and
+stay in force on both. Other platforms are unsupported and fail closed at the
+first durable operation.
+
 ## Install as a pi extension
 
 ```bash
@@ -49,22 +79,50 @@ pi install /absolute/path/to/pi-engineering-runtime
 | `/ledger [k]`     | Show work items, candidates, and ledger entities (optionally filtered) |
 | `/context`        | Show context budget, sources, and worker usage                 |
 | `/roadmap-status` | Show derived Roadmap 1.0 completion status for this repository |
-| `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (disabled by default) |
-| `/remember <text>` | Explicitly save a private Viking note (up to 4,000 characters) |
+| `/blackhole [--dashboard]` | Show optional Blackhole session-memory status (on with the extension's durable memory; off with `memory.hindsight.enabled: false`) |
+| `/remember <text>` | Explicitly save a private note through Hindsight (up to 4,000 characters) |
 | `/memory [query]` | Verify the memory connection, or search saved notes |
-| `/memory setup` | Configure or change the Viking host and access key |
 
 ### Everyday memory
 
-When no Viking connection is configured, interactive Pi offers a setup dialog.
-An existing connection is preserved across updates; use `/memory setup` to
-change it. Existing environment/token-file settings can be kept. Changed credentials are entered
-in a masked field and verified before they are saved. Settings and private key
-files live under `~/.pi/agent/engineering-memory/` (or the active
-`PI_CODING_AGENT_DIR`), outside the extension checkout. Updates preserve them.
-Cancelled setup can be retried with `/memory setup`; headless sessions never
-block for a dialog. The update command itself does not need an interactive
-credential hook: the check runs when Pi next loads the updated extension.
+Interactive memory is **on by default** and reaches **Hindsight through the
+`herdr-memory` CLI**. Pi never talks to a memory service itself and holds no
+memory credential: the CLI carries its own configuration and credentials
+(`herdr-memory doctor` checks them), and nothing under `PI_CODING_AGENT_DIR`
+stores a host, token or profile. Configuration is YAML only; environment
+variables are not read. A leftover OpenViking profile or `PI_OPENVIKING_*` /
+`PI_HINDSIGHT_*` variable is detected by name or existence only — never read —
+and warns once at load with the YAML key to use. No setup is needed; to change
+or turn it off, edit the global `engineering.yaml` (`~/.pi/agent/engineering.yaml`):
+
+```yaml
+# ~/.pi/agent/engineering.yaml (global). `cli` is honored only here.
+memory:
+  hindsight:
+    enabled: true                 # default true; set false to turn durable memory off
+    cli: herdr-memory             # executable to shell out to (global config only)
+    scopes: [project]             # default [project]; use [project, global] to also share global notes
+    timeout_ms: 5000              # per-call CLI timeout, 100..60000
+    automatic_recall_ms: 1200     # in-turn recall budget, 100..5000 (see below)
+    harness: pi                   # provenance/credential harness name the CLI sees
+    failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
+    unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
+```
+
+Memory is shared with Claude, Codex and OpenCode through the same Hindsight server
+and scopes, but each of those harnesses must be wired once with
+`herdr-eng memory install` before its notes reach Pi. If the CLI is absent or has
+no credential, Pi starts normally and shows at most one notice per session.
+
+Each turn the CLI receives up to 12 keywords of your prompt, and each worker run the
+first 120 characters of the task, both secret-redacted. A repository's
+`.pi/engineering.yaml` can only opt out (`enabled: false`) or narrow `scopes`; it
+cannot opt in or choose `harness`, `cli` or timeouts (global config only).
+
+Ranges, defaults and the repo-level rules are in
+[docs/usage.md](docs/usage.md#turning-the-connection-on-anywhere-pi-is-installed-no-code-edits);
+why the budgets are what they are (with live measurements) is in
+[Hindsight memory status](docs/integration/HINDSIGHT-MEMORY-STATUS.md).
 
 ```text
 /remember Calibration reports should use metric units.
@@ -73,45 +131,56 @@ credential hook: the check runs when Pi next loads the updated extension.
 
 Ordinary chat prompts automatically recall a small set of keyword-matching
 notes. The footer shows `Memory: ready`, match counts, or a specific connection
-failure. `/memory` distinguishes a healthy empty store from a rejected key.
+failure. `/memory` distinguishes a healthy empty store from a CLI that cannot
+answer.
 Automatic recall is ephemeral model context, inserted before the current user
 request; it is not copied into the saved transcript. Only `/remember` writes
 notes—normal conversations are not automatically uploaded or promoted.
 
-Automatic startup recall and per-prompt searches wait at most 250 ms, so a slow
-memory service does not hold up the model turn for seconds. A timed-out lookup
-adds no notes to that turn. Successful searches, including empty results, are
-cached for 60 seconds with at most 32 query entries. Saving a note, a successful
-explicit memory check/search, session replacement, or a changed host/key clears
-the cache. Transient failures pause automatic requests for 60 seconds; rejected
-or forbidden keys pause them for five minutes. `/memory` and `/memory setup`
-remain available during that pause, and changing the host or key retries
-immediately. Explicit commands retain their longer, bounded verification wait.
+Automatic recall is bounded by a measured budget, not a guessed one: a healthy
+`herdr-memory` call takes 0.4–4.9 s, so an interactive turn waits up to
+`automatic_recall_ms` (default 1200) and a headless `pi -p` run waits 5000 ms —
+nobody is watching a spinner there, and its single model call is the only chance
+to carry memory. The once-per-session readiness check gets 5000 ms and is not cut
+at the turn budget. A turn does not abandon its lookup: an answer that lands after
+the budget is used by the next model call of the **same** turn, and a turn that
+gets nothing says so in the model context — "could not be read this turn …
+unavailable, not empty" — because silence reads to the model as an empty bank.
+Successful searches, including empty results,
+are cached for 60 seconds with at most 32 query entries. Saving a note, a
+successful explicit memory check/search, session replacement, or a changed
+connection (a different CLI or scope set in the config) clears the cache.
+A CLI that timed out pauses automatic requests for 10 seconds (slow is not
+broken); one that exited badly pauses them for `failure_backoff_ms` (default 60 s),
+and a missing CLI or a refused write for `unavailable_backoff_ms` (default 5 min),
+because neither fixes itself between turns. `/memory` remains available during that
+pause, and changing the config retries immediately. Explicit commands retain their
+longer, bounded verification wait.
 Starting another turn does not cancel a pending explicit memory command. A
 completed save/check/search invalidates older automatic lookups; replacing the
 session or connection still fences results from the retired context.
 
-Saving requires a read/write device key. Read-only keys can recall but cannot
-save. Treat saved notes as user-provided reference information, not proof that
-claims were machine-verified. Independent review/challenge workers do not load
+Only a CLI that answers `persisted` is reported as saved; a queued or refused
+write says so instead of claiming success. Treat saved notes as user-provided
+reference information, not proof that claims were machine-verified. Independent review/challenge workers do not load
 these interactive hooks. Existing engineering-worker hydration is preserved.
 
-Confirmed profile settings override old shell host/key defaults. Set
-`PI_OPENVIKING_ENABLED=0` to disable all memory access for a launcher. A token
-file rotation is picked up by subsequent memory operations; changing host/key
-also refreshes the cached engineering runtime on the next engineering command.
-See [the feature design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits
-and verification boundaries.
+Set `memory.hindsight.enabled: false` (or omit it) to keep memory off. Reads stay fail-open — a memory that cannot be
+recalled costs that turn its notes and nothing else — while writes report the
+outcome they actually got. See [the feature
+design](docs/specs/2026-09-14-everyday-viking-memory.md) for limits and
+verification boundaries; the HTTP transport described there has since been
+retired in favour of the CLI, and the durable kinds below no longer accept it.
 
-### Blackhole session memory (optional, off by default)
+### Blackhole session memory (optional)
 
 `pi-blackhole` can act as an **optional per-session memory/context provider** (pinned to
 version **0.5.4**). It is fully backward compatible: when omitted or disabled the runtime
 behaves exactly as before (no sessions, no events). When enabled, each worker session gets
 an isolated session-local memory store; prior memory is recalled into worker context for
 context-efficiency; background Observer/Reflector/Dropper workers run at lower priority
-(P3/P4) via the model router + scheduler; and promoted durable memory flows through the
-OpenViking abstraction with an **evidence-gated promotion workflow** (never auto-promoted)
+(P3/P4) via the model router + scheduler; and promoted durable memory flows through the durable-memory abstraction
+(`HindsightDurableMemory`) with an **evidence-gated promotion workflow** (never auto-promoted)
 that emits audit events to the authoritative EventStore.
 
 CLI: `pi-engineering blackhole status|validate|benchmark`. A native-vs-Blackhole A/B
@@ -120,7 +189,10 @@ benchmark generates a report + **12 SVG plots** and preserves raw JSONL/CSV unde
 
 **Sharing memory across workers:** the `durable` config selects the backing store for
 *evidence-promoted* knowledge (`memory` default, `shared-file` for several workers on
-one host / CI, `openviking` for the external cross-machine service). Each worker
+one host / CI, `hindsight` for the `herdr-memory` CLI, which is the only store
+that crosses machines). A kind the runtime no longer implements — `openviking`
+was retired — fails configuration validation instead of silently running
+memoryless. Each worker
 hydrates its context from shared durable memory on run, so promoted knowledge is
 consumed by later/other workers while session-local working memory stays isolated:
 
@@ -442,16 +514,16 @@ dependencies are shared safely through `sccache` instead: install it
 `RUSTC_WRAPPER`, so a second worktree's dependency build is a cache hit rather
 than a recompile. Values the operator already set (`CARGO_TARGET_DIR`,
 `RUSTC_WRAPPER`, `SCCACHE_DIR`) are never overridden. Everything under the
-cache root is derived output: housekeeping removes a worktree's target dir
-with the worktree and expires the rest by age, and you can delete the root at
-any time. Size is bounded by age (`PI_RUST_CACHE_MAX_AGE_DAYS`) and by
-removal with the worktree; there is no byte cap.
+cache root is derived output you can delete yourself at any time. Housekeeping
+never deletes it: idle, marked generations whose worktree is gone are moved to
+`<cache root>/.trash` (see Housekeeping), and only `/gc --purge-trash` removes
+them. There is no byte cap.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_RUST_CACHE_DIR` | `~/.rust/cache` | Cache root (`~` is expanded) |
+| `PI_RUST_CACHE_DIR` | `~/.rust/cache` | Cache root (`~` is expanded). Must be empty, an older cache, or carry `.pi-eng-rust-cache-root`; any other directory is refused |
 | `PI_RUST_CACHE` | `1` | `0` disables the managed cache |
-| `PI_RUST_CACHE_MAX_AGE_DAYS` | `30` | Target dirs no build touched for this long are removed by housekeeping |
+| `PI_RUST_CACHE_MAX_AGE_DAYS` | `30` | Marked target dirs no build touched for this long (and whose worktree is gone) are moved to the cache trash by housekeeping |
 
 ## Housekeeping
 
@@ -461,29 +533,150 @@ a crashed session, a killed worker or a mission that never reached a terminal
 state leaves `pi-eng-<hash>-<branch>` checkouts next to the repository, each a
 full working tree plus whatever the worker built. Housekeeping runs at session
 start, every six hours while a session stays open, and on demand with `/gc`
-(`/gc --dry-run` previews):
+(`/gc` previews by default; `/gc --apply` acts; `--dry-run` is accepted as an alias):
 
-- Worktrees in the runtime's own namespace (`pi-eng-<hash(repoRoot)>-*`
-  siblings of the repo root, nothing else) are reclaimed only when their
-  mission is durably `COMPLETE`, `CANCELED` or `FAILED` (read from the
-  orchestration event log, so missions run by other pi processes count), or
-  when the branch names no owner at all and the checkout has been idle for
-  `PI_WORKTREE_IDLE_HOURS` (default 24). A mission this process cannot prove
-  terminal is kept, as is any worktree a durable candidate, cleanup or
-  quarantined record still names. Nothing younger than
-  `PI_WORKTREE_MIN_AGE_HOURS` (default and minimum 1) is reclaimed.
-- Reclaiming never loses work. Uncommitted changes are committed onto the
-  worktree's own branch first and the branch is always kept; only the checkout
-  on disk goes away. A directory whose git metadata is gone cannot be
-  preserved, so it is removed only once idle.
-- A reclaimed worktree's cargo target dir goes with it, and target dirs (see
-  above) that no build touched for `PI_RUST_CACHE_MAX_AGE_DAYS` are removed.
+- Only worktrees on `pi-eng-candidate-*` / `pi-eng-orch-*` branches in the
+  runtime's own namespace (`pi-eng-<hash(repoRoot)>-*` siblings of the repo
+  root) are ever reclaimed, and only when their mission is durably `COMPLETE`
+  or `CANCELED` (`FAILED` missions can be reopened, so they are never reclaimed; read from the orchestration event log, so missions run
+  by other pi processes count) **and** the worktree carries the runtime's
+  ownership marker `pi-eng-owner.json` in its git dir
+  (`.git/worktrees/<id>/`; JSON `{version:1, creator:"pi-engineering",
+  repoRootHash, repoRootSha256, branch, createdAt}`, written by
+  `GitRepo.createWorktree` via `src/git/ownerMarker.ts`, which is also the only
+  reader: `repoRootSha256` is mandatory and hashed over `realpath(repoRoot)`, the
+  branch must match the live branch exactly, a detached worktree matches only a
+  marker that recorded no branch, and a symlinked marker is never trusted). A
+  missing, unparseable or mismatching marker means "not provably ours": kept and
+  reported ("no ownership marker" / "ownership marker rejected (<reason>)").
+  Worktrees created before the marker existed therefore stay kept until you
+  remove them yourself; `/gc --adopt-preview` lists them read-only with the plain
+  `git worktree remove <path>` an operator could run for each eligible one (it
+  adopts and writes nothing; adopting is a deliberate future step). Fork
+  worktrees (`pi-fork-<hash>-<id>`) live outside the swept `pi-eng-<hash>-`
+  namespace, are never touched by this janitor, and their markers are for a
+  future janitor. A worktree on any other branch is yours: it is
+  kept and reported, however idle. A mission this process cannot prove terminal
+  is kept, as is any worktree a durable candidate, cleanup or quarantined record
+  still names. Nothing younger than `PI_WORKTREE_MIN_AGE_HOURS` (default and
+  minimum 1) is reclaimed.
+- Housekeeping never loses data. A worktree is reclaimed only when its branch
+  (or, if detached, its folder name) carries a parsable mission/task id whose
+  mission is durably `COMPLETE` or `CANCELED`; no owner means it is kept, however
+  idle (`MSN-ext-*`/`MSN-local-*` ids parse truncated and so are always kept).
+  It is also kept and reported, before anything is committed, when git has it
+  locked; a git operation is in progress in it (rebase incl. `--autostash`,
+  merge, cherry-pick, revert, bisect; their state lives only in the git dir);
+  an `index.lock` exists (never removed; one a crashed janitor run left is
+  reported as stale and still kept); per-worktree refs (`refs/worktree/*`,
+  `refs/bisect/*`, `refs/rewritten/*`) exist or its HEAD reflog (scanned up to
+  1000 entries) holds a commit no branch or tag contains; it holds an initialized submodule or an untracked embedded git
+  repository; it holds ignored files other than disposable derived folders;
+  an untracked derived folder would block a plain remove; assume-unchanged or
+  skip-worktree index entries could hide edits; its HEAD is detached and dirty or
+  unreachable from every local branch and tag (remote-tracking refs and a stash
+  do not count); changes would remain after staging; its Rust cache key is
+  the shared `_shared` fallback; an unreadable directory exists under it; or a
+  root derived folder holds any file or folder newer than the owning mission's
+  terminal timestamp (`completed_at`, else `updated_at`, the earlier of the
+  in-process store and the durable event log), or such a folder exists and no
+  terminal timestamp is known: something used the checkout after the mission
+  ended.
+- Ignored-file rules are shared with the repository layer
+  (`src/git/worktreeSafety.ts`: nested `.git`, bare repositories and secret-looking
+  files such as `.env` or `id_rsa` under a derived folder other than `node_modules`
+  keep the worktree), but the janitor stays stricter: only the five root-level
+  names below count as disposable, never the any-depth cache names.
+- **Disposable derived folders** are exactly these, and only at the worktree
+  root: `node_modules/`, `target/`, `.next/`, `dist/`, `coverage/`, and only when
+  the folder itself is git-ignored and nothing named `.git` lives beneath it.
+  Same-named folders at any other depth, or ignored files inside a folder that is
+  not itself ignored, keep the worktree. An ignored root `dist/` is treated as
+  rebuildable output even if someone hand-wrote into it; keep such files
+  elsewhere.
+- Otherwise uncommitted changes are staged in a temporary copy of the index
+  (the dry-run simulation also writes new objects to a throw-away object
+  directory) and committed onto the worktree's own branch; the real index is
+  replaced afterwards under `index.lock` with an atomic rename. A file that is
+  both staged and further modified (`MM`, `AM`, ...) keeps the worktree, since
+  restaging would lose the staged version. The repo's own `node_modules`
+  symlink that `createWorktree` provisions is never staged; on reclaim only the
+  link is unlinked.
+- **A sweep never deletes.** Every keep check runs, the checkout is moved
+  with `git worktree move` to a `reclaim-` quarantine name beside it, every
+  check runs again there (plus a comparison of the tree's newest mtime), and
+  only then is it renamed into the trash,
+  `<state-dir>/trash/<ISO-ts>/<name>` (state dir: `PI_ENGINEERING_STATE_DIR`,
+  else `$XDG_STATE_HOME/pi-engineering`, else `~/.local/state/pi-engineering`),
+  next to a `.pi-eng-trash.json` marker. The rename needs the trash on the same
+  filesystem as the repository; if it is not, the checkout is moved back, kept
+  and reported ("state dir on different filesystem: set PI_TRASH_DIR next to the
+  repos"; `PI_TRASH_DIR` relocates the trash, and the directory must be empty,
+  missing, or already a trash root marked `.pi-eng-trash-root`; it must be an
+  absolute path, must not be a symlink and must not lie inside any working tree
+  of the repository, otherwise the worktree is kept). Its git registration is
+  then MOVED, not deleted: ONLY its own `<common-git-dir>/worktrees/<id>` (found
+  by the path in its `gitdir` file, exactly one match, not locked) goes to
+  `<trash entry>/.pi-eng-admin`; `git worktree prune` is never run because it
+  would also drop other worktrees whose `.git` file is missing (an unmounted disk
+  whose mount point still exists). An ambiguous match leaves the registration
+  and reports the exact admin dir with `git worktree repair` / `remove`
+  guidance. The trash marker records `adminId` and `commonDir`, and the `/gc`
+  report prints the exact restore command. By hand: `mkdir -p
+  <common-git-dir>/worktrees`; move `<trash entry>/.pi-eng-admin` to
+  `<common-git-dir>/worktrees/<id>`, where `<id>` is the last path component of
+  the `gitdir:` line in `<trash entry>/<name>/.git`; move `<trash entry>/<name>`
+  back to its original path; run `git worktree repair <original path>`. If that
+  id is already taken, use a new admin name AND rewrite `<checkout>/.git` to
+  `gitdir: <new admin dir>` before the repair. If the ORIGINAL PATH is taken,
+  restore the checkout to another path instead and run
+  `git worktree repair <new path>`. The printed one-liner refuses (non-zero,
+  nothing moved) when the id or the path is taken, and if its second `mv` fails
+  it moves the admin dir back, leaving the trash entry exactly as it was. Restore soon: once the admin dir
+  is out of `.git`, objects that only its reflog or `refs/worktree` held can be
+  pruned by `git gc` (branch commits and preserved work are kept by earlier
+  guards). Known residuals: `config.worktree` is not checked, Rust liveness
+  treats EACCES as gone, object mtimes are not freshened, and an orphan
+  directory's own mtime is not consulted. If any check fails the checkout is moved back. A writer
+  that only knows the original path can no longer reach the files. Accepted
+  residual: a process with its
+  working directory already inside the checkout, or one that follows the
+  quarantine path, can still add an ignored file or a file in a root derived
+  folder between the final re-check and git's own removal; git itself refuses
+  for untracked files, but not for ignored ones. The branch is always kept. A
+  namespace directory git no longer lists is reported as a stray and its files
+  are never removed (`git worktree repair` may re-register it first, which only
+  rewrites git metadata); delete it yourself if you do not want it.
+- **Purging the trash is a separate, explicit act**:
+  `/gc --purge-trash [--older-than <days>] --apply` (default 14 days, minimum 7;
+  without `--apply` it only lists what it would purge, and it never sweeps).
+  It deletes only entries directly under a trash root that are regular
+  directories carrying a valid `.pi-eng-trash.json` written by housekeeping,
+  at least `<days>` old, and it never follows symlinks; everything else is
+  skipped and reported. A trash root that is a symlink is refused. Directories
+  the repository layer parked in `<repo parent>/.pi-eng-trash/<ts>-<name>` carry
+  no marker and cannot get one retroactively, so NO command ever deletes them:
+  they are listed by `/gc --purge-trash` with the `rm -rf` an operator
+  may run after looking inside. A preview never writes or chmods anything, and a Rust
+  cache root without `.pi-eng-rust-cache-root` is not purged. It covers `<state-dir>/trash` and `<rust-cache>/.trash`.
+- Rust cache: the runtime writes `.pi-eng-rust-cache.json` into every
+  generation dir (`<cache>/target/<repo>/<worktree>`) it assigns. The sweep moves
+  (never deletes) a generation to `<cache>/.trash/<ts>/` only when that marker is
+  valid, no build touched it for `PI_RUST_CACHE_MAX_AGE_DAYS`, and its worktree
+  is gone and not a live worktree's target dir. Unmarked generations (created
+  before the marker, or by anything else) are kept and reported. The cache root
+  must carry `.pi-eng-rust-cache-root`, written on first use of an empty cache or
+  an older one holding only `target/` and `sccache/`; a `PI_RUST_CACHE_DIR`
+  naming any other directory is refused (no shared cache is used, nothing is
+  written or swept in it; a one-time process warning and the `/gc` report say
+  so). A generation marker without a recorded worktree path is kept. A reclaimed worktree's cargo target dir is left to
+  this sweep.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `PI_HOUSEKEEPING` | on | Automatic housekeeping acts by default; `0`/`false`/`off` disables it, `dry-run` only reports. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` always acts (`/gc --dry-run` previews) |
+| `PI_HOUSEKEEPING` | dry-run | Automatic housekeeping only reports by default; `1`/`true`/`on`/`yes` lets it act (moving to the trash, never deleting), `0`/`false`/`off`/`no` disables it. Mission strip rows default to 2 (`PI_MISSION_PRESENCE_ROWS`). `/gc` previews by default and lists what it kept and why; `/gc --apply` moves to the trash; `/gc --purge-trash --older-than <days> --apply` is the only deletion |
 | `PI_HOUSEKEEPING_INTERVAL_MS` | `21600000` | Interval between sweeps while a session is open; `0` for session start only |
-| `PI_WORKTREE_IDLE_HOURS` | `24` | Idle threshold for worktrees with no known owner |
+| `PI_WORKTREE_IDLE_HOURS` | `24` | Retained for compatibility; governs nothing now. A worktree with no parsable mission/task owner is kept, never reclaimed by age. `PI_WORKTREE_MIN_AGE_HOURS` still sets the minimum age for a terminal-owner reclaim |
 
 ## Semantic tools
 
@@ -626,7 +819,8 @@ src/bench/           engineering benchmark with baseline gate
 src/adapters/        optional AutoSpec/InferWeave seams (empty by default)
 src/telemetry/       deterministic telemetry export for external control planes
 src/blackhole/       optional per-session memory provider (pinned 0.5.4, builtin default)
-src/blackhole/durable.ts  shared durable-memory providers (shared-file, OpenViking HTTP)
+src/blackhole/durableProvider.ts + durable.ts  durable-memory providers (in-memory, shared-file)
+src/blackhole/hindsight.ts  the herdr-memory CLI provider (the only cross-machine store)
 src/benchmark/       native-vs-Blackhole A/B benchmark (report + 12 SVG plots + raw data)
 src/workers/         role prompts + bounded worker_result tool + executors
 src/runtime/         EngineeringRuntime facade (plan/engineer/tournament/review/challenge)

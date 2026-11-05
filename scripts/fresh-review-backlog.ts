@@ -20,7 +20,6 @@ const repo = join(homedir(), "IdeaProjects", "pi-engineering-runtime");
 const SCOPE = [
   "src/routing/ModelRouter.ts (capability+quota routing, separation-of-duties diversity; must degrade to single-model)",
   "src/sched/Scheduler.ts (concurrency limit, backpressure, weighted fairness, speculative execution)",
-  "src/budget/BudgetManager.ts (token budget escalation + marginal-value stopping)",
   "src/security/SecurityPolicy.ts (secret redaction, tool policy, prompt-injection guardrails, fail-closed)",
   "src/merge/MergeQueue.ts (candidate->integration->main promotion, rebase, gate, serialized)",
   "src/intel/RepoIntel.ts (dependency-free symbol index, optional LspIntegration seam)",

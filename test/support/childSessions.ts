@@ -72,7 +72,10 @@ export function startChild(
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
     });
-    child.on("exit", (code, signal) => {
+    // "close", not "exit": "exit" can fire before the last stdout chunk has been read, so a child that DID report was judged
+    // to have exited "without a report" whenever the host was slow enough to deliver the exit first. "close" is emitted
+    // only after the child's stdio streams have ended.
+    child.on("close", (code, signal) => {
       if (!stdout.includes("\n")) {
         reject(new Error(`child ${child.pid} exited (${code ?? signal}) without a report: ${stderr.slice(-2000)}`));
       }
@@ -149,7 +152,8 @@ export function runScript<T>(
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
     });
-    child.on("exit", (code, signal) => {
+    // "close", not "exit" (see startChild): all stdout has been read by then.
+    child.on("close", (code, signal) => {
       if (!stdout.includes("\n"))
         reject(new Error(`${script} exited (${code ?? signal}) without a report: ${stderr.slice(-2000)}`));
     });

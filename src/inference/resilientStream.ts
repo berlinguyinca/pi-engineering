@@ -45,7 +45,7 @@ import {
   type ProviderResponseOptions,
   captureGatewayAttemptResponse,
 } from "../gateway/installStreamRetry.ts";
-import type { GatewayWaitSignal } from "../gateway/signals.ts";
+import { type GatewayWaitSignal, isGatewayAdmissionRefusal } from "../gateway/signals.ts";
 import {
   type AttemptObservation,
   type RetrySink,
@@ -53,6 +53,7 @@ import {
   type RetryableResult,
   pumpWithGatewayRetry,
 } from "../gateway/streamRetry.ts";
+import { classifyError } from "../guard/transient.ts";
 import type { ModelRef } from "../lifecycle/types.ts";
 import { modelKey } from "../lifecycle/types.ts";
 import { CircuitBreakerRegistry, type ModelCircuitBreaker } from "./circuitBreaker.ts";
@@ -70,6 +71,7 @@ import { ModelHealthRegistry } from "./modelHealth.ts";
 import { type ExecutedActionTracker, type RecoveryStep, decideRecoveryStep } from "./recovery.ts";
 import { type InferenceResilienceConfig, resolveInferenceResilienceConfig } from "./resilienceConfig.ts";
 import { StreamRetryPolicy } from "./retryPolicy.ts";
+import { recordRetryTrace } from "./retryTrace.ts";
 import {
   type InferenceTelemetry,
   type InferenceTelemetryData,
@@ -185,6 +187,10 @@ export class ResilientAttemptFlow {
   readonly missionId: string | undefined;
   readonly workerId: string | undefined;
   readonly interactive: boolean | undefined;
+  /** Set when the caller itself honours gateway waits (see InferenceInvocation). */
+  private readonly gatewayWaitOwner: "worker-gateway-hold" | undefined;
+  /** Set when the caller itself retries 5xx / network / timeout faults. */
+  private readonly transientRetryOwner: "worker-transient-retry" | undefined;
   private current: ModelRef;
   private readonly startedAt: number;
   private attemptOnModel = 0;
@@ -205,6 +211,8 @@ export class ResilientAttemptFlow {
     this.missionId = call.missionId ?? opts.missionId;
     this.workerId = call.workerId ?? opts.workerId;
     this.interactive = call.interactive ?? opts.interactive;
+    this.gatewayWaitOwner = call.gatewayWaitOwner;
+    this.transientRetryOwner = call.transientRetryOwner;
     this.actions = call.actions ?? opts.actions;
     this.current = model;
     this.now = opts.now ?? (() => Date.now());
@@ -375,6 +383,51 @@ export class ResilientAttemptFlow {
           note: `${failure.class}: circuit OPEN — waiting for capacity`,
         };
       }
+    }
+    // One retry owner per failure: a worker that honours the gateway's advertised
+    // wait itself (a hold on this exact refusal) owns the retry, so replaying it
+    // here as well would multiply the two budgets (this ladder's attempts times
+    // the worker's holds). Model switches are a different decision and stay.
+    if (
+      this.gatewayWaitOwner !== undefined &&
+      (step.kind === "retry" || step.kind === "wait_capacity") &&
+      isGatewayAdmissionRefusal(observed.text)
+    ) {
+      recordRetryTrace(
+        undefined,
+        {
+          layer: "resilient-stream",
+          attempt: observed.attempt,
+          reason: `${observed.status ?? 429}:${failure.class}`,
+          next: "defer",
+          owner: this.gatewayWaitOwner,
+        },
+        this.opts.telemetry,
+        { ...(this.missionId ? { mission_id: this.missionId } : {}), role: this.role },
+      );
+      return { retryAfterMs: 0, retryable: false, source: "default", reason: failure.reason ?? failure.class };
+    }
+    // Same rule for transient faults (5xx, network, timeout): the worker's
+    // withTransientRetry replays the whole attempt with its own budget. Defer
+    // only when that owner would itself retry this exact fault.
+    if (
+      this.transientRetryOwner !== undefined &&
+      (step.kind === "retry" || step.kind === "wait_capacity") &&
+      workerWillRetryTransient(observed.thrown ?? observed.text)
+    ) {
+      recordRetryTrace(
+        undefined,
+        {
+          layer: "resilient-stream",
+          attempt: observed.attempt,
+          reason: `${observed.status ?? failure.class}:${failure.class}`,
+          next: "defer",
+          owner: this.transientRetryOwner,
+        },
+        this.opts.telemetry,
+        { ...(this.missionId ? { mission_id: this.missionId } : {}), role: this.role },
+      );
+      return { retryAfterMs: 0, retryable: false, source: "default", reason: failure.reason ?? failure.class };
     }
     return this.runStep(step, failure, base);
   }
@@ -937,3 +990,11 @@ export function createInteractiveClassifyAttempt(
 }
 
 export type { RetryableEvent, RetryableResult };
+
+const WORKER_TRANSIENT_CATEGORIES = new Set(["server_error", "server_unavailable", "network", "timeout"]);
+
+/** True when the worker's transient loop would replay this fault (so the ladder must not). */
+function workerWillRetryTransient(fault: unknown): boolean {
+  const cls = classifyError(typeof fault === "string" ? new Error(fault) : fault);
+  return cls.retryable && WORKER_TRANSIENT_CATEGORIES.has(cls.category);
+}

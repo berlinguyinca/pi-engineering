@@ -323,7 +323,9 @@ test("session shutdown closes the runtime and stops its mission supervisor", asy
   let stops = 0;
   const previous = new Map<string, string | undefined>();
   const optionalProviderKeys = Object.keys(process.env).filter((key) =>
-    /METABOLOMICS|OPENVIKING|INFERWEAVE|PI_GATEWAY_HEALTH/.test(key),
+    // HINDSIGHT drives the durable-memory CLI this harness loads; OPENVIKING is
+    // retired but scrubbed too, so a stale shell variable cannot reach anything.
+    /METABOLOMICS|HINDSIGHT|OPENVIKING|INFERWEAVE|PI_GATEWAY_HEALTH/.test(key),
   );
   for (const key of optionalProviderKeys) {
     previous.set(key, process.env[key]);
@@ -418,6 +420,35 @@ test("an open superseded by session shutdown cannot repopulate the cache and the
   } finally {
     EngineeringRuntime.open = originalOpen;
     release();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent first requests for one repository share a single runtime open, and shutdown closes it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-eng-extension-single-open-"));
+  const originalOpen = EngineeringRuntime.open;
+  const opened: EngineeringRuntime[] = [];
+  let calls = 0;
+  try {
+    EngineeringRuntime.open = async (options) => {
+      calls++;
+      const runtime = await originalOpen.call(EngineeringRuntime, options);
+      opened.push(runtime);
+      return runtime;
+    };
+    const { commands, handlers } = loadHarness();
+    const first = commandContext(root);
+    const second = commandContext(root);
+    // Two callers race to the cold cache (at session start the panel and a session-control request do exactly this).
+    await Promise.all([
+      commands.get("mission-status")!.handler("", first.ctx),
+      commands.get("mission-status")!.handler("", second.ctx),
+    ]);
+    assert.equal(calls, 1, "the second caller must join the open already in flight, not start a duplicate runtime");
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, first.ctx);
+    assert.equal(opened.length, 1);
+  } finally {
+    EngineeringRuntime.open = originalOpen;
     await rm(root, { recursive: true, force: true });
   }
 });

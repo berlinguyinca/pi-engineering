@@ -112,6 +112,19 @@ describe(
       assert.equal(msgs[0].sender.id, "alice");
     });
 
+    it("log prints what the server holds, once, at each verbosity, and resumes after a sequence", async () => {
+      await runRoomCommand("say a line for the log", { agentDir: dir, newKey: () => "pi-room-live-log" });
+      const simple = await runRoomCommand("log", { agentDir: dir });
+      assert.equal(simple.level, "info", simple.text);
+      assert.equal((simple.text.match(/a line for the log/g) ?? []).length, 1, simple.text);
+      const last = /last sequence (\d+)/.exec(simple.text);
+      assert.ok(last, simple.text);
+      const expert = await runRoomCommand("log expert", { agentDir: dir });
+      assert.match(expert.text, /a line for the log.* #\d+ \S+/, expert.text);
+      const none = await runRoomCommand(`log --after ${last?.[1]}`, { agentDir: dir });
+      assert.match(none.text, /No simple events after sequence/, none.text);
+    });
+
     it("assign creates one task for the named agent; the live state and flow graph show it", async () => {
       const out = await runRoomCommand(`assign ${ready.agent_name} run the live check`, {
         agentDir: dir,

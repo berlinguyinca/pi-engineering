@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { emitRuntimeEvent, setRuntimeEventLog } from "../../src/runtime/isolation/runtimeEvents.ts";
 
@@ -45,7 +45,7 @@ test("runtime.jsonl rotates at the size cap", () => {
   try {
     for (let i = 0; i < 100; i++) emitRuntimeEvent("runtime.started", { n: i, pad: "x".repeat(50) });
     assert.ok(statSync(file).size <= 2000 + 300);
-    assert.ok(existsSync(`${file}.1`));
+    assert.ok(readdirSync(dirname(file)).some((n) => n.startsWith("runtime.jsonl.") && n.endsWith(".1")));
   } finally {
     setRuntimeEventLog(null);
     if (saved === undefined) delete process.env.PI_RUNTIME_LOG_MAX_BYTES;

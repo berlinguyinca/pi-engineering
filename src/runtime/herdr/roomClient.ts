@@ -15,6 +15,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { type HerdrConnection, loadHerdrConnection } from "./herdrConnection.ts";
+import { type RoomEvent, RoomFeed, VERBOSITIES, type Verbosity, renderEvent } from "./roomFeed.ts";
 
 const COLLAB = "/api/v1/collab";
 const REQUEST_TIMEOUT_MS = 8_000;
@@ -117,6 +118,10 @@ export class RoomClient {
 
   state(): Promise<Record<string, unknown>> {
     return this.call("GET", `${this.room("/state")}?since=-1&cursor=0&wait=0`);
+  }
+  /** One forward page of room events after `cursor` (server-global sequence; `next_cursor` resumes). */
+  events(cursor = 0, limit = 200): Promise<Record<string, unknown>> {
+    return this.call("GET", `${this.room("/events")}?cursor=${Math.max(0, Math.trunc(cursor))}&limit=${limit}`);
   }
   attention(): Promise<Record<string, unknown>> {
     return this.call("GET", this.room("/attention"));
@@ -222,7 +227,7 @@ export interface RoomCommandDeps extends RoomClientDeps {
 }
 
 const USAGE =
-  "/room [status] | /room say <text> | /room assign <agent> <text> | /room rooms   (add --room <id> to use another room)";
+  "/room [status] | /room say <text> | /room assign <agent> <text> | /room rooms | /room log [simple|activity|expert] [--after <sequence>]   (add --room <id> to use another room)";
 
 function resolveAgent(agents: Record<string, unknown>[], wanted: string): { id: string } | { error: string } {
   const w = wanted.toLowerCase();
@@ -288,6 +293,35 @@ export async function runRoomCommand(args: string, deps: RoomCommandDeps): Promi
             )
             .join("\n"),
         };
+      }
+      case "log": {
+        const level =
+          tail.find((w): w is Verbosity => (VERBOSITIES as readonly string[]).includes(w.toLowerCase())) ?? "simple";
+        const afterWord = tail.indexOf("--after");
+        const after = afterWord >= 0 ? Number(tail[afterWord + 1]) : 0;
+        if (!Number.isSafeInteger(after) || after < 0) return { level: "error", text: USAGE };
+        const feed = new RoomFeed(after);
+        const lines: string[] = [];
+        let cursor = after;
+        for (let page = 0; page < 20; page++) {
+          const body = await client.events(cursor);
+          const batch = arr(body.events);
+          for (const ev of batch) {
+            if (feed.accept(ev) !== "new") continue;
+            const line = renderEvent(ev as unknown as RoomEvent, level.toLowerCase() as Verbosity);
+            if (line) lines.push(line);
+          }
+          const next = typeof body.next_cursor === "number" ? body.next_cursor : feed.cursor;
+          if (body.has_more !== true || next <= cursor) break;
+          cursor = next;
+        }
+        if (!lines.length) return { level: "info", text: `No ${level} events after sequence ${after}.` };
+        const shown = lines.slice(-MAX_ROWS);
+        const head =
+          lines.length > shown.length
+            ? `(${lines.length - shown.length} earlier events not shown; use --after ${feed.cursor - 1})\n`
+            : "";
+        return { level: "info", text: `${head}${shown.join("\n")}\n(last sequence ${feed.cursor})` };
       }
       case "say": {
         if (!body) return { level: "error", text: USAGE };

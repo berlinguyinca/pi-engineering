@@ -11,16 +11,20 @@
 export type EventType =
   | "work_item.created"
   | "work_item.updated"
+  | "work_item.pr_linked"
   | "plan.created"
+  | "plan.recorded"
   | "task.created"
   | "task.ready"
   | "task.started"
   | "task.completed"
   | "task.blocked"
+  | "task.failed"
   | "task.updated"
   | "agent.started"
   | "agent.completed"
   | "agent.failed"
+  | "agent.heartbeat"
   | "incident.detected"
   | "candidate.created"
   | "candidate.changed"
@@ -72,6 +76,12 @@ export interface EventMeta {
   causation_id?: string;
   /** A second append with the same key returns the first event instead of writing again. */
   idempotency_key?: string;
+  /**
+   * The writer's authority epoch for this event's work item (a MissionStore lease generation).
+   * Enforced at append: a generation lower than one already recorded is rejected
+   * (LedgerAuthorityStaleError) and the event is not written.
+   */
+  authority_generation?: number;
 }
 
 export interface LedgerEvent extends EventMeta {
@@ -138,6 +148,43 @@ export type WorkItemStatus =
   | "NEEDS_HUMAN"
   | "BUDGET_EXHAUSTED";
 
+/** A GitHub pull request a work item produced or was handed (additive; recorded by `work_item.pr_linked`). */
+export interface WorkItemPrLink {
+  host: string;
+  owner: string;
+  repo: string;
+  number: number;
+  /** `https://<host>/<owner>/<repo>/pull/<n>`: the PR's canonical URL, derived from the four fields above. */
+  url_canonical: string;
+}
+
+/** One ordered step of a recorded plan: the Ledger task it became and its title (bounded). */
+export interface LedgerPlanStep {
+  task_id: string;
+  title: string;
+}
+
+/**
+ * A durable plan record (`plan.recorded`): which Ledger tasks a plan work item decomposed into, in order. Additive;
+ * revisions of one work item chain through `supersedes`. `id` is `<work_item_id>/<revision>`.
+ */
+export interface LedgerPlan {
+  id: string;
+  work_item_id: string;
+  /** 1-based, contiguous per work item. */
+  revision: number;
+  /** Hex sha256 over the ordered steps. Identical steps never mint a new revision. */
+  digest: string;
+  steps: LedgerPlanStep[];
+  /** Steps beyond the cap are counted here, not stored. */
+  total_steps: number;
+  /** An existing artifact-registry entry holding the plan, when the caller has one. */
+  artifact?: { id: string; version: string };
+  supersedes?: string;
+  superseded_by?: string;
+  recorded_at: string;
+}
+
 export interface WorkItem {
   id: string;
   goal: string;
@@ -148,6 +195,8 @@ export interface WorkItem {
   updated_at: string;
   current_candidate_id: string | null;
   incumbent_candidate_id: string | null;
+  /** Why completion was refused (set with status BLOCKED by the completion gate); cleared by a later status change. */
+  blocked_reason?: string | null;
 }
 
 export type CandidateStatus =
@@ -165,6 +214,10 @@ export interface Candidate {
   parent_id: string | null;
   status: CandidateStatus;
   base_commit: string;
+  /** Commit the candidate was last verified at; evidence recorded for another commit is stale. */
+  head_commit?: string;
+  /** Tree of `head_commit`, when the writer knows it. */
+  tree?: string;
   branch: string;
   worktree_path: string | null;
   producer_run_id: string | null;
@@ -192,6 +245,8 @@ export interface Task {
   risk: RiskLevel;
   /** Work item produced when this task was executed (via the engineer pipeline). */
   result_work_item_id: string | null;
+  /** Why the task was blocked, when a gate (not just a failed dependency) refused it. */
+  blocked_reason?: string | null;
 }
 
 export type EvidenceTrust = "authoritative" | "deterministic" | "observed" | "reviewed" | "unverified";
@@ -274,8 +329,17 @@ export interface Telemetry {
 
 /** Token/usage accounting for a single worker invocation. */
 export interface WorkerUsage {
-  input: number;
-  output: number;
+  /** Tokens the provider reported; null when it reported none (never 0 for "not reported"). */
+  input: number | null;
+  output: number | null;
+  /** Reasoning tokens: a SUBSET of `output`, null when not reported. */
+  thinking?: number | null;
+  /** input + output (thinking is already inside output); null when neither was reported. */
+  total?: number | null;
+  /** Compactions run during the task. */
+  compactions?: number;
+  /** Largest output allowance (max_tokens) a request of the task was sent with. */
+  maxTokens?: number | null;
   cacheRead: number;
   cacheWrite: number;
   cost: number;

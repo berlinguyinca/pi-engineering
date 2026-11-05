@@ -8,7 +8,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, w
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
@@ -179,7 +179,10 @@ test("transcript: size cap is honoured and rotated", async () => {
   await withRun("x".repeat(3000), { PI_WORKER_TRANSCRIPT_MAX_BYTES: "1500" }, (file) => {
     assert.ok(file);
     assert.ok(statSync(file).size <= 1500, `size ${statSync(file).size}`);
-    assert.ok(existsSync(`${file}.1`), "rotated predecessor kept");
+    assert.ok(
+      readdirSync(dirname(file)).some((n) => n.startsWith(`${basename(file)}.`) && n.endsWith(".1")),
+      "rotated predecessor kept (timestamped, never overwritten)",
+    );
   });
 });
 

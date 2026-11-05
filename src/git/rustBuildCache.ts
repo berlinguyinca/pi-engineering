@@ -18,9 +18,8 @@
  * variables are computed per spawned command and never exported to
  * `process.env`: a worker's own `bash` tool calls therefore get neither the
  * per-worktree target dir nor sccache, and build inside the worktree (the
- * janitor removes that with the worktree). Size is bounded by age only
- * (`PI_RUST_CACHE_MAX_AGE_DAYS`, default 30) plus removal with the worktree;
- * there is no byte cap.
+ * janitor removes that with the worktree). Idle generations are moved to the trash after
+ * `PI_RUST_CACHE_MAX_AGE_DAYS` (default 30); there is no byte cap.
  *
  * Each worktree gets its OWN target directory. Sharing one target directory
  * between worktrees is not safe: cargo identifies a workspace crate by its
@@ -33,9 +32,13 @@
  * inputs, so a second worktree's dependency build is a cache hit, not a
  * recompile. Nothing is installed by this module.
  *
- * Moving target dirs out of the worktrees keeps them in one place the
- * housekeeping sweep (`sweepRustCache`) expires by age, and the worktree
- * janitor removes a worktree's target dir together with the worktree.
+ * Moving target dirs out of the worktrees keeps them in one place. The
+ * housekeeping sweep (`sweepRustCache`) never deletes: it moves a generation
+ * dir to `<cache>/.trash/<ts>/` only when the runtime's ownership marker
+ * (`.pi-eng-rust-cache.json`) is present, it is idle and its worktree is gone;
+ * `/gc --purge-trash` is the only thing that removes trash. The cache root must
+ * carry `.pi-eng-rust-cache-root` (written on first use of an empty or older
+ * cache); any other directory named by `PI_RUST_CACHE_DIR` is refused.
  *
  * Operator intent always wins: an explicit `CARGO_TARGET_DIR`, `RUSTC_WRAPPER`
  * or `SCCACHE_DIR` in the environment is left untouched, `PI_RUST_CACHE_DIR`
@@ -44,10 +47,11 @@
 
 import { execFile } from "node:child_process";
 import { constants, accessSync, existsSync } from "node:fs";
-import { chmod, mkdir, readdir, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, rename, rmdir, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { abandonTrashEntry, createTrashEntry } from "./trashStore.ts";
 
 const exec = promisify(execFile);
 
@@ -111,22 +115,26 @@ export function rustCacheRoot(env: Env = process.env): string {
  * repository maps to one unscoped key.
  */
 export async function rustTargetKey(cwd: string): Promise<string> {
-  let commonDir: string;
-  let toplevel: string;
+  const identity = await repoIdentity(cwd);
+  if (!identity) return UNSCOPED_TARGET_KEY;
+  const { commonDir, toplevel } = identity;
+  // `<repo>/.git` for a normal repository; a bare repository is its own common dir.
+  const repoDir = basename(commonDir) === ".git" ? dirname(commonDir) : commonDir;
+  return join(`${sanitizeName(basename(repoDir))}-${shortHash(commonDir)}`, shortHash(toplevel));
+}
+
+async function repoIdentity(cwd: string): Promise<{ commonDir: string; toplevel: string } | null> {
   try {
     const r = await exec(
       "git",
       ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"],
       { timeout: 10_000 },
     );
-    [commonDir = "", toplevel = ""] = r.stdout.trim().split(/\r?\n/);
+    const [commonDir = "", toplevel = ""] = r.stdout.trim().split(/\r?\n/);
+    return commonDir && toplevel ? { commonDir, toplevel } : null;
   } catch {
-    return UNSCOPED_TARGET_KEY;
+    return null;
   }
-  if (!commonDir || !toplevel) return UNSCOPED_TARGET_KEY;
-  // `<repo>/.git` for a normal repository; a bare repository is its own common dir.
-  const repoDir = basename(commonDir) === ".git" ? dirname(commonDir) : commonDir;
-  return join(`${sanitizeName(basename(repoDir))}-${shortHash(commonDir)}`, shortHash(toplevel));
 }
 
 /**
@@ -226,17 +234,119 @@ export async function rustBuildEnv(cwd: string, env: Env = process.env): Promise
  */
 export async function withRustBuildEnv<T extends Env>(env: T, cwd: string): Promise<T> {
   const additions = await rustBuildEnv(cwd, env);
-  if (Object.keys(additions).length > 0) await ensurePrivateRoot(rustCacheRoot(env));
+  if (Object.keys(additions).length > 0) {
+    const root = rustCacheRoot(env);
+    // A root that is not ours (e.g. PI_RUST_CACHE_DIR pointing at a home or work dir) is never used:
+    // the build proceeds without the shared cache rather than scattering target dirs into it.
+    const check = await prepareRustCacheRoot(root);
+    if (!check.ok) {
+      warnRefusedRoot(root, check.reason);
+      return env;
+    }
+    if (additions.CARGO_TARGET_DIR) await markGeneration(additions.CARGO_TARGET_DIR, cwd);
+  }
   applyAdditions(env, additions);
   return env;
 }
 
-async function ensurePrivateRoot(root: string): Promise<void> {
+const warnedRoots = new Set<string>();
+
+/** One visible warning per root and process: without it a refused root silently disables the shared cache. */
+function warnRefusedRoot(root: string, reason: string): void {
+  if (warnedRoots.has(root)) return;
+  warnedRoots.add(root);
+  process.emitWarning(`the shared Rust cache is disabled: ${reason}`, { type: "PiRustCacheWarning" });
+}
+
+/** Marks the cache root as pi-engineering's. A root without it is refused (see `prepareRustCacheRoot`). */
+export const RUST_CACHE_ROOT_MARKER = ".pi-eng-rust-cache-root";
+/** Marks one generation dir (`target/<repo>/<worktree>`) as created by the runtime; only marked ones are swept. */
+export const RUST_CACHE_GENERATION_MARKER = ".pi-eng-rust-cache.json";
+/** Entries a root may hold and still be adopted (a cache created before the root marker existed). */
+const ADOPTABLE_ROOT_ENTRIES = new Set(["target", "sccache", ".trash", RUST_CACHE_ROOT_MARKER]);
+
+export type RustCacheRootCheck = { ok: true } | { ok: false; reason: string };
+
+export async function hasRootMarker(root: string): Promise<boolean> {
+  const file = join(root, RUST_CACHE_ROOT_MARKER);
+  if (!(await lstat(file).catch(() => null))?.isFile()) return false;
   try {
-    await mkdir(root, { recursive: true, mode: 0o700 });
-    await chmod(root, 0o700);
+    return (JSON.parse(await readFile(file, "utf8")) as { creator?: unknown }).creator === "pi-engineering";
   } catch {
-    /* a read-only or foreign root only costs the cache, not the build */
+    return false;
+  }
+}
+
+/**
+ * Make `root` usable as the cache root, or say why not. A missing or empty root
+ * (or an older cache holding only `target/` and `sccache/`) gets the root marker
+ * written on first use; any other directory without the marker is refused, so a
+ * misconfigured `PI_RUST_CACHE_DIR` can never turn a user directory into a cache.
+ */
+export async function prepareRustCacheRoot(root: string): Promise<RustCacheRootCheck> {
+  try {
+    if (!(await hasRootMarker(root))) {
+      const entries = await readdir(root).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return [] as string[];
+        throw error;
+      });
+      if (!entries.every((e) => ADOPTABLE_ROOT_ENTRIES.has(e))) {
+        return {
+          ok: false,
+          reason: `${root} is not a pi-engineering Rust cache (no ${RUST_CACHE_ROOT_MARKER} marker and it holds other files); refusing to use or sweep it`,
+        };
+      }
+      await mkdir(root, { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(root, RUST_CACHE_ROOT_MARKER),
+        `${JSON.stringify({ version: 1, creator: "pi-engineering" })}\n`,
+        { flag: "wx" },
+      ).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      });
+    }
+    await chmod(root, 0o700);
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `${root} is unusable as a Rust cache: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+interface GenerationMarker {
+  version: 1;
+  creator: "pi-engineering";
+  worktreePath: string;
+  createdAt: string;
+}
+
+async function markGeneration(dir: string, cwd: string): Promise<void> {
+  try {
+    const identity = await repoIdentity(cwd);
+    if (!identity) return; // the shared `_shared` fallback dir belongs to no one checkout: never marked, never swept
+    await mkdir(dir, { recursive: true });
+    const marker: GenerationMarker = {
+      version: 1,
+      creator: "pi-engineering",
+      worktreePath: identity.toplevel,
+      createdAt: new Date().toISOString(),
+    };
+    await writeFile(join(dir, RUST_CACHE_GENERATION_MARKER), `${JSON.stringify(marker)}\n`, { flag: "wx" });
+  } catch {
+    /* EEXIST is the normal case; a failed mark only leaves the dir unswept, which is the safe side */
+  }
+}
+
+async function readGenerationMarker(dir: string): Promise<GenerationMarker | null> {
+  const file = join(dir, RUST_CACHE_GENERATION_MARKER);
+  if (!(await lstat(file).catch(() => null))?.isFile()) return null;
+  try {
+    const parsed = JSON.parse(await readFile(file, "utf8")) as Partial<GenerationMarker>;
+    return parsed.version === 1 && parsed.creator === "pi-engineering" ? (parsed as GenerationMarker) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -246,13 +356,16 @@ function applyAdditions(env: Env, additions: RustBuildEnv): void {
   }
 }
 
-/** Days a per-repository target dir may go unused before the sweep removes it. */
+/** Days a per-worktree target dir may go unused before the sweep moves it to the trash. */
 export const RUST_CACHE_MAX_AGE_DAYS_ENV = "PI_RUST_CACHE_MAX_AGE_DAYS";
 export const DEFAULT_RUST_CACHE_MAX_AGE_DAYS = 30;
 
 export interface RustCacheSweepReport {
-  removed: Array<{ path: string; idleDays: number }>;
-  kept: Array<{ path: string; idleDays: number }>;
+  /** Generation dirs moved (or, in a dry run, that would be moved) to `<cache>/.trash`. Never deleted. */
+  trashed: Array<{ path: string; idleDays: number; trashedTo?: string }>;
+  kept: Array<{ path: string; idleDays: number; reason: string }>;
+  /** Why the whole sweep did nothing (cache root not ours). */
+  refused?: string;
   dryRun: boolean;
 }
 
@@ -279,40 +392,110 @@ async function targetLastActivity(dir: string): Promise<number> {
 }
 
 /**
- * Remove per-worktree target dirs under the cache root that no build has
- * touched for `maxAgeMs`, and repository dirs left empty by that. Everything
- * there is derived output, so a wrong guess costs one cold build, never data.
- * Worktrees removed outside the janitor, and repositories that were deleted
- * or moved, leave target dirs behind; this is what collects them.
+ * Move idle per-worktree target dirs out of the cache into `<cache>/.trash/<ts>/`.
+ * Nothing is deleted here (only `/gc --purge-trash` deletes). A generation is
+ * moved only when it carries the runtime's ownership marker, has been idle for
+ * `maxAgeMs`, and its worktree is gone (the marker's recorded checkout no longer
+ * exists and it is not in `liveTargetDirs`). Unmarked dirs (created before the
+ * marker existed, or by anyone else) are kept and reported. A cache root without
+ * the root marker is refused outright.
  */
 export async function sweepRustCache(
-  opts: { env?: Env; maxAgeMs?: number; dryRun?: boolean; now?: () => number } = {},
+  opts: {
+    env?: Env;
+    maxAgeMs?: number;
+    dryRun?: boolean;
+    now?: () => number;
+    /** Target dirs of worktrees known to be live; never moved. */
+    liveTargetDirs?: ReadonlySet<string>;
+  } = {},
 ): Promise<RustCacheSweepReport> {
   const env = opts.env ?? process.env;
-  const report: RustCacheSweepReport = { removed: [], kept: [], dryRun: Boolean(opts.dryRun) };
+  const report: RustCacheSweepReport = { trashed: [], kept: [], dryRun: Boolean(opts.dryRun) };
   if (!rustCacheEnabled(env)) return report;
-  const targets = join(rustCacheRoot(env), "target");
+  const root = rustCacheRoot(env);
+  if (!(await stat(root).catch(() => null))) return report;
+  if (!(await hasRootMarker(root))) {
+    // An older cache is adopted (marker only, nothing moved); anything else is refused.
+    const check = opts.dryRun ? await classifyRoot(root) : await prepareRustCacheRoot(root);
+    if (!check.ok) return { ...report, refused: check.reason };
+  }
+  const targets = join(root, "target");
   const now = opts.now?.() ?? Date.now();
   const maxAge = opts.maxAgeMs ?? rustCacheMaxAgeMs(env);
   for (const repoName of await readdir(targets).catch(() => [] as string[])) {
     const repoDir = join(targets, repoName);
-    if (!(await stat(repoDir).catch(() => null))?.isDirectory()) continue;
-    const children = await readdir(repoDir).catch(() => [] as string[]);
-    let remaining = children.length;
-    for (const name of children) {
+    const repoStat = await lstat(repoDir).catch(() => null);
+    if (!repoStat?.isDirectory()) continue;
+    let leftBehind = 0;
+    for (const name of await readdir(repoDir).catch(() => [] as string[])) {
       const dir = join(repoDir, name);
-      if (!(await stat(dir).catch(() => null))?.isDirectory()) continue;
-      const idleMs = now - (await targetLastActivity(dir));
-      const idleDays = Math.round(idleMs / 86_400_000);
-      if (idleMs < maxAge) {
-        report.kept.push({ path: dir, idleDays });
+      if (!(await lstat(dir).catch(() => null))?.isDirectory()) {
+        leftBehind++;
         continue;
       }
-      if (!opts.dryRun) await rm(dir, { recursive: true, force: true });
-      report.removed.push({ path: dir, idleDays });
-      remaining--;
+      const idleMs = now - (await targetLastActivity(dir));
+      const idleDays = Math.round(idleMs / 86_400_000);
+      const keep = async (reason: string) => {
+        leftBehind++;
+        report.kept.push({ path: dir, idleDays, reason });
+      };
+      const marker = await readGenerationMarker(dir);
+      if (!marker) {
+        await keep(`no ${RUST_CACHE_GENERATION_MARKER} ownership marker (not provably created by pi-engineering)`);
+        continue;
+      }
+      if (idleMs < maxAge) {
+        await keep(`active ${idleDays} d ago`);
+        continue;
+      }
+      if (opts.liveTargetDirs?.has(dir)) {
+        await keep("referenced by a live worktree");
+        continue;
+      }
+      if (!marker.worktreePath) {
+        await keep("its marker records no worktree path, so whether its worktree still exists is unknown");
+        continue;
+      }
+      if (await stat(marker.worktreePath).catch(() => null)) {
+        await keep(`its worktree ${marker.worktreePath} still exists`);
+        continue;
+      }
+      if (opts.dryRun) {
+        report.trashed.push({ path: dir, idleDays });
+        continue;
+      }
+      const entry = await createTrashEntry(
+        join(root, ".trash"),
+        "rust-cache",
+        { name: `${repoName}--${name}`, from: dir },
+        now,
+      ).catch(() => null);
+      if (!entry) {
+        await keep("could not create a trash entry");
+        continue;
+      }
+      try {
+        await rename(dir, entry.dest);
+        report.trashed.push({ path: dir, idleDays, trashedTo: entry.dest });
+      } catch (error) {
+        await abandonTrashEntry(entry);
+        await keep(`could not move it to the trash: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
-    if (remaining === 0 && !opts.dryRun) await rm(repoDir, { recursive: true, force: true }).catch(() => {});
+    // An emptied repository dir is removed with rmdir: it fails, and does nothing, if anything is left in it.
+    if (leftBehind === 0 && !opts.dryRun) await rmdir(repoDir).catch(() => {});
   }
   return report;
+}
+
+/** Dry-run twin of `prepareRustCacheRoot`: same verdict, writes nothing. */
+async function classifyRoot(root: string): Promise<RustCacheRootCheck> {
+  const entries = await readdir(root).catch(() => [] as string[]);
+  return entries.every((e) => ADOPTABLE_ROOT_ENTRIES.has(e))
+    ? { ok: true }
+    : {
+        ok: false,
+        reason: `${root} is not a pi-engineering Rust cache (no ${RUST_CACHE_ROOT_MARKER} marker and it holds other files); refusing to use or sweep it`,
+      };
 }
