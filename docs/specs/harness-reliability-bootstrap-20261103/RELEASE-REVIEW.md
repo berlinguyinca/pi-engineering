@@ -134,10 +134,22 @@ In order — 1 and 2 are the gate; 3 is the audit that tells you whether the res
   `nameWithOwner=berlinguyinca/pi-engineering`, and a push to the old URL lands in the new one.
   Nothing to decide — but records and docs should cite `pi-engineering`, since the old name only
   survives as a redirect. **[now]**
-- This unit is pushed as `fix/handoff-lineage-reachability` with **PR #603** against
-  `harness-reliability-bootstrap-20261103`, the base PRs #600 and #601 use. `main` is untouched.
-  The rest of the chain still has **85 commits ahead of `origin/main`** and is unmerged, which is
-  consistent with the verdict above rather than an accident waiting to be fixed.
+- **Merged, and what that merge does and does not mean.** This unit landed as **PR #603**
+  (`e513ff60`, merged 2026-11-05) against `harness-reliability-bootstrap-20261103`, the base PRs
+  #600 and #601 use; #600 landed alongside it. `main` is untouched. Both gates were re-run against
+  the **merged** chain tip, not just the branch, and pass there: `healthy=244 nullDeclared=12
+  broken=29` and `505/505 evidence paths`, exit 0 each.
+  A model reviewed the diff before the merge (PR comment `#issuecomment-6670235815`), found three
+  defects in the gate itself, and they were fixed and reproduced — see `AUDIT/lineage-scan.mjs`
+  header for the `refs/stash` case. **That review is not G6.** It is a model reading a model's
+  work, labelled as such in the comment, and no `approved` flag, record, or manifest was changed to
+  imply otherwise. G6 above still reads **not met**, and this review's verdict still stands:
+  **not releasable.**
+  Deleting the merged `fix/handoff-lineage-reachability` branch is safe for this unit's own
+  invariant — measured, not assumed: **0** of the 244 pointers are carried solely by it, so no
+  declared pointer loses its last carrier. Do that measurement (`AUDIT/lineage-scan.mjs` plus
+  `for-each-ref --contains`) before deleting any chain branch, because a branch can be the only ref
+  carrying a pointer this audit depends on.
 - The tracked manifest carries **no `status` and no accepted-sha field** on any of its 51 tasks, so
   accepted/rejected state lives only in the conductor's working copy. Whether that state becomes
   tracked data is a design decision.
