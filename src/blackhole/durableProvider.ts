@@ -48,8 +48,8 @@ export interface DurableMemoryProvider {
   retain?(record: DurableMemoryRecord): Promise<RetainResult>;
   /** Optional: stable cache-key component (scopes + revision epoch) for recall caching. */
   cacheScope?(): string;
-  /** Optional strict health probe: resolves to the saved count, rethrows transport failures (unlike best-effort reads). */
-  probe?(): Promise<number>;
+  /** Strict health probe: exact saved count, or null when bounded enumeration is truncated; throws on failure. */
+  probe?(): Promise<number | null>;
 }
 
 /** Dependency-free in-memory durable store (default provider). */

@@ -366,11 +366,11 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       retryAfter = 0;
       if (explicit) clearRecall();
       readinessDone = true;
-      setStatus(ctx, `ready · ${saved} saved`);
+      setStatus(ctx, saved === null ? "ready · count unknown" : `ready · ${saved} saved`);
       if (explicit)
         reply(
           ctx,
-          `Memory connection verified: ${saved} saved note(s). /remember <text> saves an explicit note; /memory <query> searches.`,
+          `Memory connection verified: ${saved === null ? "saved count unknown" : `${saved} saved note(s)`}. /remember <text> saves an explicit note; /memory <query> searches.`,
         );
     } catch (error) {
       // A failed readiness check still counts as having been attempted: the next

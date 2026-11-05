@@ -78,7 +78,12 @@ test("probe reports the list endpoint's exact total, not a recall estimate", asy
   // never the bank's size.
   const r = recorder((a) =>
     a[0] === "documents"
-      ? ok({ total: a.includes("global") ? 3 : 28, total_is_estimate: false, documents: [] })
+      ? ok({
+          bank_id: a.includes("global") ? "herdr-global" : "canary-facts",
+          total: a.includes("global") ? 3 : 28,
+          total_is_estimate: false,
+          documents: [],
+        })
       : ok({ results: [] }),
   );
   const p = new HindsightDurableMemory({ run: r.run, scopes: ["project", "global"] });
@@ -87,17 +92,17 @@ test("probe reports the list endpoint's exact total, not a recall estimate", asy
   assert.equal(r.calls.filter((a) => a[0] === "recall").length, 0);
 });
 
-test("probe falls back to the overview recall when no list count can be trusted", async () => {
+test("probe enumerates rather than inventing a semantic query when list totals are estimates", async () => {
   const r = recorder((a) =>
     a[0] === "documents"
-      ? ok({ total: 12, total_is_estimate: true, documents: [] })
+      ? ok({ bank_id: "canary-facts", total: 12, total_is_estimate: true, documents: [] })
       : ok({ results: [row("m1", "fact one"), row("m2", "fact two")] }),
   );
   const p = new HindsightDurableMemory({ run: r.run });
-  assert.equal(await p.probe(), 2, "an estimated total is not a count");
+  assert.equal(await p.probe(), 0, "an empty document list is healthy; an estimated total is not an exact count");
   assert.equal(
     r.calls.some((a) => a[0] === "recall"),
-    true,
+    false,
   );
 });
 
@@ -107,10 +112,17 @@ test("no read ever sends a wildcard, which the service rejects", async () => {
   // against a healthy service, backed automatic recall off, and the bank looked empty.
   const r = recorder((a) =>
     a[0] === "documents"
-      ? ok({ total: 4, total_is_estimate: false, documents: [] })
-      : ok({ results: [row("m1", "project uses pnpm")] }),
+      ? ok({
+          bank_id: "herdr-global",
+          total: 4,
+          total_is_estimate: false,
+          documents: [{ address: "m1", status: "verified" }],
+        })
+      : a[0] === "get"
+        ? ok(row("m1", "project uses pnpm"))
+        : ok({ results: [row("m1", "project uses pnpm")] }),
   );
-  const p = new HindsightDurableMemory({ run: r.run });
+  const p = new HindsightDurableMemory({ run: r.run, scopes: ["global"] });
   assert.equal(await p.probe(), 4);
   assert.equal((await p.recallAll()).length, 1);
   assert.equal((await p.search("pnpm")).length, 1);
@@ -293,4 +305,21 @@ test("interactive: /remember persisted reports saved; rejected does not", async 
   f.notices.length = 0;
   await f.commands.get("remember")!.handler("note two", f.ctx);
   assert.ok(!f.notices.some((n) => /^Saved/.test(n)));
+});
+
+test("interactive: a truncated listing stays ready with count unknown, not a fake total", async () => {
+  const r = recorder((args) => {
+    const limit = Number(args[args.indexOf("--limit") + 1]);
+    const offset = Number(args[args.indexOf("--offset") + 1]);
+    return ok({
+      bank_id: "herdr-global",
+      documents: Array.from({ length: limit }, (_, i) => ({ address: `mem-${offset + i}`, status: "verified" })),
+      total: 100,
+      total_is_estimate: true,
+    });
+  });
+  const f = interactive(new HindsightDurableMemory({ scopes: ["global"], run: r.run }));
+  await f.commands.get("memory")!.handler("status", f.ctx);
+  assert.match(f.notices.join("\n"), /count unknown/);
+  assert.doesNotMatch(f.notices.join("\n"), /50 saved/);
 });
