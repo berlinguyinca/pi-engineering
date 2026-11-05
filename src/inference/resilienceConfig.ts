@@ -221,3 +221,18 @@ export function resolveInferenceResilienceConfig(
   if (cfg.circuitFailures < 1) cfg.circuitFailures = 1;
   return cfg;
 }
+
+/**
+ * Status lines for the switches whose value could not be read.
+ *
+ * A mistyped disable resolves to the documented default, which is safe but
+ * silent, and silence is how an operator ends up believing `diable` armed
+ * something when it armed nothing. Every entry point that resolves this config
+ * renders through this one function so the wording is identical wherever it
+ * surfaces.
+ */
+export function describeUnparseableSwitches(config: InferenceResilienceConfig): string[] {
+  return (config.unparseableSwitches ?? []).map(
+    (entry) => `unrecognized inference-resilience switch ${entry} · the default is in force`,
+  );
+}
