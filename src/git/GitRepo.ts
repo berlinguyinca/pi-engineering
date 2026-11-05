@@ -20,7 +20,7 @@ import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
 import { compactStamp } from "../runtime/rotateFile.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { readOwnerMarker, writeOwnerMarker } from "./ownerMarker.ts";
-import { safeGit } from "./safeGit.ts";
+import { discoverRepo, safeGit } from "./safeGit.ts";
 import { shortHash } from "./shortHash.ts";
 import { shellQuote } from "./trashStore.ts";
 import { removalBlockers } from "./worktreeSafety.ts";
@@ -233,6 +233,48 @@ export function forgetOpenCache(): void {
  * git; it wraps the commands the vertical slice needs: repo detection, worktree
  * creation, diff capture, commit, and status.
  */
+/**
+ * Verify git's answer to `rev-parse --path-format=absolute --git-common-dir`.
+ *
+ * safeGit runs git with `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` pointed at Pi's shadow
+ * administration state (see safeGit.ts). When that state and the repository are not represented by
+ * the same path string, git resolves one against the other and the answer comes back with the
+ * physical prefix applied twice — on macOS, where `/var` is a symlink to `/private/var`,
+ * `/private/private/var/...` — a path that does not exist. Measured at 4ffa82f3: `commonDir()`
+ * returned the doubled path while a plain `git -C <repo> rev-parse ...` in the same process returned
+ * the right one. The upstream root cause (a state dir kept unresolved while repositories are
+ * discovered through `realpathSync`) is fixed by 61394da7 (#582); this is the consumer-side half of
+ * the contract. It matters because everything derived from the answer — the administration lock
+ * directory, the candidate state directory, the checkpoint journal — fails its mkdir with ENOENT,
+ * and `withWorktreeSection` reads ENOENT as "the other process's lock is not there yet" and queues
+ * until `promotionWait.ceilingMs`, so a repository lookup can wait ten minutes and report nothing.
+ *
+ * A reported directory that exists is returned untouched: it is usually Pi's shadow common dir,
+ * which only git knows. A reported path that does not exist is replaced by the layout resolved from
+ * the filesystem — the same realpath'd discovery Pi uses to decide what it may touch. When neither
+ * resolves, the error names the impossible path rather than letting a caller mkdir it.
+ */
+export async function resolveCommonDir(reported: string, repoRoot: string): Promise<string> {
+  const present = async (path: string): Promise<boolean> => {
+    try {
+      await lstat(path);
+      return true;
+    } catch (error) {
+      // Only ENOENT/ENOTDIR mean absent; EACCES, ESTALE, EIO ... say nothing about the layout and
+      // must not be mistaken for a path that git invented.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
+      throw error;
+    }
+  };
+  if (await present(reported)) return reported;
+  const layout = discoverRepo(repoRoot);
+  if (layout !== null && layout !== "invalid" && (await present(layout.commonDir))) return layout.commonDir;
+  throw new Error(
+    `git reported the common directory ${reported}, which does not exist, and the layout under ${repoRoot} resolves to nothing usable; the repository's git administration state is unreachable`,
+  );
+}
+
 export class GitRepo {
   private readonly cwd: string;
   private readonly repoRoot: string;
@@ -398,7 +440,7 @@ export class GitRepo {
   async commonDir(): Promise<string> {
     const r = await this.git(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     if (r.code !== 0) throw new Error(`git common directory lookup failed: ${r.stderr}`);
-    return r.stdout;
+    return resolveCommonDir(r.stdout, this.repoRoot);
   }
 
   private async candidateStateDir(create = true): Promise<string> {
