@@ -242,10 +242,32 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   }
 
   /**
+   * Exact count for one scope from the list endpoint, or null when it cannot be trusted.
+   *
+   * `documents` is the only honest count the service offers: it answers
+   * `{"total":28,"total_is_estimate":false,…}` (observed live, project `canary`), while a
+   * recall-based count is bounded by the query and the result cap. It takes a single
+   * `--scope`, so totals are summed across the configured scopes; a refused scope or an
+   * older client without the subcommand yields null and the caller falls back to the probe.
+   */
+  private async scopeTotal(scope: string): Promise<number | null> {
+    try {
+      const out = await this.call(["documents", "--kind", "fact", "--scope", scope, "--limit", "1"]);
+      return out.total_is_estimate === false && typeof out.total === "number" ? out.total : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Strict health probe for /memory and startup status: unlike the best-effort
    * reads it rethrows the HindsightError, so a missing CLI is not "0 saved".
    */
   async probe(): Promise<number> {
+    const totals = await Promise.all(this.scopes.map((s) => this.scopeTotal(s)));
+    if (totals.every((t): t is number => t !== null)) return totals.reduce((a, b) => a + b, 0);
+    // No usable list count (older client, refused scope): fall back to what the bank
+    // recalls for the overview query. That number is a probe, not a total.
     return (await this.recallStrict(OVERVIEW_QUERY, 50)).length;
   }
 
@@ -355,6 +377,16 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
     }
   }
 
+  /**
+   * Ask for a tombstone.
+   *
+   * NOT a confirmation that anything was deleted: the service accepts a tombstone for an id
+   * it has never seen and answers `{"state":"delivered","outcome":"persisted",…}` with exit 0
+   * (observed live with `mem-0000…`). A future `/forget` must resolve "forgotten / nothing
+   * with that id / could not ask" before it reports anything to the user — `get <id>` answers
+   * `{"error":"Memory not found"}` with exit 1, so the three states are distinguishable, but
+   * this boolean is not.
+   */
   async forget(memoryId: string): Promise<boolean> {
     try {
       await this.call(["forget", memoryId]);

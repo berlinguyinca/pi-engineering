@@ -72,22 +72,54 @@ test("search passes scope, max-results and --timeout-ms; maps records", async ()
   );
 });
 
-test("the overview reads never send a wildcard, which the service rejects", async () => {
+test("probe reports the list endpoint's exact total, not a recall estimate", async () => {
+  // `documents` answers {"total":28,"total_is_estimate":false} per scope (observed live);
+  // a recall-based count is bounded by the query and the cap, so "/memory: N saved" was
+  // never the bank's size.
+  const r = recorder((a) =>
+    a[0] === "documents"
+      ? ok({ total: a.includes("global") ? 3 : 28, total_is_estimate: false, documents: [] })
+      : ok({ results: [] }),
+  );
+  const p = new HindsightDurableMemory({ run: r.run, scopes: ["project", "global"] });
+  assert.equal(await p.probe(), 31);
+  assert.equal(r.calls.filter((a) => a[0] === "documents").length, 2, "one list call per scope");
+  assert.equal(r.calls.filter((a) => a[0] === "recall").length, 0);
+});
+
+test("probe falls back to the overview recall when no list count can be trusted", async () => {
+  const r = recorder((a) =>
+    a[0] === "documents"
+      ? ok({ total: 12, total_is_estimate: true, documents: [] })
+      : ok({ results: [row("m1", "fact one"), row("m2", "fact two")] }),
+  );
+  const p = new HindsightDurableMemory({ run: r.run });
+  assert.equal(await p.probe(), 2, "an estimated total is not a count");
+  assert.equal(
+    r.calls.some((a) => a[0] === "recall"),
+    true,
+  );
+});
+
+test("no read ever sends a wildcard, which the service rejects", async () => {
   // Observed live (project `canary`): `recall "*"` -> HTTP 422, exit 1, and an empty query
   // fails client-side. A readiness probe built on "*" reported "exited unsuccessfully"
   // against a healthy service, backed automatic recall off, and the bank looked empty.
-  const r = recorder(() => ok({ results: [row("m1", "project uses pnpm")], degraded: false, offline: false }));
+  const r = recorder((a) =>
+    a[0] === "documents"
+      ? ok({ total: 4, total_is_estimate: false, documents: [] })
+      : ok({ results: [row("m1", "project uses pnpm")] }),
+  );
   const p = new HindsightDurableMemory({ run: r.run });
-  assert.equal(await p.probe(), 1);
+  assert.equal(await p.probe(), 4);
   assert.equal((await p.recallAll()).length, 1);
-  assert.equal(r.calls.length, 2);
-  for (const a of r.calls) {
-    assert.equal(a[0], "recall");
+  assert.equal((await p.search("pnpm")).length, 1);
+  for (const a of r.calls.filter((x) => x[0] === "recall")) {
     const query = a[1]!;
     assert.ok(query.trim().length > 0 && query.trim() !== "*", "a non-wildcard query is required");
   }
+  assert.ok(r.calls.length >= 3, "the three reads all ran");
 });
-
 test("superseded/retracted results are never surfaced", async () => {
   const r = recorder(() =>
     ok({ results: [row("a", "x", { status: "superseded" }), row("b", "y", { status: "retracted" }), row("c", "z")] }),

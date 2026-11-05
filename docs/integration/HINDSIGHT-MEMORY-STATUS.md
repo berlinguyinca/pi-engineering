@@ -71,9 +71,47 @@ Two details are load-bearing and easy to undo by accident:
   hung client produces the notice.
 - `test/unit/hindsight-settings.test.ts` — `automatic_recall_ms` in the YAML surface.
 
+## Second pass: counts, the write path, and workers (2026-11-05)
+
+Probing the service's own surface (read-only, plus argument-shape probes that persist
+nothing) turned up four more contract facts.
+
+**`documents` is the list endpoint, and it is the only honest count.**
+`documents --kind fact --scope project --limit 1` answers
+`{"bank_id":"canary-facts","total":28,"total_is_estimate":false,…}`. `--kind` selects
+fact-vs-summary, not the record kind (the rows carry `kind: preference`, `verified`, …).
+`probe()` now sums that per configured scope and falls back to the overview recall only
+when no list count can be trusted (`total_is_estimate` true, refused scope, older client).
+Live: `["project"]` → 31, `["project","global"]` → 34, 250–290 ms for both scopes in
+parallel. So `/memory`'s "N saved" is the bank's size, not a recall sample.
+
+**The evidence gate is real and pi satisfies it.** `retain` without `--evidence` answers
+`{"error":"Durable facts require explicit save intent or evidence references","outcome":"rejected"}`.
+`/remember` satisfies it with `--evidence user-request:<uuid>`; pi never passes
+`--explicit`, which the message offers as the alternative.
+
+**`forget` is not a confirmation.** A tombstone for an id the service has never seen is
+accepted: `forget mem-0000…` → `{"state":"delivered","outcome":"persisted",…}`, exit 0.
+So `HindsightDurableMemory.forget()` returning `true` means "delivered", never "a memory
+was deleted". `get <id>` distinguishes the states (`{"error":"Memory not found"}`, exit 1),
+which is what a future `/forget` command must consult before it claims anything — recorded
+on `forget()` itself, because there is no caller to fix yet.
+
+**`correct` takes `memory_id text --evidence …`** as pi sends it; an unknown id answers
+`{"error":"Memory not found","outcome":"rejected"}`.
+
+**Worker hydration's cap was unreachable, so workers never got memory.**
+`HYDRATE_CAP_MS` was 250 ms against a 0.4–4.9 s client, and the deadline path also pauses
+the provider — so the first slow read silenced memory for a minute per process. It is now
+1200 ms, matching the interactive in-turn budget, and still bounded and fail-open.
+
 ## Not covered here
 
-- The write path (`retain` / `/remember` / `correct` / `forget`) has not been exercised
-  against the live service — only reads. A live write test must name a throwaway project.
-- Worker hydration keeps its own 250 ms cap (`HYDRATE_CAP_MS` in `BlackholeManager.ts`):
-  a worker run is not a human waiting on a turn, and its fail-open silence is intended.
+- **The write round-trip is still unproven live.** `--project pi-write-probe` is refused
+  with `{"error":"Unknown configured project"}`: projects and per-harness credentials are
+  provisioned server-side (`~/.config/herdr-memory/config.json` lists `canary` only), so
+  there is no sandbox to write into. `retain`/`correct` have been verified for argument
+  shape and rejection paths only — never for an accepted write and its read-back — because
+  doing that would write into a real bank other harnesses read.
+- `forget` cannot report "nothing with that id existed" through its `boolean` return; see
+  above. Resolving that is a prerequisite for a `/forget` command, not a bug on its own.
