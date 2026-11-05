@@ -103,7 +103,9 @@ test("hung CLI: hydrate is capped, and a second run inside the backoff makes no 
     });
     const t0 = Date.now();
     assert.deepEqual(await mgr.hydrate("wi-1 implementer task one", 10), []);
-    assert.ok(Date.now() - t0 < 1000, `hydrate took ${Date.now() - t0} ms`);
+    // The cap is the interactive in-turn budget (1200 ms) plus the wrapper's margin; a
+    // 250 ms cap was below the client's 0.4 s floor, so a worker never got memory.
+    assert.ok(Date.now() - t0 < 1600, `hydrate took ${Date.now() - t0} ms`);
     assert.equal(f.calls().length, 1);
     const t1 = Date.now();
     assert.deepEqual(await mgr.hydrate("wi-2 implementer task two", 10), []);

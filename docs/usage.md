@@ -1593,7 +1593,8 @@ passed through secret redaction first and secret-looking tokens are dropped (a q
 that is only a secret makes no call). Notes are only written by `/remember`.
 After a timeout or failure, searches pause (`failure_backoff_ms`, or
 `unavailable_backoff_ms` for a missing CLI) for the interactive hooks and worker runs
-alike; worker runs wait at most 250 ms for memory.
+alike; worker runs wait at most 1200 ms for memory (the same budget as an
+interactive turn — the CLI's 0.4 s floor made a shorter cap unreachable).
 
 **Repository config is untrusted.** The global `engineering.yaml` is authoritative. A
 repository's `.pi/engineering.yaml` can only opt **out** (`enabled: false`) or **narrow**

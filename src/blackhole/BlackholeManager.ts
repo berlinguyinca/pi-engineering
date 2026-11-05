@@ -350,8 +350,17 @@ async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T
   }
 }
 
-/** Longest a worker run waits for CLI-backed durable memory (matches the interactive lookup cap). */
-const HYDRATE_CAP_MS = 250;
+/**
+ * Longest a worker run waits for CLI-backed durable memory.
+ *
+ * This mirrors the interactive in-turn budget (`memory.hindsight.automatic_recall_ms`,
+ * default 1200 ms), and it has to: a healthy `herdr-memory` call measures 0.4-4.9 s, so the
+ * 250 ms this used to cap at was unreachable — a worker never got memory, and the provider's
+ * failure pause (triggered by the deadline) then silenced it for a minute per process. A
+ * worker run takes minutes; one bounded 1.2 s read per hydration is not what "outage must
+ * not block engineering work" is protecting against, and the bound still degrades to empty.
+ */
+const HYDRATE_CAP_MS = 1_200;
 
 export function buildDurableProvider(cfg: import("./types.ts").DurableStoreConfig): DurableMemoryProvider {
   switch (cfg.kind) {
