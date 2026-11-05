@@ -1,0 +1,49 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "X02",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "75a2c8e95be61ccbe74eb62314726a3ed10a2f0a",
+ "resultSha": "d79f2e7fd4c3140cdc246dcb06ad01e7fb9de9d6",
+ "taskAuthorityHash": "sha256:fa90432e75e0236fc203dc14721539e933a2a9ed527a80f8bf08e0e6106cd75e",
+ "changedFiles": [
+  "scripts/bench-task-drift.ts",
+  "test/fixtures/harness-drift/tasks.json",
+  "test/unit/bench-task-drift.test.ts"
+ ],
+ "commands": [
+  {
+   "command": "npm run typecheck",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/01-npm-run-typecheck-.txt"
+  },
+  {
+   "command": "node --experimental-strip-types scripts/bench-task-drift.ts",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/02-node-experimental-strip-type.txt"
+  },
+  {
+   "command": "node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts test/unit/aps-task-alignment.test.ts",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/03-node-test-import-test-suppor.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/01-npm-run-typecheck-.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/02-node-experimental-strip-type.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/X02/logs/03-node-test-import-test-suppor.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/X02/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/X02/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/X02/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "X03",
+ "nextBaseSha": "bbbcdbb67dd5ba370b83e909063f64ccc796a0a3",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Companion to X01. With declaredArtifacts in test/fixtures/harness-drift/tasks.json, scripts/bench-task-drift.ts scores the corpus it plants: precision 1.0, recall 1.0 (3 true positives, 0 false positives, 2 true negatives, missedIds empty) - drift-03, the scope-legal unrelated edit, is now caught. bench-task-drift.test.ts pins that stripping declaredArtifacts makes drift-03 invisible again, so the semantic blind spot that remains for contract-less tasks stays recorded rather than hidden. The scoring semantics comment stays accurate: a fixture without a contract is still judged by path scope alone. No detector change in this unit. | CHAIN CORRECTION: this record supersedes X02/out/X02.handoff.json (sha256 kept immutable in out/), whose nextBaseSha pointed at the task commit d79f2e7fd4c3 while the next unit is cut from the evidence commit bbbcdbb67dd5 that carries this unit's record; code, proofs and scope are unchanged."
+ }
+}

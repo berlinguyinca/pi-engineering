@@ -1,0 +1,87 @@
+{
+ "taskId": "X02",
+ "baseSha": "75a2c8e95be61ccbe74eb62314726a3ed10a2f0a",
+ "repoId": "pi",
+ "objective": "Declare the benchmark corpus's artifact contract so the runner can score the new signal, and pin the remaining blind spot Evidence: runner JSON line (precision/recall/TP/FP/TN) + unit counts at the landed commit",
+ "allowPaths": [
+  "scripts/bench-task-drift.ts",
+  "test/fixtures/harness-drift/tasks.json",
+  "test/unit/bench-task-drift.test.ts"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/orchestration/**",
+  "src/aps/**",
+  "src/errors/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "typecheck",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  },
+  {
+   "id": "cmd1",
+   "argv": [
+    "node",
+    "--experimental-strip-types",
+    "scripts/bench-task-drift.ts"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  },
+  {
+   "id": "unit",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bench-task-drift.test.ts",
+    "test/unit/aps-task-alignment.test.ts"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 1,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:ffb504ff7a4042bc333605f3431091b68fd1c71e389d2f2eebecd7a0d1da2434",
+ "expectedOutputs": [
+  "scripts/bench-task-drift.ts",
+  "test/fixtures/harness-drift/tasks.json",
+  "test/unit/bench-task-drift.test.ts"
+ ],
+ "mode": "isolated-change"
+}

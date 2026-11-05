@@ -1,0 +1,6 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts test/unit/aps-task-alignment.test.ts   # at d79f2e7fd4c3140cdc246dcb06ad01e7fb9de9d6
+{"truePositives":3,"falsePositives":0,"falseNegatives":0,"trueNegatives":2,"precision":1,"recall":1,"falsePositiveIds":[],"missedIds":[],"fixtureTaskCount":5,"detectorKinds":["out_of_scope_write","undeclared_artifact"]}
+ℹ tests 10
+ℹ pass 10
+ℹ fail 0
+exit=0
