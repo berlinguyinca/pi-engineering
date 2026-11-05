@@ -1,0 +1,18 @@
+rate_limited_429       gateway.429.rate_limited   warning  valid=true
+not_found_404          gateway.404.not_found      error    valid=true
+bad_request_400        gateway.400.bad_request    error    valid=true
+upstream_5xx           gateway.5xx.upstream       error    valid=true
+timeout                execution.timeout          error    valid=true
+network                network.connection_failed  warning  valid=true
+nonzero_exit           process.crash              fatal    valid=true
+missing_worker_result  worker.result_missing      error    valid=true
+crash                  process.crash              fatal    valid=true
+junk                   unknown.unclassified       warning  valid=true
+nul                    unknown.unclassified       warning  valid=true
+num                    unknown.unclassified       warning  valid=true
+evidence refs: ["logs/run-42.jsonl","input/extra","derived/x"]
+determinism: true
+unknown code constant: unknown.unclassified junk-> unknown.unclassified
+{"exitCode":2,"stderr":"assertion failed"} -> tool.nonzero_exit error
+{"exit_status":"3","message":"tool failed"} -> tool.nonzero_exit error
+{"exitCode":0,"message":"ok"} -> unknown.unclassified warning

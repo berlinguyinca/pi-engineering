@@ -1,0 +1,12 @@
+[
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/T09/logs/04-typecheck-slim.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/planner-worker-scope-gate.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/T09/logs/05-unit-scope-gate-slim.txt"
+ }
+]

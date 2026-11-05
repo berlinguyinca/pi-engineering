@@ -1,0 +1,80 @@
+{
+ "taskId": "R03",
+ "baseSha": "ec19e5102cd057bc66242c06837c3f5f44a67472",
+ "repoId": "pi",
+ "objective": "Evaluate max attempts, elapsed time, backoff bounds and exhaustion per incident; zero automatic retries in bootstrap mode. Evidence: Exhausted budget stops, zero budget never retries.",
+ "allowPaths": [
+  "src/inference/retryBudget.ts",
+  "test/unit/retry-budget.test.ts"
+ ],
+ "denyPaths": [
+  "src/inference/retryDelay.ts",
+  "src/inference/retryTrace.ts",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/orchestration/**",
+  "src/workers/**",
+  "src/runtime/**",
+  "src/plannerWorker/**",
+  "src/errors/**",
+  "src/incidents/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/context/**",
+  "src/aps/**",
+  "scripts/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "test/unit/retry-correlation.test.ts",
+  "test/unit/retry-error-events.test.ts",
+  "test/unit/transient.test.ts",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "typecheck",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "timeoutMs": 600000,
+   "cwd": "repo"
+  },
+  {
+   "id": "unit",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/retry-budget.test.ts"
+   ],
+   "timeoutMs": 600000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:d92f98bb7efd76cf1f74a590a29c8f0eaa8cad0425a01efcb9d5353ebd062f49",
+ "expectedOutputs": [
+  "src/inference/retryBudget.ts",
+  "test/unit/retry-budget.test.ts"
+ ],
+ "mode": "isolated-change"
+}

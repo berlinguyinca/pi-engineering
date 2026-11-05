@@ -1,0 +1,17 @@
+✔ missing proof, failing proof and missing or tampered evidence all block the gate (1.845583ms)
+✔ diff-scope violations and a commit not sitting on the approved base block the gate (0.085667ms)
+✔ the handoff writer is atomic, immutable and stamps the protocol checksum (1.231583ms)
+✔ B01: valid JSON fixture is accepted and every schema field is populated (1.370792ms)
+✔ B01: defaults apply when the optional fields (limits, denyPaths, expectedOutputs) are absent (0.151916ms)
+✔ B01: invalid fixtures are rejected with deterministic, sorted, deduplicated errors (0.219375ms)
+✔ FIX-4B: herdr-ui is accepted as a mode with a 120-line ceiling (0.402208ms)
+✔ FIX-4B: 120 changed lines is rejected against the 100 ceiling for every non-herdr-ui mode (0.063708ms)
+✔ FIX-4B: an unknown mode is still rejected and herdr-ui keeps the 2-file caps (0.058875ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 158.107125

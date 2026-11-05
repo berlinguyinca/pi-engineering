@@ -1,0 +1,14 @@
+deterministic (order-independent): true
+raw secrets absent: true
+task/handoff ids retained: false false
+file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-d07-evidence-bundle-20261104/conductor-d07-check.mts:14
+console.log("versions:", s(small.versions ?? b1.versions).slice(0, 120));
+                                                         ^
+
+TypeError: Cannot read properties of undefined (reading 'slice')
+    at file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-d07-evidence-bundle-20261104/conductor-d07-check.mts:14:58
+    at ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:646:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+
+Node.js v26.3.0

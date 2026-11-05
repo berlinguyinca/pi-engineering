@@ -1,0 +1,12 @@
+✔ the package is deterministic, names the local route hint, and carries the bundle's own fingerprints and event ids without touching it (1.790291ms)
+✔ the contract says the hard limits in words an operator can audit (0.385667ms)
+✔ maxBytes bounds the whole package and the account says what was withheld (0.276625ms)
+✔ the validator accepts a complete answer and refuses an incomplete, out-of-bundle or restated one with reasons (0.623ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 182.2525

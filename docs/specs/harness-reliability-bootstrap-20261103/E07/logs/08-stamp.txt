@@ -1,0 +1,4 @@
+REJECT baseline: HEAD a427f03e4f995b1c2ffb1e543dcebe13c241963a != manifest baseSha 9f349bb9c6068a342995dc6bf58d3f7b09b6ecb4
+plan exit=3; no model invoked (B04 stops here)
+parent=E06 accepted sha256:0f66047a471…
+REJECT gate: commit parent 3154642a52346f949a2ae1c5d456353780538914 != approved base 9f349bb9c6068a342995dc6bf58d3f7b09b6ecb4

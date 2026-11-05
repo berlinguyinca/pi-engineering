@@ -1,0 +1,18 @@
+✔ token estimation is deterministic (0.97125ms)
+✔ context broker assembles a bounded package from a repo (312.112625ms)
+✔ flagship goal with punctuation yields a non-empty context package (review HIGH F2) (248.11325ms)
+✔ oversized required file is truncated, not silently dropped (review MED F3) (254.386084ms)
+✔ repoMap matches ignore tokens against path segments, not substrings (review MED F4) (200.338291ms)
+✔ rankFiles ranks goal-relevant files first (milestone) (208.727ms)
+✔ assembleContext includes content of relevant files, not only symbol one-liners (milestone) (202.123917ms)
+✔ searchAny matches any of several literal keywords (review HIGH: join('|') was escaped as a literal) (194.72725ms)
+✔ search treats goal keywords as literals, not regex (review MED #4) (232.380708ms)
+✔ readSlice refuses paths that escape the repo root (path-traversal safety) (194.376833ms)
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2227.074583

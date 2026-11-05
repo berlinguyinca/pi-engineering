@@ -1,0 +1,14 @@
+✔ non-idempotent operations cannot be replayed (1.180167ms)
+✔ unknown operations cannot be replayed (0.085167ms)
+✔ missing information defaults to no replay (0.085209ms)
+✔ read-only is replayable, with the key recorded distinctly (0.087417ms)
+✔ replayAllowed is true exactly when safety is safe, over the whole table (0.607ms)
+✔ the classifier is pure and side-effect free (0.34425ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 157.753125

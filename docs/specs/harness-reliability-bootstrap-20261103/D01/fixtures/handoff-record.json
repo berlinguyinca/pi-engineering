@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "D01",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "8f33cfbb6cd0ce4f4a3b5f24e02965a1776cd447",
+  "resultSha": "a3f9b8820a389bc94920c4b5461c39cc68f3bc88",
+  "taskAuthorityHash": "sha256:2419c23f2e8b29c9c4ef1e8e0f148bd92f257ac291d17bd5d9fe1d1eda149777",
+  "changedFiles": [
+    "src/incidents/errorReader.ts",
+    "test/unit/error-reader.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D01/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/error-reader.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D01/logs/02-unit-error-reader.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/D01/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D01/logs/02-unit-error-reader.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D01/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D01/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D01/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "D02",
+  "nextBaseSha": "a3f9b8820a389bc94920c4b5461c39cc68f3bc88",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T16:20:00Z",
+    "notes": "Worker pane d01 (pane w0:pF) added readHostErrorOccurrences() over one verified namespace, reading only through listStreamFiles + the JSONL readers (SessionEventStore the writer class is never instantiated), selecting E05 occurrence events that still pass E02, skipping and counting foreign types/corrupt/unparsable records, with since/until/host/session/limit filters, deterministic timestamp+event_id ordering, DEFAULT_ERROR_INDEX_LIMIT 500 (max 5000) and a refused marker for a missing namespace. The conductor ran its own 12-combination filter sweep (logs/04): every filter left the namespace byte- and name-identical (no new stream, no lock, no recovery dir), limit reported truncated, a nonexistent directory was refused without creating anything, and ordering was stable across runs."
+  }
+}

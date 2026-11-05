@@ -1,0 +1,53 @@
+{
+ "taskId": "D03",
+ "baseSha": "d4c056848107cfa3bddff4311c11e9017f6e8430",
+ "repoId": "pi",
+ "objective": "Aggregate occurrences into issue clusters \u2014 Pure grouping with first/last seen, count, sessions, hosts, affected model/config and recovered/unresolved counts. Keep source event IDs.",
+ "allowPaths": [
+  "src/incidents/errorAggregate.ts",
+  "test/unit/error-aggregate.test.ts"
+ ],
+ "denyPaths": [
+  "package.json",
+  ".gitignore",
+  "scripts/**",
+  "src/bootstrap/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/templates/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/**",
+  "test/support/**",
+  "test/unit/bootstrap-*.test.ts"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-error-aggregate",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/error-aggregate.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:5085f396a12a68f662b3d678ff511978dbedb4b1a73dda6667df6a9bf3b15e03",
+ "expectedOutputs": [
+  "src/incidents/errorAggregate.ts",
+  "test/unit/error-aggregate.test.ts"
+ ],
+ "mode": "isolated-change"
+}

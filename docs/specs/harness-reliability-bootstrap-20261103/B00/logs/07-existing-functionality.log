@@ -1,0 +1,41 @@
+=== pi version ===
+1.3.0
+exit=0
+=== pi package (installed) version ===
+  "version": "0.2.0",
+=== existing seam inventory (B01-B05 territory) ===
+-- pattern 'allowPath' -> files: 0
+-- pattern 'allowlist' -> files: 23
+     src/security/SecurityPolicy.ts
+     src/platform/review.ts
+     src/platform/McpRegistry.ts
+     src/capability/roles.ts
+-- pattern 'diffScope\|diff_scope\|lineBudget\|maxChangedLines' -> files: 0
+-- pattern 'handoffHash\|handoff' -> files: 0
+-- pattern 'resultGate\|ResultGate' -> files: 0
+-- pattern 'taskAuthority' -> files: 8
+     src/orchestration/scheduler.ts
+     src/orchestration/missionStore.ts
+     src/orchestration/orchestrator.ts
+-- pattern 'microtask' -> files: 13
+     src/platform/WorkGraph.ts
+     src/runtime/host/resources.ts
+     src/gateway/streamRetry.ts
+-- pattern 'drift' -> files: 13
+     src/uieng/rubric.ts
+     src/lifecycle/rolePrompts.ts
+     src/compaction/summaryInstructions.ts
+     src/models/catalogPlan.ts
+-- pattern 'IncidentController' -> files: 0
+-- pattern 'SessionEventStore' -> files: 7
+     src/runtime/host/missionHandover.ts
+     src/runtime/isolation/RuntimeSession.ts
+     src/runtime/isolation/orchestrationNamespace.ts
+     src/runtime/isolation/SessionEventStore.ts
+-- pattern 'RetryTrace' -> files: 0
+-- pattern 'RoleRouter' -> files: 28
+     src/plannerWorker/extension.ts
+     src/capability/router.ts
+     src/capability/adapter.ts
+     src/capability/registry.ts
+-- pattern 'completion gate\|CompletionGate' -> files: 0

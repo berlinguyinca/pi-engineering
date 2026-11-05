@@ -1,0 +1,14 @@
+✔ evidence criterion: claimed recovered with httpStatus 200 and no completion is rejected, missing names the absent proof (criterion 1) (1.328916ms)
+✔ recovered needs an allowlisted completion strictly after failureAt; equal and earlier rejected; retryTraced alone is nothing (criterion 3) (0.088917ms)
+✔ suppressed only with a complete suppression record; a half-filled one is unknown naming what is missing (criterion 4) (0.097542ms)
+✔ unresolved is the default for a recorded failure alone, and no 2xx changes the outcome or leaks into reason (criteria 2+4) (0.084125ms)
+✔ totality: null, {}, non-date failureAt and completion { kind: 5 } never throw and always answer with evidence (criterion 4) (0.113209ms)
+✔ every reason is a stable code and no reason ever cites an HTTP status (criterion 2) (0.164375ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 158.240875

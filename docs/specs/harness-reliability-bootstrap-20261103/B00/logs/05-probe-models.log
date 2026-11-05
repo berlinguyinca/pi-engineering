@@ -1,0 +1,7 @@
+=== probe metabolomics /models ===
+http=401 time=0.249175s
+parse fail: Expecting value: line 1 column 1 (char 0)
+=== probe development /models (http://100.104.39.6:8390) ===
+curl: (7) Failed to connect to 100.104.39.6 port 8390 after 18 ms: Couldn't connect to server
+http=000 time=0.018038s
+parse fail: [Errno 2] No such file or directory: '/Users/wohlgemuth/IdeaProjects/pi-engineering-runtime/docs/specs/harness-reliability-bootstrap-20261103/B00/logs/05-development-models.json'

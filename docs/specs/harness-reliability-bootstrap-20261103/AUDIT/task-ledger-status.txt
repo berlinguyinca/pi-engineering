@@ -1,0 +1,61 @@
+plan tasks: 51
+  NO RECORD: 8 -> B00,B01,B02,B03,B04,B05,V05,V06
+  PASS: 43 -> E01,E02,E03,E04,E05,E06,E07,D01,D02,D03,D04,D05,D06,D07,D08,T01,T02,T03,T04,T05,T06,T07,T08,T09,R01,R02,R03,R04,R05,R06,R07,R08,H01,H02,H03,H04,H05,H06,H07,V01,V02,V03,V04
+
+per-task detail:
+  B00 | NO RECORD | read-only |  | 
+  B01 | NO RECORD | isolated-change |  | 
+  B02 | NO RECORD | isolated-change |  | 
+  B03 | NO RECORD | isolated-change |  | 
+  B04 | NO RECORD | isolated-change |  | 
+  B05 | NO RECORD | isolated-change |  | 
+  E01 | PASS |  | E01/out | commit-ok
+  E02 | PASS |  | E02/out | commit-ok
+  E03 | PASS |  | E03/out | commit-ok
+  E04 | PASS |  | E04/out | commit-ok
+  E05 | PASS |  | E05/out | commit-ok
+  E06 | PASS |  | E06/out | commit-ok
+  E07 | PASS |  | E07/out | commit-ok
+  D01 | PASS |  | D01/out | commit-ok
+  D02 | PASS |  | D02/out | commit-ok
+  D03 | PASS |  | D03/out | commit-ok
+  D04 | PASS |  | D04/out | commit-ok
+  D05 | PASS |  | D05 | commit-ok
+  D06 | PASS |  | D06/out | commit-ok
+  D07 | PASS |  | D07/out | commit-ok
+  D08 | PASS |  | D08/out | commit-ok
+  T01 | PASS |  | T01/out | commit-ok
+  T02 | PASS |  | T02/out | commit-ok
+  T03 | PASS |  | T03/out | commit-ok
+  T04 | PASS |  | T04/out | commit-ok
+  T05 | PASS |  | T05/out | commit-ok
+  T06 | PASS |  | T06/out | commit-ok
+  T07 | PASS |  | T07/out | commit-ok
+  T08 | PASS |  | T08/out | commit-ok
+  T09 | PASS |  | T09/out | commit-ok
+  R01 | PASS |  | R01/out | commit-ok
+  R02 | PASS |  | R02/out | commit-ok
+  R03 | PASS |  | R03/out | commit-ok
+  R04 | PASS |  | R04/out | commit-ok
+  R05 | PASS |  | R05/out | commit-ok
+  R06 | PASS |  | R06/out | commit-ok
+  R07 | PASS |  | R07/out | commit-ok
+  R08 | PASS |  | R08/out-corrected | commit-ok
+  H01 | PASS |  | H01/out | commit-MISSING
+  H02 | PASS |  | H02/out | commit-ok
+  H03 | PASS |  | H03/out | commit-ok
+  H04 | PASS |  | H04/out | commit-ok
+  H05 | PASS |  | H05/out | commit-ok
+  H06 | PASS |  | H06/out | commit-ok
+  H07 | PASS |  | H07/out-corrected | commit-ok
+  V01 | PASS |  | V01/out-corrected | commit-ok
+  V02 | PASS |  | V02/out-final | commit-ok
+  V03 | PASS |  | V03/out-final | commit-ok
+  V04 | PASS |  | V04/out-final | commit-ok
+  V05 | NO RECORD | read-only |  | 
+  V06 | NO RECORD | read-only |  | 
+
+chain check (parent.nextBaseSha == child baseSha):
+  (records carry nextTaskId/nextBaseSha; conductor flow recorded 3-generation records for T/R/H/V units)
+
+record dirs present: ['T03', 'T04', 'T05', 'T06', 'T07', 'T08', 'T09', 'V01', 'V02', 'V03', 'V04', 'examples', 'tasks', 'templates']

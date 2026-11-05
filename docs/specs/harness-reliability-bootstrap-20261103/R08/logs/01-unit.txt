@@ -1,0 +1,14 @@
+✔ retries alone cannot mark root cause resolved, at 0 or at 500 (criterion 1) (0.93325ms)
+✔ a run that already passed proves nothing was fixed (criterion 2) (0.64575ms)
+✔ identity is shape, not text, and never survives into the verdict (criterion 3) (0.112542ms)
+✔ scope is validated, and a prefix-extension file is outside (criterion 4) (0.08575ms)
+✔ absent or unknown post-fix status is unknown, never resolved (criterion 5) (0.498208ms)
+✔ resolved iff root_cause_resolved over the status table, and the module is pure (criterion 6) (0.489875ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 160.173375

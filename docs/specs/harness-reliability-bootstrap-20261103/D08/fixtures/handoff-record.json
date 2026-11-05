@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "D08",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "925836054ca7b8def51b4b2a636706e6c375e53b",
+  "resultSha": "7be362d657c5ed1de8d0a70ce56def5dcc60953f",
+  "taskAuthorityHash": "sha256:10334bcb754bb7ff9682a4c6f06ab16680f94d8bdef400b6d44b25f47c746082",
+  "changedFiles": [
+    "src/incidents/diagnosticTask.ts",
+    "test/unit/incident-diagnostic-task.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D08/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/incident-diagnostic-task.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D08/logs/02-unit-diagnostic-task.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/D08/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D08/logs/02-unit-diagnostic-task.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D08/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D08/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D08/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T01",
+  "nextBaseSha": "7be362d657c5ed1de8d0a70ce56def5dcc60953f",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T06:10:00Z",
+    "notes": "Worker pane d08 (pane w8:p6, metabolomics/qwen3.8-flash_next) added src/incidents/diagnosticTask.ts: buildDiagnosticTask consumes the D07 bundle (never re-derives it) and emits a deterministic, byte-bounded package naming only the local Qwen Flash / 27B route ids as a hint string, with a system contract that states the hard limits in words an operator can audit (read-only, no source modification, no self-repair, no automatic dispatch, no new tooling, answer from the supplied evidence only) and a prompt carrying the bundle's own event ids and fingerprints; parseDiagnosticResponse fails closed on unlabelled prose, a missing/duplicate/empty section, an event id outside the bundle, and a hypothesis that merely restates the representative summary, returning stable reason codes and never repairing the answer. Conductor probe (logs/04) confirmed byte-identical output for identical input, cap enforcement with a visible dropped account {items:2,bytes:1192}, refusal of every incomplete answer variant, that a foreign gpt-5.1-codex hint falls back while a named local route does not, and that no fs/network/clock/RNG/dispatch surface exists (grep clean)."
+  }
+}

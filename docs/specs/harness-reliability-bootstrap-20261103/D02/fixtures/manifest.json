@@ -1,0 +1,53 @@
+{
+ "taskId": "D02",
+ "baseSha": "a3f9b8820a389bc94920c4b5461c39cc68f3bc88",
+ "repoId": "pi",
+ "objective": "Stable cross-session error fingerprint \u2014 Normalize volatile ids, timestamps, addresses and worktree prefixes while retaining root-cause discriminators; must not collapse 404 vs 429.",
+ "allowPaths": [
+  "src/incidents/errorFingerprint.ts",
+  "test/unit/error-fingerprint.test.ts"
+ ],
+ "denyPaths": [
+  "package.json",
+  ".gitignore",
+  "scripts/**",
+  "src/bootstrap/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/templates/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/**",
+  "test/support/**",
+  "test/unit/bootstrap-*.test.ts"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-error-fingerprint",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/error-fingerprint.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:73f5a03c5685d6e65ad301c6632d206286ac9fe74120520a0227e499d84c1e16",
+ "expectedOutputs": [
+  "src/incidents/errorFingerprint.ts",
+  "test/unit/error-fingerprint.test.ts"
+ ],
+ "mode": "isolated-change"
+}

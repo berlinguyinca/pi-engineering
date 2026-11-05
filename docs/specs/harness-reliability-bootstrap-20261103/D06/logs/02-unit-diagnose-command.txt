@@ -1,0 +1,17 @@
+[pi-engineering] loading runtime…
+[pi-engineering] runtime ready in 0ms
+[pi-engineering] loading runtime…
+[pi-engineering] runtime host import failed: host is broken; loading the legacy extension (no hot reload or self-update)
+✔ registration: the shim registers /diagnose-errors with a description, whether the Host installs or fails (4.077ms)
+✔ read-only diagnose through injected deps: exact clustered totals, one read, the discovered namespace, no writer in scope (0.807542ms)
+✔ --export is refused with the exit-4 class for want of a writer, and the namespace stays byte-identical (1.326875ms)
+✔ exit 3: a refused namespace is reported through the real D01 reader and never created; an explicit --namespace wins over discovery (0.39225ms)
+✔ bounded and refused before reading: top five clusters then the counted remainder; a bad flag reads nothing (0.444417ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 157.254583

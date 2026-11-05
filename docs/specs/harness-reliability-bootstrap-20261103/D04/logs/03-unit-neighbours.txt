@@ -1,0 +1,23 @@
+✔ evidence: one failureIdentity across two event ids counts once, keeps both ids, and a shuffled input yields byte-identical output (criterion 1) (3.244375ms)
+✔ first/last seen bound only the deduped occurrences, and every dimension set is sorted and unique (criterion 2) (0.224417ms)
+✔ recovered + unresolved === count, resolution defaults to unresolved, and a duplicate's resolution counts for nothing (criterion 3) (0.192084ms)
+✔ stable ordering: lastSeen desc, then count desc, then fingerprint asc, so the order is total (criterion 1) (0.167209ms)
+✔ maxEventIds caps kept source ids with eventIdsTruncated, limit truncates clusters with truncated, the default cap is documented (criterion 2) (0.350875ms)
+✔ purity and rejection: the caller's array and rows are deep-equal after the call, and a row D02 refuses is rejected and forms no cluster (criterion 4) (0.462417ms)
+✔ equivalent occurrences from another session, host, run, timestamp, uuid, duration, byte count, worktree path and prompt digest share one key (criterion 1) (2.535ms)
+✔ distinct causes stay separate — 404 vs 429 above all, plus layer, tool, root-cause noun and exception class (criterion 2) (0.293416ms)
+✔ deterministic and idempotent, with a fixed digest shape that carries none of the volatile text (criterion 3) (0.207ms)
+✔ malformed input is total: the documented fallback key or a documented coercion, never a throw (criterion 4) (0.148333ms)
+✔ the key is not the payload digest: pointers, severity and model alone cannot move it (criterion 5) (0.12075ms)
+✔ every filter combination leaves the namespace byte- and name-identical, proving no writer was opened (8.839667ms)
+✔ time, host, session and limit filters select exactly what they say (3.407083ms)
+✔ foreign types, corrupt lines and payloads E02 refuses are skipped and counted; order is deterministic (2.078ms)
+✔ a nonexistent or empty namespace reads as the documented empty result and creates nothing (2.568833ms)
+ℹ tests 15
+ℹ suites 0
+ℹ pass 15
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 162.332292

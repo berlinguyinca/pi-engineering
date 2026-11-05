@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T08",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "fbb1258e7e69ae3184f6f4596e2dae53232100ac",
+  "resultSha": "11131ece730d723c1e497d860c6185a717b8691f",
+  "taskAuthorityHash": "sha256:750bde9fd7a6f9e9fc86beebe77a4d587934271d6a5da818a5469611a2ed55cb",
+  "changedFiles": [
+    "src/plannerWorker/handoff.ts",
+    "test/unit/task-handoff-integrity.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T08/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/task-handoff-integrity.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T08/logs/02-unit-handoff-integrity.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T08/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T08/logs/02-unit-handoff-integrity.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T08/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T08/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T08/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T09",
+  "nextBaseSha": "11131ece730d723c1e497d860c6185a717b8691f",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T20:10:00Z",
+    "notes": "Worker pane t08 (pane w8:pG, metabolomics/qwen3.8-flash_next) on base fbb1258e added a sealed-envelope authority layer to src/plannerWorker/handoff.ts (sealHandoff/verifyHandoffAuthority/resumeHandoff + HandoffAuthority/SealedHandoff + MAX_TRANSCRIPT_CHARS=2000) hashing objective/sorted constraints/acceptance/scope with T01's canonicalHash, deliberately leaving mission_summary, decisions, architectural_context, dependency_results, correction and worker_outcome non-authority-bearing. src/plannerWorker/types.ts stayed untouched (the manifest allowlist denies it), so no HandoffArtifact field was added and buildHandoff/renderHandoff behaviour is unchanged — the pre-existing planner-handoff-command unit still passes 3/3. Conductor probe (logs/04) reproduced the plan's named pair (edited objective rejected naming objective_sha256; mission_summary rewritten to a completely different summary accepted with the same authority_hash) plus rejected constraint/acceptance/scope edits, envelope tampering (authority_hash and per-part hash rewrites both named), missing/empty/non-string expected authority hash failing closed, null/{}/ {handoff:1} envelopes as 'malformed envelope', a 5200-char transcript bounded to a 2000-char excerpt with transcript_truncated/chars recorded and the tail absent from the rendered handoff, non-string transcript inert, and sealing deterministic."
+  },
+  "handoffHash": "sha256:f928904f4c544d19dfaeeb8031446cd9465725c162d981772e87302189b77dca"
+}

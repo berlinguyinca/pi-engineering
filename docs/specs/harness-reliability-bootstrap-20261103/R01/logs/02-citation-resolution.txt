@@ -1,0 +1,20 @@
+conductor citation resolution against base commit tree
+cited path:line pairs: 63 | resolvable to a non-blank line of a real file: 63 | broken: 0
+constant/value cross-check (declaration line vs document claim):
+  MATCH  src/gateway/config.ts:69 claims 'maxRetries: 8' -> actual 'maxRetries: 8,'
+  MATCH  src/gateway/config.ts:142 claims 'PI_GATEWAY_MAX_RETRIES' -> actual 'cfg.maxRetries = Math.max(0, int(env.PI_GATEWAY_MAX_RETRIES, cfg.maxRetries));'
+  MATCH  src/guard/transient.ts:467 claims 'maxAttempts: 4' -> actual 'maxAttempts: 4,'
+  MATCH  src/guard/transient.ts:127 claims 'maxRetries: 1' -> actual 'return { category: "model_unavailable", retryable: true, retryAfterMs, maxRetr'
+  MATCH  src/guard/transient.ts:283 claims 'maxRetries: 1' -> actual 'maxRetries: 1,'
+  MATCH  src/inference/resilienceConfig.ts:74 claims 'streamRetryMaxAttempts: 4' -> actual 'streamRetryMaxAttempts: 4,'
+  MATCH  src/inference/admissionConfig.ts:97 claims 'max_attempts: 50' -> actual 'max_attempts: 50,'
+  MATCH  src/inference/streamResume.ts:52 claims 'DEFAULT_STREAM_RESUME_MAX = 3' -> actual 'export const DEFAULT_STREAM_RESUME_MAX = 3;'
+  MATCH  src/workers/PiWorkerExecutor.ts:180 claims 'MAX_UNKNOWN_TOOL_CALLS = 3' -> actual 'export const MAX_UNKNOWN_TOOL_CALLS = 3;'
+  MATCH  src/lifecycle/policy.ts:294 claims 'tool_loop_limit: 3' -> actual 'tool_loop_limit: 3,'
+  MATCH  src/orchestration/missionStore.ts:1686 claims 'max_attempts ?? 3' -> actual 'max_attempts: input.max_attempts ?? 3,'
+  MATCH  src/lifecycle/roleRunner.ts:71 claims 'MAX_ROUTING_ATTEMPTS = 3' -> actual 'const MAX_ROUTING_ATTEMPTS = 3;'
+  MATCH  src/models/health.ts:48 claims 'DEFAULT_HEALTH_ERROR_BACKOFF_MS = 60_000' -> actual 'export const DEFAULT_HEALTH_ERROR_BACKOFF_MS = 60_000;'
+  MATCH  src/runtime/EngineeringRuntime.ts:200 claims 'SNAPSHOT_PUBLISH_MAX_RETRIES = 4' -> actual 'const SNAPSHOT_PUBLISH_MAX_RETRIES = 4;'
+  MATCH  src/runtime/herdr/ControlPlaneIngest.ts:197 claims 'deadLetterAfter: 5' -> actual 'this.backoff = { baseMs: 1000, maxMs: 60_000, deadLetterAfter: 5, ...opts.back'
+  MATCH  src/verify/targetedRetry.ts:44 claims 'DEFAULT_MAX_ATTEMPTS = 2' -> actual 'export const DEFAULT_MAX_ATTEMPTS = 2;'
+  MATCH  src/plannerWorker/types.ts:199 claims 'max_local_attempts' -> actual 'max_local_attempts: 2,'

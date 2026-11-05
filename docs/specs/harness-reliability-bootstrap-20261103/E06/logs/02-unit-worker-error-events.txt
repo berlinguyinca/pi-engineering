@@ -1,0 +1,15 @@
+✔ an injected provider failure emits one valid occurrence carrying session, role and model identity (3.82975ms)
+✔ a tool exception is captured too, and neither the secret nor the absolute path survives the seam (1.21975ms)
+✔ the builder is pure: the same identity plus the same failure give a deep-equal occurrence (0.568541ms)
+✔ the emitter hands the writer exactly one occurrence per failure, and says whether it was kept (0.267542ms)
+✔ a writer that throws or refuses cannot change the outcome, and each swallow is reported once (0.680292ms)
+✔ the seam derives identity from the live request and the model id it carries (0.137708ms)
+✔ the capture call exists exactly once, inside the audited terminal failure path (0.377916ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 957.557791

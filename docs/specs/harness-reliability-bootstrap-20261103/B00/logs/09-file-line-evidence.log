@@ -1,0 +1,70 @@
+=== file/line evidence for reusable seams (base SHA 0b86fc12) ===
+-- SecurityPolicy (allowlist + sanitize):
+7: *   1. Secret handling — redact known secret patterns (API keys, tokens,
+9: *   2. Tool policy — an allowlist/denylist over tool names a worker may call.
+30:/** Redact known secrets from a string. Returns the sanitized text. */
+31:export function redactSecrets(
+41:  /** Tool names workers are allowed to call. Empty = allow all. */
+42:  allowlist?: string[];
+43:  /** Tool names workers are never allowed to call. */
+48:  private readonly allowlist: Set<string>;
+52:    this.allowlist = new Set(opts.allowlist ?? []);
+56:  /** True when a tool is permitted. Denylist wins; if allowlist is non-empty it must contain the tool. */
+57:  allows(tool: string): boolean {
+59:    if (this.allowlist.size > 0) return this.allowlist.has(tool);
+-- lifecycle controller (IncidentController-equivalent):
+changeObserver.ts
+classification.ts
+controller.ts
+destructive.ts
+gate.ts
+harness.ts
+policy.ts
+reviewResultTool.ts
+rolePrompts.ts
+roleRunner.ts
+stateMachine.ts
+store.ts
+telemetry.ts
+types.ts
+verification.ts
+vision.ts
+46:export interface ApprovalRequest {
+53:export interface ControllerOptions {
+74:export interface SettleResult {
+81:export interface SessionObservation {
+101:export class LifecycleController {
+187:  changedLines?: number;
+262:  if (input.files.length > 12 || (input.changedLines ?? 0) > 600) {
+-- plannerWorker handoff surface:
+24:export const WORKER_INSTRUCTION =
+35:export function estimateTokens(text: string): number {
+51:export function buildHandoff(input: HandoffInput): HandoffArtifact {
+87:export function renderHandoff(handoff: HandoffArtifact): string {
+-- SessionEventStore:
+25:export interface SessionEventStoreOptions {
+40:export interface SessionEventStoreDiagnostics {
+93:export function listStreamFiles(eventsDir: string): string[] {
+104:export function readMergedEvents(eventsDir: string): StoredEvent[] {
+117:export class SessionEventStore implements EventStoreBackend {
+-- RoleRouter select:
+24:export interface OverrideLayer {
+30:export interface RouteQuery {
+46:export interface RouterOptions {
+56:export class RoleRouter {
+161:  async select(query: RouteQuery): Promise<RoutingDecision> {
+275:    // 4. Overrides win over ranking.
+333:    const decision = await this.select({ ...query, exclude: attempted });
+341:export function parseRef(ref: string): ModelRef {
+-- taskAuthority:
+-- worktree isolation (INV-004):
+src/git/GitRepo.ts:1184:    const worktree = await this.createWorktree(seedSha, this.candidateBranch(identity), guard);
+src/git/GitRepo.ts:1450:  async createWorktree(baseCommit: string, branch: string, guard?: GitMutationGuard): Promise<WorktreeInfo> {
+12:export function shortHash(input: string): string {
+18:export interface WorktreeInfo {
+23:export interface GitResult {
+29:export class GitQueryError extends Error {
+44:export interface GitMutationGuard {
+49:export interface PromotionResult {
+56:export interface CandidateRecord {
+84:export interface CandidateMergeLifecycle {

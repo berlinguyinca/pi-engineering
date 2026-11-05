@@ -1,0 +1,4 @@
+REJECT baseline: HEAD ec19e5102cd057bc66242c06837c3f5f44a67472 != manifest baseSha 9e508548602b78ab9b21bf3082e3dc6aca0e819e
+plan exit=3; no model invoked (B04 stops here)
+parent=R01 accepted sha256:c1edac57d88…
+REJECT gate: $.parentHandoffHash: disallowed additional property

@@ -1,0 +1,5 @@
+E2 planner-origin discard with broad grant: ACCEPTED | forbidden: ["**/*.md"] | ignored: undefined
+J2 non-string auth deny: ACCEPTED(bug) []
+K dedupe/order: order matters: ["src/a/**","src/b/**"] vs ["src/b/**","src/a/**"]
+dupes collapse: ["src/a/**"]
+empty auth list omits field: true

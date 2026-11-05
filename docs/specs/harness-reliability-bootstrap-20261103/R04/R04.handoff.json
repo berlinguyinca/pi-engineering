@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "R04",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "389f678b8eed809bc74ff740e9b984263eb5fbe9",
+  "resultSha": "5efe62fe00612c6e30e12e3a1c2f31ac4a852ef7",
+  "taskAuthorityHash": "sha256:f7dcaaac2ff823009ed7fd738b4a2d10ab5be54c9afa73e2a1f4d6a8f1a6e00f",
+  "changedFiles": [
+    "src/inference/endpointCircuit.ts",
+    "test/unit/endpoint-circuit.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R04/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/endpoint-circuit.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R04/logs/01-unit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/R04/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R04/logs/01-unit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R04/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R04/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R04/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "R05",
+  "nextBaseSha": "5efe62fe00612c6e30e12e3a1c2f31ac4a852ef7",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Worker pane r04 (pane w8:pQ, metabolomics/qwen3.8-flash_next) on base 389f678b, isolated-change mode, first pass, ~5 min. Delivered exactly the two declared new files and touched nothing else (git show --name-only HEAD lists only src/inference/endpointCircuit.ts and test/unit/endpoint-circuit.test.ts; 44 + 56 = 100 changed lines against a 100 cap). Conductor verified independently at 5efe62fe: npm run typecheck exit 0; test/unit/endpoint-circuit.test.ts 6 pass / 0 fail; per-suite regressions retry-budget 6/6, retry-correlation 5/5, transient 40/40. Purity verified by the conductor: the module has zero import statements and contains no Date.now, Math.random, process.env, setTimeout/setInterval or fetch, so it reads no clock, RNG, environment, timer or network, and every transition returns a fresh snapshot. Contract properties asserted in tests: three model_not_found failures with threshold 3 open on the third (allowAttempt false, openedAtMs that nowMs, first two closed with 1 and 2), a further failure keeps it open with openedAtMs unchanged; cooldown gives cooldown_pending at cooldownMs-1 and half_open with probe true and allowAttempt true at cooldownMs while a second concurrent evaluation on the resulting snapshot gives probe_in_flight with allowAttempt false; half_open success closes with streak 0 and openedAtMs null, half_open failure reopens with openedAtMs restarted and cooldown_pending at nowMs-1; all three failure classes open at threshold 2 and a closed success clears the streak; noteEndpointKey caps at 64 keys dropping the oldest (honouring an explicit max 3) while inputs are provably unmutated (structuredClone comparison) and the returned snapshot is a new object; non-finite nowMs, threshold 0, negative cooldownMs and an unknown state all return invalid_input with allowAttempt false over the unchanged snapshot. The unit decides only whether an endpoint may be attempted - not whether to retry - leaving RETRY_OWNERS.md conflict 3 to the ownership work, and MissionSupervisor's mutable mission-scoped CircuitBreaker is neither imported nor modified."
+  },
+  "handoffHash": "sha256:4f70f61636e9133c3657c86d47300dabd9d60cd316d154c41e536dfceb2b278f"
+}

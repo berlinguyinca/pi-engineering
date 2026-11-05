@@ -1,0 +1,14 @@
+✔ B01: valid JSON fixture is accepted and every schema field is populated (3.181125ms)
+✔ B01: defaults apply when the optional fields (limits, denyPaths, expectedOutputs) are absent (0.3435ms)
+✔ B01: invalid fixtures are rejected with deterministic, sorted, deduplicated errors (0.484417ms)
+✔ FIX-4B: herdr-ui is accepted as a mode with a 120-line ceiling (0.142667ms)
+✔ FIX-4B: 120 changed lines is rejected against the 100 ceiling for every non-herdr-ui mode (0.876042ms)
+✔ FIX-4B: an unknown mode is still rejected and herdr-ui keeps the 2-file caps (0.203042ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 322.412041

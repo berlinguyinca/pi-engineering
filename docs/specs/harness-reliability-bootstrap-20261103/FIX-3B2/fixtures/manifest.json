@@ -1,0 +1,60 @@
+{
+ "taskId": "FIX-3B2",
+ "baseSha": "22c17b582b3e342cf9ea30c7ef7e63037a8b80f1",
+ "repoId": "pi",
+ "objective": "writeHandoff creates its output directory; totality under hostile schema/record input (FIX-3B part 2).",
+ "allowPaths": [
+  "src/bootstrap/handoffWriter.ts",
+  "test/unit/bootstrap-handoff-writer.test.ts"
+ ],
+ "denyPaths": [
+  "src/bootstrap/resultGate.ts",
+  "scripts/**",
+  "docs/**",
+  "package.json"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck-at-commit",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-writer-at-commit",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-handoff-writer.test.ts"
+   ]
+  },
+  {
+   "id": "03-unit-bootstrap-all-at-commit",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-*.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 1,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:973583781db0fef35011892e9004a670e5f8e705c91404f2de6c5db97d2a0b18",
+ "expectedOutputs": [
+  "src/bootstrap/handoffWriter.ts",
+  "test/unit/bootstrap-handoff-writer.test.ts"
+ ],
+ "mode": "isolated-change"
+}

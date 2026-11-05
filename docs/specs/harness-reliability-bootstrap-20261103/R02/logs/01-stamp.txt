@@ -1,0 +1,3 @@
+REJECT baseline: HEAD ec19e5102cd057bc66242c06837c3f5f44a67472 != manifest baseSha 9e508548602b78ab9b21bf3082e3dc6aca0e819e
+plan exit=3; no model invoked (B04 stops here)
+REJECT input: ENOENT: no such file or directory, open '/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/R02/fixtures/proofs.json'

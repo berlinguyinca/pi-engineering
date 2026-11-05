@@ -1,0 +1,4 @@
+[42] -> ACCEPTED forbidden=["42"]
+[true] -> ACCEPTED forbidden=["true"]
+["src/secret/**",7] -> ACCEPTED forbidden=["src/secret/**","7"]
+{"denied":"src/secret/**"} -> REJECTED ["T-1.authorization.denied entries must be strings"]

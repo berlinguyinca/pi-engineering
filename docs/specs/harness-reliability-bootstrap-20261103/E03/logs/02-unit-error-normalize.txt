@@ -1,0 +1,12 @@
+✔ each fixture maps to the demanded code and severity with a valid, non-empty summary (63.727583ms)
+✔ unrecognised or unreadable input becomes an explicit unknown event instead of throwing (8.668708ms)
+✔ the original evidence reference is preserved unchanged, ahead of the derived refs (0.314083ms)
+✔ normalization is deterministic, clock-free, redacting and honest about missing attribution (0.894958ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 662.783209

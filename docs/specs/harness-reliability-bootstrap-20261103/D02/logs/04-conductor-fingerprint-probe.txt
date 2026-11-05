@@ -1,0 +1,16 @@
+equivalent (volatile-only differences): true 62faf93823585c99
+input view A: {"code":"gateway.429.rate_limited","layer":"gateway","summary":"upstream 429 rate limit for request <id> after <dur> with <size> at <path>","tool":""}
+input view B: {"code":"gateway.429.rate_limited","layer":"gateway","summary":"upstream 429 rate limit for request <id> after <dur> with <size> at <path>","tool":""}
+separate 404 vs 429    : true 785ac2081fc7
+separate layer         : true 7b2c7fa26e62
+separate tool          : true fdcd6d21537c
+separate root noun     : true 1ccf31bb0120
+separate exception class: true 182850efd198
+deterministic: true shape: true no volatile digits leaked: true
+malformed null -> 0000000000000000 (fallback)
+malformed undefined -> 0000000000000000 (fallback)
+malformed {} -> 0000000000000000 (fallback)
+malformed {"code":5} -> a8651eaeaa58ff8c
+malformed "x" -> 0000000000000000 (fallback)
+prompt digest does not split: true
+INVALID_FINGERPRINT: 0000000000000000 | env marker stable: true
