@@ -67,6 +67,19 @@ export function hindsightBlackholeOption(
 const TIMEOUT_FLAG_ACTIONS = new Set(["recall", "get"]);
 
 /**
+ * Query for the "everything I have" reads.
+ *
+ * The service has no list endpoint and rejects a wildcard: `recall "*"` comes back as
+ * `{"error":"Memory service rejected request (HTTP 422)"}` with exit 1, and an empty query
+ * fails client-side (observed live, project `canary`, 2026-11-04). A readiness probe built
+ * on `"*"` therefore reported "exited unsuccessfully" against a healthy service, backed
+ * automatic recall off for a minute, and the bank looked empty. A bounded overview query is
+ * the only way to ask, so every count built on it is a probe of what the bank recalls, never
+ * a literal total — and surfaces that report it must say so.
+ */
+const OVERVIEW_QUERY = "project memory decision";
+
+/**
  * herdr-memory picks the credential and provenance harness from HERDR_HARNESS
  * (default "codex"). That is the CLI's own interface, so it is set on the child
  * process from the `memory.hindsight.harness` setting; Pi never reads it.
@@ -233,7 +246,7 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
    * reads it rethrows the HindsightError, so a missing CLI is not "0 saved".
    */
   async probe(): Promise<number> {
-    return (await this.recallStrict("*", 50)).length;
+    return (await this.recallStrict(OVERVIEW_QUERY, 50)).length;
   }
 
   /**
@@ -271,7 +284,7 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   }
 
   recallAll(): Promise<DurableMemoryRecord[]> {
-    return this.recall("*", 50);
+    return this.recall(OVERVIEW_QUERY, 50);
   }
 
   async retain(record: DurableMemoryRecord): Promise<RetainResult> {

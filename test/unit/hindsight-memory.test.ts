@@ -72,6 +72,22 @@ test("search passes scope, max-results and --timeout-ms; maps records", async ()
   );
 });
 
+test("the overview reads never send a wildcard, which the service rejects", async () => {
+  // Observed live (project `canary`): `recall "*"` -> HTTP 422, exit 1, and an empty query
+  // fails client-side. A readiness probe built on "*" reported "exited unsuccessfully"
+  // against a healthy service, backed automatic recall off, and the bank looked empty.
+  const r = recorder(() => ok({ results: [row("m1", "project uses pnpm")], degraded: false, offline: false }));
+  const p = new HindsightDurableMemory({ run: r.run });
+  assert.equal(await p.probe(), 1);
+  assert.equal((await p.recallAll()).length, 1);
+  assert.equal(r.calls.length, 2);
+  for (const a of r.calls) {
+    assert.equal(a[0], "recall");
+    const query = a[1]!;
+    assert.ok(query.trim().length > 0 && query.trim() !== "*", "a non-wildcard query is required");
+  }
+});
+
 test("superseded/retracted results are never surfaced", async () => {
   const r = recorder(() =>
     ok({ results: [row("a", "x", { status: "superseded" }), row("b", "y", { status: "retracted" }), row("c", "z")] }),
@@ -185,13 +201,17 @@ function interactive(provider: HindsightDurableMemory) {
   return { events, commands, ctx, notices, injected };
 }
 
-test("interactive: automatic recall hangs -> fail-open within budget, nothing injected", async () => {
+test("interactive: automatic recall hangs -> bounded turn, and the model is told it is unavailable", async () => {
   const p = new HindsightDurableMemory({ run: () => new Promise(() => {}) });
   const f = interactive(p);
   const t0 = Date.now();
   await f.events.get("before_agent_start")!({ prompt: "gradle jdk question" }, f.ctx);
-  assert.ok(Date.now() - t0 < 1500);
-  assert.equal(await f.injected(), undefined);
+  assert.ok(Date.now() - t0 < 1500, "the turn is bounded even when the client never answers");
+  // Injecting nothing read as "the bank is empty" — a different claim from "the bank could
+  // not be read", which is what actually happened.
+  const notice = await f.injected();
+  assert.match(notice!, /could not be read this turn/);
+  assert.match(notice!, /unavailable, not empty/);
 });
 
 test("interactive: recalled hindsight memory is labeled untrusted and carries revision", async () => {
