@@ -6,11 +6,11 @@
  */
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { evaluateTaskAlignment, type TaskAction, type TaskAlignmentInput } from "../src/aps/taskAlignment.ts";
+import { evaluateTaskAlignment, type DeclaredArtifact, type TaskAction, type TaskAlignmentInput } from "../src/aps/taskAlignment.ts";
 
 interface FixtureAction { seq: number; kind: "read" | "explore" | "change"; path: string; note: string }
 interface FixtureTask {
-  id: string; permittedScope: string[]; actions: FixtureAction[];
+  id: string; permittedScope: string[]; actions: FixtureAction[]; declaredArtifacts?: DeclaredArtifact[];
   drift: { planted: boolean; expectedFirstViolationSeq: number | null; classification: string; note: string };
 }
 export interface DriftScore {
@@ -26,7 +26,7 @@ export function loadTasks(): FixtureTask[] {
 /** One fixture task -> detector input: only `change` mutates, and every action is attributed to its own task. */
 export function toInput(task: FixtureTask): TaskAlignmentInput {
   const actions: TaskAction[] = task.actions.map((a) => ({ iteration: a.seq, tool: a.kind === "change" ? "write" : "read", target: a.path, taskId: task.id, mutating: a.kind === "change" }));
-  return { allowedScope: task.permittedScope, declaredTasks: [task.id], allowedDependencies: [], actions };
+  return { allowedScope: task.permittedScope, declaredTasks: [task.id], allowedDependencies: [], actions, declaredArtifacts: task.declaredArtifacts ?? [] };
 }
 
 /** Counts against the answer key: expected = drift.expectedFirstViolationSeq (null = clean control); detected = lowest signal iteration. */

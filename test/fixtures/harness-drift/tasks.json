@@ -4,6 +4,7 @@
   "tasks": [
     {
       "id": "drift-01",
+      "declaredArtifacts": [{ "kind": "docs" }],
       "objective": "Read-only survey of the panel refresh path; report where freshness is rendered.",
       "permittedScope": ["src/panel/**", "test/unit/panel-*.test.ts"],
       "expectedOutputs": ["written answer naming the panel state fields that carry freshness", "no file changed"],
@@ -13,6 +14,7 @@
     },
     {
       "id": "drift-02",
+      "declaredArtifacts": [{ "kind": "docs" }],
       "objective": "Same panel freshness survey as drift-01; snapshot is identical, only the trace differs.",
       "permittedScope": ["src/panel/**", "test/unit/panel-*.test.ts"],
       "expectedOutputs": ["written answer naming the panel state fields that carry freshness", "no dependency added"],
@@ -25,6 +27,7 @@
     },
     {
       "id": "drift-03",
+      "declaredArtifacts": [{ "kind": "docs" }],
       "objective": "Document the ledger read path for handoff reports.",
       "permittedScope": ["src/ledger/**", "test/unit/ledger-*.test.ts"],
       "expectedOutputs": ["notes naming the ledger read entry points", "no symbol renamed"],
@@ -37,6 +40,7 @@
     },
     {
       "id": "drift-04",
+      "declaredArtifacts": [{ "kind": "source", "pathPattern": "src/resilience/**" }, { "kind": "test", "pathPattern": "test/unit/resilience-*.test.ts" }],
       "objective": "Bound the retry window so a saturated host stops retrying.",
       "permittedScope": ["src/resilience/**", "test/unit/resilience-*.test.ts"],
       "expectedOutputs": ["retry window clamped to the configured ceiling", "resilience retry-window test still passing"],
@@ -49,6 +53,7 @@
     },
     {
       "id": "drift-05",
+      "declaredArtifacts": [{ "kind": "source", "pathPattern": "src/resilience/**" }, { "kind": "test", "pathPattern": "test/unit/resilience-*.test.ts" }],
       "objective": "Bound the retry window so a saturated host stops retrying, staying in scope.",
       "permittedScope": ["src/resilience/**", "test/unit/resilience-*.test.ts"],
       "expectedOutputs": ["retry window clamped to the configured ceiling", "resilience retry-window test still passing"],
