@@ -1,0 +1,48 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X07",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "10c93281eec5fbf788919656a8d52d766ed34d9c",
+  "resultSha": "548c2a83d041a888461cddcaec0ef0a236997ef2",
+  "taskAuthorityHash": "sha256:1333f3781d9991f186d5ea79783a38329818a9e47279236040741b05f2c70b17",
+  "changedFiles": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs"
+  ],
+  "commands": [
+    {
+      "command": "node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/01-node-docs-specs-harness-rel.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts test/unit/aps-task-alignment.test.ts test/unit/aps-drift-watch.test.ts test/unit/aps-observability.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/02-node-test-import-test-suppor.txt"
+    },
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/03-npm-run-typecheck-.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/01-node-docs-specs-harness-rel.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/02-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X07/logs/03-npm-run-typecheck-.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X07/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X07/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X07/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "The audit's earlier integrity scans were one-off scripts: they counted records, recomputed canonical hashes and listed dangling evidence paths, but they could not answer the question the X-series exposed - whether a fresh clone can walk the chain at all, since the record schema has no parent pointer and the chain is forward-only (parent.nextTaskId + parent.nextBaseSha must name a child record with that taskId and baseSha). The scanner ranks generations (out-chain > out-final > out-corrected > later corrections > out, negative-control generations scanned but never canonical) and separates canonical offenders from superseded history. On a clean checkout of the X-series tip it reports 87 records, 87 canonical-hash matches, 87 field-conforming, 55 forward links resolved and 8 offenders: five X-series chain parents naming a child while untracked - the conclude flow emits a chain generation after amending the evidence commit that would carry it, so those records only ever reached the working tree - and three historical (E02's negative-control generation names an E03 base no record carries, FIX-2 names FIX-3 whose record was never emitted, T09 names T10, a task the plan never contained). This unit commits those chain records and reports the residue honestly instead of rewriting the historical PASS records that produce it. | CHAIN CORRECTION: this record supersedes X07/out/X07.handoff.json (sha256 kept immutable in out/), whose nextBaseSha pointed at the task commit 548c2a83d041 while the next unit is cut from the evidence commit a17a48ecd4fd that carries this unit's record; code, proofs and scope are unchanged."
+  },
+  "handoffHash": "sha256:d5671d050b4a42396c2911889f130c07e44b48faf3dab96310d40e319c3263ee"
+}

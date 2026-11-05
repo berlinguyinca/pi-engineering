@@ -1,0 +1,49 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X06",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "009837c32d9f9a0ac543710d05efd9cd6da390b9",
+  "resultSha": "141ca5dbba112d713f2fb459ba31392599db0a5f",
+  "taskAuthorityHash": "sha256:35573abd28d8618f671e7267558c618ecca9a7796db6e26aa9991a1df99a978d",
+  "changedFiles": [
+    "src/inference/resilienceConfig.ts",
+    "test/unit/resilience-default-off.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/01-npm-run-typecheck-.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/resilience-default-off.test.ts test/unit/resilience-circuit-breaker.test.ts test/unit/resilience-retry-window.test.ts test/unit/resilience-idempotency.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/02-node-test-import-test-suppor.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/inference-*.test.ts test/unit/resilience-*.test.ts test/unit/gateway-*.test.ts test/unit/aps-*.test.ts && echo COMPARISON-BASE-900bf8a3 && cd /Users/wohlgemuth/IdeaProjects/worktrees/pi-base-verify && node --test --import ./test/support/isolatedState.ts test/unit/inference-*.test.ts test/unit/resilience-*.test.ts test/unit/gateway-*.test.ts test/unit/aps-*.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/03-node-test-import-test-suppor.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/01-npm-run-typecheck-.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/02-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X06/logs/03-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X06/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X06/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X06/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "X07",
+  "nextBaseSha": "10c93281eec5fbf788919656a8d52d766ed34d9c",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "CHAIN EXTENSION: X06/out-final was emitted while X06 looked terminal (nextTaskId null); the series continued with X07, the handoff-chain integrity scanner, so this generation names it. Code, proofs, scope and resultSha are unchanged. Like the earlier chain generations this file reaches git through the X07 evidence commit rather than the commit it names as nextBaseSha - the conclude flow emits a chain generation after amending that commit, which is exactly the defect X07's scanner reports."
+  },
+  "handoffHash": "sha256:13df2c03d45f187b5c09eb66e376ef773f332fa76044207c90441cc79b52509f"
+}

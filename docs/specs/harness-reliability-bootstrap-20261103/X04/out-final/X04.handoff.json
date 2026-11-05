@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X04",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "a6e500f6b1ccd2867097ae3f2ac839fa93b33e3c",
+  "resultSha": "7f160212083e2d015b1a515325ffa1f984d1368f",
+  "taskAuthorityHash": "sha256:f1b0d29f1351feaa93c405a3ccbca73ab9eff32cbb193d53baf7a3b987c078d7",
+  "changedFiles": [
+    "src/aps/observability.ts",
+    "test/unit/aps-observability.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X04/logs/01-npm-run-typecheck-.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/aps-observability.test.ts test/unit/aps-worker-activity.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X04/logs/02-node-test-import-test-suppor.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X04/logs/01-npm-run-typecheck-.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X04/logs/02-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X04/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X04/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X04/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "X05",
+  "nextBaseSha": "5e1ebb8c67b492d5f77c92de4c1e7b6f726b0833",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Found while landing X03: the adapter handed signals to an onDrift callback with nowhere to go, which is the same bookkeeping defect the audit recorded for loop detection - a signal nobody accumulates cannot be audited. ApsObservability gains totals.driftSignals and driftByKind plus recordDrift(), so detections land in the snapshot operators already read. Detect-only by construction: loop accounting (loopCandidates, replanRequested) is untouched and emptySnapshot reports zero signals, so a session without the switch on is byte-identical to before. | CHAIN: this record supersedes X04/out-corrected (kept immutable), whose nextBaseSha named the pre-amend evidence commit; the child is cut from 5e1ebb8c67b4, the evidence commit as it stands now."
+  },
+  "handoffHash": "sha256:08d1fc2e8db239c0fc21ab03662f2bf7514d6d34d30c72a980794bf1d66b0b49"
+}

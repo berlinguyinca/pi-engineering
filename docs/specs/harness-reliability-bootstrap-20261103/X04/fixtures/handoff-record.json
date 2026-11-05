@@ -30,13 +30,13 @@
   "docs/specs/harness-reliability-bootstrap-20261103/X04/fixtures/handoff-record.json"
  ],
  "nextTaskId": "X05",
- "nextBaseSha": "79d3da95799c03f27c687f1ad8e27af0c4fe4ef1",
+ "nextBaseSha": "5e1ebb8c67b492d5f77c92de4c1e7b6f726b0833",
  "blockedReasons": [],
  "operatorApproval": {
   "required": true,
   "approved": true,
   "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
   "approvedAt": "2026-11-06T04:30:00Z",
-  "notes": "Found while landing X03: the adapter handed signals to an onDrift callback with nowhere to go, which is the same bookkeeping defect the audit recorded for loop detection - a signal nobody accumulates cannot be audited. ApsObservability gains totals.driftSignals and driftByKind plus recordDrift(), so detections land in the snapshot operators already read. Detect-only by construction: loop accounting (loopCandidates, replanRequested) is untouched and emptySnapshot reports zero signals, so a session without the switch on is byte-identical to before. | CHAIN CORRECTION: this record supersedes X04/out/X04.handoff.json (sha256 kept immutable in out/), whose nextBaseSha pointed at the task commit 7f160212083e while the next unit is cut from the evidence commit 79d3da95799c that carries this unit's record; code, proofs and scope are unchanged."
+  "notes": "Found while landing X03: the adapter handed signals to an onDrift callback with nowhere to go, which is the same bookkeeping defect the audit recorded for loop detection - a signal nobody accumulates cannot be audited. ApsObservability gains totals.driftSignals and driftByKind plus recordDrift(), so detections land in the snapshot operators already read. Detect-only by construction: loop accounting (loopCandidates, replanRequested) is untouched and emptySnapshot reports zero signals, so a session without the switch on is byte-identical to before. | CHAIN: this record supersedes X04/out-corrected (kept immutable), whose nextBaseSha named the pre-amend evidence commit; the child is cut from 5e1ebb8c67b4, the evidence commit as it stands now."
  }
 }

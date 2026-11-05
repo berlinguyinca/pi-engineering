@@ -35,14 +35,14 @@
   "docs/specs/harness-reliability-bootstrap-20261103/X05/fixtures/proofs.json",
   "docs/specs/harness-reliability-bootstrap-20261103/X05/fixtures/handoff-record.json"
  ],
- "nextTaskId": null,
- "nextBaseSha": null,
+ "nextTaskId": "X06",
+ "nextBaseSha": "009837c32d9f9a0ac543710d05efd9cd6da390b9",
  "blockedReasons": [],
  "operatorApproval": {
   "required": true,
   "approved": true,
   "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
   "approvedAt": "2026-11-06T04:30:00Z",
-  "notes": "Found while landing X04: the observability counters existed but nothing fed them, because the contract never reached the executor - the same unwired-seam defect the V06 audit recorded. WorkerRequest now carries the operator-declared driftWatch and PiWorkerExecutor passes it to the per-attempt activity adapter, wiring the adapter's onDrift sink to observability.recordDrift so a detection becomes durable evidence under the existing rollout.observability gate. Nothing evaluates the contract while PI_TASK_DRIFT_SIGNALS is off and the field is optional, so existing callers are unaffected. The third log runs the same clean suite here and at the pre-series base 900bf8a3: identical counts, so the wiring is additive; two environment-sensitive files (worker-commit-discipline, worker-request-plumbing) fail identically at both revisions and are excluded from the recorded command, named in the override reason rather than hidden. | CHAIN CORRECTION: this record supersedes X05/out/X05.handoff.json (sha256 kept immutable in out/), whose nextBaseSha pointed at the task commit 6a518c90fb14 while the next unit is cut from the evidence commit 4d483a9b362a that carries this unit's record; code, proofs and scope are unchanged."
+  "notes": "CHAIN EXTENSION: this generation supersedes X05/out-final, whose nextTaskId was null because it was emitted while X05 was still the last unit of the series. The series continued (X06 defaults the inference-resilience master switch off), and the handoff protocol requires the parent to name its child, so nextTaskId/nextBaseSha are corrected here; code, proofs, scope and resultSha are unchanged. The earlier attempt at this generation named a nextBaseSha the gate rejected as not a real commit and was deleted before it reached git; this one names the verified tip. The conclude flow emits a generation after amending the evidence commit that would carry it, so this file reaches git through the X07 bookkeeping commit - named here rather than papered over."
  }
 }

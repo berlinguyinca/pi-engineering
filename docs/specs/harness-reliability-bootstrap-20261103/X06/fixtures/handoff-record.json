@@ -35,14 +35,14 @@
   "docs/specs/harness-reliability-bootstrap-20261103/X06/fixtures/proofs.json",
   "docs/specs/harness-reliability-bootstrap-20261103/X06/fixtures/handoff-record.json"
  ],
- "nextTaskId": null,
- "nextBaseSha": null,
+ "nextTaskId": "X07",
+ "nextBaseSha": "10c93281eec5fbf788919656a8d52d766ed34d9c",
  "blockedReasons": [],
  "operatorApproval": {
   "required": true,
   "approved": true,
   "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
   "approvedAt": "2026-11-06T04:30:00Z",
-  "notes": "Found while wiring X03-X05: the drift switch had to be affirmative-only because the spec demands intervention flags default OFF, and the pre-existing master switch broke that rule twice - PI_INFERENCE_RESILIENCE_ENABLED resolved to enabled=true with no environment at all, and its parser armed for any value that was not false/0/off, so a typo ('ture', '1x', even 'enabled') silently turned resilient retry, stream retry and model fallback on. The default is now false and the switch parses through the affirmative-only helper already used for the interactive fallback; overrides still arm it explicitly, and the other tunables keep their values because retryPolicy, resilientInference and resilientInstall all gate on cfg.enabled first. Verified 650/650 at this commit against 644/644 at the pre-series base 900bf8a3 over the inference/resilience/gateway/aps suites, zero failures either side. | CHAIN CORRECTION: this record supersedes X06/out/X06.handoff.json (sha256 kept immutable in out/), whose nextBaseSha pointed at the task commit 141ca5dbba11 while the next unit is cut from the evidence commit c179489e5ea3 that carries this unit's record; code, proofs and scope are unchanged."
+  "notes": "CHAIN EXTENSION: X06/out-final was emitted while X06 looked terminal (nextTaskId null); the series continued with X07, the handoff-chain integrity scanner, so this generation names it. Code, proofs, scope and resultSha are unchanged. Like the earlier chain generations this file reaches git through the X07 evidence commit rather than the commit it names as nextBaseSha - the conclude flow emits a chain generation after amending that commit, which is exactly the defect X07's scanner reports."
  }
 }

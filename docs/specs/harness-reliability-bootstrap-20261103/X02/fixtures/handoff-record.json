@@ -37,13 +37,13 @@
   "docs/specs/harness-reliability-bootstrap-20261103/X02/fixtures/handoff-record.json"
  ],
  "nextTaskId": "X03",
- "nextBaseSha": "bbbcdbb67dd5ba370b83e909063f64ccc796a0a3",
+ "nextBaseSha": "a4abbb7b0f7e2583a3446b6050f47bbe9a7093a4",
  "blockedReasons": [],
  "operatorApproval": {
   "required": true,
   "approved": true,
   "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
   "approvedAt": "2026-11-06T04:30:00Z",
-  "notes": "Companion to X01. With declaredArtifacts in test/fixtures/harness-drift/tasks.json, scripts/bench-task-drift.ts scores the corpus it plants: precision 1.0, recall 1.0 (3 true positives, 0 false positives, 2 true negatives, missedIds empty) - drift-03, the scope-legal unrelated edit, is now caught. bench-task-drift.test.ts pins that stripping declaredArtifacts makes drift-03 invisible again, so the semantic blind spot that remains for contract-less tasks stays recorded rather than hidden. The scoring semantics comment stays accurate: a fixture without a contract is still judged by path scope alone. No detector change in this unit. | CHAIN CORRECTION: this record supersedes X02/out/X02.handoff.json (sha256 kept immutable in out/), whose nextBaseSha pointed at the task commit d79f2e7fd4c3 while the next unit is cut from the evidence commit bbbcdbb67dd5 that carries this unit's record; code, proofs and scope are unchanged."
+  "notes": "Companion to X01. With declaredArtifacts in test/fixtures/harness-drift/tasks.json, scripts/bench-task-drift.ts scores the corpus it plants: precision 1.0, recall 1.0 (3 true positives, 0 false positives, 2 true negatives, missedIds empty) - drift-03, the scope-legal unrelated edit, is now caught. bench-task-drift.test.ts pins that stripping declaredArtifacts makes drift-03 invisible again, so the semantic blind spot that remains for contract-less tasks stays recorded rather than hidden. The scoring semantics comment stays accurate: a fixture without a contract is still judged by path scope alone. No detector change in this unit. | CHAIN: this record supersedes X02/out-corrected (kept immutable), whose nextBaseSha named the pre-amend evidence commit; the child is cut from a4abbb7b0f7e, the evidence commit as it stands now."
  }
 }
