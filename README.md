@@ -103,6 +103,7 @@ memory:
     cli: herdr-memory             # executable to shell out to (global config only)
     scopes: [project]             # default [project]; use [project, global] to also share global notes
     timeout_ms: 5000              # per-call CLI timeout, 100..60000
+    automatic_recall_ms: 1200     # in-turn recall budget, 100..5000 (see below)
     harness: pi                   # provenance/credential harness name the CLI sees
     failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
     unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
@@ -119,7 +120,9 @@ first 120 characters of the task, both secret-redacted. A repository's
 cannot opt in or choose `harness`, `cli` or timeouts (global config only).
 
 Ranges, defaults and the repo-level rules are in
-[docs/usage.md](docs/usage.md#turning-the-connection-on-anywhere-pi-is-installed-no-code-edits).
+[docs/usage.md](docs/usage.md#turning-the-connection-on-anywhere-pi-is-installed-no-code-edits);
+why the budgets are what they are (with live measurements) is in
+[Hindsight memory status](docs/integration/HINDSIGHT-MEMORY-STATUS.md).
 
 ```text
 /remember Calibration reports should use metric units.
@@ -134,16 +137,24 @@ Automatic recall is ephemeral model context, inserted before the current user
 request; it is not copied into the saved transcript. Only `/remember` writes
 notes—normal conversations are not automatically uploaded or promoted.
 
-Automatic startup recall and per-prompt searches wait at most 250 ms, so a slow
-`herdr-memory` call does not hold up the model turn for seconds. A timed-out
-lookup adds no notes to that turn. Successful searches, including empty results,
+Automatic recall is bounded by a measured budget, not a guessed one: a healthy
+`herdr-memory` call takes 0.4–4.9 s, so an interactive turn waits up to
+`automatic_recall_ms` (default 1200) and a headless `pi -p` run waits 5000 ms —
+nobody is watching a spinner there, and its single model call is the only chance
+to carry memory. The once-per-session readiness check gets 5000 ms and is not cut
+at the turn budget. A turn does not abandon its lookup: an answer that lands after
+the budget is used by the next model call of the **same** turn, and a turn that
+gets nothing says so in the model context — "could not be read this turn …
+unavailable, not empty" — because silence reads to the model as an empty bank.
+Successful searches, including empty results,
 are cached for 60 seconds with at most 32 query entries. Saving a note, a
 successful explicit memory check/search, session replacement, or a changed
 connection (a different CLI or scope set in the config) clears the cache.
-A CLI that timed out or exited badly pauses automatic requests for 60 seconds;
-a missing CLI or a refused write pauses them for five minutes, because neither
-fixes itself between turns. `/memory` remains available during that pause, and
-changing the config retries immediately. Explicit commands retain their
+A CLI that timed out pauses automatic requests for 10 seconds (slow is not
+broken); one that exited badly pauses them for `failure_backoff_ms` (default 60 s),
+and a missing CLI or a refused write for `unavailable_backoff_ms` (default 5 min),
+because neither fixes itself between turns. `/memory` remains available during that
+pause, and changing the config retries immediately. Explicit commands retain their
 longer, bounded verification wait.
 Starting another turn does not cancel a pending explicit memory command. A
 completed save/check/search invalidates older automatic lookups; replacing the

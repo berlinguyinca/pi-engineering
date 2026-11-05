@@ -21,6 +21,15 @@ export interface HindsightSettings {
   scopes: string[];
   /** Per-call CLI timeout in ms. */
   timeout_ms: number;
+  /**
+   * How long an interactive turn may stall waiting for automatic recall (ms).
+   *
+   * Measured, not guessed: one `herdr-memory recall` over a real bank takes 0.4-4.9 s
+   * (python start + TLS + embedding), so a budget below that floor means recall can only
+   * ever time out. A headless `pi -p` run waits longer (it has no spinner and makes one
+   * model call); see `HEADLESS_LOOKUP_MS` in `interactiveMemory.ts`.
+   */
+  automatic_recall_ms: number;
   /** Harness name the CLI records as provenance and uses to pick its credential. */
   harness: string;
   /** Pause automatic requests this long after a timeout or bad exit (ms). */
@@ -43,6 +52,8 @@ export const DEFAULT_HINDSIGHT_SETTINGS: HindsightSettings = {
   cli: "herdr-memory",
   scopes: ["project"],
   timeout_ms: 5000,
+  // Above the measured 0.4 s warm floor, below what a human will wait for a turn.
+  automatic_recall_ms: 1_200,
   harness: "pi",
   failure_backoff_ms: 60_000,
   unavailable_backoff_ms: 300_000,
@@ -50,6 +61,7 @@ export const DEFAULT_HINDSIGHT_SETTINGS: HindsightSettings = {
 
 export const HINDSIGHT_RANGES = {
   timeout_ms: [100, 60_000],
+  automatic_recall_ms: [100, 5_000],
   failure_backoff_ms: [1_000, 3_600_000],
   unavailable_backoff_ms: [1_000, 86_400_000],
 } as const satisfies Record<string, readonly [number, number]>;

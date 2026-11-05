@@ -1547,6 +1547,7 @@ memory:
     cli: herdr-memory             # executable to shell out to (global config only)
     scopes: [project]             # project, global, infra, mission:<id>
     timeout_ms: 5000              # per-call CLI timeout, 100..60000
+    automatic_recall_ms: 1200     # in-turn recall budget, 100..5000
     harness: pi                   # provenance/credential harness name the CLI sees
     failure_backoff_ms: 60000     # pause automatic requests after a timeout/bad exit, 1000..3600000
     unavailable_backoff_ms: 300000 # ... after a missing CLI or refused write, 1000..86400000
@@ -1558,6 +1559,7 @@ memory:
 | `cli` | `herdr-memory` | non-empty executable name or path; global config only |
 | `scopes` | `[project]` | non-empty list of `project`, `global`, `infra`, `mission:<id>` |
 | `timeout_ms` | `5000` | 100..60000 |
+| `automatic_recall_ms` | `1200` | 100..5000 (interactive turn; a headless `pi -p` run waits 5000) |
 | `harness` | `pi` | `[a-z][a-z0-9_-]{0,31}` |
 | `failure_backoff_ms` | `60000` | 1000..3600000 |
 | `unavailable_backoff_ms` | `300000` | 1000..86400000 |
@@ -1575,8 +1577,15 @@ has to be wired up once with `herdr-eng memory install`. Notes are shared by sco
 **When the CLI is missing or has no credential.** Pi starts normally and degrades
 quietly: at most one concise notice per session (and one telemetry line per day
 when headless), then automatic recall and saves stay silent best-effort until the
-`unavailable_backoff_ms` window passes. Startup waits at most 250 ms for the
-connection check. Run `/memory` (or `herdr-memory doctor`) to see what is wrong.
+`unavailable_backoff_ms` window passes. The once-per-session connection check waits
+up to 5 s (a healthy cold client takes seconds, and a status line that says "timed
+out" about a working service teaches people to ignore it), while an interactive turn
+waits `automatic_recall_ms` and a headless run 5 s. Run `/memory` (or
+`herdr-memory doctor`) to see what is wrong.
+A turn never proceeds in silence: if the budget expires the model is told memory
+"could not be read this turn … unavailable, not empty", and an answer that arrives
+late is used by the next model call of the same turn. The measurements behind these numbers are in
+[Hindsight memory status](integration/HINDSIGHT-MEMORY-STATUS.md).
 
 **What is sent.** Each turn Pi sends the CLI a recall query of up to 12 keywords from
 your prompt, and each worker run sends the first 120 characters of the task. Both are

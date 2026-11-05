@@ -65,7 +65,7 @@ test("an invalid value fails closed: memory is off even though it is on by defau
 
 test("global YAML enables memory and sets every key", () => {
   const l = layout(
-    "memory:\n  hindsight:\n    enabled: true\n    cli: /opt/bin/herdr-memory\n    scopes: [global, 'mission:abc']\n    timeout_ms: 1500\n    harness: pi-lab\n    failure_backoff_ms: 2000\n    unavailable_backoff_ms: 9000\n",
+    "memory:\n  hindsight:\n    enabled: true\n    cli: /opt/bin/herdr-memory\n    scopes: [global, 'mission:abc']\n    timeout_ms: 1500\n    automatic_recall_ms: 900\n    harness: pi-lab\n    failure_backoff_ms: 2000\n    unavailable_backoff_ms: 9000\n",
   );
   try {
     const { settings, issues } = loadHindsightSettings(l.cwd, l.agentDir);
@@ -75,6 +75,7 @@ test("global YAML enables memory and sets every key", () => {
       cli: "/opt/bin/herdr-memory",
       scopes: ["global", "mission:abc"],
       timeout_ms: 1500,
+      automatic_recall_ms: 900,
       harness: "pi-lab",
       failure_backoff_ms: 2000,
       unavailable_backoff_ms: 9000,
