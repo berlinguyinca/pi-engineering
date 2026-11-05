@@ -1,0 +1,12 @@
+[
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X04/logs/01-npm-run-typecheck-.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/aps-observability.test.ts test/unit/aps-worker-activity.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X04/logs/02-node-test-import-test-suppor.txt"
+ }
+]

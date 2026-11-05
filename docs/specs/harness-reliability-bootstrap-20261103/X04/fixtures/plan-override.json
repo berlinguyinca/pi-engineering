@@ -1,0 +1,14 @@
+{
+  "reason": "Live wiring half 2: signals must land in the Phase 6 snapshot to be evidence rather than a getter.",
+  "production": [
+    "src/aps/observability.ts"
+  ],
+  "tests": [
+    "test/unit/aps-observability.test.ts"
+  ],
+  "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/aps-observability.test.ts test/unit/aps-worker-activity.test.ts",
+  "evidence": "snapshot accounting + unit counts at the landed commit",
+  "maxProductionFiles": 1,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+}
