@@ -5,7 +5,7 @@
  * PI_GATEWAY_* variables for long-duration outages instead of duplicating
  * their semantics:
  *
- *   PI_INFERENCE_RESILIENCE_ENABLED         master switch (default true; "false"/"0" off)
+ *   PI_INFERENCE_RESILIENCE_ENABLED         master switch (default off; affirmative 1/true/yes/on arms it)
  *   PI_INFERENCE_STREAM_RETRY_ENABLED       same-model stream retry (default true)
  *   PI_INFERENCE_STREAM_RETRY_INITIAL       first stream-retry wait (default "30s")
  *   PI_INFERENCE_STREAM_RETRY_MAX           local stream-retry ceiling (default "2m")
@@ -67,7 +67,7 @@ export interface InferenceResilienceConfig {
 }
 
 export const DEFAULT_INFERENCE_RESILIENCE: InferenceResilienceConfig = {
-  enabled: true,
+  enabled: false,
   streamRetryEnabled: true,
   streamRetryInitialMs: 30_000,
   streamRetryMaxMs: 120_000,
@@ -122,7 +122,9 @@ export function resolveInferenceResilienceConfig(
   overrides?: Partial<InferenceResilienceConfig>,
 ): InferenceResilienceConfig {
   const cfg: InferenceResilienceConfig = { ...DEFAULT_INFERENCE_RESILIENCE };
-  cfg.enabled = bool(env.PI_INFERENCE_RESILIENCE_ENABLED, cfg.enabled);
+  // Intervention stays off until the operator asks for it (05-IMPLEMENTATION-SECURITY.md:13), and
+  // only an affirmative value arms it: a typo such as "ture" must not arm resilience silently.
+  cfg.enabled = optIn(env.PI_INFERENCE_RESILIENCE_ENABLED);
   cfg.streamRetryEnabled = bool(env.PI_INFERENCE_STREAM_RETRY_ENABLED, cfg.streamRetryEnabled);
   cfg.streamRetryInitialMs = parseRetryDurationMs(env.PI_INFERENCE_STREAM_RETRY_INITIAL, cfg.streamRetryInitialMs);
   cfg.streamRetryMaxMs = parseRetryDurationMs(env.PI_INFERENCE_STREAM_RETRY_MAX, cfg.streamRetryMaxMs);
