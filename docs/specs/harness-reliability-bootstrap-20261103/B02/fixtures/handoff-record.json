@@ -1,0 +1,42 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "B02",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "be581d1d872ccc36b2a43aecc5c21eb9c71553f0",
+ "resultSha": "bcfee3b03791afae66e41050a981d28e2e8a03de",
+ "taskAuthorityHash": "sha256:f9ee5d52b584c0319fe838b342b9a6636e90c3093665eeba2fb1acb3bb333cf9",
+ "changedFiles": [
+  "src/bootstrap/pathPolicy.ts",
+  "test/unit/bootstrap-path-policy.test.ts"
+ ],
+ "commands": [
+  {
+   "command": "npm run typecheck",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B02/logs/01-npm-typecheck.txt"
+  },
+  {
+   "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-path-policy.test.ts",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B02/logs/02-unit-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/B02/logs/01-npm-typecheck.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B02/logs/02-unit-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B02/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B02/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B02/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "B03",
+ "nextBaseSha": "bcfee3b03791afae66e41050a981d28e2e8a03de",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "BACK-FILL 2026-11-05: emitted retrospectively for work that landed before the stamping flow, against evidence re-collected at the original commit bcfee3b0 (feat(bootstrap): pure path allowlist matcher), whose parent be581d1d872c is precisely the base the parent record names, so the chain B00 -> B01 -> B02 is the real landed chain. Deliverables unchanged: src/bootstrap/pathPolicy.ts plus test/unit/bootstrap-path-policy.test.ts, no other path in that commit (git show --name-only HEAD). Declared verify commands re-run at bcfee3b0 itself in a detached worktree at that commit, not at today's tip: npm run typecheck exit 0 (logs/01-npm-typecheck.txt); node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-path-policy.test.ts -> 3 tests, 3 pass, 0 fail (logs/02-unit-test.txt). node_modules symlinked from the conductor checkout; nothing installed, nothing edited, git status --porcelain empty before and after. Deviation: temporal only - the record postdates the work by about two days and resultSha is the historical commit; mode and scope follow the manifest exactly (isolated-change over these two paths)."
+ }
+}

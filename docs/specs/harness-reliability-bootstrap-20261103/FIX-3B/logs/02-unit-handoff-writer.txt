@@ -1,0 +1,16 @@
+✔ the real schema accepts a real conforming record, with or without the stamped hash (2.465667ms)
+✔ every required field is required, at the top level and nested (0.178541ms)
+✔ a value outside enum, or of the wrong scalar type, is blocked at its path (0.162625ms)
+✔ array items are validated recursively, and only integral numbers satisfy integer (0.147959ms)
+✔ additionalProperties: false blocks an unknown key, but never the hash the writer stamps (0.105458ms)
+✔ null is accepted exactly where the schema allows it, and nowhere else (0.111041ms)
+✔ hostile schema or record input yields blockers and never an exception (0.236083ms)
+✔ writeHandoff creates a missing nested directory and leaves exactly one immutable handoff (1.733209ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 217.117375

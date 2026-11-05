@@ -1,0 +1,4 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/aps-task-alignment.test.ts   # at 87f2b2c9c92c04c1522c2781f2c46555741af354
+ℹ tests 4
+ℹ pass 4
+ℹ fail 0

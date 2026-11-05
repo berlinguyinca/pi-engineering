@@ -1,0 +1,14 @@
+✔ flag off is doing nothing, for every input including one the owner already granted (1.705416ms)
+✔ flag on is bounded: the cap holds, R03's wait survives, bootstrap is never granted (0.213083ms)
+✔ the owner's grant is never answered with a second grant (0.261792ms)
+✔ only the enrolled class is integrated (0.07525ms)
+✔ replay safety and the circuit outrank the flag (0.120792ms)
+✔ logging is data, and the module executes nothing (0.335083ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 158.373875

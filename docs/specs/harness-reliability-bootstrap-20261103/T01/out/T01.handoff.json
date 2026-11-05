@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T01",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "7be362d657c5ed1de8d0a70ce56def5dcc60953f",
+  "resultSha": "145549b5061f6b56b8c99645837e8361cd5b9be4",
+  "taskAuthorityHash": "sha256:be34abf365a65c2b81347952510661f12f66b60cd89ff66b85edadf368e8c5a7",
+  "changedFiles": [
+    "src/bootstrap/taskAuthority.ts",
+    "test/unit/task-authority.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T01/logs/05-typecheck-after.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/task-authority.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T01/logs/06-unit-task-authority-after.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T01/logs/05-typecheck-after.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T01/logs/06-unit-task-authority-after.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T01/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T01/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T01/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T02",
+  "nextBaseSha": "145549b5061f6b56b8c99645837e8361cd5b9be4",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T07:40:00Z",
+    "notes": "Worker panes t01 (dead: gateway 404 model_not_found for metabolomics/qwen3.7-max-next) then t01b (pane w8:p8, metabolomics/qwen3.8-flash_next) added src/bootstrap/taskAuthority.ts: deriveTaskAuthority canonicalizes the operator-authored goal/scope/nonGoals/tests (trim, drop empties, collapse duplicates keeping first occurrence, preserve order, refuse non-strings) and hashes them with the gate's own canonicalHash from ./resultGate.ts, so no second hashing convention exists; derivePlannerContractHash is a separate canonical form for the generated planner artifact; verifyAuthority recomputes authority from the frozen operator source only, so planner output cannot move it, and reports diverged fields plus an explicit reason when the recorded hash itself is tampered with. Conductor review found the first commit detected drift only for a top-level restatement while the module's own PlannerContract type nests it under restatement; the worker amended the commit so both shapes report the same diverged set, verified independently (logs/08: top and nested both [goal,scope,nonGoals,tests] with ok true, identical restatement reports only the reordered scope, tampered recorded hash refused with 'authority mismatch')."
+  },
+  "handoffHash": "sha256:a8018b3dc9120df8ce1eaab8ad4efe806cd57e1c37b0aeea6dc06ca1719657c0"
+}

@@ -1,0 +1,13 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-task-manifest.test.ts
+✔ B01: valid JSON fixture is accepted and every schema field is populated (1.39625ms)
+✔ B01: defaults apply when the optional fields (limits, denyPaths, expectedOutputs) are absent (0.157084ms)
+✔ B01: invalid fixtures are rejected with deterministic, sorted, deduplicated errors (0.218708ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 149.643709
+exit=0

@@ -1,0 +1,152 @@
+✔ accepts a fully attributed occurrence; absent optionals stay null (2.390958ms)
+✔ an occurrence with no session is refused — unattributable errors are not recordable (0.17425ms)
+✔ rejects unredacted secrets, control characters and unsafe artifact refs (0.173041ms)
+✔ requires correlation and validates layer, severity, version, timestamp (0.099709ms)
+✔ each fixture maps to the demanded code and severity with a valid, non-empty summary (4.30025ms)
+✔ unrecognised or unreadable input becomes an explicit unknown event instead of throwing (0.985709ms)
+✔ the original evidence reference is preserved unchanged, ahead of the derived refs (0.131458ms)
+✔ normalization is deterministic, clock-free, redacting and honest about missing attribution (0.476209ms)
+✔ every secret fixture is absent from the persisted representation and only the env variable's name survives (3.321458ms)
+✔ a raw prompt becomes its length plus a stable digest, never a shorter prefix of itself (0.907291ms)
+✔ list caps drop the tail into a counted marker instead of silently, and re-sanitizing does not stack it (0.826917ms)
+✔ the persisted record respects the byte budget, however oversized the occurrence (1.2ms)
+✔ sanitize is idempotent, keeps the evidence E03 carried, and never throws on malformed input (1.375875ms)
+✔ a clean occurrence passes through unchanged apart from the caps (0.235292ms)
+✔ incident-controller: appends before publishing the first failure (6.633792ms)
+✔ incident-controller: suppresses duplicate fingerprints without republishing (0.350167ms)
+✔ incident-controller: retains durable event when publishing fails (0.449583ms)
+✔ incident-controller: room summary is bounded and excludes raw logs (0.14925ms)
+✔ incidents-fingerprint: stable across volatile metadata and configured worktree paths (2.041708ms)
+✔ incidents-fingerprint: different identity fields produce different fingerprints (0.243917ms)
+✔ incidents-fingerprint: does not strip unconfigured paths or lookalike prefixes (0.180334ms)
+✔ incidents-fingerprint: treats the configured prefix literally in quoted paths (0.165208ms)
+✔ incidents-fingerprint: normalizes shell delimiters and local file URLs (0.081ms)
+✔ incidents-fingerprint: preserves timestamps and meaningful whitespace within causes (0.132458ms)
+✔ incidents-fingerprint: payload is a JSON-safe versioned event with explicit fields (0.881875ms)
+✔ incidents-fingerprint: accepts bounded summaries and rejects blank or oversized summaries (0.307666ms)
+✔ incidents-fingerprint: bounds artifact reference count and length (0.234625ms)
+✔ incidents-fingerprint: nullable exit status survives JSON and invalid numbers are rejected (0.191667ms)
+✔ incidents-fingerprint: rejects non-primitive fields and invalid classification or risk (1.330375ms)
+✔ incidents-fingerprint: rejects blank identity fields and oversized compact fields (0.281084ms)
+▶ RuntimeRegistry
+  ✔ uses WAL and issues a fresh generation on every registration (5.687667ms)
+  ✔ a stale unregister cannot release the current generation's leases (2.913791ms)
+  ✔ prevents session resurrection: a session declared dead cannot heartbeat its old generation back to life (2.250625ms)
+  ✖ assesses liveness from process incarnation: dead pid, reused pid (forged start time) and reboot are dead (63.029333ms)
+  ✖ a stale heartbeat alone does not kill a verifiably live process (2.179833ms)
+  ✔ reboot simulation: startup reconciliation orphans sessions whose PIDs no longer exist and frees their leases (169.818083ms)
+✖ RuntimeRegistry (246.879625ms)
+▶ LeaseManager
+  ✔ is generation-fenced: an old holder can neither renew nor release a reclaimed lease (ABA) (61.675584ms)
+  ✖ PID reuse: a lease recorded with a forged start time for a live pid is reclaimed, never honored (2.237584ms)
+  ✖ respects a lease held by a live session in another process (2.533709ms)
+  ✔ is re-entrant for the holding session and released with the session on unregister (1.678959ms)
+  ✖ a verifiably live holder keeps exclusive custody after a long heartbeat gap (1.873417ms)
+  ✔ an unverifiable (remote-host) holder is displaced only after its lease expires (1.603125ms)
+  ✔ LeaseMissionCustody namespaces resources and reports the live holder (3.508625ms)
+✖ LeaseManager (75.557292ms)
+ℹ tests 43
+ℹ suites 2
+ℹ pass 38
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 510.887416
+
+✖ failing tests:
+
+test at test/unit/runtime-isolation-registry.test.ts:95:3
+✖ assesses liveness from process incarnation: dead pid, reused pid (forged start time) and reboot are dead (63.029333ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+  +   reason: 'pid_not_alive',
+  -   reason: 'pid_reused',
+      verdict: 'dead'
+    }
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-e05-session-error-writer-20261104/test/unit/runtime-isolation-registry.test.ts:104:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { verdict: 'dead', reason: 'pid_not_alive' },
+    expected: { verdict: 'dead', reason: 'pid_reused' },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at test/unit/runtime-isolation-registry.test.ts:111:3
+✖ a stale heartbeat alone does not kill a verifiably live process (2.179833ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'dead' !== 'live'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-e05-session-error-writer-20261104/test/unit/runtime-isolation-registry.test.ts:117:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'dead',
+    expected: 'live',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/unit/runtime-isolation-registry.test.ts:170:3
+✖ PID reuse: a lease recorded with a forged start time for a live pid is reclaimed, never honored (2.237584ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'pid_not_alive'
+  - 'pid_reused'
+         ^
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-e05-session-error-writer-20261104/test/unit/runtime-isolation-registry.test.ts:179:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'pid_not_alive',
+    expected: 'pid_reused',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/unit/runtime-isolation-registry.test.ts:185:3
+✖ respects a lease held by a live session in another process (2.533709ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'missing'
+  - 'present'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-e05-session-error-writer-20261104/test/unit/runtime-isolation-registry.test.ts:192:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'missing',
+    expected: 'present',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/unit/runtime-isolation-registry.test.ts:226:3
+✖ a verifiably live holder keeps exclusive custody after a long heartbeat gap (1.873417ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  true !== false
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-e05-session-error-writer-20261104/test/unit/runtime-isolation-registry.test.ts:235:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

@@ -1,0 +1,18 @@
+✔ evidence: one failureIdentity across two event ids counts once, keeps both ids, and a shuffled input yields byte-identical output (criterion 1) (3.616708ms)
+✔ first/last seen bound only the deduped occurrences, and every dimension set is sorted and unique (criterion 2) (0.268167ms)
+✔ recovered + unresolved === count, resolution defaults to unresolved, and a duplicate's resolution counts for nothing (criterion 3) (0.2145ms)
+✔ stable ordering: lastSeen desc, then count desc, then fingerprint asc, so the order is total (criterion 1) (0.180333ms)
+✔ maxEventIds caps kept source ids with eventIdsTruncated, limit truncates clusters with truncated, the default cap is documented (criterion 2) (0.360583ms)
+✔ purity and rejection: the caller's array and rows are deep-equal after the call, and a row D02 refuses is rejected and forms no cluster (criterion 4) (0.495292ms)
+✔ reproducible context survives: fingerprint, representative summary, affected versions, E07 retry identity, task/handoff ids and the D04 outcome (6.108667ms)
+✔ a bearer URL, an sk- key and a raw prompt are sanitized before byte accounting and appear nowhere in the serialized bundle (1.240625ms)
+✔ maxItems and maxBytes are enforced with the dropped count reported, so truncation is never silent (2.357458ms)
+✔ ordering is total and the same input re-serializes byte-identically in any order, without mutating the caller's data (2.644083ms)
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 184.662083

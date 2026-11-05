@@ -1,0 +1,17 @@
+[
+ {
+  "command": "node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X07/logs/01-node-docs-specs-harness-rel.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts test/unit/aps-task-alignment.test.ts test/unit/aps-drift-watch.test.ts test/unit/aps-observability.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X07/logs/02-node-test-import-test-suppor.txt"
+ },
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X07/logs/03-npm-run-typecheck-.txt"
+ }
+]

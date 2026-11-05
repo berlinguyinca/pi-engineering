@@ -1,0 +1,16 @@
+claim recovered + http200, no completion     -> unresolved reason=failure.unresolved                           missing=["completion:allowlisted-kind-after-failureAt"]
+claim recovered + http204 + retryTraced      -> unresolved reason=failure.unresolved                           missing=["completion:allowlisted-kind-after-failureAt"]
+completion kind not allowlisted              -> unknown    reason=completion.not.substantiated                 missing=["completion:allowlisted-kind-after-failureAt"]
+completion equal timestamp (not after)       -> unknown    reason=completion.not.substantiated                 missing=["completion:allowlisted-kind-after-failureAt"]
+completion earlier than failure              -> unknown    reason=completion.not.substantiated                 missing=["completion:allowlisted-kind-after-failureAt"]
+valid: allowlisted completion after failure  -> recovered  reason=completion.strictly.after.failure            missing=[]
+valid + retryTraced + 200                    -> recovered  reason=completion.strictly.after.failure            missing=[]
+failure not recorded                         -> unknown    reason=failure.not.recorded                         missing=["failureRecorded"]
+suppressed complete                          -> suppressed reason=suppression.recorded                         missing=[]
+suppression half-filled                      -> unknown    reason=suppression.incomplete                       missing=["suppression:eventId"]
+garbage null                                 -> unknown    reason=evidence.malformed                           missing=["failureRecorded"]
+garbage {}                                   -> unknown    reason=failure.not.recorded                         missing=["failureRecorded"]
+bad dates                                    -> unknown    reason=completion.not.substantiated                 missing=["completion:allowlisted-kind-after-failureAt"]
+2xx never recovered: true
+status never cited in reason: true
+COMPLETION_KINDS: ["verification.passed","unit.passed","typecheck.passed","task.completed"]

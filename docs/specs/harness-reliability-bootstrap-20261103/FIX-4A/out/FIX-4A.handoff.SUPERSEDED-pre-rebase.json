@@ -1,0 +1,50 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "FIX-4A",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "5d000abc2403189b0fc83b0685d504af220a79e9",
+  "resultSha": "e58a4376495dd814060c400cdfcfa338e9ac33e0",
+  "taskAuthorityHash": "sha256:95f71e41831d04895d8651e0c1ac0692d7cd6c9b51a62a12362a63965bef5839",
+  "changedFiles": [
+    "src/bootstrap/resultGate.ts",
+    "scripts/bootstrap-one.ts",
+    "test/unit/bootstrap-one.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-one.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/logs/02-unit-one.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-*.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/logs/03-unit-all.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/logs/02-unit-one.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/logs/03-unit-all.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "FIX-4B",
+  "nextBaseSha": "74b54eb1",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T07:20:00Z",
+    "notes": "Worker pane fix4a (pane w0:p7, metabolomics/qwen3.8-flash_next) added taskAuthorityHash(manifest) = canonicalHash(parsedManifest) to resultGate and required the record to carry it at stamp time. The conductor re-derived the same value two independent ways (its own handoff tool and a direct canonicalHash(parseTaskManifest(json).manifest) call) and got sha256:5f6183004f02b89ed52c0d3efe5425452f76e316054c7ecb456a36a5cb3b29de for the FIX-3C manifest, matching the implementation exactly. Controls in logs/04-06: wrong authority rejected with no file written, absent authority rejected, correct authority accepted with the authority line printed. Suites: bootstrap-one 18/18, whole bootstrap set 55/55. parentHandoffHash is null here because FIX-3C declared nextTaskId FIX-4 / nextBaseSha 3881178f and the conductor then made two branch commits (5d000abc docs, 74b54eb1 gitignore) before this unit; strict chain continuity is restored from FIX-4B, whose base is 74b54eb1 and whose parent is this handoff. The interleaved-commit root cause is fixed by 74b54eb1 (run artifacts untracked)."
+  },
+  "handoffHash": "sha256:ae60b0692115ad5e070d927fefa707aa38028b0b8c2bea0369b4f383075361f6"
+}

@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T09",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "11131ece730d723c1e497d860c6185a717b8691f",
+  "resultSha": "3bb21ab2e4b4434f01f01d93770ff4a131f176e9",
+  "taskAuthorityHash": "sha256:59d5cb3b8b399b849bf2fb19192293ea4a3ef7d3a852d3c76291f1d1e120295b",
+  "changedFiles": [
+    "src/plannerWorker/executor.ts",
+    "test/unit/planner-worker-scope-gate.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T09/logs/04-typecheck-slim.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/planner-worker-scope-gate.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T09/logs/05-unit-scope-gate-slim.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T09/logs/04-typecheck-slim.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T09/logs/05-unit-scope-gate-slim.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T09/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T09/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T09/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "R01",
+  "nextBaseSha": "3bb21ab2e4b4434f01f01d93770ff4a131f176e9",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T23:10:00Z",
+    "notes": "Worker pane t09 (pane w8:pH, metabolomics/qwen3.8-flash_next) on base 11131ece. First candidate 1a173b60 was rejected on budget (208 changed lines vs the 100 cap) after conductor review also required the wiring to move after commitAttempt so an unauthorized diff stays reachable; the amended commit keeps the gate in attempt() after the attempt commit and before verification/review/integration, collecting paths with git diff --name-only <base> HEAD plus git ls-files --others --exclude-standard, and on violation preserving the attempt as a collision-safe superseded/<branch>-<stamp> ref (named in the emitted phase event), setting blocked_reason through the exported scopeGateBlockedReason helper as 'evidence: scope gate: <exact refs>' so the existing blocked-evidence path consumes it, and returning done without ever calling integrate(). Exported pure scopeIntegrityCheck + PROTECTED_TASK_AUTHORITY_GLOBS reuse review.ts scopeViolations/matchesScope and contract.ts matchesGlob; a protected hit is unauthorized even inside scope and the list is overridable. Conductor probe re-verified every rule after the line cut (out-of-scope order, in-scope pass, protected-inside-scope block, override honoured, all six authority families including scripts/bootstrap-one.ts, ordinary src clean, bound 20 with the note only in refs, non-string entries ignored, empty inert, deterministic, reason prefix). Correction: this handoff replaces the first T09 emission, whose nextTaskId said 'T10'; the manifest has no T10 and the next task is R01."
+  }
+}

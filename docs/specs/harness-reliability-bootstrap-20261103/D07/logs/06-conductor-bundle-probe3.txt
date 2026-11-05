@@ -1,0 +1,10 @@
+file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-d07-evidence-bundle-20261104/conductor-d07-probe3.mts:2
+import { ERROR_OCCURRENCE_VERSION,                      } from "./src/incidents/types.ts";
+         ^^^^^^^^^^^^^^^^^^^^^^^^
+SyntaxError: The requested module './src/incidents/types.ts' does not provide an export named 'ERROR_OCCURRENCE_VERSION'
+    at #asyncInstantiate (node:internal/modules/esm/module_job:327:21)
+    at async ModuleJob.run (node:internal/modules/esm/module_job:431:5)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:646:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+
+Node.js v26.3.0

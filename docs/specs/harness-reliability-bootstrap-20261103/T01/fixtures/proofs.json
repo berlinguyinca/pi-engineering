@@ -1,0 +1,12 @@
+[
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/T01/logs/05-typecheck-after.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/task-authority.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/T01/logs/06-unit-task-authority-after.txt"
+ }
+]

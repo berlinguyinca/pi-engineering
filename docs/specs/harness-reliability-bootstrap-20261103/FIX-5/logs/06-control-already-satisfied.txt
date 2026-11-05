@@ -1,0 +1,9 @@
+$ node --experimental-strip-types scripts/bootstrap-one.ts --manifest /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmp_4huwkg5/manifest.json --parent-handoff /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmp5jsaz9jr/parent.json --proofs /Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-5/fixtures/proofs.json --handoff-record /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmpw5kmahmo/record.json --handoff-schema docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json --emit-handoff /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmpxyvliny6/06-control-already-satisfied --cwd /Users/wohlgemuth/IdeaProjects/worktrees/pi-fix5-parent-status-20261104
+
+exit=0
+REJECT baseline: HEAD ba22f28a6b540de74eb49a88a3e4fd62a08af1b4 != manifest baseSha 7f983ee05c0d6feb1ee725984070aef31bdcf92c
+plan exit=3; no model invoked (B04 stops here)
+parent=FIX-4B accepted sha256:0c4af6c5a3e…
+authority=FIX-5 sha256:7fb00e8e03884573476a6c8c2bb8c0e249a04afbd19f7b41f57eb883a3dd2d1f
+schema=FIX-5 conforms docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json
+handoff=/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmpxyvliny6/06-control-already-satisfied/FIX-5.handoff.json checksum=sha256:34ff1e2c2ce63e54d0e4e7756d5e08844ea7afb37fe4a043550c132a6620b7eb gate=accepted (clean tree + proofs + diff scope + HEAD^1 == approved base; the plan baseline line above describes the pre-task state)

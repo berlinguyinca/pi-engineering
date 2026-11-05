@@ -1,0 +1,14 @@
+✔ an exhausted budget stops, and an attempt beyond the ceiling is not a retry (1.322542ms)
+✔ zero budget never retries, and bootstrap mode stops before validation (0.079875ms)
+✔ elapsed time and the deadline are honoured (0.084917ms)
+✔ backoff bounds come from retryDelay, not a local formula, and a larger server wait dominates (0.104458ms)
+✔ the same input is the same decision, and the module reads no clock, RNG, environment or timer (0.988459ms)
+✔ invalid budgets are refused, never guessed (0.087208ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 156.644416

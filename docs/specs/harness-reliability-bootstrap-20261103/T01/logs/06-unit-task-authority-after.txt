@@ -1,0 +1,13 @@
+✔ T01 regression: modifying planner output — restating goal/scope/nonGoals/tests with different content — cannot move the authority hash (1.409ms)
+✔ T01: changing any one of goal/scope/nonGoals/tests by one item changes the authority hash (0.176042ms)
+✔ T01: authority and planner-contract digests differ for identical words; whitespace and duplicates canonicalize away; order is meaning-bearing (0.103333ms)
+✔ T01: malformed sources are refused with stable reasons, never a placeholder (0.085875ms)
+✔ T01: derive and verify are pure — the operator's object is byte-identical afterwards (0.086125ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 157.237959

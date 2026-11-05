@@ -1,0 +1,32 @@
+✔ autospec-incident-sink: sends an event file and removes it after success (22.857334ms)
+✔ autospec-incident-sink: preserves durable retry semantics on command failure (2.556916ms)
+✔ autospec-incident-sink: rejects malformed command output (6.039375ms)
+✔ autospec-incident-sink: rejects an acknowledgement for another event or mode (19.723167ms)
+✔ accepts a fully attributed occurrence; absent optionals stay null (116.465417ms)
+✔ an occurrence with no session is refused — unattributable errors are not recordable (0.416833ms)
+✔ rejects unredacted secrets, control characters and unsafe artifact refs (0.366ms)
+✔ requires correlation and validates layer, severity, version, timestamp (0.198375ms)
+✔ incident-controller: appends before publishing the first failure (5.434083ms)
+✔ incident-controller: suppresses duplicate fingerprints without republishing (0.748083ms)
+✔ incident-controller: retains durable event when publishing fails (1.005042ms)
+✔ incident-controller: room summary is bounded and excludes raw logs (0.352ms)
+✔ incidents-fingerprint: stable across volatile metadata and configured worktree paths (40.596958ms)
+✔ incidents-fingerprint: different identity fields produce different fingerprints (0.463042ms)
+✔ incidents-fingerprint: does not strip unconfigured paths or lookalike prefixes (0.371875ms)
+✔ incidents-fingerprint: treats the configured prefix literally in quoted paths (0.338667ms)
+✔ incidents-fingerprint: normalizes shell delimiters and local file URLs (0.16625ms)
+✔ incidents-fingerprint: preserves timestamps and meaningful whitespace within causes (0.199875ms)
+✔ incidents-fingerprint: payload is a JSON-safe versioned event with explicit fields (1.735417ms)
+✔ incidents-fingerprint: accepts bounded summaries and rejects blank or oversized summaries (0.615333ms)
+✔ incidents-fingerprint: bounds artifact reference count and length (1.511875ms)
+✔ incidents-fingerprint: nullable exit status survives JSON and invalid numbers are rejected (0.401708ms)
+✔ incidents-fingerprint: rejects non-primitive fields and invalid classification or risk (2.457292ms)
+✔ incidents-fingerprint: rejects blank identity fields and oversized compact fields (0.778125ms)
+ℹ tests 24
+ℹ suites 0
+ℹ pass 24
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1309.342625

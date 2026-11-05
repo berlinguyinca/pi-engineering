@@ -1,0 +1,7 @@
+missing required, default policy      : canLaunch=false reason="indispensable evidence is missing (paths: src/reader.ts)"
+missing required, investigation opt-in: canLaunch=true reason="indispensable evidence is missing (paths: src/reader.ts)"
+missing required, opt-in false        : canLaunch=false reason="indispensable evidence is missing (paths: src/reader.ts)"
+truncated only, default               : canLaunch=true reason="null"
+truncated only, opt-in true           : canLaunch=true reason="null"
+no omissions                          : canLaunch=true reason="null"
+mixed unavailable + truncated         : canLaunch=false reason="indispensable evidence is missing (paths: b.ts, c.ts)"

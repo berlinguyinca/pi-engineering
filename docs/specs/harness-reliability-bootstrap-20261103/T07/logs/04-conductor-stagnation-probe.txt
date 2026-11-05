@@ -1,0 +1,7 @@
+threshold 3, gap 10        : stagnation=1 subject="AC-1,AC-2" evidence=2 of 2 criteria (AC-1, AC-2) unadvanced for 3 iterations; last recorded progress iteration 2; actions observed
+threshold 3, fresh (gap 1) : stagnation=0 subject=null evidence=null
+default 10, gap 11         : stagnation=1 subject="AC-1" evidence=1 of 1 criteria (AC-1) unadvanced for 10 iterations; last recorded progress iteration 2; actions observed thro
+default 10, gap 9          : stagnation=0 subject=null evidence=null
+bad threshold -5, gap 11   : stagnation=1 subject="AC-1" evidence=1 of 1 criteria (AC-1) unadvanced for 10 iterations; last recorded progress iteration 2; actions observed thro
+bad threshold NaN, gap 9   : stagnation=0 subject=null evidence=null
+no acceptance provided     : stagnation=0 subject=null evidence=null

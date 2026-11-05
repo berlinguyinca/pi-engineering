@@ -1,0 +1,19 @@
+REJECT baseline: HEAD ec19e5102cd057bc66242c06837c3f5f44a67472 != manifest baseSha 9e508548602b78ab9b21bf3082e3dc6aca0e819e
+plan exit=3; no model invoked (B04 stops here)
+REJECT gate: worktree is not clean: the gate stamps only a committed, clean task commit
+REJECT gate: canonical hash sha256:c1edac57d880a06babf48548f8d5926b56ced2e5cfcb5b9d9ec13eff2ac5711a != manifest parentHandoffHash sha256:8a69505d609f6d15a86d9534ec4543ae3f84dec7b568519da67d29ffa222bb9a
+REJECT gate: $.specVersion: required property missing
+REJECT gate: $.status: required property missing
+REJECT gate: $.repo: required property missing
+REJECT gate: $.baseSha: required property missing
+REJECT gate: $.changedFiles: required property missing
+REJECT gate: $.commands: required property missing
+REJECT gate: $.evidence: required property missing
+REJECT gate: $.blockedReasons: required property missing
+REJECT gate: $.operatorApproval: required property missing
+REJECT gate: $.schemaVersion: disallowed additional property
+REJECT gate: $.parentHandoffHash: disallowed additional property
+REJECT gate: $.baseCommitSha: disallowed additional property
+REJECT gate: $.verdict: disallowed additional property
+REJECT gate: $.claimEvidenceRefs: disallowed additional property
+REJECT gate: $.failureRef: disallowed additional property

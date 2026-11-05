@@ -1,0 +1,39 @@
+harness-reliability-bootstrap-20261103 - why the whole-suite gate (G1/S2) is not recorded as green
+measured at 7c051955f5b3f47535d77d4d5518c930e37318e6 on harness-reliability-bootstrap-20261103, node v26.3.0, 728 test files
+package test script: node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts "test/unit/**/*.test.ts" "test/integration/**/*.test.ts"
+
+Symptom: `npm test` never terminates. Two integration files never settle, so the runner - even with
+  --test-force-exit - waits on them and no tally is ever printed. Confirmed identical at 900bf8a3
+  (the pre-X-series tip) and at the X-series tip, so neither X-series commit introduced it:
+    test/integration/mission-interrupt-pause.test.ts    -> tests 1 pass 0 fail 0 cancelled 1,
+      'Promise resolution is still pending but the event loop has already resolved' after 180s and 240s budgets
+    test/integration/mission-merge-queue-flow.test.ts   -> same cancellation after 180s, preceded by
+      an ERR_ASSERTION (actual false, expected true) inside a pending subtest
+In the detached whole-suite run both files were still running 21 minutes after the run started, with
+40 failures reported from other files in that time and no final tally.
+
+Mechanism (read, not inferred from the failure text):
+  mission-interrupt-pause.test.ts:36-47 - the stub worker parks the first implementer attempt on
+    await new Promise(resolve => request.signal?.addEventListener('abort', () => resolve(), { once: true }));
+    With no signal, or with an abort that never arrives, that promise is unresolvable: the file hangs
+    without failing. WorkerRequest.signal is optional (src/workers/WorkerExecutor.ts:143) and
+    src/orchestration/realBackends.ts:582 (req.signal = input.signal) is the only producer of it, so
+    the file terminates only on the path where the orchestrator hands the run's signal to the worker.
+  Adjacent mission files in the same family do terminate (mission-observability-e2e 3/3, mission-
+  operator-model-switch 3/3, mission-build-budget-wiring 2/3 with a cargo-target-dir failure that is
+  environment-bound), so this is two files, not a broken family.
+
+Consequence for the gates: unit-suite verification in this run is recorded as bounded globs with a
+  base-vs-head comparison (see the caveats in PLAN-COMPLETION.json), never as a green whole-suite run.
+  G1/S2 stay open until the two files settle on their own.
+
+Exact next step, in order:
+  1. Run each file alone with a bounded budget and print the awaited construct
+     (node --test --import ./test/support/isolatedState.ts test/integration/mission-interrupt-pause.test.ts);
+  2. Establish whether the operator interrupt reaches the parked worker: trace interruptibleRun /
+     orchestrator.resume(..., { signal, interrupt: 'pause' }) into realBackends.runWorker for the
+     mission this fixture builds - if the signal never aborts, that is a production defect in
+     interrupt/pause propagation, and the fix belongs in src/orchestration, not in the test;
+  3. Only after that, make the stub fail fast instead of hanging (race the abort with a bounded timer
+     that asserts the interrupt arrived), so a regression surfaces as a failure rather than as a
+     suite that never ends.

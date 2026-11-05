@@ -1,0 +1,18 @@
+✔ evidence criterion: the fixture index prints exact clustered totals (human and --json), exit 0, sanitized output (3.093834ms)
+✔ exit 2: invalid argv is refused with a stable message per problem and nothing is read (0.144167ms)
+✔ exit 3 and 4: refused namespace, a read that throws, an export write that throws (0.307042ms)
+✔ filters forward to the injected read: --last, --session, --model, --host; --host otherwise comes from hostname() (0.351333ms)
+✔ --export: one write to the requested path, no overwrite without --force, never inside the namespace (0.234584ms)
+✔ --help is a success path that prints usage and reads nothing (0.05ms)
+✔ every filter combination leaves the namespace byte- and name-identical, proving no writer was opened (8.003833ms)
+✔ time, host, session and limit filters select exactly what they say (3.096375ms)
+✔ foreign types, corrupt lines and payloads E02 refuses are skipped and counted; order is deterministic (1.5335ms)
+✔ a nonexistent or empty namespace reads as the documented empty result and creates nothing (1.624792ms)
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 163.023

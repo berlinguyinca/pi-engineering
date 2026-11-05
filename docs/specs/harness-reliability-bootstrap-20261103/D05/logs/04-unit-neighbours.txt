@@ -1,0 +1,29 @@
+✔ evidence: one failureIdentity across two event ids counts once, keeps both ids, and a shuffled input yields byte-identical output (criterion 1) (3.719625ms)
+✔ first/last seen bound only the deduped occurrences, and every dimension set is sorted and unique (criterion 2) (0.242083ms)
+✔ recovered + unresolved === count, resolution defaults to unresolved, and a duplicate's resolution counts for nothing (criterion 3) (0.207792ms)
+✔ stable ordering: lastSeen desc, then count desc, then fingerprint asc, so the order is total (criterion 1) (0.178333ms)
+✔ maxEventIds caps kept source ids with eventIdsTruncated, limit truncates clusters with truncated, the default cap is documented (criterion 2) (0.341333ms)
+✔ purity and rejection: the caller's array and rows are deep-equal after the call, and a row D02 refuses is rejected and forms no cluster (criterion 4) (0.475417ms)
+✔ equivalent occurrences from another session, host, run, timestamp, uuid, duration, byte count, worktree path and prompt digest share one key (criterion 1) (2.577458ms)
+✔ distinct causes stay separate — 404 vs 429 above all, plus layer, tool, root-cause noun and exception class (criterion 2) (0.291ms)
+✔ deterministic and idempotent, with a fixed digest shape that carries none of the volatile text (criterion 3) (0.202834ms)
+✔ malformed input is total: the documented fallback key or a documented coercion, never a throw (criterion 4) (0.138083ms)
+✔ the key is not the payload digest: pointers, severity and model alone cannot move it (criterion 5) (0.122375ms)
+✔ every filter combination leaves the namespace byte- and name-identical, proving no writer was opened (9.555417ms)
+✔ time, host, session and limit filters select exactly what they say (3.923625ms)
+✔ foreign types, corrupt lines and payloads E02 refuses are skipped and counted; order is deterministic (2.207958ms)
+✔ a nonexistent or empty namespace reads as the documented empty result and creates nothing (1.854875ms)
+✔ evidence criterion: claimed recovered with httpStatus 200 and no completion is rejected, missing names the absent proof (criterion 1) (1.400958ms)
+✔ recovered needs an allowlisted completion strictly after failureAt; equal and earlier rejected; retryTraced alone is nothing (criterion 3) (0.13625ms)
+✔ suppressed only with a complete suppression record; a half-filled one is unknown naming what is missing (criterion 4) (0.12725ms)
+✔ unresolved is the default for a recorded failure alone, and no 2xx changes the outcome or leaks into reason (criteria 2+4) (0.1005ms)
+✔ totality: null, {}, non-date failureAt and completion { kind: 5 } never throw and always answer with evidence (criterion 4) (0.141416ms)
+✔ every reason is a stable code and no reason ever cites an HTTP status (criterion 2) (0.753834ms)
+ℹ tests 21
+ℹ suites 0
+ℹ pass 21
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 189.851208

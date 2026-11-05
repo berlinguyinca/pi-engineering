@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T07",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "1fdccb18f986a1e4a7b09ce72f53a3f5c3acf58f",
+  "resultSha": "fbb1258e7e69ae3184f6f4596e2dae53232100ac",
+  "taskAuthorityHash": "sha256:3189d13f0af636730dff90b65a6437ff3c512842922bcfdffc2c484e5ce920ea",
+  "changedFiles": [
+    "src/aps/taskAlignment.ts",
+    "test/unit/aps-task-alignment.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T07/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/aps-task-alignment.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T07/logs/02-unit-task-alignment.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T07/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T07/logs/02-unit-task-alignment.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T07/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T07/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T07/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T08",
+  "nextBaseSha": "fbb1258e7e69ae3184f6f4596e2dae53232100ac",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T18:20:00Z",
+    "notes": "Worker pane t07 (pane w8:pF, metabolomics/qwen3.8-flash_next) on base 1fdccb18 created the pure module src/aps/taskAlignment.ts: evaluateTaskAlignment() flags out_of_scope_write (mutating actions whose target matches no allowedScope glob via the existing matchesGlob), unrelated_dependency (trimmed, case-insensitive against allowedDependencies), task_expansion (task ids outside declaredTasks) and acceptance_stagnation (last recorded progress at least stagnationIterations behind the highest observed action iteration, default 10, invalid thresholds fall back rather than throw), reporting only observable facts (grep for confidence/score/percent in the module is empty) and never flagging non-mutating reads outside scope. Conductor probes (logs/03, logs/04) reproduced the plan's named fixture pair — the irrelevant-refactor run produced exactly 5 signals (3 out-of-scope writes naming the target plus allowed globs, task_expansion naming T99 vs declared T07, unrelated_dependency naming left-pad with 'authorized: none') sorted, deduplicated and byte-identical across runs, while the same files touched read-only produced zero signals — plus the stagnation boundary (gap 11 flags, gap 9 does not, -5/NaN fall back to 10), empty allowedScope flagging any mutating target, in-scope writes silent, and ' Zod ' accepted under allowedDependencies ['zod']. Nothing wires the detector into a runtime path yet (T09's result gate is the consumer)."
+  },
+  "handoffHash": "sha256:c4334ccd36eebbaac6c2ea1bb0a1778306d721445642a9e889027ed8bddb3d80"
+}

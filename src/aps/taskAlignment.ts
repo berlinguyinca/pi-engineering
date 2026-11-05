@@ -1,20 +1,30 @@
 /**
  * APS task-alignment deviation signals (T07): pure, deterministic, evidence-only.
- * Flags out-of-scope MUTATING writes, unauthorized new dependencies, task ids
- * outside `declaredTasks`, and acceptance stagnation; read-only investigation of
- * unrelated files is legitimate and stays silent. Evidence states observable facts.
+ * Flags out-of-scope MUTATING writes, writes producing an artifact class the task
+ * never declared, unauthorized new dependencies, task ids outside `declaredTasks`,
+ * and acceptance stagnation; read-only investigation of unrelated files is
+ * legitimate and stays silent. Evidence states observable facts.
  */
 import { matchesGlob } from "../plannerWorker/contract.ts";
 import { isMutatingTool } from "./types.ts";
 
-export type AlignmentKind = "out_of_scope_write" | "unrelated_dependency" | "task_expansion" | "acceptance_stagnation";
+export type AlignmentKind = "out_of_scope_write" | "undeclared_artifact" | "unrelated_dependency" | "task_expansion" | "acceptance_stagnation";
+/** What the operator declared the task would produce, before the run (the artifact contract). */
+export interface DeclaredArtifact { kind: "source" | "test" | "docs"; pathPattern?: string }
 export interface AlignmentSignal { kind: AlignmentKind; subject: string; iteration: number; evidence: string; taskId?: string }
 export interface TaskAction { iteration: number; tool: string; target?: string; taskId?: string; mutating: boolean; newDependency?: string }
 export interface TaskAlignmentInput {
   allowedScope: readonly string[]; declaredTasks: readonly string[]; allowedDependencies: readonly string[];
   actions: readonly TaskAction[];
+  declaredArtifacts?: readonly DeclaredArtifact[];
   acceptance?: { criteria: readonly string[]; progressedAtIteration: Record<string, number> }; stagnationIterations?: number;
 }
+
+/** Artifact class of a path, by this repository's own layout conventions. */
+const artifactClass = (path: string): "source" | "test" | "docs" =>
+  path.startsWith("test/") || path.endsWith(".test.ts") ? "test" : path.startsWith("docs/") || path.endsWith(".md") ? "docs" : "source";
+const contractOf = (declared: readonly DeclaredArtifact[]): string =>
+  declared.map((d) => (d.pathPattern ? `${d.kind} ${d.pathPattern}` : d.kind)).join(", ");
 
 const DEFAULT_STAGNATION_ITERATIONS = 10; // fallback for absent or malformed stagnationIterations
 const limitOf = (value: number | undefined): number => (Number.isInteger(value) && value !== undefined && value > 0 ? value : DEFAULT_STAGNATION_ITERATIONS);
@@ -24,12 +34,17 @@ const listed = (items: readonly string[], none: string): string => (items.length
 export function evaluateTaskAlignment(input: TaskAlignmentInput): AlignmentSignal[] {
   const limit = limitOf(input.stagnationIterations);
   const scope = input.allowedScope ?? []; const declared = input.declaredTasks ?? []; const actions = input.actions ?? [];
+  const declaredArtifacts = input.declaredArtifacts ?? [];
   const deps = (input.allowedDependencies ?? []).map((d) => d.trim().toLowerCase()).filter((d) => d !== "");
   const hits: AlignmentSignal[] = []; let observed = Number.NEGATIVE_INFINITY;
   for (const a of actions) {
     if (Number.isFinite(a.iteration)) observed = Math.max(observed, a.iteration);
     const target = a.target?.trim();
-    if ((a.mutating ?? isMutatingTool(a.tool)) && target && !scope.some((glob) => matchesGlob(target, glob)))
+    const mutating = a.mutating ?? isMutatingTool(a.tool);
+    if (mutating && target && declaredArtifacts.length > 0 && !declaredArtifacts.some((d) => d.pathPattern === undefined ? d.kind === artifactClass(target) : matchesGlob(target, d.pathPattern)))
+      hits.push({ kind: "undeclared_artifact", subject: target, iteration: a.iteration, taskId: a.taskId,
+        evidence: `mutating ${a.tool} to ${target} at iteration ${a.iteration} produces a ${artifactClass(target)} artifact the task did not declare (declared: ${contractOf(declaredArtifacts)})` });
+    if (mutating && target && !scope.some((glob) => matchesGlob(target, glob)))
       hits.push({ kind: "out_of_scope_write", subject: target, iteration: a.iteration, taskId: a.taskId,
         evidence: `mutating ${a.tool} to ${target} at iteration ${a.iteration} matches no allowed scope (${listed(scope, "none declared, so nothing is authorized")})` });
     const dep = a.newDependency?.trim();

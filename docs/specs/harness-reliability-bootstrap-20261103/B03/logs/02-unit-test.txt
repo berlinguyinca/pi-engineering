@@ -1,0 +1,12 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-diff-guard.test.ts
+✔ unexpected, denied, generated, binary and budget breaches are reported deterministically (6.841917ms)
+✔ a diff inside limits passes; oversize, symlink and read-only breaches do not (0.841333ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 160.560541
+exit=0

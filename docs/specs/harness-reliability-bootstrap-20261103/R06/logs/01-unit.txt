@@ -1,0 +1,14 @@
+✔ 404 does not endlessly retry (1.341917ms)
+✔ 429 honours the server wait (0.152958ms)
+✔ unknown stops (0.127583ms)
+✔ the circuit decides whether the same endpoint may be attempted (0.321ms)
+✔ a non-replayable action goes to review, never to automatic retry (0.134334ms)
+✔ recommendations hold over the class table, and the module reads no clock, RNG, env, timer or file (1.025834ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 161.284292

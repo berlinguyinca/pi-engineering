@@ -1,0 +1,13 @@
+▶ runHandoff (manual /handoff)
+  ✔ produces a committed HandoffArtifact with bounded fields (3.850333ms)
+  ✔ passes a short summary through unclipped (0.449834ms)
+  ✔ aborts when the artifact cannot be built (0.086459ms)
+✔ runHandoff (manual /handoff) (5.121541ms)
+ℹ tests 3
+ℹ suites 1
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 152.00025

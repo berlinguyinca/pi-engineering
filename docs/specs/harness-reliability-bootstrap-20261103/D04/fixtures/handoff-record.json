@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "D04",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "23e2d90501dab6271482d0420f9268e8e244092e",
+  "resultSha": "68e70ed58b93ce31dc28dd4a07871ffa4347c02e",
+  "taskAuthorityHash": "sha256:e5d3fd8a2d8eef185e9f0f419389b3ec962405c9f0fbba1c81e080f050ddc53a",
+  "changedFiles": [
+    "src/incidents/recoveryOutcome.ts",
+    "test/unit/recovery-outcome.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D04/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/recovery-outcome.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D04/logs/02-unit-recovery-outcome.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/D04/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D04/logs/02-unit-recovery-outcome.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D04/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D04/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D04/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "D05",
+  "nextBaseSha": "68e70ed58b93ce31dc28dd4a07871ffa4347c02e",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T18:35:00Z",
+    "notes": "Worker pane d04 (pane w0:pJ) added classifyRecoveryOutcome() over caller-supplied durable evidence (no file, clock or env access): suppressed only with a complete suppression record, recovered only with an allowlisted COMPLETION_KINDS record strictly after failureAt, unresolved for a recorded failure with nothing else, unknown when evidence is malformed or a completion cannot be substantiated, each with a stable reason code and a missing list naming exactly the absent proof. Conductor probe (logs/04) confirmed the evidence criterion \u2014 claiming recovered with httpStatus 200 (or 204 plus retryTraced) and no completion returns unresolved with missing completion:allowlisted-kind-after-failureAt, a non-allowlisted kind / equal timestamp / earlier completion return unknown rather than recovered \u2014 plus 2xx never recovering, statuses never cited in reason, half-filled suppression unknown, and totality on null/{}/bad dates."
+  }
+}

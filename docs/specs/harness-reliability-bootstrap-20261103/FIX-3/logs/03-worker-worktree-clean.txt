@@ -1,0 +1,3 @@
+       0
+worker worktree HEAD 24f42fba3f711dbf62a2c61d58a5545b0234865d
+branch %(contents:subject)

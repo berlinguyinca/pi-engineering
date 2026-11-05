@@ -1,0 +1,15 @@
+{
+  "reason": "Live wiring half 1: the contract watch inside the worker activity adapter. src/aps/** sits in DENY_PI, so the grant is recorded explicitly here rather than by editing the deny list.",
+  "production": [
+    "src/aps/workerActivity.ts",
+    "src/aps/fingerprint.ts"
+  ],
+  "tests": [
+    "test/unit/aps-worker-activity.test.ts"
+  ],
+  "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/aps-worker-activity.test.ts",
+  "evidence": "flag-off/flag-on behaviour through the real session event bus; unit counts at the landed commit",
+  "maxProductionFiles": 2,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+}

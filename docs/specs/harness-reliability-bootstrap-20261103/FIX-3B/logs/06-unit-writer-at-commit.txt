@@ -1,0 +1,14 @@
+✔ the real schema accepts a real conforming record, with or without the stamped hash (2.530458ms)
+✔ every required field is required, at the top level and nested (0.232958ms)
+✔ a value outside enum, or of the wrong scalar type, is blocked at its path (0.276792ms)
+✔ array items are validated recursively, and only integral numbers satisfy integer (0.215667ms)
+✔ additionalProperties: false blocks an unknown key, but never the hash the writer stamps (0.141083ms)
+✔ null is accepted exactly where the schema allows it, and nowhere else (0.146875ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 279.121167

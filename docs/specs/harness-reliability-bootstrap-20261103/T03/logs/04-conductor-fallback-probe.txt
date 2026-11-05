@@ -1,0 +1,21 @@
+A transient x2      
+  tasks=1 domains=["src/**","docs/**"] acc=["AC-1","AC-2"] max_attempts=7 plannerCalls=2
+  reason=transient planner failure after one retry: boom; clamped write_domains: /etc/**, ../up, .git, src/gen/** clarification=null
+B hard planner error
+  tasks=1 domains=["src/**","docs/**"] acc=["AC-1","AC-2"] max_attempts=7 plannerCalls=0
+  reason=planner call failed: no model; clamped write_domains: /etc/**, ../up, .git, src/gen/** clarification=null
+C malformed plan    
+  tasks=1 domains=["src/**","docs/**"] acc=["AC-1","AC-2"] max_attempts=7 plannerCalls=0
+  reason=malformed plan: no structured plan in planner output; clamped write_domains: /etc/**, ../up, .git, src/gen/** clarification=null
+D empty contracts   
+  tasks=1 domains=["src/**","docs/**"] acc=["AC-1","AC-2"] max_attempts=7 plannerCalls=0
+  reason=malformed plan: plan has no contracts; clamped write_domains: /etc/**, ../up, .git, src/gen/** clarification=null
+E plan claims **    
+  tasks=1 domains=["src/**","docs/**"] acc=["AC-1","AC-2"] max_attempts=7 plannerCalls=0
+  reason=malformed plan: P1: scope glob "**" is unbounded (its first path segment must be literal); P1: scope glob "/etc/**" must be repository-relative; clamped write_domains: /e clarification=null
+F all domains read-only
+  tasks=0 domains=null acc=null max_attempts=null plannerCalls=2
+  reason=transient planner failure after one retry: boom; clamped write_domains: src/gen/**; mission blocked: no writable domain survives the envelope clarification=null
+G non-mutating      
+  tasks=1 domains=["src/**","/etc/**","../up",".git","docs/**","src/gen/**"] acc=["AC-OLD"] max_attempts=7 plannerCalls=0
+  reason=undefined clarification=null

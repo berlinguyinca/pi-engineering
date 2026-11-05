@@ -1,0 +1,53 @@
+{
+ "taskId": "D01",
+ "baseSha": "8f33cfbb6cd0ce4f4a3b5f24e02965a1776cd447",
+ "repoId": "pi",
+ "objective": "Read-only merged host error reader \u2014 Build index by reading existing SessionEventStore events across one verified local namespace; do not assume arbitrary session directories or introduce external service.",
+ "allowPaths": [
+  "src/incidents/errorReader.ts",
+  "test/unit/error-reader.test.ts"
+ ],
+ "denyPaths": [
+  "package.json",
+  ".gitignore",
+  "scripts/**",
+  "src/bootstrap/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/templates/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/**",
+  "test/support/**",
+  "test/unit/bootstrap-*.test.ts"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-error-reader",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/error-reader.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:5c2b097b2cc87c0e0c33851a46e34040ec19cccaf2d28dbb7a30422a8f25b3fe",
+ "expectedOutputs": [
+  "src/incidents/errorReader.ts",
+  "test/unit/error-reader.test.ts"
+ ],
+ "mode": "isolated-change"
+}

@@ -1,0 +1,71 @@
+{
+ "taskId": "V06",
+ "baseSha": "d44672d4cfa77ad991866f417724313a12adf284",
+ "repoId": "pi",
+ "objective": "Verify every task has bounded diff, passing targeted commands, scope discipline, lineage hashes and preserved raw logs; record missing artifacts. Evidence: Audit explicitly distinguishes built, tested, deployed and not verified",
+ "allowPaths": [
+  "docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/orchestration/**",
+  "src/aps/**",
+  "src/errors/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "scripts/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "cmd0",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  },
+  {
+   "id": "typecheck",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:5724286a30d25303d381d4a38d6386f55516e509243477ff370c2c1a1cb49426",
+ "expectedOutputs": [
+  "docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md"
+ ],
+ "mode": "isolated-change"
+}

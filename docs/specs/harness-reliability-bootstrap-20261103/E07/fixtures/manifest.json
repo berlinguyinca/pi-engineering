@@ -1,0 +1,53 @@
+{
+ "taskId": "E07",
+ "baseSha": "9f349bb9c6068a342995dc6bf58d3f7b09b6ecb4",
+ "repoId": "pi",
+ "objective": "Capture gateway and inference failures \u2014 Extend existing retry telemetry with correlatable occurrence identity and safe normalized error reference; preserve single-owner retry semantics and existing APIs.",
+ "allowPaths": [
+  "src/inference/retryTrace.ts",
+  "test/unit/retry-error-events.test.ts"
+ ],
+ "denyPaths": [
+  "package.json",
+  ".gitignore",
+  "scripts/**",
+  "src/bootstrap/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/templates/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/**",
+  "test/support/**",
+  "test/unit/bootstrap-*.test.ts"
+ ],
+ "commands": [
+  {
+   "id": "05-typecheck-after-trim",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "06-unit-retry-error-events-after-trim",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/retry-error-events.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:0f66047a4716c0d62f83541553cf45fdcc9667a905ad00a86015afef6be900bb",
+ "expectedOutputs": [
+  "src/inference/retryTrace.ts",
+  "test/unit/retry-error-events.test.ts"
+ ],
+ "mode": "isolated-change"
+}

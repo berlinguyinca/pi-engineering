@@ -1,0 +1,14 @@
+✔ every secret fixture is absent from the persisted representation and only the env variable's name survives (2.977417ms)
+✔ a raw prompt becomes its length plus a stable digest, never a shorter prefix of itself (0.857542ms)
+✔ list caps drop the tail into a counted marker instead of silently, and re-sanitizing does not stack it (0.797833ms)
+✔ the persisted record respects the byte budget, however oversized the occurrence (1.136791ms)
+✔ sanitize is idempotent, keeps the evidence E03 carried, and never throws on malformed input (1.2465ms)
+✔ a clean occurrence passes through unchanged apart from the caps (0.221959ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 162.660292

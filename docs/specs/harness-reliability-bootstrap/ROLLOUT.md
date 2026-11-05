@@ -52,7 +52,9 @@ Written read-only on base `fc471225`. Every flag name below was opened in source
 | 2 | The `✖` line count of the unit run exceeds the baseline recorded in §2, or the runner summary reports `fail > 0` where the same set passed before | `grep -c '✖'` on the captured log; compare against §2 |
 | 3 | A scope-gate block whose flagged paths all lie inside `scope.allowed` — i.e. `blocked_reason` matching `evidence: scope gate:` (`executor.ts:218`) that scope drift does not explain | read the task state record and re-check each path against `contract.scope`; it has no flag, so a revert is the only rollback |
 | 4 | Any write inside an events namespace directory, or an evidence artifact whose sha256 no longer matches the recorded value | `diagnose-errors.ts --export <path inside namespace>` must exit **2** and leave the directory empty (measured: 0 files); `resultGate.ts:36` names `evidence tampered` |
+
 | 5 | A second retry owner acting for one failure class, or attempts beyond `streamRetryMaxAttempts` / `RESILIENT_STREAM_MAX_ATTEMPTS = 2` (`resilientStreamOptin.ts:16`), or an intervention shipping default-on with no way to disable it | `docs/specs/harness-reliability-bootstrap/RETRY_OWNERS.md` ownership table vs observed behaviour; `docs/specs/harness-reliability-bootstrap-20261103/05-IMPLEMENTATION-SECURITY.md:8`, `:13` |
+ origin/harness-reliability-bootstrap-20261103
 
 ## 4. Flag rollback — disable, prove, observe
 

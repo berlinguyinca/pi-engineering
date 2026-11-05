@@ -1,0 +1,22 @@
+[
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/01-typecheck.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-task-manifest.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/02-unit-manifest.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-*.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/03-unit-all.txt"
+ },
+ {
+  "command": "node --experimental-strip-types -e import {parseTaskManifest} from \"./src/bootstrap/taskManifest.ts\"; import {readFileSync} from \"node:fs\"; const t=JSON.parse(readFileSync(\"docs/specs/harness-reliability-bootstrap-20261103/manifests/tasks.json\",\"utf8\")).tasks; const bad=t.filter(x=>!parseTaskManifest({taskId:x.id,baseSha:\"a\".repeat(40),repoId:\"pi\",objective:x.title,allowPaths:[\"src/**\"],denyPaths:[\"node_modules/**\"],commands:[{id:\"t\",cwd:\".\",argv:[\"npm\",\"run\",\"typecheck\"]}],limits:{maxProductionFiles:x.maxProductionFiles,maxTestFiles:x.maxTestFiles,maxChangedLines:x.maxChangedLines},parentHandoffHash:null,expectedOutputs:[\"src/**\"],mode:x.mode}).ok); console.log(\"tasks\",t.length,\"invalid\",bad.length,bad.map(b=>b.id).join(\",\")); console.log(\"herdr-ui:\",t.filter(x=>x.mode===\"herdr-ui\").map(x=>x.id).join(\",\"))",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/04-tasks-parse.txt"
+ }
+]

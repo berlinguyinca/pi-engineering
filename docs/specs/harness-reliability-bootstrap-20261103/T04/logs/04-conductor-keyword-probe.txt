@@ -1,0 +1,10 @@
+[6] "Fix the Bluetooth pairing flow in the settings screen" -> ["Bluetooth","flow","settings","screen","pairing"]
+[6] "Implement add(a, b) to return a + b" -> ["add","Implement"]
+[6] "please the of and to" -> ["please"]
+[6] "max_attempts in SettingsRouter for HTTP config.json retry" -> ["HTTP","SettingsRouter","config.json","max_attempts","retry"]
+[6] "add support for tagging, please tune the tagging flow" -> ["tagging","tune","flow","support"]
+[6] "refactor the reader and add a reader fallback for reader errors" -> ["reader","fallback","errors","refactor"]
+bounded: true
+deduped: true
+deterministic: true
+no stopwords: true

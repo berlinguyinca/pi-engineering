@@ -1,0 +1,6 @@
+REJECT baseline: HEAD 5b1ab0a465152673ac0bf29ab0956f8750c6fab1 != manifest baseSha c4acd6455a57a5cbbe19185353b661cbb69f5086
+plan exit=3; no model invoked (B04 stops here)
+parent=T03 accepted sha256:0b55737f9ed…
+authority=T04 sha256:69761cae6f8167787182f4e96e9ae919610517ce0ba72e7d095a4021914318eb
+schema=T04 conforms docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json
+handoff=/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/T04/out/T04.handoff.json checksum=sha256:a72b9d8d49b4978c9c1af0df652c0c176ca5f2800f83f8b04229db769c95d9e3 gate=accepted (clean tree + proofs + diff scope + HEAD^1 == approved base; the plan baseline line above describes the pre-task state)

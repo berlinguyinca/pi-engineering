@@ -1,0 +1,39 @@
+✔ allowlist grants exact paths and explicit recursion only (1.523583ms)
+✔ explicit deny always wins over allow (0.110875ms)
+✔ traversal, ambiguous, absolute and symlink paths are rejected before any grant (0.217625ms)
+✔ static role routing rejects known hard constraint failure {"state":"draining"} (0.973333ms)
+✔ static role routing rejects known hard constraint failure {"state":"lost"} (0.070958ms)
+✔ static role routing rejects known hard constraint failure {"state":"unavailable"} (0.064334ms)
+✔ static role routing rejects known hard constraint failure {"contextWindow":4096} (0.055042ms)
+✔ static role routing rejects known hard constraint failure {"tools":false} (0.060666ms)
+✔ static role routing cannot reselect an excluded model or alias backing (0.083667ms)
+✔ static fallback receives role context and tool requirements (0.690291ms)
+✔ static fallback only uses catalogue metadata from its own provider (0.0715ms)
+✔ failover refreshes known candidate readiness, context and tool support (0.339417ms)
+✔ sparse refusal candidates preserve known capabilities and recover role dispatch (0.391292ms)
+✔ sparse refusal candidates preserve logical alias identity (0.099583ms)
+✔ explicit empty refusal capability metadata replaces previous declarations (0.127375ms)
+✔ dispatch refuses rejected static routing for planner (0.255166ms)
+✔ dispatch refuses rejected static routing for researcher (0.0495ms)
+✔ dispatch refuses rejected static routing for implementer (0.040417ms)
+✔ dispatch refuses rejected static routing for reviewer (0.079125ms)
+✔ dispatch refuses rejected static routing for debugger (0.042542ms)
+✔ dispatch refuses rejected static routing for fixer (0.039791ms)
+✔ dispatch refuses rejected static routing for escalation (0.035541ms)
+✔ dispatch refuses a configured fallback router that returns no model or fails (0.149917ms)
+✔ dispatch refuses an excluded operator pin without a known replacement (0.072333ms)
+✔ dispatch refuses an operator-pinned alias with an excluded backing model (0.063042ms)
+✔ dispatch retains unknown standalone pins and reads the pin only once (0.057625ms)
+✔ direct dispatch resolution permits only a genuinely unconfigured standalone default (0.083042ms)
+✔ dispatch refuses an incompatible operator pin {"state":"unavailable"} (0.054375ms)
+✔ dispatch refuses an incompatible operator pin {"contextWindow":4096} (0.042291ms)
+✔ dispatch refuses an incompatible operator pin {"tools":false} (0.0335ms)
+✔ operator pins only inherit catalogue metadata from their own provider (0.042625ms)
+ℹ tests 31
+ℹ suites 0
+ℹ pass 31
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 183.0895

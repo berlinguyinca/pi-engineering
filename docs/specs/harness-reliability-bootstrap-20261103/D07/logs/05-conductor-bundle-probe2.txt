@@ -1,0 +1,5 @@
+keys: version,items,dropped,refused,bytes,truncated
+json: {"version":1,"items":[],"dropped":{"items":0,"bytes":0},"refused":1,"bytes":2,"truncated":false}
+task retained: false | handoff retained: false
+raw secret leak: false
+tight: {"version":1,"items":[],"dropped":{"items":0,"bytes":0},"refused":30,"bytes":2,"truncated":false}

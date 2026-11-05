@@ -1,0 +1,10 @@
+✔ unavailable required context is reported and blocks launch by default (T05) (365.618917ms)
+✔ truncation reports token counts without blocking; whole delivery reports nothing (T05) (407.963292ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 963.198459

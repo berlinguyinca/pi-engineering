@@ -1,0 +1,31 @@
+▶ mission planner contract
+  ✔ non-trivial goal yields a DAG with disjoint parallel domains, contextRef and a thinking-allowed planner request (376.036167ms)
+  ✔ takes the contracts the planner worker puts in worker_result.details (214.264917ms)
+  ✔ also accepts contracts at the top level, in proposed_tasks, or in a fenced summary block (412.889083ms)
+  ✔ planMission reads top-level contracts on the planner result (0.50975ms)
+  ✔ planMission carries the planner's per-task execution requirement onto the task (P3) (0.175ms)
+  ✔ planMission leaves execution_requirements empty when the planner assigns none (P3) (0.308459ms)
+  ✔ an explicit clarification question yields no tasks and a clarification finding (202.331042ms)
+  ✔ details.clarification_question is an explicit clarification even without a question mark (199.889ms)
+  ✔ a blocked planner without a question (a tool failure) still falls back to the single task (197.499875ms)
+  ✔ surfaces the planner's question to the operator and waits once (453.720167ms)
+  ✔ keeps the planning flag set until the plan is materialised and clears it when the planner throws (322.87125ms)
+  ✔ serializes tasks whose write domains overlap (200.9255ms)
+  ✔ trivial goal keeps the single task without a planner call (179.502917ms)
+  ✔ malformed plan falls back to one task and records a finding (186.2755ms)
+  ✔ a plan whose domains escape the workspace falls back naming the rejected domains (609.319875ms)
+  ✔ a plan that only writes its own forbidden path falls back (203.019208ms)
+  ✔ a transient planner failure is retried once, then falls back saying transient (203.901ms)
+  ✔ a transient failure then a good plan recovers (188.65075ms)
+  ✔ a hung planner is aborted by the timeout and falls back (1678.734166ms)
+  ✔ PI_MISSION_PLANNER=off never calls the planner (221.285708ms)
+  ✔ scopeTaskDomains drops read-only roots and domains outside the manifest's writable domains (0.593125ms)
+✔ mission planner contract (7347.88525ms)
+ℹ tests 21
+ℹ suites 1
+ℹ pass 21
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 8352.600792

@@ -2,7 +2,7 @@
  "taskId": "V01",
  "baseSha": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
  "repoId": "pi",
- "objective": "Add five tiny tasks with legitimate exploration plus planted drift opportunities and identical task snapshots. No production changes. Evidence: At least five independently labeled tasks with permitted scope and expected outputs Evidence: At least five independently labeled tasks with permitted scope and expected outputs",
+ "objective": "Add five tiny tasks with legitimate exploration plus planted drift opportunities and identical task snapshots. No production changes. Evidence: At least five independently labeled tasks with permitted scope and expected outputs",
  "allowPaths": [
   "test/fixtures/harness-drift/README.md",
   "test/fixtures/harness-drift/tasks.json"

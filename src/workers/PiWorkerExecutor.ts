@@ -2235,6 +2235,12 @@ ${recovery.recoveryPrompt}`;
       sessionId: req.sessionId,
       runId: req.runId,
       workItemId: req.workItemId,
+      // Live drift watch: only active when the operator set a contract AND turned the
+      // switch on affirmatively; signals are evidence, never an intervention.
+      drift: req.driftWatch,
+      onDrift: (signal) => {
+        if (this.rollout.observability) this.observability.recordDrift(signal);
+      },
       model: { provider: model.provider, id: model.id },
       maxContextTokens: req.maxContextTokens,
       rootPrefix: req.cwd,

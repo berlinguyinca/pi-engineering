@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T05",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "5b1ab0a465152673ac0bf29ab0956f8750c6fab1",
+  "resultSha": "75a15f0bce7b3f21ccae8a04d1525283eaf7fec7",
+  "taskAuthorityHash": "sha256:0fe80af1840d6bd6b3a455f6d880bb5fb53372ec65f13fb4dd48d5fe3872f352",
+  "changedFiles": [
+    "src/context/ContextBroker.ts",
+    "test/unit/context-required-omission.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T05/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/context-required-omission.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T05/logs/02-unit-required-omission.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T05/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T05/logs/02-unit-required-omission.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T05/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T05/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T05/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T06",
+  "nextBaseSha": "75a15f0bce7b3f21ccae8a04d1525283eaf7fec7",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T15:00:00Z",
+    "notes": "Worker pane t05 (pane w8:pD, metabolomics/qwen3.8-flash_next) on base 5b1ab0a4. ContextBroker.assembleContext no longer swallows an unreadable required file (the readSlice-null continue is gone): a new optional ContextPackage.omissions (exported RequiredContextOmission) records kind 'unavailable' with a reason naming the unreadable path, and kind 'truncated' with requestedTokens/providedTokens beside the existing per-item truncated flag, so a package with a hole cannot read as complete context; the exported pure gate requiredContextGate(pkg, policy) refuses worker launch by default when any 'unavailable' evidence is missing (reason names every missing path) and launches only under an explicit allowBlockedInvestigation: true, still returning the reason; truncation alone never blocks. Every budget is untouched (targetTokens accounting, readSlice 300-line required reads, keyword/rank/search/repoMap caps) and src/runtime/** was left alone, so the gate is deliberately unwired — the report names EngineeringRuntime.ts around line 4283 as the launch path a later unit must wire. Conductor gate probe (logs/04): default policy denies with 'indispensable evidence is missing (paths: src/reader.ts)', opt-in true launches with the same reason, opt-in false denies, truncated-only and no-omission packages launch with no reason, a mixed package denies naming only the unavailable paths."
+  },
+  "handoffHash": "sha256:3af76be362edfe86b710d934ec9a484bf00e25fa914bda8449ef46ec93f58709"
+}
