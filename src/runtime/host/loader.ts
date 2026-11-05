@@ -14,6 +14,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { cp, mkdir, readdir, readlink, rm, stat, symlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import { withoutInjectedConfig } from "../../git/gitEnvironment.ts";
 import { SourceCache } from "../../update/gitSource.ts";
 import { type EngineeringRuntimeModule, HOST_SUPPORTED_RUNTIME_APIS, isEngineeringRuntimeModule } from "./contract.ts";
 
@@ -67,9 +68,13 @@ export async function snapshotRuntimeSource(
   const dependencyParents = new Set([""]);
   try {
     if (commit) {
+      // The repository is named by `root`, so the environment must not be able to
+      // name it instead: `GIT_DIR` beats `-C`, and the git dir printed here is the
+      // one the tree is exported from (issue #512).
       const gitDir = execFileSync("git", ["-C", root, "rev-parse", "--absolute-git-dir"], {
         timeout: 5000,
         encoding: "utf8",
+        env: withoutInjectedConfig(process.env),
       }).trim();
       await new SourceCache(gitDir).exportTree(commit, dir);
       for (const excluded of SNAPSHOT_EXCLUDE) await rm(join(dir, excluded), { recursive: true, force: true });

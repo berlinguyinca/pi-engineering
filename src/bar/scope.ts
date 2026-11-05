@@ -21,6 +21,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { id } from "../core/ids.ts";
+import { withoutInjectedConfig } from "../git/gitEnvironment.ts";
 import { environmentFingerprint } from "./baseline.ts";
 import { type DiscoveryInput, discoverRepo } from "./discovery.ts";
 
@@ -73,9 +74,13 @@ function sha256Hex(text: string): string {
 /** Resolve HEAD revision deterministically; null when not a git repo. */
 export function sourceRevision(root: string): string | null {
   try {
+    // `-C` names the repository, so an inherited `GIT_DIR` must not be allowed to
+    // answer for it: the scope's revision would then describe another checkout
+    // (issue #512).
     const out = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
+      env: withoutInjectedConfig(process.env),
     });
     return out.trim() || null;
   } catch {
