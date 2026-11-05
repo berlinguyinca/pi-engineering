@@ -407,6 +407,28 @@ export class Ledger {
     return entity;
   }
 
+  /**
+   * Attach recorded evidence to an entity that already exists (issue #506). A
+   * reproduced finding used to land as a claim with nowhere to put the output
+   * that reproduced it, so it stayed indistinguishable from a guess. The claim
+   * text and status are untouched — attaching evidence says what the claim rests
+   * on, it does not certify the claim.
+   */
+  async attachEvidence(
+    entityId: string,
+    evidenceId: string,
+    workItemId: string | null,
+    actor: Actor,
+  ): Promise<LedgerEntity | null> {
+    const entity = this.entities.get(entityId);
+    if (!entity) return null;
+    if (entity.evidence.includes(evidenceId)) return entity;
+    const updated: LedgerEntity = { ...entity, evidence: [...entity.evidence, evidenceId] };
+    this.entities.set(entityId, updated);
+    await this.emit("entity.updated", workItemId, actor, { entity: updated });
+    return updated;
+  }
+
   async updateEntityStatus(id: string, status: EntityStatus, workItemId: string | null, actor: Actor): Promise<void> {
     const e = this.entities.get(id);
     if (!e) return;

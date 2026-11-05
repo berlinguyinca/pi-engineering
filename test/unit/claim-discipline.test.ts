@@ -7,6 +7,7 @@ import {
   countValuesInOutput,
   countsAreBacked,
   metricEvidenceReports,
+  metricsFromOutput,
 } from "../../src/ledger/claimDiscipline.ts";
 
 function evidence(summary: Record<string, unknown>, over: Partial<Evidence> = {}): Evidence {
@@ -92,4 +93,23 @@ test("the refusal names the number, the evidence, and the command shape that wou
   assert.match(message, /artifact:\/\/verify\/tap-run/);
   assert.match(message, /`# tests 12`/);
   assert.match(message, /not a count/);
+});
+
+test("metrics are read from a line, never assembled across a newline", () => {
+  // `# tests 12` then `# suites 1` are two statements. A pattern that let the
+  // newline stand for a space would read "12 suites" out of them and report a
+  // metric the command never printed.
+  const tap = "# tests 12\n# suites 1\n# pass 12\n# fail 0\n";
+  assert.deepEqual(metricsFromOutput(tap), { metrics: { tests: 12, suites: 1, pass: 12, fail: 0 }, ambiguous: [] });
+  assert.deepEqual(metricsFromOutput("ok 1 - room client\nnot ok 2 - write\n").metrics, {});
+  assert.deepEqual(metricsFromOutput("tests: 9\n12 failing test cases\n").metrics, { tests: 9, cases: 12 });
+  // The guard reads the same qualified noun the recorder does, or a number the
+  // recorder stored as a metric would still be refused as a claim.
+  assert.ok(countValuesInOutput("12 failing test cases\n").includes(12));
+});
+
+test("one noun printed with two values is reported as ambiguous, not averaged", () => {
+  const { metrics, ambiguous } = metricsFromOutput("# tests 12\nthe wrapper says 13 tests\n");
+  assert.equal(metrics.tests, 12, "the first statement, which is the runner's own, wins");
+  assert.deepEqual(ambiguous, ["tests"]);
 });
