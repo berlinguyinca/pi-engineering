@@ -1,0 +1,15 @@
+{"truePositives":2,"falsePositives":0,"falseNegatives":1,"trueNegatives":2,"precision":1,"recall":0.6666666666666666,"falsePositiveIds":[],"missedIds":["drift-03"],"fixtureTaskCount":5,"detectorKinds":["out_of_scope_write"]}
+✔ the five-task fixture scores exactly as the answer key says (2.574709ms)
+✔ the two clean controls (drift-01, drift-05) produce no signal (0.128708ms)
+✔ drift-03, in-scope but off-objective, is a reported recall miss (0.310291ms)
+✔ precision and recall are finite numbers or null, never NaN or Infinity (0.168083ms)
+✔ actions map to detector input: only `change` mutates (0.206709ms)
+✔ measuring is deterministic and never fails on a missed task (1.68ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 327.164708
