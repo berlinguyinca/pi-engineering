@@ -134,3 +134,41 @@ test(
     }
   },
 );
+
+test(
+  "engineering memory overlay survives launcher install, reinstall and forced rewrite",
+  { skip: process.platform === "win32" },
+  () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-memory-overlay-"));
+    try {
+      mkdirSync(join(root, "bin"));
+      mkdirSync(join(root, ".config/pi"), { recursive: true });
+      const overlay = join(root, ".config/pi/viking-env.sh");
+      const policy =
+        'export PI_OPENVIKING_ENABLED=0\nexport PI_HINDSIGHT_ENABLED=1\nexport PI_OVERLAY_UNRELATED=kept\nprintf "overlay=%s,%s,%s\\n" "$PI_OPENVIKING_ENABLED" "$PI_HINDSIGHT_ENABLED" "$PI_OVERLAY_UNRELATED"\n';
+      writeFileSync(overlay, policy, { mode: 0o600 });
+      const bin = join(root, "bin/pi");
+      const dist = dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));
+      const original = existsSync(join(dist, "bundle/cli.js")) ? join(dist, "bundle/cli.js") : join(dist, "cli.js");
+      symlinkSync(original, bin);
+      const installer = resolve("scripts/install-session-auto-resume.ts");
+      const install = join(root, "install");
+      const env = { ...process.env, HOME: root, PI_OPENVIKING_ENABLED: "1", PI_HINDSIGHT_ENABLED: "0" };
+      for (const phase of ["install", "reinstall", "rewrite"]) {
+        if (phase === "rewrite") {
+          const old = readFileSync(bin, "utf8").replace(/^exec '[^']*'/m, "exec '/nonexistent/node'");
+          writeFileSync(bin, old, { mode: 0o755 });
+        }
+        execFileSync(process.execPath, [installer, bin, install], { env });
+        const output = execFileSync(bin, ["--version"], { encoding: "utf8", env });
+        assert.match(output, /^overlay=0,1,kept\n/, phase);
+        assert.equal(output.match(/overlay=/g)?.length, 1, phase);
+        assert.equal(readFileSync(overlay, "utf8"), policy);
+      }
+      rmSync(overlay);
+      assert.match(execFileSync(bin, ["--version"], { encoding: "utf8", env }), /\d+\.\d+\.\d+/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);

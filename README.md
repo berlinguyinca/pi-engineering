@@ -835,7 +835,12 @@ MIT
 
 ### Automatic recovery when reopening a session
 
-Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`.
+Install the optional user-local launcher with `node scripts/install-session-auto-resume.ts`. Fresh launchers and forced rewrites also source the existing
+owner-managed `~/.config/pi/viking-env.sh`, when readable, before starting Pi.
+This preserves an engineering provider switch over stale terminal environment
+variables. The installer does not create that overlay, select a provider, or
+rewrite credentials; normal refreshes preserve the operator's launcher lines.
+
 It preserves the original Pi CLI and saves a backup at `~/.local/bin/pi.before-session-auto-resume`.
 
 On a host whose Pi is a *managed install* (`~/.pi/agent/bin/pi` with `install/current-version`), run
