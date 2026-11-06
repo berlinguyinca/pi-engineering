@@ -350,12 +350,19 @@ else {
     console.log(`  ${k.padEnd(15)}${tally[k] ?? 0}`);
   }
   console.log("  --- problems ---");
+  for (const r of rows.filter((x) => x.verdict === "ANCHOR_NEARBY")) {
+    console.log(`  ADVISORY(imprecise, not blocking)  ${r.doc.split("/").pop()}:${r.line}  ${r.file}:${r.cite}  anchor '${r.anchor}' is at :${r.found}`);
+  }
   for (const r of bad) {
     console.log(`  ${r.verdict}  ${r.doc.split("/").pop()}:${r.line}  ${r.file ?? "?"}:${r.cite}  want=${r.anchor ?? "-"} found=${r.found || "-"}`);
     if (r.at) console.log(`      cited  ${r.at}`);
     if (r.target) console.log(`      found  ${r.target}`);
   }
-  console.log(`RESULT drift=${bad.length}`);
+  // Measured, not assumed: the ±BAND window means a pointer one line off inside a dense block is
+  // ANCHOR_NEARBY and does NOT fail the gate. Off-by-one drift inside the 5-line DEFAULTS block is
+  // exactly how this document first went stale, so it is printed rather than hidden -- advisory now,
+  // and the number to watch if it is ever promoted to blocking.
+  console.log(`RESULT drift=${bad.length} imprecise=${rows.filter((r) => r.verdict === "ANCHOR_NEARBY").length}`);
   if ((tally.NO_ANCHOR ?? 0) > 0) {
     console.log(`NOTE ${tally.NO_ANCHOR} citation(s) were NOT judged: no identifier near the citation to compare against.`);
     console.log(`     Those are neither pass nor fail. Do not report this run as "citations verified".`);
