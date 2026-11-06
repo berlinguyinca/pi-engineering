@@ -3,6 +3,7 @@ import { evidenceIdentitiesEqual, hashCandidateEvidenceIdentity, taskCoverageFin
 import type { MissionStore } from "./missionStore.ts";
 import { hasAcceptableNestedPublication } from "./nestedPublicationGate.ts";
 import { alreadySatisfiedClause, latestAlreadySatisfied, taskFailureReason } from "./recovery.ts";
+import { type SweepRecord, referenceSweepBlockers } from "./referenceSweep.ts";
 import { noTargetsTestRequirement } from "./testRequirement.ts";
 import type { AlreadySatisfied, CandidateRevision, CompletionVerdict, Mission, RequiredGate } from "./types.ts";
 
@@ -39,14 +40,23 @@ export class CompletionGate {
    */
   private readonly extraBlockers?: (mission: Mission, candidates: CandidateRevision[]) => string[];
 
+  /**
+   * Optional drop-decision reference sweep (issue #510). Synchronous like the
+   * integration check: the caller pre-collects the decisions, their evidence,
+   * and the sweep artifact contents. Absent, the gate is unchanged.
+   */
+  private readonly decisionSweeps?: (mission: Mission, candidates: CandidateRevision[]) => SweepRecord[];
+
   constructor(
     store: MissionStore,
     nestedPublicationsFor?: (missionId: string) => ReadonlyArray<NestedRepoPublication>,
     extraBlockers?: (mission: Mission, candidates: CandidateRevision[]) => string[],
+    decisionSweeps?: (mission: Mission, candidates: CandidateRevision[]) => SweepRecord[],
   ) {
     this.store = store;
     this.nestedPublicationsFor = nestedPublicationsFor;
     this.extraBlockers = extraBlockers;
+    this.decisionSweeps = decisionSweeps;
   }
 
   evaluate(mission: Mission): CompletionVerdict {
@@ -109,13 +119,28 @@ export class CompletionGate {
       reasons.push(...integrationBlockers);
     }
 
+    // A decision that drops an identifier completes only with a clean sweep over
+    // what users read and type (issue #510).
+    let sweepBlockers: string[] = [];
+    if (this.decisionSweeps) {
+      try {
+        for (const record of this.decisionSweeps(mission, this.store.listCandidates(mission.mission_id))) {
+          sweepBlockers.push(...referenceSweepBlockers(record));
+        }
+      } catch (error) {
+        sweepBlockers = [`reference sweep evidence failed: ${error instanceof Error ? error.message : String(error)}`];
+      }
+      reasons.push(...sweepBlockers);
+    }
+
     const structuralProblems =
       (emptyCandidateProblem ? 1 : 0) +
       (evidence.terminalTaskProblems?.length ?? 0) +
       (evidence.supersessionProblems?.length ?? 0) +
       (evidence.activeExecutionProblems?.length ?? 0) +
       (evidence.acceptanceProblems?.length ?? 0) +
-      integrationBlockers.length;
+      integrationBlockers.length +
+      sweepBlockers.length;
     return {
       can_complete:
         missingGates.length === 0 &&

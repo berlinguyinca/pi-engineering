@@ -93,6 +93,7 @@ import {
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
 import { recordSchedulerStatus } from "./recoveryNotice.ts";
+import type { SweepRecord } from "./referenceSweep.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { buildReviewContext } from "./reviewContext.ts";
 import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
@@ -173,6 +174,12 @@ export interface OrchestratorOptions {
    * reasons block completion. Absent = unchanged.
    */
   completionEvidence?: (mission: Mission, candidates: CandidateRevision[]) => string[];
+  /**
+   * Optional drop-decision reference sweep supplied to CompletionGate (issue #510):
+   * a decision that drops an identifier completes only when the `references`
+   * evidence attached to it shows no hit in text a user reads or types.
+   */
+  decisionSweeps?: (mission: Mission, candidates: CandidateRevision[]) => SweepRecord[];
   /** Acceptance criterion deriver. */
   deriveAcceptance?: (mission: Mission) => Promise<string[]>;
   /** Called on each mission phase transition. */
@@ -562,7 +569,7 @@ export class Orchestrator {
         this.observeTaskSettled(missionId, taskId, status);
       },
     });
-    this.gate = new CompletionGate(this.store, undefined, opts.completionEvidence);
+    this.gate = new CompletionGate(this.store, undefined, opts.completionEvidence, opts.decisionSweeps);
     this.planner = opts.planner;
     this.deriveAcceptance = opts.deriveAcceptance;
     this.onPhase = opts.onPhase;
