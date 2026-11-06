@@ -6,7 +6,8 @@ import type { ContextBroker } from "../context/ContextBroker.ts";
 import { type Actor, type Evidence, isMachineEvidence } from "../core/types.ts";
 import type { Ledger } from "../ledger/Ledger.ts";
 import { countClaims, countGuardMessage, countsAreBacked, metricsFromOutput } from "../ledger/claimDiscipline.ts";
-import type { Orchestrator } from "../orchestration/orchestrator.ts";
+import { MissionRefusedError, missionRefusalText } from "../orchestration/missionRefusal.ts";
+import type { OrchestrateResult, Orchestrator } from "../orchestration/orchestrator.ts";
 import type { Mission } from "../orchestration/types.ts";
 import { lookupMissionDurable } from "../runtime/host/durableMissionLookup.ts";
 import { missionReportLines } from "./missionReport.ts";
@@ -750,24 +751,44 @@ export function buildCoreTools(
 
       const request = String(params.request ?? "").trim();
       if (!request) return text("The run action needs a request.");
-      const result = await services.orchestrator.orchestrate(request, {
-        repository: services.repositoryRoot ?? ctx.cwd,
-        // The orchestrator resolves the request's explicit repository before
-        // choosing a base. Forwarding the caller cwd's SHA can bind an external
-        // target mission to an unrelated launch repository commit.
-        baseRef: "",
-        constraints: (params.constraints as string[] | undefined) ?? [],
-        mutationRequested: params.mutate ?? true,
-        signal,
-        // Interrupting the call (Esc) pauses the mission; it never cancels it.
-        interrupt: "pause",
-        // Stream every live progress line (phase/task transitions + progress
-        // bar) to the operator via the tool update callback instead of blocking
-        // silently for the whole mission.
-        onProgress: (line: string) => {
-          _onUpdate?.({ content: [{ type: "text", text: line }], details: {} });
-        },
-      });
+      let result: OrchestrateResult;
+      try {
+        result = await services.orchestrator.orchestrate(request, {
+          repository: services.repositoryRoot ?? ctx.cwd,
+          // The orchestrator resolves the request's explicit repository before
+          // choosing a base. Forwarding the caller cwd's SHA can bind an external
+          // target mission to an unrelated launch repository commit.
+          baseRef: "",
+          constraints: (params.constraints as string[] | undefined) ?? [],
+          mutationRequested: params.mutate ?? true,
+          signal,
+          // Interrupting the call (Esc) pauses the mission; it never cancels it.
+          interrupt: "pause",
+          // Stream every live progress line (phase/task transitions + progress
+          // bar) to the operator via the tool update callback instead of blocking
+          // silently for the whole mission.
+          onProgress: (line: string) => {
+            _onUpdate?.({ content: [{ type: "text", text: line }], details: {} });
+          },
+        });
+      } catch (error) {
+        // #511: a delegation the runtime refused while maintenance drains is a
+        // result the caller can act on — retry after a wait, resume later — not
+        // an unlabelled tool failure the caller absorbs as "nothing to do".
+        if (error instanceof MissionRefusedError) {
+          return {
+            content: [{ type: "text", text: missionRefusalText(error) }],
+            details: {
+              delegationBlocked: true,
+              reason: error.reason,
+              retryAfterMs: error.retryAfterMs,
+              draining: error.draining,
+              resumeHint: error.resumeHint,
+            },
+          };
+        }
+        throw error;
+      }
       const m = result.mission;
       const statusLine =
         result.pausedBy === "operator" && m.status !== "PAUSED_INFRASTRUCTURE"
