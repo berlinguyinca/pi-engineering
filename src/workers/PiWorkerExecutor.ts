@@ -1040,7 +1040,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
               // The raised allowance of a length-stop retry rides the invocation.
               // While gateway holds are enabled this worker owns the wait on an
               // admission refusal: the in-call resilient ladder settles instead of
-              // replaying it too (RETRY-OWNERS.md), so attempts are not multiplied.
+              // replaying it too (RETRY_OWNERS.md), so attempts are not multiplied.
               const owned = inv && gatewayConfig.enabled;
               // withTransientRetry (this loop) owns 5xx / network / timeout replays, so
               // the ladder defers those too, whether or not gateway holds are enabled.

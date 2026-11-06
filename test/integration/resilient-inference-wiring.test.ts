@@ -225,7 +225,15 @@ async function wireResilientHarness(
 
   wireResilientModelRuntime(runtime, {
     role: "planner",
-    env: opts.env ?? { PI_INFERENCE_STREAM_RETRY_INITIAL: "30s", PI_INFERENCE_STREAM_RETRY_MAX: "2m" },
+    // Arming is explicit because the layer is opt-in (default off). A scenario
+    // that wants the unarmed path passes its own PI_INFERENCE_RESILIENCE_ENABLED,
+    // which spreads last and therefore wins.
+    env: {
+      PI_INFERENCE_RESILIENCE_ENABLED: "1",
+      PI_INFERENCE_STREAM_RETRY_INITIAL: "30s",
+      PI_INFERENCE_STREAM_RETRY_MAX: "2m",
+      ...opts.env,
+    },
     // NOTE: no `config` override here — the scenarios pace themselves through
     // PI_INFERENCE_* in `env`, which is what a real deployment would do.
     registry,
