@@ -28,7 +28,10 @@
     "E02's canonical record names E03@cc036f2f8c3b (its own resultSha) while E03 records base ba22f28a6b54 - a handoff pointer stamped from HEAD~1 rather than the handed-over commit; left unwritten because rewriting a PASS record changes its hash and its descendants.",
     "T09's record names T10, a task the plan never contained; the T-series ends at T09.",
     "test/unit/worker-commit-discipline.test.ts and test/unit/worker-request-plumbing.test.ts fail identically at 900bf8a3 and at the X-series tip (real-worktree allocation and broker fork-base assertions); they are excluded from recorded suite commands and named in the override reasons.",
-    "The whole-suite `npm test` does not terminate in this environment (session-*/orchestration-* files hold the runner past any bounded budget: 47 failures of 1367 within one 1800s budget at 900bf8a3, and an untimed run exceeded 3600s), so unit-suite gates are recorded as bounded globs with a base-vs-head comparison, never as a green whole-suite run."
+    "The whole-suite `npm test` does not terminate in this environment (session-*/orchestration-* files hold the runner past any bounded budget: 47 failures of 1367 within one 1800s budget at 900bf8a3, and an untimed run exceeded 3600s), so unit-suite gates are recorded as bounded globs with a base-vs-head comparison, never as a green whole-suite run.",
+    "X08 exceeded the isolated-change line ceiling: 158 changed lines (44 production + 114 test) against 100. The regression unit is what pins the contract, so it was not split from the behaviour; recorded in X08/out/X08.handoff.json operatorApproval.notes.",
+    "X08 is the consumer-side guard, not the root-cause fix. The doubled /private/private/var prefix measured at 4ffa82f3 comes from Pi's state dir kept unresolved while repositories are discovered through realpathSync, and upstream 61394da7 (one canonical path for the state dir and the temp root, #582) already fixes that: at 45d42acb the prefix does not reproduce and both blocker integration files pass without the guard (X08/logs/07). The guard closes the gap #582 leaves open \u2014 a caller had no way to notice an answer naming no directory, so a regression of that canonicalization would surface as a promotionWait.ceilingMs poll (600 s per attempt) rather than an error.",
+    "AUDIT/suite-termination-blocker-20261105.txt is closed at the tip: mission-interrupt-pause (12/12) and mission-merge-queue-flow (6/6) settle and pass at 45d42acb both with and without X08 (X08/logs/07, 08). The earlier whole-suite non-termination was the same doubled-prefix mechanism plus later interrupt/resume work, not a hang that survives on main."
   ],
   "concluded_with_records": [
     "B00",
@@ -88,7 +91,8 @@
     "X04",
     "X05",
     "X06",
-    "X07"
+    "X07",
+    "X08"
   ],
   "cross_repo_integration": {
     "main": "591264f9bd4fc2fc07d88d94febde4cd0e919448",
@@ -98,6 +102,7 @@
   },
   "deliverables": {
     "audit": "docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md",
+    "common_dir_guard": "src/git/GitRepo.ts resolveCommonDir \u2014 GitRepo.commonDir() repairs or refuses a git answer that names no directory (logs/X08/05, 06); the root cause is upstream 61394da7 (#582)",
     "drift_fixtures": "test/fixtures/harness-drift/{tasks.json,README.md}",
     "drift_live_wiring": "src/aps/workerActivity.ts + src/workers/PiWorkerExecutor.ts (PI_TASK_DRIFT_SIGNALS, default off)",
     "drift_runner": "scripts/bench-task-drift.ts (precision 1.0, recall 0.667, 0 false positives, 1 documented false negative)",
@@ -107,13 +112,13 @@
     "quant_schema": "src/capability/quantBenchmark.ts",
     "runbook": "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
   },
-  "head": "745acdfb9d6a2b710e679a14d2b3a7f6f4441881",
-  "next_action": "Re-run `node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs` after every unit; the two remaining canonical chain offenders (E02/E03 pointer drift, T09->T10) are recorded, not rewritten.",
+  "head": "733e4486540d03c349b7f8425d1dcb9c511c5bd1",
+  "next_action": "Open the PR for harness-reliability-bootstrap-20261103 against main (X08 is the last recorded unit); re-run `node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs` after any rebase. The two remaining canonical chain offenders (E02/E03 pointer drift, T09->T10) are recorded, not rewritten.",
   "no_handoff_record": [],
   "plan": "harness-reliability-bootstrap-20261103",
   "plan_scope_tasks": 51,
   "post_plan_extension": {
-    "chain_note": "X01 joins V06 by prose reference (V06 is terminal, nextTaskId null); X05 and X06 each needed a later chain generation (out-chain) because the series continued after their out-final generation was emitted with nextTaskId null.",
+    "chain_note": "X01 joins V06 by prose reference (V06 is terminal, nextTaskId null); X05 and X06 each needed a later chain generation (out-chain) because the series continued after their out-final generation was emitted with nextTaskId null.; X08 joins X07 through parentHandoffHash rather than a forward link, because X07's terminal generation was emitted with nextTaskId null and a PASS record is never rewritten",
     "units": [
       {
         "base_sha": "900bf8a3b10decf0bbc7f7e46b04a29241741151",
@@ -202,6 +207,27 @@
         "next": "None@None",
         "result_sha": "548c2a83d041a888461cddcaec0ef0a236997ef2",
         "unit": "X07"
+      },
+      {
+        "base_sha": "45d42acb70fc2fcac76425d18eb1d651b0e0a9ba",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/01-node-test-import-test-suppor.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/02-node-test-import-test-suppor-2.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/03-npm-run-typecheck-core.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/04-npx-biome-check-src-git-G.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/05-ab-common-dir-at-4ffa.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/06-ab-integration-at-4ffa.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/07-control-tip-without-repair.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/08-tip-with-repair-integration.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/09-git-glob-before-after.txt"
+        ],
+        "generation": "out",
+        "handoff_hash": "sha256:34f204430db6c0810f1719883f7ee90980b9a694e48e93ba07d1c4e2bae69d12",
+        "joins": "X07/out (sha256:66af2c2b\u2026) by parentHandoffHash; X07 is terminal (nextTaskId null), so the forward link does not exist and the scan lists no new orphan",
+        "next": null,
+        "result_sha": "9f0644507e51baea9f6d0a75fc838e046c4143b7",
+        "task_authority_hash": "sha256:f8e910b382b848c9e8d2b9760e29fcd8d00dc729674ddbaf57f80f91fc0abcf5",
+        "unit": "X08"
       }
     ],
     "why": "Filed after PLAN.json closed, from the completion audit: the drift detector could not see 'in-scope but undeclared' edits (drift-03), nothing called the detector at runtime, the observability counters had no producer, the contract never reached the worker, the intervention master switch defaulted ON against the security spec, and the chain parents of the X-series records were never committed."
@@ -230,14 +256,14 @@
   "repo": "berlinguyinca/pi-engineering",
   "schema_conformance": {
     "additional_properties": false,
-    "canonical_hash_recomputed": 91,
+    "canonical_hash_recomputed": 92,
     "chain_canonical_offenders": 2,
     "chain_forward_links_resolved": 56,
-    "records_distinct": 91,
+    "records_distinct": 92,
     "required_fields": 15,
-    "required_fields_ok": 91,
-    "scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261105-x-series.txt",
-    "scanned_at": "745acdfb9d6a2b710e679a14d2b3a7f6f4441881",
+    "required_fields_ok": 92,
+    "scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261106-x08.txt",
+    "scanned_at": "733e4486540d03c349b7f8425d1dcb9c511c5bd1",
     "scanner": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
     "schema": "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json"
   }
