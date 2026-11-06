@@ -13,7 +13,8 @@ import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import { forgetRemotePinsForTests, replacePathAll, safeGit, stateHooks } from "../../src/git/safeGit.ts";
+import { forgetRemotePinsForTests, safeGit, stateHooks } from "../../src/git/safeGit.ts";
+import { unshadowText } from "../../src/git/shadowPaths.ts";
 
 afterEach(() => {
   stateHooks.stateRoot = undefined;
@@ -50,29 +51,29 @@ const REAL_PARENT = "/real/repo";
 // as Pi recorded it, and as git reports the same directory
 const RECORDED = "/var/state/shadow/s-AbCdEf";
 const RESOLVED = "/private/var/state/shadow/s-AbCdEf";
-const PAIRS: Array<[string, string]> = [
-  [`${RESOLVED}/.git`, REAL],
-  [`${RECORDED}/.git`, REAL],
-  [RESOLVED, REAL_PARENT],
-  [RECORDED, REAL_PARENT],
-];
+// The two spellings of one shadow, and what each maps to — the shapes `Shadow` carries in production.
+const SPELLING = {
+  root: RECORDED,
+  rootReal: RESOLVED,
+  common: `${RECORDED}/.git`,
+  commonReal: `${RESOLVED}/.git`,
+};
+const TARGETS = { commonTo: REAL, rootTo: REAL_PARENT };
+/** The production mapping, called the way `mapOut` and `fixWorktreeLinks` call it. */
+const map = (s: string): string => unshadowText(s, SPELLING, TARGETS);
 
 test("path mapping maps the resolved form and the recorded form, and never the middle of a path", () => {
   // the answer of today's macOS: git resolved `/var` to `/private/var`, so the recorded form is a substring of it
-  assert.equal(replacePathAll(`${RESOLVED}/.git\n`, PAIRS), `${REAL}\n`);
-  assert.equal(replacePathAll(`${RECORDED}/.git\n`, PAIRS), `${REAL}\n`);
-  assert.equal(replacePathAll(`gitdir: ${RESOLVED}/.git/worktrees/wt\n`, PAIRS), `gitdir: ${REAL}/worktrees/wt\n`);
+  assert.equal(map(`${RESOLVED}/.git\n`), `${REAL}\n`);
+  assert.equal(map(`${RECORDED}/.git\n`), `${REAL}\n`);
+  assert.equal(map(`gitdir: ${RESOLVED}/.git/worktrees/wt\n`), `gitdir: ${REAL}/worktrees/wt\n`);
   // the shadow's own attributes file (the root, not its `.git`)
-  assert.equal(replacePathAll(`${RESOLVED}/attributes`, PAIRS), `${REAL_PARENT}/attributes`);
+  assert.equal(map(`${RESOLVED}/attributes`), `${REAL_PARENT}/attributes`);
   // a path that merely contains the shadow path is not the shadow path
-  assert.equal(replacePathAll(`/prefix${RECORDED}/.git`, PAIRS), `/prefix${RECORDED}/.git`);
-  assert.equal(replacePathAll(`${RECORDED}-extra/.git`, PAIRS), `${RECORDED}-extra/.git`);
+  assert.equal(map(`/prefix${RECORDED}/.git`), `/prefix${RECORDED}/.git`);
+  assert.equal(map(`${RECORDED}-extra/.git`), `${RECORDED}-extra/.git`);
   // never a doubled prefix, whichever form arrives
-  for (const out of [
-    replacePathAll(`${RESOLVED}/.git`, PAIRS),
-    replacePathAll(`${RECORDED}/.git`, PAIRS),
-    replacePathAll(`x ${RESOLVED}/.git ${RECORDED}/attributes`, PAIRS),
-  ]) {
+  for (const out of [map(`${RESOLVED}/.git`), map(`${RECORDED}/.git`), map(`x ${RESOLVED}/.git ${RECORDED}/attributes`)]) {
     assert.ok(!out.includes("private/private"), out);
     assert.ok(!out.includes("state/shadow"), out);
   }

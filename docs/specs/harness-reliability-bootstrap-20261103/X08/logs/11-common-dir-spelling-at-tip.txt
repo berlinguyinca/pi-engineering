@@ -1,0 +1,10 @@
+# CONTROL at origin/main 89e747c2 (#602, WITHOUT the X08 guard): can the doubled prefix still be produced?
+# Run in a checkout of origin/main so nothing of mine can mask the answer.
+
+git worktree add --detach /Users/wohlgemuth/IdeaProjects/worktrees/pi-x08-ctl602 89e747c2
+$ node --experimental-strip-types .spell.probe.mts
+main repo        commonDir(): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/spell-602-H8F8vx/repo/.git
+                 plain git  : /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/spell-602-H8F8vx/repo/.git  agrees=true doubled=false
+linked worktree  commonDir(): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/spell-602-H8F8vx/repo/.git
+                 plain git  : /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/spell-602-H8F8vx/repo/.git  agrees=true doubled=false
+PASS: no doubled prefix at this tip, both spellings agree

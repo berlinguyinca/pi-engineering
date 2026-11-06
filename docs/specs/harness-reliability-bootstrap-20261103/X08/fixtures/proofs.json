@@ -1,0 +1,22 @@
+[
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/git-common-dir-repair.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X08/logs/01-node-test-import-test-suppor.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/git-durable-ownership.test.ts test/unit/git-persist-concurrency.test.ts test/unit/git-lock-publication.test.ts test/unit/git-spawn-economy.test.ts test/unit/git-worktree-safety.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X08/logs/02-node-test-import-test-suppor-2.txt"
+ },
+ {
+  "command": "npm run typecheck:core",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X08/logs/03-npm-run-typecheck-core.txt"
+ },
+ {
+  "command": "npx biome check src/git/GitRepo.ts test/unit/git-common-dir-repair.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X08/logs/04-npx-biome-check-src-git-G.txt"
+ }
+]

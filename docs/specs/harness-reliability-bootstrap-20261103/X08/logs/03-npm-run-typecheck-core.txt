@@ -1,0 +1,6 @@
+$ npm run typecheck:core
+
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+
+[exit=0]

@@ -1,0 +1,15 @@
+$ git rev-parse HEAD
+9f0644507e51baea9f6d0a75fc838e046c4143b7
+
+$ node --test --import ./test/support/isolatedState.ts <the git units that touch commonDir, locks, shadow state>
+safe-git-shadow-spelling           
+git-durable-ownership              tests 5 pass 5 fail 0 
+git-persist-concurrency            tests 3 pass 3 fail 0 
+git-lock-publication               tests 3 pass 3 fail 0 
+git-spawn-economy                  tests 11 pass 11 fail 0 
+git-worktree-safety                tests 4 pass 4 fail 0 
+
+Note on the first line: test/unit/safe-git-shadow-spelling.test.ts does not exist in this tree -- it
+arrives with #602 (89e747c2), which is NOT an ancestor of 9f064450. It is reported running at the
+merged tip instead: 10/10 there (see 10-merged-tip-state.txt for the ancestry). The other five units
+are pre-existing and pass at the task commit itself.

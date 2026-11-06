@@ -1,0 +1,35 @@
+# Whole suite at bc8cd251 -- the task commit with BOTH parents merged (origin/main 89e747c2 => 61394da7 #582 + 89e747c2 #602; origin/harness-reliability-bootstrap 6818842c => 259a4233 #604).
+# Nothing else was running on the machine. The same command at the wrong base is logs/17.
+
+$ npm test
+ℹ tests 7944
+ℹ suites 558
+ℹ pass 7912
+ℹ fail 27
+ℹ cancelled 0
+ℹ skipped 5
+ℹ duration_ms 1639286.939166
+npm exit code: 1 (there are failures, see below)
+
+Comparison with the same command at origin/main 89e747c2 (control, run in a clean detached worktree:
+tests 7699, pass 7671, fail 23, cancelled 0, duration_ms 820525):
+  +245 tests, +4 failing leaf tests, +260 s duration, cancelled 0 in both.
+
+Failing test names at this tree that do NOT fail at origin/main (leaf failures, files named from
+the failing-tests block of the same log):
+  test/integration/mission-reliability-foundation.test.ts:865  keeps the incumbent unchanged when current-candidate validation is red
+  test/integration/no-fixed-deadlines.test.ts:463               resumes from the hung execution's preserved work instead of starting over
+  test/integration/worker-stream-truncation.test.ts:306         worker: resume triggers through the armed resilient stream layer (production path)
+  test/unit/herdr-plannotator-transport.test.ts:93              dismissed, crash, malformed, oversized output and timeout are unavailable (throw)
+No failing name at this tree is absent from the control list, i.e. nothing that fails here
+stopped failing -- the branch adds 4, removes 0.
+
+Single-file behaviour of those four is recorded in logs/19-branch-only-failures-alone.txt.
+Neither X08 commit touched any of those files or their subjects: the branch carries the X-series
+(drift wiring, bounded fence, metrics, resilience default, integrity scanner, this guard) and
+those four belong to earlier units' areas. They are recorded as an open finding, not closed here.
+
+Environment-bound failures present in BOTH runs, for the record:
+  test/unit/safe-git-units.test.ts:211, test/unit/safe-git-survivors.test.ts:127
+  ('stderr paths are the real ones, never the shadow's') -- the macOS /private/var spelling
+  issue #582 / #602 address at the source; they fail on this machine at origin/main too.

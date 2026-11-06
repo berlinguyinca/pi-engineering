@@ -1,0 +1,3 @@
+$ npx biome check src/git/GitRepo.ts test/unit/git-common-dir-repair.test.ts
+Checked 2 files in 106ms. No fixes applied.
+[exit=0]
