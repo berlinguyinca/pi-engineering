@@ -92,6 +92,15 @@ function tokenize(text) {
       toks.push({ kind: "cite", i: m.index, f: c[1] ?? null, raw: inner, a: Number(c[2]), b: Number(c[3] ?? c[2]) });
       continue;
     }
+    // A span that IS a file name is a path mention, not an anchor. `taskAlignment.ts` (T07 — reached
+    // from `aps/workerActivity.ts:184`) otherwise handed the tokenizer the word `taskAlignment`, which
+    // does not appear at workerActivity.ts:184 (`const signals = evaluateTaskAlignment({`) -- a
+    // perfectly correct citation reported as drift because the anchor was the file the author was
+    // TALKING ABOUT rather than the symbol the pointer must contain.
+    if (/^\.?\.?\/?(?:[\w.@-]+\/)*[\w.@-]+\.(?:ts|tsx|mjs|cjs|json|md|sh)$/.test(inner.trim())) {
+      toks.push({ kind: "path", i: m.index, t: inner.trim() });
+      continue;
+    }
     for (const w of inner.match(/[A-Za-z_][A-Za-z0-9_()]{2,}/g) ?? []) {
       const base = w.replace(/\($/, "");
       if (isIdent(base)) toks.push({ kind: "id", i: m.index, t: base });
@@ -202,10 +211,10 @@ for (const doc of FILES) {
     // deny rules live in `src/plannerWorker/contract.ts` (...): ... (`:62-80`)" is the runbook's most
     // common shape, and ignoring the unnumbered name left `:62-80` attached to whichever file was
     // named lines earlier, then reported as drift in the wrong file.
-    for (const m of line.matchAll(/[A-Za-z0-9_.\/-]+\.(?:ts|tsx|go|mjs|cjs|json|md|sh)\b/g)) {
-      if (line.slice(Math.max(0, m.index - 1), m.index).match(/[:0-9]/)) continue; // part of `file.ts:12`
-      const r = resolveFile(m[0], docDir);
-      if (r) explicit.push({ i: m.index, r });
+    for (const t of toks) {
+      if (t.kind !== "path") continue;
+      const r = resolveFile(t.t, docDir);
+      if (r) explicit.push({ i: t.i, r });
     }
     for (const t of toks) {
       if (t.kind !== "cite" || !t.f) continue;
