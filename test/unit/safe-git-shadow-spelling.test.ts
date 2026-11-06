@@ -10,7 +10,16 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -141,5 +150,71 @@ test("a shadow reached through a symlink still resolves to the real repository, 
     assert.ok(!printed.includes("/private/private"), `${args.join(" ")} doubled a prefix: ${printed}`);
     assert.ok(!printed.includes("safegit"), `${args.join(" ")} leaked the shadow directory: ${printed}`);
     assert.ok(existsSync(printed), `${args.join(" ")} named a path that does not exist: ${printed}`);
+  }
+});
+
+/**
+ * The one place a wrong translation writes WHERE THE USER LIVES rather than merely printing a bad path: git builds a
+ * work tree's `.git` pointer from the common directory it was handed, and the shadow spelling is what it knows. The
+ * pointer is then read back by every raw `git -C <worktree>` the runtime runs -- allocation, `git add`, commit, diff
+ * -- so a pointer naming the shadow, or naming `/private/private/...`, is a work tree that exists and cannot be used.
+ *
+ * This is a regression test for the translation, not for a caller's hygiene: at 4ffa82f3 the same scenario produced a
+ * `.git` of `gitdir: <shadow>/.git/worktrees/<name>` while the administration directory sat in the real repository.
+ */
+test("a work tree allocated under a linked state directory points at the real repository", async () => {
+  const repo = join(root, "wt-repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", "-b", "main", repo], { env: env() });
+  execFileSync("git", ["-C", repo, "config", "user.name", "t"], { env: env() });
+  execFileSync("git", ["-C", repo, "config", "user.email", "t@t"], { env: env() });
+  execFileSync("git", ["-C", repo, "commit", "-q", "--allow-empty", "-m", "one"], { env: env() });
+
+  const common = execFileSync("git", ["-C", repo, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    encoding: "utf8",
+    env: env(),
+  }).trim();
+  const wt = join(root, "wt-checked-out");
+  // Identity comes from the repository config set above. No `-c` here on purpose: the injection guard refuses
+  // `-c commit.gpgsign=false` outright ("a setting Pi forces"), and a test that asked for it would be refused
+  // before git ever saw the worktree request.
+  const added = await safeGit(["worktree", "add", "-q", "--detach", wt, "HEAD"], { cwd: repo, trust: "operator" });
+  try {
+    assert.equal(added.code, 0, `worktree add: ${added.stdout}\n${added.stderr}`);
+    assert.ok(existsSync(join(wt, ".git")), `${wt} was created without a .git pointer`);
+    // The pointer must name the repository's own administration directory, and nothing else.
+    const body = readFileSync(join(wt, ".git"), "utf8");
+    assert.match(body, /^gitdir: .+$/m);
+    assert.ok(!body.includes("/private/private"), `the .git pointer doubled a prefix: ${body}`);
+    assert.ok(!body.includes("safegit"), `the .git pointer names Pi's shadow directory: ${body}`);
+    assert.ok(
+      body.startsWith(`gitdir: ${common}/worktrees/`),
+      `the .git pointer names neither the repository nor its shadow: ${body} (repository common directory is ${common})`,
+    );
+    // And the work tree must be usable by a plain git that knows nothing about Pi's shadow.
+    const inside = execFileSync("git", ["-C", wt, "rev-parse", "--path-format=absolute", "--git-dir"], {
+      encoding: "utf8",
+      env: env(),
+    }).trim();
+    assert.ok(
+      existsSync(inside),
+      `a plain git resolved the work tree's git directory to ${inside}, which does not exist`,
+    );
+    assert.ok(
+      !inside.includes("safegit"),
+      `a plain git resolved the work tree's git directory into the shadow: ${inside}`,
+    );
+    // Nothing under the real repository's administration directory may name the shadow. The directory itself is
+    // part of the guarantee: work tree administration belongs in the repository, not in the shadow.
+    const admin = join(common, "worktrees");
+    assert.ok(
+      existsSync(admin),
+      `the repository has no work tree administration directory at ${admin}; it stayed in the shadow`,
+    );
+    for (const name of readdirSync(admin)) {
+      assert.ok(!name.includes("safegit"), `the shadow leaked into ${admin}: ${name}`);
+    }
+  } finally {
+    await safeGit(["worktree", "remove", "-f", wt], { cwd: repo, trust: "operator" });
   }
 });
