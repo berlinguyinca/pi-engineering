@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { ExclusiveFileLock, type FileLockRecoveryHooks } from "../../src/platform/eventstore/fileLock.ts";
+import { ExclusiveFileLock, type FileLockRecoveryHooks, readBootId } from "../../src/platform/eventstore/fileLock.ts";
 
 const root = mkdtempSync(join(tmpdir(), "filelock-nolink-"));
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -43,7 +43,10 @@ test("acquire, exclude and release work when the filesystem refuses hard links",
 
 test("a stale owner is recovered without hard links too", async () => {
   const file = join(root, "stale.jsonl");
-  const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  // The product's own probe, not procfs directly: on Darwin the boot id comes
+  // from `kern.boottime`, and a record must carry the same shape the lock writes.
+  const bootId = readBootId();
+  assert.ok(bootId, "this host exposes no boot id");
   // This process's PID with a start time that is not its own: a previous incarnation.
   writeFileSync(
     `${file}.lock`,

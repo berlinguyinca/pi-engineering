@@ -28,40 +28,13 @@ export type ProcessLiveness =
   | { state: "dead"; reason: "pid_not_alive" | "pid_reused" | "rebooted" }
   | { state: "unknown"; reason: "remote_host" | "identity_unavailable" | "permission_denied" };
 
-export function readBootId(): string | null {
-  try {
-    const value = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
-    return value || null;
-  } catch {
-    return null;
-  }
-}
+// Both probes come from the one platform implementation. This module used to
+// carry a Linux-only copy, which assessed any record that carried an incarnation
+// as `pid_not_alive` on macOS — a proof of death, and therefore a licence to
+// reclaim a live session's lease — because procfs simply is not there.
+import { readBootId, readProcessStartTime } from "../../platform/processIncarnation.ts";
 
-/**
- * Field 22 (`starttime`) of `/proc/<pid>/stat`. The command name (field 2) may
- * contain spaces and parentheses, so fields are counted after the LAST `)`.
- */
-export function readProcessStartTime(
-  pid: number,
-): { state: "present"; value: string } | { state: "missing" } | { state: "unknown" } {
-  try {
-    const line = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const close = line.lastIndexOf(")");
-    // After ")" come field 3 (state) onwards; field 22 is index 19 there.
-    const value =
-      close >= 0
-        ? line
-            .slice(close + 2)
-            .trim()
-            .split(/\s+/)[19]
-        : undefined;
-    return value && /^\d+$/.test(value) ? { state: "present", value } : { state: "unknown" };
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ESRCH") return { state: "missing" };
-    return { state: "unknown" };
-  }
-}
+export { readBootId, readProcessStartTime };
 
 /** Absolute boot time in epoch seconds (`btime` in /proc/stat), when available. */
 export function readBootTimeSeconds(): number | null {
