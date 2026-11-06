@@ -1,0 +1,30 @@
+# The four leaf failures the corrected-base whole-suite run (logs/18) adds over origin/main, each run alone
+# with nothing else on the machine, plus attribution by tree.
+
+file alone at bc8cd251 (task commit + both parents):
+  test/integration/mission-reliability-foundation.test.ts   tests 44  pass 44  fail 0   -> load-dependent in the suite, clean alone
+  test/unit/herdr-plannotator-transport.test.ts             tests  8  pass  8  fail 0   -> load-dependent in the suite, clean alone
+  test/integration/no-fixed-deadlines.test.ts               tests 11  pass 10  fail 1   -> fails alone too
+  test/integration/worker-stream-truncation.test.ts         tests 20  pass 19  fail 1   -> fails alone too
+
+Per-tree check of the two that fail alone (same command, throwaway worktree, nothing else running):
+  tree                 no-fixed-deadlines   worker-stream-truncation
+  89e747c2 (main)      pass 10 fail 1       pass 20 fail 0
+  009837c3 (X05 evid.) pass 10 fail 1       pass 20 fail 0
+  141ca5db (X06 flip)  pass 10 fail 1       pass 19 fail 1   <-- breaks here
+  45d42acb (X08 base)  pass 10 fail 1       pass 19 fail 1
+  6818842c (integ tip) pass 10 fail 1       pass 19 fail 1
+
+Attribution:
+  no-fixed-deadlines.test.ts:463 'resumes from the hung execution's preserved work instead of
+    starting over' fails alone at origin/main as well, so it is pre-existing, not branch work.
+    It passed inside the origin/main whole-suite run and failed inside this one, which is what
+    made it look branch-added; alone it is deterministic in both trees.
+  worker-stream-truncation.test.ts:306 'worker: resume triggers through the armed resilient
+    stream layer (production path)' is a REAL regression from 141ca5db (X06, 'arm inference
+    resilience only on an affirmative switch'): 20 pass at X06's parent, 19/1 at X06, and still
+    19/1 at origin/main's tip? no -- origin/main passes it, because origin/main never carries
+    141ca5db. Fixing it is a follow-up unit, not X08: either the resume path arms the layer on
+    its own affirmative opt-in (what #604 259a4233 did for the resilient-inference tests), or
+    the production resume path stops depending on the ambient default. The test name says
+    '(production path)', so loosening the assertion would be the wrong fix.

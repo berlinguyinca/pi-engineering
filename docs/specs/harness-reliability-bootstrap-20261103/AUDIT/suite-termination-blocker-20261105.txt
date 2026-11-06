@@ -12,6 +12,14 @@ Symptom: `npm test` never terminates. Two integration files never settle, so the
 In the detached whole-suite run both files were still running 21 minutes after the run started, with
 40 failures reported from other files in that time and no final tally.
 
+--------------------------------------------------------------------------------
+SUPERSEDED 2026-11-06. Everything from the next line to the closure at the end of this file was
+written before #582 and #602 and names the wrong mechanism. It is kept because it is the record of
+how the hang was investigated, but reading it as current guidance sends the next agent to
+src/bootstrap/orchestration.ts looking for an interrupt-propagation defect that does not exist.
+Read the closure at the end first.
+--------------------------------------------------------------------------------
+
 Mechanism (read, not inferred from the failure text):
   mission-interrupt-pause.test.ts:36-47 - the stub worker parks the first implementer attempt on
     await new Promise(resolve => request.signal?.addEventListener('abort', () => resolve(), { once: true }));
@@ -37,3 +45,77 @@ Exact next step, in order:
   3. Only after that, make the stub fail fast instead of hanging (race the abort with a bounded timer
      that asserts the interrupt arrived), so a regression surfaces as a failure rather than as a
      suite that never ends.
+
+--------------------------------------------------------------------------------
+CLOSED 2026-11-06 at bc8cd251 (task/x08-common-dir-repair, carrying origin/main 89e747c2
+and the integration branch 6818842c). The two files named above settle and pass, the whole
+suite terminates, and the mechanism recorded in this note is wrong: it was path resolution,
+not interrupt propagation. Steps 2 and 3 below are NOT needed and should not be started.
+
+Whole suite, `npm test`, at bc8cd251 (X08/logs/16-whole-suite-wrong-base.txt):
+
+  tests 7927   pass 7880   fail 42 -> see the base-artifact paragraph below   cancelled 0
+  duration_ms 681281 (11.4 minutes), exit status 1 (failures), no hang, no 124 from timeout
+
+That run was taken at 7637a645, before the base correction described below; the corrected
+tree is logged in X08/logs/17-whole-suite-corrected-base.txt. Either way the suite
+*completes*: it has not hung since #582 landed. The "never completes / hangs forever"
+statements in PLAN-COMPLETION.json about 7c051955, 900bf8a3 and 4ffa82f3 describe trees
+where `GitRepo.commonDir()` could return a path that does not exist.
+
+The real mechanism was the common directory, not the abort signal
+
+  At 4ffa82f3 `commonDir()` returned `/private/private/var/folders/…/<repo>/.git` — the
+  physical prefix applied twice, because safeGit points GIT_DIR/GIT_COMMON_DIR/GIT_WORK_TREE
+  at Pi's shadow state and `/var` is a symlink to `/private/var` (X08/logs/05). In the same
+  process, `git -C <repo> rev-parse --path-format=absolute --git-common-dir` returned the
+  correct path (X08/logs/09). Everything derived from the answer — the promotion
+  administration lock, the candidate journal, the checkpoint records — failed its mkdir with
+  ENOENT, and `withWorktreeSection` reads ENOENT as "the other process's lock is not there
+  yet" and queues to `promotionWait.ceilingMs` (600 s per attempt). A file whose scenario
+  touches that path several times is therefore killed by any ceiling below it, with no tally
+  and no signal — which is what the 240 s capture above shows, and why it looked like a
+  promise parked on an interrupt that never arrived.
+
+  The A/B that settles the question (X08/logs/06): at 4ffa82f3, applying ONLY a
+  common-directory guard — nothing else, no interrupt, no lease, no scheduler change — the
+  file settles and reports 12 tests collected (6 pass, 6 fail on unrelated assertions that
+  later commits fixed). At 45d42acb, with no guard, the same file is 12 pass / 0 fail in
+  29 s (X08/logs/07). So the abort-signal reading above was plausible and wrong.
+
+Upstream fixes, both now in the base
+
+  61394da7  fix(git): one canonical path for the state dir and the temp root (#582) — the
+            state directory and temp root are canonicalized at boot, the same way repository
+            discovery already resolves them, so a shadow path built over an unresolved state
+            dir is no longer constructed.
+  89e747c2  fix(git): translate shadow paths by spelling, so a real path is never doubled
+            (#602) — `toShadowPath`/`fromShadowPath` now translate by prefix spelling instead
+            of `path.resolve`, which re-applied the physical prefix. At this tip the doubled
+            prefix no longer reproduces: `commonDir()` is real and equal to a plain git
+            answer in every layout probed (X08/logs/11).
+
+Residual hardening on this branch (X08)
+
+  `GitRepo.commonDir()` no longer hands back an answer that names no directory: an answer
+  that exists is passed through untouched (it is usually the shadow common dir, which only
+  git knows), one that does not exist is repaired from the filesystem layout, and when
+  neither resolves the call throws naming the impossible path. Without it, a regression of
+  #582 or #602 is invisible at the source and reappears as a 600 s poll; with it, the
+  regression is an error at the call site naming what git reported
+  (X08/logs/12-neighbour-units.txt, test/unit/git-common-dir-repair.test.ts).
+
+A base artifact, recorded so nobody re-diagnoses it
+
+  A whole-suite comparison of the wrong base (local tip 45d42acb, missing #604) against
+  origin/main showed 42 failures against 23, all of them in the resilience integration files
+  #604 arms, and `git bisect` named 141ca5db (X06, the default-off flip) as first bad. There
+  was no defect there: merging the real integration tip 6818842c brought in 259a4233 and
+  those 17 tests report 17 pass / 0 fail. The lesson is about the gate, not the code — a
+  whole-suite tally is only comparable when the base is the current integration tip, and
+  45d42acb was not it. No assertion was touched to get that number.
+
+Residual risks this closes nothing of: a hung process still holds its lease (X03's bounded
+fence remains the only recovery), and `withWorktreeSection` still treats ENOENT as lock
+contention — the guard makes that state unreachable from `commonDir()`, it does not change
+how ENOENT is interpreted.

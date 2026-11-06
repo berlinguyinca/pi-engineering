@@ -1,0 +1,30 @@
+# Whole suite at 7637a645 (task commit + origin/main 89e747c2, WITHOUT the integration branch's #604).
+# Recorded because it is the run that shows the suite TERMINATES: 7927 tests, 681 s, cancelled 0.
+# Its failure count is inflated by the missing parent (see the base-artifact paragraph in
+# AUDIT/suite-termination-blocker-20261105.txt and 17-whole-suite-corrected-base.txt).
+
+$ npm test
+NOTE: the whole-suite run at bc8cd251 was still unfinished at the 2700 s ceiling under concurrent probes; the clean whole-suite measurements kept as evidence are the run at 7637a645 (7927 tests, 681 s, cancelled 0) and the origin/main control (7699 tests, 820 s, cancelled 0). This note explains why no corrected-base tally is recorded.
+ℹ tests 7927
+ℹ suites 554
+ℹ pass 7880
+ℹ fail 42
+ℹ cancelled 0
+ℹ skipped 5
+ℹ duration_ms 681281.183625
+
+failing files, by number of failing tests:
+  10 test/integration/resilient-inference-integration.test.ts
+   7 test/integration/resilient-inference-wiring.test.ts
+   5 test/unit/runtime-isolation-registry.test.ts
+   4 test/unit/artifacts-paging.test.ts
+   2 test/integration/runtime-isolation-stress.test.ts
+   2 test/integration/planner-worker-gateway-timeouts.test.ts
+   1 test/unit/worktree-janitor.test.ts
+   1 test/unit/workspace-manifest-corpus.test.ts
+   1 test/unit/standalone-plan-flow.test.ts
+   1 test/unit/safe-git-units.test.ts
+   1 test/unit/safe-git-survivors.test.ts
+   1 test/unit/platform-filelock-no-hardlinks.test.ts
+   1 test/unit/live-handoff-rpc.test.ts
+   1 test/unit/herdr-forks.test.ts
