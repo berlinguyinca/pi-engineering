@@ -12,15 +12,42 @@
  * the row claims it says". #607's own body put it best: **an in-range citation is not a correct
  * citation.** This tool answers the second question.
  *
- * HOW: for each citation, take the nearest code-shaped token in the prose BEFORE it (the anchor --
- * usually the environment variable, function, field or class the row is about) and test whether that
- * anchor occurs at, or within `band` lines of, the cited line.
+ * HOW an anchor is chosen -- every clause here is the residue of a false failure seen in practice:
+ *   - It must be a NAME IN BACKTICKS of SYMBOL SHAPE (CONSTANT_NAME, CamelCase, camelCase), within 60
+ *     characters of the pointer, in the SAME TABLE COLUMN and the SAME CLAUSE (no `. ` or `;` between).
+ *     Prose outside backticks is never an anchor: `executor.ts:547-554 (bounded, non-blocking)` read
+ *     "bounded" as its anchor and reported a correct citation as drift.
+ *   - NEAREST ONLY, with no fallback. "Walk backward until some token occurs in the target file" was
+ *     the single biggest false-failure source: `JSON` answered for a pointer that named `fnv1a64`, and
+ *     `WAIT_STATUSES` (already the anchor of the citation before it) answered for `signals.ts:728`.
+ *     A name an earlier citation on the line already used is not available again.
+ *   - A parenthetical AFTER the pointer naming a symbol wins over anything before it, because that is
+ *     how a row says "line N is where `foo` lives". A parenthetical that is itself a file citation
+ *     (`retryPolicy.ts:100`) names a file, not a symbol, and is not used.
+ *   - VALUE-SHAPED names are never judged: snake_case keys (`tool_loop_limit`, `loop_candidate`),
+ *     string literals and patterns (`evidence: scope gate:`, `superseded/*`), paths
+ *     (`~/.local/state/pi-engineering`), flags (`--export <path>`) and digit-bearing names (`fnv1a64`).
+ *     A row cites the code that HANDLES such a value -- the append call for an event name, the option
+ *     parser for a flag, the resolver for a state root -- and the value's own text is not on that line.
+ *     Judged by containment, four already-verified-correct citations came back ANCHOR_MISSING
+ *     (ROLLOUT.md:29/78/80 and the event-key rows of ERROR_SOURCES.md), which costs more trust than the
+ *     missed finding earns. Such a name CLOSEST to the pointer silences the judgement for that citation
+ *     and is reported in the row's `hint` field (--json), so a human still sees what was named.
+ *
+ * FILE BINDING follows Markdown structure: an explicit path is remembered PER TABLE COLUMN, so a row's
+ * bare `:146` inherits the file that column was about; in prose the path carries to the end of the
+ * PARAGRAPH (a citation wrapped across lines inherited nothing and was reported NO_FILE -- the
+ * sentence was correct). A bare pointer whose column-bound file and row-bound file disagree is
+ * BARE_AMBIGUOUS and FAILS rather than being guessed: `taskAlignment.ts:137-146` sits in the column
+ * about `workerActivity.ts`, and the row's `:130` belongs to `workerActivity.ts:130-132`, so either
+ * binding produces a confident wrong answer. The fix is to name the file, not to teach the tool to guess.
  *
  * WHAT IT CANNOT DO -- read this before believing a number:
- *   - NO_ANCHOR is NOT a pass. When no identifier precedes a citation (prose like `10 m / 2 m`,
- *     "`auto`", a bare "floors at 1") the tool has nothing to compare and reports the citation as
- *     unjudged. A document can hold a large NO_ANCHOR population while still being wrong. Those rows
- *     need a human, or an edit that names the symbol the cited line contains.
+ *   - NO_ANCHOR is NOT a pass. When no symbol-shaped name sits adjacent to a citation (prose like
+ *     `10 m / 2 m`, "`auto`", a bare "floors at 1", or any value-shaped row) the tool has nothing to
+ *     compare and reports the citation as unjudged. A document can hold a large NO_ANCHOR population
+ *     while still being wrong. Those rows need a human, or an edit that names the symbol the cited line
+ *     contains. Measured on this repo's docs/specs: about 140 citations are judged and ~400 are not.
  *   - ANCHOR_MISSING is a CANDIDATE, not a verdict. Four real ways it fires without the document
  *     being wrong, all observed while building this: an env var cited at its *field* line
  *     (`PI_INFERENCE_MODEL_FALLBACK_INTERACTIVE` vs `modelFallbackInteractive: false`); a default
@@ -28,9 +55,7 @@
  *     that *calls* the function owning the behaviour; a comment line above the code. Each was
  *     resolved by making the prose name the symbol on the cited line, which is a documentation
  *     improvement rather than a suppression. There is deliberately no allowlist.
- *   - File binding follows Markdown structure: an explicit path is remembered PER TABLE COLUMN, so a
- *     row's bare `:146` inherits the file that column was about. A global "last file seen anywhere"
- *     carry silently mis-attributes citations to a file mentioned later in the same row.
+ *   - OUT_OF_RANGE is caught; a wrong-but-in-range line inside a value-shaped row is NOT (see above).
  *   - `false`/`true`/`null`/`undefined` are not anchors. They appear on nearly every line, so
  *     accepting them manufactures confidence: an earlier version of this script "found" 7 anchors
  *     that way, all of them fake.
@@ -50,6 +75,12 @@ const REF = pos[0];
 const bandArg = pos.slice(1).find((a) => /^\d+$/.test(a));
 const FILES_RAW = pos.slice(1).filter((a) => a !== bandArg);
 const BAND = Number(bandArg ?? 4) || 4;
+// --code-at <ref>: read SOURCE files at <ref> while documents are read as written. A record declares
+// `Base commit: <sha>` for the tree it describes, but the record itself was committed later, so no
+// single ref contains both. This is what makes the claim behind a --baseline entry testable: run the
+// check with --code-at <declared base> and require drift=0. Without it, exemption-by-base is a claim a
+// human asserted and nothing could re-check.
+//
 // --baseline <file>: documents whose citations are POINT-IN-TIME records (mission handoffs, worker
 // reports, patch specs). Their line numbers describe the tree the task ran against; rewriting them to
 // today's lines would make the record claim it observed numbers it never observed, so their failures
@@ -61,7 +92,9 @@ if (baselineIdx >= 0 && !baselineFile) {
   process.exit(2);
 }
 if (!REF || FILES_RAW.length === 0) {
-  console.error("usage: citation-anchor-check.mjs <git-ref> <file.md|dir> [band] [--json] [--baseline <file>]");
+  console.error(
+    "usage: citation-anchor-check.mjs <git-ref> <file.md|dir> [band] [--json] [--baseline <file>] [--code-at <ref>]",
+  );
   process.exit(2);
 }
 const git = (args, opt = {}) =>
@@ -81,6 +114,16 @@ const STOP = new Set(["false", "true", "null", "undefined", "const", "let", "ret
 // "present in the target file" and every nearby citation became a confident ANCHOR_MISSING. Same for
 // ordinary prose nouns (`last`, `path`, `errors`, `reason`, `absent`). A lowercase word with no
 // internal capital is prose, whatever it is quoted from.
+// ANCHOR-ELIGIBLE SHAPES: the names a programming language uses for entities -- CONSTANT_NAMES,
+// CamelCase, camelCase. Deliberately EXCLUDED, and each exclusion is evidence-backed:
+//   snake_case keys (`tool_loop_limit`, `loop_candidate`, `blocked_reason`), string literals and
+//   patterns (`evidence: scope gate:`, `superseded/*`), paths (`~/.local/state/pi-engineering`), flags
+//   (`--export <path>`) and digit-bearing names (`fnv1a64`) are VALUES or KEYS. Documents cite the code
+//   that HANDLES such a value -- the append call for an event name, the option parser for a flag, the
+//   resolver for a state root -- and the value's own text is not on that line. Judged by containment,
+//   four already-verified-correct citations came back ANCHOR_MISSING (ROLLOUT.md:29/78/80,
+//   ERROR_SOURCES.md:26-27), which is a false failure that costs more trust than the missed finding
+//   earns. They are reported as hints under NO_ANCHOR instead: unjudged, visible, for a human.
 const isIdent = (t) =>
   !STOP.has(t) &&
   (/^[A-Z][A-Z0-9_]{3,}$/.test(t) || /^[A-Z][A-Za-z0-9]{2,}$/.test(t) || /^[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*$/.test(t));
@@ -112,9 +155,22 @@ function tokenize(text) {
       toks.push({ kind: "path", i: m.index, t: inner.trim() });
       continue;
     }
-    for (const w of inner.match(/[A-Za-z_][A-Za-z0-9_()]{2,}/g) ?? []) {
-      const base = w.replace(/\($/, "");
-      if (isIdent(base)) toks.push({ kind: "id", i: m.index, t: base });
+    // Each identifier carries its OWN offset inside the span. Giving every word of a multi-word span
+    // the span's opening index made `JSON.stringify`'s two words tie for "nearest", so the further one
+    // could win and a citation was judged against the wrong symbol.
+    // A span that is code but not a bare identifier -- `evidence: scope gate:`, `--export <path>`,
+    // `~/.local/state/pi-engineering`, `superseded/*`. Kept ONLY as a hint: it tells a human what the
+    // author named when no symbol-shape anchor exists. It is never judged, because such spans are values
+    // and keys (see isIdent). Without them the citation reads as if the document named nothing at all.
+    const lit = inner.trim();
+    // A span is a VALUE-shaped hint when it has code punctuation (`evidence: scope gate:`,
+    // `--export <path>`, `~/.local/state/pi-engineering`, `JSON.stringify`) or is a name the anchor
+    // rules deliberately reject (`fnv1a64`). A bare prose word in backticks is neither, and must not be
+    // able to silence a judgement.
+    if (lit.length >= 3 && (/[^A-Za-z0-9_.]/.test(lit) || !isIdent(lit))) toks.push({ kind: "hint", i: m.index, t: lit });
+    for (const wm of inner.matchAll(/[A-Za-z_][A-Za-z0-9_()]{2,}/g)) {
+      const base = wm[0].replace(/\($/, "");
+      if (isIdent(base)) toks.push({ kind: "id", i: m.index + 1 + wm.index, t: base });
     }
   }
   return toks;
@@ -126,12 +182,31 @@ const repoPrefix = git(["rev-parse", "--show-prefix"]).trim();
 const tree = git(["ls-tree", "-r", "--name-only", REF]).split("\n").filter(Boolean);
 const treeSet = new Set(tree);
 
+// The reference the CODE is read at. Defaults to the document reference, and differs when checking a
+// point-in-time RECORD: a work order declares `Base commit: <sha>` for the tree it describes, but the
+// file itself was committed later, so there is no single ref at which both the record and the code it
+// describes exist. `--code-at <sha>` says "read these documents as written, against that tree" -- which
+// is the only way to test the claim that makes a record exempt (its pointers were right AT ITS BASE).
+const codeAtIdx = argv.indexOf("--code-at");
+if (codeAtIdx >= 0 && !argv[codeAtIdx + 1]) {
+  console.error("--code-at needs a git ref, e.g. --code-at 5efe62fe");
+  process.exit(2);
+}
+const codeRef = (codeAtIdx >= 0 ? argv[codeAtIdx + 1] : null) ?? process.env.PI_CITATION_CODE_AT ?? REF;
+const treeCode = git(["ls-tree", "-r", "--name-only", codeRef]).split("\n").filter(Boolean);
+const treeCodeSet = new Set(treeCode);
+const treeCodeHas = (f) => treeCodeSet.has(f) || treeCodeSet.has(`${repoPrefix}${f}`);
+
 // A directory argument used to match nothing, and the run then printed `RESULT drift=0` over 195
 // markdown files while judging ZERO citations -- a green result from an empty sweep, which is the most
 // dangerous output a gate can produce. Directories now expand, and a sweep that judges nothing fails.
 const expandDocs = (arg) => {
   const a = arg.replace(/\/+$/, "");
   if (treeSet.has(a)) return a.endsWith(".md") ? [a] : [];
+  // An explicitly named document that is absent at REF is kept, so the per-document read reports the
+  // real reason ("exists on disk, but not in HEAD") instead of the whole sweep dying with "no markdown
+  // documents matched" -- which is what blocked checking records against their own base commit.
+  if (a.endsWith(".md")) return [a];
   return tree.filter((p) => p.startsWith(`${a}/`) && p.endsWith(".md"));
 };
 const FILES = [...new Set(FILES_RAW.flatMap(expandDocs))].sort();
@@ -170,13 +245,14 @@ const resolveFile = (f, docDir, prefixes = []) => {
   const cands = [f];
   if (docDir) cands.push(`${docDir}/${f}`);
   cands.push(`${repoPrefix}${f}`, `docs/${f}`);
-  let hit = cands.find((c) => treeSet.has(c)) ?? null;
+  let hit = cands.find((c) => treeCodeSet.has(c) || treeSet.has(c)) ?? null;
   // Unique-suffix matching applies to PARTIAL paths too, not just bare names. With the old
   // `!f.includes("/")` guard, `aps/workerActivity.ts:184` (a partial path the runbook writes to
   // distinguish it from other files of that name) resolved to nothing and silently inherited whatever
   // file the row had mentioned last -- then got reported as drift in a file the author never named.
   if (!hit) {
-    let suffix = tree.filter((p) => p === f || p.endsWith(`/${f}`));
+    let suffix = treeCode.filter((p) => p === f || p.endsWith(`/${f}`));
+    if (suffix.length === 0) suffix = tree.filter((p) => p === f || p.endsWith(`/${f}`));
     if (suffix.length === 1) hit = suffix[0];
     else if (suffix.length > 1 && prefixes.length) {
       const narrowed = suffix.filter((p) => prefixes.some((pre) => p.startsWith(pre)));
@@ -193,7 +269,7 @@ const linesCache = new Map();
 const linesOf = (f) => {
   if (!linesCache.has(f)) {
     try {
-      linesCache.set(f, git(["show", `${REF}:${f}`]).split("\n"));
+      linesCache.set(f, git(["show", `${codeRef}:${f}`]).split("\n"));
     } catch {
       linesCache.set(f, []);
     }
@@ -264,6 +340,10 @@ for (const doc of FILES) {
     // before it. A two-pass "any path on the row binds the row" version mis-binds a citation that
     // precedes its own file.
     let cur = isTable ? rowCarry : paraCarry ?? rowCarry;
+    // An identifier used as one citation's anchor (or named in its parenthetical) is not available to
+    // anchor a later citation on the same line. `signals.ts:81` (`WAIT_STATUSES`) and `:728`: taking
+    // WAIT_STATUSES as :728's anchor reported a correct pointer at signals.ts:728
+    // (`export function decideGatewayRetry(`) as drift. With nothing left, that citation is NO_ANCHOR.
     const claimed = new Set();
     const explicit = [];
     // A path named WITHOUT a line number still binds the citations that follow it -- "Its fail-closed
@@ -325,15 +405,11 @@ for (const doc of FILES) {
         continue;
       }
       const lines = file ? linesOf(file) : [];
-      // The anchor is the nearest preceding identifier THAT THE TARGET FILE ACTUALLY CONTAINS. "The
-      // nearest identifier" alone was not enough: prose backticks (`ture`, `diable`, `--last`,
-      // `path`) are code-shaped but are not symbols of the file, and each one produced a confident
-      // ANCHOR_MISSING. If no preceding token is a symbol of the file, there is nothing to compare,
-      // so the citation is reported NO_ANCHOR (unjudged) rather than guessed.
-      // Anchors are scoped to the SAME cell as the citation. The unscoped version compared a
-      // citation in a runbook table's last column against an ENV_NAME two columns earlier, and
-      // reported the last column as drift -- the anchor was simply about a different file. In prose
-      // a line is one cell, so this changes nothing there.
+      // The anchor must be code the document actually wrote, in backticks, in the SAME CELL (a table's
+      // last column must not be judged against an ENV_NAME two columns earlier -- that reported correct
+      // columns as drift; in prose a line is one cell) and adjacent to the pointer. Unanchored numeric
+      // matching turns prose `1.`, `12`, `5 s`, `100%` into phantom citations; an earlier version of this
+      // script did that and reported 156 "citations" on a document with none.
       const citeCell = cellOf(line, t.i);
       const fileText = file ? lines.join("\n") : "";
       // Adjacency, not proximity-in-the-line: the runbook writes `X` `:N`, so N must contain X.
@@ -355,10 +431,28 @@ for (const doc of FILES) {
       // wholly covering a grant ... (`:137-146`)" -> the second, correct pointer flagged as drift),
       // while counting backtick spans made unbackticked prose invisible and flagged nothing at all.
       const ANCHOR_MAX_CHARS = 60;
-      const preceding = toks
-        .filter((x) => x.kind === "id" && x.i < t.i && cellOf(line, x.i) === citeCell && t.i - x.i <= ANCHOR_MAX_CHARS)
-        .filter((x) => !/[;.](\s|$)/.test(line.slice(x.i + x.t.length + 1, t.i)))
-        .map((x) => x.t);
+      // The anchor is the SINGLE nearest code token in the same clause -- no fallback to anything
+      // further back. "Walk backward until some token happens to occur in the target file" was the
+      // largest source of confident FALSE failures in this tool: whatever far word existed in the file
+      // answered for a pointer its nearest neighbour described (`JSON` answering for `fnv1a64`;
+      // `blocked_reason` answering for the literal `evidence: scope gate:` the row actually cites), so
+      // every widening of accepted anchor shapes traded one set of false failures for another. When the
+      // nearest token is not in the file the citation is NO_ANCHOR -- unjudged -- which is the honest
+      // verdict: the prose did not name what the cited line contains.
+      const before = toks.filter((x) => x.i < t.i && cellOf(line, x.i) === citeCell && t.i - x.i <= ANCHOR_MAX_CHARS);
+      const inClause = (x) => !/[;.](\s|$)/.test(line.slice(x.i + x.t.length + 1, t.i));
+      const last = (a) => (a.length ? a[a.length - 1] : null);
+      const anchorTok = last(before.filter((x) => x.kind === "id" && inClause(x)));
+      const hintTok = last(before.filter((x) => (x.kind === "id" || x.kind === "hint") && inClause(x)));
+      // A value named CLOSER to the pointer than any symbol silences the judgement: the row is about
+      // that value, and a symbol a clause further back does not describe it. Without this veto,
+      // "`fnv1a64` (exported from `src/aps/fingerprint.ts:158`)", where 158 IS
+      // `export function fnv1a64(...)", read as drift against `JSON.stringify` three words earlier.
+      const veto = !!hintTok && (!anchorTok || hintTok.i > anchorTok.i);
+      const nearest = veto ? null : anchorTok?.t ?? null;
+      // What the author named nearest, whatever its shape -- reported with NO_ANCHOR so a human sees
+      // "the row cites the flag `--export <path>` here" rather than "nothing named".
+      const nearestHint = hintTok?.t ?? null;
       let want = null;
       // The documents have TWO grammars: "`X` `:N`" (name before the pointer) and "`:N` (`X`)"
       // (name AFTER it). Only the first was implemented, and it produced confident FALSE failures:
@@ -386,17 +480,7 @@ for (const doc of FILES) {
           if (fileText.includes(w)) { want = w; break; }
         }
       }
-      if (!want) {
-        // An identifier already claimed as the anchor of an EARLIER citation on this line is not
-        // available to anchor a later one. `gateway/signals.ts:81` (`WAIT_STATUSES`) and `:728` names
-        // WAIT_STATUSES for :81 only; taking it as :728's anchor reported a correct pointer at
-        // signals.ts:728 (`decideGatewayRetry`) as drift. With nothing left to compare, that citation
-        // is NO_ANCHOR -- unjudged, which is the truth.
-        for (const cand of preceding.reverse()) {
-          if (claimed.has(cand)) continue;
-          if (fileText.includes(cand)) { want = cand; break; }
-        }
-      }
+      if (!want && nearest && !claimed.has(nearest) && fileText.includes(nearest)) want = nearest;
       const at = file && t.a >= 1 && t.a <= lines.length ? lines[t.a - 1] : undefined;
       const outOfRange = file ? t.b > lines.length : false;
       let verdict;
@@ -410,10 +494,10 @@ for (const doc of FILES) {
         let found = 0;
         for (let n = lo; n <= hi; n++) if (lines[n - 1]?.includes(want)) { found = n; break; }
         verdict = found ? "ANCHOR_NEARBY" : "ANCHOR_MISSING";
-        rows.push({ doc, line: idx + 1, file, raw: t.raw, cite: `${t.a}${t.b !== t.a ? `-${t.b}` : ""}`, anchor: want, found, verdict, at: (at ?? "").trim().slice(0, 110), target: found ? (lines[found - 1] ?? "").trim().slice(0, 110) : "" });
+        rows.push({ doc, line: idx + 1, file, raw: t.raw, cite: `${t.a}${t.b !== t.a ? `-${t.b}` : ""}`, anchor: want, found, verdict, at: (at ?? "").trim().slice(0, 110), target: found ? (lines[found - 1] ?? "").trim().slice(0, 110) : "", hint: nearestHint });
         continue;
       }
-      rows.push({ doc, line: idx + 1, file, raw: t.raw, cite: `${t.a}${t.b !== t.a ? `-${t.b}` : ""}`, anchor: want, found: 0, verdict, at: (at ?? "").trim().slice(0, 110), target: "" });
+      rows.push({ doc, line: idx + 1, file, raw: t.raw, cite: `${t.a}${t.b !== t.a ? `-${t.b}` : ""}`, anchor: want, found: 0, verdict, at: (at ?? "").trim().slice(0, 110), target: "", hint: nearestHint });
     }
     // Publish this row's explicit paths to the column carry AFTER the row is judged, so a column
     // never binds against a path that appears later in its own row.
@@ -481,8 +565,15 @@ else {
     console.log(`NOTE ${docContextBindings} ambiguous basename(s) (executor.ts -> 2 files, review.ts -> 4) were bound by a directory the document names itself; a written path always wins.`);
   }
   if ((tally.NO_ANCHOR ?? 0) > 0) {
-    console.log(`NOTE ${tally.NO_ANCHOR} citation(s) were NOT judged: no identifier near the citation to compare against.`);
+    console.log(`NOTE ${tally.NO_ANCHOR} citation(s) were NOT judged: no symbol-shaped name adjacent to the citation.`);
+    console.log("      Their `hint` field (--json) shows what the author DID name -- usually a value, flag, path or");
+    console.log("      snake_case key, which containment cannot judge (see isIdent). To make such a citation");
+    console.log("      judgeable, name the symbol the cited line declares.");
     console.log(`     Those are neither pass nor fail. Do not report this run as "citations verified".`);
   }
 }
-process.exit(bad.length > 0 ? 1 : 0);
+// NOT process.exit(): exiting right after a large stdout write races the flush, and on a pipe Node
+// truncates at 64 KiB. `--json` over docs/specs lost everything past byte 65536 -- an automated consumer
+// got invalid JSON, and a human piped into `grep RESULT` got NO verdict at all and could read that as a
+// pass. Setting exitCode lets the process end naturally and flush completely.
+process.exitCode = bad.length > 0 ? 1 : 0;

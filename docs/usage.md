@@ -1316,6 +1316,39 @@ The same history edit backs the interactive `afterOutputRetry` extension
 - A cut before any tool call is unchanged: the attempt is retried in a fresh
   session without consuming an attempt.
 
+## Citation anchor gate
+
+Every line reference in `docs/specs/**` is checked by
+`docs/specs/harness-reliability-bootstrap-20261103/AUDIT/citation-anchor-check.mjs`:
+
+```sh
+npm run test:citations            # whole sweep; point-in-time records exempted via the baseline file
+npm run test:citations:baseline   # re-derive that baseline and fail if the committed one is stale
+node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/citation-anchor-check.mjs \
+  HEAD docs/specs/harness-reliability-bootstrap/ROLLOUT.md --json   # one document, one row per citation
+```
+
+An in-range citation is not a correct citation. A range check asks "does this file have that many lines";
+the gate asks "does the cited line say what the row claims". For each citation it takes the nearest
+**symbol-shaped name in backticks** next to the pointer — the thing the row is about — and requires that
+name on the cited line, within `band` lines (default 4, advisory). It fails on `ANCHOR_MISSING`,
+`OUT_OF_RANGE`, `NO_FILE` and `BARE_AMBIGUOUS` (a bare pointer whose column-bound file and row-bound file
+disagree — refused and reported, never guessed, because either guess yields a confident wrong answer).
+
+`NO_ANCHOR` is neither pass nor fail. Where the author named only a *value* — a flag (`--export <path>`),
+a path (`~/.local/state/pi-engineering`), a pattern (`superseded/*`), a snake_case key (`tool_loop_limit`)
+— the row cites the code that *handles* that value, so containment cannot judge it. Those rows are counted,
+carry their `hint` in `--json`, and must never be reported as verified. On today's tree 140 of 582 citations under `docs/specs` are judged; the rest are listed so they can be made judgeable by naming
+the symbol the cited line declares.
+
+`--code-at <ref>` reads source files at another commit while documents are read as written. That is how a
+record's claim — "these pointers were right against the tree I described" — gets tested instead of
+asserted: `AUDIT/citation-drift-baseline.mjs` runs the gate twice per failing document, at HEAD and at the
+base commit the document declares in prose, and exempts it only if it fails at HEAD and passes at its
+base. A document that fails at **both** was wrong when written, stays in the failure count, and is printed
+as such. Documents that fail and declare no base must either be fixed or state the commit they describe.
+The sweep is not part of `npm test` yet: as of 2026-11-08 it still reports 18 failing citations across 10 documents for exactly those two reasons.
+
 ## Verification commands
 
 `/verify` and the mission validators run the repository's own checks. npm
