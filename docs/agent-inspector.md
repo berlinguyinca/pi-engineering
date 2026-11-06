@@ -1,46 +1,9 @@
-# Split view and the Herdr agent inspector feed
+# Herdr agent inspector feed
 
-Two independent, optional, off-by-default features. Core Pi Engineering requires neither.
+An optional, off-by-default feature. Core Pi Engineering does not require it.
 
-## 1. split-view (vendored)
-
-Upstream: https://github.com/Hugo-W/pi-split-view (MIT), vendored at commit `6b6b98a` with local reliability fixes
-in `extensions/split-view/` (see `extensions/split-view/VENDORED.md` for provenance, audit, update procedure).
-
-**Install**: nothing to do. `package.json` `pi.extensions` lists it after the main entry:
-
-```json
-"extensions": ["./src/runtime/host/entry.ts", "./extensions/split-view/split-view.ts"]
-```
-
-Pi loads each entry independently, so a failure in one never affects the other (the `entry.ts` Host ->
-legacy fallback is untouched).
-
-**Use**: off until you ask. Native Pi layout and keyboard shortcuts are unchanged (the extension
-registers no shortcuts).
-
-| Command | Effect |
-|---|---|
-| `/split` | toggle all panels (thinking + tools band over the transcript) |
-| `/files` | toggle the files panel (edit diffs) |
-| `/split-thinking`, `/split-tools` | toggle a panel within the band |
-| `/split-tools-view`, `/split-tools-width <pct>`, `/split-height <rows>`, `/split-trim-response` | layout tweaks |
-| `/split-save` | write the current layout to `~/.pi/agent/ui-panels.json` as startup defaults for new windows |
-
-`pi --no-split` starts bare even if `ui-panels.json` enables panels. The thinking panel displays
-reasoning text in your local terminal only; it is not sent anywhere.
-
-Response-only mode (`/split-trim-response on`) keeps the newest 200 visible messages;
-the native transcript retains the complete history. Its duplicate response components
-are created only while that mode is active and released when it is disabled. The files
-panel tracks explicit tool paths; it does not guess file paths from shell-command words.
-
-**Conflicts**: none with pi-engineering commands; no shortcuts; no `setFooter`/`setStatus`; widget key `split-view`
-(only used once enabled). Checked by `test/unit/split-view-vendor.test.ts`.
-
-**Rollback**: remove `./extensions/split-view/split-view.ts` from `pi.extensions` and restart/`/reload`.
-
-## 2. Agent inspector feed (Pi -> Herdr)
+(The vendored `split-view` terminal panel that used to be documented here has been removed from the
+package; Pi now uses its native layout.)
 
 Streams bounded, observable per-agent detail (messages, tool calls, edit diffs, test runs, usage, model
 switches, association, lifecycle, and optionally reasoning) to the Herdr control plane so Herdr's session

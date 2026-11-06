@@ -426,7 +426,7 @@ full inventory of time limits and their classification is in
 ## Live working activity
 
 The native Pi working indicator updates every second during an active turn,
-including split view and sessions with the custom status bar disabled. It shows
+including sessions with the custom status bar disabled. It shows
 whether the model is waiting, thinking, responding, or preparing a tool call;
 running tools show a safe command label or file path, elapsed time, and time
 since output. Long periods without output stay visible rather than suggesting
@@ -474,7 +474,7 @@ findings, token spend). The right-hand **Engineering panel** (`/panel`,
 bindings (`ctrl+p` cycles models, `ctrl+b` moves the cursor) and no unused
 `ctrl+letter` exists. For a full per-agent view of conversation, tools, files and
 diffs, tokens and tests, use the Herdr agent inspector
-([`docs/split-view-and-inspector.md`](docs/split-view-and-inspector.md)).
+([`docs/agent-inspector.md`](docs/agent-inspector.md)).
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
