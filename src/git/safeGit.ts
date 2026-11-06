@@ -1096,9 +1096,18 @@ function emptyTreeFor(format: string, env: NodeJS.ProcessEnv): string | null {
 
 interface Shadow {
   root: string;
+  /**
+   * `root` with symlinks resolved, i.e. the form `git` prints for the same directory. Pi creates the shadow under
+   * the state directory as it was handed to it (`$TMPDIR/...`, a state root reached through a link), while git
+   * answers with the resolved path (`/var/...` is `/private/var/...` on macOS). Both strings name one directory,
+   * and output mapping has to recognise both; `realRoot` is always `root` where no symlink is involved.
+   */
+  realRoot: string;
   /** Names in the shadow that are private COPIES of a real file (read-only commands only): never written back. */
   copies: ReadonlySet<string>;
   common: string;
+  /** `common` with symlinks resolved (see `realRoot`). */
+  realCommon: string;
   /** The generated global attributes file (git-lfs lines only). */
   attributes: string;
   /** What was written to the attributes file (compared after the command). */
@@ -1225,6 +1234,14 @@ function makeShadow(
   sweepOnce();
   const root = makeShadowRoot();
   const common = join(root, ".git");
+  // What git will call this directory: the same path with the symlinks in it resolved.
+  let realRoot = root;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    /* gone already: the recorded form is the only one left */
+  }
+  const realCommon = join(realRoot, ".git");
   const copies = new Set<string>();
   try {
     mkdirSync(common, { mode: 0o700 });
@@ -1271,7 +1288,7 @@ function makeShadow(
       chmodSync(join(common, "hooks"), 0o500);
       chmodSync(common, 0o500);
     }
-    return { root, copies, common, attributes, attributesText, writer };
+    return { root, realRoot, copies, common, realCommon, attributes, attributesText, writer };
   } catch (e) {
     markShadowDone(root);
     removeShadow(root);
@@ -1856,8 +1873,8 @@ function fixWorktreeLinks(p: Prepared): void {
       const pointer = readFileSync(join(dir, name, "gitdir"), "utf8").trim();
       if (!pointer.endsWith("/.git") || !isFile(pointer)) continue;
       const body = readFileSync(pointer, "utf8");
-      if (!body.includes(shadow.root)) continue;
-      writeFileSync(pointer, body.split(shadow.common).join(layout.commonDir));
+      if (!body.includes(shadow.root) && !body.includes(shadow.realRoot)) continue;
+      writeFileSync(pointer, replacePathAll(body, shadowPathMap(shadow, layout)));
       // Pi created this work tree: remember which repository it belongs to, so a later rewrite of its `.git` file is noticed
       try {
         pinStore.setRepo(realpathSync(dirname(pointer)), layout.commonDir);
@@ -1896,7 +1913,9 @@ function rollbackWorktrees(p: Prepared): number {
         const pointer = readFileSync(join(dir, name, "gitdir"), "utf8").trim();
         if (!pointer.endsWith("/.git")) continue;
         const st = lstatSync(pointer);
-        if (!st.isFile() || !readFileSync(pointer, "utf8").includes(shadow.root)) continue;
+        if (!st.isFile()) continue;
+        const body = readFileSync(pointer, "utf8");
+        if (!body.includes(shadow.root) && !body.includes(shadow.realRoot)) continue;
         const tree = dirname(pointer);
         if (!done.has(tree)) {
           rmSync(tree, { recursive: true, force: true });
@@ -1912,13 +1931,84 @@ function rollbackWorktrees(p: Prepared): number {
   return removed;
 }
 
+/** Characters that cannot continue a path backwards or forwards, so an occurrence between them is a whole path. */
+function isPathBreak(c: string | undefined): boolean {
+  return (
+    c === undefined ||
+    c === " " ||
+    c === "\t" ||
+    c === "\n" ||
+    c === "\r" ||
+    c === "\v" ||
+    c === "\f" ||
+    c === '"' ||
+    c === "'" ||
+    c === "=" ||
+    c === ":" ||
+    c === "," ||
+    c === ";" ||
+    c === "(" ||
+    c === ")" ||
+    c === "[" ||
+    c === "]" ||
+    c === "{" ||
+    c === "}" ||
+    c === "<" ||
+    c === ">" ||
+    c === "|" ||
+    c === "\0"
+  );
+}
+
+/**
+ * Replace every whole-path occurrence of `from` with `to` in `s`, in a single left-to-right pass.
+ *
+ * `split().join()` cannot do this job. The recorded shadow path and the path git prints for the same directory
+ * differ by a symlink (`/var/x` and `/private/var/x` on macOS), and the recorded form is then a substring of the
+ * answer: an unanchored replacement rewrites the middle of git's path and produces a directory that does not exist
+ * (`/private/private/var/...`). So a match counts only at a path boundary — the previous character is not part of
+ * a path, the next one is `/` or not part of a path — and the text written for a match is never scanned again.
+ * Patterns are tried longest first, so `<root>/.git` wins over the `<root>` it starts with.
+ */
+export function replacePathAll(s: string, pairs: ReadonlyArray<readonly [from: string, to: string]>): string {
+  const patterns = pairs.filter(([from]) => from.length > 0).sort((a, b) => b[0].length - a[0].length);
+  if (patterns.length === 0) return s;
+  let out = "";
+  let i = 0;
+  scan: while (i < s.length) {
+    for (const [from, to] of patterns) {
+      if (!s.startsWith(from, i)) continue;
+      if (i > 0 && !isPathBreak(s[i - 1])) continue;
+      const after = s[i + from.length];
+      if (after !== undefined && after !== "/" && !isPathBreak(after)) continue;
+      out += to;
+      i += from.length;
+      continue scan;
+    }
+    out += s[i] as string;
+    i++;
+  }
+  return out;
+}
+
+/** Every form of this shadow that git can name, each mapped back to the real repository (longest first). */
+function shadowPathMap(shadow: Shadow, layout: RepoLayout): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [
+    [shadow.realCommon, layout.commonDir],
+    [shadow.common, layout.commonDir],
+  ];
+  if (basename(layout.commonDir) === ".git") {
+    const parent = dirname(layout.commonDir);
+    pairs.push([shadow.realRoot, parent], [shadow.root, parent]);
+  }
+  return pairs;
+}
+
 function mapOut(s: string, p: Prepared): string {
   const layout = p.layout as RepoLayout;
   const shadow = p.shadow as Shadow;
-  if (!s.includes(shadow.root)) return s;
-  let out = s.split(shadow.common).join(layout.commonDir);
-  if (basename(layout.commonDir) === ".git") out = out.split(shadow.root).join(dirname(layout.commonDir));
-  return out;
+  if (!s.includes(shadow.root) && !s.includes(shadow.realRoot)) return s;
+  return replacePathAll(s, shadowPathMap(shadow, layout));
 }
 
 const gitConfigFile = (file: string, args: readonly string[], env: NodeJS.ProcessEnv): SafeGitResult =>
