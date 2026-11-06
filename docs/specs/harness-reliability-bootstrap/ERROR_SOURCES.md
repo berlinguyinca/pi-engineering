@@ -46,26 +46,26 @@ rows. Sites were located by grepping `kind:`/`type:` emissions, `catch`, `throw`
 
 | Event | Exact site | Owner | Status |
 | --- | --- | --- | --- |
-| Trace entry for one failed request | `inference/retryTrace.ts:61` (`emit("inference.retry.trace", …)`) | the layer recorded as `owner` (`:40`) | **T** |
+| Trace entry for one failed request | `inference/retryTrace.ts:112` (`emit("inference.retry.trace", …)`) | the layer recorded as `owner` (`:40`) | **T** |
 | Trace transport contract | `inference/retryTrace.ts:10-11` (`details.retry_trace` + telemetry bus) | RetryTrace (data only) | **T** |
 | Retry lifecycle states | `lifecycle/telemetry.ts:27-34` (`scheduled|waiting|started|succeeded|exhausted|cancelled`) | lifecycle telemetry | **T** |
 | In-call replay ladder / fallback model | `inference/resilientStream.ts:378` (`kind: "fallback"`) | resilient-stream | **T** |
 | Compact-and-retry recovery attempt | `inference/recovery.ts:160` (`compact_and_retry`) | recovery layer | **T** |
-| Gateway capacity hold reason | `workers/PiWorkerExecutor.ts:856`, `:1438` (`${status}:${reason|code|type|"refused"}`) | worker-gateway-hold | **T** |
+| Gateway capacity hold reason | `workers/PiWorkerExecutor.ts:910`, `:1493` (`${status}:${reason|code|type|"refused"}`) | worker-gateway-hold | **T** |
 | Model takeover / scheduler relaunch window | `inference/retryTrace.ts:21-22` (layers `model-takeover`, `scheduler-window`) | realBackends / broker scheduler | **T** |
 
 ## 5. Worker result & activity — owner `src/workers/PiWorkerExecutor.ts`
 
 | Event | Exact site | Owner | Status |
 | --- | --- | --- | --- |
-| Activity: waiting for inference / stream stalled | `PiWorkerExecutor.ts:867`, `:1751` (`emitWorkerActivity … kind: "state"`) | PiWorkerExecutor → `req.onActivity` | **T** |
+| Activity: waiting for inference / stream stalled | `PiWorkerExecutor.ts:921`, `:1808` (`emitWorkerActivity … kind: "state"`) | PiWorkerExecutor → `req.onActivity` | **T** |
 | Activity observer itself throws | `workers/activity.ts:476-479` (empty `catch`, documented as intentional) | worker activity feed | **S** |
-| Transcript of session / message / tool_call / tool | `PiWorkerExecutor.ts:1769`, `:1788`, `:1799`, `:1807` (`transcript.write`) | `workers/transcriptStore.ts:105` `TranscriptWriter` | **D** |
+| Transcript of session / message / tool_call / tool | `PiWorkerExecutor.ts:1826`, `:1845`, `:1856`, `:1863` (`transcript.write`) | `workers/transcriptStore.ts:105` `TranscriptWriter` | **D** |
 | Transcript writer could not be created | `PiWorkerExecutor.ts:1770-1771` (`catch` → `transcript = undefined`): capture silently off | PiWorkerExecutor | **S** |
 | Worktree/branch identity mismatch | `PiWorkerExecutor.ts:531`, `:536` (throw) caught at `:539` | PiWorkerExecutor (identity guard) | **E** |
-| Provider connection refused / rethrow | `PiWorkerExecutor.ts:1012` (`ConnectRefusedError`) → `:1014` | worker-transient-retry | **E** |
+| Provider connection refused / rethrow | `PiWorkerExecutor.ts:1067` (`ConnectRefusedError`) → `:1069` | worker-transient-retry | **E** |
 | Transient failure on a non-throwing path | `PiWorkerExecutor.ts:1403-1404` (marker mirrors the thrown path) | worker-transient-retry | **T** |
-| Fire-and-forget setup failures | `PiWorkerExecutor.ts:438` (`wireResilience`), `:475` (`registerLocalProviders`), `:1707` (`steer`) — all `.catch(() => {})` | PiWorkerExecutor | **S** |
+| Fire-and-forget setup failures | `PiWorkerExecutor.ts:455` (`wireResilience`), `:492` (`registerLocalProviders`), `:1764` (`steer`) — all `.catch(() => {})` | PiWorkerExecutor | **S** |
 
 ## 6. Execution evidence & process exits — owner `src/orchestration/broker.ts`
 
@@ -81,7 +81,7 @@ rows. Sites were located by grepping `kind:`/`type:` emissions, `catch`, `throw`
 
 | Event | Exact site | Owner | Status |
 | --- | --- | --- | --- |
-| Runtime load / fallback diagnostics | `runtime/host/entry.ts:81`, `:89`, `:97`, `:105` (`process.stderr.write`) | host entry | **T** |
+| Runtime load / fallback diagnostics | `runtime/host/entry.ts:132`, `:140`, `:148`, `:156` (`process.stderr.write`) | host entry | **T** |
 | Subprocess `{code, stdout, stderr}` | `runtime/host/sourceWatch.ts:265` | the sourceWatch caller | **T** |
 | Uncaught exception | **no `process.on("uncaughtException")` anywhere in `src`** (repo-wide grep) | nobody | **X** |
 | Unhandled rejection | **no `process.on("unhandledRejection")` anywhere in `src`** | nobody | **X** |

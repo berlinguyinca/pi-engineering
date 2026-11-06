@@ -60,7 +60,7 @@ architecture change. Status legend:
 | Requirement | Status | Source / test |
 |---|---|---|
 | Ephemeral subagent / persistent worker / non-agent service worker | PARTIAL | Ephemeral subagents exist (`WorkerExecutor`, `PiWorkerExecutor`). Persistent worker + non-agent service worker models are not formalized. `platform/types.ts` `Worker` is the closest. |
-| Roles: planner/architect/engineer/frontend+backend/tester/reviewer/security/UI/researcher/debugger/repair | PARTIAL | `WorkerRole` (`src/core/types.ts:90`), `ROLE_BUDGETS`, `src/lifecycle/rolePrompts.ts`, `src/capability/roles.ts`, `src/routing/ModelRouter.ts` `WorkerRoleName`. Repair/security/UI roles partially covered. |
+| Roles: planner/architect/engineer/frontend+backend/tester/reviewer/security/UI/researcher/debugger/repair | PARTIAL | `WorkerRole` (`src/core/types.ts:119`), `ROLE_BUDGETS`, `src/lifecycle/rolePrompts.ts`, `src/capability/roles.ts`, `src/routing/ModelRouter.ts` `WorkerRoleName`. Repair/security/UI roles partially covered. |
 | Session Factory consuming task+capabilities+isolation+duration+dependencies+security → WorkerPlan/DAG | PARTIAL | `src/orchestration/scheduler.ts` builds task DAGs; `src/orchestration/missionStore.ts`. A formal "Session Factory → WorkerPlan" emitting a plan is not a distinct unit. |
 | Herdr executes, does not decide why workers exist | EXTERNAL | Design boundary; enforced in Phase D by keeping DAG/policy in Pi-Engineering. |
 
@@ -81,7 +81,7 @@ architecture change. Status legend:
 
 | Requirement | Status | Source / test |
 |---|---|---|
-| Structured `WorkerResult`: status, concise summary, artifact refs, changed files, commits, tests, findings, questions, recommendations, metrics | CONFLICTING | `WorkerResult` (`src/core/types.ts:225`) = status/summary/claims/evidence_refs/new_hypotheses/proposed_tasks/details/error. Missing explicit changed_files, commits, tests, findings, questions, recommendations, metrics fields. Spec wants a richer contract — extend, do not replace. |
+| Structured `WorkerResult`: status, concise summary, artifact refs, changed files, commits, tests, findings, questions, recommendations, metrics | CONFLICTING | `WorkerResult` (`src/core/types.ts:299`) = status/summary/claims/evidence_refs/new_hypotheses/proposed_tasks/details/error. Missing explicit changed_files, commits, tests, findings, questions, recommendations, metrics fields. Spec wants a richer contract — extend, do not replace. |
 | Raw transcripts separate, never auto-injected into parent context | EXISTING | `ArtifactStore` (`src/artifacts/ArtifactStore.ts`) stores content on disk, returns only `summary`; lazy `readContentByUri`. `ContextBroker` (`src/context/ContextBroker.ts`). `src/context/usage.ts`. |
 | Discover context/request limits dynamically from runtime/InferWeave metadata | EXISTING (token) / MISSING (bytes) | `src/context/capability.ts` discovers `contextWindow`/`maxTokens` from model metadata (guaranteed_routable_tokens, context_window, max_model_len) — NOT a fixed 260k. Serialized request-byte budgeting is MISSING (only token budgets in `src/budget/BudgetManager.ts`, `WorkerLimits.maxTokens`). |
 | Budget tokens and serialized bytes with safety headroom | PARTIAL | Token budget exists (`BudgetManager`, `WorkerLimits`). Serialized byte budget is MISSING. |
