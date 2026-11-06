@@ -39,6 +39,7 @@
  * and must never be reported as a pass -- the summary line prints it separately for that reason.
  */
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
 const json = argv.includes("--json");
@@ -47,10 +48,20 @@ const REF = pos[0];
 // The band is a positional number, so it must be removed from the file list rather than merely
 // detected in it -- `check.mjs <ref> <file> 4` otherwise tries to read a document named "4".
 const bandArg = pos.slice(1).find((a) => /^\d+$/.test(a));
-const FILES = pos.slice(1).filter((a) => a !== bandArg);
+const FILES_RAW = pos.slice(1).filter((a) => a !== bandArg);
 const BAND = Number(bandArg ?? 4) || 4;
-if (!REF || FILES.length === 0) {
-  console.error("usage: citation-anchor-check.mjs <git-ref> <file.md> [band] [--json]");
+// --baseline <file>: documents whose citations are POINT-IN-TIME records (mission handoffs, worker
+// reports, patch specs). Their line numbers describe the tree the task ran against; rewriting them to
+// today's lines would make the record claim it observed numbers it never observed, so their failures
+// are declared and excluded from the exit status -- listed, counted, reasoned, never silently zero.
+const baselineIdx = argv.indexOf("--baseline");
+const baselineFile = baselineIdx >= 0 ? argv[baselineIdx + 1] : null;
+if (baselineIdx >= 0 && !baselineFile) {
+  console.error("--baseline needs a file: one doc path per line, optional '| reason'");
+  process.exit(2);
+}
+if (!REF || FILES_RAW.length === 0) {
+  console.error("usage: citation-anchor-check.mjs <git-ref> <file.md|dir> [band] [--json] [--baseline <file>]");
   process.exit(2);
 }
 const git = (args, opt = {}) =>
@@ -114,8 +125,42 @@ const repoPrefix = git(["rev-parse", "--show-prefix"]).trim();
 
 const tree = git(["ls-tree", "-r", "--name-only", REF]).split("\n").filter(Boolean);
 const treeSet = new Set(tree);
+
+// A directory argument used to match nothing, and the run then printed `RESULT drift=0` over 195
+// markdown files while judging ZERO citations -- a green result from an empty sweep, which is the most
+// dangerous output a gate can produce. Directories now expand, and a sweep that judges nothing fails.
+const expandDocs = (arg) => {
+  const a = arg.replace(/\/+$/, "");
+  if (treeSet.has(a)) return a.endsWith(".md") ? [a] : [];
+  return tree.filter((p) => p.startsWith(`${a}/`) && p.endsWith(".md"));
+};
+const FILES = [...new Set(FILES_RAW.flatMap(expandDocs))].sort();
+if (FILES.length === 0) {
+  console.error(`no markdown documents matched: ${FILES_RAW.join(", ")} (at ${REF})`);
+  process.exit(2);
+}
+
+const baseline = new Map();
+if (baselineFile) {
+  for (const raw of readFileSync(baselineFile, "utf8").split("\n")) {
+    const l = raw.trim();
+    if (!l || l.startsWith("#")) continue;
+    const [doc, reason] = l.split("|").map((s) => s.trim());
+    baseline.set(doc.replace(/^HEAD:/, ""), reason || "point-in-time record");
+  }
+}
+// Which directories a document itself talks about, used ONLY to disambiguate a bare basename
+// (`executor.ts` -> 2 files, `review.ts` -> 4, `types.ts` -> 15). This is what a human reader does with
+// the surrounding text; a path the author actually wrote always wins, and a basename the document gives
+// no hint about stays NO_FILE rather than being guessed.
+const prefixesOf = (text) => {
+  const s = new Set();
+  for (const m of text.matchAll(/(?:^|[\s(`[=])((?:src|test|docs|scripts)\/[\w.@-]+(?:\/[\w.@-]+)*)\//g)) s.add(m[1] + "/");
+  return [...s];
+};
 const filesOf = new Map();
-const resolveFile = (f, docDir) => {
+let docContextBindings = 0;
+const resolveFile = (f, docDir, prefixes = []) => {
   if (!f) return null;
   if (filesOf.has(f)) return filesOf.get(f);
   // The document cites files both as full paths and as bare names (`resilientStream.ts:635`), and a
@@ -131,8 +176,15 @@ const resolveFile = (f, docDir) => {
   // distinguish it from other files of that name) resolved to nothing and silently inherited whatever
   // file the row had mentioned last -- then got reported as drift in a file the author never named.
   if (!hit) {
-    const suffix = tree.filter((p) => p === f || p.endsWith(`/${f}`));
+    let suffix = tree.filter((p) => p === f || p.endsWith(`/${f}`));
     if (suffix.length === 1) hit = suffix[0];
+    else if (suffix.length > 1 && prefixes.length) {
+      const narrowed = suffix.filter((p) => prefixes.some((pre) => p.startsWith(pre)));
+      if (narrowed.length === 1) {
+        hit = narrowed[0];
+        docContextBindings++;
+      }
+    }
   }
   filesOf.set(f, hit);
   return hit;
@@ -163,6 +215,7 @@ for (const doc of FILES) {
     }
   }
   const docDir = doc.includes("/") ? doc.slice(0, doc.lastIndexOf("/")) : "";
+  const docPrefixes = prefixesOf(text);
   const docLines = text.split("\n");
   // File binding, in the document's own convention: a table row names its file ONCE (usually in
   // the symbol column) and every later bare `:NN` on that row belongs to it; a row that names no
@@ -184,6 +237,10 @@ for (const doc of FILES) {
   // BARE_AMBIGUOUS: the reference, not the line number, is the defect, and the fix is to name the
   // file in the citation.
   let rowCarry = null;
+  // Prose wraps. `:176` shadows. / (applied `:88`) / (applied `:104`) all continue the file named on a
+  // PRECEDING line of the same paragraph, and carry was per-line, so every wrapped pointer came back
+  // NO_FILE. Tables reset at the line; paragraphs carry until a blank line ends the paragraph.
+  let paraCarry = null;
   const colCarry = new Map();
   const cellOf = (line, i) => {
     const cells = line.split("|");
@@ -199,13 +256,15 @@ for (const doc of FILES) {
     if (!isTable) {
       rowCarry = null;
       colCarry.clear();
+      if (!line.trim()) paraCarry = null;
     }
     if (!/`[^`\n]*:?\d/.test(line)) return;
     const toks = tokenize(line);
     // One left-to-right walk: an explicit path binds the citations that FOLLOW it, and nothing
     // before it. A two-pass "any path on the row binds the row" version mis-binds a citation that
     // precedes its own file.
-    let cur = rowCarry;
+    let cur = isTable ? rowCarry : paraCarry ?? rowCarry;
+    const claimed = new Set();
     const explicit = [];
     // A path named WITHOUT a line number still binds the citations that follow it -- "Its fail-closed
     // deny rules live in `src/plannerWorker/contract.ts` (...): ... (`:62-80`)" is the runbook's most
@@ -213,12 +272,12 @@ for (const doc of FILES) {
     // named lines earlier, then reported as drift in the wrong file.
     for (const t of toks) {
       if (t.kind !== "path") continue;
-      const r = resolveFile(t.t, docDir);
+      const r = resolveFile(t.t, docDir, docPrefixes);
       if (r) explicit.push({ i: t.i, r });
     }
     for (const t of toks) {
       if (t.kind !== "cite" || !t.f) continue;
-      const r = resolveFile(t.f, docDir);
+      const r = resolveFile(t.f, docDir, docPrefixes);
       if (r) explicit.push({ i: t.i, r });
     }
     explicit.sort((a, b) => a.i - b.i);
@@ -232,7 +291,7 @@ for (const doc of FILES) {
       if (t.kind !== "cite") continue;
       let file = null;
       if (t.f) {
-        const r = resolveFile(t.f, docDir);
+        const r = resolveFile(t.f, docDir, docPrefixes);
         if (r) {
           file = r;
           cur = r;
@@ -301,8 +360,42 @@ for (const doc of FILES) {
         .filter((x) => !/[;.](\s|$)/.test(line.slice(x.i + x.t.length + 1, t.i)))
         .map((x) => x.t);
       let want = null;
-      for (const cand of preceding.reverse()) {
-        if (fileText.includes(cand)) { want = cand; break; }
+      // The documents have TWO grammars: "`X` `:N`" (name before the pointer) and "`:N` (`X`)"
+      // (name AFTER it). Only the first was implemented, and it produced confident FALSE failures:
+      // `broker.ts:3676` (`canceled`) does contain `"canceled"` on that exact line, but the nearest
+      // PRECEDING identifier was `timedOut`, borrowed from the previous clause `:3543` (`timedOut`),
+      // so a correct pointer was reported as drift in ERROR_SOURCES.md and RETRY_OWNERS.md alike. A
+      // parenthetical immediately after a pointer is the author naming what it points at, so it wins
+      // over anything preceding it.
+      // `raw` is the span WITHOUT its backticks, so the closing backtick sits at i + raw.length + 1.
+      // Slicing one character early left `tail` starting on the backtick itself and the pattern never
+      // matched -- the following-anchor silently did nothing in two full runs.
+      const close = line.indexOf("`", t.i + 1);
+      const tail = close >= 0 ? line.slice(close + 1) : "";
+      const fm = tail.match(/^\s*\(`([^`]+)`\)/);
+      if (fm) {
+        // A parenthetical that is itself a citation -- "`resilienceConfig.ts:90` (`retryPolicy.ts:100`)"
+        // -- names a FILE, not a symbol. Taking "retryPolicy" as the anchor of the preceding pointer
+        // invented drift for a citation that was correct.
+        const inner = fm[1].replace(
+          /[A-Za-z0-9_./@-]+\.(?:ts|tsx|mts|cts|js|mjs|cjs|jsx|json|md|sh|py|rs|go)\b(?::\d+(?:-\d+)?)?/g,
+          " ",
+        );
+        for (const w of inner.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? []) claimed.add(w);
+        for (const w of inner.match(/[A-Za-z_][A-Za-z0-9_]{2,}/g) ?? []) {
+          if (fileText.includes(w)) { want = w; break; }
+        }
+      }
+      if (!want) {
+        // An identifier already claimed as the anchor of an EARLIER citation on this line is not
+        // available to anchor a later one. `gateway/signals.ts:81` (`WAIT_STATUSES`) and `:728` names
+        // WAIT_STATUSES for :81 only; taking it as :728's anchor reported a correct pointer at
+        // signals.ts:728 (`decideGatewayRetry`) as drift. With nothing left to compare, that citation
+        // is NO_ANCHOR -- unjudged, which is the truth.
+        for (const cand of preceding.reverse()) {
+          if (claimed.has(cand)) continue;
+          if (fileText.includes(cand)) { want = cand; break; }
+        }
       }
       const at = file && t.a >= 1 && t.a <= lines.length ? lines[t.a - 1] : undefined;
       const outOfRange = file ? t.b > lines.length : false;
@@ -325,6 +418,7 @@ for (const doc of FILES) {
     // Publish this row's explicit paths to the column carry AFTER the row is judged, so a column
     // never binds against a path that appears later in its own row.
     for (const e of explicit) colCarry.set(cellOf(line, e.i), e.r);
+    if (!isTable) paraCarry = cur;
   });
 }
 
@@ -342,7 +436,22 @@ if (process.argv.includes("--resolve")) {
 
 const tally = {};
 for (const r of rows) tally[r.verdict] = (tally[r.verdict] ?? 0) + 1;
-const bad = rows.filter((r) => ["ANCHOR_MISSING", "OUT_OF_RANGE", "NO_FILE", "BARE_AMBIGUOUS"].includes(r.verdict));
+const FAIL = ["ANCHOR_MISSING", "OUT_OF_RANGE", "NO_FILE", "BARE_AMBIGUOUS"];
+// An empty sweep is never a pass. `RESULT drift=0` after judging nothing is exactly the false green
+// this gate exists to catch, so it fails loudly instead of looking clean.
+if (rows.length === 0) {
+  console.error(`VACUOUS: ${FILES.length} document(s) scanned, 0 citations judged at ${REF}.`);
+  console.error("         A sweep that judged nothing is not a pass. Check the path/dir arguments.");
+  process.exit(2);
+}
+const isBaselined = (r) => baseline.has(r.doc);
+const bad = rows.filter((r) => FAIL.includes(r.verdict) && !isBaselined(r));
+const baselined = rows.filter((r) => FAIL.includes(r.verdict) && isBaselined(r));
+for (const doc of baseline.keys()) {
+  if (FILES.includes(doc) && !baselined.some((r) => r.doc === doc)) {
+    console.log(`  BASELINE-STALE  ${doc} declares failures but has none now -- remove the entry`);
+  }
+}
 if (json) console.log(JSON.stringify({ ref: REF, band: BAND, citations: rows.length, tally, bad, rows }, null, 2));
 else {
   console.log(`ref=${REF} band=${BAND} citations=${rows.length}`);
@@ -362,7 +471,15 @@ else {
   // ANCHOR_NEARBY and does NOT fail the gate. Off-by-one drift inside the 5-line DEFAULTS block is
   // exactly how this document first went stale, so it is printed rather than hidden -- advisory now,
   // and the number to watch if it is ever promoted to blocking.
-  console.log(`RESULT drift=${bad.length} imprecise=${rows.filter((r) => r.verdict === "ANCHOR_NEARBY").length}`);
+  console.log(`RESULT drift=${bad.length} imprecise=${rows.filter((r) => r.verdict === "ANCHOR_NEARBY").length} docs=${FILES.length}`);
+  if (baseline.size) {
+    console.log(`NOTE ${baselined.length} failure(s) in ${baseline.size} declared point-in-time document(s) are NOT counted as drift:`);
+    for (const [doc, why] of baseline) console.log(`     ${doc}  -- ${why}`);
+    console.log("     Declared records are listed, never rewritten: their numbers describe the tree they ran against.");
+  }
+  if (docContextBindings) {
+    console.log(`NOTE ${docContextBindings} ambiguous basename(s) (executor.ts -> 2 files, review.ts -> 4) were bound by a directory the document names itself; a written path always wins.`);
+  }
   if ((tally.NO_ANCHOR ?? 0) > 0) {
     console.log(`NOTE ${tally.NO_ANCHOR} citation(s) were NOT judged: no identifier near the citation to compare against.`);
     console.log(`     Those are neither pass nor fail. Do not report this run as "citations verified".`);
