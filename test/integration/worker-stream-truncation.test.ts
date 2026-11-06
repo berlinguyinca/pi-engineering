@@ -84,6 +84,7 @@ const REVIEW_RESULT = {
 async function withProbe(
   replies: Reply[],
   body: (executor: PiWorkerExecutor, cwd: string, bodies: string[]) => Promise<void>,
+  opts: { env?: Record<string, string> } = {},
 ) {
   const requests: number[] = [];
   const bodies: string[] = [];
@@ -122,9 +123,21 @@ async function withProbe(
     transientSleep: async () => {},
     transientRand: () => 0,
   });
+  // PiWorkerExecutor arms the resilient layer from the process environment, so a
+  // scenario that needs a particular arm state says so here and the environment
+  // is put back exactly afterwards — tests in this file share one process.
+  const saved: [string, string | undefined][] = [];
+  for (const [key, value] of Object.entries(opts.env ?? {})) {
+    saved.push([key, process.env[key]]);
+    process.env[key] = value;
+  }
   try {
     await body(executor, dir, bodies);
   } finally {
+    for (const [key, previous] of saved) {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    }
     server.close();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -314,8 +327,23 @@ test("worker: resume triggers through the armed resilient stream layer (producti
       assert.equal(readFileSync(join(cwd, "side-effect.txt"), "utf8"), "marker-123\n");
       assertResumedHistory(bodies[2]!);
     },
+    // The layer is opt-in — PI_INFERENCE_RESILIENCE_ENABLED defaults to off — so
+    // the arm this scenario asserts exists only under the opt-in. Arming here
+    // does not loosen the default: the unarmed worker path is asserted by the
+    // next test, and the config default by test/unit/resilience-default-off.test.ts.
+    { env: { PI_INFERENCE_RESILIENCE_ENABLED: "1" } },
   );
   assert.equal(requests, 3);
+});
+
+test("worker: the resilient layer stays unarmed without the opt-in (default off)", async () => {
+  await withProbe([toolCalls([{ name: "worker_result", args: WORKER_RESULT }])], async (executor) => {
+    assert.equal(
+      isResilientRuntime(await executor.getModelRuntime()),
+      false,
+      "with no PI_INFERENCE_RESILIENCE_ENABLED the worker runtime must not be wrapped",
+    );
+  });
 });
 
 test("worker: a connection cut after a tool ran is resumed as well", async () => {
