@@ -1,0 +1,8 @@
+$ git rev-parse HEAD
+9f0644507e51baea9f6d0a75fc838e046c4143b7
+
+$ npm run typecheck:core
+exit=0
+
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit

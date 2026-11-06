@@ -23,12 +23,15 @@
     "Conductor-written path rewrites inside worker commits: R06, H02. Conductor squash of two same-message worker commits: V06 (tree byte-identical).",
     "docs/specs/harness-reliability-bootstrap-20261103/BASELINE-unit-suite-at-c349613b.txt was untracked until the evidence-closure commit; it is a raw npm-test log (150 failure lines, 2180 pass lines), not a summary.",
     "R03-R08 resilience modules are shipped and tested; wiring into live runtime paths is tracked separately (see ROLLOUT.md known gaps).",
-    "`npm test` has never completed at any commit in this bootstrap: at the B-series base c2b75dc9 it ran ~20 min with no summary and had to be terminated (4615 pass / 1223 fail names in the partial capture); verification rests on each unit's declared targeted commands.",
     "Chain-parent emission ordering: the conclude flow emits a unit's chain generation after amending the evidence commit that would carry it, so X01-X06 chain records reached only the working tree; X07's evidence commit carries them and AUDIT/integrity-scan.mjs reports the chain as broken without them.",
     "E02's canonical record names E03@cc036f2f8c3b (its own resultSha) while E03 records base ba22f28a6b54 - a handoff pointer stamped from HEAD~1 rather than the handed-over commit; left unwritten because rewriting a PASS record changes its hash and its descendants.",
     "T09's record names T10, a task the plan never contained; the T-series ends at T09.",
     "test/unit/worker-commit-discipline.test.ts and test/unit/worker-request-plumbing.test.ts fail identically at 900bf8a3 and at the X-series tip (real-worktree allocation and broker fork-base assertions); they are excluded from recorded suite commands and named in the override reasons.",
-    "The whole-suite `npm test` does not terminate in this environment (session-*/orchestration-* files hold the runner past any bounded budget: 47 failures of 1367 within one 1800s budget at 900bf8a3, and an untimed run exceeded 3600s), so unit-suite gates are recorded as bounded globs with a base-vs-head comparison, never as a green whole-suite run."
+    "X08 exceeded the isolated-change line ceiling: 158 changed lines (44 production + 114 test) against 100. The regression unit is what pins the contract, so it was not split from the behaviour; recorded in X08/out/X08.handoff.json operatorApproval.notes.",
+    "X08 is the consumer-side guard, not the root-cause fix. The doubled /private/private/var prefix measured at 4ffa82f3 comes from Pi's state dir kept unresolved while repositories are discovered through realpathSync, and upstream 61394da7 (one canonical path for the state dir and the temp root, #582) already fixes that: at 45d42acb the prefix does not reproduce and both blocker integration files pass without the guard (X08/logs/07). The guard closes the gap #582 leaves open \u2014 a caller had no way to notice an answer naming no directory, so a regression of that canonicalization would surface as a promotionWait.ceilingMs poll (600 s per attempt) rather than an error.",
+    "Whole-suite gate (G1/S2): `npm test` now terminates. At bc8cd251 (task commit + origin/main 89e747c2 + origin/harness-reliability-bootstrap 6818842c) it reports tests 7944 / pass 7912 / fail 27 / cancelled 0 in 1639 s; the same command at origin/main 89e747c2 reports 7699 / 7671 / 23 / cancelled 0 in 820 s. The branch adds 245 tests and 4 leaf failures and removes none. The audit that recorded 'npm test never terminates' is closed and marked superseded (AUDIT/suite-termination-blocker-20261105.txt).",
+    "Open finding, carried not closed: of the four leaf failures the corrected-base whole-suite run adds over origin/main, two are load-dependent (mission-reliability-foundation:865 and herdr-plannotator-transport:93 pass 44/44 and 8/8 alone) and one is pre-existing on main (no-fixed-deadlines:463 fails alone at origin/main too). The fourth is a real regression from X06 141ca5db: worker-stream-truncation:306 'worker: resume triggers through the armed resilient stream layer (production path)' is 20 pass at X06's parent 009837c3 and 19/1 from 141ca5db onward (X06 never reaches origin/main, which is why main passes it). It needs a follow-up unit -- arm the layer through an explicit opt-in on the resume path as #604 did for resilient-inference, or remove the production path's dependence on the ambient default. Weakening the assertion is the wrong fix. Evidence: X08/logs/19-branch-only-failures-alone.txt.",
+    "Method caveat that cost a wrong diagnosis: a whole-suite tally is only comparable when the base is the current integration tip. X08 was based on the stale local tip 45d42acb while origin/harness-reliability-bootstrap had moved to 6818842c; against origin/main that produced 42 failures and a `git bisect` hit on 141ca5db (X06). Merging 6818842c brought in 259a4233 (#604) and those 17 resilience tests report 17 pass / 0 fail. No assertion was loosened; the base was corrected."
   ],
   "concluded_with_records": [
     "B00",
@@ -88,7 +91,8 @@
     "X04",
     "X05",
     "X06",
-    "X07"
+    "X07",
+    "X08"
   ],
   "cross_repo_integration": {
     "main": "591264f9bd4fc2fc07d88d94febde4cd0e919448",
@@ -98,6 +102,7 @@
   },
   "deliverables": {
     "audit": "docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md",
+    "common_dir_guard": "src/git/GitRepo.ts resolveCommonDir + test/unit/git-common-dir-repair.test.ts \u2014 GitRepo.commonDir() repairs or refuses a git answer that names no directory. The doubled-prefix bug itself is fixed upstream (61394da7 #582 state-dir canonicalization, 89e747c2 #602 shadow-path spelling); this unit pins the consumer-side invariant those leave unguarded. Evidence X08/logs (measured at 9f064450 and bc8cd251)",
     "drift_fixtures": "test/fixtures/harness-drift/{tasks.json,README.md}",
     "drift_live_wiring": "src/aps/workerActivity.ts + src/workers/PiWorkerExecutor.ts (PI_TASK_DRIFT_SIGNALS, default off)",
     "drift_runner": "scripts/bench-task-drift.ts (precision 1.0, recall 0.667, 0 false positives, 1 documented false negative)",
@@ -107,13 +112,13 @@
     "quant_schema": "src/capability/quantBenchmark.ts",
     "runbook": "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
   },
-  "head": "745acdfb9d6a2b710e679a14d2b3a7f6f4441881",
-  "next_action": "Re-run `node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs` after every unit; the two remaining canonical chain offenders (E02/E03 pointer drift, T09->T10) are recorded, not rewritten.",
+  "head": "bc8cd251d0e1e24cf9b73a79b195e082dc92f300",
+  "next_action": "Open the PR for task/x08-common-dir-repair against main (X08's canonical generation is out-final; the suite-termination blocker is closed). Before merging, re-check the four branch-only failures listed in the caveats against the CI base.",
   "no_handoff_record": [],
   "plan": "harness-reliability-bootstrap-20261103",
   "plan_scope_tasks": 51,
   "post_plan_extension": {
-    "chain_note": "X01 joins V06 by prose reference (V06 is terminal, nextTaskId null); X05 and X06 each needed a later chain generation (out-chain) because the series continued after their out-final generation was emitted with nextTaskId null.",
+    "chain_note": "X01 joins V06 by prose reference (V06 is terminal, nextTaskId null); X05 and X06 each needed a later chain generation (out-chain) because the series continued after their out-final generation was emitted with nextTaskId null.; X08 joins X07 through parentHandoffHash rather than a forward link, because X07's terminal generation was emitted with nextTaskId null and a PASS record is never rewritten; X08/out-final appears on the scanner's informational orphan list for the same reason X01/out-final does: the scanner ranks generations out-final > out-corrected > out, so within X08 the corrected generation is canonical while X07 -- being terminal -- names no child at all; the orphan class here is 'parent generation missing', the same one X01/out-final sits in. X08 is terminal (nextTaskId null), so no child needs the pointer, and rewriting an already-pushed X07 record is not allowed; the blocking metric (canonical chain offenders) stays at the two known ones (E02->E03, T09->T10).",
     "units": [
       {
         "base_sha": "900bf8a3b10decf0bbc7f7e46b04a29241741151",
@@ -202,6 +207,35 @@
         "next": "None@None",
         "result_sha": "548c2a83d041a888461cddcaec0ef0a236997ef2",
         "unit": "X07"
+      },
+      {
+        "base_sha": "45d42acb70fc2fcac76425d18eb1d651b0e0a9ba",
+        "canonical": "out-final > out, so out-final is the generation the scanner resolves; out/ is superseded",
+        "evidence": [
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/14-guard-unit-at-task-commit.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/12-neighbour-units-at-task-commit.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/15-typecheck-at-task-commit.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/16-biome-at-task-commit.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/13-blocker-files-at-task-commit.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/17-whole-suite-wrong-base.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/18-whole-suite-corrected-base.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/05-ab-common-dir-at-4ffa.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/06-ab-integration-at-4ffa.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/07-control-tip-without-repair.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/08-tip-with-repair-integration.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/09-git-glob-before-after.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/10-merged-tip-state.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/11-common-dir-spelling-at-tip.txt",
+          "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/suite-termination-blocker-20261105.txt"
+        ],
+        "generation": "out-final",
+        "handoff_hash": "sha256:0ef51ddef6f1402fab0b187d538797cd6b1478e4bee7924040631431d97561bf",
+        "joins": "X08's MANIFEST carries parentHandoffHash sha256:66af2c2b\u2026 = X07/out, the generation canonical when X08 was drafted (records themselves carry no parentHandoffHash field -- it is not in the schema's required list, and no X-series record has it). X07 is terminal (nextTaskId null in all three of its generations), so there is no forward link and the scan lists no new chain offender. taskAuthorityHash is unchanged from the first generation because out-final reads X08/fixtures/manifest.json rather than restating it.",
+        "measured_at": "the task commit 9f064450 for the command proofs and bc8cd251 (task commit + both parents merged) for the whole-suite and merged-tip runs",
+        "next": null,
+        "result_sha": "9f0644507e51baea9f6d0a75fc838e046c4143b7",
+        "task_authority_hash": "sha256:f8e910b382b848c9e8d2b9760e29fcd8d00dc729674ddbaf57f80f91fc0abcf5",
+        "unit": "X08"
       }
     ],
     "why": "Filed after PLAN.json closed, from the completion audit: the drift detector could not see 'in-scope but undeclared' edits (drift-03), nothing called the detector at runtime, the observability counters had no producer, the contract never reached the worker, the intervention master switch defaulted ON against the security spec, and the chain parents of the X-series records were never committed."
@@ -230,14 +264,15 @@
   "repo": "berlinguyinca/pi-engineering",
   "schema_conformance": {
     "additional_properties": false,
-    "canonical_hash_recomputed": 91,
+    "canonical_hash_recomputed": 93,
     "chain_canonical_offenders": 2,
     "chain_forward_links_resolved": 56,
-    "records_distinct": 91,
+    "informational_orphans": 6,
+    "records_distinct": 93,
     "required_fields": 15,
-    "required_fields_ok": 91,
-    "scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261105-x-series.txt",
-    "scanned_at": "745acdfb9d6a2b710e679a14d2b3a7f6f4441881",
+    "required_fields_ok": 93,
+    "scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261106-x08-outfinal.txt",
+    "scanned_at": "bc8cd251d0e1e24cf9b73a79b195e082dc92f300",
     "scanner": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
     "schema": "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json"
   }
