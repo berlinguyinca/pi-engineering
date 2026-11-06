@@ -1,0 +1,15 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/git-common-dir-repair.test.ts
+✔ a common directory that exists is returned untouched (215.751417ms)
+✔ a doubled physical prefix is repaired to the directory that really exists (167.472875ms)
+✔ a linked worktree recovers the SHARED common directory, not its own gitdir (238.831917ms)
+✔ an answer that resolves to nothing names the impossible path (2.212833ms)
+✔ GitRepo.commonDir() only ever hands back a directory Pi can write into (562.876209ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1461.046583
+[exit=0]
