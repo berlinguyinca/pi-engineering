@@ -27,6 +27,37 @@ import { type MigrationDecision, assessMigration, prepareMigration } from "./tra
 
 export type ValidationMode = "quick" | "default" | "full";
 
+/**
+ * The wall clock each validation step is given. Named, because the operator has to be
+ * told how long an update is going to take before they walk away from it (#484): the
+ * window is minutes by design, and it is the same window #483 had to make survivable.
+ */
+const NPM_CI_BUDGET_MS = 600_000;
+const TYPECHECK_BUDGET_MS = 600_000;
+const CRITICAL_TESTS_BUDGET_MS = 600_000;
+const FULL_SUITE_BUDGET_MS = 1_800_000;
+
+/** The worst-case wall clock validation can take for `mode` (npm ci only if the lockfile moved). */
+export function validationBudgetMs(mode: ValidationMode): number {
+  return (
+    NPM_CI_BUDGET_MS +
+    (mode === "quick" ? 0 : TYPECHECK_BUDGET_MS + CRITICAL_TESTS_BUDGET_MS) +
+    (mode === "full" ? FULL_SUITE_BUDGET_MS : 0)
+  );
+}
+
+/** The same, phrased for a notice: what the operator is waiting for, and what is safe meanwhile. */
+export function describeValidationBudget(mode: ValidationMode): string {
+  const minutes = Math.ceil(validationBudgetMs(mode) / 60_000);
+  const steps =
+    mode === "quick"
+      ? "the dependency and compatibility checks"
+      : mode === "full"
+        ? "npm ci, a typecheck and the full test suite"
+        : "npm ci, a typecheck and the critical tests";
+  return `validation runs ${steps} and can take up to ${minutes} minutes; the running runtime stays live until it passes`;
+}
+
 export interface ValidationStep {
   name: string;
   status: "passed" | "failed" | "skipped";
@@ -162,7 +193,7 @@ export async function provisionDependencies(
   if (!opts.allowInstall) {
     return { name, status: "failed", detail: "dependencies changed and installation is disabled" };
   }
-  const r = await run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], stagedDir, 600_000);
+  const r = await run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], stagedDir, NPM_CI_BUDGET_MS);
   return r.code === 0
     ? { name, status: "passed", detail: "npm ci --ignore-scripts" }
     : { name, status: "failed", detail: `npm ci failed: ${(r.stderr || r.stdout).trim().split("\n").at(-1)}` };
@@ -321,7 +352,7 @@ async function runCandidateChecks(
   if (opts.mode !== "quick") {
     const tsc = join(dir, "node_modules", "typescript", "bin", "tsc");
     if (existsSync(join(dir, "tsconfig.json")) && existsSync(tsc)) {
-      const r = await run(nodeBinary(), [tsc, "--noEmit", "-p", "tsconfig.json"], dir, 600_000, env);
+      const r = await run(nodeBinary(), [tsc, "--noEmit", "-p", "tsconfig.json"], dir, TYPECHECK_BUDGET_MS, env);
       steps.push({
         name: "typecheck",
         status: r.code === 0 ? "passed" : "failed",
@@ -333,7 +364,7 @@ async function runCandidateChecks(
     }
     const critical = CRITICAL_TESTS.filter((t) => existsSync(join(dir, t)));
     if (critical.length > 0) {
-      const r = await run(nodeBinary(), ["--test", ...critical], dir, 600_000, env);
+      const r = await run(nodeBinary(), ["--test", ...critical], dir, CRITICAL_TESTS_BUDGET_MS, env);
       steps.push({
         name: "critical unit tests",
         status: r.code === 0 ? "passed" : "failed",
@@ -352,7 +383,7 @@ async function runCandidateChecks(
     }
   }
   if (opts.mode === "full") {
-    const r = await run("npm", ["test"], dir, 1_800_000, env);
+    const r = await run("npm", ["test"], dir, FULL_SUITE_BUDGET_MS, env);
     steps.push({ name: "full test suite", status: r.code === 0 ? "passed" : "failed" });
     if (r.code !== 0) return { ok: false, steps, migration };
   }

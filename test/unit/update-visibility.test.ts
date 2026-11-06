@@ -259,6 +259,9 @@ test("an automatic install reports every step, then its outcome", async () => {
   ]);
   const text = u.notices.map((n) => n.text).join("\n");
   assert.match(text, /0\.2\.0-abababababab → 0\.3\.0-cafe1234cafe: updating automatically/);
+  // The wait is announced with it (#484): validation is minutes by design, and a
+  // status line alone is invisible to anyone not looking at that row.
+  assert.match(text, /updating automatically — validation runs .* up to 30 minutes/);
   assert.match(text, /0\.3\.0-cafe1234cafe activated\./);
   assert.equal(u.statuses.at(-1), null, "the status line is taken back when the run ends");
 });
