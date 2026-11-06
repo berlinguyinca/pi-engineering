@@ -9,8 +9,11 @@
  * against the other and answers with the physical prefix applied twice — on
  * macOS, where `/var` is a symlink to `/private/var`, `/private/private/var/...`
  * — a path that does not exist. Measured at 4ffa82f3: `commonDir()` doubled while
- * a plain `git -C <repo> rev-parse ...` in the same process was right; the upstream
- * root cause is 61394da7 (#582). Every mkdir under such a path fails with ENOENT,
+ * a plain `git -C <repo> rev-parse ...` in the same process was right. The source
+ * is fixed upstream — 61394da7 (#582) canonicalizes the state directory, 89e747c2
+ * (#602) translates the shadow path by spelling — so this unit is not a live-bug
+ * reproduction: it pins the consumer-side invariant those fixes leave unguarded.
+ * Every mkdir under such a path fails with ENOENT,
  * and `withWorktreeSection` reads ENOENT as lock contention and polls to the
  * promotion-wait ceiling — which is how an orchestration run can sit for ten
  * minutes per attempt without reporting anything.
