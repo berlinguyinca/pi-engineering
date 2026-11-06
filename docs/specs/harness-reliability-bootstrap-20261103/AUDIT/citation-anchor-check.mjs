@@ -229,7 +229,7 @@ for (const doc of FILES) {
       return b;
     };
     for (const t of toks) {
-      if (t.kind === "id") continue;
+      if (t.kind !== "cite") continue;
       let file = null;
       if (t.f) {
         const r = resolveFile(t.f, docDir);
