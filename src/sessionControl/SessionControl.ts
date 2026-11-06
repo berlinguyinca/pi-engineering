@@ -140,10 +140,10 @@ export const SOCKET_PATH_LIMIT = 100;
 export class ControlSocketLimitError extends Error {
   constructor(socketPath: string, rootDir: string) {
     super(
-      `control socket path is ${Buffer.byteLength(socketPath)} bytes, over the ${SOCKET_PATH_LIMIT}-byte Unix socket limit ` +
-        `(the kernel's sun_path is 104 bytes including the terminator): ${socketPath}\n` +
-        `Shorten the control root — currently ${rootDir} — by setting PI_ENGINEERING_CONTROL_DIR ` +
-        `(or PI_ENGINEERING_STATE_DIR, which it is derived from) to a shorter path.`,
+      [
+        `control socket path is ${Buffer.byteLength(socketPath)} bytes, over the ${SOCKET_PATH_LIMIT}-byte Unix socket limit (the kernel's sun_path is 104 bytes including the terminator): ${socketPath}`,
+        `Shorten the control root — currently ${rootDir} — by setting PI_ENGINEERING_CONTROL_DIR (or PI_ENGINEERING_STATE_DIR, which it is derived from) to a shorter path.`,
+      ].join("\n"),
     );
     this.name = "ControlSocketLimitError";
   }
@@ -162,7 +162,8 @@ function shortSocketRoot(): string {
   // Capped so that the directory name below still fits: 30 + 23 + 41 is inside the limit,
   // and anything longer is not a runtime dir worth trusting with the socket anyway.
   const xdg = process.env.XDG_RUNTIME_DIR;
-  return xdg && xdg.startsWith("/") && !xdg.includes("\0") && Buffer.byteLength(xdg) <= 30 ? xdg : "/tmp";
+  if (!xdg?.startsWith("/") || xdg.includes("\0") || Buffer.byteLength(xdg) > 30) return "/tmp";
+  return xdg;
 }
 
 /**
