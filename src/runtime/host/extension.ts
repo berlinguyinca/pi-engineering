@@ -30,6 +30,7 @@ import { applyRetention } from "../../update/retention.ts";
 import { planRollback } from "../../update/rollback.ts";
 import { DEFAULT_CHECK_INTERVAL_MS, checkTimeoutMs, shouldCheck } from "../../update/selfUpdate.ts";
 import { runActivation } from "../../update/transaction.ts";
+import { describeValidationBudget } from "../../update/validate.ts";
 import type { ValidationMode } from "../../update/validate.ts";
 import { readStateSchema } from "../migrations/schema.ts";
 import { toAutocompleteItems } from "./completions.ts";
@@ -329,6 +330,10 @@ function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T | undef
 
 export class EngineeringHostExtension {
   readonly config: HostExtensionConfig;
+  /** How thoroughly a candidate is validated — and what the operator is told to expect (#484). */
+  private get validationMode(): ValidationMode {
+    return this.config.validation ?? "default";
+  }
   readonly generationsDir: string;
   host: RuntimeHost | undefined;
   readonly telemetry: RuntimeTelemetry;
@@ -377,7 +382,7 @@ export class EngineeringHostExtension {
       stateDir: () => this.stateDir(),
       piVersion: config.piVersion ?? PI_VERSION,
       supportedRuntimeApis: HOST_SUPPORTED_RUNTIME_APIS,
-      defaultValidation: config.validation ?? "default",
+      defaultValidation: this.validationMode,
       allowDependencyInstall: config.allowDependencyInstall !== false,
       packageRoot: config.packageRoot,
     });
@@ -725,7 +730,13 @@ export class EngineeringHostExtension {
             // A stale ctx cannot show a status; the panel still does.
           }
           if (prefs.autoInstall && check.pi.ok) {
-            notify(target, `Pi Engineering ${move}: updating automatically (progress in the status line).`);
+            // Say what the wait is and what it is doing (#484): validation is
+            // minutes by design, and a status line alone is invisible to anyone
+            // not looking at that row.
+            notify(
+              target,
+              `Pi Engineering ${move}: updating automatically — ${describeValidationBudget(this.validationMode)}.`,
+            );
             const outcome = await this.updates.update({}, updateProgressReporter(target?.ui));
             this.lastUpdateOutcome = outcome;
             if (outcome.status === "handover") {
