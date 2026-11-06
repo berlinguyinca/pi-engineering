@@ -42,8 +42,14 @@ test("both spellings in one string are translated", () => {
 });
 
 test("the longer spelling wins: <root>/.git is the common directory, a bare <root> is its parent", () => {
-  assert.equal(unshadowText(`${RECORDED}/.git`, { ...spelling, rootReal: null, commonReal: null }, targets), REAL_COMMON);
-  assert.equal(unshadowText(`${RECORDED}/attributes`, { ...spelling, rootReal: null, commonReal: null }, targets), `${REAL_WORK_TREE}/attributes`);
+  assert.equal(
+    unshadowText(`${RECORDED}/.git`, { ...spelling, rootReal: null, commonReal: null }, targets),
+    REAL_COMMON,
+  );
+  assert.equal(
+    unshadowText(`${RECORDED}/attributes`, { ...spelling, rootReal: null, commonReal: null }, targets),
+    `${REAL_WORK_TREE}/attributes`,
+  );
 });
 
 test("a bare root with no real counterpart is left alone rather than guessed", () => {
@@ -54,7 +60,10 @@ test("a bare root with no real counterpart is left alone rather than guessed", (
 test("the tail of a longer absolute path is a different directory and stays untouched", () => {
   // a repository whose own path ENDS where the shadow path starts: rewriting this would corrupt a real path
   const nested = `/mnt/builds/var/folders/T/state/safegit/shadow/s-1/.git`;
-  assert.equal(unshadowText(nested, { root: "/var/folders/T/state/safegit/shadow/s-1", common: `${RECORDED}/.git` }, targets), nested);
+  assert.equal(
+    unshadowText(nested, { root: "/var/folders/T/state/safegit/shadow/s-1", common: `${RECORDED}/.git` }, targets),
+    nested,
+  );
 });
 
 test("text that holds no shadow path comes back identical, and mapping twice changes nothing", () => {
@@ -65,11 +74,18 @@ test("text that holds no shadow path comes back identical, and mapping twice cha
 });
 
 test("rewrites skip a spelling that equals its own target, longest first otherwise", () => {
-  const list = shadowRewrites({ root: "/a", rootReal: "/a", common: "/a/b", commonReal: "/x/y" }, { commonTo: "/t", rootTo: "/u" });
+  const list = shadowRewrites(
+    { root: "/a", rootReal: "/a", common: "/a/b", commonReal: "/x/y" },
+    { commonTo: "/t", rootTo: "/u" },
+  );
   assert.deepEqual(list.map((r) => r.to).sort(), ["/t", "/t", "/u"]);
   assert.deepEqual([...new Set(list.map((r) => r.from))].sort(), ["/a", "/a/b", "/x/y"]);
   const lengths = list.map((r) => r.from.length);
-  assert.deepEqual(lengths, [...lengths].sort((a, b) => b - a), "longest spelling must be tried first");
+  assert.deepEqual(
+    lengths,
+    [...lengths].sort((a, b) => b - a),
+    "longest spelling must be tried first",
+  );
   assert.equal(list.at(-1)?.from, "/a");
 });
 
@@ -96,7 +112,12 @@ after(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-const env = () => ({ ...process.env, HOME: join(root, "home"), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" });
+const env = () => ({
+  ...process.env,
+  HOME: join(root, "home"),
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+});
 
 test("a shadow reached through a symlink still resolves to the real repository, not to a doubled path", async () => {
   const repo = join(root, "repo");
