@@ -242,12 +242,15 @@ export function forgetOpenCache(): void {
  * physical prefix applied twice — on macOS, where `/var` is a symlink to `/private/var`,
  * `/private/private/var/...` — a path that does not exist. Measured at 4ffa82f3: `commonDir()`
  * returned the doubled path while a plain `git -C <repo> rev-parse ...` in the same process returned
- * the right one. The upstream root cause (a state dir kept unresolved while repositories are
- * discovered through `realpathSync`) is fixed by 61394da7 (#582); this is the consumer-side half of
- * the contract. It matters because everything derived from the answer — the administration lock
- * directory, the candidate state directory, the checkpoint journal — fails its mkdir with ENOENT,
- * and `withWorktreeSection` reads ENOENT as "the other process's lock is not there yet" and queues
- * until `promotionWait.ceilingMs`, so a repository lookup can wait ten minutes and report nothing.
+ * the right one. Two upstream commits fix that at the source — 61394da7 (#582) canonicalizes Pi's
+ * state directory, 89e747c2 (#602) translates both spellings of the shadow so safeGit never hands
+ * back a doubled path — and at their tip the doubled prefix no longer reproduces. Neither guards the
+ * consumer: `commonDir()` had no way to notice an answer that names nothing, so a regression of
+ * either fix surfaces downstream, not here. It matters because everything derived from the answer —
+ * the administration lock directory, the candidate state directory, the checkpoint journal — fails
+ * its mkdir with ENOENT, and `withWorktreeSection` reads ENOENT as "the other process's lock is not
+ * there yet" and queues until `promotionWait.ceilingMs`: measured at 4ffa82f3, one lookup cost the
+ * whole ceiling and an integration file had to be killed at 240 s without settling.
  *
  * A reported directory that exists is returned untouched: it is usually Pi's shadow common dir,
  * which only git knows. A reported path that does not exist is replaced by the layout resolved from
