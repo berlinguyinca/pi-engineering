@@ -12,6 +12,13 @@ Symptom: `npm test` never terminates. Two integration files never settle, so the
 In the detached whole-suite run both files were still running 21 minutes after the run started, with
 40 failures reported from other files in that time and no final tally.
 
+--------------------------------------------------------------------------------
+SUPERSEDED 2026-11-06. Everything below this line was written before #582, #602 and X08 reached this
+branch, and it names the wrong mechanism. It is kept because it is the record of how the hang was
+investigated, but reading it as current guidance sends the next agent to src/orchestration looking for
+an interrupt-propagation defect that does not exist. Read the closure at the end of this file first.
+--------------------------------------------------------------------------------
+
 Mechanism (read, not inferred from the failure text):
   mission-interrupt-pause.test.ts:36-47 - the stub worker parks the first implementer attempt on
     await new Promise(resolve => request.signal?.addEventListener('abort', () => resolve(), { once: true }));
@@ -37,3 +44,72 @@ Exact next step, in order:
   3. Only after that, make the stub fail fast instead of hanging (race the abort with a bounded timer
      that asserts the interrupt arrived), so a regression surfaces as a failure rather than as a
      suite that never ends.
+
+--------------------------------------------------------------------------------
+CLOSED 2026-11-06 at 34af055f on harness-reliability-bootstrap-20261103. The two files named above
+settle and pass and the suite terminates; the mechanism recorded above is wrong -- it was path
+resolution in the shadow git directory, not interrupt propagation. Steps 2 and 3 are NOT needed and
+should not be started.
+
+Step 2 was asked first, on purpose, and it has a measured answer: the operator interrupt DOES reach the
+parked worker, and nothing in src/orchestration needed changing. At 6818842c, with no change of ours,
+mission-interrupt-pause.test.ts runs 12/12, and the passing set includes 'the parked stub's signal
+aborted and it wrote the file after resume', 'a worker that observes the interrupt checkpoints and
+reports pausedBeforeStop=true', 'the operator pause is recorded the instant Esc lands; supervisor ticks
+during the pause never resume it', '/mission resume clears the operator pause of a mission paused to
+PAUSED_INFRASTRUCTURE' and 'an explicit cancel is the only thing that terminates a paused or running
+mission'. Pause keeps the attempt and the execution identity; cancel ends the mission. Step 3 (bound the
+stub's await so a regression fails instead of hanging) remains worth doing as hardening, not as a
+prerequisite for the suite to terminate.
+
+Measured on this branch
+  6818842c, no change of ours: mission-interrupt-pause 12 pass, mission-merge-queue-flow 6 pass,
+  together 18 tests / 18 pass / 0 fail in 48 s (duration_ms 47873).
+  4ffa82f3: the same two files 12 failing and 6 failing, every one 'test timed out after 120000ms'.
+  Without --test-timeout they do not fail at all and the runner prints no tally -- the symptom at the top
+  of this note, which is why it read as a promise parked on an abort that never arrived.
+
+What closed it, upstream
+  61394da7 (#582) canonicalizes the state directory and the temp root where they are handed out, so a
+  shadow path is never built over an unresolved state directory and the doubled /private/private/var
+  prefix cannot be produced. This IS in this branch, and it is what made the two files settle.
+  89e747c2 (#602) translates shadow paths by spelling in src/git/shadowPaths.ts instead of re-applying
+  the physical prefix. This is NOT in this branch -- see the divergence note below.
+  X08 adds `resolveCommonDir()` in src/git/GitRepo.ts, tested by test/unit/git-common-dir-repair.test.ts
+  (both present on task/x08-common-dir-repair, NOT on this branch),
+  so an answer that names no directory is repaired or throws at the call site instead of surfacing as a
+  600 s `promotionWait.ceilingMs` poll (ENOENT from a failed mkdir is read as "the other process's lock is
+  not there yet"). The full closure analysis,
+  including the A/B that isolated the mechanism -- at 4ffa82f3 a common-directory guard alone settles the
+  file, with no interrupt, lease or scheduler change -- is on task/x08-common-dir-repair's copy of this
+  file. This paragraph is the same conclusion measured independently, not a second account of it.
+
+Divergence this branch still carries, and what to do about it
+  #612 merged af4e052b, which added an inline anchored mapper to src/git/safeGit.ts (`replacePathAll`,
+  `shadowPathMap`, `Shadow.realRoot`/`realCommon`) and test/unit/safe-git-shadow-path.test.ts, written
+  against 4ffa82f3 and credited with the hang. It is a second, inline implementation of what #602 shipped
+  as a module. The integrating branches resolved that in #602's favour -- task/x08-common-dir-repair and
+  chore/lint-shadow-paths carry shadowPaths.ts and rootReal, and drop both `replacePathAll` and
+  safe-git-shadow-path.test.ts -- and this artifact, which #612 also merged, is dropped there too and is
+  deleted here. Keep #602's module when this branch merges; do not keep two mappers.
+  The one case worth carrying over is the one safe-git-shadow-path.test.ts asserted and
+  safe-git-shadow-spelling.test.ts does not: a created work tree's `.git` file naming the REAL repository
+  under a state directory reached through a symlink, and raw `git -C <worktree>` accepting that work tree.
+  That is the path where a wrong mapping writes a file inside the user's repository, so it belongs in
+  safe-git-shadow-spelling.test.ts rather than being lost with the file.
+
+Counts carried forward, replacing the ones in the merged version of this note
+  The workspace-scope symlink-boundary refusal that the first version of this closure blamed for most of
+  the remaining failures is gone -- #582 canonicalized the roots that generated it. What is left of it is
+  workspace-manifest-corpus #7 ('Fix <PATH uppercased>'), the only failure in that file at 6818842c
+  (24 tests / 23 pass / 1 fail): on a case-insensitive volume realpathSync of the uppercased path
+  succeeds, so the guard reports 'crosses a symlink boundary' where the corpus expects 'does not exist'.
+  #582's PR body left exactly this kind of message-semantics decision for review; it is untouched.
+  Two safe-git assertions still fail on macOS for environment reasons at this tip: 'spawn failures (an
+  argument too large for exec) are results, never rejections, for async and sync' assumes an exec-argument
+  limit above macOS's, and 'stderr paths are the real ones, never the shadow's' asserts on `git fsck`
+  output that reports 'cannot open directory <repo>/.git/refs: Not a directory'.
+  The load-bound files (runtime-isolation-*, runtime-state-dir-git, runtime-mission-live-snapshot,
+  runtime-host-legacy, mission-reliability-foundation) fail a different name every run: 96 / 90 pass / 6
+  fail both at 4ffa82f3 and at 6818842c, several of them 'test timed out after 120000ms' at
+  wall durations of 511 s-1238 s under --test-concurrency=4. Caused by nothing here.
