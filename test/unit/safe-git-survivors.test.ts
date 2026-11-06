@@ -136,6 +136,52 @@ test("stderr paths are the real ones, never the shadow's", async () => {
   }
 });
 
+test("fsck through the shadow still sees the refs: an unreachable commit is reported, not hidden", async () => {
+  const l = lab();
+  try {
+    // three commits, then the branch is moved back so `three` is unreachable. fsck must call it
+    // dangling. A shadow that snapshotted the ref tree wrongly would report a clean repository
+    // here — a passing integrity check that looked at nothing, which is worse than failing.
+    l.sh("cd repo && git commit -q --allow-empty -m two && git commit -q --allow-empty -m three && git reset -q --hard HEAD~1");
+    const r = await safeGit(["fsck", "--connectivity-only"], { cwd: l.repo, trust: "strict" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(`${r.stdout}${r.stderr}`, /dangling commit/);
+    assert.ok(!`${r.stdout}${r.stderr}`.includes(shadowDir), "the shadow must not leak into git's output");
+  } finally {
+    rmSync(l.root, { recursive: true, force: true });
+  }
+});
+
+test("fsck on a reftable repository through the shadow reports no error", async (t) => {
+  // The ref backend changes what the shadow has to look like (reftable keeps its tables under
+  // `reftable/` and must not find loose refs), and nothing else in the suite covers it.
+  const probe = mkdtempSync(join(tmpdir(), "safe-git-rt-probe-"));
+  let supported = true;
+  try {
+    execFileSync("git", ["init", "-q", "-b", "main", "--ref-format=reftable", join(probe, "r")], { stdio: "pipe" });
+  } catch {
+    supported = false;
+  }
+  rmSync(probe, { recursive: true, force: true });
+  if (!supported) return t.skip("this git has no --ref-format=reftable");
+
+  const root = mkdtempSync(join(tmpdir(), "safe-git-reftable-"));
+  const env = { ...process.env, HOME: join(root, "home"), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  const sh = (c: string) => execFileSync("bash", ["-c", c], { cwd: root, env, stdio: "pipe" }).toString();
+  mkdirSync(join(root, "home"));
+  try {
+    sh(
+      "git init -q -b main --ref-format=reftable repo && cd repo && git config user.name t && git config user.email t@t && echo a > a.txt && git add . && git commit -qm one && git commit -q --allow-empty -m two",
+    );
+    const repo = join(root, "repo");
+    const r = await safeGit(["fsck", "--verbose"], { cwd: repo, trust: "strict" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(!`${r.stdout}${r.stderr}`.includes(shadowDir));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("reads do not clear the pin: restoring the original URL after a hand edit and some reads is allowed, the edit alone is not", async () => {
   const l = lab();
   try {

@@ -1131,6 +1131,24 @@ interface Prepared {
 }
 
 const SHADOW_SKIP = new Set(["config", "hooks", "info"]);
+/**
+ * Commands that walk the ref directory themselves instead of resolving refs through the ref backend.
+ *
+ * Measured on git 2.55 against a shadow built the normal way (every entry a symlink into the real common
+ * directory): `status`, `log`, `rev-parse`, `for-each-ref`, `branch -a`, `show-ref`, `ls-files`, `diff` and
+ * `count-objects` all succeed, because the ref backend follows the link. `fsck` alone fails — it opens the
+ * ref directory directly and refuses a symlink:
+ *
+ *   error: cannot open directory <common>/refs: Not a directory      (exit 8)
+ *
+ * So `refs` is snapshotted as a real directory for exactly this command. Everywhere else it stays a symlink:
+ * copying thousands of loose refs on every git call would cost real time to fix a command nobody routes
+ * through Pi for performance reasons. A reftable repository needs nothing extra — its `extensions.refstorage`
+ * survives into the generated config, and with that key present fsck passes whether `refs` is empty or copied.
+ */
+const WALKS_REF_DIR = new Set(["fsck"]);
+/** A refusal, not a wrong answer: a repository with more loose ref files than this is not snapshotted. */
+const MAX_SNAPSHOT_REF_ENTRIES = 20_000;
 const DERIVED_KEYS = new Set(["core.repositoryformatversion", "core.bare"]);
 const noticed = new Set<string>();
 
@@ -1225,12 +1243,43 @@ export function readPlainFile(path: string): Buffer | null {
   }
 }
 
+/**
+ * Copy the loose ref tree (refs/heads/main, refs/tags/v1, …) into the shadow. Contents only: a
+ * symlinked ref is git's deprecated symref form, and copying what git would read is the faithful
+ * choice, so anything that reads as a file is copied and anything else is skipped. Depth- and
+ * entry-capped; over the cap it throws, and the caller refuses rather than handing fsck a view of
+ * the repository that silently omits refs — a reachability check that misses its roots is worse
+ * than no check.
+ */
+function snapshotRefTree(source: string, target: string, depth: number, count: { entries: number }): void {
+  if (depth > 32) throw new Error("the ref directory is nested too deeply to snapshot");
+  mkdirSync(target, { mode: 0o700 });
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (++count.entries > MAX_SNAPSHOT_REF_ENTRIES)
+      throw new Error(
+        `the repository has more than ${MAX_SNAPSHOT_REF_ENTRIES} loose ref files; run \`git pack-refs --all\` (Pi is allowed to run it) and retry`,
+      );
+    const from = join(source, entry.name);
+    const to = join(target, entry.name);
+    if (entry.isDirectory()) {
+      snapshotRefTree(from, to, depth + 1, count);
+      continue;
+    }
+    try {
+      writeFileSync(to, readFileSync(from), { mode: 0o400 });
+    } catch {
+      /* a ref git itself cannot read is not ours to invent */
+    }
+  }
+}
+
 function makeShadow(
   layout: RepoLayout,
   configText: string,
   writer: boolean,
   attributesFor: (common: string) => string,
   readOnlyCommand = false,
+  snapshotRefs = false,
 ): Shadow {
   sweepOnce();
   const root = makeShadowRoot();
@@ -1240,10 +1289,19 @@ function makeShadow(
   const rootReal = realpathOrSelf(root);
   const commonReal = realpathOrSelf(common);
   const copies = new Set<string>();
+  // Per shadow, not per process: a long-lived session runs many git commands, and a counter that
+  // accumulated across them would start refusing fsck on a repository that was always fine.
+  const refSnapshotCount = { entries: 0 };
   try {
     mkdirSync(common, { mode: 0o700 });
     for (const name of readdirSync(layout.commonDir)) {
       if (SHADOW_SKIP.has(name)) continue;
+      if (snapshotRefs && name === "refs") {
+        // A real directory of copies: git's fsck will not open a symlinked ref directory.
+        snapshotRefTree(join(layout.commonDir, name), join(common, name), 0, refSnapshotCount);
+        copies.add("refs");
+        continue;
+      }
       if (readOnlyCommand && name === "shallow") {
         const body = readPlainFile(join(layout.commonDir, name));
         if (body !== null) {
@@ -1715,6 +1773,7 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
         return lfsInfo?.text ?? "";
       },
       READS_ONLY_SHARED_FILES.has(sub ?? ""),
+      WALKS_REF_DIR.has(sub ?? ""),
     );
   } catch (e) {
     return refuse(
