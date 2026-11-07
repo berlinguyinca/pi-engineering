@@ -1,0 +1,1642 @@
+cmd internalError/io  INTERNAL  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × No such file or directory (os error 2)
+  
+  ! This diagnostic was derived from an internal Biome error. Potential bug, please report it if necessary.
+  
+
+src/aps/observability.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+     18  18 │   import type { EscalationEvent } from "./escalation.ts";
+     19  19 │   import type { ApsRecoveryAction } from "./recovery.ts";
+     20     │ - import·type·{·AgentLoopEvent,·AgentLoopPreventedEvent,·SemanticStrategyFamily·}·from·"./types.ts";
+     21     │ - import·type·{·AlignmentKind,·AlignmentSignal·}·from·"./taskAlignment.ts";
+         20 │ + import·type·{·AlignmentKind,·AlignmentSignal·}·from·"./taskAlignment.ts";
+         21 │ + import·type·{·AgentLoopEvent,·AgentLoopPreventedEvent,·SemanticStrategyFamily·}·from·"./types.ts";
+     22  22 │   
+     23  23 │   export type ContextUtilizationBucket = "<0.5" | "0.5-0.75" | "0.75-0.9" | ">=0.9" | "unknown";
+  
+
+src/aps/workerActivity.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+     17  17 │   import { TARGET_ARGUMENT_KEYS, ToolCallNormalizer, canonicalJson, semanticFingerprint } from "./fingerprint.ts";
+     18  18 │   import { AgentProgressSupervisor, type AgentProgressSupervisorOptions } from "./supervisor.ts";
+     19     │ - import·{·evaluateTaskAlignment,·type·AlignmentSignal,·type·DeclaredArtifact,·type·TaskAction·}·from·"./taskAlignment.ts";
+         19 │ + import·{·type·AlignmentSignal,·type·DeclaredArtifact,·type·TaskAction,·evaluateTaskAlignment·}·from·"./taskAlignment.ts";
+     20  20 │   import { type AgentAction, isMutatingTool } from "./types.ts";
+     21  21 │   
+  
+
+src/aps/taskAlignment.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     9   9 │   import { isMutatingTool } from "./types.ts";
+    10  10 │   
+    11     │ - export·type·AlignmentKind·=·"out_of_scope_write"·|·"undeclared_artifact"·|·"unrelated_dependency"·|·"task_expansion"·|·"acceptance_stagnation";
+        11 │ + export·type·AlignmentKind·=
+        12 │ + ··|·"out_of_scope_write"
+        13 │ + ··|·"undeclared_artifact"
+        14 │ + ··|·"unrelated_dependency"
+        15 │ + ··|·"task_expansion"
+        16 │ + ··|·"acceptance_stagnation";
+    12  17 │   /** What the operator declared the task would produce, before the run (the artifact contract). */
+    13     │ - export·interface·DeclaredArtifact·{·kind:·"source"·|·"test"·|·"docs";·pathPattern?:·string·}
+    14     │ - export·interface·AlignmentSignal·{·kind:·AlignmentKind;·subject:·string;·iteration:·number;·evidence:·string;·taskId?:·string·}
+    15     │ - export·interface·TaskAction·{·iteration:·number;·tool:·string;·target?:·string;·taskId?:·string;·mutating:·boolean;·newDependency?:·string·}
+        18 │ + export·interface·DeclaredArtifact·{
+        19 │ + ··kind:·"source"·|·"test"·|·"docs";
+        20 │ + ··pathPattern?:·string;
+        21 │ + }
+        22 │ + export·interface·AlignmentSignal·{
+        23 │ + ··kind:·AlignmentKind;
+        24 │ + ··subject:·string;
+        25 │ + ··iteration:·number;
+        26 │ + ··evidence:·string;
+        27 │ + ··taskId?:·string;
+        28 │ + }
+        29 │ + export·interface·TaskAction·{
+        30 │ + ··iteration:·number;
+        31 │ + ··tool:·string;
+        32 │ + ··target?:·string;
+        33 │ + ··taskId?:·string;
+        34 │ + ··mutating:·boolean;
+        35 │ + ··newDependency?:·string;
+        36 │ + }
+    16  37 │   export interface TaskAlignmentInput {
+    17     │ - ··allowedScope:·readonly·string[];·declaredTasks:·readonly·string[];·allowedDependencies:·readonly·string[];
+        38 │ + ··allowedScope:·readonly·string[];
+        39 │ + ··declaredTasks:·readonly·string[];
+        40 │ + ··allowedDependencies:·readonly·string[];
+    18  41 │     actions: readonly TaskAction[];
+    19  42 │     declaredArtifacts?: readonly DeclaredArtifact[];
+    20     │ - ··acceptance?:·{·criteria:·readonly·string[];·progressedAtIteration:·Record<string,·number>·};·stagnationIterations?:·number;
+        43 │ + ··acceptance?:·{·criteria:·readonly·string[];·progressedAtIteration:·Record<string,·number>·};
+        44 │ + ··stagnationIterations?:·number;
+    21  45 │   }
+    22  46 │   
+    23  47 │   /** Artifact class of a path, by this repository's own layout conventions. */
+    24  48 │   const artifactClass = (path: string): "source" | "test" | "docs" =>
+    25     │ - ··path.startsWith("test/")·||·path.endsWith(".test.ts")·?·"test"·:·path.startsWith("docs/")·||·path.endsWith(".md")·?·"docs"·:·"source";
+        49 │ + ··path.startsWith("test/")·||·path.endsWith(".test.ts")
+        50 │ + ····?·"test"
+        51 │ + ····:·path.startsWith("docs/")·||·path.endsWith(".md")
+        52 │ + ······?·"docs"
+        53 │ + ······:·"source";
+    26  54 │   const contractOf = (declared: readonly DeclaredArtifact[]): string =>
+    27  55 │     declared.map((d) => (d.pathPattern ? `${d.kind} ${d.pathPattern}` : d.kind)).join(", ");
+    28  56 │   
+    29  57 │   const DEFAULT_STAGNATION_ITERATIONS = 10; // fallback for absent or malformed stagnationIterations
+    30     │ - const·limitOf·=·(value:·number·|·undefined):·number·=>·(Number.isInteger(value)·&&·value·!==·undefined·&&·value·>·0·?·value·:·DEFAULT_STAGNATION_ITERATIONS);
+        58 │ + const·limitOf·=·(value:·number·|·undefined):·number·=>
+        59 │ + ··Number.isInteger(value)·&&·value·!==·undefined·&&·value·>·0·?·value·:·DEFAULT_STAGNATION_ITERATIONS;
+    31  60 │   const listed = (items: readonly string[], none: string): string => (items.length > 0 ? items.join(", ") : none);
+    32  61 │   
+    ······ │ 
+    34  63 │   export function evaluateTaskAlignment(input: TaskAlignmentInput): AlignmentSignal[] {
+    35  64 │     const limit = limitOf(input.stagnationIterations);
+    36     │ - ··const·scope·=·input.allowedScope·??·[];·const·declared·=·input.declaredTasks·??·[];·const·actions·=·input.actions·??·[];
+        65 │ + ··const·scope·=·input.allowedScope·??·[];
+        66 │ + ··const·declared·=·input.declaredTasks·??·[];
+        67 │ + ··const·actions·=·input.actions·??·[];
+    37  68 │     const declaredArtifacts = input.declaredArtifacts ?? [];
+    38  69 │     const deps = (input.allowedDependencies ?? []).map((d) => d.trim().toLowerCase()).filter((d) => d !== "");
+    39     │ - ··const·hits:·AlignmentSignal[]·=·[];·let·observed·=·Number.NEGATIVE_INFINITY;
+        70 │ + ··const·hits:·AlignmentSignal[]·=·[];
+        71 │ + ··let·observed·=·Number.NEGATIVE_INFINITY;
+    40  72 │     for (const a of actions) {
+    41  73 │       if (Number.isFinite(a.iteration)) observed = Math.max(observed, a.iteration);
+    42  74 │       const target = a.target?.trim();
+    43  75 │       const mutating = a.mutating ?? isMutatingTool(a.tool);
+    44     │ - ····if·(mutating·&&·target·&&·declaredArtifacts.length·>·0·&&·!declaredArtifacts.some((d)·=>·d.pathPattern·===·undefined·?·d.kind·===·artifactClass(target)·:·matchesGlob(target,·d.pathPattern)))
+    45     │ - ······hits.push({·kind:·"undeclared_artifact",·subject:·target,·iteration:·a.iteration,·taskId:·a.taskId,
+    46     │ - ········evidence:·`mutating·${a.tool}·to·${target}·at·iteration·${a.iteration}·produces·a·${artifactClass(target)}·artifact·the·task·did·not·declare·(declared:·${contractOf(declaredArtifacts)})`·});
+        76 │ + ····if·(
+        77 │ + ······mutating·&&
+        78 │ + ······target·&&
+        79 │ + ······declaredArtifacts.length·>·0·&&
+        80 │ + ······!declaredArtifacts.some((d)·=>
+        81 │ + ········d.pathPattern·===·undefined·?·d.kind·===·artifactClass(target)·:·matchesGlob(target,·d.pathPattern),
+        82 │ + ······)
+        83 │ + ····)
+        84 │ + ······hits.push({
+        85 │ + ········kind:·"undeclared_artifact",
+        86 │ + ········subject:·target,
+        87 │ + ········iteration:·a.iteration,
+        88 │ + ········taskId:·a.taskId,
+        89 │ + ········evidence:·`mutating·${a.tool}·to·${target}·at·iteration·${a.iteration}·produces·a·${artifactClass(target)}·artifact·the·task·did·not·declare·(declared:·${contractOf(declaredArtifacts)})`,
+        90 │ + ······});
+    47  91 │       if (mutating && target && !scope.some((glob) => matchesGlob(target, glob)))
+    48     │ - ······hits.push({·kind:·"out_of_scope_write",·subject:·target,·iteration:·a.iteration,·taskId:·a.taskId,
+    49     │ - ········evidence:·`mutating·${a.tool}·to·${target}·at·iteration·${a.iteration}·matches·no·allowed·scope·(${listed(scope,·"none·declared,·so·nothing·is·authorized")})`·});
+        92 │ + ······hits.push({
+        93 │ + ········kind:·"out_of_scope_write",
+        94 │ + ········subject:·target,
+        95 │ + ········iteration:·a.iteration,
+        96 │ + ········taskId:·a.taskId,
+        97 │ + ········evidence:·`mutating·${a.tool}·to·${target}·at·iteration·${a.iteration}·matches·no·allowed·scope·(${listed(scope,·"none·declared,·so·nothing·is·authorized")})`,
+        98 │ + ······});
+    50  99 │       const dep = a.newDependency?.trim();
+    51 100 │       if (dep && !deps.includes(dep.toLowerCase()))
+    52     │ - ······hits.push({·kind:·"unrelated_dependency",·subject:·dep,·iteration:·a.iteration,·taskId:·a.taskId,
+    53     │ - ········evidence:·`new·dependency·${dep}·added·at·iteration·${a.iteration};·authorized:·${listed(deps,·"none")}`·});
+       101 │ + ······hits.push({
+       102 │ + ········kind:·"unrelated_dependency",
+       103 │ + ········subject:·dep,
+       104 │ + ········iteration:·a.iteration,
+       105 │ + ········taskId:·a.taskId,
+       106 │ + ········evidence:·`new·dependency·${dep}·added·at·iteration·${a.iteration};·authorized:·${listed(deps,·"none")}`,
+       107 │ + ······});
+    54 108 │       if (a.taskId && !declared.includes(a.taskId))
+    55     │ - ······hits.push({·kind:·"task_expansion",·subject:·a.taskId,·iteration:·a.iteration,·taskId:·a.taskId,
+    56     │ - ········evidence:·`task·${a.taskId}·observed·at·iteration·${a.iteration};·declared·tasks:·${listed(declared,·"none")}`·});
+       109 │ + ······hits.push({
+       110 │ + ········kind:·"task_expansion",
+       111 │ + ········subject:·a.taskId,
+       112 │ + ········iteration:·a.iteration,
+       113 │ + ········taskId:·a.taskId,
+       114 │ + ········evidence:·`task·${a.taskId}·observed·at·iteration·${a.iteration};·declared·tasks:·${listed(declared,·"none")}`,
+       115 │ + ······});
+    57 116 │     }
+    58 117 │     const acceptance = input.acceptance;
+    59 118 │     if (acceptance && acceptance.criteria.length > 0 && actions.length > 0) {
+    60     │ - ····const·marks·=·acceptance.criteria.map((c)·=>·acceptance.progressedAtIteration[c]).filter((n):·n·is·number·=>·typeof·n·===·"number"·&&·Number.isFinite(n));
+       119 │ + ····const·marks·=·acceptance.criteria
+       120 │ + ······.map((c)·=>·acceptance.progressedAtIteration[c])
+       121 │ + ······.filter((n):·n·is·number·=>·typeof·n·===·"number"·&&·Number.isFinite(n));
+    61 122 │       const last = marks.length > 0 ? Math.max(...marks) : undefined;
+    62     │ - ····const·stale·=·acceptance.criteria.filter((c)·=>·{·const·at·=·acceptance.progressedAtIteration[c];·return·at·===·undefined·||·observed·-·at·>=·limit;·}).sort();
+       123 │ + ····const·stale·=·acceptance.criteria
+       124 │ + ······.filter((c)·=>·{
+       125 │ + ········const·at·=·acceptance.progressedAtIteration[c];
+       126 │ + ········return·at·===·undefined·||·observed·-·at·>=·limit;
+       127 │ + ······})
+       128 │ + ······.sort();
+    63 129 │       if (stale.length > 0 && (last === undefined || observed - last >= limit))
+    64     │ - ······hits.push({·kind:·"acceptance_stagnation",·subject:·stale.join(","),·iteration:·observed,
+    65     │ - ········evidence:·`${stale.length}·of·${acceptance.criteria.length}·criteria·(${stale.join(",·")})·unadvanced·for·${limit}·iterations;·last·recorded·progress·${last·===·undefined·?·"never·recorded"·:·`iteration·${last}`};·actions·observed·through·iteration·${observed}`·});
+       130 │ + ······hits.push({
+       131 │ + ········kind:·"acceptance_stagnation",
+       132 │ + ········subject:·stale.join(","),
+       133 │ + ········iteration:·observed,
+       134 │ + ········evidence:·`${stale.length}·of·${acceptance.criteria.length}·criteria·(${stale.join(",·")})·unadvanced·for·${limit}·iterations;·last·recorded·progress·${last·===·undefined·?·"never·recorded"·:·`iteration·${last}`};·actions·observed·through·iteration·${observed}`,
+       135 │ + ······});
+    66 136 │     }
+  11 more lines truncated
+  
+
+src/aps/workerActivity.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     17  17 │   import { TARGET_ARGUMENT_KEYS, ToolCallNormalizer, canonicalJson, semanticFingerprint } from "./fingerprint.ts";
+     18  18 │   import { AgentProgressSupervisor, type AgentProgressSupervisorOptions } from "./supervisor.ts";
+     19     │ - import·{·evaluateTaskAlignment,·type·AlignmentSignal,·type·DeclaredArtifact,·type·TaskAction·}·from·"./taskAlignment.ts";
+         19 │ + import·{
+         20 │ + ··evaluateTaskAlignment,
+         21 │ + ··type·AlignmentSignal,
+         22 │ + ··type·DeclaredArtifact,
+         23 │ + ··type·TaskAction,
+         24 │ + }·from·"./taskAlignment.ts";
+     20  25 │   import { type AgentAction, isMutatingTool } from "./types.ts";
+     21  26 │   
+    ······· │ 
+     82  87 │   function alignmentAction(action: AgentAction): TaskAction {
+     83  88 │     const target = TARGET_ARGUMENT_KEYS.map((key) => action.normalizedArguments[key])
+     84     │ - ····.find((value):·value·is·string·=>·typeof·value·===·"string"·&&·value.trim()·!==·"")?.trim();
+     85     │ - ··return·{·iteration:·action.iteration,·tool:·action.tool,·target,·taskId:·action.workItemId·??·undefined,·mutating:·isMutatingTool(action.tool)·};
+         89 │ + ····.find((value):·value·is·string·=>·typeof·value·===·"string"·&&·value.trim()·!==·"")
+         90 │ + ····?.trim();
+         91 │ + ··return·{
+         92 │ + ····iteration:·action.iteration,
+         93 │ + ····tool:·action.tool,
+         94 │ + ····target,
+         95 │ + ····taskId:·action.workItemId·??·undefined,
+         96 │ + ····mutating:·isMutatingTool(action.tool),
+         97 │ + ··};
+     86  98 │   }
+     87  99 │   
+    ······· │ 
+    192 204 │           if (this.driftLog.some((seen) => seen.kind === signal.kind && seen.subject === signal.subject)) continue;
+    193 205 │           this.driftLog.push(signal);
+    194     │ - ········try·{·this.onDrift?.(signal);·}·catch·{·/*·a·failing·sink·never·breaks·the·run·*/·}
+        206 │ + ········try·{
+        207 │ + ··········this.onDrift?.(signal);
+        208 │ + ········}·catch·{
+        209 │ + ··········/*·a·failing·sink·never·breaks·the·run·*/
+        210 │ + ········}
+    195 211 │         }
+    196     │ - ····}·catch·{·/*·evidence-only:·a·malformed·action·never·breaks·the·session·*/·}
+        212 │ + ····}·catch·{
+        213 │ + ······/*·evidence-only:·a·malformed·action·never·breaks·the·session·*/
+        214 │ + ····}
+    197 215 │     }
+    198 216 │   
+  
+
+src/bootstrap/pathPolicy.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    11 11 │     readonly symlinks?: readonly string[];
+    12 12 │   }
+    13    │ - export·interface·PathDecision·{·readonly·allowed:·boolean;·readonly·path:·string;·readonly·reason:·string·}
+    14    │ - type·Pattern·=·{·readonly·source:·string;·readonly·any:·boolean;·readonly·prefix:·string[]·|·null;·readonly·exact:·string·|·null·};
+       13 │ + export·interface·PathDecision·{
+       14 │ + ··readonly·allowed:·boolean;
+       15 │ + ··readonly·path:·string;
+       16 │ + ··readonly·reason:·string;
+       17 │ + }
+       18 │ + type·Pattern·=·{
+       19 │ + ··readonly·source:·string;
+       20 │ + ··readonly·any:·boolean;
+       21 │ + ··readonly·prefix:·string[]·|·null;
+       22 │ + ··readonly·exact:·string·|·null;
+       23 │ + };
+    15 24 │   
+    16 25 │   const AMBIGUOUS = /[*?"<>|\\]/u;
+    ····· │ 
+    19 28 │     const canonical = canonicalizeWriteDomain(pattern);
+    20 29 │     if (canonical === "**") return { source: pattern, any: true, prefix: null, exact: null };
+    21    │ - ··if·(canonical.endsWith("/**"))·return·{·source:·pattern,·any:·false,·prefix:·canonical.slice(0,·-3).split("/"),·exact:·null·};
+       30 │ + ··if·(canonical.endsWith("/**"))
+       31 │ + ····return·{·source:·pattern,·any:·false,·prefix:·canonical.slice(0,·-3).split("/"),·exact:·null·};
+    22 32 │     return { source: pattern, any: false, prefix: null, exact: canonical };
+    23 33 │   }
+    24 34 │   
+    25 35 │   function matches(pattern: Pattern, segments: string[]): boolean {
+    26    │ - ··if·(pattern.prefix)·return·segments.length·>=·pattern.prefix.length·&&·pattern.prefix.every((s,·i)·=>·segments[i]·===·s);
+       36 │ + ··if·(pattern.prefix)
+       37 │ + ····return·segments.length·>=·pattern.prefix.length·&&·pattern.prefix.every((s,·i)·=>·segments[i]·===·s);
+    27 38 │     return pattern.any || segments.join("/") === pattern.exact;
+    28 39 │   }
+    29 40 │   
+    30    │ - export·function·createPathPolicy(input:·PathPolicyInput):·{·policy:·{·check(request:·string):·PathDecision·}·|·null;·errors:·string[]·}·{
+       41 │ + export·function·createPathPolicy(input:·PathPolicyInput):·{
+       42 │ + ··policy:·{·check(request:·string):·PathDecision·}·|·null;
+       43 │ + ··errors:·string[];
+       44 │ + }·{
+    31 45 │     const compileAll = (patterns: readonly string[], kind: string): [Pattern[], string[]] => {
+    32    │ - ····const·compiled:·Pattern[]·=·[];·const·errors:·string[]·=·[];
+       46 │ + ····const·compiled:·Pattern[]·=·[];
+       47 │ + ····const·errors:·string[]·=·[];
+    33 48 │       for (const pattern of patterns) {
+    34    │ - ······try·{·compiled.push(compile(pattern));·}·catch·(error)·{·errors.push(`${kind}·pattern·"${pattern}"·is·not·canonical:·${(error·as·Error).message}`);·}
+       49 │ + ······try·{
+       50 │ + ········compiled.push(compile(pattern));
+       51 │ + ······}·catch·(error)·{
+       52 │ + ········errors.push(`${kind}·pattern·"${pattern}"·is·not·canonical:·${(error·as·Error).message}`);
+       53 │ + ······}
+    35 54 │       }
+    36 55 │       return [compiled, errors];
+    ····· │ 
+    38 57 │     const [allow, allowErrors] = compileAll(input.allowPaths, "allow");
+    39 58 │     const [deny, denyErrors] = compileAll(input.denyPaths ?? [], "deny");
+    40    │ - ··const·errors·=·[...allowErrors,·...denyErrors];·if·(errors.length·>·0)·return·{·policy:·null,·errors·};
+       59 │ + ··const·errors·=·[...allowErrors,·...denyErrors];
+       60 │ + ··if·(errors.length·>·0)·return·{·policy:·null,·errors·};
+    41 61 │     const anchors = new Set((input.symlinks ?? []).map((path) => canonicalizeWriteDomain(path)));
+    42 62 │     return {
+    ····· │ 
+    45 65 │         check(request: string): PathDecision {
+    46 66 │           const reject = (reason: string): PathDecision => ({ allowed: false, path: request, reason });
+    47    │ - ········if·(AMBIGUOUS.test(request))·return·reject("ambiguous·path:·glob·metacharacters·and·backslashes·are·not·accepted");
+       67 │ + ········if·(AMBIGUOUS.test(request))
+       68 │ + ··········return·reject("ambiguous·path:·glob·metacharacters·and·backslashes·are·not·accepted");
+    48 69 │           if (request.startsWith("~")) return reject("home-relative paths are rejected");
+    49 70 │           if (request.endsWith("/")) return reject("ambiguous path: trailing separator");
+    50    │ - ········if·(request.trim()·===·""·||·request·!==·request.trim())·return·reject("ambiguous·path:·blank·or·whitespace-padded");
+       71 │ + ········if·(request.trim()·===·""·||·request·!==·request.trim())
+       72 │ + ··········return·reject("ambiguous·path:·blank·or·whitespace-padded");
+    51 73 │           let path: string;
+    52    │ - ········try·{·path·=·canonicalizeWriteDomain(request);·}·catch·(error)·{·return·reject((error·as·Error).message);·}
+       74 │ + ········try·{
+       75 │ + ··········path·=·canonicalizeWriteDomain(request);
+       76 │ + ········}·catch·(error)·{
+       77 │ + ··········return·reject((error·as·Error).message);
+       78 │ + ········}
+    53 79 │           const segments = path.split("/");
+    54 80 │           for (let depth = 1; depth <= segments.length; depth += 1) {
+    ····· │ 
+    59 85 │           if (denied) return reject(`denied by "${denied.source}"`);
+    60 86 │           const granted = allow.find((pattern) => matches(pattern, segments));
+    61    │ - ········return·granted·?·{·allowed:·true,·path,·reason:·`matched·by·"${granted.source}"`·}·:·reject("no·allow·pattern·matches");
+       87 │ + ········return·granted
+       88 │ + ··········?·{·allowed:·true,·path,·reason:·`matched·by·"${granted.source}"`·}
+       89 │ + ··········:·reject("no·allow·pattern·matches");
+    62 90 │         },
+    63 91 │       },
+  
+
+src/bootstrap/resultGate.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     9   9 │   import type { DiffGuardReport } from "./diffGuard.ts";
+    10  10 │   import type { TaskManifest } from "./taskManifest.ts";
+    11     │ - export·interface·Proof·{·command:·string;·exitCode:·number;·outputArtifact:·string·}
+    12     │ - export·interface·GateObservations·{·requiredCommands:·readonly·string[];·proofs:·readonly·Proof[];·artifactSha256:·Readonly<Record<string,·string·|·null>>;·expectedArtifactSha256?:·Readonly<Record<string,·string>>;·diff:·DiffGuardReport;·commitParentSha:·string;·approvedBaseSha:·string·}
+    13     │ - export·interface·GateResult·{·ok:·boolean;·blockers:·string[]·}
+        11 │ + export·interface·Proof·{
+        12 │ + ··command:·string;
+        13 │ + ··exitCode:·number;
+        14 │ + ··outputArtifact:·string;
+        15 │ + }
+        16 │ + export·interface·GateObservations·{
+        17 │ + ··requiredCommands:·readonly·string[];
+        18 │ + ··proofs:·readonly·Proof[];
+        19 │ + ··artifactSha256:·Readonly<Record<string,·string·|·null>>;
+        20 │ + ··expectedArtifactSha256?:·Readonly<Record<string,·string>>;
+        21 │ + ··diff:·DiffGuardReport;
+        22 │ + ··commitParentSha:·string;
+        23 │ + ··approvedBaseSha:·string;
+        24 │ + }
+        25 │ + export·interface·GateResult·{
+        26 │ + ··ok:·boolean;
+        27 │ + ··blockers:·string[];
+        28 │ + }
+    14  29 │   /** Protocol canonicalization (02-HANDOFF-PROTOCOL.md:15): sorted keys at every level, compact JSON, UTF-8, `handoffHash` excluded. */
+    15  30 │   export function canonicalHash(record: unknown): string {
+    16     │ - ··const·sort·=·(value:·unknown):·unknown·=>·Array.isArray(value)·?·value.map(sort)·:·value·!==·null·&&·typeof·value·===·"object"
+    17     │ - ····?·Object.fromEntries(Object.keys(value·as·Record<string,·unknown>).sort().map((key)·=>·[key,·sort((value·as·Record<string,·unknown>)[key])]))·:·value;
+    18     │ - ··const·clone·=·{·...(record·as·Record<string,·unknown>)·};·delete·clone.handoffHash;·return·`sha256:${createHash("sha256").update(JSON.stringify(sort(clone)),·"utf8").digest("hex")}`;
+        31 │ + ··const·sort·=·(value:·unknown):·unknown·=>
+        32 │ + ····Array.isArray(value)
+        33 │ + ······?·value.map(sort)
+        34 │ + ······:·value·!==·null·&&·typeof·value·===·"object"
+        35 │ + ········?·Object.fromEntries(
+        36 │ + ············Object.keys(value·as·Record<string,·unknown>)
+        37 │ + ··············.sort()
+        38 │ + ··············.map((key)·=>·[key,·sort((value·as·Record<string,·unknown>)[key])]),
+        39 │ + ··········)
+        40 │ + ········:·value;
+        41 │ + ··const·clone·=·{·...(record·as·Record<string,·unknown>)·};
+        42 │ + ··delete·clone.handoffHash;
+        43 │ + ··return·`sha256:${createHash("sha256")
+        44 │ + ····.update(JSON.stringify(sort(clone)),·"utf8")
+        45 │ + ····.digest("hex")}`;
+    19  46 │   }
+    20  47 │   
+    ······ │ 
+    27  54 │   export const taskAuthorityHash = (manifest: TaskManifest): string => canonicalHash(manifest);
+    28  55 │   
+    29     │ - export·function·hashArtifact(path:·string):·string·|·null·{·try·{·return·`sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;·}·catch·{·return·null;·}·}
+        56 │ + export·function·hashArtifact(path:·string):·string·|·null·{
+        57 │ + ··try·{
+        58 │ + ····return·`sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
+        59 │ + ··}·catch·{
+        60 │ + ····return·null;
+        61 │ + ··}
+        62 │ + }
+    30  63 │   export function evaluateResultGate(obs: GateObservations): GateResult {
+    31     │ - ··const·proofs·=·new·Map(obs.proofs.map((proof)·=>·[proof.command,·proof]));·const·blockers:·string[]·=·[];
+    32     │ - ··for·(const·command·of·obs.requiredCommands)·{·const·proof·=·proofs.get(command);
+    33     │ - ····if·(proof·===·undefined)·blockers.push(`missing·proof·for·required·command:·${command}`);·else·if·(proof.exitCode·!==·0)·blockers.push(`proof·exit·code·${proof.exitCode}·!=·0·for:·${command}`);·}
+        64 │ + ··const·proofs·=·new·Map(obs.proofs.map((proof)·=>·[proof.command,·proof]));
+        65 │ + ··const·blockers:·string[]·=·[];
+        66 │ + ··for·(const·command·of·obs.requiredCommands)·{
+        67 │ + ····const·proof·=·proofs.get(command);
+        68 │ + ····if·(proof·===·undefined)·blockers.push(`missing·proof·for·required·command:·${command}`);
+        69 │ + ····else·if·(proof.exitCode·!==·0)·blockers.push(`proof·exit·code·${proof.exitCode}·!=·0·for:·${command}`);
+        70 │ + ··}
+    34  71 │     for (const proof of obs.proofs) {
+    35     │ - ····const·sha·=·obs.artifactSha256[proof.outputArtifact]·??·null;·const·want·=·obs.expectedArtifactSha256?.[proof.outputArtifact];
+    36     │ - ····if·(sha·===·null)·blockers.push(`evidence·artifact·absent·or·unreadable:·${proof.outputArtifact}`);·else·if·(want·!==·undefined·&&·sha·!==·want)·blockers.push(`evidence·tampered:·${proof.outputArtifact}·sha·${sha}·!=·recorded·${want}`);
+        72 │ + ····const·sha·=·obs.artifactSha256[proof.outputArtifact]·??·null;
+        73 │ + ····const·want·=·obs.expectedArtifactSha256?.[proof.outputArtifact];
+        74 │ + ····if·(sha·===·null)·blockers.push(`evidence·artifact·absent·or·unreadable:·${proof.outputArtifact}`);
+        75 │ + ····else·if·(want·!==·undefined·&&·sha·!==·want)
+        76 │ + ······blockers.push(`evidence·tampered:·${proof.outputArtifact}·sha·${sha}·!=·recorded·${want}`);
+    37  77 │     }
+    38     │ - ··if·(!obs.diff.ok)·for·(const·violation·of·obs.diff.violations)·blockers.push(`diff·scope·rejected·(${violation.kind}):·${violation.detail}`);
+    39     │ - ··if·(obs.commitParentSha·!==·obs.approvedBaseSha)·blockers.push(`commit·parent·${obs.commitParentSha}·!=·approved·base·${obs.approvedBaseSha}`);·//·the·task·commit·must·sit·on·the·approved·base
+        78 │ + ··if·(!obs.diff.ok)
+        79 │ + ····for·(const·violation·of·obs.diff.violations)
+        80 │ + ······blockers.push(`diff·scope·rejected·(${violation.kind}):·${violation.detail}`);
+        81 │ + ··if·(obs.commitParentSha·!==·obs.approvedBaseSha)
+        82 │ + ····blockers.push(`commit·parent·${obs.commitParentSha}·!=·approved·base·${obs.approvedBaseSha}`);·//·the·task·commit·must·sit·on·the·approved·base
+    40  83 │     return { ok: blockers.length === 0, blockers };
+    41  84 │   }
+    42  85 │   
+    43  86 │   /** Atomic (tmp + rename) and immutable: an existing handoff is never rewritten. Returns the stamped checksum. */
+    44     │ - export·function·writeHandoff(dir:·string,·taskId:·string,·record:·Record<string,·unknown>):·{·path:·string;·handoffHash:·string·}·{
+    45     │ - ··const·handoffHash·=·canonicalHash(record);·const·target·=·join(dir,·`${taskId}.handoff.json`);
+        87 │ + export·function·writeHandoff(
+        88 │ + ··dir:·string,
+        89 │ + ··taskId:·string,
+        90 │ + ··record:·Record<string,·unknown>,
+        91 │ + ):·{·path:·string;·handoffHash:·string·}·{
+        92 │ + ··const·handoffHash·=·canonicalHash(record);
+        93 │ + ··const·target·=·join(dir,·`${taskId}.handoff.json`);
+    46  94 │     if (existsSync(target)) throw new Error(`refusing to overwrite an existing handoff: ${target}`);
+    47     │ - ··const·tmp·=·join(dir,·`.${taskId}.handoff.${process.pid}.tmp`);·writeFileSync(tmp,·`${JSON.stringify({·...record,·handoffHash·},·null,·2)}\n`,·"utf8");·renameSync(tmp,·target);
+        95 │ + ··const·tmp·=·join(dir,·`.${taskId}.handoff.${process.pid}.tmp`);
+        96 │ + ··writeFileSync(tmp,·`${JSON.stringify({·...record,·handoffHash·},·null,·2)}\n`,·"utf8");
+        97 │ + ··renameSync(tmp,·target);
+    48  98 │     return { path: target, handoffHash };
+    49  99 │   }
+  
+
+src/bootstrap/handoffWriter.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    12 12 │   import { writeHandoff as writeHandoffAtomic } from "./resultGate.ts";
+    13 13 │   
+    14    │ - const·isObject·=·(value:·unknown):·value·is·Record<string,·unknown>·=>·value·!==·null·&&·typeof·value·===·"object"·&&·!Array.isArray(value);
+       14 │ + const·isObject·=·(value:·unknown):·value·is·Record<string,·unknown>·=>
+       15 │ + ··value·!==·null·&&·typeof·value·===·"object"·&&·!Array.isArray(value);
+    15 16 │   const lit = (value: unknown): string => JSON.stringify(value) ?? String(value);
+    16 17 │   const sameJson = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+    17    │ - const·TYPE_CHECKS:·Record<string,·(value:·unknown)·=>·boolean>·=·{·null:·(v)·=>·v·===·null,·string:·(v)·=>·typeof·v·===·"string",·boolean:·(v)·=>·typeof·v·===·"boolean",·number:·(v)·=>·typeof·v·===·"number",·integer:·(v)·=>·typeof·v·===·"number"·&&·Number.isInteger(v),·array:·(v)·=>·Array.isArray(v),·object:·isObject·};
+       18 │ + const·TYPE_CHECKS:·Record<string,·(value:·unknown)·=>·boolean>·=·{
+       19 │ + ··null:·(v)·=>·v·===·null,
+       20 │ + ··string:·(v)·=>·typeof·v·===·"string",
+       21 │ + ··boolean:·(v)·=>·typeof·v·===·"boolean",
+       22 │ + ··number:·(v)·=>·typeof·v·===·"number",
+       23 │ + ··integer:·(v)·=>·typeof·v·===·"number"·&&·Number.isInteger(v),
+       24 │ + ··array:·(v)·=>·Array.isArray(v),
+       25 │ + ··object:·isObject,
+       26 │ + };
+    18 27 │   /** A `type` keyword outside this table constrains nothing: we invent no semantics the schema does not state. */
+    19    │ - const·matchesType·=·(type:·unknown,·value:·unknown):·boolean·=>·{·const·check·=·typeof·type·===·"string"·?·TYPE_CHECKS[type]·:·undefined;·return·check·===·undefined·||·check(value);·};
+       28 │ + const·matchesType·=·(type:·unknown,·value:·unknown):·boolean·=>·{
+       29 │ + ··const·check·=·typeof·type·===·"string"·?·TYPE_CHECKS[type]·:·undefined;
+       30 │ + ··return·check·===·undefined·||·check(value);
+       31 │ + };
+    20 32 │   
+    21 33 │   /** Recursive descent over `properties`/`items`; `top` is what enables the single `handoffHash` exemption. */
+    22 34 │   function walk(value: unknown, schema: unknown, path: string, top: boolean, blockers: string[]): void {
+    23    │ - ··if·(!isObject(schema))·{·blockers.push(`${path}:·schema·is·not·an·object:·${lit(schema)}`);·return;·}
+       35 │ + ··if·(!isObject(schema))·{
+       36 │ + ····blockers.push(`${path}:·schema·is·not·an·object:·${lit(schema)}`);
+       37 │ + ····return;
+       38 │ + ··}
+    24 39 │     const properties = isObject(schema.properties) ? schema.properties : {};
+    25    │ - ··if·(Array.isArray(schema.enum)·&&·!schema.enum.some((option)·=>·sameJson(option,·value)))·blockers.push(`${path}:·${lit(value)}·is·not·one·of·enum·${lit(schema.enum)}`);
+    26    │ - ··if·("const"·in·schema·&&·!sameJson(schema.const,·value))·blockers.push(`${path}:·${lit(value)}·!=·const·${lit(schema.const)}`);
+       40 │ + ··if·(Array.isArray(schema.enum)·&&·!schema.enum.some((option)·=>·sameJson(option,·value)))
+       41 │ + ····blockers.push(`${path}:·${lit(value)}·is·not·one·of·enum·${lit(schema.enum)}`);
+       42 │ + ··if·("const"·in·schema·&&·!sameJson(schema.const,·value))
+       43 │ + ····blockers.push(`${path}:·${lit(value)}·!=·const·${lit(schema.const)}`);
+    27 44 │     const types = schema.type === undefined ? [] : Array.isArray(schema.type) ? schema.type : [schema.type];
+    28    │ - ··if·(types.length·>·0·&&·!types.some((type)·=>·matchesType(type,·value)))·blockers.push(`${path}:·${lit(value)}·does·not·match·type·${lit(schema.type)}`);
+       45 │ + ··if·(types.length·>·0·&&·!types.some((type)·=>·matchesType(type,·value)))
+       46 │ + ····blockers.push(`${path}:·${lit(value)}·does·not·match·type·${lit(schema.type)}`);
+    29 47 │     if (isObject(value)) {
+    30    │ - ····if·(Array.isArray(schema.required))·for·(const·key·of·schema.required)·{
+    31    │ - ······if·(typeof·key·!==·"string")·blockers.push(`${path}.${lit(key)}:·schema·required·entry·is·not·a·string`);
+    32    │ - ······else·if·(!(top·&&·key·===·"handoffHash")·&&·!(key·in·value))·blockers.push(`${path}.${key}:·required·property·missing`);
+    33    │ - ····}
+    34    │ - ····if·(schema.additionalProperties·===·false)·for·(const·key·of·Object.keys(value))·if·(!(top·&&·key·===·"handoffHash")·&&·!(key·in·properties))·blockers.push(`${path}.${key}:·disallowed·additional·property`);
+    35    │ - ····for·(const·[key,·sub]·of·Object.entries(properties))·if·(key·in·value)·walk(value[key],·sub,·`${path}.${key}`,·false,·blockers);
+    36    │ - ··}·else·if·(Array.isArray(schema.required)·||·schema.additionalProperties·!==·undefined·||·Object.keys(properties).length·>·0)·blockers.push(`${path}:·object·required·by·schema,·got·${lit(value)}`);
+    37    │ - ··if·(!Array.isArray(value))·{·if·(schema.items·!==·undefined)·blockers.push(`${path}:·items·declared·but·value·is·${lit(value)},·not·an·array`);·return;·}
+       48 │ + ····if·(Array.isArray(schema.required))
+       49 │ + ······for·(const·key·of·schema.required)·{
+       50 │ + ········if·(typeof·key·!==·"string")·blockers.push(`${path}.${lit(key)}:·schema·required·entry·is·not·a·string`);
+       51 │ + ········else·if·(!(top·&&·key·===·"handoffHash")·&&·!(key·in·value))
+       52 │ + ··········blockers.push(`${path}.${key}:·required·property·missing`);
+       53 │ + ······}
+       54 │ + ····if·(schema.additionalProperties·===·false)
+       55 │ + ······for·(const·key·of·Object.keys(value))
+       56 │ + ········if·(!(top·&&·key·===·"handoffHash")·&&·!(key·in·properties))
+       57 │ + ··········blockers.push(`${path}.${key}:·disallowed·additional·property`);
+       58 │ + ····for·(const·[key,·sub]·of·Object.entries(properties))
+       59 │ + ······if·(key·in·value)·walk(value[key],·sub,·`${path}.${key}`,·false,·blockers);
+       60 │ + ··}·else·if·(
+       61 │ + ····Array.isArray(schema.required)·||
+       62 │ + ····schema.additionalProperties·!==·undefined·||
+       63 │ + ····Object.keys(properties).length·>·0
+       64 │ + ··)
+       65 │ + ····blockers.push(`${path}:·object·required·by·schema,·got·${lit(value)}`);
+       66 │ + ··if·(!Array.isArray(value))·{
+       67 │ + ····if·(schema.items·!==·undefined)·blockers.push(`${path}:·items·declared·but·value·is·${lit(value)},·not·an·array`);
+       68 │ + ····return;
+       69 │ + ··}
+    38 70 │     if (schema.items === undefined) return;
+    39    │ - ··if·(!isObject(schema.items))·{·blockers.push(`${path}.items:·schema·is·not·an·object:·${lit(schema.items)}`);·return;·}
+       71 │ + ··if·(!isObject(schema.items))·{
+       72 │ + ····blockers.push(`${path}.items:·schema·is·not·an·object:·${lit(schema.items)}`);
+       73 │ + ····return;
+       74 │ + ··}
+    40 75 │     value.forEach((element, index) => walk(element, schema.items, `${path}[${index}]`, false, blockers));
+    41 76 │   }
+    ····· │ 
+    43 78 │   /** Blockers for `record` against `schema`; `[]` means it conforms. Pure, never throws — hostile input is a blocker. */
+    44 79 │   export function validateHandoffSchema(record: Record<string, unknown>, schema: unknown): string[] {
+    45    │ - ··const·blockers:·string[]·=·[];·walk(record,·schema,·"$",·true,·blockers);·return·blockers;
+       80 │ + ··const·blockers:·string[]·=·[];
+       81 │ + ··walk(record,·schema,·"$",·true,·blockers);
+       82 │ + ··return·blockers;
+    46 83 │   }
+    47 84 │   
+    48 85 │   /** resultGate's writer with every rule intact (canonical hash excluding `handoffHash`, tmp + rename, never overwrite, same return value) plus mkdir -p, so `.<taskId>.handoff.<pid>.tmp` can no longer fail ENOENT in a missing directory. */
+    49    │ - export·function·writeHandoff(dir:·string,·taskId:·string,·record:·Record<string,·unknown>):·{·path:·string;·handoffHash:·string·}·{
+    50    │ - ··mkdirSync(dir,·{·recursive:·true·});·return·writeHandoffAtomic(dir,·taskId,·record);
+       86 │ + export·function·writeHandoff(
+       87 │ + ··dir:·string,
+       88 │ + ··taskId:·string,
+       89 │ + ··record:·Record<string,·unknown>,
+       90 │ + ):·{·path:·string;·handoffHash:·string·}·{
+       91 │ + ··mkdirSync(dir,·{·recursive:·true·});
+       92 │ + ··return·writeHandoffAtomic(dir,·taskId,·record);
+    51 93 │   }
+    52 94 │   
+  
+
+src/bootstrap/diffGuard.ts:57:83 lint/style/useTemplate  FIXABLE  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Template literals are preferred over string concatenation.
+  
+    55 │   const push = (kind: DiffViolationKind, path: string | null, detail: string): void => { violations.push({ kind, path, detail }); };
+    56 │   for (const path of changedPaths) {
+  > 57 │     const decision = built.policy?.check(path) ?? { allowed: false, path, reason: "path policy unavailable: " + built.errors.join("; ") };
+       │                                                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    58 │     if (!decision.allowed) push(decision.reason.startsWith("denied by") ? "denied-path" : "unexpected-path", path, decision.reason);
+    59 │     if (GENERATED_DIR.test(path) || GENERATED_FILE.test(path)) push("generated-file", path, "machine-generated output is never an accepted deliverable");
+  
+  i Unsafe fix: Use a template literal.
+  
+    55 55 │     const push = (kind: DiffViolationKind, path: string | null, detail: string): void => { violations.push({ kind, path, detail }); };
+    56 56 │     for (const path of changedPaths) {
+    57    │ - ····const·decision·=·built.policy?.check(path)·??·{·allowed:·false,·path,·reason:·"path·policy·unavailable:·"·+·built.errors.join(";·")·};
+       57 │ + ····const·decision·=·built.policy?.check(path)·??·{·allowed:·false,·path,·reason:·`path·policy·unavailable:·${built.errors.join(";·")}`·};
+    58 58 │       if (!decision.allowed) push(decision.reason.startsWith("denied by") ? "denied-path" : "unexpected-path", path, decision.reason);
+    59 59 │       if (GENERATED_DIR.test(path) || GENERATED_FILE.test(path)) push("generated-file", path, "machine-generated output is never an accepted deliverable");
+  
+
+src/bootstrap/taskAuthority.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     6   6 │    */
+     7   7 │   import { canonicalHash } from "./resultGate.ts";
+     8     │ - export·const·AUTHORITY_KIND·=·"operator-task/v1";·export·const·PLANNER_KIND·=·"planner-contract/v1";
+     9     │ - const·FIELDS·=·["goal",·"scope",·"nonGoals",·"tests"]·as·const;·const·LIST_FIELDS·=·["scope",·"nonGoals",·"tests"]·as·const;
+         8 │ + export·const·AUTHORITY_KIND·=·"operator-task/v1";
+         9 │ + export·const·PLANNER_KIND·=·"planner-contract/v1";
+        10 │ + const·FIELDS·=·["goal",·"scope",·"nonGoals",·"tests"]·as·const;
+        11 │ + const·LIST_FIELDS·=·["scope",·"nonGoals",·"tests"]·as·const;
+    10  12 │   export type AuthorityField = (typeof FIELDS)[number];
+    11     │ - export·interface·OperatorTaskSource·{·goal:·string;·scope:·readonly·string[];·nonGoals:·readonly·string[];·tests:·readonly·string[];·origin?:·string·}
+    12     │ - export·interface·CanonicalTask·{·kind:·string;·goal:·string;·scope:·string[];·nonGoals:·string[];·tests:·string[]·}
+    13     │ - export·interface·PlannerContract·{·plan:·string;·tasks:·readonly·string[];·restatement?:·Record<string,·unknown>·}
+    14     │ - export·type·TaskAuthorityResult·=·{·ok:·true;·authorityHash:·string;·canonical:·CanonicalTask·}·|·{·ok:·false;·reasons:·string[]·};
+    15     │ - export·interface·AuthorityVerification·{·ok:·boolean;·authorityHash:·string·|·null;·diverged:·AuthorityField[];·reasons:·string[]·}
+        13 │ + export·interface·OperatorTaskSource·{
+        14 │ + ··goal:·string;
+        15 │ + ··scope:·readonly·string[];
+        16 │ + ··nonGoals:·readonly·string[];
+        17 │ + ··tests:·readonly·string[];
+        18 │ + ··origin?:·string;
+        19 │ + }
+        20 │ + export·interface·CanonicalTask·{
+        21 │ + ··kind:·string;
+        22 │ + ··goal:·string;
+        23 │ + ··scope:·string[];
+        24 │ + ··nonGoals:·string[];
+        25 │ + ··tests:·string[];
+        26 │ + }
+        27 │ + export·interface·PlannerContract·{
+        28 │ + ··plan:·string;
+        29 │ + ··tasks:·readonly·string[];
+        30 │ + ··restatement?:·Record<string,·unknown>;
+        31 │ + }
+        32 │ + export·type·TaskAuthorityResult·=
+        33 │ + ··|·{·ok:·true;·authorityHash:·string;·canonical:·CanonicalTask·}
+        34 │ + ··|·{·ok:·false;·reasons:·string[]·};
+        35 │ + export·interface·AuthorityVerification·{
+        36 │ + ··ok:·boolean;
+        37 │ + ··authorityHash:·string·|·null;
+        38 │ + ··diverged:·AuthorityField[];
+        39 │ + ··reasons:·string[];
+        40 │ + }
+    16  41 │   const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+    17     │ - const·sameList·=·(a:·readonly·string[],·b:·readonly·string[]):·boolean·=>·a.length·===·b.length·&&·a.every((s,·i)·=>·s·===·b[i]);
+        42 │ + const·sameList·=·(a:·readonly·string[],·b:·readonly·string[]):·boolean·=>
+        43 │ + ··a.length·===·b.length·&&·a.every((s,·i)·=>·s·===·b[i]);
+    18  44 │   // Trim, drop empty strings, collapse duplicates keeping the first occurrence, preserve authored order (a scope list
+    19  45 │   // is a contract, not a set). Non-string members and non-arrays are reported, never coerced or silently dropped.
+    20  46 │   function cleanList(value: unknown): { values: string[]; bad: string[] } {
+    21  47 │     if (!Array.isArray(value)) return { values: [], bad: ["expected an array of strings"] };
+    22     │ - ··const·values:·string[]·=·[];·const·bad:·string[]·=·[];
+    23     │ - ··value.forEach((member,·i)·=>·{·if·(typeof·member·!==·"string")·bad.push(`member·${i}·is·not·a·string`);·else·{·const·s·=·member.trim();·if·(s·!==·""·&&·!values.includes(s))·values.push(s);·}·});
+        48 │ + ··const·values:·string[]·=·[];
+        49 │ + ··const·bad:·string[]·=·[];
+        50 │ + ··value.forEach((member,·i)·=>·{
+        51 │ + ····if·(typeof·member·!==·"string")·bad.push(`member·${i}·is·not·a·string`);
+        52 │ + ····else·{
+        53 │ + ······const·s·=·member.trim();
+        54 │ + ······if·(s·!==·""·&&·!values.includes(s))·values.push(s);
+        55 │ + ····}
+        56 │ + ··});
+    24  57 │     return { values, bad };
+    25  58 │   }
+    ······ │ 
+    28  61 │     if (!isRecord(source)) return { ok: false, reasons: ["source: expected an operator-authored task object"] };
+    29  62 │     const reasons: string[] = [];
+    30     │ - ··if·(source.origin·!==·undefined·&&·source.origin·!==·"operator")·reasons.push(`origin:·${typeof·source.origin·===·"string"·&&·source.origin·!==·""·?·source.origin·:·typeof·source.origin}-authored·content·cannot·define·task·authority,·expected·"operator"`);
+        63 │ + ··if·(source.origin·!==·undefined·&&·source.origin·!==·"operator")
+        64 │ + ····reasons.push(
+        65 │ + ······`origin:·${typeof·source.origin·===·"string"·&&·source.origin·!==·""·?·source.origin·:·typeof·source.origin}-authored·content·cannot·define·task·authority,·expected·"operator"`,
+        66 │ + ····);
+    31  67 │     const goal = typeof source.goal === "string" ? source.goal.trim() : "";
+    32     │ - ··if·(typeof·source.goal·!==·"string")·reasons.push("goal:·expected·a·string");·else·if·(goal·===·"")·reasons.push("goal:·empty·after·trimming");
+        68 │ + ··if·(typeof·source.goal·!==·"string")·reasons.push("goal:·expected·a·string");
+        69 │ + ··else·if·(goal·===·"")·reasons.push("goal:·empty·after·trimming");
+    33  70 │     const lists = {} as Record<(typeof LIST_FIELDS)[number], string[]>;
+    34     │ - ··for·(const·field·of·LIST_FIELDS)·{·const·cleaned·=·cleanList(source[field]);·for·(const·reason·of·cleaned.bad)·reasons.push(`${field}:·${reason}`);
+    35     │ - ····if·(cleaned.values.length·===·0·&&·cleaned.bad.length·===·0)·reasons.push(`${field}:·empty·after·canonicalization`);·lists[field]·=·cleaned.values;·}
+        71 │ + ··for·(const·field·of·LIST_FIELDS)·{
+        72 │ + ····const·cleaned·=·cleanList(source[field]);
+        73 │ + ····for·(const·reason·of·cleaned.bad)·reasons.push(`${field}:·${reason}`);
+        74 │ + ····if·(cleaned.values.length·===·0·&&·cleaned.bad.length·===·0)·reasons.push(`${field}:·empty·after·canonicalization`);
+        75 │ + ····lists[field]·=·cleaned.values;
+        76 │ + ··}
+    36  77 │     if (reasons.length > 0) return { ok: false, reasons }; // no placeholder is ever invented for a missing operator field
+    37     │ - ··const·canonical:·CanonicalTask·=·{·kind:·AUTHORITY_KIND,·goal,·scope:·lists.scope,·nonGoals:·lists.nonGoals,·tests:·lists.tests·};
+        78 │ + ··const·canonical:·CanonicalTask·=·{
+        79 │ + ····kind:·AUTHORITY_KIND,
+        80 │ + ····goal,
+        81 │ + ····scope:·lists.scope,
+        82 │ + ····nonGoals:·lists.nonGoals,
+        83 │ + ····tests:·lists.tests,
+        84 │ + ··};
+    38  85 │     return { ok: true, authorityHash: canonicalHash(canonical), canonical };
+    39  86 │   }
+    40  87 │   /** The generated planner artifact hashes over its own canonical form, so identical words give a different digest; its restatement is recorded, never dropped. */
+    41  88 │   export function derivePlannerContractHash(contract: PlannerContract): string {
+    42     │ - ··return·canonicalHash({·kind:·PLANNER_KIND,·plan:·contract.plan.trim(),·tasks:·contract.tasks.map((t)·=>·t.trim()).filter((t)·=>·t·!==·""),·restatement:·contract.restatement·??·null·});
+        89 │ + ··return·canonicalHash({
+        90 │ + ····kind:·PLANNER_KIND,
+        91 │ + ····plan:·contract.plan.trim(),
+        92 │ + ····tasks:·contract.tasks.map((t)·=>·t.trim()).filter((t)·=>·t·!==·""),
+        93 │ + ····restatement:·contract.restatement·??·null,
+        94 │ + ··});
+    43  95 │   }
+    44  96 │   /** Recompute authority from the frozen operator source ONLY. Planner output is read to name `diverged` drift — a field stated at its top level, or else under `plannerOutput.restatement` (this module's own PlannerContract shape) — and is never substituted, so a planner edit — however it restates goal/scope/nonGoals/tests — cannot move the hash, and divergence is never a re-authorization. */
+    45     │ - export·function·verifyAuthority(authorityHash:·string,·candidate:·{·source:·unknown;·plannerOutput?:·unknown·}):·AuthorityVerification·{
+        97 │ + export·function·verifyAuthority(
+        98 │ + ··authorityHash:·string,
+        99 │ + ··candidate:·{·source:·unknown;·plannerOutput?:·unknown·},
+       100 │ + ):·AuthorityVerification·{
+    46 101 │     const derived = deriveTaskAuthority(candidate.source);
+    47 102 │     if (!derived.ok) return { ok: false, authorityHash: null, diverged: [], reasons: derived.reasons };
+    48     │ - ··const·planner·=·isRecord(candidate.plannerOutput)·?·candidate.plannerOutput·:·{};·const·nested·=·isRecord(planner.restatement)·?·planner.restatement·:·{};·const·diverged:·AuthorityField[]·=·[];
+    49     │ - ··for·(const·field·of·FIELDS)·{·const·holder·=·field·in·planner·?·planner·:·nested;·if·(!(field·in·holder))·continue;·const·restated·=·holder[field];·//·top-level·restatement·wins;·a·PlannerContract's·nested·restatement·is·the·fallback·holder
+    50     │ - ····if·(field·===·"goal")·{·if·(typeof·restated·!==·"string"·||·restated.trim()·!==·derived.canonical.goal)·diverged.push(field);·}
+    51     │ - ····else·{·const·cleaned·=·cleanList(restated);·if·(cleaned.bad.length·>·0·||·!sameList(cleaned.values,·derived.canonical[field]))·diverged.push(field);·}·}
+       103 │ + ··const·planner·=·isRecord(candidate.plannerOutput)·?·candidate.plannerOutput·:·{};
+       104 │ + ··const·nested·=·isRecord(planner.restatement)·?·planner.restatement·:·{};
+       105 │ + ··const·diverged:·AuthorityField[]·=·[];
+       106 │ + ··for·(const·field·of·FIELDS)·{
+       107 │ + ····const·holder·=·field·in·planner·?·planner·:·nested;
+       108 │ + ····if·(!(field·in·holder))·continue;
+       109 │ + ····const·restated·=·holder[field];·//·top-level·restatement·wins;·a·PlannerContract's·nested·restatement·is·the·fallback·holder
+       110 │ + ····if·(field·===·"goal")·{
+       111 │ + ······if·(typeof·restated·!==·"string"·||·restated.trim()·!==·derived.canonical.goal)·diverged.push(field);
+       112 │ + ····}·else·{
+       113 │ + ······const·cleaned·=·cleanList(restated);
+       114 │ + ······if·(cleaned.bad.length·>·0·||·!sameList(cleaned.values,·derived.canonical[field]))·diverged.push(field);
+       115 │ + ····}
+       116 │ + ··}
+    52 117 │     const ok = derived.authorityHash === authorityHash;
+    53     │ - ··return·{·ok,·authorityHash:·derived.authorityHash,·diverged,·reasons:·ok·?·[]·:·[`authority·mismatch:·recomputed·${derived.authorityHash}·!=·recorded·${authorityHash}`]·};
+       118 │ + ··return·{
+       119 │ + ····ok,
+       120 │ + ····authorityHash:·derived.authorityHash,
+       121 │ + ····diverged,
+       122 │ + ····reasons:·ok·?·[]·:·[`authority·mismatch:·recomputed·${derived.authorityHash}·!=·recorded·${authorityHash}`],
+       123 │ + ··};
+    54 124 │   }
+    55 125 │   
+  
+
+src/bootstrap/trailVerifier.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+          1 │ + import·{·sep·}·from·"node:path";
+      1   2 │   /**
+      2   3 │    * V07: verify a finished handoff trail from the outside. Where `resultGate` gates ONE task at write time, this
+    ······· │ 
+     18  19 │    */
+     19  20 │   import { validateHandoffSchema } from "./handoffWriter.ts";
+     20     │ - import·{·canonicalHash·}·from·"./resultGate.ts";
+     21     │ - import·{·sep·}·from·"node:path";
+         21 │ + import·{·canonicalHash·}·from·"./resultGate.ts";
+     22  22 │   
+     23  23 │   export interface TrailRecord {
+  
+
+src/bootstrap/taskManifest.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     1   1 │   /** B01 microtask manifest schema: parse + validate only (no runtime integration, no I/O, no deps); see tasks/02-B01.md. */
+     2     │ - export·const·TASK_MANIFEST_FIELDS·=·["taskId",·"baseSha",·"repoId",·"objective",·"allowPaths",·"denyPaths",·"commands",·"limits",·"parentHandoffHash",·"expectedOutputs",·"mode"]·as·const;
+         2 │ + export·const·TASK_MANIFEST_FIELDS·=·[
+         3 │ + ··"taskId",
+         4 │ + ··"baseSha",
+         5 │ + ··"repoId",
+         6 │ + ··"objective",
+         7 │ + ··"allowPaths",
+         8 │ + ··"denyPaths",
+         9 │ + ··"commands",
+        10 │ + ··"limits",
+        11 │ + ··"parentHandoffHash",
+        12 │ + ··"expectedOutputs",
+        13 │ + ··"mode",
+        14 │ + ]·as·const;
+     3  15 │   export const TASK_MANIFEST_MODES = ["read-only", "isolated-change", "herdr-ui"] as const;
+     4  16 │   export type TaskManifestMode = (typeof TASK_MANIFEST_MODES)[number];
+     5     │ - export·const·MICROTASK_CEILING·=·{·maxProductionFiles:·2,·maxTestFiles:·2,·maxChangedLines:·100·};··//·bootstrap·hard·ceiling:·the·file·caps·apply·to·every·mode
+        17 │ + export·const·MICROTASK_CEILING·=·{·maxProductionFiles:·2,·maxTestFiles:·2,·maxChangedLines:·100·};·//·bootstrap·hard·ceiling:·the·file·caps·apply·to·every·mode
+     6  18 │   // 03-TEST-AND-RELEASE-GATES.md rule 3: "<=2 production files, <=2 tests, target <=100 changed lines (Herdr UI <=120)".
+     7     │ - export·const·MODE_LINE_CEILINGS:·Record<TaskManifestMode,·number>·=·{·"read-only":·100,·"isolated-change":·100,·"herdr-ui":·120·};
+        19 │ + export·const·MODE_LINE_CEILINGS:·Record<TaskManifestMode,·number>·=·{
+        20 │ + ··"read-only":·100,
+        21 │ + ··"isolated-change":·100,
+        22 │ + ··"herdr-ui":·120,
+        23 │ + };
+     8  24 │   export const DEFAULT_LIMITS = { maxProductionFiles: 1, maxTestFiles: 1, maxChangedLines: 100 };
+     9  25 │   const OPTIONAL_FIELDS = ["limits", "denyPaths", "expectedOutputs"] as const; // absent -> defaults
+    10  26 │   const LIMIT_FIELDS = ["maxProductionFiles", "maxTestFiles", "maxChangedLines"] as const;
+    11     │ - export·interface·TaskManifestLimits·{·maxProductionFiles:·number;·maxTestFiles:·number;·maxChangedLines:·number·}
+    12     │ - export·interface·TaskManifestCommand·{·argv:·string[];·cwd:·string·}
+        27 │ + export·interface·TaskManifestLimits·{
+        28 │ + ··maxProductionFiles:·number;
+        29 │ + ··maxTestFiles:·number;
+        30 │ + ··maxChangedLines:·number;
+        31 │ + }
+        32 │ + export·interface·TaskManifestCommand·{
+        33 │ + ··argv:·string[];
+        34 │ + ··cwd:·string;
+        35 │ + }
+    13  36 │   export interface TaskManifest {
+    14     │ - ··taskId:·string;·baseSha:·string;·repoId:·string;·objective:·string;·allowPaths:·string[];·denyPaths:·string[];
+    15     │ - ··commands:·TaskManifestCommand[];·limits:·TaskManifestLimits;·parentHandoffHash:·string·|·null;·expectedOutputs:·string[];·mode:·TaskManifestMode;
+        37 │ + ··taskId:·string;
+        38 │ + ··baseSha:·string;
+        39 │ + ··repoId:·string;
+        40 │ + ··objective:·string;
+        41 │ + ··allowPaths:·string[];
+        42 │ + ··denyPaths:·string[];
+        43 │ + ··commands:·TaskManifestCommand[];
+        44 │ + ··limits:·TaskManifestLimits;
+        45 │ + ··parentHandoffHash:·string·|·null;
+        46 │ + ··expectedOutputs:·string[];
+        47 │ + ··mode:·TaskManifestMode;
+    16  48 │   }
+    17  49 │   export type TaskManifestParseResult = { ok: true; manifest: TaskManifest } | { ok: false; errors: string[] };
+    18  50 │   const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+    19  51 │   const text = (v: unknown): string | undefined => (typeof v === "string" && v.trim() !== "" ? v : undefined);
+    20     │ - const·paths·=·(v:·unknown):·string[]·|·undefined·=>·(Array.isArray(v)·&&·v.every((p)·=>·typeof·p·===·"string"·&&·p.trim()·!==·"")·?·v·as·string[]·:·undefined);
+    21     │ - const·count·=·(v:·unknown):·number·|·undefined·=>·(typeof·v·===·"number"·&&·Number.isInteger(v)·&&·v·>=·0·?·v·:·undefined);
+        52 │ + const·paths·=·(v:·unknown):·string[]·|·undefined·=>
+        53 │ + ··Array.isArray(v)·&&·v.every((p)·=>·typeof·p·===·"string"·&&·p.trim()·!==·"")·?·(v·as·string[])·:·undefined;
+        54 │ + const·count·=·(v:·unknown):·number·|·undefined·=>
+        55 │ + ··typeof·v·===·"number"·&&·Number.isInteger(v)·&&·v·>=·0·?·v·:·undefined;
+    22  56 │   /** Valid input (e.g. JSON.parse output) -> { ok: true, manifest } with defaults applied; else deduplicated, sorted errors. */
+    23  57 │   export function parseTaskManifest(input: unknown): TaskManifestParseResult {
+    ······ │ 
+    26  60 │     const bad = (field: string, reason: string) => errors.push(`${field}: ${reason}`);
+    27  61 │     const m: Partial<TaskManifest> = {};
+    28     │ - ··for·(const·key·of·Object.keys(input).filter((k)·=>·!(TASK_MANIFEST_FIELDS·as·readonly·string[]).includes(k)).sort())·errors.push(`unknown·field:·${key}`);
+    29     │ - ··for·(const·field·of·TASK_MANIFEST_FIELDS)·if·(!(OPTIONAL_FIELDS·as·readonly·string[]).includes(field)·&&·input[field]·===·undefined)·errors.push(`${field}:·missing`);
+        62 │ + ··for·(const·key·of·Object.keys(input)
+        63 │ + ····.filter((k)·=>·!(TASK_MANIFEST_FIELDS·as·readonly·string[]).includes(k))
+        64 │ + ····.sort())
+        65 │ + ····errors.push(`unknown·field:·${key}`);
+        66 │ + ··for·(const·field·of·TASK_MANIFEST_FIELDS)
+        67 │ + ····if·(!(OPTIONAL_FIELDS·as·readonly·string[]).includes(field)·&&·input[field]·===·undefined)
+        68 │ + ······errors.push(`${field}:·missing`);
+    30  69 │     for (const field of ["taskId", "baseSha", "repoId", "objective"] as const) {
+    31  70 │       const value = text(input[field]);
+    ······ │ 
+    35  74 │     }
+    36  75 │     const allow = paths(input.allowPaths);
+    37     │ - ··if·(allow·===·undefined)·bad("allowPaths",·"expected·an·array·of·non-empty·paths");·else·if·(allow.length·===·0)·bad("allowPaths",·"scope·must·name·at·least·one·path");·else·m.allowPaths·=·allow;
+    38     │ - ··if·(input.denyPaths·!==·undefined)·{·const·deny·=·paths(input.denyPaths);·if·(deny·===·undefined)·bad("denyPaths",·"expected·an·array·of·paths");·else·m.denyPaths·=·deny;·}
+        76 │ + ··if·(allow·===·undefined)·bad("allowPaths",·"expected·an·array·of·non-empty·paths");
+        77 │ + ··else·if·(allow.length·===·0)·bad("allowPaths",·"scope·must·name·at·least·one·path");
+        78 │ + ··else·m.allowPaths·=·allow;
+        79 │ + ··if·(input.denyPaths·!==·undefined)·{
+        80 │ + ····const·deny·=·paths(input.denyPaths);
+        81 │ + ····if·(deny·===·undefined)·bad("denyPaths",·"expected·an·array·of·paths");
+        82 │ + ····else·m.denyPaths·=·deny;
+        83 │ + ··}
+    39  84 │     const commands = input.commands;
+    40  85 │     if (!Array.isArray(commands) || commands.length === 0) bad("commands", "expected a non-empty array");
+    41     │ - ··else·m.commands·=·commands.map((command:·unknown,·index:·number)·=>·{
+    42     │ - ····if·(!isRecord(command))·{·bad(`commands[${index}]`,·"expected·an·object");·return·{·argv:·[],·cwd:·""·};·}
+    43     │ - ····const·argv·=·paths(command.argv);·const·cwd·=·text(command.cwd);
+    44     │ - ····if·(argv·===·undefined·||·argv.length·===·0)·bad(`commands[${index}].argv`,·"expected·a·non-empty·argv·array");·if·(cwd·===·undefined)·bad(`commands[${index}].cwd`,·"expected·a·non-empty·string");
+    45     │ - ····return·{·argv:·argv·??·[],·cwd:·cwd·??·""·};
+    46     │ - ··});
+        86 │ + ··else
+        87 │ + ····m.commands·=·commands.map((command:·unknown,·index:·number)·=>·{
+        88 │ + ······if·(!isRecord(command))·{
+        89 │ + ········bad(`commands[${index}]`,·"expected·an·object");
+        90 │ + ········return·{·argv:·[],·cwd:·""·};
+        91 │ + ······}
+        92 │ + ······const·argv·=·paths(command.argv);
+        93 │ + ······const·cwd·=·text(command.cwd);
+        94 │ + ······if·(argv·===·undefined·||·argv.length·===·0)·bad(`commands[${index}].argv`,·"expected·a·non-empty·argv·array");
+        95 │ + ······if·(cwd·===·undefined)·bad(`commands[${index}].cwd`,·"expected·a·non-empty·string");
+        96 │ + ······return·{·argv:·argv·??·[],·cwd:·cwd·??·""·};
+        97 │ + ····});
+    47  98 │     const mode = text(input.mode); // parsed before limits: the line ceiling is mode-aware (spec rule 3)
+    48     │ - ··if·(mode·===·undefined·||·!(TASK_MANIFEST_MODES·as·readonly·string[]).includes(mode))·bad("mode",·`expected·one·of·${TASK_MANIFEST_MODES.join(",·")}`);
+        99 │ + ··if·(mode·===·undefined·||·!(TASK_MANIFEST_MODES·as·readonly·string[]).includes(mode))
+       100 │ + ····bad("mode",·`expected·one·of·${TASK_MANIFEST_MODES.join(",·")}`);
+    49 101 │     else m.mode = mode as TaskManifestMode;
+    50 102 │     const knownMode = m.mode; // undefined when mode is invalid, which is reported by its own error
+    ······ │ 
+    62 114 │         else parsed[key] = value;
+    63 115 │       }
+    64     │ - ····for·(const·key·of·Object.keys(limits).filter((k)·=>·!(LIMIT_FIELDS·as·readonly·string[]).includes(k)).sort())·errors.push(`unknown·field:·limits.${key}`);
+       116 │ + ····for·(const·key·of·Object.keys(limits)
+       117 │ + ······.filter((k)·=>·!(LIMIT_FIELDS·as·readonly·string[]).includes(k))
+       118 │ + ······.sort())
+       119 │ + ······errors.push(`unknown·field:·limits.${key}`);
+    65 120 │       if (Object.keys(parsed).length === LIMIT_FIELDS.length) m.limits = parsed as TaskManifestLimits;
+    66 121 │     }
+    ······ │ 
+    69 124 │     else if (typeof parent === "string" && /^sha256:[0-9a-f]{64}$/.test(parent)) m.parentHandoffHash = parent;
+    70 125 │     else bad("parentHandoffHash", "expected null or sha256:<64 hex>");
+    71     │ - ··if·(input.expectedOutputs·!==·undefined)·{·const·out·=·paths(input.expectedOutputs);·if·(out·===·undefined)·bad("expectedOutputs",·"expected·an·array·of·paths");·else·m.expectedOutputs·=·out;·}
+       126 │ + ··if·(input.expectedOutputs·!==·undefined)·{
+       127 │ + ····const·out·=·paths(input.expectedOutputs);
+       128 │ + ····if·(out·===·undefined)·bad("expectedOutputs",·"expected·an·array·of·paths");
+       129 │ + ····else·m.expectedOutputs·=·out;
+       130 │ + ··}
+    72 131 │     if (errors.length > 0) return { ok: false, errors: [...new Set(errors)].sort() };
+    73 132 │     return { ok: true, manifest: { denyPaths: [], expectedOutputs: [], ...m } as TaskManifest }; // no errors -> the partial is complete
+  
+
+src/bootstrap/diffGuard.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     9   9 │   import type { TaskManifest } from "./taskManifest.ts";
+    10  10 │   
+    11     │ - export·interface·DiffMetadata·{·readonly·porcelain:·string;·readonly·numstat:·string·}
+    12     │ - export·type·DiffViolationKind·=·"unexpected-path"·|·"denied-path"·|·"generated-file"·|·"binary-change"·|·"read-only-mode"·|·"production-file-budget"·|·"test-file-budget"·|·"changed-line-budget";
+    13     │ - export·interface·DiffViolation·{·kind:·DiffViolationKind;·path:·string·|·null;·detail:·string·}
+    14     │ - export·interface·DiffGuardReport·{·ok:·boolean;·changedPaths:·string[];·productionFiles:·number;·testFiles:·number;·added:·number;·deleted:·number;·violations:·DiffViolation[]·}
+        11 │ + export·interface·DiffMetadata·{
+        12 │ + ··readonly·porcelain:·string;
+        13 │ + ··readonly·numstat:·string;
+        14 │ + }
+        15 │ + export·type·DiffViolationKind·=
+        16 │ + ··|·"unexpected-path"
+        17 │ + ··|·"denied-path"
+        18 │ + ··|·"generated-file"
+        19 │ + ··|·"binary-change"
+        20 │ + ··|·"read-only-mode"
+        21 │ + ··|·"production-file-budget"
+        22 │ + ··|·"test-file-budget"
+        23 │ + ··|·"changed-line-budget";
+        24 │ + export·interface·DiffViolation·{
+        25 │ + ··kind:·DiffViolationKind;
+        26 │ + ··path:·string·|·null;
+        27 │ + ··detail:·string;
+        28 │ + }
+        29 │ + export·interface·DiffGuardReport·{
+        30 │ + ··ok:·boolean;
+        31 │ + ··changedPaths:·string[];
+        32 │ + ··productionFiles:·number;
+        33 │ + ··testFiles:·number;
+        34 │ + ··added:·number;
+        35 │ + ··deleted:·number;
+        36 │ + ··violations:·DiffViolation[];
+        37 │ + }
+    15  38 │   type DiffRow = { path: string; added: number; removed: number; binary: boolean };
+    16  39 │   
+    ······ │ 
+    33  56 │   
+    34  57 │   function numstatRows(numstat: string): { rows: DiffRow[]; added: number; deleted: number } {
+    35     │ - ··const·rows:·DiffRow[]·=·[];·let·added·=·0;·let·deleted·=·0;
+        58 │ + ··const·rows:·DiffRow[]·=·[];
+        59 │ + ··let·added·=·0;
+        60 │ + ··let·deleted·=·0;
+    36  61 │     for (const line of numstat.split("\n")) {
+    37  62 │       if (line.trim() === "") continue;
+    ······ │ 
+    40  65 │       if (path === "") continue;
+    41  66 │       const binary = first === "-" || second === "-";
+    42     │ - ····const·row:·DiffRow·=·{·path,·added:·binary·?·0·:·Number.parseInt(first·??·"0",·10)·||·0,·removed:·binary·?·0·:·Number.parseInt(second·??·"0",·10)·||·0,·binary·};
+    43     │ - ····rows.push(row);·added·+=·row.added;·deleted·+=·row.removed;
+        67 │ + ····const·row:·DiffRow·=·{
+        68 │ + ······path,
+        69 │ + ······added:·binary·?·0·:·Number.parseInt(first·??·"0",·10)·||·0,
+        70 │ + ······removed:·binary·?·0·:·Number.parseInt(second·??·"0",·10)·||·0,
+        71 │ + ······binary,
+        72 │ + ····};
+        73 │ + ····rows.push(row);
+        74 │ + ····added·+=·row.added;
+        75 │ + ····deleted·+=·row.removed;
+    44  76 │     }
+    45  77 │     return { rows, added, deleted };
+    46  78 │   }
+    47  79 │   
+    48     │ - export·function·evaluateDiffScope(manifest:·TaskManifest,·meta:·DiffMetadata,·symlinks:·readonly·string[]·=·[]):·DiffGuardReport·{
+        80 │ + export·function·evaluateDiffScope(
+        81 │ + ··manifest:·TaskManifest,
+        82 │ + ··meta:·DiffMetadata,
+        83 │ + ··symlinks:·readonly·string[]·=·[],
+        84 │ + ):·DiffGuardReport·{
+    49  85 │     const { rows, added, deleted } = numstatRows(meta.numstat);
+    50  86 │     // Committed paths must join the scope set: at the stamping commit the tree is clean, so porcelain
+    ······ │ 
+    53  89 │     const built = createPathPolicy({ allowPaths: manifest.allowPaths, denyPaths: manifest.denyPaths, symlinks });
+    54  90 │     const violations: DiffViolation[] = [];
+    55     │ - ··const·push·=·(kind:·DiffViolationKind,·path:·string·|·null,·detail:·string):·void·=>·{·violations.push({·kind,·path,·detail·});·};
+        91 │ + ··const·push·=·(kind:·DiffViolationKind,·path:·string·|·null,·detail:·string):·void·=>·{
+        92 │ + ····violations.push({·kind,·path,·detail·});
+        93 │ + ··};
+    56  94 │     for (const path of changedPaths) {
+    57     │ - ····const·decision·=·built.policy?.check(path)·??·{·allowed:·false,·path,·reason:·"path·policy·unavailable:·"·+·built.errors.join(";·")·};
+    58     │ - ····if·(!decision.allowed)·push(decision.reason.startsWith("denied·by")·?·"denied-path"·:·"unexpected-path",·path,·decision.reason);
+    59     │ - ····if·(GENERATED_DIR.test(path)·||·GENERATED_FILE.test(path))·push("generated-file",·path,·"machine-generated·output·is·never·an·accepted·deliverable");
+        95 │ + ····const·decision·=·built.policy?.check(path)·??·{
+        96 │ + ······allowed:·false,
+        97 │ + ······path,
+        98 │ + ······reason:·"path·policy·unavailable:·"·+·built.errors.join(";·"),
+        99 │ + ····};
+       100 │ + ····if·(!decision.allowed)
+       101 │ + ······push(decision.reason.startsWith("denied·by")·?·"denied-path"·:·"unexpected-path",·path,·decision.reason);
+       102 │ + ····if·(GENERATED_DIR.test(path)·||·GENERATED_FILE.test(path))
+       103 │ + ······push("generated-file",·path,·"machine-generated·output·is·never·an·accepted·deliverable");
+    60 104 │     }
+    61 105 │     for (const row of rows) if (row.binary) push("binary-change", row.path, "git numstat reported a binary change (-)");
+    62     │ - ··if·(manifest.mode·===·"read-only"·&&·changedPaths.length·>·0)·push("read-only-mode",·null,·`${changedPaths.length}·changed·path(s)·under·a·read-only·manifest`);
+       106 │ + ··if·(manifest.mode·===·"read-only"·&&·changedPaths.length·>·0)
+       107 │ + ····push("read-only-mode",·null,·`${changedPaths.length}·changed·path(s)·under·a·read-only·manifest`);
+    63 108 │     const productionFiles = changedPaths.filter((path) => !isTestPath(path)).length;
+    64 109 │     const testFiles = changedPaths.length - productionFiles;
+    65 110 │     const { maxProductionFiles, maxTestFiles, maxChangedLines } = manifest.limits;
+    66     │ - ··if·(productionFiles·>·maxProductionFiles)·push("production-file-budget",·null,·`${productionFiles}·production·file(s)·>·limit·${maxProductionFiles}`);
+       111 │ + ··if·(productionFiles·>·maxProductionFiles)
+       112 │ + ····push("production-file-budget",·null,·`${productionFiles}·production·file(s)·>·limit·${maxProductionFiles}`);
+    67 113 │     if (testFiles > maxTestFiles) push("test-file-budget", null, `${testFiles} test file(s) > limit ${maxTestFiles}`);
+    68     │ - ··if·(added·+·deleted·>·maxChangedLines)·push("changed-line-budget",·null,·`${added}·added·+·${deleted}·deleted·>·limit·${maxChangedLines}`);
+    69     │ - ··return·{·ok:·violations.length·===·0,·changedPaths,·productionFiles,·testFiles,·added,·deleted,·violations:·violations.sort((a,·b)·=>·a.kind.localeCompare(b.kind)·||·String(a.path).localeCompare(String(b.path))·||·a.detail.localeCompare(b.detail))·};
+       114 │ + ··if·(added·+·deleted·>·maxChangedLines)
+       115 │ + ····push("changed-line-budget",·null,·`${added}·added·+·${deleted}·deleted·>·limit·${maxChangedLines}`);
+       116 │ + ··return·{
+       117 │ + ····ok:·violations.length·===·0,
+       118 │ + ····changedPaths,
+       119 │ + ····productionFiles,
+       120 │ + ····testFiles,
+       121 │ + ····added,
+       122 │ + ····deleted,
+       123 │ + ····violations:·violations.sort(
+       124 │ + ······(a,·b)·=>
+       125 │ + ········a.kind.localeCompare(b.kind)·||
+       126 │ + ········String(a.path).localeCompare(String(b.path))·||
+       127 │ + ········a.detail.localeCompare(b.detail),
+       128 │ + ····),
+       129 │ + ··};
+    70 130 │   }
+    71 131 │   
+  
+
+src/bootstrap/trailVerifier.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     59  59 │     readonly liveRunners?: readonly string[];
+     60  60 │   }
+     61     │ - const·strings·=·(value:·unknown):·string[]·=>·(Array.isArray(value)·?·value.filter((item):·item·is·string·=>·typeof·item·===·"string")·:·[]);
+         61 │ + const·strings·=·(value:·unknown):·string[]·=>
+         62 │ + ··Array.isArray(value)·?·value.filter((item):·item·is·string·=>·typeof·item·===·"string")·:·[];
+     62  63 │   /** Every artifact a record points at: its `evidence` list plus every command's `outputArtifact`. */
+     63  64 │   export const declaredArtifacts = (record: Record<string, unknown>): string[] => {
+     64  65 │     const outputs = (Array.isArray(record.commands) ? record.commands : [])
+     65     │ - ····.filter((command):·command·is·Record<string,·unknown>·=>·command·!==·null·&&·typeof·command·===·"object"·&&·!Array.isArray(command)·&&·typeof·(command·as·Record<string,·unknown>).outputArtifact·===·"string")
+         66 │ + ····.filter(
+         67 │ + ······(command):·command·is·Record<string,·unknown>·=>
+         68 │ + ········command·!==·null·&&
+         69 │ + ········typeof·command·===·"object"·&&
+         70 │ + ········!Array.isArray(command)·&&
+         71 │ + ········typeof·(command·as·Record<string,·unknown>).outputArtifact·===·"string",
+         72 │ + ····)
+     66  73 │       .map((command) => command.outputArtifact as string);
+     67  74 │     return [...new Set([...strings(record.evidence), ...outputs])].sort();
+    ······· │ 
+     73  80 │     const byTask = new Map<string, Record<string, unknown>>();
+     74  81 │     for (const entry of input.records) {
+     75     │ - ····if·(byTask.has(entry.taskId))·issues.push({·kind:·"duplicate-record",·taskId:·entry.taskId,·detail:·`a·second·record·exists·for·task·${entry.taskId}`·});
+         82 │ + ····if·(byTask.has(entry.taskId))
+         83 │ + ······issues.push({
+         84 │ + ········kind:·"duplicate-record",
+         85 │ + ········taskId:·entry.taskId,
+         86 │ + ········detail:·`a·second·record·exists·for·task·${entry.taskId}`,
+         87 │ + ······});
+     76  88 │       byTask.set(entry.taskId, entry.record);
+     77  89 │       const stamped = entry.record.handoffHash;
+     78  90 │       const recomputed = canonicalHash(entry.record);
+     79     │ - ····if·(stamped·!==·recomputed)·issues.push({·kind:·"hash-mismatch",·taskId:·entry.taskId,·detail:·`stamped·${String(stamped)}·!=·recomputed·${recomputed}`·});
+     80     │ - ····for·(const·blocker·of·validateHandoffSchema(entry.record,·input.schema))·issues.push({·kind:·"schema-violation",·taskId:·entry.taskId,·detail:·blocker·});
+         91 │ + ····if·(stamped·!==·recomputed)
+         92 │ + ······issues.push({
+         93 │ + ········kind:·"hash-mismatch",
+         94 │ + ········taskId:·entry.taskId,
+         95 │ + ········detail:·`stamped·${String(stamped)}·!=·recomputed·${recomputed}`,
+         96 │ + ······});
+         97 │ + ····for·(const·blocker·of·validateHandoffSchema(entry.record,·input.schema))
+         98 │ + ······issues.push({·kind:·"schema-violation",·taskId:·entry.taskId,·detail:·blocker·});
+     81  99 │       for (const artifact of declaredArtifacts(entry.record)) {
+     82     │ - ······if·(input.artifactExists·!==·undefined·&&·!input.artifactExists(artifact))·issues.push({·kind:·"evidence-absent",·taskId:·entry.taskId,·detail:·`declared·artifact·absent:·${artifact}`·});
+     83     │ - ······if·(input.committed·!==·undefined·&&·!input.committed(artifact))·issues.push({·kind:·"evidence-uncommitted",·taskId:·entry.taskId,·detail:·`declared·artifact·has·no·blob·at·the·audited·revision:·${artifact}`·});
+        100 │ + ······if·(input.artifactExists·!==·undefined·&&·!input.artifactExists(artifact))
+        101 │ + ········issues.push({·kind:·"evidence-absent",·taskId:·entry.taskId,·detail:·`declared·artifact·absent:·${artifact}`·});
+        102 │ + ······if·(input.committed·!==·undefined·&&·!input.committed(artifact))
+        103 │ + ········issues.push({
+        104 │ + ··········kind:·"evidence-uncommitted",
+        105 │ + ··········taskId:·entry.taskId,
+        106 │ + ··········detail:·`declared·artifact·has·no·blob·at·the·audited·revision:·${artifact}`,
+        107 │ + ········});
+     84 108 │       }
+     85 109 │     }
+     86 110 │     const ordered = new Set(input.order);
+     87     │ - ··for·(const·taskId·of·input.order)·if·(!byTask.has(taskId))·issues.push({·kind:·"missing-record",·taskId,·detail:·`the·plan·ordered·${taskId}·and·no·record·exists`·});
+     88     │ - ··for·(const·taskId·of·[...byTask.keys()].sort())·if·(!ordered.has(taskId))·issues.push({·kind:·"unplanned-record",·taskId,·detail:·`${taskId}·carries·a·record·the·plan·never·ordered`·});
+        111 │ + ··for·(const·taskId·of·input.order)
+        112 │ + ····if·(!byTask.has(taskId))
+        113 │ + ······issues.push({·kind:·"missing-record",·taskId,·detail:·`the·plan·ordered·${taskId}·and·no·record·exists`·});
+        114 │ + ··for·(const·taskId·of·[...byTask.keys()].sort())
+        115 │ + ····if·(!ordered.has(taskId))
+        116 │ + ······issues.push({·kind:·"unplanned-record",·taskId,·detail:·`${taskId}·carries·a·record·the·plan·never·ordered`·});
+     89 117 │     for (let index = 1; index < input.order.length; index += 1) {
+     90 118 │       const parent = byTask.get(input.order[index - 1] as string);
+    ······· │ 
+     94 122 │       const actual = child.baseSha;
+     95 123 │       if (typeof promised === "string" && typeof actual === "string" && promised !== actual)
+     96     │ - ······issues.push({·kind:·"lineage-break",·taskId:·input.order[index]·as·string,·detail:·`${input.order[index·-·1]}.nextBaseSha·${promised}·!=·${input.order[index]}.baseSha·${actual}`·});
+        124 │ + ······issues.push({
+        125 │ + ········kind:·"lineage-break",
+        126 │ + ········taskId:·input.order[index]·as·string,
+        127 │ + ········detail:·`${input.order[index·-·1]}.nextBaseSha·${promised}·!=·${input.order[index]}.baseSha·${actual}`,
+        128 │ + ······});
+     97 129 │     }
+     98 130 │     for (let index = 0; index < input.order.length; index += 1) {
+    ······· │ 
+    101 133 │       const promised = index + 1 < input.order.length ? (input.order[index + 1] as string) : null;
+    102 134 │       if (record.nextTaskId !== promised)
+    103     │ - ······issues.push({·kind:·"next-pointer-mismatch",·taskId:·input.order[index]·as·string,·detail:·`record·declares·nextTaskId·${JSON.stringify(record.nextTaskId)}·where·the·plan·orders·${JSON.stringify(promised)}`·});
+        135 │ + ······issues.push({
+        136 │ + ········kind:·"next-pointer-mismatch",
+        137 │ + ········taskId:·input.order[index]·as·string,
+        138 │ + ········detail:·`record·declares·nextTaskId·${JSON.stringify(record.nextTaskId)}·where·the·plan·orders·${JSON.stringify(promised)}`,
+        139 │ + ······});
+    104 140 │     }
+    105     │ - ··for·(const·runner·of·input.liveRunners·??·[])·issues.push({·kind:·"live-runner",·taskId:·null,·detail:·`process·started·by·the·run·is·still·alive:·${runner}`·});
+        141 │ + ··for·(const·runner·of·input.liveRunners·??·[])
+        142 │ + ····issues.push({·kind:·"live-runner",·taskId:·null,·detail:·`process·started·by·the·run·is·still·alive:·${runner}`·});
+    106 143 │     return { ok: issues.length === 0, records: input.records.length, issues };
+    107 144 │   }
+    ······· │ 
+    172 209 │       const before = at === 0 ? "" : (line[at - 1] as string);
+    173 210 │       const after = (line[at + command.length] ?? "") as string;
+    174     │ - ····if·((before·===·""·||·before·===·"·"·||·before·===·"\t"·||·";&|(".includes(before))·&&·COMMAND_END.has(after))·return·true;
+        211 │ + ····if·((before·===·""·||·before·===·"·"·||·before·===·"\t"·||·";&|(".includes(before))·&&·COMMAND_END.has(after))
+        212 │ + ······return·true;
+    175 213 │       from = at + 1;
+    176 214 │     }
+    ······· │ 
+    184 222 │    * ignoring them. An empty `attributed` list is not proof that nothing ever ran.
+    185 223 │    */
+    186     │ - export·function·matchLiveRunners(processes:·readonly·LiveProcess[],·recordedCommands:·readonly·string[],·root:·string):·LiveRunnerMatch·{
+        224 │ + export·function·matchLiveRunners(
+        225 │ + ··processes:·readonly·LiveProcess[],
+        226 │ + ··recordedCommands:·readonly·string[],
+        227 │ + ··root:·string,
+        228 │ + ):·LiveRunnerMatch·{
+    187 229 │     const recorded = recordedCommands.filter((command) => command.trim().length > 0);
+    188 230 │     const boundary = root.endsWith(sep) ? root : root + sep;
+  
+
+src/capability/quantBenchmark.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     3  3 │   /** One measured run of the quantization-benchmark protocol (docs/specs/harness-reliability-bootstrap-20261103/04-QUANTIZATION-BENCHMARK.md).
+     4  4 │    * Names follow ExecutionProvenance (src/uieng/schemas.ts): selected_model -> modelId, quantization -> quantMethod, timings_ms -> latencyMs. */
+     5    │ - export·interface·QuantRunRecord·{·//·every·provenance·field·is·required:·a·missing·value·is·a·gap,·never·a·default
+        5 │ + export·interface·QuantRunRecord·{
+        6 │ + ··//·every·provenance·field·is·required:·a·missing·value·is·a·gap,·never·a·default
+     6  7 │     modelId: string; // model id; the comparison is only ever drawn within one modelFamily()
+     7  8 │     weightsHash: string; // exact weights/version hash; the literal "unknown" is a provenance gap in comparisons
+    ····· │ 
+    17 18 │   }
+    18 19 │   
+    19    │ - const·UNIONS·=·{·quantMethod:·["q8",·"q6",·"q4",·"fp16",·"bf16",·"unknown"],·kvCache:·["fp16",·"q8",·"q4",·"unknown"],·outcome:·["completed",·"refused",·"error",·"timeout"],·harness:·["minimal",·"full"]·};
+       20 │ + const·UNIONS·=·{
+       21 │ + ··quantMethod:·["q8",·"q6",·"q4",·"fp16",·"bf16",·"unknown"],
+       22 │ + ··kvCache:·["fp16",·"q8",·"q4",·"unknown"],
+       23 │ + ··outcome:·["completed",·"refused",·"error",·"timeout"],
+       24 │ + ··harness:·["minimal",·"full"],
+       25 │ + };
+    20 26 │   const TOLERANCE = 1e-9; // a decoding difference below this is not a different controlled condition
+    21 27 │   
+    22 28 │   /** Ordered, human-readable problems for a candidate run record; never throws. [] means provenance is complete. */
+    23 29 │   export function validateRunRecord(input: unknown): string[] {
+    24    │ - ··const·r·=·(input·??·{})·as·Record<string,·unknown>;·const·problems:·string[]·=·[];
+    25    │ - ··const·text·=·(key:·string)·=>·{·if·(typeof·r[key]·!==·"string"·||·(r[key]·as·string).trim()·===·"")·problems.push(`${key}:·required·non-empty·string`);·};
+    26    │ - ··const·count·=·(key:·string)·=>·{·const·v·=·r[key];·if·(typeof·v·!==·"number"·||·!Number.isInteger(v)·||·v·<·0)·problems.push(`${key}:·required·integer·>=·0`);·};
+    27    │ - ··const·oneOf·=·(key:·string,·allowed:·string[])·=>·{·if·(typeof·r[key]·!==·"string"·||·!allowed.includes(r[key]))·problems.push(`${key}:·must·be·one·of·${allowed.join("|")}`);·};
+    28    │ - ··text("modelId");·text("weightsHash");·text("baseSha");·text("promptSha256");
+    29    │ - ··count("contextTokens");·count("latencyMs");
+       30 │ + ··const·r·=·(input·??·{})·as·Record<string,·unknown>;
+       31 │ + ··const·problems:·string[]·=·[];
+       32 │ + ··const·text·=·(key:·string)·=>·{
+       33 │ + ····if·(typeof·r[key]·!==·"string"·||·(r[key]·as·string).trim()·===·"")
+       34 │ + ······problems.push(`${key}:·required·non-empty·string`);
+       35 │ + ··};
+       36 │ + ··const·count·=·(key:·string)·=>·{
+       37 │ + ····const·v·=·r[key];
+       38 │ + ····if·(typeof·v·!==·"number"·||·!Number.isInteger(v)·||·v·<·0)·problems.push(`${key}:·required·integer·>=·0`);
+       39 │ + ··};
+       40 │ + ··const·oneOf·=·(key:·string,·allowed:·string[])·=>·{
+       41 │ + ····if·(typeof·r[key]·!==·"string"·||·!allowed.includes(r[key]))
+       42 │ + ······problems.push(`${key}:·must·be·one·of·${allowed.join("|")}`);
+       43 │ + ··};
+       44 │ + ··text("modelId");
+       45 │ + ··text("weightsHash");
+       46 │ + ··text("baseSha");
+       47 │ + ··text("promptSha256");
+       48 │ + ··count("contextTokens");
+       49 │ + ··count("latencyMs");
+    30 50 │     for (const [key, allowed] of Object.entries(UNIONS)) oneOf(key, allowed); // insertion order = stable problem order
+    31    │ - ··if·(typeof·r.promptSha256·===·"string"·&&·!/^sha256:[0-9a-f]{64}$/.test(r.promptSha256))·problems.push("promptSha256:·expected·sha256:<64·hex>");
+       51 │ + ··if·(typeof·r.promptSha256·===·"string"·&&·!/^sha256:[0-9a-f]{64}$/.test(r.promptSha256))
+       52 │ + ····problems.push("promptSha256:·expected·sha256:<64·hex>");
+    32 53 │     const s = (r.sampling ?? {}) as Record<string, unknown>;
+    33    │ - ··if·(typeof·s.temperature·!==·"number"·||·!(s.temperature·>=·0·&&·s.temperature·<=·2))·problems.push("sampling.temperature:·required·number·within·0..2");
+    34    │ - ··if·(s.seed·!==·undefined·&&·(typeof·s.seed·!==·"number"·||·!Number.isInteger(s.seed)))·problems.push("sampling.seed:·integer·when·present");
+       54 │ + ··if·(typeof·s.temperature·!==·"number"·||·!(s.temperature·>=·0·&&·s.temperature·<=·2))
+       55 │ + ····problems.push("sampling.temperature:·required·number·within·0..2");
+       56 │ + ··if·(s.seed·!==·undefined·&&·(typeof·s.seed·!==·"number"·||·!Number.isInteger(s.seed)))
+       57 │ + ····problems.push("sampling.seed:·integer·when·present");
+    35 58 │     return problems;
+    36 59 │   }
+    ····· │ 
+    39 62 │   export function compareRuns(left: unknown, right: unknown): { comparable: boolean; reasons: string[] } {
+    40 63 │     const reasons: string[] = [];
+    41    │ - ··for·(const·[side,·rec]·of·[["left",·left],·["right",·right]]·as·const)·for·(const·p·of·validateRunRecord(rec))·reasons.push(`${side}.${p}`);
+       64 │ + ··for·(const·[side,·rec]·of·[
+       65 │ + ····["left",·left],
+       66 │ + ····["right",·right],
+       67 │ + ··]·as·const)
+       68 │ + ····for·(const·p·of·validateRunRecord(rec))·reasons.push(`${side}.${p}`);
+    42 69 │     if (reasons.length > 0) return { comparable: false, reasons }; // an unprovable record is never comparable
+    43    │ - ··const·a·=·left·as·QuantRunRecord;·const·b·=·right·as·QuantRunRecord;·const·[familyA,·familyB]·=·[modelFamily(a.modelId),·modelFamily(b.modelId)];
+    44    │ - ··for·(const·[side,·rec]·of·[["left",·a],·["right",·b]]·as·const)·{
+       70 │ + ··const·a·=·left·as·QuantRunRecord;
+       71 │ + ··const·b·=·right·as·QuantRunRecord;
+       72 │ + ··const·[familyA,·familyB]·=·[modelFamily(a.modelId),·modelFamily(b.modelId)];
+       73 │ + ··for·(const·[side,·rec]·of·[
+       74 │ + ····["left",·a],
+       75 │ + ····["right",·b],
+       76 │ + ··]·as·const)·{
+    45 77 │       if (rec.weightsHash === "unknown") reasons.push(`${side}.weightsHash is unknown: exact weights hash required`);
+    46    │ - ····if·(modelFamily(rec.modelId)·===·undefined)·reasons.push(`${side}.modelId·family·cannot·be·established:·not·comparable`);
+       78 │ + ····if·(modelFamily(rec.modelId)·===·undefined)
+       79 │ + ······reasons.push(`${side}.modelId·family·cannot·be·established:·not·comparable`);
+    47 80 │     }
+    48    │ - ··if·(familyA·!==·undefined·&&·familyB·!==·undefined·&&·!sameFamily(a.modelId,·b.modelId))·reasons.push(`model·family·differs:·${familyA}·vs·${familyB}`);
+       81 │ + ··if·(familyA·!==·undefined·&&·familyB·!==·undefined·&&·!sameFamily(a.modelId,·b.modelId))
+       82 │ + ····reasons.push(`model·family·differs:·${familyA}·vs·${familyB}`);
+    49 83 │     if (a.quantMethod !== b.quantMethod) reasons.push(`quantMethod differs: ${a.quantMethod} vs ${b.quantMethod}`);
+    50 84 │     if (a.kvCache !== b.kvCache) reasons.push(`kvCache differs: ${a.kvCache} vs ${b.kvCache}`);
+    51 85 │     if (a.baseSha !== b.baseSha) reasons.push(`baseSha differs: ${a.baseSha} vs ${b.baseSha}`);
+    52    │ - ··if·(a.contextTokens·!==·b.contextTokens)·reasons.push(`contextTokens·differ:·${a.contextTokens}·vs·${b.contextTokens}`);
+       86 │ + ··if·(a.contextTokens·!==·b.contextTokens)
+       87 │ + ····reasons.push(`contextTokens·differ:·${a.contextTokens}·vs·${b.contextTokens}`);
+    53 88 │     if (a.promptSha256 !== b.promptSha256) reasons.push(`promptSha256 differs: ${a.promptSha256} vs ${b.promptSha256}`);
+    54    │ - ··if·(a.sampling.seed·!==·b.sampling.seed)·reasons.push(`sampling.seed·differs:·${a.sampling.seed}·vs·${b.sampling.seed}`);
+    55    │ - ··if·(Math.abs(a.sampling.temperature·-·b.sampling.temperature)·>·TOLERANCE)·reasons.push(`sampling.temperature·differs:·${a.sampling.temperature}·vs·${b.sampling.temperature}`);
+       89 │ + ··if·(a.sampling.seed·!==·b.sampling.seed)
+       90 │ + ····reasons.push(`sampling.seed·differs:·${a.sampling.seed}·vs·${b.sampling.seed}`);
+       91 │ + ··if·(Math.abs(a.sampling.temperature·-·b.sampling.temperature)·>·TOLERANCE)
+       92 │ + ····reasons.push(`sampling.temperature·differs:·${a.sampling.temperature}·vs·${b.sampling.temperature}`);
+    56 93 │     return { comparable: reasons.length === 0, reasons };
+    57 94 │   }
+  
+
+src/incidents/errorAggregate.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+        1 │ + import·type·{·ErrorOccurrence·}·from·"./errorEvent.ts";
+     1  2 │   // D03: pure aggregation of persisted E02 occurrences into issue clusters — no I/O, no clock, no randomness, no input
+     2  3 │   // mutation. The grouping key is D02's `errorFingerprint` (never a second key) and the ordering is total, so every
+     3  4 │   // permutation of the same rows yields byte-identical output. D01's IndexedErrorOccurrence satisfies AggregateRow.
+     4    │ - import·{·errorFingerprint,·INVALID_FINGERPRINT·}·from·"./errorFingerprint.ts";
+     5    │ - import·type·{·ErrorOccurrence·}·from·"./errorEvent.ts";
+        5 │ + import·{·INVALID_FINGERPRINT,·errorFingerprint·}·from·"./errorFingerprint.ts";
+     6  6 │   
+     7  7 │   /** Source event ids kept per cluster when the caller is silent. */
+  
+
+src/incidents/errorEvent.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     7   7 │   
+     8   8 │   export const ERROR_OCCURRENCE_VERSION = 1;
+     9     │ - export·const·ERROR_LAYERS·=·["host",·"process",·"session-store",·"aps",·"incident",·"retry",·"worker",·"gateway",·"verify"]·as·const;
+         9 │ + export·const·ERROR_LAYERS·=·[
+        10 │ + ··"host",
+        11 │ + ··"process",
+        12 │ + ··"session-store",
+        13 │ + ··"aps",
+        14 │ + ··"incident",
+        15 │ + ··"retry",
+        16 │ + ··"worker",
+        17 │ + ··"gateway",
+        18 │ + ··"verify",
+        19 │ + ]·as·const;
+    10  20 │   export const ERROR_SEVERITIES = ["info", "warning", "error", "fatal"] as const;
+    11  21 │   export type ErrorLayer = (typeof ERROR_LAYERS)[number];
+    12  22 │   export interface ErrorOccurrence {
+    13     │ - ··version:·number;·timestamp:·string;·host:·string;·sessionId:·string;·runtime:·string;
+    14     │ - ··layer:·ErrorLayer;·code:·string;·severity:·(typeof·ERROR_SEVERITIES)[number];·summary:·string;
+    15     │ - ··runId:·string·|·null;·taskId:·string·|·null;·model:·string·|·null;·quantization:·string·|·null;
+    16     │ - ··correlationIds:·string[];·artifactRefs:·string[];·//·>=1·correlation·id;·refs·are·repo-relative·evidence·paths
+        23 │ + ··version:·number;
+        24 │ + ··timestamp:·string;
+        25 │ + ··host:·string;
+        26 │ + ··sessionId:·string;
+        27 │ + ··runtime:·string;
+        28 │ + ··layer:·ErrorLayer;
+        29 │ + ··code:·string;
+        30 │ + ··severity:·(typeof·ERROR_SEVERITIES)[number];
+        31 │ + ··summary:·string;
+        32 │ + ··runId:·string·|·null;
+        33 │ + ··taskId:·string·|·null;
+        34 │ + ··model:·string·|·null;
+        35 │ + ··quantization:·string·|·null;
+        36 │ + ··correlationIds:·string[];
+        37 │ + ··artifactRefs:·string[];·//·>=1·correlation·id;·refs·are·repo-relative·evidence·paths
+    17  38 │   }
+    18  39 │   export type ErrorOccurrenceResult = { ok: true; event: ErrorOccurrence } | { ok: false; errors: string[] };
+    ······ │ 
+    21  42 │   
+    22  43 │   export function parseErrorOccurrence(input: unknown): ErrorOccurrenceResult {
+    23     │ - ··if·(input·===·null·||·typeof·input·!==·"object"·||·Array.isArray(input))·return·{·ok:·false,·errors:·["expected·an·object"]·};
+    24     │ - ··const·raw·=·input·as·Record<string,·unknown>;·const·errors:·string[]·=·[];
+        44 │ + ··if·(input·===·null·||·typeof·input·!==·"object"·||·Array.isArray(input))
+        45 │ + ····return·{·ok:·false,·errors:·["expected·an·object"]·};
+        46 │ + ··const·raw·=·input·as·Record<string,·unknown>;
+        47 │ + ··const·errors:·string[]·=·[];
+    25  48 │     const text = (field: string, max: number): string => {
+    26  49 │       const value = raw[field];
+    27     │ - ····if·(typeof·value·!==·"string"·||·value.length·===·0·||·!PRINTABLE.test(value))·errors.push(`${field}:·expected·a·non-empty·printable·string`);
+        50 │ + ····if·(typeof·value·!==·"string"·||·value.length·===·0·||·!PRINTABLE.test(value))
+        51 │ + ······errors.push(`${field}:·expected·a·non-empty·printable·string`);
+    28  52 │       else if (value.length > max) errors.push(`${field}: longer than ${max} characters`);
+    29  53 │       else return value;
+    ······ │ 
+    31  55 │     };
+    32  56 │     if (raw.version !== ERROR_OCCURRENCE_VERSION) errors.push(`version: expected ${ERROR_OCCURRENCE_VERSION}`);
+    33     │ - ··const·host·=·text("host",·200);·const·sessionId·=·text("sessionId",·200);·const·runtime·=·text("runtime",·200);·const·code·=·text("code",·200);
+    34     │ - ··const·timestamp·=·text("timestamp",·40);·if·(timestamp.length·>·0·&&·!ISO_8601.test(timestamp))·errors.push("timestamp:·expected·ISO-8601·UTC");
+    35     │ - ··const·layer·=·text("layer",·40);·if·(layer.length·>·0·&&·!ERROR_LAYERS.includes(layer·as·ErrorLayer))·errors.push(`layer:·expected·one·of·${ERROR_LAYERS.join(",·")}`);
+    36     │ - ··const·severity·=·text("severity",·20);·if·(severity.length·>·0·&&·!ERROR_SEVERITIES.includes(severity·as·never))·errors.push(`severity:·expected·one·of·${ERROR_SEVERITIES.join(",·")}`);
+        57 │ + ··const·host·=·text("host",·200);
+        58 │ + ··const·sessionId·=·text("sessionId",·200);
+        59 │ + ··const·runtime·=·text("runtime",·200);
+        60 │ + ··const·code·=·text("code",·200);
+        61 │ + ··const·timestamp·=·text("timestamp",·40);
+        62 │ + ··if·(timestamp.length·>·0·&&·!ISO_8601.test(timestamp))·errors.push("timestamp:·expected·ISO-8601·UTC");
+        63 │ + ··const·layer·=·text("layer",·40);
+        64 │ + ··if·(layer.length·>·0·&&·!ERROR_LAYERS.includes(layer·as·ErrorLayer))
+        65 │ + ····errors.push(`layer:·expected·one·of·${ERROR_LAYERS.join(",·")}`);
+        66 │ + ··const·severity·=·text("severity",·20);
+        67 │ + ··if·(severity.length·>·0·&&·!ERROR_SEVERITIES.includes(severity·as·never))
+        68 │ + ····errors.push(`severity:·expected·one·of·${ERROR_SEVERITIES.join(",·")}`);
+    37  69 │     const summary = text("summary", 500);
+    38     │ - ··if·(summary.length·>·0·&&·redactSecrets(summary)·!==·summary)·errors.push("summary:·contains·an·unredacted·secret·—·redact·it·first");
+    39     │ - ··const·nullable:·Record<"runId"·|·"taskId"·|·"model"·|·"quantization",·string·|·null>·=·{·runId:·null,·taskId:·null,·model:·null,·quantization:·null·};
+        70 │ + ··if·(summary.length·>·0·&&·redactSecrets(summary)·!==·summary)
+        71 │ + ····errors.push("summary:·contains·an·unredacted·secret·—·redact·it·first");
+        72 │ + ··const·nullable:·Record<"runId"·|·"taskId"·|·"model"·|·"quantization",·string·|·null>·=·{
+        73 │ + ····runId:·null,
+        74 │ + ····taskId:·null,
+        75 │ + ····model:·null,
+        76 │ + ····quantization:·null,
+        77 │ + ··};
+    40  78 │     for (const field of Object.keys(nullable) as Array<keyof typeof nullable>) {
+    41  79 │       const value = raw[field]; // absent means null, never guessed
+    42     │ - ····if·(value·!==·null·&&·value·!==·undefined)·{·if·(typeof·value·===·"string"·&&·PRINTABLE.test(value))·nullable[field]·=·value;·else·errors.push(`${field}:·expected·a·string·or·null`);·}
+        80 │ + ····if·(value·!==·null·&&·value·!==·undefined)·{
+        81 │ + ······if·(typeof·value·===·"string"·&&·PRINTABLE.test(value))·nullable[field]·=·value;
+        82 │ + ······else·errors.push(`${field}:·expected·a·string·or·null`);
+        83 │ + ····}
+    43  84 │     }
+    44  85 │     const list = (field: string, min: number): string[] => {
+    45     │ - ····const·values·=·raw[field];·if·(!Array.isArray(values))·{·errors.push(`${field}:·expected·an·array`);·return·[];·}
+    46     │ - ····const·items·=·values.filter((item:·unknown,·index:·number)·=>·{
+    47     │ - ······const·printable·=·typeof·item·===·"string"·&&·item.length·>·0·&&·PRINTABLE.test(item);
+    48     │ - ······const·unsafeRef·=·field·===·"artifactRefs"·&&·printable·&&·(/^\//.test(item)·||·/\s/.test(item)·||·item.split("/").includes(".."));
+    49     │ - ······if·(!printable)·errors.push(`${field}[${index}]:·expected·a·printable·string`);
+    50     │ - ······else·if·(unsafeRef)·errors.push(`${field}[${index}]:·expected·a·relative·artifact·path`);
+    51     │ - ······return·printable·&&·!unsafeRef;
+    52     │ - ····}).map(String);
+    53     │ - ····if·(items.length·<·min)·errors.push(`${field}:·expected·at·least·${min}·entry`);·return·items;
+        86 │ + ····const·values·=·raw[field];
+        87 │ + ····if·(!Array.isArray(values))·{
+        88 │ + ······errors.push(`${field}:·expected·an·array`);
+        89 │ + ······return·[];
+        90 │ + ····}
+        91 │ + ····const·items·=·values
+        92 │ + ······.filter((item:·unknown,·index:·number)·=>·{
+        93 │ + ········const·printable·=·typeof·item·===·"string"·&&·item.length·>·0·&&·PRINTABLE.test(item);
+        94 │ + ········const·unsafeRef·=
+        95 │ + ··········field·===·"artifactRefs"·&&
+        96 │ + ··········printable·&&
+        97 │ + ··········(/^\//.test(item)·||·/\s/.test(item)·||·item.split("/").includes(".."));
+        98 │ + ········if·(!printable)·errors.push(`${field}[${index}]:·expected·a·printable·string`);
+        99 │ + ········else·if·(unsafeRef)·errors.push(`${field}[${index}]:·expected·a·relative·artifact·path`);
+       100 │ + ········return·printable·&&·!unsafeRef;
+       101 │ + ······})
+       102 │ + ······.map(String);
+       103 │ + ····if·(items.length·<·min)·errors.push(`${field}:·expected·at·least·${min}·entry`);
+       104 │ + ····return·items;
+    54 105 │     };
+    55     │ - ··const·correlationIds·=·list("correlationIds",·1);·const·artifactRefs·=·list("artifactRefs",·0);
+       106 │ + ··const·correlationIds·=·list("correlationIds",·1);
+       107 │ + ··const·artifactRefs·=·list("artifactRefs",·0);
+    56 108 │     if (errors.length > 0) return { ok: false, errors: [...new Set(errors)] };
+    57     │ - ··return·{·ok:·true,·event:·{·version:·ERROR_OCCURRENCE_VERSION,·timestamp,·host,·sessionId,·runtime,·layer:·layer·as·ErrorLayer,·code,·severity:·severity·as·(typeof·ERROR_SEVERITIES)[number],·summary,·...nullable,·correlationIds,·artifactRefs·}·};
+       109 │ + ··return·{
+       110 │ + ····ok:·true,
+       111 │ + ····event:·{
+       112 │ + ······version:·ERROR_OCCURRENCE_VERSION,
+       113 │ + ······timestamp,
+       114 │ + ······host,
+       115 │ + ······sessionId,
+       116 │ + ······runtime,
+       117 │ + ······layer:·layer·as·ErrorLayer,
+       118 │ + ······code,
+       119 │ + ······severity:·severity·as·(typeof·ERROR_SEVERITIES)[number],
+       120 │ + ······summary,
+       121 │ + ······...nullable,
+       122 │ + ······correlationIds,
+       123 │ + ······artifactRefs,
+       124 │ + ····},
+       125 │ + ··};
+    58 126 │   }
+    59 127 │   
+  
+
+src/workers/WorkerExecutor.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+      1     │ - import·type·{·WorkerResult,·WorkerRole,·WorkerUsage·}·from·"../core/types.ts";
+      2     │ - import·type·{·CheckpointRecoveryContext·}·from·"../orchestration/broker.ts";
+      3     │ - import·type·{·CheckpointProgressClaim·}·from·"./checkpointProgressTool.ts";
+      4     │ - import·type·{·ContextBudget·}·from·"./contextBudget.ts";
+      5     │ - import·type·{·DriftWatch·}·from·"../aps/workerActivity.ts";
+          1 │ + import·type·{·DriftWatch·}·from·"../aps/workerActivity.ts";
+          2 │ + import·type·{·WorkerResult,·WorkerRole,·WorkerUsage·}·from·"../core/types.ts";
+          3 │ + import·type·{·CheckpointRecoveryContext·}·from·"../orchestration/broker.ts";
+          4 │ + import·type·{·CheckpointProgressClaim·}·from·"./checkpointProgressTool.ts";
+          5 │ + import·type·{·ContextBudget·}·from·"./contextBudget.ts";
+      6   6 │   
+      7   7 │   /** Bounded, operator-safe live state from a worker session. */
+  
+
+src/incidents/errorAggregate.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     8   8 │   export const DEFAULT_MAX_EVENT_IDS = 50;
+     9   9 │   
+    10     │ - export·interface·AggregateRow·{·eventId:·string;·occurrence:·ErrorOccurrence;·resolution?:·"recovered"·|·"unresolved";·failureIdentity?:·string·}
+    11     │ - export·interface·ErrorCluster·{·fingerprint:·string;·count:·number;·firstSeen:·string;·lastSeen:·string;·sessions:·string[];·hosts:·string[];·models:·string[];·quantizations:·string[];·layers:·string[];·codes:·string[];·recovered:·number;·unresolved:·number;·eventIds:·string[];·eventIdsTruncated:·boolean·}
+    12     │ - export·interface·AggregateResult·{·clusters:·ErrorCluster[];·truncated:·boolean;·duplicateEvents:·number;·rejected:·number·}
+        10 │ + export·interface·AggregateRow·{
+        11 │ + ··eventId:·string;
+        12 │ + ··occurrence:·ErrorOccurrence;
+        13 │ + ··resolution?:·"recovered"·|·"unresolved";
+        14 │ + ··failureIdentity?:·string;
+        15 │ + }
+        16 │ + export·interface·ErrorCluster·{
+        17 │ + ··fingerprint:·string;
+        18 │ + ··count:·number;
+        19 │ + ··firstSeen:·string;
+        20 │ + ··lastSeen:·string;
+        21 │ + ··sessions:·string[];
+        22 │ + ··hosts:·string[];
+        23 │ + ··models:·string[];
+        24 │ + ··quantizations:·string[];
+        25 │ + ··layers:·string[];
+        26 │ + ··codes:·string[];
+        27 │ + ··recovered:·number;
+        28 │ + ··unresolved:·number;
+        29 │ + ··eventIds:·string[];
+        30 │ + ··eventIdsTruncated:·boolean;
+        31 │ + }
+        32 │ + export·interface·AggregateResult·{
+        33 │ + ··clusters:·ErrorCluster[];
+        34 │ + ··truncated:·boolean;
+        35 │ + ··duplicateEvents:·number;
+        36 │ + ··rejected:·number;
+        37 │ + }
+    13  38 │   
+    14  39 │   // `keys` is the dedupe ledger (one entry per counted eventId and per counted failureIdentity); `count` counts what it admitted, so recovered + unresolved === count holds by construction.
+    15     │ - type·Bucket·=·{·fingerprint:·string;·keys:·Set<string>;·count:·number;·ids:·Set<string>;·firstMs:·number;·firstSeen:·string;·lastMs:·number;·lastSeen:·string;·recovered:·number;·unresolved:·number;·dims:·Record<"sessions"·|·"hosts"·|·"models"·|·"quantizations"·|·"layers"·|·"codes",·Set<string>>·};
+    16     │ - const·sorted·=·(set:·Set<string>):·string[]·=>·[...set].sort();·const·add·=·(set:·Set<string>,·value:·string·|·null·|·undefined):·void·=>·{·if·(typeof·value·===·"string"·&&·value·!==·"")·set.add(value);·};·//·an·unset·dimension·stays·absent·rather·than·becoming·a·fabricated·"unknown"·member
+    17     │ - const·bound·=·(requested:·number·|·undefined,·fallback:·number):·number·=>·{·const·n·=·requested·??·fallback;·return·Number.isFinite(n)·?·Math.max(1,·Math.floor(n))·:·fallback;·};·//·a·non-finite·request·falls·back,·a·negative·one·clamps:·never·unbounded
+    18     │ - const·str·=·(value:·unknown):·string·=>·(typeof·value·===·"string"·?·value·:·"");·const·foldKey·=·(r:·AggregateRow):·string·=>·`${str(r?.eventId)}·${str(r?.failureIdentity)}·${str(r?.occurrence?.timestamp)}`;·//·rows·are·folded·in·this·canonical·order,·so·WHICH·row·of·a·duplicate·set·becomes·the·representative·cannot·depend·on·input·order·either
+        40 │ + type·Bucket·=·{
+        41 │ + ··fingerprint:·string;
+        42 │ + ··keys:·Set<string>;
+        43 │ + ··count:·number;
+        44 │ + ··ids:·Set<string>;
+        45 │ + ··firstMs:·number;
+        46 │ + ··firstSeen:·string;
+        47 │ + ··lastMs:·number;
+        48 │ + ··lastSeen:·string;
+        49 │ + ··recovered:·number;
+        50 │ + ··unresolved:·number;
+        51 │ + ··dims:·Record<"sessions"·|·"hosts"·|·"models"·|·"quantizations"·|·"layers"·|·"codes",·Set<string>>;
+        52 │ + };
+        53 │ + const·sorted·=·(set:·Set<string>):·string[]·=>·[...set].sort();
+        54 │ + const·add·=·(set:·Set<string>,·value:·string·|·null·|·undefined):·void·=>·{
+        55 │ + ··if·(typeof·value·===·"string"·&&·value·!==·"")·set.add(value);
+        56 │ + };·//·an·unset·dimension·stays·absent·rather·than·becoming·a·fabricated·"unknown"·member
+        57 │ + const·bound·=·(requested:·number·|·undefined,·fallback:·number):·number·=>·{
+        58 │ + ··const·n·=·requested·??·fallback;
+        59 │ + ··return·Number.isFinite(n)·?·Math.max(1,·Math.floor(n))·:·fallback;
+        60 │ + };·//·a·non-finite·request·falls·back,·a·negative·one·clamps:·never·unbounded
+        61 │ + const·str·=·(value:·unknown):·string·=>·(typeof·value·===·"string"·?·value·:·"");
+        62 │ + const·foldKey·=·(r:·AggregateRow):·string·=>
+        63 │ + ··`${str(r?.eventId)}·${str(r?.failureIdentity)}·${str(r?.occurrence?.timestamp)}`;·//·rows·are·folded·in·this·canonical·order,·so·WHICH·row·of·a·duplicate·set·becomes·the·representative·cannot·depend·on·input·order·either
+    19  64 │   
+    20     │ - const·newBucket·=·(fingerprint:·string):·Bucket·=>·({·fingerprint,·keys:·new·Set(),·count:·0,·ids:·new·Set(),·firstMs:·Number.POSITIVE_INFINITY,·firstSeen:·"",·lastMs:·Number.NEGATIVE_INFINITY,·lastSeen:·"",·recovered:·0,·unresolved:·0,·dims:·{·sessions:·new·Set(),·hosts:·new·Set(),·models:·new·Set(),·quantizations:·new·Set(),·layers:·new·Set(),·codes:·new·Set()·}·});
+        65 │ + const·newBucket·=·(fingerprint:·string):·Bucket·=>·({
+        66 │ + ··fingerprint,
+        67 │ + ··keys:·new·Set(),
+        68 │ + ··count:·0,
+        69 │ + ··ids:·new·Set(),
+        70 │ + ··firstMs:·Number.POSITIVE_INFINITY,
+        71 │ + ··firstSeen:·"",
+        72 │ + ··lastMs:·Number.NEGATIVE_INFINITY,
+        73 │ + ··lastSeen:·"",
+        74 │ + ··recovered:·0,
+        75 │ + ··unresolved:·0,
+        76 │ + ··dims:·{
+        77 │ + ····sessions:·new·Set(),
+        78 │ + ····hosts:·new·Set(),
+        79 │ + ····models:·new·Set(),
+        80 │ + ····quantizations:·new·Set(),
+        81 │ + ····layers:·new·Set(),
+        82 │ + ····codes:·new·Set(),
+        83 │ + ··},
+        84 │ + });
+    21  85 │   
+    22  86 │   // Source event ids are kept sorted and capped for the report; `count` stays exact whatever the cap hides.
+    23     │ - const·toCluster·=·(b:·Bucket,·maxEventIds:·number):·ErrorCluster·=>·{·const·ids·=·[...b.ids].sort();·return·{·fingerprint:·b.fingerprint,·count:·b.count,·firstSeen:·b.firstSeen,·lastSeen:·b.lastSeen,·sessions:·sorted(b.dims.sessions),·hosts:·sorted(b.dims.hosts),·models:·sorted(b.dims.models),·quantizations:·sorted(b.dims.quantizations),·layers:·sorted(b.dims.layers),·codes:·sorted(b.dims.codes),·recovered:·b.recovered,·unresolved:·b.unresolved,·eventIds:·ids.slice(0,·maxEventIds),·eventIdsTruncated:·ids.length·>·maxEventIds·};·};
+        87 │ + const·toCluster·=·(b:·Bucket,·maxEventIds:·number):·ErrorCluster·=>·{
+        88 │ + ··const·ids·=·[...b.ids].sort();
+        89 │ + ··return·{
+        90 │ + ····fingerprint:·b.fingerprint,
+        91 │ + ····count:·b.count,
+        92 │ + ····firstSeen:·b.firstSeen,
+        93 │ + ····lastSeen:·b.lastSeen,
+        94 │ + ····sessions:·sorted(b.dims.sessions),
+        95 │ + ····hosts:·sorted(b.dims.hosts),
+        96 │ + ····models:·sorted(b.dims.models),
+        97 │ + ····quantizations:·sorted(b.dims.quantizations),
+        98 │ + ····layers:·sorted(b.dims.layers),
+        99 │ + ····codes:·sorted(b.dims.codes),
+       100 │ + ····recovered:·b.recovered,
+       101 │ + ····unresolved:·b.unresolved,
+       102 │ + ····eventIds:·ids.slice(0,·maxEventIds),
+       103 │ + ····eventIdsTruncated:·ids.length·>·maxEventIds,
+       104 │ + ··};
+       105 │ + };
+    24 106 │   
+    25 107 │   /** Group occurrences by root cause. A row D02 refuses (`INVALID_FINGERPRINT`) lands in `rejected` and forms no
+    ······ │ 
+    29 111 │    * `failureIdentity` already seen here: one upstream failure observable through two paths is ONE failure, so it must
+    30 112 │    * not inflate `count` even though BOTH source event ids are kept as evidence. */
+    31     │ - export·function·aggregateErrorOccurrences(rows:·readonly·AggregateRow[],·opts:·{·maxEventIds?:·number;·limit?:·number·}·=·{}):·AggregateResult·{
+       113 │ + export·function·aggregateErrorOccurrences(
+       114 │ + ··rows:·readonly·AggregateRow[],
+       115 │ + ··opts:·{·maxEventIds?:·number;·limit?:·number·}·=·{},
+       116 │ + ):·AggregateResult·{
+    32 117 │     const maxEventIds = bound(opts.maxEventIds, DEFAULT_MAX_EVENT_IDS);
+    33 118 │     const buckets = new Map<string, Bucket>();
+    34     │ - ··let·duplicateEvents·=·0;·let·rejected·=·0;
+    35     │ - ··for·(const·row·of·(Array.isArray(rows)·?·[...rows]·:·[]).sort((p,·q)·=>·(foldKey(p)·<·foldKey(q)·?·-1·:·foldKey(p)·>·foldKey(q)·?·1·:·0)))·{·//·a·copy·is·sorted;·the·caller's·array·is·never·touched
+       119 │ + ··let·duplicateEvents·=·0;
+       120 │ + ··let·rejected·=·0;
+       121 │ + ··for·(const·row·of·(Array.isArray(rows)·?·[...rows]·:·[]).sort((p,·q)·=>
+       122 │ + ····foldKey(p)·<·foldKey(q)·?·-1·:·foldKey(p)·>·foldKey(q)·?·1·:·0,
+       123 │ + ··))·{
+       124 │ + ····//·a·copy·is·sorted;·the·caller's·array·is·never·touched
+    36 125 │       const occurrence = row?.occurrence;
+    37     │ - ····const·fingerprint·=·occurrence·===·null·||·typeof·occurrence·!==·"object"·?·INVALID_FINGERPRINT·:·errorFingerprint(occurrence);
+    38     │ - ····if·(fingerprint·===·INVALID_FINGERPRINT)·{·rejected++;·continue;·}·//·unattributable:·counted,·never·clustered
+       126 │ + ····const·fingerprint·=
+       127 │ + ······occurrence·===·null·||·typeof·occurrence·!==·"object"·?·INVALID_FINGERPRINT·:·errorFingerprint(occurrence);
+       128 │ + ····if·(fingerprint·===·INVALID_FINGERPRINT)·{
+       129 │ + ······rejected++;
+       130 │ + ······continue;
+       131 │ + ····}·//·unattributable:·counted,·never·clustered
+    39 132 │       const eventId = typeof row.eventId === "string" ? row.eventId : "";
+    40 133 │       let b = buckets.get(fingerprint);
+    41     │ - ····if·(b·===·undefined)·{·b·=·newBucket(fingerprint);·buckets.set(fingerprint,·b);·}
+       134 │ + ····if·(b·===·undefined)·{
+       135 │ + ······b·=·newBucket(fingerprint);
+       136 │ + ······buckets.set(fingerprint,·b);
+       137 │ + ····}
+    42 138 │       if (eventId !== "") b.ids.add(eventId); // evidence survives even when this row itself is a duplicate
+    43 139 │       const fid = typeof row.failureIdentity === "string" ? row.failureIdentity : ""; // E07 gives one upstream failure one identity across both observation paths
+    44 140 │       const keys = [eventId !== "" ? `e:${eventId}` : "", fid !== "" ? `f:${fid}` : ""].filter((k) => k !== ""); // duplicate if EITHER key was counted already, so a retry-trace twin carrying a fid cannot re-count the eventId it repeats
+    45     │ - ····if·(keys.some((k)·=>·b.keys.has(k)))·{·duplicateEvents++;·continue;·}
+    46     │ - ····for·(const·k·of·keys)·b.keys.add(k);·b.count++;·//·`b.count++`·follows·the·loop·body,·it·is·not·part·of·it
+       141 │ + ····if·(keys.some((k)·=>·b.keys.has(k)))·{
+       142 │ + ······duplicateEvents++;
+       143 │ + ······continue;
+  43 more lines truncated
+  
+
+src/incidents/errorFingerprint.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     8  8 │   /** Malformed or wholly-empty input is unattributable: one stable key, never a digest of raw text, never a throw. */
+     9  9 │   export const INVALID_FINGERPRINT = "0000000000000000";
+    10    │ - export·interface·ErrorFingerprintInput·{·code:·string;·layer:·string;·summary:·string;·tool:·string·}
+       10 │ + export·interface·ErrorFingerprintInput·{
+       11 │ + ··code:·string;
+       12 │ + ··layer:·string;
+       13 │ + ··summary:·string;
+       14 │ + ··tool:·string;
+       15 │ + }
+    11 16 │   
+    12 17 │   // Folds applied to the retained text, in this order. A run of >= 4 digits is volatile (id, port, epoch); 2-3 digit
+    ····· │ 
+    30 35 │   ];
+    31 36 │   // The field is read inside the try: a throwing accessor is no evidence rather than a crash, a non-string scalar is stringified, an absent field is empty text, and nothing raw ever reaches the key.
+    32    │ - const·raw·=·(source:·object,·key:·string):·string·=>·{·try·{·const·value·=·(source·as·Record<string,·unknown>)[key];·return·typeof·value·===·"string"·?·value·:·value·===·null·||·value·===·undefined·?·""·:·String(value);·}·catch·{·return·"";·}·};
+    33    │ - const·fold·=·(source:·object,·key:·string):·string·=>·FOLD.reduce((acc,·[re,·to])·=>·acc.replace(re,·to),·raw(source,·key)).trim().toLowerCase();
+    34    │ - const·foldCode·=·(source:·object,·key:·string):·string·=>·raw(source,·key).replace(/\s+/g,·"").toLowerCase().slice(0,·120);·//·digits·survive:·gateway.429.rate_limited·!==·gateway.404.not_found
+       37 │ + const·raw·=·(source:·object,·key:·string):·string·=>·{
+       38 │ + ··try·{
+       39 │ + ····const·value·=·(source·as·Record<string,·unknown>)[key];
+       40 │ + ····return·typeof·value·===·"string"·?·value·:·value·===·null·||·value·===·undefined·?·""·:·String(value);
+       41 │ + ··}·catch·{
+       42 │ + ····return·"";
+       43 │ + ··}
+       44 │ + };
+       45 │ + const·fold·=·(source:·object,·key:·string):·string·=>
+       46 │ + ··FOLD.reduce((acc,·[re,·to])·=>·acc.replace(re,·to),·raw(source,·key))
+       47 │ + ····.trim()
+       48 │ + ····.toLowerCase();
+       49 │ + const·foldCode·=·(source:·object,·key:·string):·string·=>
+       50 │ + ··raw(source,·key).replace(/\s+/g,·"").toLowerCase().slice(0,·120);·//·digits·survive:·gateway.429.rate_limited·!==·gateway.404.not_found
+    35 51 │   // The tool is part of the cause when it is named in the code (`tool.bash.*`) or in the summary ("tool=rg", "tool rg").
+    36 52 │   const toolOf = (code: string, summary: string): string => {
+    37    │ - ··const·named·=·/^(?:tool|worker)\.([a-z0-9][a-z0-9_-]*)\./i.exec(code)·??·/\btool[·_-]?(?:name|is)?[·=:]+([a-z0-9][a-z0-9_-]*)/i.exec(summary);
+       53 │ + ··const·named·=
+       54 │ + ····/^(?:tool|worker)\.([a-z0-9][a-z0-9_-]*)\./i.exec(code)·??
+       55 │ + ····/\btool[·_-]?(?:name|is)?[·=:]+([a-z0-9][a-z0-9_-]*)/i.exec(summary);
+    38 56 │     return (named?.[1] ?? "").toLowerCase().slice(0, 60);
+    39 57 │   };
+    ····· │ 
+    42 60 │   export function fingerprintInput(occurrence: ErrorOccurrence): ErrorFingerprintInput | null {
+    43 61 │     if (occurrence === null || typeof occurrence !== "object" || Array.isArray(occurrence)) return null;
+    44    │ - ··const·code·=·foldCode(occurrence,·"code");·const·summary·=·fold(occurrence,·"summary");
+       62 │ + ··const·code·=·foldCode(occurrence,·"code");
+       63 │ + ··const·summary·=·fold(occurrence,·"summary");
+    45 64 │     if (code === "" && summary === "") return null; // no cause recorded: there is nothing to correlate on
+    46 65 │     return { code, layer: fold(occurrence, "layer"), summary, tool: toolOf(code, raw(occurrence, "summary")) };
+  
+
+Skipped 11 suggested fixes.
+If you wish to apply the suggested (unsafe) fixes, use the command biome check --fix --unsafe
+
+The number of diagnostics exceeds the number allowed by Biome.
+Diagnostics not shown: 29.
+Checked 665 files in 880ms. No fixes applied.
+Found 48 errors.
+check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while running checks.
+  
+

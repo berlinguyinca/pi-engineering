@@ -1,0 +1,13 @@
+▶ budget-exhausted worker that ran builds
+  ✔ says probable cold build when builds took most of the execution (1572.148833ms)
+  ✔ says the time went elsewhere when builds were short (1466.107708ms)
+  ✔ keeps the bare reason when the worker ran no builds (1449.36925ms)
+✔ budget-exhausted worker that ran builds (5172.367584ms)
+ℹ tests 3
+ℹ suites 1
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 6554.367042

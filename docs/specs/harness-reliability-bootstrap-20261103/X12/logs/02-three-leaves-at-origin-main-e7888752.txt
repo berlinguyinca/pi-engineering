@@ -1,0 +1,89 @@
+✖ a completion whose headers arrive after the fetch dispatcher's timeouts still completes (22.225625ms)
+✖ the caller's signal still ends a completion (1.512583ms)
+[info] thinking: off (mission role) · reviewer
+✔ the reviewer's prompt carries the change context and it can read files and run bash (145.054916ms)
+[info] thinking: off (mission role) · reviewer
+✔ mangled, duplicate and invented acceptance IDs do not invalidate the review (37.563834ms)
+[info] thinking: off (mission role) · reviewer
+✔ unreadable review output fails the attempt and classifies as a gate re-run, not repair (33.121083ms)
+✔ a green validation passes test-like criteria and leaves the rest to the reviewer (200.345667ms)
+[info] thinking: off (mission role) · reviewer
+✔ an empty acceptance_results list is invalid output, not every criterion failed (37.883459ms)
+[info] thinking: off (mission role) · reviewer
+✔ acceptance warnings are minor open findings that never block (29.921667ms)
+✔ validation stage names decide whether a green run proves test criteria (0.283458ms)
+✔ a lint-only profile does not pass test criteria even when green (46.373958ms)
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+✔ a reviewer that commits or writes through bash is rejected and the candidate is unchanged (408.817208ms)
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+✔ a reviewer that commits through bash is rejected too (416.104208ms)
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+✔ a retry after a reviewer mutation (a written file) starts from the recorded candidate (602.052167ms)
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+✔ a retry after a reviewer mutation (a commit) starts from the recorded candidate (620.137458ms)
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+[info] thinking: off (mission role) · reviewer
+✖ moving the candidate branch or planting a hook fails the review; ignored output and other branches do not (902.622292ms)
+[info] thinking: off (mission role) · reviewer
+✔ request_changes with a sloppy findings envelope still keeps its findings for repair (28.115375ms)
+[info] thinking: off (mission role) · reviewer
+✔ request_changes with a blocking finding stays a valid verdict without acceptance_results (28.016625ms)
+ℹ tests 17
+ℹ suites 0
+ℹ pass 14
+ℹ fail 3
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 4471.844083
+
+✖ failing tests:
+
+test at test/integration/planner-worker-gateway-timeouts.test.ts:43:1
+✖ a completion whose headers arrive after the fetch dispatcher's timeouts still completes (22.225625ms)
+  Error [InvalidArgumentError]: Argument dispatcher must implement dispatch
+      at new Dispatcher1Wrapper (node:internal/deps/undici/undici:10092:17)
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x10-main-ctl/test/integration/planner-worker-gateway-timeouts.test.ts:35:25)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async TestHook.run (node:internal/test_runner/test:1389:7) {
+    code: 'UND_ERR_INVALID_ARG'
+  }
+
+test at test/integration/planner-worker-gateway-timeouts.test.ts:64:1
+✖ the caller's signal still ends a completion (1.512583ms)
+  Error [InvalidArgumentError]: Argument dispatcher must implement dispatch
+      at new Dispatcher1Wrapper (node:internal/deps/undici/undici:10092:17)
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x10-main-ctl/test/integration/planner-worker-gateway-timeouts.test.ts:35:25)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async TestHook.run (node:internal/test_runner/test:1389:7) {
+    code: 'UND_ERR_INVALID_ARG'
+  }
+
+test at test/integration/review-context-and-acceptance.test.ts:399:1
+✖ moving the candidate branch or planting a hook fails the review; ignored output and other branches do not (902.622292ms)
+  AssertionError [ERR_ASSERTION]: echo x > .git/hooks/pre-commit
+  + actual - expected
+  
+  + 'succeeded'
+  - 'failed'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x10-main-ctl/test/integration/review-context-and-acceptance.test.ts:430:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 'succeeded',
+    expected: 'failed',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

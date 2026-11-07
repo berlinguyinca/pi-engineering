@@ -1,0 +1,8 @@
+
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+
+src/git/GitRepo.ts(256,23): error TS2323: Cannot redeclare exported variable 'resolveCommonDir'.
+src/git/GitRepo.ts(256,23): error TS2393: Duplicate function implementation.
+src/git/GitRepo.ts(308,23): error TS2323: Cannot redeclare exported variable 'resolveCommonDir'.
+src/git/GitRepo.ts(308,23): error TS2393: Duplicate function implementation.

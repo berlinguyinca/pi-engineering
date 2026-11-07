@@ -1,0 +1,36 @@
+=== X12 log 05 -- the correction X10's record needs: my measurement, not the branch ===
+
+X10 reported (X10/logs/05) that test/integration/worker-budget-build-hint.test.ts fails 2 of 3 copies at
+--test-concurrency=4 on this branch while passing alone and at origin/main, and carried it as the blocking caveat.
+It is not branch behaviour. It is what happens when you run the suite without the harness's own preload and without
+--test-force-exit. The repo's gate is:
+
+  npm test = node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts                "test/unit/**/*.test.ts" "test/integration/**/*.test.ts"
+
+X10's runs (and the X08/X11-era runs before them) used `npx tsx --test …` with no --import and no --test-force-exit.
+A/B at this branch tip (4be00c17), same files, same concurrency:
+
+$ node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts       mission-reliability-foundation.test.ts worker-budget-build-hint.test.ts       worker-resilience-no-fixed-deadlines.test.ts herdr-plannotator-transport.test.ts      # 03-four-files-gate-invocation.txt
+  real 0m47.673s ; tests 55 / pass 55 / fail 0 / cancelled 0 ; exit 0
+$ npx tsx --test --test-timeout=180000 <the same four files>                                 # 03-four-files-no-preload-stall.txt
+  one leaf hit the per-test ceiling: "✖ says probable cold build when builds took most of the execution (180017.59ms)",
+  the process then did not exit and had to be killed at 2400 s.
+
+$ node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts <budget-hint x3>   # 03-budget-hint-3copies-canonical.txt
+  tests 3 / pass 3 / fail 0 ; exit 0
+$ npx tsx --test --test-concurrency=4 --test-timeout=180000 <budget-hint x3>                                       # 03-budget-hint-3copies-no-preload.txt
+  tests 3 / pass 3 / fail 0 ; exit 0
+$ npx tsx --test --test-timeout=180000 <budget-hint alone>                                                         # 03-budget-hint-alone-no-preload.txt
+  tests 3 / pass 3 / fail 0 ; exit 0
+
+So the reproduction X10 measured -- three copies of the file at concurrency 4, no preload -- now passes, and the same
+recipe with the preload passes; what does not pass is running that file next to other files without the isolated state
+the preload provides. The leaf asserts elapsed milliseconds against a 10 s budget, so it is genuinely sensitive to what
+shares the process' state directory with it, and the harness's preload is what stops that sharing. X10's conclusion
+("branch-introduced, blocks merge") is wrong in its attribution and its severity: nothing on this branch makes it
+worse than main, and under the gate's own command the suite terminates with 0 cancelled.
+
+This unit corrects it in the record rather than quietly re-measuring, because the same method produced X10's whole-suite
+tally (5 failures) and X08's earlier tallies. Every number X12 reports is from `node --test … --test-force-exit
+--import ./test/support/isolatedState.ts`, and 02-whole-suite-canonical-at-4be00c17.txt is the first whole-suite figure
+in the series taken with the command the repository actually gates on (plus --test-timeout=180000 as a bound).
