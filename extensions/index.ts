@@ -820,7 +820,7 @@ export default function (pi: ExtensionAPI) {
   // (~/.config/herdr-engineering/host.json) sets inspector.enabled. Loaded in the
   // background with a short timeout so session start never waits on the network;
   // a missing config or unreachable control plane simply means no inspector.
-  // Best-effort and bounded; see docs/split-view-and-inspector.md.
+  // Best-effort and bounded; see docs/agent-inspector.md.
   const inspector = createInspectorSlot();
   void attachInspectorWhenReady(pi, {
     modelReason: () => (automaticModelSwitch ? "fallback" : undefined),
