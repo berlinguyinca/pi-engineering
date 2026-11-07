@@ -267,58 +267,6 @@ export async function resolveCommonDir(reported: string, repoRoot: string): Prom
     }
   };
   if (await present(reported)) return reported;
-  const layout = discoverRepo(repoRoot);
-  if (layout !== null && layout !== "invalid" && (await present(layout.commonDir))) return layout.commonDir;
-  throw new Error(
-    `git reported the common directory ${reported}, which does not exist, and the layout under ${repoRoot} resolves to nothing usable; the repository's git administration state is unreachable`,
-  );
-}
-
-/**
- * Minimal Git repository provider (spec §7 `git/`, §13.3 worktree isolation).
- *
- * The core runtime talks to git through this small surface. It does not replace
- * git; it wraps the commands the vertical slice needs: repo detection, worktree
- * creation, diff capture, commit, and status.
- */
-/**
- * Verify git's answer to `rev-parse --path-format=absolute --git-common-dir`.
- *
- * safeGit runs git with `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` pointed at Pi's shadow
- * administration state (see safeGit.ts). When that state and the repository are not represented by
- * the same path string, git resolves one against the other and the answer comes back with the
- * physical prefix applied twice — on macOS, where `/var` is a symlink to `/private/var`,
- * `/private/private/var/...` — a path that does not exist. Measured at 4ffa82f3: `commonDir()`
- * returned the doubled path while a plain `git -C <repo> rev-parse ...` in the same process returned
- * the right one. Two upstream commits fix that at the source — 61394da7 (#582) canonicalizes Pi's
- * state directory, 89e747c2 (#602) translates both spellings of the shadow so safeGit never hands
- * back a doubled path — and at their tip the doubled prefix no longer reproduces. Neither guards the
- * consumer: `commonDir()` had no way to notice an answer that names nothing, so a regression of
- * either fix surfaces downstream, not here. It matters because everything derived from the answer —
- * the administration lock directory, the candidate state directory, the checkpoint journal — fails
- * its mkdir with ENOENT, and `withWorktreeSection` reads ENOENT as "the other process's lock is not
- * there yet" and queues until `promotionWait.ceilingMs`: measured at 4ffa82f3, one lookup cost the
- * whole ceiling and an integration file had to be killed at 240 s without settling.
- *
- * A reported directory that exists is returned untouched: it is usually Pi's shadow common dir,
- * which only git knows. A reported path that does not exist is replaced by the layout resolved from
- * the filesystem — the same realpath'd discovery Pi uses to decide what it may touch. When neither
- * resolves, the error names the impossible path rather than letting a caller mkdir it.
- */
-export async function resolveCommonDir(reported: string, repoRoot: string): Promise<string> {
-  const present = async (path: string): Promise<boolean> => {
-    try {
-      await lstat(path);
-      return true;
-    } catch (error) {
-      // Only ENOENT/ENOTDIR mean absent; EACCES, ESTALE, EIO ... say nothing about the layout and
-      // must not be mistaken for a path that git invented.
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "ENOENT" || code === "ENOTDIR") return false;
-      throw error;
-    }
-  };
-  if (await present(reported)) return reported;
   // Discovery reads the filesystem too, and an EACCES/ESTALE/EIO there says nothing about the layout:
   // report it as what it is, with what git had answered, rather than as "resolves to nothing usable".
   try {
@@ -334,6 +282,14 @@ export async function resolveCommonDir(reported: string, repoRoot: string): Prom
     `git reported the common directory ${reported}, which does not exist, and the layout under ${repoRoot} resolves to nothing usable; the repository's git administration state is unreachable`,
   );
 }
+
+/**
+ * Minimal Git repository provider (spec §7 `git/`, §13.3 worktree isolation).
+ *
+ * The core runtime talks to git through this small surface. It does not replace
+ * git; it wraps the commands the vertical slice needs: repo detection, worktree
+ * creation, diff capture, commit, and status.
+ */
 
 export class GitRepo {
   private readonly cwd: string;
