@@ -1,0 +1,54 @@
+=== X12 closure gates, measured in the working tree at the X12 evidence commit 9fa508c5d815bb522371702bbc3a217979514e75
+(this log cannot carry its own commit's sha; it is committed one commit later, together with PLAN-COMPLETION.json, whose "head" names 9fa508c5)
+
+$ git log --oneline -3
+fe83bd89 docs(bootstrap): X12 evidence -- the merge that compiled, the caveat that was mine, the lint gap I had understated
+4be00c17 fix(git): one resolveCommonDir -- main's #632 slice and X09's error-context fix are the same function
+5a37a85d merge: origin/main (5 commits) into task/x08-common-dir-repair
+
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs   (artifact: AUDIT/integrity-scan-20261109-x12.txt)
+records=101 canonical=66 hash_ok=101 field_ok=101
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=60 offenders=2
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+superseded-generation links (informational)=21
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 6
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 1
+  ?? docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261109-x12.txt
+exit=0
+
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+ref=HEAD records=105 fields=3
+pointers healthy=267 nullDeclared=18 broken=30 unparseableRecords=0
+healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 1
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+exit=0
+
+$ node --experimental-strip-types scripts/verify-handoff-trail.ts --trail docs/specs/harness-reliability-bootstrap-20261103
+  evidence-uncommitted FIX-1: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-1/03-unit-bootstrap-regression.txt
+  evidence-absent FIX-2: declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/01-typecheck.txt
+  evidence-uncommitted FIX-2: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/01-typecheck.txt
+  evidence-absent FIX-2: declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/02-unit-bootstrap-one.txt
+  evidence-uncommitted FIX-2: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/02-unit-bootstrap-one.txt
+  evidence-absent FIX-2: declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/03-unit-bootstrap-regression.txt
+  evidence-uncommitted FIX-2: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/03-unit-bootstrap-regression.txt
+  unplanned-record X12: X12 carries a record the plan never ordered
+  lineage-break E03: E02.nextBaseSha cc036f2f8c3b938c80348dff821af77c973fde7b != E03.baseSha ba22f28a6b540de74eb49a88a3e4fd62a08af1b4
+  next-pointer-mismatch E07: record declares nextTaskId "E08" where the plan orders "D01"
+  next-pointer-mismatch T09: record declares nextTaskId "T10" where the plan orders "R01"
+NOT VERIFIED: 35 issue(s) across 71 record(s)
+
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+ref=HEAD records=105
+hashes recomputed ok=105 mismatch=0 noHashField=0 unparseable=0
+declared evidence paths=638 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree

@@ -42,7 +42,10 @@
     "Lint parity gap, measured and left open for the operator: origin/main is clean under `biome check src cmd` (0 findings) and this branch is not (47 findings in 15 files, all written by earlier units of this series; whole-tree `biome check .` reports 513 errors against main's 2). Earlier units each ran biome only over the files they touched, so the tree-wide debt accumulated invisibly across ~100 commits. The mechanical fix is not mechanical: `biome check --write` over the 15 files rewrote 37 files (+2855/-591) and still left 13 flagged with 45 findings requiring --unsafe; it was reverted and recorded (X10/logs/04) rather than folded into a behaviour PR.",
     "Convention conflict inside the series, recorded rather than silently resolved: .gitignore (Bootstrap Protocol 2026-11-03) says per-unit logs, fixtures and handoffs 'must stay untracked; integrity comes from handoffHash + artifactSha256', and the gate does stamp only a clean worktree -- but every unit from X01 on has force-added its evidence so a reviewer can open the paths a record cites, and the integrity scanner counts a cited-but-untracked path as dangling (evidence untracked=0 is only reachable by committing them). X10 follows the series' actual practice (force-add) and flags the rule as the thing that should change, not the practice.",
     "X11 corrected a cause claim X10's committed record makes. X10's notes and logs attribute X08/out's 8-character resultSha to `git rev-parse --path-format=absolute --git-common-dir` under GIT_COMMON_DIR. That is not how it was written: X08's generator carried it as a literal (`resultSha: \"9f064450\",`), and the durable facts are that templates/handoff.schema.json types baseSha/resultSha as plain {\"type\":\"string\"} -- so the emit path had nothing to check it against -- and that the stored value is byte-identical to `git rev-parse --short 9f0644507e51baea9f6d0a75fc838e046c4143b7`. X10/out is hash-bound and keeps the wrong cause; the correction lives in X10/out-chain and X11/logs/01.",
-    "The writer can still produce the defect X11 declares. templates/handoff.schema.json still types baseSha and resultSha as plain {\"type\":\"string\"} and nextBaseSha as {\"type\":[\"string\",\"null\"]} -- no pattern, no length -- so writeHandoff accepts any shape, hashes it into handoffHash, and commits it. The chain gate now catches and names it on every run and X11 declares the only instance the series produced with a proved-unique referent, but the durable fix is a shape pattern on those three fields, which changes the handoff protocol for every record in the series: the operator's call, not an audit-tooling unit's. Unchanged from X10 and still open: worker-budget-build-hint.test.ts hangs under concurrency on this branch (green alone, green at origin/main), and `biome check src cmd` is red with 44 findings across 14 files this branch wrote (green at origin/main)."
+    "The writer can still produce the defect X11 declares. templates/handoff.schema.json still types baseSha and resultSha as plain {\"type\":\"string\"} and nextBaseSha as {\"type\":[\"string\",\"null\"]} -- no pattern, no length -- so writeHandoff accepts any shape, hashes it into handoffHash, and commits it. The chain gate now catches and names it on every run and X11 declares the only instance the series produced with a proved-unique referent, but the durable fix is a shape pattern on those three fields, which changes the handoff protocol for every record in the series: the operator's call, not an audit-tooling unit's. Unchanged from X10 and still open: worker-budget-build-hint.test.ts hangs under concurrency on this branch (green alone, green at origin/main), and `biome check src cmd` is red with 44 findings across 14 files this branch wrote (green at origin/main).",
+    "X10's merge-blocking caveat for test/integration/worker-budget-build-hint.test.ts is withdrawn by X12 (X10/CORRECTION.md): the reproduction omitted --import ./test/support/isolatedState.ts and --test-force-exit, which `npm test` passes; under the gate invocation the file passes alone, as three copies, and next to the three other drifted integration files (55 pass / 0 fail, 47.7 s). Every X-series suite tally before X12 was taken with `npx tsx --test` and no preload.",
+    "`npm run lint` (= `biome check .`, the repository's gate) is exit 1 at the branch tip with 516 findings over 488 files, against exit 0 at origin/main tip e7888752. 365 are the evidence tree (json), whose bytes are hash-bound (evidence[].sha256, stdoutSha256, handoffHash) and which AUDIT/integrity-scan.mjs checks only for existence and tracked-ness, so formatting them would make the trail unverifiable silently; 118 ts + 5 mjs are code this branch wrote (~500 formatter findings + 15 analyzer errors, fixable). Merging as-is takes main from exit 0 to exit 1. Options and the biome.json golden-file precedent: X12/logs/06.",
+    "Whole suite at the branch tip under the gate invocation: 7964 tests / 7956 pass / 3 fail / 0 cancelled in 15m26s (X12/logs/02). The three failing leaves reproduce identically at origin/main's tip in a separate checkout (X12/logs/02-three-leaves-at-origin-main-e7888752.txt): they are pre-existing on main, not branch damage. X12's record does not list the whole-suite run in `commands[]` -- resultGate requires proof exitCode 0 (src/bootstrap/resultGate.ts:33) -- it is carried as evidence instead of being made to look green."
   ],
   "concluded_with_records": [
     "B00",
@@ -106,7 +109,8 @@
     "X08",
     "X09",
     "X10",
-    "X11"
+    "X11",
+    "X12"
   ],
   "cross_repo_integration": {
     "main": "591264f9bd4fc2fc07d88d94febde4cd0e919448",
@@ -126,8 +130,8 @@
     "quant_schema": "src/capability/quantBenchmark.ts",
     "runbook": "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
   },
-  "head": "449765f1b808a1babd0283b108df708892087f5d",
-  "next_action": "Merge #616 (task/x08-common-dir-repair) into main. X09 fixed the review's MAJOR regression and MINOR error-context gap; X10 merged origin/main b0c0e75d in and re-attributed the residue; X11 closed the last thing X10 could not close from an integration unit -- the canonical lineage gate, which was red on a pointer shape it had no vocabulary for. It now exits 0: AUDIT/lineage-scan.mjs has a third declaration kind whose acceptance conditions are proofs (manifest vocabulary, shape, the value the record holds at the audited sha, exactly one reachable commit for the abbreviation, a full `replacement` passing the superseded tests, an annotator that is neither the defective commit nor older than it), X08/out's abbreviated resultSha is declared against 9f0644507e51baea9f6d0a75fc838e046c4143b7, and ten mutations of that declaration are each refused for the reason that refuses them (X11/logs/02). Before the merge the operator should know three things remain open, all measured: `node --test test/integration/worker-budget-build-hint.test.ts --test-concurrency=4 --test-timeout=180000` fails in 2 of 3 copies at the branch tip (X10/logs/05) while green at origin/main's tip and green alone; `biome check src cmd` is red with 44 findings across 14 files this branch wrote (X10/logs/04, X10/fixtures/lint-diff-vs-origin-main.txt) while green at origin/main; and templates/handoff.schema.json still types baseSha/resultSha/nextBaseSha as plain strings, so the emit path can still write a pointer shape X11's gate has to catch after the fact.",
+  "head": "9fa508c5d815bb522371702bbc3a217979514e75",
+  "next_action": "Merge #616 (task/x08-common-dir-repair, head 9fa508c5d815bb522371702bbc3a217979514e75) into main. X09 fixed the review's MAJOR regression and MINOR error-context gap; X10 merged origin/main in and re-attributed the residue; X11 closed the canonical lineage gate, which was red on a pointer shape it had no vocabulary for; X12 merged the five commits main moved during X11, removed the duplicate resolveCommonDir that a conflict-free merge produced and that only typecheck could see, and re-measured the branch with the command the repository actually gates on. Three things remain open before the merge, all measured. (1) `npm run lint` is exit 1 here (516 findings / 488 files) against exit 0 at main, and 365 of them are the hash-bound evidence tree: the decision is whether to format the 123 code files and add the evidence tree to biome.json's files.ignore (the golden-file precedent), or merge with the regression and file the config question -- X12/logs/06. (2) The whole suite leaves 3 failures that reproduce identically at main's tip (pre-existing; #630/#633/#634 territory). (3) X10's blocking caveat about worker-budget-build-hint.test.ts is withdrawn as my measurement error, not branch damage (X10/CORRECTION.md). The schema-level pattern on baseSha/resultSha/nextBaseSha (templates/handoff.schema.json still types them as plain strings and does not require parentHandoffHash) stays the operator's residual, carried unchanged from X11.",
   "no_handoff_record": [],
   "plan": "harness-reliability-bootstrap-20261103",
   "plan_scope_tasks": 51,
@@ -357,16 +361,16 @@
   "repo": "berlinguyinca/pi-engineering",
   "schema_conformance": {
     "additional_properties": false,
-    "canonical_hash_recomputed": "99/99 recomputed handoffHash equal to the stored value; 99/99 required fields present",
-    "canonical_records": 65,
+    "canonical_hash_recomputed": "101/101 recomputed handoffHash equal to the stored value; 101/101 required fields present (AUDIT/integrity-scan.mjs). AUDIT/record-reproducibility.mjs at fe83bd89: records=105, hashes recomputed ok=105, mismatch=0, noHashField=0, unparseable=0, declared evidence paths=638, absent from HEAD tree=0.",
+    "canonical_records": 66,
     "chain_canonical_offenders": [
       "E02/out -> E03@cc036f2f8c3b (no such record)",
       "T09/out -> T10@3bb21ab2e4b4 (no such record)"
     ],
-    "chain_forward_links_resolved": 59,
+    "chain_forward_links_resolved": 60,
     "evidence_dangling": 0,
     "evidence_untracked": 0,
-    "field_ok": 99,
+    "field_ok": 101,
     "generations": [
       "V01/out",
       "V02/out",
@@ -387,9 +391,11 @@
       "X09/out-chain",
       "X10/out",
       "X10/out-chain",
-      "X11/out"
+      "X11/out",
+      "X11/out-chain",
+      "X12/out"
     ],
-    "hash_ok": 99,
+    "hash_ok": 101,
     "informational_orphans": [
       "B00/out-backfill",
       "FIX-1/out",
@@ -398,21 +404,22 @@
       "X01/out-final",
       "X08/out-chain"
     ],
-    "note": "untracked/dangling recomputed after X09; X09/out, X09/logs and X09/fixtures are force-added with `git add -f` because .gitignore:44-46 keeps */logs/, */fixtures/ and */out/ untracked by design -- the series tracks them anyway so the chain scan can prove evidence provenance (same as X01..X08). Recomputed after X11: records 97 -> 99 (X10/out-chain, X11/out), canonical 64 -> 65, canonical chain links resolved 58 -> 59, offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, and every handoffHash recomputed equal to its stored value. The canonical lineage gate now exits 0 for the first time in the series -- see AUDIT/lineage-scan.mjs and X11.",
-    "records_distinct": 97,
-    "records_total": 99,
+    "note": "untracked/dangling recomputed after X09; X09/out, X09/logs and X09/fixtures are force-added with `git add -f` because .gitignore:44-46 keeps */logs/, */fixtures/ and */out/ untracked by design -- the series tracks them anyway so the chain scan can prove evidence provenance (same as X01..X08). Recomputed after X11: records 97 -> 99 (X10/out-chain, X11/out), canonical 64 -> 65, canonical chain links resolved 58 -> 59, offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, and every handoffHash recomputed equal to its stored value. The canonical lineage gate now exits 0 for the first time in the series -- see AUDIT/lineage-scan.mjs and X11. Recomputed after X12: records 99 -> 101 (X11/out-chain, X12/out), canonical 65 -> 66, canonical chain links resolved 59 -> 60 (X11/out-chain -> X12 resolves on nextBaseSha == X12.baseSha), offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, hash_ok/field_ok 101/101. X12's logs, fixtures and record are force-added with `git add -f` like X01..X11, which contradicts the comment at .gitignore:42-46 ('logs, fixtures, handoffs ... must stay untracked'); the series tracks them so record-reproducibility can prove every declared artifact is in the same tree as the record that vouches for it. scripts/verify-handoff-trail.ts still reports 35 issues at fe83bd89, all standing: FIX-1/FIX-2 evidence absent, 'unplanned-record' for the post-plan-extension units X01..X12 and the FIX-* units, the E02->E03 lineage break and the E07/T09 next-pointer mismatches. Closure log: X12/logs/09-closure-gates.txt.",
+    "records_distinct": 99,
+    "records_total": 101,
     "required_fields": 15,
-    "required_fields_ok": 99,
-    "scan_artifact": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261107-x11.txt",
+    "required_fields_ok": 101,
+    "scan_artifact": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261109-x12.txt",
     "scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261106-x09.txt",
-    "scanned_at": "147b827159c426b21b7806ce751e5d9ab771ece9",
+    "scanned_at": "9fa508c5d815bb522371702bbc3a217979514e75",
     "scanner": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
     "schema": "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json",
     "lineage_gate": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs",
-    "lineage_gate_result": "RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation (entries=30, superseded=8, unresolvable=21, abbreviated=1)"
+    "lineage_gate_result": "RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation (records=103, fields=3, pointers healthy=262 nullDeclared=17 broken=30 unparseableRecords=0, entries=30 superseded=8 unresolvable=21 abbreviated=1)"
   },
   "series_terminal_record": {
-    "handoff_hash": "sha256:49d60217910b93d502d8b1f8e1a41c1a2ae4a02a414f1a799d7a83713c4a18e0",
-    "note": "X11 is terminal (nextTaskId null): it declares the one malformed pointer the series produced -- X08/out resultSha, eight characters -- and gives AUDIT/lineage-scan.mjs a third declaration kind whose acceptance conditions are proofs (manifest vocabulary, shape, the value the record holds at the audited sha, exactly one reachable commit for the prefix enumerated with `git rev-list --all`, a full `replacement` that passes the same tests a superseded replacement passes, and an annotator that is neither the defective commit nor older than it), so the canonical lineage gate exits 0 with nothing declared on trust and ten mutations of the declaration each refused for the reason that refuses them. X10 is no longer terminal: X10/out-chain (sha256:be1b374a4675ee714273a7e58c80a1b0ebe1aa393e553b4bbdcb7547344c3db0) carries nextTaskId=X11 / nextBaseSha=5403bf30a4b9efef9930b36d96996a1398bc4c62, and it carries the correction of X10's cause claim about the abbreviation while X10/out stays byte-unchanged and hash-bound. Residue carried unresolved, unchanged: worker-budget-build-hint.test.ts hanging under concurrency on this branch, 44 biome findings across 14 files this branch wrote, and the handoff schema still typing commit pointers as plain strings."
-  }
+    "handoff_hash": "sha256:865e41cf09f40c3d1231f1992fc146735aaa06c55c941fb803c86ea2a146ad9f",
+    "note": "X12 is terminal (nextTaskId null): it is the unit the merge forced. main moved five commits during X11 (#630-#634); git merge-tree reported one tree and zero conflicts and git merge said 'Automatic merge went well', and typecheck:core then failed with TS2323/TS2393 -- two exported implementations of resolveCommonDir at src/git/GitRepo.ts:256 and :308 -- because both sides added the same function to a file the merge base had neither in. A conflict-free textual merge cannot see that; nothing in the merge contract says a file now has two implementations of one exported function. The resolution keeps the branch's (the superset: X09's discoverRepo wrapper, so EACCES/ESTALE/EIO is reported with git's answer and the cause) and main's provenance line, 8 insertions / 52 deletions in one file. X12 also restates two of the series' own measurements that were taken with the wrong command: worker-budget-build-hint.test.ts is not branch damage (X10/logs/05 ran tsx without --import ./test/support/isolatedState.ts or --test-force-exit; under `npm test`'s invocation the same four integration files are 55 pass / 0 fail in 47.7 s, and without the preload one leaf hits the 180 s ceiling and the process must be killed -- X10/CORRECTION.md), and lint parity is 516 findings over 488 files at the branch tip against exit 0 at origin/main measured with the repository's own `npm run lint` = `biome check .`, not the scoped `biome check src cmd` X11 quoted (44). Whole suite at 4be00c17 under the gate invocation: 7964 tests, 7956 pass, 3 fail, 0 cancelled, 15m26s, with the three failures reproduced identically at origin/main's tip e7888752 in a separate checkout. X11 is no longer terminal: X11/out-chain (sha256:5b3ca8ae72b6d079b1a37e0ae18bc0cc5a6b39278627557619336528cbe4ec09) carries nextTaskId=X12 / nextBaseSha=308935c0f1600201b6f2d5563c7500718cd8f32a -- X12's baseSha, the sha X12 branched from, because the chain gate matches nextBaseSha == successor.baseSha; an earlier draft carried X12's resolution commit 4be00c17, which resolved to no record and put a third CHAIN offender in integrity-scan. X11/out and X10/out stay byte-unchanged as pushed."
+  },
+  "scanned_at": null
 }
