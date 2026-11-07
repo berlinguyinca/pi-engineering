@@ -1,0 +1,83 @@
+Adversarial review of PR #616 (task/x08-common-dir-repair -> main) produced by the Claude Code CLI
+with model claude-opus-4-5, 2026-11-06.
+
+How it was run (reproducible):
+  git -c core.hooksPath=/dev/null diff --unified=60 origin/main...task/x08-common-dir-repair -- src cmd > diff-src-cmd.patch
+  git -c core.hooksPath=/dev/null diff --unified=60 origin/main...task/x08-common-dir-repair -- test  > diff-test.patch
+  (plus bootstrap/templates/manifests, the evidence tree, and the two JSON schemas)
+  claude -p --model claude-opus-4-5 --allowedTools Read Grep Glob --add-dir /tmp/review-616 \
+         --output-format text --permission-mode acceptEdits < brief.md
+  Working tree: /Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103 at 9f064450
+  (the branch head then; the evidence commit a93b53a0 came after). 6121 bytes of output, exit 0.
+
+The review is read-only input. Every finding is adjudicated against the repository in
+review-616-adjudication-20261106.txt; only accepted findings were acted on.
+
+---------------------------------- review text ----------------------------------
+
+I've reviewed the production code, tests, and evidence trail. Here is my adversarial review:
+
+---
+
+## Code Review: PR #616 (task/x08-common-dir-repair → main)
+
+### Findings
+
+**MAJOR (1) — `worker-stream-truncation.test.ts:306` fails due to default flip and no mitigation**
+- **Path**: `test/integration/worker-stream-truncation.test.ts:306-310`
+- **Input**: The test asserts `isResilientRuntime(await executor.getModelRuntime()) === true` at line 310, but the `withProbe()` helper at lines 83-131 creates a `PiWorkerExecutor` without setting `PI_INFERENCE_RESILIENCE_ENABLED=1`.
+- **Evidence**: The PR flips `DEFAULT_INFERENCE_RESILIENCE.enabled` from `true` to `false` at `src/inference/resilienceConfig.ts:103`. The test implicitly relied on the old default. Unlike the two integration tests (`resilient-inference-integration.test.ts:126`, `resilient-inference-wiring.test.ts:145`) that were updated to pass `PI_INFERENCE_RESILIENCE_ENABLED: "1"` explicitly, this test was not.
+- **Actual regression**: The author acknowledges this exact failure in `X08/logs/18-whole-suite-corrected-base.txt:21` and `PLAN-COMPLETION.json:33`, calling it "a real regression from commit 141ca5db". However, no fix was applied — the test remains broken at this branch head.
+- **Severity**: **MAJOR** — the test itself is sound; the production path it covers (resilient stream resume) is real. The default flip silently disabled the production path in this test harness without updating it.
+- **FIX REQUIRED**: Add `env: { PI_INFERENCE_RESILIENCE_ENABLED: "1" }` to the `PiWorkerExecutor` options in `withProbe()` or create a dedicated harness for that one test case.
+
+**MINOR (2) — `resolveCommonDir` can throw EACCES/ESTALE from `discoverRepo` without a meaningful message**
+- **Path**: `src/git/GitRepo.ts:273-278`
+- **Input**: When the `reported` path does not exist, `discoverRepo(repoRoot)` is called. If the repository is on a NFS mount and ESTALE occurs during the discovery, the error bubbles up with no mention of the repository or the reported path.
+- **Evidence**: Lines 266-270 handle EACCES/ESTALE for `lstat(reported)` by rethrowing, but line 274's `discoverRepo` call can similarly fail (it reads `.git` or resolves the worktree linkage).
+- **Severity**: **MINOR** — the guard exists for macOS `/private/var` doubling, not for stale NFS handles; the error is honest (throws instead of silently accepting a bogus path), just lacks detail.
+
+**MINOR (3) — `pathPolicy.ts` symlink anchor set is case-sensitive; filesystem may not be**
+- **Path**: `src/bootstrap/pathPolicy.ts:41,54-56`
+- **Input**: On macOS APFS with case-insensitivity, a symlink named `Src` is not equal to a request for `src/foo.ts`. The set lookup at line 41 (`anchors.has(ancestor)`) is string-exact.
+- **Evidence**: The policy normalizes paths through `canonicalizeWriteDomain` which does not case-fold (it only strips leading slash and collapses `.`/`..`). A request for `SRC/module.ts` will not match an anchor registered as `src`.
+- **Severity**: **MINOR** — the caller must populate `symlinks` from `lstat`, which sees the casing git uses; a mismatch between git's casing and the manifest's casing is unlikely but not impossible.
+
+**NIT (4) — Duplicated evidence entry in `X08.handoff.json`**
+- **Path**: `docs/specs/harness-reliability-bootstrap-20261103/X08/out-final/X08.handoff.json:41,54`
+- **Input**: The `evidence` array lists `logs/17-whole-suite-wrong-base.txt` twice (indices 41 and 54 in the array).
+- **Evidence**: The handoff writer does not deduplicate the evidence list.
+- **Severity**: **NIT** — cosmetic.
+
+**NIT (5) — `taskManifest.ts` missing `const` before MICROTASK_CEILING**
+- **Path**: `src/bootstrap/taskManifest.ts:4`
+- **Input**: The parser treats `MICROTASK_CEILING` as the hard ceiling, but the value is declared with `export const` so it cannot be reassigned at runtime. No issue, just unusual to export a ceiling — callers could weaken gate semantics by reading this export and passing it as their own limit.
+- **Severity**: **NIT** — the ceiling is frozen by `const` and is never re-exported elsewhere in this patch; the risk is theoretical.
+
+---
+
+### Evidence Trail Verification
+
+| Claim (from `X08.handoff.json`) | Checked | Result |
+|---|---|---|
+| Suite tallies: 7944 / 7912 / 27 / 0 | `logs/18-whole-suite-corrected-base.txt:4-8` | **matches** |
+| Origin/main control: 7699 / 7671 / 23 / 0 | `logs/18-whole-suite-corrected-base.txt:14` | **matches** |
+| Delta: +245 tests, +4 failing leaf tests | `logs/18-whole-suite-corrected-base.txt:15` | **matches** |
+| `worker-stream-truncation:306` named as failing | `logs/18-whole-suite-corrected-base.txt:21` | **confirmed** |
+| Blocker files settled 18/18 in 52 s | `logs/13-blocker-files-at-task-commit.txt` | grep `18/18` — **confirmed** |
+| Guard unit 5/5 | `logs/14-guard-unit-at-task-commit.txt` | grep `✔ 5 tests, 5 pass` — **unverified** (log file lists 5 tests, no failure banner) |
+
+The evidence entries are present and consistent with the claims. The duplicated entry is cosmetic.
+
+---
+
+### Verdict: **MERGE-WITH-FOLLOW-UPS**
+
+The core change (`resolveCommonDir`) is sound and well-tested. The bootstrap modules add new gates that are restrictive by design — they reject, not admit. The resilience default-off flip is policy-correct and surfaces its own switch-parsing problems. The one **MAJOR** issue is that `worker-stream-truncation.test.ts:306` is knowingly left failing without an inline fix.
+
+**Before merging, the human should**:
+1. **Run** `node --test test/integration/worker-stream-truncation.test.ts` at this branch head and confirm line 306 fails.
+2. **Decide** whether to merge as-is and fix in a follow-up (issue #621 already tracks herdr-plannotator; worker-stream-truncation may be grouped with it) or apply a one-line `env` fix now.
+3. **Spot-check** that `npm run test:unit` terminates (the suite-termination blocker claimed closed).
+
+**Misattributions observed**: None. The author explicitly called out the regression at line 306 and attributed it to commit `141ca5db`, not to upstream or another branch.

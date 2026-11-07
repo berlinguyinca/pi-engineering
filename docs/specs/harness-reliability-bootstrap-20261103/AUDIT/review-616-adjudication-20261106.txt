@@ -1,0 +1,91 @@
+Adjudication of the claude-opus-4-5 review of PR #616
+=====================================================
+
+Review: AUDIT/review-616-opus-20261106.txt (model claude-opus-4-5, read-only tools Read/Grep/Glob,
+run against the branch head 9f064450). Verdict: MERGE-WITH-FOLLOW-UPS.
+
+Every finding was re-checked against the repository before acting on it. Child-model output is not
+authority; the measurements below are the authority. Accepted findings are fixed in 147b8271 (X09);
+the record is docs/specs/harness-reliability-bootstrap-20261103/X09/out/X09.handoff.json.
+
+  Finding                          Verdict     Action
+  ---------------------------------------------------------------------------
+  1 worker-stream-truncation:306   ACCEPTED    fixed in 147b8271 (X09), 20 pass / 0 fail
+  2 discoverRepo error context     ACCEPTED    fixed in 147b8271 (X09), error text only
+  3 pathPolicy case folding        REJECTED    would cause false rejects; no change
+  4 duplicated evidence entries    ACCEPTED    X08/out-chain generation (dedup)
+  5 taskManifest ceiling note      REJECTED    reviewer's own text calls it theoretical
+  (evidence check: guard unit)     REVIEW WRONG  log 14 does report pass 5 / fail 0
+  ("issue #621 already tracks…")   UNVERIFIABLE not relied upon
+
+1. MAJOR worker-stream-truncation.test.ts:306 — accepted, and it was the review's best finding
+---------------------------------------------------------------------------------------------
+Claim: the scenario asserts `isResilientRuntime(await executor.getModelRuntime()) === true` while
+`withProbe()` builds a `PiWorkerExecutor` that never opts into resilience, and 141ca5db moved
+`DEFAULT_INFERENCE_RESILIENCE.enabled` to false.
+
+Verified independently, on the tree:
+  * `PiWorkerExecutor.wireResilience()` (src/workers/PiWorkerExecutor.ts:417-427) passes no `env`, and
+    `wireResilientModelRuntime` then resolves configuration from `process.env`
+    (src/inference/resilientInstall.ts:57-60, 127-133). So the executor arms only from the ambient
+    environment — exactly the coupling the reviewer inferred.
+  * Measured per tree: 20 pass at X06's parent 009837c3 (run alone); 19 pass / 1 fail at 141ca5db,
+    45d42acb and 6818842c (X08/logs/19, each file run alone) and failing among the branch-only failing
+    leaf tests at a93b53a0 (X08/logs/18, whole suite). Only one commit changes that file's outcome, and
+    it is X06's default flip.
+  * The precedent the reviewer pointed at is real: 259a4233 (#604) armed
+    resilient-inference-integration.test.ts:133 and resilient-inference-wiring.test.ts:232 explicitly.
+
+Correction to the reviewer's proposed fix. It suggested `env: { PI_INFERENCE_RESILIENCE_ENABLED: "1" }`
+"to the PiWorkerExecutor options in withProbe()". `PiWorkerExecutorOptions` (src/workers/PiWorkerExecutor.ts:220-311)
+has no `env` member; #604 passed env to `createResilientInference`, which is a different seam. Arming the
+executor's runtime therefore goes through the environment the executor reads. X09 sets
+`process.env.PI_INFERENCE_RESILIENCE_ENABLED` for the one scenario that asks for it and restores the
+previous value in the same `finally`, so the other 19 scenarios keep exercising the unarmed default.
+No assertion was touched. After: 20 pass / 0 fail; resilience-default-off 3/3 still asserts the default.
+
+2. MINOR resolveCommonDir discovery failure — accepted
+------------------------------------------------------
+`present(reported)` distinguishes ENOENT/ENOTDIR from EACCES/ESTALE/EIO, but `discoverRepo(repoRoot)`
+was called outside any handler, so a filesystem error there surfaced bare and lost the fact that git had
+reported a nonexistent directory. X09 wraps discovery and throws with both facts plus `cause`. Error text
+only; the "resolves to nothing usable" branch and its test are unchanged (guard unit 5/5). The reviewer's
+own severity ("the error is honest, just lacks detail") is the right reading — this is not a hang risk.
+
+3. MINOR pathPolicy case folding — rejected
+-------------------------------------------
+The observation is factually right (anchors are matched case-exactly; `canonicalizeWriteDomain` does not
+case-fold) but the implied fix is wrong. Paths in git's index and in manifest allowPaths are case-sensitive
+strings; folding them would reject legitimate requests on case-sensitive filesystems (the Linux runners),
+which is worse than the aliasing it avoids on case-insensitive APFS. `createPathPolicy` takes the anchor set
+from its caller, which derives it from `lstat`/git casing; making the caller's casing consistent with the
+manifest's is a caller-side concern, not a reason to weaken the matcher. Recorded, no change.
+
+4. NIT duplicated evidence entries — accepted
+---------------------------------------------
+Measured: X08/out-final/X08.handoff.json evidence has 24 entries, 22 unique — `X08/logs/17-whole-suite-wrong-base.txt`
+and `X08/logs/18-whole-suite-corrected-base.txt` each appear twice (my generator listed the 17/18 pair once in the
+extra set and once in the 10..18 sweep). Fixed by a new generation `X08/out-chain` rather than editing the pushed
+generation, and the same generation carries the forward link to X09 (`nextTaskId`, `nextBaseSha=a93b53a0`), because
+out-final was emitted terminal.
+
+5. NIT taskManifest MICROTASK_CEILING — rejected
+------------------------------------------------
+The reviewer's own text: "No issue… the risk is theoretical." No change.
+
+Corrections to the review's own evidence checks
+-----------------------------------------------
+* It marked the guard unit "unverified (log file lists 5 tests, no failure banner)".
+  X08/logs/14-guard-unit-at-task-commit.txt does report `ℹ tests 5`, `ℹ pass 5`, `ℹ fail 0`, `ℹ cancelled 0`.
+* Its other four cross-checks against logs/18 and logs/13 were accurate; the suite tallies it read
+  (7944/7912/27/0 and 7699/7671/23/0) match the log.
+* "issue #621 already tracks herdr-plannotator" is not reproducible from the repository — the evidence tree
+  contains no reference to #621, and the reviewer had no network tools. The number does name a real open issue
+  (herdr-plannotator-transport timeout flake), so it was plausible, but unverified citations were not relied
+  upon for any action.
+
+Disposition
+-----------
+The verdict MERGE-WITH-FOLLOW-UPS is accepted. The MAJOR is closed by X09; the remaining follow-ups the review
+lists are already carried here: re-running `npm run test:unit` for termination (done: X08/logs/15-17) and the
+spot-check of the blocker files (X09/logs/03, 18/18 in 49 s).

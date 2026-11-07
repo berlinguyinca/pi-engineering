@@ -1,0 +1,21 @@
+records=95 canonical=63 hash_ok=95 field_ok=95
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=57 offenders=2
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+superseded-generation links (informational)=21
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 6
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 6
+  A  docs/specs/harness-reliability-bootstrap-20261103/X09/fixtures/manifest.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X09/logs/01-affected-files.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X09/logs/02-typecheck-biome.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X09/logs/03-blocker-and-neighbours.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X09/out/X09.handoff.json
+  ?? docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261106-x09.txt
