@@ -7,7 +7,7 @@
  * writable. A second table holds plain prompts that must stay writable.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -37,12 +37,46 @@ interface Row {
   excluded?: Name[];
   /** Expected refusal message fragment. */
   message?: RegExp;
+  /**
+   * The expected refusal message on a filesystem that does not preserve filename
+   * case, for the rows whose reason for refusing depends on the filename not
+   * resolving. The refusal itself never changes between filesystems.
+   */
+  messageCaseInsensitive?: RegExp;
 }
 
 /** A one-character typo of an existing path (never the path itself). */
 function typo(path: string): string {
   return `${path.slice(0, -1)}${path.at(-1) === "x" ? "y" : "x"}`;
 }
+
+/**
+ * Whether `$TMPDIR` preserves filename case, measured rather than assumed: the
+ * answer belongs to the mounted filesystem, not to the OS. APFS volumes are
+ * case-insensitive by default but can be formatted case-sensitive, and a Linux
+ * host can mount a case-insensitive share, so `process.platform` would be wrong
+ * in both directions.
+ *
+ * A flipped-case lookup that resolves means two spellings name one file, which
+ * is what makes "this path does not exist" unprovable for a row that depends on
+ * case alone.
+ */
+async function probeCasePreservingTmp(): Promise<boolean> {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-corpus-case-"));
+  try {
+    await writeFile(join(dir, "probe.txt"), "x");
+    try {
+      await stat(join(dir, "PROBE.TXT"));
+      return false;
+    } catch {
+      return true;
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+const CASE_PRESERVING_TMP = await probeCasePreservingTmp();
 
 const DIRECTIVE_HINT = /writable: \/path/;
 
@@ -59,7 +93,17 @@ const CORPUS: Row[] = [
   { prompt: (p) => `Update ${p.T} and ${p.R} except do not touch ${p.R}`, write: ["T"], read: ["R"], excluded: ["R"] },
   { prompt: (p) => `Fix ${p.R} but do not touch ${p.Rsrc}`, write: "refuse", excluded: ["Rsrc", "R"] },
   { prompt: (p) => `Update ${typo(p.T)}`, write: "refuse", message: /does not exist/ },
-  { prompt: (p) => `Fix ${p.T.toUpperCase()}`, write: "refuse", message: /does not exist/ },
+  // Refused because the upper-cased task directory is a path that does not exist
+  // — except on a case-insensitive `$TMPDIR`, where it is the task directory
+  // under another spelling and the scope check's realpath comparison reports a
+  // symlink boundary instead. Both are refusals of the same prompt; only the
+  // reason is filesystem-dependent, so only the reason may vary.
+  {
+    prompt: (p) => `Fix ${p.T.toUpperCase()}`,
+    write: "refuse",
+    message: /does not exist/,
+    messageCaseInsensitive: /does not exist|crosses a symlink boundary/,
+  },
   { prompt: () => "Fix ~/pi-eng-repo-that-does-not-exist-7f3a", write: "refuse" },
   { prompt: (p) => `Port the change from ${p.R} into ${p.T}`, write: ["T"], read: ["R"], excluded: ["R"] },
   { prompt: (p) => `Do not touch ${p.L}. Build the feature.`, write: "refuse", excluded: ["L"] },
@@ -493,7 +537,12 @@ describe("workspace authority corpus (PR #106 final reviews)", () => {
       }
       if (row.write === "refuse") {
         assert.ok(outcome.error instanceof WorkspaceScopeError, `expected a refusal for: ${prompt}`);
-        if (row.message) assert.match(String(outcome.error), row.message);
+        if (row.message) {
+          assert.match(
+            String(outcome.error),
+            CASE_PRESERVING_TMP ? row.message : (row.messageCaseInsensitive ?? row.message),
+          );
+        }
         return;
       }
       assert.ok(outcome.resolved, `unexpected refusal for ${prompt}: ${String(outcome.error)}`);
