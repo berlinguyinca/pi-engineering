@@ -227,13 +227,6 @@ export function forgetOpenCache(): void {
 }
 
 /**
- * Minimal Git repository provider (spec §7 `git/`, §13.3 worktree isolation).
- *
- * The core runtime talks to git through this small surface. It does not replace
- * git; it wraps the commands the vertical slice needs: repo detection, worktree
- * creation, diff capture, commit, and status.
- */
-/**
  * Verify git's answer to `rev-parse --path-format=absolute --git-common-dir`.
  *
  * safeGit runs git with `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` pointed at Pi's shadow
@@ -256,6 +249,9 @@ export function forgetOpenCache(): void {
  * which only git knows. A reported path that does not exist is replaced by the layout resolved from
  * the filesystem — the same realpath'd discovery Pi uses to decide what it may touch. When neither
  * resolves, the error names the impossible path rather than letting a caller mkdir it.
+ *
+ * Landed from PR #616 as unit X08, on its own so `main` gets the consumer-side guard without the
+ * 941-file evidence tree that rode with it.
  */
 export async function resolveCommonDir(reported: string, repoRoot: string): Promise<string> {
   const present = async (path: string): Promise<boolean> => {
@@ -278,6 +274,13 @@ export async function resolveCommonDir(reported: string, repoRoot: string): Prom
   );
 }
 
+/**
+ * Minimal Git repository provider (spec §7 `git/`, §13.3 worktree isolation).
+ *
+ * The core runtime talks to git through this small surface. It does not replace
+ * git; it wraps the commands the vertical slice needs: repo detection, worktree
+ * creation, diff capture, commit, and status.
+ */
 export class GitRepo {
   private readonly cwd: string;
   private readonly repoRoot: string;
