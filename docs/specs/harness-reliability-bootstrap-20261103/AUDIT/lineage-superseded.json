@@ -1,7 +1,7 @@
 {
   "schema": "harness-reliability-lineage-superseded/v2",
   "auditedRef": "HEAD",
-  "auditedSha": "8dd30a22c5d6a3c8cb8aa8da7137b24f34239bf0",
+  "auditedSha": "5403bf30a4b9efef9930b36d96996a1398bc4c62",
   "fieldsScanned": [
     "baseSha",
     "resultSha",
@@ -10,9 +10,10 @@
   "purpose": "Declared breaks in the commit pointers of tracked handoff records (baseSha, resultSha, nextBaseSha). Records are hash-bound -- handoffHash is the SHA-256 over deterministic sorted-key UTF-8 serialisation excluding handoffHash (02-HANDOFF-PROTOCOL.md:15; canonicalHash at src/bootstrap/resultGate.ts:15) -- so nothing is rewritten. AUDIT/lineage-scan.mjs re-verifies every entry on each run.",
   "kinds": {
     "superseded": "a reachable commit with a byte-identical commit subject is provably the same commit rewritten; `replacement` may be used as the pointer",
-    "unresolvable": "no live commit is provably the declared value; `annotatedBy` names the reachable commit that carries this record and its evidence, and MUST NOT be used as a replacement"
+    "unresolvable": "no live commit is provably the declared value; `annotatedBy` names the reachable commit that carries this record and its evidence, and MUST NOT be used as a replacement",
+    "abbreviated": "the pointer is a git abbreviation of a commit id rather than the id itself; `replacement` must be the ONE commit the prefix names, and `annotatedBy` the commit that makes the declaration (X11, AUDIT/lineage-scan.mjs: it proves the prefix unique, that the entry matches the record, and that the annotation post-dates the defect)"
   },
-  "count": 29,
+  "count": 30,
   "entries": [
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H01/out/H01.handoff.json",
@@ -382,11 +383,26 @@
       "replacement": "5e1ebb8c67b492d5f77c92de4c1e7b6f726b0833",
       "replacementSubject": "docs(bootstrap): X04 handoff evidence tree",
       "annotatedBy": "5e1ebb8c67b492d5f77c92de4c1e7b6f726b0833"
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/X08/out/X08.handoff.json",
+      "field": "resultSha",
+      "taskId": "X08",
+      "brokenSha": "9f064450",
+      "defect": "malformed",
+      "kind": "abbreviated",
+      "rule": "uniqueAbbreviation",
+      "replacement": "9f0644507e51baea9f6d0a75fc838e046c4143b7",
+      "replacementSubject": "fix(git): preserve a malformed --git-common-dir pointer instead of failing the load",
+      "annotatedBy": "5403bf30a4b9efef9930b36d96996a1398bc4c62",
+      "annotatedBySubject": "docs(bootstrap): X10 integration evidence, base-drift attribution, terminal chain link",
+      "note": "resultSha holds an 8-character abbreviation -- the form `git log --oneline` prints -- not a commit id. X11 found the mechanism rather than assuming one: X08's generator carried the value as a hand-written literal, and nothing downstream could have caught it. templates/handoff.schema.json types baseSha, resultSha and nextBaseSha as plain {\"type\": \"string\"} and writeHandoff validates only against that schema, so the emit path hashed and committed whatever shape it was handed. The link 9f064450 resolved and named this unit's own task commit, so nothing was lost -- but the shape was wrong and anyone following the pointer had to guess. The full id is provably the same commit: prefix 9f064450 names exactly one commit reachable from the audited refs (AUDIT/lineage-scan.mjs, kind=abbreviated, rule=uniqueAbbreviation). The record is byte-unchanged; it predates this declaration and its handoffHash still covers the abbreviation."
     }
   ],
   "defectKinds": {
     "object_missing": "git cat-file -e fails: no such object in this repository",
     "unreachable_from_any_ref": "the object exists but git for-each-ref --contains reports no ref at all",
-    "non_fetchable_ref_only": "the object exists and has a ref, but only one a clone never receives (refs/stash, refs/notes/*, refs/original/*, refs/bisect/*). Not declared here today; the gate reports carriers= so a future break can be told apart from the two above."
+    "non_fetchable_ref_only": "the object exists and has a ref, but only one a clone never receives (refs/stash, refs/notes/*, refs/original/*, refs/bisect/*). Not declared here today; the gate reports carriers= so a future break can be told apart from the two above.",
+    "malformed": "the pointer is not a 40-hex commit id at all -- X11 found an 8-character abbreviation (the form `git log --oneline` prints) in X08/out resultSha, and the schema is why it got through: templates/handoff.schema.json types the three commit pointers as plain strings"
   }
 }
