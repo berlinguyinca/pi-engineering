@@ -881,6 +881,11 @@ describe("git hardening: repository-controlled state cannot run code or redirect
   it("pre-push, post-checkout, fsmonitor and sshCommand planted in the repository never run", async () => {
     const { s, f, marker } = await prepare();
     const head = commit(f.rec.worktreePath, "b.txt", "x\n"); // made BEFORE planting: the test's own git is not hardened
+    // The hooks directory is not a given: `git init` populates it from the
+    // template directory, and a machine whose init.templateDir points elsewhere
+    // (or at nothing) gets a repository with no hooks dir at all. Planting the
+    // hooks is what the test is about; the directory is plumbing.
+    mkdirSync(join(s.root, ".git/hooks"), { recursive: true });
     for (const hook of ["pre-push", "post-checkout", "reference-transaction"]) {
       const path = join(s.root, ".git/hooks", hook);
       writeFileSync(path, `#!/bin/sh\necho ${hook} >> ${marker}\n`);

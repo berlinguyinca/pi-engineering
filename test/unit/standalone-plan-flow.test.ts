@@ -16,6 +16,7 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { runStandalonePlan } from "../../src/orchestration/standaloneEntry.ts";
 import { PlannotatorAdapter } from "../../src/platform/Plannotator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+import { readBootId, readProcessStartTime } from "../../src/platform/processIncarnation.ts";
 import { installOutsideWorldGuard } from "../support/outsideWorldGuard.ts";
 
 const CLEAN_ENV: NodeJS.ProcessEnv = {}; // no PI_AUTOSPEC_*, no GitHub/Herdr/InferWeave variables
@@ -188,6 +189,12 @@ describe("standalone plan flow", () => {
 
   it("touches no network, DNS or subprocess (guarded, not just fetch)", async () => {
     const fake = mkdtempSync(join(tmpdir(), "pi-standalone-fake-"));
+    // Warm the process-identity probes before the guard goes up. On Darwin the
+    // boot id comes from `sysctl`, so a cold cache would be a real subprocess —
+    // and the point of this test is that the *store* reaches nothing outside.
+    // Both probes cache for the process lifetime, so this is the last spawn.
+    readBootId();
+    readProcessStartTime(process.pid);
     const guard = installOutsideWorldGuard({ allowSpawnUnder: fake });
     try {
       const dir = mkdtempSync(join(tmpdir(), "pi-standalone-"));

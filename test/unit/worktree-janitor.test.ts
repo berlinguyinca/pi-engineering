@@ -1259,6 +1259,9 @@ test("an interrupted rebase --autostash keeps the worktree: the autostashed edit
     const wt = await createOwned(repo, await repo.headCommit(), CAND("q7aaaa"));
     await commitFile(wt.path, "c1.txt", "one\n");
     await writeFile(join(wt.path, "src/add.js"), "UNCOMMITTED PRECIOUS EDIT\n");
+    const breakEditor = join(dirname(wt.path), "pi-break-sequence.sh");
+    await writeFile(breakEditor, '#!/bin/sh\n{ printf "break\\n"; cat "$1"; } > "$1.pi-todo" && mv "$1.pi-todo" "$1"\n');
+    await chmod(breakEditor, 0o755);
     await exec(
       "git",
       [
@@ -1276,7 +1279,11 @@ test("an interrupted rebase --autostash keeps the worktree: the autostashed edit
         "--autostash",
         "HEAD~1",
       ],
-      { env: { ...process.env, GIT_SEQUENCE_EDITOR: "sed -i '1i break'" } },
+    // A sequence editor that prepends `break`. `sed -i '1i break'` is GNU syntax:
+    // BSD sed (macOS) demands an argument to -i, so the editor exits non-zero and
+    // the rebase never starts — the test then fails on the setup, not on the
+    // janitor. A two-line script is portable and says what it does.
+    { env: { ...process.env, GIT_SEQUENCE_EDITOR: breakEditor } },
     );
     const gd = await gitDirOf(wt.path);
     const stash = (await readFile(join(gd, "rebase-merge", "autostash"), "utf8")).trim();

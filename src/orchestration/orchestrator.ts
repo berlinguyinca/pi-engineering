@@ -66,6 +66,7 @@ import {
   isPauseAbort,
 } from "./interrupt.ts";
 import { transitionMissionToCanceled } from "./missionCancel.ts";
+import { MISSION_REFUSAL_POLL_MS, MissionRefusedError } from "./missionRefusal.ts";
 import { HandoffRecordError, type MissionStore } from "./missionStore.ts";
 import { MissionActivityTicker } from "./observability/MissionActivityTicker.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
@@ -92,6 +93,7 @@ import {
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
 import { recordSchedulerStatus } from "./recoveryNotice.ts";
+import type { SweepRecord } from "./referenceSweep.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { buildReviewContext } from "./reviewContext.ts";
 import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
@@ -172,6 +174,12 @@ export interface OrchestratorOptions {
    * reasons block completion. Absent = unchanged.
    */
   completionEvidence?: (mission: Mission, candidates: CandidateRevision[]) => string[];
+  /**
+   * Optional drop-decision reference sweep supplied to CompletionGate (issue #510):
+   * a decision that drops an identifier completes only when the `references`
+   * evidence attached to it shows no hit in text a user reads or types.
+   */
+  decisionSweeps?: (mission: Mission, candidates: CandidateRevision[]) => SweepRecord[];
   /** Acceptance criterion deriver. */
   deriveAcceptance?: (mission: Mission) => Promise<string[]>;
   /** Called on each mission phase transition. */
@@ -455,6 +463,8 @@ export class Orchestrator {
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   /** Run controllers of missions executing in this process, for an explicit cancel. */
   private maintenanceRequested = false;
+  /** When the drain started by `prepareForMaintenance` must have settled (0 outside maintenance). */
+  private maintenanceDeadline = 0;
   private startingRuns = 0;
   private readonly liveRuns = new Map<string, AbortController>();
   private readonly runControllers = new WeakMap<AbortSignal, AbortController>();
@@ -559,7 +569,7 @@ export class Orchestrator {
         this.observeTaskSettled(missionId, taskId, status);
       },
     });
-    this.gate = new CompletionGate(this.store, undefined, opts.completionEvidence);
+    this.gate = new CompletionGate(this.store, undefined, opts.completionEvidence, opts.decisionSweeps);
     this.planner = opts.planner;
     this.deriveAcceptance = opts.deriveAcceptance;
     this.onPhase = opts.onPhase;
@@ -2290,6 +2300,9 @@ export class Orchestrator {
     this.maintenanceRequested = true;
     for (const controller of this.liveRuns.values()) controller.abort(MISSION_MAINTENANCE_REASON);
     const deadline = performance.now() + timeoutMs;
+    // Refusals during the drain quote this window, so a caller is told how long
+    // the wait it is being asked to take was measured to be (#511).
+    this.maintenanceDeadline = deadline;
     while (this.liveRuns.size || this.startingRuns || this.store.listExecutions().some(localExecution)) {
       if (performance.now() >= deadline)
         return { status: "busy", reason: "waiting for resumable worker cancellation to settle" };
@@ -2301,20 +2314,38 @@ export class Orchestrator {
 
   endMaintenance(): void {
     this.maintenanceRequested = false;
+    this.maintenanceDeadline = 0;
+  }
+
+  /**
+   * The refusal every entry point raises while maintenance drains missions (#511).
+   *
+   * `retryAfterMs` is the remaining drain window, floored at a poll interval:
+   * maintenance itself ends when the operator ends it, so the number is when to
+   * ask again, not a promise that the next attempt succeeds.
+   */
+  private maintenanceRefusal(): MissionRefusedError {
+    const remaining = this.maintenanceDeadline > 0 ? this.maintenanceDeadline - performance.now() : 0;
+    return new MissionRefusedError("runtime_maintenance", {
+      retryAfterMs: Math.max(MISSION_REFUSAL_POLL_MS, Math.round(remaining)),
+      resumeHint: "mission action=resume <missionId> (or /mission resume <missionId>) once maintenance ends",
+      draining: this.liveRuns.size,
+    });
   }
 
   async orchestrate(
     request: string,
     options: OrchestrateOptions = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
-    if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
+    if (this.maintenanceRequested) throw this.maintenanceRefusal();
     this.startingRuns++;
     const run = interruptibleRun(options.signal, options.interrupt);
     this.runControllers.set(run.signal, run.controller);
     this.pauseHooks.set(run.controller, run.onPause);
     try {
       await this.refreshMissionLimits();
-      if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
+      // Maintenance can begin during the await above; the mission must not start after it.
+      if (this.maintenanceRequested) throw this.maintenanceRefusal();
       return await this.orchestrateLimited(request, { ...options, signal: run.signal });
     } finally {
       this.startingRuns--;
@@ -2399,7 +2430,7 @@ export class Orchestrator {
         selectedBaseRef = targetCommit;
       }
     }
-    if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
+    if (this.maintenanceRequested) throw this.maintenanceRefusal();
     const mission = this.store.createMission({
       title: opts.title ?? request,
       goal: request,

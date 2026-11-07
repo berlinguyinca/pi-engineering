@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -206,6 +206,9 @@ describe("GitRepo remote-ref primitives", () => {
     const { repo, origin } = await fixtureWithOrigin();
     const first = await repo.casPushRef("refs/lanes/hooked", "v1", null);
     const hook = join(origin, "hooks", "pre-receive");
+    // `git init --bare` fills hooks/ from the template directory; a host whose
+    // init.templateDir points elsewhere has a bare repo with no hooks dir.
+    await mkdir(join(origin, "hooks"), { recursive: true });
     await writeFile(hook, "#!/bin/sh\necho 'policy says no' >&2\nexit 1\n");
     await chmod(hook, 0o755);
     await assert.rejects(repo.casPushRef("refs/lanes/hooked", "v2", first.remoteSha), /policy says no/);

@@ -72,6 +72,7 @@ import { guardFeedFor } from "../guard/streamText.ts";
 import {
   type BackoffConfig,
   TransientError,
+  type TransientErrorCategory,
   type TransientTelemetry,
   backoffDelayMs,
   classifyError,
@@ -1462,9 +1463,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
           !gateway &&
           lastAssistantError !== undefined &&
           classifyError(lastAssistantError).category === "model_unavailable";
+        // A verdict the gateway already gave outranks the wall clock (#457): the run
+        // kept talking to a model that had refused it, and the timer that finally cut
+        // it off is not the failure. Reporting `timeout` here sends the mission down
+        // the resilience path instead of #76's model takeover.
+        const verdict = lastAssistantError === undefined ? undefined : terminalAssistantVerdict(lastAssistantError);
+        const timed = timedOut && verdict === undefined;
         const reason = budgetExhausted
           ? "Worker exceeded the hard context-token budget."
-          : timedOut
+          : timed
             ? "Worker timed out."
             : truncated
               ? `Worker reply truncated at the output limit${lengthRetried ? " (again after a retry with a larger allowance)" : ""}; no worker_result. ${lastAssistantError}`
@@ -1473,7 +1480,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
                 : `Worker returned no worker_result${lengthRetried ? " (the retry after a reply cut at the output limit failed)" : ""}.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
         const error = budgetExhausted
           ? "budget-exhausted"
-          : timedOut
+          : timed
             ? "timeout"
             : truncated
               ? "truncated"
@@ -1700,6 +1707,8 @@ ${recovery.recoveryPrompt}`;
     let toolCalls = 0;
     let budgetExhausted = false;
     let timedOut = false;
+    // A terminal assistant-message verdict (see terminalAssistantVerdict) ended the turn.
+    let terminalVerdict = false;
     let guardAborted = false;
     let guardReason: GuardAbortReason | undefined;
     let guardDiagnostics: Record<string, unknown> = {};
@@ -1997,6 +2006,10 @@ ${recovery.recoveryPrompt}`;
         // limit from a degeneration.
         if (msg.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
           assistantError = msg.errorMessage;
+          if (terminalAssistantVerdict(msg.errorMessage) !== undefined) {
+            terminalVerdict = true;
+            void session.abort();
+          }
         }
         // Cut at the output limit, whatever partial text it carries: not a result.
         // Scoped to the final turn: a later turn that ends normally clears it.
@@ -2161,6 +2174,7 @@ ${recovery.recoveryPrompt}`;
         !timedOut &&
         !ownerAborted &&
         !stalled &&
+        !terminalVerdict &&
         !unknownToolLoop &&
         !toolLoop
       ) {
@@ -2618,4 +2632,44 @@ export async function recordWorkerFailure(writer: ErrorOccurrenceWriter | undefi
   if (writer === undefined) return false; // capture unarmed: the default, and the behaviour of every run that does not ask for it
   const swallow = (why: string): false => { try { emitTelemetry({ level: "warning", key: "worker:failure-capture", text: `worker failure capture ${why} (${ctx.role})` }); } catch { /* reporting is best-effort too */ } return false; };
   try { const occurrence = workerFailureOccurrence(ctx, error); if (occurrence === null) return swallow("found nothing attributable"); const kept = await writer.record(occurrence); return kept ? true : swallow("was refused"); } catch { return swallow("threw"); } // a capture's own failure ends as a value plus one notice, never an exception into the failure path
+}
+/**
+ * A 5xx is infrastructure whatever the keyword table made of the wording, and the retry
+ * ladder owns infrastructure: never let it be reported as a refusal.
+ */
+const SERVER_SHAPED = /\b5\d\d\b|service unavailable|bad gateway|gateway timeout|overloaded/i;
+
+/**
+ * The category of an assistant-message error that ends this run's turn, or undefined.
+ *
+ * A provider or gateway failure can arrive as a terminal assistant message instead of a
+ * throw. Some of those are worth another turn in the same session — a stream cut resumes,
+ * a transport drop retries, a gateway that quotes its own wait is held by the admission
+ * layer, a context overflow compacts once — but a verdict that says the request will not
+ * succeed as sent (a model that is not served, a bad key, a closed billing account) is
+ * not. The model answers the same way to every further turn, and the run sat talking to
+ * it until the inactivity window fired, which reported `timeout` and buried the verdict
+ * (#457). Under a whole-family outage (#433) that was per worker, per attempt, on a model
+ * the gateway had already refused — and `timeout` sends the mission down the resilience
+ * path instead of the model takeover (#76) that the refusal calls for.
+ *
+ * The categories here are exactly the ones the thrown path already treats as final; this
+ * only stops the assistant path from being more patient than the throw.
+ */
+export function terminalAssistantVerdict(text: string): TransientErrorCategory | undefined {
+  if (
+    parseGatewayWait({ text }) !== null ||
+    isTruncatedStream(text) ||
+    isTransportDrop(text) ||
+    isStalledStream(text) ||
+    isTruncatedReply(text) ||
+    isCutStreamError(text)
+  )
+    return undefined;
+  if (SERVER_SHAPED.test(text)) return undefined;
+  const class_ = classifyError(text);
+  if (class_.category === "model_unavailable") return class_.category;
+  // Context overflow has its own ladder (compact once, then fail structured).
+  if (class_.category === "context_overflow") return undefined;
+  return class_.retryable ? undefined : class_.category;
 }

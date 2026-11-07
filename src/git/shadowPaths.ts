@@ -21,7 +21,26 @@
  */
 
 /** Characters that may sit on either side of a path occurrence without belonging to it. */
-const PATH_EDGE = new Set(["", "/", " ", "\t", "\n", "\r", "\0", '"', "'", "=", ":", ",", "(", ")", "[", "]", "{", "}"]);
+const PATH_EDGE = new Set([
+  "",
+  "/",
+  " ",
+  "\t",
+  "\n",
+  "\r",
+  "\0",
+  '"',
+  "'",
+  "=",
+  ":",
+  ",",
+  "(",
+  ")",
+  "[",
+  "]",
+  "{",
+  "}",
+]);
 
 const isBoundary = (char: string): boolean => PATH_EDGE.has(char);
 
@@ -50,7 +69,10 @@ export interface ShadowTargets {
 }
 
 /** Every (spelling -> target) pair worth translating, deduplicated, longest spelling first. */
-export function shadowRewrites(spelling: ShadowSpelling, targets: ShadowTargets): readonly { from: string; to: string }[] {
+export function shadowRewrites(
+  spelling: ShadowSpelling,
+  targets: ShadowTargets,
+): readonly { from: string; to: string }[] {
   const out: { from: string; to: string }[] = [];
   const seen = new Set<string>();
   const add = (from: string | undefined | null, to: string | null): void => {

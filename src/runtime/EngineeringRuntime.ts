@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, rename, statfs, unlink, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -14,6 +15,7 @@ import type {
   Actor,
   Candidate,
   EventMeta,
+  Evidence,
   RiskLevel,
   Task,
   TaskKind,
@@ -1911,6 +1913,33 @@ export class EngineeringRuntime {
         const why = error instanceof Error ? error.message : String(error);
         if (autospecOn) completionEvidence = () => [`autospec_config: integration failed to load: ${why}`];
       }
+      // A decision that drops an identifier completes only with a clean reference
+      // sweep over what users read or type (issue #510). The decisions in scope are
+      // the ones recorded against the work item this session is working on — the
+      // same scoping the ledger tools use — so a mission that records no drop
+      // decision is untouched.
+      const decisionSweeps: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["decisionSweeps"]> = () => {
+        const workItemId = rt.ledger.listWorkItems().at(-1)?.id;
+        if (!workItemId) return [];
+        return rt.ledger.listEntities("decision", workItemId).map((entity) => ({
+          statement: entity.claim,
+          evidence: entity.evidence.flatMap((id) => {
+            const record = rt.ledger.getEvidence(id);
+            return record ? [record] : [];
+          }),
+          // A sweep artifact is the recorded file path (`ledger_evidence` stores
+          // paths); an artifact-store URI needs the async reader, so it reads as
+          // unreadable and blocks conservatively.
+          readArtifact: (artifact: string) => {
+            if (/^[a-z+][a-z0-9+.-]*:\/\//i.test(artifact)) return null;
+            try {
+              return readFileSync(resolve(repoRoot, artifact), "utf8").split("\n");
+            } catch {
+              return null;
+            }
+          },
+        }));
+      };
       // Context-threshold continuity: enables the phase-boundary handoff, the live context trigger and the quota handoff.
       const continuityModels = registryWorker
         ? async () =>
@@ -1937,6 +1966,7 @@ export class EngineeringRuntime {
       rt.orchestrator = new Orchestrator({
         phaseHandoff,
         ...(completionEvidence ? { completionEvidence } : {}),
+        decisionSweeps,
         recovery: recoveryBudget,
         store: rt.missionStore,
         backends,
