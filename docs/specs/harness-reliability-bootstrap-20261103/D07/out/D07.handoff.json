@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "D07",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "5a5a2a654a78475725a0e56ec4773c9dfa2e3f6e",
+  "resultSha": "925836054ca7b8def51b4b2a636706e6c375e53b",
+  "taskAuthorityHash": "sha256:37da992f5a87b06e1cdc7e057e46649f3525a7aac0950346e3fc761198306579",
+  "changedFiles": [
+    "src/incidents/evidenceBundle.ts",
+    "test/unit/error-evidence-bundle.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D07/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/error-evidence-bundle.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D07/logs/02-unit-evidence-bundle.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/D07/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D07/logs/02-unit-evidence-bundle.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D07/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D07/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D07/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "D08",
+  "nextBaseSha": "925836054ca7b8def51b4b2a636706e6c375e53b",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T05:10:00Z",
+    "notes": "Worker pane d07 (pane w8:p5, metabolomics/qwen3.8-flash_next) added src/incidents/evidenceBundle.ts: buildEvidenceBundle(input, limits) is a pure, read-only builder that calls the existing modules instead of copying them — E04 sanitizeForPersistence runs first so no caller-written string reaches an item unredacted, D02 owns the fingerprint, D03 owns clustering/representatives/counts, D04 owns the recovery outcome, E07 owns failure identity — and each item carries the representative sanitized summary, distinct affected runtime/model/quantization, retry identities, correlation ids with task:/handoff: ids discovered (never invented) and the outcome class. maxItems/maxBytes caps are enforced after sanitization with dropped counts reported so truncation is never silent, ordering is total, and the same input re-serializes byte-identically. Conductor probe (logs/06) confirmed order-independent determinism, cap respect with visible drops, recovered-outcome classification, and that a bearer token, an sk- key, a credential-bearing URL and a 568-character raw prompt all disappear (the summary becomes <redacted-prompt len=568 sha256=…>), with inputs untouched and invalid caps falling back to defaults."
+  },
+  "handoffHash": "sha256:5a604be0f0fc7e488066185289d087a9d48ce31efaa8ea05a3a6ee04e3ad1d23"
+}

@@ -1,0 +1,3 @@
+schema harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15 additionalProperties=False
+distinct_records=104 field_conforming=104 hash_recomputed_ok=104
+offenders= none

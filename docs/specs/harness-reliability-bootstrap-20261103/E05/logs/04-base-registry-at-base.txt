@@ -1,0 +1,122 @@
+▶ RuntimeRegistry
+  ✔ uses WAL and issues a fresh generation on every registration (5.088084ms)
+  ✔ a stale unregister cannot release the current generation's leases (2.832167ms)
+  ✔ prevents session resurrection: a session declared dead cannot heartbeat its old generation back to life (2.463916ms)
+  ✖ assesses liveness from process incarnation: dead pid, reused pid (forged start time) and reboot are dead (59.608458ms)
+  ✖ a stale heartbeat alone does not kill a verifiably live process (2.0475ms)
+  ✔ reboot simulation: startup reconciliation orphans sessions whose PIDs no longer exist and frees their leases (181.170334ms)
+✖ RuntimeRegistry (254.147333ms)
+▶ LeaseManager
+  ✔ is generation-fenced: an old holder can neither renew nor release a reclaimed lease (ABA) (60.556959ms)
+  ✖ PID reuse: a lease recorded with a forged start time for a live pid is reclaimed, never honored (2.837791ms)
+  ✖ respects a lease held by a live session in another process (2.608083ms)
+  ✔ is re-entrant for the holding session and released with the session on unregister (1.980667ms)
+  ✖ a verifiably live holder keeps exclusive custody after a long heartbeat gap (2.239333ms)
+  ✔ an unverifiable (remote-host) holder is displaced only after its lease expires (2.190042ms)
+  ✔ LeaseMissionCustody namespaces resources and reports the live holder (3.025166ms)
+✖ LeaseManager (75.855583ms)
+ℹ tests 13
+ℹ suites 2
+ℹ pass 8
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 487.667375
+
+✖ failing tests:
+
+test at test/unit/runtime-isolation-registry.test.ts:95:3
+✖ assesses liveness from process incarnation: dead pid, reused pid (forged start time) and reboot are dead (59.608458ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    {
+  +   reason: 'pid_not_alive',
+  -   reason: 'pid_reused',
+      verdict: 'dead'
+    }
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/test/unit/runtime-isolation-registry.test.ts:104:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: { verdict: 'dead', reason: 'pid_not_alive' },
+    expected: { verdict: 'dead', reason: 'pid_reused' },
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at test/unit/runtime-isolation-registry.test.ts:111:3
+✖ a stale heartbeat alone does not kill a verifiably live process (2.0475ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'dead' !== 'live'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/test/unit/runtime-isolation-registry.test.ts:117:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'dead',
+    expected: 'live',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/unit/runtime-isolation-registry.test.ts:170:3
+✖ PID reuse: a lease recorded with a forged start time for a live pid is reclaimed, never honored (2.837791ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'pid_not_alive'
+  - 'pid_reused'
+         ^
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/test/unit/runtime-isolation-registry.test.ts:179:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'pid_not_alive',
+    expected: 'pid_reused',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/unit/runtime-isolation-registry.test.ts:185:3
+✖ respects a lease held by a live session in another process (2.608083ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  + actual - expected
+  
+  + 'missing'
+  - 'present'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/test/unit/runtime-isolation-registry.test.ts:192:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'missing',
+    expected: 'present',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/unit/runtime-isolation-registry.test.ts:226:3
+✖ a verifiably live holder keeps exclusive custody after a long heartbeat gap (2.239333ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  true !== false
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/test/unit/runtime-isolation-registry.test.ts:235:14)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Suite.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: true,
+    expected: false,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

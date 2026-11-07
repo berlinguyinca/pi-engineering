@@ -1,0 +1,80 @@
+{
+  "taskId": "X12",
+  "baseSha": "308935c0f1600201b6f2d5563c7500718cd8f32a",
+  "repoId": "pi",
+  "objective": "main moved five commits while X11 landed, four of them fixes to tests this branch had been reporting as failing and one the operator's own landing of the X08 guard. Bring main into the task branch, resolve what a conflict-free textual merge cannot resolve (two exported implementations of resolveCommonDir in src/git/GitRepo.ts), re-measure the branch with the command the repository actually gates on (npm test's node --test invocation) instead of tsx without the isolated-state preload, correct X10's merge-blocking caveat for worker-budget-build-hint.test.ts on that evidence, and state lint parity with npm run lint rather than with a scoped biome check.",
+  "allowPaths": [
+    "src/git/GitRepo.ts",
+    "docs/specs/harness-reliability-bootstrap-20261103/X12/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/CORRECTION.md",
+    "docs/specs/harness-reliability-bootstrap-20261103/X11/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/PLAN-COMPLETION.json"
+  ],
+  "denyPaths": [
+    "templates/handoff.schema.json",
+    "package.json",
+    "scripts/**"
+  ],
+  "commands": [
+    {
+      "id": "cmd1",
+      "argv": [
+        "npm",
+        "run",
+        "typecheck:core"
+      ],
+      "timeoutMs": 900000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd2",
+      "argv": [
+        "npx",
+        "tsx",
+        "--test",
+        "test/unit/git-common-dir-repair.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd3",
+      "argv": [
+        "npx",
+        "biome",
+        "check",
+        "src/git/GitRepo.ts"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd4",
+      "argv": [
+        "node",
+        "--test",
+        "--test-concurrency=4",
+        "--test-force-exit",
+        "--import",
+        "./test/support/isolatedState.ts",
+        "test/integration/mission-reliability-foundation.test.ts",
+        "test/integration/worker-budget-build-hint.test.ts",
+        "test/integration/worker-resilience-no-fixed-deadlines.test.ts",
+        "test/integration/herdr-plannotator-transport.test.ts"
+      ],
+      "timeoutMs": 1800000,
+      "cwd": "repo"
+    }
+  ],
+  "limits": {
+    "maxProductionFiles": 1,
+    "maxTestFiles": 0,
+    "maxChangedLines": 100
+  },
+  "parentHandoffHash": "sha256:5b3ca8ae72b6d079b1a37e0ae18bc0cc5a6b39278627557619336528cbe4ec09",
+  "expectedOutputs": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X11/out-chain/X11.handoff.json"
+  ],
+  "mode": "isolated-change"
+}

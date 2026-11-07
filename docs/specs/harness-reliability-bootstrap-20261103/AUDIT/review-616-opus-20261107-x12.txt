@@ -1,0 +1,24 @@
+Permission allow rule (../../../.claude/settings.json): Bash(timeout * ssh * gw@hive.hpc.ucdavis.edu *) has a wildcard before the rest of the command, so it also matches any options inserted at that position and approves them without a prompt. Replace that * with the exact value you mean, or only use * after the subcommand.
+---
+
+## Review Verdict: **MERGE**
+
+### Summary
+
+**Q1: Is the surviving `resolveCommonDir` correct?**  
+Yes. X09's version is a strict superset — identical happy path, enhanced error reporting for `discoverRepo` failures (EACCES/ESTALE/EIO now throw with context + `cause`). No consumer depends on specific error text; the test only asserts the path appears in the message.
+
+**Q2: Any merge issues invisible to tsc/tests?**  
+No. The dedup correctly kept X09's enhanced version, moved the class docstring to its proper position, and preserved #632's provenance line. `npm run typecheck:core` exits 0, unit tests 5/5 pass.
+
+**Q3: Is X10's correction honest?**  
+Yes. I reproduced it:
+```
+npx tsx --import ./test/support/isolatedState.ts --test-force-exit \
+  --test test/integration/worker-budget-build-hint.test.ts
+→ 3 pass / 0 fail, 9.2s
+```
+X10's original caveat used bare `npx tsx --test` without the gate's preload — a measurement error, not a branch regression.
+
+**Q4: Any blocker?**  
+None. PR #616 is ready to merge.

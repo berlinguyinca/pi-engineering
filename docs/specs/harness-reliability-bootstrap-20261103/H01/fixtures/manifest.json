@@ -1,0 +1,42 @@
+{
+ "taskId": "H01",
+ "baseSha": "b5e6903c2f49c462c3e91528c42b5547137921ab",
+ "repoId": "herdr",
+ "objective": "Identify actual mission timeline endpoints, web components, naming conventions, existing error and APS signals; no UI code. Evidence: Precise integration map with evidence of reusable components. Evidence: Precise integration map with evidence of reusable components",
+ "allowPaths": [
+  "docs/specs/harness-reliability-bootstrap/HERDR_SURFACES.md"
+ ],
+ "denyPaths": [
+  "herdr_engineering/**",
+  "tests/**",
+  "deploy/**",
+  "pyproject.toml",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "AGENTS.md",
+  "README.md"
+ ],
+ "commands": [
+  {
+   "id": "diff-check",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 120000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 120
+ },
+ "parentHandoffHash": "sha256:3621103302ed7ee7985f0ca9c7b17e3c68ba0a3a25a26abf9c432aa05a0eb569",
+ "expectedOutputs": [
+  "docs/specs/harness-reliability-bootstrap/HERDR_SURFACES.md"
+ ],
+ "mode": "herdr-ui"
+}

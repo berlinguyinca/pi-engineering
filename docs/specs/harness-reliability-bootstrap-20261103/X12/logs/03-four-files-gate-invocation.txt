@@ -1,0 +1,72 @@
+[info] thinking: off (mission role) · implementer
+[info] thinking: off (mission role) · implementer
+[info] thinking: off (mission role) · implementer
+▶ mission reliability foundation — synthetic MSN-qSLaeM
+  ✔ runs MSN-qSLaeM through the public runtime, times out after 2/3, and repairs only the remainder (13268.724584ms)
+  ✔ keeps the incumbent unchanged when integration conflicts (4990.702708ms)
+  ✔ records a fresh same-model review with the reduced-independence warning (3161.676792ms)
+  ✔ keeps the incumbent unchanged when current-candidate validation is red (6210.063667ms)
+  ✔ replays checkpoint, failure fingerprint, and recovery budget after restart (23.554875ms)
+  ✔ rejects recovery before replacement dispatch when checkpoint artifact content is overwritten (724.007459ms)
+  ✔ rejects recovery before replacement dispatch when checkpoint artifact content is deleted (688.477792ms)
+  ✔ re-verifies checkpoint artifacts after execute returns and immediately before replacement dispatch (677.987125ms)
+  ✔ reads current canonical bytes in the true-final synchronous verify-and-dispatch call (691.911042ms)
+  ✔ replays checkpoint-owned artifact bytes and verifies them before recovery dispatch (680.936334ms)
+  ✔ stops with preserved work and an exact resume condition when a fingerprint is exhausted (629.616959ms)
+  ✔ classifies a nonterminal zero-worker mission as ORPHANED with a scheduled recovery (1.160875ms)
+  ✔ isolates repository authority between two missions without mutating either incumbent (322.259167ms)
+  ✔ refuses a non-local dogfood model before launching Pi or creating a repository (154.935042ms)
+  ✔ still refuses a temporary parent that overlaps the checkout (428.120958ms)
+  ✔ dogfoods the uniquely installed package and validates the versioned snapshot contract (549.453167ms)
+  ✔ rejects wrong-mission dogfood event evidence (504.320292ms)
+  ✔ rejects nested-counterfeit dogfood event evidence (511.361834ms)
+  ✔ rejects out-of-order dogfood event evidence (510.659583ms)
+  ✔ rejects failed-recovery dogfood event evidence (524.264916ms)
+  ✔ rejects wrong-recovery dogfood event evidence (526.744334ms)
+  ✔ rejects malformed dogfood event evidence (480.156042ms)
+  ✔ labels source-only dogfood and disables extension discovery before loading the source extension (412.226ms)
+  ✔ refuses a dirty installed package before any extension-loading Pi invocation (297.723375ms)
+  ✔ returns nonzero for a missing runtime v3 snapshot (508.671209ms)
+  ✔ returns nonzero for a malformed runtime v3 snapshot (494.962667ms)
+  ✔ returns nonzero for a acceptance-not-passed runtime v3 snapshot (492.7455ms)
+  ✔ returns nonzero for a acceptance-coverage runtime v3 snapshot (500.39925ms)
+  ✔ returns nonzero for a test-accounting runtime v3 snapshot (492.92875ms)
+  ✔ returns nonzero for a test-failed runtime v3 snapshot (470.349542ms)
+  ✔ returns nonzero for a review-findings runtime v3 snapshot (455.0055ms)
+  ✔ returns nonzero for a review-incomplete runtime v3 snapshot (465.444083ms)
+  ✔ returns nonzero for a review-invalid-severity runtime v3 snapshot (469.311125ms)
+  ✔ returns nonzero for a review-invalid-status runtime v3 snapshot (468.2445ms)
+  ✔ returns nonzero for a review-accepted-blocker runtime v3 snapshot (467.938041ms)
+  ✔ returns nonzero for a review-resolved-not-repaired runtime v3 snapshot (458.792292ms)
+  ✔ returns nonzero for a review-open-repaired runtime v3 snapshot (465.21825ms)
+  ✔ returns nonzero for a top-finding-invalid-severity runtime v3 snapshot (481.434417ms)
+  ✔ returns nonzero for a top-finding-invalid-status runtime v3 snapshot (472.598125ms)
+  ✔ returns nonzero for a top-finding-resolved-not-repaired runtime v3 snapshot (504.970167ms)
+  ✔ returns nonzero for a top-finding-accepted-blocker runtime v3 snapshot (490.44625ms)
+  ✔ returns nonzero for a top-finding-projection-mismatch runtime v3 snapshot (501.615125ms)
+  ✔ refuses a temporary parent inside any Git worktree before creating a repository (404.803167ms)
+  ✔ returns nonzero and retains the temporary path for FAILED or CANCELED dogfood missions (560.449625ms)
+✔ mission reliability foundation — synthetic MSN-qSLaeM (46600.545959ms)
+▶ budget-exhausted worker that ran builds
+  ✔ says probable cold build when builds took most of the execution (1647.711583ms)
+  ✔ says the time went elsewhere when builds were short (1478.435583ms)
+  ✔ keeps the bare reason when the worker ran no builds (1456.717125ms)
+✔ budget-exhausted worker that ran builds (5128.257125ms)
+▶ HerdrPlannotatorTransport
+  ✔ approved: passes exact plan bytes by argv (no shell), echoes digest, scrubs secrets (220.441208ms)
+  ✔ annotated and denied map to changes requested with the feedback (341.021208ms)
+  ✔ dismissed, crash, malformed, oversized output and timeout are unavailable (throw) (1214.111875ms)
+  ✔ a missing CLI and a plan whose text does not match its digest never launch (0.7495ms)
+  ✔ through the gate: digest echo mismatch blocks require; matching echo approves; unavailable blocks (497.486334ms)
+  ✔ the child gets an ALLOWLISTED environment, not the caller's minus some patterns (165.573542ms)
+  ✔ refuses relative and path-qualified commands; a bare name uses the fixed trusted PATH, not the caller's (0.626ms)
+  ✔ a timeout kills the whole process group (the upstream grandchild too) before the plan dir is removed (430.884667ms)
+✔ HerdrPlannotatorTransport (2872.076083ms)
+ℹ tests 55
+ℹ suites 3
+ℹ pass 55
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 47595.350542

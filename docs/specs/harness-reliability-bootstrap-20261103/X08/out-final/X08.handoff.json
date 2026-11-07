@@ -1,0 +1,72 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X08",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "45d42acb70fc2fcac76425d18eb1d651b0e0a9ba",
+  "resultSha": "9f0644507e51baea9f6d0a75fc838e046c4143b7",
+  "taskAuthorityHash": "sha256:f8e910b382b848c9e8d2b9760e29fcd8d00dc729674ddbaf57f80f91fc0abcf5",
+  "changedFiles": [
+    "src/git/GitRepo.ts",
+    "test/unit/git-common-dir-repair.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/git-common-dir-repair.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/14-guard-unit-at-task-commit.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/git-durable-ownership.test.ts test/unit/git-persist-concurrency.test.ts test/unit/git-lock-publication.test.ts test/unit/git-spawn-economy.test.ts test/unit/git-worktree-safety.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/12-neighbour-units-at-task-commit.txt"
+    },
+    {
+      "command": "npm run typecheck:core",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/15-typecheck-at-task-commit.txt"
+    },
+    {
+      "command": "npx biome check src/git/GitRepo.ts test/unit/git-common-dir-repair.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/16-biome-at-task-commit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/14-guard-unit-at-task-commit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/12-neighbour-units-at-task-commit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/15-typecheck-at-task-commit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/16-biome-at-task-commit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/13-blocker-files-at-task-commit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/17-whole-suite-wrong-base.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/18-whole-suite-corrected-base.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/01-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/02-node-test-import-test-suppor-2.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/03-npm-run-typecheck-core.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/04-npx-biome-check-src-git-G.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/05-ab-common-dir-at-4ffa.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/06-ab-integration-at-4ffa.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/07-control-tip-without-repair.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/08-tip-with-repair-integration.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/09-git-glob-before-after.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/10-merged-tip-state.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/11-common-dir-spelling-at-tip.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/17-whole-suite-wrong-base.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/18-whole-suite-corrected-base.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/fixtures/handoff-record.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/suite-termination-blocker-20261105.txt"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T05:00:00Z",
+    "notes": "GENERATION out-final: supersedes out/ and out-corrected/. The task commit and the task authority are unchanged (9f064450 on 45d42acb, the approved base); what changed is what the unit is for and what was measured after the merge.\n\nWhy the unit exists. `GitRepo.commonDir()` handed back whatever `git rev-parse --path-format=absolute --git-common-dir` said. safeGit runs git with GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE pointed at Pi's shadow administration state, and when that state and the repository are not spelled the same way the answer comes back with the physical prefix applied twice — on macOS `/private/private/var/...`, a path that does not exist (measured at 4ffa82f3: logs/05, and logs/09 shows a plain `git -C <repo> rev-parse ...` in the same process answering correctly). Everything derived from it — the promotion administration lock, the candidate journal, the checkpoint records — fails its mkdir with ENOENT, and `withWorktreeSection` reads ENOENT as lock contention and queues to `promotionWait.ceilingMs` (600 s per attempt): measured at 4ffa82f3, one lookup cost the whole ceiling and an integration file was killed at 240 s without settling (logs/06).\n\nThe root cause is fixed upstream, not here. 61394da7 (#582) canonicalizes Pi's state directory and temp root at boot; 89e747c2 (#602) translates the shadow path by spelling instead of re-resolving it. At origin/main 89e747c2, with no guard of mine in the tree, `commonDir()` equals a plain git answer for both a main repository and a linked worktree and the doubled prefix does not reproduce (logs/11). This unit is therefore NOT a live-bug reproduction: it pins the consumer-side invariant those two commits leave unguarded — an answer that names no directory is never handed to a caller. Without it, a regression of #582 or #602 is invisible at the source and reappears downstream as a 600 s poll; with it, the regression is an error naming what git reported.\n\nWhat was measured, and at which tree. The five proofs below were run at the task commit 9f064450 itself (base 45d42acb, which does NOT contain #602), where the guard is load-bearing: the guard unit 5/5 (logs/14), the four git units 5/3/3/11 pass (logs/12), and both files the suite-termination audit named — mission-interrupt-pause and mission-merge-queue-flow — settle at 18/18 in 52 s (logs/13). The same files at 4ffa82f3 with nothing applied are killed at 240 s with no tally (logs/06).\n\nAfter merging, the same tree was re-checked with both parents present (logs/10): #582, #602 and #604 are all ancestors of the merged tip; the guard unit is 5/5, the blocker files 18/18, #602's own unit safe-git-shadow-spelling is 10/10, the six git units are 5/3/3/11/4 pass, and `npm run typecheck:core` and `npx biome check` exit 0.\n\nBase correction, recorded because it cost a wrong diagnosis. X08 was based on the local branch tip 45d42acb while the remote integration branch had moved to 6818842c. A whole-suite comparison of that wrong base against origin/main gave 42 failures against 23, all of them in the resilience integration files #604 arms, and `git bisect` named 141ca5db (X06, the default-off flip) as first bad. There was no defect there: merging 6818842c brought in 259a4233 and those 17 tests report 17 pass / 0 fail. The base was corrected; no assertion was touched. A whole-suite tally is only comparable when the base is the current integration tip.\n\nThe suite-termination blocker (AUDIT/suite-termination-blocker-20261105.txt) is closed and the note is marked superseded. Its diagnosis — a stub worker parked on an abort signal that never arrives — was plausible and wrong: applying ONLY a common-directory guard makes the file settle (logs/06). The gate consequence is corrected there: `npm test` terminates. The run recorded in logs/17 reports 7927 tests, 681 s, cancelled 0; the run at the corrected base is recorded in logs/18.\n\nResidual, unclosed by this unit: a hung process still holds its lease, so X03's bounded fence remains the only recovery; and `withWorktreeSection` still interprets ENOENT as lock contention — the guard makes that state unreachable from `commonDir()`, it does not change the interpretation."
+  },
+  "handoffHash": "sha256:0ef51ddef6f1402fab0b187d538797cd6b1478e4bee7924040631431d97561bf"
+}

@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "R06",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "62f190ff77c244734678788458f889cddd7ff4ea",
+  "resultSha": "16d35ecb020a70a2f1d9ee3cc83a84251d969c6c",
+  "taskAuthorityHash": "sha256:d26178cf55e197dbf0938e72e2fc2ff0317024e742ed4ecc8cea8cf69f6a6892",
+  "changedFiles": [
+    "src/incidents/recoveryRecommend.ts",
+    "test/unit/recovery-recommend.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R06/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/recovery-recommend.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R06/logs/01-unit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/R06/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R06/logs/01-unit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R06/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R06/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R06/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "R07",
+  "nextBaseSha": "16d35ecb020a70a2f1d9ee3cc83a84251d969c6c",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Worker pane r06 (pane w8:pS, metabolomics/qwen3.8-flash_next) on base 62f190ff, isolated-change mode, first pass, ~10 min. Exactly the two declared new files (git show --name-only HEAD), 47 + 52 = 99 changed lines against a 100 cap. Conductor verified independently at 16d35ecb: npm run typecheck exit 0; test/unit/recovery-recommend.test.ts 6 pass / 0 fail; per-suite regressions recovery-safety 6/6, endpoint-circuit 6/6, retry-budget 6/6. Composition verified by the conductor at the import surface: the only imports are the InferenceFailureClass type from src/inference/failureClassifier.ts plus evaluateEndpointCircuit (R04), evaluateRetryBudget (R03) and classifyReplaySafety (R05) - no failure classes re-declared, no status re-parsing, no re-derivation of InferenceFailureAction, and recoveryOutcome.ts untouched, so the durable post-hoc verdict and this forward recommendation stay separate. Read-only verified: no clock, RNG, env, timer, fetch or file write anywhere in the module, with nowMs supplied as data. Evidence properties asserted in tests: model_not_found stops as permanent_class with waitMs null even at attempt 1 of maxAttempts 5 and even with a healthy circuit plus switchAvailable true (the 404-does-not-endlessly-retry clause, and this unit adds no retry grant on top of the two grants RETRY_OWNERS.md conflict 4 already records); rate_limited holds at max(retryAfterMs, local backoff) - 45000 over a 100 ms local wait and 12800 when the local wait dominates - yet stops as budget_exhausted at attempt 2 of 2 however large retryAfterMs is; unknown stops as unclassified while a non-union class and a missing failure stop as invalid_input from the input source; an open circuit yields failover only when switchAvailable is true, otherwise stop as circuit_open, a circuit in probe_in_flight stops as no_probe_slot, and no such case ever returns retry; a writes:true or unrecognised action routes to review as not_replayable from the recoverySafety source while a read action falls through to the budget. Because the emitted recommendation is advisory, nothing here executes, schedules or logs, and no runtime path consults it yet."
+  }
+}

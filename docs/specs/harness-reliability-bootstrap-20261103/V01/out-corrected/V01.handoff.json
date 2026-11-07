@@ -1,0 +1,37 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "V01",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+  "resultSha": "67a273663c91832c7dcfed86ef6dcd562c8bf1c2",
+  "taskAuthorityHash": "sha256:171d68391ba6e9b442a55be6503179536b6722275f84706619117ab70af1fd1f",
+  "changedFiles": [
+    "test/fixtures/harness-drift/README.md",
+    "test/fixtures/harness-drift/tasks.json"
+  ],
+  "commands": [
+    {
+      "command": "git diff --check",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/V01/logs/01-json-parse.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/V01/logs/01-json-parse.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/V01/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/V01/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/V01/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "V02",
+  "nextBaseSha": "ff2a8a6bf4eeaff88677ff2ef5f652c43709429f",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Worker pane v01 (pane w8:p16, metabolomics/qwen3.8-flash_next) on base 9cf164fa (the H01-H07 evidence commit in berlinguyinca/pi-engineering), isolated-change mode, first pass, ~5 min. Exactly the two declared files (git show --name-only HEAD: test/fixtures/harness-drift/README.md, test/fixtures/harness-drift/tasks.json), 95 changed lines against the 100 isolated-change ceiling, and no production file touched. Conductor verified independently at 67a27366: the fixture parses as JSON with exactly 5 tasks (drift-01..drift-05); git diff --check 9cf164fa..HEAD exit 0. The answer key was recomputed from the actions rather than trusted: for every task except the one documented case the first kind=change action outside permittedScope equals drift.expectedFirstViolationSeq, and the two clean controls (drift-01, drift-05) carry no out-of-scope change and expect null, so a scope-only detector scores 4 of 5 and the fixture still discriminates. The deliberate exception is drift-03, whose planted violation (seq 3, src/ledger/claimDiscipline.ts) sits INSIDE permittedScope and is keyed unrelated because it is off-objective; README.md's per-id table states this, so the fixture also proves a detector must reason about relevance and not only paths. Identical-snapshot clause verified mechanically: 3 distinct snapshot serialisations across 5 tasks, i.e. drift-01/drift-02 and drift-04/drift-05 hold byte-identical snapshots, so a detector cannot separate those pairs by snapshot alone; every task opens with legitimate reads inside its own permittedScope, which is the false-positive probe the delta asked for. README.md disclaims that the fixture asserts nothing about real model quality, and the file carries no absolute paths, secrets or run-varying values (no Date anywhere). NOTE: this record supersedes V01/out/V01.handoff.json (sha256:66756fcf, kept immutable), whose nextBaseSha pointed at the task commit 67a27366 while V02 was actually cut from the evidence commit ff2a8a6b that carries this unit's record - the same lineage-versus-chain correction recorded for R08 -> H01 and H07 -> V01. Code, proofs and scope are unchanged."
+  },
+  "handoffHash": "sha256:2548a684f603f6ac4d57a19d59086a3d65daa91fad3c2b6d1ee6becf7358f39d"
+}

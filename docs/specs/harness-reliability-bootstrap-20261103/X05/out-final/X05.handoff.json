@@ -1,0 +1,49 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X05",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "5e1ebb8c67b492d5f77c92de4c1e7b6f726b0833",
+  "resultSha": "6a518c90fb148d2fb2c27b99b2c76cfa2a2826de",
+  "taskAuthorityHash": "sha256:9fea202b03b87ad206e62f53ae0b3d7654c9b6a2c309ada687c43598a548fea5",
+  "changedFiles": [
+    "src/workers/PiWorkerExecutor.ts",
+    "src/workers/WorkerExecutor.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/01-npm-run-typecheck-.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/aps-observability.test.ts test/unit/aps-worker-activity.test.ts test/unit/aps-task-alignment.test.ts test/unit/bench-task-drift.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/02-node-test-import-test-suppor.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/aps-*.test.ts test/unit/worker-activity-detail.test.ts test/unit/worker-live-activity.test.ts test/unit/worker-error-events.test.ts test/unit/worker-build-activity.test.ts test/unit/worker-command-env.test.ts && echo COMPARISON-BASE-900bf8a3 && cd /Users/wohlgemuth/IdeaProjects/worktrees/pi-base-verify && node --test --import ./test/support/isolatedState.ts test/unit/aps-*.test.ts test/unit/worker-activity-detail.test.ts test/unit/worker-live-activity.test.ts test/unit/worker-error-events.test.ts test/unit/worker-build-activity.test.ts test/unit/worker-command-env.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/03-node-test-import-test-suppor.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/01-npm-run-typecheck-.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/02-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X05/logs/03-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X05/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X05/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X05/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Found while landing X04: the observability counters existed but nothing fed them, because the contract never reached the executor - the same unwired-seam defect the V06 audit recorded. WorkerRequest now carries the operator-declared driftWatch and PiWorkerExecutor passes it to the per-attempt activity adapter, wiring the adapter's onDrift sink to observability.recordDrift so a detection becomes durable evidence under the existing rollout.observability gate. Nothing evaluates the contract while PI_TASK_DRIFT_SIGNALS is off and the field is optional, so existing callers are unaffected. The third log runs the same clean suite here and at the pre-series base 900bf8a3: identical counts, so the wiring is additive; two environment-sensitive files (worker-commit-discipline, worker-request-plumbing) fail identically at both revisions and are excluded from the recorded command, named in the override reason rather than hidden. | CHAIN: this record supersedes X05/out-corrected (kept immutable), whose nextBaseSha named the pre-amend evidence commit; the child is cut from 009837c32d9f, the evidence commit as it stands now."
+  },
+  "handoffHash": "sha256:36271b18761b83c1deb0f4d14ca8d5210ff9216b9a276c300b11cf96ce12d2b2"
+}

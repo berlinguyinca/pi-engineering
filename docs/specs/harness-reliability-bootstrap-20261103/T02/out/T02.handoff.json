@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T02",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "145549b5061f6b56b8c99645837e8361cd5b9be4",
+  "resultSha": "95aba353f1876f8d617143556ec753709b718e34",
+  "taskAuthorityHash": "sha256:060a5ae6e5d4ad859ce55297a0af86a84573b46655f980420f7fbcf669f07823",
+  "changedFiles": [
+    "src/plannerWorker/contract.ts",
+    "test/unit/planner-worker-contract.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T02/logs/07-typecheck-after.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/planner-worker-contract.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T02/logs/08-unit-planner-contract-after.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T02/logs/07-typecheck-after.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T02/logs/08-unit-planner-contract-after.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T02/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T02/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T02/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T03",
+  "nextBaseSha": "95aba353f1876f8d617143556ec753709b718e34",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T09:30:00Z",
+    "notes": "Worker panes: t02 (claude-opus-5) died at start with 'No API key found for anthropic' on this host, so the unit ran as t02b (pane w8:pA, metabolomics/qwen3.8-flash_next) on base 145549b5. It changed src/plannerWorker/contract.ts so authorization-origin denies arriving on scope.forbidden_authorization and authorization.denied are never discarded: a grant wholly inside such a deny rejects the contract naming both sides, a narrowing deny is kept and tagged in scope.forbiddenAuthorization, and planner-origin scope.forbidden keeps its base keep/discard semantics because a planner note can only narrow its own contract. Conductor review found the first commit reused the lenient stringList on the authorization channels, so denied:[42] became a deny pattern named '42' and denied:[true] one named 'true' — a fail-open host channel inventing denies from junk; the worker amended the commit to require an array of non-empty strings per channel with an index-naming refusal, leaving planner leniency untouched. Verified independently (logs/10): [42]/[true]/['src/secret/**',7] and a bare string all refused, a well-formed array accepted and tagged, the plan's named regression (broad grant + restricted subtree keeps the deny; explicit re-grant inside it rejected), planner-origin coercion unchanged."
+  },
+  "handoffHash": "sha256:cbd2fae48b886e8d68d0400ab85a25e506962c1ab0ccbcbeb9cc9b4c54eb2ed2"
+}

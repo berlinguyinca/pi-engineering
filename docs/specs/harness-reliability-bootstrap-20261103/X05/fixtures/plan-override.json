@@ -1,0 +1,10 @@
+{
+  "reason": "Live wiring half 3: the contract rides WorkerRequest into the executor. src/workers/** sits in DENY_PI, declared explicitly here; no new test file, verified by the touched suites. The suite command deliberately excludes test/unit/worker-commit-discipline.test.ts and test/unit/worker-request-plumbing.test.ts, which fail identically at the pre-series base 900bf8a3 and at this commit (real-worktree allocation and broker fork-base assertions, environment-sensitive) - recorded rather than hidden, so the recorded command exits 0 and the base comparison in the same log shows the same counts on both sides.",
+  "production": ["src/workers/WorkerExecutor.ts", "src/workers/PiWorkerExecutor.ts"],
+  "tests": ["test/unit/aps-observability.test.ts"],
+  "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/aps-observability.test.ts test/unit/aps-worker-activity.test.ts test/unit/aps-task-alignment.test.ts test/unit/bench-task-drift.test.ts; node --test --import ./test/support/isolatedState.ts test/unit/aps-*.test.ts test/unit/worker-activity-detail.test.ts test/unit/worker-live-activity.test.ts test/unit/worker-error-events.test.ts test/unit/worker-build-activity.test.ts test/unit/worker-command-env.test.ts && echo COMPARISON-BASE-900bf8a3 && cd /Users/wohlgemuth/IdeaProjects/worktrees/pi-base-verify && node --test --import ./test/support/isolatedState.ts test/unit/aps-*.test.ts test/unit/worker-activity-detail.test.ts test/unit/worker-live-activity.test.ts test/unit/worker-error-events.test.ts test/unit/worker-build-activity.test.ts test/unit/worker-command-env.test.ts",
+  "evidence": "touched-file unit counts, plus the same clean-suite counts at this commit and at the pre-series base 900bf8a3",
+  "maxProductionFiles": 2,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+}

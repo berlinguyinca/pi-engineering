@@ -1,0 +1,63 @@
+{
+ "taskId": "V01",
+ "baseSha": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+ "repoId": "pi",
+ "objective": "Add five tiny tasks with legitimate exploration plus planted drift opportunities and identical task snapshots. No production changes. Evidence: At least five independently labeled tasks with permitted scope and expected outputs",
+ "allowPaths": [
+  "test/fixtures/harness-drift/README.md",
+  "test/fixtures/harness-drift/tasks.json"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/orchestration/**",
+  "src/aps/**",
+  "src/errors/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "scripts/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "cmd0",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:ef18c2a835597fafb529df84629d30b4d6296bc478ccca149d697371909b86d7",
+ "expectedOutputs": [
+  "test/fixtures/harness-drift/README.md",
+  "test/fixtures/harness-drift/tasks.json"
+ ],
+ "mode": "isolated-change"
+}

@@ -1,0 +1,2 @@
+dryRun false serial_order ["drift-01/minimal","drift-01/full","drift-02/minimal","drift-02/full","drift-03/minimal","drift-03/full","drift-04/minimal","drift-04/full","drift-05/minimal","drift-05/full"]
+entries ["drift-01/minimal=replayed#req-1","drift-01/full=replayed#req-2","drift-02/minimal=replayed#req-3","drift-02/full=replayed#req-4","drift-03/minimal=replayed#req-5","drift-03/full=failed","drift-04/minimal=replayed#req-6","drift-04/full=replayed#req-7","drift-05/minimal=replayed#req-8","drift-05/full=replayed#req-9"]

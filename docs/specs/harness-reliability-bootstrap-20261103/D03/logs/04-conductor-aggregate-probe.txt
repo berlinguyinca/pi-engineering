@@ -1,0 +1,9 @@
+purity (input deep-equal): true
+clusters: 3 | duplicateEvents: 2 | rejected: 1 | truncated: false | default cap: 50
+ fp=697c6f189f n=1 first=11-06T10:00 last=11-06T10:00 rec=1 unr=0 sum_ok=true sessions=["s1"] hosts=["h1"] models=["m1"] codes=["worker.tool.shell_failed"] ids=["e4"] idsTrunc=false
+ fp=a43d39834a n=1 first=11-03T10:00 last=11-03T10:00 rec=0 unr=1 sum_ok=true sessions=["s3"] hosts=["h1"] models=["m1"] codes=["gateway.404.not_found"] ids=["e3"] idsTrunc=false
+ fp=6859cd93bc n=1 first=11-02T10:00 last=11-02T10:00 rec=0 unr=1 sum_ok=true sessions=["s1"] hosts=["h1"] models=["m1"] codes=["gateway.429.rate_limited"] ids=["e1","e2"] idsTrunc=false
+shuffle-stable ordering + counts: true
+caps: 1 ["e4"] false truncated: true
+dimension sets sorted+unique: true
+fp is D02's: false

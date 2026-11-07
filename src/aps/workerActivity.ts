@@ -14,9 +14,10 @@
 
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { id } from "../core/ids.ts";
-import { ToolCallNormalizer, canonicalJson, semanticFingerprint } from "./fingerprint.ts";
+import { TARGET_ARGUMENT_KEYS, ToolCallNormalizer, canonicalJson, semanticFingerprint } from "./fingerprint.ts";
 import { AgentProgressSupervisor, type AgentProgressSupervisorOptions } from "./supervisor.ts";
-import type { AgentAction } from "./types.ts";
+import { evaluateTaskAlignment, type AlignmentSignal, type DeclaredArtifact, type TaskAction } from "./taskAlignment.ts";
+import { type AgentAction, isMutatingTool } from "./types.ts";
 
 /** Maximum length of the bounded tool-result summary fed to the fingerprint. */
 const RESULT_SUMMARY_MAX_CHARS = 400;
@@ -50,6 +51,38 @@ export interface WorkerActivityAdapterOptions {
   supervisor?: AgentProgressSupervisor;
   /** Options for the fresh supervisor when `supervisor` is omitted. */
   supervisorOptions?: AgentProgressSupervisorOptions;
+  /** Operator-declared scope/artifact contract to watch live actions against. */
+  drift?: DriftWatch;
+  /** Env source for the drift switch; defaults to `process.env`. */
+  env?: Record<string, string | undefined>;
+  /** Sink for each newly detected drift signal (evidence only; never affects the run). */
+  onDrift?: (signal: AlignmentSignal) => void;
+}
+
+/**
+ * What the operator declared the task may touch and must produce. Without a
+ * contract there is nothing to watch: the adapter stays silent.
+ */
+export interface DriftWatch {
+  allowedScope: readonly string[];
+  declaredTasks?: readonly string[];
+  declaredArtifacts?: readonly DeclaredArtifact[];
+  allowedDependencies?: readonly string[];
+}
+
+/** Affirmative-only switch: only an explicit true-ish value turns live drift signals on. */
+export function driftSignalsEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return /^(1|true|yes|on)$/i.test((env.PI_TASK_DRIFT_SIGNALS ?? "").trim());
+}
+
+/** Safety bound on distinct drift signals retained per session. */
+const MAX_DRIFT_SIGNALS = 64;
+
+/** One recorded action -> detector input, target taken from the canonical argument keys. */
+function alignmentAction(action: AgentAction): TaskAction {
+  const target = TARGET_ARGUMENT_KEYS.map((key) => action.normalizedArguments[key])
+    .find((value): value is string => typeof value === "string" && value.trim() !== "")?.trim();
+  return { iteration: action.iteration, tool: action.tool, target, taskId: action.workItemId ?? undefined, mutating: isMutatingTool(action.tool) };
 }
 
 /**
@@ -74,6 +107,10 @@ export class WorkerActivityAdapter {
   private inputTokens: number | undefined;
   private readonly pending = new Map<string, { tool: string; args: Record<string, unknown> }>();
   private readonly actionLog: AgentAction[] = [];
+  private readonly driftWatch: DriftWatch | undefined;
+  private readonly driftEnabled: boolean;
+  private readonly onDrift: ((signal: AlignmentSignal) => void) | undefined;
+  private readonly driftLog: AlignmentSignal[] = [];
 
   constructor(options: WorkerActivityAdapterOptions) {
     this.role = options.role;
@@ -85,6 +122,9 @@ export class WorkerActivityAdapter {
     this.phase = options.phase ?? "execute";
     this.normalizer = options.normalizer ?? new ToolCallNormalizer({ rootPrefix: options.rootPrefix });
     this.supervisor = options.supervisor ?? new AgentProgressSupervisor(options.supervisorOptions ?? {});
+    this.driftWatch = options.drift;
+    this.driftEnabled = options.drift !== undefined && driftSignalsEnabled(options.env ?? process.env);
+    this.onDrift = options.onDrift;
   }
 
   /**
@@ -132,6 +172,30 @@ export class WorkerActivityAdapter {
     return this.actionLog;
   }
 
+  /** Distinct drift signals detected so far, in first-observation order (evidence only). */
+  get driftSignals(): readonly AlignmentSignal[] {
+    return this.driftLog;
+  }
+
+  /** Live drift watch: evaluates one action against the declared contract, never throws. */
+  private observeDrift(action: AgentAction): void {
+    if (!this.driftEnabled || !this.driftWatch || this.driftLog.length >= MAX_DRIFT_SIGNALS) return;
+    try {
+      const signals = evaluateTaskAlignment({
+        allowedScope: this.driftWatch.allowedScope,
+        declaredTasks: this.driftWatch.declaredTasks ?? [],
+        declaredArtifacts: this.driftWatch.declaredArtifacts ?? [],
+        allowedDependencies: this.driftWatch.allowedDependencies ?? [],
+        actions: [alignmentAction(action)],
+      });
+      for (const signal of signals) {
+        if (this.driftLog.some((seen) => seen.kind === signal.kind && seen.subject === signal.subject)) continue;
+        this.driftLog.push(signal);
+        try { this.onDrift?.(signal); } catch { /* a failing sink never breaks the run */ }
+      }
+    } catch { /* evidence-only: a malformed action never breaks the session */ }
+  }
+
   private observeToolEnd(tool: string, args: Record<string, unknown>, result: unknown, isError: boolean): void {
     const summary = summarizeToolResult(result, isError);
     const normalizedArguments = this.normalizer.normalize({ name: tool, arguments: args }).arguments;
@@ -156,6 +220,7 @@ export class WorkerActivityAdapter {
       maxContextTokens: this.maxContextTokens,
     };
     this.actionLog.push(action);
+    this.observeDrift(action);
     // Detect-only and side-effect-free for the observed session: a failing
     // supervisor must never throw into (or slow down) the run.
     this.supervisor.observe(action).catch(() => {});

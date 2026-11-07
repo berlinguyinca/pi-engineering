@@ -1,0 +1,1 @@
+usage: node --experimental-strip-types scripts/diagnose-errors.ts --namespace <dir> [--last <n>] [--all-sessions|--no-all-sessions] [--session <id>] [--model <id>] [--host <id>] [--json] [--export <path> [--force]] [--help]

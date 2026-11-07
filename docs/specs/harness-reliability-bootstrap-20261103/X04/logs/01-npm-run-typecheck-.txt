@@ -1,0 +1,8 @@
+$ npm run typecheck   # at 7f160212083e2d015b1a515325ffa1f984d1368f
+> pi-engineering-runtime@0.2.0 typecheck
+> npm run typecheck:core && npm run typecheck:scripts
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+> pi-engineering-runtime@0.2.0 typecheck:scripts
+> tsc --noEmit -p tsconfig.scripts.json
+exit=0

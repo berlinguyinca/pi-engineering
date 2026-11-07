@@ -1,0 +1,55 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "FIX-4B",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "5c5d5a5d6ab8681390c8daf35c1daab542f7051d",
+  "resultSha": "7f983ee05c0d6feb1ee725984070aef31bdcf92c",
+  "taskAuthorityHash": "sha256:c0dddacf52c6e3a8076b0fc8788003d4c5c96476b57f2a3af2d5529a2f493667",
+  "changedFiles": [
+    "src/bootstrap/taskManifest.ts",
+    "docs/specs/harness-reliability-bootstrap-20261103/manifests/tasks.json",
+    "test/unit/bootstrap-task-manifest.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-task-manifest.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/02-unit-manifest.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-*.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/03-unit-all.txt"
+    },
+    {
+      "command": "node --experimental-strip-types -e import {parseTaskManifest} from \"./src/bootstrap/taskManifest.ts\"; import {readFileSync} from \"node:fs\"; const t=JSON.parse(readFileSync(\"docs/specs/harness-reliability-bootstrap-20261103/manifests/tasks.json\",\"utf8\")).tasks; const bad=t.filter(x=>!parseTaskManifest({taskId:x.id,baseSha:\"a\".repeat(40),repoId:\"pi\",objective:x.title,allowPaths:[\"src/**\"],denyPaths:[\"node_modules/**\"],commands:[{id:\"t\",cwd:\".\",argv:[\"npm\",\"run\",\"typecheck\"]}],limits:{maxProductionFiles:x.maxProductionFiles,maxTestFiles:x.maxTestFiles,maxChangedLines:x.maxChangedLines},parentHandoffHash:null,expectedOutputs:[\"src/**\"],mode:x.mode}).ok); console.log(\"tasks\",t.length,\"invalid\",bad.length,bad.map(b=>b.id).join(\",\")); console.log(\"herdr-ui:\",t.filter(x=>x.mode===\"herdr-ui\").map(x=>x.id).join(\",\"))",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/04-tasks-parse.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/02-unit-manifest.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/03-unit-all.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/logs/04-tasks-parse.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "FIX-5",
+  "nextBaseSha": "7f983ee05c0d6feb1ee725984070aef31bdcf92c",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T08:20:00Z",
+    "notes": "Worker pane fix4b (pane w0:p8, metabolomics/qwen3.8-flash_next) made the line ceiling mode-aware and set H01..H07 to the new herdr-ui mode. This unit is stamped with a strictly verified parent for the first time since the run-artifact commits broke the chain: parent FIX-4A, parent.nextTaskId == FIX-4B, parent.nextBaseSha == this manifest baseSha. Conductor controls (logs/05) independently confirm: herdr-ui 120 accepted, 121 rejected against 120, isolated-change 120 rejected against 100, maxProductionFiles 3 rejected against 2, unknown mode rejected, and all 51 tasks.json entries parse (logs/04). Suites: bootstrap-task-manifest 6/6, whole bootstrap set 58/58. [conductor amendment 2026-11-04: forward pointer corrected from FIX-4C to FIX-5 \u2014 the assumed FIX-4C defect (TaskLimits.maxLinesPerFile / maxFilesPerFileBudget being inexpressible) does not exist: those fields appear nowhere in src, test or templates (grep over the tree), so no unit was created for it; the next real gate defect is FIX-5, parent status.]"
+  }
+}

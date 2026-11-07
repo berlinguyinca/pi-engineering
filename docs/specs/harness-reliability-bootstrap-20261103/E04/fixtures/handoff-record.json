@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "E04",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "a0eca33248a368a45ea8208314f048db754bf35e",
+  "resultSha": "c349613b59ab6a0a9666633df68002394767cfa6",
+  "taskAuthorityHash": "sha256:3e42f907e014c17da3d4007517a9c0aac9c8d6f85912b93df9477c42a0a2bb87",
+  "changedFiles": [
+    "src/incidents/errorSanitize.ts",
+    "test/unit/error-sanitize.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E04/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/error-sanitize.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E04/logs/02-unit-error-sanitize.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/E04/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E04/logs/02-unit-error-sanitize.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E04/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E04/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E04/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "E05",
+  "nextBaseSha": "c349613b59ab6a0a9666633df68002394767cfa6",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T11:25:00Z",
+    "notes": "Worker pane e04 (pane w0:pB) added sanitizeForPersistence(): caps (400-char summary, 8 refs/ids, 60/120-char pointers, 4096-byte record), env-value redaction by secret-looking variable NAME, absolute-path folding, prompt transcripts reduced to len+sha256, idempotent, malformed input refused rather than thrown. Conductor ran its own secret fixtures (logs/04): OpenAI-style key, Bearer token, AWS id, injected env value, absolute path and a raw prompt are all absent from the persisted record; a full PEM block is redacted to [REDACTED]; oversized input collapses to 555 bytes with 8 refs/8 ids; sanitize(sanitize(x)) == sanitize(x). Deviations: the gateway dropped the worker twice (transport failure) and switched its model from metabolomics/qwen3.8-flash_next to qwen3.8-27b-text mid-unit; parent verified strictly against E03."
+  }
+}

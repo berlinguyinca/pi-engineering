@@ -1,0 +1,74 @@
+{
+ "taskId": "V04",
+ "baseSha": "b11662eb88261c30c02bc78ec7fe556539b5681a",
+ "repoId": "pi",
+ "objective": "Provide opt-in dry-run first; when enabled run task replay serially under static contract using available Flash/Lite models and record request IDs. Evidence: Dry-run requires no endpoint; unavailable models skipped with reason",
+ "allowPaths": [
+  "scripts/bench-harness-roles.ts",
+  "test/unit/bench-harness-roles.test.ts"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/orchestration/**",
+  "src/aps/**",
+  "src/errors/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "typecheck",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  },
+  {
+   "id": "unit",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bench-harness-roles.test.ts"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:d908869a355373bdbd124eca3a756b16903f9132970976ab3ee29ec7699b8b34",
+ "expectedOutputs": [
+  "scripts/bench-harness-roles.ts",
+  "test/unit/bench-harness-roles.test.ts"
+ ],
+ "mode": "isolated-change"
+}

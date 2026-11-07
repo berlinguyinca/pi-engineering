@@ -1,0 +1,13 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-result-gate.test.ts
+✔ missing proof, failing proof and missing or tampered evidence all block the gate (2.638584ms)
+✔ diff-scope violations and a commit not sitting on the approved base block the gate (0.123792ms)
+✔ the handoff writer is atomic, immutable and stamps the protocol checksum (1.441042ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 168.055333
+exit=0

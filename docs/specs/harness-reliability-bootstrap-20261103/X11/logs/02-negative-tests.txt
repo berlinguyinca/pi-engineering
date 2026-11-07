@@ -1,0 +1,22 @@
+Not currently on any branch.
+nothing to commit, working tree clean
+### lineage-scan 'abbreviated' negative tests   scratch=4797c26b   started=04:54:21   load= 24.01 54.02 72.03 
+
+  PASS  0 baseline, entry correct                    RESULT ok    matched "RESULT ok"
+  PASS  1 entry removed                              RESULT FAIL (1) matched "UNCOVERED"
+  PASS  2 entry disagrees with the record            RESULT FAIL (1) matched "STALE"
+  PASS  3 replacement is not the named commit        RESULT FAIL (1) matched "names 9f0644507e51"
+  PASS  4 replacement not in full form               RESULT FAIL (1) matched "must carry the replacement in full 40-hex form"
+  PASS  5a too-short abbreviation refused            RESULT FAIL (1) matched "not a git abbreviation"
+     (reachable commits named by prefix '0000000': 0; duplicate 7-hex commit prefixes in this repository: 0)
+  PASS  5b prefix naming no commit refused           RESULT FAIL (1) matched "denotes 0 reachable commits"
+  PASS  6 entry on a healthy pointer refused         RESULT FAIL (1) matched "DEFECT_GONE"
+  PASS  7 unknown kind refused                       RESULT FAIL (1) matched "unknown kind"
+  PASS  8 self-certifying entry refused              RESULT FAIL (1) matched "cannot declare its own defect"
+     (oldest reachable commit 44693e093811b11d2a3caf935021bf3b48f38b0b, committer date 2026-09-12 12:27:34 -0700; defect commit 9f0644507e51 2026-11-05 13:46:48 -0800)
+  PASS  9 back-dated entry refused                   RESULT FAIL (1) matched "precedes the defect commit"
+
+### reset to 4797c26b; scratch worktree clean: yes
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+### ended 04:56:20; scratch /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmp.XqGooGp4n9/lineage-negative-scratch removed: yes; worktree count before cleanup: 79

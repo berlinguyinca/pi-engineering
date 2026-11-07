@@ -1,0 +1,57 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "FIX-1",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "cc036f2f8c3b938c80348dff821af77c973fde7b",
+  "resultSha": "04846ae2e5346cce8729994d96e870fe2f56015f",
+  "taskAuthorityHash": "sha256:420a9c7cabdfae889541e33727fc3e1e7961e86de925851276e1f38d0d9f991b",
+  "changedFiles": [
+    "src/bootstrap/diffGuard.ts",
+    "test/unit/bootstrap-diff-guard.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-diff-guard.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/02-unit-diff-guard.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-one.test.ts test/unit/bootstrap-result-gate.test.ts test/unit/bootstrap-package.test.ts test/unit/bootstrap-path-policy.test.ts test/unit/bootstrap-task-manifest.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/03-unit-bootstrap-regression.txt"
+    },
+    {
+      "command": "node --experimental-strip-types scripts/bootstrap-one.ts --manifest <manifest-fix1-negctl.json> --proofs <proofs-fix1.json> --emit-handoff <out> --cwd <worktree at the task commit>",
+      "exitCode": 5,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/logs/04-negctl-must-reject.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/logs/02-unit-diff-guard.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/logs/03-unit-bootstrap-regression.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/logs/04-negctl-must-reject.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/fixtures/manifest-fix1.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/fixtures/manifest-fix1-negctl.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/fixtures/proofs-fix1.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/fixtures/handoff-record.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/HANDOFF.md",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-1/WORKER_REPORT.md"
+  ],
+  "nextTaskId": "FIX-2",
+  "nextBaseSha": "04846ae2e5346cce8729994d96e870fe2f56015f",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T03:40:00Z",
+    "notes": "Inserted hotfix unit, executed by a separate pi worker pane on the same model (metabolomics/qwen3.8-flash_next) and verified by the conductor, not by the worker. parentHandoffHash is null deliberately: E02.handoff.json names nextTaskId=E03, so chaining FIX-1 to E02 would assert a plan order that does not hold; SHA continuity is instead enforced by baseSha=E02 resultSha plus the gate's commitParent check. Deviation recorded in TASK_REPORT.md. taskAuthorityHash = canonicalHash(parseTaskManifest(manifest-fix1.json).manifest)."
+  }
+}

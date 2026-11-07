@@ -18,6 +18,7 @@
 import type { EscalationEvent } from "./escalation.ts";
 import type { ApsRecoveryAction } from "./recovery.ts";
 import type { AgentLoopEvent, AgentLoopPreventedEvent, SemanticStrategyFamily } from "./types.ts";
+import type { AlignmentKind, AlignmentSignal } from "./taskAlignment.ts";
 
 export type ContextUtilizationBucket = "<0.5" | "0.5-0.75" | "0.75-0.9" | ">=0.9" | "unknown";
 
@@ -40,7 +41,10 @@ export interface ApsSnapshot {
     replans: number;
     modelEscalations: number;
     humanEscalations: number;
+    driftSignals: number;
   };
+  /** Live drift detections by signal kind (detect-only; never changes the run). */
+  driftByKind: Record<string, number>;
   loopRateByModel: Record<string, number>;
   recoverySuccessRate: number | null;
   noProgressTurnsBySession: Record<string, number>;
@@ -60,7 +64,9 @@ export function emptySnapshot(): ApsSnapshot {
       replans: 0,
       modelEscalations: 0,
       humanEscalations: 0,
+      driftSignals: 0,
     },
+    driftByKind: {},
     loopRateByModel: {},
     recoverySuccessRate: null,
     noProgressTurnsBySession: {},
@@ -91,6 +97,13 @@ export class ApsObservability {
   recordPrevented(event: AgentLoopPreventedEvent): void {
     this.s.totals.loopsPrevented += 1;
     this.recordCandidate(event);
+  }
+
+  /** Record one live drift detection (emitted by the activity adapter when enabled). */
+  recordDrift(signal: AlignmentSignal): void {
+    this.s.totals.driftSignals += 1;
+    const kind: AlignmentKind = signal.kind;
+    this.s.driftByKind[kind] = (this.s.driftByKind[kind] ?? 0) + 1;
   }
 
   recordRecovery(action: ApsRecoveryAction): void {

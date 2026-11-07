@@ -1,0 +1,229 @@
+### A/B at base 4ffa82f3 -- test/integration/mission-interrupt-pause.test.ts termination (only variable: the repair db3f08b8)
+$ timeout 240 node --test --import ./test/support/isolatedState.ts test/integration/mission-interrupt-pause.test.ts   # BASE 4ffa82f3, NO repair (doubled common dir live)
+
+Interrupted while running:
+
+⚠ test/integration/mission-interrupt-pause.test.ts (test/integration/mission-interrupt-pause.test.ts:1:1)
+✖ test/integration/mission-interrupt-pause.test.ts (239938.818208ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 0
+ℹ cancelled 1
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 239943.192292
+
+✖ failing tests:
+
+test at test/integration/mission-interrupt-pause.test.ts:1:1
+✖ test/integration/mission-interrupt-pause.test.ts (239938.818208ms)
+  'Promise resolution is still pending but the event loop has already resolved'
+[exit=0 — 124 means the run was killed at the ceiling: it never settled]
+
+### ------- with repair
+$ timeout 240 node --test --import ./test/support/isolatedState.ts test/integration/mission-interrupt-pause.test.ts   # BASE 4ffa82f3 + repair db3f08b8 (only variable: the repair)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-1qhduk-pi-eng-orch-TSK-Dd7kgf: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-1qhduk-pi-eng-orch-TSK-Dd7kgf (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-1qhduk-pi-eng-orch-TSK-Dd7kgf (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-SXZhoO] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-SXZhoO","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✖ Esc on the mission tool pauses the mission; resume keeps the operator pin and preserved work (2697.256791ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-u3m0re-pi-eng-orch-TSK-uZahK8: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-u3m0re-pi-eng-orch-TSK-uZahK8 (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-u3m0re-pi-eng-orch-TSK-uZahK8 (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-cHDrq0] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-cHDrq0","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✔ an explicit cancel is the only thing that terminates a paused or running mission (1840.167625ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-5kywnh-pi-eng-orch-TSK-rKSrRs: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-5kywnh-pi-eng-orch-TSK-rKSrRs (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-5kywnh-pi-eng-orch-TSK-rKSrRs (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-AUJalw] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-AUJalw","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✔ the operator pause is recorded the instant Esc lands; supervisor ticks during the pause never resume it (1936.750958ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-2mw9l9-pi-eng-orch-TSK-IrU9xK: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-2mw9l9-pi-eng-orch-TSK-IrU9xK (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-2mw9l9-pi-eng-orch-TSK-IrU9xK (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-pIJRSK] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-pIJRSK","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✖ Esc on a mission that cannot pause (NEEDS_ATTENTION) leaves it where it is instead of cancelling (1621.64575ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-86uxpz-pi-eng-orch-TSK-J5Sppq: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-86uxpz-pi-eng-orch-TSK-J5Sppq (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-86uxpz-pi-eng-orch-TSK-J5Sppq (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-oeOV1U] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-oeOV1U","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+[info] [mission MSN-oeOV1U] model: auto (operator pin cleared) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-oeOV1U","from":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","to":null,"reason":"operator pin released"}
+✔ clear_pin releases a paused mission from a persisted operator pin before it resumes (4850.294292ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-bhhau5-pi-eng-orch-TSK-vPEjXh: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-bhhau5-pi-eng-orch-TSK-vPEjXh (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-bhhau5-pi-eng-orch-TSK-vPEjXh (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-PojBkG] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-PojBkG","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✔ an operator pause is visible on every status surface, survives a restart, and /mission resume clears it (5308.252125ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-q5ro6p-pi-eng-orch-TSK-AVAKhh: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-q5ro6p-pi-eng-orch-TSK-AVAKhh (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-q5ro6p-pi-eng-orch-TSK-AVAKhh (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-z67joD] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-z67joD","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✔ /mission resume clears the operator pause of a mission paused to PAUSED_INFRASTRUCTURE (9930.882167ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-vuaopq-pi-eng-orch-TSK-9oPNgy: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-vuaopq-pi-eng-orch-TSK-9oPNgy (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-vuaopq-pi-eng-orch-TSK-9oPNgy (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-qsWLLc] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-qsWLLc","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✖ maintenance drains an executing mission without setting operator pause and resumes the same work (2034.862333ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-82q1xx-pi-eng-orch-TSK-YNnExh: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-82q1xx-pi-eng-orch-TSK-YNnExh (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-82q1xx-pi-eng-orch-TSK-YNnExh (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-ByFoUb] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-ByFoUb","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✖ operator Esc during a maintenance drain prevents automatic resumption (2292.842166ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-762qei-pi-eng-orch-TSK-5oSsWg: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-762qei-pi-eng-orch-TSK-5oSsWg (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-762qei-pi-eng-orch-TSK-5oSsWg (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-SkQUs9] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-SkQUs9","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✔ maintenance refuses integration without aborting its worker (2680.286459ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-q1de3-pi-eng-orch-TSK-43wvWp: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-q1de3-pi-eng-orch-TSK-43wvWp (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-q1de3-pi-eng-orch-TSK-43wvWp (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-CqnerZ] model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-CqnerZ","from":null,"to":"gw/deepseek_v4-flash-modality-text-quant-mxfp4","reason":"operator pin"}
+✖ maintenance refuses ambiguous legacy task cancellation without consuming a resumption (2388.603417ms)
+[warning] worktree kept (not removed): /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-avds8y-pi-eng-orch-TSK-1DSP6A: the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-avds8y-pi-eng-orch-TSK-1DSP6A (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[warning] worktree creation refused, existing data kept: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-avds8y-pi-eng-orch-TSK-1DSP6A (kept; inspect it and remove it yourself): the worktree cannot be inspected
+[info] [mission MSN-5hTwW1] model: gw/glm5.3-flash-modality-vision-quant-q6_k_xl (operator pin) from its next worker dispatch {"type":"MODEL_TRANSITION","missionId":"MSN-5hTwW1","from":null,"to":"gw/glm5.3-flash-modality-vision-quant-q6_k_xl","reason":"session starting model"}
+✖ exact maintenance selection changes only the fenced mission and dispatches the validated model (2895.98075ms)
+ℹ tests 12
+ℹ suites 0
+ℹ pass 6
+ℹ fail 6
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 41818.259833
+
+✖ failing tests:
+
+test at test/integration/mission-interrupt-pause.test.ts:95:1
+✖ Esc on the mission tool pauses the mission; resume keeps the operator pin and preserved work (2697.256791ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /PAUSED by interrupt.*\/mission resume MSN-SXZhoO/s. Input:
+  
+  'Mission MSN-SXZhoO [PAUSED_INFRASTRUCTURE] workflow=engineering_review\n' +
+    'Intent: implement | required gates: validation, independent_review\n' +
+    'Not completed: paused by the operator (interrupt); progress is preserved.\n' +
+    'Elapsed: 1s · last activity 0s ago · stage PAUSED_INFRASTRUCTURE\n' +
+    'PAUSED by operator at 2026-11-05T21:33:33.292Z — automatic repair is off; resume with /mission resume MSN-SXZhoO (add --model auto to release a model pin)\n' +
+    'model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin)\n' +
+    'Stopped: paused by the operator (interrupt); progress is preserved\n' +
+    'Preserved work:\n' +
+    '  - branch pi-eng-orch-TSK-TwZXaw, commit 67de98442e05, worktree /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-1qhduk-pi-eng-orch-TSK-TwZXaw\n' +
+    '  - 67de98442e054b0fbdf610b4927712cf9fa118be\n' +
+    'Failed tasks (3):\n' +
+    '  - TSK-Dd7kgf agent:implementer "Make add return the sum": Required isolated worktree allocation failed: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-1qhduk-pi-eng-orch-TSK-Dd7kgf (kept; inspect…\n' +
+    '  - TSK-GSxLBT validation:validator "Run deterministic validation (typecheck/tests/lint) over the integrated result.": CANDIDATE_UNAVAILABLE: validation cannot fall back to the incumbent checkout\n' +
+    '  - TSK-w7m3pv review:reviewer "Fresh independent review of the integrated change. Mission: Make add return the…": CANDIDATE_UNAVAILABLE: review cannot fall back to the incumbent checkout\n' +
+    'Remaining deliverables:\n' +
+    '  - repair\n' +
+    'Next step: the operator resumes it: /mission resume MSN-SXZhoO; then resume with mission tool {action:"resume", missionId:"MSN-SXZhoO"} (or /mission resume MSN-SXZhoO).'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x08-fix-build/test/integration/mission-interrupt-pause.test.ts:139:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:387:3) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'Mission MSN-SXZhoO [PAUSED_INFRASTRUCTURE] workflow=engineering_review\nIntent: implement | required gates: validation, independent_review\nNot completed: paused by the operator (interrupt); progress is preserved.\nElapsed: 1s · last activity 0s ago · stage PAUSED_INFRASTRUCTURE\nPAUSED by operator at 2026-11-05T21:33:33.292Z — automatic repair is off; resume with /mission resume MSN-SXZhoO (add --model auto to release a model pin)\nmodel: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin)\nStopped: paused by the operator (interrupt); progress is preserved\nPreserved work:\n  - branch pi-eng-orch-TSK-TwZXaw, commit 67de98442e05, worktree /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-1qhduk-pi-eng-orch-TSK-TwZXaw\n  - 67de98442e054b0fbdf610b4927712cf9fa118be\nFailed tasks (3):\n  - TSK-Dd7kgf agent:implementer "Make add return the sum": Required isolated worktree allocation failed: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-1qhduk-pi-eng-orch-TSK-Dd7kgf (kept; inspect…\n  - TSK-GSxLBT validation:validator "Run deterministic validation (typecheck/tests/lint) over the integrated result.": CANDIDATE_UNAVAILABLE: validation cannot fall back to the incumbent checkout\n  - TSK-w7m3pv review:reviewer "Fresh independent review of the integrated change. Mission: Make add return the…": CANDIDATE_UNAVAILABLE: review cannot fall back to the incumbent checkout\nRemaining deliverables:\n  - repair\nNext step: the operator resumes it: /mission resume MSN-SXZhoO; then resume with mission tool {action:"resume", missionId:"MSN-SXZhoO"} (or /mission resume MSN-SXZhoO).',
+    expected: /PAUSED by interrupt.*\/mission resume MSN-SXZhoO/s,
+    operator: 'match',
+    diff: 'simple'
+  }
+
+test at test/integration/mission-interrupt-pause.test.ts:250:1
+✖ Esc on a mission that cannot pause (NEEDS_ATTENTION) leaves it where it is instead of cancelling (1621.64575ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /interrupt noted/i. Input:
+  
+  'Mission MSN-pIJRSK [NEEDS_ATTENTION] workflow=engineering_review\n' +
+    'Intent: implement | required gates: validation, independent_review\n' +
+    'Not completed: paused by the operator (interrupt); progress is preserved.\n' +
+    'Elapsed: 1s · last activity 0s ago · stage NEEDS_ATTENTION\n' +
+    'PAUSED by operator at 2026-11-05T21:33:38.884Z — automatic repair is off; resume with /mission resume MSN-pIJRSK (add --model auto to release a model pin)\n' +
+    'model: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin)\n' +
+    'Preserved work:\n' +
+    '  - branch pi-eng-orch-TSK-xGZWNw, commit 3010868dd2f7, worktree /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-2mw9l9-pi-eng-orch-TSK-xGZWNw\n' +
+    'Failed tasks (3):\n' +
+    '  - TSK-IrU9xK agent:implementer "Make add return the sum": Required isolated worktree allocation failed: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-2mw9l9-pi-eng-orch-TSK-IrU9xK (kept; inspect…\n' +
+    '  - TSK-DZ1i5w validation:validator "Run deterministic validation (typecheck/tests/lint) over the integrated result.": CANDIDATE_UNAVAILABLE: validation cannot fall back to the incumbent checkout\n' +
+    '  - TSK-GAnPla review:reviewer "Fresh independent review of the integrated change. Mission: Make add return the…": CANDIDATE_UNAVAILABLE: review cannot fall back to the incumbent checkout\n' +
+    'Remaining deliverables:\n' +
+    '  - repair\n' +
+    'Next step: the mission is still NEEDS_ATTENTION (no deadline: it runs while it makes progress); check it with {action:"status", missionId:"MSN-pIJRSK"}, or cancel the running mission to stop it.'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x08-fix-build/test/integration/mission-interrupt-pause.test.ts:275:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'Mission MSN-pIJRSK [NEEDS_ATTENTION] workflow=engineering_review\nIntent: implement | required gates: validation, independent_review\nNot completed: paused by the operator (interrupt); progress is preserved.\nElapsed: 1s · last activity 0s ago · stage NEEDS_ATTENTION\nPAUSED by operator at 2026-11-05T21:33:38.884Z — automatic repair is off; resume with /mission resume MSN-pIJRSK (add --model auto to release a model pin)\nmodel: gw/deepseek_v4-flash-modality-text-quant-mxfp4 (operator pin)\nPreserved work:\n  - branch pi-eng-orch-TSK-xGZWNw, commit 3010868dd2f7, worktree /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-2mw9l9-pi-eng-orch-TSK-xGZWNw\nFailed tasks (3):\n  - TSK-IrU9xK agent:implementer "Make add return the sum": Required isolated worktree allocation failed: refusing to replace the existing worktree at /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/pi-eng-2mw9l9-pi-eng-orch-TSK-IrU9xK (kept; inspect…\n  - TSK-DZ1i5w validation:validator "Run deterministic validation (typecheck/tests/lint) over the integrated result.": CANDIDATE_UNAVAILABLE: validation cannot fall back to the incumbent checkout\n  - TSK-GAnPla review:reviewer "Fresh independent review of the integrated change. Mission: Make add return the…": CANDIDATE_UNAVAILABLE: review cannot fall back to the incumbent checkout\nRemaining deliverables:\n  - repair\nNext step: the mission is still NEEDS_ATTENTION (no deadline: it runs while it makes progress); check it with {action:"status", missionId:"MSN-pIJRSK"}, or cancel the running mission to stop it.',
+    expected: /interrupt noted/i,
+    operator: 'match',
+    diff: 'simple'
+  }
+
+test at test/integration/mission-interrupt-pause.test.ts:431:1
+✖ maintenance drains an executing mission without setting operator pause and resumes the same work (2034.862333ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'busy' !== 'ready'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x08-fix-build/test/integration/mission-interrupt-pause.test.ts:453:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'busy',
+    expected: 'ready',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/integration/mission-interrupt-pause.test.ts:484:1
+✖ operator Esc during a maintenance drain prevents automatic resumption (2292.842166ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'busy' !== 'ready'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x08-fix-build/test/integration/mission-interrupt-pause.test.ts:511:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'busy',
+    expected: 'ready',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/integration/mission-interrupt-pause.test.ts:566:1
+✖ maintenance refuses ambiguous legacy task cancellation without consuming a resumption (2388.603417ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'busy' !== 'ready'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x08-fix-build/test/integration/mission-interrupt-pause.test.ts:585:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'busy',
+    expected: 'ready',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/integration/mission-interrupt-pause.test.ts:607:1
+✖ exact maintenance selection changes only the fenced mission and dispatches the validated model (2895.98075ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  'busy' !== 'ready'
+  
+      at TestContext.<anonymous> (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-x08-fix-build/test/integration/mission-interrupt-pause.test.ts:655:12)
+      at async Test.run (node:internal/test_runner/test:1389:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:960:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 'busy',
+    expected: 'ready',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+[exit=1]

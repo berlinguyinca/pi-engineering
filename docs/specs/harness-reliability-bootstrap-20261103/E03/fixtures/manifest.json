@@ -1,0 +1,53 @@
+{
+ "taskId": "E03",
+ "baseSha": "ba22f28a6b540de74eb49a88a3e4fd62a08af1b4",
+ "repoId": "pi",
+ "objective": "Build deterministic error normalization \u2014 Map known HTTP, network, tool, context, worker result and crash shapes into E02 schema; unknown category is allowed; preserve original evidence reference.",
+ "allowPaths": [
+  "src/incidents/errorNormalize.ts",
+  "test/unit/error-normalize.test.ts"
+ ],
+ "denyPaths": [
+  "package.json",
+  ".gitignore",
+  "scripts/**",
+  "src/bootstrap/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/templates/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/**",
+  "test/support/**",
+  "test/unit/bootstrap-*.test.ts"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-error-normalize",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/error-normalize.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:1e87cb429e78d7c38d2b5261bcc35ca533e91378d33e1174f6e87fe165fa844a",
+ "expectedOutputs": [
+  "src/incidents/errorNormalize.ts",
+  "test/unit/error-normalize.test.ts"
+ ],
+ "mode": "isolated-change"
+}

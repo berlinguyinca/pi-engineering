@@ -1,0 +1,4 @@
+REJECT baseline: HEAD 3bb21ab2e4b4434f01f01d93770ff4a131f176e9 != manifest baseSha 11131ece730d723c1e497d860c6185a717b8691f
+plan exit=3; no model invoked (B04 stops here)
+parent=T08 accepted sha256:f928904f4c5…
+REJECT gate: worktree is not clean: the gate stamps only a committed, clean task commit

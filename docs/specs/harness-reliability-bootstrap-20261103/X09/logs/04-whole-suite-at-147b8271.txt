@@ -1,0 +1,60 @@
+# Whole suite (`npm test`) at the X09 tree, after X09's two changes. Raw transcript was /tmp/nptest-x09.txt (not
+# committed, 674 KB); this is the annotated summary in the same form as X08/logs/18.
+
+# Tree: task commit 147b8271, records commit d5e256e6 (first parent 89e747c2, second 6818842c).
+# Load: the machine is shared with other agent sessions; load averages 98-155 during this run, which is why it took
+# 1864 s where the same suite at bc8cd251 took 1639 s (X08/logs/18) and 681 s on a quiet machine.
+
+ℹ tests 7945
+ℹ suites 558
+ℹ pass 7912
+ℹ fail 28
+ℹ cancelled 0
+ℹ skipped 5
+ℹ duration_ms 1864070.545667
+
+# 28 failing leaf tests in 19 files. Files and their failing-site counts:
+  test/unit/runtime-isolation-registry.test.ts             5
+  test/unit/artifacts-paging.test.ts                       4
+  test/integration/planner-worker-gateway-timeouts.test.ts 2
+  test/integration/runtime-isolation-stress.test.ts        2
+  test/integration/disk-pressure-snapshot-e2e.test.ts      1
+  test/integration/no-fixed-deadlines.test.ts              1
+  test/integration/review-context-and-acceptance.test.ts   1
+  test/integration/runtime-host-entry.test.ts              1
+  test/unit/envelope-v2-hardening.test.ts                  1
+  test/unit/git-remote-ref.test.ts                         1
+  test/unit/herdr-forks.test.ts                            1
+  test/unit/herdr-plannotator-transport.test.ts            1
+  test/unit/live-handoff-rpc.test.ts                       1
+  test/unit/platform-filelock-no-hardlinks.test.ts         1
+  test/unit/safe-git-survivors.test.ts                     1
+  test/unit/safe-git-units.test.ts                         1
+  test/unit/standalone-plan-flow.test.ts                   1
+  test/unit/workspace-manifest-corpus.test.ts              1
+  test/unit/worktree-janitor.test.ts                       1
+
+# Comparisons (each file also measured ALONE at three trees in X10/logs/01, which is the decisive attribution):
+#   - 5 files are red alone at this branch AND red alone at origin/main (no-fixed-deadlines, planner-worker-
+#     gateway-timeouts, review-context-and-acceptance, herdr-plannotator-transport, live-handoff-rpc, plus
+#     workspace-manifest-corpus): environment-bound, they fail at main too.
+#   - 10 files are red alone here but GREEN alone at origin/main (runtime-isolation-stress, artifacts-paging,
+#     git-remote-ref, herdr-forks, platform-filelock-no-hardlinks, runtime-isolation-registry, safe-git-survivors,
+#     safe-git-units, standalone-plan-flow, worktree-janitor): the branch lacks main's fixes -- stale base, see
+#     X10/logs/01. All ten are green alone once origin/main is merged in.
+#   - 2 files (disk-pressure-snapshot-e2e, envelope-v2-hardening) are green alone: load-bound under this machine load.
+#   - test/integration/worker-stream-truncation.test.ts, the file X09 fixed, is NOT in the failing list: 20/0 alone
+#     (X09/logs/01) and it did not fail in this whole-suite run either.
+
+# Cancellation: 0. The suite terminated (this is the X08 blocker's requirement: npm test must exit).
+
+# Citation correction: earlier notes in this series (PLAN-COMPLETION.json and the X09 record's own note text) referred
+# to "X08/logs/20" for the branch-only attribution. No such log exists -- X08/logs ends at 19, and 19 covers the four
+# branch-only names as they stood at bc8cd251. The attribution that was attributed to logs/20 is produced here
+# (X09/logs/04) and in X10/logs/01, from commands re-run at 147b8271, origin/main and the merge commit. The PLAN text
+# is corrected in the same commit as this log.
+
+# Also corrected: X09/logs/02 records `npx biome check src/git/GitRepo.ts test/integration/worker-stream-truncation.
+# test.ts` (exit 0), which is what cmd4 actually ran; the X09 note's shorthand "npx biome check src cmd -> exit 0" was
+# wrong -- `biome check src cmd` reports 47 findings at 147b8271 too, all in files earlier units wrote. See
+# X10/logs/04 for the measured parity gap.

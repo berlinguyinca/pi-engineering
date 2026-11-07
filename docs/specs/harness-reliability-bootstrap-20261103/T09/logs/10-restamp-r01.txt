@@ -1,0 +1,6 @@
+REJECT baseline: HEAD 3bb21ab2e4b4434f01f01d93770ff4a131f176e9 != manifest baseSha 11131ece730d723c1e497d860c6185a717b8691f
+plan exit=3; no model invoked (B04 stops here)
+parent=T08 accepted sha256:f928904f4c5…
+authority=T09 sha256:59d5cb3b8b399b849bf2fb19192293ea4a3ef7d3a852d3c76291f1d1e120295b
+schema=T09 conforms docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json
+REJECT input: refusing to overwrite an existing handoff: /Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/T09/out/T09.handoff.json

@@ -1,0 +1,19 @@
+out-of-scope: ["src/ui/theme.ts","docs/roadmap.md"] | protected: []
+  refs: task=T09 branch=pw/T09 base=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb head=hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh paths=src/ui/theme.ts,docs/roadmap.md
+in-scope: true | refs still names attempt: true
+protected INSIDE scope -> ok=false protectedHits=["docs/specs/x/manifests/tasks.json"] violations=[]
+  protected glob covers docs/specs/h/manifests/tasks.json: true
+  protected glob covers docs/specs/h/T01.handoff.json: true
+  protected glob covers docs/specs/h/T01/fixtures/proofs.json: true
+  protected glob covers docs/specs/h/templates/handoff.schema.json: true
+  protected glob covers templates/handoff.schema.json: true
+  protected glob covers scripts/bootstrap-one.ts: true
+ordinary src paths not flagged: true
+bounded: 20 refs note: true no note path invented: true
+dedup+order: ["z.ts","a.ts"]
+non-strings ignored: ["x.ts"]
+empty diff: true
+determinism: true
+blocked reason prefix: "evidence: scope gate: task=T09 …"
+PROTECTED list: ["docs/specs/**/manifests/**","docs/specs/**/*.handoff.json","docs/specs/**/fixtures/**","docs/specs/**/templates/**","templates/**","scripts/bootstrap-*.ts"]
+missing scope object does not throw: {"ok":false,"violations":["a"],"protectedHits":[],"refs":"ta

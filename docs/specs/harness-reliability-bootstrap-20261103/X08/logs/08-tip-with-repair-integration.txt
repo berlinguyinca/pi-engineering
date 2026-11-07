@@ -1,0 +1,15 @@
+### TIP 45d42acb + repair -- the two integration files named by AUDIT/suite-termination-blocker-20261105.txt, re-run end to end
+$ timeout 900 node --test --import ./test/support/isolatedState.ts test/integration/mission-interrupt-pause.test.ts
+ℹ tests 12
+ℹ pass 12
+ℹ fail 0
+ℹ cancelled 0
+ℹ duration_ms 29351.032541
+[exit=0]
+$ timeout 900 node --test --import ./test/support/isolatedState.ts test/integration/mission-merge-queue-flow.test.ts
+ℹ tests 6
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ duration_ms 22121.058334
+[exit=0]

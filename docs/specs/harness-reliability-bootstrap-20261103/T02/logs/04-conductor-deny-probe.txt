@@ -1,0 +1,10 @@
+A broad grant + narrow auth deny        : ACCEPTED {"forbidden":["src/secret/**"],"auth":["src/secret/**"],"ignored":null}
+B re-grant inside auth deny             : REJECTED ["T-1: scope.allowed \"src/secret/app.ts\" is inside authorization deny \"src/secret/**\": nothing writable"]
+C directory deny swallows literal grant : REJECTED ["T-1: scope.allowed \"src/secret/app.ts\" is inside authorization deny \"src/secret/**\": nothing writable"]
+D auth deny via authorization.denied    : ACCEPTED {"forbidden":["docs/secret/**","src/secret/**"],"auth":["docs/secret/**","src/secret/**"],"ignored":null}
+E planner-origin wildcard discard (base): ACCEPTED {"forbidden":["**/*.md"],"auth":null,"ignored":null}
+F planner grants inside its own deny    : ACCEPTED {"forbidden":["src/**"],"auth":null,"ignored":null}
+G planner omits the auth deny entirely  : ACCEPTED {"forbidden":["src/secret/**"],"auth":["src/secret/**"],"ignored":null}
+H planner restates auth deny as note    : ACCEPTED {"forbidden":["src/secret/**"],"auth":["src/secret/**"],"ignored":null}
+I malformed auth glob                   : REJECTED ["T-1: scope glob \"..\" escapes the repository"]
+J auth deny non-string                  : REJECTED ["T-1.scope.allowed is required"]

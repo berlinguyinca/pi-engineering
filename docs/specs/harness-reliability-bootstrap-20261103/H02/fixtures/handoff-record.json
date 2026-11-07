@@ -1,0 +1,36 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "H02",
+ "status": "PASS",
+ "repo": "berlinguyinca/herdr-engineering",
+ "baseSha": "debcfeef2ed712bc75e3b702033a005e15646f89",
+ "resultSha": "ab96dc25bc2b672cc73923d648e683b0edc885b9",
+ "taskAuthorityHash": "sha256:6ad820c6cbdf40345e7ab549bf9e4792c52fb40ca8a037c4afe8c9cb37098b50",
+ "changedFiles": [
+  "packages/diagnostics-model.js",
+  "packages/diagnostics-model.test.js"
+ ],
+ "commands": [
+  {
+   "command": "git diff --check",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/H02/logs/01-node-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/H02/logs/01-node-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/H02/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H02/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H02/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "H03",
+ "nextBaseSha": "ab96dc25bc2b672cc73923d648e683b0edc885b9",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Worker pane h02 (pane w8:p0, metabolomics/qwen3.8-flash_next) on base debcfeef (H01's result in berlinguyinca/herdr-engineering), herdr-ui mode, first pass, ~7 min. Exactly the two declared new files (git show --name-only HEAD), 60 + 55 = 115 changed lines against the 120 herdr-ui ceiling. Conductor verified independently at ab96dc25: node --test packages/diagnostics-model.test.js 6 pass / 0 fail; node --check on both files exit 0; git diff --check debcfeef..HEAD exit 0; and a purity grep for fetch|readFile|writeFile|Date.now|Math.random|setTimeout|document|window|require( returns 0 hits, so the module is a view model and not a data source. Conductor checks on the two halves of the delta: input validation is rejection-not-repair (normalizeIncident/normalizeEvent return {ok:false, errors[]} and refuse unknown keys, so a record carrying renderer/html/fetch cannot enter the model, and a frozen input proves no mutation); stable filtering is proven by buildTimeline sorting on at with a positional tiebreak so same-instant events keep arrival order, with discarded records counted as {dropped, invalid} rather than hidden; decideDrift returns drifted:false plus a reason naming the unusable input for non-finite expected/actual/tolerance, so the view never invents drift. API: SEVERITIES, normalizeIncident, normalizeEvent, buildTimeline, decideDrift - no DOM, no I/O, no imports at all. NOTE for the next unit: the survey records two coexisting event-type vocabularies (dotted-lowercase on the wire vs verb = event_type.split('.')[-1].lower() in graph_ingest.py:90), so eventType stays an open non-empty string here rather than a closed enum - closing it would be a contract change and belongs with the API unit, not a pure model."
+ }
+}

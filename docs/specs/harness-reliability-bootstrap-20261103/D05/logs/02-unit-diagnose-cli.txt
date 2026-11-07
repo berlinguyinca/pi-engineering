@@ -1,0 +1,14 @@
+✔ evidence criterion: the fixture index prints exact clustered totals (human and --json), exit 0, sanitized output (3.381084ms)
+✔ exit 2: invalid argv is refused with a stable message per problem and nothing is read (0.148792ms)
+✔ exit 3 and 4: refused namespace, a read that throws, an export write that throws (0.33125ms)
+✔ filters forward to the injected read: --last, --session, --model, --host; --host otherwise comes from hostname() (0.345459ms)
+✔ --export: one write to the requested path, no overwrite without --force, never inside the namespace (0.283292ms)
+✔ --help is a success path that prints usage and reads nothing (0.070709ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 164.993292

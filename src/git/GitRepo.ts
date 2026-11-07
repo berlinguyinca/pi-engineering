@@ -267,8 +267,17 @@ export async function resolveCommonDir(reported: string, repoRoot: string): Prom
     }
   };
   if (await present(reported)) return reported;
-  const layout = discoverRepo(repoRoot);
-  if (layout !== null && layout !== "invalid" && (await present(layout.commonDir))) return layout.commonDir;
+  // Discovery reads the filesystem too, and an EACCES/ESTALE/EIO there says nothing about the layout:
+  // report it as what it is, with what git had answered, rather than as "resolves to nothing usable".
+  try {
+    const layout = discoverRepo(repoRoot);
+    if (layout !== null && layout !== "invalid" && (await present(layout.commonDir))) return layout.commonDir;
+  } catch (error) {
+    throw new Error(
+      `git reported the common directory ${reported}, which does not exist, and resolving the layout under ${repoRoot} failed: ${(error as Error).message}`,
+      { cause: error },
+    );
+  }
   throw new Error(
     `git reported the common directory ${reported}, which does not exist, and the layout under ${repoRoot} resolves to nothing usable; the repository's git administration state is unreachable`,
   );
@@ -281,6 +290,7 @@ export async function resolveCommonDir(reported: string, repoRoot: string): Prom
  * git; it wraps the commands the vertical slice needs: repo detection, worktree
  * creation, diff capture, commit, and status.
  */
+
 export class GitRepo {
   private readonly cwd: string;
   private readonly repoRoot: string;

@@ -1,0 +1,7 @@
+{
+  "taskId": "R07",
+  "reason": "The plan lists src/inference/resilientStream.ts as this unit's production path, but at base 16d35ecb that path is already a 930-line LIVE module: its header states every model invocation in the harness reaches it, and it already owns streamRetryEnabled (:226) and incomplete_stream rules (:316, :335). Editing it would violate R07's own 'no other fallback changes' clause and its 100-line cap, so the opt-in decision was delivered as the new src/inference/resilientStreamOptin.ts and the declared production path was widened to that single new file. No existing file was touched.",
+  "declaredProduction": ["src/inference/resilientStream.ts"],
+  "production": ["src/inference/resilientStreamOptin.ts"],
+  "tests": ["test/unit/recovery-optin.test.ts"]
+}

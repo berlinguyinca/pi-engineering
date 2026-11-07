@@ -1,0 +1,14 @@
+$ node --test --import ./test/support/isolatedState.ts test/integration/mission-interrupt-pause.test.ts test/integration/mission-merge-queue-flow.test.ts
+# (the two files the suite-termination audit named; run without any ceiling)
+  ✔ a stale base moves the mission to REPAIRING twice, and the third rejection leaves it BLOCKED (5523.733583ms)
+  ✔ a repair round that clears the rejection promotes from REPAIRING and completes (5436.736125ms)
+  ✔ reopening the runtime while MERGING finishes the promotion with exactly 1 merge commit (10355.819541ms)
+✔ mission promotion through the merge queue (issue #153) (39694.454208ms)
+ℹ tests 18
+ℹ suites 1
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 52516.50175

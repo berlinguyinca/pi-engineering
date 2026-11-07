@@ -1,0 +1,44 @@
+{
+ "taskId": "H06",
+ "baseSha": "5e56bf43cc7ee67855f7e072f7d4bcddb78ec380",
+ "repoId": "herdr",
+ "objective": "Show original objective vs observed actions, first violation, scope diffs, model/quantization and uncertainty. No fabricated alignment score. Evidence: Relevant vs unrelated actions visually distinguished using fixtures. Evidence: Relevant vs unrelated actions visually distinguished using fixtures",
+ "allowPaths": [
+  "packages/task-drift-view.js",
+  "packages/task-drift-view.test.js"
+ ],
+ "denyPaths": [
+  "herdr_engineering/**",
+  "tests/**",
+  "deploy/**",
+  "pyproject.toml",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "AGENTS.md",
+  "README.md"
+ ],
+ "commands": [
+  {
+   "id": "diff-check",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 120000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 120
+ },
+ "parentHandoffHash": "sha256:27e74eaf7bb606a6f5e6fc7a0f21161ab65fa945c82c2f8150077480376c1b5c",
+ "expectedOutputs": [
+  "packages/task-drift-view.js",
+  "packages/task-drift-view.test.js"
+ ],
+ "mode": "herdr-ui"
+}

@@ -1,0 +1,53 @@
+{
+ "taskId": "E05",
+ "baseSha": "c349613b59ab6a0a9666633df68002394767cfa6",
+ "repoId": "pi",
+ "objective": "Record normalized error occurrences per session \u2014 Adapter emitting E02 records to the EXISTING per-session event writer. Separate event occurrences from deduplicated incidents; no new database.",
+ "allowPaths": [
+  "src/runtime/isolation/SessionErrorWriter.ts",
+  "test/unit/session-error-writer.test.ts"
+ ],
+ "denyPaths": [
+  "package.json",
+  ".gitignore",
+  "scripts/**",
+  "src/bootstrap/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/templates/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/**",
+  "test/support/**",
+  "test/unit/bootstrap-*.test.ts"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-session-error-writer",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/session-error-writer.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:44b2064fa51af5abffd992d78577b6a7937b536f50c46a6af0d93c6df5221e9b",
+ "expectedOutputs": [
+  "src/runtime/isolation/SessionErrorWriter.ts",
+  "test/unit/session-error-writer.test.ts"
+ ],
+ "mode": "isolated-change"
+}

@@ -1,0 +1,53 @@
+{
+ "taskId": "E06",
+ "baseSha": "d19553b9601f616be01b65c5041c91ed2e9ff889",
+ "repoId": "pi",
+ "objective": "Capture worker/tool failures at single stable seam \u2014 Wire E05 on one verified SDK failure path only; record model/role/session identity and tool exception; do not change retry or failure behavior. Audit actual hook before editing.",
+ "allowPaths": [
+  "src/workers/PiWorkerExecutor.ts",
+  "test/unit/worker-error-events.test.ts"
+ ],
+ "denyPaths": [
+  "package.json",
+  ".gitignore",
+  "scripts/**",
+  "src/bootstrap/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/templates/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/**",
+  "test/support/**",
+  "test/unit/bootstrap-*.test.ts"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-worker-error-events",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/worker-error-events.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:40b04647d4bcd398a6e304b2e107546dc1ae484879f846b4b36cb642b925db62",
+ "expectedOutputs": [
+  "src/workers/PiWorkerExecutor.ts",
+  "test/unit/worker-error-events.test.ts"
+ ],
+ "mode": "isolated-change"
+}

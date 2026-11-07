@@ -1,0 +1,36 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "V05",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "fc4712252558dc438365094929b2071828c94b5c",
+  "resultSha": "761d85780e76f1a611a78e0f366a75d0eec425b6",
+  "taskAuthorityHash": "sha256:839fe882ad7e7ca8e1888c9036e2cb4a7d08505d1778a6eab10bdc7d8ad5bb50",
+  "changedFiles": [
+    "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
+  ],
+  "commands": [
+    {
+      "command": "git diff --check",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/V05/logs/02-scope.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/V05/logs/02-scope.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/V05/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/V05/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/V05/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "V06",
+  "nextBaseSha": "e6ad2208ad77a765056d00c414fce45b089f74ef",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Worker pane v05 (pane w8:p1B, metabolomics/qwen3.8-flash_next) on base fc471225 (the V04 evidence commit in berlinguyinca/pi-engineering), executed in isolated-change mode after ~25 min of source verification plus two conductor nudges to stop re-running suites. MODE DEVIATION, recorded deliberately: the plan declares V05 read-only (docs/specs/harness-reliability-bootstrap-20261103/manifests/tasks.json), and the scope gate rejects a read-only manifest with 1 changed path - the DELTA requires creating docs/specs/harness-reliability-bootstrap/ROLLOUT.md, which no read-only mode can produce (04-QUANTIZATION-BENCHMARK line 14 of 02-HANDOFF-PROTOCOL.md permits only byte-identical reads). The conductor stamped isolated-change, the stricter production-writing mode (100-line ceiling, deny paths still enforced), because read-only cannot express this task at all; the manifest mode is left unchanged so the conflict stays visible. Exactly the one declared file (git show --name-only HEAD), 92 changed lines against the 100 ceiling, git diff --check fc471225..HEAD exit 0 (logs/01), scope in logs/02. The worker corrected two facts the conductor handed it, and the conductor re-verified both against source. First: the brief said the env boolean parser is affirmative-only; the source shows the opposite for the parser that gates these switches - bool() at src/inference/resilienceConfig.ts:88-92 is negative-only, returning the fallback for undefined or empty and otherwise true unless the value is exactly false, 0 or off (logs/04), so PI_INFERENCE_RESILIENCE_ENABLED=ture or PI_INFERENCE_STREAM_RETRY_ENABLED=0n leaves the intervention ENABLED; an affirmative-only parser exists nearby but is not the one used at :125, :126 and :134. The runbook records this as an operator hazard - a mistyped disable does not disable - and requires rollback proof to read the resolved config rather than the env string. Second: the brief cited docs/specs/harness-reliability-bootstrap-20261103/BASELINE-unit-suite-at-c349613b.txt as a metric baseline; that file is absent from every worktree because it was never committed - it existed only as an untracked file in the conductor checkout (150 failure lines, 2180 pass lines), and the conductor has now committed it with this unit's evidence instead of letting the worker quote an unreachable artifact. The facts that did hold were re-verified by the worker: the scope-integrity gate runs unconditionally (executor.ts:772 -> :931; executor.ts touches process.env only at the unrelated :1803) so its rollback is a revert with no flag; the diagnose path is read-only by construction (src/runtime/host/entry.ts:82 types the dependency set as Omit<..., 'writeFile'>; scripts/diagnose-errors.ts reads no config and no environment and caps --last at 5000); and the Herdr diagnostics view is integrated at herdr main 591264f9bd4fc2fc07d88d94febde4cd0e919448 with 36/36 tests across the six diagnostics and task-drift files. All six required sections are present with 13 rows saying 'no flag' where no flag exists, and the known-gaps section records the wiring debt: PiWorkerExecutor.ts:302 has no production supplier, diagnosticTask.ts has no production importer, and the modules wired through PiWorkerExecutor.ts:410 wireResilientModelRuntime are listed - so the runbook is honest about shipped versus live-path. | CHAIN CORRECTION: this record supersedes V05/out/V05.handoff.json (sha256 kept immutable in out/), whose nextBaseSha pointed at the task commit 761d85780e76 while the next unit is cut from the evidence commit e6ad2208ad77 that carries this unit's record; code, proofs and scope are unchanged."
+  },
+  "handoffHash": "sha256:a737a404f2d839c3eb5d98b348098ea3f0bcba2a55482614523ea836f4d26285"
+}

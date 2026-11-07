@@ -620,7 +620,7 @@ export function realBackends(opts: RealBackendsOptions) {
   /**
    * Models a task's takeover walk already found dead, carried across scheduler
    * relaunches of the same task so a relaunch starts after them instead of
-   * re-walking the list (RETRY-OWNERS.md). Held here, not in UnavailableModels
+   * re-walking the list (RETRY_OWNERS.md). Held here, not in UnavailableModels
    * (global, only for gateway-confirmed gone models, so a capacity-exhausted
    * model would wrongly leave routing for every task) and not in the task
    * record (this layer has no write access to it). In memory: a process restart

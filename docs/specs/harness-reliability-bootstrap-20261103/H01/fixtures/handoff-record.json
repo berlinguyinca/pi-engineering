@@ -1,0 +1,35 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "H01",
+ "status": "PASS",
+ "repo": "berlinguyinca/herdr-engineering",
+ "baseSha": "b5e6903c2f49c462c3e91528c42b5547137921ab",
+ "resultSha": "debcfeef2ed712bc75e3b702033a005e15646f89",
+ "taskAuthorityHash": "sha256:34008feb7c89a5a35a083c6a79f5052157358cba620d7d14707bf51266a57bc6",
+ "changedFiles": [
+  "docs/specs/harness-reliability-bootstrap/HERDR_SURFACES.md"
+ ],
+ "commands": [
+  {
+   "command": "git diff --check",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/H01/logs/01-diff-check.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/H01/logs/01-diff-check.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/H01/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H01/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H01/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "H02",
+ "nextBaseSha": "debcfeef2ed712bc75e3b702033a005e15646f89",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Worker pane h01 (pane w8:pW, metabolomics/qwen3.8-flash_next) on herdr base b5e6903c (origin/main of berlinguyinca/herdr-engineering - the first cross-repo transition of the bootstrap), herdr-ui mode, first pass, ~8 min. One new file docs/specs/harness-reliability-bootstrap/HERDR_SURFACES.md, 86 changed lines against the 120 herdr-ui ceiling, verified independently by the conductor: git diff --check exit 0, and every one of the 141 unique file:line citations resolved against this checkout to a non-empty line (0 missing), so the map is checkable rather than decorative. DEVIATIONS recorded: (1) the survey cites bare filenames (api.py:1905, repo.py:2901) rather than repo-relative paths - each section names its directory once so the reference is unambiguous and resolved here to exactly one file, but an integration unit should re-derive full paths before editing; (2) the worker's first commit amended in WORKER_REPORT.md (103 extra lines, 189 total, over the 120 ceiling and outside scope), so the conductor reset and recommitted with only the declared file, and the report now lives in the evidence tree rather than in code history. Content verified against the plan clause no UI code: zero source files touched and no component/CSS/JS/Python/test in the diff; sections cover mission timeline endpoints (api.py timeline route :3500, repo.py mission_timeline :2901), browser-facing assets (deploy/herdr-cp-feed-plugin, which is NOT custom elements - the survey says so and names the convention actually used), naming conventions including the Python-snake_case to JSON-camelCase boundary, existing error signals (error_code, errorCode at pi_recovery_verification.py:247, and which exception types reach the API versus stopping at a log), and existing APS signals (pi_autospec.py ingest_mission and ingest_worker)."
+ }
+}

@@ -1,0 +1,1217 @@
+{
+  "specVersion": "1.2.0",
+  "total": 51,
+  "execution": "strictly-sequential",
+  "tasks": [
+    {
+      "id": "B00",
+      "title": "Capture exact baseline",
+      "repo": "pi",
+      "production": [
+        "docs/specs/harness-reliability-bootstrap/BASELINE.md"
+      ],
+      "tests": [],
+      "delta": "Record clean status, HEAD, Node/npm versions, installed Pi extension revision, resolved role routes, test commands and baseline failures. Observation only; never modify installed configuration.",
+      "verify": "git status --short; git rev-parse HEAD; npm run typecheck",
+      "evidence": "Report containing SHA, timestamps, outcomes, unknowns, no source edits",
+      "ordinal": 1,
+      "phase": "Safe baseline and microtask runner",
+      "dependsOn": [],
+      "mode": "read-only",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "B01",
+      "title": "Define static microtask manifest schema",
+      "repo": "pi",
+      "production": [
+        "src/bootstrap/taskManifest.ts"
+      ],
+      "tests": [
+        "test/unit/bootstrap-task-manifest.test.ts"
+      ],
+      "delta": "Define fields taskId, baseSha, repoId, objective, allowPaths, denyPaths, commands, limits, parentHandoffHash, expectedOutputs, mode. Validate defaults and unknown fields; no runtime integration.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-task-manifest.test.ts",
+      "evidence": "Valid and invalid JSON fixtures accepted/rejected deterministically",
+      "ordinal": 2,
+      "phase": "Safe baseline and microtask runner",
+      "dependsOn": [
+        "B00"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "B02",
+      "title": "Implement path allowlist matcher",
+      "repo": "pi",
+      "production": [
+        "src/bootstrap/pathPolicy.ts"
+      ],
+      "tests": [
+        "test/unit/bootstrap-path-policy.test.ts"
+      ],
+      "delta": "Pure normalized repository-relative path matcher with explicit deny precedence; reject symlinks, traversal and ambiguous paths; do not grant implicit **.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-path-policy.test.ts",
+      "evidence": "Allow, deny, traversal and symlink cases proved by tests",
+      "ordinal": 3,
+      "phase": "Safe baseline and microtask runner",
+      "dependsOn": [
+        "B01"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "B03",
+      "title": "Implement diff-scope and size validator",
+      "repo": "pi",
+      "production": [
+        "src/bootstrap/diffGuard.ts"
+      ],
+      "tests": [
+        "test/unit/bootstrap-diff-guard.test.ts"
+      ],
+      "delta": "Validate changed paths, total added/deleted lines, generated files and binary changes against static task manifest using git porcelain/diff metadata; read-only only.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-diff-guard.test.ts",
+      "evidence": "Reports unexpected paths and oversized changes without mutating tree",
+      "ordinal": 4,
+      "phase": "Safe baseline and microtask runner",
+      "dependsOn": [
+        "B02"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "B04",
+      "title": "Create single-task bootstrap CLI wrapper",
+      "repo": "pi",
+      "production": [
+        "scripts/bootstrap-one.ts"
+      ],
+      "tests": [
+        "test/unit/bootstrap-one.test.ts"
+      ],
+      "delta": "Implement CLI skeleton: load one manifest, verify clean baseline/commit, validate dependencies/handoff, print deterministic execution plan; STOP before invoking a model at this stage. No scheduler imports.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-one.test.ts",
+      "evidence": "One manifest accepted; malformed/handoff mismatch rejected; no model calls",
+      "ordinal": 5,
+      "phase": "Safe baseline and microtask runner",
+      "dependsOn": [
+        "B03"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "B05",
+      "title": "Add result gate and immutable handoff writer",
+      "repo": "pi",
+      "production": [
+        "src/bootstrap/resultGate.ts",
+        "scripts/bootstrap-one.ts"
+      ],
+      "tests": [
+        "test/unit/bootstrap-result-gate.test.ts"
+      ],
+      "delta": "Verify exit codes + diff policy + commit parent SHA; emit next-task handoff JSON to output directory via atomic write. Block if proof absent. No automatic commits.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-result-gate.test.ts",
+      "evidence": "Tampered/missing test evidence rejected; handoff includes checksum",
+      "ordinal": 6,
+      "phase": "Safe baseline and microtask runner",
+      "dependsOn": [
+        "B04"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "E01",
+      "title": "Inventory all existing error sources",
+      "repo": "pi",
+      "production": [
+        "docs/specs/harness-reliability-bootstrap/ERROR_SOURCES.md"
+      ],
+      "tests": [],
+      "delta": "Document actual event paths from SessionEventStore, APS, IncidentController, retry trace, worker result, stderr and process exits; classify what is already emitted and missing. No implementation.",
+      "verify": "git diff --check",
+      "evidence": "Source map cites exact files and distinct owner for every event",
+      "ordinal": 7,
+      "phase": "Error capture",
+      "dependsOn": [
+        "B05"
+      ],
+      "mode": "read-only",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "E02",
+      "title": "Define normalized error event types",
+      "repo": "pi",
+      "production": [
+        "src/incidents/errorEvent.ts"
+      ],
+      "tests": [
+        "test/unit/error-event.test.ts"
+      ],
+      "delta": "Add versioned ErrorOccurrence schema with host/session/run/task/model/quantization/runtime, correlation IDs, timestamps, layer, code, severity, redacted summary and artifact refs. Keep incidents/types.ts backward compatible.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/error-event.test.ts",
+      "evidence": "Schema rejects missing session or unsafe strings",
+      "ordinal": 8,
+      "phase": "Error capture",
+      "dependsOn": [
+        "E01"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "E03",
+      "title": "Build deterministic error normalization",
+      "repo": "pi",
+      "production": [
+        "src/incidents/errorNormalize.ts"
+      ],
+      "tests": [
+        "test/unit/error-normalize.test.ts"
+      ],
+      "delta": "Map known HTTP, network, tool, context, worker result and crash shapes into E02 schema; unknown category is allowed; preserve original evidence reference.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/error-normalize.test.ts",
+      "evidence": "Fixture table covers 429,404,400,5xx, timeout, exit status, missing worker result",
+      "ordinal": 9,
+      "phase": "Error capture",
+      "dependsOn": [
+        "E02"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "E04",
+      "title": "Add sanitization before durable error capture",
+      "repo": "pi",
+      "production": [
+        "src/incidents/errorSanitize.ts"
+      ],
+      "tests": [
+        "test/unit/error-sanitize.test.ts"
+      ],
+      "delta": "Reuse src/platform/redact.ts; limit payload size and redact tokens, host secrets, env values and paths where appropriate; never store raw prompts in error index.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/error-sanitize.test.ts",
+      "evidence": "Secret fixtures never appear in persisted representation",
+      "ordinal": 10,
+      "phase": "Error capture",
+      "dependsOn": [
+        "E03"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "E05",
+      "title": "Record normalized error occurrences per session",
+      "repo": "pi",
+      "production": [
+        "src/runtime/isolation/SessionErrorWriter.ts"
+      ],
+      "tests": [
+        "test/unit/session-error-writer.test.ts"
+      ],
+      "delta": "Adapter emitting E02 records to the EXISTING per-session event writer. Separate event occurrences from deduplicated incidents; no new database.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/session-error-writer.test.ts",
+      "evidence": "Two concurrent sessions remain isolated; append survives reopen",
+      "ordinal": 11,
+      "phase": "Error capture",
+      "dependsOn": [
+        "E04"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "E06",
+      "title": "Capture worker/tool failures at single stable seam",
+      "repo": "pi",
+      "production": [
+        "src/workers/PiWorkerExecutor.ts"
+      ],
+      "tests": [
+        "test/unit/worker-error-events.test.ts"
+      ],
+      "delta": "Wire E05 on one verified SDK failure path only; record model/role/session identity and tool exception; do not change retry or failure behavior. Audit actual hook before editing.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/worker-error-events.test.ts",
+      "evidence": "Injected worker failure emits one error and preserves existing outcome",
+      "ordinal": 12,
+      "phase": "Error capture",
+      "dependsOn": [
+        "E05"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "E07",
+      "title": "Capture gateway and inference failures",
+      "repo": "pi",
+      "production": [
+        "src/inference/retryTrace.ts"
+      ],
+      "tests": [
+        "test/unit/retry-error-events.test.ts"
+      ],
+      "delta": "Extend existing retry telemetry with correlatable occurrence identity and safe normalized error reference; preserve single-owner retry semantics and existing APIs.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/retry-error-events.test.ts",
+      "evidence": "One upstream failure with three layer observations remains one occurrence",
+      "ordinal": 13,
+      "phase": "Error capture",
+      "dependsOn": [
+        "E06"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "D01",
+      "title": "Read-only merged host error reader",
+      "repo": "pi",
+      "production": [
+        "src/incidents/errorReader.ts"
+      ],
+      "tests": [
+        "test/unit/error-reader.test.ts"
+      ],
+      "delta": "Build index by reading existing SessionEventStore events across one verified local namespace; do not assume arbitrary session directories or introduce external service.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/error-reader.test.ts",
+      "evidence": "Time/host/session filters do not open writers or corrupt records",
+      "ordinal": 14,
+      "phase": "Read-only diagnosis",
+      "dependsOn": [
+        "E07"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "D02",
+      "title": "Stable cross-session error fingerprint",
+      "repo": "pi",
+      "production": [
+        "src/incidents/errorFingerprint.ts"
+      ],
+      "tests": [
+        "test/unit/error-fingerprint.test.ts"
+      ],
+      "delta": "Normalize volatile ids, timestamps, addresses and worktree prefixes while retaining root-cause discriminators; must not collapse 404 vs 429.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/error-fingerprint.test.ts",
+      "evidence": "Equivalent errors correlate; distinct causes remain separate",
+      "ordinal": 15,
+      "phase": "Read-only diagnosis",
+      "dependsOn": [
+        "D01"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "D03",
+      "title": "Aggregate occurrences into issue clusters",
+      "repo": "pi",
+      "production": [
+        "src/incidents/errorAggregate.ts"
+      ],
+      "tests": [
+        "test/unit/error-aggregate.test.ts"
+      ],
+      "delta": "Pure grouping with first/last seen, count, sessions, hosts, affected model/config and recovered/unresolved counts. Keep source event IDs.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/error-aggregate.test.ts",
+      "evidence": "Stable ordering and correct counts with duplicate retry traces",
+      "ordinal": 16,
+      "phase": "Read-only diagnosis",
+      "dependsOn": [
+        "D02"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "D04",
+      "title": "Classify recovery outcome accurately",
+      "repo": "pi",
+      "production": [
+        "src/incidents/recoveryOutcome.ts"
+      ],
+      "tests": [
+        "test/unit/recovery-outcome.test.ts"
+      ],
+      "delta": "Compute recovered, unresolved, suppressed, and unknown from durable evidence; never infer success from HTTP 200 alone.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/recovery-outcome.test.ts",
+      "evidence": "False recovery claims rejected with missing completion evidence",
+      "ordinal": 17,
+      "phase": "Read-only diagnosis",
+      "dependsOn": [
+        "D03"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "D05",
+      "title": "Read-only diagnose-errors CLI",
+      "repo": "pi",
+      "production": [
+        "scripts/diagnose-errors.ts"
+      ],
+      "tests": [
+        "test/unit/diagnose-errors-cli.test.ts"
+      ],
+      "delta": "Expose --last, --all-sessions, --session, --model, --json, --export. Default local-host read-only; validate args. Do not call an LLM or edit configuration.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/diagnose-errors-cli.test.ts",
+      "evidence": "Fixture index prints exact clustered totals and exit codes",
+      "ordinal": 18,
+      "phase": "Read-only diagnosis",
+      "dependsOn": [
+        "D04"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "D06",
+      "title": "Register /diagnose-errors Pi command",
+      "repo": "pi",
+      "production": [
+        "src/runtime/host/entry.ts"
+      ],
+      "tests": [
+        "test/unit/diagnose-errors-command.test.ts"
+      ],
+      "delta": "Discover existing command registration convention; add thin adapter to D05 local read-only diagnostics. No new slash-command registry.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/diagnose-errors-command.test.ts",
+      "evidence": "Command registration and permission scope tested",
+      "ordinal": 19,
+      "phase": "Read-only diagnosis",
+      "dependsOn": [
+        "D05"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "D07",
+      "title": "Produce bounded diagnostic evidence bundle",
+      "repo": "pi",
+      "production": [
+        "src/incidents/evidenceBundle.ts"
+      ],
+      "tests": [
+        "test/unit/error-evidence-bundle.test.ts"
+      ],
+      "delta": "Collect representative sanitized occurrences, linked retries, affected versions and task/handoff IDs; enforce size and privacy limits.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/error-evidence-bundle.test.ts",
+      "evidence": "Bundle retains reproducible context and redacts all secrets",
+      "ordinal": 20,
+      "phase": "Read-only diagnosis",
+      "dependsOn": [
+        "D06"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "D08",
+      "title": "Add bounded local-model diagnostic adapter",
+      "repo": "pi",
+      "production": [
+        "src/incidents/diagnosticTask.ts"
+      ],
+      "tests": [
+        "test/unit/incident-diagnostic-task.test.ts"
+      ],
+      "delta": "Build a pure contract/prompt package for Qwen Flash or 27B with evidence and read-only constraints; no automatic dispatch, no source changes, no self-repair.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/incident-diagnostic-task.test.ts",
+      "evidence": "Output requires hypothesis, supporting events, disconfirming evidence and uncertainty",
+      "ordinal": 21,
+      "phase": "Read-only diagnosis",
+      "dependsOn": [
+        "D07"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T01",
+      "title": "Persist canonical original task identity",
+      "repo": "pi",
+      "production": [
+        "src/bootstrap/taskAuthority.ts"
+      ],
+      "tests": [
+        "test/unit/task-authority.test.ts"
+      ],
+      "delta": "Canonicalize and SHA-256 hash original user goal, scope, explicit non-goals and tests separately from generated planner contracts. Source cannot be overwritten by a model.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/task-authority.test.ts",
+      "evidence": "Modified planner output cannot change authority hash",
+      "ordinal": 22,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "D08"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T02",
+      "title": "Fail closed on dropped deny patterns",
+      "repo": "pi",
+      "production": [
+        "src/plannerWorker/contract.ts"
+      ],
+      "tests": [
+        "test/unit/planner-worker-contract.test.ts"
+      ],
+      "delta": "For authorization-origin deny constraints, reject contradictions rather than discard; preserve existing parser behavior for planner-origin notes only where safe and explicitly reviewed.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/planner-worker-contract.test.ts",
+      "evidence": "Regression: broad grant + restricted subtree does not weaken deny",
+      "ordinal": 23,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "T01"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T03",
+      "title": "Constrain malformed-plan fallback",
+      "repo": "pi",
+      "production": [
+        "src/orchestration/missionPlanner.ts"
+      ],
+      "tests": [
+        "test/unit/mission-planner-fallback-scope.test.ts"
+      ],
+      "delta": "On planner failure, carry original scope/budget/acceptance to single-task fallback or block when no safe envelope exists; emit visible fallback reason.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/mission-planner-fallback-scope.test.ts",
+      "evidence": "Malformed planner output cannot expand allowed write paths",
+      "ordinal": 24,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "T02"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T04",
+      "title": "Improve goal keyword extraction",
+      "repo": "pi",
+      "production": [
+        "src/context/ContextBroker.ts"
+      ],
+      "tests": [
+        "test/unit/context-keyword-ranking.test.ts"
+      ],
+      "delta": "Filter stopwords, weight identifiers/path tokens and later distinctive terms; retain deterministic ordering; avoid expanding context budget.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/context-keyword-ranking.test.ts",
+      "evidence": "Bluetooth/settings example ranks relevant files ahead of generic text",
+      "ordinal": 25,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "T03"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T05",
+      "title": "Surface required context omissions",
+      "repo": "pi",
+      "production": [
+        "src/context/ContextBroker.ts"
+      ],
+      "tests": [
+        "test/unit/context-required-omission.test.ts"
+      ],
+      "delta": "Return explicit unavailable/truncated required-context diagnostics; fail worker launch when indispensable evidence is missing unless policy explicitly allows blocked investigation.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/context-required-omission.test.ts",
+      "evidence": "Missing required file cannot be silently treated as complete context",
+      "ordinal": 26,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "T04"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T06",
+      "title": "Attach task authority to APS actions",
+      "repo": "pi",
+      "production": [
+        "src/aps/types.ts"
+      ],
+      "tests": [
+        "test/unit/aps-task-authority.test.ts"
+      ],
+      "delta": "Add optional task contract/hash + model quantization provenance fields to APS events; maintain backward compatibility with existing event consumers.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/aps-task-authority.test.ts",
+      "evidence": "Trace links every classified action to known original task or marks unknown",
+      "ordinal": 27,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "T05"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T07",
+      "title": "Detect deterministic goal deviation signals",
+      "repo": "pi",
+      "production": [
+        "src/aps/taskAlignment.ts"
+      ],
+      "tests": [
+        "test/unit/aps-task-alignment.test.ts"
+      ],
+      "delta": "Flag out-of-scope writes, unrelated new dependencies, unexpected task expansion, and acceptance criterion stagnation. Report evidence not invented numeric certainty.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/aps-task-alignment.test.ts",
+      "evidence": "Fixture flags irrelevant refactor; allows legitimate read-only investigation",
+      "ordinal": 28,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "T06"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T08",
+      "title": "Carry authority through context handoff",
+      "repo": "pi",
+      "production": [
+        "src/plannerWorker/handoff.ts"
+      ],
+      "tests": [
+        "test/unit/task-handoff-integrity.test.ts"
+      ],
+      "delta": "Preserve original contract hash and constraints through handoff while keeping transcript bounded; reject altered authority on resumed worker. Verify actual handoff schema first.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/task-handoff-integrity.test.ts",
+      "evidence": "Handoff with edited goal rejected; same goal with new summary accepted",
+      "ordinal": 29,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "T07"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "T09",
+      "title": "Add scope-integrity result gate",
+      "repo": "pi",
+      "production": [
+        "src/plannerWorker/executor.ts"
+      ],
+      "tests": [
+        "test/unit/planner-worker-scope-gate.test.ts"
+      ],
+      "delta": "Before integration verify changed paths against protected task authority; report blocked with exact diff refs. Do not attempt new sandbox or shell pre-hook here.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/planner-worker-scope-gate.test.ts",
+      "evidence": "Unauthorized diff never passes to integration; evidence remains recoverable",
+      "ordinal": 30,
+      "phase": "Task discipline and drift",
+      "dependsOn": [
+        "T08"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "R01",
+      "title": "Catalog current retry ownership by failure",
+      "repo": "pi",
+      "production": [
+        "docs/specs/harness-reliability-bootstrap/RETRY_OWNERS.md"
+      ],
+      "tests": [],
+      "delta": "Document actual owners for 429,404,400,5xx, network timeout, missing worker_result and tool errors; cite files and current retry limits. No changes.",
+      "verify": "git diff --check",
+      "evidence": "One owner proposed for each class; unresolved conflicts explicitly listed",
+      "ordinal": 31,
+      "phase": "Safe recovery",
+      "dependsOn": [
+        "T09"
+      ],
+      "mode": "read-only",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "R02",
+      "title": "Expose retry correlation ID across layers",
+      "repo": "pi",
+      "production": [
+        "src/inference/retryTrace.ts"
+      ],
+      "tests": [
+        "test/unit/retry-correlation.test.ts"
+      ],
+      "delta": "Add stable failure correlation ID so duplicate layer actions are detected without treating independent failures as one; keep existing trace format compatible.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/retry-correlation.test.ts",
+      "evidence": "Same failure across layers correlated; independent requests separate",
+      "ordinal": 32,
+      "phase": "Safe recovery",
+      "dependsOn": [
+        "R01"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "R03",
+      "title": "Implement retry budget evaluator pure function",
+      "repo": "pi",
+      "production": [
+        "src/inference/retryBudget.ts"
+      ],
+      "tests": [
+        "test/unit/retry-budget.test.ts"
+      ],
+      "delta": "Evaluate max attempts, elapsed time, backoff bounds and exhaustion per incident; zero automatic retries in bootstrap mode.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/retry-budget.test.ts",
+      "evidence": "Exhausted budget stops, zero budget never retries",
+      "ordinal": 33,
+      "phase": "Safe recovery",
+      "dependsOn": [
+        "R02"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "R04",
+      "title": "Add endpoint circuit-breaker state machine",
+      "repo": "pi",
+      "production": [
+        "src/inference/endpointCircuit.ts"
+      ],
+      "tests": [
+        "test/unit/endpoint-circuit.test.ts"
+      ],
+      "delta": "Pure closed/open/half-open decisions for repeated model_not_found, upstream failures, unhealthy response; bounded memory and cooldown; no network calls.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/endpoint-circuit.test.ts",
+      "evidence": "Repeated 404 opens circuit, cooldown enables one probe",
+      "ordinal": 34,
+      "phase": "Safe recovery",
+      "dependsOn": [
+        "R03"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "R05",
+      "title": "Define idempotency classifier for recovery",
+      "repo": "pi",
+      "production": [
+        "src/inference/recoverySafety.ts"
+      ],
+      "tests": [
+        "test/unit/recovery-safety.test.ts"
+      ],
+      "delta": "Mark tool actions safe, unsafe or unknown for replay, default unknown to no replay; explicit safeguards for writes and external calls.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/recovery-safety.test.ts",
+      "evidence": "Non-idempotent and unknown operations cannot be replayed automatically",
+      "ordinal": 35,
+      "phase": "Safe recovery",
+      "dependsOn": [
+        "R04"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "R06",
+      "title": "Add read-only recovery recommendation engine",
+      "repo": "pi",
+      "production": [
+        "src/incidents/recoveryRecommend.ts"
+      ],
+      "tests": [
+        "test/unit/recovery-recommend.test.ts"
+      ],
+      "delta": "Map normalized errors to retry/hold/failover/stop/review recommendations using R01-R05; do not execute actions in this task.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/recovery-recommend.test.ts",
+      "evidence": "404 does not endlessly retry; 429 honors server wait; unknown stops",
+      "ordinal": 36,
+      "phase": "Safe recovery",
+      "dependsOn": [
+        "R05"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "R07",
+      "title": "Enable one safe recovery behind opt-in",
+      "repo": "pi",
+      "production": [
+        "src/inference/resilientStream.ts"
+      ],
+      "tests": [
+        "test/unit/recovery-optin.test.ts"
+      ],
+      "delta": "Integrate only one demonstrated idempotent retry class with feature flag default-off, existing retry owner, hard attempt cap; no other fallback changes.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/recovery-optin.test.ts",
+      "evidence": "Flag off unchanged, on bounded and logged, duplicate owner prevented",
+      "ordinal": 37,
+      "phase": "Safe recovery",
+      "dependsOn": [
+        "R06"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "R08",
+      "title": "Record final resolution and regression evidence",
+      "repo": "pi",
+      "production": [
+        "src/incidents/resolutionEvidence.ts"
+      ],
+      "tests": [
+        "test/unit/incident-resolution-evidence.test.ts"
+      ],
+      "delta": "Require failing reproduction, patch/setting identity, passing test, scope validation and observed post-fix status; distinguish temporary recovered vs root cause resolved.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/incident-resolution-evidence.test.ts",
+      "evidence": "Retries alone cannot mark root cause resolved",
+      "ordinal": 38,
+      "phase": "Safe recovery",
+      "dependsOn": [
+        "R07"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "H01",
+      "title": "Inventory existing Herdr telemetry surfaces",
+      "repo": "herdr",
+      "production": [
+        "docs/specs/harness-reliability-bootstrap/HERDR_SURFACES.md"
+      ],
+      "tests": [],
+      "delta": "Identify actual mission timeline endpoints, web components, naming conventions, existing error and APS signals; no UI code.",
+      "verify": "git diff --check",
+      "evidence": "Precise integration map with evidence of reusable components",
+      "ordinal": 39,
+      "phase": "Herdr visualization",
+      "dependsOn": [
+        "R08"
+      ],
+      "mode": "herdr-ui",
+      "maxChangedLines": 120,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/herdr-engineering"
+    },
+    {
+      "id": "H02",
+      "title": "Define normalized diagnostics view model",
+      "repo": "herdr",
+      "production": [
+        "packages/diagnostics-model.js"
+      ],
+      "tests": [
+        "packages/diagnostics-model.test.js"
+      ],
+      "delta": "Pure model shape for host/session/incident/event/timeline/drift decisions; no API or rendering changes.",
+      "verify": "node --test packages/diagnostics-model.test.js",
+      "evidence": "Input validation and stable filtering tested",
+      "ordinal": 40,
+      "phase": "Herdr visualization",
+      "dependsOn": [
+        "H01"
+      ],
+      "mode": "herdr-ui",
+      "maxChangedLines": 120,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/herdr-engineering"
+    },
+    {
+      "id": "H03",
+      "title": "Add read-only host diagnostics transport adapter",
+      "repo": "herdr",
+      "production": [
+        "packages/diagnostics-source.js"
+      ],
+      "tests": [
+        "packages/diagnostics-source.test.js"
+      ],
+      "delta": "Adapt existing Herdr API/event feed to H02; gracefully show unavailable data; do not create new backend or cross-host protocol without evidence.",
+      "verify": "node --test packages/diagnostics-source.test.js",
+      "evidence": "Unavailable host and partial results handled safely",
+      "ordinal": 41,
+      "phase": "Herdr visualization",
+      "dependsOn": [
+        "H02"
+      ],
+      "mode": "herdr-ui",
+      "maxChangedLines": 120,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/herdr-engineering"
+    },
+    {
+      "id": "H04",
+      "title": "Render error issue list",
+      "repo": "herdr",
+      "production": [
+        "packages/diagnostics-view.js"
+      ],
+      "tests": [
+        "packages/diagnostics-view.test.js"
+      ],
+      "delta": "Reuse existing Herdr visual tokens/components; show fingerprint, severity, occurrences, sessions, last seen and recovery state; read-only.",
+      "verify": "node --test packages/diagnostics-view.test.js",
+      "evidence": "Escaped HTML and stable sorted incident cards",
+      "ordinal": 42,
+      "phase": "Herdr visualization",
+      "dependsOn": [
+        "H03"
+      ],
+      "mode": "herdr-ui",
+      "maxChangedLines": 120,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/herdr-engineering"
+    },
+    {
+      "id": "H05",
+      "title": "Render per-session error timeline",
+      "repo": "herdr",
+      "production": [
+        "packages/diagnostics-timeline.js"
+      ],
+      "tests": [
+        "packages/diagnostics-timeline.test.js"
+      ],
+      "delta": "Add chronological timeline by event IDs and step; show link to retry trace and input errors; no control actions.",
+      "verify": "node --test packages/diagnostics-timeline.test.js",
+      "evidence": "Order, grouping and evidence links tested",
+      "ordinal": 43,
+      "phase": "Herdr visualization",
+      "dependsOn": [
+        "H04"
+      ],
+      "mode": "herdr-ui",
+      "maxChangedLines": 120,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/herdr-engineering"
+    },
+    {
+      "id": "H06",
+      "title": "Render task drift comparison",
+      "repo": "herdr",
+      "production": [
+        "packages/task-drift-view.js"
+      ],
+      "tests": [
+        "packages/task-drift-view.test.js"
+      ],
+      "delta": "Show original objective vs observed actions, first violation, scope diffs, model/quantization and uncertainty. No fabricated alignment score.",
+      "verify": "node --test packages/task-drift-view.test.js",
+      "evidence": "Relevant vs unrelated actions visually distinguished using fixtures",
+      "ordinal": 44,
+      "phase": "Herdr visualization",
+      "dependsOn": [
+        "H05"
+      ],
+      "mode": "herdr-ui",
+      "maxChangedLines": 120,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/herdr-engineering"
+    },
+    {
+      "id": "H07",
+      "title": "Integrate diagnostics route into existing UI",
+      "repo": "herdr",
+      "production": [
+        "packages/hosts-view.js"
+      ],
+      "tests": [
+        "packages/diagnostics-route.test.js"
+      ],
+      "delta": "Add a discoverable navigation link using existing router pattern after confirming exact mount file; do not rewrite dashboard shell.",
+      "verify": "node --test packages/diagnostics-route.test.js",
+      "evidence": "Route works, no navigation regressions; screenshot after integration if available",
+      "ordinal": 45,
+      "phase": "Herdr visualization",
+      "dependsOn": [
+        "H06"
+      ],
+      "mode": "herdr-ui",
+      "maxChangedLines": 120,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/herdr-engineering"
+    },
+    {
+      "id": "V01",
+      "title": "Create benchmark task fixtures",
+      "repo": "pi",
+      "production": [
+        "test/fixtures/harness-drift/README.md",
+        "test/fixtures/harness-drift/tasks.json"
+      ],
+      "tests": [],
+      "delta": "Add five tiny tasks with legitimate exploration plus planted drift opportunities and identical task snapshots. No production changes.",
+      "verify": "git diff --check",
+      "evidence": "At least five independently labeled tasks with permitted scope and expected outputs",
+      "ordinal": 46,
+      "phase": "Validation and rollout",
+      "dependsOn": [
+        "H07"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "V02",
+      "title": "Create drift detector evaluation runner",
+      "repo": "pi",
+      "production": [
+        "scripts/bench-task-drift.ts"
+      ],
+      "tests": [
+        "test/unit/bench-task-drift.test.ts"
+      ],
+      "delta": "Evaluate T07 against fixed traces, print precision/recall and false positives; no live models required.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts",
+      "evidence": "Machine-readable deterministic scores and false positive list",
+      "ordinal": 47,
+      "phase": "Validation and rollout",
+      "dependsOn": [
+        "V01"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "V03",
+      "title": "Create quantization benchmark recording schema",
+      "repo": "pi",
+      "production": [
+        "src/capability/quantBenchmark.ts"
+      ],
+      "tests": [
+        "test/unit/quant-benchmark.test.ts"
+      ],
+      "delta": "Capture model family, exact weights hash, quant method, runtime, KV cache format, context, prompt, seed/temp, completion outcome; compare same base family only.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/quant-benchmark.test.ts",
+      "evidence": "Reject comparisons missing model/quantization provenance",
+      "ordinal": 48,
+      "phase": "Validation and rollout",
+      "dependsOn": [
+        "V02"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "V04",
+      "title": "Add isolated live benchmark command",
+      "repo": "pi",
+      "production": [
+        "scripts/bench-harness-roles.ts"
+      ],
+      "tests": [
+        "test/unit/bench-harness-roles.test.ts"
+      ],
+      "delta": "Provide opt-in dry-run first; when enabled run task replay serially under static contract using available Flash/27B. No forced model allocations or automatic code promotion.",
+      "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/bench-harness-roles.test.ts",
+      "evidence": "Dry-run requires no endpoint; unavailable models skipped with reason",
+      "ordinal": 49,
+      "phase": "Validation and rollout",
+      "dependsOn": [
+        "V03"
+      ],
+      "mode": "isolated-change",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "V05",
+      "title": "Add feature flag and rollback checklist",
+      "repo": "pi",
+      "production": [
+        "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
+      ],
+      "tests": [],
+      "delta": "Document shadow-mode enablement, metric baselines, stop criteria, flag rollback and incident data retention; do not turn on new recovery by default.",
+      "verify": "git diff --check",
+      "evidence": "Operator can disable each intervention and preserve evidence",
+      "ordinal": 50,
+      "phase": "Validation and rollout",
+      "dependsOn": [
+        "V04"
+      ],
+      "mode": "read-only",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    },
+    {
+      "id": "V06",
+      "title": "Final cross-repo acceptance audit",
+      "repo": "pi",
+      "production": [
+        "docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md"
+      ],
+      "tests": [],
+      "delta": "Gather all task SHA/handoff records, test results, source evidence, known gaps, model benchmark validity and readiness verdict. No source modifications or broad repair.",
+      "verify": "git diff --check; npm run typecheck",
+      "evidence": "Audit explicitly distinguishes built, tested, deployed and not verified",
+      "ordinal": 51,
+      "phase": "Validation and rollout",
+      "dependsOn": [
+        "V05"
+      ],
+      "mode": "read-only",
+      "maxChangedLines": 100,
+      "maxProductionFiles": 2,
+      "maxTestFiles": 2,
+      "repoFullName": "berlinguyinca/pi-engineering"
+    }
+  ]
+}

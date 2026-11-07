@@ -1,0 +1,53 @@
+{
+ "taskId": "D04",
+ "baseSha": "23e2d90501dab6271482d0420f9268e8e244092e",
+ "repoId": "pi",
+ "objective": "Classify recovery outcome accurately \u2014 Compute recovered, unresolved, suppressed, and unknown from durable evidence; never infer success from HTTP 200 alone.",
+ "allowPaths": [
+  "src/incidents/recoveryOutcome.ts",
+  "test/unit/recovery-outcome.test.ts"
+ ],
+ "denyPaths": [
+  "package.json",
+  ".gitignore",
+  "scripts/**",
+  "src/bootstrap/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/templates/**",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/**",
+  "test/support/**",
+  "test/unit/bootstrap-*.test.ts"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-recovery-outcome",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/recovery-outcome.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:9e4972d15bee2fafc71d9859d217e92a871005f199dcb3e341b5eae77326be9d",
+ "expectedOutputs": [
+  "src/incidents/recoveryOutcome.ts",
+  "test/unit/recovery-outcome.test.ts"
+ ],
+ "mode": "isolated-change"
+}

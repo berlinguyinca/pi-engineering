@@ -1,0 +1,46 @@
+{
+ "taskId": "FIX-1",
+ "baseSha": "cc036f2f8c3b938c80348dff821af77c973fde7b",
+ "repoId": "pi",
+ "objective": "Negative control: the task commit adds test/unit/bootstrap-diff-guard.test.ts, which this manifest neither allows and explicitly denies.",
+ "commands": [
+  {
+   "id": "typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "diff-guard-tests",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-diff-guard.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 1,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": null,
+ "expectedOutputs": [
+  "src/bootstrap/diffGuard.ts",
+  "test/unit/bootstrap-diff-guard.test.ts"
+ ],
+ "mode": "isolated-change",
+ "allowPaths": [
+  "src/bootstrap/diffGuard.ts"
+ ],
+ "denyPaths": [
+  "test/**",
+  "package.json"
+ ]
+}

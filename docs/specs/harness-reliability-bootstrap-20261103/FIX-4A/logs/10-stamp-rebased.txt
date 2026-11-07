@@ -1,0 +1,5 @@
+REJECT baseline: HEAD 5c5d5a5d6ab8681390c8daf35c1daab542f7051d != manifest baseSha 74b54eb17f51fdd0a1c89f2b6327953ee357e914
+plan exit=3; no model invoked (B04 stops here)
+authority=FIX-4A sha256:0b1106cf3b70669e1a61cbf25a693350158ed2336c29f04b3620fef44b908a05
+schema=FIX-4A conforms docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json
+REJECT input: refusing to overwrite an existing handoff: /Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/out/FIX-4A.handoff.json

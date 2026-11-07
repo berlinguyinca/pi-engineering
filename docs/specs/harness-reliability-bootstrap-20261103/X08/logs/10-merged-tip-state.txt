@@ -1,0 +1,26 @@
+$ git rev-parse HEAD
+bc8cd251b6e58f5ba1bc303c3e8793cbc0276242
+
+$ git log --oneline --graph -6
+*   bc8cd251 Merge remote-tracking branch 'origin/harness-reliability-bootstrap-20261103' into task/x08-common-dir-repair
+|\  
+| *   6818842c Merge pull request #611 from berlinguyinca/fix/v05-citation-precision
+| |\  
+| | * f84f4b12 docs(rollout): put the three imprecise anchors on their anchor line
+| |/  
+| *   be3d5424 Merge pull request #608 from berlinguyinca/docs/citation-anchor-gate-20261108
+| |\  
+| | * d0582205 feat(audit): print imprecise citations as advisories, and say what the band tolerates
+| | * 184c8a17 fix(audit): the citation loop must handle only cite tokens
+
+Both parents are present, which is what the unit needs to be measured against:
+  61394da7 (#582, state-dir canonicalization) ancestor: yes
+  89e747c2 (#602, shadow path translation)     ancestor: yes
+  259a4233 (#604, resilience harness opt-in)  ancestor: yes
+
+Base-drift note (measured, not editorial). X08 was first based on the local branch tip 45d42acb,
+while the remote integration branch had moved to 6818842c. A whole-suite comparison of that
+wrong base against origin/main reported 42 failures vs 23, all of them in the resilience
+integration files that #604 arms, and git bisect named 141ca5db (X06, the default-off flip) as
+first bad. The branch had no defect there: merging 6818842c brought in 259a4233 and those 17
+tests report 17 pass / 0 fail. The base was corrected; no assertion was touched.

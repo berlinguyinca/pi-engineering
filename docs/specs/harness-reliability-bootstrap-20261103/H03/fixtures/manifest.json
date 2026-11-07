@@ -1,0 +1,44 @@
+{
+ "taskId": "H03",
+ "baseSha": "ab96dc25bc2b672cc73923d648e683b0edc885b9",
+ "repoId": "herdr",
+ "objective": "Adapt existing Herdr API/event feed to H02; gracefully show unavailable data; do not create new backend or cross-host protocol without evidence. Evidence: Unavailable host and partial results handled safely. Evidence: Unavailable host and partial results handled safely",
+ "allowPaths": [
+  "packages/diagnostics-source.js",
+  "packages/diagnostics-source.test.js"
+ ],
+ "denyPaths": [
+  "herdr_engineering/**",
+  "tests/**",
+  "deploy/**",
+  "pyproject.toml",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "AGENTS.md",
+  "README.md"
+ ],
+ "commands": [
+  {
+   "id": "diff-check",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 120000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 120
+ },
+ "parentHandoffHash": "sha256:cef53dd9ca93a4cd1a6bc4619311d90271564d8235a4d8e079fd1a134d6dc8b3",
+ "expectedOutputs": [
+  "packages/diagnostics-source.js",
+  "packages/diagnostics-source.test.js"
+ ],
+ "mode": "herdr-ui"
+}

@@ -33,7 +33,11 @@ import { CircuitBreakerRegistry } from "./circuitBreaker.ts";
 import { currentInferenceInvocation } from "./inferenceContext.ts";
 import { ModelHealthRegistry } from "./modelHealth.ts";
 import type { ExecutedActionTracker } from "./recovery.ts";
-import { type InferenceResilienceConfig, resolveInferenceResilienceConfig } from "./resilienceConfig.ts";
+import {
+  type InferenceResilienceConfig,
+  describeUnparseableSwitches,
+  resolveInferenceResilienceConfig,
+} from "./resilienceConfig.ts";
 import type { ResilientStreamInstallOptions, ResilientStreamScheduler } from "./resilientStream.ts";
 import { installResilientRuntime } from "./resilientStream.ts";
 import { InferenceTelemetry } from "./telemetry.ts";
@@ -127,6 +131,11 @@ export function wireResilientModelRuntime(
   // armed the runtime first) and would silently outrank this one's
   // PI_INFERENCE_* settings.
   const config = resolveInferenceResilienceConfig(env, opts.config);
+  // Reported before the enabled gate: a switch this resolver could not read is
+  // exactly the case where the answer may not be the one the operator asked
+  // for, including `PI_INFERENCE_RESILIENCE_ENABLED=ture`, which resolves to
+  // the default (off) and returns "disabled" a few lines below.
+  if (opts.status) for (const line of describeUnparseableSwitches(config)) opts.status(line);
   const enabled = opts.enabled ?? config.enabled;
   if (!enabled) return "disabled";
   const admission = opts.admission ?? sharedAdmissionController();

@@ -1,0 +1,14 @@
+{
+  "reason": "Post-plan extension unit (operator directive 2026-11-08: fix the measured drift blind spot). The frozen plan has no entry for it, and ids D1/D2 would collide with plan tasks D01-D08, so this series is X01-X05. Scope/budget/verify are declared here instead of quietly editing a plan task.",
+  "production": [
+    "src/aps/taskAlignment.ts"
+  ],
+  "tests": [
+    "test/unit/aps-task-alignment.test.ts"
+  ],
+  "verify": "npm run typecheck; node --test --import ./test/support/isolatedState.ts test/unit/aps-task-alignment.test.ts",
+  "evidence": "typecheck exit + unit counts at the landed commit",
+  "maxProductionFiles": 1,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+}

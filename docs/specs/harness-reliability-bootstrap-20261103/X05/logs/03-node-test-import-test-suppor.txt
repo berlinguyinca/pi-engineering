@@ -1,0 +1,8 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/aps-*.test.ts test/unit/worker-activity-detail.test.ts test/unit/worker-live-activity.test.ts test/unit/worker-error-events.test.ts test/unit/worker-build-activity.test.ts test/unit/worker-command-env.test.ts && echo COMPARISON-BASE-900bf8a3 && cd /Users/wohlgemuth/IdeaProjects/worktrees/pi-base-verify && node --test --import ./test/support/isolatedState.ts test/unit/aps-*.test.ts test/unit/worker-activity-detail.test.ts test/unit/worker-live-activity.test.ts test/unit/worker-error-events.test.ts test/unit/worker-build-activity.test.ts test/unit/worker-command-env.test.ts   # at 6a518c90fb148d2fb2c27b99b2c76cfa2a2826de
+ℹ tests 127
+ℹ pass 127
+ℹ fail 0
+ℹ tests 124
+ℹ pass 124
+ℹ fail 0
+exit=0

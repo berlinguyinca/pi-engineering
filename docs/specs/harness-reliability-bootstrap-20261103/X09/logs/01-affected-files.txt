@@ -1,0 +1,9 @@
+$ git status --porcelain (working tree, before the task commit)
+ M src/git/GitRepo.ts
+ M test/integration/worker-stream-truncation.test.ts
+
+worker-stream-truncation.test.ts                           tests 20 pass 20 fail 0 
+git-common-dir-repair.test.ts                              tests 5 pass 5 fail 0 
+resilience-default-off.test.ts                             tests 3 pass 3 fail 0 
+resilient-inference-integration.test.ts                    tests 10 pass 10 fail 0 
+resilient-inference-wiring.test.ts                         tests 7 pass 7 fail 0 

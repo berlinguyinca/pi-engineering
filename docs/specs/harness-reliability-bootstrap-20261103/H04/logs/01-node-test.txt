@@ -1,0 +1,13 @@
+✔ escapeHtml covers the five characters, and a payload that looks like markup stays inert (2.448917ms)
+✔ cards sort by severity, then last seen descending, then fingerprint; tied records keep one reproducible order (1.838375ms)
+✔ a record H02 refuses is a visible rejected record — never a half card, never silence (0.190917ms)
+✔ every card figure comes from the record: reported where reported, unknown where not, and never "resolved" (0.237667ms)
+✔ an unavailable section says unavailable instead of an empty list that looks like no issues (0.301458ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 125.796

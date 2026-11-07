@@ -1,0 +1,45 @@
+✔ normalizeSentence: trims, collapses whitespace, lowercases (0.92025ms)
+✔ normalizeSentence: strips trailing punctuation (0.100875ms)
+✔ normalizeSentence: strips leading discourse markers (0.047125ms)
+✔ splitSentences: splits on sentence boundaries (0.085084ms)
+✔ Test 1: Four identical sentences trigger repeated_sentence abort (0.240917ms)
+✔ Test 2: Two repetitions with intervening text do not abort (0.069667ms)
+✔ Test 3: Tool call resets the guard — no abort after progress (0.092417ms)
+✔ Test 4: Long non-repetitive reasoning without progress triggers no_progress (0.25875ms)
+✔ Test 5: Brief narration followed by tool call does not abort (0.0655ms)
+✔ Test 6: Final answer start prevents narration abort (0.167667ms)
+✔ Test 7: Guard state is reset for each generation — old text not carried (0.066ms)
+✔ Test 8: Recovery decision includes the recovery prompt (0.08275ms)
+✔ Test 9: Recovery lowers reasoning effort from high to medium (0.033084ms)
+✔ lowerReasoningEffort: clamps at low (0.031542ms)
+✔ Test 10: Recovery exhaustion produces ModelDegenerationError (0.176708ms)
+✔ Test 10b: Attempts 1-3 still retry (0.058083ms)
+✔ Recovery attempt 2 compacts context (0.032792ms)
+✔ Recovery attempt 1 does NOT compact context (0.025709ms)
+✔ Recovery attempt 3 uses fallback model (0.025042ms)
+✔ Recovery attempt 1-2 do NOT use fallback model (0.024708ms)
+✔ buildCompactedContext: produces structured checkpoint without failed text (0.10175ms)
+✔ TOOL_TRANSITION_RULE: contains the required guidance (0.02975ms)
+✔ Telemetry: recordAbort increments counters (0.0585ms)
+✔ Telemetry: recordRetryOutcome tracks success/failure (0.034417ms)
+✔ buildDegenerationEvent: produces structured event (0.730167ms)
+✔ Config: defaults match spec §26 (0.0525ms)
+✔ Config: resolveGuardConfig applies overrides (0.089584ms)
+✔ Config: disabled guard never aborts (0.038666ms)
+✔ Excessive narration: triggers when narration exceeds budget with no tool calls (0.069167ms)
+✔ Excessive narration: does NOT trigger when tool calls present (0.088667ms)
+✔ Guard state: initial state is clean (0.040209ms)
+✔ Guard: multiple progress events accumulate tool calls (0.027167ms)
+✔ buildCompactedWorkerPrompt: produces focused checkpoint with task, role, recovery (0.130334ms)
+✔ buildCompactedWorkerPrompt: context is truncated to 500 chars (0.078083ms)
+✔ guardConfigForRole gives prose roles a generous narration/no-progress budget (444.947ms)
+✔ guardConfigForRole keeps strict budgets for tool-driven roles (0.0995ms)
+✔ PiWorkerExecutor accepts fallbackModelId option (0.433292ms)
+ℹ tests 37
+ℹ suites 0
+ℹ pass 37
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 620.974791

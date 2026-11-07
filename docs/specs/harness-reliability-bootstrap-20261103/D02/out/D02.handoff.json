@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "D02",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "a3f9b8820a389bc94920c4b5461c39cc68f3bc88",
+  "resultSha": "d4c056848107cfa3bddff4311c11e9017f6e8430",
+  "taskAuthorityHash": "sha256:405e4dc03e9779a2757d137fe167ac8ff6e5a8ac721b77685be01a8d983a360b",
+  "changedFiles": [
+    "src/incidents/errorFingerprint.ts",
+    "test/unit/error-fingerprint.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D02/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/error-fingerprint.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/D02/logs/02-unit-error-fingerprint.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/D02/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D02/logs/02-unit-error-fingerprint.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/D02/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D02/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/D02/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "D03",
+  "nextBaseSha": "d4c056848107cfa3bddff4311c11e9017f6e8430",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T17:05:00Z",
+    "notes": "Worker pane d02 (pane w0:pG) added errorFingerprint()/fingerprintInput(): the compared view keeps code (digits intact, so 404 never collapses into 429), layer, normalized summary and tool, while timestamp/host/session/run/task/runtime/model/artifact pointers/correlation ids are dropped and volatile text inside the summary folds to <id>/<dur>/<size>/<path>/<url>/<addr>/<prompt>/<env> markers; output is a 16-hex fnv1a64 digest of sorted keys, total on malformed input via INVALID_FINGERPRINT 0000000000000000 (documented coercion for a non-string code). Conductor probe (logs/04): two occurrences differing only in session/host/run/timestamp/uuid/duration/bytes/worktree path/severity/model share one key; 404 vs 429, layer, tool, root-cause noun and exception class all stay separate; digest shape /^[0-9a-f]{12,}$/ with no volatile text; differing <redacted-prompt sha256=...> digests do not split."
+  },
+  "handoffHash": "sha256:5085f396a12a68f662b3d678ff511978dbedb4b1a73dda6667df6a9bf3b15e03"
+}

@@ -1,0 +1,8 @@
+dedupe+trim canonicalizes same: true
+order is meaning-bearing: true
+goal/tests changes move it: true true
+planner hash moves with planner text: true | authority != planner for same words: true
+verify ok both: true true | authority hash identical across planner change: true
+diverged names planner restatement: [] | reasons: []
+refusals: origin: planner-authored content cannot define task authority, expected "operator" ; goal: empty after trimming ; scope: empty after canonicalization ; tests: member 1 is not a string ; source: expected an operator-authored task object
+source untouched: true | hash shape: true

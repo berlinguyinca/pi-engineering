@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "R03",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "ec19e5102cd057bc66242c06837c3f5f44a67472",
+  "resultSha": "389f678b8eed809bc74ff740e9b984263eb5fbe9",
+  "taskAuthorityHash": "sha256:a819f047537c8b5f2b482d22f186061fe67df2640495329582c779a7c2c8201a",
+  "changedFiles": [
+    "src/inference/retryBudget.ts",
+    "test/unit/retry-budget.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R03/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/retry-budget.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R03/logs/01-unit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/R03/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R03/logs/01-unit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R03/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R03/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R03/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "R04",
+  "nextBaseSha": "389f678b8eed809bc74ff740e9b984263eb5fbe9",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T03:05:00Z",
+    "notes": "Worker pane r03 (pane w8:pP, metabolomics/qwen3.8-flash_next) on base ec19e510, isolated-change mode, first pass, ~6 min. Delivered exactly the two declared new files and modified nothing else (git show --name-only lists only src/inference/retryBudget.ts and test/unit/retry-budget.test.ts; 50 + 48 = 98 changed lines against a 100 cap). Conductor verified independently at 389f678b: npm run typecheck exit 0; test/unit/retry-budget.test.ts 6 pass / 0 fail; and per-suite regressions run individually - retry-correlation 5/5, retry-error-events 4/4, transient 40/40. Purity verified by the conductor with grep: retryBudget.ts contains no Date.now, Math.random, process.env, setTimeout/setInterval, fetch or require, and its only import is exponentialBackoffMs from ./retryDelay.ts, so the backoff math is not reinvented. Decision order matches the contract and is asserted in tests: bootstrap_mode first (stops even with maxAttempts 8 and even when the budget is invalid), then invalid_budget, attempts_exhausted (attempt 3 of 3 and attempt 4 of 3 both stop), deadline_exceeded, backoff_exceeds_deadline, else retry; waitMs is asserted equal to exponentialBackoffMs(attempt, 500, 4000) for attempts 1..5 and equal to a dominating retryAfterMs of 9000 at each. Conductor also confirmed the two honest disclosures in the worker report: test/unit/retry-delay.test.ts does not exist in this repo (the contract asked for a regression count against it; the conductor ran the three suites that do exist instead), and npx biome check . fails identically at base ec19e510 and at this commit, so npm run lint was already red repo-wide before this unit and the dense style matches the existing corpus."
+  },
+  "handoffHash": "sha256:85724fdd4105bd973b4e3a0d4f4423f57959af7361dc3d089e9f32a3f69d7bd2"
+}

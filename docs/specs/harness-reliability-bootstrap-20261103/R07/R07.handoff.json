@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "R07",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "16d35ecb020a70a2f1d9ee3cc83a84251d969c6c",
+  "resultSha": "e151794ff1fc21ee9ab77567f330817f802ce0e3",
+  "taskAuthorityHash": "sha256:abd5d3aeeb2628ce4721b1143a673e5802b76126c9d001d7df23daefc737e702",
+  "changedFiles": [
+    "src/inference/resilientStreamOptin.ts",
+    "test/unit/recovery-optin.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R07/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/recovery-optin.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R07/logs/01-unit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/R07/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R07/logs/01-unit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R07/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R07/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R07/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "R08",
+  "nextBaseSha": "e151794ff1fc21ee9ab77567f330817f802ce0e3",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Worker pane r07 (pane w8:pT, metabolomics/qwen3.8-flash_next) on base 16d35ecb, isolated-change mode, first pass, ~5 min. Exactly two new files (git show --name-only HEAD), 43 + 56 = 99 changed lines against a 100 cap. DEVIATION recorded in fixtures/plan-override.json: the plan names src/inference/resilientStream.ts, but at this base that path is a 930-line LIVE module (header: every model invocation in the harness reaches it; it already owns streamRetryEnabled :226 and incomplete_stream rules :316/:335), so editing it would break R07's own no-other-fallback-changes clause and the 100-line cap; the decision therefore landed in the new src/inference/resilientStreamOptin.ts and no existing file was touched. Conductor verified independently at e151794f: npm run typecheck exit 0; test/unit/recovery-optin.test.ts 6 pass / 0 fail; per-suite regressions recovery-recommend 6/6, retry-budget 6/6 and transient 40/40, so the existing owner's suite is untouched and green. Conductor checks on the file: process.env appears exactly once, as the parameter default copied from resolveTransientRetryConfig (src/guard/transient.ts:471) and resolveToolCallGuardConfig (src/guard/toolCallGuard.ts:49); no writeFile, appendFile, console, setTimeout, Math.random, Date.now, fetch or node:fs, so logging is purely the returned ResilientStreamLogEntry; imports are only the TransientErrorCategory type plus the R03/R04/R05 pure siblings, with no import of src/inference/recovery.ts and no new executor. Order verified in source: flag_off, class_not_enrolled, owner_granted, not_replayable, circuit_denied, cap_reached, then R03 giving granted or budget_exhausted, with cap always Math.min(maxAttempts, 2). Evidence clauses asserted in tests: flag absent/0/yes/empty gives retry false for every input including one the owner already granted, so flag-off is indistinguishable from doing nothing; flag on keeps R03's waitMs and caps at 2 even with maxAttempts 10, stops at attempt 2 or maxAttempts 1 as cap_reached, never grants bootstrap mode; ownerGranted true never receives a second grant (RETRY_OWNERS.md conflicts 1 and 3); only incomplete_stream proceeds; replay-safety and circuit denial outrank the flag."
+  },
+  "handoffHash": "sha256:bb491e863114f06dd320a932d2391c611f63f7f8351f77ab1643829c738baabf"
+}
