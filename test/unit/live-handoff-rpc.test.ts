@@ -24,10 +24,42 @@ import {
   serializeLiveHandoffPayload,
   validateLiveHandoffParams,
 } from "../../src/runtime/herdr/liveHandoff.ts";
+import { SOCKET_PATH_LIMIT } from "../../src/sessionControl/SessionControl.ts";
 
 const exec = promisify(execFile);
 
 const tmpRoot = await mkdtemp(path.join(tmpdir(), "live-handoff-test-"));
+
+// The fake Herdr server listens on a unix socket, so its path is capped by
+// `sun_path`: 104 bytes including the terminator, budgeted here by the same
+// SOCKET_PATH_LIMIT the production control socket uses. Node 22 bound an
+// over-long path anyway (truncated, and the test still passed); Node 25+ returns
+// EINVAL, and because a listen failure surfaces as a server 'error' event this
+// file died with a native assertion
+// (`InternalCallbackScope::Close: (env_->execution_async_id()) == 0`) instead of
+// a test failure — which is why it read as a flaky RPC timeout.
+//
+// `os.tmpdir()` is exactly the wrong root for this: on macOS it is the long
+// per-user temp dir (`/private/var/folders/…/T/`, already 58 bytes), and this
+// suite canonicalizes it. So the sockets hang off a short root, following the
+// rule in `src/sessionControl/SessionControl.ts`: `$XDG_RUNTIME_DIR` where it is
+// short enough, `/tmp` otherwise.
+function shortSocketRoot(): string {
+  const xdg = process.env.XDG_RUNTIME_DIR;
+  if (!xdg?.startsWith("/") || xdg.includes("\0") || Buffer.byteLength(xdg) > 30) return "/tmp";
+  return xdg;
+}
+
+const sockRoot = await mkdtemp(path.join(shortSocketRoot(), "lh-"));
+
+function assertFitsSunPath(socketPath: string): void {
+  const bytes = Buffer.byteLength(socketPath, "utf8");
+  if (bytes > SOCKET_PATH_LIMIT) {
+    throw new Error(
+      `unix socket path is ${bytes} bytes, over the ${SOCKET_PATH_LIMIT}-byte limit (the kernel's sun_path is 104 bytes including the terminator): ${socketPath}`,
+    );
+  }
+}
 
 // ── params builder/validator ────────────────────────────────────────────────
 
@@ -178,8 +210,9 @@ interface FakeServer {
 async function startFakeHerdrServer(
   handler: (request: Record<string, unknown>) => Record<string, unknown>,
 ): Promise<FakeServer> {
-  const dir = await mkdtemp(path.join(tmpRoot, "sock-"));
+  const dir = await mkdtemp(path.join(sockRoot, "s-"));
   const socketPath = path.join(dir, "herdr.sock");
+  assertFitsSunPath(socketPath);
   const requests: string[] = [];
   const server = net.createServer((socket) => {
     let buffer = "";
@@ -247,8 +280,9 @@ describe("server.live_handoff over the socket", () => {
   });
 
   it("times out when the server never answers", async () => {
-    const dir = await mkdtemp(path.join(tmpRoot, "silent-"));
+    const dir = await mkdtemp(path.join(sockRoot, "s-"));
     const socketPath = path.join(dir, "herdr.sock");
+    assertFitsSunPath(socketPath);
     const server = net.createServer((socket) => {
       // accept, then never respond. The socket IS read (discarded) so that
       // EOF is delivered as 'end' — a paused stream never emits it — and the
@@ -307,7 +341,7 @@ describe("probeLiveHandoffCapability", () => {
 
   it("resolves unreachable as not-reachable (no throw)", async () => {
     const probe = await probeLiveHandoffCapability({
-      socketPath: path.join(tmpRoot, "no-such-socket.sock"),
+      socketPath: path.join(sockRoot, "no-such-socket.sock"),
       timeoutMs: 500,
     });
     assert.deepEqual(probe, { reachable: false, liveHandoff: false });
@@ -357,6 +391,9 @@ describe("HandoffArtifact round-trips between two processes", () => {
 
 // ── cleanup ─────────────────────────────────────────────────────────────────
 
-after(() => {
-  void rm(tmpRoot, { recursive: true, force: true });
+after(async () => {
+  // Awaited, not `void`: an fs promise still settling after the runner's
+  // callback scope has closed is the same Node 25+ assertion class as above.
+  await rm(tmpRoot, { recursive: true, force: true });
+  await rm(sockRoot, { recursive: true, force: true });
 });
