@@ -1,0 +1,52 @@
+# Whole suite at the merge commit a9f1787c (origin/main b0c0e75d merged in). Two runs; the first is part of the story.
+
+# Run 1 -- `npm test` exactly as package.json defines it:
+#   node --test --test-concurrency=4 --test-force-exit --import ./test/support/isolatedState.ts \
+#       "test/unit/**/*.test.ts" "test/integration/**/*.test.ts"
+# It ran 49 minutes and had to be killed: 32 of those minutes were one file, test/integration/
+# worker-budget-build-hint.test.ts, waiting for a budget abort that never arrived. That stall is attributed in full in
+# X10/logs/05 (short version: the file is main's own, its only completion condition is a 1 s watchdog race, and under
+# load average 82 it stalls on main's tree exactly as it does here; interleaved against the merged tree at load 25 it
+# failed its own assertion in 2 of 4 copies on MAIN while the merged tree passed 8 of 8). Nothing in this branch's
+# diff reaches that path.
+
+# Run 2 -- the same argv with one added flag, --test-timeout=180000, so no single test can hold the run open. The
+# point of the run is the pass/fail set, and a bound is what makes it measurable on a machine shared with other agent
+# sessions (load averaged 81 when it started, 25 by the end; duration 1201 s):
+#   started 03:48:44, ended 04:09:47, exit code 1 (the five failures below).
+ℹ tests 7964
+ℹ suites 564
+ℹ pass 7954
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 5
+ℹ duration_ms 1201366.686542
+
+# 7964 tests / 7954 pass / 5 fail / 0 cancelled. Against the X09 tree (X09/logs/04: 7945 / 7912 / 28 / 0 cancelled):
+# 19 more tests arrived with main, 23 fewer failures. The residue is no longer branch-shaped at all -- every failing
+# file below is red ALONE at origin/main too, with identical counts, measured minutes apart (driver /tmp/five.sh):
+
+#   file                                       merged tree alone   origin/main alone
+#   no-fixed-deadlines.test.ts                 10/11 (1 fail)        10/11 (1 fail)
+#   planner-worker-gateway-timeouts.test.ts    0/2   (2 fail)        0/2   (2 fail)
+#   review-context-and-acceptance.test.ts      14/15 (1 fail)        14/15 (1 fail)
+#   workspace-manifest-corpus.test.ts          170/171 (1 fail)      170/171 (1 fail)
+
+# The failing leaves:
+  test/integration/no-fixed-deadlines.test.ts:463:3
+  test/integration/planner-worker-gateway-timeouts.test.ts:43:1
+  test/integration/planner-worker-gateway-timeouts.test.ts:64:1
+  test/integration/review-context-and-acceptance.test.ts:399:1
+  test/unit/workspace-manifest-corpus.test.ts:477:5
+
+# What each one is:
+#   - no-fixed-deadlines / planner-worker-gateway-timeouts / review-context-and-acceptance: red alone at main as well,
+#     the environment-bound residue of this macOS machine (X10/logs/01 column B).
+#   - workspace-manifest-corpus corpus #7: the /var -> /private/var symlink boundary again, this time in the workspace
+#     scope guard -- the same macOS double-prefix family X08's guard defends against, in a different subsystem
+#     (WorkspaceScopeError: 'Explicit workspace path crosses a symlink boundary', reported with the path upper-cased).
+#     Red alone at main too.
+
+# Cancellation 0 and the run exits: with a per-test bound the suite terminates. The unbound run would have hung on
+# main's budget-hint file. The actionable platform follow-up -- a per-test timeout in that file, or a watchdog that
+# cannot be starved -- is recorded for the operator in X10/logs/05.

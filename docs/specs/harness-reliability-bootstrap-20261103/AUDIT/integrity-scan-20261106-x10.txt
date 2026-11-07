@@ -1,0 +1,32 @@
+# Integrity scan after X10 (origin/main integrated, X09/out-chain + X10/out emitted). Reproduce:
+#   node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+# Recorded at the staged state preceding the X10 evidence commit; tree HEAD a9f1787ca723487b8867fcfd39c1936e64fdbbbb.
+records=97 canonical=64 hash_ok=97 field_ok=97
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=58 offenders=2
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+superseded-generation links (informational)=21
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 6
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 14
+  M  docs/specs/harness-reliability-bootstrap-20261103/PLAN-COMPLETION.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X09/logs/04-whole-suite-at-147b8271.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X09/out-chain/X09.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/drift10.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/manifest.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-budget-hint-copies.sh
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-drift10.sh
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-owned.sh
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/logs/01-base-drift-attribution.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/logs/02-owned-files-and-gates.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/logs/03-whole-suite-at-merge.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/logs/04-lint-parity-finding.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/logs/05-budget-hint-load-flake.txt
+  A  docs/specs/harness-reliability-bootstrap-20261103/X10/out/X10.handoff.json

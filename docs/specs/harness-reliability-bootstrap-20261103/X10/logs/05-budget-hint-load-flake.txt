@@ -1,0 +1,75 @@
+# Attribution of the one thing that went wrong in the merged-tree whole-suite run: after 49 minutes `npm test` was
+# still alive, stuck on test/integration/worker-budget-build-hint.test.ts (32 minutes on that one file). I killed that
+# run and settled whether the branch caused it. It did not. The transcript below is the whole investigation, in order.
+#
+# Why the file can hang at all, from its own source (lines 40-66, main's file, added by c379a805 / PR #610): the stub
+# worker ends with
+#     await new Promise<void>((resolve) => {
+#       if (req.signal?.aborted) resolve();
+#       req.signal?.addEventListener("abort", () => resolve(), { once: true });
+#     });
+# It resolves only when the runtime aborts the worker. The test's budget is execution_budget_ms: 1000 with
+# checkpoint_policy.before_deadline_ms: 200, and node's default per-test timeout is Infinity. So if the budget
+# watchdog is starved, the test waits forever and `npm test` never exits -- which is the suite-termination property
+# this whole series exists to protect, reached from the opposite side: not a bug in the branch, but a test whose only
+# exit condition is a timer that has to win a CPU race.
+#
+# Step 1, alone at concurrency 1 (no contention): the file passes at BOTH trees, 3/3 in ~16 s.
+#   merged  a9f1787c: tests 3 pass 3 fail 0 duration_ms 15981   (run twice, same result)
+#   main    b0c0e75d: tests 3 pass 3 fail 0 duration_ms 16815
+#
+# Step 2, the first four-way attempt, at load average 82 (my own stuck copies plus two other agent sessions running
+# whole suites at the same time): the merged copies never finished -- three produced no summary within 6 minutes, one
+# reported a file-level failure after 358 s. main's four copies finished in ~17 s each. That looked like a branch
+# regression, so I bisected it.
+#
+# Step 3, bisection by tree content (scratch worktree pi-x11-scratch at a9f1787c, node_modules shared):
+#   E1: merged tree with `git checkout b0c0e75d -- src/` (all 43 branch-changed production files back to main's, the
+#       branch's new modules left in place but unreachable). Four copies, 240 s wall: every copy still exit=124, and
+#       three of them printed results first (tests 3, pass 0-1, fail 1-2). main's src cannot fail main's assertion --
+#       so those failures are not production-code failures at all; they are the load, and the 124s are starvation.
+#   That is what pointed away from the branch: the same file, same tree content as main, same breakage.
+#
+# Step 4, interleaved A/B at identical moments (the only fair comparison, because the load average fell from 82 to 25
+# as the pile-up drained), four copies per tree per round, 240 s wall, driver /tmp/bbh4.sh:
+### ABmain1  tree=b0c0e75d  started=04:02:23  concurrency=4 wall=240s load= 25.08 47.87 71.65 
+  copy1: tests 3 pass 3 fail 0  exit=0 dur=11735ms
+  copy2: tests 3 pass 3 fail 0  exit=0 dur=11596ms
+  copy3: tests 3 pass 3 fail 0  exit=0 dur=11861ms
+  copy4: tests 3 pass 3 fail 0  exit=0 dur=11158ms
+verdict: PASS  ended=04:02:35
+### ABmerged1  tree=a9f1787c  started=04:02:35  concurrency=4 wall=240s load= 26.29 47.37 71.19 
+  copy1: tests 3 pass 3 fail 0  exit=0 dur=11223ms
+  copy2: tests 3 pass 3 fail 0  exit=0 dur=11337ms
+  copy3: tests 3 pass 3 fail 0  exit=0 dur=11146ms
+  copy4: tests 3 pass 3 fail 0  exit=0 dur=10940ms
+verdict: PASS  ended=04:02:47
+### ABmain2  tree=b0c0e75d  started=04:02:47  concurrency=4 wall=240s load= 25.86 46.58 70.64 
+  copy1: tests 3 pass 3 fail 0  exit=0 dur=12512ms
+  copy2: tests 3 pass 2 fail 1  exit=1 dur=12762ms
+  copy3: tests 3 pass 2 fail 1  exit=1 dur=12812ms
+  copy4: tests 3 pass 3 fail 0  exit=0 dur=12776ms
+verdict: FAIL/HANG  ended=04:03:00
+### ABmerged2  tree=a9f1787c  started=04:03:00  concurrency=4 wall=240s load= 24.44 45.23 69.73 
+  copy1: tests 3 pass 3 fail 0  exit=0 dur=11925ms
+  copy2: tests 3 pass 3 fail 0  exit=0 dur=11865ms
+  copy3: tests 3 pass 3 fail 0  exit=0 dur=11544ms
+  copy4: tests 3 pass 3 fail 0  exit=0 dur=11913ms
+verdict: PASS  ended=04:03:12
+DONE
+#
+# Reading:
+#   - main fails its own assertion in 2 of 4 copies at load 25.86 (ABmain2): the flake is main's, reproduced on main's
+#     own tree. The assertion is /in 2 build command\(s\) \(cargo x2\), and made no commit/ -- it compares composed
+#     elapsed-time accounting, which is exactly what slips when the loop is starved.
+#   - the merged tree passed 8 of 8 copies across ABmerged1 and ABmerged2 and 3/3 alone twice.
+#   - nothing in the branch's diff reaches this path: src/workers/buildActivity.ts, which composes the hint, is
+#     untouched (git diff --name-only b0c0e75d...HEAD does not contain it), and the test's executor is a stub, so the
+#     branch's PiWorkerExecutor seam is never instantiated.
+#
+# Verdict: not a branch regression. It is a load-bound test in main whose only completion condition is a 1 s watchdog
+# race; on a saturated machine it flakes and can stall `npm test` indefinitely. Recorded so the 49-minute interruption
+# in X10/logs/03 is not mistaken for branch breakage, and so the platform owner can bound it (a per-test timeout in
+# that file, or an explicit watchdog that cannot be starved). Reproduce: run four copies of the file at once while the
+# machine is busy -- bash the driver is committed as X10/fixtures/run-budget-hint-copies.sh, so: bash X10/fixtures/run-budget-hint-copies.sh <tree> <label> 4 240 -- and watch load average, not the tree.
+

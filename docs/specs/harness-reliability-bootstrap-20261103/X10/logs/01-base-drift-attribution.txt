@@ -1,0 +1,76 @@
+# Base-drift attribution: files red at 147b8271 and green at main, measured alone (concurrency 1) at three trees.
+# This machine is shared with other agent sessions (load averages printed per run); timings are not comparable, but
+# each count below is a single-file run, so pass/fail is not a neighbour effect.
+
+#   Run A: 147b8271  (X09 task commit; its first parent is 89e747c2)
+#   Run B: 1bd754cf  (origin/main at the time, clean detached worktree, node_modules shared by symlink)
+#   Run C: a9f1787c  (this unit's merge commit -- origin/main b0c0e75d merged into the branch)
+# Command, one file at a time: node --test --test-concurrency=1 --test-force-exit --import ./test/support/isolatedState.ts <file>
+# Counts are pass/tests. "-" in column C means the file was NOT re-run at C: it is red at both A and B, so it is
+# pre-existing/environment-bound and not part of the drift question. Only the ten files that differ between A and B
+# were re-run at C -- the list is X10/fixtures/drift10.txt, the same ten named below.
+
+file                                                       A 147b8271     B main   C merged
+test/integration/disk-pressure-snapshot-e2e.test.ts               2/2        2/2          -
+test/integration/no-fixed-deadlines.test.ts                     10/11      10/11          -
+test/integration/planner-worker-gateway-timeouts.test.ts          0/2        0/2          -
+test/integration/review-context-and-acceptance.test.ts          14/15      14/15          -
+test/integration/runtime-host-entry.test.ts                       5/5        5/5          -
+test/integration/runtime-isolation-stress.test.ts                8/10      10/10      10/10
+test/unit/artifacts-paging.test.ts                                2/6        6/6        6/6
+test/unit/envelope-v2-hardening.test.ts                         22/22      22/22          -
+test/unit/git-remote-ref.test.ts                                13/14      14/14      14/14
+test/unit/herdr-forks.test.ts                                   47/48      48/48      48/48
+test/unit/herdr-plannotator-transport.test.ts                     7/8        7/8          -
+test/unit/live-handoff-rpc.test.ts                                7/8        7/8          -
+test/unit/platform-filelock-no-hardlinks.test.ts                  2/3        3/3        3/3
+test/unit/runtime-isolation-registry.test.ts                     8/13      13/13      13/13
+test/unit/safe-git-survivors.test.ts                             9/10      12/12      12/12
+test/unit/safe-git-units.test.ts                                15/16      16/16      16/16
+test/unit/standalone-plan-flow.test.ts                            6/7        7/7        7/7
+test/unit/workspace-manifest-corpus.test.ts                   170/171    170/171          -
+test/unit/worktree-janitor.test.ts                              65/66      66/66      66/66
+
+The ten files that were red alone at A and green alone at B, measured again at C:
+  test/integration/runtime-isolation-stress.test.ts        A 2 fail -> C 0 fail
+  test/unit/artifacts-paging.test.ts                       A 4 fail -> C 0 fail
+  test/unit/git-remote-ref.test.ts                         A 1 fail -> C 0 fail
+  test/unit/herdr-forks.test.ts                            A 1 fail -> C 0 fail
+  test/unit/platform-filelock-no-hardlinks.test.ts         A 1 fail -> C 0 fail
+  test/unit/runtime-isolation-registry.test.ts             A 5 fail -> C 0 fail
+  test/unit/safe-git-survivors.test.ts                     A 1 fail -> C 0 fail
+  test/unit/safe-git-units.test.ts                         A 1 fail -> C 0 fail
+  test/unit/standalone-plan-flow.test.ts                   A 1 fail -> C 0 fail
+  test/unit/worktree-janitor.test.ts                       A 1 fail -> C 0 fail
+
+At C, 10 of 10 are green: runtime-isolation-stress.test.ts, artifacts-paging.test.ts, git-remote-ref.test.ts, herdr-forks.test.ts, platform-filelock-no-hardlinks.test.ts, runtime-isolation-registry.test.ts, safe-git-survivors.test.ts, safe-git-units.test.ts, standalone-plan-flow.test.ts, worktree-janitor.test.ts
+
+# Conclusion: the branch was measured against 89e747c2 as its integration tip while main had moved 13 commits, three
+# of which are exactly the platform fixes these files need (c85832dd #622 macOS assumptions, 1bd754cf #625 fsck ref
+# directory, 9bc11c51 #618 work-tree pointer). None of the ten is a branch regression -- they are the branch lacking
+# main's fixes, and `git diff --name-only b0c0e75d...HEAD` contains none of them. Same class of mistake as the
+# E03->E04 base drift: a branch must be measured against the current integration tip.
+
+# Run headers as recorded:
+  run A: ### HEAD 147b8271 (X09 task commit) tree=d5e256e6f761e068f79b256870a3327a09a8c510 at=02:20:54 load= 18.96 53.38 79.69
+  run B: ### origin/main 1bd754cf (control) tree=1bd754cf79b5cc1b0e673bcaebc78f3b118171cb at=02:28:23 load= 23.40 41.06 64.41
+  run C: # X10 measurement at the merged tree a9f1787ca723487b8867fcfd39c1936e64fdbbbb -- origin/main b0c0e75d merged in
+  run C: # started 02:45:26 load= 41.91 49.20 53.56
+
+## cmd1 as committed: bash docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-drift10.sh
+# Run C re-driven through the committed script: one node process per file, concurrency 1, aggregated exit status, so
+# exit 0 means every one of the ten reported zero failures. Transcript:
+  test/integration/runtime-isolation-stress.test.ts        tests 10 pass 10 fail 0 dur=99864ms
+  test/unit/artifacts-paging.test.ts                       tests 6 pass 6 fail 0 dur=2858ms
+  test/unit/git-remote-ref.test.ts                         tests 14 pass 14 fail 0 dur=10594ms
+  test/unit/herdr-forks.test.ts                            tests 48 pass 48 fail 0 dur=29051ms
+  test/unit/platform-filelock-no-hardlinks.test.ts         tests 3 pass 3 fail 0 dur=326ms
+  test/unit/runtime-isolation-registry.test.ts             tests 13 pass 13 fail 0 dur=794ms
+  test/unit/safe-git-survivors.test.ts                     tests 12 pass 12 fail 0 dur=2779ms
+  test/unit/safe-git-units.test.ts                         tests 16 pass 16 fail 0 dur=2355ms
+  test/unit/standalone-plan-flow.test.ts                   tests 7 pass 7 fail 0 dur=769ms
+  test/unit/worktree-janitor.test.ts                       tests 66 pass 66 fail 0 dur=96222ms
+  exit=0
+Totals: 195 tests / 195 pass / 0 fail across 10 files, exit code 0.
+# Against column A above (the same ten files at 147b8271): every one carried failures there, none does with
+# origin/main merged in.

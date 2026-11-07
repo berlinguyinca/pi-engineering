@@ -1,0 +1,37 @@
+# At the merge commit a9f1787c (origin/main b0c0e75d merged in): the files this series owns, then the gates.
+# Load during these runs: ~49-155 (this machine is shared with other agent sessions; one was running the whole unit
+# suite at the same time). Timings are therefore not comparable with X08/logs/18's quieter-machine run; pass/fail
+# counts are what this unit relies on.
+
+$ bash docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-owned.sh
+> node --test --test-concurrency=1 --test-force-exit --import ./test/support/isolatedState.ts \
+      test/unit/git-common-dir-repair.test.ts test/unit/resilience-default-off.test.ts \
+      test/integration/resilient-inference-integration.test.ts test/integration/resilient-inference-wiring.test.ts \
+      test/integration/worker-stream-truncation.test.ts test/integration/mission-interrupt-pause.test.ts \
+      test/integration/mission-merge-queue-flow.test.ts test/unit/worker-error-events.test.ts \
+      test/unit/worker-assistant-verdict.test.ts test/integration/worker-assistant-verdict.test.ts
+
+ℹ tests 73
+ℹ suites 14
+ℹ pass 73
+ℹ fail 0
+ℹ cancelled 0
+ℹ duration_ms 82790.327416
+exit code 0
+
+73 / 73 / 0 fail / 0 cancelled in 83 s across ten files: the X08 guard and the X09 resilience default, the four
+inference/resilience seams, the two integration files that were the suite-termination blocker (worker-stream-truncation
+is 20/20 inside this run -- the file X09 repaired), the mission pause/merge-queue flows, and both copies of main's
+#457 verdict test (test/unit and test/integration) sitting next to this branch's worker-error-events capture seam.
+That adjacency is the check on the hand-resolved conflict in src/workers/PiWorkerExecutor.ts: main's
+terminalAssistantVerdict and this branch's recordWorkerFailure both still behave.
+
+$ npm run typecheck:core
+> tsc --noEmit
+exit code 0 (no output).
+
+$ npx biome check src cmd
+exit code 1 -- 47 findings in 15 files. Not caused by this merge and not caused by X08/X09: all 15 files are files
+this branch wrote (src/bootstrap/*, src/aps/*, src/incidents/*, src/capability/*), and the same command reports the
+same findings at 147b8271, while origin/main reports 0 for `biome check src cmd`. Measured parity and the decision:
+X10/logs/04-lint-parity-finding.txt.

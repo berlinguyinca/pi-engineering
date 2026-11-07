@@ -1,0 +1,55 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X10",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "d5e256e6f761e068f79b256870a3327a09a8c510",
+  "resultSha": "a9f1787ca723487b8867fcfd39c1936e64fdbbbb",
+  "taskAuthorityHash": "sha256:7f8d1f4f1d807bcfc541a090099cb7cef4d5f35488434c2c39f8b1cedbace5b0",
+  "changedFiles": [
+    "src/workers/PiWorkerExecutor.ts"
+  ],
+  "commands": [
+    {
+      "command": "bash docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-drift10.sh",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X10/logs/01-base-drift-attribution.txt"
+    },
+    {
+      "command": "bash docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-owned.sh",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X10/logs/02-owned-files-and-gates.txt"
+    },
+    {
+      "command": "npm run typecheck:core",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X10/logs/02-owned-files-and-gates.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/logs/01-base-drift-attribution.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/logs/02-owned-files-and-gates.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/logs/03-whole-suite-at-merge.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/logs/04-lint-parity-finding.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/logs/05-budget-hint-load-flake.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-budget-hint-copies.sh",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/drift10.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-drift10.sh",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-owned.sh",
+    "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/04-whole-suite-at-147b8271.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X09/out-chain/X09.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/18-whole-suite-corrected-base.txt"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:05:00Z",
+    "notes": "The unit the measurement forced. X08/X09 were scored against origin/main as it stood at 89e747c2 + 61394da7 + #604, but main had moved 13 commits, and three of them are platform fixes this branch's own test files need: c85832dd (#622) removes four macOS assumptions, 1bd754cf (#625) gives fsck a real ref directory, 9bc11c51 (#618) pins the work-tree pointer that shadow translation writes. This unit is the merge plus the re-attribution.\n\nHow the diagnosis was reached, in the order it happened. The whole suite at 147b8271 (X09/logs/04) ended 7945 tests / 7912 pass / 28 fail / 0 cancelled in 1864 s -- one more failing leaf than X08's run at bc8cd251 (X08/logs/18: 7944 / 7912 / 27), and worker-stream-truncation was gone from the failing list, which meant two leaves had newly broken. Rather than guess, the 19 failing files were measured ALONE, one node process each at concurrency 1, at three trees (X10/logs/01): ten of them are red alone at this branch and GREEN alone at origin/main. `git diff --name-only b0c0e75d...HEAD` does not contain any of those ten, so this branch cannot have regressed them.\n\nThat is the branch being scored against an integration tip 13 commits stale -- the same class of mistake as the E03->E04 base drift, and the second time this series has had to write the lesson down. Merging main is therefore part of closing the series, not a courtesy to the merge button.\n\nThe merge itself: one conflict, src/workers/PiWorkerExecutor.ts. This branch appended the E06 capture seam (workerFailureContext / workerFailureOccurrence / recordWorkerFailure) at the end of the file; main appended #457's terminalAssistantVerdict with its SERVER_SHAPED guard at the same place. Both are kept, main's function last. Git had folded the two functions' closing braces into a single shared line, which is why deleting the three conflict markers alone does not typecheck -- the resolution puts recordWorkerFailure's closing brace back. npx tsc --noEmit -p tsconfig.json exits 0 after that.\n\nMeasured at this merge commit:\n  - cmd1, X10/fixtures/run-drift10.sh (X10/logs/01): the ten drift files, alone, one process each -- all ten green, 195 tests / 195 pass / 0 fail (runtime-isolation-stress 10/10, artifacts-paging 6/6, git-remote-ref 14/14, herdr-forks 48/48, platform-filelock-no-hardlinks 3/3, runtime-isolation-registry 13/13, safe-git-survivors 12/12, safe-git-units 16/16, standalone-plan-flow 7/7, worktree-janitor 66/66). The script aggregates exit status across all ten, so a 0 means every file passed.\n  - cmd2, X10/fixtures/run-owned.sh (X10/logs/02): the files this series owns plus both merge seams -- 73 tests / 73 pass / 0 fail / 0 cancelled in 83 s. It includes test/integration/worker-stream-truncation.test.ts (the file X09 repaired, 20/20 inside this run), test/unit/git-common-dir-repair.test.ts (the X08 guard, 5/5) and both copies of main's #457 verdict test next to this branch's worker-error-events capture seam -- the check that the hand-resolved conflict keeps both sides' behaviour.\n  - cmd3, npm run typecheck:core (X10/logs/02): exit 0.\n  - npm test on the merged tree (X10/logs/03): the tally with its load caveat. These runs happen on a machine shared with other agent sessions (load averages 98-155; another session was running the whole unit suite at the same time), so timings are not comparable with X08/logs/18's 1639 s on a quieter machine. Attribution therefore comes from the alone-runs, never from whole-suite counts.\n\nOpen finding recorded, not closed (X10/logs/04): this branch makes the repo's own lint command red while main is clean. `npx biome check --reporter=json .` reports 2 errors at origin/main and 513 at this tree (437 format, 45 organizeImports, 16 parse, 15 lint-style). `biome check src cmd` is 0 findings at main and 47 findings in 15 files here, and all 15 are files this branch wrote (src/bootstrap, src/aps, src/incidents, src/capability). The debt is the whole bootstrap series', not X08/X09' -- every earlier unit ran biome only over the files it touched (X08/logs/16, X09/logs/02), which never sees the rest of the tree. `biome check --write` over those 15 files was tried and reverted: 37 files, +2855/-591 lines, 13 files still flagged (45 findings need --unsafe, which biome skipped). Folding a rewrite that size into a behaviour PR serves nobody, so the choice is recorded for the operator: a dedicated lint-parity commit before merging -- mechanical format + organizeImports, 15 hand-written lint findings, and ~16 parse complaints caused by the compact evidence JSON under docs/specs/... (ignoring that directory as data, the way .gitignore already ignores */logs/ and */out/, removes most of the format noise) -- or merge as-is and file the parity work.\n\nThe 49-minute interruption, attributed (X10/logs/05). The first whole-suite attempt at this merge commit, `npm test` exactly as package.json defines it, had to be killed after 49 minutes: 32 of them on test/integration/worker-budget-hint.test.ts, waiting for a budget abort that never arrived. It looks like a branch regression and it is not one. The file is main's own (c379a805, PR #610); its stub worker's only completion condition is `await new Promise(resolve => req.signal.addEventListener(\"abort\", ...))` against execution_budget_ms 1000, with node's default per-test timeout Infinity -- so when the watchdog loses the CPU race the test waits forever and `npm test` never exits. Alone at concurrency 1 it passes 3/3 in ~16 s at both trees. Four-way at load average 25.86 it failed its own hint assertion in 2 of 4 copies on MAIN's tree while the merged tree passed 8 of 8 across two rounds; at load average 82 copies on both trees hit the wall. Bisection by tree content clinched it: with all 43 branch-changed production files reverted to main the file still broke, and src/workers/buildActivity.ts, which composes the hint, is not in this branch's diff at all. The suite was therefore re-run with --test-timeout=180000, which is the honest way to measure it on a machine shared with other agent sessions.\n\nCorrected citation, mine: PLAN-COMPLETION.json and the X09 record's note text referred to 'X08/logs/20' for the branch-only attribution. That log does not exist -- X08/logs ends at 19, and 19 covers the four branch-only names as they stood at bc8cd251. The attribution it was cited for is produced here (X09/logs/04 and X10/logs/01) from commands re-run at 147b8271, at origin/main, and at this merge commit. The PLAN text is corrected in the same commit.\n\nManifest deviation, reasoned. A merge commit is the task change here, so the limits cannot be read against its first-parent diff: `git diff --shortstat HEAD^1 HEAD` is 46 files / +1660/-3096 and that is main's content arriving, not this unit's writing. The hand-written content is the single resolved conflict: `git diff --shortstat HEAD^1 HEAD -- src/workers/PiWorkerExecutor.ts` = 1 file, +56/-2, which is inside limits { maxProductionFiles: 1, maxTestFiles: 0, maxChangedLines: 100 }. allowPaths names exactly that file; X10 writes no test files and no other production file."
+  },
+  "handoffHash": "sha256:6123bccefbf3883b6507324eab12a346998c746e2d4a978d6dff79169a1664a5"
+}
