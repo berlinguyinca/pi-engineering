@@ -142,7 +142,9 @@ test("fsck through the shadow still sees the refs: an unreachable commit is repo
     // three commits, then the branch is moved back so `three` is unreachable. fsck must call it
     // dangling. A shadow that snapshotted the ref tree wrongly would report a clean repository
     // here — a passing integrity check that looked at nothing, which is worse than failing.
-    l.sh("cd repo && git commit -q --allow-empty -m two && git commit -q --allow-empty -m three && git reset -q --hard HEAD~1");
+    l.sh(
+      "cd repo && git commit -q --allow-empty -m two && git commit -q --allow-empty -m three && git reset -q --hard HEAD~1",
+    );
     const r = await safeGit(["fsck", "--connectivity-only"], { cwd: l.repo, trust: "strict" });
     assert.equal(r.code, 0, r.stderr);
     assert.match(`${r.stdout}${r.stderr}`, /dangling commit/);
