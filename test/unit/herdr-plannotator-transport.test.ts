@@ -97,11 +97,19 @@ describe("HerdrPlannotatorTransport", () => {
       ["malformed", 'process.stdout.write("not json at all");', /no JSON object/],
       ["unsupported", out({ decision: "maybe" }), /unsupported/],
       ["flood", 'process.stdout.write("a".repeat(5000));', /exceeded the limit/],
-      ["timeout", "setTimeout(() => {}, 60000);", /timed out after 300ms/],
+      // The one case whose budget is the behaviour under test: it must lose the
+      // race, so it keeps the short timeout its message quotes.
+      ["timeout", "setTimeout(() => {}, 60000);", /timed out after 300ms/, 300],
     ];
-    for (const [name, behavior, re] of cases) {
+    // 300 ms for every case looked harmless and was not: each case spawns a Node
+    // child, and on a saturated machine the bridge does not start, write, and
+    // exit inside 300 ms. The transport then reports its own timeout instead of
+    // the reason the row asserts, and the row fails for load, not for behaviour —
+    // 6 of 10 runs failed this way with all cores busy. Only the case that is
+    // *about* the deadline needs a tight one.
+    for (const [name, behavior, re, timeoutMs = 10_000] of cases) {
       const cli = fakeCli(behavior);
-      const t = createHerdrPlannotatorTransport({ command: cli.bin, timeoutMs: 300, maxOutputBytes: 1000 });
+      const t = createHerdrPlannotatorTransport({ command: cli.bin, timeoutMs, maxOutputBytes: 1000 });
       await assert.rejects(t.submitPlan(proposal), re, name);
     }
   });
