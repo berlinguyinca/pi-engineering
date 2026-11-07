@@ -1,0 +1,118 @@
+#!/usr/bin/env node
+/**
+ * Produce and re-verify `citation-drift-baseline.txt` -- the list of documents exempt from the
+ * citation-anchor check because they are POINT-IN-TIME RECORDS.
+ *
+ * WHY THIS SCRIPT EXISTS INSTEAD OF A HAND-WRITTEN LIST
+ *
+ * A handoff, work order or worker report states facts about the tree it was written against, and names
+ * that tree in prose (`Base commit: <sha>`, or `**Base:** \`<sha>\``). Judging it against today's tree
+ * reports its pointers as drift and invites a rewrite that destroys the record -- a work order is
+ * evidence about the past precisely because nobody edited it afterwards. So such documents are exempt.
+ *
+ * But "it is a record" is not evidence that its pointers were ever right. Three shapes exist, and only
+ * running the tool tells them apart:
+ *
+ *   BASE-OK   drift > 0 at HEAD, drift = 0 at its declared base  -> genuinely point-in-time; EXEMPT.
+ *   BASE-BAD  drift > 0 at HEAD, drift > 0 at its declared base  -> it was WRONG when written. A record
+ *             of a wrong measurement is still a wrong measurement: it is NOT exempt and must be fixed
+ *             or annotated in place. (Found: D06/WORKER_REPORT.md, R04/HANDOFF.md.)
+ *   NO-BASE   drift > 0 at HEAD, declares no base                -> cannot be exempted. Either it is a
+ *             living document (fix the pointers) or it is a record (state the commit it describes).
+ *
+ * Exemptions are therefore derived by running the check twice per document -- once against HEAD, once
+ * with `--code-at <declared base>` -- never by judgment. `citation-anchor-check.mjs` additionally refuses
+ * to run with a needless entry (BASE-STALE), so an exemption cannot outlive the drift it excuses.
+ *
+ *   node AUDIT/citation-drift-baseline.mjs [dir] [--out <file>] [--check]
+ *
+ *   --check  verify the committed file matches current evidence; change nothing (exit 1 if it does not)
+ *
+ * Exit status: 1 if any document is BASE-BAD (a record that was wrong at its own base), else 0.
+ */
+import { execFileSync, spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const CHECK = join(HERE, "citation-anchor-check.mjs");
+const argv = process.argv.slice(2);
+const args = argv.filter((a) => !a.startsWith("--"));
+const DIR = args[0] ?? "docs/specs";
+const OUT = argv.includes("--out") ? argv[argv.indexOf("--out") + 1] : join(HERE, "citation-drift-baseline.txt");
+const CHECK_ONLY = argv.includes("--check");
+
+const git = (a) => execFileSync("git", a, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+const gitOrEmpty = (a) => {
+  try {
+    return git(a);
+  } catch {
+    return "";
+  }
+};
+const driftOf = (refArgs, doc) => {
+  const r = spawnSync("node", [CHECK, ...refArgs, doc], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  const m = (r.stdout || "").match(/RESULT drift=(\d+)/);
+  return m ? Number(m[1]) : null;
+};
+
+const head = JSON.parse(spawnSync("node", [CHECK, "HEAD", DIR, "--json"], { maxBuffer: 64 * 1024 * 1024 }).stdout.toString());
+const failing = [...new Set(head.bad.map((b) => b.doc))].sort();
+
+// Records declare their base in prose, and both observed shapes are accepted. Only the FIRST 4 KB is
+// scanned: `Base commit:` is front matter, and a sha in the body is a commit being reviewed, not the
+// tree the document describes -- reading the body instead would exempt a document against an arbitrary
+// commit mentioned in prose.
+const baseOf = (text) => (text.slice(0, 4096).match(/(?:Base commit:\s*|\*\*Base:\*\*\s*`?)([0-9a-f]{40})/) ?? [])[1] ?? null;
+
+const rows = failing.map((doc) => {
+  const base = baseOf(gitOrEmpty(["show", `HEAD:${doc}`]));
+  return { doc, base, atHead: driftOf(["HEAD"], doc), atBase: base ? driftOf(["HEAD", "--code-at", base], doc) : null };
+});
+
+const ok = rows.filter((r) => r.atBase === 0);
+const bad = rows.filter((r) => r.atBase !== null && r.atBase !== 0);
+const none = rows.filter((r) => r.atBase === null);
+
+for (const r of rows) {
+  const tag = r.atBase === 0 ? "BASE-OK " : r.atBase === null ? "NO-BASE " : "BASE-BAD";
+  console.log(`${tag} head=${r.atHead} base=${String(r.atBase).padStart(3)} ${(r.base ?? "-").slice(0, 9).padEnd(10)} ${r.doc}`);
+}
+
+const HDR = `# Exemptions for citation-anchor-check.mjs: documents whose pointers are correct AT THEIR OWN
+# BASE commit and therefore cannot be judged against HEAD.
+#
+# A runbook, work order or mission report states facts about the tree it was written against and names
+# that commit in prose (\`Base commit: <sha>\`). Checking it against today's tree reports its pointers as
+# drift and would force a rewrite that destroys the record.
+#
+# Format: <path>|<reason>, the reason naming the base commit. The check refuses to run with a NEEDLESS
+# entry (verdict BASE-STALE), so an exemption cannot outlive the drift it excuses.
+#
+# Generated by AUDIT/citation-drift-baseline.mjs, which classifies every failing document by running
+# the check twice -- at HEAD and with --code-at <declared base>. Documents that fail at BOTH were wrong
+# when written and are deliberately NOT listed here; neither are documents that declare no base.
+`;
+const body = ok.map((r) => `${r.doc}|point-in-time record; correct at its declared base ${r.base}\n`).join("");
+const want = HDR + body;
+
+if (CHECK_ONLY) {
+  const have = (() => { try { return readFileSync(OUT, "utf8"); } catch { return ""; } })();
+  if (have !== want) {
+    console.error(`${OUT} is out of date: ${ok.length} exempt document(s) supported now.`);
+    process.exit(1);
+  }
+} else {
+  writeFileSync(OUT, want);
+  console.log(`\nwrote ${OUT}: ${ok.length} exempt record(s)`);
+}
+if (bad.length) {
+  console.log(`\n${bad.length} RECORD(S) WRONG AT THEIR OWN BASE -- not exempted, fix or annotate in place:`);
+  for (const r of bad) console.log(`  ${r.doc}  drift=${r.atBase} at ${r.base}`);
+}
+if (none.length) {
+  console.log(`\n${none.length} document(s) fail at HEAD and declare no base -- fix, or state the commit they describe:`);
+  for (const r of none) console.log(`  ${r.doc}`);
+}
+process.exit(bad.length ? 1 : 0);
