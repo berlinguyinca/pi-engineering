@@ -40,7 +40,9 @@
     "Lesson recorded twice now and finally acted on (E03->E04, then X10): a branch must be measured against the current integration tip. X08/X09 were scored against a main 13 commits stale, which manufactured ten 'regressions' that were main's own missing fixes (runtime-isolation-stress, artifacts-paging, git-remote-ref, herdr-forks, platform-filelock-no-hardlinks, runtime-isolation-registry, safe-git-survivors, safe-git-units, standalone-plan-flow, worktree-janitor -- all green alone once origin/main was merged in, 195 tests / 195 pass, X10/logs/01). Measuring alone, one process per file, at three trees is what distinguishes a stale base from a regression; `git diff --name-only <main>...HEAD` intersected with the failing file list settles it in one command.",
     "Platform finding, not branch debt: test/integration/worker-budget-build-hint.test.ts (main's own, c379a805 / PR #610) can hold `npm test` open forever. Its stub worker resolves only on `req.signal` abort, the budget is 1000 ms, node's default per-test timeout is Infinity, and under load average 82 copies on both this tree and main's tree hit a 240 s wall while an interleaved round at load 25.86 saw main fail its own hint assertion in 2 of 4 copies as the merged tree passed 8 of 8 (X10/logs/05). The series' suite-termination requirement is met at this tree; the exposure lives in main's test design and needs a per-test timeout or a watchdog that cannot be starved.",
     "Lint parity gap, measured and left open for the operator: origin/main is clean under `biome check src cmd` (0 findings) and this branch is not (47 findings in 15 files, all written by earlier units of this series; whole-tree `biome check .` reports 513 errors against main's 2). Earlier units each ran biome only over the files they touched, so the tree-wide debt accumulated invisibly across ~100 commits. The mechanical fix is not mechanical: `biome check --write` over the 15 files rewrote 37 files (+2855/-591) and still left 13 flagged with 45 findings requiring --unsafe; it was reverted and recorded (X10/logs/04) rather than folded into a behaviour PR.",
-    "Convention conflict inside the series, recorded rather than silently resolved: .gitignore (Bootstrap Protocol 2026-11-03) says per-unit logs, fixtures and handoffs 'must stay untracked; integrity comes from handoffHash + artifactSha256', and the gate does stamp only a clean worktree -- but every unit from X01 on has force-added its evidence so a reviewer can open the paths a record cites, and the integrity scanner counts a cited-but-untracked path as dangling (evidence untracked=0 is only reachable by committing them). X10 follows the series' actual practice (force-add) and flags the rule as the thing that should change, not the practice."
+    "Convention conflict inside the series, recorded rather than silently resolved: .gitignore (Bootstrap Protocol 2026-11-03) says per-unit logs, fixtures and handoffs 'must stay untracked; integrity comes from handoffHash + artifactSha256', and the gate does stamp only a clean worktree -- but every unit from X01 on has force-added its evidence so a reviewer can open the paths a record cites, and the integrity scanner counts a cited-but-untracked path as dangling (evidence untracked=0 is only reachable by committing them). X10 follows the series' actual practice (force-add) and flags the rule as the thing that should change, not the practice.",
+    "X11 corrected a cause claim X10's committed record makes. X10's notes and logs attribute X08/out's 8-character resultSha to `git rev-parse --path-format=absolute --git-common-dir` under GIT_COMMON_DIR. That is not how it was written: X08's generator carried it as a literal (`resultSha: \"9f064450\",`), and the durable facts are that templates/handoff.schema.json types baseSha/resultSha as plain {\"type\":\"string\"} -- so the emit path had nothing to check it against -- and that the stored value is byte-identical to `git rev-parse --short 9f0644507e51baea9f6d0a75fc838e046c4143b7`. X10/out is hash-bound and keeps the wrong cause; the correction lives in X10/out-chain and X11/logs/01.",
+    "The writer can still produce the defect X11 declares. templates/handoff.schema.json still types baseSha and resultSha as plain {\"type\":\"string\"} and nextBaseSha as {\"type\":[\"string\",\"null\"]} -- no pattern, no length -- so writeHandoff accepts any shape, hashes it into handoffHash, and commits it. The chain gate now catches and names it on every run and X11 declares the only instance the series produced with a proved-unique referent, but the durable fix is a shape pattern on those three fields, which changes the handoff protocol for every record in the series: the operator's call, not an audit-tooling unit's. Unchanged from X10 and still open: worker-budget-build-hint.test.ts hangs under concurrency on this branch (green alone, green at origin/main), and `biome check src cmd` is red with 44 findings across 14 files this branch wrote (green at origin/main)."
   ],
   "concluded_with_records": [
     "B00",
@@ -103,7 +105,8 @@
     "X07",
     "X08",
     "X09",
-    "X10"
+    "X10",
+    "X11"
   ],
   "cross_repo_integration": {
     "main": "591264f9bd4fc2fc07d88d94febde4cd0e919448",
@@ -123,13 +126,13 @@
     "quant_schema": "src/capability/quantBenchmark.ts",
     "runbook": "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
   },
-  "head": "a9f1787ca723487b8867fcfd39c1936e64fdbbbb",
-  "next_action": "Merge #616 (task/x08-common-dir-repair, head a9f1787c) into main. X09 fixed the review's MAJOR regression and its MINOR error-context gap; X10 merged origin/main b0c0e75d in and re-attributed the residue: the whole suite at the merge commit, run with --test-timeout=180000 so no single test can hold it open, ends 7964 tests / 7954 pass / 5 fail / 0 cancelled, and all five failing leaves sit in files that are red ALONE at origin/main too with identical counts (X10/logs/03) -- no branch-attributable failure remains. Two things the operator must decide before pressing merge, both measured and neither invented by this branch: (1) lint parity -- `npx biome check src cmd` is 0 findings at origin/main and 47 findings in 15 files here, all 15 written by earlier units of this series; `biome check --write` over them was tried and reverted (37 files, +2855/-591, 13 still flagged, 45 findings needing --unsafe), so it is either a dedicated lint-parity commit before merging or an issue (X10/logs/04); (2) test/integration/worker-budget-build-hint.test.ts, main's own file from PR #610, whose only completion condition is a 1 s watchdog race -- it stalled `npm test` for 32 minutes here and fails its own assertion on main's tree under load (X10/logs/05), so it needs a per-test timeout or an unstarvable watchdog on main.",
+  "head": "449765f1b808a1babd0283b108df708892087f5d",
+  "next_action": "Merge #616 (task/x08-common-dir-repair) into main. X09 fixed the review's MAJOR regression and MINOR error-context gap; X10 merged origin/main b0c0e75d in and re-attributed the residue; X11 closed the last thing X10 could not close from an integration unit -- the canonical lineage gate, which was red on a pointer shape it had no vocabulary for. It now exits 0: AUDIT/lineage-scan.mjs has a third declaration kind whose acceptance conditions are proofs (manifest vocabulary, shape, the value the record holds at the audited sha, exactly one reachable commit for the abbreviation, a full `replacement` passing the superseded tests, an annotator that is neither the defective commit nor older than it), X08/out's abbreviated resultSha is declared against 9f0644507e51baea9f6d0a75fc838e046c4143b7, and ten mutations of that declaration are each refused for the reason that refuses them (X11/logs/02). Before the merge the operator should know three things remain open, all measured: `node --test test/integration/worker-budget-build-hint.test.ts --test-concurrency=4 --test-timeout=180000` fails in 2 of 3 copies at the branch tip (X10/logs/05) while green at origin/main's tip and green alone; `biome check src cmd` is red with 44 findings across 14 files this branch wrote (X10/logs/04, X10/fixtures/lint-diff-vs-origin-main.txt) while green at origin/main; and templates/handoff.schema.json still types baseSha/resultSha/nextBaseSha as plain strings, so the emit path can still write a pointer shape X11's gate has to catch after the fact.",
   "no_handoff_record": [],
   "plan": "harness-reliability-bootstrap-20261103",
   "plan_scope_tasks": 51,
   "post_plan_extension": {
-    "chain_note": "X01 joins V06 by prose reference (V06 is terminal, nextTaskId null); X05 and X06 each needed a later chain generation (out-chain) because the series continued after their out-final generation was emitted with nextTaskId null.; X08 joins X07 through parentHandoffHash rather than a forward link, because X07's terminal generation was emitted with nextTaskId null and a PASS record is never rewritten; X08/out-final appears on the scanner's informational orphan list for the same reason X01/out-final does: the scanner ranks generations out-final > out-corrected > out, so within X08 the corrected generation is canonical while X07 -- being terminal -- names no child at all; the orphan class here is 'parent generation missing', the same one X01/out-final sits in. X08 is terminal (nextTaskId null), so no child needs the pointer, and rewriting an already-pushed X07 record is not allowed; the blocking metric (canonical chain offenders) stays at the two known ones (E02->E03, T09->T10). X08 was emitted terminal at out-final, so continuing the series needed a chain generation for it too: X08/out-chain carries nextTaskId=X09 / nextBaseSha=a93b53a076ca136d0871250d475577f9d574d86d and removes two evidence paths out-final had listed twice. X09 is terminal (nextTaskId null).; X09 was emitted terminal and X10 continued the series, so X09/out-chain carries the forward link (the same mechanism as X05/out-chain, X06/out-chain, X08/out-chain); X10 is terminal.",
+    "chain_note": "X01 joins V06 by prose reference (V06 is terminal, nextTaskId null); X05 and X06 each needed a later chain generation (out-chain) because the series continued after their out-final generation was emitted with nextTaskId null.; X08 joins X07 through parentHandoffHash rather than a forward link, because X07's terminal generation was emitted with nextTaskId null and a PASS record is never rewritten; X08/out-final appears on the scanner's informational orphan list for the same reason X01/out-final does: the scanner ranks generations out-final > out-corrected > out, so within X08 the corrected generation is canonical while X07 -- being terminal -- names no child at all; the orphan class here is 'parent generation missing', the same one X01/out-final sits in. X08 is terminal (nextTaskId null), so no child needs the pointer, and rewriting an already-pushed X07 record is not allowed; the blocking metric (canonical chain offenders) stays at the two known ones (E02->E03, T09->T10). X08 was emitted terminal at out-final, so continuing the series needed a chain generation for it too: X08/out-chain carries nextTaskId=X09 / nextBaseSha=a93b53a076ca136d0871250d475577f9d574d86d and removes two evidence paths out-final had listed twice. X09 is terminal (nextTaskId null).; X09 was emitted terminal and X10 continued the series, so X09/out-chain carries the forward link (the same mechanism as X05/out-chain, X06/out-chain, X08/out-chain); X10 is terminal. X10 was emitted terminal and the series continued once more, to close the one thing X10 could not close from inside an integration unit: the canonical lineage gate was red on a pointer shape it had no vocabulary for. X10/out-chain carries the forward link (nextTaskId=X11 / nextBaseSha=5403bf30a4b9efef9930b36d96996a1398bc4c62) and also carries the correction of X10's claim about how X08/out's abbreviated resultSha came to be written -- X10/out itself stays byte-unchanged and hash-bound. X11 is terminal.",
     "units": [
       {
         "base_sha": "900bf8a3b10decf0bbc7f7e46b04a29241741151",
@@ -306,6 +309,26 @@
         "result_sha": "a9f1787ca723487b8867fcfd39c1936e64fdbbbb",
         "task_authority_hash": "sha256:7f8d1f4f1d807bcfc541a090099cb7cef4d5f35488434c2c39f8b1cedbace5b0",
         "unit": "X10"
+      },
+      {
+        "unit": "X11",
+        "generation": "out",
+        "base_sha": "5403bf30a4b9efef9930b36d96996a1398bc4c62",
+        "result_sha": "4797c26b9b5091a763d49aecc0009bb5f58953f6",
+        "handoff_hash": "sha256:49d60217910b93d502d8b1f8e1a41c1a2ae4a02a414f1a799d7a83713c4a18e0",
+        "task_authority_hash": "sha256:db4ee1764ab2238c5b988e0a99a34356edef2f3fbed8152d44630c51f342ed82",
+        "next": null,
+        "joins": "X11 joins X10 through parentHandoffHash = sha256:be1b374a4675ee714273a7e58c80a1b0ebe1aa393e553b4bbdcb7547344c3db0 (X10/out-chain/X10.handoff.json), and X10/out-chain carries nextTaskId=X11 / nextBaseSha=5403bf30a4b9efef9930b36d96996a1398bc4c62, which is X11's baseSha -- both directions resolve, and the link's record is the file whose content was hashed. X10/out stays byte-unchanged and hash-bound; the correction of its cause claim travels in the chain generation.",
+        "measured_at": "the task commit 4797c26b (lineage gate, the ten negative tests, and the integrity scan, each run at that tree)",
+        "evidence": [
+          "X11/logs/01-defect-found-and-corrected.txt",
+          "X11/logs/02-negative-tests.txt",
+          "X11/logs/03-gate-before-after.txt",
+          "X11/fixtures/manifest.json",
+          "X11/fixtures/lineage-negative-tests.sh",
+          "X10/out-chain/X10.handoff.json",
+          "AUDIT/lineage-superseded.json"
+        ]
       }
     ],
     "why": "Filed after PLAN.json closed, from the completion audit: the drift detector could not see 'in-scope but undeclared' edits (drift-03), nothing called the detector at runtime, the observability counters had no producer, the contract never reached the worker, the intervention master switch defaulted ON against the security spec, and the chain parents of the X-series records were never committed."
@@ -334,16 +357,16 @@
   "repo": "berlinguyinca/pi-engineering",
   "schema_conformance": {
     "additional_properties": false,
-    "canonical_hash_recomputed": "97/97 recomputed handoffHash equal to the stored value; 97/97 required fields present",
-    "canonical_records": 64,
+    "canonical_hash_recomputed": "99/99 recomputed handoffHash equal to the stored value; 99/99 required fields present",
+    "canonical_records": 65,
     "chain_canonical_offenders": [
       "E02/out -> E03@cc036f2f8c3b (no such record)",
       "T09/out -> T10@3bb21ab2e4b4 (no such record)"
     ],
-    "chain_forward_links_resolved": 58,
+    "chain_forward_links_resolved": 59,
     "evidence_dangling": 0,
     "evidence_untracked": 0,
-    "field_ok": 97,
+    "field_ok": 99,
     "generations": [
       "V01/out",
       "V02/out",
@@ -362,33 +385,34 @@
       "X08/out-final",
       "X09/out",
       "X09/out-chain",
-      "X10/out"
+      "X10/out",
+      "X10/out-chain",
+      "X11/out"
     ],
-    "hash_ok": 97,
+    "hash_ok": 99,
     "informational_orphans": [
       "B00/out-backfill",
       "FIX-1/out",
       "FIX-5/out",
       "R01/out",
       "X01/out-final",
-      "X08/out-chain",
-      "X10/out"
+      "X08/out-chain"
     ],
-    "note": "untracked/dangling recomputed after X09; X09/out, X09/logs and X09/fixtures are force-added with `git add -f` because .gitignore:44-46 keeps */logs/, */fixtures/ and */out/ untracked by design -- the series tracks them anyway so the chain scan can prove evidence provenance (same as X01..X08).",
-    "records_distinct": 95,
-    "records_total": 97,
+    "note": "untracked/dangling recomputed after X09; X09/out, X09/logs and X09/fixtures are force-added with `git add -f` because .gitignore:44-46 keeps */logs/, */fixtures/ and */out/ untracked by design -- the series tracks them anyway so the chain scan can prove evidence provenance (same as X01..X08). Recomputed after X11: records 97 -> 99 (X10/out-chain, X11/out), canonical 64 -> 65, canonical chain links resolved 58 -> 59, offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, and every handoffHash recomputed equal to its stored value. The canonical lineage gate now exits 0 for the first time in the series -- see AUDIT/lineage-scan.mjs and X11.",
+    "records_distinct": 97,
+    "records_total": 99,
     "required_fields": 15,
-    "required_fields_ok": 95,
-    "scan_artifact": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261106-x10.txt",
+    "required_fields_ok": 99,
+    "scan_artifact": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261107-x11.txt",
     "scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261106-x09.txt",
     "scanned_at": "147b827159c426b21b7806ce751e5d9ab771ece9",
     "scanner": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
-    "schema": "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json"
+    "schema": "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json",
+    "lineage_gate": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs",
+    "lineage_gate_result": "RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation (entries=30, superseded=8, unresolvable=21, abbreviated=1)"
   },
   "series_terminal_record": {
-    "handoff_hash": "sha256:6123bccefbf3883b6507324eab12a346998c746e2d4a978d6dff79169a1664a5",
-    "note": "X10 is terminal (nextTaskId null): it integrated origin/main b0c0e75d into the branch and re-attributed the failures the stale base was producing. X09 is no longer terminal -- X09/out-chain (sha256:39806a4dcfdcb66fd69abcec0ce26e1c78f2abec21e8d413b493a89e75aac046) carries the forward link nextTaskId=X10 / nextBaseSha=d5e256e6f761e068f79b256870a3327a09a8c510; X09/out (sha256:755b98e83a7c87194e90627d44c9f4ac1234ec2fda8df14aedca1767d42c6960) remains the canonical generation for the unit itself (out-chain changes only the forward link). X08 stays PASS at out-final (sha256:0ef51ddef6f1402fab0b187d538797cd6b1478e4bee7924040631431d97561bf) with X08/out-chain as its chain generation.",
-    "record": "docs/specs/harness-reliability-bootstrap-20261103/X10/out/X10.handoff.json",
-    "taskId": "X10"
+    "handoff_hash": "sha256:49d60217910b93d502d8b1f8e1a41c1a2ae4a02a414f1a799d7a83713c4a18e0",
+    "note": "X11 is terminal (nextTaskId null): it declares the one malformed pointer the series produced -- X08/out resultSha, eight characters -- and gives AUDIT/lineage-scan.mjs a third declaration kind whose acceptance conditions are proofs (manifest vocabulary, shape, the value the record holds at the audited sha, exactly one reachable commit for the prefix enumerated with `git rev-list --all`, a full `replacement` that passes the same tests a superseded replacement passes, and an annotator that is neither the defective commit nor older than it), so the canonical lineage gate exits 0 with nothing declared on trust and ten mutations of the declaration each refused for the reason that refuses them. X10 is no longer terminal: X10/out-chain (sha256:be1b374a4675ee714273a7e58c80a1b0ebe1aa393e553b4bbdcb7547344c3db0) carries nextTaskId=X11 / nextBaseSha=5403bf30a4b9efef9930b36d96996a1398bc4c62, and it carries the correction of X10's cause claim about the abbreviation while X10/out stays byte-unchanged and hash-bound. Residue carried unresolved, unchanged: worker-budget-build-hint.test.ts hanging under concurrency on this branch, 44 biome findings across 14 files this branch wrote, and the handoff schema still typing commit pointers as plain strings."
   }
 }

@@ -1,0 +1,45 @@
+=== X11 log 03 -- the gate, before and after, plus what the manifest costs to edit ===
+$ # in a checkout of the series tip before this unit (5403bf30)
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+  ref=HEAD records=101 fields=3
+  pointers healthy=257 nullDeclared=16 broken=30 unparseableRecords=0
+  healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 0
+  manifest=harness-reliability-lineage-superseded/v2 entries=29 superseded=8 unresolvable=21
+    UNCOVERED       docs/specs/harness-reliability-bootstrap-20261103/X08/out/X08.handoff.json|resultSha 9f064450
+  RESULT FAIL (1)
+  exit=1
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs   # with X11's declaration, at 4797c26b
+  ref=HEAD records=101 fields=3
+  pointers healthy=257 nullDeclared=16 broken=30 unparseableRecords=0
+  healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 0
+  manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+  RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+  exit=0
+
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+  records=97 canonical=64 hash_ok=97 field_ok=97
+  schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+  canonical chain links resolved=58 offenders=2
+    CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+    CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+  superseded-generation links (informational)=21
+  canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 6
+    ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+    ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+    ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+    ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+    ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+    ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+  evidence dangling=0 untracked=0
+  working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+  exit=0
+
+EDITING THE MANIFEST WITHOUT TOUCHING ITS LAYOUT
+  committed change to docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-superseded.json: 1 file changed, 20 insertions(+), 4 deletions(-)
+  the same file re-serialised with sorted keys and no content change at all: 406 of its 408 lines differ.
+  The manifest is hand-maintained and its field order is X04's; canonical sorted-key serialisation is the
+  discipline the handoff RECORDS observe because handoffHash hashes it. Re-serialising the manifest turns a
+  reviewable 20-line declaration into a whole-file diff, which is how the first attempt at this commit
+  measured 465 changed lines for a one-entry change. Layout preserved, the unit fits its own ceiling.
+
+The record X08/out is byte-unchanged: 733e4486 docs(bootstrap): X08 handoff evidence tree
