@@ -84,7 +84,17 @@ const REVIEW_RESULT = {
 async function withProbe(
   replies: Reply[],
   body: (executor: PiWorkerExecutor, cwd: string, bodies: string[]) => Promise<void>,
+  opts?: { resilience?: "on" },
 ) {
+  // The resilient layer is opt-in: PI_INFERENCE_RESILIENCE_ENABLED defaults to off (X06 141ca5db),
+  // and PiWorkerExecutor arms it from the ambient environment, so a scenario that asserts the layer
+  // is armed has to say so. Arming here does not loosen the default-off semantics -- those are
+  // asserted where they belong, in test/unit/resilience-default-off.test.ts. Only the scenario that
+  // needs the armed path asks for it, so the other scenarios in this file keep driving the unarmed
+  // production default.
+  const armed = opts?.resilience === "on";
+  const previousEnv = process.env.PI_INFERENCE_RESILIENCE_ENABLED;
+  if (armed) process.env.PI_INFERENCE_RESILIENCE_ENABLED = "1";
   const requests: number[] = [];
   const bodies: string[] = [];
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -127,6 +137,10 @@ async function withProbe(
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });
+    if (armed) {
+      if (previousEnv === undefined) delete process.env.PI_INFERENCE_RESILIENCE_ENABLED;
+      else process.env.PI_INFERENCE_RESILIENCE_ENABLED = previousEnv;
+    }
   }
   return requests.length;
 }
@@ -314,6 +328,7 @@ test("worker: resume triggers through the armed resilient stream layer (producti
       assert.equal(readFileSync(join(cwd, "side-effect.txt"), "utf8"), "marker-123\n");
       assertResumedHistory(bodies[2]!);
     },
+    { resilience: "on" },
   );
   assert.equal(requests, 3);
 });
