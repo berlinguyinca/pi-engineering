@@ -2179,8 +2179,8 @@ writes — the orchestration event log, the session-control descriptors, the Tas
 and neither can advance state.
 
 ```sh
-pi-engineering runtime-ops status   [--store <dir|file>] [--window-minutes N] [--json]
-pi-engineering runtime-ops health   [--store <dir|file>] [--json]
+pi-engineering runtime-ops status   [--store <dir|file>] [--registry <file>] [--window-minutes N] [--json]
+pi-engineering runtime-ops health   [--store <dir|file>] [--registry <file>] [--json]
 pi-engineering runtime-ops missions [--store <dir|file>] [--json]
 pi-engineering runtime-ops tasks    [--mission <ID>] [--status S]... [--limit N] [--json]
 pi-engineering runtime-ops task  <TASK-ID> [--at-ref HEAD|worktree] [--json]
@@ -2194,18 +2194,32 @@ which rule won, and `health` prints the answer for every durable source. A confi
 reported as a problem and defaults are used — status must still work when something is broken, because that is
 why it is being run. `stateRoot` defaults to the machine-local runtime state (`resolveStateRoot()`, normally
 `~/.local/state/pi-engineering`); the orchestration store is discovered under `<stateRoot>/control-plane` and
-`<repo>/.pi-eng` unless the config or `--store` names one.
+`<repo>/.pi-eng` unless the config or `--store` names one. Leases come from `registryFile`, which defaults to
+`resolveRegistryLocation(stateRoot)` — `<stateRoot>/registry.db`, or the relocated machine-local path when the
+state root is on a network filesystem — and can be overridden by config or `--registry`.
+
+**Read-only means read-only.** The store opens through `JsonlEventStore.openReadOnly` and the registry through
+`RuntimeRegistry.openReadOnly`. The registry path deliberately does not use node:sqlite's `openReadOnly: true`
+flag: measured on Node 26.3.0, a connection opened with it still executes `INSERT` and `UPDATE`, and pointing
+it at a path that does not exist **creates** a zero-byte file there. So `openDatabaseReadOnly()` enforces
+`PRAGMA query_only = ON` (which does fail writes), refuses a path that does not already exist, and creates no
+directories — a status command with a mistyped path leaves nothing behind, and cannot mutate coordination state
+while a worker holds the write lock.
 
 **What each endpoint promises.**
 
 - `health` — can each durable source actually be read. A store that does not exist *because nothing has run
   here* is `ok` with that explanation; a store that is configured and unreadable is a `FAIL`. Exit 3 means the
   store could not be opened, exit 1 a check failed, exit 0 healthy.
-- `status` / `missions` — session liveness from the session-control descriptors, missions by status, blocking
-  reason for each non-terminal mission, and orchestration events inside `--window-minutes` (default 15). A
-  heartbeat older than `staleAfterMs` (default 5 minutes) is reported `stale`, never alive; a session with a
-  fresh heartbeat whose pid is gone is printed with `pidAlive=false`, because that contradiction is the thing
-  worth looking at. Counts cover every registered session; only the printed list is bounded.
+- `status` / `missions` — session liveness from the session-control descriptors, **lease state** from the
+  coordination registry, missions by status, blocking reason for each non-terminal mission, and orchestration
+  events inside `--window-minutes` (default 15). A heartbeat older than `staleAfterMs` (default 5 minutes) is
+  reported `stale`, never alive; a session with a fresh heartbeat whose pid is gone is printed with
+  `pidAlive=false`, because that contradiction is the thing worth looking at. Counts cover every registered
+  session; only the printed list is bounded. A lease is reported with `assessProcess`'s verdict on its holder,
+  and a lease taken on another host is `holder=unknown (remote_host)` — this machine cannot see that process,
+  and "we cannot see it" is not "it is gone". Exit 1 covers an expired lease whose holder still exists: a
+  process that is alive and not renewing what it holds.
 - `tasks` — the task list with dependencies, attempt/max-attempt, artifact counts and timestamps, filtered by
   mission and status.
 - `task <ID>` — one task: its mission's acceptance criteria, the artifacts it declared and which of them are

@@ -156,3 +156,79 @@ test("the CLI answers status and task, and its exit code means what it says", as
   assert.equal(await runRuntimeOpsCli(["nonsense"], env, io), 2);
   assert.match(err, /unknown runtime-ops verb nonsense/u);
 });
+
+// --- leases (coordination registry) ---------------------------------------------------------------
+import { RuntimeRegistry } from "../../src/runtime/isolation/RuntimeRegistry.ts";
+import { currentProcessIdentity } from "../../src/runtime/isolation/processIdentity.ts";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { hostname } from "node:os";
+
+/** A pid that existed and is gone — the repo's proven way to get a dead incarnation. */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
+  return Number(child.stdout);
+}
+
+function leasesView(stateRoot: string): RuntimeOpsView {
+  return RuntimeOpsView.open(resolveRuntimeOpsConfig({ repoRoot: root, env: { PI_ENGINEERING_STATE_DIR: stateRoot }, configPath: join(root, "ops.json"), cwd: root }));
+}
+
+test("leases are read from the coordination registry and say who holds them", async () => {
+  const stateRoot = mkdtempSync(join(tmpdir(), "pi-runtime-ops-leases-"));
+  const registry = RuntimeRegistry.open(join(stateRoot, "registry.db"));
+  try {
+    registry.leases.acquire("worktree:live", { sessionId: "s-live", process: currentProcessIdentity() }, 60_000);
+    registry.leases.acquire(
+      "worktree:expired",
+      { sessionId: "s-dead", process: { ...currentProcessIdentity(), pid: deadPid(), processStartTime: null } },
+      -1_000,
+    );
+    registry.leases.acquire(
+      "worktree:remote",
+      { sessionId: "s-remote", process: { ...currentProcessIdentity(), pid: 4242, host: "not-this-host", bootId: null, processStartTime: null } },
+      60_000,
+    );
+  } finally {
+    registry.close();
+  }
+
+  const report = await leasesView(stateRoot).runtimeStatus({});
+  assert.equal(report.leases.available, true, report.leases.available ? "" : report.leases.reason);
+  if (!report.leases.available) return;
+  assert.equal(report.leases.data.total, 3);
+  assert.equal(report.leases.data.expired, 1);
+  assert.equal(report.leases.data.held, 2);
+  assert.equal(report.leases.data.foreignHosts, 1);
+  const byResource = new Map(report.leases.data.items.map((lease) => [lease.resourceId, lease]));
+  assert.equal(byResource.get("worktree:live")?.holder, "alive");
+  assert.equal(byResource.get("worktree:live")?.expired, false);
+  assert.ok((byResource.get("worktree:live")?.ttlMs ?? 0) > 0);
+  assert.equal(byResource.get("worktree:expired")?.holder, "dead");
+  assert.equal(byResource.get("worktree:expired")?.expired, true);
+  // A lease taken on another host is never called dead: this host cannot see that process.
+  assert.equal(byResource.get("worktree:remote")?.holder, "unknown");
+  assert.equal(byResource.get("worktree:remote")?.holderReason, "remote_host");
+
+  const health = await leasesView(stateRoot).health();
+  const check = health.checks.find((entry) => entry.name === "registryReadable");
+  assert.equal(check?.ok, true);
+  assert.match(check?.detail ?? "", /3 lease\(s\), 1 past expiry/u);
+});
+
+test("a registry that does not exist is a reason, and a mistyped path never creates one", async () => {
+  const missing = join(root, "nope", "registry.db");
+  const resolution = resolveRuntimeOpsConfig({ repoRoot: root, env: {}, configPath: join(root, "ops.json"), cwd: root });
+  const view = RuntimeOpsView.open({ ...resolution, config: { ...resolution.config, registryFile: missing } });
+  const report = await view.runtimeStatus({});
+  assert.equal(report.leases.available, false);
+  if (report.leases.available) return;
+  assert.match(report.leases.reason, /no coordination registry at/u);
+  assert.equal(report.registryFile, missing);
+  // The trap this guards: opening a SQLite path read-write, or with node:sqlite's
+  // `openReadOnly` flag, creates the file. A status command must leave no trace.
+  assert.equal(existsSync(missing), false);
+  assert.equal(existsSync(join(root, "nope")), false);
+  const health = await view.health();
+  assert.equal(health.checks.find((entry) => entry.name === "registryReadable")?.ok, true, "nothing has run here is a known state");
+});

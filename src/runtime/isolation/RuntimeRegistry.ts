@@ -11,7 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { LeaseManager } from "./LeaseManager.ts";
 import { type ProcessIdentity, type ProcessLiveness, assessProcess } from "./processIdentity.ts";
-import { type Database, immediate, openDatabase } from "./sqlite.ts";
+import { type Database, immediate, openDatabase, openDatabaseReadOnly } from "./sqlite.ts";
 
 export type SessionState =
   | "starting"
@@ -161,6 +161,33 @@ export class RuntimeRegistry {
         db.exec(SCHEMA);
         db.prepare("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
       });
+      return new RuntimeRegistry(file, db, options);
+    } catch (error) {
+      db.close();
+      throw error;
+    }
+  }
+
+  /**
+   * Open an existing registry without touching it: no schema, no mkdir, no file
+   * creation (see `openDatabaseReadOnly` for why `openReadOnly: true` is not that
+   * guarantee). Read paths are safe on the result — `leases.list()` and the
+   * session lookups — and every mutator fails with ERR_SQLITE_ERROR from
+   * `PRAGMA query_only = ON`, which is the point: status and health must be
+   * runnable while a worker holds the write lock, and a mistyped path must not
+   * leave an empty registry behind.
+   */
+  static openReadOnly(file: string, options: RuntimeRegistryOptions = {}): RuntimeRegistry {
+    const db = openDatabaseReadOnly(file);
+    try {
+      const tables = new Set(
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Record<string, unknown>[]).map(
+          (row) => String(row.name),
+        ),
+      );
+      for (const table of ["sessions", "leases"]) {
+        if (!tables.has(table)) throw new Error(`registry at ${file} has no ${table} table (not an initialised registry)`);
+      }
       return new RuntimeRegistry(file, db, options);
     } catch (error) {
       db.close();
