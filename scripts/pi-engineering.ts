@@ -26,6 +26,8 @@ import { blackholeTelemetry, formatBlackholeTelemetry } from "../src/blackhole/t
 import { listSafeGitPins, resetSafeGitPins } from "../src/git/safeGit.ts";
 import { runGithubSyncCli } from "../src/github/syncCli.ts";
 import { Ledger } from "../src/ledger/Ledger.ts";
+import { runRuntimeOpsCli } from "../src/lifecycle/runtimeOpsCli.ts";
+import { runTaskWorkflowCli } from "../src/lifecycle/taskWorkflowCli.ts";
 import { runExternalEntry } from "../src/orchestration/externalEntry.ts";
 import { runMissionsCommand } from "../src/orchestration/missionCancelCli.ts";
 import { runStandalonePlan } from "../src/orchestration/standaloneEntry.ts";
@@ -70,6 +72,11 @@ async function main(): Promise<number> {
   const rest = args.slice(1);
   if (cmd === "sessions") return runSessionsCommand(rest);
   if (cmd === "missions") return runMissionsCommand(rest);
+  // Read-only operational queries. `runtime-ops` never advances state; `task` materializes plans and
+  // verifies handoff trails. Both exist so "what is running / did it finish cleanly" is one command
+  // whose exit code means something, instead of a human reading a dashboard.
+  if (cmd === "runtime-ops") return runRuntimeOpsCli(rest, process.env, { cwd: process.cwd(), repoRoot: REPO_ROOT });
+  if (cmd === "task") return runTaskWorkflowCli(rest, { cwd: process.cwd(), repoRoot: REPO_ROOT });
   if (cmd === "mission") return runExternalEntry(rest, await readStdin(), process.env);
   if (cmd === "plan") return runStandalonePlan(rest, await readStdin(), process.env);
   if (cmd === "herdr") return runHerdrExternalCli(rest, process.env, readStdin);
@@ -91,7 +98,7 @@ async function main(): Promise<number> {
   }
   if (cmd !== "roadmap") {
     console.error(
-      "usage: pi-engineering <plan --store <dir>|github sync --store <dir>|doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions why|missions cancel|blackhole ...|benchmark|cav status|...> [flags]",
+      "usage: pi-engineering <plan --store <dir>|github sync --store <dir>|doctor [--repair] [--json]|roadmap check|roadmap status|missions list|missions why|missions cancel|runtime-ops status|runtime-ops tasks|runtime-ops task <ID>|task materialize|task handoff-check|blackhole ...|benchmark|cav status|...> [flags]",
     );
     return 2;
   }

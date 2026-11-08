@@ -1,0 +1,10 @@
+{
+  "specsDir": "docs/specs",
+  "staleAfterMs": 300000,
+  "limits": {
+    "missions": 200,
+    "tasks": 200,
+    "activityEvents": 200,
+    "textChars": 240
+  }
+}
