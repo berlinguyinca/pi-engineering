@@ -7,13 +7,14 @@
  *   <state>/worktrees/<worktree-id>/transcripts/<mission>/<execution>.jsonl
  *
  * Records carry role, tool calls/results (truncated), per-turn stop reason,
- * tokens, model and timestamps. Secrets are redacted; the file is size-capped
+ * tokens, model, the tools offered and a sha256 of the system prompt sent, and timestamps. Secrets are redacted; the file is size-capped
  * and rotated to `<file>.<timestamp>.<n>` (earlier generations are never overwritten or deleted).
  *
  *   PI_WORKER_TRANSCRIPTS=on|off          (default on)
  *   PI_WORKER_TRANSCRIPT_MAX_BYTES        (default 5 MiB per file)
  *   PI_WORKER_TRANSCRIPT_TOOL_CHARS       (default 4000 chars per tool arg/result)
  */
+import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { rotateIfOver } from "../runtime/rotateFile.ts";
@@ -25,6 +26,23 @@ const DEFAULT_TOOL_CHARS = 4000;
 export function transcriptsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env.PI_WORKER_TRANSCRIPTS?.trim().toLowerCase();
   return !(raw === "off" || raw === "0" || raw === "false");
+}
+
+/**
+ * What a turn exposed to the model, for attributing behaviour to harness
+ * exposure: the tool NAMES offered (sorted) and the sha256 hex of the system
+ * prompt. A content hash only; the prompt text and tool schemas are never logged.
+ */
+export interface TurnExposure {
+  offeredTools: string[];
+  systemPromptSha256: string;
+}
+
+export function turnExposure(systemPrompt: string, toolNames: readonly string[]): TurnExposure {
+  return {
+    offeredTools: [...toolNames].sort(),
+    systemPromptSha256: createHash("sha256").update(systemPrompt, "utf8").digest("hex"),
+  };
 }
 
 function envInt(name: string, fallback: number): number {
