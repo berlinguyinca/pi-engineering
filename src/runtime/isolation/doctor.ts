@@ -176,6 +176,26 @@ export async function runDoctor(options: {
           : "0",
       repairable: stale.length,
     });
+    // Sessions a heartbeat gap alone cannot classify — live processes on hosts without an
+    // incarnation proof. Not a fault, and deliberately not in the stale list (they are not
+    // dead), but not invisible either: their leases expire and can be taken, which is what
+    // an operator should know before wondering why two sessions hold the same worktree.
+    const unverified = sessions.filter((session) => {
+      const assessment = registry!.assess(session);
+      return (
+        assessment.verdict === "uncertain" ||
+        (assessment.verdict === "live" && assessment.liveness.reason !== "incarnation_matches")
+      );
+    });
+    checks.push({
+      name: "Unverified sessions",
+      status: "info",
+      detail:
+        unverified.length > 0
+          ? `${unverified.length} (${unverified.map((session) => `${session.sessionId.slice(0, 8)} pid ${session.pid}`).join(", ")}) — the pid is live but its identity cannot be verified here; nothing reclaims it, custody falls to lease expiry`
+          : "0",
+      repairable: 0,
+    });
     const leases = registry.leases.list();
     checks.push({ name: "Leases", status: "info", detail: String(leases.length), repairable: 0 });
   }
