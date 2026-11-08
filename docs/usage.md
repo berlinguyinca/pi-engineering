@@ -2170,3 +2170,73 @@ cause `vision_delegate`; and back, id `vision-<requestId>-back`, cause `vision_r
 carries the outcome (`vision`, `vision_partial`, `vision_failed`, `vision_timeout`), and both carry the text
 and vision model. No image count is carried. The events reach herdr only when the `herdr:` block of the global
 `engineering.yaml` sets `lineage: true` (see "Herdr connection" above); without it nothing is sent.
+
+## Runtime operations and task workflow
+
+Two read surfaces answer the questions that do not involve changing anything: *is what I started still
+alive*, and *did the thing that finished leave its proof*. Both read the durable stores the runtime already
+writes — the orchestration event log, the session-control descriptors, the Task Contract, the handoff trail —
+and neither can advance state.
+
+```sh
+pi-engineering runtime-ops status   [--store <dir|file>] [--window-minutes N] [--json]
+pi-engineering runtime-ops health   [--store <dir|file>] [--json]
+pi-engineering runtime-ops missions [--store <dir|file>] [--json]
+pi-engineering runtime-ops tasks    [--mission <ID>] [--status S]... [--limit N] [--json]
+pi-engineering runtime-ops task  <TASK-ID> [--at-ref HEAD|worktree] [--json]
+pi-engineering task materialize   (--plan <file> | --trail <dir> | --specs-dir <dir>) [--template <contract.json>] [--write-dir <dir>]
+pi-engineering task handoff-check --trail <dir> [--rev <ref>] [--no-committed] [--no-live]
+```
+
+**Config.** `runtime-ops` resolves its config in this order: `--config <file>`,
+`$PI_ENGINEERING_RUNTIME_OPS`, `<repo>/config/runtime-ops.json`, then defaults. `runtime-ops config` prints
+which rule won, and `health` prints the answer for every durable source. A config file that does not parse is
+reported as a problem and defaults are used — status must still work when something is broken, because that is
+why it is being run. `stateRoot` defaults to the machine-local runtime state (`resolveStateRoot()`, normally
+`~/.local/state/pi-engineering`); the orchestration store is discovered under `<stateRoot>/control-plane` and
+`<repo>/.pi-eng` unless the config or `--store` names one.
+
+**What each endpoint promises.**
+
+- `health` — can each durable source actually be read. A store that does not exist *because nothing has run
+  here* is `ok` with that explanation; a store that is configured and unreadable is a `FAIL`. Exit 3 means the
+  store could not be opened, exit 1 a check failed, exit 0 healthy.
+- `status` / `missions` — session liveness from the session-control descriptors, missions by status, blocking
+  reason for each non-terminal mission, and orchestration events inside `--window-minutes` (default 15). A
+  heartbeat older than `staleAfterMs` (default 5 minutes) is reported `stale`, never alive; a session with a
+  fresh heartbeat whose pid is gone is printed with `pidAlive=false`, because that contradiction is the thing
+  worth looking at. Counts cover every registered session; only the printed list is bounded.
+- `tasks` — the task list with dependencies, attempt/max-attempt, artifact counts and timestamps, filtered by
+  mission and status.
+- `task <ID>` — one task: its mission's acceptance criteria, the artifacts it declared and which of them are
+  absent from disk, and **citation drift** — every `docs/specs` document the task declares in its
+  `artifacts` or `deliverables` is re-resolved with the ledger's citation checker, against `HEAD` by default
+  (`--at-ref worktree` for uncommitted edits). A task that declares no document is reported
+  `not_applicable` with a reason: nothing was checked, which is not the same as clean. Unresolved citations
+  exit 1.
+
+Unknown task ids are answered with the near matches, and a section with no data says why instead of printing
+an empty list.
+
+**Materialize** turns plan prose (`## Task T7: …` plus `Depends on:`) and/or a trail's
+`manifests/tasks.json` into one checked task list: duplicate ids with every source line, dependencies on ids
+nobody defined, cycles as concrete paths (`T4 -> T5 -> T4`), and — when a template is supplied, via
+`--template` or the trail's `templates/task-contract.json` — a Task Contract draft per task, validated by
+`parseContract` and printed with its authorization hash. The manifest wins over prose, because the trail
+verifier already takes record order from the manifest and never from the records. Nothing is written unless
+`--write-dir` is passed, and then only *validated* contracts: a contract file is authorization, so a draft that
+would not validate is never handed to a worker.
+
+**Handoff-check** runs the bootstrapping audit's own verifier (`src/bootstrap/trailVerifier.ts`) over any
+trail: exactly one canonical record per planned task, schema-valid against the trail's
+`templates/handoff.schema.json`, its stamped `handoffHash` equal to the recomputed canonical hash, every
+declared artifact present on disk and committed at `--rev` (default HEAD), and no process the run started still
+alive. Generation handling is the verifier's: the newest ranked generation is canonical, older generations are
+reported as superseded, and a generation directory the reader cannot rank is surfaced in
+`unreadGenerations` and flips the verdict — a new directory is never verified past quietly. On the
+`harness-reliability-bootstrap-20261103` trail it reports the same 31 issues as
+`scripts/verify-handoff-trail.ts`, because it is the same code with the same inputs.
+
+**Retry, resume, cancel and re-run are deliberately absent here.** They live on `pi-engineering missions`
+(`list` / `why` / `cancel`), where the authority checks for changing state already exist; a status surface that
+could also act would need its own authorization story and would give the same operation two front doors.
