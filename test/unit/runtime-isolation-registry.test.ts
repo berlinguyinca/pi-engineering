@@ -5,7 +5,8 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -33,6 +34,47 @@ function register(registry: RuntimeRegistry, sessionId: string, identity: Proces
 }
 
 describe("RuntimeRegistry", () => {
+  it("opens read-only in a way that actually blocks writes and never creates a file", async () => {
+    const file = await registryFile();
+    const writer = RuntimeRegistry.open(file);
+    try {
+      register(writer, "s-ro");
+      writer.leases.acquire("worktree:ro", { sessionId: "s-ro", process: currentProcessIdentity() }, 60_000);
+    } finally {
+      writer.close();
+    }
+
+    const reader = RuntimeRegistry.openReadOnly(file);
+    try {
+      assert.equal(reader.leases.list().length, 1, "reads work while no writer holds the lock");
+      // node:sqlite's openReadOnly flag does not block writes on Node 26; query_only does.
+      assert.throws(() => reader.db.exec("DELETE FROM leases"), /readonly|query only|error/iu);
+      assert.throws(
+        () => reader.leases.acquire("worktree:other", { sessionId: "s-ro", process: currentProcessIdentity() }, 60_000),
+        /readonly|query only|error/iu,
+      );
+      assert.equal(reader.leases.list().length, 1, "the failed writes wrote nothing");
+    } finally {
+      reader.close();
+    }
+
+    // A path that does not exist is an error, and must not be created — neither the
+    // file nor its directory — because a status command with a mistyped path has no
+    // business leaving a registry behind.
+    const dir = await mkdtemp(join(tmpdir(), "pi-eng-registry-missing-"));
+    const missing = join(dir, "absent", "registry.db");
+    await assert.rejects(async () => RuntimeRegistry.openReadOnly(missing), /never creates one|no database at/iu);
+    assert.equal(existsSync(missing), false);
+    assert.equal(existsSync(join(dir, "absent")), false);
+
+    // A database that exists but is not a pi-engineering registry says so.
+    const partial = await registryFile();
+    const maker = RuntimeRegistry.open(partial);
+    maker.db.exec("DROP TABLE leases");
+    maker.close();
+    assert.throws(() => RuntimeRegistry.openReadOnly(partial), /no leases table/iu);
+  });
+
   it("uses WAL and issues a fresh generation on every registration", async () => {
     const registry = RuntimeRegistry.open(await registryFile());
     try {

@@ -13,7 +13,7 @@
  * Callers treat that like any coordination outage (degrade, report the
  * contention) and retry on their next heartbeat, tick or claim.
  */
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
@@ -79,6 +79,36 @@ export function openDatabase(path: string, options: OpenDatabaseOptions = {}): D
     const mode = options.journalMode ?? "WAL";
     db.exec(`PRAGMA journal_mode = ${mode}`);
     db.exec("PRAGMA synchronous = NORMAL");
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+/**
+ * Open a database for reading only, in a way that actually holds.
+ *
+ * `openReadOnly: true` is NOT that guarantee. Measured on Node 26.3.0: a
+ * connection opened with it still executes `INSERT` and `UPDATE`, and pointing it
+ * at a path that does not exist CREATES a zero-byte file there. A status tool
+ * that trusted the flag would therefore believe it cannot mutate coordination
+ * state while it silently can — and would leave an empty registry behind after a
+ * mistyped path. The guarantee here is `PRAGMA query_only = ON` (verified to fail
+ * writes with ERR_SQLITE_ERROR) plus refusing to open a path that does not
+ * already exist and never creating directories.
+ *
+ * Reading a WAL database may still create its `-shm`/`-wal` sidecar files: that
+ * is how SQLite reads WAL, not a write to the database.
+ */
+export function openDatabaseReadOnly(path: string, options: { busyTimeoutMs?: number } = {}): Database {
+  if (!existsSync(path)) throw new Error(`no database at ${path}; a read-only open never creates one`);
+  const busy = Math.min(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS, MAX_SYNC_BLOCK_MS);
+  const DatabaseSync = sqliteConstructor();
+  const db = new DatabaseSync(path, { timeout: busy });
+  try {
+    db.exec(`PRAGMA busy_timeout = ${busy}`);
+    db.exec("PRAGMA query_only = ON");
     return db;
   } catch (error) {
     db.close();

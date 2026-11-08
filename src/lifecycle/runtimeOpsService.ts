@@ -28,13 +28,17 @@
  *    mission with no heartbeat record is `unknown`, not "fine". Absence of evidence is printed as absence.
  */
 import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { hostname } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { version as nodeVersion } from "node:process";
 import { citationSummary, fileSystemReader, gitObjectReader, resolveCitations, type CitationReport } from "../ledger/citations.ts";
 import { JsonlEventStore } from "../platform/eventstore/jsonl.ts";
 import { MissionStore } from "../orchestration/missionStore.ts";
 import type { Mission, OrchestrationTask, TaskStatus } from "../orchestration/types.ts";
-import { resolveStateRoot } from "../runtime/isolation/stateDir.ts";
+import { resolveRegistryLocation, resolveStateRoot } from "../runtime/isolation/stateDir.ts";
+import { RuntimeRegistry } from "../runtime/isolation/RuntimeRegistry.ts";
+import type { LeaseRecord } from "../runtime/isolation/LeaseManager.ts";
+import { assessProcess } from "../runtime/isolation/processIdentity.ts";
 import { discoverSessions } from "../sessionControl/SessionControl.ts";
 
 /** Where the operator's config lives, in precedence order. */
@@ -47,6 +51,13 @@ export interface RuntimeOpsConfig {
   stateRoot: string;
   /** Orchestration store: a directory containing `orchestration.jsonl`, or that file. */
   orchestrationStore: string | null;
+  /**
+   * Coordination registry (`<stateRoot>/registry.db`) holding session records and
+   * leases. Null means "wherever the runtime puts it": `resolveRegistryLocation()`
+   * answers that, including the relocation off network filesystems, so the usual
+   * answer is not to name one.
+   */
+  registryFile: string | null;
   /** Document tree whose citations are checked for tasks that changed it. */
   specsDir: string;
   /** A heartbeat older than this is reported stale rather than alive. */
@@ -123,12 +134,36 @@ export interface SessionSummary {
   processAlive: boolean;
 }
 
+/**
+ * One lease from the coordination registry. `holder` is `assessProcess`'s verdict
+ * about the pid that took it, and it stays `unknown` for a lease taken on another
+ * host — this host cannot see that process, and "we cannot see it" is not "it is
+ * gone". `expired && holder === "alive"` is the contradiction worth looking at:
+ * a process that still exists and is not renewing the thing it holds.
+ */
+export interface LeaseSummary {
+  resourceId: string;
+  sessionId: string;
+  pid: number;
+  host: string;
+  acquiredAt: string;
+  heartbeatAt: string;
+  expiresAt: string;
+  expired: boolean;
+  /** Milliseconds until `expiresAt`; negative once expired. */
+  ttlMs: number;
+  holder: "alive" | "dead" | "unknown";
+  holderReason: string;
+}
+
 export interface RuntimeStatusReport {
   checkedAt: string;
   staleAfterMs: number;
   node: string;
   stateRoot: Section<{ path: string; namespaces: { name: string; modifiedAt: string }[] }>;
   sessions: Section<{ total: number; fresh: number; stale: number; unknown: number; items: SessionSummary[] }>;
+  registryFile: string;
+  leases: Section<{ total: number; held: number; expired: number; foreignHosts: number; items: LeaseSummary[] }>;
   missions: Section<{ total: number; byStatus: Record<string, number>; active: MissionSummary[] }>;
   activity: Section<{ windowMs: number; events: ActivityEvent[]; newest: string | null }>;
 }
@@ -241,6 +276,7 @@ export function resolveRuntimeOpsConfig(options: {
       repoRoot,
       stateRoot: resolve(cwd, stateRoot),
       orchestrationStore: store,
+      registryFile: typeof raw.registryFile === "string" && raw.registryFile.trim() !== "" ? resolve(cwd, raw.registryFile) : null,
       specsDir: resolve(cwd, str(raw.specsDir, "docs/specs")),
       staleAfterMs: typeof raw.staleAfterMs === "number" && raw.staleAfterMs > 0 ? raw.staleAfterMs : 5 * 60_000,
       limits: { ...DEFAULT_LIMITS, ...(typeof raw.limits === "object" && raw.limits !== null ? (raw.limits as Partial<typeof DEFAULT_LIMITS>) : {}) },
@@ -446,6 +482,27 @@ export class RuntimeOpsView {
     return this.cached;
   }
 
+  /**
+   * Read the coordination registry without touching it (`RuntimeRegistry.openReadOnly`:
+   * no schema, no mkdir, `PRAGMA query_only = ON`). The reason is returned rather
+   * than thrown, and `absent` separates "no registry because nothing has run here"
+   * from a registry that exists and will not read.
+   */
+  private readLeases(): { registryFile: string; leases: LeaseRecord[] } | { registryFile: string; reason: string; absent: boolean } {
+    const registryFile = this.config.registryFile ?? resolveRegistryLocation(this.config.stateRoot).file;
+    try {
+      const registry = RuntimeRegistry.openReadOnly(registryFile);
+      try {
+        return { registryFile, leases: registry.leases.list() };
+      } finally {
+        registry.close();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { registryFile, reason: message, absent: /no database at/u.test(message) };
+    }
+  }
+
   async health(): Promise<HealthReport> {
     const checks: HealthCheck[] = [];
     const push = (name: string, ok: boolean, detail: string): void => {
@@ -468,6 +525,16 @@ export class RuntimeOpsView {
     push("orchestrationStore", file !== null || storeAbsent, file ?? (storeAbsent ? reason : reason));
     const opened = file !== null ? await this.store() : { reason };
     push("orchestrationReadable", storeAbsent || !("reason" in opened), storeAbsent ? "no store yet — nothing has run here, which is a known state, not a failure" : "reason" in opened ? opened.reason : `read-only open succeeded (a live writer lock does not block status)`);
+    const registry = this.readLeases();
+    push(
+      "registryReadable",
+      "leases" in registry || registry.absent,
+      "leases" in registry
+        ? `${registry.registryFile}: ${registry.leases.length} lease(s), ${registry.leases.filter((lease) => Date.now() > lease.expiresAtMs).length} past expiry`
+        : registry.absent
+          ? `no registry at ${registry.registryFile} — nothing has run here, which is a known state, not a failure`
+          : registry.reason,
+    );
     push("specsDir", existsSync(this.config.specsDir), this.config.specsDir);
     push("gitRef", true, `citation checks resolve against HEAD unless --at-ref worktree is passed (node ${nodeVersion})`);
     for (const problem of this.configProblems) push("configProblem", false, problem);
@@ -567,12 +634,59 @@ export class RuntimeOpsView {
         ? { available: false, reason: opened.reason }
         : { available: true, data: { windowMs, events: recent, newest: events.map((event) => event.timestamp).sort().at(-1) ?? null } };
 
+    // Leases come from the coordination registry, opened read-only: status must work
+    // while a worker holds the write lock, and a mistyped path must not create a registry.
+    const registry = this.readLeases();
+    const registryFile = registry.registryFile;
+    let leasesSection: RuntimeStatusReport["leases"];
+    if ("leases" in registry) {
+      const local = hostname();
+      const all = registry.leases.map((lease) => {
+        const liveness = assessProcess({
+          pid: lease.pid,
+          host: lease.host,
+          bootId: lease.bootId,
+          processStartTime: lease.processStartTime,
+        });
+        return {
+          resourceId: lease.resourceId,
+          sessionId: lease.sessionId,
+          pid: lease.pid,
+          host: lease.host,
+          acquiredAt: new Date(lease.acquiredAtMs).toISOString(),
+          heartbeatAt: new Date(lease.heartbeatAtMs).toISOString(),
+          expiresAt: new Date(lease.expiresAtMs).toISOString(),
+          expired: now > lease.expiresAtMs,
+          ttlMs: lease.expiresAtMs - now,
+          holder: liveness.state,
+          holderReason: liveness.reason,
+        };
+      });
+      leasesSection = {
+        available: true,
+        data: {
+          total: all.length,
+          held: all.filter((lease) => !lease.expired).length,
+          expired: all.filter((lease) => lease.expired).length,
+          foreignHosts: all.filter((lease) => lease.host !== local).length,
+          items: all.slice(0, 50),
+        },
+      };
+    } else {
+      leasesSection = {
+        available: false,
+        reason: registry.absent ? `no coordination registry at ${registryFile} — nothing has run here` : `coordination registry at ${registryFile} could not be read: ${registry.reason}`,
+      };
+    }
+
     return {
       checkedAt: new Date(now).toISOString(),
       staleAfterMs: this.config.staleAfterMs,
       node: nodeVersion,
       stateRoot: namespaces.length > 0 ? { available: true, data: { path: this.config.stateRoot, namespaces } } : { available: false, reason: stateRootReason || `${this.config.stateRoot} holds no worktree namespace yet` },
       sessions: sessionsSection,
+      registryFile,
+      leases: leasesSection,
       missions: missionsSection,
       activity: activitySection,
     };

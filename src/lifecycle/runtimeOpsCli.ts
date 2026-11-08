@@ -9,8 +9,9 @@ import { RuntimeOpsView, resolveRuntimeOpsConfig } from "./runtimeOpsService.ts"
 
 const USAGE = `usage: pi-engineering runtime-ops <status|health|missions|tasks|task|config> [flags]
 
-  status    [--store <dir|file>] [--window-minutes N] [--json]   state root, missions by status, recent events
-  health    [--store <dir|file>] [--json]                        can each durable source be read at all
+  status    [--store <dir|file>] [--registry <file>] [--window-minutes N] [--json]
+            state root, session liveness, leases, missions by status, recent events
+  health    [--store <dir|file>] [--registry <file>] [--json]    can each durable source be read at all
   missions  [--store <dir|file>] [--json]                        every mission, its status and blocking reason
   tasks     [--store <dir|file>] [--mission <ID>] [--status S]... [--limit N] [--json]
   task      <TASK-ID> [--store <dir|file>] [--at-ref HEAD|worktree] [--json]
@@ -52,6 +53,7 @@ export async function runRuntimeOpsCli(
   const rest = args.slice(1);
   const json = rest.includes("--json");
   const store = values(rest, "--store")[0] ?? null;
+  const registryArg = values(rest, "--registry")[0] ?? null;
   const configPath = values(rest, "--config")[0] ?? null;
 
   if (typeof verb !== "string" || verb === "" || verb.startsWith("--")) {
@@ -60,8 +62,11 @@ export async function runRuntimeOpsCli(
   }
 
   const resolution = resolveRuntimeOpsConfig({ repoRoot, env, configPath, cwd });
-  // --store is a per-invocation override of the configured store, nothing else.
-  const view = RuntimeOpsView.open(store !== null ? { ...resolution, config: { ...resolution.config, orchestrationStore: store } } : resolution);
+  // --store and --registry are per-invocation overrides of the configured sources, nothing else.
+  const view = RuntimeOpsView.open({
+    ...resolution,
+    config: { ...resolution.config, ...(store !== null ? { orchestrationStore: store } : {}), ...(registryArg !== null ? { registryFile: registryArg } : {}) },
+  });
 
   if (verb === "config") {
     emit(out, json, { source: resolution.source, problems: resolution.problems, config: resolution.config }, () =>
@@ -89,6 +94,7 @@ export async function runRuntimeOpsCli(
       const lines = [`runtime status at ${report.checkedAt} (heartbeat older than ${report.staleAfterMs} ms is reported stale)`, report.stateRoot.available ? `state root ${report.stateRoot.data.path}: ${report.stateRoot.data.namespaces.length} namespace(s)` : `state root: ${report.stateRoot.reason}`];
       if (verb === "status") {
         lines.push(
+          `registry ${report.registryFile}: ${report.leases.available ? `${report.leases.data.total} lease(s) — ${report.leases.data.held} unexpired, ${report.leases.data.expired} past expiry${report.leases.data.foreignHosts > 0 ? `, ${report.leases.data.foreignHosts} on other hosts` : ""}` : report.leases.reason}`,
           report.sessions.available
             ? `sessions: ${report.sessions.data.total} registered — ${report.sessions.data.fresh} fresh, ${report.sessions.data.stale} stale, ${report.sessions.data.unknown} unknown (heartbeat window ${report.staleAfterMs} ms)`
             : `sessions: ${report.sessions.reason}`,
@@ -99,6 +105,11 @@ export async function runRuntimeOpsCli(
             ? `events in the last ${Math.round(report.activity.data.windowMs / 60000)} min: ${report.activity.data.events.length}${report.activity.data.newest !== null ? ` (newest ${report.activity.data.newest})` : ""}`
             : `events: unavailable — ${report.activity.reason}`,
         );
+      }
+      if (verb === "status" && report.leases.available) {
+        for (const lease of report.leases.data.items.slice(0, 8)) {
+          lines.push(`  ${lease.resourceId} session=${lease.sessionId.slice(0, 8)} pid=${lease.pid} holder=${lease.holder} (${lease.holderReason}) ${lease.expired ? `expired ${Math.abs(Math.round(lease.ttlMs / 1000))}s ago` : `${Math.round(lease.ttlMs / 1000)}s left`}`);
+        }
       }
       if (report.sessions.available) {
         for (const session of report.sessions.data.items.slice(0, 10)) {
@@ -117,7 +128,8 @@ export async function runRuntimeOpsCli(
     if (!report.missions.available) return report.missions.reason.includes("no orchestration store") ? 0 : 3;
     if (verb === "status") {
       const staleSessions = report.sessions.available && report.sessions.data.stale > 0;
-      const contradicted = report.sessions.available && report.sessions.data.items.some((session) => session.liveness === "fresh" && !session.processAlive);
+      const contradicted = (report.sessions.available && report.sessions.data.items.some((session) => session.liveness === "fresh" && !session.processAlive))
+        || (report.leases.available && report.leases.data.items.some((lease) => lease.expired && lease.holder === "alive"));
       const staleMissions = report.missions.data.active.some((mission) => Date.parse(mission.updatedAt) < Date.now() - report.staleAfterMs);
       return staleSessions || contradicted || staleMissions ? 1 : 0;
     }
