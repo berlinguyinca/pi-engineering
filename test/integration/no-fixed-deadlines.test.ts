@@ -516,7 +516,13 @@ describe("no fixed mission deadlines: resuming a hung worker", () => {
         git,
         checkpoints: new CheckpointManager({ store }),
         resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
-        inactivityTimeoutMs: 400,
+        // 400ms was not a budget, it was a coin flip: this case needs the abort-checkpoint-resume
+        // round trip to complete, and on this machine that reliably takes longer than 400ms (fails
+        // 400 every run, passes 600). 2000ms is ~3x the observed need. The neighbours keep their
+        // 300/400ms windows on purpose — they assert wall-clock relationships (">= 1_900: ran five
+        // times longer than the window", "< 5_000: caught promptly"), so their window IS the
+        // behaviour under test. This one asserts `calls === 2` and resumed content, not timing.
+        inactivityTimeoutMs: 2_000,
         cancellationAckTimeoutMs: 5_000,
         inferenceWaiting: () => false,
         backends: {
