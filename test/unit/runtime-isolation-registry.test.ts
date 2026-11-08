@@ -6,14 +6,19 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir } from "node:fs/promises";
+import { mkdir, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { LeaseMissionCustody } from "../../src/runtime/isolation/MissionCustody.ts";
 import { RecoveryManager } from "../../src/runtime/isolation/RecoveryManager.ts";
 import { RuntimeRegistry } from "../../src/runtime/isolation/RuntimeRegistry.ts";
-import { type ProcessIdentity, currentProcessIdentity } from "../../src/runtime/isolation/processIdentity.ts";
+import {
+  type ProcessIdentity,
+  currentProcessIdentity,
+  readBootId,
+  readProcessStartTime,
+} from "../../src/runtime/isolation/processIdentity.ts";
 import { journalMode } from "../../src/runtime/isolation/sqlite.ts";
 
 async function registryFile(): Promise<string> {
@@ -137,14 +142,35 @@ describe("RuntimeRegistry", () => {
   it("assesses liveness from process incarnation: dead pid, reused pid (forged start time) and reboot are dead", async () => {
     const registry = RuntimeRegistry.open(await registryFile());
     try {
+      // Whether this host can read an incarnation at all decides which DEATH reason is
+      // provable: `/proc/<pid>/stat` gives the start time that distinguishes "the pid is
+      // gone" from "the pid is a different process". Where it cannot be read (macOS), both
+      // land on pid_not_alive. The safety property — a mismatched or missing incarnation is
+      // dead, never alive — holds on every platform; only the reason name differs.
+      const incarnationReadable = readProcessStartTime(process.pid).state === "present";
       const live = register(registry, "live");
       const gone = register(registry, "gone", forged({ pid: deadPid() }));
       const reused = register(registry, "reused", forged({ processStartTime: "1" }));
       const rebooted = register(registry, "rebooted", forged({ bootId: "00000000-0000-0000-0000-000000000000" }));
+      // A reboot is provable only where a boot id exists. Without one, a record written
+      // before the restart looks like any other live-pid-but-unproven session, and what
+      // unblocks the resource is lease expiry — so the assertion runs where the platform
+      // can actually make the proof, and the rest of this test keeps checking the reasons
+      // that are provable everywhere.
+      const bootIdReadable = readBootId() !== null;
       assert.equal(registry.assess(live).verdict, "live");
       assert.deepEqual(registry.assess(gone), { verdict: "dead", reason: "pid_not_alive" });
-      assert.deepEqual(registry.assess(reused), { verdict: "dead", reason: "pid_reused" });
-      assert.deepEqual(registry.assess(rebooted), { verdict: "dead", reason: "rebooted" });
+      assert.deepEqual(registry.assess(reused), {
+        verdict: "dead",
+        reason: incarnationReadable ? "pid_reused" : "pid_not_alive",
+      });
+      if (bootIdReadable) assert.deepEqual(registry.assess(rebooted), { verdict: "dead", reason: "rebooted" });
+      else
+        assert.equal(
+          registry.assess(rebooted).verdict,
+          "live",
+          "no boot id, no proof — doctor surfaces it as unverified",
+        );
     } finally {
       registry.close();
     }
@@ -156,7 +182,11 @@ describe("RuntimeRegistry", () => {
     try {
       const record = register(registry, "slow");
       now += 60_000;
-      assert.equal(registry.assess(record).verdict, "live");
+      // Where the incarnation is readable, a live process is simply live and the gap is
+      // irrelevant. Where it is not (no /proc), the honest verdict is `uncertain` — still
+      // not `dead`, which is the property this test exists to protect.
+      if (readProcessStartTime(process.pid).state === "present") assert.equal(registry.assess(record).verdict, "live");
+      else assert.deepEqual(registry.assess(record), { verdict: "uncertain", reason: "heartbeat_expired_unverified" });
     } finally {
       registry.close();
     }
@@ -217,8 +247,14 @@ describe("LeaseManager", () => {
       assert.equal(registry.leases.acquire("res", { sessionId: "impostor", process: impostor }).ok, true);
       register(registry, "me");
       const mine = registry.leases.acquire("res", { sessionId: "me", process: currentProcessIdentity() });
-      assert.ok(mine.ok);
-      assert.equal(mine.reclaimed?.reason, "pid_reused");
+      assert.ok(mine.ok, "a holder whose recorded incarnation does not match its live pid is never honored");
+      // The reclaim itself is the safety property; the reason name depends on whether this
+      // host can read an incarnation to prove reuse (Linux) or only that the recorded
+      // identity is unverifiable (no /proc).
+      assert.equal(
+        mine.reclaimed?.reason,
+        readProcessStartTime(process.pid).state === "present" ? "pid_reused" : "pid_not_alive",
+      );
     } finally {
       registry.close();
     }
@@ -231,7 +267,9 @@ describe("LeaseManager", () => {
     try {
       const pid = holder.pid!;
       const start = (await import("../../src/runtime/isolation/processIdentity.ts")).readProcessStartTime(pid);
-      assert.equal(start.state, "present");
+      // On a host without /proc the start time cannot be read, and the holder is then
+      // live-but-unverifiable rather than verifiably live. The lease must be honoured in
+      // both cases, so the assertion below is the one that matters on every platform.
       const identity = forged({ pid, processStartTime: start.state === "present" ? start.value : null });
       register(registry, "other", identity);
       assert.equal(registry.leases.acquire("res", { sessionId: "other", process: identity }).ok, true);
@@ -265,7 +303,7 @@ describe("LeaseManager", () => {
     }
   });
 
-  it("a verifiably live holder keeps exclusive custody after a long heartbeat gap", async () => {
+  it("a heartbeat gap alone never kills a live holder; where the incarnation is provable, custody survives expiry", async () => {
     let now = Date.now();
     const registry = RuntimeRegistry.open(await registryFile(), { now: () => now });
     try {
@@ -273,16 +311,25 @@ describe("LeaseManager", () => {
       const held = registry.leases.acquire("res", { sessionId: "live-owner", process: currentProcessIdentity() });
       assert.ok(held.ok);
       now += 12 * 60 * 60_000;
+      // The gap on its own must not read as death, on any platform.
+      assert.notEqual(registry.assess(registry.get("live-owner")!).verdict, "dead");
       register(registry, "contender");
-      assert.equal(
-        registry.leases.acquire("res", {
-          sessionId: "contender",
-          process: currentProcessIdentity(),
-        }).ok,
-        false,
-      );
-      assert.deepEqual(registry.leases.reapStale(), []);
-      assert.equal(registry.leases.get("res")?.generationId, held.lease.generationId);
+      const challenged = registry.leases.acquire("res", {
+        sessionId: "contender",
+        process: currentProcessIdentity(),
+      });
+      if (readProcessStartTime(process.pid).state === "present") {
+        // With an incarnation proof the holder is identified, not merely alive: nothing
+        // displaces it, not even a lease that timed out while it kept working.
+        assert.equal(challenged.ok, false);
+        assert.deepEqual(registry.leases.reapStale(), []);
+        assert.equal(registry.leases.get("res")?.generationId, held.lease.generationId);
+      } else {
+        // Without one, the lease TTL is what bounds a possibly-recycled pid: it may be
+        // taken, and only ever for being expired — never because the holder "died".
+        assert.equal(challenged.ok, true);
+        assert.equal(challenged.reclaimed?.reason, "lease_expired");
+      }
     } finally {
       registry.close();
     }

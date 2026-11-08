@@ -186,7 +186,8 @@ export class RuntimeRegistry {
         ),
       );
       for (const table of ["sessions", "leases"]) {
-        if (!tables.has(table)) throw new Error(`registry at ${file} has no ${table} table (not an initialised registry)`);
+        if (!tables.has(table))
+          throw new Error(`registry at ${file} has no ${table} table (not an initialised registry)`);
       }
       return new RuntimeRegistry(file, db, options);
     } catch (error) {
@@ -371,16 +372,25 @@ export class RuntimeRegistry {
     });
     if (liveness.state === "dead") return { verdict: "dead", reason: liveness.reason };
     const heartbeatAge = this.now() - record.lastHeartbeatMs;
-    if (liveness.state === "alive" && liveness.reason === "incarnation_matches") return { verdict: "live", liveness };
-    if (heartbeatAge > this.staleAfterMs) {
-      return {
-        verdict: "dead",
-        reason: liveness.state === "alive" ? "heartbeat_expired" : `heartbeat_expired_${liveness.reason}`,
-      };
+    if (liveness.state === "alive") {
+      if (liveness.reason === "incarnation_matches") return { verdict: "live", liveness };
+      // The process is here; whether it is the SAME process is unprovable where there is no
+      // incarnation (`/proc/<pid>/stat` on Linux) and no boot id to compare. A heartbeat gap
+      // then says nothing about liveness, so it must not be reported as DEAD: `dead` frees
+      // the session's leases, lets recovery orphan or restart work that is still running, and
+      // is exactly how two sessions end up in one checkout. Neither may it be called live,
+      // because the same shape — recycled pid, machine rebooted under the record — is also
+      // what a pre-reboot record looks like when this host cannot read a boot id. `uncertain`
+      // is the honest verdict: nobody acts on it, the lease still expires on its own clock
+      // (LeaseManager.displacementReason), and doctor reports it.
+      return heartbeatAge > this.staleAfterMs
+        ? { verdict: "uncertain", reason: "heartbeat_expired_unverified" }
+        : { verdict: "live", liveness };
     }
-    return liveness.state === "alive"
-      ? { verdict: "live", liveness }
-      : { verdict: "uncertain", reason: liveness.reason };
+    // Liveness itself is unprovable (remote host, unreadable identity, EPERM). A heartbeat
+    // gap on top of that is the only available signal, so it still reads as dead here.
+    if (heartbeatAge > this.staleAfterMs) return { verdict: "dead", reason: `heartbeat_expired_${liveness.reason}` };
+    return { verdict: "uncertain", reason: liveness.reason };
   }
 
   /** Is the session currently registered and alive? Unknown sessions are not live. */
