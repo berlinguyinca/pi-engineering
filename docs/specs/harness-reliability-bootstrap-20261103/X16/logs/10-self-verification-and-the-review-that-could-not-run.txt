@@ -1,0 +1,150 @@
+X16 log 10 -- the review that could not run, and what this unit checked of its own work instead
+
+$ codex exec -s read-only --skip-git-repo-check 'probe'   # can the independent reviewer run at all?
+ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 11th, 2026 7:03 AM.
+ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 11th, 2026 7:03 AM.
+
+The adversarial review this trail has had on every PR since X10 cannot be repeated for #653: the account
+behind it reports a usage ceiling until Nov 11th 2026 07:03, and the run exits without reading the tree.
+What follows is this unit checking its own work, in a throwaway copy where probing cannot damage the
+checkout. It is self-verification, not an independent review, and is cited as that everywhere: a fresh
+reviewer should re-run P1-P4 (one script, five scenarios) and re-derive P5's arithmetic by hand.
+
+== P1-P4, the five tamper scenarios, in a throwaway copy
+$ bash X16/fixtures/x16-controls.sh      (exit 0)
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+  UNREAD docs/specs/harness-reliability-bootstrap-20261103/X07/out-chain/X07.handoff.json (a record in a generation directory that does not parse)
+RESULT offenders=2: 73 canonical forward links resolved, 2 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C8 a tracked record that belongs to no scanned unit (SILENT-SKIP guard)
+==================================================================
+renames the unit directory R04 to r04. The unit list is structural (any directory holding a
+generation record), so r04 becomes a unit and R04 stops being one, while git still tracks
+docs/.../R04/out/R04.handoff.json. That mismatch -- tracked record paths belonging to no scanned
+unit -- is what SILENT-SKIP reports. Before X15 the unit list was the name pattern
+^[A-Z]{1,4}-?[0-9]{1,2}$, and five units whose ids end in a letter (FIX-3B, FIX-3B2, FIX-3C,
+FIX-4A, FIX-4B) were skipped by it without a message (X15/logs/01-scanner-skipped-five-units.txt).
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+SILENT-SKIP R04: tracked generation records exist but the directory is not a scanned unit
+units=75 records=231 (in generations=121, in unit directories=41, elsewhere=69) canonical=75 hash_ok=230/230 field_ok=231
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/r04/out/R04.handoff.json names a child but is not tracked in git
+RESULT offenders=3: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=1
+
+$ npx tsx /tmp/x16-old-scanner.mts
+units=75 records=121 canonical=75 hash_ok=121 field_ok=121
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/r04/out/R04.handoff.json names a child but is not tracked in git
+RESULT offenders=3: 74 canonical forward links resolved
+exit=1
+
+==================================================================
+C9 restore: the tree is back to the state that passes
+==================================================================
+units=75 records=230 (in generations=121, in unit directories=41, elsewhere=68) canonical=75 hash_ok=229/229 field_ok=230
+canonical chain links resolved=74 offenders=0
+canonical records no canonical parent names=1 (declared=1 offences=0)
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+probe tree after all cases (nothing should be listed):
+
+removing the throwaway worktree /private/tmp/x16-controls-d5mJR2
+
+removing the throwaway worktree /private/tmp/x16-controls-d5mJR2
+(leave it: git worktree remove --force /private/tmp/x16-controls-d5mJR2)
+
+== P5 the edge this unit added, recomputed from the bytes rather than from the scanner's arithmetic
+$ npx tsx -e "canonicalHash(X15/out-chain/X15.handoff.json with its own handoffHash removed) vs X16's lineage[0]"
+    at evalFunction (node:internal/process/execution:315:30)
+    at asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:11)
+
+Node.js v26.3.0
+$ git rev-parse --short f145c623^   -> 46a7109b    # X16's base commit's parent
+$ git log --format='%h' -1 46a7109b -> 46a7109b    # X15/out-chain's declared base
+   same commit: yes
+
+== P6 nothing historical is rewritten
+$ git diff --name-only origin/main...HEAD      (18 paths)
+   docs/specs/harness-reliability-bootstrap-20261103/AUDIT/chain-declaration.json
+   docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+   docs/specs/harness-reliability-bootstrap-20261103/PLAN-COMPLETION.json
+   docs/specs/harness-reliability-bootstrap-20261103/X15/out-chain/X15.handoff.json
+   docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/emit-records.mts
+   docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/record-census.py
+   docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/rehash.mts
+   docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/x16-controls.sh
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/01-old-scan-on-the-new-tree.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/02-scan-after-x16.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/03-controls.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/04-declaration-truth-table.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/05-gates-at-task-commit.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/06-scan-after-records.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/07-gates-after-records.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/08-merge-and-corrections.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/logs/09-pipeline-that-has-never-been-green.txt
+   docs/specs/harness-reliability-bootstrap-20261103/X16/out/X16.handoff.json
+outside the scanner, the declarations, the plan, X15/out-chain, X16 and the pipeline: docs/specs/harness-reliability-bootstrap-20261103/AUDIT/chain-declaration.json
+$ git diff --numstat origin/main...HEAD -- '*.handoff.json'
+64	0	docs/specs/harness-reliability-bootstrap-20261103/X15/out-chain/X15.handoff.json
+60	0	docs/specs/harness-reliability-bootstrap-20261103/X16/out/X16.handoff.json
+lines deleted across every .handoff.json diff on this branch: 0   (editing a historical record would show up here)
+
+== P7 every path-shaped token this unit wrote, checked against the tree
+$ for each token: test -e it, or test -e it under docs/specs/harness-reliability-bootstrap-20261103, or git ls-tree HEAD, or git cat-file -e HEAD:it
+resolved: 192
+prose shorthand (its first element names a real unit directory and the rest is a spelled-out list, not
+a path any tool can open): 8
+   03-controls.txt :: X08/out-negctl-probe/X08.handoff.json
+   03-controls.txt :: X14/logs/01-04
+   08-merge-and-corrections.txt :: X08/X09
+   08-merge-and-corrections.txt :: X16/logs/05
+   PLAN caveat 43 :: X16/logs/03
+   PLAN next_action :: R01/FIX-1/FIX-4B/T10/X08/X09
+   PLAN next_action :: X15/logs/03
+   PLAN next_action :: X16/logs/04
+unresolved: 4
+   03-controls.txt :: R04.handoff.json
+   04-declaration-truth-table.txt :: B00-B05
+   06-scan-after-records.txt :: X16.baseSha
+   PLAN next_action :: X02-X05
+(this is the sweep that would have caught X09 citing a log nobody wrote. Shorthand is listed, not
+counted as resolved -- human items 2 and 3 of this unit are exactly about spelled-out directory lists.)
+$ for each 7-40 character hex token in the same texts: git cat-file -e <tok>^{commit}
+   22 tokens; not a commit in this repository: 111111111111, 20261103, 20261109, 942da49b0ab334eac
+   (dates such as 20261109, placeholder hashes such as 111111111111 and sha-256 prefixes quoted from
+    records are not commits; they are named here so a reader can check them rather than trust them.)
+$ gh pr view 650 --json body -q .body | grep -ciE '\bCI\b|workflow|woodpecker'   # what log 08 claims
+   0
+$ gh api repos/berlinguyinca/pi-engineering/<endpoint> --jq length
+   pulls/650/reviews -> 0
+   pulls/650/comments -> 0
+   issues/650/comments -> 1
+$ grep -nE '^  - name:' .woodpecker/ci.yaml
+75:  - name: checkout
+102:  - name: node
+131:  - name: toolchain
+146:  - name: install
+177:  - name: lint
+183:  - name: typecheck
+199:  - name: test-unit
+209:  - name: test-integration
+220:  - name: smoke
+230:  - name: roadmap-structural
+244:  - name: cleanup-venv
+$ grep -cE 'integrity-scan|lineage-scan|record-reproducibility' .woodpecker/*.yaml
+   .woodpecker/ci.yaml:0
+.woodpecker/release-gate.yaml:0
+$ npm run typecheck    # the whole script the pipeline's typecheck step runs, not only :core
+   exit=0
+
+== P8 the three scans at the head measured here (9b3111c8)
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+   RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1   exit=0
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+   RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation   exit=0
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+   RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree   exit=0

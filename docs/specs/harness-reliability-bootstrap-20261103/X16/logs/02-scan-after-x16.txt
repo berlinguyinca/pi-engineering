@@ -1,0 +1,31 @@
+X16 log 02 -- the scan with this unit's fix, run in the worktree the unit was executed in
+commit: f145c623 f145c623f9c93de7a25c7f65af95c48fd4e63c81 fix(audit): the integrity scan read 119 of the 228 records the trail holds
+worktree: /Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+HASH-WAIVED docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/parent-tampered.json -- A negative control, not a trail record. It is FIX-1/out's record with one field altered -- operatorApproval.no …(full text in AUDIT/chain-declaration.json)
+ORPHAN (declared) docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json -- The chain head. The trail was reconstructed backwards from the runtime defects -- E01 was emitted first, then  …(full text in AUDIT/chain-declaration.json)
+units=74 records=228 (in generations=119, in unit directories=41, elsewhere=68) canonical=74 hash_ok=227/227 field_ok=228
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=73 offenders=0
+superseded-generation links (informational)=25
+canonical records no canonical parent names=1 (declared=1 offences=0)
+evidence dangling=0 untracked=0
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+RESULT ok: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+This checkout keeps 12 empty out* directories on disk, left by negative-control runs whose
+records were removed. git cannot store an empty directory, so a fresh checkout of the same commit
+holds none -- logs/01's probe worktree holds 0, and logs/03 C0 runs both scanners there. The
+two runs agree on units, records per location, canonical, links and RESULT, which is the
+regression X14 filed (AUDIT/integrity-scan-20261109-x14.txt): generation selection requires a
+.json in the directory, not merely a directory whose name starts with out.
+
+A trap this run shows in passing. .gitignore:44-45 ignore */logs/ and */fixtures/ under the spec
+directory, so the files in this directory appear neither in `git status` nor in the scan's tracked
+set unless they are `git add -f`-ed -- as every unit's evidence before this one was. The scan's
+UNTRACKED rule tests the git index rather than the disk, which is the right direction: a record
+vouching for a file nobody force-added is an offence, not an invisible file.

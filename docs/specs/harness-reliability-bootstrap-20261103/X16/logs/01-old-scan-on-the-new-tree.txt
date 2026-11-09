@@ -1,0 +1,117 @@
+X16 log 01 -- the scan as merged at 46a7109b (PR #650), run against the tree that carries X16's fix
+commit under test: f145c623f9c93de7a25c7f65af95c48fd4e63c81
+probe worktree: /tmp/x16-log01-probe, created by `git worktree add --detach /tmp/x16-log01-probe f145c623f9c93de7a25c7f65af95c48fd4e63c81` -- a checkout that holds no empty
+out* directories, because git cannot store an empty directory.
+$ git -C /tmp/x16-log01-probe log --format='%h %s' -1
+f145c623 fix(audit): the integrity scan read 119 of the 228 records the trail holds
+
+The scanner under test is AUDIT/integrity-scan.mjs as it stood before this unit, extracted with
+$ git show 46a7109b:docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+and run unchanged -- only the import path of canonicalHash made absolute, no logic touched:
+
+$ cd /tmp/x16-log01-probe && npx tsx /tmp/x16-old-scanner.mts
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=73 offenders=0
+superseded-generation links (informational)=25
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 1
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+RESULT ok, exit 0, over a tree whose records it has not opened. Which ones, as arithmetic on
+`git ls-files` (reproducible, and it names every file in each class):
+
+$ python3 docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/record-census.py
+tracked files under docs/specs/harness-reliability-bootstrap-20261103: 1041   of them .json: 391
+unit directories (structural rule, both scanners): 74
+  read by the scan as merged at 46a7109b (generation directories only): 119
+  additionally read by the X16 scan:                                  109
+    records sitting directly in a unit directory: 41
+      docs/specs/harness-reliability-bootstrap-20261103/D01/D01.handoff.json
+      docs/specs/harness-reliability-bootstrap-20261103/B00/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/B01/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/B02/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/B03/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/B04/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/B05/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/D01/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/D02/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/D03/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/D04/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/D05/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/D06/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/D07/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/D08/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/E01/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/E02/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/E03/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/E04/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/E05/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/E06/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/E07/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-1/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/parent-tampered.json  [control]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-3B/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-3B2/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-3C/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-4B/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-5/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/H01/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/H02/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/H03/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/H04/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/H05/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/H06/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/H07/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/R01/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/R02/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/R03/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/R04/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/R05/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/R06/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/R07/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/R08/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T01/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T02/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T03/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T04/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T05/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T06/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T07/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T08/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/T09/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/V01/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/V02/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/V03/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/V04/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/V05/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/V06/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/X01/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/X02/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/X03/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/X04/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/X05/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/X06/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/X07/fixtures/handoff-record.json  [payload fixture (no handoffHash)]
+      docs/specs/harness-reliability-bootstrap-20261103/X08/fixtures/handoff-record.json  [record copy]
+total records read: X15 scan 119, X16 scan 228
+of the unit-directory records, these are the ones X15's chain generations copy (so the scan
+printed links for them while never opening them):
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-3C/FIX-3C.handoff.json
+      docs/specs/harness-reliability-bootstrap-20261103/T09/T09.handoff.json
+
+Among the 41 unit-directory records are the two the X15 chain generations were built to copy:
+of the unit-directory records, these are the ones X15's chain generations copy (so the scan
+printed links for them while never opening them):
+      docs/specs/harness-reliability-bootstrap-20261103/FIX-3C/FIX-3C.handoff.json
+      docs/specs/harness-reliability-bootstrap-20261103/T09/T09.handoff.json
+
+X15's PR body says of those generations that each copy is "the byte-identical body of its unit's
+record plus the pointer the commit graph already proves". The bodies they copy were never opened by
+the scan that certified the pointers. C1 of logs/03 flips one of them -- status PASS to FAIL in
+T09/T09.handoff.json -- and the scan above still prints RESULT ok with exit 0.

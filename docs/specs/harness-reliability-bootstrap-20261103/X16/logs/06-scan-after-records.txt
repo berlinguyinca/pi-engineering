@@ -1,0 +1,68 @@
+X16 log 06 -- the trail scans over 19756418, the commit that carries X16/out and X15/out-chain
+run at /Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103, unmodified, before the commit that carries this log
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+HASH-WAIVED docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/parent-tampered.json -- A negative control, not a trail record. It is FIX-1/out's record with one field altered -- operatorApproval.no …(full text in AUDIT/chain-declaration.json)
+ORPHAN (declared) docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json -- The chain head. The trail was reconstructed backwards from the runtime defects -- E01 was emitted first, then  …(full text in AUDIT/chain-declaration.json)
+units=75 records=230 (in generations=121, in unit directories=41, elsewhere=68) canonical=75 hash_ok=229/229 field_ok=230
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=74 offenders=0
+superseded-generation links (informational)=25
+canonical records no canonical parent names=1 (declared=1 offences=0)
+evidence dangling=0 untracked=0
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+ref=HEAD records=119 fields=3
+pointers healthy=305 nullDeclared=22 broken=30 unparseableRecords=0
+healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 3
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+ref=HEAD records=119
+hashes recomputed ok=119 mismatch=0 noHashField=0 unparseable=0
+declared evidence paths=781 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree
+exit=0
+
+Against X15/logs/05-scan-after-records.txt, which ran the same three commands at X15's records commit
+(units=74 records=119 canonical=74 resolved=73 offenders=0):
+
+  units       74 -> 75   X16/ holds a generation directory now.
+  records    119 -> 121  in generation directories: X16/out/X16.handoff.json and X15/out-chain/X15.handoff.json.
+                         230 overall, 109 of them outside generation directories (41 in unit directories,
+                         68 elsewhere) -- the class the scan could not see before this unit. Of the 121,
+                         119 are *.handoff.json and 2 are FIX-4A/out/FIX-4A.handoff.SUPERSEDED-pre-rebase.json
+                         and FIX-4B/out/FIX-4B.handoff.SUPERSEDED-nextFIX4C.json: renamed superseded copies
+                         that sit inside a real generation directory, so both scanners read and hash them,
+                         and both hashes verify. record-reproducibility counts 119 for that reason -- its
+                         filter asks for *.handoff.json -- while the trail scan counts 121. The two
+                         numbers are consistent, not in conflict; the difference is named here because a
+                         reader comparing logs would otherwise see 121 and 119 and look for a defect.
+  canonical   74 -> 75
+  links        73 -> 74  resolved, offenders 0. X15/out-chain -> X16@19756418... is a NEW link rather than
+                         a repair: X15 had been emitted terminal, so nothing named X16 before this commit.
+                         It resolves because X16.baseSha is that nextBaseSha and X16's manifest carries
+                         X15/out-chain's handoffHash as parentHandoffHash.
+  orphans       1 unnamed canonical record, B00/out-backfill, declared as the chain head; 25 links in
+                superseded generations, reported informationally as before.
+
+AUDIT/lineage-scan.mjs: pointers healthy 277 -> 305 (X15 and X16's chain generations add pointers, and
+the scan's own commit-pointer count rises as commits accumulate), nullDeclared 20 -> 22, broken=30 all
+covered by the v2 superseded manifest, unparseableRecords=0, RESULT ok. It reports 3 healthy pointers
+carried only by local heads -- the three commits of this branch (f145c623, 7cc443c7 and the records
+commit this log is committed in), which are not on origin until the branch is pushed; X14's note about
+pointers landing with #649 is the same fact seen after the push.
+
+$ python3 docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/record-census.py
+tracked files under docs/specs/harness-reliability-bootstrap-20261103: 1052   of them .json: 393
+unit directories (structural rule, both scanners): 75
+  read by the scan as merged at 46a7109b (generation directories only): 121
+  additionally read by the X16 scan:                                  109
+    records sitting directly in a unit directory: 41

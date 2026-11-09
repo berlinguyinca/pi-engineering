@@ -1,0 +1,37 @@
+X16 log 09 -- the pipeline #653 runs on, and the fact that it has never reported green
+
+Log 08 established that CI exists and does not run the trail scans. #653's own check then went red:
+$ gh pr checks 653
+ci/woodpecker/pr/ci	fail	0	https://ci.metabolomics.us/repos/121/pipeline/22/1	Pipeline failed
+GitGuardian Security Checks	pass	1s	https://dashboard.gitguardian.com
+
+That red does not discriminate this branch from main. The same status was measured on the commits around it:
+$ for sha in $(git log --format='%H' -6 origin/main); do ...; gh api repos/berlinguyinca/pi-engineering/commits/$sha/status; done
+02e4c1fa 2026-11-08 ci: provision a pinned, checksummed Node in the pipeline (#502) (#651)
+   statuses: ci/woodpecker/push/ci:failure
+46a7109b 2026-11-08 Merge pull request #650 from berlinguyinca/task/x15-chain-closure
+   statuses: ci/woodpecker/push/ci:failure
+8c4dc030 2026-11-08 docs(trail): post-commit proof for X15, and the plan head it moves
+   statuses: ci/woodpecker/pr/ci:failure
+b0a2cf0e 2026-11-08 docs(trail): close the four canonical chain offenders with the pointers the 
+   statuses: (none)
+9790f21c 2026-11-08 docs(trail): what the four offenders and seven unnamed canonical records act
+   statuses: (none)
+2eee4d1a 2026-11-08 fix(audit): the integrity scan skipped whole units, and had no exit status
+   statuses: (none)
+
+Four consecutive commits carry a woodpecker status and all four are failures, including main's own tip
+(02e4c1fa, the commit that introduced the pinned Node download the pipeline depends on) and the merge of
+#650. Commits before 8c4dc030 carry no status at all -- the pipeline is new enough that nothing older
+than X15's task commit has ever run under it. So no commit in this repository has been observed green
+under the Woodpecker pipeline, and a failing check on #653 says nothing about what #653 changed.
+
+The step log is not readable from here. The API answers every path under /api with the web app's HTML
+(curl -H 'Accept: application/json' https://ci.metabolomics.us/api/repos/berlinguyinca/pi-engineering
+-> http 200, content-type text/html; charset=UTF-8, 1288 bytes), and there is no token in the
+environment (env | grep -i woodpecker -> nothing; no ~/.config/woodpecker). Naming the failing step
+requires either the log pasted from https://ci.metabolomics.us/repos/121/pipeline/22/1 or a token, so
+it is not claimed here: this log states the observed statuses and stops. Nothing in this unit's scope
+touches the pipeline -- `git diff --name-only origin/main...HEAD` contains no .woodpecker path -- and
+repairing a pipeline that has never been green is a harness-infrastructure task, named in
+PLAN-COMPLETION.json's next_action alongside the question of whether the trail scans belong in it.

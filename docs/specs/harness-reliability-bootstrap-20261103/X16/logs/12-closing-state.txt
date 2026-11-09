@@ -1,0 +1,52 @@
+X16 log 12 -- the closing state of this unit, and the newest pipeline run at the newest head
+
+$ git rev-parse HEAD
+00822b4c8f4419373c0fbdf63729cba6d6a395b6
+$ git log --oneline origin/main..HEAD | wc -l   (commits on the branch beyond main)
+11
+
+== pipeline 31, the run for this head (00822b4c), from the API
+$ GET /api/repos/121/pipelines/31   commit 00822b4c8f44  status failure
+   checkout             success  exit=0
+   node                 success  exit=0
+   toolchain            success  exit=0
+   install              success  exit=0
+   lint                 success  exit=0
+   typecheck            success  exit=0
+   test-unit            failure  exit=1
+   test-integration     skipped  exit=0
+   smoke                skipped  exit=0
+   roadmap-structural   skipped  exit=0
+   cleanup-venv         success  exit=0
+$ GET /api/repos/121/logs/31/38313, decoded
+   231 - test/unit/live-handoff-rpc.test.ts
+   3378 - a state dir too deep for sun_path still gets a working control socket (\#583)
+   4439 - workspace authority corpus (PR \#106 final reviews)
+   4482 - terminal owner: worktree reclaimed, uncommitted work preserved on its branch, branch kep
+   # tests 6743, # pass 6736, # fail 4, # skipped 3
+
+Same four tests as pipelines 21 (main) and 26 (the previous head). The totals are not the same across
+runs -- 6773 tests in pipelines 21 and 26, 6743 here, 4 failures in all three -- so the test count on
+that host moves by tens between runs while the failures do not move at all. Worth knowing before
+anyone treats a count in a CI log as a baseline.
+
+== local gates at this head, re-run rather than quoted from an earlier commit
+$ npm run lint -> exit 0
+$ npm run typecheck -> exit 0
+$ npm run typecheck:core -> exit 0
+$ npm run test:unit -> ℹ pass 6779 ℹ fail 0 ℹ skipped 5
+$ integrity-scan.mjs -> RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1 | exit=0
+$ lineage-scan.mjs -> RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation | exit=0
+$ record-reproducibility.mjs -> RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree | exit=0
+
+== where the unit stands
+* The canonical chain has no offenders: 230 tracked records, 75 canonical, 74 of 75 forward links
+  resolved, X16 terminal with nextTaskId null, and X15/out-chain resolving to it. The three scans
+  exit 0, and the scanner now reads every record in the tree rather than the 68 it read before.
+* X16 is closed by its own record, not by prose: X16/out/X16.handoff.json, parent X15/out-chain,
+  hash b557072e..., baseCommitSha 9b3111c84464f5b045d9b7004491348e834c266d = the scanner commit.
+* Still open, and not by omission: #653 has no merge commit; no independent review has happened
+  (codex reports a usage ceiling until Nov 11th 2026 07:03, so log 10 is self-verification);
+  Woodpecker cannot go green while those four unit tests fail on the Slurm exec host; the trail
+  scans remain absent from .woodpecker/ci.yaml; and the human items in RELEASE-REVIEW.md /
+  AUDIT/lineage-allowlist.json are unchanged by this unit.
