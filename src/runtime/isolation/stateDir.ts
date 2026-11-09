@@ -24,6 +24,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { usableRuntimeDir } from "../../platform/runtimeDir.ts";
 import { filesystemInfo, forcedNetworkFilesystem } from "./fsType.ts";
 
 export const STATE_DIR_ENV = "PI_ENGINEERING_STATE_DIR";
@@ -70,8 +71,14 @@ function nearestExisting(path: string): string {
 }
 
 function localRuntimeRoot(env: NodeJS.ProcessEnv): string {
-  const runtimeDir = env.XDG_RUNTIME_DIR?.trim();
-  if (runtimeDir) return join(resolve(runtimeDir), "pi-engineering");
+  // Not `env.XDG_RUNTIME_DIR` on its own: a scheduler host can export it pointing at a
+  // directory that was never created, and nothing below this function creates a directory
+  // before opening the SQLite registry in it — so the registry would fail to open on the
+  // very hosts this relocation exists for. `usableRuntimeDir` checks it is there and
+  // writable; the length cap is deliberately absent, because a registry path is not
+  // length-constrained the way a Unix socket path is.
+  const runtimeDir = usableRuntimeDir(env);
+  if (runtimeDir) return join(runtimeDir, "pi-engineering");
   let uid = "user";
   try {
     uid = String(userInfo().uid);
