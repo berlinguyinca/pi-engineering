@@ -20,8 +20,8 @@ import { lstat, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import { discoverRepo, safeGit, testHooks } from "../../src/git/safeGit.ts";
 import { GitRepo } from "../../src/git/GitRepo.ts";
+import { discoverRepo, safeGit, testHooks } from "../../src/git/safeGit.ts";
 import {
   makeShadowRoot,
   removeShadow,
@@ -52,7 +52,10 @@ function fixtureRepo(): string {
   mkdirSync(repo);
   const env = { ...process.env, HOME: root, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
   const sh = (script: string, cwd: string) => execFileSync("bash", ["-c", script], { cwd, env, stdio: "pipe" });
-  sh("git init -q -b main . && git config user.name t && git config user.email t@t && echo a > a.txt && git add . && git commit -qm one", repo);
+  sh(
+    "git init -q -b main . && git config user.name t && git config user.email t@t && echo a > a.txt && git add . && git commit -qm one",
+    repo,
+  );
   return repo;
 }
 
