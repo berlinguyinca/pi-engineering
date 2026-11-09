@@ -2599,18 +2599,51 @@ function durableRecoveryContext(req: WorkerRequest): string | undefined {
 
 // E06 — capture at the ONE terminal worker-failure seam: `runSingleAttempt`'s final catch ("Capture the error"), where a provider/transport or tool
 // failure ends the attempt. Pure builder + swallowing emitter over E03's table, E04's sanitizer and E05's writer; no retry, abort or telemetry change.
-export interface WorkerFailureContext { // what the record must attribute; `timestamp` is injected so the builder stays clock-free (E03 owns stamps)
-  sessionId: string; role: string; model: string | null; quantization: string | null; runId: string | null; taskId: string | null;
-  host?: string; runtime?: string; timestamp?: string; toolName?: string | null; toolError?: unknown; correlationIds?: string[] }
-export interface ErrorOccurrenceWriter { record(input: unknown): Promise<unknown> } // E05's writer, seen through the ONE method capture needs
+export interface WorkerFailureContext {
+  // what the record must attribute; `timestamp` is injected so the builder stays clock-free (E03 owns stamps)
+  sessionId: string;
+  role: string;
+  model: string | null;
+  quantization: string | null;
+  runId: string | null;
+  taskId: string | null;
+  host?: string;
+  runtime?: string;
+  timestamp?: string;
+  toolName?: string | null;
+  toolError?: unknown;
+  correlationIds?: string[];
+}
+export interface ErrorOccurrenceWriter {
+  record(input: unknown): Promise<unknown>;
+} // E05's writer, seen through the ONE method capture needs
 const WORKER_FAILURE_RUNTIME = "pi-engineering-runtime"; // E02's `runtime`: which runtime failed, not which model answered
-const evidenceOf = (value: unknown): Record<string, any> => (value !== null && typeof value === "object" ? value : { message: String(value) }) as Record<string, any>;
-const statusOf = (e: Record<string, any>): unknown => e.httpStatus ?? e.status ?? e.statusCode ?? evidenceOf(e.cause).httpStatus ?? evidenceOf(e.cause).status ?? evidenceOf(e.cause).statusCode;
+const evidenceOf = (value: unknown): Record<string, any> =>
+  (value !== null && typeof value === "object" ? value : { message: String(value) }) as Record<string, any>;
+const statusOf = (e: Record<string, any>): unknown =>
+  e.httpStatus ??
+  e.status ??
+  e.statusCode ??
+  evidenceOf(e.cause).httpStatus ??
+  evidenceOf(e.cause).status ??
+  evidenceOf(e.cause).statusCode;
 /** Identity of the attempt that just failed; quantization only when the model id itself names it. */
 export function workerFailureContext(req: WorkerRequest, model: Model<any>, attempt: number): WorkerFailureContext {
-  const ids = [...(req.missionId ? [`mission:${req.missionId}`] : []), ...(req.runId ? [`run:${req.runId}`] : []), ...(req.workItemId ? [`task:${req.workItemId}`] : [])];
-  return { sessionId: req.sessionId ?? `${req.role}-${attempt}`, role: req.role, model: `${model.provider}/${model.id}`,
-    quantization: /[-_]quant[-_]([a-z0-9._]+)/i.exec(model.id)?.[1] ?? null, runId: req.runId ?? null, taskId: req.workItemId ?? null, host: hostname(), correlationIds: ids };
+  const ids = [
+    ...(req.missionId ? [`mission:${req.missionId}`] : []),
+    ...(req.runId ? [`run:${req.runId}`] : []),
+    ...(req.workItemId ? [`task:${req.workItemId}`] : []),
+  ];
+  return {
+    sessionId: req.sessionId ?? `${req.role}-${attempt}`,
+    role: req.role,
+    model: `${model.provider}/${model.id}`,
+    quantization: /[-_]quant[-_]([a-z0-9._]+)/i.exec(model.id)?.[1] ?? null,
+    runId: req.runId ?? null,
+    taskId: req.workItemId ?? null,
+    host: hostname(),
+    correlationIds: ids,
+  };
 }
 /**
  * The pure half of E06: identity + the raw failure → what E04 would persist, through E03's table and E04's sanitizer, so the result
@@ -2618,20 +2651,60 @@ export function workerFailureContext(req: WorkerRequest, model: Model<any>, atte
  * a dropped socket `host`); a tool exception is this seam's own layer, `worker`. The role has no E02 field, so it rides in the summary. */
 export function workerFailureOccurrence(ctx: WorkerFailureContext, error: unknown): ErrorOccurrence | null {
   const raw = ctx.toolError !== undefined && ctx.toolError !== null ? evidenceOf(ctx.toolError) : evidenceOf(error);
-  const tool = ctx.toolName ?? (typeof raw.toolName === "string" ? raw.toolName : typeof raw.tool === "string" ? raw.tool : null);
-  const status = statusOf(raw); const who = tool === null ? `${ctx.role} worker` : `${ctx.role} tool ${tool}`;
-  const input = { message: `${who} failed: ${String(raw.message ?? raw.error ?? "")}`, code: raw.code, ...(status !== undefined && status !== null ? { httpStatus: status } : {}) };
-  return sanitizeForPersistence(normalizeError(input, { timestamp: ctx.timestamp ?? new Date().toISOString(), host: ctx.host ?? "", sessionId: ctx.sessionId, runtime: ctx.runtime ?? WORKER_FAILURE_RUNTIME,
-    correlationIds: ctx.correlationIds ?? [], runId: ctx.runId, taskId: ctx.taskId, model: ctx.model, quantization: ctx.quantization, layer: tool === null ? undefined : "worker" }));
+  const tool =
+    ctx.toolName ?? (typeof raw.toolName === "string" ? raw.toolName : typeof raw.tool === "string" ? raw.tool : null);
+  const status = statusOf(raw);
+  const who = tool === null ? `${ctx.role} worker` : `${ctx.role} tool ${tool}`;
+  const input = {
+    message: `${who} failed: ${String(raw.message ?? raw.error ?? "")}`,
+    code: raw.code,
+    ...(status !== undefined && status !== null ? { httpStatus: status } : {}),
+  };
+  return sanitizeForPersistence(
+    normalizeError(input, {
+      timestamp: ctx.timestamp ?? new Date().toISOString(),
+      host: ctx.host ?? "",
+      sessionId: ctx.sessionId,
+      runtime: ctx.runtime ?? WORKER_FAILURE_RUNTIME,
+      correlationIds: ctx.correlationIds ?? [],
+      runId: ctx.runId,
+      taskId: ctx.taskId,
+      model: ctx.model,
+      quantization: ctx.quantization,
+      layer: tool === null ? undefined : "worker",
+    }),
+  );
 }
 /**
  * The emitter: build, hand to E05, report whether the writer kept it (E05 answers `null` when E04 refuses). Every failure of the capture
  * itself is swallowed — a broken writer, a refusal, a throw all end as `false` plus one notice on the EXISTING telemetry sink — because a
  * capture must never change the outcome of the failure it records. */
-export async function recordWorkerFailure(writer: ErrorOccurrenceWriter | undefined, ctx: WorkerFailureContext, error: unknown): Promise<boolean> {
+export async function recordWorkerFailure(
+  writer: ErrorOccurrenceWriter | undefined,
+  ctx: WorkerFailureContext,
+  error: unknown,
+): Promise<boolean> {
   if (writer === undefined) return false; // capture unarmed: the default, and the behaviour of every run that does not ask for it
-  const swallow = (why: string): false => { try { emitTelemetry({ level: "warning", key: "worker:failure-capture", text: `worker failure capture ${why} (${ctx.role})` }); } catch { /* reporting is best-effort too */ } return false; };
-  try { const occurrence = workerFailureOccurrence(ctx, error); if (occurrence === null) return swallow("found nothing attributable"); const kept = await writer.record(occurrence); return kept ? true : swallow("was refused"); } catch { return swallow("threw"); } // a capture's own failure ends as a value plus one notice, never an exception into the failure path
+  const swallow = (why: string): false => {
+    try {
+      emitTelemetry({
+        level: "warning",
+        key: "worker:failure-capture",
+        text: `worker failure capture ${why} (${ctx.role})`,
+      });
+    } catch {
+      /* reporting is best-effort too */
+    }
+    return false;
+  };
+  try {
+    const occurrence = workerFailureOccurrence(ctx, error);
+    if (occurrence === null) return swallow("found nothing attributable");
+    const kept = await writer.record(occurrence);
+    return kept ? true : swallow("was refused");
+  } catch {
+    return swallow("threw");
+  } // a capture's own failure ends as a value plus one notice, never an exception into the failure path
 }
 /**
  * A 5xx is infrastructure whatever the keyword table made of the wording, and the retry

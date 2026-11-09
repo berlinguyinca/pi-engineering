@@ -1,40 +1,220 @@
 // D05: the read-only diagnose CLI prints exact clustered totals from an injected fixture index, forwards every filter to the injected read, honours 0/2/3/4, and writes only an explicit --export path.
-import assert from "node:assert/strict"; import { test } from "node:test"; import { resolve } from "node:path";
-import { ERROR_OCCURRENCE_VERSION, type ErrorOccurrence } from "../../src/incidents/errorEvent.ts"; import { type ErrorIndex, type ErrorIndexFilter, type IndexedErrorOccurrence } from "../../src/incidents/errorReader.ts"; import type { RecoveryEvidence } from "../../src/incidents/recoveryOutcome.ts";
-import { type DiagnoseDeps, parseArgs, runDiagnoseErrors, USAGE } from "../../scripts/diagnose-errors.ts";
-const NS = "/tmp/d05-namespace"; const occ = (over: Partial<ErrorOccurrence> = {}): ErrorOccurrence => ({ version: ERROR_OCCURRENCE_VERSION, timestamp: "2026-11-01T00:00:00Z", host: "host-a", sessionId: "sess-a", runtime: "pi@aaa1111", layer: "gateway", code: "gateway.429.rate_limited", severity: "warning", summary: "upstream rate limit: 429", runId: null, taskId: null, model: "gemma-2b", quantization: null, correlationIds: ["mission-d05"], artifactRefs: [], ...over });
-const rows = (xs: [string, Partial<ErrorOccurrence>][]): IndexedErrorOccurrence[] => xs.map(([eventId, over]) => ({ eventId, stream: "errors.jsonl", occurrence: occ(over) })); // 7 occurrences -> 3 clusters, 2 duplicate events, 1 unattributable (empty code + summary)
-const FIXTURE: ErrorIndex = { namespaceDir: NS, refused: null, scannedStreams: 3, scannedEvents: 9, skipped: { foreignType: 1, corrupt: 2, unparsable: 0 }, truncated: false, occurrences: rows([["evt-a1", {}], ["evt-a1", {}], ["evt-a2", { timestamp: "2026-11-02T00:00:00Z" }], ["evt-b1", { code: "gateway.404.not_found", summary: "no such model route" }], ["evt-b1", { code: "gateway.404.not_found", summary: "no such model route" }], ["evt-c1", { timestamp: "2026-11-03T00:00:00Z", layer: "host", code: "host.disk_full", summary: "disk full while flushing" }], ["evt-z9", { code: "", summary: "" }]]) };
-const REFUSED: ErrorIndex = { ...FIXTURE, refused: "missing", occurrences: [] }; const DONE: Record<string, RecoveryEvidence> = { "evt-c1": { failureRecorded: true, failureAt: "2026-11-03T00:00:00Z", completion: { kind: "typecheck.passed", at: "2026-11-03T00:05:00Z", eventId: "evt-c1-done" } } }; // D04 evidence: the ONLY recovered row
-let reads = 0; let seen: ErrorIndexFilter | undefined; const reader = (index: ErrorIndex = FIXTURE) => (_ns: string, f?: ErrorIndexFilter): ErrorIndex => { reads++; seen = f; return index; };
-const run = (argv: string[], over: Partial<DiagnoseDeps> = {}) => { const p = parseArgs(argv); assert.ok(p.ok, p.errors.join("; ")); return runDiagnoseErrors(p.opts!, { read: reader(), hostname: () => "host-a", evidence: (id: string) => DONE[id] ?? null, ...over }); };
+import assert from "node:assert/strict";
+import { resolve } from "node:path";
+import { test } from "node:test";
+import { type DiagnoseDeps, USAGE, parseArgs, runDiagnoseErrors } from "../../scripts/diagnose-errors.ts";
+import { ERROR_OCCURRENCE_VERSION, type ErrorOccurrence } from "../../src/incidents/errorEvent.ts";
+import type { ErrorIndex, ErrorIndexFilter, IndexedErrorOccurrence } from "../../src/incidents/errorReader.ts";
+import type { RecoveryEvidence } from "../../src/incidents/recoveryOutcome.ts";
+const NS = "/tmp/d05-namespace";
+const occ = (over: Partial<ErrorOccurrence> = {}): ErrorOccurrence => ({
+  version: ERROR_OCCURRENCE_VERSION,
+  timestamp: "2026-11-01T00:00:00Z",
+  host: "host-a",
+  sessionId: "sess-a",
+  runtime: "pi@aaa1111",
+  layer: "gateway",
+  code: "gateway.429.rate_limited",
+  severity: "warning",
+  summary: "upstream rate limit: 429",
+  runId: null,
+  taskId: null,
+  model: "gemma-2b",
+  quantization: null,
+  correlationIds: ["mission-d05"],
+  artifactRefs: [],
+  ...over,
+});
+const rows = (xs: [string, Partial<ErrorOccurrence>][]): IndexedErrorOccurrence[] =>
+  xs.map(([eventId, over]) => ({ eventId, stream: "errors.jsonl", occurrence: occ(over) })); // 7 occurrences -> 3 clusters, 2 duplicate events, 1 unattributable (empty code + summary)
+const FIXTURE: ErrorIndex = {
+  namespaceDir: NS,
+  refused: null,
+  scannedStreams: 3,
+  scannedEvents: 9,
+  skipped: { foreignType: 1, corrupt: 2, unparsable: 0 },
+  truncated: false,
+  occurrences: rows([
+    ["evt-a1", {}],
+    ["evt-a1", {}],
+    ["evt-a2", { timestamp: "2026-11-02T00:00:00Z" }],
+    ["evt-b1", { code: "gateway.404.not_found", summary: "no such model route" }],
+    ["evt-b1", { code: "gateway.404.not_found", summary: "no such model route" }],
+    [
+      "evt-c1",
+      { timestamp: "2026-11-03T00:00:00Z", layer: "host", code: "host.disk_full", summary: "disk full while flushing" },
+    ],
+    ["evt-z9", { code: "", summary: "" }],
+  ]),
+};
+const REFUSED: ErrorIndex = { ...FIXTURE, refused: "missing", occurrences: [] };
+const DONE: Record<string, RecoveryEvidence> = {
+  "evt-c1": {
+    failureRecorded: true,
+    failureAt: "2026-11-03T00:00:00Z",
+    completion: { kind: "typecheck.passed", at: "2026-11-03T00:05:00Z", eventId: "evt-c1-done" },
+  },
+}; // D04 evidence: the ONLY recovered row
+let reads = 0;
+let seen: ErrorIndexFilter | undefined;
+const reader =
+  (index: ErrorIndex = FIXTURE) =>
+  (_ns: string, f?: ErrorIndexFilter): ErrorIndex => {
+    reads++;
+    seen = f;
+    return index;
+  };
+const run = (argv: string[], over: Partial<DiagnoseDeps> = {}) => {
+  const p = parseArgs(argv);
+  assert.ok(p.ok, p.errors.join("; "));
+  return runDiagnoseErrors(p.opts!, {
+    read: reader(),
+    hostname: () => "host-a",
+    evidence: (id: string) => DONE[id] ?? null,
+    ...over,
+  });
+};
 test("evidence criterion: the fixture index prints exact clustered totals (human and --json), exit 0, sanitized output", () => {
-  const h = run(["--namespace", NS, "--host", "host-a"]); const before = reads;
-  assert.deepEqual([h.exitCode, h.stderr.length, h.stdout.length], [0, 0, 6], "three header lines plus one per cluster"); assert.equal(h.stdout[2], "occurrences=7 clusters=3 recovered=1 unresolved=6 duplicateEvents=2 rejected=1", "the exact human totals line");
-  assert.match(h.stdout[1]!, /scannedStreams=3 scannedEvents=9 skipped=1\/2\/0 truncated=false refused=none/); assert.equal(h.stdout.filter((l) => l.startsWith("cluster=")).length, 3);
-  const j = run(["--namespace", NS, "--host", "host-a", "--json"]); const p = JSON.parse(j.stdout[0]!) as { namespace: string; totals: unknown; clusters: unknown[] };
-  assert.deepEqual([j.exitCode, p.namespace, p.clusters.length], [0, NS, 3]); assert.deepEqual(p.totals, { occurrences: 7, clusters: 3, duplicateEvents: 2, rejected: 1, recovered: 1, unresolved: 6 }, "the same exact totals as machine output"); assert.equal(reads, before + 1, "exactly one read per invocation, nothing else touched");
-  const all = [...h.stdout, j.stdout[0]!].join("\n"); assert.ok(!all.includes("sk-") && !all.includes("/Users/") && !all.includes("/home/"), "no secret-shaped text and no path beyond the namespace read");
+  const h = run(["--namespace", NS, "--host", "host-a"]);
+  const before = reads;
+  assert.deepEqual(
+    [h.exitCode, h.stderr.length, h.stdout.length],
+    [0, 0, 6],
+    "three header lines plus one per cluster",
+  );
+  assert.equal(
+    h.stdout[2],
+    "occurrences=7 clusters=3 recovered=1 unresolved=6 duplicateEvents=2 rejected=1",
+    "the exact human totals line",
+  );
+  assert.match(h.stdout[1]!, /scannedStreams=3 scannedEvents=9 skipped=1\/2\/0 truncated=false refused=none/);
+  assert.equal(h.stdout.filter((l) => l.startsWith("cluster=")).length, 3);
+  const j = run(["--namespace", NS, "--host", "host-a", "--json"]);
+  const p = JSON.parse(j.stdout[0]!) as { namespace: string; totals: unknown; clusters: unknown[] };
+  assert.deepEqual([j.exitCode, p.namespace, p.clusters.length], [0, NS, 3]);
+  assert.deepEqual(
+    p.totals,
+    { occurrences: 7, clusters: 3, duplicateEvents: 2, rejected: 1, recovered: 1, unresolved: 6 },
+    "the same exact totals as machine output",
+  );
+  assert.equal(reads, before + 1, "exactly one read per invocation, nothing else touched");
+  const all = [...h.stdout, j.stdout[0]!].join("\n");
+  assert.ok(
+    !all.includes("sk-") && !all.includes("/Users/") && !all.includes("/home/"),
+    "no secret-shaped text and no path beyond the namespace read",
+  );
 });
 test("exit 2: invalid argv is refused with a stable message per problem and nothing is read", () => {
-  const before = reads; const bad: string[][] = [["--bogus"], ["--namespace"], ["--namespace", NS, "--last", "0"], ["--namespace", NS, "--last", "abc"], ["--namespace", NS, "--last", "5001"], ["--namespace", NS, "--session", "sess 1"], ["--namespace", NS, "--model", "gemma\t2b"], ["--namespace", NS, "--last", "5", "--no-all-sessions", "--session", "sess-a"], ["--namespace", NS, "--namespace", NS]];
-  for (const argv of bad) { const r = parseArgs(argv); assert.equal(r.ok, false, argv.join(" ")); assert.ok(r.errors.length >= 1, `message for ${argv.join(" ")}`); }
-  assert.equal(reads, before, "neither parseArgs nor a refused run ever reaches the reader"); assert.equal(parseArgs(["--namespace", NS, "--last", "1", "--all-sessions"]).ok, true, "the accepted form of the same flags");
+  const before = reads;
+  const bad: string[][] = [
+    ["--bogus"],
+    ["--namespace"],
+    ["--namespace", NS, "--last", "0"],
+    ["--namespace", NS, "--last", "abc"],
+    ["--namespace", NS, "--last", "5001"],
+    ["--namespace", NS, "--session", "sess 1"],
+    ["--namespace", NS, "--model", "gemma\t2b"],
+    ["--namespace", NS, "--last", "5", "--no-all-sessions", "--session", "sess-a"],
+    ["--namespace", NS, "--namespace", NS],
+  ];
+  for (const argv of bad) {
+    const r = parseArgs(argv);
+    assert.equal(r.ok, false, argv.join(" "));
+    assert.ok(r.errors.length >= 1, `message for ${argv.join(" ")}`);
+  }
+  assert.equal(reads, before, "neither parseArgs nor a refused run ever reaches the reader");
+  assert.equal(
+    parseArgs(["--namespace", NS, "--last", "1", "--all-sessions"]).ok,
+    true,
+    "the accepted form of the same flags",
+  );
 });
 test("exit 3 and 4: refused namespace, a read that throws, an export write that throws", () => {
-  const r = run(["--namespace", NS, "--host", "host-a"], { read: reader(REFUSED) }); assert.deepEqual([r.exitCode, r.stdout.length], [3, 0], "a refused namespace prints no report"); assert.match(r.stderr[0]!, /namespace refused \(missing\)/);
-  const t = run(["--namespace", NS, "--host", "host-a"], { read: () => { throw new Error("reader exploded"); } }); assert.deepEqual([t.exitCode, /read failed: reader exploded/.test(t.stderr[0]!)], [4, true]);
-  const w = run(["--namespace", NS, "--host", "host-a", "--export", "d05-report.json"], { exists: () => false, writeFile: () => { throw new Error("disk gone"); } }); assert.deepEqual([w.exitCode, /export failed: disk gone/.test(w.stderr[0]!)], [4, true], "a failed export is exit 4, and only the requested path was attempted");
+  const r = run(["--namespace", NS, "--host", "host-a"], { read: reader(REFUSED) });
+  assert.deepEqual([r.exitCode, r.stdout.length], [3, 0], "a refused namespace prints no report");
+  assert.match(r.stderr[0]!, /namespace refused \(missing\)/);
+  const t = run(["--namespace", NS, "--host", "host-a"], {
+    read: () => {
+      throw new Error("reader exploded");
+    },
+  });
+  assert.deepEqual([t.exitCode, /read failed: reader exploded/.test(t.stderr[0]!)], [4, true]);
+  const w = run(["--namespace", NS, "--host", "host-a", "--export", "d05-report.json"], {
+    exists: () => false,
+    writeFile: () => {
+      throw new Error("disk gone");
+    },
+  });
+  assert.deepEqual(
+    [w.exitCode, /export failed: disk gone/.test(w.stderr[0]!)],
+    [4, true],
+    "a failed export is exit 4, and only the requested path was attempted",
+  );
 });
 test("filters forward to the injected read: --last, --session, --model, --host; --host otherwise comes from hostname()", () => {
-  assert.deepEqual([run(["--namespace", NS, "--last", "7", "--session", "sess-a", "--model", "gemma-2b", "--host", "host-a"]).exitCode, seen], [0, { limit: 7, sessionId: "sess-a", model: "gemma-2b", host: "host-a" }]);
-  assert.deepEqual([run(["--namespace", NS]).exitCode, seen], [0, { host: "host-a" }], "the local host is passed through from os.hostname(), never guessed");
-  const m = run(["--namespace", NS, "--host", "host-a", "--model", "llama-70b", "--json"]); assert.deepEqual([m.exitCode, (JSON.parse(m.stdout[0]!) as { totals: { occurrences: number } }).totals.occurrences], [0, 0], "--model also filters here, because D01's own filter has no model dimension");
+  assert.deepEqual(
+    [
+      run(["--namespace", NS, "--last", "7", "--session", "sess-a", "--model", "gemma-2b", "--host", "host-a"])
+        .exitCode,
+      seen,
+    ],
+    [0, { limit: 7, sessionId: "sess-a", model: "gemma-2b", host: "host-a" }],
+  );
+  assert.deepEqual(
+    [run(["--namespace", NS]).exitCode, seen],
+    [0, { host: "host-a" }],
+    "the local host is passed through from os.hostname(), never guessed",
+  );
+  const m = run(["--namespace", NS, "--host", "host-a", "--model", "llama-70b", "--json"]);
+  assert.deepEqual(
+    [m.exitCode, (JSON.parse(m.stdout[0]!) as { totals: { occurrences: number } }).totals.occurrences],
+    [0, 0],
+    "--model also filters here, because D01's own filter has no model dimension",
+  );
 });
 test("--export: one write to the requested path, no overwrite without --force, never inside the namespace", () => {
-  const writes: [string, string][] = []; const before = reads; const w = run(["--namespace", NS, "--host", "host-a", "--export", "d05-report.json"], { exists: () => false, writeFile: (p, s) => { writes.push([p, s]); } });
-  assert.deepEqual([w.exitCode, writes.length, writes[0]![0], w.stdout.at(-1)], [0, 1, resolve("d05-report.json"), `export=${resolve("d05-report.json")}`]); assert.deepEqual((JSON.parse(writes[0]![1]) as { totals: unknown }).totals, { occurrences: 7, clusters: 3, duplicateEvents: 2, rejected: 1, recovered: 1, unresolved: 6 }, "the exported JSON carries the same exact totals");
-  const dup = run(["--namespace", NS, "--host", "host-a", "--export", "d05-report.json"], { exists: () => true, writeFile: (p) => { writes.push([p, "never"]); } }); assert.deepEqual([dup.exitCode, writes.length, /pass --force/.test(dup.stderr[0]!)], [2, 1, true], "an existing file is refused without --force, before any read");
-  const inside = run(["--namespace", NS, "--host", "host-a", "--export", `${NS}/leak.json`], { exists: () => false, writeFile: (p) => { writes.push([p, "never"]); } }); assert.deepEqual([inside.exitCode, inside.stdout.length, writes.length, reads], [2, 0, 1, before + 1], "a path inside the namespace is refused and the namespace stays byte-identical");
+  const writes: [string, string][] = [];
+  const before = reads;
+  const w = run(["--namespace", NS, "--host", "host-a", "--export", "d05-report.json"], {
+    exists: () => false,
+    writeFile: (p, s) => {
+      writes.push([p, s]);
+    },
+  });
+  assert.deepEqual(
+    [w.exitCode, writes.length, writes[0]![0], w.stdout.at(-1)],
+    [0, 1, resolve("d05-report.json"), `export=${resolve("d05-report.json")}`],
+  );
+  assert.deepEqual(
+    (JSON.parse(writes[0]![1]) as { totals: unknown }).totals,
+    { occurrences: 7, clusters: 3, duplicateEvents: 2, rejected: 1, recovered: 1, unresolved: 6 },
+    "the exported JSON carries the same exact totals",
+  );
+  const dup = run(["--namespace", NS, "--host", "host-a", "--export", "d05-report.json"], {
+    exists: () => true,
+    writeFile: (p) => {
+      writes.push([p, "never"]);
+    },
+  });
+  assert.deepEqual(
+    [dup.exitCode, writes.length, /pass --force/.test(dup.stderr[0]!)],
+    [2, 1, true],
+    "an existing file is refused without --force, before any read",
+  );
+  const inside = run(["--namespace", NS, "--host", "host-a", "--export", `${NS}/leak.json`], {
+    exists: () => false,
+    writeFile: (p) => {
+      writes.push([p, "never"]);
+    },
+  });
+  assert.deepEqual(
+    [inside.exitCode, inside.stdout.length, writes.length, reads],
+    [2, 0, 1, before + 1],
+    "a path inside the namespace is refused and the namespace stays byte-identical",
+  );
 });
-test("--help is a success path that prints usage and reads nothing", () => { const before = reads; const h = run(["--help"]); assert.deepEqual([h.exitCode, h.stdout[0], h.stderr.length, reads], [0, USAGE, 0, before]); });
+test("--help is a success path that prints usage and reads nothing", () => {
+  const before = reads;
+  const h = run(["--help"]);
+  assert.deepEqual([h.exitCode, h.stdout[0], h.stderr.length, reads], [0, USAGE, 0, before]);
+});

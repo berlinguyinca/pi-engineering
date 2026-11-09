@@ -76,28 +76,62 @@ function tracking(pi: ExtensionAPI): { api: ExtensionAPI; undo: () => void } {
 }
 
 /** How each D05 exit code reads in the terminal, and how many clusters one report shows. */
-const DIAGNOSE_CLASS: Record<number, string> = { 0: "ok", 2: "usage refused", 3: "namespace refused", 4: "read or export failed" };
+const DIAGNOSE_CLASS: Record<number, string> = {
+  0: "ok",
+  2: "usage refused",
+  3: "namespace refused",
+  4: "read or export failed",
+};
 const DIAGNOSE_TOP = 5;
 
 /** What `/diagnose-errors` reads with. `Omit<…, "writeFile">` IS the permission scope: no writer can be injected, so
  * D05's own `--export` path fails closed (exit 4) and nothing here can write, mkdir or append. */
-export interface DiagnoseHooks { namespace: (cwd: string) => Promise<string>; deps: Omit<DiagnoseDeps, "writeFile"> }
+export interface DiagnoseHooks {
+  namespace: (cwd: string) => Promise<string>;
+  deps: Omit<DiagnoseDeps, "writeFile">;
+}
 
 /** The calling worktree's events namespace by this repo's existing convention — orchestration override, else state
  * root + worktree identity — and nothing else: pure path arithmetic, never a probe or mkdir, so a read-only command
  * cannot create the namespace it reports on. D04 owns recovery and this command has no durable evidence source, so a
  * row stays unresolved rather than an invented one. */
 const productionDiagnoseHooks = async (): Promise<DiagnoseHooks> => {
-  const [reader, aggregate, identity, stateDir, os, fs] = await Promise.all([import("../../incidents/errorReader.ts"), import("../../incidents/errorAggregate.ts"), import("../isolation/WorktreeIdentity.ts"), import("../isolation/stateDir.ts"), import("node:os"), import("node:fs")]);
-  const rootFor = async (cwd: string): Promise<string> => stateDir.resolveOrchestrationOverride() ?? stateDir.worktreeRuntimeDir(stateDir.resolveStateRoot(), (await identity.resolveWorktreeIdentity(cwd)).worktreeId);
-  return { namespace: async (cwd) => join(await rootFor(cwd), "events"), deps: { read: reader.readHostErrorOccurrences, aggregate: aggregate.aggregateErrorOccurrences, evidence: () => null, hostname: () => os.hostname(), exists: fs.existsSync } };
+  const [reader, aggregate, identity, stateDir, os, fs] = await Promise.all([
+    import("../../incidents/errorReader.ts"),
+    import("../../incidents/errorAggregate.ts"),
+    import("../isolation/WorktreeIdentity.ts"),
+    import("../isolation/stateDir.ts"),
+    import("node:os"),
+    import("node:fs"),
+  ]);
+  const rootFor = async (cwd: string): Promise<string> =>
+    stateDir.resolveOrchestrationOverride() ??
+    stateDir.worktreeRuntimeDir(stateDir.resolveStateRoot(), (await identity.resolveWorktreeIdentity(cwd)).worktreeId);
+  return {
+    namespace: async (cwd) => join(await rootFor(cwd), "events"),
+    deps: {
+      read: reader.readHostErrorOccurrences,
+      aggregate: aggregate.aggregateErrorOccurrences,
+      evidence: () => null,
+      hostname: () => os.hostname(),
+      exists: fs.existsSync,
+    },
+  };
 };
 
 /** The bounded report: D05's three summary lines, at most DIAGNOSE_TOP clusters, what it refused, and the exit class. */
 function diagnoseReport(result: { exitCode: number; stdout: string[]; stderr: string[] }): string {
   const clusters = result.stdout.slice(3);
-  const shown = [...result.stdout.slice(0, 3), ...clusters.slice(0, DIAGNOSE_TOP), ...(clusters.length > DIAGNOSE_TOP ? [`… ${clusters.length - DIAGNOSE_TOP} more clusters (scripts/diagnose-errors.ts prints all)`] : [])];
-  return [...shown, ...result.stderr, `exit=${result.exitCode} ${DIAGNOSE_CLASS[result.exitCode] ?? "unknown"}`].join("\n");
+  const shown = [
+    ...result.stdout.slice(0, 3),
+    ...clusters.slice(0, DIAGNOSE_TOP),
+    ...(clusters.length > DIAGNOSE_TOP
+      ? [`… ${clusters.length - DIAGNOSE_TOP} more clusters (scripts/diagnose-errors.ts prints all)`]
+      : []),
+  ];
+  return [...shown, ...result.stderr, `exit=${result.exitCode} ${DIAGNOSE_CLASS[result.exitCode] ?? "unknown"}`].join(
+    "\n",
+  );
 }
 
 /**
@@ -106,19 +140,28 @@ function diagnoseReport(result: { exitCode: number; stdout: string[]; stderr: st
  * shim rather than the Host so the diagnosis exists even when the Host is broken, with D05 imported only when the
  * command runs so this file still loads on its own. Read-only by construction: `DiagnoseHooks` has no writer.
  */
-export function registerDiagnoseErrors(pi: ExtensionAPI, load: () => Promise<DiagnoseHooks> = productionDiagnoseHooks): void {
+export function registerDiagnoseErrors(
+  pi: ExtensionAPI,
+  load: () => Promise<DiagnoseHooks> = productionDiagnoseHooks,
+): void {
   pi.registerCommand("diagnose-errors", {
-    description: "Read-only diagnosis of this worktree's error namespace: clustered totals and top clusters (never writes)",
+    description:
+      "Read-only diagnosis of this worktree's error namespace: clustered totals and top clusters (never writes)",
     handler: async (args, ctx) => {
       try {
         const [cli, hooks] = await Promise.all([import("../../../scripts/diagnose-errors.ts"), load()]);
         const argv = args.trim() === "" ? [] : args.trim().split(/\s+/);
         if (!argv.includes("--namespace")) argv.push("--namespace", await hooks.namespace(ctx.cwd));
         const parsed = cli.parseArgs(argv);
-        if (!parsed.ok || parsed.opts === undefined) { ctx.ui.notify(parsed.errors.join("\n"), "warning"); return; }
+        if (!parsed.ok || parsed.opts === undefined) {
+          ctx.ui.notify(parsed.errors.join("\n"), "warning");
+          return;
+        }
         const result = cli.runDiagnoseErrors(parsed.opts, hooks.deps);
         ctx.ui.notify(diagnoseReport(result), result.exitCode === 0 ? "info" : "warning");
-      } catch (error) { ctx.ui.notify(`diagnose-errors failed: ${describe(error)}`, "error"); }
+      } catch (error) {
+        ctx.ui.notify(`diagnose-errors failed: ${describe(error)}`, "error");
+      }
     },
   });
 }

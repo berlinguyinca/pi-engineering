@@ -1,3 +1,4 @@
+import { sep } from "node:path";
 /**
  * V07: verify a finished handoff trail from the outside. Where `resultGate` gates ONE task at write time, this
  * walks a WHOLE trail after the fact and is deliberately run by something other than the process that wrote the
@@ -18,7 +19,6 @@
  */
 import { validateHandoffSchema } from "./handoffWriter.ts";
 import { canonicalHash } from "./resultGate.ts";
-import { sep } from "node:path";
 
 export interface TrailRecord {
   readonly taskId: string;
@@ -58,11 +58,18 @@ export interface TrailInput {
   /** Descriptions (argv) of processes the run started that are still alive. Omit to skip the liveness gate. */
   readonly liveRunners?: readonly string[];
 }
-const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []);
+const strings = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 /** Every artifact a record points at: its `evidence` list plus every command's `outputArtifact`. */
 export const declaredArtifacts = (record: Record<string, unknown>): string[] => {
   const outputs = (Array.isArray(record.commands) ? record.commands : [])
-    .filter((command): command is Record<string, unknown> => command !== null && typeof command === "object" && !Array.isArray(command) && typeof (command as Record<string, unknown>).outputArtifact === "string")
+    .filter(
+      (command): command is Record<string, unknown> =>
+        command !== null &&
+        typeof command === "object" &&
+        !Array.isArray(command) &&
+        typeof (command as Record<string, unknown>).outputArtifact === "string",
+    )
     .map((command) => command.outputArtifact as string);
   return [...new Set([...strings(record.evidence), ...outputs])].sort();
 };
@@ -72,20 +79,41 @@ export function verifyTrail(input: TrailInput): TrailVerdict {
   const issues: TrailIssue[] = [];
   const byTask = new Map<string, Record<string, unknown>>();
   for (const entry of input.records) {
-    if (byTask.has(entry.taskId)) issues.push({ kind: "duplicate-record", taskId: entry.taskId, detail: `a second record exists for task ${entry.taskId}` });
+    if (byTask.has(entry.taskId))
+      issues.push({
+        kind: "duplicate-record",
+        taskId: entry.taskId,
+        detail: `a second record exists for task ${entry.taskId}`,
+      });
     byTask.set(entry.taskId, entry.record);
     const stamped = entry.record.handoffHash;
     const recomputed = canonicalHash(entry.record);
-    if (stamped !== recomputed) issues.push({ kind: "hash-mismatch", taskId: entry.taskId, detail: `stamped ${String(stamped)} != recomputed ${recomputed}` });
-    for (const blocker of validateHandoffSchema(entry.record, input.schema)) issues.push({ kind: "schema-violation", taskId: entry.taskId, detail: blocker });
+    if (stamped !== recomputed)
+      issues.push({
+        kind: "hash-mismatch",
+        taskId: entry.taskId,
+        detail: `stamped ${String(stamped)} != recomputed ${recomputed}`,
+      });
+    for (const blocker of validateHandoffSchema(entry.record, input.schema))
+      issues.push({ kind: "schema-violation", taskId: entry.taskId, detail: blocker });
     for (const artifact of declaredArtifacts(entry.record)) {
-      if (input.artifactExists !== undefined && !input.artifactExists(artifact)) issues.push({ kind: "evidence-absent", taskId: entry.taskId, detail: `declared artifact absent: ${artifact}` });
-      if (input.committed !== undefined && !input.committed(artifact)) issues.push({ kind: "evidence-uncommitted", taskId: entry.taskId, detail: `declared artifact has no blob at the audited revision: ${artifact}` });
+      if (input.artifactExists !== undefined && !input.artifactExists(artifact))
+        issues.push({ kind: "evidence-absent", taskId: entry.taskId, detail: `declared artifact absent: ${artifact}` });
+      if (input.committed !== undefined && !input.committed(artifact))
+        issues.push({
+          kind: "evidence-uncommitted",
+          taskId: entry.taskId,
+          detail: `declared artifact has no blob at the audited revision: ${artifact}`,
+        });
     }
   }
   const ordered = new Set(input.order);
-  for (const taskId of input.order) if (!byTask.has(taskId)) issues.push({ kind: "missing-record", taskId, detail: `the plan ordered ${taskId} and no record exists` });
-  for (const taskId of [...byTask.keys()].sort()) if (!ordered.has(taskId)) issues.push({ kind: "unplanned-record", taskId, detail: `${taskId} carries a record the plan never ordered` });
+  for (const taskId of input.order)
+    if (!byTask.has(taskId))
+      issues.push({ kind: "missing-record", taskId, detail: `the plan ordered ${taskId} and no record exists` });
+  for (const taskId of [...byTask.keys()].sort())
+    if (!ordered.has(taskId))
+      issues.push({ kind: "unplanned-record", taskId, detail: `${taskId} carries a record the plan never ordered` });
   for (let index = 1; index < input.order.length; index += 1) {
     const parent = byTask.get(input.order[index - 1] as string);
     const child = byTask.get(input.order[index] as string);
@@ -93,16 +121,25 @@ export function verifyTrail(input: TrailInput): TrailVerdict {
     const promised = parent.nextBaseSha;
     const actual = child.baseSha;
     if (typeof promised === "string" && typeof actual === "string" && promised !== actual)
-      issues.push({ kind: "lineage-break", taskId: input.order[index] as string, detail: `${input.order[index - 1]}.nextBaseSha ${promised} != ${input.order[index]}.baseSha ${actual}` });
+      issues.push({
+        kind: "lineage-break",
+        taskId: input.order[index] as string,
+        detail: `${input.order[index - 1]}.nextBaseSha ${promised} != ${input.order[index]}.baseSha ${actual}`,
+      });
   }
   for (let index = 0; index < input.order.length; index += 1) {
     const record = byTask.get(input.order[index] as string);
     if (record === undefined || !("nextTaskId" in record)) continue; // absence is already a missing-record issue
     const promised = index + 1 < input.order.length ? (input.order[index + 1] as string) : null;
     if (record.nextTaskId !== promised)
-      issues.push({ kind: "next-pointer-mismatch", taskId: input.order[index] as string, detail: `record declares nextTaskId ${JSON.stringify(record.nextTaskId)} where the plan orders ${JSON.stringify(promised)}` });
+      issues.push({
+        kind: "next-pointer-mismatch",
+        taskId: input.order[index] as string,
+        detail: `record declares nextTaskId ${JSON.stringify(record.nextTaskId)} where the plan orders ${JSON.stringify(promised)}`,
+      });
   }
-  for (const runner of input.liveRunners ?? []) issues.push({ kind: "live-runner", taskId: null, detail: `process started by the run is still alive: ${runner}` });
+  for (const runner of input.liveRunners ?? [])
+    issues.push({ kind: "live-runner", taskId: null, detail: `process started by the run is still alive: ${runner}` });
   return { ok: issues.length === 0, records: input.records.length, issues };
 }
 
@@ -171,7 +208,8 @@ export function mentionsCommand(line: string, command: string): boolean {
     if (at < 0) return false;
     const before = at === 0 ? "" : (line[at - 1] as string);
     const after = (line[at + command.length] ?? "") as string;
-    if ((before === "" || before === " " || before === "\t" || ";&|(".includes(before)) && COMMAND_END.has(after)) return true;
+    if ((before === "" || before === " " || before === "\t" || ";&|(".includes(before)) && COMMAND_END.has(after))
+      return true;
     from = at + 1;
   }
 }
@@ -183,7 +221,11 @@ export function mentionsCommand(line: string, command: string): boolean {
  * a recorded command from elsewhere are counted as `unattributed` so the audit can say so instead of silently
  * ignoring them. An empty `attributed` list is not proof that nothing ever ran.
  */
-export function matchLiveRunners(processes: readonly LiveProcess[], recordedCommands: readonly string[], root: string): LiveRunnerMatch {
+export function matchLiveRunners(
+  processes: readonly LiveProcess[],
+  recordedCommands: readonly string[],
+  root: string,
+): LiveRunnerMatch {
   const recorded = recordedCommands.filter((command) => command.trim().length > 0);
   const boundary = root.endsWith(sep) ? root : root + sep;
   const attributed = new Set<string>();

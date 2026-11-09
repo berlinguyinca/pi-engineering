@@ -7,8 +7,8 @@
  * implementer's input this small is what stops it re-planning the mission.
  */
 
-import { canonicalHash } from "../bootstrap/resultGate.ts";
 import { stringify as toYaml } from "yaml";
+import { canonicalHash } from "../bootstrap/resultGate.ts";
 import type {
   CorrectionContract,
   DependencyResult,
@@ -96,39 +96,89 @@ export function buildHandoff(input: HandoffInput): HandoffArtifact {
  * worker receive a new summary without moving the handoff's authority.
  */
 export const MAX_TRANSCRIPT_CHARS = 2_000; // excerpt bound; the full transcript is never retained
-export interface HandoffAuthority { authority_hash: string; objective_sha256: string; constraints_sha256: string; acceptance_sha256: string; scope_sha256: string; transcript_excerpt: string; transcript_truncated: boolean; transcript_chars: number }
-export interface SealedHandoff { handoff: HandoffArtifact; authority: HandoffAuthority }
-export type HandoffAuthorityCheck = { ok: true; authority: HandoffAuthority } | { ok: false; reasons: string[]; authority?: HandoffAuthority };
+export interface HandoffAuthority {
+  authority_hash: string;
+  objective_sha256: string;
+  constraints_sha256: string;
+  acceptance_sha256: string;
+  scope_sha256: string;
+  transcript_excerpt: string;
+  transcript_truncated: boolean;
+  transcript_chars: number;
+}
+export interface SealedHandoff {
+  handoff: HandoffArtifact;
+  authority: HandoffAuthority;
+}
+export type HandoffAuthorityCheck =
+  | { ok: true; authority: HandoffAuthority }
+  | { ok: false; reasons: string[]; authority?: HandoffAuthority };
 const AUTHORITY_FIELDS = ["objective", "constraints", "acceptance", "scope"] as const;
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 /** Recomputed digests of the authority-bearing parts; defensive so verification never throws, and it never mutates the handoff. */
 function digests(handoff: unknown) {
   const h: Partial<HandoffArtifact> = isRecord(handoff) ? handoff : {};
   const objective = typeof h.objective === "string" ? h.objective : String(h.objective ?? "");
-  const constraints = Array.isArray(h.constraints) ? [...h.constraints].sort() : []; const acceptance = Array.isArray(h.acceptance) ? [...h.acceptance].sort() : [];
+  const constraints = Array.isArray(h.constraints) ? [...h.constraints].sort() : [];
+  const acceptance = Array.isArray(h.acceptance) ? [...h.acceptance].sort() : [];
   const scope = h.scope ?? { allowed: [], forbidden: [] };
-  return { objective: canonicalHash(objective), constraints: canonicalHash(constraints), acceptance: canonicalHash(acceptance), scope: canonicalHash(scope), authority_hash: canonicalHash({ objective, constraints, acceptance, scope }) };
+  return {
+    objective: canonicalHash(objective),
+    constraints: canonicalHash(constraints),
+    acceptance: canonicalHash(acceptance),
+    scope: canonicalHash(scope),
+    authority_hash: canonicalHash({ objective, constraints, acceptance, scope }),
+  };
 }
 /** Seal a handoff: digest its authority-bearing parts, retain at most MAX_TRANSCRIPT_CHARS of the transcript. */
 export function sealHandoff(handoff: HandoffArtifact, transcript?: unknown): SealedHandoff {
-  const d = digests(handoff); const text = typeof transcript === "string" ? transcript.trim() : "";
-  return { handoff, authority: { authority_hash: d.authority_hash, objective_sha256: d.objective, constraints_sha256: d.constraints, acceptance_sha256: d.acceptance, scope_sha256: d.scope, transcript_excerpt: text.slice(0, MAX_TRANSCRIPT_CHARS), transcript_truncated: text.length > MAX_TRANSCRIPT_CHARS, transcript_chars: text.length } };
+  const d = digests(handoff);
+  const text = typeof transcript === "string" ? transcript.trim() : "";
+  return {
+    handoff,
+    authority: {
+      authority_hash: d.authority_hash,
+      objective_sha256: d.objective,
+      constraints_sha256: d.constraints,
+      acceptance_sha256: d.acceptance,
+      scope_sha256: d.scope,
+      transcript_excerpt: text.slice(0, MAX_TRANSCRIPT_CHARS),
+      transcript_truncated: text.length > MAX_TRANSCRIPT_CHARS,
+      transcript_chars: text.length,
+    },
+  };
 }
 /** Recompute authority from the handoff actually carried; a missing or non-string expected hash fails closed. Never throws. */
 export function verifyHandoffAuthority(sealed: SealedHandoff, expectedAuthorityHash?: unknown): HandoffAuthorityCheck {
-  const recorded: Record<string, unknown> = isRecord(sealed?.authority) ? sealed.authority : {}; const want = digests(sealed?.handoff); const reasons: string[] = [];
-  for (const field of AUTHORITY_FIELDS) { const got = recorded[`${field}_sha256`]; if (got !== want[field]) reasons.push(`${field} diverged: ${String(got)} != ${want[field]}`); }
+  const recorded: Record<string, unknown> = isRecord(sealed?.authority) ? sealed.authority : {};
+  const want = digests(sealed?.handoff);
+  const reasons: string[] = [];
+  for (const field of AUTHORITY_FIELDS) {
+    const got = recorded[`${field}_sha256`];
+    if (got !== want[field]) reasons.push(`${field} diverged: ${String(got)} != ${want[field]}`);
+  }
   const expected = typeof expectedAuthorityHash === "string" ? expectedAuthorityHash.trim() : "";
   if (expected === "") reasons.push(`expected authority hash missing: recomputed ${want.authority_hash}`);
-  else if (expected !== want.authority_hash) reasons.push(`authority mismatch: expected ${expected} != recomputed ${want.authority_hash}`);
-  return reasons.length > 0 ? { ok: false, reasons, authority: sealed.authority } : { ok: true, authority: sealed.authority };
+  else if (expected !== want.authority_hash)
+    reasons.push(`authority mismatch: expected ${expected} != recomputed ${want.authority_hash}`);
+  return reasons.length > 0
+    ? { ok: false, reasons, authority: sealed.authority }
+    : { ok: true, authority: sealed.authority };
 }
 /** Resume a worker: reject a malformed envelope, then an envelope whose recorded hashes disagree with the handoff it carries (naming the altered part), then verify authority. */
 export function resumeHandoff(env: unknown, expectedAuthorityHash?: unknown): HandoffAuthorityCheck {
-  if (!isRecord(env) || !isRecord(env.handoff) || !isRecord(env.authority)) return { ok: false, reasons: ["malformed envelope"] };
-  const want = digests(env.handoff); const recorded = env.authority; const reasons: string[] = [];
-  for (const field of AUTHORITY_FIELDS) { const got = recorded[`${field}_sha256`]; if (got !== want[field]) reasons.push(`envelope altered: ${field}_sha256 ${String(got)} != ${want[field]}`); }
-  if (recorded.authority_hash !== want.authority_hash) reasons.push(`envelope altered: authority_hash ${String(recorded.authority_hash)} != ${want.authority_hash}`);
+  if (!isRecord(env) || !isRecord(env.handoff) || !isRecord(env.authority))
+    return { ok: false, reasons: ["malformed envelope"] };
+  const want = digests(env.handoff);
+  const recorded = env.authority;
+  const reasons: string[] = [];
+  for (const field of AUTHORITY_FIELDS) {
+    const got = recorded[`${field}_sha256`];
+    if (got !== want[field]) reasons.push(`envelope altered: ${field}_sha256 ${String(got)} != ${want[field]}`);
+  }
+  if (recorded.authority_hash !== want.authority_hash)
+    reasons.push(`envelope altered: authority_hash ${String(recorded.authority_hash)} != ${want.authority_hash}`);
   if (reasons.length > 0) return { ok: false, reasons, authority: recorded as unknown as HandoffAuthority };
   return verifyHandoffAuthority(env as unknown as SealedHandoff, expectedAuthorityHash);
 }

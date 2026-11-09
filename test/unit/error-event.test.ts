@@ -3,22 +3,45 @@ import test from "node:test";
 
 import { ERROR_OCCURRENCE_VERSION, parseErrorOccurrence } from "../../src/incidents/errorEvent.ts";
 
-const valid = { version: ERROR_OCCURRENCE_VERSION, timestamp: "2026-11-03T12:00:00.000Z", host: "workstation",
-  sessionId: "sess-7c1", runtime: "pi-engineering@0cc5b21c", layer: "retry", severity: "warning",
-  code: "inference.429.queue_timeout", summary: "gateway held the request: 429 queue_timeout after 3 attempts",
-  runId: null, taskId: "E02", model: "claude-x", quantization: null, correlationIds: ["mission-msn-1", "exec-9"],
-  artifactRefs: ["docs/specs/harness-reliability-bootstrap-20261103/E01/logs/01-verify-git-diff-check.txt"] };
-const errorsOf = (patch: Record<string, unknown>): string => { const r = parseErrorOccurrence({ ...valid, ...patch }); return r.ok ? "" : r.errors.join("|"); };
+const valid = {
+  version: ERROR_OCCURRENCE_VERSION,
+  timestamp: "2026-11-03T12:00:00.000Z",
+  host: "workstation",
+  sessionId: "sess-7c1",
+  runtime: "pi-engineering@0cc5b21c",
+  layer: "retry",
+  severity: "warning",
+  code: "inference.429.queue_timeout",
+  summary: "gateway held the request: 429 queue_timeout after 3 attempts",
+  runId: null,
+  taskId: "E02",
+  model: "claude-x",
+  quantization: null,
+  correlationIds: ["mission-msn-1", "exec-9"],
+  artifactRefs: ["docs/specs/harness-reliability-bootstrap-20261103/E01/logs/01-verify-git-diff-check.txt"],
+};
+const errorsOf = (patch: Record<string, unknown>): string => {
+  const r = parseErrorOccurrence({ ...valid, ...patch });
+  return r.ok ? "" : r.errors.join("|");
+};
 
 test("accepts a fully attributed occurrence; absent optionals stay null", () => {
   const result = parseErrorOccurrence(valid);
   assert.equal(result.ok, true);
-  if (result.ok) { assert.equal(result.event.sessionId, "sess-7c1"); assert.equal(result.event.runId, null); assert.deepEqual(result.event.correlationIds, ["mission-msn-1", "exec-9"]); }
+  if (result.ok) {
+    assert.equal(result.event.sessionId, "sess-7c1");
+    assert.equal(result.event.runId, null);
+    assert.deepEqual(result.event.correlationIds, ["mission-msn-1", "exec-9"]);
+  }
 });
 
 test("an occurrence with no session is refused — unattributable errors are not recordable", () => {
-  const missing = { ...valid } as Record<string, unknown>; delete missing.sessionId;
-  assert.deepEqual(parseErrorOccurrence(missing), { ok: false, errors: ["sessionId: expected a non-empty printable string"] });
+  const missing = { ...valid } as Record<string, unknown>;
+  delete missing.sessionId;
+  assert.deepEqual(parseErrorOccurrence(missing), {
+    ok: false,
+    errors: ["sessionId: expected a non-empty printable string"],
+  });
   assert.equal(parseErrorOccurrence({ ...valid, sessionId: "" }).ok, false);
 });
 

@@ -8,6 +8,7 @@
       ".pi-eng",
       ".omc",
       "services",
+      "docs/specs/harness-reliability-bootstrap-20261103/**",
       "test/fixtures/backpressure-conformance-v1.json",
       "test/fixtures/mission-snapshot-v3.golden.json"
     ]

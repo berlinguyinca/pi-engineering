@@ -17,8 +17,8 @@
 
 import type { EscalationEvent } from "./escalation.ts";
 import type { ApsRecoveryAction } from "./recovery.ts";
-import type { AgentLoopEvent, AgentLoopPreventedEvent, SemanticStrategyFamily } from "./types.ts";
 import type { AlignmentKind, AlignmentSignal } from "./taskAlignment.ts";
+import type { AgentLoopEvent, AgentLoopPreventedEvent, SemanticStrategyFamily } from "./types.ts";
 
 export type ContextUtilizationBucket = "<0.5" | "0.5-0.75" | "0.75-0.9" | ">=0.9" | "unknown";
 

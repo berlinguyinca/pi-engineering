@@ -1,8 +1,8 @@
+import type { DriftWatch } from "../aps/workerActivity.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { CheckpointRecoveryContext } from "../orchestration/broker.ts";
 import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
 import type { ContextBudget } from "./contextBudget.ts";
-import type { DriftWatch } from "../aps/workerActivity.ts";
 
 /** Bounded, operator-safe live state from a worker session. */
 export interface WorkerActivity {

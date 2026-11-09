@@ -80,12 +80,22 @@ export interface FailureIdentityInput {
 }
 
 /** The failure through E03+E04, reduced to values that are safe in any payload. */
-export interface ErrorRef { code: string; layer: string; severity: string; summary_digest: string }
+export interface ErrorRef {
+  code: string;
+  layer: string;
+  severity: string;
+  summary_digest: string;
+}
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 const normalize = (input: FailureIdentityInput, timestamp: string) =>
   normalizeError(input.error, {
-    timestamp, host: "", sessionId: input.sessionId, runtime: "pi-engineering-runtime",
-    correlationIds: input.runId ? [`run:${input.runId}`] : [], runId: input.runId ?? null, model: input.model ?? null,
+    timestamp,
+    host: "",
+    sessionId: input.sessionId,
+    runtime: "pi-engineering-runtime",
+    correlationIds: input.runId ? [`run:${input.runId}`] : [],
+    runId: input.runId ?? null,
+    model: input.model ?? null,
   });
 
 /** The stable identity of the upstream failure: `sha256:<64 hex>` — deterministic without a clock; an injected clock extends the scope with its stamp. */
@@ -98,7 +108,14 @@ export function failureIdentity(input: FailureIdentityInput, clock?: () => strin
 /** The normalized safe reference for a failure — E03's code/layer/severity plus a digest of E04's summary; `null` when E04 refuses. */
 export function errorRef(input: FailureIdentityInput, clock?: () => string): ErrorRef | null {
   const kept = sanitizeForPersistence(normalize(input, clock?.() ?? ""));
-  return kept === null ? null : { code: kept.code, layer: kept.layer, severity: kept.severity, summary_digest: sha256(kept.summary).slice(0, 32) };
+  return kept === null
+    ? null
+    : {
+        code: kept.code,
+        layer: kept.layer,
+        severity: kept.severity,
+        summary_digest: sha256(kept.summary).slice(0, 32),
+      };
 }
 
 /** Append an entry and publish it on the telemetry bus (when one is given). */

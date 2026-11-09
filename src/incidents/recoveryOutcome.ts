@@ -21,12 +21,21 @@ export interface RecoveryVerdict {
 }
 
 // Durable record kinds that prove completion; an unrecognised kind proves nothing and is never guessed at.
-export const COMPLETION_KINDS: readonly string[] = ["verification.passed", "unit.passed", "typecheck.passed", "task.completed"];
+export const COMPLETION_KINDS: readonly string[] = [
+  "verification.passed",
+  "unit.passed",
+  "typecheck.passed",
+  "task.completed",
+];
 
 const NEED_COMPLETION = "completion:allowlisted-kind-after-failureAt";
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 const isStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
-const verdict = (outcome: RecoveryOutcome, reason: string, missing: string[] = []): RecoveryVerdict => ({ outcome, reason, missing });
+const verdict = (outcome: RecoveryOutcome, reason: string, missing: string[] = []): RecoveryVerdict => ({
+  outcome,
+  reason,
+  missing,
+});
 
 // Rules in order: suppressed (complete record) > recovered (allowlisted completion strictly after failureAt)
 // > unresolved (recorded failure, no completion/suppression) > unknown (inconsistent / unsubstantiated claim).
@@ -41,7 +50,11 @@ export function classifyRecoveryOutcome(evidence: RecoveryEvidence): RecoveryVer
   const c = isObj(evidence.completion) ? evidence.completion : undefined;
   if (c === undefined) {
     // Nothing durable says this ever finished; a claimed "recovered" is rejected for lack of proof.
-    return verdict("unresolved", "failure.unresolved", evidence.claimedOutcome === "recovered" ? [NEED_COMPLETION] : []);
+    return verdict(
+      "unresolved",
+      "failure.unresolved",
+      evidence.claimedOutcome === "recovered" ? [NEED_COMPLETION] : [],
+    );
   }
   const failureAt = isStr(evidence.failureAt) ? evidence.failureAt : undefined;
   const allowlisted = isStr(c.kind) && COMPLETION_KINDS.includes(c.kind);

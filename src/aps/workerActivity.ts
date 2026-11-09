@@ -16,7 +16,12 @@ import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { id } from "../core/ids.ts";
 import { TARGET_ARGUMENT_KEYS, ToolCallNormalizer, canonicalJson, semanticFingerprint } from "./fingerprint.ts";
 import { AgentProgressSupervisor, type AgentProgressSupervisorOptions } from "./supervisor.ts";
-import { evaluateTaskAlignment, type AlignmentSignal, type DeclaredArtifact, type TaskAction } from "./taskAlignment.ts";
+import {
+  type AlignmentSignal,
+  type DeclaredArtifact,
+  type TaskAction,
+  evaluateTaskAlignment,
+} from "./taskAlignment.ts";
 import { type AgentAction, isMutatingTool } from "./types.ts";
 
 /** Maximum length of the bounded tool-result summary fed to the fingerprint. */
@@ -81,8 +86,15 @@ const MAX_DRIFT_SIGNALS = 64;
 /** One recorded action -> detector input, target taken from the canonical argument keys. */
 function alignmentAction(action: AgentAction): TaskAction {
   const target = TARGET_ARGUMENT_KEYS.map((key) => action.normalizedArguments[key])
-    .find((value): value is string => typeof value === "string" && value.trim() !== "")?.trim();
-  return { iteration: action.iteration, tool: action.tool, target, taskId: action.workItemId ?? undefined, mutating: isMutatingTool(action.tool) };
+    .find((value): value is string => typeof value === "string" && value.trim() !== "")
+    ?.trim();
+  return {
+    iteration: action.iteration,
+    tool: action.tool,
+    target,
+    taskId: action.workItemId ?? undefined,
+    mutating: isMutatingTool(action.tool),
+  };
 }
 
 /**
@@ -191,9 +203,15 @@ export class WorkerActivityAdapter {
       for (const signal of signals) {
         if (this.driftLog.some((seen) => seen.kind === signal.kind && seen.subject === signal.subject)) continue;
         this.driftLog.push(signal);
-        try { this.onDrift?.(signal); } catch { /* a failing sink never breaks the run */ }
+        try {
+          this.onDrift?.(signal);
+        } catch {
+          /* a failing sink never breaks the run */
+        }
       }
-    } catch { /* evidence-only: a malformed action never breaks the session */ }
+    } catch {
+      /* evidence-only: a malformed action never breaks the session */
+    }
   }
 
   private observeToolEnd(tool: string, args: Record<string, unknown>, result: unknown, isError: boolean): void {

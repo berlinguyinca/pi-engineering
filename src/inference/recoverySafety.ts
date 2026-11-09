@@ -12,12 +12,33 @@ export type ReplaySafety = "safe" | "unsafe" | "unknown";
 export type ReplayReason = "read_only" | "idempotent_key" | "mutating" | "external" | "unknown_tool" | "invalid_input";
 /** The harness's non-mutating tool surface, matched by exact name only: never case-folded, never trimmed.
  * Adding a name here is a policy change requiring evidence, not a convenience. */
-export const READ_ONLY_TOOL_NAMES: readonly string[] = ["read", "grep", "glob", "ls", "symbol", "repo_search", "tests_for"];
+export const READ_ONLY_TOOL_NAMES: readonly string[] = [
+  "read",
+  "grep",
+  "glob",
+  "ls",
+  "symbol",
+  "repo_search",
+  "tests_for",
+];
 /** The action recovery is holding, with its self-declared hazards; an absent flag is not proof of either. */
-export interface ToolAction { name: string; writes?: boolean; external?: boolean; idempotencyKey?: string }
-export interface ReplayVerdict { safety: ReplaySafety; replayAllowed: boolean; reason: ReplayReason }
+export interface ToolAction {
+  name: string;
+  writes?: boolean;
+  external?: boolean;
+  idempotencyKey?: string;
+}
+export interface ReplayVerdict {
+  safety: ReplaySafety;
+  replayAllowed: boolean;
+  reason: ReplayReason;
+}
 
-const refused = (safety: ReplaySafety, reason: ReplayReason): ReplayVerdict => ({ safety, replayAllowed: false, reason });
+const refused = (safety: ReplaySafety, reason: ReplayReason): ReplayVerdict => ({
+  safety,
+  replayAllowed: false,
+  reason,
+});
 
 /** Decide whether recovery may replay this action; anything it cannot prove read-only is refused. */
 export function classifyReplaySafety(action: ToolAction): ReplayVerdict {

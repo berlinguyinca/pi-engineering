@@ -209,11 +209,16 @@ export function plannerStateTempPath(stateDir: string): string {
 }
 
 export const PROTECTED_TASK_AUTHORITY_GLOBS: readonly string[] = [
-  "docs/specs/**/manifests/**", "docs/specs/**/*.handoff.json", "docs/specs/**/fixtures/**",
-  "docs/specs/**/templates/**", "templates/**", "scripts/bootstrap-*.ts",
+  "docs/specs/**/manifests/**",
+  "docs/specs/**/*.handoff.json",
+  "docs/specs/**/fixtures/**",
+  "docs/specs/**/templates/**",
+  "templates/**",
+  "scripts/bootstrap-*.ts",
 ];
 
-const stringsOf = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+const stringsOf = (v: unknown): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 
 export const scopeGateBlockedReason = (refs: string): string => `evidence: scope gate: ${refs}`;
 
@@ -225,7 +230,8 @@ export function scopeIntegrityCheck(input: {
 }): { ok: true; refs: string } | { ok: false; violations: string[]; protectedHits: string[]; refs: string } {
   const changed = [...new Set(stringsOf(input.changed))];
   const scope = { allowed: stringsOf(input.scope?.allowed), forbidden: stringsOf(input.scope?.forbidden) };
-  const protectedGlobs = input.authorityProtected === undefined ? PROTECTED_TASK_AUTHORITY_GLOBS : stringsOf(input.authorityProtected);
+  const protectedGlobs =
+    input.authorityProtected === undefined ? PROTECTED_TASK_AUTHORITY_GLOBS : stringsOf(input.authorityProtected);
   const violations = scopeViolations(changed, scope);
   const protectedHits = changed.filter((p) => protectedGlobs.some((g) => matchesGlob(p, g)));
   const first = violations.length > 0 ? violations : protectedHits;
@@ -928,14 +934,23 @@ export class PlannerWorkerExecutor {
     const head = (await checkedGit(rt.worktree!.path, ["rev-parse", "HEAD"])).stdout.trim();
     const committed = (await checkedGit(rt.worktree!.path, ["diff", "--name-only", rt.baseCommit, head])).stdout;
     const untracked = (await checkedGit(rt.worktree!.path, ["ls-files", "--others", "--exclude-standard"])).stdout;
-    const check = scopeIntegrityCheck({ changed: `${committed}\n${untracked}`.split("\n").filter(Boolean), scope: rt.state.contract.scope, refs: { taskId: rt.state.contract.task_id, branch: rt.worktree!.branch, base: rt.baseCommit, head } });
+    const check = scopeIntegrityCheck({
+      changed: `${committed}\n${untracked}`.split("\n").filter(Boolean),
+      scope: rt.state.contract.scope,
+      refs: { taskId: rt.state.contract.task_id, branch: rt.worktree!.branch, base: rt.baseCommit, head },
+    });
     return check.ok ? null : { refs: check.refs, head };
   }
 
   private async keepSuperseded(rt: Runtime, head: string): Promise<string> {
     const base = `superseded/${rt.worktree!.branch}-${compactStamp()}`;
     let keep = base;
-    for (let n = 1; (await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${keep}`])).code === 0; n++) keep = `${base}.${n}`;
+    for (
+      let n = 1;
+      (await git(this.opts.repoRoot, ["rev-parse", "--verify", "-q", `refs/heads/${keep}`])).code === 0;
+      n++
+    )
+      keep = `${base}.${n}`;
     await checkedGit(this.opts.repoRoot, ["branch", keep, head]);
     return keep;
   }

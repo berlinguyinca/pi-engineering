@@ -10,7 +10,11 @@ import { exponentialBackoffMs } from "./retryDelay.ts";
 
 /** Why no further attempt is allowed for this incident. */
 export type RetryBudgetStopReason =
-  | "attempts_exhausted" | "deadline_exceeded" | "backoff_exceeds_deadline" | "bootstrap_mode" | "invalid_budget";
+  | "attempts_exhausted"
+  | "deadline_exceeded"
+  | "backoff_exceeds_deadline"
+  | "bootstrap_mode"
+  | "invalid_budget";
 
 /** One budget check: every bound and every time arrives as an argument. Both counts are 1-based — `maxAttempts` is the total attempts allowed (1 means "no retry"), `attempt` the attempts already made. */
 export interface RetryBudgetInput {
@@ -28,7 +32,8 @@ export interface RetryBudgetInput {
   mode?: "bootstrap" | "normal";
 }
 
-export type RetryBudgetDecision = { action: "retry"; waitMs: number; attempt: number }
+export type RetryBudgetDecision =
+  | { action: "retry"; waitMs: number; attempt: number }
   | { action: "stop"; reason: RetryBudgetStopReason };
 
 /** A supplied bound that is not a finite non-negative number is a broken budget, not a default. */
@@ -39,12 +44,25 @@ export function evaluateRetryBudget(input: RetryBudgetInput): RetryBudgetDecisio
   if (input.mode === "bootstrap") return { action: "stop", reason: "bootstrap_mode" };
   const { maxAttempts, attempt, elapsedMs, baseBackoffMs, deadlineMs, maxBackoffMs, retryAfterMs } = input;
   if (
-    !Number.isFinite(maxAttempts) || maxAttempts < 1 || !Number.isFinite(attempt) || attempt < 1 || !Number.isFinite(elapsedMs) || elapsedMs < 0 ||
-    !Number.isFinite(baseBackoffMs) || unusable(deadlineMs) || unusable(maxBackoffMs) || unusable(retryAfterMs)
-  ) return { action: "stop", reason: "invalid_budget" };
+    !Number.isFinite(maxAttempts) ||
+    maxAttempts < 1 ||
+    !Number.isFinite(attempt) ||
+    attempt < 1 ||
+    !Number.isFinite(elapsedMs) ||
+    elapsedMs < 0 ||
+    !Number.isFinite(baseBackoffMs) ||
+    unusable(deadlineMs) ||
+    unusable(maxBackoffMs) ||
+    unusable(retryAfterMs)
+  )
+    return { action: "stop", reason: "invalid_budget" };
   if (attempt >= maxAttempts) return { action: "stop", reason: "attempts_exhausted" };
   if (deadlineMs !== undefined && elapsedMs >= deadlineMs) return { action: "stop", reason: "deadline_exceeded" };
-  const waitMs = Math.max(exponentialBackoffMs(attempt, baseBackoffMs, maxBackoffMs ?? Number.POSITIVE_INFINITY), retryAfterMs ?? 0);
-  if (deadlineMs !== undefined && waitMs > deadlineMs - elapsedMs) return { action: "stop", reason: "backoff_exceeds_deadline" };
+  const waitMs = Math.max(
+    exponentialBackoffMs(attempt, baseBackoffMs, maxBackoffMs ?? Number.POSITIVE_INFINITY),
+    retryAfterMs ?? 0,
+  );
+  if (deadlineMs !== undefined && waitMs > deadlineMs - elapsedMs)
+    return { action: "stop", reason: "backoff_exceeds_deadline" };
   return { action: "retry", waitMs, attempt };
 }

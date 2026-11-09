@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { DEFAULT_INFERENCE_RESILIENCE, resolveInferenceResilienceConfig } from "../../src/inference/resilienceConfig.ts";
+import {
+  DEFAULT_INFERENCE_RESILIENCE,
+  resolveInferenceResilienceConfig,
+} from "../../src/inference/resilienceConfig.ts";
 
 // 05-IMPLEMENTATION-SECURITY.md:13 - "Feature flags default OFF for intervention".
 describe("PI_INFERENCE_RESILIENCE_ENABLED", () => {

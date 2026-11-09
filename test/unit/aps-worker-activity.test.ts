@@ -13,9 +13,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { contextUtilization } from "../../src/aps/context.ts";
 import { AgentProgressSupervisor, type AgentProgressSupervisorOptions } from "../../src/aps/supervisor.ts";
-import type { AgentLoopCandidateEvent, AgentLoopEvent } from "../../src/aps/types.ts";
 import type { AlignmentSignal } from "../../src/aps/taskAlignment.ts";
-import { driftSignalsEnabled, WorkerActivityAdapter } from "../../src/aps/workerActivity.ts";
+import type { AgentLoopCandidateEvent, AgentLoopEvent } from "../../src/aps/types.ts";
+import { WorkerActivityAdapter, driftSignalsEnabled } from "../../src/aps/workerActivity.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { TelemetryNotice } from "../../src/telemetry/sink.ts";
 import { setTelemetrySink } from "../../src/telemetry/sink.ts";
@@ -247,21 +247,46 @@ test("contextUtilization is reported in the event only when usage and budget are
   assert.equal(noBudget.events[0]!.contextUtilization, null);
 });
 test("(d) live drift watch is off unless switched on affirmatively, then flags contract violations", () => {
-  const watch = { allowedScope: ["src/panel/**"], declaredTasks: ["WI-1"], declaredArtifacts: [{ kind: "docs" as const }] };
+  const watch = {
+    allowedScope: ["src/panel/**"],
+    declaredTasks: ["WI-1"],
+    declaredArtifacts: [{ kind: "docs" as const }],
+  };
   const off = setup({}, { drift: watch });
   emitTool(off.bus, "write", { path: "/home/u/proj/src/other/x.ts" }, "ok");
   assert.deepEqual(off.adapter.driftSignals, []); // PI_TASK_DRIFT_SIGNALS absent -> nothing evaluated
-  for (const v of [undefined, "", "0", "false", "ture", "off", "1x"]) assert.equal(driftSignalsEnabled({ PI_TASK_DRIFT_SIGNALS: v }), false);
-  for (const v of ["1", "true", "TRUE", "On", " on ", "YES"]) assert.equal(driftSignalsEnabled({ PI_TASK_DRIFT_SIGNALS: v }), true);
+  for (const v of [undefined, "", "0", "false", "ture", "off", "1x"])
+    assert.equal(driftSignalsEnabled({ PI_TASK_DRIFT_SIGNALS: v }), false);
+  for (const v of ["1", "true", "TRUE", "On", " on ", "YES"])
+    assert.equal(driftSignalsEnabled({ PI_TASK_DRIFT_SIGNALS: v }), true);
   const seen: AlignmentSignal[] = [];
-  const on = setup({}, { drift: watch, env: { PI_TASK_DRIFT_SIGNALS: "1" }, onDrift: (s) => { seen.push(s); throw new Error("sink exploded"); } });
+  const on = setup(
+    {},
+    {
+      drift: watch,
+      env: { PI_TASK_DRIFT_SIGNALS: "1" },
+      onDrift: (s) => {
+        seen.push(s);
+        throw new Error("sink exploded");
+      },
+    },
+  );
   const expanded = setup({}, { drift: { ...watch, declaredTasks: ["WI-2"] }, env: { PI_TASK_DRIFT_SIGNALS: "1" } });
   emitTool(on.bus, "write", { path: "/home/u/proj/src/panel/Feed.ts" }, "ok"); // in scope, no source artifact declared
   emitTool(on.bus, "read", { path: "/home/u/proj/src/other/x.ts" }, "ok"); // read-only investigation stays silent
   emitTool(on.bus, "write", { path: "/home/u/proj/src/panel/Feed.ts" }, "ok"); // repeat collapses to first observation
   emitTool(expanded.bus, "write", { path: "/home/u/proj/src/panel/Feed.ts" }, "ok");
-  assert.deepEqual(on.adapter.driftSignals.map((s) => [s.kind, s.subject, s.iteration]), [["undeclared_artifact", "src/panel/Feed.ts", 0]]);
-  assert.deepEqual(seen.map((s) => s.subject), ["src/panel/Feed.ts"]); // the sink rides the same signal and never breaks the run
-  assert.deepEqual(expanded.adapter.driftSignals.map((s) => s.kind), ["task_expansion", "undeclared_artifact"]); // every kind rides the live path
+  assert.deepEqual(
+    on.adapter.driftSignals.map((s) => [s.kind, s.subject, s.iteration]),
+    [["undeclared_artifact", "src/panel/Feed.ts", 0]],
+  );
+  assert.deepEqual(
+    seen.map((s) => s.subject),
+    ["src/panel/Feed.ts"],
+  ); // the sink rides the same signal and never breaks the run
+  assert.deepEqual(
+    expanded.adapter.driftSignals.map((s) => s.kind),
+    ["task_expansion", "undeclared_artifact"],
+  ); // every kind rides the live path
   assert.equal(on.adapter.actions.length, 3); // the watch changes no recorded action
 });
