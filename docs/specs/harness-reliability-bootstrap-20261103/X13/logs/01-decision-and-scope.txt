@@ -1,0 +1,23 @@
+X13 scope: the operator-approved lint remediation, so that merging #616 does not take main's own gate from exit 0 to exit 1.
+
+Measured before this unit (X12/logs/04-lint-*.txt, X12/logs/06-lint-parity-with-the-repos-own-command.txt):
+  `npm run lint` = `biome check .`  ->  exit 1, 517 errors, 1930 files checked.
+Bucketed from `biome check . --reporter=summary`:
+  evidence tree  docs/specs/harness-reliability-bootstrap-20261103/**   366 format + 1 organizeImports + 3 parse = 370
+      the 3 parse findings are raw npm-test logs stored under a .json name and they are not JSON and never were:
+        B00/logs/05-metabolomics-models.json
+        B00/logs/05b-metabolomics-models.json
+        V04/logs/03-dry-run-no-endpoint.json
+  code this branch wrote   77 files (33 src, 39 test, 5 scripts)   75 format + 44 organizeImports + 15 analyzer findings
+
+Approved option, taken here: ignore the evidence tree in biome.json -- its bytes are hash-bound, see
+04-evidence-hash-independence.txt for the proof that this decision was required, not merely convenient --
+and format the code files. The ignore is one line, the trail's own prefix, and it is the mechanism biome.json
+already uses for the two golden fixtures whose bytes are compared verbatim
+(test/fixtures/backpressure-conformance-v1.json, test/fixtures/mission-snapshot-v3.golden.json).
+
+$ git diff -- biome.json
++      "docs/specs/harness-reliability-bootstrap-20261103/**",
+
+Effect of the ignore alone: 517 -> 127 errors, 1930 -> 1551 files checked.
+Then `biome check --write` (safe fixes only) took it to 6; the 6 are fixed by hand in 03-; then 0 (08-).

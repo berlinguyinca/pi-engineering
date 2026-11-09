@@ -1,0 +1,12 @@
+$ npm run typecheck:core      ->  exit 0 (tsc --noEmit), before the sweep and after it
+
+$ npm run lint                ->  exit 0
+> biome check .
+Checked 1551 files in 5s. No fixes applied.
+
+  (517 errors -> 127 after the biome.json ignore -> 6 after `--write` -> 0 after 03- and 05-.
+   `npm run lint` was exit 1 for the whole X series, which is the gap X12 recorded and this unit closes:
+   main returns exit 0 today, and after this unit the branch does too, so merging #616 no longer regresses it.)
+
+$ npx biome check . --reporter=summary   (same conclusion, per-reporter view)
+  no reporter/format section, no reporter/parse section, no reporter/analyzer section.
