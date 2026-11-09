@@ -83,6 +83,20 @@ if (!ok("rev-parse", "--verify", ref)) { console.error(`ref not found: ${ref}`);
 // The manifest lives beside the repository, so resolve it from the repo root rather than the
 // caller's directory -- otherwise running the gate from anywhere but the root fails confusingly.
 const root = out("rev-parse", "--show-toplevel");
+
+// Reachability is a question about history, and a shallow clone does not hold the history. Measured
+// at this commit with the manifest unchanged: a full clone reports broken=30 and a 50-commit clone of
+// the same commit reports broken=219, because a pointer whose ancestors were never fetched cannot be
+// shown reachable and is filed as a defect. A truncated checkout is then read as damage to the chain,
+// which is the inverse of the error this scanner was written for. Say the environment is unfit (exit
+// 2) instead of letting it speak: CI's `checkout` step fetches full history, all branches and tags,
+// so a CI run never lands here; a hand-run in a shallow clone should re-clone, not chase 189 phantoms.
+if (out("rev-parse", "--is-shallow-repository").trim() === "true") {
+  console.log("manifest=harness-reliability-lineage-superseded/v2 (not consulted -- history is shallow)");
+  console.log("RESULT not-evaluated: this is a shallow clone, so ancestry cannot be judged from it");
+  console.log("  re-run against a full clone: git clone (no --depth) or git fetch --unshallow");
+  process.exit(2);
+}
 const paths = out("ls-tree", "-r", "--name-only", ref).split("\n").filter((p) => /(^|\/)out[^/]*\/[^/]+\.handoff\.json$/.test(p));
 
 const broken = new Map();                 // "record|field" -> { sha, defect, carriers }
