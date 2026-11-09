@@ -11,12 +11,14 @@
 // copy changes nextTaskId/nextBaseSha, adds two evidence references and one note paragraph -- every
 // other byte is X15/out/X15.handoff.json's, which is what makes it a generation of X15 rather than a
 // new unit.
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { canonicalHash } from "../../../../../src/bootstrap/resultGate.ts";
 
 const R = "docs/specs/harness-reliability-bootstrap-20261103";
 const [baseSha, resultSha, approvedAt] = process.argv.slice(2);
 const write = (path: string, record: Record<string, unknown>) => {
+  mkdirSync(dirname(path), { recursive: true });
   const full = { ...record };
   delete full.handoffHash;
   full.handoffHash = canonicalHash(full);
