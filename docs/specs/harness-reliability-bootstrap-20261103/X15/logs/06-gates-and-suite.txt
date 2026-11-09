@@ -1,0 +1,48 @@
+# gates at the corrected-generation state (task commit 2eee4d1a + six out-chain records, generators moved out of the linted tree)
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=72 offenders=0
+superseded-generation links (informational)=25
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 1
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 6
+  A  docs/specs/harness-reliability-bootstrap-20261103/E02/out-chain/E02.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/FIX-2/out-chain/FIX-2.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/FIX-3C/out-chain/FIX-3C.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/T09/out-chain/T09.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/V06/out-chain/V06.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X07/out-chain/X07.handoff.json
+RESULT ok: 72 canonical forward links resolved
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+ref=HEAD records=109 fields=3
+pointers healthy=277 nullDeclared=20 broken=30 unparseableRecords=0
+healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 0
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+ref=HEAD records=109
+hashes recomputed ok=109 mismatch=0 noHashField=0 unparseable=0
+declared evidence paths=691 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree
+exit=0
+
+$ npm run lint
+
+> pi-engineering-runtime@0.2.0 lint
+> biome check .
+
+Checked 1552 files in 1047ms. No fixes applied.
+exit=0
+
+$ npm run typecheck:core
+
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+
+exit=0
