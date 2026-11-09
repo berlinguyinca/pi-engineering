@@ -1,0 +1,43 @@
+What the divergence is, and what causes it.
+
+The same committed tree (81e229a6, the merge of #616) produced two different answers from
+AUDIT/integrity-scan.mjs depending on which checkout it was run in:
+
+  conductor worktree   canonical chain links resolved=61  offenders=2  superseded-generation links=21
+  main worktree        canonical chain links resolved=61  offenders=3  superseded-generation links=20
+
+The extra offender on main is `FIX-2/out -> FIX-3@e77904e73f3c (no such record)`, and the mechanism is a directory
+listing. `rank()` ranked any `out*` directory that is not in its table as 2 -- above the real `out`, which is 1 -- and
+the only negative-control test was `g.includes("negctl")`. FIX-2 has three such directories:
+
+  FIX-2/out            the real record
+  FIX-2/out-noparent   empty   (a tamper/no-parent control run left it behind)
+  FIX-2/out-tampered   empty   (ditto)
+
+Ranked, that is [out-noparent(2), out-tampered(2), out(1)], so `chainable[0]` was `out-noparent` and
+`records.find(... gen === "out-noparent")` returned undefined: FIX-2 had no canonical record at all, and
+`isCanonical(FIX-2/out)` was false, which routes its unresolved forward link to chainHistory instead of chainBad.
+Git cannot store empty directories, so those two shadows exist only in the checkout where the control runs happened.
+
+Reproduced by replicating the pre-fix selection against both trees and diffing the result: exactly one unit of 67
+differs --
+
+  FIX-2: conductor -> out-noparent (EMPTY -> canonical undefined)   main -> out
+
+The same shadow also moves one link between the canonical and the informational buckets, which is the 21/20
+difference. Nothing else changes.
+
+The truth is offenders=3: E02/out -> E03@cc036f2f8c3b, FIX-2/out -> FIX-3@e77904e73f3c, T09/out -> T10@3bb21ab2e4b4,
+each "no such record" because the child unit never emitted a record (FIX-3/ carries HANDOFF.md and logs only).
+The series has been reporting "the two known ones" -- that count was produced by a worktree with shadow directories,
+and PLAN-COMPLETION.json says so in three places. Corrected in this unit, not quietly.
+
+The fix is two lines of intent:
+  * a named negative-control pattern (out-negctl*, out-noparent*, out-tampered*) instead of a substring test on
+    "negctl", so a control generation can never be canonical even when it holds a record;
+  * canonical = the highest-ranked generation that actually holds a record, so a leftover empty directory cannot
+    shadow the generation that carries one.
+
+Both scans now agree byte-for-byte across the two worktrees (03-, 04-), and this defect class is visible to the
+trail only because the scan is run somewhere other than where it was written -- which is worth keeping in mind for
+every "RESULT ok" this series has produced from a single checkout.
