@@ -7,7 +7,7 @@
  * writable. A second table holds plain prompts that must stay writable.
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -571,4 +571,33 @@ describe("workspace authority corpus (PR #106 final reviews)", () => {
       assert.deepEqual(writable, [...row.write].sort());
     });
   });
+});
+
+// Corpus #8 failed on the first Linux CI run and passes on every laptop, and the difference
+// was the host, not the code path: a Woodpecker agent keeps its cache under /tmp and HOME
+// follows it, and the resolver's scratch heuristic read "under the temp dir" as "an output,
+// not a target" — so `Fix ~/repo-that-does-not-exist` resolved instead of refusing. Laptops
+// keep HOME outside the temp dir and never saw it. This pins the host shape itself, so the
+// next machine with an unusual HOME cannot quietly widen what a prompt may write.
+it("a HOME under the temp dir does not turn a missing ~ target into a scratch output (#652)", async () => {
+  const savedHome = process.env.HOME;
+  const tempRoot = await realpath(tmpdir());
+  const home = await mkdtemp(join(tempRoot, "pi-eng-fake-home-"));
+  const fixture = await makeFixtureRepo();
+  process.env.HOME = home;
+  try {
+    // If the host will not let HOME sit under the temp dir, this test proves nothing — say
+    // so rather than pass for the wrong reason.
+    assert.ok(home.startsWith(`${tempRoot}/`), `could not place HOME under ${tempRoot}`);
+    await assert.rejects(
+      () => new WorkspaceManifestResolver().resolve("Fix ~/pi-eng-repo-that-does-not-exist-7f3a", fixture.root),
+      WorkspaceScopeError,
+      "a missing ~ target must refuse even when HOME lives inside the temp dir",
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    await rm(home, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
 });

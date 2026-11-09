@@ -315,7 +315,14 @@ async function planAuthority(analysis: RequestAnalysis, launchCwd: string): Prom
         // Only a verb aimed straight at it makes it a target ("fix ~/repo-typo");
         // a new directory under the temp dir is a scratch output unless it is
         // a near-miss of an existing one.
-        const scratch = isWithin(await realpath(tmpdir()).catch(() => tmpdir()), ancestor) && !nearMiss;
+        const scratchAncestor = isWithin(await realpath(tmpdir()).catch(() => tmpdir()), ancestor);
+        // "Under the temp dir" cannot be the whole test, because HOME is not always outside
+        // it: a CI agent with HOME under /tmp (Woodpecker's default cache location, and what
+        // the first Linux runner had) made every `~/some-missing-repo` target look like a
+        // scratch output, so "Fix ~/repo-that-does-not-exist" resolved instead of refusing.
+        // A path inside the user's home is not scratch however the temp dir is arranged.
+        const insideHome = isWithin(resolve(homedir()), ancestor);
+        const scratch = scratchAncestor && !nearMiss && !insideHome;
         if (analysis.mutationLed[index] && !scratch && !/\.[A-Za-z0-9]{1,8}$/.test(basename(mention.path))) {
           missing.push(mention.path);
         }
