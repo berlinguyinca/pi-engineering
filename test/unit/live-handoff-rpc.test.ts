@@ -24,7 +24,10 @@ import {
   serializeLiveHandoffPayload,
   validateLiveHandoffParams,
 } from "../../src/runtime/herdr/liveHandoff.ts";
-import { SOCKET_PATH_LIMIT } from "../../src/sessionControl/SessionControl.ts";
+import {
+  SOCKET_PATH_LIMIT,
+  shortSocketRoot as productShortSocketRoot,
+} from "../../src/sessionControl/SessionControl.ts";
 
 const exec = promisify(execFile);
 
@@ -41,14 +44,13 @@ const tmpRoot = await mkdtemp(path.join(tmpdir(), "live-handoff-test-"));
 //
 // `os.tmpdir()` is exactly the wrong root for this: on macOS it is the long
 // per-user temp dir (`/private/var/folders/…/T/`, already 58 bytes), and this
-// suite canonicalizes it. So the sockets hang off a short root, following the
-// rule in `src/sessionControl/SessionControl.ts`: `$XDG_RUNTIME_DIR` where it is
-// short enough, `/tmp` otherwise.
-function shortSocketRoot(): string {
-  const xdg = process.env.XDG_RUNTIME_DIR;
-  if (!xdg?.startsWith("/") || xdg.includes("\0") || Buffer.byteLength(xdg) > 30) return "/tmp";
-  return xdg;
-}
+// suite canonicalizes it. So the sockets hang off a short root — and the root is
+// the product's own `shortSocketRoot`, imported rather than copied. The copy is
+// what killed this file on the first Linux CI run: it accepted
+// `XDG_RUNTIME_DIR=/run/user/<uid>` on shape alone, and `mkdtemp` of a child of a
+// directory that does not exist failed at top level, so the whole file died in
+// ~119 ms with no subtest output at all.
+const shortSocketRoot = productShortSocketRoot;
 
 const sockRoot = await mkdtemp(path.join(shortSocketRoot(), "lh-"));
 
