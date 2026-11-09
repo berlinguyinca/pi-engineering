@@ -1,0 +1,36 @@
+
+BEFORE  (scanner as it stands)
+  records=105 canonical=68 offenders=3 orphans=6
+   OFFENDER E02/out -> E03@cc036f2f8c3b
+   OFFENDER FIX-2/out -> FIX-3@e77904e73f3c
+   OFFENDER T09/out -> T10@3bb21ab2e4b4
+   ORPHAN   B00/out-backfill B00@c2b75dc93885
+   ORPHAN   FIX-1/out FIX-1@cc036f2f8c3b
+   ORPHAN   FIX-5/out FIX-5@7f983ee05c0d
+   ORPHAN   R01/out R01@3bb21ab2e4b4
+   ORPHAN   X01/out-final X01@900bf8a3b10d
+   ORPHAN   X08/out-chain X08@45d42acb70fc
+
+AFTER1  (unit regex fixed only)
+  records=111 canonical=72 offenders=4 orphans=7
+   OFFENDER E02/out -> E03@cc036f2f8c3b
+   OFFENDER FIX-2/out -> FIX-3@e77904e73f3c
+   OFFENDER FIX-3B2/out -> FIX-3C@0ddf27714f80
+   OFFENDER T09/out -> T10@3bb21ab2e4b4
+   ORPHAN   B00/out-backfill B00@c2b75dc93885
+   ORPHAN   FIX-1/out FIX-1@cc036f2f8c3b
+   ORPHAN   FIX-3B/out FIX-3B@24f42fba3f71
+   ORPHAN   FIX-4A/out2 FIX-4A@74b54eb17f51
+   ORPHAN   R01/out R01@3bb21ab2e4b4
+   ORPHAN   X01/out-final X01@900bf8a3b10d
+   ORPHAN   X08/out-chain X08@45d42acb70fc
+
+AFTER2  (regex fixed + 6 corrected generations)
+  records=117 canonical=73 offenders=0 orphans=1
+   ORPHAN   B00/out-backfill B00@c2b75dc93885
+
+X08 with old regex=True: canonical gen=out-chain key=X08@45d42acb70fc2fcac764 named=False
+   namers of X08: []
+
+X08 with old regex=False: canonical gen=out-chain key=X08@45d42acb70fc2fcac764 named=False
+   namers of X08: []

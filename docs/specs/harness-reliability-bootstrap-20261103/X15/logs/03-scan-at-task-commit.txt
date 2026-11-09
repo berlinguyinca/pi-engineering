@@ -1,0 +1,22 @@
+# scan at this unit's task commit 2eee4d1a (structural unit rule + exit status, before this unit's records)
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+units=73 records=111 canonical=72 hash_ok=111 field_ok=111
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=65 offenders=4
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN FIX-2/out -> FIX-3@e77904e73f3c (no such record)
+  CHAIN FIX-3B2/out -> FIX-3C@0ddf27714f80 (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+superseded-generation links (informational)=22
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 7
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-3B/out/FIX-3B.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-4A/out2/FIX-4A.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+RESULT offenders=4: 65 canonical forward links resolved
+exit=1
