@@ -1,0 +1,45 @@
+X16 log 14 -- the first green run this branch has had, and where green actually began
+
+$ GET /api/repos/121/pipelines/41
+  commit 8562c878f0ca  status success
+   checkout             success  exit=0
+   node                 success  exit=0
+   toolchain            success  exit=0
+   install              success  exit=0
+   lint                 success  exit=0
+   typecheck            success  exit=0
+   test-unit            success  exit=0
+   test-integration     success  exit=0
+   smoke                success  exit=0
+   roadmap-structural   success  exit=0
+   cleanup-venv         success  exit=0
+
+test-unit, test-integration, smoke and roadmap-structural all pass. This is the first run of a
+pipeline on this branch that has ever gone green: #653's earlier runs are 24 (failure), 26
+(failure), 28 and 30 (cancelled by later pushes), 31 (failure), 33 (failure), and 41 (success).
+
+Green did not begin here. From the same list endpoint, the five successes in the repo, oldest
+first:
+   #35  pull_request b64b51bc84b9  fix: the four Linux CI test failures were three host ass
+   #37  push         64cae00bd0ea  (push on main)
+   #38  pull_request 2f9c7019b828  docs(operations): a CI runbook, written while the cost w
+   #40  push         f6ac8f6d708f  (push on main)
+   #41  pull_request 8562c878f0ca  fix(audit): the integrity scan reads the 230 records the
+
+The first was #35, the pull-request run of #654 itself -- the commit that made the four tests
+host-independent. #37 and #40 are pushes of 64cae00b and f6ac8f6d to main; #38 is #655's PR run.
+#41 is green because this branch merges 64cae00b, and for no other reason. Nothing in #653 made
+a test pass: git diff --name-only origin/main...HEAD before this merge is the scanner, the
+declaration file, the plan, X15/out-chain, X16 and its logs, and that remains true of the green
+run -- the code that fixed the four failures arrived from main.
+
+== what green here does not mean
+* The trail scans are still not in the pipeline. The steps that ran are checkout, node, toolchain,
+  install, lint, typecheck, test-unit, test-integration, smoke, roadmap-structural, cleanup-venv.
+  integrity-scan.mjs, lineage-scan.mjs and record-reproducibility.mjs appear in no workflow file, so
+  a green check on this PR says nothing about the chain; the scans are still operator-run, and the
+  proof they pass is the three RESULT ok lines in log 13, run by hand at this head.
+* Green is not review. #653 still has no independent reviewer; the reviewing account is capped
+  until Nov 11th 07:03, and log 10 is self-verification.
+* The pipeline's own history still contains 22 failures and 3 cancellations, all of them before
+  #654. A green check is a statement about one commit, not about the harness.
