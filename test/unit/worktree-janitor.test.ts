@@ -82,7 +82,14 @@ test("terminal owner: worktree reclaimed, uncommitted work preserved on its bran
     const branch = "pi-eng-candidate-MSN-done01-repo-1-0-EXC-a";
     const wt = await createOwned(repo, head, branch);
     process.env.PI_RUST_CACHE_DIR = join(fixture.root, "rust-cache");
-    const target = (await rustTargetDir(wt.path))!;
+    const target = await rustTargetDir(wt.path);
+    // Not `!`: when the cache is off this returns null by design, and the assertion that
+    // used to sit here was a `join(target, …)` TypeError about a null "path" argument —
+    // which is how a host exporting CARGO_TARGET_DIR showed up as a broken janitor test.
+    assert.ok(
+      target,
+      "the Rust cache is off here (CARGO_TARGET_DIR set, or PI_RUST_CACHE=0), so this fixture cannot place a target dir",
+    );
     await mkdir(join(target, "debug"), { recursive: true });
     await writeFile(join(wt.path, "src", "unsaved.js"), "export const unsaved = 1;\n");
     await writeFile(join(wt.path, "src", "add.js"), "export const add = (a, b) => a + b;\n");
