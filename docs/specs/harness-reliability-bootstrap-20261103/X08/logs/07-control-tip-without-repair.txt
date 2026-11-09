@@ -1,0 +1,9 @@
+### CONTROL at tip 45d42acb WITHOUT the repair: the doubled prefix no longer reproduces, because upstream 61394da7 (fix(git): one canonical path for the state dir and the temp root, #582) fixes the root cause
+$ node --import ./test/support/isolatedState.ts ./abprobe.mts   # CONTROL: tip 45d42acb WITHOUT the repair (upstream 61394da7 / #582 canonicalizes the state dir)
+commonDir() = /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/abprobe-A75Sdb/.git EXISTS
+[exit=0]
+ℹ tests 12
+ℹ pass 12
+ℹ fail 0
+ℹ cancelled 0
+ℹ duration_ms 46560.106

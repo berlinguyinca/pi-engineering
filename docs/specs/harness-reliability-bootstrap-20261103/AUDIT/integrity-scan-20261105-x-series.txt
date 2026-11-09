@@ -1,0 +1,77 @@
+harness-reliability-bootstrap-20261103 - post-X-series integrity scan (chain walk + evidence tracking)
+generated at de6254b1a7c2736912a38d26d4d704cf3ded7a4d on branch harness-reliability-bootstrap-20261103
+tool: node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs   (read-only; scans every */out*/*.handoff.json)
+
+== BEFORE (clean checkout of the X-series tip 10c93281, run in build/X07 before the records below were staged):
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs   # at 548c2a83d041a888461cddcaec0ef0a236997ef2
+records=88 canonical=60 hash_ok=88 field_ok=88
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=55 offenders=10
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN FIX-2/out -> FIX-3@e77904e73f3c (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json names a child but is not tracked in git
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/X02/out-final/X02.handoff.json names a child but is not tracked in git
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/X03/out-final/X03.handoff.json names a child but is not tracked in git
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/X04/out-final/X04.handoff.json names a child but is not tracked in git
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/X05/out-chain/X05.handoff.json names a child but is not tracked in git
+  CHAIN X06/out-chain -> X07@10c93281eec5 (no such record)
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/X06/out-chain/X06.handoff.json names a child but is not tracked in git
+superseded-generation links (informational)=20
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 5
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+
+== AFTER (this commit, with the X-series chain parents staged):
+records=91 canonical=61 hash_ok=91 field_ok=91
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=56 offenders=2
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+superseded-generation links (informational)=21
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 5
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+evidence dangling=0 untracked=1
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X07/out-final/X07.handoff.json (record itself)
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 16
+  M  docs/specs/harness-reliability-bootstrap-20261103/X01/fixtures/handoff-record.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+  M  docs/specs/harness-reliability-bootstrap-20261103/X02/fixtures/handoff-record.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X02/out-final/X02.handoff.json
+  M  docs/specs/harness-reliability-bootstrap-20261103/X03/fixtures/handoff-record.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X03/out-final/X03.handoff.json
+  M  docs/specs/harness-reliability-bootstrap-20261103/X04/fixtures/handoff-record.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X04/out-final/X04.handoff.json
+  M  docs/specs/harness-reliability-bootstrap-20261103/X05/fixtures/handoff-record.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X05/out-chain/X05.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X05/out-final/X05.handoff.json
+  M  docs/specs/harness-reliability-bootstrap-20261103/X06/fixtures/handoff-record.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X06/out-chain/X06.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X06/out-final/X06.handoff.json
+   M docs/specs/harness-reliability-bootstrap-20261103/X07/fixtures/handoff-record.json
+  ?? docs/specs/harness-reliability-bootstrap-20261103/X07/out-final/
+
+== Reading of the residue
+records: every emitted generation agrees with its embedded canonical hash and conforms to the
+  15-required-field schema with no extra fields; no evidence path is dangling.
+canonical chain offenders (2):
+  E02/out names E03@cc036f2f8c3b (its own resultSha) while E03/out records base ba22f28a6b54 -
+    E03 was stamped with base=HEAD~1 instead of the commit E02 handed over, so the pointer pair
+    cannot resolve. Left as-is: rewriting a PASS record would change its hash and its children.
+  T09/out names T10@3bb21ab2e4b4, and T10 is not in the plan (the T-series ends at T09) - a
+    terminal record whose next step was planned and never created.
+canonical orphans (5): B00/out-backfill (chain head), R01/out (head of the R-series),
+  FIX-1/out (head of the FIX audit fixes), FIX-5/out (terminal of the FIX run),
+  X01/out-final (X01 joins the series to V06 by prose reference, not by a pointer, because V06
+  was terminal when the X-series started - see V06 nextTaskId=None above).
+Chain-parent tracking: fixed here. X01-X04 out-final, X05 out-final+out-chain, X06 out-final+
+  out-chain and the matching fixtures/handoff-record.json copies are now in git; before this
+  commit five of them named a child while untracked, which a fresh clone could not verify.
+Superseded generations keep the pointers they were written with; the scanner reports those as
+  informational history rather than offenders.

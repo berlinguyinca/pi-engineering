@@ -1,0 +1,12 @@
+✔ a well-formed authority hash + trimmed task id is known and carries both (1.376417ms)
+✔ absent, malformed or non-string authority and a blank task id are unknown, each reason naming the failure (0.242417ms)
+✔ model provenance reads quantization from the id; every absent or non-string part is null (0.236792ms)
+✔ an action built with only the pre-existing required fields still typechecks, provenance absent (0.061208ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 169.586666

@@ -1,0 +1,12 @@
+✔ every filter combination leaves the namespace byte- and name-identical, proving no writer was opened (9.477ms)
+✔ time, host, session and limit filters select exactly what they say (2.318792ms)
+✔ foreign types, corrupt lines and payloads E02 refuses are skipped and counted; order is deterministic (1.963458ms)
+✔ a nonexistent or empty namespace reads as the documented empty result and creates nothing (1.610958ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 166.42325

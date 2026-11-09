@@ -1,0 +1,12 @@
+[
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/E07/logs/05-typecheck-after-trim.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/retry-error-events.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/E07/logs/06-unit-retry-error-events-after-trim.txt"
+ }
+]

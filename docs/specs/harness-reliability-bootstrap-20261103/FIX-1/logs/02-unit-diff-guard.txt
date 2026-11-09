@@ -1,0 +1,13 @@
+✔ unexpected, denied, generated, binary and budget breaches are reported deterministically (11.686208ms)
+✔ a clean worktree still scopes the commit under review (FIX-1) (0.525416ms)
+✔ file budgets count committed paths, not just dirty ones (FIX-1) (0.19975ms)
+✔ a path in both porcelain and numstat is scoped once (FIX-1) (0.131875ms)
+✔ a diff inside limits passes; oversize, symlink and read-only breaches do not (0.28375ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 249.500667

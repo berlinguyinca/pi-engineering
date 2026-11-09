@@ -13,7 +13,9 @@
  * even when everything else is broken.
  */
 
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { DiagnoseDeps } from "../../../scripts/diagnose-errors.ts";
 
 type Factory = (pi: ExtensionAPI) => unknown;
 
@@ -73,7 +75,99 @@ function tracking(pi: ExtensionAPI): { api: ExtensionAPI; undo: () => void } {
   };
 }
 
+/** How each D05 exit code reads in the terminal, and how many clusters one report shows. */
+const DIAGNOSE_CLASS: Record<number, string> = {
+  0: "ok",
+  2: "usage refused",
+  3: "namespace refused",
+  4: "read or export failed",
+};
+const DIAGNOSE_TOP = 5;
+
+/** What `/diagnose-errors` reads with. `Omit<…, "writeFile">` IS the permission scope: no writer can be injected, so
+ * D05's own `--export` path fails closed (exit 4) and nothing here can write, mkdir or append. */
+export interface DiagnoseHooks {
+  namespace: (cwd: string) => Promise<string>;
+  deps: Omit<DiagnoseDeps, "writeFile">;
+}
+
+/** The calling worktree's events namespace by this repo's existing convention — orchestration override, else state
+ * root + worktree identity — and nothing else: pure path arithmetic, never a probe or mkdir, so a read-only command
+ * cannot create the namespace it reports on. D04 owns recovery and this command has no durable evidence source, so a
+ * row stays unresolved rather than an invented one. */
+const productionDiagnoseHooks = async (): Promise<DiagnoseHooks> => {
+  const [reader, aggregate, identity, stateDir, os, fs] = await Promise.all([
+    import("../../incidents/errorReader.ts"),
+    import("../../incidents/errorAggregate.ts"),
+    import("../isolation/WorktreeIdentity.ts"),
+    import("../isolation/stateDir.ts"),
+    import("node:os"),
+    import("node:fs"),
+  ]);
+  const rootFor = async (cwd: string): Promise<string> =>
+    stateDir.resolveOrchestrationOverride() ??
+    stateDir.worktreeRuntimeDir(stateDir.resolveStateRoot(), (await identity.resolveWorktreeIdentity(cwd)).worktreeId);
+  return {
+    namespace: async (cwd) => join(await rootFor(cwd), "events"),
+    deps: {
+      read: reader.readHostErrorOccurrences,
+      aggregate: aggregate.aggregateErrorOccurrences,
+      evidence: () => null,
+      hostname: () => os.hostname(),
+      exists: fs.existsSync,
+    },
+  };
+};
+
+/** The bounded report: D05's three summary lines, at most DIAGNOSE_TOP clusters, what it refused, and the exit class. */
+function diagnoseReport(result: { exitCode: number; stdout: string[]; stderr: string[] }): string {
+  const clusters = result.stdout.slice(3);
+  const shown = [
+    ...result.stdout.slice(0, 3),
+    ...clusters.slice(0, DIAGNOSE_TOP),
+    ...(clusters.length > DIAGNOSE_TOP
+      ? [`… ${clusters.length - DIAGNOSE_TOP} more clusters (scripts/diagnose-errors.ts prints all)`]
+      : []),
+  ];
+  return [...shown, ...result.stderr, `exit=${result.exitCode} ${DIAGNOSE_CLASS[result.exitCode] ?? "unknown"}`].join(
+    "\n",
+  );
+}
+
+/**
+ * `/diagnose-errors` — a thin adapter over the D05 CLI, which owns every argument, read, cluster and verdict; this
+ * discovers the namespace, calls `parseArgs` and `runDiagnoseErrors`, and reports what comes back. Registered by the
+ * shim rather than the Host so the diagnosis exists even when the Host is broken, with D05 imported only when the
+ * command runs so this file still loads on its own. Read-only by construction: `DiagnoseHooks` has no writer.
+ */
+export function registerDiagnoseErrors(
+  pi: ExtensionAPI,
+  load: () => Promise<DiagnoseHooks> = productionDiagnoseHooks,
+): void {
+  pi.registerCommand("diagnose-errors", {
+    description:
+      "Read-only diagnosis of this worktree's error namespace: clustered totals and top clusters (never writes)",
+    handler: async (args, ctx) => {
+      try {
+        const [cli, hooks] = await Promise.all([import("../../../scripts/diagnose-errors.ts"), load()]);
+        const argv = args.trim() === "" ? [] : args.trim().split(/\s+/);
+        if (!argv.includes("--namespace")) argv.push("--namespace", await hooks.namespace(ctx.cwd));
+        const parsed = cli.parseArgs(argv);
+        if (!parsed.ok || parsed.opts === undefined) {
+          ctx.ui.notify(parsed.errors.join("\n"), "warning");
+          return;
+        }
+        const result = cli.runDiagnoseErrors(parsed.opts, hooks.deps);
+        ctx.ui.notify(diagnoseReport(result), result.exitCode === 0 ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(`diagnose-errors failed: ${describe(error)}`, "error");
+      }
+    },
+  });
+}
+
 export async function installPiEngineering(pi: ExtensionAPI, modules: EntryModules = DEFAULT_MODULES): Promise<void> {
+  registerDiagnoseErrors(pi); // read-only diagnosis, so it must exist whatever the Host below does
   const startedAt = Date.now();
   // The TUI renders its first frame only after extensions finish loading, so
   // for a second or more the user sees a blank terminal. stderr is the one

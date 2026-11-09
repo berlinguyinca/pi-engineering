@@ -1,0 +1,9 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/inference-*.test.ts test/unit/resilience-*.test.ts test/unit/gateway-*.test.ts test/unit/aps-*.test.ts   # head 141ca5dbba112d713f2fb459ba31392599db0a5f then base 900bf8a3
+ℹ tests 650
+ℹ pass 650
+ℹ fail 0
+COMPARISON-BASE-900bf8a3
+ℹ tests 644
+ℹ pass 644
+ℹ fail 0
+exit=0

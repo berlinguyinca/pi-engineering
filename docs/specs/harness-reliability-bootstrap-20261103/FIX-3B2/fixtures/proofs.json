@@ -1,0 +1,17 @@
+[
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-3B2/logs/01-typecheck-at-commit.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-handoff-writer.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-3B2/logs/02-unit-writer-at-commit.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-*.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-3B2/logs/03-unit-bootstrap-all-at-commit.txt"
+ }
+]

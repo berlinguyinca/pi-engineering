@@ -1,0 +1,74 @@
+{
+ "taskId": "FIX-4B",
+ "baseSha": "5c5d5a5d6ab8681390c8daf35c1daab542f7051d",
+ "repoId": "pi",
+ "objective": "Mode-aware microtask line ceiling (100, 120 for herdr-ui) so the H-phase tasks are schedulable.",
+ "allowPaths": [
+  "src/bootstrap/taskManifest.ts",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/tasks.json",
+  "test/unit/bootstrap-task-manifest.test.ts"
+ ],
+ "denyPaths": [
+  "src/bootstrap/diffGuard.ts",
+  "src/bootstrap/resultGate.ts",
+  "src/bootstrap/handoffWriter.ts",
+  "scripts/**",
+  "templates/**",
+  "package.json"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-manifest",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-task-manifest.test.ts"
+   ]
+  },
+  {
+   "id": "03-unit-all",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-*.test.ts"
+   ]
+  },
+  {
+   "id": "04-tasks-parse",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--experimental-strip-types",
+    "-e",
+    "import {parseTaskManifest} from \"./src/bootstrap/taskManifest.ts\"; import {readFileSync} from \"node:fs\"; const t=JSON.parse(readFileSync(\"docs/specs/harness-reliability-bootstrap-20261103/manifests/tasks.json\",\"utf8\")).tasks; const bad=t.filter(x=>!parseTaskManifest({taskId:x.id,baseSha:\"a\".repeat(40),repoId:\"pi\",objective:x.title,allowPaths:[\"src/**\"],denyPaths:[\"node_modules/**\"],commands:[{id:\"t\",cwd:\".\",argv:[\"npm\",\"run\",\"typecheck\"]}],limits:{maxProductionFiles:x.maxProductionFiles,maxTestFiles:x.maxTestFiles,maxChangedLines:x.maxChangedLines},parentHandoffHash:null,expectedOutputs:[\"src/**\"],mode:x.mode}).ok); console.log(\"tasks\",t.length,\"invalid\",bad.length,bad.map(b=>b.id).join(\",\")); console.log(\"herdr-ui:\",t.filter(x=>x.mode===\"herdr-ui\").map(x=>x.id).join(\",\"))"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:0194df91874fbe7c68f0a79766b208aa857bf47806155dd4a38d332b8b6a6b50",
+ "expectedOutputs": [
+  "src/bootstrap/taskManifest.ts",
+  "docs/specs/harness-reliability-bootstrap-20261103/manifests/tasks.json",
+  "test/unit/bootstrap-task-manifest.test.ts"
+ ],
+ "mode": "isolated-change"
+}

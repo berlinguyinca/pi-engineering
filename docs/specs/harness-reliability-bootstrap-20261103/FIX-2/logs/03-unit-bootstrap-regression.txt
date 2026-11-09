@@ -1,0 +1,37 @@
+✔ unexpected, denied, generated, binary and budget breaches are reported deterministically (10.821584ms)
+✔ a clean worktree still scopes the commit under review (FIX-1) (0.507042ms)
+✔ file budgets count committed paths, not just dirty ones (FIX-1) (0.21225ms)
+✔ a path in both porcelain and numstat is scoped once (FIX-1) (0.133292ms)
+✔ a diff inside limits passes; oversize, symlink and read-only breaches do not (0.284917ms)
+✔ bootstrap package: empty items produce an all-empty package (1.885708ms)
+✔ bootstrap package: a sensitive item is dropped even when required (0.237458ms)
+✔ bootstrap package: unverified items are dropped (0.109667ms)
+✔ bootstrap package: stale items are dropped and exactly-fresh items are included (0.161042ms)
+✔ bootstrap package: kinds are ordered decision, file_ref, summary, raw_log (0.147625ms)
+✔ bootstrap package: newest first within a kind, id ascending on ties (0.630417ms)
+✔ bootstrap package: required items sort first even when raw_log and old-but-fresh (0.109459ms)
+✔ bootstrap package: a large item is deferred over token budget and a later small item still fits (0.127708ms)
+✔ bootstrap package: over item budget defers the third item and adds a lazy-retrieval reason (0.102625ms)
+✔ bootstrap package: a required item over budget is included with a reason and later items are deferred (0.137208ms)
+✔ bootstrap package: required items beyond maxItems are all included with one reason each (0.094958ms)
+✔ bootstrap package: undefined and false required sort as equal (0.081334ms)
+✔ bootstrap package: mixed sensitive, unverified, stale and survivors pack correctly (0.13375ms)
+✔ bootstrap package: NaN and negative token counts are dropped (0.072459ms)
+✔ bootstrap package: frozen input is not mutated (0.101ms)
+✔ allowlist grants exact paths and explicit recursion only (2.157625ms)
+✔ explicit deny always wins over allow (0.156958ms)
+✔ traversal, ambiguous, absolute and symlink paths are rejected before any grant (0.33625ms)
+✔ missing proof, failing proof and missing or tampered evidence all block the gate (2.542083ms)
+✔ diff-scope violations and a commit not sitting on the approved base block the gate (0.1315ms)
+✔ the handoff writer is atomic, immutable and stamps the protocol checksum (1.434417ms)
+✔ B01: valid JSON fixture is accepted and every schema field is populated (2.040333ms)
+✔ B01: defaults apply when the optional fields (limits, denyPaths, expectedOutputs) are absent (0.232ms)
+✔ B01: invalid fixtures are rejected with deterministic, sorted, deduplicated errors (0.324958ms)
+ℹ tests 29
+ℹ suites 0
+ℹ pass 29
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 249.117583

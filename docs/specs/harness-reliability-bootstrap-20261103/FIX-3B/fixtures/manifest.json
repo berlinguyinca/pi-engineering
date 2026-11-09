@@ -1,0 +1,60 @@
+{
+ "taskId": "FIX-3B",
+ "baseSha": "24f42fba3f711dbf62a2c61d58a5545b0234865d",
+ "repoId": "pi",
+ "objective": "Validate handoff records against templates/handoff.schema.json with a pure total validator in the writer (FIX-3B part 1).",
+ "allowPaths": [
+  "src/bootstrap/handoffWriter.ts",
+  "test/unit/bootstrap-handoff-writer.test.ts"
+ ],
+ "denyPaths": [
+  "src/bootstrap/resultGate.ts",
+  "scripts/**",
+  "docs/**",
+  "package.json"
+ ],
+ "commands": [
+  {
+   "id": "05-typecheck-at-commit",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "06-unit-writer-at-commit",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-handoff-writer.test.ts"
+   ]
+  },
+  {
+   "id": "07-unit-bootstrap-all-at-commit",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-*.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 1,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": null,
+ "expectedOutputs": [
+  "src/bootstrap/handoffWriter.ts",
+  "test/unit/bootstrap-handoff-writer.test.ts"
+ ],
+ "mode": "isolated-change"
+}

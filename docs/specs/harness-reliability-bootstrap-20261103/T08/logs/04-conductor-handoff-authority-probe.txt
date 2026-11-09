@@ -1,0 +1,22 @@
+buildHandoff still clips summary: true token_estimate>0: true constraints: ["c1","c2","no new deps"] scope.allowed: ["src/plannerWorker/**"]
+authority keys: authority_hash,objective_sha256,constraints_sha256,acceptance_sha256,scope_sha256,transcript_excerpt,transcript_truncated,transcript_chars
+clean resume: {"ok":true,"authority":{"authority_hash":"sha256:f8b1a470c87bd9378c6407dcaf152ee
+edit objective     -> ok=false reasons=["envelope altered: objective_sha256 sha256:196288ac36279e2e76181deada63f4a639cea0df84aa60b1f4134a0c
+edit constraints   -> ok=false reasons=["envelope altered: constraints_sha256 sha256:d50a52bc6e7db547350ae9b62aa13356f700762298b336366be97a
+edit acceptance    -> ok=false reasons=["envelope altered: acceptance_sha256 sha256:d6794210e569b4abfddb6b6e834b22aef6fbbd37ab7e84ab8455fac
+edit scope         -> ok=false reasons=["envelope altered: scope_sha256 sha256:91e8a99aa66adbb0ed66d79dd5f53f2d6374469c2fa7ea62b468b7483304
+edit summary_only  -> ok=true reasons=[]
+edit decisions     -> ok=true reasons=[]
+tampered envelope hash -> ok=false ["envelope altered: authority_hash sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb != sha256:f8b
+tampered part hash -> ["envelope altered: constraints_sha256 sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+expected undefined -> ok=false reasons=["expected authority hash missing: recomputed sha256:f8b1a470c87bd9378c6407dcaf152eed95fbc
+expected "" -> ok=false reasons=["expected authority hash missing: recomputed sha256:f8b1a470c87bd9378c6407dcaf152eed95fbc
+expected 42 -> ok=false reasons=["expected authority hash missing: recomputed sha256:f8b1a470c87bd9378c6407dcaf152eed95fbc
+malformed envelope: null -> ["malformed envelope"]
+malformed envelope: {} -> ["malformed envelope"]
+malformed envelope: {"handoff":1} -> ["malformed envelope"]
+transcript excerpt len: 2000 truncated: true chars: 5200
+tail absent from rendered handoff: true
+non-string transcript: "" no throw
+determinism: true
+direct verify: true sha256:f8b1a47

@@ -1,0 +1,9 @@
+chain B01: result be581d1d872c base c2b75dc93885 next B02@be581d1d872c
+chain B02: result bcfee3b03791 base be581d1d872c next B03@bcfee3b03791
+chain B03: result bfffb5390259 base bcfee3b03791 next B04@bfffb5390259
+chain B04: result 7e7157c715f3 base bfffb5390259 next B05@7e7157c715f3
+chain B05: result 36cab891c696 base 7e7157c715f3 next E01@36cab891c696
+schema=harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15 additionalProperties=False
+distinct_records=113 field_conforming=113 canonical_hash_ok=113
+field offenders: none
+hash offenders: none

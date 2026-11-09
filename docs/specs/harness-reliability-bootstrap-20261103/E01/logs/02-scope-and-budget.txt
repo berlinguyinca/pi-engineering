@@ -1,0 +1,7 @@
+measure: git diff --numstat HEAD^1..HEAD
+100	0	docs/specs/harness-reliability-bootstrap/ERROR_SOURCES.md
+ins=100 del=0 total= 1 file changed, 100 insertions(+)
+production files: 1 (docs/specs/harness-reliability-bootstrap/ERROR_SOURCES.md, the manifest's declared production file) <= 2
+test files: 0 <= 2 (manifest tests = [])
+mode: read-only — no src/, no test/ path touched:
+docs/specs/harness-reliability-bootstrap/ERROR_SOURCES.md

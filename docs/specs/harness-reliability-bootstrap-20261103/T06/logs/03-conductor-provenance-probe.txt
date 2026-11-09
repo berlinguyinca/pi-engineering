@@ -1,0 +1,30 @@
+task {"authority":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaa -> known sha256:aaaaaaa/T06
+task {"authority":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaa -> unknown "missing task id"
+task {"taskId":"T06"} -> unknown "missing authority hash"
+task {"authority":"sha256:abc","taskId":"T"} -> unknown "malformed authority hash (want sha256:<64 hex>)"
+task {"authority":"sha256:AAAAAAAAAAAAAAAAAAAAAAAAA -> unknown "malformed authority hash (want sha256:<64 hex>)"
+task {"authority":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaa -> unknown "malformed authority hash (want sha256:<64 hex>)"
+task {"authority":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaa -> unknown "missing task id"
+task {"authority":42,"taskId":"T"} -> unknown "malformed authority hash (not a string)"
+task {"authority":{"h":"sha256:aaaaaaaaaaaaaaaaaaaa -> unknown "malformed authority hash (not a string)"
+file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-t06-aps-authority-20261104/src/aps/types.ts:234
+  const a = input.authority;
+                  ^
+
+TypeError: Cannot read properties of undefined (reading 'authority')
+    at describeTaskProvenance (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-t06-aps-authority-20261104/src/aps/types.ts:234:19)
+    at file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-t06-aps-authority-20261104/conductor-t06-probe.mts:4:13
+    at ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:646:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+
+Node.js v26.3.0
+model {"provider":"metabolomics","modelId":"qwen3.8-max_ne -> {"provider":"metabolomics","model":"qwen3.8-max_next-quant-int8","quantization":"int8"}
+model {"provider":"metabolomics","modelId":"qwen3.8-flash_ -> {"provider":"metabolomics","model":"qwen3.8-flash_next","quantization":null}
+model {"modelId":"x_quant_4bit_y"} -> {"provider":null,"model":"x_quant_4bit_y","quantization":"4bit_y"}
+model {"provider":7,"modelId":null} -> {"provider":null,"model":null,"quantization":null}
+model {} -> {"provider":null,"model":null,"quantization":null}
+model {"modelId":"  a-quant-fp16  "} -> {"provider":null,"model":"a-quant-fp16","quantization":"fp16"}
+guard known/unknown/undefined: true false false
+empty object input: {"state":"unknown","reason":"missing authority hash"}
+legacy action provenance: true true

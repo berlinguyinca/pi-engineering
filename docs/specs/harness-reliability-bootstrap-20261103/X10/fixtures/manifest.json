@@ -1,0 +1,110 @@
+{
+  "taskId": "X10",
+  "baseSha": "d5e256e6f761e068f79b256870a3327a09a8c510",
+  "repoId": "pi",
+  "objective": "Integrate origin/main (b0c0e75d, 13 commits past this branch's first parent 89e747c2, three of them platform fixes this branch's own test files need) into the branch, resolve the one conflict by hand keeping both sides, and re-attribute the failures the stale base was producing so the series is measured against the tree it is about to land on",
+  "allowPaths": [
+    "src/workers/PiWorkerExecutor.ts"
+  ],
+  "denyPaths": [
+    "src/git/**",
+    "src/bootstrap/**",
+    "src/aps/**",
+    "src/incidents/**",
+    "src/capability/**",
+    "src/mission/**",
+    "src/merge/**",
+    "src/orchestration/**",
+    "src/plannerWorker/**",
+    "src/runtime/**",
+    "src/resilience/**",
+    "src/inference/**",
+    "src/models/**",
+    "src/platform/**",
+    "src/gateway/**",
+    "src/guard/**",
+    "src/context/**",
+    "src/routing/**",
+    "src/scheduler/**",
+    "src/session/**",
+    "src/config/**",
+    "src/tools/**",
+    "src/errors/**",
+    "src/verify/**",
+    "src/agents/**",
+    "src/auth/**",
+    "src/authx/**",
+    "src/artifacts/**",
+    "src/assistant/**",
+    "src/canonical/**",
+    "src/checkpoints/**",
+    "src/commands/**",
+    "src/compression/**",
+    "src/contracts/**",
+    "src/credentials/**",
+    "src/delegation/**",
+    "src/extensions/**",
+    "src/extras/**",
+    "src/hooks/**",
+    "src/plan/**",
+    "src/review/**",
+    "src/sandbox/**",
+    "src/secrets/**",
+    "src/signals/**",
+    "src/testing/**",
+    "src/tracing/**",
+    "src/types/**",
+    "src/util/**",
+    "test/unit/**",
+    "test/integration/**",
+    "test/e2e/**",
+    "test/support/**",
+    "templates/**",
+    "manifests/**",
+    "scripts/**",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "biome.json"
+  ],
+  "commands": [
+    {
+      "id": "cmd1",
+      "argv": [
+        "bash",
+        "docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-drift10.sh"
+      ],
+      "timeoutMs": 1500000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd2",
+      "argv": [
+        "bash",
+        "docs/specs/harness-reliability-bootstrap-20261103/X10/fixtures/run-owned.sh"
+      ],
+      "timeoutMs": 1200000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd3",
+      "argv": [
+        "npm",
+        "run",
+        "typecheck:core"
+      ],
+      "timeoutMs": 900000,
+      "cwd": "repo"
+    }
+  ],
+  "limits": {
+    "maxProductionFiles": 1,
+    "maxTestFiles": 0,
+    "maxChangedLines": 100
+  },
+  "parentHandoffHash": "sha256:39806a4dcfdcb66fd69abcec0ce26e1c78f2abec21e8d413b493a89e75aac046",
+  "expectedOutputs": [
+    "src/workers/PiWorkerExecutor.ts"
+  ],
+  "mode": "isolated-change"
+}

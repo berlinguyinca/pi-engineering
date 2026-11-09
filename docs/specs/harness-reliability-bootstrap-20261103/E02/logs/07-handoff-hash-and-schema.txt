@@ -1,0 +1,8 @@
+schema=/Users/wohlgemuth/IdeaProjects/pi-engineering-runtime/docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json
+embedded   = sha256:d92a4c99a26dd4fe20291d0678507d1e83821d8acfe81bc156312af6b6410209
+recomputed = sha256:d92a4c99a26dd4fe20291d0678507d1e83821d8acfe81bc156312af6b6410209 MATCH
+schema errors: 0 
+status=PASS baseSha=0cc5b21cb68caacd44bb09cb7a9674c616f02d9b resultSha=cc036f2f8c3b938c80348dff821af77c973fde7b
+next=E03 @ cc036f2f8c3b938c80348dff821af77c973fde7b
+changedFiles=src/incidents/errorEvent.ts,test/unit/error-event.test.ts
+taskAuthorityHash=sha256:99b5f9b276cbcfe50bff26b48166deec935f6b2ca593875d21b9a8596050595b (derivation: canonicalHash(parseTaskManifest(manifest-e02.json).manifest))

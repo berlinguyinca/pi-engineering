@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T03",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "95aba353f1876f8d617143556ec753709b718e34",
+  "resultSha": "c4acd6455a57a5cbbe19185353b661cbb69f5086",
+  "taskAuthorityHash": "sha256:24203f9563f10f3bfcc7e6c6a06d02513354e5d87a08c66e4737d102899da01d",
+  "changedFiles": [
+    "src/orchestration/missionPlanner.ts",
+    "test/unit/mission-planner-fallback-scope.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T03/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/mission-planner-fallback-scope.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T03/logs/02-unit-fallback-scope.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T03/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T03/logs/02-unit-fallback-scope.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T03/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T03/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T03/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T04",
+  "nextBaseSha": "c4acd6455a57a5cbbe19185353b661cbb69f5086",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T10:40:00Z",
+    "notes": "Worker pane t03 (pane w8:pB, metabolomics/qwen3.8-flash_next) on base 95aba353. All five planner-failure paths in src/orchestration/missionPlanner.ts now route through clampedFallback(): the mission's own single() task is rebuilt with write_domains passed through scopeTaskDomains (narrowed to Pick<TaskContract,'scope'>, so the clamp is literally the same rule as the success path), acceptance_ids taken from the mission's acceptanceIds, budget kept from single(), every removed glob named in fallbackReason, and zero tasks plus a visible 'mission blocked: no writable domain survives the envelope' reason when nothing writable remains; the non-mutating/no-attempt path is untouched. Conductor probes (logs/04) confirmed transient errors retried exactly once, hard error/malformed/empty-contract/invalid-grant fallbacks all clamped to ['src/**','docs/**'] from a request containing /etc/**, ../up, .git and src/gen/**, a plan claiming write:['**','/etc/**'] unable to widen anything, an all-read-only mutating mission blocked with clarification null, and the non-mutating path unchanged. Consumer gap carried forward: EngineeringRuntime.ts still files the finding 'Mission planner output unusable; ran the goal as a single task.' and returns planned.tasks = [] for the blocked case, so the block is visible in evidence but the summary is wrong and an empty plan is not distinguished upstream; src/runtime/** is deny-listed for this unit."
+  }
+}

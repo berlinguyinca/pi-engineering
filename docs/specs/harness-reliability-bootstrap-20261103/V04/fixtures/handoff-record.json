@@ -1,0 +1,42 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "V04",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "b11662eb88261c30c02bc78ec7fe556539b5681a",
+ "resultSha": "b11377bbfb69dbfd2e417b6416eec7b428ad1707",
+ "taskAuthorityHash": "sha256:0e5ef3b36d513108b727e1454588241c3cec4237bad36adab6bad26bde4ea091",
+ "changedFiles": [
+  "scripts/bench-harness-roles.ts",
+  "test/unit/bench-harness-roles.test.ts"
+ ],
+ "commands": [
+  {
+   "command": "npm run typecheck",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/V04/logs/01-typecheck.txt"
+  },
+  {
+   "command": "node --test --import ./test/support/isolatedState.ts test/unit/bench-harness-roles.test.ts",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/V04/logs/02-unit-bench-harness-roles.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/V04/logs/01-typecheck.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/V04/logs/02-unit-bench-harness-roles.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/V04/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/V04/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/V04/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "V05",
+ "nextBaseSha": "fc4712252558dc438365094929b2071828c94b5c",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Worker pane v04 (pane w8:p1A, metabolomics/qwen3.8-flash_next) on base b11662eb (the V03 evidence commit in berlinguyinca/pi-engineering), isolated-change mode, first pass, ~9 min. Exactly the two declared files (git show --name-only HEAD: scripts/bench-harness-roles.ts, test/unit/bench-harness-roles.test.ts), 98 changed lines against the 100 isolated-change ceiling; src/capability/quantBenchmark.ts (V03) and scripts/bench-task-drift.ts were read and reused, not modified. Conductor verified independently at b11377bb: npm run typecheck exit 0 (logs/01); node --test --import ./test/support/isolatedState.ts test/unit/bench-harness-roles.test.ts 7 pass / 0 fail (logs/02); git diff --check b11662eb..HEAD exit 0 (logs/05). The evidence clause was proved two ways by the conductor rather than by trusting the suite. Dry-run needs no endpoint (logs/03): with ANTHROPIC_API_KEY and OPENAI_API_KEY removed from the environment, node --experimental-strip-types scripts/bench-harness-roles.ts printed exactly one JSON line {dryRun:true,planned:4,skipped:6,replayed:0,...} and exit 0, with every skip reason naming the class gate ('not a Flash/Lite class model') or availability ('<id> is not among the available model ids [...]', scripts/bench-harness-roles.ts:24-29). Serial replay with request IDs (logs/04): runReplan with both opt-ins (dryRun:false, enabled:true, env.BENCH_HARNESS_ROLES='1') awaited the injected callback one entry at a time in plan order (drift-01/minimal .. drift-05/full), attached req-1..req-9 to the replayed entries, and a callback that threw on drift-03/full marked that entry failed while the remaining entries still replayed - so the script itself never touches a provider, model client or endpoint; the callback is injected by the caller. ReplanOptions.live requires both opt-ins (scripts/bench-harness-roles.ts:31), which the conductor re-confirmed by omitting dryRun:false and observing dryRun:true with zero callback calls. | CHAIN: this record supersedes V04/out-corrected (kept immutable), whose nextBaseSha named the pre-amend evidence commit; the child is cut from fc4712252558, the evidence commit as it stands now."
+ }
+}

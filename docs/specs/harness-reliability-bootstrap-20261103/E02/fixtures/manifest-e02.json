@@ -1,0 +1,50 @@
+{
+ "taskId": "E02",
+ "baseSha": "0cc5b21cb68caacd44bb09cb7a9674c616f02d9b",
+ "repoId": "pi",
+ "objective": "Add a versioned ErrorOccurrence schema (session id, host, runtime, layer, model, quantization, correlation ids, artifact refs) that is machine-parseable and safe to persist, keeping incidents/types.ts backward compatible.",
+ "allowPaths": [
+  "src/incidents/errorEvent.ts",
+  "test/unit/error-event.test.ts"
+ ],
+ "denyPaths": [
+  "src/incidents/types.ts",
+  "src/incidents/incidentStateMachine.ts",
+  "src/platform/redact.ts",
+  "scripts/**",
+  "package.json"
+ ],
+ "commands": [
+  {
+   "id": "typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "error-event-tests",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/error-event.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:2077162a05a98d11dc110bd63c59415aa86b033378843b41934ad18e297bcd89",
+ "expectedOutputs": [
+  "src/incidents/errorEvent.ts",
+  "test/unit/error-event.test.ts"
+ ],
+ "mode": "isolated-change"
+}

@@ -1,0 +1,3 @@
+REJECT baseline: HEAD 04846ae2e5346cce8729994d96e870fe2f56015f != manifest baseSha cc036f2f8c3b938c80348dff821af77c973fde7b
+plan exit=3; no model invoked (B04 stops here)
+REJECT gate: diff scope rejected (denied-path): denied by "test/**"

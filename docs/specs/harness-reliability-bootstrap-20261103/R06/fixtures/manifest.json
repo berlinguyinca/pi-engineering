@@ -1,0 +1,81 @@
+{
+ "taskId": "R06",
+ "baseSha": "62f190ff77c244734678788458f889cddd7ff4ea",
+ "repoId": "pi",
+ "objective": "Map normalized errors to retry/hold/failover/stop/review recommendations using R01-R05; do not execute actions in this task. Evidence: 404 does not endlessly retry; 429 honors server wait; unknown stops.",
+ "allowPaths": [
+  "src/incidents/recoveryRecommend.ts",
+  "test/unit/recovery-recommend.test.ts"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/runtime/herdr/**",
+  "src/orchestration/**",
+  "src/aps/**",
+  "src/errors/**",
+  "src/incidents/*.ts",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "src/inference/retryDelay.ts",
+  "src/inference/retryTrace.ts",
+  "src/inference/retryBudget.ts",
+  "src/inference/endpointCircuit.ts",
+  "scripts/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "typecheck",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  },
+  {
+   "id": "unit",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/recovery-recommend.test.ts"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:e2ab3140e7bdbb3d8b47b9f7ed399776b0b220dc9bea4c12f74428f7008c32e9",
+ "expectedOutputs": [
+  "src/incidents/recoveryRecommend.ts",
+  "test/unit/recovery-recommend.test.ts"
+ ],
+ "mode": "isolated-change"
+}

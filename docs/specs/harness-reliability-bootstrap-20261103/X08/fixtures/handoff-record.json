@@ -1,0 +1,60 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X08",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "45d42acb70fc2fcac76425d18eb1d651b0e0a9ba",
+  "resultSha": "9f064450",
+  "taskAuthorityHash": "sha256:f8e910b382b848c9e8d2b9760e29fcd8d00dc729674ddbaf57f80f91fc0abcf5",
+  "changedFiles": [
+    "src/git/GitRepo.ts",
+    "test/unit/git-common-dir-repair.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/git-common-dir-repair.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/01-node-test-import-test-suppor.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/git-durable-ownership.test.ts test/unit/git-persist-concurrency.test.ts test/unit/git-lock-publication.test.ts test/unit/git-spawn-economy.test.ts test/unit/git-worktree-safety.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/02-node-test-import-test-suppor-2.txt"
+    },
+    {
+      "command": "npm run typecheck:core",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/03-npm-run-typecheck-core.txt"
+    },
+    {
+      "command": "npx biome check src/git/GitRepo.ts test/unit/git-common-dir-repair.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/04-npx-biome-check-src-git-G.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/01-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/02-node-test-import-test-suppor-2.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/03-npm-run-typecheck-core.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/04-npx-biome-check-src-git-G.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/05-ab-common-dir-at-4ffa.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/06-ab-integration-at-4ffa.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/07-control-tip-without-repair.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/08-tip-with-repair-integration.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/09-git-glob-before-after.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T22:26:40Z",
+    "notes": "AUDIT/suite-termination-blocker-20261105.txt reported two integration files that never settled. Reproduced at 4ffa82f3: GitRepo.commonDir() returned /private/private/var/folders/.../<repo>/.git, a path that does not exist, while a plain `git -C <repo> rev-parse --path-format=absolute --git-common-dir` in the same process returned the right one; mkdir under the doubled path ENOENTs and withWorktreeSection reads ENOENT as lock contention, so mission-interrupt-pause.test.ts had to be killed at 240 s (see logs/05, logs/06). The upstream ROOT cause - Pi's state dir kept unresolved while repositories are discovered through realpathSync - is already fixed on main by 61394da7 (one canonical path for the state dir and the temp root, #582): at 45d42acb the doubled prefix no longer reproduces and both blocker files pass unaided (logs/07). What this unit adds is the consumer-side half of the contract, which #582 does not provide: commonDir() had no way to notice an answer that names nothing, so any future regression of that canonicalization surfaces as a ten-minute poll per attempt rather than an error. resolveCommonDir returns an existing answer untouched (it is usually the shadow common dir, which only git knows), repairs a missing one from discoverRepo - which also recovers the SHARED common directory for a linked worktree - and names the impossible path when neither resolves; only ENOENT/ENOTDIR count as absent, EACCES/ESTALE/EIO propagate. Measured: new unit 5/5; the five git unit files in the touched area 26/26 (logs/02); A/B at 4ffa82f3 24/40 -> 39/45 on test/unit/git-*.test.ts with 10 fixed and 0 regressions (logs/09); blocker files at the tip 12/12 and 6/6 (logs/08). Deviation recorded: the unit measures 158 changed lines across 1 production + 1 test file, over the isolated-change ceiling of 100; the guard is 44 lines and its regression unit 114, and splitting the test from the behaviour it pins would leave the contract unpinned."
+  },
+  "handoffHash": "sha256:34f204430db6c0810f1719883f7ee90980b9a694e48e93ba07d1c4e2bae69d12"
+}

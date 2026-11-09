@@ -1,0 +1,15 @@
+cmd: npm run typecheck  (cwd=/Users/wohlgemuth/IdeaProjects/worktrees/pi-b00-baseline-20261103)
+exit=0
+--- output (tail 40) ---
+
+> pi-engineering-runtime@0.2.0 typecheck
+> npm run typecheck:core && npm run typecheck:scripts
+
+
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+
+
+> pi-engineering-runtime@0.2.0 typecheck:scripts
+> tsc --noEmit -p tsconfig.scripts.json
+

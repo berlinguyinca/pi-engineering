@@ -1,0 +1,4 @@
+REJECT baseline: HEAD 57b81f9608339c8481151df4b27a4bee60040703 != manifest baseSha 68e70ed58b93ce31dc28dd4a07871ffa4347c02e
+plan exit=3; no model invoked (B04 stops here)
+parent=D04 accepted sha256:5ad9e5f80f0…
+REJECT gate: diff scope rejected (denied-path): denied by "scripts/**"

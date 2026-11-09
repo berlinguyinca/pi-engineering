@@ -1,0 +1,75 @@
+{
+ "taskId": "X04",
+ "baseSha": "a6e500f6b1ccd2867097ae3f2ac839fa93b33e3c",
+ "repoId": "pi",
+ "objective": "Count live drift signals in the Phase 6 snapshot so a detection is evidence, not a getter Evidence: snapshot accounting + unit counts at the landed commit",
+ "allowPaths": [
+  "src/aps/observability.ts",
+  "test/unit/aps-observability.test.ts"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/orchestration/**",
+  "src/errors/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "scripts/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "typecheck",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  },
+  {
+   "id": "unit",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/aps-observability.test.ts",
+    "test/unit/aps-worker-activity.test.ts"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 1,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:2eff6f5edc7623b3eab44794d54a55279d21a20310597dd969e6fa26bdf90755",
+ "expectedOutputs": [
+  "src/aps/observability.ts",
+  "test/unit/aps-observability.test.ts"
+ ],
+ "mode": "isolated-change"
+}

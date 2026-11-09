@@ -1,0 +1,13 @@
+✔ equivalent occurrences from another session, host, run, timestamp, uuid, duration, byte count, worktree path and prompt digest share one key (criterion 1) (2.483084ms)
+✔ distinct causes stay separate — 404 vs 429 above all, plus layer, tool, root-cause noun and exception class (criterion 2) (0.274334ms)
+✔ deterministic and idempotent, with a fixed digest shape that carries none of the volatile text (criterion 3) (0.204834ms)
+✔ malformed input is total: the documented fallback key or a documented coercion, never a throw (criterion 4) (0.153333ms)
+✔ the key is not the payload digest: pointers, severity and model alone cannot move it (criterion 5) (0.116458ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 146.369542

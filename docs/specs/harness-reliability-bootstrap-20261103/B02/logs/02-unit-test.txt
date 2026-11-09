@@ -1,0 +1,13 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-path-policy.test.ts
+✔ allowlist grants exact paths and explicit recursion only (1.517833ms)
+✔ explicit deny always wins over allow (0.108916ms)
+✔ traversal, ambiguous, absolute and symlink paths are rejected before any grant (0.247334ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 152.235458
+exit=0

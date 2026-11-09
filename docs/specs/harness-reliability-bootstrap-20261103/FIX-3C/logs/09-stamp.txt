@@ -1,0 +1,5 @@
+REJECT baseline: HEAD 3881178f963d01cad1e6fcedb95c696f27d3ac5d != manifest baseSha 0ddf27714f80a8e98d01d4662c0242b789de15c7
+plan exit=3; no model invoked (B04 stops here)
+parent=FIX-3B2 accepted sha256:d2435ac2784…
+schema=FIX-3C conforms docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json
+handoff=/tmp/ok/FIX-3C.handoff.json checksum=sha256:0bc72a82f0e17f712c7a2c9ac134edce17fbf07af0dc4298c8d7f669bf96ee98 gate=accepted (clean tree + proofs + diff scope + HEAD^1 == approved base; the plan baseline line above describes the pre-task state)

@@ -125,7 +125,12 @@ async function buildHarness(opts: {
 
   const inst = createResilientInference({
     transport,
-    env: {},
+    // The layer is opt-in — PI_INFERENCE_RESILIENCE_ENABLED defaults to off — and
+    // every scenario in this file drives behaviour that exists only while it is
+    // armed (the ladder, the breaker, capability fallback). The default-off
+    // semantics are asserted where they belong, in
+    // test/unit/resilience-default-off.test.ts; arming here does not loosen them.
+    env: { PI_INFERENCE_RESILIENCE_ENABLED: "1" },
     registry,
     router,
     now: () => t,

@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X01",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "900bf8a3b10decf0bbc7f7e46b04a29241741151",
+  "resultSha": "87f2b2c9c92c04c1522c2781f2c46555741af354",
+  "taskAuthorityHash": "sha256:ce479b64f5a2109784e56d6a8832833dc75b77bf27429b130fc999b2a40758cf",
+  "changedFiles": [
+    "src/aps/taskAlignment.ts",
+    "test/unit/aps-task-alignment.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X01/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/aps-task-alignment.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X01/logs/02-unit-alignment.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X01/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X01/logs/02-unit-alignment.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X01/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X01/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X01/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "X02",
+  "nextBaseSha": "87f2b2c9c92c04c1522c2781f2c46555741af354",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Measured before touching anything: re-running the V02 runner at the conductor tip gave recall 0.667 with drift-03 missed, and that fixture's answer key puts the planted change inside permittedScope, so path scope is blind by construction. evaluateTaskAlignment now scores each mutating write against a declared artifact contract and raises undeclared_artifact when no declared artifact covers the class; a task declaring no contract is judged exactly as before. parentHandoffHash is null on purpose: V06's canonical record declares plan end (nextTaskId null), so naming it parent would forge a lineage the parent denies - the predecessor is quoted in prose as V06 out-final sha256:e6afc6b65a396b0d4f639782d8a680ddc36fa6db0ba9e077eb94b3d5843e580b. Ids X01-X05 avoid colliding with plan tasks D01-D08."
+  },
+  "handoffHash": "sha256:816dfb491fe9bc964f3ba4d5e9c411326af48d2c955d99a39d6f2a03a53f2b9e"
+}

@@ -1,0 +1,14 @@
+✔ a relevant and an unrelated action render with different classes, and one fixture re-rendered is byte-identical (4.134084ms)
+✔ relevance comes only from what the report states: an action it never classes renders "relevance unknown", never relevant (0.40275ms)
+✔ the drift verdict and its reason are H02 decideDrift, and the rendered HTML carries no percentage and no score token (0.926208ms)
+✔ the first violation is the record the report carries, and a decided drift with no such record says so rather than pointing at the first action (0.357792ms)
+✔ scope paths are escaped, an unlisted scope reads unknown and a scope listed empty reads none reported (0.270583ms)
+✔ objective, model, quantization and uncertainty absent render the literal unknown, and the sections keep the plan order (0.359875ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 168.012167

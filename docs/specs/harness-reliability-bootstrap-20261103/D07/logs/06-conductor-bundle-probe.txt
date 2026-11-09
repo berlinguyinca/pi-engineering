@@ -1,0 +1,6 @@
+deterministic: true | items: 1 | dropped: {"items":1,"bytes":1} | bytes: 726 | truncated: true | cap respected: true
+outcomes: gateway.429.rate_limited:recovered
+versions: {"runtime":["pi@aaa1111"],"model":["m0","m1"],"quantization":["q0","q1","q2"]} | taskIds: ["D07"] | handoffIds: ["D06"]
+failureIds: sha256:3eaf1cb8481fb
+privacy: clean | summary: "<redacted-prompt len=568 sha256=9656b008903112bf2e4b5454d9e7eec1>"
+inputs untouched: true | bad caps fall back to defaults: 1

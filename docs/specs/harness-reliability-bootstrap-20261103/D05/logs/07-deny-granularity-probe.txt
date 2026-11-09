@@ -1,0 +1,1 @@
+ok: false | violations: changed-line-budget:-, denied-path:package.json, denied-path:scripts/bootstrap-one.ts, denied-path:src/bootstrap/resultGate.ts, production-file-budget:-

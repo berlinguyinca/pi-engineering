@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "E06",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "d19553b9601f616be01b65c5041c91ed2e9ff889",
+  "resultSha": "9f349bb9c6068a342995dc6bf58d3f7b09b6ecb4",
+  "taskAuthorityHash": "sha256:c034387526ece033e813dd6f4c867a210958810ddd07f6998cd7e7ef0c00feaa",
+  "changedFiles": [
+    "src/workers/PiWorkerExecutor.ts",
+    "test/unit/worker-error-events.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E06/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/worker-error-events.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E06/logs/02-unit-worker-error-events.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/E06/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E06/logs/02-unit-worker-error-events.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E06/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E06/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E06/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "E07",
+  "nextBaseSha": "9f349bb9c6068a342995dc6bf58d3f7b09b6ecb4",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T13:20:00Z",
+    "notes": "Worker pane e06 (pane w0:pD) wired E05 into PiWorkerExecutor at one audited seam: exported workerFailureOccurrence() (identity from the live request + model id, through normalizeError then sanitizeForPersistence) and unthrowable recordWorkerFailure(), called once at the terminal failure path where promptError is assigned (guarded by !ownerAborted && !stalled && !toolLoop), injected as an optional workerErrorWriter that defaults to undefined. Conductor confirmed zero removed lines in the production file, exactly one call site, and generation-guard 37/37 still green. Deviation: commit subject wording differs from the prescribed one."
+  }
+}

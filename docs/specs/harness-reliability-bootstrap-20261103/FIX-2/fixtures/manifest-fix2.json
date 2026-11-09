@@ -1,0 +1,63 @@
+{
+ "taskId": "FIX-2",
+ "baseSha": "04846ae2e5346cce8729994d96e870fe2f56015f",
+ "repoId": "pi",
+ "objective": "Verify the declared parent handoff in the --emit-handoff path, not only in the plan path.",
+ "allowPaths": [
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "denyPaths": [
+  "src/bootstrap/**",
+  "package.json",
+  "docs/**"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-bootstrap-one",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-one.test.ts"
+   ]
+  },
+  {
+   "id": "03-unit-bootstrap-regression",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-diff-guard.test.ts",
+    "test/unit/bootstrap-result-gate.test.ts",
+    "test/unit/bootstrap-package.test.ts",
+    "test/unit/bootstrap-path-policy.test.ts",
+    "test/unit/bootstrap-task-manifest.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 1,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:942da49b0ab334eacf3164210b6c303c8a02d3103914599bb7250cefbc2f7586",
+ "expectedOutputs": [
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "mode": "isolated-change"
+}

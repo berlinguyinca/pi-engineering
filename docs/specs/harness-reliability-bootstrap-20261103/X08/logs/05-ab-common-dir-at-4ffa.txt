@@ -1,0 +1,8 @@
+### A/B at base 4ffa82f3 -- GitRepo.commonDir() on a repository created under $TMPDIR (macOS /var -> /private/var)
+$ node --import ./test/support/isolatedState.ts ./abprobe.mts   # worktree pi-x08-at4ffa-build @ 4ffa82f3 repair=0
+commonDir() = /private/private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/abprobe-MVWWIa/.git DOES-NOT-EXIST
+[exit=0]
+
+$ node --import ./test/support/isolatedState.ts ./abprobe.mts   # worktree pi-x08-fix-build @ db3f08b8 repair=2
+commonDir() = /private/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/abprobe-eh443B/.git EXISTS
+[exit=0]

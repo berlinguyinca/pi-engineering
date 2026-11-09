@@ -1,0 +1,47 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "B00",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "c2b75dc93885d246d712d656f72de1764cf198e0",
+ "resultSha": "cf1aaf124c87cc438ac64f67b8ad5b43e0aaf4e0",
+ "taskAuthorityHash": "sha256:55629fd7a03988573aba6bbb2d364d972bda961d8ad4ec150afabfc9df354a40",
+ "changedFiles": [
+  "docs/specs/harness-reliability-bootstrap/BASELINE.md"
+ ],
+ "commands": [
+  {
+   "command": "git status --short",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B00/logs/01-git-status-short.txt"
+  },
+  {
+   "command": "git rev-parse HEAD",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B00/logs/02-git-rev-parse.txt"
+  },
+  {
+   "command": "npm run typecheck",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B00/logs/03-npm-typecheck.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/B00/logs/01-git-status-short.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B00/logs/02-git-rev-parse.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B00/logs/03-npm-typecheck.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B00/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B00/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B00/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "B01",
+ "nextBaseSha": "c2b75dc93885d246d712d656f72de1764cf198e0",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "BACK-FILL 2026-11-05: B00 ran before the stamping flow existed, so this record is emitted retrospectively against evidence re-coloured at the original commit. Base c2b75dc93885d246d712d656f72de1764cf198e0 is the commit B01 was built on, verified in this worktree (parent of the back-fill commit, git status --short empty). Observations re-run at that commit: node v26.3.0 npm 11.16.0; npm run typecheck exit 0 (logs/03-npm-typecheck.txt); .pi/engineering.yaml routing.mode auto with six concrete role pins (logs quoted in the report). Two findings the earlier run never recorded. (1) npm test does not terminate at this commit: after ~20 min the conductor killed it and no tests/pass/fail summary was ever printed; the captured partial stream holds 20728 lines, 4615 passing and 1223 failing test names, so the suite has never had a green or even completed baseline here - do not treat the 2180/150 figures in BASELINE-unit-suite-at-c349613b.txt as this commit's numbers, they come from a different base. (2) .pi/engineering.yaml:36-52 claims the text/vision roles pin logical gateway route IDs (coding-planning, coding-implementation, coding-review) while every model: value in the same block is a concrete model ID; the report records the file as written rather than the comment's claim. DEVIATIONS: the manifest declares mode read-only but B00's declared production path docs/specs/harness-reliability-bootstrap/BASELINE.md is a new file, and src/bootstrap/diffGuard.ts:62 rejects any changed path under read-only, so the record is stamped isolated-change bounded to that one path (63 lines vs the 100 ceiling) and the manifest is left unmodified so the contradiction stays visible. Also outside normal lineage by construction: the result commit cf1aaf12 sits on branch backfill/b00-baseline-20261108 off c2b75dc9, because a back-fill cannot be inserted into the already-landed B01 chain; nextBaseSha is therefore set to c2b75dc9, the commit B01 actually used, not to this record's own resultSha. The deliverable itself was never committed in the original run - B00 had only raw logs - so this record closes a real gap rather than restating completed work."
+ }
+}

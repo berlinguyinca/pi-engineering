@@ -1,0 +1,44 @@
+{
+ "taskId": "H05",
+ "baseSha": "4c4f4c89b55ae5b492a381397a0a8b591b7d41bc",
+ "repoId": "herdr",
+ "objective": "Add chronological timeline by event IDs and step; show link to retry trace and input errors; no control actions. Evidence: Order, grouping and evidence links tested. Evidence: Order, grouping and evidence links tested",
+ "allowPaths": [
+  "packages/diagnostics-timeline.js",
+  "packages/diagnostics-timeline.test.js"
+ ],
+ "denyPaths": [
+  "herdr_engineering/**",
+  "tests/**",
+  "deploy/**",
+  "pyproject.toml",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "AGENTS.md",
+  "README.md"
+ ],
+ "commands": [
+  {
+   "id": "diff-check",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 120000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 120
+ },
+ "parentHandoffHash": "sha256:090c159e7b93711eca7733bbe949ddf2929d72d32bd32e3178bdf37691b88796",
+ "expectedOutputs": [
+  "packages/diagnostics-timeline.js",
+  "packages/diagnostics-timeline.test.js"
+ ],
+ "mode": "herdr-ui"
+}

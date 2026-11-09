@@ -1,0 +1,55 @@
+Citation drift caused by this unit's reformatting, measured over every markdown file in the trail (195 files), not assumed.
+
+$ for f in <195 trail .md>; do npx tsx AUDIT/citation-anchor-check.mjs <ref> $f --json; done      (band 4, default)
+  drift items (ANCHOR_MISSING + OUT_OF_RANGE)  at e26541c0 (pre-sweep) : 15
+  drift items                                  at 59b6620c (swept)    : 26
+  drift items                                  at HEAD after the fix  : 24
+  NO_FILE                                                        : 26 -> 26 (unchanged, all pre-existing)
+  NO_ANCHOR (the checker declines to judge these)                : 160 -> 160 (unchanged)
+
+The sweep introduced exactly 11 new drifts, all one kind: a prose citation of a line number in a file biome
+reflowed, so the identifier is no longer there. None of the six documents involved is declared as evidence in any
+handoff record (checked -- 0 records list any of them), so no hash-bound bytes move either way.
+
+The items as reported:
+  HANDOFF.md:14  cites :13-14  -> ANCHOR_MISSING
+  HANDOFF.md:14  cites :16  -> ANCHOR_MISSING
+  HANDOFF.md:14  cites :17  -> ANCHOR_MISSING
+  HANDOFF.md:14  cites :92  -> ANCHOR_MISSING
+  HANDOFF.md:15  cites :33  -> ANCHOR_MISSING
+  HANDOFF.md:15  cites :92  -> ANCHOR_MISSING
+  HANDOFF.md:16  cites :92  -> ANCHOR_MISSING
+  RELEASE-REVIEW.md:69  cites src/bootstrap/resultGate.ts:15  -> ANCHOR_MISSING
+  WORKER_REPORT.md:25  cites :122  -> ANCHOR_MISSING
+  WORKER_REPORT.md:25  cites entry.ts:119  -> ANCHOR_MISSING
+  lineage-reachability.md:30  cites src/bootstrap/resultGate.ts:15  -> ANCHOR_MISSING
+
+Two are claims about where something lives in the current tree, so they were fixed rather than filed:
+  RELEASE-REVIEW.md:69              canonicalHash, src/bootstrap/resultGate.ts:15 -> :30
+  AUDIT/lineage-reachability.md:30  the same citation, the same move
+each with the move stated in the sentence itself, in commit 0991ba50. Line 30 of src/bootstrap/resultGate.ts is
+`export function canonicalHash(record: unknown): string` (grep-verified), and both files were re-checked after:
+  RELEASE-REVIEW.md          drift=2  (the two pre-existing NO_FILE items at line 100)
+  AUDIT/lineage-reachability.md  drift=0
+
+The remaining 9 are left as debt on purpose:
+  HANDOFF.md:14  cites :13-14
+  HANDOFF.md:14  cites :16
+  HANDOFF.md:14  cites :17
+  HANDOFF.md:14  cites :92
+  HANDOFF.md:15  cites :33
+  HANDOFF.md:15  cites :92
+  HANDOFF.md:16  cites :92
+  WORKER_REPORT.md:25  cites :122
+  WORKER_REPORT.md:25  cites entry.ts:119
+
+They sit in D06/WORKER_REPORT.md and the R04/R06/R08 HANDOFF.md files and they are base-relative -- 'base
+src/runtime/host/entry.ts:109 ... same call shape at HEAD entry.ts:160', 'failureIdentity at :92', 'RecoveryVerdict
+:17', 'BUNDLE_VERSION / caps :13-14'. They record where things stood for the unit that was handed that base, which is
+a claim about history, not about this tree; renumbering them would make a report say something it did not say when
+it was written. Same citation surface X12 recorded as human-review debt (X12/logs/05-correction-citation-checker.txt),
+and the checker's own footer still refuses to call an unjudged run a verification.
+
+What the checker actually returns at HEAD across these 195 files -- stated because 'citations verified' would be false:
+  262 citations, 26 NO_FILE, 24 drift items,
+  160 not judged for want of an identifier near the citation.

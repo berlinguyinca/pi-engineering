@@ -1,0 +1,24 @@
+Two whole-suite runs of `npm test` with the sweep applied (raw logs: 06a-, 06b-).
+
+  run 1  14:15:19 -> 14:32:19 UTC, duration_ms 1019395   tests 7965  pass 7954  fail 6  cancelled 0
+  run 2  14:33:11 -> 14:52:55 UTC, duration_ms 1184454   tests 7965  pass 7955  fail 5  cancelled 0
+
+The difference between them is recovery-optin, fixed between the runs (05-). Failing leaves in run 2:
+
+  test/integration/planner-worker-gateway-timeouts.test.ts:43   headers arrive after the dispatcher's timeouts
+  test/integration/planner-worker-gateway-timeouts.test.ts:64   the caller's signal still ends a completion
+  test/integration/no-fixed-deadlines.test.ts:463               resumes from the hung execution's preserved work
+  test/integration/review-context-and-acceptance.test.ts:399    moving the candidate branch / planting a hook
+  test/integration/runtime-host-entry.test.ts:44 (file level)   ENOTEMPTY rmdir .../go-build/02
+
+X12's baseline at 4be00c17 named only three (gateway x2 + review-context). The two new names are
+no-fixed-deadlines:463 and runtime-host-entry, and neither file is in the sweep:
+
+  $ git diff --name-only -- test/integration/no-fixed-deadlines.test.ts test/integration/runtime-host-entry.test.ts
+      (empty)
+
+Their failure modes are also ones a formatter cannot produce: runtime-host-entry fails in cleanup with ENOTEMPTY
+removing a fabricated HOME/Library/Caches/go-build/02; no-fixed-deadlines:463 asserts a resumed worker ends
+"failed" and observed "succeeded" -- an unmet deadline. Both pass alone and as two copies under concurrency 4
+(16 tests, 16 pass, 0 fail). Load was not comparable to X12's run either: 1019 s and 1184 s against 926 s.
+The clean attribution is 07-.

@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "E03",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "ba22f28a6b540de74eb49a88a3e4fd62a08af1b4",
+  "resultSha": "a0eca33248a368a45ea8208314f048db754bf35e",
+  "taskAuthorityHash": "sha256:bcd787677606e09750b58888ddd51c9328bcda554a72235c8f677a393cd91a83",
+  "changedFiles": [
+    "src/incidents/errorNormalize.ts",
+    "test/unit/error-normalize.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E03/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/error-normalize.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E03/logs/02-unit-error-normalize.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/E03/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E03/logs/02-unit-error-normalize.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E03/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E03/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E03/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "E04",
+  "nextBaseSha": "a0eca33248a368a45ea8208314f048db754bf35e",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T10:10:00Z",
+    "notes": "First planned spec task on the verified harness (ordinal 9). Worker pane e03 (pane w0:pA, metabolomics/qwen3.8-flash_next) added normalizeError() with a 10-rule table (429, 404, 400/413, 5xx, network errno, timeout, non-zero exit, worker result missing, crash signals, explicit unknown fallback) that preserves the caller's evidence reference and reuses E02's redaction. Conductor re-ran the spec verify commands (logs/01, logs/02) plus the whole incident suite (logs/03: 24/24) and asserted the fixture table names all seven required shapes (logs/04). Parent verified strictly against FIX-5 (nextTaskId E03, nextBaseSha == baseSha)."
+  }
+}

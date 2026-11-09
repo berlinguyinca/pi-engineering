@@ -1,0 +1,6 @@
+$ node --experimental-strip-types scripts/bootstrap-one.ts --manifest /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmpxikndiv1/manifest.json --parent-handoff /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmpsdkkf9ji/parent.json --proofs /Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/FIX-5/fixtures/proofs.json --handoff-record /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmpizjv4onh/record.json --handoff-schema docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json --emit-handoff /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/tmp0jvda6bi/04-control-blocked-parent --cwd /Users/wohlgemuth/IdeaProjects/worktrees/pi-fix5-parent-status-20261104
+
+exit=5
+REJECT baseline: HEAD ba22f28a6b540de74eb49a88a3e4fd62a08af1b4 != manifest baseSha 7f983ee05c0d6feb1ee725984070aef31bdcf92c
+plan exit=3; no model invoked (B04 stops here)
+REJECT gate: parent handoff FIX-4B reports status BLOCKED; only PASS or ALREADY_SATISFIED may be a base

@@ -1,0 +1,16 @@
+Why the evidence tree had to be ignored rather than formatted, measured rather than asserted.
+
+Every evidence entry in every handoff declares sha256 over a file, and AUDIT/integrity-scan.mjs checks those
+paths only for existence and tracked-ness -- not bytes. So formatting a declared file would not make any gate
+red; it would make 867 declared hashes silently wrong.
+
+$ python3 (walk every *.handoff.json under the trail, recompute sha256 over every declared evidence path that
+          exists, and compare against the working-tree set of files the sweep modified)
+
+  evidence entries checked: 867
+  evidence paths the sweep modified: 0
+  declared sha256 that no longer matches bytes: 0
+
+changedFiles[] overlap is a different matter and is not a problem: 106 records name a file this sweep re-flowed,
+but changedFiles is a description of what a unit touched, it is not hashed, and a record is audited at its own
+sha -- the bytes it described are the bytes at that commit, not at this one.

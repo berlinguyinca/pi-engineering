@@ -1,0 +1,4 @@
+REJECT baseline: HEAD 3154642a52346f949a2ae1c5d456353780538914 != manifest baseSha 9f349bb9c6068a342995dc6bf58d3f7b09b6ecb4
+plan exit=3; no model invoked (B04 stops here)
+parent=E06 accepted sha256:0f66047a471…
+REJECT gate: diff scope rejected (changed-line-budget): 100 added + 1 deleted > limit 100

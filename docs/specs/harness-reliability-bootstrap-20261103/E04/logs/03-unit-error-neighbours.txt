@@ -1,0 +1,16 @@
+✔ accepts a fully attributed occurrence; absent optionals stay null (2.2ms)
+✔ an occurrence with no session is refused — unattributable errors are not recordable (0.166417ms)
+✔ rejects unredacted secrets, control characters and unsafe artifact refs (0.157292ms)
+✔ requires correlation and validates layer, severity, version, timestamp (0.094583ms)
+✔ each fixture maps to the demanded code and severity with a valid, non-empty summary (3.423333ms)
+✔ unrecognised or unreadable input becomes an explicit unknown event instead of throwing (0.938042ms)
+✔ the original evidence reference is preserved unchanged, ahead of the derived refs (0.118ms)
+✔ normalization is deterministic, clock-free, redacting and honest about missing attribution (0.416083ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 157.790042

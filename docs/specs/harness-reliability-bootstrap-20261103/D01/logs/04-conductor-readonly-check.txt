@@ -1,0 +1,17 @@
+filter {} -> n=3 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"since":"2026-11-02T00:00:00Z"} -> n=2 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"until":"2026-11-02T00:00:00Z"} -> n=1 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"since":"2026-11-01T00:00:00Z","until":"2026-11-03T00:00:00Z"} -> n=2 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"host":"hostA"} -> n=2 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"sessionId":"sessB"} -> n=0 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"host":"hostA","since":"2026-11-02T00:00:00Z"} -> n=1 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"sessionId":"sessA","until":"2026-11-02T00:00:00Z"} -> n=0 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"limit":1} -> n=1 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=true after=UNCHANGED
+filter {"limit":2,"host":"hostA"} -> n=2 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"since":"2027-01-01T00:00:00Z"} -> n=0 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+filter {"host":"nope"} -> n=0 streams=3 events=4 skipped={"foreignType":1,"corrupt":1,"unparsable":0} truncated=false after=UNCHANGED
+DEFAULT_ERROR_INDEX_LIMIT = 500 | perms: 644,644,600
+all filters left namespace untouched: true
+deterministic order: true ["err-64698b7a3d20362734c2a2472e1f0cbe684f91ec","err-74b2478a4629ee9a7d52d1755e42de5bb3403775","err-a3fee03f0fa6f25c19706bd48db637a7aedcc3fe"]
+nonexistent namespace: {"namespaceDir":"/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/d01-conductor-6aNPxT/missing","refused":"missing","occurrences":[],"scannedStreams":
+nothing created for missing dir: true

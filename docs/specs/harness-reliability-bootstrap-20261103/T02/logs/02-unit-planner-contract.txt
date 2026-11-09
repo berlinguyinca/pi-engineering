@@ -1,0 +1,24 @@
+✔ parseTaskContract accepts the spec example shape and fills defaults (1.536667ms)
+✔ parseTaskContract rejects unsafe or unbounded scope globs (0.232584ms)
+✔ parseTaskContract rejects missing objective, bad ids, self-dependency and bad risk (0.109375ms)
+✔ parseTaskContract reserves the executor's own final-review and final-fix ids (0.096084ms)
+✔ validateContractDag rejects cycles, duplicates and unknown dependencies (0.223458ms)
+✔ dagLayers groups independent contracts for parallel execution (0.164541ms)
+✔ readyContracts returns contracts whose dependencies all passed (0.097083ms)
+✔ matchesScope honours allowed and forbidden globs (0.286125ms)
+✔ scopeConflict detects overlapping write scopes (0.128167ms)
+✔ parsePlannerOutput accepts JSON or YAML and validates the DAG (3.906208ms)
+✔ task state machine allows the documented lifecycle and rejects illegal moves (0.19725ms)
+✔ parseTaskContract accepts an optional per-task execution requirement (P3) (0.083ms)
+✔ parseTaskContract rejects malformed execution requirements (P3) (0.06475ms)
+✔ parseTaskContract omits execution when absent (P3) (0.033167ms)
+✔ authorization-origin denies are never discarded; a contradicting grant rejects the contract (T02) (0.270667ms)
+✔ planner-origin keep/discard is unchanged and a planner note cannot outrank authorization denies (T02) (0.326833ms)
+ℹ tests 16
+ℹ suites 0
+ℹ pass 16
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 157.924542

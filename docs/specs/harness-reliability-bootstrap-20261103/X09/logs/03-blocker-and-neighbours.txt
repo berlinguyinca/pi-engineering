@@ -1,0 +1,13 @@
+$ node --test --import ./test/support/isolatedState.ts test/integration/mission-interrupt-pause.test.ts test/integration/mission-merge-queue-flow.test.ts
+tests 18
+pass 18
+fail 0
+duration_ms 49111.170834
+
+neighbour git units:
+  git-durable-ownership            pass 5 fail 0 
+  git-persist-concurrency          pass 3 fail 0 
+  git-lock-publication             pass 3 fail 0 
+  git-spawn-economy                pass 11 fail 0 
+  git-worktree-safety              pass 4 fail 0 
+  safe-git-shadow-spelling         pass 10 fail 0 

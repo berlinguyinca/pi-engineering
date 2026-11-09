@@ -1,0 +1,45 @@
+=== X12 log 01 -- main moved again; the merge that looked clean and did not compile ===
+
+$ git rev-list --count HEAD..origin/main
+5
+$ git log --oneline origin/main~5..origin/main
+  1d326bcd test(orchestration): the corpus row that refuses on case alone, refuses for the right reason (#630)
+  bc15254d test(platform): stop racing the plannotator bridge against a 300 ms budget (#631)
+  85523bb7 fix(git): refuse a common directory that does not exist (X08 slice of #616) (#632)
+  35fd14a8 test(herdr): gate the outbox perf ratio on absolute growth as well (#633)
+  e7888752 style(test): normalize the last two biome formatter findings (#634)
+
+Four of the five are platform fixes for tests this branch has been reporting as failing. The fifth is the operator's
+own slice of X08 onto main -- the common-directory guard, landed independently of this branch.
+
+$ git merge-tree --write-tree origin/main HEAD
+a65026a1e2f8929c093e4c8a8b5d309dab461edc        # one tree, zero CONFLICT lines
+$ git merge --no-commit --no-ff origin/main
+Auto-merging src/git/GitRepo.ts
+Automatic merge went well; stopped before committing as requested
+
+$ npm run typecheck:core      # at the merge commit 5a37a85d, before this unit resolved it
+  src/git/GitRepo.ts(256,23): error TS2323: Cannot redeclare exported variable 'resolveCommonDir'.
+  src/git/GitRepo.ts(256,23): error TS2393: Duplicate function implementation.
+  src/git/GitRepo.ts(308,23): error TS2323: Cannot redeclare exported variable 'resolveCommonDir'.
+  src/git/GitRepo.ts(308,23): error TS2393: Duplicate function implementation.
+(full output: 00-pre-resolution-typecheck-core.txt; the merge also dropped GitRepo's own class doc comment between the
+two copies of the function.)
+
+Why: main added the guard (85523bb7, X08 as written) and this branch added the guard plus X09's error-context fix, at
+the same place in a file the merge base had neither in. A textual merge keeps both; nothing in a conflict-free merge
+says "you now have two implementations of the same exported function".
+
+Resolution (commit 4be00c17): keep one -- the branch's, which is the superset (X09 wraps discoverRepo so an
+EACCES/ESTALE/EIO from discovery is reported with git's answer and the cause, instead of being misreported as
+"resolves to nothing usable") -- and keep main's provenance line ("Landed from PR #616 as unit X08") in the surviving
+doc comment. test/unit/git-common-dir-repair.test.ts was already identical on both sides
+(`git diff origin/main HEAD -- test/unit/git-common-dir-repair.test.ts` empty before the merge), so there is nothing
+to reconcile in the tests.
+
+$ npm run typecheck:core                                   # after
+  exit 0
+$ npx biome check src/git/GitRepo.ts
+  Checked 1 file in 97ms. No fixes applied.
+$ npx tsx --test test/unit/git-common-dir-repair.test.ts
+  tests 5 / pass 5 / fail 0

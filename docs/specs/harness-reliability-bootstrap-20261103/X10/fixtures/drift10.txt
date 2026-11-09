@@ -1,0 +1,10 @@
+test/integration/runtime-isolation-stress.test.ts
+test/unit/artifacts-paging.test.ts
+test/unit/git-remote-ref.test.ts
+test/unit/herdr-forks.test.ts
+test/unit/platform-filelock-no-hardlinks.test.ts
+test/unit/runtime-isolation-registry.test.ts
+test/unit/safe-git-survivors.test.ts
+test/unit/safe-git-units.test.ts
+test/unit/standalone-plan-flow.test.ts
+test/unit/worktree-janitor.test.ts

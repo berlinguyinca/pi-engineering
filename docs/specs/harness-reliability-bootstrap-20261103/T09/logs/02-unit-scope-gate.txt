@@ -1,0 +1,16 @@
+▶ scopeIntegrityCheck
+  ✔ names out-of-scope paths in input order with exact, recoverable refs (36.337959ms)
+  ✔ passes a fully in-scope diff while still naming the attempt (0.239542ms)
+  ✔ reports protected hits even when the scope allows them, and honours overrides (0.316916ms)
+  ✔ protects every documented authority family and flags nothing ordinary (0.391208ms)
+  ✔ dedupes, bounds violations to 20 with the note only in refs, and stays inert (16.3745ms)
+  ✔ scopeGateBlockedReason carries the exact blocked-evidence prefix (0.245333ms)
+✔ scopeIntegrityCheck (55.432042ms)
+ℹ tests 6
+ℹ suites 1
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1038.026333

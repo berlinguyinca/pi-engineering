@@ -1,0 +1,13 @@
+✔ one failure observed by two layers derives one byte-identical id, and the observing layer's own attempt is not identity (2.971334ms)
+✔ independent failures stay separate ids while one failure re-derived stays one id (0.321625ms)
+✔ duplicate layer action on one correlated failure reads straight out of actingLayers (0.148458ms)
+✔ the five original RetryTrace fields stay valid and identity rides the emitted payload unchanged (1.080875ms)
+✔ identity is deterministic and errorRef keeps only normalized code, layer, severity and a digest (0.398041ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 153.197208

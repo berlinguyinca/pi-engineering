@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "R05",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "5efe62fe00612c6e30e12e3a1c2f31ac4a852ef7",
+  "resultSha": "62f190ff77c244734678788458f889cddd7ff4ea",
+  "taskAuthorityHash": "sha256:af2b4e30c691826232982fdaa43e9b03aa3dd533830b7abc4e04e7ec0b94ff90",
+  "changedFiles": [
+    "src/inference/recoverySafety.ts",
+    "test/unit/recovery-safety.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R05/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/recovery-safety.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R05/logs/01-unit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/R05/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R05/logs/01-unit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R05/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R05/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R05/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "R06",
+  "nextBaseSha": "62f190ff77c244734678788458f889cddd7ff4ea",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Worker pane r05 (pane w8:pR, metabolomics/qwen3.8-flash_next) on base 5efe62fe, isolated-change mode, first pass, ~5 min. Exactly the two declared new files (git show --name-only HEAD), 33 + 54 = 87 changed lines against a 100 cap. Conductor verified independently at 62f190ff: npm run typecheck exit 0; test/unit/recovery-safety.test.ts 6 pass / 0 fail; per-suite regressions endpoint-circuit 6/6, retry-budget 6/6, transient 40/40. Purity verified by the conductor: zero import statements and no Date.now, Math.random, process.env, setTimeout, fetch or writeFile, and deliberately no nowMs parameter. Precedence asserted as implemented: invalid_input for null/non-object/empty/non-string name; mutating when writes === true even on a read-only name; external next; unknown_tool for any name outside READ_ONLY_TOOL_NAMES including case and whitespace variants (exact match, never normalised); then safe with idempotent_key when a non-blank key is present, else safe read_only; replayAllowed true only when safety is safe, proven over all 168 name x writes x external x key combinations. The header states the boundary: this is neither permission (src/guard/toolCallGuard.ts checkToolCall, blocking-only verdict at :102 with its identical-consecutive-call budget at :27) nor the ledger's idempotency_key fence (src/ledger/Ledger.ts :83/:287/:294 rejecting a reused durable event, not a repeated side effect), and RiskPolicy in src/lifecycle/policy.ts is named in prose only. READ_ONLY_TOOL_NAMES is pinned to the seven non-mutating harness tools with a comment that adding a name is a policy change requiring evidence."
+  },
+  "handoffHash": "sha256:e2ab3140e7bdbb3d8b47b9f7ed399776b0b220dc9bea4c12f74428f7008c32e9"
+}

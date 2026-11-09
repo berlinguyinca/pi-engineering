@@ -1,0 +1,36 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "H04",
+ "status": "PASS",
+ "repo": "berlinguyinca/herdr-engineering",
+ "baseSha": "b8378ffc37ae7169f42ab794cc62994c13614ca8",
+ "resultSha": "4c4f4c89b55ae5b492a381397a0a8b591b7d41bc",
+ "taskAuthorityHash": "sha256:f0657829dfdc71375259f7b172e53afccdd36a2f4240ee3e06633e3fa6fa96e7",
+ "changedFiles": [
+  "packages/diagnostics-view.js",
+  "packages/diagnostics-view.test.js"
+ ],
+ "commands": [
+  {
+   "command": "git diff --check",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/H04/logs/01-node-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/H04/logs/01-node-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/H04/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H04/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H04/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "H05",
+ "nextBaseSha": "4c4f4c89b55ae5b492a381397a0a8b591b7d41bc",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Worker pane h04 (pane w8:p12, metabolomics/qwen3.8-flash_next) on base b8378ffc (H03 result, berlinguyinca/herdr-engineering), herdr-ui mode, first pass, ~7 min. Exactly the two declared new files (git show --name-only HEAD), 61 + 55 = 116 changed lines against the 120 herdr-ui ceiling. Conductor verified independently at 4c4f4c89: node --test packages/diagnostics-view.test.js 5 pass / 0 fail; node --check on both files exit 0; git diff --check b8378ffc..HEAD exit 0; and a token sweep for fetch(|readFileSync|writeFileSync|Date.now|Math.random|setTimeout|addEventListener|onclick returns 0 hits, so the view is read-only in fact, not only in name. Reuse was verified rather than asserted, which is the clause the plan actually wrote: escapeHtml is imported from the existing packages/herdr-web-components/util.js:8 (the repo's own util, re-exported, not a private reimplementation), severity/identity validation comes from H02 normalizeIncident with SEVERITIES as the only severity vocabulary, and the unavailable banner calls H03 describeUnavailable - so no existing file changed and no parallel notion of validity or escaping was created. Evidence clauses: the test file carries 6 script/onmouseover payloads proving interpolated values cannot form a live tag, and the sort key is severity rank, then last seen descending, then fingerprint ascending with input order as the stable last resort, asserted on a fixture with ties. Anti-fabrication posture verified in source: an absent figure renders the literal unknown (never 0, never resolved), a record H02 refuses renders as a rejected record rather than a half-rendered card or a silent skip, and a section H03 reported read:false renders a banner instead of an empty list that would read as no issues. NOTE: the card markup ships a small inline <style> that uses the repo's existing custom properties (var(--border)) rather than adding a CSS file - within the two-file limit, and a later styling pass may fold it into the shared stylesheet."
+ }
+}

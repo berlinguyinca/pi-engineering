@@ -1,0 +1,4 @@
+REJECT baseline: HEAD e58a4376495dd814060c400cdfcfa338e9ac33e0 != manifest baseSha 5d000abc2403189b0fc83b0685d504af220a79e9
+plan exit=3; no model invoked (B04 stops here)
+REJECT gate: parent nextTaskId FIX-4 != FIX-4A
+REJECT gate: $.taskAuthorityHash: the record says sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff but manifest FIX-4A derives sha256:aed83475d326eba0511c763afeab7ee961d380f99f01e680ab06eef56903c8a2

@@ -1,0 +1,35 @@
+{
+ "taskId": "E01",
+ "baseSha": "36cab891c696ff709d09fb2c4066186e5201c5d9",
+ "repoId": "pi",
+ "objective": "Inventory every existing error source in the harness with exact citations and a single owner per event; classify emitted vs missing.",
+ "allowPaths": [
+  "docs/specs/harness-reliability-bootstrap/ERROR_SOURCES.md"
+ ],
+ "denyPaths": [
+  "src/**",
+  "test/**",
+  "package.json"
+ ],
+ "commands": [
+  {
+   "id": "git diff --check",
+   "cwd": "repo-root",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:21bae9f5a1c1231b992b3909ca3d754f0426a1f2c618a03c37c0083329750cb7",
+ "expectedOutputs": [
+  "docs/specs/harness-reliability-bootstrap/ERROR_SOURCES.md"
+ ],
+ "mode": "read-only"
+}

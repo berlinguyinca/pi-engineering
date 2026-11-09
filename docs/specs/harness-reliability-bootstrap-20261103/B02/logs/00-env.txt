@@ -1,0 +1,3 @@
+# back-fill observation for B02 - unit 2026-11-05T06:01:24Z
+# worktree /Users/wohlgemuth/IdeaProjects/worktrees/pi-backfill-B02 at bcfee3b03791afae66e41050a981d28e2e8a03de (parent be581d1d)
+# node v26.3.0 npm 11.16.0

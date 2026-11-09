@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "R08",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "e151794ff1fc21ee9ab77567f330817f802ce0e3",
+  "resultSha": "12d47c2f5658f4e154474f4d235c397b43af65b3",
+  "taskAuthorityHash": "sha256:9d9080fc0ce808b62ac0b6c9ca2a461d1e5880719a316dd547b27b8820c0c349",
+  "changedFiles": [
+    "src/incidents/resolutionEvidence.ts",
+    "test/unit/incident-resolution-evidence.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R08/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/incident-resolution-evidence.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R08/logs/01-unit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/logs/01-unit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "H01",
+  "nextBaseSha": "b5e6903c2f49c462c3e91528c42b5547137921ab",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "CORRECTIVE RE-STAMP (conductor metadata defect, no source change): the original record at R08/out/R08.handoff.json carried nextTaskId R09, an id that exists nowhere in the plan (the plan runs R01-R08, then H01-H07, then V01-V06), and nextBaseSha 12d47c2f, a pi commit, for a successor that lives in the herdr repo - 02-HANDOFF-PROTOCOL.md:10 requires a cross-repo successor base to be obtained independently, so the correct value is herdr origin/main b5e6903c. Both fields were the conductor's own stamping error, not the worker's: the worker's commit 12d47c2f, its two-file diff scope and its proofs are unchanged and were re-verified from R08/logs; the stamp ran in a clean detached worktree at 12d47c2f because the gate stamps only a clean committed task commit. Because handoffs are immutable by construction (writeHandoff refuses to overwrite), the repair is a NEW record at R08/out-corrected/R08.handoff.json and the original is declared superseded by R08/SUPERSEDED.md; nothing downstream references the old hash. Original R08 verification stands: npm run typecheck exit 0; test/unit/incident-resolution-evidence.test.ts 6 pass / 0 fail; recovery-outcome 6/6, recovery-optin 6/6, error-evidence-bundle 4/4; only a type-only RecoveryOutcome import; rules ordered failing reproduction, identity by shape, passing check, scope by prefix, observed post-fix status; retryCount confined to reason so retries alone can never mark root cause resolved; resolved iff root_cause_resolved over the status table."
+  },
+  "handoffHash": "sha256:3621103302ed7ee7985f0ca9c7b17e3c68ba0a3a25a26abf9c432aa05a0eb569"
+}

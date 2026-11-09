@@ -1,0 +1,14 @@
+✔ repeated 404s open the circuit and a further failure keeps it open (1.329042ms)
+✔ the cooldown gates exactly one probe and rejects the second (0.086875ms)
+✔ a probe closes on success and reopens on failure (0.079667ms)
+✔ every failure class opens the circuit and success while closed clears the streak (0.088542ms)
+✔ tracked keys stay bounded and inputs are never mutated (0.622208ms)
+✔ invalid input fails closed and the module reads no clock or RNG (0.270417ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 155.746458

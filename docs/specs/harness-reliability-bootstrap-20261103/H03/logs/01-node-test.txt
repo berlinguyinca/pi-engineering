@@ -1,0 +1,16 @@
+✔ each feed is read once and what arrives becomes an H02 timeline (2.664875ms)
+✔ the injected instant is the only instant; without one a source says null rather than reading a clock (0.170083ms)
+✔ a host that rejects leaves its section unavailable and partial — never a rejection, never a fabricated empty success (0.399917ms)
+✔ a feed that returns nothing is unavailable; a feed that returns an empty page is not (0.998958ms)
+✔ a truncated page keeps what arrived and admits it is incomplete (0.222416ms)
+✔ records H02 cannot use are counted, and a filter counts what it excludes (0.263417ms)
+✔ a source with no transport, or no source at all, says unavailable instead of throwing (0.206542ms)
+✔ unavailable sections are named in one line; nothing withheld says nothing and unknown names are not laundered in (0.322459ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 157.281542

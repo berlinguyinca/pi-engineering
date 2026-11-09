@@ -1,0 +1,3 @@
+REJECT baseline: HEAD e77904e73f3cffc9bd3bb1c628900d91bff4e020 != manifest baseSha 04846ae2e5346cce8729994d96e870fe2f56015f
+plan exit=3; no model invoked (B04 stops here)
+REJECT gate: manifest declares parentHandoffHash sha256:942da49b0ab334eacf3164210b6c303c8a02d3103914599bb7250cefbc2f7586 but no parent handoff was supplied

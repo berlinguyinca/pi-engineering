@@ -37,3 +37,17 @@ test/e2e/acceptance.local.yaml
 
 # /room live test: local Herdr checkout paths
 test/fixtures/room-live.local.yaml
+
+# Harness run artifacts (Bootstrap Protocol 2026-11-03): the run directory is evidence, not source.
+# The gate stamps only a clean worktree, so per-unit logs, fixtures, handoffs and reports must stay
+# untracked; integrity comes from handoffHash + artifactSha256, not from committing them.
+docs/specs/harness-reliability-bootstrap-20261103/*/logs/
+docs/specs/harness-reliability-bootstrap-20261103/*/fixtures/
+docs/specs/harness-reliability-bootstrap-20261103/*/out/
+docs/specs/harness-reliability-bootstrap-20261103/*/*.handoff.json
+docs/specs/harness-reliability-bootstrap-20261103/*/*.operator-approval.md
+docs/specs/harness-reliability-bootstrap-20261103/*/TASK_REPORT.md
+docs/specs/harness-reliability-bootstrap-20261103/*/WORKER_REPORT.md
+docs/specs/harness-reliability-bootstrap-20261103/*/TASK_PLAN.md
+docs/specs/harness-reliability-bootstrap-20261103/*/HANDOFF.md
+docs/specs/harness-reliability-bootstrap-20261103/*/HANDOFF-2.md

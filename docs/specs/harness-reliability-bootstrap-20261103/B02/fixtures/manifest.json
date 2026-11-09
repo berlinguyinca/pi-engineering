@@ -1,0 +1,75 @@
+{
+ "taskId": "B02",
+ "baseSha": "be581d1d872ccc36b2a43aecc5c21eb9c71553f0",
+ "repoId": "pi",
+ "objective": "Pure normalized repository-relative path matcher with explicit deny precedence; reject symlinks, traversal and ambiguous paths; do not grant implicit **. Evidence: Allow, deny, traversal and symlink cases proved by tests",
+ "allowPaths": [
+  "src/bootstrap/pathPolicy.ts",
+  "test/unit/bootstrap-path-policy.test.ts"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/orchestration/**",
+  "src/aps/**",
+  "src/errors/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "scripts/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "typecheck",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  },
+  {
+   "id": "unit",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-path-policy.test.ts"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:ae3c2f9cf2b5bed6560efc58b4241df3c14c6c13661c6ebf3319fd84cdb0d9c2",
+ "expectedOutputs": [
+  "src/bootstrap/pathPolicy.ts",
+  "test/unit/bootstrap-path-policy.test.ts"
+ ],
+ "mode": "isolated-change"
+}

@@ -1,0 +1,14 @@
+✔ evidence: one failureIdentity across two event ids counts once, keeps both ids, and a shuffled input yields byte-identical output (criterion 1) (3.039083ms)
+✔ first/last seen bound only the deduped occurrences, and every dimension set is sorted and unique (criterion 2) (0.202708ms)
+✔ recovered + unresolved === count, resolution defaults to unresolved, and a duplicate's resolution counts for nothing (criterion 3) (0.182625ms)
+✔ stable ordering: lastSeen desc, then count desc, then fingerprint asc, so the order is total (criterion 1) (0.158208ms)
+✔ maxEventIds caps kept source ids with eventIdsTruncated, limit truncates clusters with truncated, the default cap is documented (criterion 2) (0.335542ms)
+✔ purity and rejection: the caller's array and rows are deep-equal after the call, and a row D02 refuses is rejected and forms no cluster (criterion 4) (0.446709ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 156.643667

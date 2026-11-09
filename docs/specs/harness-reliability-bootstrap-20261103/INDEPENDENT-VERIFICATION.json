@@ -1,0 +1,156 @@
+{
+  "trail": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-handoff-trail-verify-20261108/docs/specs/harness-reliability-bootstrap-20261103",
+  "rev": "HEAD",
+  "planned": 51,
+  "canonical": 53,
+  "superseded": 52,
+  "ok": false,
+  "records": 53,
+  "issues": [
+    {
+      "kind": "evidence-absent",
+      "taskId": "FIX-1",
+      "detail": "declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-1/01-typecheck.txt"
+    },
+    {
+      "kind": "evidence-uncommitted",
+      "taskId": "FIX-1",
+      "detail": "declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-1/01-typecheck.txt"
+    },
+    {
+      "kind": "evidence-absent",
+      "taskId": "FIX-1",
+      "detail": "declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-1/02-unit-diff-guard.txt"
+    },
+    {
+      "kind": "evidence-uncommitted",
+      "taskId": "FIX-1",
+      "detail": "declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-1/02-unit-diff-guard.txt"
+    },
+    {
+      "kind": "evidence-absent",
+      "taskId": "FIX-1",
+      "detail": "declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-1/03-unit-bootstrap-regression.txt"
+    },
+    {
+      "kind": "evidence-uncommitted",
+      "taskId": "FIX-1",
+      "detail": "declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-1/03-unit-bootstrap-regression.txt"
+    },
+    {
+      "kind": "evidence-absent",
+      "taskId": "FIX-2",
+      "detail": "declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/01-typecheck.txt"
+    },
+    {
+      "kind": "evidence-uncommitted",
+      "taskId": "FIX-2",
+      "detail": "declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/01-typecheck.txt"
+    },
+    {
+      "kind": "evidence-absent",
+      "taskId": "FIX-2",
+      "detail": "declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/02-unit-bootstrap-one.txt"
+    },
+    {
+      "kind": "evidence-uncommitted",
+      "taskId": "FIX-2",
+      "detail": "declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/02-unit-bootstrap-one.txt"
+    },
+    {
+      "kind": "evidence-absent",
+      "taskId": "FIX-2",
+      "detail": "declared artifact absent: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/03-unit-bootstrap-regression.txt"
+    },
+    {
+      "kind": "evidence-uncommitted",
+      "taskId": "FIX-2",
+      "detail": "declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/FIX-2/03-unit-bootstrap-regression.txt"
+    },
+    {
+      "kind": "missing-record",
+      "taskId": "B00",
+      "detail": "the plan ordered B00 and no record exists"
+    },
+    {
+      "kind": "missing-record",
+      "taskId": "B01",
+      "detail": "the plan ordered B01 and no record exists"
+    },
+    {
+      "kind": "missing-record",
+      "taskId": "B02",
+      "detail": "the plan ordered B02 and no record exists"
+    },
+    {
+      "kind": "missing-record",
+      "taskId": "B03",
+      "detail": "the plan ordered B03 and no record exists"
+    },
+    {
+      "kind": "missing-record",
+      "taskId": "B04",
+      "detail": "the plan ordered B04 and no record exists"
+    },
+    {
+      "kind": "missing-record",
+      "taskId": "B05",
+      "detail": "the plan ordered B05 and no record exists"
+    },
+    {
+      "kind": "unplanned-record",
+      "taskId": "FIX-1",
+      "detail": "FIX-1 carries a record the plan never ordered"
+    },
+    {
+      "kind": "unplanned-record",
+      "taskId": "FIX-2",
+      "detail": "FIX-2 carries a record the plan never ordered"
+    },
+    {
+      "kind": "unplanned-record",
+      "taskId": "FIX-3B",
+      "detail": "FIX-3B carries a record the plan never ordered"
+    },
+    {
+      "kind": "unplanned-record",
+      "taskId": "FIX-3B2",
+      "detail": "FIX-3B2 carries a record the plan never ordered"
+    },
+    {
+      "kind": "unplanned-record",
+      "taskId": "FIX-3C",
+      "detail": "FIX-3C carries a record the plan never ordered"
+    },
+    {
+      "kind": "unplanned-record",
+      "taskId": "FIX-4A",
+      "detail": "FIX-4A carries a record the plan never ordered"
+    },
+    {
+      "kind": "unplanned-record",
+      "taskId": "FIX-4B",
+      "detail": "FIX-4B carries a record the plan never ordered"
+    },
+    {
+      "kind": "unplanned-record",
+      "taskId": "FIX-5",
+      "detail": "FIX-5 carries a record the plan never ordered"
+    },
+    {
+      "kind": "lineage-break",
+      "taskId": "E03",
+      "detail": "E02.nextBaseSha cc036f2f8c3b938c80348dff821af77c973fde7b != E03.baseSha ba22f28a6b540de74eb49a88a3e4fd62a08af1b4"
+    },
+    {
+      "kind": "next-pointer-mismatch",
+      "taskId": "E07",
+      "detail": "record declares nextTaskId \"E08\" where the plan orders \"D01\""
+    },
+    {
+      "kind": "next-pointer-mismatch",
+      "taskId": "T09",
+      "detail": "record declares nextTaskId \"T10\" where the plan orders \"R01\""
+    }
+  ]
+}

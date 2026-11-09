@@ -15,6 +15,16 @@ export interface ContextItem {
   truncated?: boolean;
 }
 
+/** An indispensable (required) file the package could not deliver whole (spec §10.5). */
+export interface RequiredContextOmission {
+  path: string;
+  kind: "unavailable" | "truncated";
+  reason: string;
+  /** For `truncated`: tokens the required slice needed, and tokens actually delivered. */
+  requestedTokens?: number;
+  providedTokens?: number;
+}
+
 /** A bounded context package assembled for a task (spec §10, §17.2). */
 export interface ContextPackage {
   id: string;
@@ -23,6 +33,24 @@ export interface ContextPackage {
   items: ContextItem[];
   totalTokens: number;
   sources: string[];
+  /** Required files delivered unavailable or partial; absent when nothing is missing. */
+  omissions?: RequiredContextOmission[];
+}
+
+/**
+ * Pure worker-launch gate over required-context omissions: `unavailable` evidence blocks launch by default,
+ * and only `allowBlockedInvestigation: true` launches — with the reason still returned for the caller to
+ * surface. A `truncated` omission alone never blocks. Not wired yet: the launch path in
+ * `src/runtime/EngineeringRuntime.ts` (~line 4283) consumes it in a later unit.
+ */
+export function requiredContextGate(
+  pkg: ContextPackage,
+  policy: { allowBlockedInvestigation?: boolean } = {},
+): { canLaunch: boolean; reason?: string } {
+  const missing = (pkg.omissions ?? []).filter((o) => o.kind === "unavailable");
+  if (missing.length === 0) return { canLaunch: true };
+  const reason = `indispensable evidence is missing (paths: ${missing.map((o) => o.path).join(", ")})`;
+  return policy.allowBlockedInvestigation ? { canLaunch: true, reason } : { canLaunch: false, reason };
 }
 
 export interface SearchHit {
@@ -38,19 +66,55 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/**
- * Derive searchable keywords from a goal by extracting alphanumeric runs
- * (stripping punctuation). 'Implement add(a, b) to return a + b' yields
- * ['Implement', 'add', 'to', 'return'] — NOT the broken token 'add(a,' that a
- * whitespace split produces. Bounded and de-duplicated.
- */
 function isTestPath(p: string): boolean {
   return /(^|\/)test\//i.test(p) || /\.test\.|_test\./i.test(p) || /\/tests\//i.test(p);
 }
 
-function goalKeywords(goal: string, limit = 6): string[] {
-  const matches = goal.match(/[A-Za-z][A-Za-z0-9_]{1,}/g) ?? [];
-  return [...new Set(matches)].slice(0, limit);
+/** Frozen English stopwords: prose glue that must never become a search keyword. */
+const STOPWORD_LIST =
+  "the a an and or but to of for in on at by with from into is are was were be been this that these those it " +
+  "its as if then than so such not no nor do does did can will would should could may might must shall we you " +
+  "they he she i our your their my his her them us please make use using via when while where what which who " +
+  "how why all any each every some none more most other onto over under again once about against between " +
+  "during before after above below up down out off too very just also there here add adds adding return " +
+  "returns fix fixes fixing";
+const STOPWORDS: ReadonlySet<string> = new Set(STOPWORD_LIST.split(" "));
+
+/**
+ * Weight a goal token: path-like ('/' or '.ext'), identifier-shaped (`snake_case`, camel hump, ALL-CAPS) and
+ * `name(` call sites name code; a mid-sentence capital is a proper noun. Those outrank plain prose, with small
+ * bonuses for a repeat and the back half of the goal, so a distinctive tail beats the generic head.
+ */
+function tokenWeight(token: string, index: number, total: number, repeats: number, callSite: boolean): number {
+  const codeLike = callSite || token.includes("/") || /\.[A-Za-z][A-Za-z0-9]{0,4}$/.test(token);
+  const ident = token.includes("_") || /[a-z][A-Z]/.test(token) || /^[A-Z][A-Z0-9]+$/.test(token);
+  const bonus = Math.min(repeats - 1, 2) + (index >= (total - 1) / 2 ? 0.5 : 0);
+  return 1 + (codeLike ? 3 : 0) + (ident ? 2 : 0) + (index > 0 && /^[A-Z]/.test(token) ? 2 : 0) + bonus;
+}
+
+/**
+ * Searchable keywords for a goal: alphanumeric runs joined across '/' and '.' ('src/add.js' stays ONE token,
+ * while 'add(a, b)' yields 'add' and never the broken 'add(a,') minus the frozen English stopwords, so prose
+ * glue like 'to'/'return' never becomes a search term — except a stopword written as a call site is code, so
+ * 'add' survives. Ordered by `tokenWeight` (ties by first appearance), de-duplicated, capped at `limit`
+ * (default 6); an all-stopword goal keeps its first raw token rather than returning [].
+ */
+export function goalKeywords(goal: string, limit = 6): string[] {
+  const raw = goal.match(/[A-Za-z][A-Za-z0-9_]*(?:[/.][A-Za-z][A-Za-z0-9_]+)+|[A-Za-z][A-Za-z0-9_]+/g) ?? [];
+  const calls = new Set((goal.match(/[A-Za-z][A-Za-z0-9_]*(?=\s*\()/g) ?? []).map((t) => t.toLowerCase()));
+  const kept: [string, number, number][] = [];
+  const seen = new Set<string>();
+  for (let index = 0; index < raw.length; index++) {
+    const lower = raw[index]!.toLowerCase();
+    const callSite = calls.has(lower); // `name(` is code, not the prose verb
+    if (seen.has(lower) || (!callSite && STOPWORDS.has(lower))) continue;
+    seen.add(lower);
+    const repeats = raw.filter((t) => t.toLowerCase() === lower).length; // goals are short
+    kept.push([raw[index]!, tokenWeight(raw[index]!, index, raw.length, repeats, callSite), index]);
+  }
+  if (kept.length === 0) return raw.slice(0, 1); // all prose: never an empty keyword list
+  kept.sort((a, b) => b[1] - a[1] || a[2] - b[2]);
+  return kept.slice(0, limit).map((k) => k[0]);
 }
 
 /** Rough token estimate: ~4 chars per token. */
@@ -178,8 +242,8 @@ export class ContextBroker {
 
   /**
    * Rank repository files by relevance to the goal keywords: path substring
-   * matches (cheap, no content read) plus symbol-hit counts from git grep.
-   * Returns the top `limit` file paths, most-relevant first. This lets the
+   * matches (cheap, no content read) weighted by each keyword's `tokenWeight`,
+   * plus distinct keyword hits from git grep. Top `limit` (default 10). This lets the
    * context assembler pull in the *content* of the most relevant files up front
    * (instead of only one-line symbol hits), so a worker does fewer tool
    * round-trips to locate what it needs.
@@ -190,7 +254,7 @@ export class ContextBroker {
     for (const p of paths) {
       const lower = p.toLowerCase();
       for (const kw of keywords) {
-        if (lower.includes(kw.toLowerCase())) score.set(p, (score.get(p) ?? 0) + 3);
+        if (lower.includes(kw.toLowerCase())) score.set(p, (score.get(p) ?? 0) + 3 * tokenWeight(kw, 0, 1, 1, false));
       }
     }
     // Symbol hits: a file containing several DISTINCT goal keywords is more
@@ -212,12 +276,12 @@ export class ContextBroker {
     return [...score.entries()]
       .sort((a, b) => {
         if (b[1] !== a[1]) return b[1] - a[1];
-        // Tie-break: prefer non-test source files, then shorter paths, so
+        // Tie-break: non-test source files, then shorter paths, then the path, so
         // ranking is deterministic and not an artifact of ls-files order.
         const at = isTestPath(a[0]);
         const bt = isTestPath(b[0]);
         if (at !== bt) return at ? 1 : -1;
-        return a[0].length - b[0].length;
+        return a[0].length - b[0].length || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
       })
       .slice(0, limit)
       .map(([p]) => p);
@@ -235,25 +299,36 @@ export class ContextBroker {
       return true;
     };
 
-    // Required files first. If a required file's slice would exceed the
-    // remaining budget it is TRUNCATED (not silently dropped) so the
-    // "required context" guarantee holds even for large files.
+    // Required files first. If a required file's slice would exceed the remaining budget it is TRUNCATED
+    // (not silently dropped) so the "required context" guarantee holds even for large files, and one that
+    // cannot be read at all is reported rather than skipped. Either way the shortfall lands in the package's
+    // `omissions` (with token counts when partial), so a reader sees the hole instead of assuming
+    // completeness, and `requiredContextGate` refuses worker launch on `unavailable` evidence unless the
+    // launch policy explicitly allows blocked investigation.
+    const omissions: RequiredContextOmission[] = [];
     for (const rel of required) {
       const text = await this.readSlice(rel, 0, 300);
-      if (text === null) continue;
+      if (text === null) {
+        const reason = `required file could not be read from the repository: ${rel}`;
+        omissions.push({ path: rel, kind: "unavailable", reason });
+        continue;
+      }
       const remaining = targetTokens - total;
       const est = estimateTokens(text);
       if (est > remaining && remaining > 0) {
         const slice = text.slice(0, Math.max(0, Math.floor(remaining * 4)));
+        const provided = estimateTokens(slice);
         push({
           id: `file:${rel}`,
           kind: "file",
           path: rel,
           summary: slice,
-          estimatedTokens: estimateTokens(slice),
+          estimatedTokens: provided,
           required: true,
           truncated: true,
         });
+        const reason = `required file arrived only partially within the token budget: ${rel}`;
+        omissions.push({ path: rel, kind: "truncated", reason, requestedTokens: est, providedTokens: provided });
       } else {
         push({
           id: `file:${rel}`,
@@ -310,6 +385,7 @@ export class ContextBroker {
       items,
       totalTokens: total,
       sources: ["git grep", "file reads", "git ls-files"],
+      ...(omissions.length > 0 ? { omissions } : {}),
     };
   }
 

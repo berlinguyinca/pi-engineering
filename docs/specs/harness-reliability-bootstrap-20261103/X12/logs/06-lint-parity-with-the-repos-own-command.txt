@@ -1,0 +1,39 @@
+=== X12 log 06 -- lint parity, measured with the command the repository gates on ===
+
+X10 measured `npx biome check src cmd` and `npx biome check test`. The repository's gate is `npm run lint` =
+`biome check .` -- the whole tree, which includes the evidence tree and scripts/. Measured with the real command:
+
+$ npm run lint            # branch tip 4be00c17
+  exit 1 ; Found 516 errors.        (04-lint-npm-branch.txt)
+$ npm run lint            # origin/main tip e7888752, in a separate checkout
+  exit 0                            (04-lint-npm-main.txt)
+
+$ npx biome check . --reporter=summary | (files listed: 488)
+  by extension   json 365 | ts 118 | mjs 5
+  by area        docs/specs/harness-reliability-bootstrap-20261103 365 | test/unit 66 | src/incidents 15 |
+                 src/bootstrap 8 | src/inference 6 | src/aps 4 | src/plannerWorker 3 | src/runtime 3 | scripts 5 …
+  rules          analyzer rules account for 15 errors total: lint/style/useSingleVarDeclarator 8,
+                 lint/style/useTemplate 3, lint/style/useImportType 2, lint/complexity/useOptionalChain 1,
+                 lint/suspicious/noAssignInExpressions 1. The other ~500 are formatter findings (lineWidth 120,
+                 2-space indent), mechanically fixable with `biome check --write`.
+
+The 365 JSON findings are the problem, and they are not fixable by formatting: they are captured command output and
+handoff records whose bytes are hashed -- `evidence[].sha256` in 99 records, `stdoutSha256` in the commands, and
+`handoffHash` over the canonical serialisation of each record. Running the formatter over them would rewrite the
+artifacts the trail exists to preserve; every recorded evidence hash for those files would then disagree with the file
+on disk. `AUDIT/integrity-scan.mjs` reports evidence dangling/untracked but does not re-hash the files, so nothing in
+the current tooling would even notice -- the trail would silently become unverifiable.
+
+The repository has already decided this case once. biome.json's files.ignore already carries two artifacts of exactly
+this class --
+  "test/fixtures/backpressure-conformance-v1.json", "test/fixtures/mission-snapshot-v3.golden.json"
+-- golden files, excluded because formatting a golden file destroys the thing it is a golden file for. The evidence
+tree is the same class of artifact, at 365 files' scale.
+
+Options for the operator, in the order I would take them:
+  1. Format the 123 code files this branch wrote (118 ts + 5 mjs; `biome check --write` for the formatter findings plus
+     15 hand-fixes for the analyzer rules) and add the evidence tree to biome.json's files.ignore with that reason.
+     `npm run lint` green, evidence bytes untouched, one config line with a justification.
+  2. Format the code files only, leave `npm run lint` red on the evidence tree, and file the config question.
+  3. Merge as-is: `main` goes from `npm run lint` exit 0 to exit 1 with 516 findings.
+This unit measures it; the choice is the operator's, because option 1 changes the lint contract for a whole subtree.

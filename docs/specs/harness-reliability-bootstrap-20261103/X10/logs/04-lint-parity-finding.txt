@@ -1,0 +1,37 @@
+# Finding (found while acting on the #616 review's "run npm run lint" suggestion): this branch makes the repo's own
+# lint command red, and main is clean. Measured with `npx biome check --reporter=json .` in two trees.
+
+origin/main 1bd754cf : errors 2  (files checked 1479)
+merged branch a9f1787c: errors 513  (files checked 1921, suggested fixes skipped 45)
+
+By category on the merged tree:
+  format                                   437
+  organizeImports                          45
+  parse                                    16
+  lint/style/useSingleVarDeclarator        8
+  lint/style/useTemplate                   3
+  lint/style/useImportType                 2
+  lint/suspicious/noAssignInExpressions    1
+  lint/complexity/useOptionalChain         1
+
+Scope check: `npx biome check src cmd` gives 0 findings at origin/main and 47 at this branch, in 15 files --
+src/aps/{observability,taskAlignment,workerActivity}.ts, src/bootstrap/{diffGuard,handoffWriter,pathPolicy,resultGate,
+taskManifest,taskAuthority,trailVerifier}.ts, src/capability/quantBenchmark.ts, src/incidents/{diagnosticTask,
+errorAggregate,errorEvent,errorFingerprint,evidenceBundle}.ts. Every one of those 15 is a file this branch touched
+(`git diff --name-only b0c0e75d...HEAD` intersected with the flagged set = all 15; the pre-existing remainder is 0),
+so this is debt the bootstrap series itself introduced across ~100 commits, not something X08 or X09 created --
+each earlier unit checked biome only on the files it touched (X08/logs/16, X09/logs/02), which never caught the
+rest of the tree.
+
+Attempted mechanical fix, then reverted: `npx biome check --write` over the 15 flagged files, iterated three times.
+Result: 37 files changed, +2855/-591 lines, and 13 files still flagged (45 findings need --unsafe, biome skipped
+them). Folding a 2855-line formatter rewrite into a behaviour PR makes the review worse, not better, so the tree was
+reverted (`git checkout -- .`, 0 modified afterwards) and this is recorded instead:
+
+  Either (a) a dedicated lint-parity commit on this branch before merging -- mechanical format + organizeImports plus
+     15 hand-written lint findings and ~16 parse complaints (the compact evidence JSON under docs/specs/... is what
+     `biome check .` chokes on; ignoring docs/specs/harness-reliability-bootstrap*/ as data, like .gitignore already
+     does for */logs/ and */out/, would remove most of the 437 format findings),
+  or (b) merge as-is and file the parity work as its own issue.
+
+Numbers to reproduce: npx biome check --reporter=json . | jq '.summary.errors' in each tree.

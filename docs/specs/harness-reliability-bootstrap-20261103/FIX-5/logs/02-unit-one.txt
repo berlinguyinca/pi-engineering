@@ -1,0 +1,30 @@
+✔ canonical hashing agrees with the handoff protocol's Python canonicalization (3.59725ms)
+✔ one accepted manifest yields a deterministic plan and touches nothing (6.645208ms)
+✔ malformed manifests and baseline drift are rejected before any planning (0.594458ms)
+✔ handoff mismatch is rejected and no model, scheduler or inference path is reachable (2.148292ms)
+✔ validateParentHandoff is pure: a manifest with no parent and a correct parent both yield no blockers (0.349417ms)
+✔ FIX-2: a declared parent that is absent at stamp time blocks the gate, exits 5 and writes no handoff (470.200916ms)
+✔ FIX-2: a parent whose stored hash is not its canonical hash is rejected at stamp time (321.142375ms)
+✔ FIX-2: a correctly hashed parent pointing at the wrong next task is rejected at stamp time (309.3795ms)
+✔ FIX-2: a valid parent chain stamps, and the stamping run itself prints the verification (618.2915ms)
+✔ FIX-5: validateParentHandoff reads the parent's status — BLOCKED and absent are blockers, ALREADY_SATISFIED is a base (0.776083ms)
+✔ FIX-5: a parent whose status is BLOCKED blocks the gate, exits 5, is never logged accepted, writes no handoff (809.687458ms)
+✔ FIX-5: a parent with no status key is rejected the same way, and the run fails closed rather than throwing (408.217667ms)
+✔ FIX-5: a parent whose status is ALREADY_SATISFIED is accepted, stamped, exit 0, and the acceptance line is unchanged (391.870375ms)
+✔ FIX-3C: --emit-handoff without --handoff-schema is a gate blocker, exit 5, nothing written (322.001833ms)
+✔ FIX-3C: a record violating the real handoff schema is rejected with the validator's path-named blocker (744.931666ms)
+✔ FIX-3C: an unreadable or non-JSON --handoff-schema fails closed — blocker, exit 5, no stack trace, nothing written (1038.132958ms)
+✔ FIX-3C: a record conforming to the real schema stamps, and the log proves validation ran (844.234167ms)
+✔ FIX-4A: taskAuthorityHash IS canonicalHash(parseTaskManifest(json).manifest) — defaults invisible, fields decisive (0.535292ms)
+✔ FIX-4A: an accepted stamp prints exactly one authority line, the derived value, before the schema line (590.030916ms)
+✔ FIX-4A: the permissive-schema accept path (the FIX-2 fixtures) stamps on the derived authority as well (521.326208ms)
+✔ FIX-4A: a record that names a different authority is rejected at stamp time — exit 5, nothing written (418.210791ms)
+✔ FIX-4A: a record with no taskAuthorityHash is rejected — exit 5, nothing written (362.45775ms)
+ℹ tests 22
+ℹ suites 0
+ℹ pass 22
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 8486.174542

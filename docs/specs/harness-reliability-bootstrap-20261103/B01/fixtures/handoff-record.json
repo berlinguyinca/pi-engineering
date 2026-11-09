@@ -1,0 +1,42 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "B01",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "c2b75dc93885d246d712d656f72de1764cf198e0",
+ "resultSha": "be581d1d872ccc36b2a43aecc5c21eb9c71553f0",
+ "taskAuthorityHash": "sha256:81bc925ee3b501d057abc300487aa0eb9768e0474248bfe2e45de5daed733461",
+ "changedFiles": [
+  "src/bootstrap/taskManifest.ts",
+  "test/unit/bootstrap-task-manifest.test.ts"
+ ],
+ "commands": [
+  {
+   "command": "npm run typecheck",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B01/logs/01-npm-typecheck.txt"
+  },
+  {
+   "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-task-manifest.test.ts",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B01/logs/02-unit-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/B01/logs/01-npm-typecheck.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B01/logs/02-unit-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B01/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B01/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B01/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "B02",
+ "nextBaseSha": "be581d1d872ccc36b2a43aecc5c21eb9c71553f0",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "BACK-FILL 2026-11-05: this unit landed before the stamping flow existed, so the record is emitted retrospectively against evidence re-collected at the original commit be581d1d (feat(bootstrap): static microtask manifest schema), whose parent c2b75dc93885d246d712d656f72de1764cf198e0 is exactly the base the parent record names - the B-series chain is genuine, not reconstructed. Deliverables were already present and are unchanged: src/bootstrap/taskManifest.ts plus test/unit/bootstrap-task-manifest.test.ts, and that commit touched no other path (git show --name-only HEAD). The declared verify commands were re-run at be581d1d itself, in a detached worktree checked out at that commit rather than at today's tip: npm run typecheck exit 0 (logs/01-npm-typecheck.txt) and node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-task-manifest.test.ts gave 3 tests, 3 pass, 0 fail (logs/02-unit-test.txt). node_modules was symlinked from the conductor checkout to run them; no dependency was installed or resolved differently, and nothing in the tree was edited to make a command pass (git status --porcelain empty before and after). Deviation: none of mode or scope - the manifest already declares isolated-change over exactly these two paths; the only deviation is temporal, this record postdates the work by roughly two days and its resultSha is the historical commit rather than a freshly produced one."
+ }
+}

@@ -1,0 +1,14 @@
+{
+  "reason": "Companion to X01: the benchmark corpus declares its artifact contract, so the runner can score the new signal. The fixture data file under test/ counts against the test-file budget, hence two test paths here.",
+  "production": [
+    "scripts/bench-task-drift.ts"
+  ],
+  "tests": [
+    "test/unit/bench-task-drift.test.ts"
+  ],
+  "verify": "npm run typecheck; node --experimental-strip-types scripts/bench-task-drift.ts; node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts test/unit/aps-task-alignment.test.ts",
+  "evidence": "runner JSON line (precision/recall/TP/FP/TN) + unit counts at the landed commit",
+  "maxProductionFiles": 1,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+}

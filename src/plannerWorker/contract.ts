@@ -23,7 +23,10 @@ const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const RESERVED_TASK_IDS: ReadonlySet<string> = new Set(["final-review", "final-fix"]);
 const RISKS: readonly ContractRisk[] = ["low", "medium", "high"];
 
-export type ContractParse = { ok: true; contract: TaskContract } | { ok: false; errors: string[] };
+export type ParsedContractScope = ContractScope & { forbiddenAuthorization?: string[] };
+export type ContractParse =
+  | { ok: true; contract: TaskContract & { scope: ParsedContractScope } }
+  | { ok: false; errors: string[] };
 export type PlanParse = { ok: true; plan: PlannerOutput } | { ok: false; errors: string[] };
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -96,11 +99,30 @@ export function parseTaskContract(raw: unknown): ContractParse {
   const forbiddenRaw = isRecord(rawScope) ? rawScope.forbidden : undefined;
   const allowed = stringList(allowedRaw, `${id}.scope.allowed`, errors, { required: true });
   const forbiddenListed = stringList(forbiddenRaw, `${id}.scope.forbidden`, errors);
+  // Authorization-origin denies come from the host on `scope.forbidden_authorization`
+  // and/or `authorization.denied` (both shapes), never from model text, and are never
+  // discarded. They are read strictly (array of non-empty strings, no coercion: a
+  // coerced number would invent a deny pattern and fail open). `scope.forbidden` below
+  // is a planner note: it can only narrow its own contract, so its keep/discard
+  // semantics stay as they were and cannot weaken a policy it never issued.
+  const authListed: string[] = [];
+  const authChannels: Array<[unknown, string]> = [
+    [isRecord(rawScope) ? rawScope.forbidden_authorization : undefined, `${id}.scope.forbidden_authorization`],
+    [isRecord(raw.authorization) ? raw.authorization.denied : undefined, `${id}.authorization.denied`],
+  ];
+  for (const [value, field] of authChannels) {
+    if (value === undefined || value === null) continue;
+    const arr = Array.isArray(value) ? (value as unknown[]) : undefined;
+    const bad = arr ? arr.findIndex((x) => typeof x !== "string" || !x.trim()) : -2;
+    if (!arr) errors.push(`${id}: ${field} must be an array of strings`);
+    else if (bad >= 0) errors.push(`${id}: ${field}[${bad}] must be a non-empty string`);
+    else for (const glob of arr as string[]) if (!authListed.includes(glob)) authListed.push(glob);
+  }
   for (const glob of allowed) {
     const why = scopeGlobError(glob);
     if (why) errors.push(`${id}: ${why}`);
   }
-  for (const glob of forbiddenListed) {
+  for (const glob of [...forbiddenListed, ...authListed]) {
     const why = scopeGlobError(glob, { deny: true });
     if (why) errors.push(`${id}: ${why}`);
   }
@@ -110,8 +132,20 @@ export function parseTaskContract(raw: unknown): ContractParse {
   // ("src/**") is kept: the mission planner falls back on that contradiction.
   const keepsDeny = (deny: string): boolean =>
     DIRECTORY_DENY.test(deny) || !allowed.some((grant) => matchesGlob(grant, deny));
-  const forbidden = forbiddenListed.filter(keepsDeny);
+  const keptPlannerDenies = forbiddenListed.filter(keepsDeny);
   const ignored_forbidden = forbiddenListed.filter((deny) => !keepsDeny(deny));
+  // An authorization deny wholly covering a grant leaves nothing writable: reject
+  // the contradiction (naming both) rather than weaken the deny. Otherwise the
+  // deny only narrows the grant: keep it, tagged with its origin, enforced.
+  for (const deny of authListed) {
+    for (const grant of allowed) {
+      if (grantInsideDeny(grant, deny)) {
+        errors.push(`${id}: scope.allowed "${grant}" is inside authorization deny "${deny}": nothing writable`);
+      }
+    }
+  }
+  const forbidden = [...new Set([...keptPlannerDenies, ...authListed])];
+  const forbiddenAuthorization = [...new Set(authListed)];
 
   const acceptance = stringList(raw.acceptance, `${id}.acceptance`, errors, { required: true });
   const verification = stringList(raw.verification, `${id}.verification`, errors);
@@ -152,7 +186,7 @@ export function parseTaskContract(raw: unknown): ContractParse {
       task_id: id,
       objective,
       depends_on,
-      scope: { allowed, forbidden },
+      scope: { allowed, forbidden, ...(forbiddenAuthorization.length > 0 ? { forbiddenAuthorization } : {}) },
       ...(ignored_forbidden.length > 0 ? { ignored_forbidden } : {}),
       acceptance,
       verification,
@@ -279,6 +313,12 @@ function staticPrefix(glob: string): string {
     out.push(seg);
   }
   return out.join("/");
+}
+
+/** True when all of `grant` lies inside deny `deny`, leaving nothing writable. */
+function grantInsideDeny(grant: string, deny: string): boolean {
+  const [d, g] = [staticPrefix(deny), staticPrefix(grant)];
+  return matchesGlob(grant, deny) || (d !== "" && (g === d || g.startsWith(`${d}/`)));
 }
 
 /** Conservative write-scope overlap between two contracts. */

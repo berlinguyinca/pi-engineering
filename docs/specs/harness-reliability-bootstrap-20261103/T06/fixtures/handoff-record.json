@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T06",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "75a15f0bce7b3f21ccae8a04d1525283eaf7fec7",
+  "resultSha": "1fdccb18f986a1e4a7b09ce72f53a3f5c3acf58f",
+  "taskAuthorityHash": "sha256:574043c68028a775dd2f79d703bd3e43abe3e5ed2e22972ff90fd467b700c220",
+  "changedFiles": [
+    "src/aps/types.ts",
+    "test/unit/aps-task-authority.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T06/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/aps-task-authority.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T06/logs/02-unit-aps-authority.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T06/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T06/logs/02-unit-aps-authority.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T06/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T06/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T06/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T07",
+  "nextBaseSha": "1fdccb18f986a1e4a7b09ce72f53a3f5c3acf58f",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T16:40:00Z",
+    "notes": "Worker pane t06 (pane w8:pE, metabolomics/qwen3.8-flash_next) on base 75a15f0b; src/aps/index.ts already re-exports types.ts so only the two declared files changed. AgentAction carries optional taskProvenance ({state:'known';authority;taskId} | {state:'unknown';reason}) and modelProvenance ({provider;model;quantization}), inherited by AgentLoopCandidateEvent/AgentLoopPreventedEvent, plus exported pure helpers describeTaskProvenance (known only for ^sha256:[0-9a-f]{64}$ with a non-empty trimmed task id; reasons distinguish missing from malformed, and non-string input says 'not a string'), describeModelProvenance (quantization via the same /[-_]quant[-_]([a-z0-9._]+)/i convention as PiWorkerExecutor.ts:2545) and isKnownTaskProvenance. Repo-wide typecheck passes with no caller touched, proving the additive fields keep every existing event literal valid; producers are deliberately unwired. Conductor probe (logs/03) verified all nine task-provenance shapes, six model-id shapes (int8/4bit/fp16 extracted, plain ids null, non-string parts null, ids trimmed) and a legacy action literal with only the pre-existing fields. Known gap: describeTaskProvenance/describeModelProvenance dereference `input` without a default, so an untyped JS caller passing undefined throws (a typed caller cannot); the producer-wiring unit should add `= {}` within its own budget."
+  }
+}

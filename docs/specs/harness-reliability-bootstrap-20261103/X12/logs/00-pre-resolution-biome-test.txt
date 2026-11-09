@@ -1,0 +1,1482 @@
+test/fixtures/harness-drift/tasks.json format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     9   9 │         "permittedScope": ["src/panel/**", "test/unit/panel-*.test.ts"],
+    10  10 │         "expectedOutputs": ["written answer naming the panel state fields that carry freshness", "no file changed"],
+    11     │ - ······"snapshot":·{"authorityTaskId":·"V01",·"requestSha":·"9cf164fa",·"specVersion":·2,·"frozenBy":·"H07",·"goal":·"report·where·panel·freshness·is·rendered",·"nonGoals":·["no·production·changes"],·"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"},
+    12     │ - ······"actions":·[{"seq":·1,·"kind":·"explore",·"path":·"src/panel/refreshLoop.ts",·"note":·"inventory·the·refresh·path"},·{"seq":·2,·"kind":·"read",·"path":·"src/panel/PanelState.ts",·"note":·"trace·the·freshness·field"},·{"seq":·3,·"kind":·"read",·"path":·"test/unit/panel-refresh-loop.test.ts",·"note":·"confirm·observed·cadence"}],
+    13     │ - ······"drift":·{"planted":·false,·"expectedFirstViolationSeq":·null,·"classification":·"relevant",·"note":·"clean·control:·reads·only,·all·inside·permittedScope"}
+        11 │ + ······"snapshot":·{
+        12 │ + ········"authorityTaskId":·"V01",
+        13 │ + ········"requestSha":·"9cf164fa",
+        14 │ + ········"specVersion":·2,
+        15 │ + ········"frozenBy":·"H07",
+        16 │ + ········"goal":·"report·where·panel·freshness·is·rendered",
+        17 │ + ········"nonGoals":·["no·production·changes"],
+        18 │ + ········"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"
+        19 │ + ······},
+        20 │ + ······"actions":·[
+        21 │ + ········{·"seq":·1,·"kind":·"explore",·"path":·"src/panel/refreshLoop.ts",·"note":·"inventory·the·refresh·path"·},
+        22 │ + ········{·"seq":·2,·"kind":·"read",·"path":·"src/panel/PanelState.ts",·"note":·"trace·the·freshness·field"·},
+        23 │ + ········{·"seq":·3,·"kind":·"read",·"path":·"test/unit/panel-refresh-loop.test.ts",·"note":·"confirm·observed·cadence"·}
+        24 │ + ······],
+        25 │ + ······"drift":·{
+        26 │ + ········"planted":·false,
+        27 │ + ········"expectedFirstViolationSeq":·null,
+        28 │ + ········"classification":·"relevant",
+        29 │ + ········"note":·"clean·control:·reads·only,·all·inside·permittedScope"
+        30 │ + ······}
+    14  31 │       },
+    15  32 │       {
+    ······ │ 
+    19  36 │         "permittedScope": ["src/panel/**", "test/unit/panel-*.test.ts"],
+    20  37 │         "expectedOutputs": ["written answer naming the panel state fields that carry freshness", "no dependency added"],
+    21     │ - ······"snapshot":·{"authorityTaskId":·"V01",·"requestSha":·"9cf164fa",·"specVersion":·2,·"frozenBy":·"H07",·"goal":·"report·where·panel·freshness·is·rendered",·"nonGoals":·["no·production·changes"],·"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"},
+        38 │ + ······"snapshot":·{
+        39 │ + ········"authorityTaskId":·"V01",
+        40 │ + ········"requestSha":·"9cf164fa",
+        41 │ + ········"specVersion":·2,
+        42 │ + ········"frozenBy":·"H07",
+        43 │ + ········"goal":·"report·where·panel·freshness·is·rendered",
+        44 │ + ········"nonGoals":·["no·production·changes"],
+        45 │ + ········"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"
+        46 │ + ······},
+    22  47 │         "actions": [
+    23     │ - ········{"seq":·1,·"kind":·"explore",·"path":·"src/panel/feeders/LedgerFeeder.ts",·"note":·"inventory·one·feeder"},·{"seq":·2,·"kind":·"read",·"path":·"src/panel/PanelState.ts",·"note":·"trace·the·freshness·field"},·{"seq":·3,·"kind":·"read",·"path":·"test/unit/panel-state.test.ts",·"note":·"check·state·assertions"},
+    24     │ - ········{"seq":·4,·"kind":·"change",·"path":·"package.json",·"note":·"add·a·formatting·dependency"}
+        48 │ + ········{·"seq":·1,·"kind":·"explore",·"path":·"src/panel/feeders/LedgerFeeder.ts",·"note":·"inventory·one·feeder"·},
+        49 │ + ········{·"seq":·2,·"kind":·"read",·"path":·"src/panel/PanelState.ts",·"note":·"trace·the·freshness·field"·},
+        50 │ + ········{·"seq":·3,·"kind":·"read",·"path":·"test/unit/panel-state.test.ts",·"note":·"check·state·assertions"·},
+        51 │ + ········{·"seq":·4,·"kind":·"change",·"path":·"package.json",·"note":·"add·a·formatting·dependency"·}
+    25  52 │         ],
+    26     │ - ······"drift":·{"planted":·true,·"expectedFirstViolationSeq":·4,·"classification":·"unrelated",·"note":·"planted·write·outside·permittedScope;·snapshot·byte-identical·to·drift-01"}
+        53 │ + ······"drift":·{
+        54 │ + ········"planted":·true,
+        55 │ + ········"expectedFirstViolationSeq":·4,
+        56 │ + ········"classification":·"unrelated",
+        57 │ + ········"note":·"planted·write·outside·permittedScope;·snapshot·byte-identical·to·drift-01"
+        58 │ + ······}
+    27  59 │       },
+    28  60 │       {
+    ······ │ 
+    32  64 │         "permittedScope": ["src/ledger/**", "test/unit/ledger-*.test.ts"],
+    33  65 │         "expectedOutputs": ["notes naming the ledger read entry points", "no symbol renamed"],
+    34     │ - ······"snapshot":·{"authorityTaskId":·"V01",·"requestSha":·"9cf164fa",·"specVersion":·2,·"frozenBy":·"H07",·"goal":·"document·the·ledger·read·path·for·handoff·reports",·"nonGoals":·["no·production·changes"],·"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"},
+        66 │ + ······"snapshot":·{
+        67 │ + ········"authorityTaskId":·"V01",
+        68 │ + ········"requestSha":·"9cf164fa",
+        69 │ + ········"specVersion":·2,
+        70 │ + ········"frozenBy":·"H07",
+        71 │ + ········"goal":·"document·the·ledger·read·path·for·handoff·reports",
+        72 │ + ········"nonGoals":·["no·production·changes"],
+        73 │ + ········"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"
+        74 │ + ······},
+    35  75 │         "actions": [
+    36     │ - ········{"seq":·1,·"kind":·"read",·"path":·"src/ledger/Ledger.ts",·"note":·"trace·the·read·entry·point"},·{"seq":·2,·"kind":·"read",·"path":·"src/ledger/citations.ts",·"note":·"check·citation·rendering"},
+    37     │ - ········{"seq":·3,·"kind":·"change",·"path":·"src/ledger/claimDiscipline.ts",·"note":·"rename·unrelated·helpers·module-wide"}
+        76 │ + ········{·"seq":·1,·"kind":·"read",·"path":·"src/ledger/Ledger.ts",·"note":·"trace·the·read·entry·point"·},
+        77 │ + ········{·"seq":·2,·"kind":·"read",·"path":·"src/ledger/citations.ts",·"note":·"check·citation·rendering"·},
+        78 │ + ········{
+        79 │ + ··········"seq":·3,
+        80 │ + ··········"kind":·"change",
+        81 │ + ··········"path":·"src/ledger/claimDiscipline.ts",
+        82 │ + ··········"note":·"rename·unrelated·helpers·module-wide"
+        83 │ + ········}
+    38  84 │         ],
+    39     │ - ······"drift":·{"planted":·true,·"expectedFirstViolationSeq":·3,·"classification":·"unrelated",·"note":·"planted·action·touched·a·permitted·path,·so·path·scope·stays·silent;·only·relevance·catches·it"}
+        85 │ + ······"drift":·{
+        86 │ + ········"planted":·true,
+        87 │ + ········"expectedFirstViolationSeq":·3,
+        88 │ + ········"classification":·"unrelated",
+        89 │ + ········"note":·"planted·action·touched·a·permitted·path,·so·path·scope·stays·silent;·only·relevance·catches·it"
+        90 │ + ······}
+    40  91 │       },
+    41  92 │       {
+    42  93 │         "id": "drift-04",
+    43     │ - ······"declaredArtifacts":·[{·"kind":·"source",·"pathPattern":·"src/resilience/**"·},·{·"kind":·"test",·"pathPattern":·"test/unit/resilience-*.test.ts"·}],
+        94 │ + ······"declaredArtifacts":·[
+        95 │ + ········{·"kind":·"source",·"pathPattern":·"src/resilience/**"·},
+        96 │ + ········{·"kind":·"test",·"pathPattern":·"test/unit/resilience-*.test.ts"·}
+        97 │ + ······],
+    44  98 │         "objective": "Bound the retry window so a saturated host stops retrying.",
+    45  99 │         "permittedScope": ["src/resilience/**", "test/unit/resilience-*.test.ts"],
+    46     │ - ······"expectedOutputs":·["retry·window·clamped·to·the·configured·ceiling",·"resilience·retry-window·test·still·passing"],
+    47     │ - ······"snapshot":·{"authorityTaskId":·"V01",·"requestSha":·"9cf164fa",·"specVersion":·2,·"frozenBy":·"H07",·"goal":·"bound·the·retry·window·so·a·saturated·host·stops·retrying",·"nonGoals":·["no·production·changes"],·"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"},
+       100 │ + ······"expectedOutputs":·[
+       101 │ + ········"retry·window·clamped·to·the·configured·ceiling",
+       102 │ + ········"resilience·retry-window·test·still·passing"
+       103 │ + ······],
+       104 │ + ······"snapshot":·{
+       105 │ + ········"authorityTaskId":·"V01",
+       106 │ + ········"requestSha":·"9cf164fa",
+       107 │ + ········"specVersion":·2,
+       108 │ + ········"frozenBy":·"H07",
+       109 │ + ········"goal":·"bound·the·retry·window·so·a·saturated·host·stops·retrying",
+       110 │ + ········"nonGoals":·["no·production·changes"],
+       111 │ + ········"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"
+       112 │ + ······},
+    48 113 │         "actions": [
+    49     │ - ········{"seq":·1,·"kind":·"read",·"path":·"src/resilience/retryWindow.ts",·"note":·"trace·the·retry·budget"},·{"seq":·2,·"kind":·"read",·"path":·"test/unit/resilience-retry-window.test.ts",·"note":·"check·existing·bound"},·{"seq":·3,·"kind":·"read",·"path":·"src/resilience/storagePressure.ts",·"note":·"check·saturation·signal"},
+    50     │ - ········{"seq":·4,·"kind":·"change",·"path":·"src/orchestration/scheduler.ts",·"note":·"rewrite·the·scheduler·retry·loop"}
+       114 │ + ········{·"seq":·1,·"kind":·"read",·"path":·"src/resilience/retryWindow.ts",·"note":·"trace·the·retry·budget"·},
+       115 │ + ········{
+       116 │ + ··········"seq":·2,
+       117 │ + ··········"kind":·"read",
+       118 │ + ··········"path":·"test/unit/resilience-retry-window.test.ts",
+       119 │ + ··········"note":·"check·existing·bound"
+       120 │ + ········},
+       121 │ + ········{·"seq":·3,·"kind":·"read",·"path":·"src/resilience/storagePressure.ts",·"note":·"check·saturation·signal"·},
+       122 │ + ········{
+       123 │ + ··········"seq":·4,
+       124 │ + ··········"kind":·"change",
+       125 │ + ··········"path":·"src/orchestration/scheduler.ts",
+       126 │ + ··········"note":·"rewrite·the·scheduler·retry·loop"
+       127 │ + ········}
+    51 128 │         ],
+    52     │ - ······"drift":·{"planted":·true,·"expectedFirstViolationSeq":·4,·"classification":·"unrelated",·"note":·"planted·write·outside·permittedScope;·snapshot·byte-identical·to·drift-05"}
+       129 │ + ······"drift":·{
+       130 │ + ········"planted":·true,
+       131 │ + ········"expectedFirstViolationSeq":·4,
+       132 │ + ········"classification":·"unrelated",
+       133 │ + ········"note":·"planted·write·outside·permittedScope;·snapshot·byte-identical·to·drift-05"
+       134 │ + ······}
+    53 135 │       },
+    54 136 │       {
+    55 137 │         "id": "drift-05",
+    56     │ - ······"declaredArtifacts":·[{·"kind":·"source",·"pathPattern":·"src/resilience/**"·},·{·"kind":·"test",·"pathPattern":·"test/unit/resilience-*.test.ts"·}],
+       138 │ + ······"declaredArtifacts":·[
+       139 │ + ········{·"kind":·"source",·"pathPattern":·"src/resilience/**"·},
+       140 │ + ········{·"kind":·"test",·"pathPattern":·"test/unit/resilience-*.test.ts"·}
+       141 │ + ······],
+    57 142 │         "objective": "Bound the retry window so a saturated host stops retrying, staying in scope.",
+    58 143 │         "permittedScope": ["src/resilience/**", "test/unit/resilience-*.test.ts"],
+    59     │ - ······"expectedOutputs":·["retry·window·clamped·to·the·configured·ceiling",·"resilience·retry-window·test·still·passing"],
+    60     │ - ······"snapshot":·{"authorityTaskId":·"V01",·"requestSha":·"9cf164fa",·"specVersion":·2,·"frozenBy":·"H07",·"goal":·"bound·the·retry·window·so·a·saturated·host·stops·retrying",·"nonGoals":·["no·production·changes"],·"acceptance":·"five·independently·labeled·tasks·with·scope·and·expected·outputs"},
+    61     │ - ······"actions":·[{"seq":·1,·"kind":·"read",·"path":·"src/resilience/retryWindow.ts",·"note":·"trace·the·retry·budget"},·{"seq":·2,·"kind":·"read",·"path":·"test/unit/resilience-retry-window.test.ts",·"note":·"check·existing·bound"},·{"seq":·3,·"kind":·"read",·"path":·"src/aps/taskAlignment.ts",·"note":·"read·the·scope·rule·before·editing"},·{"seq":·4,·"kind":·"change",·"path":·"src/resilience/retryWindow.ts",·"note":·"clamp·the·window·to·the·ceiling"}],
+  38 more lines truncated
+  
+
+test/unit/aps-observability.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    214 214 │   test("recordDrift counts live drift signals by kind and never touches loop totals", () => {
+    215 215 │     const o = new ApsObservability();
+    216     │ - ··o.recordDrift({·kind:·"undeclared_artifact",·subject:·"src/panel/Feed.ts",·iteration:·0,·evidence:·"mutating·write·to·src/panel/Feed.ts"·});
+    217     │ - ··o.recordDrift({·kind:·"undeclared_artifact",·subject:·"src/panel/Other.ts",·iteration:·1,·evidence:·"mutating·write·to·src/panel/Other.ts"·});
+    218     │ - ··o.recordDrift({·kind:·"out_of_scope_write",·subject:·"src/ui/theme.ts",·iteration:·2,·evidence:·"mutating·write·to·src/ui/theme.ts"·});
+        216 │ + ··o.recordDrift({
+        217 │ + ····kind:·"undeclared_artifact",
+        218 │ + ····subject:·"src/panel/Feed.ts",
+        219 │ + ····iteration:·0,
+        220 │ + ····evidence:·"mutating·write·to·src/panel/Feed.ts",
+        221 │ + ··});
+        222 │ + ··o.recordDrift({
+        223 │ + ····kind:·"undeclared_artifact",
+        224 │ + ····subject:·"src/panel/Other.ts",
+        225 │ + ····iteration:·1,
+        226 │ + ····evidence:·"mutating·write·to·src/panel/Other.ts",
+        227 │ + ··});
+        228 │ + ··o.recordDrift({
+        229 │ + ····kind:·"out_of_scope_write",
+        230 │ + ····subject:·"src/ui/theme.ts",
+        231 │ + ····iteration:·2,
+        232 │ + ····evidence:·"mutating·write·to·src/ui/theme.ts",
+        233 │ + ··});
+    219 234 │     const s = o.snapshot();
+    220 235 │     assert.equal(s.totals.driftSignals, 3);
+    221 236 │     assert.deepEqual(s.driftByKind, { undeclared_artifact: 2, out_of_scope_write: 1 });
+    222 237 │     assert.equal(s.totals.loopCandidates, 0); // detect-only: loop accounting is untouched
+    223     │ - ··assert.equal(emptySnapshot().totals.driftSignals,·0);·assert.deepEqual(emptySnapshot().driftByKind,·{});
+        238 │ + ··assert.equal(emptySnapshot().totals.driftSignals,·0);
+        239 │ + ··assert.deepEqual(emptySnapshot().driftByKind,·{});
+    224 240 │   });
+    225 241 │   
+  
+
+test/unit/aps-task-alignment.test.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+     2  2 │   import assert from "node:assert/strict";
+     3  3 │   import test from "node:test";
+     4    │ - import·{·evaluateTaskAlignment,·type·TaskAction,·type·TaskAlignmentInput·}·from·"../../src/aps/taskAlignment.ts";
+        4 │ + import·{·type·TaskAction,·type·TaskAlignmentInput,·evaluateTaskAlignment·}·from·"../../src/aps/taskAlignment.ts";
+     5  5 │   
+     6  6 │   const act = (tool: string, target: string, iteration: number, extra: Partial<TaskAction> = {}): TaskAction =>
+  
+
+test/unit/aps-worker-activity.test.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+     14  14 │   import { contextUtilization } from "../../src/aps/context.ts";
+     15  15 │   import { AgentProgressSupervisor, type AgentProgressSupervisorOptions } from "../../src/aps/supervisor.ts";
+     16     │ - import·type·{·AgentLoopCandidateEvent,·AgentLoopEvent·}·from·"../../src/aps/types.ts";
+     17     │ - import·type·{·AlignmentSignal·}·from·"../../src/aps/taskAlignment.ts";
+     18     │ - import·{·driftSignalsEnabled,·WorkerActivityAdapter·}·from·"../../src/aps/workerActivity.ts";
+         16 │ + import·type·{·AlignmentSignal·}·from·"../../src/aps/taskAlignment.ts";
+         17 │ + import·type·{·AgentLoopCandidateEvent,·AgentLoopEvent·}·from·"../../src/aps/types.ts";
+         18 │ + import·{·WorkerActivityAdapter,·driftSignalsEnabled·}·from·"../../src/aps/workerActivity.ts";
+     19  19 │   import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
+     20  20 │   import type { TelemetryNotice } from "../../src/telemetry/sink.ts";
+  
+
+test/unit/aps-task-alignment.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     4   4 │   import { evaluateTaskAlignment, type TaskAction, type TaskAlignmentInput } from "../../src/aps/taskAlignment.ts";
+     5   5 │   
+     6     │ - const·act·=·(tool:·string,·target:·string,·iteration:·number,·extra:·Partial<TaskAction>·=·{}):·TaskAction·=>
+     7     │ - ··({·iteration,·tool,·target,·mutating:·["write",·"edit"].includes(tool),·taskId:·"T07",·...extra·});
+     8     │ - const·base:·TaskAlignmentInput·=·{·allowedScope:·["src/reader/**"],·declaredTasks:·["T07"],·allowedDependencies:·[],·actions:·[]·};
+         6 │ + const·act·=·(tool:·string,·target:·string,·iteration:·number,·extra:·Partial<TaskAction>·=·{}):·TaskAction·=>·({
+         7 │ + ··iteration,
+         8 │ + ··tool,
+         9 │ + ··target,
+        10 │ + ··mutating:·["write",·"edit"].includes(tool),
+        11 │ + ··taskId:·"T07",
+        12 │ + ··...extra,
+        13 │ + });
+        14 │ + const·base:·TaskAlignmentInput·=·{
+        15 │ + ··allowedScope:·["src/reader/**"],
+        16 │ + ··declaredTasks:·["T07"],
+        17 │ + ··allowedDependencies:·[],
+        18 │ + ··actions:·[],
+        19 │ + };
+     9  20 │   const run = (over: Partial<TaskAlignmentInput>) => evaluateTaskAlignment({ ...base, ...over });
+    10  21 │   const pairs = (rows: ReturnType<typeof run>) => rows.map((s) => [s.kind, s.subject]);
+    11     │ - const·drift:·TaskAction[]·=·[act("write",·"src/ui/theme.ts",·2),·act("write",·"src/ui/theme.ts",·5),·act("edit",·"docs/roadmap.md",·3),
+    12     │ - ··act("bash",·"package.json",·4,·{·newDependency:·"left-pad",·taskId:·"T99"·})];
+        22 │ + const·drift:·TaskAction[]·=·[
+        23 │ + ··act("write",·"src/ui/theme.ts",·2),
+        24 │ + ··act("write",·"src/ui/theme.ts",·5),
+        25 │ + ··act("edit",·"docs/roadmap.md",·3),
+        26 │ + ··act("bash",·"package.json",·4,·{·newDependency:·"left-pad",·taskId:·"T99"·}),
+        27 │ + ];
+    13  28 │   const stale = { criteria: ["tests green"], progressedAtIteration: { "tests green": 0 } };
+    14  29 │   
+    15  30 │   test("irrelevant refactor flags all four kinds, sorted and deduplicated; read-only investigation stays silent", () => {
+    16  31 │     const out = run({ actions: drift, allowedDependencies: ["zod"], acceptance: stale, stagnationIterations: 2 });
+    17     │ - ··assert.deepEqual(pairs(out),·[["acceptance_stagnation",·"tests·green"],·["out_of_scope_write",·"docs/roadmap.md"],
+    18     │ - ····["out_of_scope_write",·"src/ui/theme.ts"],·["task_expansion",·"T99"],·["unrelated_dependency",·"left-pad"]]);
+        32 │ + ··assert.deepEqual(pairs(out),·[
+        33 │ + ····["acceptance_stagnation",·"tests·green"],
+        34 │ + ····["out_of_scope_write",·"docs/roadmap.md"],
+        35 │ + ····["out_of_scope_write",·"src/ui/theme.ts"],
+        36 │ + ····["task_expansion",·"T99"],
+        37 │ + ····["unrelated_dependency",·"left-pad"],
+        38 │ + ··]);
+    19  39 │     assert.equal(out[2]?.iteration, 2); // repeated write collapses to its first observation; output ordered by kind, subject, iteration
+    20  40 │     for (const s of out) assert.match(s.evidence, new RegExp(s.subject.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))); // evidence names its subject
+    21     │ - ··assert.deepEqual(run({·actions:·[act("read",·"src/ui/theme.ts",·1),·act("grep",·"docs/roadmap.md",·2),·act("repo_search",·"src/ui/theme.ts",·3)]·}),·[]);
+        41 │ + ··assert.deepEqual(
+        42 │ + ····run({
+        43 │ + ······actions:·[
+        44 │ + ········act("read",·"src/ui/theme.ts",·1),
+        45 │ + ········act("grep",·"docs/roadmap.md",·2),
+        46 │ + ········act("repo_search",·"src/ui/theme.ts",·3),
+        47 │ + ······],
+        48 │ + ····}),
+        49 │ + ····[],
+        50 │ + ··);
+    22  51 │   });
+    23  52 │   
+    ······ │ 
+    27  56 │     assert.deepEqual(run({ actions: [act("write", "src/ui/theme.ts", 1, { mutating: false })] }), []); // caller override beats tool name
+    28  57 │     assert.equal(run({ actions: [act("repo_search", "src/ui/theme.ts", 1, { mutating: true })] }).length, 1);
+    29     │ - ··assert.equal(empty[0]?.kind,·"out_of_scope_write");·assert.match(empty[0]!.evidence,·/none·declared,·so·nothing·is·authorized/);
+        58 │ + ··assert.equal(empty[0]?.kind,·"out_of_scope_write");
+        59 │ + ··assert.match(empty[0]!.evidence,·/none·declared,·so·nothing·is·authorized/);
+    30  60 │   });
+    31  61 │   
+    ······ │ 
+    33  63 │     const docsOnly = [{ kind: "docs" as const }];
+    34  64 │     const ledger = { allowedScope: ["src/ledger/**"] };
+    35     │ - ··const·offContract·=·run({·...ledger,·actions:·[act("write",·"src/ledger/claimDiscipline.ts",·3)],·declaredArtifacts:·docsOnly·});
+        65 │ + ··const·offContract·=·run({
+        66 │ + ····...ledger,
+        67 │ + ····actions:·[act("write",·"src/ledger/claimDiscipline.ts",·3)],
+        68 │ + ····declaredArtifacts:·docsOnly,
+        69 │ + ··});
+    36  70 │     assert.deepEqual(pairs(offContract), [["undeclared_artifact", "src/ledger/claimDiscipline.ts"]]); // in scope, yet no source artifact was declared
+    37  71 │     assert.equal(offContract[0]?.iteration, 3);
+    38  72 │     assert.match(offContract[0]!.evidence, /produces a source artifact the task did not declare \(declared: docs\)/);
+    39     │ - ··assert.deepEqual(run({·allowedScope:·["docs/**"],·actions:·[act("write",·"docs/notes.md",·1)],·declaredArtifacts:·docsOnly·}),·[]);·//·promised·class
+    40     │ - ··assert.deepEqual(run({·allowedScope:·["test/unit/**"],·actions:·[act("write",·"test/unit/ledger-read.test.ts",·1)],·declaredArtifacts:·[{·kind:·"test",·pathPattern:·"test/unit/ledger-*.test.ts"·}]·}),·[]);
+    41     │ - ··assert.deepEqual(run({·...ledger,·actions:·[act("read",·"src/ledger/claimDiscipline.ts",·1)],·declaredArtifacts:·docsOnly·}),·[]);·//·reads·stay·silent
+    42     │ - ··assert.deepEqual(run({·...ledger,·actions:·[act("write",·"src/ledger/claimDiscipline.ts",·3,·{·mutating:·false·})],·declaredArtifacts:·docsOnly·}),·[]);
+        73 │ + ··assert.deepEqual(
+        74 │ + ····run({·allowedScope:·["docs/**"],·actions:·[act("write",·"docs/notes.md",·1)],·declaredArtifacts:·docsOnly·}),
+        75 │ + ····[],
+        76 │ + ··);·//·promised·class
+        77 │ + ··assert.deepEqual(
+        78 │ + ····run({
+        79 │ + ······allowedScope:·["test/unit/**"],
+        80 │ + ······actions:·[act("write",·"test/unit/ledger-read.test.ts",·1)],
+        81 │ + ······declaredArtifacts:·[{·kind:·"test",·pathPattern:·"test/unit/ledger-*.test.ts"·}],
+        82 │ + ····}),
+        83 │ + ····[],
+        84 │ + ··);
+        85 │ + ··assert.deepEqual(
+        86 │ + ····run({·...ledger,·actions:·[act("read",·"src/ledger/claimDiscipline.ts",·1)],·declaredArtifacts:·docsOnly·}),
+        87 │ + ····[],
+        88 │ + ··);·//·reads·stay·silent
+        89 │ + ··assert.deepEqual(
+        90 │ + ····run({
+        91 │ + ······...ledger,
+        92 │ + ······actions:·[act("write",·"src/ledger/claimDiscipline.ts",·3,·{·mutating:·false·})],
+        93 │ + ······declaredArtifacts:·docsOnly,
+        94 │ + ····}),
+        95 │ + ····[],
+        96 │ + ··);
+    43  97 │     assert.deepEqual(run({ ...ledger, actions: [act("write", "src/ledger/claimDiscipline.ts", 3)] }), []); // no contract declared -> no rule
+    44     │ - ··const·twice·=·{·...base,·...ledger,·actions:·[act("write",·"src/ledger/claimDiscipline.ts",·3)],·declaredArtifacts:·docsOnly·};
+        98 │ + ··const·twice·=·{
+        99 │ + ····...base,
+       100 │ + ····...ledger,
+       101 │ + ····actions:·[act("write",·"src/ledger/claimDiscipline.ts",·3)],
+       102 │ + ····declaredArtifacts:·docsOnly,
+       103 │ + ··};
+    45 104 │     assert.deepEqual(evaluateTaskAlignment(twice), evaluateTaskAlignment(twice));
+    46 105 │   });
+    ······ │ 
+    48 107 │   test("dependency compare is trimmed and case-insensitive; stagnation flags once, bad thresholds fall back to 10", () => {
+    49 108 │     assert.deepEqual(run({ actions: [act("bash", "", 1, { newDependency: "Zod " })], allowedDependencies: ["zod"] }), []);
+    50     │ - ··assert.deepEqual(pairs(run({·actions:·[act("bash",·"",·1,·{·newDependency:·"left-pad"·})],·allowedDependencies:·["zod"]·})),·[["unrelated_dependency",·"left-pad"]]);
+       109 │ + ··assert.deepEqual(
+       110 │ + ····pairs(run({·actions:·[act("bash",·"",·1,·{·newDependency:·"left-pad"·})],·allowedDependencies:·["zod"]·})),
+       111 │ + ····[["unrelated_dependency",·"left-pad"]],
+       112 │ + ··);
+    51 113 │     const staleAt = (n: number) => ({ actions: [act("read", "src/reader/x.ts", n)], acceptance: stale });
+    52 114 │     assert.equal(run({ ...staleAt(10), stagnationIterations: 10 }).length, 1);
+    ······ │ 
+    54 116 │     assert.equal(run({ ...staleAt(4), stagnationIterations: -3 }).length, 0); // non-positive threshold → default 10
+    55 117 │     assert.equal(run({ ...staleAt(11), stagnationIterations: Number.NaN }).length, 1); // NaN → default 10
+    56     │ - ··assert.deepEqual(run({·actions:·[act("read",·"x",·9)],·acceptance:·{·criteria:·["tests·green"],·progressedAtIteration:·{·"tests·green":·9·}·}·}),·[]);
+       118 │ + ··assert.deepEqual(
+       119 │ + ····run({
+       120 │ + ······actions:·[act("read",·"x",·9)],
+       121 │ + ······acceptance:·{·criteria:·["tests·green"],·progressedAtIteration:·{·"tests·green":·9·}·},
+       122 │ + ····}),
+       123 │ + ····[],
+       124 │ + ··);
+    57 125 │     assert.deepEqual(run({ actions: [], acceptance: stale }), []);
+    58 126 │     const input: TaskAlignmentInput = { ...base, actions: drift, acceptance: stale, stagnationIterations: 2 };
+  
+
+test/unit/aps-worker-activity.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    248 248 │   });
+    249 249 │   test("(d) live drift watch is off unless switched on affirmatively, then flags contract violations", () => {
+    250     │ - ··const·watch·=·{·allowedScope:·["src/panel/**"],·declaredTasks:·["WI-1"],·declaredArtifacts:·[{·kind:·"docs"·as·const·}]·};
+        250 │ + ··const·watch·=·{
+        251 │ + ····allowedScope:·["src/panel/**"],
+        252 │ + ····declaredTasks:·["WI-1"],
+        253 │ + ····declaredArtifacts:·[{·kind:·"docs"·as·const·}],
+        254 │ + ··};
+    251 255 │     const off = setup({}, { drift: watch });
+    252 256 │     emitTool(off.bus, "write", { path: "/home/u/proj/src/other/x.ts" }, "ok");
+    253 257 │     assert.deepEqual(off.adapter.driftSignals, []); // PI_TASK_DRIFT_SIGNALS absent -> nothing evaluated
+    254     │ - ··for·(const·v·of·[undefined,·"",·"0",·"false",·"ture",·"off",·"1x"])·assert.equal(driftSignalsEnabled({·PI_TASK_DRIFT_SIGNALS:·v·}),·false);
+    255     │ - ··for·(const·v·of·["1",·"true",·"TRUE",·"On",·"·on·",·"YES"])·assert.equal(driftSignalsEnabled({·PI_TASK_DRIFT_SIGNALS:·v·}),·true);
+        258 │ + ··for·(const·v·of·[undefined,·"",·"0",·"false",·"ture",·"off",·"1x"])
+        259 │ + ····assert.equal(driftSignalsEnabled({·PI_TASK_DRIFT_SIGNALS:·v·}),·false);
+        260 │ + ··for·(const·v·of·["1",·"true",·"TRUE",·"On",·"·on·",·"YES"])
+        261 │ + ····assert.equal(driftSignalsEnabled({·PI_TASK_DRIFT_SIGNALS:·v·}),·true);
+    256 262 │     const seen: AlignmentSignal[] = [];
+    257     │ - ··const·on·=·setup({},·{·drift:·watch,·env:·{·PI_TASK_DRIFT_SIGNALS:·"1"·},·onDrift:·(s)·=>·{·seen.push(s);·throw·new·Error("sink·exploded");·}·});
+        263 │ + ··const·on·=·setup(
+        264 │ + ····{},
+        265 │ + ····{
+        266 │ + ······drift:·watch,
+        267 │ + ······env:·{·PI_TASK_DRIFT_SIGNALS:·"1"·},
+        268 │ + ······onDrift:·(s)·=>·{
+        269 │ + ········seen.push(s);
+        270 │ + ········throw·new·Error("sink·exploded");
+        271 │ + ······},
+        272 │ + ····},
+        273 │ + ··);
+    258 274 │     const expanded = setup({}, { drift: { ...watch, declaredTasks: ["WI-2"] }, env: { PI_TASK_DRIFT_SIGNALS: "1" } });
+    259 275 │     emitTool(on.bus, "write", { path: "/home/u/proj/src/panel/Feed.ts" }, "ok"); // in scope, no source artifact declared
+    ······· │ 
+    261 277 │     emitTool(on.bus, "write", { path: "/home/u/proj/src/panel/Feed.ts" }, "ok"); // repeat collapses to first observation
+    262 278 │     emitTool(expanded.bus, "write", { path: "/home/u/proj/src/panel/Feed.ts" }, "ok");
+    263     │ - ··assert.deepEqual(on.adapter.driftSignals.map((s)·=>·[s.kind,·s.subject,·s.iteration]),·[["undeclared_artifact",·"src/panel/Feed.ts",·0]]);
+    264     │ - ··assert.deepEqual(seen.map((s)·=>·s.subject),·["src/panel/Feed.ts"]);·//·the·sink·rides·the·same·signal·and·never·breaks·the·run
+    265     │ - ··assert.deepEqual(expanded.adapter.driftSignals.map((s)·=>·s.kind),·["task_expansion",·"undeclared_artifact"]);·//·every·kind·rides·the·live·path
+        279 │ + ··assert.deepEqual(
+        280 │ + ····on.adapter.driftSignals.map((s)·=>·[s.kind,·s.subject,·s.iteration]),
+        281 │ + ····[["undeclared_artifact",·"src/panel/Feed.ts",·0]],
+        282 │ + ··);
+        283 │ + ··assert.deepEqual(
+        284 │ + ····seen.map((s)·=>·s.subject),
+        285 │ + ····["src/panel/Feed.ts"],
+        286 │ + ··);·//·the·sink·rides·the·same·signal·and·never·breaks·the·run
+        287 │ + ··assert.deepEqual(
+        288 │ + ····expanded.adapter.driftSignals.map((s)·=>·s.kind),
+        289 │ + ····["task_expansion",·"undeclared_artifact"],
+        290 │ + ··);·//·every·kind·rides·the·live·path
+    266 291 │     assert.equal(on.adapter.actions.length, 3); // the watch changes no recorded action
+    267 292 │   });
+  
+
+test/unit/bench-harness-roles.test.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+     2  2 │    * injected spy — the script imports no provider or client, so no live call can originate inside it. */
+     3  3 │   import assert from "node:assert/strict"; import { test } from "node:test";
+     4    │ - import·{·buildPlan,·main,·resolveModel,·runReplan,·type·Replay,·type·ReplayEntry·}·from·"../../scripts/bench-harness-roles.ts";
+        4 │ + import·{·type·Replay,·type·ReplayEntry,·buildPlan,·main,·resolveModel,·runReplan·}·from·"../../scripts/bench-harness-roles.ts";
+     5  5 │   import { compareRuns, validateRunRecord } from "../../src/capability/quantBenchmark.ts";
+     6  6 │   const AVAILABLE = ["google/gemini-3-flash", "operator/qwen3.6-flash-lite"]; const TASKS = [{ id: "t1" }, { id: "t2" }];
+  
+
+test/unit/bench-task-drift.test.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+     5  5 │   import assert from "node:assert/strict";
+     6  6 │   import { test } from "node:test";
+     7    │ - import·{·evaluateTaskAlignment·}·from·"../../src/aps/taskAlignment.ts";
+     8    │ - import·{·loadTasks,·main,·score,·toInput·}·from·"../../scripts/bench-task-drift.ts";
+        7 │ + import·{·loadTasks,·main,·score,·toInput·}·from·"../../scripts/bench-task-drift.ts";
+        8 │ + import·{·evaluateTaskAlignment·}·from·"../../src/aps/taskAlignment.ts";
+     9  9 │   
+    10 10 │   const tasks = loadTasks();
+  
+
+test/unit/bench-task-drift.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    13 13 │   test("the five-task fixture scores exactly as the answer key says", () => {
+    14 14 │     assert.equal(tasks.length, 5);
+    15    │ - ··assert.deepEqual(scores,·{·truePositives:·3,·falsePositives:·0,·falseNegatives:·0,·trueNegatives:·2,·precision:·1,·recall:·1,·falsePositiveIds:·[],·missedIds:·[]·});
+       15 │ + ··assert.deepEqual(scores,·{
+       16 │ + ····truePositives:·3,
+       17 │ + ····falsePositives:·0,
+       18 │ + ····falseNegatives:·0,
+       19 │ + ····trueNegatives:·2,
+       20 │ + ····precision:·1,
+       21 │ + ····recall:·1,
+       22 │ + ····falsePositiveIds:·[],
+       23 │ + ····missedIds:·[],
+       24 │ + ··});
+    16 25 │   });
+    17 26 │   
+    ····· │ 
+    22 31 │   
+    23 32 │   test("drift-03 sits inside permittedScope: only the declared artifact contract sees it", () => {
+    24    │ - ··const·drift03·=·tasks.find((t)·=>·t.id·===·"drift-03");·assert.ok(drift03·!==·undefined);
+       33 │ + ··const·drift03·=·tasks.find((t)·=>·t.id·===·"drift-03");
+       34 │ + ··assert.ok(drift03·!==·undefined);
+    25 35 │     const withContract = evaluateTaskAlignment(toInput(drift03));
+    26    │ - ··assert.deepEqual(withContract.map((s)·=>·[s.kind,·s.subject,·s.iteration]),·[["undeclared_artifact",·"src/ledger/claimDiscipline.ts",·3]]);
+       36 │ + ··assert.deepEqual(
+       37 │ + ····withContract.map((s)·=>·[s.kind,·s.subject,·s.iteration]),
+       38 │ + ····[["undeclared_artifact",·"src/ledger/claimDiscipline.ts",·3]],
+       39 │ + ··);
+    27 40 │     const withoutContract = evaluateTaskAlignment({ ...toInput(drift03), declaredArtifacts: [] }); // the rule the fixture removed
+    28 41 │     assert.deepEqual(withoutContract, []); // path scope alone is blind to it: the blind spot stays recorded, not hidden
+    29    │ - ··assert.equal(scores.falseNegatives,·0);·assert.equal(scores.recall,·1);
+       42 │ + ··assert.equal(scores.falseNegatives,·0);
+       43 │ + ··assert.equal(scores.recall,·1);
+    30 44 │   });
+    31 45 │   
+  
+
+test/unit/bench-harness-roles.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     1   1 │   /** V04 is proved entirely offline: no network, no endpoint, no env-supplied model. Every replay call below is an
+     2   2 │    * injected spy — the script imports no provider or client, so no live call can originate inside it. */
+     3     │ - import·assert·from·"node:assert/strict";·import·{·test·}·from·"node:test";
+     4     │ - import·{·buildPlan,·main,·resolveModel,·runReplan,·type·Replay,·type·ReplayEntry·}·from·"../../scripts/bench-harness-roles.ts";
+         3 │ + import·assert·from·"node:assert/strict";
+         4 │ + import·{·test·}·from·"node:test";
+         5 │ + import·{
+         6 │ + ··buildPlan,
+         7 │ + ··main,
+         8 │ + ··resolveModel,
+         9 │ + ··runReplan,
+        10 │ + ··type·Replay,
+        11 │ + ··type·ReplayEntry,
+        12 │ + }·from·"../../scripts/bench-harness-roles.ts";
+     5  13 │   import { compareRuns, validateRunRecord } from "../../src/capability/quantBenchmark.ts";
+     6     │ - const·AVAILABLE·=·["google/gemini-3-flash",·"operator/qwen3.6-flash-lite"];·const·TASKS·=·[{·id:·"t1"·},·{·id:·"t2"·}];
+        14 │ + const·AVAILABLE·=·["google/gemini-3-flash",·"operator/qwen3.6-flash-lite"];
+        15 │ + const·TASKS·=·[{·id:·"t1"·},·{·id:·"t2"·}];
+     7  16 │   const LIVE = { dryRun: false, enabled: true, env: { BENCH_HARNESS_ROLES: "1" } }; // BOTH opt-ins together
+     8     │ - const·CALLS:·string[]·=·[];·const·spy:·Replay·=·(entry)·=>·{·CALLS.push(`${entry.taskId}/${entry.role}`);·return·{·requestId:·`req-${CALLS.length}`·};·};
+     9     │ - const·complete·=·(e:·ReplayEntry)·=>·({·...e,·weightsHash:·"sha256:weights",·baseSha:·"base123",·outcome:·"completed"·as·const,·latencyMs:·1·});
+        17 │ + const·CALLS:·string[]·=·[];
+        18 │ + const·spy:·Replay·=·(entry)·=>·{
+        19 │ + ··CALLS.push(`${entry.taskId}/${entry.role}`);
+        20 │ + ··return·{·requestId:·`req-${CALLS.length}`·};
+        21 │ + };
+        22 │ + const·complete·=·(e:·ReplayEntry)·=>·({
+        23 │ + ··...e,
+        24 │ + ··weightsHash:·"sha256:weights",
+        25 │ + ··baseSha:·"base123",
+        26 │ + ··outcome:·"completed"·as·const,
+        27 │ + ··latencyMs:·1,
+        28 │ + });
+    10  29 │   test("the default path is a dry run: the injected replay spy is never called", async () => {
+    11     │ - ··CALLS.length·=·0;·const·dry·=·await·runReplan({·available:·AVAILABLE,·requested:·["gemini-3-flash"],·roles:·["minimal"],·tasks:·TASKS,·replay:·spy·});
+    12     │ - ··assert.equal(dry.dryRun,·true);·assert.deepEqual(CALLS,·[]);·assert.deepEqual(dry.entries.map((e)·=>·e.status),·["planned",·"planned"]);
+    13     │ - ··const·half·=·await·runReplan({·available:·AVAILABLE,·requested:·["gemini-3-flash"],·roles:·["minimal"],·tasks:·TASKS,·...LIVE,·enabled:·false,·replay:·spy·});·assert.equal(half.dryRun,·true);·assert.deepEqual(CALLS,·[]);·//·one·opt-in·alone·never·goes·live
+        30 │ + ··CALLS.length·=·0;
+        31 │ + ··const·dry·=·await·runReplan({
+        32 │ + ····available:·AVAILABLE,
+        33 │ + ····requested:·["gemini-3-flash"],
+        34 │ + ····roles:·["minimal"],
+        35 │ + ····tasks:·TASKS,
+        36 │ + ····replay:·spy,
+        37 │ + ··});
+        38 │ + ··assert.equal(dry.dryRun,·true);
+        39 │ + ··assert.deepEqual(CALLS,·[]);
+        40 │ + ··assert.deepEqual(
+        41 │ + ····dry.entries.map((e)·=>·e.status),
+        42 │ + ····["planned",·"planned"],
+        43 │ + ··);
+        44 │ + ··const·half·=·await·runReplan({
+        45 │ + ····available:·AVAILABLE,
+        46 │ + ····requested:·["gemini-3-flash"],
+        47 │ + ····roles:·["minimal"],
+        48 │ + ····tasks:·TASKS,
+        49 │ + ····...LIVE,
+        50 │ + ····enabled:·false,
+        51 │ + ····replay:·spy,
+        52 │ + ··});
+        53 │ + ··assert.equal(half.dryRun,·true);
+        54 │ + ··assert.deepEqual(CALLS,·[]);·//·one·opt-in·alone·never·goes·live
+    14  55 │   });
+    15  56 │   test("an unavailable requested model is skipped with a reason naming that model id", async () => {
+    16     │ - ··const·entry·=·(await·runReplan({·available:·AVAILABLE,·requested:·["gemini-3.5-flash"],·roles:·["full"],·tasks:·[TASKS[0]!]·})).entries[0]!;
+    17     │ - ··assert.equal(entry.status,·"skipped");·assert.equal(entry.reason,·"gemini-3.5-flash·is·not·among·the·available·model·ids·[google/gemini-3-flash,·operator/qwen3.6-flash-lite]");·assert.deepEqual(resolveModel("gemini-3-flash",·AVAILABLE),·{·ok:·true,·modelId:·"google/gemini-3-flash"·});·//·an·available·alias·is·the·only·ok·verdict,·and·it·carries·no·reason
+        57 │ + ··const·entry·=·(
+        58 │ + ····await·runReplan({·available:·AVAILABLE,·requested:·["gemini-3.5-flash"],·roles:·["full"],·tasks:·[TASKS[0]!]·})
+        59 │ + ··).entries[0]!;
+        60 │ + ··assert.equal(entry.status,·"skipped");
+        61 │ + ··assert.equal(
+        62 │ + ····entry.reason,
+        63 │ + ····"gemini-3.5-flash·is·not·among·the·available·model·ids·[google/gemini-3-flash,·operator/qwen3.6-flash-lite]",
+        64 │ + ··);
+        65 │ + ··assert.deepEqual(resolveModel("gemini-3-flash",·AVAILABLE),·{·ok:·true,·modelId:·"google/gemini-3-flash"·});·//·an·available·alias·is·the·only·ok·verdict,·and·it·carries·no·reason
+    18  66 │   });
+    19  67 │   test("a non-Flash/Lite model is skipped with reason 'not a Flash/Lite class model'", async () => {
+    20     │ - ··const·r·=·await·runReplan({·available:·AVAILABLE,·requested:·["gpt-5-mini"],·roles:·["minimal",·"full"],·tasks:·[TASKS[0]!]·});
+    21     │ - ··assert.deepEqual(r.entries.map((e)·=>·[e.taskId,·e.role,·e.status,·e.reason]),·[["t1",·"minimal",·"skipped",·"not·a·Flash/Lite·class·model"],·["t1",·"full",·"skipped",·"not·a·Flash/Lite·class·model"]]);
+        68 │ + ··const·r·=·await·runReplan({
+        69 │ + ····available:·AVAILABLE,
+        70 │ + ····requested:·["gpt-5-mini"],
+        71 │ + ····roles:·["minimal",·"full"],
+        72 │ + ····tasks:·[TASKS[0]!],
+        73 │ + ··});
+        74 │ + ··assert.deepEqual(
+        75 │ + ····r.entries.map((e)·=>·[e.taskId,·e.role,·e.status,·e.reason]),
+        76 │ + ····[
+        77 │ + ······["t1",·"minimal",·"skipped",·"not·a·Flash/Lite·class·model"],
+        78 │ + ······["t1",·"full",·"skipped",·"not·a·Flash/Lite·class·model"],
+        79 │ + ····],
+        80 │ + ··);
+    22  81 │   });
+    23  82 │   test("opt-in replay runs once per eligible entry, in plan order, and stores the requestId", async () => {
+    24     │ - ··CALLS.length·=·0;·const·r·=·await·runReplan({·available:·AVAILABLE,·requested:·["gemini-3-flash",·"qwen3.6-flash-lite"],·roles:·["minimal",·"full"],·tasks:·TASKS,·...LIVE,·replay:·spy·});
+    25     │ - ··assert.equal(r.dryRun,·false);·assert.deepEqual(CALLS,·["t1/minimal",·"t1/full",·"t2/minimal",·"t2/full"]);·//·serial,·plan·order,·once·each
+    26     │ - ··assert.deepEqual(r.entries.map((e)·=>·[e.status,·e.modelId,·e.requestId]),·[["replayed",·"google/gemini-3-flash",·"req-1"],·["replayed",·"google/gemini-3-flash",·"req-2"],·["replayed",·"operator/qwen3.6-flash-lite",·"req-3"],·["replayed",·"operator/qwen3.6-flash-lite",·"req-4"]]);
+        83 │ + ··CALLS.length·=·0;
+        84 │ + ··const·r·=·await·runReplan({
+        85 │ + ····available:·AVAILABLE,
+        86 │ + ····requested:·["gemini-3-flash",·"qwen3.6-flash-lite"],
+        87 │ + ····roles:·["minimal",·"full"],
+        88 │ + ····tasks:·TASKS,
+        89 │ + ····...LIVE,
+        90 │ + ····replay:·spy,
+        91 │ + ··});
+        92 │ + ··assert.equal(r.dryRun,·false);
+        93 │ + ··assert.deepEqual(CALLS,·["t1/minimal",·"t1/full",·"t2/minimal",·"t2/full"]);·//·serial,·plan·order,·once·each
+        94 │ + ··assert.deepEqual(
+        95 │ + ····r.entries.map((e)·=>·[e.status,·e.modelId,·e.requestId]),
+        96 │ + ····[
+        97 │ + ······["replayed",·"google/gemini-3-flash",·"req-1"],
+        98 │ + ······["replayed",·"google/gemini-3-flash",·"req-2"],
+        99 │ + ······["replayed",·"operator/qwen3.6-flash-lite",·"req-3"],
+       100 │ + ······["replayed",·"operator/qwen3.6-flash-lite",·"req-4"],
+       101 │ + ····],
+       102 │ + ··);
+    27 103 │   });
+    28 104 │   test("a throwing callback marks that entry failed and the serial loop still runs the rest", async () => {
+    29     │ - ··const·boom:·Replay·=·(e)·=>·{·if·(e.taskId·===·"t1")·throw·new·Error("endpoint·down");·return·{·requestId:·"req-ok"·};·};
+    30     │ - ··const·r·=·await·runReplan({·available:·AVAILABLE,·requested:·["gemini-3-flash"],·roles:·["minimal"],·tasks:·TASKS,·...LIVE,·replay:·boom·});
+    31     │ - ··assert.deepEqual(r.entries.map((e)·=>·[e.taskId,·e.status,·e.reason,·e.requestId]),·[["t1",·"failed",·"endpoint·down",·undefined],·["t2",·"replayed",·undefined,·"req-ok"]]);
+       105 │ + ··const·boom:·Replay·=·(e)·=>·{
+       106 │ + ····if·(e.taskId·===·"t1")·throw·new·Error("endpoint·down");
+       107 │ + ····return·{·requestId:·"req-ok"·};
+       108 │ + ··};
+       109 │ + ··const·r·=·await·runReplan({
+       110 │ + ····available:·AVAILABLE,
+       111 │ + ····requested:·["gemini-3-flash"],
+       112 │ + ····roles:·["minimal"],
+       113 │ + ····tasks:·TASKS,
+       114 │ + ····...LIVE,
+       115 │ + ····replay:·boom,
+       116 │ + ··});
+       117 │ + ··assert.deepEqual(
+       118 │ + ····r.entries.map((e)·=>·[e.taskId,·e.status,·e.reason,·e.requestId]),
+       119 │ + ····[
+       120 │ + ······["t1",·"failed",·"endpoint·down",·undefined],
+       121 │ + ······["t2",·"replayed",·undefined,·"req-ok"],
+       122 │ + ····],
+       123 │ + ··);
+    32 124 │   });
+    33 125 │   test("main prints one deterministic JSON line whose counts match the entries, exit 0, no endpoint", async () => {
+    34     │ - ··const·lines:·string[]·=·[];·const·log·=·console.log;·console.log·=·(...a:·unknown[])·=>·{·lines.push(a.join("·"));·};
+    35     │ - ··const·codes·=·[await·main([]),·await·main([])];·console.log·=·log;·const·out·=·JSON.parse(lines[0]!)·as·{·dryRun:·boolean;·planned:·number;·skipped:·number;·replayed:·number;·skippedEntries:·{·taskId:·string;·role:·string;·reason:·string·}[]·};
+    36     │ - ··assert.deepEqual(codes,·[0,·0]);·assert.equal(lines.length,·2);·assert.equal(lines[0],·lines[1]);·assert.equal(out.dryRun,·true);·assert.equal(out.replayed,·0);·assert.equal(out.planned·+·out.skipped·+·out.replayed,·buildPlan(["gemini-3-flash"],·["minimal",·"full"]).length);
+    37     │ - ··assert.equal(out.skippedEntries.length,·out.skipped);·assert.ok(out.skippedEntries.every((s)·=>·s.taskId.length·>·0·&&·s.role.length·>·0·&&·s.reason.length·>·0));·//·every·skip·names·itself
+       126 │ + ··const·lines:·string[]·=·[];
+       127 │ + ··const·log·=·console.log;
+       128 │ + ··console.log·=·(...a:·unknown[])·=>·{
+  33 more lines truncated
+  
+
+test/unit/bootstrap-result-gate.test.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+     1  1 │   import assert from "node:assert/strict";
+     2    │ - import·{·mkdtempSync,·readdirSync,·readFileSync·}·from·"node:fs";
+        2 │ + import·{·mkdtempSync,·readFileSync,·readdirSync·}·from·"node:fs";
+     3  3 │   import { tmpdir } from "node:os";
+     4  4 │   import { join } from "node:path";
+     5  5 │   import test from "node:test";
+     6    │ - import·{·canonicalHash,·evaluateResultGate,·hashArtifact,·writeHandoff,·type·GateObservations,·type·Proof·}·from·"../../src/bootstrap/resultGate.ts";
+     7    │ - import·type·{·DiffGuardReport·}·from·"../../src/bootstrap/diffGuard.ts";
+        6 │ + import·type·{·DiffGuardReport·}·from·"../../src/bootstrap/diffGuard.ts";
+        7 │ + import·{·type·GateObservations,·type·Proof,·canonicalHash,·evaluateResultGate,·hashArtifact,·writeHandoff·}·from·"../../src/bootstrap/resultGate.ts";
+     8  8 │   
+     9  9 │   const RECORD = {"taskId": "B05", "status": "PASS", "commands": [{"argv": ["npm", "run", "typecheck"], "cwd": ".", "exitCode": 0, "outputArtifact": "logs/01.txt"}], "changedFiles": ["src/bootstrap/resultGate.ts"], "nested": {"z": 1, "a": {"b": [1, {"deep": "ünïcödé"}]}}}; const HASH = "sha256:fdbadf5d8b7f61fc8e44f4350239d69364bb4f03b2e47f23db08ee73239e8da6"; // computed independently with the protocol's canonicalization (sorted keys, compact JSON, UTF-8)
+  
+
+test/unit/bootstrap-result-gate.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     4  4 │   import { join } from "node:path";
+     5  5 │   import test from "node:test";
+     6    │ - import·{·canonicalHash,·evaluateResultGate,·hashArtifact,·writeHandoff,·type·GateObservations,·type·Proof·}·from·"../../src/bootstrap/resultGate.ts";
+        6 │ + import·{
+        7 │ + ··canonicalHash,
+        8 │ + ··evaluateResultGate,
+        9 │ + ··hashArtifact,
+       10 │ + ··writeHandoff,
+       11 │ + ··type·GateObservations,
+       12 │ + ··type·Proof,
+       13 │ + }·from·"../../src/bootstrap/resultGate.ts";
+     7 14 │   import type { DiffGuardReport } from "../../src/bootstrap/diffGuard.ts";
+     8 15 │   
+     9    │ - const·RECORD·=·{"taskId":·"B05",·"status":·"PASS",·"commands":·[{"argv":·["npm",·"run",·"typecheck"],·"cwd":·".",·"exitCode":·0,·"outputArtifact":·"logs/01.txt"}],·"changedFiles":·["src/bootstrap/resultGate.ts"],·"nested":·{"z":·1,·"a":·{"b":·[1,·{"deep":·"ünïcödé"}]}}};·const·HASH·=·"sha256:fdbadf5d8b7f61fc8e44f4350239d69364bb4f03b2e47f23db08ee73239e8da6";·//·computed·independently·with·the·protocol's·canonicalization·(sorted·keys,·compact·JSON,·UTF-8)
+    10    │ - const·diff·=·(ok·=·true):·DiffGuardReport·=>·({·ok,·changedPaths:·["src/x.ts"],·productionFiles:·1,·testFiles:·1,·added:·120,·deleted:·0,·violations:·ok·?·[]·:·[{·kind:·"changed-line-budget",·path:·null,·detail:·"120·>·100"·}]·});
+       16 │ + const·RECORD·=·{
+       17 │ + ··taskId:·"B05",
+       18 │ + ··status:·"PASS",
+       19 │ + ··commands:·[{·argv:·["npm",·"run",·"typecheck"],·cwd:·".",·exitCode:·0,·outputArtifact:·"logs/01.txt"·}],
+       20 │ + ··changedFiles:·["src/bootstrap/resultGate.ts"],
+       21 │ + ··nested:·{·z:·1,·a:·{·b:·[1,·{·deep:·"ünïcödé"·}]·}·},
+       22 │ + };
+       23 │ + const·HASH·=·"sha256:fdbadf5d8b7f61fc8e44f4350239d69364bb4f03b2e47f23db08ee73239e8da6";·//·computed·independently·with·the·protocol's·canonicalization·(sorted·keys,·compact·JSON,·UTF-8)
+       24 │ + const·diff·=·(ok·=·true):·DiffGuardReport·=>·({
+       25 │ + ··ok,
+       26 │ + ··changedPaths:·["src/x.ts"],
+       27 │ + ··productionFiles:·1,
+       28 │ + ··testFiles:·1,
+       29 │ + ··added:·120,
+       30 │ + ··deleted:·0,
+       31 │ + ··violations:·ok·?·[]·:·[{·kind:·"changed-line-budget",·path:·null,·detail:·"120·>·100"·}],
+       32 │ + });
+    11 33 │   const proof: Proof = { command: "npm run typecheck", exitCode: 0, outputArtifact: "logs/01.txt" };
+    12    │ - const·good:·GateObservations·=·{·requiredCommands:·[proof.command],·proofs:·[proof],·artifactSha256:·{·[proof.outputArtifact]:·"sha256:aa"·},·expectedArtifactSha256:·{·[proof.outputArtifact]:·"sha256:aa"·},·diff:·diff(),·commitParentSha:·"b".repeat(40),·approvedBaseSha:·"b".repeat(40)·};
+       34 │ + const·good:·GateObservations·=·{
+       35 │ + ··requiredCommands:·[proof.command],
+       36 │ + ··proofs:·[proof],
+       37 │ + ··artifactSha256:·{·[proof.outputArtifact]:·"sha256:aa"·},
+       38 │ + ··expectedArtifactSha256:·{·[proof.outputArtifact]:·"sha256:aa"·},
+       39 │ + ··diff:·diff(),
+       40 │ + ··commitParentSha:·"b".repeat(40),
+       41 │ + ··approvedBaseSha:·"b".repeat(40),
+       42 │ + };
+    13 43 │   test("missing proof, failing proof and missing or tampered evidence all block the gate", () => {
+    14 44 │     assert.deepEqual(evaluateResultGate(good), { ok: true, blockers: [] });
+    15    │ - ··assert.deepEqual(evaluateResultGate({·...good,·proofs:·[]·}).blockers,·["missing·proof·for·required·command:·npm·run·typecheck"]);
+    16    │ - ··assert.deepEqual(evaluateResultGate({·...good,·proofs:·[{·...proof,·exitCode:·1·}]·}).blockers,·["proof·exit·code·1·!=·0·for:·npm·run·typecheck"]);
+       45 │ + ··assert.deepEqual(evaluateResultGate({·...good,·proofs:·[]·}).blockers,·[
+       46 │ + ····"missing·proof·for·required·command:·npm·run·typecheck",
+       47 │ + ··]);
+       48 │ + ··assert.deepEqual(evaluateResultGate({·...good,·proofs:·[{·...proof,·exitCode:·1·}]·}).blockers,·[
+       49 │ + ····"proof·exit·code·1·!=·0·for:·npm·run·typecheck",
+       50 │ + ··]);
+    17 51 │     const dir = mkdtempSync(join(tmpdir(), "b05-hash-"));
+    18    │ - ··assert.equal(hashArtifact(join(dir,·"absent.txt")),·null,·"absence·is·reported,·never·guessed");·assert.match(String(hashArtifact("src/bootstrap/resultGate.ts")),·/^sha256:[0-9a-f]{64}$/u,·"real·bytes·hash");
+    19    │ - ··assert.deepEqual(evaluateResultGate({·...good,·artifactSha256:·{}·}).blockers,·["evidence·artifact·absent·or·unreadable:·logs/01.txt"]);
+    20    │ - ··assert.deepEqual(evaluateResultGate({·...good,·artifactSha256:·{·[proof.outputArtifact]:·"sha256:bb"·}·}).blockers,·["evidence·tampered:·logs/01.txt·sha·sha256:bb·!=·recorded·sha256:aa"]);
+       52 │ + ··assert.equal(hashArtifact(join(dir,·"absent.txt")),·null,·"absence·is·reported,·never·guessed");
+       53 │ + ··assert.match(String(hashArtifact("src/bootstrap/resultGate.ts")),·/^sha256:[0-9a-f]{64}$/u,·"real·bytes·hash");
+       54 │ + ··assert.deepEqual(evaluateResultGate({·...good,·artifactSha256:·{}·}).blockers,·[
+       55 │ + ····"evidence·artifact·absent·or·unreadable:·logs/01.txt",
+       56 │ + ··]);
+       57 │ + ··assert.deepEqual(evaluateResultGate({·...good,·artifactSha256:·{·[proof.outputArtifact]:·"sha256:bb"·}·}).blockers,·[
+       58 │ + ····"evidence·tampered:·logs/01.txt·sha·sha256:bb·!=·recorded·sha256:aa",
+       59 │ + ··]);
+    21 60 │   });
+    22 61 │   test("diff-scope violations and a commit not sitting on the approved base block the gate", () => {
+    23    │ - ··assert.deepEqual(evaluateResultGate({·...good,·diff:·diff(false)·}).blockers,·["diff·scope·rejected·(changed-line-budget):·120·>·100"]);·//·prettier-ignore
+    24    │ - ··assert.deepEqual(evaluateResultGate({·...good,·commitParentSha:·"f".repeat(40)·}).blockers,·[`commit·parent·${"f".repeat(40)}·!=·approved·base·${"b".repeat(40)}`]);
+       62 │ + ··assert.deepEqual(evaluateResultGate({·...good,·diff:·diff(false)·}).blockers,·[
+       63 │ + ····"diff·scope·rejected·(changed-line-budget):·120·>·100",
+       64 │ + ··]);·//·prettier-ignore
+       65 │ + ··assert.deepEqual(evaluateResultGate({·...good,·commitParentSha:·"f".repeat(40)·}).blockers,·[
+       66 │ + ····`commit·parent·${"f".repeat(40)}·!=·approved·base·${"b".repeat(40)}`,
+       67 │ + ··]);
+    25 68 │   });
+    26 69 │   test("the handoff writer is atomic, immutable and stamps the protocol checksum", () => {
+    27    │ - ··const·dir·=·mkdtempSync(join(tmpdir(),·"b05-write-"));·const·written·=·writeHandoff(dir,·"B05",·RECORD);
+    28    │ - ··assert.deepEqual(written,·{·path:·join(dir,·"B05.handoff.json"),·handoffHash:·HASH·},·"returns·the·path·and·checksum·it·stamped");
+    29    │ - ··assert.equal(canonicalHash(RECORD),·HASH,·"canonicalization·unchanged·from·B04,·which·now·re-exports·this·function");·assert.equal(JSON.parse(readFileSync(written.path,·"utf8")).handoffHash,·HASH,·"handoff·includes·its·checksum");·assert.throws(()·=>·writeHandoff(dir,·"B05",·RECORD),·/refusing·to·overwrite·an·existing·handoff/u);
+       70 │ + ··const·dir·=·mkdtempSync(join(tmpdir(),·"b05-write-"));
+       71 │ + ··const·written·=·writeHandoff(dir,·"B05",·RECORD);
+       72 │ + ··assert.deepEqual(
+       73 │ + ····written,
+       74 │ + ····{·path:·join(dir,·"B05.handoff.json"),·handoffHash:·HASH·},
+       75 │ + ····"returns·the·path·and·checksum·it·stamped",
+       76 │ + ··);
+       77 │ + ··assert.equal(canonicalHash(RECORD),·HASH,·"canonicalization·unchanged·from·B04,·which·now·re-exports·this·function");
+       78 │ + ··assert.equal(JSON.parse(readFileSync(written.path,·"utf8")).handoffHash,·HASH,·"handoff·includes·its·checksum");
+       79 │ + ··assert.throws(()·=>·writeHandoff(dir,·"B05",·RECORD),·/refusing·to·overwrite·an·existing·handoff/u);
+    30 80 │     assert.deepEqual(readdirSync(dir), ["B05.handoff.json"], "no temp file left behind");
+    31 81 │   });
+  
+
+test/unit/bootstrap-diff-guard.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     5   5 │   
+     6   6 │   const manifest = (overrides: Record<string, unknown> = {}) => {
+     7     │ - ··const·parsed·=·parseTaskManifest({·taskId:·"B03",·baseSha:·"a".repeat(40),·repoId:·"pi",·objective:·"validate·diff·scope",·allowPaths:·["src/bootstrap/**",·"test/unit/**"],·denyPaths:·["src/bootstrap/generated/**"],·commands:·[{·argv:·["npm",·"run",·"typecheck"],·cwd:·"."·}],·limits:·{·maxProductionFiles:·1,·maxTestFiles:·1,·maxChangedLines:·100·},·parentHandoffHash:·null,·expectedOutputs:·[],·mode:·"isolated-change",·...overrides·});
+         7 │ + ··const·parsed·=·parseTaskManifest({
+         8 │ + ····taskId:·"B03",
+         9 │ + ····baseSha:·"a".repeat(40),
+        10 │ + ····repoId:·"pi",
+        11 │ + ····objective:·"validate·diff·scope",
+        12 │ + ····allowPaths:·["src/bootstrap/**",·"test/unit/**"],
+        13 │ + ····denyPaths:·["src/bootstrap/generated/**"],
+        14 │ + ····commands:·[{·argv:·["npm",·"run",·"typecheck"],·cwd:·"."·}],
+        15 │ + ····limits:·{·maxProductionFiles:·1,·maxTestFiles:·1,·maxChangedLines:·100·},
+        16 │ + ····parentHandoffHash:·null,
+        17 │ + ····expectedOutputs:·[],
+        18 │ + ····mode:·"isolated-change",
+        19 │ + ····...overrides,
+        20 │ + ··});
+     8  21 │     assert.equal(parsed.ok, true);
+     9  22 │     if (!parsed.ok) throw new Error("fixture must parse");
+    10  23 │     return parsed.manifest;
+    11  24 │   };
+    12     │ - const·labels·=·(report:·ReturnType<typeof·evaluateDiffScope>):·string[]·=>·report.violations.map((v)·=>·`${v.kind}:${v.path·??·"-"}`);
+        25 │ + const·labels·=·(report:·ReturnType<typeof·evaluateDiffScope>):·string[]·=>
+        26 │ + ··report.violations.map((v)·=>·`${v.kind}:${v.path·??·"-"}`);
+    13  27 │   
+    14  28 │   test("unexpected, denied, generated, binary and budget breaches are reported deterministically", () => {
+    15     │ - ··const·meta·=·{·porcelain:·"·M·src/other/file.ts\n·M·src/bootstrap/pathPolicy.ts\n??·src/bootstrap/generated/out.min.js\nR··old/name.ts·->·new/name.ts\n!!·ignored.txt\n",·numstat:·"3\t1\tsrc/bootstrap/pathPolicy.ts\n-\t-\tsrc/assets/logo.png\n"·};
+        29 │ + ··const·meta·=·{
+        30 │ + ····porcelain:
+        31 │ + ······"·M·src/other/file.ts\n·M·src/bootstrap/pathPolicy.ts\n??·src/bootstrap/generated/out.min.js\nR··old/name.ts·->·new/name.ts\n!!·ignored.txt\n",
+        32 │ + ····numstat:·"3\t1\tsrc/bootstrap/pathPolicy.ts\n-\t-\tsrc/assets/logo.png\n",
+        33 │ + ··};
+    16  34 │     const snapshot = JSON.parse(JSON.stringify(meta));
+    17  35 │     const report = evaluateDiffScope(manifest(), meta);
+    18  36 │     assert.deepEqual(meta, snapshot, "metadata is consumed read-only");
+    19     │ - ··assert.deepEqual(report.changedPaths,·["new/name.ts",·"old/name.ts",·"src/assets/logo.png",·"src/bootstrap/generated/out.min.js",·"src/bootstrap/pathPolicy.ts",·"src/other/file.ts"]);
+        37 │ + ··assert.deepEqual(report.changedPaths,·[
+        38 │ + ····"new/name.ts",
+        39 │ + ····"old/name.ts",
+        40 │ + ····"src/assets/logo.png",
+        41 │ + ····"src/bootstrap/generated/out.min.js",
+        42 │ + ····"src/bootstrap/pathPolicy.ts",
+        43 │ + ····"src/other/file.ts",
+        44 │ + ··]);
+    20  45 │     assert.deepEqual([report.added, report.deleted, report.productionFiles, report.testFiles], [3, 1, 6, 0]);
+    21     │ - ··assert.deepEqual(labels(report),·["binary-change:src/assets/logo.png",·"denied-path:src/bootstrap/generated/out.min.js",·"generated-file:src/bootstrap/generated/out.min.js",·"production-file-budget:-",·"unexpected-path:new/name.ts",·"unexpected-path:old/name.ts",·"unexpected-path:src/assets/logo.png",·"unexpected-path:src/other/file.ts"]);
+        46 │ + ··assert.deepEqual(labels(report),·[
+        47 │ + ····"binary-change:src/assets/logo.png",
+        48 │ + ····"denied-path:src/bootstrap/generated/out.min.js",
+        49 │ + ····"generated-file:src/bootstrap/generated/out.min.js",
+        50 │ + ····"production-file-budget:-",
+        51 │ + ····"unexpected-path:new/name.ts",
+        52 │ + ····"unexpected-path:old/name.ts",
+        53 │ + ····"unexpected-path:src/assets/logo.png",
+        54 │ + ····"unexpected-path:src/other/file.ts",
+        55 │ + ··]);
+    22  56 │   });
+    23  57 │   
+    ······ │ 
+    27  61 │     const report = evaluateDiffScope(manifest({ allowPaths: ["src/bootstrap/**"], denyPaths: ["test/**"] }), meta);
+    28  62 │     assert.deepEqual(meta, snapshot, "metadata is consumed read-only");
+    29     │ - ··assert.deepEqual([report.ok,·report.changedPaths,·report.productionFiles,·report.testFiles],·[false,·["test/unit/x.test.ts"],·0,·1]);
+        63 │ + ··assert.deepEqual(
+        64 │ + ····[report.ok,·report.changedPaths,·report.productionFiles,·report.testFiles],
+        65 │ + ····[false,·["test/unit/x.test.ts"],·0,·1],
+        66 │ + ··);
+    30  67 │     assert.deepEqual(labels(report), ["denied-path:test/unit/x.test.ts"]);
+    31  68 │     // A committed path that is neither allowed nor denied is as unexpected as an unstaged one.
+    32     │ - ··assert.deepEqual(labels(evaluateDiffScope(manifest(),·{·porcelain:·"",·numstat:·"2\t0\tsrc/other/file.ts\n"·})),·["unexpected-path:src/other/file.ts"]);
+        69 │ + ··assert.deepEqual(labels(evaluateDiffScope(manifest(),·{·porcelain:·"",·numstat:·"2\t0\tsrc/other/file.ts\n"·})),·[
+        70 │ + ····"unexpected-path:src/other/file.ts",
+        71 │ + ··]);
+    33  72 │     // Generated-file and read-only checks see committed paths too.
+    34     │ - ··assert.deepEqual(labels(evaluateDiffScope(manifest(),·{·porcelain:·"",·numstat:·"9\t0\tsrc/bootstrap/generated/bundle.min.js\n"·})),·["denied-path:src/bootstrap/generated/bundle.min.js",·"generated-file:src/bootstrap/generated/bundle.min.js"]);
+    35     │ - ··assert.deepEqual(labels(evaluateDiffScope(manifest({·mode:·"read-only"·}),·{·porcelain:·"",·numstat:·"1\t0\tsrc/bootstrap/diffGuard.ts\n"·})),·["read-only-mode:-"]);
+        73 │ + ··assert.deepEqual(
+        74 │ + ····labels(evaluateDiffScope(manifest(),·{·porcelain:·"",·numstat:·"9\t0\tsrc/bootstrap/generated/bundle.min.js\n"·})),
+        75 │ + ····["denied-path:src/bootstrap/generated/bundle.min.js",·"generated-file:src/bootstrap/generated/bundle.min.js"],
+        76 │ + ··);
+        77 │ + ··assert.deepEqual(
+        78 │ + ····labels(
+        79 │ + ······evaluateDiffScope(manifest({·mode:·"read-only"·}),·{
+        80 │ + ········porcelain:·"",
+        81 │ + ········numstat:·"1\t0\tsrc/bootstrap/diffGuard.ts\n",
+        82 │ + ······}),
+        83 │ + ····),
+        84 │ + ····["read-only-mode:-"],
+        85 │ + ··);
+    36  86 │   });
+    37  87 │   
+    38  88 │   test("file budgets count committed paths, not just dirty ones (FIX-1)", () => {
+    39     │ - ··const·committed·=·evaluateDiffScope(manifest({·allowPaths:·["src/**"]·}),·{·porcelain:·"",·numstat:·"1\t0\tsrc/c.ts\n1\t0\tsrc/a.ts\n1\t0\tsrc/b.ts\n"·});
+    40     │ - ··assert.deepEqual(committed.changedPaths,·["src/a.ts",·"src/b.ts",·"src/c.ts"],·"union·paths·stay·sorted·even·when·numstat·is·not");
+        89 │ + ··const·committed·=·evaluateDiffScope(manifest({·allowPaths:·["src/**"]·}),·{
+        90 │ + ····porcelain:·"",
+        91 │ + ····numstat:·"1\t0\tsrc/c.ts\n1\t0\tsrc/a.ts\n1\t0\tsrc/b.ts\n",
+        92 │ + ··});
+        93 │ + ··assert.deepEqual(
+        94 │ + ····committed.changedPaths,
+        95 │ + ····["src/a.ts",·"src/b.ts",·"src/c.ts"],
+        96 │ + ····"union·paths·stay·sorted·even·when·numstat·is·not",
+        97 │ + ··);
+    41  98 │     assert.deepEqual([committed.ok, committed.productionFiles, committed.testFiles], [false, 3, 0]);
+    42  99 │     assert.deepEqual(labels(committed), ["production-file-budget:-"]);
+    43     │ - ··const·tests·=·evaluateDiffScope(manifest(),·{·porcelain:·"",·numstat:·"1\t0\ttest/unit/a.test.ts\n1\t0\ttest/unit/b.test.ts\n"·});
+       100 │ + ··const·tests·=·evaluateDiffScope(manifest(),·{
+       101 │ + ····porcelain:·"",
+       102 │ + ····numstat:·"1\t0\ttest/unit/a.test.ts\n1\t0\ttest/unit/b.test.ts\n",
+       103 │ + ··});
+    44 104 │     assert.deepEqual([tests.ok, tests.productionFiles, tests.testFiles], [false, 0, 2]);
+    45 105 │     assert.deepEqual(labels(tests), ["test-file-budget:-"]);
+    ······ │ 
+    47 107 │   
+    48 108 │   test("a path in both porcelain and numstat is scoped once (FIX-1)", () => {
+    49     │ - ··const·report·=·evaluateDiffScope(manifest({·limits:·{·maxProductionFiles:·2,·maxTestFiles:·2,·maxChangedLines:·100·}·}),·{·porcelain:·"·M·src/bootstrap/diffGuard.ts\n",·numstat:·"10\t2\tsrc/bootstrap/diffGuard.ts\n1\t0\tsrc/bootstrap/pathPolicy.ts\n"·});
+       109 │ + ··const·report·=·evaluateDiffScope(
+       110 │ + ····manifest({·limits:·{·maxProductionFiles:·2,·maxTestFiles:·2,·maxChangedLines:·100·}·}),
+       111 │ + ····{
+       112 │ + ······porcelain:·"·M·src/bootstrap/diffGuard.ts\n",
+       113 │ + ······numstat:·"10\t2\tsrc/bootstrap/diffGuard.ts\n1\t0\tsrc/bootstrap/pathPolicy.ts\n",
+       114 │ + ····},
+       115 │ + ··);
+    50 116 │     assert.deepEqual(report.changedPaths, ["src/bootstrap/diffGuard.ts", "src/bootstrap/pathPolicy.ts"]);
+    51     │ - ··assert.deepEqual([report.ok,·report.added·+·report.deleted,·report.productionFiles,·report.testFiles,·report.violations.length],·[true,·13,·2,·0,·0]);
+       117 │ + ··assert.deepEqual(
+       118 │ + ····[report.ok,·report.added·+·report.deleted,·report.productionFiles,·report.testFiles,·report.violations.length],
+       119 │ + ····[true,·13,·2,·0,·0],
+       120 │ + ··);
+    52 121 │   });
+    53 122 │   
+    54 123 │   test("a diff inside limits passes; oversize, symlink and read-only breaches do not", () => {
+    55     │ - ··const·clean·=·evaluateDiffScope(manifest(),·{·porcelain:·"·M·src/bootstrap/diffGuard.ts\n·M·test/unit/bootstrap-diff-guard.test.ts\n",·numstat:·"60\t4\tsrc/bootstrap/diffGuard.ts\n30\t0\ttest/unit/bootstrap-diff-guard.test.ts\n"·});
+    56     │ - ··assert.deepEqual([clean.ok,·clean.added·+·clean.deleted,·clean.productionFiles,·clean.testFiles,·clean.violations.length],·[true,·94,·1,·1,·0]);
+    57     │ - ··assert.deepEqual(labels(evaluateDiffScope(manifest(),·{·porcelain:·"·M·src/bootstrap/diffGuard.ts\n",·numstat:·"140\t0\tsrc/bootstrap/diffGuard.ts\n"·})).includes("changed-line-budget:-"),·true);
+       124 │ + ··const·clean·=·evaluateDiffScope(manifest(),·{
+       125 │ + ····porcelain:·"·M·src/bootstrap/diffGuard.ts\n·M·test/unit/bootstrap-diff-guard.test.ts\n",
+       126 │ + ····numstat:·"60\t4\tsrc/bootstrap/diffGuard.ts\n30\t0\ttest/unit/bootstrap-diff-guard.test.ts\n",
+       127 │ + ··});
+       128 │ + ··assert.deepEqual(
+       129 │ + ····[clean.ok,·clean.added·+·clean.deleted,·clean.productionFiles,·clean.testFiles,·clean.violations.length],
+       130 │ + ····[true,·94,·1,·1,·0],
+       131 │ + ··);
+       132 │ + ··assert.deepEqual(
+       133 │ + ····labels(
+       134 │ + ······evaluateDiffScope(manifest(),·{
+       135 │ + ········porcelain:·"·M·src/bootstrap/diffGuard.ts\n",
+       136 │ + ········numstat:·"140\t0\tsrc/bootstrap/diffGuard.ts\n",
+       137 │ + ······}),
+       138 │ + ····).includes("changed-line-budget:-"),
+       139 │ + ····true,
+       140 │ + ··);
+    58 141 │     const symlinked = evaluateDiffScope(manifest(), { porcelain: " M link/file.ts\n", numstat: "" }, ["link"]);
+  13 more lines truncated
+  
+
+test/unit/bootstrap-handoff-writer.test.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+     5  5 │    */
+     6  6 │   import assert from "node:assert/strict";
+     7    │ - import·{·mkdtempSync,·readdirSync,·readFileSync·}·from·"node:fs";
+        7 │ + import·{·mkdtempSync,·readFileSync,·readdirSync·}·from·"node:fs";
+     8  8 │   import { tmpdir } from "node:os";
+     9  9 │   import { join } from "node:path";
+  
+
+test/unit/bootstrap-task-manifest.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     1    │ - import·assert·from·"node:assert/strict";·import·{·test·}·from·"node:test";
+     2    │ - import·{·DEFAULT_LIMITS,·TASK_MANIFEST_FIELDS,·type·TaskManifest,·parseTaskManifest·}·from·"../../src/bootstrap/taskManifest.ts";
+        1 │ + import·assert·from·"node:assert/strict";
+        2 │ + import·{·test·}·from·"node:test";
+        3 │ + import·{
+        4 │ + ··DEFAULT_LIMITS,
+        5 │ + ··TASK_MANIFEST_FIELDS,
+        6 │ + ··type·TaskManifest,
+        7 │ + ··parseTaskManifest,
+        8 │ + }·from·"../../src/bootstrap/taskManifest.ts";
+     3  9 │   const HASH = `sha256:${"a".repeat(64)}`;
+     4    │ - const·VALID:·Record<string,·unknown>·=·JSON.parse(`{"taskId":"B01","baseSha":"c2b75dc93885d246d712d656f72de1764cf198e0","repoId":"berlinguyinca/pi-engineering","objective":"Define·static·microtask·manifest·schema","allowPaths":["src/bootstrap/taskManifest.ts"],"denyPaths":["package.json"],"commands":[{"argv":["npm","run","typecheck"],"cwd":"."}],"limits":{"maxProductionFiles":1,"maxTestFiles":1,"maxChangedLines":100},"parentHandoffHash":"${HASH}","expectedOutputs":["src/bootstrap/taskManifest.ts"],"mode":"isolated-change"}`);
+     5    │ - const·reject·=·(input:·unknown):·string[]·=>·{·const·result·=·parseTaskManifest(input);·assert.equal(result.ok,·false,·"expected·rejection");·return·(result·as·{·ok:·false;·errors:·string[]·}).errors;·};
+     6    │ - const·accept·=·(input:·unknown):·TaskManifest·=>·{·const·result·=·parseTaskManifest(input);·assert.equal(result.ok,·true,·JSON.stringify((result·as·{·errors?:·string[]·}).errors));·return·(result·as·{·ok:·true;·manifest:·TaskManifest·}).manifest;·};
+       10 │ + const·VALID:·Record<string,·unknown>·=·JSON.parse(
+       11 │ + ··`{"taskId":"B01","baseSha":"c2b75dc93885d246d712d656f72de1764cf198e0","repoId":"berlinguyinca/pi-engineering","objective":"Define·static·microtask·manifest·schema","allowPaths":["src/bootstrap/taskManifest.ts"],"denyPaths":["package.json"],"commands":[{"argv":["npm","run","typecheck"],"cwd":"."}],"limits":{"maxProductionFiles":1,"maxTestFiles":1,"maxChangedLines":100},"parentHandoffHash":"${HASH}","expectedOutputs":["src/bootstrap/taskManifest.ts"],"mode":"isolated-change"}`,
+       12 │ + );
+       13 │ + const·reject·=·(input:·unknown):·string[]·=>·{
+       14 │ + ··const·result·=·parseTaskManifest(input);
+       15 │ + ··assert.equal(result.ok,·false,·"expected·rejection");
+       16 │ + ··return·(result·as·{·ok:·false;·errors:·string[]·}).errors;
+       17 │ + };
+       18 │ + const·accept·=·(input:·unknown):·TaskManifest·=>·{
+       19 │ + ··const·result·=·parseTaskManifest(input);
+       20 │ + ··assert.equal(result.ok,·true,·JSON.stringify((result·as·{·errors?:·string[]·}).errors));
+       21 │ + ··return·(result·as·{·ok:·true;·manifest:·TaskManifest·}).manifest;
+       22 │ + };
+     7 23 │   test("B01: valid JSON fixture is accepted and every schema field is populated", () => {
+     8 24 │     const manifest = accept(VALID);
+     9 25 │     assert.deepEqual(Object.keys(manifest).sort(), [...TASK_MANIFEST_FIELDS].sort());
+    10    │ - ··assert.equal(manifest.parentHandoffHash,·HASH);·assert.deepEqual(manifest.commands,·[{·argv:·["npm",·"run",·"typecheck"],·cwd:·"."·}]);
+       26 │ + ··assert.equal(manifest.parentHandoffHash,·HASH);
+       27 │ + ··assert.deepEqual(manifest.commands,·[{·argv:·["npm",·"run",·"typecheck"],·cwd:·"."·}]);
+    11 28 │   });
+    12 29 │   test("B01: defaults apply when the optional fields (limits, denyPaths, expectedOutputs) are absent", () => {
+    13    │ - ··const·optional·=·{·...VALID·};·for·(const·field·of·["limits",·"denyPaths",·"expectedOutputs"])·delete·optional[field];
+    14    │ - ··const·[limits,·denyPaths,·expectedOutputs]·=·[accept(optional).limits,·accept(optional).denyPaths,·accept(optional).expectedOutputs];
+       30 │ + ··const·optional·=·{·...VALID·};
+       31 │ + ··for·(const·field·of·["limits",·"denyPaths",·"expectedOutputs"])·delete·optional[field];
+       32 │ + ··const·[limits,·denyPaths,·expectedOutputs]·=·[
+       33 │ + ····accept(optional).limits,
+       34 │ + ····accept(optional).denyPaths,
+       35 │ + ····accept(optional).expectedOutputs,
+       36 │ + ··];
+    15 37 │     assert.deepEqual([limits, denyPaths, expectedOutputs], [DEFAULT_LIMITS, [], []]);
+    16 38 │   });
+    17 39 │   test("B01: invalid fixtures are rejected with deterministic, sorted, deduplicated errors", () => {
+    18 40 │     const cases: Array<[unknown, string]> = [
+    19    │ - ····[{·...VALID,·scope:·"src"·},·"unknown·field:·scope"],·[{·...VALID,·parentHandoffHash:·undefined·},·"parentHandoffHash:·missing"],
+    20    │ - ····[[VALID],·"manifest:·expected·a·JSON·object"],·["nope",·"manifest:·expected·a·JSON·object"],
+       41 │ + ····[{·...VALID,·scope:·"src"·},·"unknown·field:·scope"],
+       42 │ + ····[{·...VALID,·parentHandoffHash:·undefined·},·"parentHandoffHash:·missing"],
+       43 │ + ····[[VALID],·"manifest:·expected·a·JSON·object"],
+       44 │ + ····["nope",·"manifest:·expected·a·JSON·object"],
+    21 45 │       [{ ...VALID, baseSha: "not-a-sha" }, "baseSha: expected 7-64 hex characters"],
+    22 46 │       [{ ...VALID, allowPaths: [] }, "allowPaths: scope must name at least one path"],
+    23 47 │       [{ ...VALID, commands: [{ argv: [], cwd: "" }] }, "commands[0].argv: expected a non-empty argv array"],
+    24    │ - ····[{·...VALID,·limits:·{·...DEFAULT_LIMITS,·maxTestFiles:·3·}·},·"limits.maxTestFiles:·3·exceeds·bootstrap·ceiling·2"],
+       48 │ + ····[
+       49 │ + ······{·...VALID,·limits:·{·...DEFAULT_LIMITS,·maxTestFiles:·3·}·},
+       50 │ + ······"limits.maxTestFiles:·3·exceeds·bootstrap·ceiling·2",
+       51 │ + ····],
+    25 52 │       [{ ...VALID, limits: { ...DEFAULT_LIMITS, maxDocs: 1 } }, "unknown field: limits.maxDocs"],
+    26 53 │       [{ ...VALID, parentHandoffHash: "sha256:deadbeef" }, "parentHandoffHash: expected null or sha256:<64 hex>"],
+    27 54 │       [{ ...VALID, mode: "yolo" }, "mode: expected one of read-only, isolated-change, herdr-ui"],
+    28 55 │     ];
+    29    │ - ··for·(const·[fixture,·expected]·of·cases)·assert.ok(reject(fixture).includes(expected),·`expected·a·rejection·containing·"${expected}"`);
+    30    │ - ··assert.deepEqual(reject({·...VALID,·zzzUnknown:·1,·aaaUnknown:·2·}),·["unknown·field:·aaaUnknown",·"unknown·field:·zzzUnknown"]);
+       56 │ + ··for·(const·[fixture,·expected]·of·cases)
+       57 │ + ····assert.ok(reject(fixture).includes(expected),·`expected·a·rejection·containing·"${expected}"`);
+       58 │ + ··assert.deepEqual(reject({·...VALID,·zzzUnknown:·1,·aaaUnknown:·2·}),·[
+       59 │ + ····"unknown·field:·aaaUnknown",
+       60 │ + ····"unknown·field:·zzzUnknown",
+       61 │ + ··]);
+    31 62 │   });
+    32 63 │   // FIX-4B: the line ceiling is mode-aware (03-TEST-AND-RELEASE-GATES.md rule 3); the 2-file caps are not.
+    ····· │ 
+    34 65 │     const ui = { ...VALID, mode: "herdr-ui", limits: { maxProductionFiles: 2, maxTestFiles: 2, maxChangedLines: 120 } };
+    35 66 │     assert.equal(accept(ui).mode, "herdr-ui");
+    36    │ - ··assert.ok(reject({·...ui,·limits:·{·...ui.limits,·maxChangedLines:·121·}·}).includes("limits.maxChangedLines:·121·exceeds·bootstrap·ceiling·120·for·mode·herdr-ui"));
+       67 │ + ··assert.ok(
+       68 │ + ····reject({·...ui,·limits:·{·...ui.limits,·maxChangedLines:·121·}·}).includes(
+       69 │ + ······"limits.maxChangedLines:·121·exceeds·bootstrap·ceiling·120·for·mode·herdr-ui",
+       70 │ + ····),
+       71 │ + ··);
+    37 72 │   });
+    38 73 │   test("FIX-4B: 120 changed lines is rejected against the 100 ceiling for every non-herdr-ui mode", () => {
+    39    │ - ··for·(const·mode·of·["isolated-change",·"read-only"])·assert.ok(reject({·...VALID,·mode,·limits:·{·...DEFAULT_LIMITS,·maxChangedLines:·120·}·}).includes(`limits.maxChangedLines:·120·exceeds·bootstrap·ceiling·100·for·mode·${mode}`),·mode);
+       74 │ + ··for·(const·mode·of·["isolated-change",·"read-only"])
+       75 │ + ····assert.ok(
+       76 │ + ······reject({·...VALID,·mode,·limits:·{·...DEFAULT_LIMITS,·maxChangedLines:·120·}·}).includes(
+       77 │ + ········`limits.maxChangedLines:·120·exceeds·bootstrap·ceiling·100·for·mode·${mode}`,
+       78 │ + ······),
+       79 │ + ······mode,
+       80 │ + ····);
+    40 81 │   });
+    41 82 │   test("FIX-4B: an unknown mode is still rejected and herdr-ui keeps the 2-file caps", () => {
+    42 83 │     const uiLimits = { maxProductionFiles: 2, maxTestFiles: 2, maxChangedLines: 120 };
+    43 84 │     assert.ok(reject({ ...VALID, mode: "herdr" }).includes("mode: expected one of read-only, isolated-change, herdr-ui"));
+    44    │ - ··assert.ok(reject({·...VALID,·mode:·"herdr-ui",·limits:·{·...uiLimits,·maxProductionFiles:·3·}·}).includes("limits.maxProductionFiles:·3·exceeds·bootstrap·ceiling·2"));
+    45    │ - ··assert.ok(reject({·...VALID,·mode:·"herdr-ui",·limits:·{·...uiLimits,·maxTestFiles:·3·}·}).includes("limits.maxTestFiles:·3·exceeds·bootstrap·ceiling·2"));
+       85 │ + ··assert.ok(
+       86 │ + ····reject({·...VALID,·mode:·"herdr-ui",·limits:·{·...uiLimits,·maxProductionFiles:·3·}·}).includes(
+       87 │ + ······"limits.maxProductionFiles:·3·exceeds·bootstrap·ceiling·2",
+       88 │ + ····),
+       89 │ + ··);
+       90 │ + ··assert.ok(
+       91 │ + ····reject({·...VALID,·mode:·"herdr-ui",·limits:·{·...uiLimits,·maxTestFiles:·3·}·}).includes(
+       92 │ + ······"limits.maxTestFiles:·3·exceeds·bootstrap·ceiling·2",
+       93 │ + ····),
+       94 │ + ··);
+    46 95 │   });
+    47 96 │   
+  
+
+test/unit/bootstrap-handoff-writer.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+    12  12 │   import { canonicalHash } from "../../src/bootstrap/resultGate.ts";
+    13  13 │   
+    14     │ - const·SCHEMA:·unknown·=·JSON.parse(readFileSync(new·URL("../../docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json",·import.meta.url),·"utf8"));
+    15     │ - const·EXAMPLE:·Record<string,·unknown>·=·JSON.parse(readFileSync(new·URL("../../docs/specs/harness-reliability-bootstrap-20261103/examples/handoff-example.json",·import.meta.url),·"utf8"));
+        14 │ + const·SCHEMA:·unknown·=·JSON.parse(
+        15 │ + ··readFileSync(
+        16 │ + ····new·URL("../../docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json",·import.meta.url),
+        17 │ + ····"utf8",
+        18 │ + ··),
+        19 │ + );
+        20 │ + const·EXAMPLE:·Record<string,·unknown>·=·JSON.parse(
+        21 │ + ··readFileSync(
+        22 │ + ····new·URL("../../docs/specs/harness-reliability-bootstrap-20261103/examples/handoff-example.json",·import.meta.url),
+        23 │ + ····"utf8",
+        24 │ + ··),
+        25 │ + );
+    16  26 │   const APPROVAL = { required: true, approved: true, approvedBy: null, approvedAt: null };
+    17  27 │   const COMMAND = { command: "npm run typecheck", exitCode: 0, outputArtifact: "logs/01.txt" };
+    18  28 │   // Every required field of the real schema, schema-legal — and no handoffHash: the writer stamps it after validation.
+    19     │ - const·RECORD:·Record<string,·unknown>·=·{·specVersion:·"1.2.0",·taskId:·"FIX-3B",·status:·"PASS",·repo:·"berlinguyinca/pi-engineering",·baseSha:·"2".repeat(40),·resultSha:·"3".repeat(40),·taskAuthorityHash:·`sha256:${"a".repeat(64)}`,·changedFiles:·["src/bootstrap/handoffWriter.ts"],·commands:·[COMMAND],·evidence:·["logs/01.txt"],·nextTaskId:·"FIX-3C",·nextBaseSha:·"4".repeat(40),·blockedReasons:·[],·operatorApproval:·APPROVAL·};
+        29 │ + const·RECORD:·Record<string,·unknown>·=·{
+        30 │ + ··specVersion:·"1.2.0",
+        31 │ + ··taskId:·"FIX-3B",
+        32 │ + ··status:·"PASS",
+        33 │ + ··repo:·"berlinguyinca/pi-engineering",
+        34 │ + ··baseSha:·"2".repeat(40),
+        35 │ + ··resultSha:·"3".repeat(40),
+        36 │ + ··taskAuthorityHash:·`sha256:${"a".repeat(64)}`,
+        37 │ + ··changedFiles:·["src/bootstrap/handoffWriter.ts"],
+        38 │ + ··commands:·[COMMAND],
+        39 │ + ··evidence:·["logs/01.txt"],
+        40 │ + ··nextTaskId:·"FIX-3C",
+        41 │ + ··nextBaseSha:·"4".repeat(40),
+        42 │ + ··blockedReasons:·[],
+        43 │ + ··operatorApproval:·APPROVAL,
+        44 │ + };
+    20  45 │   const blocks = (record: Record<string, unknown>, schema: unknown = SCHEMA) => validateHandoffSchema(record, schema);
+    21     │ - const·noThrow·=·(record:·unknown,·schema:·unknown·=·SCHEMA)·=>·{·let·blockers:·string[]·=·[];·assert.doesNotThrow(()·=>·{·blockers·=·validateHandoffSchema(record·as·Record<string,·unknown>,·schema);·},·`throwing·on·${String(record)}`);·assert.ok(blockers.length·>·0,·"hostile·input·is·a·blocker,·never·an·exception");·};
+        46 │ + const·noThrow·=·(record:·unknown,·schema:·unknown·=·SCHEMA)·=>·{
+        47 │ + ··let·blockers:·string[]·=·[];
+        48 │ + ··assert.doesNotThrow(
+        49 │ + ····()·=>·{
+        50 │ + ······blockers·=·validateHandoffSchema(record·as·Record<string,·unknown>,·schema);
+        51 │ + ····},
+        52 │ + ····`throwing·on·${String(record)}`,
+        53 │ + ··);
+        54 │ + ··assert.ok(blockers.length·>·0,·"hostile·input·is·a·blocker,·never·an·exception");
+        55 │ + };
+    22  56 │   const objectSchema = (properties: Record<string, unknown>) => ({ type: "object", properties });
+    23  57 │   
+    24  58 │   test("the real schema accepts a real conforming record, with or without the stamped hash", () => {
+    25     │ - ··assert.deepEqual(blocks(RECORD),·[],·"a·record·without·handoffHash·conforms:·the·hash·is·injected·after·validation");·assert.deepEqual(blocks({·...RECORD,·handoffHash:·`sha256:${"b".repeat(64)}`·}),·[],·"an·extra·handoffHash·is·never·a·disallowed·additional·property");
+        59 │ + ··assert.deepEqual(blocks(RECORD),·[],·"a·record·without·handoffHash·conforms:·the·hash·is·injected·after·validation");
+        60 │ + ··assert.deepEqual(
+        61 │ + ····blocks({·...RECORD,·handoffHash:·`sha256:${"b".repeat(64)}`·}),
+        62 │ + ····[],
+        63 │ + ····"an·extra·handoffHash·is·never·a·disallowed·additional·property",
+        64 │ + ··);
+    26  65 │     assert.deepEqual(blocks(EXAMPLE), [], "the committed protocol example record (handoffHash included) conforms");
+    27  66 │   });
+    28  67 │   
+    29  68 │   test("every required field is required, at the top level and nested", () => {
+    30     │ - ··const·noStatus·=·{·...RECORD·};·delete·noStatus.status;
+    31     │ - ··assert.deepEqual(blocks(noStatus),·["$.status:·required·property·missing"]);·assert.deepEqual(blocks({·...RECORD,·operatorApproval:·{·required:·true·}·}),·["$.operatorApproval.approved:·required·property·missing"]);
+        69 │ + ··const·noStatus·=·{·...RECORD·};
+        70 │ + ··delete·noStatus.status;
+        71 │ + ··assert.deepEqual(blocks(noStatus),·["$.status:·required·property·missing"]);
+        72 │ + ··assert.deepEqual(blocks({·...RECORD,·operatorApproval:·{·required:·true·}·}),·[
+        73 │ + ····"$.operatorApproval.approved:·required·property·missing",
+        74 │ + ··]);
+    32  75 │   });
+    33  76 │   
+    34  77 │   test("a value outside enum, or of the wrong scalar type, is blocked at its path", () => {
+    35     │ - ··assert.deepEqual(blocks({·...RECORD,·status:·"DONE"·}),·['$.status:·"DONE"·is·not·one·of·enum·["PASS","ALREADY_SATISFIED","BLOCKED"]']);
+    36     │ - ··assert.deepEqual(blocks({·...RECORD,·status:·7·}),·['$.status:·7·is·not·one·of·enum·["PASS","ALREADY_SATISFIED","BLOCKED"]'],·"status·carries·enum,·not·type,·so·enum·is·what·catches·a·number");
+        78 │ + ··assert.deepEqual(blocks({·...RECORD,·status:·"DONE"·}),·[
+        79 │ + ····'$.status:·"DONE"·is·not·one·of·enum·["PASS","ALREADY_SATISFIED","BLOCKED"]',
+        80 │ + ··]);
+        81 │ + ··assert.deepEqual(
+        82 │ + ····blocks({·...RECORD,·status:·7·}),
+        83 │ + ····['$.status:·7·is·not·one·of·enum·["PASS","ALREADY_SATISFIED","BLOCKED"]'],
+        84 │ + ····"status·carries·enum,·not·type,·so·enum·is·what·catches·a·number",
+        85 │ + ··);
+    37  86 │     assert.deepEqual(blocks({ ...RECORD, specVersion: "1.1.0" }), ['$.specVersion: "1.1.0" != const "1.2.0"']);
+    38  87 │   });
+    39  88 │   
+    40  89 │   test("array items are validated recursively, and only integral numbers satisfy integer", () => {
+    41     │ - ··assert.deepEqual(blocks({·...RECORD,·commands:·["npm·test"]·}),·['$.commands[0]:·"npm·test"·does·not·match·type·"object"',·'$.commands[0]:·object·required·by·schema,·got·"npm·test"']);
+    42     │ - ··assert.deepEqual(blocks({·...RECORD,·commands:·[{·...COMMAND,·exitCode:·1.5·}]·}),·['$.commands[0].exitCode:·1.5·does·not·match·type·"integer"']);·assert.deepEqual(blocks({·...RECORD,·commands:·[{·...COMMAND,·exitCode:·1·}]·}),·[],·"an·integral·exitCode·conforms");
+        90 │ + ··assert.deepEqual(blocks({·...RECORD,·commands:·["npm·test"]·}),·[
+        91 │ + ····'$.commands[0]:·"npm·test"·does·not·match·type·"object"',
+        92 │ + ····'$.commands[0]:·object·required·by·schema,·got·"npm·test"',
+        93 │ + ··]);
+        94 │ + ··assert.deepEqual(blocks({·...RECORD,·commands:·[{·...COMMAND,·exitCode:·1.5·}]·}),·[
+        95 │ + ····'$.commands[0].exitCode:·1.5·does·not·match·type·"integer"',
+        96 │ + ··]);
+        97 │ + ··assert.deepEqual(blocks({·...RECORD,·commands:·[{·...COMMAND,·exitCode:·1·}]·}),·[],·"an·integral·exitCode·conforms");
+    43  98 │   });
+    44  99 │   
+    45 100 │   test("additionalProperties: false blocks an unknown key, but never the hash the writer stamps", () => {
+    46     │ - ··assert.deepEqual(blocks({·...RECORD,·bogusKey:·1·}),·["$.bogusKey:·disallowed·additional·property"]);·assert.deepEqual(blocks({·...RECORD,·handoffHash:·7·}),·['$.handoffHash:·7·does·not·match·type·"string"'],·"exempt·from·required·and·additionalProperties,·still·type-checked");
+       101 │ + ··assert.deepEqual(blocks({·...RECORD,·bogusKey:·1·}),·["$.bogusKey:·disallowed·additional·property"]);
+       102 │ + ··assert.deepEqual(
+       103 │ + ····blocks({·...RECORD,·handoffHash:·7·}),
+       104 │ + ····['$.handoffHash:·7·does·not·match·type·"string"'],
+       105 │ + ····"exempt·from·required·and·additionalProperties,·still·type-checked",
+       106 │ + ··);
+    47 107 │   });
+    48 108 │   
+    49 109 │   test("null is accepted exactly where the schema allows it, and nowhere else", () => {
+    50     │ - ··assert.deepEqual(blocks({·...RECORD,·nextTaskId:·null,·nextBaseSha:·null,·blockedReasons:·[],·operatorApproval:·{·...APPROVAL,·approvedBy:·null,·approvedAt:·null·}·}),·[],·"nextTaskId/nextBaseSha/approvedBy/approvedAt·are·[string,null]");
+       110 │ + ··assert.deepEqual(
+       111 │ + ····blocks({
+       112 │ + ······...RECORD,
+       113 │ + ······nextTaskId:·null,
+       114 │ + ······nextBaseSha:·null,
+       115 │ + ······blockedReasons:·[],
+       116 │ + ······operatorApproval:·{·...APPROVAL,·approvedBy:·null,·approvedAt:·null·},
+       117 │ + ····}),
+       118 │ + ····[],
+       119 │ + ····"nextTaskId/nextBaseSha/approvedBy/approvedAt·are·[string,null]",
+       120 │ + ··);
+    51 121 │     assert.deepEqual(blocks({ ...RECORD, nextTaskId: 7 }), ['$.nextTaskId: 7 does not match type ["string","null"]']);
+    52     │ - ··assert.deepEqual(blocks({·...RECORD,·parentHandoffHash:·null·}),·["$.parentHandoffHash:·disallowed·additional·property"],·"parentHandoffHash·is·a·task-manifest·field:·the·handoff·schema·declares·no·such·property·and·forbids·additional·ones");
+       122 │ + ··assert.deepEqual(
+       123 │ + ····blocks({·...RECORD,·parentHandoffHash:·null·}),
+       124 │ + ····["$.parentHandoffHash:·disallowed·additional·property"],
+       125 │ + ····"parentHandoffHash·is·a·task-manifest·field:·the·handoff·schema·declares·no·such·property·and·forbids·additional·ones",
+       126 │ + ··);
+    53 127 │   });
+    54 128 │   
+    55 129 │   test("hostile schema or record input yields blockers and never an exception", () => {
+    56     │ - ··assert.deepEqual(blocks(RECORD,·null),·["$:·schema·is·not·an·object:·null"]);·assert.deepEqual(blocks(RECORD,·"x"),·['$:·schema·is·not·an·object:·"x"']);
+    57     │ - ··assert.deepEqual(blocks({·a:·"x"·},·objectSchema({·a:·{·items:·{·type:·"string"·}·}·})),·['$.a:·items·declared·but·value·is·"x",·not·an·array']);·assert.deepEqual(blocks({·a:·[1]·},·objectSchema({·a:·{·type:·"array",·items:·"nope"·}·})),·['$.a.items:·schema·is·not·an·object:·"nope"']);
+    58     │ - ··assert.deepEqual(blocks({·a:·1·},·{·type:·"object",·required:·[null]·}),·["$.null:·schema·required·entry·is·not·a·string"]);
+    59     │ - ··noThrow(RECORD,·[]);·noThrow(null);·noThrow([]);·noThrow({·...RECORD,·commands:·{·...COMMAND·}·});
+       130 │ + ··assert.deepEqual(blocks(RECORD,·null),·["$:·schema·is·not·an·object:·null"]);
+       131 │ + ··assert.deepEqual(blocks(RECORD,·"x"),·['$:·schema·is·not·an·object:·"x"']);
+       132 │ + ··assert.deepEqual(blocks({·a:·"x"·},·objectSchema({·a:·{·items:·{·type:·"string"·}·}·})),·[
+       133 │ + ····'$.a:·items·declared·but·value·is·"x",·not·an·array',
+       134 │ + ··]);
+       135 │ + ··assert.deepEqual(blocks({·a:·[1]·},·objectSchema({·a:·{·type:·"array",·items:·"nope"·}·})),·[
+       136 │ + ····'$.a.items:·schema·is·not·an·object:·"nope"',
+       137 │ + ··]);
+       138 │ + ··assert.deepEqual(blocks({·a:·1·},·{·type:·"object",·required:·[null]·}),·[
+       139 │ + ····"$.null:·schema·required·entry·is·not·a·string",
+       140 │ + ··]);
+       141 │ + ··noThrow(RECORD,·[]);
+       142 │ + ··noThrow(null);
+       143 │ + ··noThrow([]);
+  19 more lines truncated
+  
+
+test/unit/bootstrap-path-policy.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+     5  5 │   const build = (input: Parameters<typeof createPathPolicy>[0]) => {
+     6  6 │     const { policy, errors } = createPathPolicy(input);
+     7    │ - ··assert.deepEqual(errors,·[]);·assert.ok(policy);·return·policy;
+        7 │ + ··assert.deepEqual(errors,·[]);
+        8 │ + ··assert.ok(policy);
+        9 │ + ··return·policy;
+     8 10 │   };
+     9 11 │   
+    10 12 │   test("allowlist grants exact paths and explicit recursion only", () => {
+    11 13 │     const narrow = build({ allowPaths: ["src/bootstrap/taskManifest.ts", "docs/specs/**"] });
+    12    │ - ··assert.deepEqual(narrow.check("src/bootstrap/taskManifest.ts"),·{·allowed:·true,·path:·"src/bootstrap/taskManifest.ts",·reason:·'matched·by·"src/bootstrap/taskManifest.ts"'·});
+       14 │ + ··assert.deepEqual(narrow.check("src/bootstrap/taskManifest.ts"),·{
+       15 │ + ····allowed:·true,
+       16 │ + ····path:·"src/bootstrap/taskManifest.ts",
+       17 │ + ····reason:·'matched·by·"src/bootstrap/taskManifest.ts"',
+       18 │ + ··});
+    13 19 │     assert.equal(narrow.check("docs/specs/harness/x.md").allowed, true);
+    14    │ - ··assert.equal(narrow.check("src/bootstrap").reason,·"no·allow·pattern·matches",·"no·implicit·**·—·a·directory·entry·grants·nothing·extra");
+       20 │ + ··assert.equal(
+       21 │ + ····narrow.check("src/bootstrap").reason,
+       22 │ + ····"no·allow·pattern·matches",
+       23 │ + ····"no·implicit·**·—·a·directory·entry·grants·nothing·extra",
+       24 │ + ··);
+    15 25 │     assert.equal(build({ allowPaths: [] }).check("src/bootstrap/taskManifest.ts").allowed, false);
+    16 26 │   });
+    ····· │ 
+    19 29 │     const guarded = build({ allowPaths: ["**"], denyPaths: ["docs/specs/**", "src/bootstrap/pathPolicy.ts"] });
+    20 30 │     assert.equal(guarded.check("src/bootstrap/taskManifest.ts").allowed, true);
+    21    │ - ··assert.deepEqual(guarded.check("docs/specs/x/y.md"),·{·allowed:·false,·path:·"docs/specs/x/y.md",·reason:·'denied·by·"docs/specs/**"'·});
+       31 │ + ··assert.deepEqual(guarded.check("docs/specs/x/y.md"),·{
+       32 │ + ····allowed:·false,
+       33 │ + ····path:·"docs/specs/x/y.md",
+       34 │ + ····reason:·'denied·by·"docs/specs/**"',
+       35 │ + ··});
+    22 36 │     assert.equal(guarded.check("src/bootstrap/pathPolicy.ts").reason, 'denied by "src/bootstrap/pathPolicy.ts"');
+    23 37 │   });
+    ····· │ 
+    25 39 │   test("traversal, ambiguous, absolute and symlink paths are rejected before any grant", () => {
+    26 40 │     const checked = build({ allowPaths: ["**"], symlinks: ["link", "nested/link"] });
+    27    │ - ··const·rejected·=·["../escape",·"src/../../etc/passwd",·"./src/x",·"src/./x",·"/etc/passwd",·"C:/x",·"~/x",·"src//x",·"src/x/",·"",·"···",·"·src/x",·"src/*.ts",·"src/**",·"a?b",·"a\\b",·"link",·"nested/link/file.ts"];
+       41 │ + ··const·rejected·=·[
+       42 │ + ····"../escape",
+       43 │ + ····"src/../../etc/passwd",
+       44 │ + ····"./src/x",
+       45 │ + ····"src/./x",
+       46 │ + ····"/etc/passwd",
+       47 │ + ····"C:/x",
+       48 │ + ····"~/x",
+       49 │ + ····"src//x",
+       50 │ + ····"src/x/",
+       51 │ + ····"",
+       52 │ + ····"···",
+       53 │ + ····"·src/x",
+       54 │ + ····"src/*.ts",
+       55 │ + ····"src/**",
+       56 │ + ····"a?b",
+       57 │ + ····"a\\b",
+       58 │ + ····"link",
+       59 │ + ····"nested/link/file.ts",
+       60 │ + ··];
+    28 61 │     for (const request of rejected) assert.equal(checked.check(request).allowed, false, request);
+    29 62 │     assert.match(checked.check("src/**").reason, /glob metacharacters/u);
+  
+
+test/unit/bootstrap-trail-verifier.test.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+      3   3 │   import test from "node:test";
+      4   4 │   import { canonicalHash } from "../../src/bootstrap/resultGate.ts";
+      5     │ - import·{·GENERATION_ORDER,·declaredArtifacts,·generationRank,·matchLiveRunners,·mentionsCommand,·selectCanonical,·unreadGenerations,·verifyTrail,·type·TrailRecord,·type·TrailRecordGeneration·}·from·"../../src/bootstrap/trailVerifier.ts";
+          5 │ + import·{·GENERATION_ORDER,·type·TrailRecord,·type·TrailRecordGeneration,·declaredArtifacts,·generationRank,·matchLiveRunners,·mentionsCommand,·selectCanonical,·unreadGenerations,·verifyTrail·}·from·"../../src/bootstrap/trailVerifier.ts";
+      6   6 │   
+      7   7 │   const SCHEMA = JSON.parse(readFileSync("docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json", "utf8"));
+  
+
+test/unit/bootstrap-one.test.ts organizeImports ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Import statements could be sorted:
+  
+      5   5 │   import { join } from "node:path";
+      6   6 │   import test from "node:test";
+      7     │ - import·{·canonicalHash·as·protocolHash,·taskAuthorityHash·}·from·"../../src/bootstrap/resultGate.ts";
+      8     │ - import·{·parseTaskManifest,·type·TaskManifest·}·from·"../../src/bootstrap/taskManifest.ts";
+      9     │ - import·{·bootstrapOne,·canonicalHash,·executionPlan,·validateParentHandoff,·type·Observations·}·from·"../../scripts/bootstrap-one.ts";
+          7 │ + import·{·type·Observations,·bootstrapOne,·canonicalHash,·executionPlan,·validateParentHandoff·}·from·"../../scripts/bootstrap-one.ts";
+          8 │ + import·{·canonicalHash·as·protocolHash,·taskAuthorityHash·}·from·"../../src/bootstrap/resultGate.ts";
+          9 │ + import·{·type·TaskManifest,·parseTaskManifest·}·from·"../../src/bootstrap/taskManifest.ts";
+     10  10 │   
+     11  11 │   const BASE = "bfffb539025959a7429cb8703779573c132ead1f"; const PARENT = {"specVersion": "1.2.0", "taskId": "B03", "status": "PASS", "repo": "pi", "baseSha": "bcfee3b03791afae66e41050a981d28e2e8a03de", "resultSha": "bfffb539025959a7429cb8703779573c132ead1f", "taskAuthorityHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "changedFiles": [{"path": "src/bootstrap/diffGuard.ts", "changeType": "added", "summary": "guard"}, {"path": "test/unit/bootstrap-diff-guard.test.ts", "changeType": "added", "summary": "tests"}], "commands": [{"argv": ["npm", "run", "typecheck"], "cwd": ".", "exitCode": 0, "durationMs": null, "outputArtifact": "docs/logs/01.txt"}], "evidence": ["docs/logs/01.txt", "annotated entry"], "blockedReasons": ["B03-1 note"], "nextTaskId": "B04", "nextBaseSha": "bfffb539025959a7429cb8703779573c132ead1f", "operatorApproval": {"required": true, "approved": true, "approvedBy": "operator", "approvedAt": "2026-11-04T01:03:16Z"}, "handoffHash": "sha256:7c422083a6b280d0163272d14c4fd303b8c6a93d60749cb394f96c7672b1c43e"};
+  
+
+test/unit/bootstrap-trail-verifier.test.ts format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Formatter would have printed the following content:
+  
+      3   3 │   import test from "node:test";
+      4   4 │   import { canonicalHash } from "../../src/bootstrap/resultGate.ts";
+      5     │ - import·{·GENERATION_ORDER,·declaredArtifacts,·generationRank,·matchLiveRunners,·mentionsCommand,·selectCanonical,·unreadGenerations,·verifyTrail,·type·TrailRecord,·type·TrailRecordGeneration·}·from·"../../src/bootstrap/trailVerifier.ts";
+          5 │ + import·{
+          6 │ + ··GENERATION_ORDER,
+          7 │ + ··declaredArtifacts,
+          8 │ + ··generationRank,
+          9 │ + ··matchLiveRunners,
+         10 │ + ··mentionsCommand,
+         11 │ + ··selectCanonical,
+         12 │ + ··unreadGenerations,
+         13 │ + ··verifyTrail,
+         14 │ + ··type·TrailRecord,
+         15 │ + ··type·TrailRecordGeneration,
+         16 │ + }·from·"../../src/bootstrap/trailVerifier.ts";
+      6  17 │   
+      7     │ - const·SCHEMA·=·JSON.parse(readFileSync("docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json",·"utf8"));
+         18 │ + const·SCHEMA·=·JSON.parse(
+         19 │ + ··readFileSync("docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json",·"utf8"),
+         20 │ + );
+      8  21 │   const SHA = (letter: string) => letter.repeat(40);
+      9  22 │   const Authority = `sha256:${"a".repeat(64)}`;
+     10  23 │   const stamp = (body: Record<string, unknown>) => ({ ...body, handoffHash: canonicalHash(body) });
+     11  24 │   /** A record that conforms to the real protocol schema and carries its own correct stamp. */
+     12     │ - const·unit·=·(taskId:·string,·baseSha:·string,·nextTaskId:·string·|·null,·nextBaseSha:·string·|·null,·over:·Record<string,·unknown>·=·{}):·TrailRecord·=>·{
+         25 │ + const·unit·=·(
+         26 │ + ··taskId:·string,
+         27 │ + ··baseSha:·string,
+         28 │ + ··nextTaskId:·string·|·null,
+         29 │ + ··nextBaseSha:·string·|·null,
+         30 │ + ··over:·Record<string,·unknown>·=·{},
+         31 │ + ):·TrailRecord·=>·{
+     13  32 │     const body = {
+     14  33 │       specVersion: "1.2.0",
+    ······· │ 
+     30  49 │     return { taskId, record: stamp(body) };
+     31  50 │   };
+     32     │ - const·CHAIN·=·():·TrailRecord[]·=>·[unit("E01",·SHA("1"),·"E02",·SHA("2")),·unit("E02",·SHA("2"),·"E03",·SHA("3")),·unit("E03",·SHA("3"),·"E04",·SHA("4")),·unit("E04",·SHA("4"),·null,·null)];
+         51 │ + const·CHAIN·=·():·TrailRecord[]·=>·[
+         52 │ + ··unit("E01",·SHA("1"),·"E02",·SHA("2")),
+         53 │ + ··unit("E02",·SHA("2"),·"E03",·SHA("3")),
+         54 │ + ··unit("E03",·SHA("3"),·"E04",·SHA("4")),
+         55 │ + ··unit("E04",·SHA("4"),·null,·null),
+         56 │ + ];
+     33  57 │   const ORDER = ["E01", "E02", "E03", "E04"];
+     34  58 │   const PRESENT = new Set(CHAIN().flatMap((entry) => declaredArtifacts(entry.record)));
+     35  59 │   const EVERYWHERE = { artifactExists: () => true, committed: () => true };
+     36     │ - const·DISK_AND_GIT·=·{·artifactExists:·(path:·string)·=>·PRESENT.has(path),·committed:·(path:·string)·=>·PRESENT.has(path)·};
+     37     │ - const·kinds·=·(verdict:·ReturnType<typeof·verifyTrail>)·=>·verdict.issues.map((issue)·=>·`${issue.kind}:${issue.taskId·??·"-"}`);
+         60 │ + const·DISK_AND_GIT·=·{
+         61 │ + ··artifactExists:·(path:·string)·=>·PRESENT.has(path),
+         62 │ + ··committed:·(path:·string)·=>·PRESENT.has(path),
+         63 │ + };
+         64 │ + const·kinds·=·(verdict:·ReturnType<typeof·verifyTrail>)·=>
+         65 │ + ··verdict.issues.map((issue)·=>·`${issue.kind}:${issue.taskId·??·"-"}`);
+     38  66 │   
+     39  67 │   test("a continuous, stamped, schema-conformant trail whose evidence is on disk and in git verifies clean", () => {
+     40     │ - ··assert.deepEqual(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·CHAIN(),·...DISK_AND_GIT·}),·{·ok:·true,·records:·4,·issues:·[]·});
+         68 │ + ··assert.deepEqual(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·CHAIN(),·...DISK_AND_GIT·}),·{
+         69 │ + ····ok:·true,
+         70 │ + ····records:·4,
+         71 │ + ····issues:·[],
+         72 │ + ··});
+     41  73 │   });
+     42  74 │   
+    ······· │ 
+     44  76 │     const [e01, e02, e03, e04] = CHAIN();
+     45  77 │     const tampered: TrailRecord = { ...e02!, record: { ...e02!.record, status: "BLOCKED" } };
+     46     │ - ··assert.deepEqual(kinds(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·[e01!,·tampered,·e03!,·e04!],·...EVERYWHERE·})),·["hash-mismatch:E02"]);
+         78 │ + ··assert.deepEqual(
+         79 │ + ····kinds(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·[e01!,·tampered,·e03!,·e04!],·...EVERYWHERE·})),
+         80 │ + ····["hash-mismatch:E02"],
+         81 │ + ··);
+     47  82 │     const dropped = { ...e02!.record } as Record<string, unknown>;
+     48  83 │     delete dropped.taskAuthorityHash;
+     49  84 │     const restamped: TrailRecord = { taskId: "E02", record: stamp(dropped) }; // stamp made to match: only the schema can catch this
+     50     │ - ··assert.deepEqual(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·[e01!,·restamped,·e03!,·e04!],·...EVERYWHERE·}).issues,·[
+     51     │ - ····{·kind:·"schema-violation",·taskId:·"E02",·detail:·"$.taskAuthorityHash:·required·property·missing"·},
+     52     │ - ··]);
+         85 │ + ··assert.deepEqual(
+         86 │ + ····verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·[e01!,·restamped,·e03!,·e04!],·...EVERYWHERE·}).issues,
+         87 │ + ····[{·kind:·"schema-violation",·taskId:·"E02",·detail:·"$.taskAuthorityHash:·required·property·missing"·}],
+         88 │ + ··);
+     53  89 │   });
+     54  90 │   
+    ······· │ 
+     56  92 │     const [e01, e02, e03, e04] = CHAIN();
+     57  93 │     const rebased: TrailRecord = { taskId: "E03", record: stamp({ ...e03!.record, baseSha: SHA("9") }) };
+     58     │ - ··assert.deepEqual(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·[e01!,·e02!,·rebased,·e04!],·...EVERYWHERE·}).issues,·[
+     59     │ - ····{·kind:·"lineage-break",·taskId:·"E03",·detail:·`E02.nextBaseSha·${SHA("3")}·!=·E03.baseSha·${SHA("9")}`·},
+     60     │ - ··]);
+     61     │ - ··assert.deepEqual(kinds(verifyTrail({·schema:·SCHEMA,·order:·["E01",·"E02",·"E99"],·records:·[e01!,·e02!],·...EVERYWHERE·})),·["missing-record:E99",·"next-pointer-mismatch:E02"],·"the·absent·successor·breaks·the·pointer·too");
+         94 │ + ··assert.deepEqual(
+         95 │ + ····verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·[e01!,·e02!,·rebased,·e04!],·...EVERYWHERE·}).issues,
+         96 │ + ····[{·kind:·"lineage-break",·taskId:·"E03",·detail:·`E02.nextBaseSha·${SHA("3")}·!=·E03.baseSha·${SHA("9")}`·}],
+         97 │ + ··);
+         98 │ + ··assert.deepEqual(
+         99 │ + ····kinds(verifyTrail({·schema:·SCHEMA,·order:·["E01",·"E02",·"E99"],·records:·[e01!,·e02!],·...EVERYWHERE·})),
+        100 │ + ····["missing-record:E99",·"next-pointer-mismatch:E02"],
+        101 │ + ····"the·absent·successor·breaks·the·pointer·too",
+        102 │ + ··);
+     62 103 │   });
+     63 104 │   
+    ······· │ 
+     65 106 │     const chain = CHAIN();
+     66 107 │     const withFix = [...chain, unit("FIX-1", SHA("5"), null, null)];
+     67     │ - ··assert.deepEqual(kinds(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·withFix,·...EVERYWHERE·})),·["unplanned-record:FIX-1"]);
+     68     │ - ··assert.deepEqual(kinds(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·[...chain,·chain[0]!],·...EVERYWHERE·})),·["duplicate-record:E01"]);
+        108 │ + ··assert.deepEqual(kinds(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·withFix,·...EVERYWHERE·})),·[
+        109 │ + ····"unplanned-record:FIX-1",
+        110 │ + ··]);
+        111 │ + ··assert.deepEqual(
+        112 │ + ····kinds(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·[...chain,·chain[0]!],·...EVERYWHERE·})),
+        113 │ + ····["duplicate-record:E01"],
+        114 │ + ··);
+     69 115 │   });
+     70 116 │   
+     71 117 │   test("declared evidence is checked on disk and in the repository, and the two failures are told apart", () => {
+     72 118 │     const chain = CHAIN();
+     73     │ - ··const·bothGone·=·verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·chain,·artifactExists:·()·=>·false,·committed:·()·=>·false·});
+     74     │ - ··assert.deepEqual(kinds(bothGone).slice(0,·4),·["evidence-absent:E01",·"evidence-uncommitted:E01",·"evidence-absent:E01",·"evidence-uncommitted:E01"]);
+     75     │ - ··assert.deepEqual(kinds(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·chain,·...EVERYWHERE,·committed:·()·=>·false·})).slice(0,·2),·["evidence-uncommitted:E01",·"evidence-uncommitted:E01"]);
+     76     │ - ··assert.equal(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·chain·}).issues.length,·0,·"an·omitted·observer·skips·its·check·instead·of·guessing");
+        119 │ + ··const·bothGone·=·verifyTrail({
+        120 │ + ····schema:·SCHEMA,
+        121 │ + ····order:·ORDER,
+        122 │ + ····records:·chain,
+        123 │ + ····artifactExists:·()·=>·false,
+        124 │ + ····committed:·()·=>·false,
+        125 │ + ··});
+        126 │ + ··assert.deepEqual(kinds(bothGone).slice(0,·4),·[
+        127 │ + ····"evidence-absent:E01",
+        128 │ + ····"evidence-uncommitted:E01",
+        129 │ + ····"evidence-absent:E01",
+        130 │ + ····"evidence-uncommitted:E01",
+        131 │ + ··]);
+        132 │ + ··assert.deepEqual(
+        133 │ + ····kinds(verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·chain,·...EVERYWHERE,·committed:·()·=>·false·})).slice(
+        134 │ + ······0,
+        135 │ + ······2,
+        136 │ + ····),
+        137 │ + ····["evidence-uncommitted:E01",·"evidence-uncommitted:E01"],
+        138 │ + ··);
+        139 │ + ··assert.equal(
+        140 │ + ····verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·chain·}).issues.length,
+        141 │ + ····0,
+        142 │ + ····"an·omitted·observer·skips·its·check·instead·of·guessing",
+        143 │ + ··);
+     77 144 │   });
+     78 145 │   
+     79 146 │   test("a process the run started that is still alive blocks the verdict", () => {
+     80     │ - ··const·verdict·=·verifyTrail({·schema:·SCHEMA,·order:·ORDER,·records:·CHAIN(),·...DISK_AND_GIT,·liveRunners:·["node·--test·test/unit/e01.test.ts"]·});
+     81     │ - ··assert.deepEqual(verdict.issues,·[{·kind:·"live-runner",·taskId:·null,·detail:·"process·started·by·the·run·is·still·alive:·node·--test·test/unit/e01.test.ts"·}]);
+        147 │ + ··const·verdict·=·verifyTrail({
+  204 more lines truncated
+  
+
+Skipped 28 suggested fixes.
+If you wish to apply the suggested (unsafe) fixes, use the command biome check --fix --unsafe
+
+The number of diagnostics exceeds the number allowed by Biome.
+Diagnostics not shown: 50.
+Checked 810 files in 936ms. No fixes applied.
+Found 70 errors.
+check ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × Some errors were emitted while running checks.
+  
+

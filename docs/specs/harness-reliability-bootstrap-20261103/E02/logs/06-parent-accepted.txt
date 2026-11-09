@@ -1,0 +1,11 @@
+parent=E01 accepted sha256:2077162a05a…
+task=E02
+mode=isolated-change
+repo=pi
+base=0cc5b21cb68caacd44bb09cb7a9674c616f02d9b
+allow=src/incidents/errorEvent.ts,test/unit/error-event.test.ts
+deny=package.json,scripts/**,src/incidents/incidentStateMachine.ts,src/incidents/types.ts,src/platform/redact.ts
+limits=2/2/100
+command=repo-root :: npm run typecheck
+command=repo-root :: node --test --import ./test/support/isolatedState.ts test/unit/error-event.test.ts
+plan exit=0; no model invoked (B04 stops here)
