@@ -48,7 +48,9 @@
     "Whole suite at the branch tip under the gate invocation: 7964 tests / 7956 pass / 3 fail / 0 cancelled in 15m26s (X12/logs/02). The three failing leaves reproduce identically at origin/main's tip in a separate checkout (X12/logs/02-three-leaves-at-origin-main-e7888752.txt): they are pre-existing on main, not branch damage. X12's record does not list the whole-suite run in `commands[]` -- resultGate requires proof exitCode 0 (src/bootstrap/resultGate.ts:33) -- it is carried as evidence instead of being made to look green.",
     "AUDIT/citation-anchor-check.mjs at dd543bf5: RELEASE-REVIEW.md (branch-only; not on origin/main) reports citations=22, drift=2, imprecise=0 -- both 'problems' are NO_FILE at RELEASE-REVIEW.md:100 (citation forms whose file the extractor cannot parse), and the run prints that 19 citations were NOT judged for lack of an anchor, so it must not be read as 'citations verified'. The four 0X-*.md plan docs and X10/CORRECTION.md return citations=0 (their prose carries no file:line form the extractor reads), which is a vacuous pass, not a checked one.",
     "Whole-suite residue, attributed rather than assumed (X13/logs/07a-): `npm test` at the pristine tip e26541c0 in a separate worktree leaves 6 leaves red without X13 applied -- planner-worker-gateway-timeouts x2 ('Argument dispatcher must implement dispatch', also red at origin/main, X12/logs/02-three-leaves-at-origin-main-e7888752.txt), review-context-and-acceptance:399, no-fixed-deadlines:463, and one rotating ENOTEMPTY temp-cleanup failure (runtime-host-entry in one run, disk-pressure-snapshot-e2e in another). Neither no-fixed-deadlines nor runtime-host-entry is in X13's diff. The suite terminates (796 s pristine / 1019 s / 1184 s swept) so these are failing leaves, not hangs, and they are pre-existing on the branch -- they are the same population X12 recorded, now with a baseline that names the tip they are red at.",
-    "manifest.limits cannot express a whole-tree formatter reflow: parseTaskManifest refuses limits above MICROTASK_CEILING (2 files) / the mode's 100-line ceiling, so X13's manifest declares the two authored edits (biome.json, the recovery-optin assertion) while its record's changedFiles carries the measured 78. diffGuard would report budget breaches against that diff and was not run -- the same posture X08/X09/X10/X11/X12 took for merge-sized diffs. Recorded as a harness finding."
+    "manifest.limits cannot express a whole-tree formatter reflow: parseTaskManifest refuses limits above MICROTASK_CEILING (2 files) / the mode's 100-line ceiling, so X13's manifest declares the two authored edits (biome.json, the recovery-optin assertion) while its record's changedFiles carries the measured 78. diffGuard would report budget breaches against that diff and was not run -- the same posture X08/X09/X10/X11/X12 took for merge-sized diffs. Recorded as a harness finding.",
+    "X13's post-record gates are in X13/logs/09-closure-gates.txt (pre-commit), 10-post-commit-gates.txt and 11-citation-drift-from-reflow.txt; they postdate X13/out/X13.handoff.json, so they are named here rather than in that record's evidence[].",
+    "Side effect of the lint sweep, measured rather than noticed later: reformatting src files moved line numbers that the trail's prose cites, so AUDIT/citation-anchor-check.mjs over all 195 trail .md files went 15 -> 26 drift items between e26541c0 and 59b6620c. The 11 new items are all ANCHOR_MISSING in six documents, none of which any record declares as evidence (checked), so no hash-bound bytes are involved. The two current-tree citations of canonicalHash (RELEASE-REVIEW.md:69, AUDIT/lineage-reachability.md:30) were repointed to src/bootstrap/resultGate.ts:30 with the move stated in the sentence (commit 0991ba50); the remaining 9 in D06/WORKER_REPORT.md and the R04/R06/R08 HANDOFF.md files are base-relative claims about the base those units were handed and were left alone rather than rewritten. After the fix the sweep is 15 -> 24, NO_FILE unchanged at 26, and 160 citations still unjudged for want of an identifier -- which is why this is reported as drift accounting, not as 'citations verified' (same correction X12 recorded). X13/logs/11-."
   ],
   "concluded_with_records": [
     "B00",
@@ -135,7 +137,7 @@
     "runbook": "docs/specs/harness-reliability-bootstrap/ROLLOUT.md",
     "lint_parity": "docs/specs/harness-reliability-bootstrap-20261103/X13/logs/01-decision-and-scope.txt"
   },
-  "head": "9fa508c5d815bb522371702bbc3a217979514e75",
+  "head": "6edf4dadd28fbc9b0a812508b28543e12acbe060",
   "next_action": "Merge #616 (task/x08-common-dir-repair). X13 closed the last merge-blocking gap: `npm run lint` now exits 0 on the branch as it does at origin/main (it was exit 1 with 517 errors), typecheck:core exits 0, the canonical lineage gate passes, and the whole-suite residue is attributed to the pristine tip and to origin/main by a baseline run rather than assumed. After the merge, the open items are the two known canonical chain offenders (E02->E03, T09->T10), the unjudged citations X12 recorded for human review, and the pre-existing failing leaves named in the caveats.",
   "no_handoff_record": [],
   "plan": "harness-reliability-bootstrap-20261103",
@@ -387,16 +389,16 @@
   "repo": "berlinguyinca/pi-engineering",
   "schema_conformance": {
     "additional_properties": false,
-    "canonical_hash_recomputed": "101/101 recomputed handoffHash equal to the stored value; 101/101 required fields present (AUDIT/integrity-scan.mjs). AUDIT/record-reproducibility.mjs at fe83bd89: records=105, hashes recomputed ok=105, mismatch=0, noHashField=0, unparseable=0, declared evidence paths=638, absent from HEAD tree=0.",
-    "canonical_records": 66,
+    "canonical_hash_recomputed": "103/103 recomputed handoffHash equal to the stored value; 103/103 required fields present (AUDIT/integrity-scan.mjs). AUDIT/record-reproducibility.mjs at 6edf4dad: records=107, hashes recomputed ok=107, mismatch=0, noHashField=0, unparseable=0, declared evidence paths=672, absent from HEAD tree=0.",
+    "canonical_records": 67,
     "chain_canonical_offenders": [
       "E02/out -> E03@cc036f2f8c3b (no such record)",
       "T09/out -> T10@3bb21ab2e4b4 (no such record)"
     ],
-    "chain_forward_links_resolved": 60,
+    "chain_forward_links_resolved": 61,
     "evidence_dangling": 0,
     "evidence_untracked": 0,
-    "field_ok": 101,
+    "field_ok": 103,
     "generations": [
       "V01/out",
       "V02/out",
@@ -419,9 +421,11 @@
       "X10/out-chain",
       "X11/out",
       "X11/out-chain",
-      "X12/out"
+      "X12/out",
+      "X12/out-chain",
+      "X13/out"
     ],
-    "hash_ok": 101,
+    "hash_ok": 103,
     "informational_orphans": [
       "B00/out-backfill",
       "FIX-1/out",
@@ -430,7 +434,7 @@
       "X01/out-final",
       "X08/out-chain"
     ],
-    "note": "untracked/dangling recomputed after X09; X09/out, X09/logs and X09/fixtures are force-added with `git add -f` because .gitignore:44-46 keeps */logs/, */fixtures/ and */out/ untracked by design -- the series tracks them anyway so the chain scan can prove evidence provenance (same as X01..X08). Recomputed after X11: records 97 -> 99 (X10/out-chain, X11/out), canonical 64 -> 65, canonical chain links resolved 58 -> 59, offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, and every handoffHash recomputed equal to its stored value. The canonical lineage gate now exits 0 for the first time in the series -- see AUDIT/lineage-scan.mjs and X11. Recomputed after X12: records 99 -> 101 (X11/out-chain, X12/out), canonical 65 -> 66, canonical chain links resolved 59 -> 60 (X11/out-chain -> X12 resolves on nextBaseSha == X12.baseSha), offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, hash_ok/field_ok 101/101. X12's logs, fixtures and record are force-added with `git add -f` like X01..X11, which contradicts the comment at .gitignore:42-46 ('logs, fixtures, handoffs ... must stay untracked'); the series tracks them so record-reproducibility can prove every declared artifact is in the same tree as the record that vouches for it. scripts/verify-handoff-trail.ts still reports 35 issues at fe83bd89, all standing: FIX-1/FIX-2 evidence absent, 'unplanned-record' for the post-plan-extension units X01..X12 and the FIX-* units, the E02->E03 lineage break and the E07/T09 next-pointer mismatches. Closure log: X12/logs/09-closure-gates.txt.",
+    "note": "untracked/dangling recomputed after X09; X09/out, X09/logs and X09/fixtures are force-added with `git add -f` because .gitignore:44-46 keeps */logs/, */fixtures/ and */out/ untracked by design -- the series tracks them anyway so the chain scan can prove evidence provenance (same as X01..X08). Recomputed after X11: records 97 -> 99 (X10/out-chain, X11/out), canonical 64 -> 65, canonical chain links resolved 58 -> 59, offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, and every handoffHash recomputed equal to its stored value. The canonical lineage gate now exits 0 for the first time in the series -- see AUDIT/lineage-scan.mjs and X11. Recomputed after X12: records 99 -> 101 (X11/out-chain, X12/out), canonical 65 -> 66, canonical chain links resolved 59 -> 60 (X11/out-chain -> X12 resolves on nextBaseSha == X12.baseSha), offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, hash_ok/field_ok 101/101. X12's logs, fixtures and record are force-added with `git add -f` like X01..X11, which contradicts the comment at .gitignore:42-46 ('logs, fixtures, handoffs ... must stay untracked'); the series tracks them so record-reproducibility can prove every declared artifact is in the same tree as the record that vouches for it. scripts/verify-handoff-trail.ts still reports 35 issues at fe83bd89, all standing: FIX-1/FIX-2 evidence absent, 'unplanned-record' for the post-plan-extension units X01..X12 and the FIX-* units, the E02->E03 lineage break and the E07/T09 next-pointer mismatches. Closure log: X12/logs/09-closure-gates.txt. Recomputed after X13: records 101 -> 103 (X12/out-chain, X13/out), canonical 66 -> 67, canonical chain links resolved 60 -> 61, offenders still the two known ones (E02->E03, T09->T10), evidence dangling/untracked 0/0, hash_ok/field_ok 103/103, and the 6 informational orphans unchanged -- X13/out is named by X12/out-chain, so it joins neither the orphan list nor the canonical-link count through an informational parent. X13's logs, fixtures and record are force-added with `git add -f` (the first X13 evidence commit missed them because .gitignore keeps */logs/, */fixtures/ and */out/ untracked; caught by the scan reporting evidence untracked=12, not by assumption).",
     "records_distinct": 99,
     "records_total": 101,
     "required_fields": 15,
@@ -440,7 +444,7 @@
     "scanned_at": "9fa508c5d815bb522371702bbc3a217979514e75",
     "scanner": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
     "schema": "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json",
-    "lineage_gate": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs",
+    "lineage_gate": "AUDIT/lineage-scan.mjs at 6edf4dad: records=107, healthy pointers 267, null-declared 18, broken pointers 30 all covered by the v2 manifest (superseded=8, unresolvable=21, abbreviated=1), exit 0.",
     "lineage_gate_result": "RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation (records=103, fields=3, pointers healthy=262 nullDeclared=17 broken=30 unparseableRecords=0, entries=30 superseded=8 unresolvable=21 abbreviated=1)"
   },
   "series_terminal_record": {
