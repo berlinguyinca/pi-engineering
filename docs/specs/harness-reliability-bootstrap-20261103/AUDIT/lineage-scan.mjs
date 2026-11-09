@@ -37,6 +37,9 @@
 // Fails on:
 //   UNCOVERED      a broken pointer with no manifest entry
 //   STALE          manifest sha/kind/defect no longer matches what the record says
+//                  (a lost object's two spellings -- unreachable_from_any_ref where the object is
+//                   still present, object_missing in a clone of the remote -- are one class:
+//                   see DEFECT_ALIASES, so the gate does not depend on where it is run)
 //   DEFECT_GONE    the pointer healed or the record went missing -- prune or re-add the entry
 //   BAD_REPL       a superseded replacement that is missing or unreachable from the audited ref
 //   BAD_ANNOTATION an annotatedBy that is missing or unreachable, an unresolvable entry that quietly
@@ -59,6 +62,21 @@ const run = (...a) => spawnSync("git", ["-c", "core.quotePath=false", ...a], { e
 const ok = (...a) => run(...a).status === 0;
 const out = (...a) => { const r = run(...a); return r.status === 0 ? r.stdout.trim() : null; };
 const reach = (s) => /^[0-9a-f]{40}$/.test(String(s)) && ok("merge-base", "--is-ancestor", s, ref);
+
+// A lost object declares itself in two spellings, and which one you see depends on where you
+// stand: `unreachable_from_any_ref` in the checkout where the object still exists as a dangling
+// object, `object_missing` in a clone of the remote, where it never arrived. Same SHA, same cause
+// (the per-unit commit was lost), same disposition. They are one defect class, so a declared
+// defect accepts its alias -- otherwise the gate fails on the environment rather than on the
+// repository, which is what made this scan pass in the working checkout and fail in a fresh clone
+// of the same commit. Everything else about the entry is still checked exactly: the SHA, the
+// record's state, the kind, and the annotation/replacement chain.
+const DEFECT_ALIASES = {
+  unreachable_from_any_ref: ["object_missing", "non_fetchable_ref_only"],
+  object_missing: ["unreachable_from_any_ref"],
+  non_fetchable_ref_only: ["unreachable_from_any_ref"],
+};
+const defectMatches = (declared, actual) => declared === actual || (DEFECT_ALIASES[declared] ?? []).includes(actual);
 
 if (!ok("rev-parse", "--git-dir")) { console.error("not a git repository: run this from inside the repository"); process.exit(2); }
 if (!ok("rev-parse", "--verify", ref)) { console.error(`ref not found: ${ref}`); process.exit(2); }
@@ -108,7 +126,7 @@ for (const e of man.entries) {
     continue;
   }
   if (cur.sha !== e.brokenSha) { failures.push({ kind: "STALE", key, manifest: e.brokenSha, actual: cur.sha }); continue; }
-  if (cur.defect !== e.defect) failures.push({ kind: "STALE", key, note: `defect ${e.defect} -> ${cur.defect}` });
+  if (!defectMatches(e.defect, cur.defect)) failures.push({ kind: "STALE", key, note: `defect ${e.defect} -> ${cur.defect}` });
   if (e.kind === "superseded") {
     if (!e.replacement) failures.push({ kind: "BAD_REPL", key, note: "superseded entry has no replacement" });
     else if (!ok("cat-file", "-e", `${e.replacement}^{commit}`)) failures.push({ kind: "BAD_REPL", key, replacement: e.replacement, note: "object missing" });
