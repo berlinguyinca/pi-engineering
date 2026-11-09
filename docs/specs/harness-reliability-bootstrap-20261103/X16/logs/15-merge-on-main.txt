@@ -1,0 +1,27 @@
+X16 log 15 -- merged, and the state of main after the merge
+
+$ gh pr view 653 --json state,mergedAt,mergeCommit
+   state MERGED  mergedAt 2026-11-09T17:41:30Z (09:41 local)  merge commit d00bbb733c40763e80998a8e91bba694f997e7a7
+   subject: fix(audit): the integrity scan reads the 230 records the trail holds, and the trail closes through X16 (#653)
+
+Merged squash, after pipeline 43 went green at 61d1540e -- not through a failing check:
+   pipeline 43 (success) steps: checkout=success, node=success, toolchain=success, install=success, lint=success, typecheck=success, test-unit=success, test-integration=success, smoke=success, roadmap-structural=success, cleanup-venv=success
+
+== the three scans, run at origin/main rather than quoted from the branch
+$ integrity-scan.mjs at d00bbb733c40 -> RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1 | exit=0
+$ lineage-scan.mjs at d00bbb733c40 -> RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation | exit=0
+$ record-reproducibility.mjs at d00bbb733c40 -> RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree | exit=0
+
+$ git ls-tree -r --name-only origin/main docs/specs/harness-reliability-bootstrap-20261103 | wc -l
+   1061 files under the spec directory on main
+
+What the merge closes and what it does not:
+* Closes: the canonical chain has no offenders on main -- 230 records read, 75 canonical, 74 of 75
+  forward links resolved, X16 terminal through X15/out-chain, hash 229/229 plus one declared waiver.
+  X15's terminal state was corrected (E02, FIX-2, FIX-3C, T09, X07, V06, X14) and X16 is the only
+  unnamed link, declared.
+* Does not close: an independent review. The reviewing account is capped until Nov 11th 07:03 and
+  log 10 is this unit checking its own work, labelled as such in the plan and in the PR.
+* Does not close: the trail scans still run in no workflow. Green on #653 came from #654's fix
+  arriving through the merge; a green check is about test-unit/integration/smoke/roadmap, not about
+  the chain.
