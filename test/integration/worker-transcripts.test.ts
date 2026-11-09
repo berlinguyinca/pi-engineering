@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -51,6 +52,12 @@ const WORKER_RESULT = {
   proposed_tasks: [],
 };
 
+/** Request bodies the real server received, in order (reset per run). */
+const sentBodies: Array<{
+  tools?: Array<{ function?: { name?: string } }>;
+  messages?: Array<{ role?: string; content?: unknown }>;
+}> = [];
+
 async function withRun(
   noteText: string,
   env: Record<string, string | undefined>,
@@ -70,9 +77,18 @@ async function withRun(
     toolCalls([{ name: "worker_result", args: WORKER_RESULT }]),
   ];
   let n = 0;
+  sentBodies.length = 0;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    req.resume();
-    req.on("end", () => (replies[n++] ?? ((r: ServerResponse) => r.writeHead(500).end()))(res));
+    const parts: Buffer[] = [];
+    req.on("data", (c: Buffer) => parts.push(c));
+    req.on("end", () => {
+      try {
+        sentBodies.push(JSON.parse(Buffer.concat(parts).toString("utf8")));
+      } catch {
+        // not JSON: nothing to compare against
+      }
+      (replies[n++] ?? ((r: ServerResponse) => r.writeHead(500).end()))(res);
+    });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
@@ -204,5 +220,30 @@ test("transcript: user-role kickoff messages are scrubbed and keyed by missionId
 test("transcript: PiWorkerExecutor.setTranscriptDir overrides the cwd-derived worktree", async () => {
   await withRun("x\n", { TRANSCRIPT_DIR: "mission-wt" }, (_file, stateRoot) => {
     assert.ok(existsSync(join(stateRoot, "worktrees", "mission-wt", "transcripts", "m1", "e1.jsonl")));
+  });
+});
+
+test("transcript: each turn records the tools offered and a sha256 of the system prompt actually sent", async () => {
+  await withRun("hello note\n", {}, (file) => {
+    assert.ok(file);
+    const turns = lines(file).filter((r) => r.kind === "turn");
+    assert.equal(turns.length, sentBodies.length, "one turn record per provider request");
+    assert.ok(turns.length >= 2);
+    for (const [i, turn] of turns.entries()) {
+      const body = sentBodies[i];
+      const offered = (body?.tools ?? []).map((t) => t.function?.name ?? "").sort();
+      assert.ok(offered.includes("read"), "the read tool was offered");
+      assert.deepEqual(turn.offeredTools, offered, "names match the request body, sorted");
+      const system = body?.messages?.find((m) => m.role === "system" || m.role === "developer");
+      assert.equal(typeof system?.content, "string");
+      assert.equal(turn.systemPromptSha256, createHash("sha256").update(String(system?.content)).digest("hex"));
+      assert.match(turn.systemPromptSha256, /^[0-9a-f]{64}$/);
+    }
+    // Content hash only: neither the prompt text nor tool schemas are written.
+    const raw = readFileSync(file, "utf8");
+    const systemText = String(
+      sentBodies[0]?.messages?.find((m) => m.role === "system" || m.role === "developer")?.content,
+    );
+    assert.ok(!raw.includes(systemText.slice(0, 80)), "prompt text never logged");
   });
 });

@@ -131,6 +131,14 @@ steps:
 
   # Never bare `node --test`: git-touching suites need
   # test/support/isolatedState.ts, which the npm scripts import.
+  #
+  # Two different timeouts guard this step, and they are not the same knob. The `timeout 30m` below
+  # reaps the whole step and names nothing. `--test-timeout` inside the npm scripts is per TEST: a
+  # hung test fails naming itself, which is what #581 needed (a `test:unit` sat at zero output for
+  # over an hour, and the log said only that the step died). It is 600s because the suite's slowest
+  # single test measures 87s (`outbox perf: 2000 events stage + deliver end to end`) — a tidy 60s
+  # would fail real tests, on a quiet machine let alone a loaded Slurm exec host. Re-measure before
+  # lowering it.
   - name: test-unit
     image: bash
     environment:

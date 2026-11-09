@@ -423,7 +423,13 @@ test("moving the candidate branch or planting a hook fails the review; ignored o
     assert.equal(existsSync(join(repo, "ignored.log")), false, "new ignored output was removed quietly");
     for (const [command, reason] of [
       ["git tag evil", /git refs changed/],
-      ["echo x > .git/hooks/pre-commit", /hooks or config/],
+      // `mkdir -p` is the point, not decoration: `git init` has not created `.git/hooks` since
+      // git 2.55, so a bare redirect failed with ENOENT, planted nothing, and the guard — seeing
+      // an unchanged (absent) hooks directory — correctly reported no violation. The review then
+      // "succeeded", because `outcome.exitStatus` is the REVIEW's status: a reviewer's failing
+      // command is data, not a failed review. Planting the directory is also the realistic attack
+      // on a modern repository, so this case is stronger than the one it replaces.
+      ["mkdir -p .git/hooks && echo x > .git/hooks/pre-commit", /hooks or config/],
       ["git -c user.name=x -c user.email=x@x commit -q --allow-empty -m s", /HEAD moved/],
     ] as const) {
       const { outcome } = await run(command);

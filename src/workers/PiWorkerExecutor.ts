@@ -149,7 +149,13 @@ import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
 import { ToolLoopDetector, type ToolLoopTrip, toolResultText } from "./toolLoopGuard.ts";
-import { TranscriptWriter, transcriptPath, transcriptsEnabled } from "./transcriptStore.ts";
+import {
+  TranscriptWriter,
+  type TurnExposure,
+  transcriptPath,
+  transcriptsEnabled,
+  turnExposure,
+} from "./transcriptStore.ts";
 import {
   DEFAULT_BUDGET_NOTICE_EVERY,
   NUDGE_MESSAGE,
@@ -1838,6 +1844,9 @@ ${recovery.recoveryPrompt}`;
       }
     }
     let turnToolErrors: string[] = [];
+    // What the model was offered this turn, snapshotted when the turn starts
+    // (the request is built from it) and logged with the turn's record.
+    let turnExposureSnapshot: TurnExposure | undefined;
     const unsubscribe = session.subscribe((event) => {
       armInactivity();
       // Every request is counted as it ends, including a reply Pi later drops.
@@ -1877,6 +1886,8 @@ ${recovery.recoveryPrompt}`;
             isError: Boolean(t.isError),
             errorCategory: category,
           });
+        } else if (t.type === "turn_start") {
+          turnExposureSnapshot = turnExposure(session.systemPrompt, session.getActiveToolNames());
         } else if (t.type === "turn_end") {
           const m = t.message ?? {};
           const toolErrorCategory = turnToolErrors[0] ?? "none";
@@ -1887,7 +1898,9 @@ ${recovery.recoveryPrompt}`;
             stopReason: m.stopReason,
             toolErrorCategory,
             tokens: m.usage?.totalTokens,
+            ...turnExposureSnapshot,
           });
+          turnExposureSnapshot = undefined;
           emitWorkerActivity(req, {
             kind: "state",
             summary: `Turn ended: stop=${m.stopReason ?? "unknown"} tool_error=${toolErrorCategory}`,
