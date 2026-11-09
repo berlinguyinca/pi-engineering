@@ -46,3 +46,66 @@ $ npm run typecheck:core
 > tsc --noEmit
 
 exit=0
+
+# post-commit run at b0a2cf0e (task commit 2eee4d1a + evidence 9790f21c + records b0a2cf0e)
+$ git status --short docs/specs/harness-reliability-bootstrap-20261103
+ M docs/specs/harness-reliability-bootstrap-20261103/X15/logs/06-gates-and-suite.txt
+(one entry: this log, appended by the run itself)
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=73 offenders=0
+superseded-generation links (informational)=25
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 1
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 1
+  M docs/specs/harness-reliability-bootstrap-20261103/X15/logs/06-gates-and-suite.txt
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+ref=HEAD records=117 fields=3
+pointers healthy=300 nullDeclared=21 broken=30 unparseableRecords=0
+healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 3
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+ref=HEAD records=117
+hashes recomputed ok=117 mismatch=0 noHashField=0 unparseable=0
+declared evidence paths=757 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree
+exit=0
+
+$ npm run lint
+
+> pi-engineering-runtime@0.2.0 lint
+> biome check .
+
+Checked 1552 files in 956ms. No fixes applied.
+exit=0
+
+$ npm run typecheck:core
+
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+
+exit=0
+
+$ npm run test:unit
+✔ a COMPLETE mission holding a live ns#mission:MSN-1 lease is kept as lease_live (0.123666ms)
+✔ a detached worktree (branch null) with no registry record is quarantined as unowned (0.078666ms)
+✔ ListedWorktree literals including head compile (0.114292ms)
+✔ TERMINAL_MISSION_STATUSES is the documented set (0.074417ms)
+ℹ tests 6784
+ℹ suites 460
+ℹ pass 6779
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 5
+ℹ todo 0
+ℹ duration_ms 543279.942167
+exit=0

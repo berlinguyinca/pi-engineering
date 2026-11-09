@@ -143,7 +143,7 @@
     "runbook": "docs/specs/harness-reliability-bootstrap/ROLLOUT.md",
     "lint_parity": "docs/specs/harness-reliability-bootstrap-20261103/X13/logs/01-decision-and-scope.txt"
   },
-  "head": "33775a89cd3d17f3b25dcfa320d130af3faeb1fb",
+  "head": "b0a2cf0eeb84062210d5965f2c71a6c55e0f3e41",
   "next_action": "Merge the X15 branch (task/x15-chain-closure -> main): it closes the four canonical chain offenders the trail held and leaves the chain connected end to end (73 forward links resolved, offenders=0, B00/out-backfill as head). What remains is human work the trail cannot close by itself: the unjudged citations X12 recorded for RELEASE-REVIEW.md, the two environment-attributed failures in test/integration/planner-worker-gateway-timeouts.test.ts, 13 records whose citations point at objects no longer reachable, X04/X05/X09/X10's abbreviated lineage spellings, the 96 records whose commands[].exitCode is the string 'PASS' (conformant against handoff.schema.json's own example, but not an integer), and X04's evidence paths whose prefix was mangled in an early commit.",
   "no_handoff_record": [
     "FIX-3 -- not a bootstrap unit and never will be: it is the conductor docs land 24f42fba (131 files, 37 960 insertions), which parseTaskManifest's 100-line ceiling and two-mode union make impossible to admit as a unit (FIX-3/logs/DOCS-COMMIT.md records this at the time). FIX-3B is the unit that continued from that commit; since X15, FIX-2/out-chain names FIX-3B rather than the never-emitted FIX-3."
@@ -468,12 +468,13 @@
     "required_fields_ok": 119,
     "scan_artifact": "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/05-scan-after-records.txt",
     "scan_report": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan-20261106-x09.txt",
-    "scanned_at": "33775a89cd3d17f3b25dcfa320d130af3faeb1fb",
+    "scanned_at": "b0a2cf0eeb84062210d5965f2c71a6c55e0f3e41",
     "scanner": "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
     "schema": "docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json",
     "lineage_gate": "AUDIT/lineage-scan.mjs at the X15 tree: records=109 (out + chain generations scanned), pointers healthy=277, nullDeclared=20, broken=30 all covered by the v2 superseded manifest (entries=30 superseded=8 unresolvable=21 abbreviated=1), unparseableRecords=0; 0 healthy pointers ride local heads only -- the three that did in the X14 note landed with #649.",
     "lineage_gate_result": "RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation",
-    "units_scanned": 74
+    "units_scanned": 74,
+    "post_commit_gates": "X15/logs/06-gates-and-suite.txt at b0a2cf0e: integrity RESULT ok (73 links, offenders=0, exit 0), lineage RESULT ok, record-reproducibility RESULT ok (declared evidence paths=757, absent from HEAD tree=0), lint exit 0, typecheck:core exit 0, test:unit 6784 tests / 460 suites / 6779 pass / 0 fail."
   },
   "series_terminal_record": {
     "handoff_hash": "sha256:93382632c61e976cfe0db74b200dd4f0d8b76494d14d8d3c0c18505ad66d86d0",
