@@ -12,10 +12,13 @@ import { canonicalHash } from "../../../../src/bootstrap/resultGate.ts";
 const ROOT = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
 const SPEC = "docs/specs/harness-reliability-bootstrap-20261103";
 // out-chain > out-final > out-corrected > later correction generations (out2, out3) > out.
-// Generations named *negctl* hold negative-control records: scanned, never canonical.
+// Generations holding negative controls -- *negctl*, out-noparent, out-tampered -- are scanned,
+// never canonical. The two named out-noparent/out-tampered were ranked 2 (above real `out`) until
+// X14, because the only negative-control test was a substring match on "negctl".
+const NEGATIVE_GEN = /^(out-negctl|out-noparent|out-tampered)/;
 const rank = (g) =>
   ({ "out-chain": 5, "out-final": 4, "out-corrected": 3, out: 1 })[g] ??
-  (g.includes("negctl") ? 0.5 : g.startsWith("out") ? 2 : -1);
+  (NEGATIVE_GEN.test(g) ? 0.5 : g.startsWith("out") ? 2 : -1);
 const schema = JSON.parse(readFileSync(join(ROOT, SPEC, "templates/handoff.schema.json"), "utf8"));
 const required = schema.required ?? [];
 const props = schema.properties ?? {};
@@ -58,11 +61,16 @@ for (const { file, rec } of records) {
   if (!tracked.has(file)) untracked.push(`${file} (record itself)`);
 }
 
-// Canonical generation per unit = highest rank; lower ones are immutable history.
+// Canonical generation per unit = the highest-ranked generation that actually holds a record;
+// lower ones are immutable history. A generation directory that exists but is empty must not be
+// allowed to shadow the one carrying the record: negative-control runs leave such directories
+// behind, git does not track empty directories, so they differ between checkouts -- and this scan
+// read a directory listing, so the same committed tree produced a different offender count in two
+// worktrees (X14: 2 beside the trail, 3 on main, the same bytes).
 const canonical = new Map();
 for (const unit of unitDirs) {
-  const chainable = gens(unit).filter((g) => !g.includes("negctl"));
-  const chosen = chainable[0];
+  const chainable = gens(unit).filter((g) => !NEGATIVE_GEN.test(g) && !g.includes("negctl"));
+  const chosen = chainable.find((g) => records.some((r) => r.unit === unit && r.gen === g));
   if (chosen) canonical.set(unit, records.find((r) => r.unit === unit && r.gen === chosen));
 }
 const byTaskBase = new Map(records.map((r) => [`${r.rec.taskId}@${r.rec.baseSha}`, r]));

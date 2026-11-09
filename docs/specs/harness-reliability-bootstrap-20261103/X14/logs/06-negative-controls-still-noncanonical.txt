@@ -1,0 +1,33 @@
+A4 on a synthetic trail, because the real trail cannot carry a populated out-noparent without destroying FIX-2.
+
+Synthetic repo (/tmp/x14-negctl-check, `git init`, src/bootstrap symlinked to the real one so the scanner can import
+canonicalHash, templates/handoff.schema.json copied). One unit, three generation directories:
+
+  A01/out/FIX-2.handoff.json         real record, its forward link FIX-2 -> FIX-3@e77904e73f3c names no record
+  A01/out-noparent/E02.handoff.json  real record, populated, its forward link E02 -> E03@cc036f2f8c3b names no record
+  A01/out-empty/                     empty, rank 2 before the fix -- the shadow class
+
+PRE-FIX (81e229a6 bytes of the scanner):
+  records=2 canonical=1 hash_ok=2 field_ok=2
+  canonical chain links resolved=0 offenders=0
+  superseded-generation links (informational)=2
+  canonical records not named by a canonical parent ...: 0
+
+Both records became non-canonical: the empty A01/out-empty outranked the real `out`, `records.find(...)` found
+nothing there, canonical held undefined, and two genuinely unresolved links were filed as informational history.
+
+POST-FIX (this unit's scanner):
+  records=2 canonical=1 hash_ok=2 field_ok=2
+  canonical chain links resolved=0 offenders=1
+    CHAIN A01/out -> FIX-3@e77904e73f3c (no such record)
+  superseded-generation links (informational)=1
+  canonical records not named by a canonical parent ...: 1
+    ORPHAN docs/specs/harness-reliability-bootstrap-20261103/A01/out/FIX-2.handoff.json
+
+Canonical is now the real generation: the empty shadow is skipped because it holds no record, and the populated
+negative control is skipped by name -- it is still scanned (hash_ok=2, field_ok=2) and its unresolved link is still
+reported, just informationally, which is what a control must do.
+
+On the real trail the same property holds for the generation that was already handled correctly by name:
+E02/out-negctl holds a record, is scanned, and E02/out remains the canonical generation whose link is the reported
+offender (03-, 04-: `CHAIN E02/out -> E03@cc036f2f8c3b`), exactly as before the fix.
