@@ -1,0 +1,62 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X15",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "2eee4d1a9592b839f0dd3eb677dd9d7d8ed8d59b",
+  "resultSha": "9790f21c254d788cc830d047a37781336cfba4f3",
+  "taskAuthorityHash": "sha256:9766e2fb5a7ad9cc8cc855cfc226f9d997becd1328ffc6b9aef9cc2de6ec84f6",
+  "changedFiles": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs"
+  ],
+  "commands": [
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs   # at the task commit, before this unit's records",
+      "exitCode": 1,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/03-scan-at-task-commit.txt"
+    },
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs   # after the six corrected generations",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/05-scan-after-records.txt"
+    },
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs && npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs && npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs && npm run lint && npm run typecheck:core",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/06-gates-and-suite.txt"
+    },
+    {
+      "command": "controls: scanner with the old name pattern restored, and a pointer to a base of all zeros",
+      "exitCode": 1,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/07-negative-controls.txt"
+    },
+    {
+      "command": "python3 docs/specs/harness-reliability-bootstrap-20261103/X15/fixtures/chainsim.py   # before / scanner fixed / scanner fixed + records",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/02-link-simulation-before-after.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/01-scanner-skipped-five-units.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/02-link-simulation-before-after.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/03-scan-at-task-commit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/04-link-truth-table.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/05-scan-after-records.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/06-gates-and-suite.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/07-negative-controls.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/fixtures/chainsim.py",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/fixtures/derive-corrected-generations.mts.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/fixtures/manifest.json"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review) -- this unit closes the offenders #649 left, on the operator's explicit request to fix the missing links and close what needs closing; each correction is a pointer the commits already prove, not a record the trail lacked",
+    "approvedAt": "2026-11-09T06:28:36Z",
+    "notes": "Four offenders and seven unnamed canonical records, where the trail claimed three and six, because the scan had been skipping whole units and had no exit status. Fixed both, then closed what the commits prove: E02 -> FIX-1 (FIX-1/out.baseSha == E02/out.resultSha; E03's base is ba22f28a and FIX-5/out already names E03@ba22f28a), FIX-2 -> FIX-3B (FIX-3 is a conductor docs land that parseTaskManifest cannot admit as a unit; FIX-3B branched from that commit), FIX-3C -> FIX-4A (FIX-3C's own pointer named FIX-4, which the plan split in two), T09 -> R01 (the corrected pointer T09's own TASK_REPORT.md demanded, tracked but never emitted into a generation), X07 -> X08 and V06 -> X01 (both emitted terminal while the trail continued; same as X13/out-chain). Every correction is a new out-chain generation carrying only the corrected pointer -- the record as first emitted stays byte-identical in `out`, and the scan reads generations highest-rank-first, so the superseded pointer is still reported, informationally. B00/out-backfill stays unnamed and that is correct: it is the chain head, reconstructed backwards. After the records: units=73 records=117 canonical=73 hash_ok=117 field_ok=117, 72 canonical forward links resolved, offenders=0, the only unnamed canonical record the chain head, and the scan exits 0 because it now has an exit status. Two controls, both failing: the old name pattern restored produces five SILENT-SKIP lines, 66 links instead of 72, exit 1; a nextBaseSha of all zeros produces a hash mismatch plus a CHAIN offender, exit 1. Out of scope, unchanged: the two planner-worker-gateway-timeouts failures (environment-attributed, still unfixed), 13 records whose citations point at objects no longer reachable, X04/X05/X09/X10's abbreviated lineage spellings, the 96 records whose commands[].exitCode is not an integer (handoff.schema.json's own example is 'PASS', so they are conformant), and X04's evidence paths whose prefix was mangled in an early commit."
+  },
+  "handoffHash": "sha256:93382632c61e976cfe0db74b200dd4f0d8b76494d14d8d3c0c18505ad66d86d0"
+}

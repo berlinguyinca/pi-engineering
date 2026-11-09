@@ -1,0 +1,62 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "E02",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "0cc5b21cb68caacd44bb09cb7a9674c616f02d9b",
+  "resultSha": "cc036f2f8c3b938c80348dff821af77c973fde7b",
+  "taskAuthorityHash": "sha256:99b5f9b276cbcfe50bff26b48166deec935f6b2ca593875d21b9a8596050595b",
+  "changedFiles": [
+    "src/incidents/errorEvent.ts",
+    "test/unit/error-event.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/error-event.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/02-unit-error-event.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/autospec-incident-sink.test.ts test/unit/incident-controller.test.ts test/unit/incidents-fingerprint.test.ts test/unit/security-redaction-regression.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/03-unit-regression.txt"
+    },
+    {
+      "command": "git diff --numstat (before commit: scope and budget — 98 insertions, 1 production file, 1 test file)",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/04-diff-scope.txt"
+    },
+    {
+      "command": "node --experimental-strip-types scripts/bootstrap-one.ts --manifest <E02 manifest> --parent-handoff <E01 handoff> --proofs <proofs> --handoff-record <record> --emit-handoff <out> --cwd <clean worktree at cc036f2f>",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/05-cli-accepted.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/02-unit-error-event.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/03-unit-regression.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/04-diff-scope.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/logs/05-cli-accepted.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/fixtures/manifest-e02.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/fixtures/proofs-e02.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/fixtures/handoff-record.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/04-link-truth-table.txt"
+  ],
+  "nextTaskId": "FIX-1",
+  "nextBaseSha": "cc036f2f8c3b938c80348dff821af77c973fde7b",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T00:00:00Z",
+    "notes": "E01 handoff sha256:2077162a05a98d11dc110bd63c59415aa86b033378843b41934ad18e297bcd89 verified by the CLI before this handoff was emitted. taskAuthorityHash is canonicalHash(parseTaskManifest(manifest-e02.json).manifest) — the spec names the field but never defines its derivation, so the derivation is stated here and in TASK_REPORT.md. Findings recorded for E03/E05: the result gate validates allow/deny and per-file budgets against the working tree only, so a clean-tree run cannot see an out-of-scope commit; writeHandoff still performs no schema validation.\n\nX15 correction: the forward pointer carried by this generation names a record that was never emitted, and the unit that actually continued from this commit is named instead. The correction is a new generation (out-chain); the record as first emitted stays in `out` unchanged, and AUDIT/integrity-scan.mjs reads generations from highest rank down, so the corrected pointer is canonical and the original is reported as a superseded-generation link. Every field not named below is byte-identical to the record it copies; see X15/logs/04-link-truth-table.txt for the commit facts, and X15/logs/01 and 03 for the scanner defect that had hidden part of it (unit ids ending in a letter were skipped outright, and the script had no exit status).\n\nBasis: FIX-1/out.baseSha == E02/out.resultSha (cc036f2f), and E03's base is ba22f28a -- FIX-5's result, already named by FIX-5/out."
+  },
+  "handoffHash": "sha256:817c99a925f5aa3fb2446c98effb370b57f473283e58f4d1338fb3ae161ba702"
+}

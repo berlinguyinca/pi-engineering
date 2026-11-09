@@ -1,0 +1,95 @@
+{
+  "taskId": "X15",
+  "baseSha": "2eee4d1a9592b839f0dd3eb677dd9d7d8ed8d59b",
+  "repoId": "pi",
+  "objective": "Two defects in AUDIT/integrity-scan.mjs had made the series' chain-offender count wrong in the same direction, and #649 closed only the canonical-generation one. Units were selected by ^[A-Z]{1,4}-?\\d{1,2}$, which demands an id ending in digits, so FIX-3B, FIX-3B2, FIX-3C, FIX-4A and FIX-4B were never scanned: their records were not hashed, field-checked, chain-walked or evidence-checked, and the broken link FIX-3B2/out -> FIX-3C@0ddf2771 was invisible outright. The script also never set an exit status, so it printed offenders and exited 0 -- any gate written against it passed with the chain broken. A unit is now any directory under the spec that holds a generation directory; SILENT-SKIP plus a failing exit fires if tracked generation records ever fall outside the scanned set; offences exit 1 with a RESULT line to gate on. Re-scanned with the scanner honest, the tree holds four offenders and seven canonical records no canonical parent named, not three and six. Each offender is closed by a new out-chain generation that changes only the forward pointer, leaving the record as first emitted in `out` untouched: E02 named E03 with a base E03 never had (E03's base is ba22f28a, FIX-5's result, and FIX-5/out already names E03), while the unit that branched from E02's result -- FIX-1 -- was named by nobody; FIX-2 named FIX-3, a conductor docs land of 131 files and 37 960 insertions that parseTaskManifest's 100-line ceiling makes impossible as a bootstrap unit, while FIX-3B, based on that docs land commit, was named by nobody; FIX-3C's record existed but sat outside every generation directory and named FIX-4, which the plan executed as FIX-4A and FIX-4B; T09's corrected record (R01, not the nonexistent T10) likewise sat outside every generation directory. Two records emitted terminal had successors: X07 -> X08 and V06 -> X01, the same situation X13/out-chain was created for.",
+  "allowPaths": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-3C/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/T09/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/X07/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/V06/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/PLAN-COMPLETION.json"
+  ],
+  "denyPaths": [
+    "templates/handoff.schema.json",
+    "package.json",
+    "src/**",
+    "test/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/**/logs/**"
+  ],
+  "commands": [
+    {
+      "id": "cmd1",
+      "argv": [
+        "npx",
+        "tsx",
+        "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd2",
+      "argv": [
+        "npx",
+        "tsx",
+        "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd3",
+      "argv": [
+        "npx",
+        "tsx",
+        "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd4",
+      "argv": [
+        "npm",
+        "run",
+        "lint"
+      ],
+      "timeoutMs": 600000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd5",
+      "argv": [
+        "npm",
+        "run",
+        "typecheck:core"
+      ],
+      "timeoutMs": 600000,
+      "cwd": "repo"
+    }
+  ],
+  "limits": {
+    "maxProductionFiles": 1,
+    "maxTestFiles": 0,
+    "maxChangedLines": 100
+  },
+  "parentHandoffHash": "sha256:b204a11f148a80bdbefea26881fc44891347565e390d9cc4697eaba28856da56",
+  "expectedOutputs": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/out/X15.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/out-chain/X14.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/E02/out-chain/E02.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/out-chain/FIX-2.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-3C/out-chain/FIX-3C.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T09/out-chain/T09.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X07/out-chain/X07.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/V06/out-chain/V06.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/fixtures/manifest.json"
+  ],
+  "mode": "isolated-change"
+}

@@ -1,0 +1,45 @@
+# two controls, run then removed -- neither file is committed
+
+# control 1: put the old name pattern back and see whether the scan notices.
+36:const unitDirs = readdirSync(join(ROOT, SPEC), { withFileTypes: true })
+37-  .filter((d) => d.isDirectory() && /^[A-Z]{1,4}-?\d{1,2}$/.test(d.name))
+38-  .map((d) => d.name)
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/.negctl-oldpattern.mjs
+SILENT-SKIP FIX-3B: tracked generation records exist but the directory is not a scanned unit
+SILENT-SKIP FIX-3B2: tracked generation records exist but the directory is not a scanned unit
+SILENT-SKIP FIX-3C: tracked generation records exist but the directory is not a scanned unit
+SILENT-SKIP FIX-4A: tracked generation records exist but the directory is not a scanned unit
+SILENT-SKIP FIX-4B: tracked generation records exist but the directory is not a scanned unit
+units=70 records=110 canonical=68 hash_ok=110 field_ok=110
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=66 offenders=1
+  CHAIN FIX-2/out-chain -> FIX-3B@24f42fba3f71 (no such record)
+superseded-generation links (informational)=23
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 2
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 7
+  A  docs/specs/harness-reliability-bootstrap-20261103/E02/out-chain/E02.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/FIX-2/out-chain/FIX-2.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/FIX-3C/out-chain/FIX-3C.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/T09/out-chain/T09.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/V06/out-chain/V06.handoff.json
+  A  docs/specs/harness-reliability-bootstrap-20261103/X07/out-chain/X07.handoff.json
+  ?? docs/specs/harness-reliability-bootstrap-20261103/AUDIT/.negctl-oldpattern.mjs
+RESULT offenders=6: 66 canonical forward links resolved
+exit=1
+
+# control 2: a pointer to a base that does not exist, in a generation directory the scanner will read.
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+units=73 records=117 canonical=73 hash_ok=116 field_ok=117
+canonical chain links resolved=71 offenders=1
+  CHAIN E02/out-chain -> FIX-1@000000000000 (no such record)
+RESULT offenders=2: 71 canonical forward links resolved
+exit=1
+
+$ git restore docs/specs/harness-reliability-bootstrap-20261103/E02/out-chain/E02.handoff.json && npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+units=73 records=117 canonical=73 hash_ok=117 field_ok=117
+canonical chain links resolved=72 offenders=0
+RESULT ok: 72 canonical forward links resolved
+exit=0

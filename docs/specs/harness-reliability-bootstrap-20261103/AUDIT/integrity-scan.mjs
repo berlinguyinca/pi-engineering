@@ -22,15 +22,21 @@ const rank = (g) =>
 const schema = JSON.parse(readFileSync(join(ROOT, SPEC, "templates/handoff.schema.json"), "utf8"));
 const required = schema.required ?? [];
 const props = schema.properties ?? {};
-const unitDirs = readdirSync(join(ROOT, SPEC), { withFileTypes: true })
-  .filter((d) => d.isDirectory() && /^[A-Z]{1,4}-?\d{1,2}$/.test(d.name))
-  .map((d) => d.name)
-  .sort();
 const gens = (unit) =>
   readdirSync(join(ROOT, SPEC, unit), { withFileTypes: true })
     .filter((d) => d.isDirectory() && rank(d.name) >= 0)
     .map((d) => d.name)
     .sort((a, b) => rank(b) - rank(a));
+// A unit is any directory under SPEC holding at least one generation directory. The rule is
+// structural, not name-shaped: the previous pattern ^[A-Z]{1,4}-?\d{1,2}$ demanded the id END in
+// digits, so it silently skipped the five units whose ids end with a letter -- FIX-3B, FIX-3B2,
+// FIX-3C, FIX-4A, FIX-4B. Their records were never hashed or field-checked, and the unresolved link
+// FIX-3B2/out -> FIX-3C@0ddf2771 was invisible (FIX-3C's record sat in the unit directory, never in
+// a generation directory): the scan reported offenders=3 where the trail held 4 (X15).
+const unitDirs = readdirSync(join(ROOT, SPEC), { withFileTypes: true })
+  .filter((d) => d.isDirectory() && gens(d.name).length > 0)
+  .map((d) => d.name)
+  .sort();
 
 const records = [];
 for (const unit of unitDirs)
@@ -89,7 +95,23 @@ for (const p of records.filter((r) => r.rec.nextTaskId)) {
 const named = new Set(records.filter(isCanonical).map((p) => `${p.rec.nextTaskId}@${p.rec.nextBaseSha}`));
 const orphans = [...canonical.values()].filter((r) => r && !named.has(`${r.rec.taskId}@${r.rec.baseSha}`));
 
-console.log(`records=${records.length} canonical=${canonical.size} hash_ok=${records.length - hashBad.length} field_ok=${records.length - fieldBad.length}`);
+// Nothing may hold tracked generation records and not be scanned. The name pattern above made that
+// silently possible for five units; this makes it loud, and a failure, whatever the directories are called.
+const skippedUnits = [
+  ...new Set(
+    [...tracked]
+      .map((f) => f.slice(SPEC.length + 1).split("/"))
+      .filter((p) => p.length >= 3 && p[0] !== "AUDIT" && p[2].endsWith(".json") && rank(p[1]) >= 0)
+      .map((p) => p[0])
+      .filter((u) => !unitDirs.includes(u)),
+  ),
+].sort();
+for (const u of skippedUnits)
+  console.log(`SILENT-SKIP ${u}: tracked generation records exist but the directory is not a scanned unit`);
+
+console.log(
+  `units=${unitDirs.length} records=${records.length} canonical=${canonical.size} hash_ok=${records.length - hashBad.length} field_ok=${records.length - fieldBad.length}`,
+);
 console.log(`schema=${SPEC}/templates/handoff.schema.json required=${required.length}`);
 console.log(`canonical chain links resolved=${chainOk.length} offenders=${chainBad.length}`);
 for (const b of chainBad) console.log(`  CHAIN ${b}`);
@@ -101,3 +123,9 @@ for (const u of [...new Set(untracked)].slice(0, 40)) console.log(`  UNTRACKED $
 const dirty = execFileSync("git", ["status", "--short", SPEC], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
 console.log(`working-tree dirty entries under ${SPEC}: ${dirty.length}`);
 for (const d of dirty.slice(0, 20)) console.log(`  ${d}`);
+// Until X15 this script had no exit status at all: it printed offenders and still exited 0, so any
+// CI gate written against it passed while the chain was broken. Offences are now failures.
+const offences = hashBad.length + fieldBad.length + chainBad.length + dangling.length + untracked.length +
+  skippedUnits.length;
+console.log(`RESULT ${offences === 0 ? "ok" : "offenders=" + offences}: ${chainOk.length} canonical forward links resolved`);
+process.exit(offences === 0 ? 0 : 1);

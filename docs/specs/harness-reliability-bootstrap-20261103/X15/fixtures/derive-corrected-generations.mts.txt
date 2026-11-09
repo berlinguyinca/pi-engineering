@@ -1,0 +1,100 @@
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { canonicalHash } from "./src/bootstrap/resultGate.ts";
+
+const R = "docs/specs/harness-reliability-bootstrap-20261103";
+const TASK = "2eee4d1a9592b839f0dd3eb677dd9d7d8ed8d59b"; // X15 task commit (scanner fix)
+const EVID = "9790f21c254d788cc830d047a37781336cfba4f3"; // X15 evidence commit
+const TRUTH = `${R}/X15/logs/04-link-truth-table.txt`;
+const read = (p) => JSON.parse(readFileSync(p, "utf8"));
+const sha = (o) => "sha256:" + createHash("sha256").update(JSON.stringify(o)).digest("hex");
+const patchOf = (path, base) =>
+  "sha256:" +
+  createHash("sha256")
+    .update(execFileSync("git", ["diff", `${base}..${TASK}`, "--", path], { encoding: "utf8", maxBuffer: 1 << 28 }))
+    .digest("hex");
+
+const correction =
+  "X15 correction: the forward pointer carried by this generation names a record that was never emitted, and the" +
+  " unit that actually continued from this commit is named instead. The correction is a new generation" +
+  " (out-chain); the record as first emitted stays in `out` unchanged, and AUDIT/integrity-scan.mjs reads" +
+  " generations from highest rank down, so the corrected pointer is canonical and the original is reported as a" +
+  " superseded-generation link. Every field not named below is byte-identical to the record it copies; see" +
+  " X15/logs/04-link-truth-table.txt for the commit facts, and X15/logs/01 and 03 for the scanner defect that" +
+  " had hidden part of it (unit ids ending in a letter were skipped outright, and the script had no exit status).";
+
+const PLAN = [
+  {
+    unit: "E02",
+    src: `${R}/E02/out/E02.handoff.json`,
+    child: `${R}/FIX-1/out/FIX-1.handoff.json`,
+    nextTaskId: "FIX-1",
+    why: "FIX-1/out.baseSha == E02/out.resultSha (cc036f2f), and E03's base is ba22f28a -- FIX-5's result, already named by FIX-5/out.",
+  },
+  {
+    unit: "FIX-2",
+    src: `${R}/FIX-2/out/FIX-2.handoff.json`,
+    child: `${R}/FIX-3B/out/FIX-3B.handoff.json`,
+    nextTaskId: "FIX-3B",
+    why: "FIX-3 was a conductor docs land (131 files, 37 960 insertions) that parseTaskManifest cannot admit as a unit; FIX-3B branched from the docs land 24f42fba, whose parent is FIX-2's result.",
+  },
+  {
+    unit: "FIX-3C",
+    src: `${R}/FIX-3C/FIX-3C.handoff.json`,
+    child: `${R}/FIX-4A/out2/FIX-4A.handoff.json`,
+    nextTaskId: "FIX-4A",
+    why: "FIX-3C's own pointer named FIX-4, which the plan split into FIX-4A and FIX-4B; FIX-4A/out2.base (74b54eb1) descends from FIX-3C's result 3881178f.",
+  },
+  {
+    unit: "T09",
+    src: `${R}/T09/T09.handoff.json`,
+    child: `${R}/R01/out/R01.handoff.json`,
+    nextTaskId: "R01",
+    why: "T09's corrected record (R01, not T10 -- manifests/tasks.json has 51 tasks and no T10) was tracked but never emitted into a generation.",
+  },
+  {
+    unit: "X07",
+    src: `${R}/X07/out-final/X07.handoff.json`,
+    child: `${R}/X08/out-chain/X08.handoff.json`,
+    nextTaskId: "X08",
+    why: "X07 was emitted terminal; X08/out-chain.base (45d42acb) descends from X07's result 548c2a83.",
+  },
+  {
+    unit: "V06",
+    src: `${R}/V06/out-final/V06.handoff.json`,
+    child: `${R}/X01/out-final/X01.handoff.json`,
+    nextTaskId: "X01",
+    why: "V06 was emitted terminal; X01/out-final.base (900bf8a3) descends from V06's result 05b730fd.",
+  },
+];
+
+const out = [];
+for (const p of PLAN) {
+  const d = read(p.src);
+  const child = read(p.child);
+  d.nextTaskId = p.nextTaskId;
+  d.nextBaseSha = child.baseSha;
+  d.evidence = [...new Set([...d.evidence, TRUTH])];
+  d.operatorApproval = {
+    ...d.operatorApproval,
+    notes: `${d.operatorApproval.notes}\n\n${correction}\n\nBasis: ${p.why}`,
+  };
+  delete d.handoffHash;
+  d.handoffHash = canonicalHash(d);
+  const dir = `${R}/${p.unit}/out-chain`;
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(`${dir}/${p.unit}.handoff.json`, JSON.stringify(d, null, 2) + "\n");
+  out.push({
+    unit: p.unit,
+    copied: p.src,
+    next: `${d.nextTaskId}@${d.nextBaseSha.slice(0, 12)}`,
+    childBaseMatchesChildRecord: d.nextBaseSha === child.baseSha,
+    hash: d.handoffHash,
+    verify: canonicalHash(d) === d.handoffHash,
+    evidenceCount: d.evidence.length,
+    notesBytes: d.operatorApproval.notes.length,
+  });
+}
+
+console.log(JSON.stringify(out, null, 1));

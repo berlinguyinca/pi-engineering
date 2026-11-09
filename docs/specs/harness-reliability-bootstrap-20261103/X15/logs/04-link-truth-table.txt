@@ -1,0 +1,76 @@
+# The truth behind every unresolved canonical forward link and every unnamed canonical record,
+# proved against git rather than asserted. Format: what the parent claims, what actually exists,
+# and the commit facts that decide it.
+
+== offenders ==
+
+[E02/out] names E03@cc036f2f8c3b.
+  E02/out   base 0cc5b21cb68c result cc036f2f8c3b  next E03@cc036f2f8c3b
+  E03/out   base ba22f28a6b54 result a0eca33248a3  next E04@a0eca33248a3
+  FIX-1/out base cc036f2f8c3b result 04846ae2e534  next FIX-2@04846ae2e534
+  git log -1 cc036f2f8c3b: feat(incidents): versioned normalized error occurrence schema (E02)
+  git log -1 ba22f28a6b54: fix(bootstrap): require an accepted parent status (FIX-5)   <-- E03's base is FIX-5's result, not E02's
+  git log -1 cc036f2f8c3b: feat(incidents): versioned normalized error occurrence schema (E02)
+  FIX-1/out.baseSha == E02/out.resultSha: True
+  E02/out.resultSha (cc036f2f8c3b) is ancestor of E03's commit, but E03 was handed off by
+  FIX-5/out, which already names E03@ba22f28a6b54 and resolves. So E02's pointer named the plan's next task with a
+  base that task never had. The commit E02 actually handed over is its own result, and the unit that branched from it is
+  FIX-1 -- which nothing named, so FIX-1 sat orphaned for the whole series.
+  correction: E02/out-chain names FIX-1@cc036f2f8c3b. E02/out is untouched.
+
+[FIX-2/out] names FIX-3@e77904e73f3c.
+  FIX-2/out    base 04846ae2e534 result e77904e73f3c  next FIX-3@e77904e73f3c
+  FIX-3B/out   base 24f42fba3f71 result 22c17b582b3e  next FIX-3B2@22c17b582b3e
+  git log -1 24f42fba3f71: docs(bootstrap): land harness-reliability run state (specs, manifests, handoffs, evidence) e77904e7
+  FIX-3 has no record and no generation directory: FIX-3/ holds HANDOFF.md, logs/ and DOCS-COMMIT.md only.
+  FIX-3/logs/DOCS-COMMIT.md, first lines:
+    | # FIX-3 — land the run state in the repository (conductor commit, NOT a bootstrap unit)
+    | 
+    | Commit `24f42fba3f711dbf62a2c61d58a5545b0234865d` on `harness-reliability-bootstrap-20261103`
+    | (parent `e77904e73f3cffc9bd3bb1c628900d91bff4e020` = FIX-2 result).
+    | 131 files, 37 960 insertions, 0 deletions — all under `docs/specs/harness-reliability-bootstrap-20261103/`
+    | (task specs `00`–`09`, `B00`, `E01`, `E02`, `FIX-1`, `FIX-2`, `manifests/`, `examples/`, `templates/`
+  So FIX-3 was a conductor docs land, deliberately outside the bootstrap contract: parseTaskManifest caps a
+  unit at 100 changed lines and two modes, and that commit is 131 files / 37 960 insertions. A unit that cannot
+  exist by contract cannot emit a record, so the link cannot resolve to one. What did run next is FIX-3B, based on
+  the docs land itself (24f42fba3f71, whose parent is e77904e73f3c = FIX-2's result).
+  correction: FIX-2/out-chain names FIX-3B@24f42fba3f71. FIX-2/out is untouched.
+
+[FIX-3B2/out] names FIX-3C@0ddf27714f80 -- invisible until this unit, because FIX-3C's id ends in a letter.
+  FIX-3B2/out  base 22c17b582b3e result 0ddf27714f80  next FIX-3C@0ddf27714f80
+  FIX-3C (unit directory, never emitted into a generation): base 0ddf27714f80 result 3881178f963d  next FIX-4@3881178f963d
+  FIX-3C/out on disk: (empty) -- git does not store empty directories
+  FIX-4A/out2  base 74b54eb17f51 result 5c5d5a5d6ab8  next FIX-4B@5c5d5a5d6ab8
+  FIX-3C/out-chain base == FIX-3B2/out result: True
+  FIX-3C's own pointer named FIX-4, which the plan never contained: FIX-4 was executed as FIX-4A then FIX-4B.
+  git log -1 74b54eb17f51: chore(repo): keep harness run artifacts untracked so the gate can stamp a clean tree
+  FIX-3C's result 3881178f963d (fix(bootstrap): schema-validate handoffs at stamp time (FIX-3C)) is ancestor of FIX-4A's base
+  correction: FIX-3C/out-chain, the generation FIX-3C never had, next = FIX-4A@74b54eb17f51.
+
+[T09/out] names T10@3bb21ab2e4b4.
+  T09/out                base 11131ece730d result 3bb21ab2e4b4  next T10@3bb21ab2e4b4
+  T09/T09.handoff.json   base 11131ece730d result 3bb21ab2e4b4  next R01@3bb21ab2e4b4  hash sha256:57a2f40ceccf
+  R01/out                base 3bb21ab2e4b4 result 9e508548602b  next R02@9e508548602b
+  manifests/tasks.json: 51 tasks; after T09 comes R01; T10 present: False
+  T09/TASK_REPORT.md: "the first T09 emission recorded nextTaskId: 'T10', which does not exist in
+  manifests/tasks.json (51 tasks; after T09 comes R01). The handoff was re-stamped from a clean detached
+  worktree at the task commit (logs/10, logs/11) so the ledger record is right."  The corrected record is
+  T09/T09.handoff.json, tracked, hash sha256:57a2f40ceccf0b48a01e25e5d4e56700a6668f6ad4eada374f4f78a747ff2524; it was never emitted into a generation, so
+  the canonical T09/out still carries the wrong pointer and R01 sat unnamed.
+  R01/out.baseSha == T09/out.resultSha: True
+  correction: T09/out-chain, next = R01@3bb21ab2e4b4 (the corrected value, unchanged bytes otherwise).
+
+[X07 and V06 were emitted terminal, and the trail continued after them.]
+  X07/out-final terminal (nextTaskId None); X08/out-chain base 45d42acb70fc (Merge remote-tracking branch 'origin/harness-reliability-bootstrap-20261103' into harness-reliability-bootstrap-20261103)
+    X07's result 548c2a83d041 is ancestor of X08's base -- X08 continued from X07.
+    correction: X07/out-chain, next = X08@45d42acb70fc. Same as X13/out-chain, which #649 emitted for the
+    identical situation: a terminal record whose series kept going.
+  V06/out-final terminal (nextTaskId None); X01/out-final base 900bf8a3b10d (docs(bootstrap): back-fill B00-B05 handoff records with evidence re-run at each unit's own commit)
+    V06's result 05b730fd490b is ancestor of X01's base -- the X-series began from V06's result.
+    correction: V06/out-chain, next = X01@900bf8a3b10d.
+
+[B00/out-backfill] stays unnamed on purpose: it is the chain head. The trail was reconstructed backwards
+  from the runtime defects (FIX-*), then back-filled B00-B05 (900bf8a3), so no canonical parent precedes B00.
+
+[FIX-5/out] was listed as an orphan only because FIX-4B was hidden by the unit pattern.
+  FIX-4B/out2 names FIX-5@7f983ee05c0d; FIX-5/out base 7f983ee05c0d -- resolves once FIX-4B is scanned.

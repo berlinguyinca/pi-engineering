@@ -1,0 +1,70 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "FIX-2",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "04846ae2e5346cce8729994d96e870fe2f56015f",
+  "resultSha": "e77904e73f3cffc9bd3bb1c628900d91bff4e020",
+  "taskAuthorityHash": "sha256:a7d0b785266d56bc6a4125e3e615e986a931c669b33e267bf0961c6fdc7a54f1",
+  "changedFiles": [
+    "scripts/bootstrap-one.ts",
+    "test/unit/bootstrap-one.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-one.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/02-unit-bootstrap-one.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-diff-guard.test.ts test/unit/bootstrap-result-gate.test.ts test/unit/bootstrap-package.test.ts test/unit/bootstrap-path-policy.test.ts test/unit/bootstrap-task-manifest.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/03-unit-bootstrap-regression.txt"
+    },
+    {
+      "command": "node scripts/bootstrap-one.ts --manifest <manifest-fix2.json> --handoff-record <record> --emit-handoff <out> --cwd <clean worktree at e77904e7> (no --parent-handoff)",
+      "exitCode": 5,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/04-stamp-missing-parent.txt"
+    },
+    {
+      "command": "node scripts/bootstrap-one.ts … --parent-handoff <tampered copy of FIX-1.handoff.json> …",
+      "exitCode": 5,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/05-stamp-tampered-parent.txt"
+    },
+    {
+      "command": "node scripts/bootstrap-one.ts … --parent-handoff FIX-1.handoff.json … (real chain)",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/06-stamp-parent-accepted.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/02-unit-bootstrap-one.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/03-unit-bootstrap-regression.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/04-stamp-missing-parent.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/05-stamp-tampered-parent.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/logs/06-stamp-parent-accepted.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/manifest-fix2.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/proofs-fix2.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/handoff-record.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/HANDOFF.md",
+    "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/WORKER_REPORT.md",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/04-link-truth-table.txt"
+  ],
+  "nextTaskId": "FIX-3B",
+  "nextBaseSha": "24f42fba3f711dbf62a2c61d58a5545b0234865d",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-04T04:05:00Z",
+    "notes": "Worker pane fix2 (same model metabolomics/qwen3.8-flash_next); conductor re-ran every check. This handoff is the first in the chain whose parent was cryptographically verified at stamp time by the fixed code itself (FIX-1.handoff.json sha256:942da49b0ab334eacf3164210b6c303c8a02d3103914599bb7250cefbc2f7586). Remaining gaps handed to FIX-3/FIX-5: writeHandoff performs no schema validation and needs its output dir to exist; the parent's status field is not checked, so a BLOCKED parent would still be accepted.\n\nX15 correction: the forward pointer carried by this generation names a record that was never emitted, and the unit that actually continued from this commit is named instead. The correction is a new generation (out-chain); the record as first emitted stays in `out` unchanged, and AUDIT/integrity-scan.mjs reads generations from highest rank down, so the corrected pointer is canonical and the original is reported as a superseded-generation link. Every field not named below is byte-identical to the record it copies; see X15/logs/04-link-truth-table.txt for the commit facts, and X15/logs/01 and 03 for the scanner defect that had hidden part of it (unit ids ending in a letter were skipped outright, and the script had no exit status).\n\nBasis: FIX-3 was a conductor docs land (131 files, 37 960 insertions) that parseTaskManifest cannot admit as a unit; FIX-3B branched from the docs land 24f42fba, whose parent is FIX-2's result."
+  },
+  "handoffHash": "sha256:3a842fbd81d6978e9985b7a8a96d9344caa55995d833a6ebf0705c4f110ac29d"
+}
