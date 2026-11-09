@@ -1429,7 +1429,20 @@ export class EngineeringRuntime {
     await mkdir(workDir, { recursive: true });
     await ensureStateDirIgnored(workDir);
     const ledger = await Ledger.create(join(workDir, "ledger.jsonl"));
-    const artifacts = await ArtifactStore.create(join(workDir, "artifacts"));
+    const artifactsDir = join(workDir, "artifacts");
+    const artifacts = await ArtifactStore.create(artifactsDir, {
+      // Audit trail for the one identity field that is allowed to move: the
+      // device stamp. The store has already proven inode + ownership + domain
+      // token continuity, so this is informational — but an operator (and a
+      // support report) should be able to see that the mount generation changed
+      // under a long-lived store rather than wonder why the record moved.
+      afterLockDomainRestamped: (info) => {
+        console.warn(
+          `[pi-engineering] Artifact lock domain moved to a new mount generation (device ${info.from} -> ${info.to}, ` +
+            `inode ${info.inode} and domain token unchanged); re-stamped ${join(artifactsDir, ".artifact-lock-domain.json")}.`,
+        );
+      },
+    });
     const broker = await ContextBroker.open(repoRoot);
     const rt = new EngineeringRuntime(opts);
     rt.ledger = ledger;

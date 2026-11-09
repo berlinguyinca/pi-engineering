@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { type LockDomainHealth, inspectLockDomainStore, repairLockDomainStore } from "../../artifacts/lockDomain.ts";
 import { RecoveryManager } from "./RecoveryManager.ts";
 import { RuntimeRegistry } from "./RuntimeRegistry.ts";
 import { openRegistryWithRecovery } from "./RuntimeSession.ts";
@@ -223,6 +224,32 @@ export async function runDoctor(options: {
     repairable: 0,
   });
 
+  // ── artifact lock domain ──
+  // `st_dev` is a mount-generation stamp, not identity: an APFS volume rollover
+  // (OS update, restore, `/pie update`) regenerates it while the inode,
+  // ownership and domain token stay put. ArtifactStore re-stamps that itself
+  // when it opens, so a healthy store reports ok here; the check exists to name
+  // the reason when a store *cannot* open and to repair only what continuity
+  // proves.
+  const artifactsDir = join(identity.worktreeRoot, ".pi-eng", "artifacts");
+  let lockDomain: LockDomainHealth;
+  try {
+    lockDomain = await inspectLockDomainStore(artifactsDir);
+  } catch (error) {
+    lockDomain = {
+      status: "unsafe",
+      code: "LOCK_DOMAIN_RECORD_CORRUPT",
+      detail: `${artifactsDir}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  const lockDomainCheck: DoctorCheck =
+    lockDomain.status === "stale_device"
+      ? { name: "Artifact lock domain", status: "warn", detail: lockDomain.detail, repairable: 1 }
+      : lockDomain.status === "unsafe"
+        ? { name: "Artifact lock domain", status: "fail", detail: lockDomain.detail, repairable: 0 }
+        : { name: "Artifact lock domain", status: "ok", detail: lockDomain.detail, repairable: 0 };
+  checks.push(lockDomainCheck);
+
   // ── legacy migration / legacy lock ──
   const legacyFile = join(identity.worktreeRoot, ".pi-eng", "orchestration.jsonl");
   if (existsSync(legacyFile)) {
@@ -312,6 +339,24 @@ export async function runDoctor(options: {
         repaired.push(`moved stale legacy lock to ${target}`);
       } catch {
         // Gone already or not movable; reported again next run.
+      }
+    }
+    if (lockDomain.status === "stale_device") {
+      try {
+        const note = await repairLockDomainStore(artifactsDir);
+        if (note) {
+          repaired.push(note);
+          const after = await inspectLockDomainStore(artifactsDir).catch(() => lockDomain);
+          lockDomainCheck.status = after.status === "ok" ? "ok" : "warn";
+          lockDomainCheck.repairable = after.status === "ok" ? 0 : 1;
+          lockDomainCheck.detail = after.status === "ok" ? `${after.detail} (re-stamped)` : lockDomain.detail;
+        } else {
+          lockDomainCheck.detail = `${lockDomain.detail} (re-stamp refused: the record moved while repairing; run again)`;
+        }
+      } catch (error) {
+        repaired.push(
+          `artifact lock domain re-stamp failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
     // Re-evaluate what remains after repair.

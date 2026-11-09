@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
@@ -1108,6 +1108,223 @@ test("deleting the final lock record cannot authorize a replacement while the ol
     rmSync(join(root, ".artifact-lock-domain.json"));
     await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root.*(?:unproven|bootstrap)/i);
     await assert.rejects(() => first.put("logs", "blocked", "bytes", "blocked"), /artifact integrity.*lock root/i);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * `st_dev` names the mount a path was resolved through, not the storage object.
+ * macOS regenerates it whenever the APFS volume generation changes — an OS
+ * update, a restore, or `/pie update` — which left every existing store stamped
+ * with a device no longer in use and the runtime answering `Orchestrator not
+ * initialized`. These tests move the stamp the way a remount does (same inode,
+ * same ownership, same domain token) and assert the store heals, and that a
+ * change proven to be anything else is still refused without rewriting the
+ * record that proves it.
+ */
+
+interface DurableDomain {
+  version: number;
+  token: string;
+  device: string;
+  inode: string;
+}
+
+async function domainOf(root: string): Promise<DurableDomain> {
+  return JSON.parse(await readFile(join(root, ".artifact-lock-domain.json"), "utf8")) as DurableDomain;
+}
+
+async function stampDeviceOf(root: string, device: bigint): Promise<void> {
+  const recordPath = join(root, ".artifact-lock-domain.json");
+  const record = await domainOf(root);
+  await writeFile(recordPath, `${JSON.stringify({ ...record, device: device.toString() })}\n`);
+}
+
+function liveLockRoot(root: string): { dev: bigint; ino: bigint } {
+  const stat = lstatSync(join(root, ".artifact-locks"), { bigint: true });
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+test("a new mount generation re-stamps the device stamp instead of refusing the store", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-mount-generation-"));
+  try {
+    const root = join(dir, "artifacts");
+    const first = await ArtifactStore.create(root);
+    await first.put("logs", "before", "survives a remount", "before");
+    const stamped = await domainOf(root);
+    const live = liveLockRoot(root);
+    assert.equal(stamped.device, live.dev.toString());
+    await stampDeviceOf(root, live.dev + 1n);
+
+    const restamped: Array<{ from: bigint; to: bigint; reason: string }> = [];
+    const reopened = await ArtifactStore.create(root, {
+      afterLockDomainRestamped: (info) => restamped.push({ from: info.from, to: info.to, reason: info.reason }),
+    });
+    assert.deepEqual(restamped, [{ from: live.dev + 1n, to: live.dev, reason: "mount_generation" }]);
+    assert.equal(await reopened.readContent("logs", "before"), "survives a remount");
+
+    const healed = await domainOf(root);
+    assert.equal(healed.device, live.dev.toString(), "the stamp follows the live mount generation");
+    assert.equal(healed.inode, stamped.inode, "identity fields are untouched");
+    assert.equal(healed.token, stamped.token, "identity fields are untouched");
+
+    await reopened.put("logs", "after", "writes still work", "after");
+    assert.equal(await reopened.readContent("logs", "after"), "writes still work");
+    // A third open needs no further repair: the stamp is stable now.
+    const third = await ArtifactStore.create(root, {
+      afterLockDomainRestamped: () => assert.fail("a healed store must not re-stamp again"),
+    });
+    assert.equal(await third.readContent("logs", "after"), "writes still work");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a device change whose domain token belongs to another store is refused and never rewritten", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-mount-generation-token-"));
+  try {
+    const root = join(dir, "artifacts");
+    await ArtifactStore.create(root);
+    const live = liveLockRoot(root);
+    const recordPath = join(root, ".artifact-lock-domain.json");
+    const foreign = { version: 1, token: randomUUID(), device: (live.dev + 1n).toString(), inode: live.ino.toString() };
+    await writeFile(recordPath, `${JSON.stringify(foreign)}\n`);
+    const before = await readFile(recordPath, "utf8");
+    await assert.rejects(
+      () => ArtifactStore.create(root),
+      /artifact integrity.*lock root identity changed.*(?:domain token|another store)/i,
+    );
+    assert.equal(await readFile(recordPath, "utf8"), before, "a refused identity is never rewritten");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a device change on a substituted lock directory is refused as an inode change", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-mount-generation-inode-"));
+  try {
+    const root = join(dir, "artifacts");
+    await ArtifactStore.create(root);
+    const live = liveLockRoot(root);
+    const recordPath = join(root, ".artifact-lock-domain.json");
+    const stamped = await domainOf(root);
+    // A copied lock root carries the token but is a different inode: that is a
+    // substitution, and the device drift must not disguise it.
+    await writeFile(
+      recordPath,
+      `${JSON.stringify({ ...stamped, device: (live.dev + 1n).toString(), inode: (live.ino + 1n).toString() })}\n`,
+    );
+    const before = await readFile(recordPath, "utf8");
+    await assert.rejects(() => ArtifactStore.create(root), /artifact integrity.*lock root identity changed.*inode/i);
+    assert.equal(await readFile(recordPath, "utf8"), before);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a device change with no domain token inside the lock root proves nothing and is refused", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-mount-generation-no-token-"));
+  try {
+    const root = join(dir, "artifacts");
+    await ArtifactStore.create(root);
+    const live = liveLockRoot(root);
+    rmSync(join(root, ".artifact-locks", ".domain-token"));
+    const recordPath = join(root, ".artifact-lock-domain.json");
+    await stampDeviceOf(root, live.dev + 1n);
+    const before = await readFile(recordPath, "utf8");
+    await assert.rejects(
+      () => ArtifactStore.create(root),
+      /artifact integrity.*lock root identity changed.*no readable domain token/i,
+    );
+    assert.equal(await readFile(recordPath, "utf8"), before);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a bound bootstrap marker stamped before a mount generation still recovers the domain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-mount-generation-bootstrap-"));
+  try {
+    const root = join(dir, "artifacts");
+    const store = await ArtifactStore.create(root);
+    await store.put("logs", "kept", "crash spans the reboot", "kept");
+    const stamped = await domainOf(root);
+    const live = liveLockRoot(root);
+    // The crash window that spans a reboot: the bound marker is the only durable
+    // authority, and it was written on the previous mount generation.
+    rmSync(join(root, ".artifact-lock-domain.json"));
+    await writeFile(
+      join(root, ".artifact-lock-bootstrap.json"),
+      `${JSON.stringify({
+        version: 1,
+        phase: "bound",
+        token: stamped.token,
+        device: (live.dev + 1n).toString(),
+        inode: live.ino.toString(),
+      })}\n`,
+    );
+    const recovered = await ArtifactStore.create(root);
+    assert.equal(await recovered.readContent("logs", "kept"), "crash spans the reboot");
+    const healed = await domainOf(root);
+    assert.equal(healed.device, live.dev.toString());
+    assert.equal(healed.token, stamped.token);
+    await assert.rejects(() => readFile(join(root, ".artifact-lock-bootstrap.json")), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a bound bootstrap marker with a foreign token on a new device is still refused", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-mount-generation-bootstrap-token-"));
+  try {
+    const root = join(dir, "artifacts");
+    // A live store keeps the domain it published; the marker below claims a
+    // different one.
+    await ArtifactStore.create(root);
+    const live = liveLockRoot(root);
+    rmSync(join(root, ".artifact-lock-domain.json"));
+    await writeFile(
+      join(root, ".artifact-lock-bootstrap.json"),
+      `${JSON.stringify({
+        version: 1,
+        phase: "bound",
+        token: randomUUID(),
+        device: (live.dev + 1n).toString(),
+        inode: live.ino.toString(),
+      })}\n`,
+    );
+    await assert.rejects(
+      () => ArtifactStore.create(root),
+      /artifact integrity.*bootstrap identity changed.*(?:domain token|does not match)/i,
+    );
+    // Refusing means refusing: nothing is published on the strength of a marker
+    // whose token the lock directory does not carry.
+    await assert.rejects(() => readFile(join(root, ".artifact-lock-domain.json")), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("two openers racing a mount generation converge on one re-stamped domain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-eng-art-mount-generation-race-"));
+  try {
+    const root = join(dir, "artifacts");
+    const first = await ArtifactStore.create(root);
+    await first.put("logs", "shared", "both openers read this", "shared");
+    const stamped = await domainOf(root);
+    const live = liveLockRoot(root);
+    await stampDeviceOf(root, live.dev + 1n);
+
+    const [a, b] = await Promise.all([ArtifactStore.create(root), ArtifactStore.create(root)]);
+    assert.equal(await a.readContent("logs", "shared"), "both openers read this");
+    assert.equal(await b.readContent("logs", "shared"), "both openers read this");
+    const healed = await domainOf(root);
+    assert.equal(healed.device, live.dev.toString());
+    assert.equal(healed.token, stamped.token);
+    assert.equal(healed.inode, stamped.inode);
+    await Promise.all([a.put("logs", "a", "from a", "a"), b.put("logs", "b", "from b", "b")]);
+    assert.equal(await a.readContent("logs", "b"), "from b");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
