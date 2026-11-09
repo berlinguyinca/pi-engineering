@@ -159,6 +159,64 @@ In order — 1 and 2 are the gate; 3 is the audit that tells you whether the res
   carries at `d44672d4`/`fc471225`) should be deleted once you agree they are superseded; nothing
   has been deleted by this review.
 
+## Corrections, 2026-11-09, measured at `main` = `e008b3dc`
+
+This section is additive. The verdict above is a point-in-time judgement and is left standing; three
+of its disqualifiers were measured again today and two of them no longer hold, in detail, so that
+anyone reading the verdict knows which parts still do.
+
+1. **"The repository's own gate cannot be evaluated. `npm test` never terminates."** -- **no longer
+   true for the named files.** `test/integration/mission-interrupt-pause.test.ts` and
+   `test/integration/mission-merge-queue-flow.test.ts` were split into bounded files (#636, #640,
+   #641, #643, #645, #646, #647, #648, #649, #651) and the Woodpecker pipeline's `test-integration`
+   step now runs to completion and passes -- pipelines **41, 43, 44, 45** report every step
+   (`install`, `lint`, `typecheck`, `test-unit`, `test-integration`, `smoke`, `roadmap-structural`) as
+   `success` **[ci-log]**. The remaining hang class in `test:unit` was cross-file shared state in
+   `src/verify/testResultCache.ts` (#627) and was fixed by making the cache host-aware (#654,
+   `64cae00b`) **[ci-log]**.
+2. **"Every suite run that did produce an answer was red."** -- **no longer true, with one
+   qualification that is itself a finding.** A green whole-suite run is now recorded twice: by CI (the
+   pipelines above **[ci-log]**), and locally at `d00bbb73` where `npm run test:unit` completes with a
+   final tally -- **460 files, 6789 tests, 0 fail, 5 skipped**, exit 0, in about 400 s **[now]**. One
+   failure mode was found since and is fixed in an open PR: `repoFingerprint` trusted `git add`'s stat
+   cache, so an edit landing inside the same filesystem tick left `treeHash` stale and
+   `test/unit/verify-test-result-cache.test.ts` failed determinism on Linux (pipeline 48 at
+   `e008b3dc`, reproducible on any coarse-tick filesystem) -- PR **#658**.
+
+   The qualification, measured at `e008b3dc` on this laptop **[now]**: `npm run test:integration` on
+   the machine's default **Node v26.3.0** answers **1185 tests, 1182 pass, 3 fail**, exit 1 -- so the
+   suite is *not* green on every runtime, only on the pinned one. The same files on **v22.22.3** (the
+   family CI pins, `NODE_VER=22.23.4` in `.woodpecker/ci.yaml:61`) answer 16 tests, 0 fail, exit 0:
+
+   * `test/integration/planner-worker-gateway-timeouts.test.ts:35` -- both its tests die in
+     `new Dispatcher1Wrapper` with `InvalidArgumentError: Argument dispatcher must implement
+     dispatch`, i.e. Node 26's bundled undici rejects the dispatcher the test installs;
+   * `test/integration/planner-worker-executor.test.ts:110` -- `independent contracts must run
+     concurrently (max in flight 1)`, an assertion about scheduling that passes on v22.
+
+   The two files this review named as unterminating were also run alone, on v26: **18 tests, 0 fail,
+   exit 0** -- the hang class is gone on both runtimes. What replaces the old finding is narrower and
+   still worth someone's attention: the suite is green on the runtime CI pins and red on a newer one,
+   and nothing in the repository says so -- `package.json` declares no `engines` field, so a contributor
+   on Node 26 gets three red tests and no hint that the pinned runtime is the contract.
+3. **"No human approved anything."** -- **unchanged.** Nothing here adds a signature or an independent
+   validator, and the trail's own independent review is still absent: the reviewing account reports a
+   usage ceiling until 2026-11-11 07:03, so #653/#656 are self-verified and labelled so.
+
+Citations in the review above that do not resolve, corrected today **[now]**:
+
+* `AUDIT/lineage-allowlist.json` **does not exist** and never was committed (`git log --all
+  --diff-filter=A` finds nothing on any ref). The tracked declaration file is
+  **`AUDIT/lineage-superseded.json`**, 30 entries. The same dangling name is also carried by
+  `PLAN-COMPLETION.json`'s `next_action` and by `X16/logs/12-closing-state.txt` -- the latter was
+  written today by the unit that is supposed to prevent exactly this, and is corrected with the rest.
+* The trail gates do not share one record denominator, and reading them as one overstates coverage:
+  **160** tracked `*.handoff.json` files (what `record-reproducibility.mjs` recomputes, after #660
+  widened it from 119), versus **230** in `integrity-scan.mjs`, which counts any `*handoff*.json`
+  (231 such files: 121 in generation directories, 41 in unit directories, 68 elsewhere). Neither
+  number is wrong; `lineage-scan.mjs` walks **generation records only**, so **41 of the 160 records
+  are outside its pointer check** -- that gap is open work, not coverage.
+
 ## Re-check commands
 
 ```sh
@@ -166,5 +224,6 @@ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs HE
 node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs   # expect: RESULT ok, exit 0
 npm run typecheck                                                                          # expect: exit 0
 node --test --test-concurrency=1 --import ./test/support/isolatedState.ts \
-  test/integration/mission-interrupt-pause.test.ts                                    # expect: hangs (exit 124) until blocker 1 lands
+  test/integration/mission-interrupt-pause.test.ts                                    # 2026-11-09: exits 0; the hang above is resolved [now]
+node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs       # expect: RESULT ok, exit 0 -- full clone (a shallow one makes lineage-scan exit 2 saying so)
 ```
