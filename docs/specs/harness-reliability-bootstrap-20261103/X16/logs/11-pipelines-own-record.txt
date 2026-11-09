@@ -1,0 +1,96 @@
+X16 log 11 -- the pipeline's own record, read from its API, and what it says about #653
+
+Log 09 stopped at 'the step log is not readable from here'. That was wrong in the direction of giving up:
+the API answers unauthenticated GETs on the numeric-repo path. What did not answer is the owner/name form
+-- every /api/repos/berlinguyinca/pi-engineering/... request returns the web app's HTML -- and the
+pipelines-by-owner form. What does answer, with no token:
+  GET https://ci.metabolomics.us/api/repos/121/pipelines                    -> 200 application/json
+  GET https://ci.metabolomics.us/api/repos/121/pipelines/<n>                -> 200 application/json (workflows + children)
+  GET https://ci.metabolomics.us/api/repos/121/logs/<pipeline>/<step_id>    -> 200 application/json (base64 per line)
+
+== the whole history of this pipeline, 21 pipelines, not one green
+$ curl .../api/repos/121/pipelines | count by status: {'failure': 20, 'canceled': 1}
+   #26  pull_request failure   ad83df4bb16e  fix(audit): the integrity scan reads the 230 r
+   #24  pull_request failure   9b3111c84464  fix(audit): the integrity scan reads the 230 r
+   #23  pull_request canceled  4cb44fb9f57e  fix(audit): the integrity scan reads the 230 r
+   #22  pull_request failure   d62d9c6e347d  fix(audit): the integrity scan reads the 230 r
+   #21  push         failure   02e4c1fa0f47  (push)
+   #20  pull_request failure   278c1891cb73  ci: provision a pinned, checksummed Node in th
+   #19  push         failure   46a7109b5aed  (push)
+   #17  pull_request failure   8c4dc030d69c  fix(audit): the integrity scan skipped five un
+   ... down to #1 (manual, failure). 20 failures and 1 cancellation since the pipeline exists; #23 was
+      cancelled by a newer push to this branch, not by the runner.
+
+== the step that fails, on #653 and on main's own push, is the same step
+$ GET /api/repos/121/pipelines/26   (PR #653 head)
+   checkout             success  exit=0
+   node                 success  exit=0
+   toolchain            success  exit=0
+   install              success  exit=0
+   lint                 success  exit=0
+   typecheck            success  exit=0
+   test-unit            failure  exit=1
+   test-integration     skipped  exit=0
+   smoke                skipped  exit=0
+   roadmap-structural   skipped  exit=0
+   cleanup-venv         success  exit=0
+
+$ GET /api/repos/121/pipelines/21   (main push 02e4c1fa)
+   checkout             success  exit=0
+   node                 success  exit=0
+   toolchain            success  exit=0
+   install              success  exit=0
+   lint                 success  exit=0
+   typecheck            success  exit=0
+   test-unit            failure  exit=1
+   test-integration     skipped  exit=0
+   smoke                skipped  exit=0
+   roadmap-structural   skipped  exit=0
+   cleanup-venv         success  exit=0
+
+Both: checkout, node, toolchain, install, lint, typecheck succeed; test-unit fails with exit 1;
+test-integration, smoke and roadmap-structural are skipped because the failed step stops the workflow;
+cleanup-venv runs and succeeds. So the pipeline never reaches the steps this unit's PR body named as
+'the ones CI will run' -- which is a third thing #653's body overstates, in the same direction as the
+two claims log 08 retracts: the body says CI will run test:integration, test:e2e and roadmap:structural,
+and on the current main it does not reach them.
+
+== the four failing tests, identical on main and on #653
+$ GET /api/repos/121/logs/26/38268 and /api/repos/121/logs/21/38086, decoded, grep '^not ok'
+   pipeline 26 (PR #653): not ok 231 - test/unit/live-handoff-rpc.test.ts, not ok 3391 - a state dir too deep for sun_path still gets a working c, not ok 4456 - workspace authority corpus (PR \#106 final reviews), not ok 4499 - terminal owner: worktree reclaimed, uncommitted work pre
+   summary: # tests 6773, # pass 6766, # fail 4, # skipped 3
+   pipeline 21 (main 02e4c1fa): not ok 231 - test/unit/live-handoff-rpc.test.ts, not ok 3391 - a state dir too deep for sun_path still gets a working c, not ok 4456 - workspace authority corpus (PR \#106 final reviews), not ok 4499 - terminal owner: worktree reclaimed, uncommitted work pre
+   summary: # tests 6773, # pass 6766, # fail 4, # skipped 3
+   same set of four: True
+
+What each one says when it fails (pipeline 26):
+   231 - test/unit/live-handoff-rpc.test.ts
+      error: 'test failed'
+   3391 - a state dir too deep for sun_path still gets a working control socket (
+      error: "ENOENT: no such file or directory, mkdir '/run/user/298907/pi-sc-hash-82cdb046c18e'"
+   4456 - workspace authority corpus (PR \#106 final reviews)
+      error: '1 subtest failed'
+   4499 - terminal owner: worktree reclaimed, uncommitted work preserved on its b
+      error: 'The "path" argument must be of type string. Received null'
+
+   read against the host: the runner is a Slurm exec host, its workspace is
+   /tmp/woodpecker-local-<n>/workspace, and two of the four fail on `mkdir`/`mkdtemp` under
+   /run/user/<uid> -- a directory that does not exist there. One asserts a refusal for `Fix
+   ~/pi-eng-repo-that-does-not-exist-7f3a` and gets none; one passes null to `path.join` in
+   worktree-janitor.test.ts:86, where a worktree's branch comes back null. None of the four touches
+   docs/specs/, and #653 changes nothing under src/ or test/.
+
+== what this means for #653, stated narrowly
+* #653's red check is not evidence about #653: main's own tip fails the same step with the identical four
+  tests, and the pipeline has reported no success in 21 runs.
+* #653 cannot be green until those four unit tests pass on a Slurm exec host, or the pipeline stops
+  running them there. That is harness work, not this unit's: `git diff --name-only origin/main...HEAD`
+  is the scanner, the declaration file, the plan, X15/out-chain, X16 and nothing under src/ or test/.
+* Log 09's sentence 'the step log is not readable from here' is superseded by the first lines of this log.
+
+(One more correction, small and in the same class: log 10's P6 line prints
+ docs/specs/harness-reliability-bootstrap-20261103/AUDIT/chain-declaration.json as 'outside the
+ scanner, the declarations, the plan'. It is the declarations file; the allow-list in log 10's own
+ script spelled it chain-declarations.json, and every one of the 29 citations in the spec tree spells it
+ chain-declaration.json, singular. The check flagged its own typo, which is what a check is for, but the
+ sentence as printed reads as though a stray file had been added. It did not.)
