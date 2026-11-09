@@ -1,6 +1,7 @@
 /** Same-user, same-host status channel for one live PI process instance. */
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { accessSync, constants, statSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { type Server, type Socket, createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -163,6 +164,17 @@ function shortSocketRoot(): string {
   // and anything longer is not a runtime dir worth trusting with the socket anyway.
   const xdg = process.env.XDG_RUNTIME_DIR;
   if (!xdg?.startsWith("/") || xdg.includes("\0") || Buffer.byteLength(xdg) > 30) return "/tmp";
+  // Shape is not existence. A Slurm exec host inherits XDG_RUNTIME_DIR=/run/user/<uid>
+  // from pam_systemd without the directory ever being created (no user slice), and
+  // `mkdir` of a child of it fails ENOENT — so the control socket could never start, on
+  // exactly the host class this fallback exists to survive. Ask the filesystem: a
+  // directory that is there and writable, or /tmp.
+  try {
+    if (!statSync(xdg).isDirectory()) return "/tmp";
+    accessSync(xdg, constants.W_OK);
+  } catch {
+    return "/tmp";
+  }
   return xdg;
 }
 
