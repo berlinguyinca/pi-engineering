@@ -27,7 +27,8 @@ The 29 break down as `baseSha` 7, `resultSha` 7, `nextBaseSha` 15 — of which 2
 
 **Why nothing was re-stamped.** `handoffHash` is the SHA-256 over deterministic sorted-key UTF-8
 serialisation of the record excluding `handoffHash` itself — `02-HANDOFF-PROTOCOL.md:15`,
-implemented as `canonicalHash` at `src/bootstrap/resultGate.ts:15`. It binds the pointers to the
+implemented as `canonicalHash` at `src/bootstrap/resultGate.ts:30` (it was line 15 until X13 reformatted that
+file to make `npm run lint` pass). It binds the pointers to the
 record's log paths and proof hashes, so editing one silently decouples an accepted record from the
 logs it vouches for. The breaks are declared in `lineage-superseded.json` instead, and the gate
 re-verifies every entry live on every run.

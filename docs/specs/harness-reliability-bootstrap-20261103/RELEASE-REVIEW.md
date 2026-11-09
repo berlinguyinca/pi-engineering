@@ -66,7 +66,8 @@ The first cut of this gate looked only at `nextBaseSha` and reported 15 breaks; 
 three fields is what surfaced the other 14, including `H07`, which the narrower scan never touched.
 
 Nothing was re-stamped, because `handoffHash` binds the pointers to the record's log paths
-(`02-HANDOFF-PROTOCOL.md:15`; `canonicalHash`, `src/bootstrap/resultGate.ts:15`) — verified by
+(`02-HANDOFF-PROTOCOL.md:15`; `canonicalHash`, `src/bootstrap/resultGate.ts:30` — the line moved from 15 when
+X13 reformatted the file to make `npm run lint` pass) — verified by
 recomputing all 95 above. `AUDIT/lineage-superseded.json` declares each break in one of two kinds
 that are deliberately not interchangeable:
 
