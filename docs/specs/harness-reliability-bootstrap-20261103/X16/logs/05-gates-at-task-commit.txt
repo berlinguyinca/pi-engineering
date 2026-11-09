@@ -1,0 +1,59 @@
+X16 log 05 -- the gates over the tree that carries the scanner change (commit f145c623).
+This unit's trail records land in the following commit; logs/06 repeats the trail scans over the tree
+that carries those too. Nothing runs any of these automatically: this repository has no
+.github/workflows since 85b1b064 removed them, and grepping .github, scripts and package.json for
+integrity-scan, lineage-scan or record-reproducibility finds nothing. They are operator-run. The
+claim in #650's PR body that CI runs them, repeated in #650's review, is false -- see the PR body
+of this unit.
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+canonical records no canonical parent names=1 (declared=1 offences=0)
+evidence dangling=0 untracked=0
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+RESULT ok: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+ref=HEAD records=117 fields=3
+pointers healthy=300 nullDeclared=21 broken=30 unparseableRecords=0
+healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 0
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+ref=HEAD records=117
+hashes recomputed ok=117 mismatch=0 noHashField=0 unparseable=0
+declared evidence paths=757 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree
+exit=0
+
+$ npm run lint
+
+> pi-engineering-runtime@0.2.0 lint
+> biome check .
+
+Checked 1552 files in 472ms. No fixes applied.
+exit=0
+
+$ npm run typecheck:core
+
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+
+exit=0
+
+$ npm run test:unit
+ℹ tests 6784
+ℹ suites 460
+ℹ pass 6779
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 5
+exit=0
+
+0 fail, the same counts as at X15's commit. The environment-attributed planner-worker
+gateway-timeout cases sit in test/integration, which test:unit does not select; they stay open
+in X15's logs.
