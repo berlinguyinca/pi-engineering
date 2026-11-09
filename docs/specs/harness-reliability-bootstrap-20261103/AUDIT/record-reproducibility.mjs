@@ -24,7 +24,32 @@ const canon = (r) => { const c = { ...r }; delete c.handoffHash; return `sha256:
 if (out("rev-parse", "--git-dir") === null) { console.error("not a git repository: run this from inside the repository"); process.exit(2); }
 if (out("rev-parse", "--verify", ref) === null) { console.error(`ref not found: ${ref}`); process.exit(2); }
 const tree = new Set((out("-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", ref) ?? "").split("\n"));
-const files = [...tree].filter((p) => /(^|\/)out[^/]*\/[^/]+\.handoff\.json$/.test(p));
+// What counts as a record is stated here rather than guessed. This gate counts the files whose name
+// is exactly `<something>.handoff.json` and whose directory is a generation (`out`, `out-final`,
+// `out-corrected`, ...), a `fixtures/` payload directory, or the unit directory itself
+// (`<unit>/<ID>.handoff.json`, the shape the D-series and the corrected T-series use). That is 160
+// tracked files at this commit. The filter used to be generation-only, which counted 119 and left
+// 41 records -- every unit-directory record -- never re-hashed from their committed bytes, while
+// the RESULT line read as though the trail had been covered.
+//
+// `integrity-scan.mjs` uses a wider denominator on purpose: any `*handoff*.json` in the trail,
+// which in a clean clone of this commit is 231 files and it reports as 230 records (121 in
+// generation directories, 41 in unit directories, 68 elsewhere -- payload fixtures named
+// `handoff-record.json`, superseded copies, and so on). Two definitions, both legitimate: this gate
+// asks "does every emitted record reproduce from its committed bytes", that one asks "can anything
+// shaped like a record be tampered with unnoticed". The two numbers are not comparable, and the
+// prose here used to imply they were -- do not read a difference between 160 and 230 as missing
+// coverage. What IS missing, and this change does not close it: `lineage-scan.mjs` walks generation
+// records only, so 41 of the 160 records are outside its pointer check.
+const isRecord = (p) => {
+  if (!/\.handoff\.json$/.test(p)) return false;
+  const parts = p.split("/");
+  const file = parts.pop();
+  const dir = parts.pop() ?? "";
+  const stem = file.replace(/\.handoff\.json$/, "");
+  return dir === "fixtures" || dir === stem || /^out[^/]*$/.test(dir);
+};
+const files = [...tree].filter(isRecord);
 
 let hashOk = 0, unparseable = 0, noHash = 0, evTotal = 0;
 const failures = [];
@@ -40,7 +65,7 @@ for (const f of files) {
 console.log(`ref=${ref} records=${files.length}`);
 console.log(`hashes recomputed ok=${hashOk} mismatch=${files.length - hashOk - unparseable - noHash} noHashField=${noHash} unparseable=${unparseable}`);
 console.log(`declared evidence paths=${evTotal} absent from ${ref} tree=${failures.filter((f) => f.kind === "EVIDENCE_UNTRACKED").length}`);
-if (failures.length === 0) { console.log("RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree"); process.exit(0); }
+if (failures.length === 0) { console.log(`RESULT ok: ${files.length} records (generation, fixtures payload and unit-directory) verify from their committed bytes, and every file they vouch for is in the same tree`); process.exit(0); }
 for (const f of failures) console.log(`  ${f.kind.padEnd(19)} ${f.record.replace("docs/specs/harness-reliability-bootstrap-20261103/", "")} ${f.detail ?? ""}`.trimEnd());
 console.log(`RESULT FAIL (${failures.length})`);
 process.exit(1);
