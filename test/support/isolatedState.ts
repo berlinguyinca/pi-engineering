@@ -77,6 +77,14 @@ if (!process.env.PI_ENGINEERING_HOME) {
 // The retired Herdr environment variables are never an input to a test (Herdr is configured by YAML only).
 for (const name of ["HERDR_INGEST_URL", "HERDR_INGEST_API_KEY", "HERDR_HOST_ID"]) delete process.env[name];
 
+// `CARGO_TARGET_DIR` is how an operator claims the Rust build directory, and the product
+// honours it by turning its own cache off (`rustTargetDir` returns null). A host that sets
+// it — a shared cargo install puts `/usr/local/cargo/bin` on PATH and usually this with it,
+// which is what the first Linux CI runner did — would silently change what the Rust-cache
+// tests observe. No test reads it from the ambient environment: the ones that care pass an
+// explicit env object, and one asserts the operator-set case directly.
+delete process.env.CARGO_TARGET_DIR;
+
 // Test repositories use local bare repositories as remotes. safeGit refuses local-path / file:// remotes unless the
 // operator listed them in `pi.allowedRemote`, so the suite enables local transports as a whole; the tests that check
 // that refusal switch it off (`testHooks.localTransports = false`) for their own duration.
