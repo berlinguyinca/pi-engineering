@@ -35,6 +35,33 @@ variables:
     VENV="$VENV_PREFIX$(printf '%s' "$CI_REPO" | tr / _)-$CI_PIPELINE_NUMBER"
     case "$VENV" in "$VENV_PREFIX"?*) ;; *) echo "refusing: '$VENV' is outside $VENV_PREFIX" >&2; exit 1;; esac
     if [ -L "$VENV" ]; then echo "refusing: $VENV is a symlink" >&2; exit 1; fi
+  # Diagnostic, never fatal: how the staged credential actually reaches git.
+  # The checkout has always relied on the host's system git config wiring
+  # /etc/woodpecker-git-credentials in, and never verified it — so a host change
+  # shows up as an authentication error in a step that never mentions the
+  # credential. Before asserting anything about that wiring, record what it is.
+  #
+  # Everything printed goes through `redact`, and it has to: a git config KEY can
+  # carry a secret, because an insteadOf rewrite is keyed by its URL —
+  # `url.https://<token>@github.com/.insteadOf` — so printing keys "safely" still
+  # prints the token. Same for a helper whose value embeds a password.
+  - &cred_probe |
+    echo "credential wiring (diagnostic)"
+    redact() {
+      sed -E -e 's#://[^/@[:space:]]*@#://<redacted>@#g' \
+             -e 's#(password|passwd|token|apikey|api_key|pat)=[^&[:space:]]*#\1=<redacted>#gI'
+    }
+    # Capture, then branch. `git config … | sed …` exits with sed's status, so a
+    # pipeline fallback would never fire on an empty result and silence would be
+    # indistinguishable from "no helper".
+    helper=$(git config --show-origin --get-all credential.helper 2>/dev/null || true)
+    if [ -n "$helper" ]; then printf '%s\n' "$helper" | redact | sed 's/^/  helper: /'; else echo "  helper: none configured anywhere"; fi
+    rewrites=$(git config --get-regexp '^url\..*\.insteadof' 2>/dev/null | cut -d' ' -f1 || true)
+    if [ -n "$rewrites" ]; then printf '%s\n' "$rewrites" | redact | sed 's/^/  rewrite: /'; else echo "  rewrite: none"; fi
+    for f in /etc/gitconfig "$HOME/.gitconfig" "$HOME/.git-credentials" "$HOME/.netrc" /etc/woodpecker-git-credentials; do
+      if [ -e "$f" ]; then echo "  present: $f"; else echo "  absent:  $f"; fi
+    done
+    echo "  GIT_ASKPASS=${GIT_ASKPASS:+set} GITHUB_TOKEN=${GITHUB_TOKEN:+set} GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL:-unset}"
 
 steps:
   - name: checkout
@@ -44,8 +71,11 @@ steps:
       # The credential reaches git through the host's system git config
       # (/etc/gitconfig, bound in by the Slurm job; the other pipelines of
       # this org rely on the same). This test only proves the staged file is
-      # there; nothing here passes it to git explicitly.
+      # there; nothing here passes it to git explicitly — the line below
+      # records which mechanism really did it, so the next step can assert it
+      # instead of trusting it.
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - *cred_probe
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
       - 'git remote add origin "https://github.com/${CI_REPO}.git"'
       # Full history, all branches and tags, as the Actions job had
