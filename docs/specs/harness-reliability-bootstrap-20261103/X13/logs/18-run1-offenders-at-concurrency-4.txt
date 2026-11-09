@@ -1,0 +1,65 @@
+The four extra red leaves from run 1 at the merged tip, re-run at the same tip with concurrency 4 (the whole-suite setting): 49/49 pass, exit 0.
+Same files, same command form as the canonical gate, --test-concurrency=4.
+
+[info] thinking: off (mission role) · implementer
+[info] thinking: off (mission role) · implementer
+[info] thinking: off (mission role) · implementer
+▶ mission reliability foundation — synthetic MSN-qSLaeM
+  ✔ runs MSN-qSLaeM through the public runtime, times out after 2/3, and repairs only the remainder (13160.781083ms)
+  ✔ keeps the incumbent unchanged when integration conflicts (4799.822ms)
+  ✔ records a fresh same-model review with the reduced-independence warning (3244.496833ms)
+  ✔ keeps the incumbent unchanged when current-candidate validation is red (6386.642ms)
+  ✔ replays checkpoint, failure fingerprint, and recovery budget after restart (6.4785ms)
+  ✔ rejects recovery before replacement dispatch when checkpoint artifact content is overwritten (893.378834ms)
+  ✔ rejects recovery before replacement dispatch when checkpoint artifact content is deleted (822.467166ms)
+  ✔ re-verifies checkpoint artifacts after execute returns and immediately before replacement dispatch (933.420375ms)
+  ✔ reads current canonical bytes in the true-final synchronous verify-and-dispatch call (907.157375ms)
+  ✔ replays checkpoint-owned artifact bytes and verifies them before recovery dispatch (911.787875ms)
+  ✔ stops with preserved work and an exact resume condition when a fingerprint is exhausted (774.854958ms)
+  ✔ classifies a nonterminal zero-worker mission as ORPHANED with a scheduled recovery (1.213458ms)
+  ✔ isolates repository authority between two missions without mutating either incumbent (431.55525ms)
+  ✔ refuses a non-local dogfood model before launching Pi or creating a repository (137.031458ms)
+  ✔ still refuses a temporary parent that overlaps the checkout (482.455625ms)
+  ✔ dogfoods the uniquely installed package and validates the versioned snapshot contract (455.503667ms)
+  ✔ rejects wrong-mission dogfood event evidence (458.984875ms)
+  ✔ rejects nested-counterfeit dogfood event evidence (469.078083ms)
+  ✔ rejects out-of-order dogfood event evidence (468.293792ms)
+  ✔ rejects failed-recovery dogfood event evidence (486.984167ms)
+  ✔ rejects wrong-recovery dogfood event evidence (497.411583ms)
+  ✔ rejects malformed dogfood event evidence (461.382ms)
+  ✔ labels source-only dogfood and disables extension discovery before loading the source extension (411.421ms)
+  ✔ refuses a dirty installed package before any extension-loading Pi invocation (281.646667ms)
+  ✔ returns nonzero for a missing runtime v3 snapshot (462.432042ms)
+  ✔ returns nonzero for a malformed runtime v3 snapshot (456.770167ms)
+  ✔ returns nonzero for a acceptance-not-passed runtime v3 snapshot (467.407ms)
+  ✔ returns nonzero for a acceptance-coverage runtime v3 snapshot (490.376ms)
+  ✔ returns nonzero for a test-accounting runtime v3 snapshot (469.218208ms)
+  ✔ returns nonzero for a test-failed runtime v3 snapshot (459.118583ms)
+  ✔ returns nonzero for a review-findings runtime v3 snapshot (465.634541ms)
+  ✔ returns nonzero for a review-incomplete runtime v3 snapshot (611.286875ms)
+  ✔ returns nonzero for a review-invalid-severity runtime v3 snapshot (569.603541ms)
+  ✔ returns nonzero for a review-invalid-status runtime v3 snapshot (466.8695ms)
+  ✔ returns nonzero for a review-accepted-blocker runtime v3 snapshot (559.4365ms)
+  ✔ returns nonzero for a review-resolved-not-repaired runtime v3 snapshot (467.242375ms)
+  ✔ returns nonzero for a review-open-repaired runtime v3 snapshot (457.13425ms)
+  ✔ returns nonzero for a top-finding-invalid-severity runtime v3 snapshot (484.769042ms)
+  ✔ returns nonzero for a top-finding-invalid-status runtime v3 snapshot (453.019209ms)
+  ✔ returns nonzero for a top-finding-resolved-not-repaired runtime v3 snapshot (462.623667ms)
+  ✔ returns nonzero for a top-finding-accepted-blocker runtime v3 snapshot (464.945917ms)
+  ✔ returns nonzero for a top-finding-projection-mismatch runtime v3 snapshot (487.572208ms)
+  ✔ refuses a temporary parent inside any Git worktree before creating a repository (359.60525ms)
+  ✔ returns nonzero and retains the temporary path for FAILED or CANCELED dogfood missions (549.164166ms)
+✔ mission reliability foundation — synthetic MSN-qSLaeM (47551.46825ms)
+✔ a verification command that opens a listener and never exits is killed after its silence window (669.345875ms)
+✔ a backgrounded child holding stdout open after the shell exits is killed with its process group (321.763125ms)
+✔ a mission abort terminates a running verification command promptly (106.576875ms)
+✔ a command aborted before it starts never runs (0.549917ms)
+✔ a long command that keeps printing is never cut off (1338.98575ms)
+ℹ tests 49
+ℹ suites 1
+ℹ pass 49
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 49290.429333

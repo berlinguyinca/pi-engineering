@@ -1,0 +1,47 @@
+Pre-merge gates at the merged tip e4b8c021 (origin/main 107a1ceb merged in, plus the biome fix to main's own test/unit/path-identity.test.ts).
+HEAD=e4b8c0219edb9eaff97dc4782606a677941da2b8
+
+$ npm run lint
+exit=0
+$ npm run typecheck:core
+exit=0
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+exit=0
+ref=HEAD records=107 fields=3
+pointers healthy=272 nullDeclared=19 broken=30 unparseableRecords=0
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+exit=0
+records=103 canonical=67 hash_ok=103 field_ok=103
+canonical chain links resolved=61 offenders=2
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+exit=0
+ref=HEAD records=107
+declared evidence paths=672 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree
+
+$ npm test  (run 2 at this tip; run 1 is in 12- and recorded there)
+ℹ tests 7969
+ℹ suites 564
+ℹ pass 7962
+ℹ fail 2
+ℹ cancelled 0
+failing leaves: ✖ a completion whose headers arrive after the fetch dispatcher's timeouts still completes (34.965ms)|✖ the caller's signal still ends a completion (2.164834ms)|
+real: real	19m53.913s
+
+Attribution of the two, run in the control worktree at 107a1ceb with the same gate command and the same whole-suite
+invocation (npm test, 29m33s): the identical pair, and nothing else. They are red on main, in isolation and in the
+whole suite; this merge does not change them, and no file in the merge touches src/plannerWorker/gateway*.ts.
+
+Run 1 at this tip (32m27s) had four more red leaves -- mission-reliability-foundation 'keeps the incumbent unchanged
+when current-candidate validation is red' plus its synthetic-MSN parent, and two planner-worker-verification silence-
+window leaves. All four are green at this same tip in isolation (concurrency 1) and at concurrency 4 (49/49), and
+none of them appears in run 2 or in main's own whole-suite run, so they are load-dependent, not merge damage.
+Recorded as observed rather than quietly dropped: 12-suite-run1-at-merged-tip.txt carries run 1.
