@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=22.18"
+    "node": ">=22.18 <26"
   },
   "keywords": ["pi-package", "engineering", "orchestration", "ledger", "agent"],
   "exports": {
