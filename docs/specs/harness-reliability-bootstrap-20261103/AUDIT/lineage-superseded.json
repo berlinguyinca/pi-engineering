@@ -26,7 +26,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this baseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. baseSha of H01, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H01/out/H01.handoff.json",
@@ -39,7 +39,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this resultSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. resultSha of H01, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H01/out/H01.handoff.json",
@@ -52,7 +52,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this nextBaseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. nextBaseSha of H01, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H02/out/H02.handoff.json",
@@ -65,7 +65,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this baseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. baseSha of H02, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H02/out/H02.handoff.json",
@@ -78,7 +78,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this resultSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. resultSha of H02, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H02/out/H02.handoff.json",
@@ -91,7 +91,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this nextBaseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. nextBaseSha of H02, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H03/out/H03.handoff.json",
@@ -104,7 +104,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this baseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. baseSha of H03, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H03/out/H03.handoff.json",
@@ -117,7 +117,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this resultSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. resultSha of H03, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H03/out/H03.handoff.json",
@@ -130,7 +130,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this nextBaseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. nextBaseSha of H03, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H04/out/H04.handoff.json",
@@ -143,7 +143,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this baseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. baseSha of H04, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H04/out/H04.handoff.json",
@@ -156,7 +156,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this resultSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. resultSha of H04, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H04/out/H04.handoff.json",
@@ -169,7 +169,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this nextBaseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. nextBaseSha of H04, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H05/out/H05.handoff.json",
@@ -182,7 +182,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this baseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. baseSha of H05, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H05/out/H05.handoff.json",
@@ -195,7 +195,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this resultSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. resultSha of H05, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H05/out/H05.handoff.json",
@@ -208,7 +208,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this nextBaseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. nextBaseSha of H05, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H06/out/H06.handoff.json",
@@ -221,7 +221,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this baseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. baseSha of H06, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H06/out/H06.handoff.json",
@@ -234,7 +234,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this resultSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. resultSha of H06, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H06/out/H06.handoff.json",
@@ -247,7 +247,7 @@
       "replacement": null,
       "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
       "annotatedBySubject": "docs(bootstrap): H01-H07 handoff evidence trees (surveys, adapters, views, route mount)",
-      "note": "No live commit is provably this nextBaseSha. The per-unit commit was lost when its generation was batch-committed; 9cf164fa5f5f carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. nextBaseSha of H06, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H07/out-corrected/H07.handoff.json",
@@ -260,7 +260,7 @@
       "replacement": null,
       "annotatedBy": "ff2a8a6bf4eeaff88677ff2ef5f652c43709429f",
       "annotatedBySubject": "docs(bootstrap): V01 drift-fixture handoff and corrected H07 cross-repo chain record",
-      "note": "No live commit is provably this baseSha. The per-unit commit was lost when its generation was batch-committed; ff2a8a6bf4ee carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. baseSha of H07, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/H07/out-corrected/H07.handoff.json",
@@ -273,7 +273,7 @@
       "replacement": null,
       "annotatedBy": "ff2a8a6bf4eeaff88677ff2ef5f652c43709429f",
       "annotatedBySubject": "docs(bootstrap): V01 drift-fixture handoff and corrected H07 cross-repo chain record",
-      "note": "No live commit is provably this resultSha. The per-unit commit was lost when its generation was batch-committed; ff2a8a6bf4ee carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. resultSha of H07, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/R08/out-corrected/R08.handoff.json",
@@ -286,7 +286,7 @@
       "replacement": null,
       "annotatedBy": "0a50cc482e039e69714536149d30fc4fc302816a",
       "annotatedBySubject": "docs(bootstrap): correct R08 successor to H01 with the herdr base; first record superseded",
-      "note": "No live commit is provably this nextBaseSha. The per-unit commit was lost when its generation was batch-committed; 0a50cc482e03 carries this record and its evidence, so the generation is reproducible even though the pointer is not."
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. nextBaseSha of R08, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     },
     {
       "record": "docs/specs/harness-reliability-bootstrap-20261103/V02/out-corrected/V02.handoff.json",
@@ -397,6 +397,45 @@
       "annotatedBy": "5403bf30a4b9efef9930b36d96996a1398bc4c62",
       "annotatedBySubject": "docs(bootstrap): X10 integration evidence, base-drift attribution, terminal chain link",
       "note": "resultSha holds an 8-character abbreviation -- the form `git log --oneline` prints -- not a commit id. X11 found the mechanism rather than assuming one: X08's generator carried the value as a hand-written literal, and nothing downstream could have caught it. templates/handoff.schema.json types baseSha, resultSha and nextBaseSha as plain {\"type\": \"string\"} and writeHandoff validates only against that schema, so the emit path hashed and committed whatever shape it was handed. The link 9f064450 resolved and named this unit's own task commit, so nothing was lost -- but the shape was wrong and anyone following the pointer had to guess. The full id is provably the same commit: prefix 9f064450 names exactly one commit reachable from the audited refs (AUDIT/lineage-scan.mjs, kind=abbreviated, rule=uniqueAbbreviation). The record is byte-unchanged; it predates this declaration and its handoffHash still covers the abbreviation."
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H07/H07.handoff.json",
+      "field": "baseSha",
+      "taskId": "H07",
+      "brokenSha": "1466be76b49d6c6918ed25a4db5b8fb9ee849c32",
+      "defect": "object_missing",
+      "kind": "unresolvable",
+      "rule": null,
+      "replacement": null,
+      "annotatedBy": "ff2a8a6bf4eeaff88677ff2ef5f652c43709429f",
+      "annotatedBySubject": "docs(bootstrap): V01 drift-fixture handoff and corrected H07 cross-repo chain record",
+      "note": "Cross-repo pointer, not a lost commit: 1466be76b49d is a commit of berlinguyinca/herdr-engineering (the repository every H01-H07 record declares), absent from this repository by construction and from the public herdr-engineering (GitHub commit lookup 404, checked 2026-11-09). This is the unit-directory copy of H07's record, added by 9cf164fa -- the note I first wrote said 9cf164fa \"lost the per-unit objects\", which was wrong for the same reason as the other entries. baseSha of H07, annotated by ff2a8a6bf4ee, which carries both copies of the record and their evidence."
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H07/H07.handoff.json",
+      "field": "resultSha",
+      "taskId": "H07",
+      "brokenSha": "591264f9bd4fc2fc07d88d94febde4cd0e919448",
+      "defect": "object_missing",
+      "kind": "unresolvable",
+      "rule": null,
+      "replacement": null,
+      "annotatedBy": "ff2a8a6bf4eeaff88677ff2ef5f652c43709429f",
+      "annotatedBySubject": "docs(bootstrap): V01 drift-fixture handoff and corrected H07 cross-repo chain record",
+      "note": "Cross-repo pointer, not a lost commit: 591264f9bd4f is the tip recorded in PLAN-COMPLETION.json cross_repo_integration.main, repo=berlinguyinca/herdr-engineering -- a commit of that repository, not of this one (the earlier note said 'the upstream pi repository's main tip'; the repo field says otherwise). It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering (GitHub commit lookup 404, checked 2026-11-09). resultSha of H07, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
+    },
+    {
+      "record": "docs/specs/harness-reliability-bootstrap-20261103/H07/H07.handoff.json",
+      "field": "nextBaseSha",
+      "taskId": "H07",
+      "brokenSha": "1466be76b49d6c6918ed25a4db5b8fb9ee849c32",
+      "defect": "object_missing",
+      "kind": "unresolvable",
+      "rule": null,
+      "replacement": null,
+      "annotatedBy": "ff2a8a6bf4eeaff88677ff2ef5f652c43709429f",
+      "annotatedBySubject": "docs(bootstrap): V01 drift-fixture handoff and corrected H07 cross-repo chain record",
+      "note": "Cross-repo pointer, not a lost commit: the H01-H07 records declare repo=berlinguyinca/herdr-engineering (PLAN-COMPLETION.json cross_repo_integration, units H01-H07), and this sha is a commit of that repository, not of this one. It is absent here by construction, and absent from the public berlinguyinca/herdr-engineering as well (GitHub commit lookup 404 for each of the eight distinct shas, checked 2026-11-09), so it cannot be re-pointed without that repository's private objects. The earlier note said the per-unit commit was lost when the generation was batch-committed; that cause was wrong -- the pointer never named a commit of this repository. nextBaseSha of H07, annotated by ff2a8a6bf4ee, which carries this record and its evidence."
     }
   ],
   "defectKinds": {
