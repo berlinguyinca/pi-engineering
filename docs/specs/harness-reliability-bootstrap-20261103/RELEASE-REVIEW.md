@@ -167,13 +167,18 @@ anyone reading the verdict knows which parts still do.
 
 1. **"The repository's own gate cannot be evaluated. `npm test` never terminates."** -- **no longer
    true for the named files.** `test/integration/mission-interrupt-pause.test.ts` and
-   `test/integration/mission-merge-queue-flow.test.ts` were split into bounded files (#636, #640,
-   #641, #643, #645, #646, #647, #648, #649, #651) and the Woodpecker pipeline's `test-integration`
-   step now runs to completion and passes -- pipelines **41, 43, 44, 45** report every step
-   (`install`, `lint`, `typecheck`, `test-unit`, `test-integration`, `smoke`, `roadmap-structural`) as
-   `success` **[ci-log]**. The remaining hang class in `test:unit` was cross-file shared state in
-   `src/verify/testResultCache.ts` (#627) and was fixed by making the cache host-aware (#654,
-   `64cae00b`) **[ci-log]**.
+   `test/integration/mission-merge-queue-flow.test.ts` now complete and pass when run alone --
+   **18 tests, 0 fail, exit 0**, measured at `e008b3dc` on both **Node v26.3.0** and **v22.22.3**
+   **[now]** -- and the Woodpecker pipeline's `test-integration` step runs to completion: pipelines
+   **41, 43, 44, 45** report every step (`install`, `lint`, `typecheck`, `test-unit`,
+   `test-integration`, `smoke`, `roadmap-structural`) as `success` **[ci-log]**, while the pipeline at
+   `e008b3dc` itself (**48**) is red on the `treeHash` fingerprint defect that PR **#658** fixes, not
+   on any of the files this review named. What fixed the original hang is **not identified in this
+   correction**: I could not attribute it to a commit, and an attribution I could not verify would be
+   the same class of error this file's caveats exist to stop. The first draft of this correction
+   claimed the hang was cross-file cache state fixed by #654; that was wrong on both counts
+   (#654's diff touches no cache file, and #627 is an unrelated refactor), and it is removed here
+   rather than footnoted.
 2. **"Every suite run that did produce an answer was red."** -- **no longer true, with one
    qualification that is itself a finding.** A green whole-suite run is now recorded twice: by CI (the
    pipelines above **[ci-log]**), and locally at `d00bbb73` where `npm run test:unit` completes with a
@@ -181,7 +186,9 @@ anyone reading the verdict knows which parts still do.
    failure mode was found since and is fixed in an open PR: `repoFingerprint` trusted `git add`'s stat
    cache, so an edit landing inside the same filesystem tick left `treeHash` stale and
    `test/unit/verify-test-result-cache.test.ts` failed determinism on Linux (pipeline 48 at
-   `e008b3dc`, reproducible on any coarse-tick filesystem) -- PR **#658**.
+   `e008b3dc`; reproduced locally by touching a file with no content change, and the mechanism --
+   `git add` trusting stat data within the same filesystem tick -- applies to any coarse-timestamp
+   filesystem) -- PR **#658**.
 
    The qualification, measured at `e008b3dc` on this laptop **[now]**: `npm run test:integration` on
    the machine's default **Node v26.3.0** answers **1185 tests, 1182 pass, 3 fail**, exit 1 -- so the
@@ -194,11 +201,13 @@ anyone reading the verdict knows which parts still do.
    * `test/integration/planner-worker-executor.test.ts:110` -- `independent contracts must run
      concurrently (max in flight 1)`, an assertion about scheduling that passes on v22.
 
-   The two files this review named as unterminating were also run alone, on v26: **18 tests, 0 fail,
-   exit 0** -- the hang class is gone on both runtimes. What replaces the old finding is narrower and
-   still worth someone's attention: the suite is green on the runtime CI pins and red on a newer one,
-   and nothing in the repository says so -- `package.json` declares no `engines` field, so a contributor
-   on Node 26 gets three red tests and no hint that the pinned runtime is the contract.
+   The same two files on v22.22.3: **16 tests, 0 fail, exit 0** -- so in one run of each runtime,
+   neither file hung; one run is what was measured, and a regression would be a hang again. What
+   replaces the old finding is narrower and still worth someone's attention: the suite is green on
+   the runtime CI pins and red on a newer one, and the only statement of which runtime is the
+   contract is `package.json`'s `engines` field, `"node": ">=22.18"` -- a lower bound with **no
+   upper bound**, so Node 26 satisfies it and a contributor on a newer runtime gets three red tests
+   and nothing else.
 3. **"No human approved anything."** -- **unchanged.** Nothing here adds a signature or an independent
    validator, and the trail's own independent review is still absent: the reviewing account reports a
    usage ceiling until 2026-11-11 07:03, so #653/#656 are self-verified and labelled so.
@@ -208,11 +217,13 @@ Citations in the review above that do not resolve, corrected today **[now]**:
 * `AUDIT/lineage-allowlist.json` **does not exist** and never was committed (`git log --all
   --diff-filter=A` finds nothing on any ref). The tracked declaration file is
   **`AUDIT/lineage-superseded.json`**, 30 entries. The same dangling name is also carried by
-  `PLAN-COMPLETION.json`'s `next_action` and by `X16/logs/12-closing-state.txt` -- the latter was
-  written today by the unit that is supposed to prevent exactly this, and is corrected with the rest.
+  `PLAN-COMPLETION.json`'s `next_action` (marked in place) and by `X16/logs/12-closing-state.txt`,
+  a log written today by the unit that is supposed to prevent exactly this. The log is a
+  historical record and is **not rewritten**; the correction stands here and in
+  `PLAN-COMPLETION.json`, where the trail keeps living state.
 * The trail gates do not share one record denominator, and reading them as one overstates coverage:
-  **160** tracked `*.handoff.json` files (what `record-reproducibility.mjs` recomputes, after #660
-  widened it from 119), versus **230** in `integrity-scan.mjs`, which counts any `*handoff*.json`
+  **160** tracked `*.handoff.json` files (what `record-reproducibility.mjs` recomputes, which PR #660
+  widens from 119 (open; on `main` the figure is still 119)), versus **230** in `integrity-scan.mjs`, which counts any `*handoff*.json`
   (231 such files: 121 in generation directories, 41 in unit directories, 68 elsewhere). Neither
   number is wrong; `lineage-scan.mjs` walks **generation records only**, so **41 of the 160 records
   are outside its pointer check** -- that gap is open work, not coverage.
@@ -225,5 +236,5 @@ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibil
 npm run typecheck                                                                          # expect: exit 0
 node --test --test-concurrency=1 --import ./test/support/isolatedState.ts \
   test/integration/mission-interrupt-pause.test.ts                                    # 2026-11-09: exits 0; the hang above is resolved [now]
-node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs       # expect: RESULT ok, exit 0 -- full clone (a shallow one makes lineage-scan exit 2 saying so)
+node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs       # expect: RESULT ok, exit 0 -- run in a full clone; after #659 merges, a shallow one makes lineage-scan exit 2 saying so
 ```
