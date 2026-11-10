@@ -122,7 +122,6 @@ steps:
       # mechanism should keep building; only the absence of any way to authenticate
       # is fatal, and that is the case that used to surface as an opaque auth error
       # in a step that never mentioned credentials.
-      - 'mechanism=""; if [ -n "${GIT_ASKPASS:-}" ] && [ -x "${GIT_ASKPASS:-}" ]; then mechanism="GIT_ASKPASS"; elif git config --get-all credential.helper >/dev/null 2>&1 || git config --get-regexp "^url\..*\.insteadof" >/dev/null 2>&1; then mechanism="git config"; else echo "no git credential mechanism: GIT_ASKPASS unset or not executable, no credential.helper, no insteadOf rewrite" >&2; exit 1; fi; echo "git will authenticate via $mechanism"'
       # The staged file the askpass helper reads. Kept as a check of its own: the
       # helper can be present and the credential it serves be missing.
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential file" >&2; exit 1; }'
