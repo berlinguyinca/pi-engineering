@@ -95,7 +95,7 @@ steps:
       # which reads as a broken agent, not as a wrong precondition.
       # The staged file the askpass helper reads. Kept as a check of its own: the
       # helper can be present and the credential it serves be missing.
-      - 'mechanism=""; if [ -n "${GIT_ASKPASS:-}" ]; then mechanism="GIT_ASKPASS"; elif git config --get-all credential.helper >/dev/null 2>&1 || git config --get-regexp "^url\..*\.insteadof" >/dev/null 2>&1; then mechanism="git config"; else echo "no git credential mechanism: GIT_ASKPASS unset, no credential.helper, no insteadOf rewrite" >&2; exit 1; fi; echo "git will authenticate via $mechanism"'
+      - 'echo "probe-only: ${GIT_ASKPASS:+GIT_ASKPASS is set}"'
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential file" >&2; exit 1; }'
       - *cred_probe
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
