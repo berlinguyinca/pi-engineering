@@ -19,12 +19,18 @@
  * Woodpecker leaves alone and the shell evaluates, or the unbraced `$NAME`.
  */
 import assert from "node:assert/strict";
-import { readdir, readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 
+// A note for whoever debugs a checkout that dies in one second with no log output at
+// all, including from steps that succeeded: check `gh api .../pulls/N --jq
+// .merge_commit_sha` first. Woodpecker checks out refs/pull/N/merge, and GitHub rebuilds
+// that ref lazily — while mergeability is `unknown` the ref can be missing or point at a
+// merge of an older head. Both cases look identical to a broken pipeline config, and three
+// runs here were attributed to a `${VAR}` bug that a previous commit had already fixed.
 const PIPELINE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".woodpecker");
 
 const REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}/g;
