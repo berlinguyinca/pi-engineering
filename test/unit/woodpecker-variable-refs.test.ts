@@ -33,6 +33,13 @@ import { parse as parseYaml } from "yaml";
 // runs here were attributed to a `${VAR}` bug that a previous commit had already fixed.
 const PIPELINE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", ".woodpecker");
 
+/** The message every offender gets, kept out of the assert so it stays readable. */
+const HINT = [
+  "Woodpecker expands \${VAR} from its own table and blanks what it does not know, so a container",
+  "variable arrives at the shell as an empty string. Use \${VAR:-} (or plain $VAR) for anything the",
+  "agent puts in the environment.",
+].join(" ");
+
 const REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}/g;
 
 /** Every string leaf of a parsed document, with a path for the failure message. */
@@ -68,13 +75,7 @@ test("no pipeline step asks Woodpecker to expand a variable it does not know", a
     }
   }
 
-  assert.deepEqual(
-    offenders,
-    [],
-    `${offenders.join(", ")} — Woodpecker expands \${VAR} from its own table and blanks what it does not ` +
-      `know, so a container variable arrives at the shell as an empty string. Use \${VAR:-} (or plain $VAR) ` +
-      `for anything the agent puts in the environment.`,
-  );
+  assert.deepEqual(offenders, [], `${offenders.join(", ")} — ${HINT}`);
   // Guards the walk itself: if the parser or the directory ever stops yielding the
   // step text, the assertion above would pass by finding nothing.
   assert.ok(operatorRefs >= 10, `only ${operatorRefs} braced references found; the walk is not seeing step text`);
