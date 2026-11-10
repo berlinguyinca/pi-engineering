@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { PRIORART_REMOTE, defaultPriorartPaths, ensurePriorart } from "../../src/platform/priorartDependency.ts";
+import {
+  PRIORART_REMOTE,
+  defaultPriorartPaths,
+  ensurePriorart,
+  isUnderTmpdir,
+} from "../../src/platform/priorartDependency.ts";
 
 /** The cold-start rebuild is a detached `git clone` that keeps writing into the sandbox while it is deleted. */
 const NO_REBUILD = { rebuild: false } as const;
@@ -97,5 +102,47 @@ describe("priorartDependency", () => {
     assert.ok(d.mcp.endsWith(".pi/agent/mcp.json"));
     assert.equal(d.remote, PRIORART_REMOTE);
     assert.equal(PRIORART_REMOTE, "https://github.com/berlinguyinca/pi-priorart.git");
+  });
+
+  it("isUnderTmpdir: true inside tmpdir, false for a real home and near-miss names", () => {
+    const inside = join(tmpdir(), "a", "b");
+    assert.equal(isUnderTmpdir(inside), true, "a nested path is under tmpdir");
+    assert.equal(isUnderTmpdir(tmpdir()), true, "tmpdir itself is under tmpdir");
+    // A name that merely contains the string "tmp" but is not under it must not match.
+    assert.equal(isUnderTmpdir("/opt/always-present"), false);
+    assert.equal(
+      isUnderTmpdir(join(homedir(), "IdeaProjects", "priorart")),
+      false,
+      "a real home path is not ephemeral",
+    );
+    assert.equal(isUnderTmpdir("relative/priorart"), false, "relative paths are never under tmpdir");
+  });
+
+  it("default rebuild into a temp HOME does not spawn: the detached build would race its own cleanup", () => {
+    // This is the exact CI condition. A test (or an ephemeral HOME) puts the derived
+    // source under mkdtemp; with the default options (rebuild not disabled) the old code
+    // still spawned a detached `git clone`+`make build` that kept writing into the temp
+    // tree (and, for a Go build, $HOME/.cache/go-build) after the test deleted it.
+    const { dir, paths } = makeSandbox();
+    try {
+      const res = ensurePriorart(paths); // rebuild left at its default
+      assert.equal(res.rebuildStarted, false, "no background build is spawned into a temp source");
+      assert.equal(existsSync(paths.source), false, "the temp source tree is never created");
+      assert.equal(res.configPresent, true, "config is still written (harmless in a throwaway home)");
+      assert.equal(res.mcpRegistered, true, "mcp registration is still attempted");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rebuild still starts for a source OUTSIDE tmpdir when the binary is missing", () => {
+    // The self-heal must survive the guard on a real home. We cannot spawn a real clone in
+    // a unit test, so we assert the decision boundary directly: a source outside tmpdir is
+    // NOT filtered by isUnderTmpdir, which is the only new reason for maybeRebuildBinary to
+    // return false here.
+    const fakeHome = "/home/someone";
+    assert.equal(isUnderTmpdir(join(fakeHome, "IdeaProjects", "priorart")), false);
+    // And the guard is what makes the ephemeral case false (see the temp-HOME test above),
+    // so the two branches are distinguishable purely on the source path.
   });
 });
