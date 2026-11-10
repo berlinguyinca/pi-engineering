@@ -218,14 +218,18 @@ steps:
       - 'python3 -m venv --help >/dev/null 2>&1 || { echo "python3 venv module missing on this agent" >&2; exit 1; }'
       - 'echo "node=$(node --version) npm=$(npm --version) $(python3 --version) $(make --version | head -1)"'
 
-  # The four trail gates: does every record reproduce from its committed bytes, does the evidence
+  # The trail gates: does every record reproduce from its committed bytes, does the evidence
   # point at commits that exist and are reachable, and does the canonical chain connect. Until now
   # they were operator-run, which is how the trail's certification stayed true only in the checkout
-  # that wrote it (a fifth gate for this file's own prose, `citation-existence-check`, lands with #665 and joins this step here): a fresh clone of main failed the lineage scan with 8 STALE defects minutes after
+  # that wrote it (another gate for this file's own prose, `citation-existence-check`, lands with #665
+  # and joins this step here, as does `manifest-binding-scan` for the two hash edges no gate read --
+  # record.taskAuthorityHash and manifest.parentHandoffHash): a fresh clone of main failed the lineage
+  # scan with 8 STALE defects minutes after
   # the checkout that fixed them printed `RESULT ok` (#659), and `record-reproducibility` certified
   # 119 of the 160 records it reads while a RESULT line read as though it covered the trail (#660).
   # Measured cost at this commit, on this laptop: integrity-scan 0.3 s, lineage-scan 8.0 s,
-  # record-reproducibility 1.1 s -- 9.4 s against an install step that takes minutes. The 8.0 s is the
+  # record-reproducibility 1.1 s, citation-existence-check 0.2 s, manifest-binding-scan 2.0 s -- 11.6 s
+  # against an install step that takes minutes. The lineage-scan figure is the
   # laptop's number and will differ on CI: lineage-scan's cost scales with the refs present (it asks
   # `for-each-ref --contains` per pointer, memoised per sha), and a CI clone holds `refs/remotes/*`
   # plus tags, not the dozens of local heads this checkout has. The 5-minute timeouts are slack for a
@@ -246,6 +250,10 @@ steps:
       - 'timeout -k 30 5m node "$AUDIT/lineage-scan.mjs"'
       - 'timeout -k 30 5m node "$AUDIT/record-reproducibility.mjs"'
       - 'timeout -k 30 5m node "$AUDIT/citation-existence-check.mjs"'
+      # The fifth gate: the two hash edges (record.taskAuthorityHash, manifest.parentHandoffHash) the
+      # four above never read. It runs under plain node like the rest, before install; the TypeScript
+      # test that pins its manifest normalization to the real parseTaskManifest runs later, in test-unit.
+      - 'timeout -k 30 5m node "$AUDIT/manifest-binding-scan.mjs"'
 
   - name: install
     image: bash
