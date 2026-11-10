@@ -41,6 +41,12 @@ const tree = new Set((out("-c", "core.quotePath=false", "ls-tree", "-r", "--name
 // prose here used to imply they were -- do not read a difference between 160 and 230 as missing
 // coverage. What IS missing, and this change does not close it: `lineage-scan.mjs` walks generation
 // records only, so 41 of the 160 records are outside its pointer check.
+//
+// One clause of the predicate matches nothing today, and says so rather than flattering the count:
+// `dir === "fixtures"` covers 0 tracked files, because the 67 payload fixtures are named
+// `handoff-record.json`, which is not `*.handoff.json`. It is kept so a fixture emitted later with the
+// record suffix is covered instead of silently skipped. The 160 are 119 generation + 41 unit-directory,
+// measured against `git ls-tree -r HEAD`.
 const isRecord = (p) => {
   if (!/\.handoff\.json$/.test(p)) return false;
   const parts = p.split("/");
@@ -65,7 +71,7 @@ for (const f of files) {
 console.log(`ref=${ref} records=${files.length}`);
 console.log(`hashes recomputed ok=${hashOk} mismatch=${files.length - hashOk - unparseable - noHash} noHashField=${noHash} unparseable=${unparseable}`);
 console.log(`declared evidence paths=${evTotal} absent from ${ref} tree=${failures.filter((f) => f.kind === "EVIDENCE_UNTRACKED").length}`);
-if (failures.length === 0) { console.log(`RESULT ok: ${files.length} records (generation, fixtures payload and unit-directory) verify from their committed bytes, and every file they vouch for is in the same tree`); process.exit(0); }
+if (failures.length === 0) { console.log(`RESULT ok: ${files.length} records (generation and unit-directory; the fixtures clause matches 0 today) verify from their committed bytes, and every file they vouch for is in the same tree`); process.exit(0); }
 for (const f of failures) console.log(`  ${f.kind.padEnd(19)} ${f.record.replace("docs/specs/harness-reliability-bootstrap-20261103/", "")} ${f.detail ?? ""}`.trimEnd());
 console.log(`RESULT FAIL (${failures.length})`);
 process.exit(1);
