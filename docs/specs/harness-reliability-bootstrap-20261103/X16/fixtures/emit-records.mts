@@ -1,12 +1,12 @@
 // Emit X16's handoff record and the X15/out-chain generation that names it.
 //
 //   npx tsx docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/emit-records.mts \
-//     <baseSha> <resultSha> <x15-outchain-hash> <approvedAt>
+//     <baseSha> <resultSha> <approvedAt>
 //
 // baseSha   = the commit that carries the scanner change (X16's task commit)
 // resultSha = the commit that carries the logs and scripts proving it (X16's evidence commit)
 //
-// Hashing is the trail's own canonicalHash (src/bootstrap/resultGate.ts:36), which sorts every key and
+// Hashing is the trail's own canonicalHash (src/bootstrap/resultGate.ts:30), which sorts every key and
 // drops handoffHash, so a record's hash is a function of the bytes below it and nothing else. The X15
 // copy changes nextTaskId/nextBaseSha, adds two evidence references and one note paragraph -- every
 // other byte is X15/out/X15.handoff.json's, which is what makes it a generation of X15 rather than a
@@ -64,11 +64,15 @@ const x16: Record<string, unknown> = {
   repo: "berlinguyinca/pi-engineering",
   baseSha,
   resultSha,
-  // Carried forward, not earned: X16 has no TaskManifest of its own (it is post-merge follow-up in X15's
-  // scope), and neither do X14's or X15's records -- grepping the repository for X15's value
-  // (9766e2fb...) finds it only inside X15's own records, so no stored object reproduces it. The scan
-  // checks the field's presence and the record hash, never the authority, so it says nothing either way.
-  // Making this field point at a stored, re-hashable object is part of what X16/logs/06 hands to X17.
+  // Carried forward, not earned: X16 has no TaskManifest of its own (it is post-merge follow-up in
+  // X15's scope). The carried value IS reproducible from a stored object, but under the wrong
+  // canonicalization: it is canonicalHash of the RAW X15/fixtures/manifest.json bytes, while the
+  // FIX-4A protocol (resultGate.ts:47-54) defines authority as the hash of the PARSED manifest
+  // (1352fe82... for X15; X14's record follows the protocol with its parsed-manifest hash). This
+  // comment used to claim no stored object reproduces the value and that X14/X15 have no manifests --
+  // both false; the independent review of 2026-11-10 (X16/logs/16, finding F4) found it, and the
+  // deviation is declared in PLAN-COMPLETION.json's caveats. The record is hash-bound, so the
+  // deviation stands; no gate reads taskAuthorityHash.
   taskAuthorityHash: JSON.parse(readFileSync(`${R}/X15/out/X15.handoff.json`, "utf8")).taskAuthorityHash,
   changedFiles: [`${R}/AUDIT/integrity-scan.mjs`, `${R}/AUDIT/chain-declaration.json`],
   commands: [

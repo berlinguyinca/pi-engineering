@@ -44,14 +44,18 @@ const tree = new Set((out("-c", "core.quotePath=false", "ls-tree", "-r", "--name
 // asks "does every emitted record reproduce from its committed bytes", that one asks "can anything
 // shaped like a record be tampered with unnoticed". The two numbers are not comparable, and the
 // prose here used to imply they were -- do not read a difference between 160 and 230 as missing
-// coverage. What IS missing, and this change does not close it: `lineage-scan.mjs` walks generation
-// records only, so 41 of the 160 records are outside its pointer check.
+// coverage. The gap this comment used to name -- `lineage-scan.mjs` walking generation records only,
+// with 41 of the 160 outside its pointer check -- is closed: the lineage widening landed on main and
+// the scan walks the same 160 records as this gate. The independent review of 2026-11-10
+// (X16/logs/16) found the stale sentence here and in RELEASE-REVIEW.md; both are corrected, not
+// footnoted, because a comment in a gate is prose a reader will act on.
 //
 // One clause of the predicate matches nothing today, and says so rather than flattering the count:
-// `dir === "fixtures"` covers 0 tracked files, because the 67 payload fixtures are named
-// `handoff-record.json`, which is not `*.handoff.json`. It is kept so a fixture emitted later with the
-// record suffix is covered instead of silently skipped. The 160 are 119 generation + 41 unit-directory,
-// measured against `git ls-tree -r HEAD`.
+// `dir === "fixtures"` covers 0 tracked files, because the 67 tracked files under */fixtures/ are
+// named `handoff-record.json`, which is not `*.handoff.json` -- 66 of them are integrity-scan's
+// payload fixtures, and X08's carries its own handoffHash and is hash-checked instead. The clause is
+// kept so a fixture emitted later with the record suffix is covered instead of silently skipped. The
+// 160 are 119 generation + 41 unit-directory, measured against `git ls-tree -r HEAD`.
 // Anchored to the trail. The filter used to run over the whole tree, so a `test/fixtures/...` or an
 // `output/`-style directory anywhere in the repository could be counted as (or silently drop out of)
 // the record population. The trail lives in one place and the denominator should be about it.
