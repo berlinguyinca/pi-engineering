@@ -173,10 +173,10 @@ steps:
       - 'python3 -m venv --help >/dev/null 2>&1 || { echo "python3 venv module missing on this agent" >&2; exit 1; }'
       - 'echo "node=$(node --version) npm=$(npm --version) $(python3 --version) $(make --version | head -1)"'
 
-  # The three trail gates: does every record reproduce from its committed bytes, does the evidence
+  # The four trail gates: does every record reproduce from its committed bytes, does the evidence
   # point at commits that exist and are reachable, and does the canonical chain connect. Until now
   # they were operator-run, which is how the trail's certification stayed true only in the checkout
-  # that wrote it: a fresh clone of main failed the lineage scan with 8 STALE defects minutes after
+  # that wrote it (a fifth gate for this file's own prose, `citation-existence-check`, lands with #665 and joins this step here): a fresh clone of main failed the lineage scan with 8 STALE defects minutes after
   # the checkout that fixed them printed `RESULT ok` (#659), and `record-reproducibility` certified
   # 119 of the 160 records it reads while a RESULT line read as though it covered the trail (#660).
   # Measured cost at this commit, on this laptop: integrity-scan 0.3 s, lineage-scan 8.0 s,
@@ -200,6 +200,7 @@ steps:
       - 'timeout -k 30 5m node "$AUDIT/integrity-scan.mjs"'
       - 'timeout -k 30 5m node "$AUDIT/lineage-scan.mjs"'
       - 'timeout -k 30 5m node "$AUDIT/record-reproducibility.mjs"'
+      - 'timeout -k 30 5m node "$AUDIT/citation-existence-check.mjs"'
 
   - name: install
     image: bash
