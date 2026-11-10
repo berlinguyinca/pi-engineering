@@ -8,7 +8,9 @@
 when:
   - event: tag
     ref: refs/tags/release/**
-    # Unproven on this server; if it never matches, try `refs/tags/release/*`.
+    # Proven on this server: pushing release/ci-trigger-probe produced pipeline
+    # 138 with event=tag and ref=refs/tags/release/ci-trigger-probe. The `*`
+    # form was never needed — `**` matches a single path segment here.
 
 skip_clone: true
 
@@ -28,6 +30,18 @@ variables:
   # Written with plain $VAR on purpose: Woodpecker substitutes braced variable
   # references in the YAML text before parsing and would blank any it does
   # not know.
+  # Duplicated from ci.yaml on purpose: YAML anchors do not cross files, and
+  # every step here gets a clean environment, so each step that runs node/npm
+  # has to re-export PATH itself. The release gate had no Node provisioning at
+  # all until a `release/*` tag proved it: `toolchain` died on the 22.18 floor
+  # because the agent's ambient Node is older, which means the gate could never
+  # have run its own roadmap:check. Keep in step with ci.yaml.
+  - &node_env |
+    NODE_VER=22.23.4
+    NODE_SHA256=b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406
+    NODE_HOME=/tmp/woodpecker-cache/pe-node-v$NODE_VER-linux-x64
+    export PATH="$NODE_HOME/bin:$PATH"
+    hash -r 2>/dev/null || true
   - &venv_resolve |
     VENV_PREFIX=/tmp/woodpecker-cache/pe-venv-
     case "$CI_REPO" in ''|*[!A-Za-z0-9._/-]*) echo "refusing: CI_REPO empty or unexpected: '$CI_REPO'" >&2; exit 1;; esac
@@ -136,11 +150,32 @@ steps:
       - 'test "$(git rev-parse HEAD)" = "$CI_COMMIT_SHA" || { echo "checked out $(git rev-parse HEAD), expected $CI_COMMIT_SHA" >&2; exit 1; }'
       - 'git --no-pager log --oneline -1'
 
+  # Provision the pinned Node before anything runs it. Same download, same
+  # digest check, same cache path as ci.yaml, so the two pipelines share one
+  # copy per agent and a stale pin can never satisfy a newer one.
+  - name: node
+    image: bash
+    commands:
+      - 'set -eu'
+      - *node_env
+      - 'if [ -x "$NODE_HOME/bin/node" ] && [ "$("$NODE_HOME/bin/node" --version)" = "v$NODE_VER" ]; then echo "node: reusing $NODE_HOME"; exit 0; fi'
+      - 'echo "node: host has $(node --version 2>/dev/null || echo nothing) at $(command -v node || echo none); provisioning v$NODE_VER"'
+      - 'CACHE=/tmp/woodpecker-cache; TMP="$CACHE/.pe-node-dl-$$-$RANDOM"; mkdir -p "$TMP"; trap "rm -rf -- \"$TMP\"" EXIT'
+      - 'timeout -k 30 10m curl -fsSL "https://nodejs.org/dist/v$NODE_VER/node-v$NODE_VER-linux-x64.tar.gz" -o "$TMP/node.tar.gz"'
+      - 'echo "$NODE_SHA256  $TMP/node.tar.gz" | sha256sum -c -'
+      - 'tar -xzf "$TMP/node.tar.gz" -C "$TMP"'
+      - 'test -x "$TMP/node-v$NODE_VER-linux-x64/bin/node" || { echo "tarball has no bin/node" >&2; exit 1; }'
+      - 'if [ -e "$NODE_HOME" ]; then echo "node: $NODE_HOME was placed while we were downloading"; else mv "$TMP/node-v$NODE_VER-linux-x64" "$NODE_HOME"; fi'
+      - '"$NODE_HOME/bin/node" --version | grep -qx "v$NODE_VER" || { echo "node: $NODE_HOME is not a working v$NODE_VER (the download verified; what is in place is not). This path is owned by this pin alone, so removing it is safe: rm -rf $NODE_HOME" >&2; exit 1; }'
+      - 'echo "node: provisioned $NODE_HOME ($("$NODE_HOME/bin/node" --version))"'
+
   - name: toolchain
     image: bash
     commands:
       - 'set -eu'
+      - *node_env
       - 'for t in node npm git make python3 bash; do command -v "$t" >/dev/null || { echo "missing on this agent: $t" >&2; exit 1; }; done'
+      - 'test "$(command -v node)" = "$NODE_HOME/bin/node" || { echo "node is $(command -v node), expected $NODE_HOME/bin/node" >&2; exit 1; }'
       # package.json runs .ts files with no flag: type stripping is on by
       # default only from Node 22.18.
       - 'node -e "const [a,b]=process.versions.node.split(\".\").map(Number); if (a<22||(a===22&&b<18)) { console.error(\"Node 22.18+ required, found \"+process.version); process.exit(1); }"'
@@ -153,6 +188,7 @@ steps:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
       - 'set -eu'
+      - *node_env
       - 'timeout -k 30 15m npm ci --no-audit --no-fund'
       # The CAV suites drive a real headless Chromium; npm ci does not fetch
       # the binary. No --with-deps: the hosts have no apt/sudo, so system
@@ -182,6 +218,10 @@ steps:
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
+      # npm has to resolve the provisioned Node here too — this step runs
+      # `npm run roadmap:check`, and the agent's ambient Node is below the
+      # 22.18 floor the package needs for type stripping.
+      - *node_env
       - *venv_resolve
       - 'export PATH="$VENV/bin:$PATH"'
       # Exit 0 = every required milestone VERIFIED, evidence fresh, no

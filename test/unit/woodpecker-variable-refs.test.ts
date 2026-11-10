@@ -71,6 +71,32 @@ function textLeaves(node: unknown, at: string, into: Array<{ at: string; text: s
   }
 }
 
+/**
+ * The Node pin is duplicated across pipelines because YAML anchors do not cross files.
+ * That is fine until one file is raised and the other is not: the release gate had no
+ * provisioning step at all, so it ran the agent's ambient Node and died on the 22.18
+ * floor in `toolchain` — a gate that could never have reached its own `roadmap:check`.
+ */
+test("every pipeline that pins Node pins the same version and digest", async () => {
+  const pins = new Map<string, string>();
+  const files = (await readdir(PIPELINE_DIR)).filter((f) => f.endsWith(".yaml")).sort();
+  for (const file of files) {
+    const text = await readFile(join(PIPELINE_DIR, file), "utf8");
+    const ver = text.match(/^\s*NODE_VER=(\S+)$/m)?.[1];
+    const sha = text.match(/^\s*NODE_SHA256=([0-9a-f]{64})$/m)?.[1];
+    if (ver === undefined && sha === undefined) continue;
+    assert.ok(ver !== undefined && sha !== undefined, `${file}: pins Node without a version+digest pair`);
+    pins.set(file, `${ver} ${sha}`);
+  }
+  assert.ok(pins.size >= 2, "expected ci.yaml and release-gate.yaml both to pin Node");
+  const distinct = new Set(pins.values());
+  assert.equal(
+    distinct.size,
+    1,
+    `Node pin drifted across pipelines: ${[...pins].map(([f, v]) => `${f}=${v}`).join(" vs ")}`,
+  );
+});
+
 test("no pipeline step asks Woodpecker to expand a variable it does not know", async () => {
   const files = (await readdir(PIPELINE_DIR)).filter((f) => f.endsWith(".yaml")).sort();
   assert.ok(files.length >= 2, `expected at least the ci and release-gate pipelines, saw: ${files.join(", ")}`);
