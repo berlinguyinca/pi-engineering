@@ -94,6 +94,7 @@ import {
 } from "./recovery.ts";
 import { recordSchedulerStatus } from "./recoveryNotice.ts";
 import type { SweepRecord } from "./referenceSweep.ts";
+import { enterRepairing } from "./repairEntry.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { buildReviewContext } from "./reviewContext.ts";
 import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
@@ -3529,11 +3530,16 @@ export class Orchestrator {
           handedOver ??
           this.store.getRecoveryDecision(recoveryChoice.recoveryId) ??
           this.store.planRecovery(recoveryChoice);
-        if (probe.status === "planned") this.store.transitionRecovery(probe.recoveryId, "started");
-        await this.store.flush();
-        if (this.store.getMission(missionId)!.status !== "REPAIRING") {
-          this.store.transitionMission(missionId, "REPAIRING");
+        // BLOCKED -> REPAIRING consumes the planned decision (the transition marks
+        // it started); starting it first made the mission's own transition fail the
+        // store's "must be planned" check on top of the missing decision ID.
+        if (probe.status === "planned" && this.store.getMission(missionId)!.status === "BLOCKED") {
+          enterRepairing(this.store, missionId, probe.recoveryId);
+        } else {
+          if (probe.status === "planned") this.store.transitionRecovery(probe.recoveryId, "started");
+          enterRepairing(this.store, missionId);
         }
+        await this.store.flush();
         await this.scheduler.gateBackoff(priorProbes, signal);
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         if (blockerTask.kind === "integration") {
@@ -3593,9 +3599,7 @@ export class Orchestrator {
         ) {
           mergeRetries++;
           repairRounds--;
-          if (this.store.getMission(missionId)!.status !== "REPAIRING") {
-            this.store.transitionMission(missionId, "REPAIRING");
-          }
+          enterRepairing(this.store, missionId);
           this.report(
             missionId,
             `[mission ${missionId}] integration failed; retrying the merge onto the current base (${mergeRetries}/${MAX_DETERMINISTIC_MERGE_RETRIES})`,
@@ -3678,9 +3682,7 @@ export class Orchestrator {
         });
       }
 
-      if (this.store.getMission(missionId)!.status !== "REPAIRING") {
-        this.store.transitionMission(missionId, "REPAIRING");
-      }
+      enterRepairing(this.store, missionId);
       this.phase(this.store.getMission(missionId)!, "repairing");
       // Failed re-adoptions are counted per stranded tip, so a different tip
       // gets its own attempts.
@@ -4082,7 +4084,7 @@ export class Orchestrator {
     const reviewGates: RequiredGate[] = ["independent_review", "compatibility_review", "security_review"];
     const missing = () => this.gate.evaluate(this.store.getMission(missionId)!).missing_gates;
     // FINAL_VALIDATION cannot move to VALIDATING; REPAIRING can.
-    if (this.store.getMission(missionId)!.status !== "REPAIRING") this.store.transitionMission(missionId, "REPAIRING");
+    enterRepairing(this.store, missionId);
     let validated = true;
     if (
       required.some((gate) => validationGates.includes(gate)) ||
@@ -4112,7 +4114,7 @@ export class Orchestrator {
     // REPAIRING — the legal, durably-recorded recovery state — before running.
     const cur = this.store.getMission(mission.mission_id)!.status;
     if (cur !== "VALIDATING" && !canTransitionMission(cur, "VALIDATING") && cur !== "REPAIRING") {
-      this.store.transitionMission(mission.mission_id, "REPAIRING");
+      enterRepairing(this.store, mission.mission_id);
     }
     this.store.transitionMission(mission.mission_id, "VALIDATING");
     const task = this.store.createTask({

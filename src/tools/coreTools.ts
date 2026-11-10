@@ -8,6 +8,7 @@ import type { Ledger } from "../ledger/Ledger.ts";
 import { countClaims, countGuardMessage, countsAreBacked, metricsFromOutput } from "../ledger/claimDiscipline.ts";
 import { MissionRefusedError, missionRefusalText } from "../orchestration/missionRefusal.ts";
 import type { OrchestrateResult, Orchestrator } from "../orchestration/orchestrator.ts";
+import { RepairEntryBlockedError } from "../orchestration/repairEntry.ts";
 import type { Mission } from "../orchestration/types.ts";
 import { lookupMissionDurable } from "../runtime/host/durableMissionLookup.ts";
 import { missionReportLines } from "./missionReport.ts";
@@ -745,6 +746,17 @@ export function buildCoreTools(
           const resumed = await services.resumeMission(missionId, signal);
           return describe(resumed, ["Resume requested."]);
         } catch (error) {
+          // #629: a blocked mission with no repair authority is a result the model
+          // can act on — it names the command — not a bare "Resume failed:" line.
+          if (error instanceof RepairEntryBlockedError) {
+            return text(error.message, {
+              missionId: error.missionId,
+              status: current.status,
+              recoveryBlocked: true,
+              blockedEpisodeId: error.blockedEpisodeId,
+              resumeCommand: error.resumeCommand,
+            });
+          }
           return describe(current, [`Resume failed: ${error instanceof Error ? error.message : String(error)}`]);
         }
       }
@@ -784,6 +796,20 @@ export function buildCoreTools(
               retryAfterMs: error.retryAfterMs,
               draining: error.draining,
               resumeHint: error.resumeHint,
+            },
+          };
+        }
+        // #629: a fresh run that lands on a BLOCKED mission in the same scope used
+        // to escape as the store's raw precondition. That was the agent's last
+        // door, and it said nothing about the one that exists.
+        if (error instanceof RepairEntryBlockedError) {
+          return {
+            content: [{ type: "text", text: error.message }],
+            details: {
+              recoveryBlocked: true,
+              missionId: error.missionId,
+              blockedEpisodeId: error.blockedEpisodeId,
+              resumeCommand: error.resumeCommand,
             },
           };
         }
