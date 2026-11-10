@@ -1478,7 +1478,11 @@ export class MissionStore {
     if (m.status === "BLOCKED" && to === "REPAIRING") {
       repairDecision = repairRecoveryId ? this.recoveryDecisions.get(repairRecoveryId) : undefined;
       if (!repairDecision) {
-        throw new Error("BLOCKED -> REPAIRING requires a durable repair recovery decision ID");
+        throw new Error(
+          `BLOCKED -> REPAIRING requires a durable repair recovery decision ID for mission ${missionId} ` +
+            `(episode ${m.blocked_episode_id ?? "unrecorded"}); resume it with /mission resume ${missionId} ` +
+            `(or the mission tool's resume action), or end it with /mission cancel ${missionId}`,
+        );
       }
       // A probe normally only waits, but re-running a gate that died on a
       // provider failure is active work on the existing candidate.
