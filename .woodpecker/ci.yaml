@@ -96,12 +96,16 @@ variables:
     for f in /etc/gitconfig "$HOME/.gitconfig" "$HOME/.git-credentials" "$HOME/.netrc" /etc/woodpecker-git-credentials; do
       if [ -e "$f" ]; then echo "  present: $f"; else echo "  absent:  $f"; fi
     done
-    if [ -n "${GIT_ASKPASS:-}" ]; then
-      # The agent's helper is deliberately NOT readable by the step: the first run that
-      # looked reported `set but not readable`, and a check that demanded -r or -x would
-      # fail a healthy checkout. So only its presence is asserted, and readability is
-      # reported rather than required.
-      echo "  askpass: set, not readable by this step (expected)"
+    # The colon-plus form, not colon-dash: the agent prints both lines for the same
+    # variable: the colon-dash form came back empty while the colon-plus form saw it
+    # set. Woodpecker substitutes colon-dash defaults from its own table and leaves the
+    # colon-plus form for the shell, so colon-dash is how a container variable silently
+    # becomes empty here. Written in words, because the substitution runs on comments
+    # too and the test that enforces this reads them.
+    if [ "${GIT_ASKPASS:+set}" = "set" ]; then
+      # Presence only. The helper is deliberately not readable by the step, and a check
+      # that demanded -r or -x would fail a healthy checkout.
+      echo "  askpass: set (not readable by this step, as expected)"
     else
       echo "  askpass: unset"
     fi
@@ -125,7 +129,7 @@ variables:
       echo "no git credential mechanism: GIT_ASKPASS unset, no credential.helper, no insteadOf rewrite" >&2
       exit 1
     fi
-    echo "  GIT_ASKPASS=${GIT_ASKPASS:+set} GITHUB_TOKEN=${GITHUB_TOKEN:+set} GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL:-unset}"
+    echo "  GIT_ASKPASS=${GIT_ASKPASS:+set} GITHUB_TOKEN=${GITHUB_TOKEN:+set} GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL:+set}"
 
 steps:
   - name: checkout

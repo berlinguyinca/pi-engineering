@@ -35,9 +35,10 @@ const PIPELINE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "
 
 /** The message every offender gets, kept out of the assert so it stays readable. */
 const HINT = [
-  "Woodpecker expands ${VAR} from its own table and blanks what it does not know, so a container",
-  "variable arrives at the shell as an empty string. Use ${VAR:-} (or plain $VAR) for anything the",
-  "agent puts in the environment.",
+  "Woodpecker expands brace references from its own table — the CI_* built-ins and declared",
+  "variables — and blanks the rest, so a container variable arrives at the shell as an empty",
+  "string. For anything the agent puts in the environment, use the colon-plus presence form or",
+  "plain $VAR; never the plain brace form, and never a colon-dash default.",
 ].join(" ");
 
 const REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}/g;
@@ -91,8 +92,16 @@ test("no pipeline step asks Woodpecker to expand a variable it does not know", a
         const rest = match[2] ?? "";
         // A reference with an operator (`:-`, `:+`, `#`, `%%`, …) is left alone by
         // Woodpecker and evaluated by the shell, which is the point.
-        if (rest !== "") operatorRefs++;
-        else if (!/^CI_/.test(name)) offenders.push(`${file}: \${${name}}`);
+        if (rest === "") {
+          if (!/^CI_/.test(name)) offenders.push(`${file}: \${${name}} (plain — Woodpecker substitutes it)`);
+          else operatorRefs++;
+        } else if (!/^CI_/.test(name) && !/^:\+/.test(rest)) {
+          // Proven on the agent, not inferred: for the same variable, `${GIT_ASKPASS:-}`
+          // arrived empty while `${GIT_ASKPASS:+set}` saw the value. A colon-dash default
+          // is filled from Woodpecker's table, so a container variable becomes "" and a
+          // guard built on it silently always fails.
+          offenders.push(`${file}: \${${name}:${rest} (colon-dash is substituted; use \${${name}:+word} or $${name}})`);
+        } else operatorRefs++;
       }
     }
   }
