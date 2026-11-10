@@ -83,9 +83,12 @@ test("no pipeline step asks Woodpecker to expand a variable it does not know", a
     textLeaves(doc, file, leaves);
     assert.ok(leaves.length > 10, `${file}: the walk found almost nothing; the test would pass vacuously`);
     for (const { at, text } of leaves) {
-      for (const bad of text.match(UNPARSEABLE) ?? []) unparseable.push(`${file}: ${bad}…`);
+      for (const bad of text.matchAll(UNPARSEABLE)) unparseable.push(`${file}: ${bad[0] ?? "?"}…`);
       for (const match of text.matchAll(REF)) {
-        const [, name, rest] = match;
+        // Destructuring would type them `string | undefined` under
+        // noUncheckedIndexedAccess; index explicitly with a default instead.
+        const name = match[1] ?? "";
+        const rest = match[2] ?? "";
         // A reference with an operator (`:-`, `:+`, `#`, `%%`, …) is left alone by
         // Woodpecker and evaluated by the shell, which is the point.
         if (rest !== "") operatorRefs++;
