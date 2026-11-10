@@ -3,9 +3,13 @@
 //
 //   node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs [ref]
 //
-// Every commit pointer in every tracked */out*/*.handoff.json -- baseSha, resultSha,
-// nextBaseSha -- must either be null (schema-legal: nothing declared / the chain ends here)
-// or name a commit that BOTH exists as an object AND is carried by at least one ref.
+// Every commit pointer in every tracked record -- baseSha, resultSha, nextBaseSha -- must either be
+// null (schema-legal: nothing declared / the chain ends here) or name a commit that BOTH exists as an
+// object AND is carried by at least one ref a clone of this repository would receive.
+//
+// A record is `<unit>/out*/<ID>.handoff.json` (a generation) or `<unit>/<ID>.handoff.json` (a
+// unit-directory record: the D-series and the corrected T-series). The header used to name only the
+// first shape and the code agreed with it, which left 41 records whose pointers no gate resolved.
 //
 // Existence alone is the wrong test, and that is how earlier audits proved these pointers:
 // an object can sit in the local object store with no ref carrying it, and a fresh clone only
@@ -61,7 +65,25 @@ const FETCHABLE = (r) => r.startsWith("refs/heads/") || r.startsWith("refs/tags/
 const run = (...a) => spawnSync("git", ["-c", "core.quotePath=false", ...a], { encoding: "utf8", maxBuffer: 1 << 26 });
 const ok = (...a) => run(...a).status === 0;
 const out = (...a) => { const r = run(...a); return r.status === 0 ? r.stdout.trim() : null; };
-const reach = (s) => /^[0-9a-f]{40}$/.test(String(s)) && ok("merge-base", "--is-ancestor", s, ref);
+// One git call per sha, not per mention. The trail names the same commits over and over -- a chain
+// unit's nextBaseSha is its child's baseSha, and a unit-directory record repeats its generation's
+// pointers -- and both `merge-base --is-ancestor` and `for-each-ref --contains` walk history on every
+// call. Measured -- medians of three warm runs on one machine -- widening to 160 records took 7.26 s
+// to 9.51 s, and with these two caches it is 5.70 s: faster than the narrower scan ran without them.
+const reachCache = new Map();
+const reach = (s) => {
+  if (!/^[0-9a-f]{40}$/.test(String(s))) return false;
+  if (!reachCache.has(s)) reachCache.set(s, ok("merge-base", "--is-ancestor", s, ref));
+  return reachCache.get(s);
+};
+const carriersCache = new Map();
+const carriers = (sha) => {
+  if (!carriersCache.has(sha)) {
+    const refs = ((out("for-each-ref", "--contains", sha, "--format=%(refname)") ?? "").split("\n").filter(Boolean));
+    carriersCache.set(sha, { all: refs, fetchable: refs.filter(FETCHABLE).length });
+  }
+  return carriersCache.get(sha);
+};
 
 // One defect, two spellings, and the environment picks which one you see: an object that is gone from
 // the refs reads `unreachable_from_any_ref` in the checkout that still holds it as a dangling object,
@@ -109,11 +131,50 @@ if ((out("rev-parse", "--is-shallow-repository") ?? "").trim() === "true") {
   console.log("  re-run against a full clone: git clone (no --depth) or git fetch --unshallow");
   process.exit(2);
 }
-const paths = out("ls-tree", "-r", "--name-only", ref).split("\n").filter((p) => /(^|\/)out[^/]*\/[^/]+\.handoff\.json$/.test(p));
+// Which files are records. Generation directories (`<unit>/out*/<ID>.handoff.json`) were the whole
+// story until today; the trail also holds unit-directory records (`<unit>/<ID>.handoff.json` -- the
+// D-series and the corrected T-series, 41 files), and those records declare baseSha / resultSha /
+// nextBaseSha exactly as the generations do. Walking only generations left 41 records whose pointers
+// no gate ever resolved, which is the same shape of gap #660 closed for hashes: the pointer check
+// printed `RESULT ok` over 119 of the 160 records. Widening costs one record's worth of new defects
+// (H07/H07.handoff.json, three pointers, declared in the manifest alongside its out-corrected twin).
+// Cost, medians of three warm runs on one machine (the first cold run of the widened scan read 27.5 s,
+// which is why these are medians and not one run each):
+//   119 records, no carrier cache   7.26 s
+//   160 records, no carrier cache   9.51 s
+//   160 records, with carrier cache 5.70 s
+// so the wider scan is faster than the narrower one was before the cache existed.
+//
+// `fixtures/` is deliberately NOT a record shape here even though `record-reproducibility.mjs` names
+// it: a payload fixture is a byte-copy of another record of the same unit, so its pointers are that
+// record's pointers, and re-declaring them per fixture path would put the same lost commit under
+// several manifest keys that can drift apart. (Moot in practice -- no fixture carries the
+// `.handoff.json` suffix today.)
+const SPEC = "docs/specs/harness-reliability-bootstrap-20261103";
+const shapeOf = (p) => {
+  if (!p.endsWith(".handoff.json")) return "not-a-record";
+  const parts = p.split("/");
+  const file = parts.pop();
+  const dir = parts.pop() ?? "";
+  const stem = file.replace(/\.handoff\.json$/, "");
+  if (/^out[^/]*$/.test(dir)) return "generation";
+  if (dir === stem) return "unit-directory";
+  if (dir === "fixtures") return "fixture-copy";   // a byte-copy of another record; see the note above
+  return "unclassified";
+};
+// Fail open never. A record whose name matches no known shape used to be skipped silently -- the same
+// under-count the `core.quotePath` comment above was written about, one level up: `T05/T05-v2.handoff.json`
+// or `H07/H07.corrected.handoff.json` is a record by any reading, and the old filter walked past it
+// while `records=` kept looking plausible.
+const allHandoffs = out("ls-tree", "-r", "--name-only", ref).split("\n").filter((p) => p.endsWith(".handoff.json"));
+const shapeCount = (want) => allHandoffs.filter((p) => shapeOf(p) === want).length;
+const unclassified = allHandoffs.filter((p) => p.startsWith(SPEC + "/") && shapeOf(p) === "unclassified");
+const outsideTrail = allHandoffs.filter((p) => !p.startsWith(SPEC + "/"));
+const paths = allHandoffs.filter((p) => ["generation", "unit-directory"].includes(shapeOf(p)));
 
 const broken = new Map();                 // "record|field" -> { sha, defect, carriers }
 const aliasApplied = [];               // entries whose observed defect is the alias of the declared one
-let nulls = 0, healthy = 0, unparseable = 0, localOnly = 0;
+let nulls = 0, healthy = 0, unparseable = 0, localOnly = 0, nonOriginOnly = 0;
 for (const f of paths) {
   let j; try { j = JSON.parse(out("show", `${ref}:${f}`)); } catch { unparseable++; continue; }
   for (const field of FIELDS) {
@@ -121,8 +182,8 @@ for (const f of paths) {
     if (sha === null || sha === undefined) { nulls++; continue; }
     if (!/^[0-9a-f]{40}$/.test(String(sha))) { broken.set(`${f}|${field}`, { sha: String(sha), defect: "malformed" }); continue; }
     if (!ok("cat-file", "-e", `${sha}^{commit}`)) { broken.set(`${f}|${field}`, { sha, defect: "object_missing" }); continue; }
-    const refs = (out("for-each-ref", "--contains", sha, "--format=%(refname)") ?? "").split("\n").filter(Boolean);
-    if (refs.filter(FETCHABLE).length === 0) {
+    const refs = carriers(sha).all;
+    if (carriers(sha).fetchable === 0) {
       // Distinguish "no ref at all" from "only a ref no clone will ever receive": the second is a
       // local-artifact problem and needs a different fix (push a branch, or re-stamp properly).
       broken.set(`${f}|${field}`, { sha, defect: refs.length ? "non_fetchable_ref_only" : "unreachable_from_any_ref", carriers: refs.map((r) => r.replace("refs/", "")) });
@@ -130,6 +191,13 @@ for (const f of paths) {
     }
     healthy++;
     if (!refs.some((r) => r.startsWith("refs/remotes/"))) localOnly++;
+    // FETCHABLE counts any `refs/remotes/*`, but a clone of THIS repository receives only what its
+    // origin carries. A pointer held solely by a second remote (an `upstream` someone added, as the
+    // H-series records' own repository might be added one day) is healthy here and `object_missing`
+    // for everyone else. Measured at this commit: 0 of 425 healthy pointers are in that class, so this
+    // is a tripwire rather than a fix -- deciding what origin really carries means asking origin, and
+    // a gate that needs the network to answer is a gate that goes red on a plane.
+    else if (!refs.some((r) => r.startsWith("refs/remotes/origin/"))) nonOriginOnly++;
   }
 }
 
@@ -164,7 +232,7 @@ for (const e of man.entries) {
     else if (!reach(e.replacement)) failures.push({ kind: "BAD_REPL", key, replacement: e.replacement.slice(0, 12), note: `not an ancestor of ${ref}` });
     // A replacement is only useful if someone else can obtain it, so it must sit on a clone-visible
     // ref, not merely be an ancestor of a local HEAD.
-    else if ((out("for-each-ref", "--contains", e.replacement, "--format=%(refname)") ?? "").split("\n").filter(FETCHABLE).length === 0) failures.push({ kind: "BAD_REPL", key, replacement: e.replacement.slice(0, 12), note: "carried by no fetchable ref (a clone cannot obtain it)" });
+    else if (carriers(e.replacement).fetchable === 0) failures.push({ kind: "BAD_REPL", key, replacement: e.replacement.slice(0, 12), note: "carried by no fetchable ref (a clone cannot obtain it)" });
   } else if (e.kind === "unresolvable") {
     if (e.replacement) failures.push({ kind: "BAD_ANNOTATION", key, note: "unresolvable entry must not carry a replacement" });
     if (!e.annotatedBy) failures.push({ kind: "BAD_ANNOTATION", key, note: "no annotatedBy" });
@@ -176,7 +244,7 @@ for (const e of man.entries) {
     // `abbreviated` entry asserts strictly more than "some commit starting with these bytes exists".
     const abbr = String(e.brokenSha);
     const repl = String(e.replacement ?? "");
-    const carriers = (r) => (out("for-each-ref", "--contains", r, "--format=%(refname)") ?? "").split("\n").filter(FETCHABLE).length;
+    const carrierCount = (r) => carriers(r).fetchable;
     if (!/^[0-9a-f]{7,39}$/.test(abbr)) failures.push({ kind: "BAD_ANNOTATION", key, note: `brokenSha is not a git abbreviation: ${abbr}` });
     else if (!/^[0-9a-f]{40}$/.test(repl)) failures.push({ kind: "BAD_ANNOTATION", key, note: "abbreviated entry must carry the replacement in full 40-hex form" });
     else {
@@ -191,7 +259,7 @@ for (const e of man.entries) {
       else if (named[0] !== repl) failures.push({ kind: "BAD_ANNOTATION", key, replacement: repl.slice(0, 12), note: `${abbr} names ${named[0].slice(0, 12)}, not this replacement` });
       else if (!ok("cat-file", "-e", `${repl}^{commit}`)) failures.push({ kind: "BAD_REPL", key, replacement: repl.slice(0, 12), note: "object missing" });
       else if (!reach(repl)) failures.push({ kind: "BAD_REPL", key, replacement: repl.slice(0, 12), note: `not an ancestor of ${ref}` });
-      else if (carriers(repl) === 0) failures.push({ kind: "BAD_REPL", key, replacement: repl.slice(0, 12), note: "carried by no fetchable ref (a clone cannot obtain it)" });
+      else if (carrierCount(repl) === 0) failures.push({ kind: "BAD_REPL", key, replacement: repl.slice(0, 12), note: "carried by no fetchable ref (a clone cannot obtain it)" });
       else if (!e.annotatedBy) failures.push({ kind: "BAD_ANNOTATION", key, note: "no annotatedBy naming the commit that carries the record" });
       else if (!reach(e.annotatedBy)) failures.push({ kind: "BAD_ANNOTATION", key, annotatedBy: String(e.annotatedBy).slice(0, 12), note: `not reachable from ${ref}` });
       // Anti-self-certification. A pointer is stamped wrong by the commit that carries the record, so
@@ -209,11 +277,13 @@ const dup = new Set(), seenPath = new Set();
 for (const f of paths) { if (seenPath.has(f)) dup.add(f); seenPath.add(f); }
 for (const f of dup) failures.push({ kind: "DUPLICATE", key: f });
 
-console.log(`ref=${ref} records=${paths.length} fields=${FIELDS.length}`);
+for (const u of unclassified) failures.push({ kind: "UNCLASSIFIED_RECORD", key: u, note: "a *.handoff.json in the trail matching no known record shape -- add the shape, do not skip it" });
+console.log(`ref=${ref} records=${paths.length} (generation=${shapeCount("generation")}, unit-directory=${shapeCount("unit-directory")}) fields=${FIELDS.length} fixture-copies-skipped=${shapeCount("fixture-copy")} outside-trail=${outsideTrail.length}`);
 for (const a of aliasApplied) console.log(`  alias applied     ${a}`);
 if (aliasApplied.length) console.log(`  (${aliasApplied.length} entry/entries matched through the alias; the object is no longer present locally, so re-pointing it onto a ref is no longer possible)`);
 console.log(`pointers healthy=${healthy} nullDeclared=${nulls} broken=${broken.size} unparseableRecords=${unparseable}`);
 console.log(`healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): ${localOnly}`);
+console.log(`healthy pointers carried only by a NON-origin remote (a clone of this repository would not get them): ${nonOriginOnly}`);
 const kindCount = (k) => man.entries.filter((e) => e.kind === k).length;
 console.log(`manifest=${man.schema} entries=${man.entries.length} superseded=${kindCount("superseded")} unresolvable=${kindCount("unresolvable")} abbreviated=${kindCount("abbreviated")}`);
 if (failures.length === 0) { console.log("RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation"); process.exit(0); }
