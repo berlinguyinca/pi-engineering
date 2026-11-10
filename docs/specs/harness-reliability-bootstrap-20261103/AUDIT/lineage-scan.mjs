@@ -37,6 +37,9 @@
 // Fails on:
 //   UNCOVERED      a broken pointer with no manifest entry
 //   STALE          manifest sha/kind/defect no longer matches what the record says
+//                  (a lost object's two spellings -- unreachable_from_any_ref where the object is
+//                   still present, object_missing in a clone of the remote -- are one class:
+//                   see DEFECT_ALIASES, so the gate does not depend on where it is run)
 //   DEFECT_GONE    the pointer healed or the record went missing -- prune or re-add the entry
 //   BAD_REPL       a superseded replacement that is missing or unreachable from the audited ref
 //   BAD_ANNOTATION an annotatedBy that is missing or unreachable, an unresolvable entry that quietly
@@ -60,14 +63,56 @@ const ok = (...a) => run(...a).status === 0;
 const out = (...a) => { const r = run(...a); return r.status === 0 ? r.stdout.trim() : null; };
 const reach = (s) => /^[0-9a-f]{40}$/.test(String(s)) && ok("merge-base", "--is-ancestor", s, ref);
 
+// One defect, two spellings, and the environment picks which one you see: an object that is gone from
+// the refs reads `unreachable_from_any_ref` in the checkout that still holds it as a dangling object,
+// and `object_missing` in a clone of the remote, where it never arrived. Measured at one commit with
+// the manifest unchanged: the working checkout reported 8 STALE defects and a fresh clone of the same
+// commit reported `RESULT ok` -- the gate was failing on where it was run, not on the repository. So a
+// declared defect accepts its alias. Everything else about the entry is still checked exactly: the SHA,
+// the record's state, the kind, and the annotation/replacement chain.
+//
+// What the alias does NOT claim: that the two spellings carry the same *recovery* prospect. While the
+// object still exists locally it can be pushed back onto a ref; once it is pruned it cannot. That is
+// why an alias that fires is printed (below, as `alias applied`) instead of passing unnoticed.
+const DEFECT_ALIASES = {
+  unreachable_from_any_ref: ["object_missing"],
+  object_missing: ["unreachable_from_any_ref"],
+  // `non_fetchable_ref_only` is deliberately NOT an alias. It says the object EXISTS and has a ref --
+  // just one a clone never receives (refs/stash, refs/notes/*, refs/original/*) -- and its fix is "push
+  // a branch", not "the commit is gone". Folding it in would let a declared lost-commit entry pass
+  // because somebody stashed on top of it. Measured at this commit: 0 pointers carry that defect, so
+  // excluding it costs nothing today and keeps the two fixes distinguishable tomorrow.
+};
+const defectMatches = (declared, actual) => declared === actual || (DEFECT_ALIASES[declared] ?? []).includes(actual);
+
 if (!ok("rev-parse", "--git-dir")) { console.error("not a git repository: run this from inside the repository"); process.exit(2); }
 if (!ok("rev-parse", "--verify", ref)) { console.error(`ref not found: ${ref}`); process.exit(2); }
 // The manifest lives beside the repository, so resolve it from the repo root rather than the
 // caller's directory -- otherwise running the gate from anywhere but the root fails confusingly.
 const root = out("rev-parse", "--show-toplevel");
+
+// Reachability is a question about history, and a shallow clone does not hold the history. Measured
+// at this commit with the manifest unchanged: a full clone reports broken=30 and a 50-commit clone of
+// the same commit reports broken=219, because a pointer whose ancestors were never fetched cannot be
+// shown reachable and is filed as a defect. A truncated checkout is then read as damage to the chain,
+// which is the inverse of the error this scanner was written for. Say the environment is unfit (exit
+// 2) instead of letting it speak. Today the gate is hand-run -- `.woodpecker/ci.yaml` runs no trail
+// scan -- so this protects manual runs; if the scans join the pipeline (PR #661's draft step) the
+// `checkout` step there fetches full history with all branches and tags, so a CI run would not land
+// here either. `?? ""` because `out` returns null when git errors, and `rev-parse
+// --is-shallow-repository` does error on git older than 2.15: without the guard the probe threw a
+// TypeError and exited 1 with a stack trace, which reads as a scan failure rather than an old git.
+// A hand-run in a shallow clone should re-clone, not chase 189 phantoms.
+if ((out("rev-parse", "--is-shallow-repository") ?? "").trim() === "true") {
+  console.log("manifest=harness-reliability-lineage-superseded/v2 (not consulted -- history is shallow)");
+  console.log("RESULT not-evaluated: this is a shallow clone, so ancestry cannot be judged from it");
+  console.log("  re-run against a full clone: git clone (no --depth) or git fetch --unshallow");
+  process.exit(2);
+}
 const paths = out("ls-tree", "-r", "--name-only", ref).split("\n").filter((p) => /(^|\/)out[^/]*\/[^/]+\.handoff\.json$/.test(p));
 
 const broken = new Map();                 // "record|field" -> { sha, defect, carriers }
+const aliasApplied = [];               // entries whose observed defect is the alias of the declared one
 let nulls = 0, healthy = 0, unparseable = 0, localOnly = 0;
 for (const f of paths) {
   let j; try { j = JSON.parse(out("show", `${ref}:${f}`)); } catch { unparseable++; continue; }
@@ -108,7 +153,11 @@ for (const e of man.entries) {
     continue;
   }
   if (cur.sha !== e.brokenSha) { failures.push({ kind: "STALE", key, manifest: e.brokenSha, actual: cur.sha }); continue; }
-  if (cur.defect !== e.defect) failures.push({ kind: "STALE", key, note: `defect ${e.defect} -> ${cur.defect}` });
+  if (!defectMatches(e.defect, cur.defect)) failures.push({ kind: "STALE", key, note: `defect ${e.defect} -> ${cur.defect}` });
+  // Accepted, but said out loud: `unreachable_from_any_ref -> object_missing` means the object was
+  // recoverable when the entry was written and is not now. Failing the run would be wrong (the entry
+  // is still true), and silence would drop the only signal that the window to push it closed.
+  else if (e.defect !== cur.defect) aliasApplied.push(`${key} ${e.defect} -> ${cur.defect}`);
   if (e.kind === "superseded") {
     if (!e.replacement) failures.push({ kind: "BAD_REPL", key, note: "superseded entry has no replacement" });
     else if (!ok("cat-file", "-e", `${e.replacement}^{commit}`)) failures.push({ kind: "BAD_REPL", key, replacement: e.replacement, note: "object missing" });
@@ -161,6 +210,8 @@ for (const f of paths) { if (seenPath.has(f)) dup.add(f); seenPath.add(f); }
 for (const f of dup) failures.push({ kind: "DUPLICATE", key: f });
 
 console.log(`ref=${ref} records=${paths.length} fields=${FIELDS.length}`);
+for (const a of aliasApplied) console.log(`  alias applied     ${a}`);
+if (aliasApplied.length) console.log(`  (${aliasApplied.length} entry/entries matched through the alias; the object is no longer present locally, so re-pointing it onto a ref is no longer possible)`);
 console.log(`pointers healthy=${healthy} nullDeclared=${nulls} broken=${broken.size} unparseableRecords=${unparseable}`);
 console.log(`healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): ${localOnly}`);
 const kindCount = (k) => man.entries.filter((e) => e.kind === k).length;
