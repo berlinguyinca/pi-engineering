@@ -238,3 +238,38 @@ node --test --test-concurrency=1 --import ./test/support/isolatedState.ts \
   test/integration/mission-interrupt-pause.test.ts                                    # 2026-11-09: exits 0; the hang above is resolved [now]
 node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs       # expect: RESULT ok, exit 0 -- run in a full clone; after #659 merges, a shallow one makes lineage-scan exit 2 saying so
 ```
+
+## Addendum, 2026-11-10, measured at `main` = `b29bf258`
+
+The Corrections section above was written while the work it describes was open, and main has since
+moved; this addendum states what is true now, without rewriting the dated text above it.
+
+* **#658, #659 and #660 are merged** (`6f380767`, `093c7bda`, and #660 as `568234b3`, with its review
+  fixes as `ec4dcf0c`). The "(open)" wording above was already false when this document's section was
+  committed: #660 merged at 04:25Z on 2026-11-10, before the section went in at 11:24Z.
+* **`lineage-scan.mjs` walks all 160 records** (119 generation, 41 unit-directory) since the lineage
+  widening `05781055`; the "generation records only" sentence above -- and the same sentence that
+  survived as a code comment in `AUDIT/record-reproducibility.mjs` -- are stale and are corrected
+  alongside this addendum. `AUDIT/lineage-superseded.json` now holds **33** entries (the "30" above
+  predates the widening's H-series declarations).
+* **The trail gates run in CI.** The `trail-scans` step (merged as `52a5ef15`) runs all four gates --
+  integrity-scan, lineage-scan, record-reproducibility, and the citation-existence gate (`e19cc560`)
+  -- on every pipeline, before `install`, so a red test run cannot hide a red trail. The first push
+  to main with the step on main itself (pipeline 131) is green; this addendum's own pipeline is the
+  next measurement of the same.
+* **The independent review happened.** Disqualifier 3 above ("the trail's own independent review is
+  still absent") is resolved by the review recorded in `X16/logs/16`: a fresh session of **Claude
+  Opus 5.5** (claude CLI), a different model and account from both the authoring session and the
+  capped Codex reviewer the trail's adversarial reviews used. Its verdict: the central claim holds --
+  all four gates pass in a true clone of origin, the controls detect every tamper scenario, and the
+  named hashes recompute exactly from their bytes. It also found that **the trail's description of its
+  own verification was stronger than what it recorded**: the P5 hash re-derivation in `X16/logs/10`
+  is a crash trace, the X15->X16 edge is a commit pointer rather than the hash binding the prose
+  claims, the state file carried a `task_authority_hash` no record has, X15's authority hash breaks
+  the FIX-4A parsed-manifest rule, and one predecessor hash at the B05->E01 seam cannot be verified
+  from the current tree. Each finding was re-verified by the operator before acting; the fixes and
+  declarations are in `PLAN-COMPLETION.json` (caveats and the 2026-11-10 `next_action` segment),
+  `X16/logs/16`, and the files it names. The controls script now asserts each case's expectation, so
+  its recorded exit status is evidence instead of an artifact of `set -u`.
+* **What this does not change:** the Verdict above remains NOT RELEASABLE until the operator's own
+  release decision; this addendum corrects the record, it does not make the call.
