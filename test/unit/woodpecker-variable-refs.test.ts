@@ -52,6 +52,11 @@ const REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}/g;
  * over the raw text: a comment explaining that the length form breaks the build breaks
  * the build.
  */
+const BRACE_HINT = [
+  "Woodpecker's substitution scanner cannot parse these brace shapes, and it scans comments",
+  "too, so documenting them in code form breaks the pipeline. Describe them in words.",
+].join(" ");
+
 const UNPARSEABLE = /\$\{#|\$\{[A-Za-z_]\w*\+[^:}]/g;
 
 /** Every string leaf of a parsed document, with a path for the failure message. */
@@ -90,12 +95,7 @@ test("no pipeline step asks Woodpecker to expand a variable it does not know", a
   }
 
   assert.deepEqual(offenders, [], `${offenders.join(", ")} — ${HINT}`);
-  assert.deepEqual(
-    unparseable,
-    [],
-    `${unparseable.join(", ")} — Woodpecker's substitution scanner cannot parse these brace shapes, ` +
-      `and it scans comments too, so documenting them in code form breaks the pipeline. Describe them in words.`,
-  );
+  assert.deepEqual(unparseable, [], `${unparseable.join(", ")} — ${BRACE_HINT}`);
   // Guards the walk itself: if the parser or the directory ever stops yielding the
   // step text, the assertion above would pass by finding nothing.
   assert.ok(operatorRefs >= 10, `only ${operatorRefs} braced references found; the walk is not seeing step text`);
