@@ -173,6 +173,35 @@ steps:
       - 'python3 -m venv --help >/dev/null 2>&1 || { echo "python3 venv module missing on this agent" >&2; exit 1; }'
       - 'echo "node=$(node --version) npm=$(npm --version) $(python3 --version) $(make --version | head -1)"'
 
+  # The four trail gates: does every record reproduce from its committed bytes, does the evidence
+  # point at commits that exist and are reachable, and does the canonical chain connect. Until now
+  # they were operator-run, which is how the trail's certification stayed true only in the checkout
+  # that wrote it (a fifth gate for this file's own prose, `citation-existence-check`, lands with #665 and joins this step here): a fresh clone of main failed the lineage scan with 8 STALE defects minutes after
+  # the checkout that fixed them printed `RESULT ok` (#659), and `record-reproducibility` certified
+  # 119 of the 160 records it reads while a RESULT line read as though it covered the trail (#660).
+  # Measured cost at this commit, on this laptop: integrity-scan 0.3 s, lineage-scan 8.0 s,
+  # record-reproducibility 1.1 s -- 9.4 s against an install step that takes minutes. The 8.0 s is the
+  # laptop's number and will differ on CI: lineage-scan's cost scales with the refs present (it asks
+  # `for-each-ref --contains` per pointer, memoised per sha), and a CI clone holds `refs/remotes/*`
+  # plus tags, not the dozens of local heads this checkout has. The 5-minute timeouts are slack for a
+  # loaded exec host, not a measured need. `lineage-scan` reads
+  # history, and the `checkout` step above fetches full history with all branches and tags -- that
+  # fetch is the guarantee; the scan's own shallow refusal (exit 2, #659) is the backstop for any
+  # future job that clones cheaper, since exit 2 fails this step the way any failure does.
+  # Placed after `toolchain`, before `install`: the step needs only the checkout step's full fetch and
+  # the pinned node, not the npm tree, and running it first means a red install or test run cannot
+  # hide a red trail -- the trail result is visible in every run, not only in green ones.
+  - name: trail-scans
+    image: bash
+    commands:
+      - 'set -eu'
+      - *node_env
+      - 'AUDIT=docs/specs/harness-reliability-bootstrap-20261103/AUDIT'
+      - 'timeout -k 30 5m node "$AUDIT/integrity-scan.mjs"'
+      - 'timeout -k 30 5m node "$AUDIT/lineage-scan.mjs"'
+      - 'timeout -k 30 5m node "$AUDIT/record-reproducibility.mjs"'
+      - 'timeout -k 30 5m node "$AUDIT/citation-existence-check.mjs"'
+
   - name: install
     image: bash
     environment:
