@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -110,8 +110,11 @@ describe("priorartDependency", () => {
     assert.equal(isUnderTmpdir(tmpdir()), true, "tmpdir itself is under tmpdir");
     // A name that merely contains the string "tmp" but is not under it must not match.
     assert.equal(isUnderTmpdir("/opt/always-present"), false);
+    // A fixed path, NOT homedir(): on CI the step's HOME is itself under /tmp (each step
+    // gets its own HOME under the scratch root), so homedir() is not a reliable "real
+    // home" there. /home is never a system temp dir, so this is host-independent.
     assert.equal(
-      isUnderTmpdir(join(homedir(), "IdeaProjects", "priorart")),
+      isUnderTmpdir(join("/home", "someone", "IdeaProjects", "priorart")),
       false,
       "a real home path is not ephemeral",
     );
