@@ -105,6 +105,24 @@ variables:
     else
       echo "  askpass: unset"
     fi
+    # Require *a* mechanism, not this one: an agent that changes mechanism should keep
+    # building, and only the absence of any way to authenticate is fatal. Presence only —
+    # never -x or -r, because the helper is deliberately not readable by the step.
+    #
+    # Inside the block scalar, and using `:+`, on purpose: Woodpecker's substitution
+    # scanner rejects `${#VAR}` and `${VAR+word}` outright (status=error, "missing
+    # closing brace", no agent, no logs), and a long single-line step command is where
+    # that is easiest to hit. The block's shapes are the tested ones.
+    if [ "${GIT_ASKPASS:+set}" = "set" ]; then
+      echo "  mechanism: GIT_ASKPASS"
+    elif git config --get-all credential.helper >/dev/null 2>&1; then
+      echo "  mechanism: credential.helper"
+    elif git config --get-regexp '^url\..*\.insteadof' >/dev/null 2>&1; then
+      echo "  mechanism: insteadOf rewrite"
+    else
+      echo "no git credential mechanism: GIT_ASKPASS unset, no credential.helper, no insteadOf rewrite" >&2
+      exit 1
+    fi
     echo "  GIT_ASKPASS=${GIT_ASKPASS:+set} GITHUB_TOKEN=${GITHUB_TOKEN:+set} GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL:-unset}"
 
 steps:
@@ -130,9 +148,6 @@ steps:
       # which reads as a broken agent, not as a wrong precondition.
       # The staged file the askpass helper reads. Kept as a check of its own: the
       # helper can be present and the credential it serves be missing.
-      - 'echo "DIAG colonplus=[${GIT_ASKPASS:+SET}]"'
-      - 'if [ -n "${GIT_ASKPASS:-}" ]; then echo "DIAG dashdash_test=nonempty"; else echo "DIAG dashdash_test=empty"; fi'
-      - 'if [ "${GIT_ASKPASS:+set}" = "set" ]; then echo "DIAG colonplus_test=set"; else echo "DIAG colonplus_test=notset"; fi'
       - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential file" >&2; exit 1; }'
       - *cred_probe
       - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
