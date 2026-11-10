@@ -35,12 +35,24 @@ const PIPELINE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "
 
 /** The message every offender gets, kept out of the assert so it stays readable. */
 const HINT = [
-  "Woodpecker expands \${VAR} from its own table and blanks what it does not know, so a container",
-  "variable arrives at the shell as an empty string. Use \${VAR:-} (or plain $VAR) for anything the",
+  "Woodpecker expands ${VAR} from its own table and blanks what it does not know, so a container",
+  "variable arrives at the shell as an empty string. Use ${VAR:-} (or plain $VAR) for anything the",
   "agent puts in the environment.",
 ].join(" ");
 
 const REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}/g;
+
+/**
+ * Two brace shapes Woodpecker's scanner cannot parse at all. They are not a step
+ * failure: the whole pipeline comes back status=error, "missing closing brace", with no
+ * agent assigned and no step logs anywhere, which looks like an outage. The length form
+ * (hash before the name) and the plus form without a colon. Both are valid shell.
+ *
+ * They are also easy to write by accident *in a comment*, because the substitution runs
+ * over the raw text: a comment explaining that the length form breaks the build breaks
+ * the build.
+ */
+const UNPARSEABLE = /\$\{#|\$\{[A-Za-z_]\w*\+[^:}]/g;
 
 /** Every string leaf of a parsed document, with a path for the failure message. */
 function textLeaves(node: unknown, at: string, into: Array<{ at: string; text: string }>): void {
@@ -58,6 +70,7 @@ test("no pipeline step asks Woodpecker to expand a variable it does not know", a
   assert.ok(files.length >= 2, `expected at least the ci and release-gate pipelines, saw: ${files.join(", ")}`);
 
   const offenders: string[] = [];
+  const unparseable: string[] = [];
   let operatorRefs = 0;
   for (const file of files) {
     const doc = parseYaml(await readFile(join(PIPELINE_DIR, file), "utf8"));
@@ -65,6 +78,7 @@ test("no pipeline step asks Woodpecker to expand a variable it does not know", a
     textLeaves(doc, file, leaves);
     assert.ok(leaves.length > 10, `${file}: the walk found almost nothing; the test would pass vacuously`);
     for (const { at, text } of leaves) {
+      for (const bad of text.match(UNPARSEABLE) ?? []) unparseable.push(`${file}: ${bad}…`);
       for (const match of text.matchAll(REF)) {
         const [, name, rest] = match;
         // A reference with an operator (`:-`, `:+`, `#`, `%%`, …) is left alone by
@@ -76,6 +90,12 @@ test("no pipeline step asks Woodpecker to expand a variable it does not know", a
   }
 
   assert.deepEqual(offenders, [], `${offenders.join(", ")} — ${HINT}`);
+  assert.deepEqual(
+    unparseable,
+    [],
+    `${unparseable.join(", ")} — Woodpecker's substitution scanner cannot parse these brace shapes, ` +
+      `and it scans comments too, so documenting them in code form breaks the pipeline. Describe them in words.`,
+  );
   // Guards the walk itself: if the parser or the directory ever stops yielding the
   // step text, the assertion above would pass by finding nothing.
   assert.ok(operatorRefs >= 10, `only ${operatorRefs} braced references found; the walk is not seeing step text`);

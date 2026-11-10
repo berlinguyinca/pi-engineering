@@ -74,10 +74,12 @@ variables:
     # building, and only the absence of any way to authenticate is fatal. Presence only —
     # never -x or -r, because the helper is deliberately not readable by the step.
     #
-    # Inside the block scalar, and using `:+`, on purpose: Woodpecker's substitution
-    # scanner rejects `${#VAR}` and `${VAR+word}` outright (status=error, "missing
-    # closing brace", no agent, no logs), and a long single-line step command is where
-    # that is easiest to hit. The block's shapes are the tested ones.
+    # Inside the block scalar, and using the colon-plus form, on purpose. Woodpecker
+    # runs its substitution over the raw YAML text -- comments included -- and its
+    # scanner rejects two other brace shapes outright: the length form (hash inside the
+    # braces) and the plus form without a colon. Either one makes the whole pipeline
+    # status=error, "missing closing brace", with no agent and no logs. Write those
+    # shapes in prose, never literally, or the documentation breaks the build.
     if [ "${GIT_ASKPASS:+set}" = "set" ]; then
       echo "  mechanism: GIT_ASKPASS"
     elif git config --get-all credential.helper >/dev/null 2>&1; then
