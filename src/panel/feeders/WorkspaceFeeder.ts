@@ -10,11 +10,12 @@
  * reason to blank what the operator was looking at.
  */
 
+import { envTtlMs } from "../../core/envKnob.ts";
 import type { GitRepo } from "../../git/GitRepo.ts";
 import type { PanelFileEntry, PanelState } from "../PanelState.ts";
 
-/** Matches the status bar's git cache TTL. */
-export const DEFAULT_WORKSPACE_TTL_MS = 30_000;
+/** Matches the status bar's git cache TTL. `PI_ENG_WORKSPACE_TTL_MS` retunes it for a session. */
+export const DEFAULT_WORKSPACE_TTL_MS = envTtlMs("PI_ENG_WORKSPACE_TTL_MS", 30_000);
 
 export interface WorkspaceFeederOptions {
   state: PanelState;

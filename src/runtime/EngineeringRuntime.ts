@@ -10,6 +10,7 @@ import { BlackholeManager, type BlackholeManagerOptions } from "../blackhole/Bla
 import type { RoleRouterAdapter } from "../capability/adapter.ts";
 import { differentFamilyReviewerAvailable } from "../capability/registryCandidates.ts";
 import { ContextBroker } from "../context/ContextBroker.ts";
+import { envTtlMs } from "../core/envKnob.ts";
 import { newRunId } from "../core/ids.ts";
 import type {
   Actor,
@@ -206,8 +207,8 @@ const SNAPSHOT_PUBLISH_BACKOFF_MS = 100;
 const SNAPSHOT_LOCK_BUSY_MAX_ATTEMPTS = 5;
 /** How long a publish waits for a live holder before skipping (#427). */
 const SNAPSHOT_LOCK_WAIT_MS = 250;
-/** Minimum interval between internal live-view snapshot publications. */
-const SNAPSHOT_PUBLISH_INTERVAL_MS = 750;
+/** Minimum interval between internal live-view snapshot publications; `PI_ENG_SNAPSHOT_PUBLISH_MS` retunes it. */
+const SNAPSHOT_PUBLISH_INTERVAL_MS = envTtlMs("PI_ENG_SNAPSHOT_PUBLISH_MS", 750, 50);
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
