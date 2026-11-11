@@ -32,8 +32,10 @@ import {
   type FallbackContext,
   FallbackCoordinator,
   type PendingFallback,
+  applyChosenModel,
   applyPendingFallback,
   previewFallback,
+  recordOperatorSwitch,
 } from "../src/gateway/fallbackLifecycle.ts";
 import {
   installGatewayStreamRetry,
@@ -2195,6 +2197,25 @@ ${RECOVERY_PROMPT}`;
       new AdvisedModelSwitch({
         claimPending: () => fallbackCoordinator.claimPending(),
         apply: applyClaimedFallback,
+        healthFor: (c) => healthFor(c as { model?: Model<any>; modelRegistry?: unknown }),
+        // The interactive picker's switch: the operator's own choice, so unlike
+        // the automatic switch it is NOT flagged automatic (a mission may adopt
+        // it as an operator pin). It keeps the replay-safety rule and the
+        // coordinator/stand-in bookkeeping.
+        applyChosen: async (ctx, chosen, pending) => {
+          const result = await applyChosenModel(
+            {
+              setModel: (m) => pi.setModel(m),
+              log: (message) => console.error(message),
+            },
+            ctx,
+            pending,
+            chosen,
+          );
+          recordOperatorSwitch(fallbackCoordinator, result, pending);
+          await refreshStandIn(ctx);
+          return result;
+        },
         // The wait the pump skipped, taken by the gateway wrapper before the
         // continued request (the same seam AfterOutputRetry uses).
         oweWait: (ctx, delayMs, attempt) => {
