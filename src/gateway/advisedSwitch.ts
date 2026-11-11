@@ -34,7 +34,10 @@
  * ctx that handler was given. Nothing here stores a ctx.
  */
 
+import type { Model } from "@earendil-works/pi-ai/compat";
+import type { ModelHealthProvider } from "../models/health.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
+import { PICKER_TIMEOUT_MS, buildPickerEntries, runModelPicker } from "./advisedPicker.ts";
 import { type ProjectedEntry, hasVisibleOutput, lastFailedAssistant } from "./afterOutputRetry.ts";
 import type { FallbackApplyResult, FallbackContext, PendingFallback } from "./fallbackLifecycle.ts";
 import {
@@ -87,7 +90,19 @@ export interface AdvisedSwitchDeps {
    * same model — never worse than having waited in the first place.
    */
   oweWait?(ctx: FallbackContext, delayMs: number, attempt: number): void;
+  /**
+   * Switch to the model the operator picked (the interactive picker offered
+   * when no stand-in fits). Same ownership as `apply`: the caller holds the
+   * live `pi`. Without it the picker is never offered.
+   */
+  applyChosen?(ctx: FallbackContext, model: Model<any>, pending: PendingFallback): Promise<FallbackApplyResult>;
+  /** Gateway readiness for the picker's rows; optional and allowed to throw. */
+  healthFor?(ctx: FallbackContext): Promise<ModelHealthProvider | undefined> | ModelHealthProvider | undefined;
+  /** How long the picker waits for an answer; defaults to {@link PICKER_TIMEOUT_MS}. */
+  pickerTimeoutMs?: number;
 }
+
+type BoundaryReplay = { entries: unknown[]; continue: true };
 
 /** Did this failed assistant message carry the gateway's alternate-model advice? */
 export function carriesAlternateAdvice(message: { errorMessage?: string } | undefined): boolean {
@@ -143,7 +158,7 @@ export class AdvisedModelSwitch {
     // Omit the failed (empty) message from the model's context, as Pi's own
     // retry would, and ask for one more provider request. Boundary results
     // REPLACE the accumulated drafts, so keep other handlers' entries.
-    const replay = {
+    const replay: BoundaryReplay = {
       entries: [...(event.entries ?? []), { type: "context_edit", targetId: failed.entryId, replacement: null }],
       continue: true,
     };
@@ -155,6 +170,8 @@ export class AdvisedModelSwitch {
       // keep a turn in this loop.
       const why = result.reason ?? result.skipped ?? "unknown";
       if (!this.deps.oweWait || ++this.stays > MAX_STAY_CONTINUES) {
+        const chosen = await this.offerPicker(ctx, pending, result, replay);
+        if (chosen) return chosen;
         emitTelemetry({
           level: "warning",
           key: "advised-model-switch:stay",
@@ -179,5 +196,70 @@ export class AdvisedModelSwitch {
       text: `${result.currentId} is out of capacity — the gateway advised another model; continuing on ${result.targetId}.`,
     });
     return replay;
+  }
+
+  /**
+   * No stand-in fits and the automatic waits are spent: let an operator at a
+   * live UI choose. Anything but an applied choice or an explicit "keep
+   * waiting" returns undefined, and the caller ends the turn as it always did.
+   */
+  private async offerPicker(
+    ctx: FallbackContext,
+    pending: PendingFallback,
+    result: FallbackApplyResult,
+    replay: BoundaryReplay,
+  ): Promise<BoundaryReplay | undefined> {
+    const { applyChosen, oweWait } = this.deps;
+    const select = ctx.ui?.select;
+    // A refusal for an unsafe replay would refuse the pick too; do not ask.
+    if (!applyChosen || !select || ctx.hasUI !== true || result.skipped === "tool-started-not-replay-safe") {
+      return undefined;
+    }
+    const entries = buildPickerEntries({
+      source: ctx.model,
+      available: ctx.modelRegistry?.getAvailable?.() ?? [],
+      excludeIds: pending.excludeIds,
+      usedTokens: ctx.getContextUsage?.()?.tokens,
+      health: await this.healthOf(ctx),
+      waitMs: result.blocked?.retryAfterMs ?? pending.retryAfterMs ?? DEFAULT_STAY_WAIT_MS,
+      allowKeepWaiting: oweWait !== undefined,
+    });
+    const source = pending.sourceModelId ?? ctx.model?.id ?? "the current model";
+    const outcome = await runModelPicker(select, entries, {
+      title: `${source} is out of capacity and the gateway advises another model. Choose one:`,
+      timeoutMs: this.deps.pickerTimeoutMs ?? PICKER_TIMEOUT_MS,
+    });
+    if (outcome.kind === "keep-waiting" && oweWait) {
+      oweWait(ctx, outcome.delayMs, this.stays);
+      return replay;
+    }
+    if (outcome.kind !== "picked") return undefined;
+    let applied: FallbackApplyResult;
+    try {
+      applied = await applyChosen(ctx, outcome.model, pending);
+    } catch (error) {
+      emitTelemetry({
+        level: "warning",
+        key: "advised-model-switch:failed",
+        text: `Could not switch to ${outcome.model.id}: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return undefined;
+    }
+    if (!applied.switched) return undefined;
+    this.stays = 0;
+    emitTelemetry({
+      level: "info",
+      key: "advised-model-switch:picked",
+      text: `${source} is out of capacity — you picked ${outcome.model.id}; continuing on it.`,
+    });
+    return replay;
+  }
+
+  private async healthOf(ctx: FallbackContext): Promise<ModelHealthProvider | undefined> {
+    try {
+      return await this.deps.healthFor?.(ctx);
+    } catch {
+      return undefined;
+    }
   }
 }
