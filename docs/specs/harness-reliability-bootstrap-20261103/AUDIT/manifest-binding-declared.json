@@ -9,9 +9,9 @@
     "authority_unresolvable": "no tracked version of any manifest in the record's unit hashes to the record's taskAuthorityHash, raw or parsed, at the audited ref or at any commit reachable from it. `annotatedBy` names a reachable commit that carries this record and its evidence -- it is NOT a substitute for the missing manifest.",
     "no_manifest": "the record carries taskAuthorityHash and its unit tracks no manifest at all, so the field cannot reproduce from anything in the repository. `observed` names what the value actually is, where the gate could trace it.",
     "parent_unresolvable": "manifest.parentHandoffHash is a well-formed sha256 digest that is no tracked record's handoffHash. `annotatedBy` names a reachable commit that carries this manifest -- it is NOT a substitute for the missing parent record.",
-    "edge_absent": "a child manifest names a parent record by hash while that record declares nextBaseSha null, so the hash edge exists and the commit edge does not. AUDIT/integrity-scan.mjs certifies the chain in the commit direction (parent.nextTaskId@nextBaseSha -> child taskId@baseSha), so the link this entry declares is absent from the chain that gate certifies. `observed` is the parent's declared nextBaseSha."
+    "edge_absent": "a child manifest names a parent record by hash while NO generation of that parent unit declares the forward commit edge, so the hash edge exists and the commit edge does not. Not used by any entry today: the first version of the gate raised this against X08 by asking the wrong record -- X08's hash names X07/out, while X07/out-chain carries nextTaskId=X08 / nextBaseSha=45d42acb... == X08.baseSha, exactly as PLAN-COMPLETION.json's post_plan_extension.chain_note has recorded since the X-series. The kind stays because the gate can still detect the shape."
   },
-  "count": 11,
+  "count": 10,
   "entries": [
     {
       "record": "E01/E01.handoff.json",
@@ -82,13 +82,6 @@
       "observed": "sha256:21bae9f5a1c1231b992b3909ca3d754f0426a1f2c618a03c37c0083329750cb7",
       "annotatedBy": "24f42fba3f711dbf62a2c61d58a5545b0234865d",
       "why": "The one parentHandoffHash of 71 that names no tracked record's handoffHash (measured across every tracked record at the audited ref). The only B05 record the repository holds is 064b4e71..., produced by the 2026-11-05 backfill, and it is not this value. The structural edge is intact and is what integrity-scan certifies -- B05.nextBaseSha equals E01.baseSha -- so the chain link exists in the direction the chain gate walks; what is missing is the hash half, and it cannot be recovered because the record it named is not in the repository. Found by the 2026-11-10 independent review as finding F5."
-    },
-    {
-      "manifest": "X08/fixtures/manifest.json",
-      "kind": "edge_absent",
-      "observed": "nextBaseSha=null",
-      "annotatedBy": "733e4486540d03c349b7f8425d1dcb9c511c5bd1",
-      "why": "X08's manifest names X07 as parent by hash, and X07/out/X07.handoff.json's handoffHash is that value -- so the hash edge holds. X07 declares nextTaskId null and nextBaseSha null, so it declares no forward edge at all, and integrity-scan -- which walks parent.nextTaskId@nextBaseSha to child taskId@baseSha -- therefore does not see an X07 -> X08 link. 69 of the 70 resolvable parent edges are symmetric; this is the one that is declared in only one direction. X07 is hash-bound, so the asymmetry cannot be corrected by editing X07: it takes a new generation or a protocol decision. Found by this scan on 2026-11-10; the independent review did not reach it, because no gate read these edges before this file existed."
     }
   ]
 }

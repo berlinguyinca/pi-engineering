@@ -68,8 +68,9 @@ replace() {
 # break <file> <old> <new> -- replace, then commit, so the audited ref contains the break.
 break_() {
   replace "$1" "$2" "$3"
-  git -C "$PROBE" add -A >/dev/null && git -C "$PROBE" -c commit.gpgsign=false commit -q -m "probe: deliberate break" || { echo "FATAL: cannot commit the probe break"; exit 1; }
+  commit_break
 }
+commit_break() { git -C "$PROBE" add -A >/dev/null && git -C "$PROBE" -c commit.gpgsign=false commit -q -m "probe: deliberate break" || { echo "FATAL: cannot commit the probe break"; exit 1; }; }
 undo() { git -C "$PROBE" reset --hard -q HEAD~1 >/dev/null && git -C "$PROBE" clean -qfd; }
 # Declaration cases: mutate on disk, restore from the index. No commit -- see the header.
 restore_decl() { git -C "$PROBE" checkout -q -- "$DECL"; }
@@ -196,6 +197,25 @@ fi
 if [ "$(git -C "$PROBE" rev-parse HEAD)" != "$(git -C "$PROBE" rev-parse "$BASE")" ]; then
   expect_failed "M13-head-moved: the probe is not back at $BASE"
 fi
+
+line "M14 the parent's forward edge is carried by a LATER generation, and removing THAT one is caught"
+# The regression this exists for: the first version of the gate resolved X08's parent to the record the
+# hash names (X07/out, nextTaskId null) and demanded the forward edge from that same record -- reporting
+# a false EDGE-ABSENT on a link that X07/out-chain carries (nextTaskId=X08,
+# nextBaseSha=45d42acb... == X08.baseSha), exactly as PLAN-COMPLETION.json's
+# post_plan_extension.chain_note has recorded since the X-series. Nothing here caught that; the state
+# file did. So the case asserts both halves now: the multi-generation shape is NOT an offence (M0 covers
+# that), and breaking the generation that actually carries the edge IS.
+replace "$R/X07/out-chain/X07.handoff.json" '"nextTaskId": "X08"' '"nextTaskId": null'
+replace "$R/X07/out-chain/X07.handoff.json" '"nextBaseSha": "45d42acb70fc2fcac76425d18eb1d651b0e0a9ba"' '"nextBaseSha": null'
+commit_break
+run; grep -E 'EDGE-ABSENT|^RESULT' "$LAST_OUT" | head -3
+check M14-edge-carried-by-later-generation fail 'EDGE-ABSENT.*X08/fixtures/manifest.json.*no generation of X07 declares'
+undo
+
+line "M15 back to the untouched tree"
+run; tail -1 "$LAST_OUT"
+check M15-restored-again ok 'RESULT ok'
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

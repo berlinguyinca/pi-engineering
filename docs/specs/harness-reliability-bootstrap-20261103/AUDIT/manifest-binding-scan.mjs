@@ -334,15 +334,27 @@ for (const m of manifests) {
   const [pUnit] = [...units.keys()];
   const pRec = records.find((r) => r.unit === pUnit && r.json.handoffHash === parent && (genOf(r) === null || rank(genOf(r)) >= 1)) ?? records.find((r) => r.unit === pUnit && r.json.handoffHash === parent);
   const childTask = m.json.taskId, childBase = m.json.baseSha;
+  // The forward commit edge may be carried by ANY generation of the parent unit, and for eight units
+  // of the X-series it is not the one the hash names. X08 descends from the X07 record that existed
+  // when it was handed off (X07/out, handoffHash 66af2c2b...), while the chain link is carried by the
+  // generation written later to continue a unit that had been emitted terminal (X07/out-chain:
+  // nextTaskId=X08, nextBaseSha=45d42acb... == X08.baseSha). PLAN-COMPLETION.json's
+  // post_plan_extension.chain_note has said so since the X-series -- "a PASS record is never
+  // rewritten" -- and demanding the edge from the hash-named record specifically is what made the
+  // first version of this gate report a false EDGE-ABSENT on X08. The question the chain actually
+  // asks, and the one integrity-scan asks, is whether the parent unit declares the link at all.
+  const declares = records.filter((r) => r.unit === pUnit && r.json.nextTaskId === childTask && r.json.nextBaseSha === childBase);
+  if (declares.length > 0) { parentOk++; continue; }
   const nt = pRec?.json?.nextTaskId, nb = pRec?.json?.nextBaseSha;
+  const anyEdge = records.find((r) => r.unit === pUnit && r.json.nextTaskId != null);
   if (nt === undefined || nt === null || nb === undefined || nb === null) {
     if (excuse(m.file, "edge_absent", `nextBaseSha=${nb}`)) parentDeclared.push(`${m.file} parent ${pUnit} declares no forward commit edge (hash edge only)`);
-    else flag("EDGE-ABSENT", `${m.file} names ${pUnit} parent by hash; ${pUnit} declares nextTaskId=${nt} nextBaseSha=${nb}, so integrity-scan sees no ${pUnit} -> ${childTask} link`);
+    else flag("EDGE-ABSENT", `${m.file} names ${pUnit} parent by hash; no generation of ${pUnit} declares ${childTask}@${String(childBase).slice(0, 12)}, so integrity-scan sees no ${pUnit} -> ${childTask} link`);
     continue;
   }
   if (nt !== childTask || nb !== childBase) {
     if (excuse(m.file, "edge_wrong", `${nt}@${String(nb).slice(0, 12)}`)) parentDeclared.push(`${m.file} parent ${pUnit} points at ${nt}@${String(nb).slice(0, 12)}`);
-    else flag("EDGE-WRONG", `${m.file} names ${pUnit} parent; ${pUnit} declares forward edge ${nt}@${String(nb).slice(0, 12)}, not ${childTask}@${String(childBase).slice(0, 12)}`);
+    else flag("EDGE-WRONG", `${m.file} names ${pUnit} parent; no generation of ${pUnit} declares ${childTask}@${String(childBase).slice(0, 12)}${anyEdge ? ` (its ${genOf(anyEdge) ?? "unit-dir"} generation points at ${anyEdge.json.nextTaskId}@${String(anyEdge.json.nextBaseSha).slice(0, 12)})` : ""}`);
     continue;
   }
   parentOk++;
