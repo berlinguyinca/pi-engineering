@@ -1,0 +1,87 @@
+{
+  "schema": "harness-reliability-manifest-binding-declared/v1",
+  "auditedRef": "HEAD",
+  "purpose": "Declared breaks in the two hash edges the other four gates never read: record.taskAuthorityHash (the canonical hash of the task's manifest, FIX-4A) and manifest.parentHandoffHash (the handoffHash of the record a task descended from). Handoff records are hash-bound -- handoffHash is the SHA-256 over deterministic sorted-key UTF-8 serialisation excluding handoffHash (02-HANDOFF-PROTOCOL.md:15; canonicalHash at src/bootstrap/resultGate.ts:30) -- so a record that was stamped wrong cannot be corrected in place without destroying the bytes every log it vouches for is hashed against. Nothing here is rewritten. AUDIT/manifest-binding-scan.mjs re-verifies every entry on each run: an entry whose observed value no longer matches what the tree says is STALE, an entry whose deviation has gone is DECL-GONE, and an entry whose annotatedBy is unreachable or does not carry the file it annotates is BAD-DECLARATION.",
+  "kinds": {
+    "authority_raw": "record.taskAuthorityHash is canonicalHash(RAW manifest) where FIX-4A (src/bootstrap/resultGate.ts:47-51) requires canonicalHash(PARSED manifest). The two differ for every manifest in this trail, because the parser rebuilds each command object as {argv, cwd} and applies three defaults, so no manifest hashes the same raw and parsed. `observed` is the value the record carries.",
+    "authority_superseded": "the record's authority matches no tracked manifest version, and a higher-ranked generation of the same unit -- ranked as AUDIT/integrity-scan.mjs:29-33 ranks generations -- does conform. The record is the pre-correction original; the correction is the generation, and the original stays because it is hash-bound. The gate PROVES the sibling conforms rather than accepting the claim.",
+    "authority_historic": "the record's authority reproduces from a historical version of its unit's manifest and the manifest moved afterwards, so the record was right when it was stamped. Not used by any entry today; the kind exists because the gate can prove it and a future entry may need it.",
+    "authority_unresolvable": "no tracked version of any manifest in the record's unit hashes to the record's taskAuthorityHash, raw or parsed, at the audited ref or at any commit reachable from it. `annotatedBy` names a reachable commit that carries this record and its evidence -- it is NOT a substitute for the missing manifest.",
+    "no_manifest": "the record carries taskAuthorityHash and its unit tracks no manifest at all, so the field cannot reproduce from anything in the repository. `observed` names what the value actually is, where the gate could trace it.",
+    "parent_unresolvable": "manifest.parentHandoffHash is a well-formed sha256 digest that is no tracked record's handoffHash. `annotatedBy` names a reachable commit that carries this manifest -- it is NOT a substitute for the missing parent record.",
+    "edge_absent": "a child manifest names a parent record by hash while NO generation of that parent unit declares the forward commit edge, so the hash edge exists and the commit edge does not. Not used by any entry today: the first version of the gate raised this against X08 by asking the wrong record -- X08's hash names X07/out, while X07/out-chain carries nextTaskId=X08 / nextBaseSha=45d42acb... == X08.baseSha, exactly as PLAN-COMPLETION.json's post_plan_extension.chain_note has recorded since the X-series. The kind stays because the gate can still detect the shape."
+  },
+  "count": 10,
+  "entries": [
+    {
+      "record": "E01/E01.handoff.json",
+      "kind": "authority_unresolvable",
+      "observed": "sha256:5dd2176930904126c7969a734bd0cac49dfece2f3421c40eebcddbc3b68e620e",
+      "annotatedBy": "24f42fba3f711dbf62a2c61d58a5545b0234865d",
+      "why": "E01 is the earliest unit whose record carries the field, and its manifest (E01/fixtures/manifest-e01.json) has exactly one version in the whole history -- the one landed by the commit that also landed the record. Neither that version's raw nor its parsed canonical hash is the value the record stamps, so the authority was never reproducible from the manifest the repository holds. The same unit also holds the trail's only unresolved parentHandoffHash (see the manifest entry below), which is consistent with E01's record and manifest having been written from run-state that was never committed rather than from the committed pair."
+    },
+    {
+      "record": "E01/out/E01.handoff.json",
+      "kind": "authority_unresolvable",
+      "observed": "sha256:5dd2176930904126c7969a734bd0cac49dfece2f3421c40eebcddbc3b68e620e",
+      "annotatedBy": "ba6ef0d1484f185682e793af65f69ecc0f5f065e",
+      "why": "The generation copy of the unit-directory record above: byte-identical, so the same handoffHash and the same unreproducible authority. Declared separately because the gate reports offences per file, and a declaration that excused only one of the two would leave the other red."
+    },
+    {
+      "record": "H07/H07.handoff.json",
+      "kind": "authority_superseded",
+      "observed": "sha256:a916c10950de2abece2fb2d8b2d66ff4ee96e1519db4ef590f34e1b14c1fe9f9",
+      "annotatedBy": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+      "why": "H07/out-corrected/H07.handoff.json -- ranked above the unit-directory record, and the gate verifies its authority reproduces from the parsed H07 manifest rather than taking this entry's word. No version of any H07 manifest, raw or parsed, at any commit, hashes to the value this record carries, so this is a pre-correction original and not a manifest that moved under a correct record."
+    },
+    {
+      "record": "R08/R08.handoff.json",
+      "kind": "authority_superseded",
+      "observed": "sha256:9b2c4477263be1ee4f8a1d461063709da1b5e3e5fae710839e9cdb8ea10dd5fb",
+      "annotatedBy": "ba6ef0d1484f185682e793af65f69ecc0f5f065e",
+      "why": "R08/out-corrected/R08.handoff.json conforms to the parsed-manifest protocol (9d9080fc0ce808b62ac...), and no version of any R08 manifest hashes to the value this record carries. Same correction pattern as H07: the successor was re-stamped, the original is hash-bound and stays."
+    },
+    {
+      "record": "R08/out/R08.handoff.json",
+      "kind": "authority_superseded",
+      "observed": "sha256:9b2c4477263be1ee4f8a1d461063709da1b5e3e5fae710839e9cdb8ea10dd5fb",
+      "annotatedBy": "ba6ef0d1484f185682e793af65f69ecc0f5f065e",
+      "why": "The generation copy of the unit-directory record above -- identical bytes, identical unreproducible authority, corrected by the same out-corrected generation."
+    },
+    {
+      "record": "V01/out/V01.handoff.json",
+      "kind": "authority_superseded",
+      "observed": "sha256:4327b896981df1c0bcb313b97d82fc9adf05b9bb8548383420874c0953309365",
+      "annotatedBy": "ff2a8a6bf4eeaff88677ff2ef5f652c43709429f",
+      "why": "Two facts hold at once, and both are recorded rather than the convenient one. This record's authority IS canonicalHash(parsed V01/fixtures/manifest.json) AT ff2a8a6b -- the commit that carries it -- so it was correct when it was stamped and the manifest moved under it afterwards. And V01/out-corrected/V01.handoff.json conforms to the manifest as it now stands, so the trail already holds the corrected record. The gate reports the supersession because that is the explanation it reaches first; the historic match is measured in X16/logs/17 and is the reason this entry is worded as it is."
+    },
+    {
+      "record": "X15/out/X15.handoff.json",
+      "kind": "authority_raw",
+      "observed": "sha256:9766e2fb5a7ad9cc8cc855cfc226f9d997becd1328ffc6b9aef9cc2de6ec84f6",
+      "annotatedBy": "b0a2cf0eeb84062210d5965f2c71a6c55e0f3e41",
+      "why": "The value is canonicalHash(RAW X15/fixtures/manifest.json), measured; the parsed manifest hashes to 1352fe82..., which is what FIX-4A requires and what X14's record does carry. Declared, not corrected: handoffHash binds every field of the record to the logs it vouches for, so restamping the authority would silently unbind X15's evidence. No gate read taskAuthorityHash before this scan existed, which is why the deviation survived to be found by an independent review (finding F4) rather than by CI. The 2026-11-10 review named X15/out-chain only; this scan measures BOTH X15 records carrying the same raw-manifest value."
+    },
+    {
+      "record": "X15/out-chain/X15.handoff.json",
+      "kind": "authority_raw",
+      "observed": "sha256:9766e2fb5a7ad9cc8cc855cfc226f9d997becd1328ffc6b9aef9cc2de6ec84f6",
+      "annotatedBy": "d00bbb733c40763e80998a8e91bba694f997e7a7",
+      "why": "The chain-continuation copy of X15/out/X15.handoff.json, carrying the same authority value and the same deviation. This is the record finding F4 named; the scan found its sibling too."
+    },
+    {
+      "record": "X16/out/X16.handoff.json",
+      "kind": "no_manifest",
+      "observed": "sha256:9766e2fb5a7ad9cc8cc855cfc226f9d997becd1328ffc6b9aef9cc2de6ec84f6",
+      "annotatedBy": "d00bbb733c40763e80998a8e91bba694f997e7a7",
+      "why": "X16 is the terminal unit and has no manifest -- X16/fixtures/emit-records.mts:69 says so itself. Its taskAuthorityHash is not this unit's authority at all: line 76 of that script reads X15/out/X15.handoff.json and copies its taskAuthorityHash into X16's record, and the copied value is measured to equal canonicalHash(RAW X15/fixtures/manifest.json) -- so X16 inherits X15's deviation one level down. Declared as no_manifest rather than authority_raw because the gate cannot reach a manifest for this unit at all, and the distinction matters: fixing X15 does not fix this field, which is a copy frozen into hashed bytes."
+    },
+    {
+      "manifest": "E01/fixtures/manifest-e01.json",
+      "kind": "parent_unresolvable",
+      "observed": "sha256:21bae9f5a1c1231b992b3909ca3d754f0426a1f2c618a03c37c0083329750cb7",
+      "annotatedBy": "24f42fba3f711dbf62a2c61d58a5545b0234865d",
+      "why": "The one parentHandoffHash of 71 that names no tracked record's handoffHash (measured across every tracked record at the audited ref). The only B05 record the repository holds is 064b4e71..., produced by the 2026-11-05 backfill, and it is not this value. The structural edge is intact and is what integrity-scan certifies -- B05.nextBaseSha equals E01.baseSha -- so the chain link exists in the direction the chain gate walks; what is missing is the hash half, and it cannot be recovered because the record it named is not in the repository. Found by the 2026-11-10 independent review as finding F5."
+    }
+  ]
+}
