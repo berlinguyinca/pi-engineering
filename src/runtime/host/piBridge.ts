@@ -238,6 +238,11 @@ export class PiBridge {
       shadowedTools: new Map(),
     };
     this.tables.set(generation, table);
+    // A fresh generation ends the "no generation active" window. Drop the generation-less
+    // unservable dedup keys so a later incident of the same name (e.g. after this generation
+    // also retires) is reported again; numbered-generation keys are left alone, their numbers
+    // only go up so a stale one is never misleading.
+    for (const key of [...this.reportedUnservable]) if (key.startsWith("none:")) this.reportedUnservable.delete(key);
     const live = () => this.target.isLive(generation) && this.tables.get(generation) === table;
 
     const on = (event: string, handler: Handler): (() => void) => {

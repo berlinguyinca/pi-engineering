@@ -1724,7 +1724,9 @@ export class EngineeringHostExtension {
       for (const entry of lost.slice(0, 6)) lines.push(`  g${entry.generation} ${entry.name}: ${entry.reason}`);
       if (lost.length > 6) lines.push(`  …and ${lost.length - 6} more`);
     }
-    const unservable = (host?.telemetry.recent(200) ?? []).filter((e) => e.event === "runtime.tool.unservable").at(-1);
+    // last() scans the whole ring; recent(200) would drop the event once the ring
+    // (500) held a newer unrelated burst.
+    const unservable = host?.telemetry.last("runtime.tool.unservable");
     if (unservable) {
       lines.push(
         "",
