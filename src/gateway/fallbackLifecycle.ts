@@ -509,19 +509,34 @@ export async function applyChosenModel(
 ): Promise<FallbackApplyResult> {
   const refused = refuseUnsafeReplay(deps, ctx, pending);
   if (refused) return refused;
-  const current = ctx.model;
+  const currentId = ctx.model?.id ?? pending.sourceModelId;
   if (!(await deps.setModel(target))) {
     deps.log?.(`[gateway-fallback] setModel declined target=${target.id}`);
     return { switched: false, skipped: "set-model-declined" };
   }
-  deps.log?.(`[gateway-fallback] operator picked current=${current?.id} target=${target.id}`);
-  ctx.ui?.notify(`Switched to ${target.id} on your choice. /model to change back.`, "info");
+  deps.log?.(`[gateway-fallback] operator picked current=${currentId} target=${target.id}`);
+  // No ui.notify here: the caller emits the one operator-visible notice.
   return {
     switched: true,
-    ...(current ? { currentId: current.id } : {}),
+    ...(currentId ? { currentId } : {}),
     targetId: target.id,
     reason: "operator choice",
   };
+}
+
+/**
+ * Bookkeeping after an operator-picked switch: the model just left stays
+ * excluded (so the next advice cannot bounce the session back to it) and the
+ * hold ledger starts clean. The id comes from the apply result, else from the
+ * pending record, so a missing ctx model cannot drop the exclusion.
+ */
+export function recordOperatorSwitch(
+  coordinator: Pick<FallbackCoordinator, "onSwitched">,
+  result: FallbackApplyResult,
+  pending: Pick<PendingFallback, "sourceModelId">,
+): void {
+  if (!result.switched) return;
+  coordinator.onSwitched(result.currentId ?? pending.sourceModelId);
 }
 
 /**

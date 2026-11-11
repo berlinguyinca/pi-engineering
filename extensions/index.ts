@@ -35,6 +35,7 @@ import {
   applyChosenModel,
   applyPendingFallback,
   previewFallback,
+  recordOperatorSwitch,
 } from "../src/gateway/fallbackLifecycle.ts";
 import {
   installGatewayStreamRetry,
@@ -2211,7 +2212,7 @@ ${RECOVERY_PROMPT}`;
             pending,
             chosen,
           );
-          if (result.switched) fallbackCoordinator.onSwitched(result.currentId);
+          recordOperatorSwitch(fallbackCoordinator, result, pending);
           await refreshStandIn(ctx);
           return result;
         },

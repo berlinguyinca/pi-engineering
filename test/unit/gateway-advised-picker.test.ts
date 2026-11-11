@@ -15,8 +15,10 @@ import {
   type PendingFallback,
   applyChosenModel,
   applyPendingFallback,
+  recordOperatorSwitch,
 } from "../../src/gateway/fallbackLifecycle.ts";
 import { ALTERNATE_MODEL_ADVICE } from "../../src/gateway/signals.ts";
+import { type TelemetryNotice, setTelemetrySink } from "../../src/telemetry/sink.ts";
 
 type M = Model<any>;
 
@@ -198,7 +200,7 @@ function ctxFor(opts: {
   return c;
 }
 
-test("applyChosenModel: sets the chosen model and announces it", async () => {
+test("applyChosenModel: sets the chosen model (the caller owns the one notice)", async () => {
   const set: string[] = [];
   const c = ctxFor({});
   const r = await applyChosenModel(
@@ -215,7 +217,7 @@ test("applyChosenModel: sets the chosen model and announces it", async () => {
   assert.deepEqual(set, ["tiny-8k"]);
   assert.equal(r.switched, true);
   assert.equal(r.targetId, "tiny-8k");
-  assert.match(c.notes.join("\n"), /Switched to tiny-8k/);
+  assert.deepEqual(c.notes, [], "no ui.notify of its own");
 });
 
 test("applyChosenModel: refuses (with a notify) when a non-replay-safe tool already started", async () => {
@@ -366,7 +368,7 @@ test("settle picker: keep waiting owes the declared delay and replays", async ()
   arm(t.c);
   const r = await t.h.onBeforeSettle(settleEvent(), t.ctx());
   assert.deepEqual(r, REPLAY);
-  assert.deepEqual(t.owed.at(-1), { delayMs: 20_000, attempt: MAX_STAY_CONTINUES + 1 });
+  assert.deepEqual(t.owed.at(-1), { delayMs: 20_000, attempt: 1 }, "a sane attempt number, not past the cap");
   assert.equal(t.asked.length, 1);
 });
 
@@ -429,4 +431,185 @@ test("settle picker: a successful pick resets the stay counter", async () => {
   const r = await t.h.onBeforeSettle(settleEvent(), t.ctx());
   assert.deepEqual(r, REPLAY);
   assert.equal(t.asked.length, 1, "the second failure waited automatically instead of asking");
+});
+
+// ─── Review findings ────────────────────────────────────────────────────────
+
+test("review 1: after a pick the failed model is excluded, so the next advice cannot offer it back (A->B->A)", async () => {
+  const t = harness({ answer: (o) => o.find((x) => x.startsWith("tiny-8k")) });
+  arm(t.c);
+  const pending = t.c.snapshot();
+  const applied = await applyChosenModel({ setModel: () => true }, ctxFor({}), pending, TINY());
+  recordOperatorSwitch(t.c, applied, pending);
+  assert.deepEqual(t.c.excludedModelIds, ["qwen3.8-27b"]);
+  arm(t.c);
+  assert.deepEqual(t.c.claimPending()?.excludeIds, ["qwen3.8-27b"]);
+});
+
+test("review 1: with no ctx model the pending source id still records the exclusion", async () => {
+  const c = new FallbackCoordinator({ advisedSwitch: true });
+  const ctxNoModel: FallbackContext = { model: undefined, modelRegistry: undefined };
+  const pending: PendingFallback = { consecutiveHolds: 1, sourceModelId: "qwen3.8-27b" };
+  const applied = await applyChosenModel({ setModel: () => true }, ctxNoModel, pending, TINY());
+  assert.equal(applied.currentId, "qwen3.8-27b");
+  recordOperatorSwitch(c, applied, pending);
+  assert.deepEqual(c.excludedModelIds, ["qwen3.8-27b"]);
+  recordOperatorSwitch(c, { switched: false }, pending);
+  recordOperatorSwitch(new FallbackCoordinator({ advisedSwitch: true }), { switched: true }, {});
+});
+
+test("review 2: keep waiting resets the stays, so the operator gets the automatic waits between prompts", async () => {
+  const t = harness({ owe: true, answer: (o) => o.find((x) => x.startsWith("Keep waiting")) });
+  for (let i = 1; i <= MAX_STAY_CONTINUES; i++) {
+    arm(t.c);
+    await t.h.onBeforeSettle(settleEvent(), t.ctx({ hasUI: false }));
+  }
+  arm(t.c);
+  assert.deepEqual(await t.h.onBeforeSettle(settleEvent(), t.ctx()), REPLAY);
+  assert.equal(t.asked.length, 1);
+  for (let i = 1; i <= MAX_STAY_CONTINUES; i++) {
+    arm(t.c);
+    assert.deepEqual(await t.h.onBeforeSettle(settleEvent(), t.ctx()), REPLAY);
+    assert.deepEqual(t.owed.at(-1)?.attempt, i);
+  }
+  assert.equal(t.asked.length, 1, "no prompt during the automatic waits");
+  arm(t.c);
+  await t.h.onBeforeSettle(settleEvent(), t.ctx());
+  assert.equal(t.asked.length, 2, "then the picker returns");
+});
+
+test("review 3: an already-aborted signal never opens the dialog; an abort closes it synchronously", async () => {
+  const done = new AbortController();
+  done.abort();
+  let called = 0;
+  const outcome = await runModelPicker(
+    async () => {
+      called++;
+      return undefined;
+    },
+    entriesFor(),
+    { title: "t", signal: done.signal },
+  );
+  assert.equal(called, 0);
+  assert.deepEqual(outcome, { kind: "cancelled", reason: "aborted" });
+
+  const ac = new AbortController();
+  let dialogAborted = false;
+  const p = runModelPicker(
+    (_t, _o, opts) =>
+      new Promise<string | undefined>(() => {
+        opts?.signal?.addEventListener("abort", () => {
+          dialogAborted = true;
+        });
+      }),
+    entriesFor(),
+    { title: "t", timeoutMs: 10_000, signal: ac.signal },
+  );
+  ac.abort();
+  assert.equal(dialogAborted, true, "the dialog is closed at once, not when the race settles");
+  await p;
+});
+
+test("review 4: identical labels cannot make a row unreachable", async () => {
+  const a = model("a", 1_000_000);
+  const b = model("b", 1_000_000);
+  const entries: PickerEntry[] = [
+    { label: "same", choice: { kind: "model", model: a } },
+    { label: "same", choice: { kind: "model", model: b } },
+  ];
+  let shown: string[] = [];
+  const outcome = await runModelPicker(
+    async (_t, options) => {
+      shown = options;
+      return options[1];
+    },
+    entries,
+    { title: "t" },
+  );
+  assert.equal(new Set(shown).size, 2, "labels are made unique");
+  assert.equal(outcome.kind === "picked" && outcome.model.id, "b");
+});
+
+test("review 5: a ctx gone stale during the dialog ends the turn quietly (no throw, no switch, no wait)", async () => {
+  for (const answer of ["tiny", "wait"] as const) {
+    const t = harness({ owe: true });
+    for (let i = 1; i <= MAX_STAY_CONTINUES; i++) {
+      arm(t.c);
+      await t.h.onBeforeSettle(settleEvent(), t.ctx({ hasUI: false }));
+    }
+    t.owed.length = 0;
+    arm(t.c);
+    let stale = false;
+    const real = t.ctx();
+    const c = {
+      get model() {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+        return real.model;
+      },
+      modelRegistry: real.modelRegistry,
+      getContextUsage: real.getContextUsage,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        select: async (_t: string, options: string[]) => {
+          stale = true;
+          return options.find((o) => (answer === "tiny" ? o.startsWith("tiny-8k") : o.startsWith("Keep waiting")));
+        },
+      },
+    } as FallbackContext;
+    assert.equal(await t.h.onBeforeSettle(settleEvent(), c), undefined, answer);
+    assert.deepEqual(t.set, []);
+    assert.deepEqual(t.owed, []);
+  }
+});
+
+test("review 6: exclusion is by id AND provider; a same-id model on another provider stays offered", () => {
+  const sameProvider = model("left-before", 400_000, ["text", "image"]);
+  const otherProvider = { ...model("left-before", 400_000, ["text", "image"]), provider: "other" } as M;
+  const failedElsewhere = { ...SOURCE(), provider: "other" } as M;
+  const entries = buildPickerEntries({
+    source: SOURCE(),
+    available: [SOURCE(), failedElsewhere, sameProvider, otherProvider],
+    excludeIds: ["left-before"],
+    usedTokens: 0,
+    waitMs: 1_000,
+  });
+  const offered = entries.flatMap((e) => (e.choice.kind === "model" ? [e.choice.model] : []));
+  assert.deepEqual(
+    offered.map((m) => `${m.provider}/${m.id}`),
+    ["other/left-before", "other/qwen3.8-27b"],
+    "the exact failed model and the id-excluded same-provider model are hidden; others are not",
+  );
+});
+
+test("review 7: token counts are exact below 1000 and never render 1000k", () => {
+  const cases: Array<[number, string]> = [
+    [512, "ctx 512"],
+    [999, "ctx 999"],
+    [1_000, "ctx 1k"],
+    [32_768, "ctx 33k"],
+    [999_499, "ctx 999k"],
+    [999_500, "ctx 1.0M"],
+    [1_048_576, "ctx 1.0M"],
+  ];
+  for (const [window, expected] of cases) {
+    const [row] = buildPickerEntries({ source: SOURCE(), available: [model("m", window)], usedTokens: null });
+    assert.ok(row?.label.includes(expected), `${window}: ${row?.label}`);
+    assert.doesNotMatch(row?.label ?? "", /1000k/);
+  }
+});
+
+test("review 8: one pick produces one operator-visible notice (telemetry), not a second ui.notify", async () => {
+  const notices: TelemetryNotice[] = [];
+  const off = setTelemetrySink((n) => notices.push(n));
+  try {
+    const t = harness({ answer: (o) => o.find((x) => x.startsWith("tiny-8k")) });
+    arm(t.c);
+    const c = t.ctx() as FallbackContext & { notes: string[] };
+    assert.deepEqual(await t.h.onBeforeSettle(settleEvent(), c), REPLAY);
+    assert.equal(c.notes.length, 0, "no ui.notify for a successful pick");
+    assert.equal(notices.filter((n) => n.key === "advised-model-switch:picked").length, 1);
+  } finally {
+    off();
+  }
 });

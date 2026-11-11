@@ -104,6 +104,16 @@ export interface AdvisedSwitchDeps {
 
 type BoundaryReplay = { entries: unknown[]; continue: true };
 
+/** Is the settle ctx still bound to a live session? Reading `model` asserts it. */
+function isCtxLive(ctx: FallbackContext): boolean {
+  try {
+    void ctx.model;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Did this failed assistant message carry the gateway's alternate-model advice? */
 export function carriesAlternateAdvice(message: { errorMessage?: string } | undefined): boolean {
   const text = message?.errorMessage ?? "";
@@ -229,11 +239,30 @@ export class AdvisedModelSwitch {
       title: `${source} is out of capacity and the gateway advises another model. Choose one:`,
       timeoutMs: this.deps.pickerTimeoutMs ?? PICKER_TIMEOUT_MS,
     });
-    if (outcome.kind === "keep-waiting" && oweWait) {
-      oweWait(ctx, outcome.delayMs, this.stays);
+    // The dialog may have outlived the session (reload, /new): Pi's ctx getters
+    // throw once the extension instance is invalidated (runner.js createContext
+    // -> assertActive), and a stale `pi`/ctx must not be driven. Probe first.
+    if (outcome.kind !== "keep-waiting" && outcome.kind !== "picked") return undefined;
+    if (!isCtxLive(ctx)) {
+      emitTelemetry({
+        level: "warning",
+        key: "advised-model-switch:failed",
+        text: "The session changed while the model picker was open; leaving the turn as it ended.",
+      });
+      return undefined;
+    }
+    if (outcome.kind === "keep-waiting") {
+      if (!oweWait) return undefined;
+      // The operator chose to wait: grant the automatic waits again before the
+      // next prompt; the wait itself is attempt 1, as for any first stay.
+      this.stays = 0;
+      try {
+        oweWait(ctx, outcome.delayMs, 1);
+      } catch {
+        return undefined;
+      }
       return replay;
     }
-    if (outcome.kind !== "picked") return undefined;
     let applied: FallbackApplyResult;
     try {
       applied = await applyChosen(ctx, outcome.model, pending);

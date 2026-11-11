@@ -41,7 +41,13 @@ export interface PickerInput {
   /** The model that refused. Never offered; its input types are the modalities a stand-in should keep. */
   source: Model<any> | undefined;
   available: readonly Model<any>[];
-  /** Models this outage episode already left. */
+  /**
+   * Models this outage episode already left. The coordinator records ids only
+   * (`PendingFallback.excludeIds`), so an id matches only models on the
+   * SOURCE's provider — the provider a switch-away leaves from; a same-id model
+   * on another provider is not hidden. Known limitation until the coordinator
+   * records providers.
+   */
   excludeIds?: readonly string[] | undefined;
   /** Context tokens in use; unknown (null/undefined) marks nothing, since nothing can be shown to not fit. */
   usedTokens: number | null | undefined;
@@ -53,7 +59,10 @@ export interface PickerInput {
 }
 
 function compactTokens(n: number): string {
-  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1_000)}k`;
+  if (n < 1_000) return String(Math.round(n));
+  // Round first: 999_600 is "1.0M", never "1000k".
+  const k = Math.round(n / 1_000);
+  return k >= 1_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${k}k`;
 }
 
 function warnings(m: Model<any>, input: PickerInput, health: PickerInput["health"]): string[] {
@@ -101,9 +110,11 @@ function describe(m: Model<any>, label: string, input: PickerInput): { text: str
 export function buildPickerEntries(input: PickerInput): PickerEntry[] {
   const excluded = new Set(input.excludeIds ?? []);
   const sourceId = input.source?.id;
-  const candidates = input.available.filter(
-    (m) => !excluded.has(m.id) && !(m.id === sourceId && m.provider === input.source?.provider),
-  );
+  const sourceProvider = input.source?.provider;
+  const isSource = (m: Model<any>) => m.id === sourceId && m.provider === sourceProvider;
+  const isExcluded = (m: Model<any>) =>
+    excluded.has(m.id) && (sourceProvider === undefined || m.provider === sourceProvider);
+  const candidates = input.available.filter((m) => !isSource(m) && !isExcluded(m));
   const idCounts = new Map<string, number>();
   for (const m of candidates) idCounts.set(m.id, (idCounts.get(m.id) ?? 0) + 1);
   const rows = candidates.map((model) => {
@@ -148,23 +159,24 @@ export async function runModelPicker(
   entries: readonly PickerEntry[],
   opts: RunPickerOptions,
 ): Promise<PickerOutcome> {
+  if (opts.signal?.aborted) return { kind: "cancelled", reason: "aborted" };
   const timeoutMs = opts.timeoutMs ?? PICKER_TIMEOUT_MS;
   const dialog = new AbortController();
+  const labels = uniqueLabels(entries);
   let timer: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
   const gone = new Promise<PickerOutcome>((resolve) => {
     timer = setTimeout(() => resolve({ kind: "cancelled", reason: "timeout" }), timeoutMs);
-    onAbort = () => resolve({ kind: "cancelled", reason: "aborted" });
-    if (opts.signal?.aborted) onAbort();
-    else opts.signal?.addEventListener("abort", onAbort, { once: true });
+    onAbort = () => {
+      dialog.abort(); // close the dialog now, not when the race has settled
+      resolve({ kind: "cancelled", reason: "aborted" });
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
   });
-  const answer = select(
-    opts.title,
-    entries.map((e) => e.label),
-    { signal: dialog.signal, timeout: timeoutMs },
-  ).then(
+  const answer = select(opts.title, labels, { signal: dialog.signal, timeout: timeoutMs }).then(
     (label): PickerOutcome => {
-      const chosen = entries.find((e) => e.label === label)?.choice;
+      // By position in the (unique) labels, so no row can shadow another.
+      const chosen = label === undefined ? undefined : entries[labels.indexOf(label)]?.choice;
       if (!chosen) return { kind: "cancelled", reason: "dismissed" };
       if (chosen.kind === "model") return { kind: "picked", model: chosen.model };
       if (chosen.kind === "keep-waiting") return { kind: "keep-waiting", delayMs: chosen.delayMs };
@@ -179,4 +191,15 @@ export async function runModelPicker(
     if (onAbort) opts.signal?.removeEventListener("abort", onAbort);
     dialog.abort();
   }
+}
+
+/** The rows' labels, with a " (n)" suffix on repeats so every one is distinct. */
+function uniqueLabels(entries: readonly PickerEntry[]): string[] {
+  const seen = new Set<string>();
+  return entries.map((e) => {
+    let label = e.label;
+    for (let n = 2; seen.has(label); n++) label = `${e.label} (${n})`;
+    seen.add(label);
+    return label;
+  });
 }
