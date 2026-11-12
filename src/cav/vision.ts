@@ -45,6 +45,35 @@ export interface VisionReviewResult {
   overrideHardGate: false;
 }
 
+/** Degraded advisory result: no findings, no gate change, and a reason in `raw`. */
+function degraded(modelId: string, reason: string): VisionReviewResult {
+  return { findings: [], completed: false, raw: reason, modelId, overrideHardGate: false };
+}
+
+/**
+ * Run one step of the advisory, reporting failure as a value instead of throwing.
+ *
+ * Advisory means advisory: an outage, a refused request, or a misconfigured
+ * runtime must not propagate into the pipeline that asked for advice, because
+ * the caller cannot distinguish "the vision model disagreed" from "the vision
+ * model call blew up", and neither is allowed to move a hard gate. Each step
+ * therefore reports its own failure, with the step named, so `raw` says which
+ * side broke instead of the caller seeing an unhandled rejection.
+ */
+async function attempt<T>(
+  step: string,
+  fn: () => Promise<T>,
+): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  try {
+    return { ok: true, value: await fn() };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `vision review failed (${step}): ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
 /**
  * Dispatch a vision review of a screenshot to the vision-capable model.
  * The result is advisory: it can add findings but cannot waive a deterministic
@@ -63,11 +92,15 @@ export async function runVisionReview(opts: VisionReviewOptions): Promise<Vision
     return { findings: [], completed: false, raw: "", modelId, overrideHardGate: false };
   }
 
-  const runtime = await ModelRuntime.create({
-    authPath: join(agentDir, "auth.json"),
-    modelsPath: join(agentDir, "models.json"),
-    allowModelNetwork: false,
-  });
+  const created = await attempt("model runtime", () =>
+    ModelRuntime.create({
+      authPath: join(agentDir, "auth.json"),
+      modelsPath: join(agentDir, "models.json"),
+      allowModelNetwork: false,
+    }),
+  );
+  if (!created.ok) return degraded(modelId, created.error);
+  const runtime = created.value;
   const model = runtime.getModel(provider, modelId);
   if (!model) {
     return {
@@ -83,35 +116,46 @@ export async function runVisionReview(opts: VisionReviewOptions): Promise<Vision
 
   const sessionManager = SessionManager.inMemory(opts.cwd);
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
-  const { session } = await createAgentSession({
-    cwd: opts.cwd,
-    agentDir,
-    model,
-    modelRuntime: runtime,
-    resourceLoader: {
-      getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
-      getSkills: () => ({ skills: [], diagnostics: [] }),
-      getPrompts: () => ({ prompts: [], diagnostics: [] }),
-      getThemes: () => ({ themes: [], diagnostics: [] }),
-      getAgentsFiles: () => ({ agentsFiles: [] }),
-      getSystemPrompt: () => prompt,
-      getSystemPromptSource: () => undefined,
-      getAppendSystemPrompt: () => [],
-      getAppendSystemPromptSources: () => [],
-      extendResources: () => {},
-      reload: async () => {},
-    },
-    sessionManager,
-    settingsManager,
-    tools: [],
-    customTools: [],
-    thinkingLevel: "off",
-  });
+  const opened = await attempt("agent session", () =>
+    createAgentSession({
+      cwd: opts.cwd,
+      agentDir,
+      model,
+      modelRuntime: runtime,
+      resourceLoader: {
+        getExtensions: () => ({ extensions: [], errors: [], runtime: createExtensionRuntime() }),
+        getSkills: () => ({ skills: [], diagnostics: [] }),
+        getPrompts: () => ({ prompts: [], diagnostics: [] }),
+        getThemes: () => ({ themes: [], diagnostics: [] }),
+        getAgentsFiles: () => ({ agentsFiles: [] }),
+        getSystemPrompt: () => prompt,
+        getSystemPromptSource: () => undefined,
+        getAppendSystemPrompt: () => [],
+        getAppendSystemPromptSources: () => [],
+        extendResources: () => {},
+        reload: async () => {},
+      },
+      sessionManager,
+      settingsManager,
+      tools: [],
+      customTools: [],
+      thinkingLevel: "off",
+    }),
+  );
+  if (!opened.ok) return degraded(modelId, opened.error);
+  const { session } = opened.value;
 
-  const out = await session.prompt("Review the image and return the JSON findings array only.", {
-    images: [{ type: "image" as const, data: imageData, mimeType: "image/png" }],
-    expandPromptTemplates: false,
-  });
+  const prompted = await attempt("vision model prompt", () =>
+    session.prompt("Review the image and return the JSON findings array only.", {
+      images: [{ type: "image" as const, data: imageData, mimeType: "image/png" }],
+      expandPromptTemplates: false,
+    }),
+  );
+  if (!prompted.ok) {
+    session.dispose();
+    return degraded(modelId, prompted.error);
+  }
+  const out = prompted.value;
   const rawMessages = (session as unknown as { messages?: unknown[] }).messages ?? [];
   session.dispose();
 
