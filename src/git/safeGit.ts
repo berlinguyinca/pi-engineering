@@ -2109,6 +2109,10 @@ export function withholdQuotedContent(stderr: string): string {
   return out;
 }
 const clamp = (r: SafeGitResult): SafeGitResult => {
+  // Nothing to withhold and nothing to limit when stderr is empty: `withholdQuotedContent("")` returns "" and
+  // the length/identity test below would return `r` untouched. Same result, five regex passes cheaper, on the
+  // path every git probe takes.
+  if (!r.stderr) return r;
   const text = withholdQuotedContent(r.stderr);
   return text.length > STDERR_LINE || text !== r.stderr ? { ...r, stderr: limitStderr(text) } : r;
 };

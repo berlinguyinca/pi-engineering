@@ -18,6 +18,7 @@
  * saturation adds load to the problem it is describing.
  */
 
+import { envTtlMs } from "../core/envKnob.ts";
 import { type GatewayModelEntry, fetchGatewayModels } from "./gatewayCatalog.ts";
 
 export interface ModelHealth {
@@ -44,7 +45,8 @@ export interface HealthProviderOptions {
   fetchImpl?: typeof fetch;
 }
 
-export const DEFAULT_HEALTH_TTL_MS = 30_000;
+/** `PI_ENG_HEALTH_TTL_MS` retunes this for a session; 30 s is the default either way. */
+export const DEFAULT_HEALTH_TTL_MS = envTtlMs("PI_ENG_HEALTH_TTL_MS", 30_000);
 export const DEFAULT_HEALTH_ERROR_BACKOFF_MS = 60_000;
 
 /**
