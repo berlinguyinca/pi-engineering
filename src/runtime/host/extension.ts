@@ -1716,6 +1716,23 @@ export class EngineeringHostExtension {
       ago(host?.lastReloadAt),
     ];
     if (this.startupFallback) lines.push("", `Startup: ${this.startupFallback}`);
+    // Tool names a generation could not register (#672). Before this, a session
+    // that had lost `ledger_evidence` had no surface that said so.
+    const lost = host?.bridge.toolNameLosses() ?? [];
+    if (lost.length > 0) {
+      lines.push("", `Tool names lost at registration (${lost.length}):`);
+      for (const entry of lost.slice(0, 6)) lines.push(`  g${entry.generation} ${entry.name}: ${entry.reason}`);
+      if (lost.length > 6) lines.push(`  …and ${lost.length - 6} more`);
+    }
+    // last() scans the whole ring; recent(200) would drop the event once the ring
+    // (500) held a newer unrelated burst.
+    const unservable = host?.telemetry.last("runtime.tool.unservable");
+    if (unservable) {
+      lines.push(
+        "",
+        `Last unservable tool: ${String(unservable.tool ?? "?")} (generation ${String(unservable.generation ?? "-")}, ${ago(Date.parse(unservable.at))})`,
+      );
+    }
     const pending = host?.pendingTask();
     if (pending) lines.push("", `Handover in progress: ${pending.kind} (${pending.phase})`);
     if (host?.lastFailure) lines.push("", `Last failure: ${host.lastFailure}`);

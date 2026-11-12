@@ -111,6 +111,8 @@ test("/engineering version and the runtime status show version, generation, sche
   assert.match(text, /Pi compatibility: OK/);
   assert.match(text, /Previous:\n0\.2\.1 \/ [0-9a-f]{7}/);
   assert.match(text, /Last update:\n\d+s ago/);
+  // A healthy generation declares every tool: the surface stays silent (#672).
+  assert.doesNotMatch(text, /Tool names lost at registration/);
   await w.pi.run("/engineering version");
 
   const lines = runtimeStatusLines();
