@@ -12,6 +12,21 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Browser, Page } from "playwright";
 
+/**
+ * Launch headless Chromium the way this repo's runners actually run it.
+ *
+ * Suite runners put browser steps in containers with a small /dev/shm, and a
+ * shared-memory segment exhausted mid-capture is what surfaces as the transient
+ * "Protocol error (Page.captureScreenshot): Unable to capture screenshot" under
+ * concurrent load that cav-visual-capture-failure.test.ts exists to cover.
+ * Chromium's own remedy is to write to disk instead of /dev/shm, so every launch
+ * in this layer goes through here rather than each caller re-deriving the flags.
+ */
+export async function launchChromium(): Promise<Browser> {
+  const { chromium } = await import("playwright");
+  return chromium.launch({ headless: true, args: ["--disable-dev-shm-usage"] });
+}
+
 export interface BrowserEvidence {
   consoleErrors: string[];
   pageExceptions: string[];
@@ -63,8 +78,7 @@ export async function instrumentBrowserRun(opts: InstrumentedRunOptions): Promis
   let tracing = false;
   try {
     if (!browser && opts.launch !== false) {
-      const { chromium } = await import("playwright");
-      browser = await chromium.launch({ headless: true });
+      browser = await launchChromium();
       owned = true;
     }
     if (!browser) throw new Error("no browser available for instrumentation");

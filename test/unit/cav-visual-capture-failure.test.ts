@@ -16,7 +16,7 @@ import { test } from "node:test";
 import type { Browser } from "playwright";
 import { PNG } from "pngjs";
 
-import { writeHarness } from "../../src/cav/browser.ts";
+import { launchChromium, writeHarness } from "../../src/cav/browser.ts";
 import { calibratePilot } from "../../src/cav/pilot.ts";
 import { compareToGolden } from "../../src/cav/visual.ts";
 
@@ -68,10 +68,9 @@ test("compareToGolden reports a capture failure instead of throwing", async () =
 });
 
 test("pilot calibration survives a host that cannot screenshot", async (t) => {
-  const { chromium } = await import("playwright");
   let probe;
   try {
-    probe = await chromium.launch({ headless: true });
+    probe = await launchChromium();
   } catch (err) {
     t.skip(`playwright cannot launch here: ${err instanceof Error ? err.message : String(err)}`);
     return;

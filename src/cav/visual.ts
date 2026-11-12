@@ -12,6 +12,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Browser, Page } from "playwright";
 import { PNG } from "pngjs";
+import { launchChromium } from "./browser.ts";
 
 export interface GoldenCompareOptions {
   goldenPath: string;
@@ -116,8 +117,7 @@ export async function compareToGolden(opts: GoldenCompareOptions): Promise<Golde
   let page;
   try {
     if (!browser && opts.launch !== false) {
-      const { chromium } = await import("playwright");
-      browser = await chromium.launch({ headless: true });
+      browser = await launchChromium();
       owned = true;
     }
     if (!browser) throw new Error("no browser available");

@@ -12,7 +12,7 @@
  */
 import { mkdir, readFile } from "node:fs/promises";
 import { verifyAccessibility } from "./a11y.ts";
-import { instrumentBrowserRun } from "./browser.ts";
+import { instrumentBrowserRun, launchChromium } from "./browser.ts";
 import { exploreUi } from "./explore.ts";
 import { captureScreenshot, compareToGolden } from "./visual.ts";
 
@@ -131,8 +131,7 @@ export async function calibratePilot(cfg: PilotConfig): Promise<PilotCalibration
     goldenExists = false;
   }
   if (!goldenExists) {
-    const { chromium } = await import("playwright");
-    const browser = await chromium.launch({ headless: true });
+    const browser = await launchChromium();
     try {
       const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
       await page.goto(cfg.url, { waitUntil: "load", timeout: 30000 });

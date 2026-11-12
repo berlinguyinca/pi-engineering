@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +26,46 @@ import { EnvelopeOutbox } from "../../src/runtime/herdr/outbox.ts";
 import { SourceSequence } from "../../src/runtime/herdr/sourceSequence.ts";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "pi-envelope-"));
+
+/**
+ * Run an allocation child and return the numbers it printed.
+ *
+ * On failure the child's own stderr is attached to the rejection. That is the
+ * whole point: a bare `exit 1` is what made the intermittent failure in issue
+ * #682 undiagnosable, because the reason -- lock timeout and its holder, corrupt
+ * state file, failed import -- is only ever printed by the child.
+ *
+ * "close", not "exit": "exit" may fire before the last stdout chunk has been
+ * read, which on a loaded host made JSON.parse see a truncated (or empty) line.
+ */
+function runAllocChild(script: string, dir: string, tag: string): Promise<number[]> {
+  return new Promise<number[]>((resolve, reject) => {
+    const p = spawn(process.execPath, [script, dir], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    p.stdout.on("data", (d) => {
+      out += String(d);
+    });
+    p.stderr.on("data", (d) => {
+      err += String(d);
+    });
+    p.on("error", reject);
+    p.on("close", (code, signal) => {
+      if (code === 0) {
+        try {
+          return resolve(JSON.parse(out));
+        } catch (e) {
+          return reject(new Error(`${tag}: unparsable child stdout ${JSON.stringify(out)}: ${(e as Error).message}`));
+        }
+      }
+      reject(
+        new Error(
+          `${tag}: child exited ${code ?? `signal ${signal}`}${err.trim() ? `\n  stderr: ${err.trim()}` : " (no stderr)"}`,
+        ),
+      );
+    });
+  });
+}
 const draft = (id?: string) => ({
   event_id: id,
   occurred_at: "2026-10-22T10:00:00Z",
@@ -100,26 +141,88 @@ test("SourceSequence: concurrent allocations across real processes never collide
   writeFileSync(
     script,
     `import { SourceSequence } from ${JSON.stringify(join(process.cwd(), "src/runtime/herdr/sourceSequence.ts"))};
-const s = new SourceSequence({ dir: process.argv[2], source: "pi" });
+// lockTimeoutMs is passed explicitly on purpose. The product default (5s) is a
+// budget for waiting on a lock HOLDER, so inheriting it here would let a
+// starved CI runner turn "the scheduler did not run this child promptly" into a
+// reported sequence-allocator defect. What this test asserts -- that two
+// processes never hand out the same id -- is a collision property, and stays
+// asserted regardless of this budget.
+const s = new SourceSequence({ dir: process.argv[2], source: "pi", lockTimeoutMs: 120_000 });
 const out = [];
 for (let i = 0; i < 15; i++) out.push(await s.next());
 console.log(JSON.stringify(out));`,
   );
-  const { spawn } = await import("node:child_process");
-  const run = () =>
-    new Promise<number[]>((resolve, reject) => {
-      const p = spawn(process.execPath, [script, dir], { stdio: ["ignore", "pipe", "inherit"] });
-      let out = "";
-      p.stdout.on("data", (d) => {
-        out += d;
-      });
-      // "close", not "exit": "exit" may fire before the last stdout chunk has been read, which on a loaded host made
-      // JSON.parse see a truncated (or empty) line. "close" comes after the child's stdout has ended.
-      p.on("close", (code) => (code === 0 ? resolve(JSON.parse(out)) : reject(new Error(`exit ${code}`))));
-    });
-  const all = (await Promise.all([run(), run(), run()])).flat();
+  const all = (
+    await Promise.all([
+      runAllocChild(script, dir, "child A"),
+      runAllocChild(script, dir, "child B"),
+      runAllocChild(script, dir, "child C"),
+    ])
+  ).flat();
   assert.equal(new Set(all).size, 45);
   assert.equal(Math.max(...all), 45);
+});
+
+test("SourceSequence: a lock held by a live owner fails loudly, naming the lock and holder", async () => {
+  // The failure this covers is real and legitimate: a lock whose holder is alive
+  // is not stale, so a waiter gives up at its budget. What must never happen is
+  // the harness reporting that as an unexplained exit code -- the whole reason
+  // "is the budget too small or do two processes actually collide?" could not be
+  // answered from CI output was the child's reason being thrown away.
+  const dir = tmp();
+  const script = join(tmp(), "alloc-short-budget.ts");
+  writeFileSync(
+    script,
+    `import { SourceSequence } from ${JSON.stringify(join(process.cwd(), "src/runtime/herdr/sourceSequence.ts"))};
+const s = new SourceSequence({ dir: process.argv[2], source: "pi", lockTimeoutMs: 300 });
+console.log(JSON.stringify([await s.next()]));`,
+  );
+  const lockPath = join(dir, "sequence-pi.json.lock");
+  const { hostname } = await import("node:os");
+  const { readlinkSync, rmSync } = await import("node:fs");
+  const tryRead = (p: string) => {
+    try {
+      return readFileSync(p, "utf8").trim();
+    } catch {
+      return "";
+    }
+  };
+  // Same probe portableLock uses, so the record is comparable to the child's own
+  // identity and liveness -- not age -- decides staleness.
+  const tryReadlink = (p: string) => {
+    try {
+      return readlinkSync(p);
+    } catch {
+      return "";
+    }
+  };
+  // A record a peer would read as "held right now, by a process that is alive on
+  // this host, in this pid namespace": comparable, so age never makes it stale.
+  writeFileSync(
+    lockPath,
+    JSON.stringify({
+      host: hostname(),
+      boot: tryRead("/proc/sys/kernel/random/boot_id"),
+      pidns: tryReadlink("/proc/self/ns/pid"),
+      pid: process.pid,
+      token: "live-holder-test",
+      at: new Date().toISOString(),
+    }),
+  );
+  const message = await runAllocChild(script, dir, "starved child").then(
+    () => "",
+    (e: Error) => e.message,
+  );
+  assert.notEqual(message, "", "child should have failed against a live lock holder");
+  // What a reader of the CI log needs, in one message: which child, that it died,
+  // and the lock it was waiting on.
+  assert.match(message, /starved child: child exited 1/);
+  assert.match(message, /timed out after 300ms waiting for lock/);
+  assert.match(message, /sequence-pi\.json\.lock/);
+
+  // And the failure was the lock, not the harness: release it and the same child succeeds.
+  rmSync(lockPath, { force: true });
+  assert.deepEqual(await runAllocChild(script, dir, "after release"), [1]);
 });
 
 test("SourceSequence: a corrupt state file fails closed instead of restarting at 1", async () => {

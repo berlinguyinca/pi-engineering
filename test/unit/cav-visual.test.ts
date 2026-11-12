@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { copyFile, mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { test } from "node:test";
-import { writeHarness } from "../../src/cav/browser.ts";
+import { launchChromium, writeHarness } from "../../src/cav/browser.ts";
 import { ProtectedArtifactGuard } from "../../src/cav/guard.ts";
 import { compareToGolden } from "../../src/cav/visual.ts";
 
@@ -20,8 +20,7 @@ body{margin:0;background:#fff} h1{color:#000;font-size:32px;font-family:sans-ser
  */
 async function captureGolden(url: string, goldenPath: string): Promise<void> {
   await mkdir(GOLDEN_DIR, { recursive: true });
-  const { chromium } = await import("playwright");
-  const b = await chromium.launch({ headless: true });
+  const b = await launchChromium();
   try {
     const p = await b.newPage({ viewport: { width: 600, height: 400 } });
     await p.goto(url, { waitUntil: "load" });
