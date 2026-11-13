@@ -698,10 +698,10 @@ test("wiring: refresh accepts a timeout before the provider and clears its visib
         setWidget: (_key: string, value: string[] | undefined) => widgets.push(value),
       },
     });
-    assert.equal(attempts, 2, "CLI timeout must reach both probe attempts");
+    assert.equal(attempts, 1, "CLI timeout reaches the probe, and a timeout is not retried");
     assert.ok(statuses.some((value) => /remote.*0%/.test(value ?? "")));
     assert.ok(widgets.some((value) => /flash-next/.test(value?.join(" ") ?? "")));
-    assert.ok(widgets.some((value) => /attempt 2/.test(value?.join(" ") ?? "")));
+    assert.ok(widgets.every((value) => !/attempt 2/.test(value?.join(" ") ?? "")));
     assert.equal(statuses.at(-1), undefined);
     assert.equal(widgets.at(-1), undefined);
     assert.match(notices[0]?.text ?? "", /probe timed out/);

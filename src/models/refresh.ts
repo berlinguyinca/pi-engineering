@@ -38,6 +38,11 @@ export interface RefreshProgress {
   attempt?: number;
   elapsedMs: number;
   timeoutMs?: number;
+  /**
+   * Probes in flight right now. `modelId`, `attempt` and `elapsedMs` describe
+   * the oldest of them, so the reading is steady while several run at once.
+   */
+  inFlight?: number;
 }
 
 export interface RefreshOptions {
@@ -109,12 +114,16 @@ export interface RefreshConfiguredProvidersOptions
   authForProvider?: (providerId: string) => ProviderRefreshAuth | Promise<ProviderRefreshAuth>;
 }
 
-export const DEFAULT_PROBE_TIMEOUT_MS = 120_000;
-// Backends commonly expose several model aliases through one GPU worker. Probe
-// sequentially by default so refresh itself does not manufacture a capacity
-// failure and hide an otherwise healthy model. Callers may opt into bounded
-// parallelism when their gateway is known to have independent capacity.
-const DEFAULT_PROBE_CONCURRENCY = 1;
+export const DEFAULT_PROBE_TIMEOUT_MS = 20_000;
+// Backends commonly expose several model aliases through one GPU worker, so
+// probes were once strictly sequential to keep refresh from manufacturing its
+// own capacity failures. That cost minutes per refresh. Four in flight is safe
+// now: a timed-out or capacity-refused probe is `inconclusive` and never prunes
+// a model, there is no retry after a timeout, and the deadline is short. A
+// capacity refusal under parallel load therefore only leaves a model "not
+// verified this time". Callers may still set `probeConcurrency` (1 restores
+// the sequential behavior).
+export const DEFAULT_PROBE_CONCURRENCY = 4;
 /**
  * Small, so the probe never brushes a model's per-slot context, yet the same
  * budget as before: a reasoning model that ignores the thinking-off parameter
@@ -290,74 +299,88 @@ async function verifiedGatewayModels(
   const verdicts = new Array<ProbeResult>(gateway.length);
   let next = 0;
   let completed = 0;
+  const timeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+  const inFlight = new Set<{ model: GatewayModelEntry; attempt: number; started: number }>();
+  // One shared ticker: with several probes running, per-probe tickers would
+  // alternate between models. Report the oldest in-flight probe plus a count.
+  const emit = (entry: { model: GatewayModelEntry; attempt: number; started: number }) =>
+    opts.onProgress?.({
+      providerId: opts.providerId,
+      phase: "probing",
+      completed,
+      total: gateway.length,
+      modelId: entry.model.id,
+      ...(entry.model.backingModel ? { backingModel: entry.model.backingModel } : {}),
+      attempt: entry.attempt,
+      elapsedMs: Date.now() - entry.started,
+      timeoutMs,
+      inFlight: inFlight.size,
+    });
+  const report = () => {
+    const oldest = [...inFlight].sort((a, b) => a.started - b.started)[0];
+    if (oldest) emit(oldest);
+  };
+  const heartbeat = opts.onProgress ? setInterval(report, 1000) : undefined;
   const probe = async (
     model: GatewayModelEntry,
     optional: { disableThinking: boolean } | null,
     budget: number,
     attempt: number,
   ) => {
-    const started = Date.now();
-    const report = () =>
-      opts.onProgress?.({
-        providerId: opts.providerId,
-        phase: "probing",
-        completed,
-        total: gateway.length,
-        modelId: model.id,
-        ...(model.backingModel ? { backingModel: model.backingModel } : {}),
-        attempt,
-        elapsedMs: Date.now() - started,
-        timeoutMs: opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
-      });
-    report();
-    const heartbeat = opts.onProgress ? setInterval(report, 1000) : undefined;
+    const entry = { model, attempt, started: Date.now() };
+    inFlight.add(entry);
+    emit(entry); // announce the probe that just started; the ticker then follows the oldest
     try {
       return await probeGatewayModel(model, baseUrl, opts, optional, budget);
     } finally {
-      clearInterval(heartbeat);
+      inFlight.delete(entry);
     }
   };
   const workers = Math.max(1, Math.min(opts.probeConcurrency ?? DEFAULT_PROBE_CONCURRENCY, gateway.length));
-  await Promise.all(
-    Array.from({ length: workers }, async () => {
-      for (;;) {
-        const index = next++;
-        if (index >= gateway.length) return;
-        const model = gateway[index]!;
-        const budget =
-          reasoningIds.has(model.id) || (model.backingModel !== undefined && reasoningIds.has(model.backingModel))
-            ? REASONING_PROBE_MAX_TOKENS
-            : PROBE_MAX_TOKENS;
-        let result = await probe(model, { disableThinking }, budget, 1);
-        if (result.verdict === "inconclusive" && result.reason === "probe timed out") {
-          result = await probe(model, { disableThinking }, budget, 2);
-        } else if (result.verdict === "rejected") {
-          // A 400 is most often a parameter this model's backend does not
-          // accept. Retry once with only the required fields; a second refusal
-          // is the model's definitive answer to the minimal probe.
-          const retry = await probe(model, null, budget, 2);
-          // Whatever else the retry says, the model answered the full probe with
-          // a 400: it is never pruned on the retry's word alone.
-          result =
-            retry.verdict === "working"
-              ? { verdict: "working", note: "verified without optional probe parameters" }
-              : retry.verdict === "rejected" || retry.verdict === "unavailable"
-                ? result
-                : retry;
+  try {
+    await Promise.all(
+      Array.from({ length: workers }, async () => {
+        for (;;) {
+          const index = next++;
+          if (index >= gateway.length) return;
+          const model = gateway[index]!;
+          const budget =
+            reasoningIds.has(model.id) || (model.backingModel !== undefined && reasoningIds.has(model.backingModel))
+              ? REASONING_PROBE_MAX_TOKENS
+              : PROBE_MAX_TOKENS;
+          let result = await probe(model, { disableThinking }, budget, 1);
+          // No retry after a timeout: that verdict is inconclusive (the model is
+          // kept), so a second wait only doubles the cost of a busy model.
+          if (result.verdict === "rejected") {
+            // A 400 is most often a parameter this model's backend does not
+            // accept. Retry once with only the required fields; a second refusal
+            // is the model's definitive answer to the minimal probe.
+            const retry = await probe(model, null, budget, 2);
+            // Whatever else the retry says, the model answered the full probe with
+            // a 400: it is never pruned on the retry's word alone.
+            result =
+              retry.verdict === "working"
+                ? { verdict: "working", note: "verified without optional probe parameters" }
+                : retry.verdict === "rejected" || retry.verdict === "unavailable"
+                  ? result
+                  : retry;
+          }
+          verdicts[index] = result;
+          completed += 1;
+          opts.onProgress?.({
+            providerId: opts.providerId,
+            phase: completed === gateway.length ? "complete" : "probing",
+            completed,
+            total: gateway.length,
+            modelId: model.id,
+            elapsedMs: 0,
+          });
         }
-        verdicts[index] = result;
-        completed += 1;
-        opts.onProgress?.({
-          providerId: opts.providerId,
-          phase: completed === gateway.length ? "complete" : "probing",
-          completed,
-          total: gateway.length,
-          modelId: model.id,
-          elapsedMs: 0,
-        });
-      }
-    }),
-  );
+      }),
+    );
+  } finally {
+    clearInterval(heartbeat);
+  }
   // A single 404 never deletes a model: only one that has also left the
   // gateway's listing is gone. A listing that cannot be re-read confirms nothing.
   if (verdicts.some((result) => result.verdict === "unavailable")) {

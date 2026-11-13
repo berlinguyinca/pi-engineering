@@ -517,17 +517,20 @@ opens with the filter filled in. The `all` tab labels each model with its
 provider; a provider tab does not need to.
 
 `/model-refresh [provider] [--timeout seconds] [--dry-run] [--prune]` refreshes
-all configured providers, or only the named provider. Probes run sequentially
-within each provider to avoid creating their own capacity contention. Each
-attempt now waits up to **120 seconds** by default; a timed-out probe is retried
-once. For a slower endpoint, use `/model-refresh metabolomics --timeout 300`.
-The timeout accepts 1–3600 seconds per attempt. Discovery has a separate
+all configured providers, or only the named provider. Up to four probes run at
+once within each provider. Each probe waits up to **20 seconds** by default and
+a timed-out probe is not retried: a timeout leaves the model "not verified this
+time" and it stays configured, so it is never pruned. Only a 400 rejection is
+retried, once, with minimal parameters. For a slower endpoint, use
+`/model-refresh metabolomics --timeout 120`. The timeout accepts 1–3600 seconds
+per probe. Discovery has a separate
 15-second deadline.
 
 While refresh runs, the footer and a progress panel show the provider, a bar and
 completed-model percentage, plus the current model, attempt, elapsed seconds
 and deadline. For example: `metabolomics [##--------] 20% (1/5 probed)` and
-`Probing flash-next · attempt 1/2 · 42s / 120s`. The elapsed time updates every
+`Probing flash-next · attempt 1/2 · 12s / 20s`. With several probes running, the
+panel shows the oldest one and appends `(+3 more)`. The elapsed time updates every
 second; the percentage advances only when a model's probes finish, so it can
 remain at 20% while a slow model answers. The panel clears on completion,
 failure or cancellation.

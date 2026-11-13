@@ -1612,7 +1612,9 @@ ${RECOVERY_PROMPT}`;
             ? `${progress.providerId}: discovering models…`
             : `${progress.providerId} ${bar} ${percent}% (${progress.completed}/${progress.total} probed)`;
         const timing = progress.attempt
-          ? ` · attempt ${progress.attempt}/2 · ${Math.floor(progress.elapsedMs / 1000)}s / ${(progress.timeoutMs ?? probeTimeoutMs) / 1000}s`
+          ? ` · attempt ${progress.attempt}/2 · ${Math.floor(progress.elapsedMs / 1000)}s / ${(progress.timeoutMs ?? probeTimeoutMs) / 1000}s${
+              progress.inFlight && progress.inFlight > 1 ? ` (+${progress.inFlight - 1} more)` : ""
+            }`
           : "";
         const detail =
           progress.phase === "complete"
