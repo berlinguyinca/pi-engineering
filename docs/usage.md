@@ -519,10 +519,16 @@ provider; a provider tab does not need to.
 `/model-refresh [provider] [--timeout seconds] [--dry-run] [--prune]` refreshes
 all configured providers, or only the named provider. Up to four probes run at
 once within each provider. Each probe waits up to **20 seconds** by default and
-a timed-out probe is not retried: a timeout leaves the model "not verified this
-time" and it stays configured, so it is never pruned. Only a 400 rejection is
-retried, once, with minimal parameters. For a slower endpoint, use
-`/model-refresh metabolomics --timeout 120`. The timeout accepts 1–3600 seconds
+a timed-out probe is not retried: a model that is already configured stays
+configured (a timeout never prunes it), but a model that is not yet configured is
+not added until it answers, and the report names it with a hint. If every probe
+times out or is refused for capacity, nothing is verified, the configuration is
+kept, and the report says to raise the timeout. For first-time additions,
+cold-loading models or a slower endpoint, use
+`/model-refresh metabolomics --timeout 120`. Only a 400 rejection is retried,
+once, with minimal parameters; that retry shares the remaining part of the
+original deadline, so one model never holds a worker for more than the timeout.
+The timeout accepts 1–3600 seconds
 per probe. Discovery has a separate
 15-second deadline.
 

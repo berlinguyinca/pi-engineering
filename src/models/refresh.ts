@@ -197,6 +197,8 @@ function errorText(payload: unknown, raw: string): string {
 }
 
 /** "HTTP 400 upstream_error: Correct the request syntax, …" */
+const PROBE_TIMED_OUT = "probe timed out";
+
 function describeRefusal(status: number, code: string, text: string): string {
   return `HTTP ${status}${code ? ` ${code}` : ""}${text ? `: ${text}` : ""}`;
 }
@@ -216,6 +218,7 @@ async function probeGatewayModel(
   opts: RefreshOptions,
   optional: { disableThinking: boolean } | null,
   maxTokens: number = PROBE_MAX_TOKENS,
+  timeoutMs: number = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
 ): Promise<ProbeResult> {
   opts.signal?.throwIfAborted();
   const controller = new AbortController();
@@ -223,7 +226,7 @@ async function probeGatewayModel(
   const timeout = setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS);
+  }, timeoutMs);
   const onAbort = () => controller.abort();
   opts.signal?.addEventListener("abort", onAbort, { once: true });
   try {
@@ -271,7 +274,7 @@ async function probeGatewayModel(
     return { verdict: "inconclusive", reason };
   } catch (error) {
     opts.signal?.throwIfAborted();
-    if (timedOut || controller.signal.aborted) return { verdict: "inconclusive", reason: "probe timed out" };
+    if (timedOut || controller.signal.aborted) return { verdict: "inconclusive", reason: PROBE_TIMED_OUT };
     return { verdict: "inconclusive", reason: error instanceof Error ? error.message : String(error) };
   } finally {
     clearTimeout(timeout);
@@ -286,6 +289,8 @@ interface Verification {
   /** Not verified this time (rejected or inconclusive): kept as configured, never added. */
   held: Array<{ id: string; verdict: "rejected" | "inconclusive"; reason: string }>;
   notes: Array<{ id: string; note: string }>;
+  /** Nothing answered and nothing was refused: the run proved nothing either way. */
+  allInconclusive?: boolean;
 }
 
 async function verifiedGatewayModels(
@@ -300,13 +305,19 @@ async function verifiedGatewayModels(
   let next = 0;
   let completed = 0;
   const timeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-  const inFlight = new Set<{ model: GatewayModelEntry; attempt: number; started: number }>();
+  interface InFlight {
+    model: GatewayModelEntry;
+    attempt: number;
+    /** First start of this model across attempts, so elapsed never jumps backwards. */
+    started: number;
+  }
+  const inFlight = new Set<InFlight>();
   // One shared ticker: with several probes running, per-probe tickers would
   // alternate between models. Report the oldest in-flight probe plus a count.
-  const emit = (entry: { model: GatewayModelEntry; attempt: number; started: number }) =>
+  const emit = (entry: InFlight, phase: "probing" | "complete" = "probing") =>
     opts.onProgress?.({
       providerId: opts.providerId,
-      phase: "probing",
+      phase,
       completed,
       total: gateway.length,
       modelId: entry.model.id,
@@ -316,8 +327,9 @@ async function verifiedGatewayModels(
       timeoutMs,
       inFlight: inFlight.size,
     });
+  const oldestInFlight = () => [...inFlight].sort((a, b) => a.started - b.started)[0];
   const report = () => {
-    const oldest = [...inFlight].sort((a, b) => a.started - b.started)[0];
+    const oldest = oldestInFlight();
     if (oldest) emit(oldest);
   };
   const heartbeat = opts.onProgress ? setInterval(report, 1000) : undefined;
@@ -326,12 +338,16 @@ async function verifiedGatewayModels(
     optional: { disableThinking: boolean } | null,
     budget: number,
     attempt: number,
+    started: number,
   ) => {
-    const entry = { model, attempt, started: Date.now() };
+    const entry = { model, attempt, started };
     inFlight.add(entry);
-    emit(entry); // announce the probe that just started; the ticker then follows the oldest
+    report(); // the display follows the oldest in-flight probe, not the newest start
+    // The retry shares the original deadline instead of earning a fresh one.
+    const remaining = timeoutMs - (Date.now() - started);
     try {
-      return await probeGatewayModel(model, baseUrl, opts, optional, budget);
+      if (remaining <= 0) return { verdict: "inconclusive", reason: PROBE_TIMED_OUT } as ProbeResult;
+      return await probeGatewayModel(model, baseUrl, opts, optional, budget, remaining);
     } finally {
       inFlight.delete(entry);
     }
@@ -348,14 +364,15 @@ async function verifiedGatewayModels(
             reasoningIds.has(model.id) || (model.backingModel !== undefined && reasoningIds.has(model.backingModel))
               ? REASONING_PROBE_MAX_TOKENS
               : PROBE_MAX_TOKENS;
-          let result = await probe(model, { disableThinking }, budget, 1);
+          const started = Date.now();
+          let result = await probe(model, { disableThinking }, budget, 1, started);
           // No retry after a timeout: that verdict is inconclusive (the model is
           // kept), so a second wait only doubles the cost of a busy model.
           if (result.verdict === "rejected") {
             // A 400 is most often a parameter this model's backend does not
             // accept. Retry once with only the required fields; a second refusal
             // is the model's definitive answer to the minimal probe.
-            const retry = await probe(model, null, budget, 2);
+            const retry = await probe(model, null, budget, 2, started);
             // Whatever else the retry says, the model answered the full probe with
             // a 400: it is never pruned on the retry's word alone.
             result =
@@ -367,14 +384,20 @@ async function verifiedGatewayModels(
           }
           verdicts[index] = result;
           completed += 1;
-          opts.onProgress?.({
-            providerId: opts.providerId,
-            phase: completed === gateway.length ? "complete" : "probing",
-            completed,
-            total: gateway.length,
-            modelId: model.id,
-            elapsedMs: 0,
-          });
+          // A finished probe only advances the count: the displayed probe stays
+          // the oldest one still running, so the panel does not flicker.
+          const oldest = oldestInFlight();
+          if (oldest && completed < gateway.length) emit(oldest);
+          else {
+            opts.onProgress?.({
+              providerId: opts.providerId,
+              phase: completed === gateway.length ? "complete" : "probing",
+              completed,
+              total: gateway.length,
+              modelId: model.id,
+              elapsedMs: 0,
+            });
+          }
         }
       }),
     );
@@ -417,6 +440,11 @@ async function verifiedGatewayModels(
       held.push({ id: model.id, verdict: result.verdict, reason: result.reason });
     } else if (result.verdict === "working" && result.note) notes.push({ id: model.id, note: result.note });
   });
+  if (working.length === 0 && excluded.length === 0 && held.every((entry) => entry.verdict === "inconclusive")) {
+    // Nothing answered and nothing was refused (timeouts, capacity): that proves
+    // nothing about any model, so it is not a failure and nothing changes.
+    return { working, excluded, held, notes, allInconclusive: true };
+  }
   if (working.length === 0) {
     throw new Error(
       `none of the ${gateway.length} advertised models produced a usable completion (${[...excluded, ...held]
@@ -478,6 +506,7 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
   const verified: Verification = canProbe
     ? await verifiedGatewayModels(advertised, baseUrl, opts, disableThinking, reasoningIds, relisting)
     : { working: advertised, excluded: [], held: [], notes: [] };
+  const timeoutSeconds = (opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS) / 1000;
   const gateway = verified.working;
   const configuredIds = new Set(existing.map((model) => model.id));
   // Configured ids the listing does not mention at all, in either direction.
@@ -492,7 +521,10 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
     ...(opts.pruneMissing || canProbe || aliased ? { pruneMissing: true } : {}),
     // A model that was not verified this time keeps its configured entry
     // exactly as it was; only a definitive "not served" removes one.
-    keep: [...verified.held.map(({ id }) => id), ...unevidenced.map((model) => model.id)],
+    keep: [
+      ...(verified.allInconclusive ? existing.map((model) => model.id) : verified.held.map(({ id }) => id)),
+      ...unevidenced.map((model) => model.id),
+    ],
   });
   const planLines = describeCatalogPlan(plan).map((line) =>
     canProbe
@@ -501,6 +533,9 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
           .replace(" — the gateway no longer lists it", " — not advertised or inference probe failed")
       : line,
   );
+  const newTimedOut = verified.held.filter(
+    ({ id, reason }) => reason === PROBE_TIMED_OUT && !configuredIds.has(id),
+  ).length;
   const lines = [
     `${opts.providerId} — ${gateway.length} ${canProbe ? "working" : "advertised"} model(s) on ${baseUrl}`,
     ...(aliased
@@ -537,10 +572,20 @@ async function planProviderRefresh(config: ModelsConfig, opts: RefreshOptions): 
       : []),
     ...(opts.probeModels && !canProbe ? [`Inference probe skipped for unsupported provider API ${api}.`] : []),
     ...verified.excluded.map(({ id, reason }) => `  excluded: ${id} — ${reason}`),
-    ...verified.held.map(
-      ({ id, verdict, reason }) =>
-        `  ${verdict}: ${id} — ${reason} (${configuredIds.has(id) ? "kept as configured" : "not added"})`,
+    ...verified.held.map(({ id, verdict, reason }) =>
+      reason === PROBE_TIMED_OUT && !configuredIds.has(id)
+        ? `  ${id}: timed out after ${timeoutSeconds}s, not added — rerun with --timeout 120`
+        : `  ${verdict}: ${id} — ${reason} (${configuredIds.has(id) ? "kept as configured" : "not added"})`,
     ),
+    ...(verified.allInconclusive
+      ? [
+          `  no model could be verified within ${timeoutSeconds}s; configuration kept — raise --timeout (e.g. --timeout 120)`,
+        ]
+      : newTimedOut > 0
+        ? [
+            `  ${newTimedOut} new model(s) timed out and were not added; rerun with --timeout 120 to add slow or cold-loading models.`,
+          ]
+        : []),
     ...verified.notes.map(({ id, note }) => `  note: ${id} — ${note}`),
     ...(unevidenced.length > 0
       ? [

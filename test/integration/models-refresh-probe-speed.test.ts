@@ -25,11 +25,14 @@ interface Behavior {
   never?: boolean;
   /** Reject the full probe (one carrying `temperature`) with this status. */
   status?: number;
+  /** Hold the minimal (no temperature) retry open. */
+  retryHangs?: boolean;
 }
 
 async function gateway(behaviors: Record<string, Behavior>, configured: string[] = []) {
   const requests: Array<{ model: string; hasTemperature: boolean }> = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
+  const load = { inFlight: 0, maxInFlight: 0 };
   const server = createServer(async (req, res) => {
     res.setHeader("content-type", "application/json");
     if (req.url === "/v1/models") {
@@ -40,8 +43,13 @@ async function gateway(behaviors: Record<string, Behavior>, configured: string[]
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const body = JSON.parse(Buffer.concat(chunks).toString()) as { model: string; temperature?: number };
     requests.push({ model: body.model, hasTemperature: body.temperature !== undefined });
+    load.inFlight += 1;
+    load.maxInFlight = Math.max(load.maxInFlight, load.inFlight);
+    res.on("close", () => {
+      load.inFlight -= 1;
+    });
     const behavior = behaviors[body.model] ?? {};
-    if (behavior.never) return;
+    if (behavior.never || (behavior.retryHangs && body.temperature === undefined)) return;
     const respond = () => {
       const fail = behavior.status !== undefined && body.temperature !== undefined;
       res.statusCode = fail ? behavior.status! : 200;
@@ -81,6 +89,7 @@ async function gateway(behaviors: Record<string, Behavior>, configured: string[]
   return {
     modelsPath,
     requests,
+    load,
     configuredIds: () =>
       (JSON.parse(readFileSync(modelsPath, "utf8")).providers.p.models as Array<{ id: string }>).map((m) => m.id),
     async close() {
@@ -208,7 +217,11 @@ test("progress reaches total exactly once with 4 probes in flight, and attempt 2
       "progress reports concurrent probes",
     );
     const attempt2 = events.filter((e) => e.attempt === 2);
-    assert.ok(attempt2.length > 0 && attempt2.every((e) => e.modelId === "picky"), "attempt 2 only for the 400 retry");
+    assert.ok(
+      attempt2.every((e) => e.modelId === "picky"),
+      "attempt 2 only for the 400 retry",
+    );
+    assert.equal(g.requests.filter((r) => r.model === "picky").length, 2);
   } finally {
     await g.close();
   }
@@ -218,18 +231,118 @@ test("a timeout never produces an attempt 2 progress event", async () => {
   const g = await gateway({ hung: { never: true } }, ["hung"]);
   const events: RefreshProgress[] = [];
   try {
-    await assert.rejects(
-      refreshProviderModels({
-        modelsPath: g.modelsPath,
-        providerId: "p",
-        probeModels: true,
-        probeTimeoutMs: 200,
-        onProgress: (event) => events.push(event),
-      }),
-      /none of the 1 advertised models/,
-    );
+    await refreshProviderModels({
+      modelsPath: g.modelsPath,
+      providerId: "p",
+      probeModels: true,
+      probeTimeoutMs: 200,
+      onProgress: (event) => events.push(event),
+    });
     assert.ok(events.some((e) => e.attempt === 1));
     assert.ok(events.every((e) => e.attempt !== 2));
+  } finally {
+    await g.close();
+  }
+});
+
+test("default concurrency really overlaps 4 probes; probeConcurrency 1 never overlaps", async () => {
+  const ids = Array.from({ length: 8 }, (_, i) => `m${i}`);
+  const g = await gateway(Object.fromEntries(ids.map((id) => [id, { delayMs: 150 }])));
+  const h = await gateway(Object.fromEntries(ids.slice(0, 3).map((id) => [id, { delayMs: 50 }])));
+  try {
+    await refreshProviderModels({ modelsPath: g.modelsPath, providerId: "p", probeModels: true });
+    assert.equal(g.load.maxInFlight, DEFAULT_PROBE_CONCURRENCY);
+    await refreshProviderModels({ modelsPath: h.modelsPath, providerId: "p", probeModels: true, probeConcurrency: 1 });
+    assert.equal(h.load.maxInFlight, 1);
+  } finally {
+    await g.close();
+    await h.close();
+  }
+});
+
+test("when every probe is inconclusive, refresh keeps the configuration and says how to proceed", async () => {
+  const g = await gateway({ hung: { never: true }, hung2: { never: true }, fresh: { never: true } }, ["hung", "hung2"]);
+  try {
+    const before = readFileSync(g.modelsPath, "utf8");
+    const result = await refreshProviderModels({
+      modelsPath: g.modelsPath,
+      providerId: "p",
+      probeModels: true,
+      pruneMissing: true,
+      probeTimeoutMs: 1000,
+    });
+    const text = result.lines.join("\n");
+    assert.match(
+      text,
+      /no model could be verified within 1s; configuration kept — raise --timeout \(e\.g\. --timeout 120\)/,
+    );
+    assert.match(text, /fresh: timed out after 1s, not added — rerun with --timeout 120/);
+    assert.equal(result.written, false);
+    assert.equal(readFileSync(g.modelsPath, "utf8"), before);
+  } finally {
+    await g.close();
+  }
+});
+
+test("an unconfigured model that times out gets an explicit line and a summary hint", async () => {
+  const g = await gateway({ ok: {}, fresh: { never: true } });
+  try {
+    const result = await refreshProviderModels({
+      modelsPath: g.modelsPath,
+      providerId: "p",
+      probeModels: true,
+      probeTimeoutMs: 300,
+    });
+    const text = result.lines.join("\n");
+    assert.match(text, /fresh: timed out after 0\.3s, not added — rerun with --timeout 120/);
+    assert.match(text, /1 new model\(s\) timed out and were not added/);
+    assert.ok(!g.configuredIds().includes("fresh"));
+  } finally {
+    await g.close();
+  }
+});
+
+test("finished events keep the displayed probe: oldest in flight, with attempt, and elapsed never goes backwards", async () => {
+  const g = await gateway({ "a-slow": { delayMs: 900 }, a: { delayMs: 50 }, b: { delayMs: 50 }, c: { delayMs: 50 } });
+  const events: RefreshProgress[] = [];
+  try {
+    await refreshProviderModels({
+      modelsPath: g.modelsPath,
+      providerId: "p",
+      probeModels: true,
+      onProgress: (event) => events.push(event),
+    });
+    const during = events.filter((e) => e.phase === "probing" && e.completed > 0 && e.completed < 4);
+    assert.ok(during.length > 0);
+    for (const event of during) {
+      assert.equal(event.modelId, "a-slow", "finished model must not replace the displayed probe");
+      assert.equal(event.attempt, 1);
+      assert.ok((event.inFlight ?? 0) >= 1);
+    }
+    const slow = events.filter((e) => e.modelId === "a-slow" && e.attempt !== undefined).map((e) => e.elapsedMs);
+    assert.deepEqual(
+      slow,
+      [...slow].sort((x, y) => x - y),
+    );
+  } finally {
+    await g.close();
+  }
+});
+
+test("a 400 retry is bounded by the remaining part of the original deadline", async () => {
+  // Full probe is rejected after 700 ms; the retry would hang. With a 1 s
+  // deadline the retry may only wait about 300 ms more.
+  const g = await gateway({ picky: { status: 400, delayMs: 700, retryHangs: true } });
+  try {
+    const started = Date.now();
+    await refreshProviderModels({
+      modelsPath: g.modelsPath,
+      providerId: "p",
+      probeModels: true,
+      probeTimeoutMs: 1000,
+    });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 1000 + 600, `retry must share the deadline, took ${elapsed} ms`);
   } finally {
     await g.close();
   }

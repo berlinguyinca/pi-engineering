@@ -11,7 +11,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { refreshConfiguredProviders, refreshProviderModels } from "../../src/models/refresh.ts";
+import {
+  DEFAULT_PROBE_CONCURRENCY,
+  refreshConfiguredProviders,
+  refreshProviderModels,
+} from "../../src/models/refresh.ts";
 
 const PAYLOAD = {
   data: [
@@ -469,7 +473,11 @@ test("refresh: verification keeps every model that answers, visible text or not"
         assert.equal(body.reasoning_effort, "none", "known reasoning gateways must not spend the probe on thinking");
         inFlight += 1;
         maxInFlight = Math.max(maxInFlight, inFlight);
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        // Hold every request until the pool is saturated, so the assertion
+        // below proves real overlap instead of merely allowing it.
+        for (const waitUntil = Date.now() + 2000; inFlight < DEFAULT_PROBE_CONCURRENCY && Date.now() < waitUntil; ) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
         try {
           if (body.model === "qwen3.8-27b-q4-250k" || body.model === "deepseek-v4-flash") {
             return {
@@ -490,7 +498,7 @@ test("refresh: verification keeps every model that answers, visible text or not"
     });
 
     assert.deepEqual(requested.sort(), PAYLOAD.data.map((model) => model.id).sort());
-    assert.ok(maxInFlight >= 1 && maxInFlight <= 4, "default probing is bounded to 4 in flight");
+    assert.equal(maxInFlight, DEFAULT_PROBE_CONCURRENCY, "default probing overlaps exactly 4 probes");
     // A reasoning model that spends the probe budget thinking (empty content)
     // is still served: it must never be pruned from the picker for that.
     assert.deepEqual(
@@ -634,26 +642,27 @@ test("refresh: thinking-off environment allowlists can disable probe parameters"
   }
 });
 
-test("refresh: zero successful verification probes preserve the last-known-good config", async () => {
+test("refresh: every probe inconclusive keeps the last-known-good config without failing", async () => {
   const s = scratch();
   const before = readFileSync(s.path, "utf8");
   try {
-    await assert.rejects(
-      () =>
-        refreshProviderModels({
-          modelsPath: s.path,
-          providerId: "metabolomics",
-          apiKey: "k",
-          probeModels: true,
-          fetchImpl: (async (input: string | URL | Request) => {
-            if (String(input).endsWith("/models")) {
-              return { ok: true, status: 200, headers: new Headers(), json: async () => PAYLOAD };
-            }
-            return { ok: false, status: 503, json: async () => ({ error: { code: "capacity_unavailable" } }) };
-          }) as typeof fetch,
-        }),
-      /none of the 5 advertised models produced a usable completion/,
+    const result = await refreshProviderModels({
+      modelsPath: s.path,
+      providerId: "metabolomics",
+      apiKey: "k",
+      probeModels: true,
+      fetchImpl: (async (input: string | URL | Request) => {
+        if (String(input).endsWith("/models")) {
+          return { ok: true, status: 200, headers: new Headers(), json: async () => PAYLOAD };
+        }
+        return { ok: false, status: 503, json: async () => ({ error: { code: "capacity_unavailable" } }) };
+      }) as typeof fetch,
+    });
+    assert.match(
+      result.lines.join("\n"),
+      /no model could be verified within 20s; configuration kept — raise --timeout/,
     );
+    assert.equal(result.written, false);
     assert.equal(readFileSync(s.path, "utf8"), before);
   } finally {
     s.cleanup();
