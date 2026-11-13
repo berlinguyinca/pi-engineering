@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import { PICKER_TIMEOUT_MS } from "../../src/gateway/advisedPicker.ts";
-import { AdvisedModelSwitch } from "../../src/gateway/advisedSwitch.ts";
+import { AdvisedModelSwitch, MAX_PICKER_TIMEOUTS } from "../../src/gateway/advisedSwitch.ts";
 import {
   type FallbackContext,
   FallbackCoordinator,
@@ -271,19 +271,83 @@ test("keep waiting: the next refusal in the same episode is waited out normally;
   assert.equal((await third.outcome).holds, 0);
 });
 
-test("timeout is keep waiting, not cancel: the turn continues on the current model with the normal hold", async () => {
+const hang = () => new Promise<string | undefined>(() => {});
+
+async function refuseThenSettle(
+  c: FallbackCoordinator,
+  t: ReturnType<typeof switcher>,
+  answer: () => Promise<string | undefined>,
+  options?: string[][],
+) {
+  const p = pumpOnce(c, [refused()]);
+  const r = await p.outcome;
+  const res = await t.h.onBeforeSettle(
+    settleEvent(p.out.ended?.errorMessage ?? ""),
+    ui(async (o) => {
+      options?.push(o);
+      return answer();
+    }),
+  );
+  return { r, res };
+}
+
+test("timeout takes the owed wait once and replays, but does NOT suppress the picker", async () => {
+  const c = advisedCoordinator({ picker: true });
+  const t = switcher(c, { timeoutMs: 20 });
+  const { res } = await refuseThenSettle(c, t, hang);
+  assert.equal(res?.continue, true);
+  assert.deepEqual(t.owed, [{ delayMs: 20_000, attempt: 1 }]);
+  assert.equal(c.willAbandonOnAdvice, true, "the next refusal prompts again");
+  assert.deepEqual(t.set, []);
+});
+
+test("timeout then the next refusal offers the picker again; an explicit keep waiting does not", async () => {
+  const c = advisedCoordinator({ picker: true });
+  const t = switcher(c, { timeoutMs: 20 });
+  const shown: string[][] = [];
+  await refuseThenSettle(c, t, hang, shown);
+  assert.equal(shown.length, 1);
+  const again = await refuseThenSettle(c, t, async () => undefined, shown);
+  assert.equal(again.r.holds, 0, "abandoned for the picker again");
+  assert.equal(shown.length, 2);
+
+  const c2 = advisedCoordinator({ picker: true });
+  const t2 = switcher(c2);
+  const shown2: string[][] = [];
+  await refuseThenSettle(c2, t2, async () => shown2[0]?.find((x) => x.startsWith("Keep waiting")), shown2);
+  const next = await pumpOnce(c2, [refused(), served()]).outcome;
+  assert.equal(next.holds, 1, "waited, no picker");
+  assert.equal(shown2.length, 1);
+});
+
+test("timeout with no oweWait seam still ends the turn", async () => {
   const c = advisedCoordinator({ picker: true });
   const p = pumpOnce(c, [refused()]);
   await p.outcome;
-  const t = switcher(c, { timeoutMs: 20 });
-  const res = await t.h.onBeforeSettle(
-    settleEvent(p.out.ended?.errorMessage ?? ""),
-    ui(() => new Promise(() => {})),
-  );
-  assert.equal(res?.continue, true);
-  assert.deepEqual(t.owed, [{ delayMs: 20_000, attempt: 1 }]);
-  assert.equal(c.willAbandonOnAdvice, false, "no re-prompt this episode");
-  assert.deepEqual(t.set, []);
+  const h = new AdvisedModelSwitch({
+    claimPending: () => c.claimPending(),
+    apply: async () => ({ switched: false }),
+    applyChosen: async () => ({ switched: false }),
+    pickerTimeoutMs: 20,
+  });
+  assert.equal(await h.onBeforeSettle(settleEvent(p.out.ended?.errorMessage ?? ""), ui(hang)), undefined);
+});
+
+test("repeated timeouts are bounded: after MAX_PICKER_TIMEOUTS the episode suppresses the picker and waits", async () => {
+  const c = advisedCoordinator({ picker: true });
+  const t = switcher(c, { timeoutMs: 2 });
+  for (let i = 0; i < MAX_PICKER_TIMEOUTS; i++) {
+    await refuseThenSettle(c, t, hang);
+    assert.equal(c.willAbandonOnAdvice, true, `timeout ${i + 1} still prompts next time`);
+  }
+  await refuseThenSettle(c, t, hang);
+  assert.equal(c.willAbandonOnAdvice, false, "the bound is spent: wait normally under the pump's budgets");
+  // A settled run starts over.
+  t.h.register({
+    on: (name: string, fn: (e: never, c: never) => unknown) =>
+      name === "agent_settled" && fn(undefined as never, undefined as never),
+  });
+  assert.equal(c.willAbandonOnAdvice, true);
 });
 
 test("cancel: the turn ends with the advice, and settle recovery does not resume it", async () => {

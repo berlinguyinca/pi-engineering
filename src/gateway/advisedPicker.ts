@@ -20,9 +20,10 @@ import { toCandidate } from "./fallbackLifecycle.ts";
 /**
  * How long the picker waits for an answer. We measure this in seconds: the
  * picker appears at the first refusal, so an unattended session must not sit
- * in a dialog. A timeout is treated as "Keep waiting" (the current model, the
- * normal hold), NOT as Cancel: nobody answered, so behave as if the picker
- * did not exist.
+ * in a dialog. A timeout is NOT Cancel and NOT an explicit "Keep waiting": the
+ * owed wait is taken once on the current model and the turn continues, but the
+ * picker stays available, so the next refusal prompts again (bounded by
+ * MAX_PICKER_TIMEOUTS in advisedSwitch.ts).
  */
 export const PICKER_TIMEOUT_MS = 45_000;
 const DEFAULT_WAIT_MS = 20_000;

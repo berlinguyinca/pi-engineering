@@ -113,7 +113,7 @@ export class FallbackCoordinator {
   private standInAvailable = false;
   /** Last lifecycle-time check: can an interactive picker be shown right now? Plain boolean. */
   private pickerAvailable = false;
-  /** The operator chose "Keep waiting" (or the picker timed out) this episode: no more picker-driven abandons. */
+  /** The operator chose "Keep waiting" this episode: no more picker-driven abandons. */
   private keepWaiting = false;
   private declined = false;
   /** The armed fallback was armed for the picker (no stand-in on record). */
@@ -218,8 +218,8 @@ export class FallbackCoordinator {
   }
 
   /**
-   * The operator chose to keep waiting on the current model (or did not
-   * answer in time): the pump waits normally for the rest of the episode
+   * The operator explicitly chose to keep waiting on the current model (a picker
+   * timeout does NOT call this, so the next refusal prompts again): the pump waits normally for the rest of the episode
    * instead of abandoning the hold for the picker again. Cleared by
    * {@link endEpisode}, a model switch, or a new turn.
    */

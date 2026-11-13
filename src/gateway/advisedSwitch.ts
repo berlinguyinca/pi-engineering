@@ -72,6 +72,13 @@ interface BoundaryResult {
 
 /** Consecutive "no stand-in fits, wait instead" continues before the turn is let go. */
 export const MAX_STAY_CONTINUES = 3;
+/**
+ * Consecutive picker timeouts (nobody answered) before the episode stops
+ * prompting and just waits. Each replay is a NEW request, so the pump's 15
+ * minute chain budget restarts every time; this bound (20 x ~45 s) keeps an
+ * unattended turn from being re-prompted for ever.
+ */
+export const MAX_PICKER_TIMEOUTS = 20;
 /** The wait owed on a stay when the hold carried no delay of its own. */
 export const DEFAULT_STAY_WAIT_MS = 20_000;
 
@@ -102,7 +109,7 @@ export interface AdvisedSwitchDeps {
   healthFor?(ctx: FallbackContext): Promise<ModelHealthProvider | undefined> | ModelHealthProvider | undefined;
   /** How long the picker waits for an answer; defaults to {@link PICKER_TIMEOUT_MS}. */
   pickerTimeoutMs?: number;
-  /** The operator chose "Keep waiting" (or the picker timed out): the pump must not abandon for the picker again this episode. */
+  /** The operator explicitly chose "Keep waiting" (or the timeout bound is spent): the pump must not abandon for the picker again this episode. */
   noteKeepWaiting?(): void;
   /** The operator chose Cancel: later settle handlers must leave the turn ended. */
   noteOperatorDeclined?(): void;
@@ -134,6 +141,8 @@ export function carriesAlternateAdvice(message: { errorMessage?: string } | unde
 export class AdvisedModelSwitch {
   private readonly deps: AdvisedSwitchDeps;
   private stays = 0;
+  /** Consecutive picker timeouts; reset by any answer and by agent_settled. */
+  private timeouts = 0;
 
   constructor(deps: AdvisedSwitchDeps) {
     this.deps = deps;
@@ -145,6 +154,7 @@ export class AdvisedModelSwitch {
       this.onBeforeSettle(event, ctx)) as never);
     pi.on("agent_settled", (() => {
       this.stays = 0;
+      this.timeouts = 0;
       this.deps.onSettled?.();
     }) as never);
   }
@@ -290,14 +300,20 @@ export class AdvisedModelSwitch {
       title: `${source} is out of capacity and the gateway advises another model. Choose one:`,
       timeoutMs: this.deps.pickerTimeoutMs ?? PICKER_TIMEOUT_MS,
     });
-    // Nobody answered in time: behave as if the picker did not exist, i.e.
-    // wait on the current model with the normal hold. That is "Keep waiting",
-    // not Cancel; an unattended session must not have its turn ended by a
-    // dialog nobody saw. (Needs the wait seam; without it the turn ends.)
-    const outcome: PickerOutcome =
-      answered.kind === "cancelled" && answered.reason === "timeout" && oweWait
-        ? { kind: "keep-waiting", delayMs: waitMs }
-        : answered;
+    // Nobody answered in time: take the owed wait once and replay, as for
+    // "Keep waiting", but WITHOUT suppressing the picker: an operator who
+    // looked away for a moment must still be able to pick at the next refusal,
+    // so an unattended session waits in picker-timeout slices plus the
+    // declared delay. Not Cancel either: a dialog nobody saw must not end the
+    // turn. Bounded: each replay is a new request (the pump's chain budget
+    // restarts), so after MAX_PICKER_TIMEOUTS in a row the picker is
+    // suppressed and the normal hold applies. (Needs the wait seam; without
+    // it the turn ends.)
+    const timedOut = answered.kind === "cancelled" && answered.reason === "timeout" && oweWait !== undefined;
+    const outcome: PickerOutcome = timedOut ? { kind: "keep-waiting", delayMs: waitMs } : answered;
+    const suppress = outcome.kind === "keep-waiting" && (!timedOut || ++this.timeouts > MAX_PICKER_TIMEOUTS);
+    if (outcome.kind !== "keep-waiting") this.timeouts = 0;
+    if (suppress) this.timeouts = 0;
     // The dialog may have outlived the session (reload, /new): Pi's ctx getters
     // throw once the extension instance is invalidated (runner.js createContext
     // -> assertActive), and a stale `pi`/ctx must not be driven. Probe first.
@@ -316,7 +332,7 @@ export class AdvisedModelSwitch {
       // The operator chose to wait: grant the automatic waits again before the
       // next prompt; the wait itself is attempt 1, as for any first stay.
       this.stays = 0;
-      this.deps.noteKeepWaiting?.();
+      if (suppress) this.deps.noteKeepWaiting?.();
       try {
         oweWait(ctx, outcome.delayMs, 1);
       } catch {
