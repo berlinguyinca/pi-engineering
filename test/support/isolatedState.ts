@@ -70,6 +70,15 @@ if (!process.env.PI_ENGINEERING_STATE_DIR) {
 if (!process.env.HERDR_DISABLED) {
   process.env.HERDR_DISABLED = "1";
 }
+// The priorart self-heal (`session_start` -> `ensurePriorart`) spawns a DETACHED `git clone`
+// of an external repo plus a build whenever its binary is missing. Its tmpdir guard covers a
+// HOME under mkdtemp; this makes the spawn impossible for any test process whatever HOME a
+// test points at — no network, no build, and nothing that can outlive a test's own cleanup
+// and turn its teardown into ENOTEMPTY (#681). Priorart's own tests set the variable when
+// they need the decision boundary itself.
+if (!process.env.PI_ENGINEERING_PRIORART_REBUILD) {
+  process.env.PI_ENGINEERING_PRIORART_REBUILD = "0";
+}
 if (!process.env.PI_ENGINEERING_HOME) {
   process.env.PI_ENGINEERING_HOME = mkdtempSync(join(tmpdir(), "pi-eng-test-install-"));
 }

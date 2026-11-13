@@ -7,12 +7,13 @@
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { cp, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { startPiSession } from "../support/piSession.ts";
+import { removeTree } from "../support/removeTree.ts";
 import { bag, writeFixtureRuntime } from "../support/runtimeFixtures.ts";
 
 const repoRoot = resolve(fileURLToPath(new URL("../../", import.meta.url)));
@@ -46,7 +47,11 @@ after(async () => {
     if (saved[k] === undefined) delete process.env[k];
     else process.env[k] = saved[k];
   }
-  await rm(root, { recursive: true, force: true });
+  // The tests point HOME inside `root` and load the real host extension, so anything the
+  // session leaves writing under it (repo discovery, a self-heal, a grandchild) races this
+  // teardown. A single unlink pass turns that into `ENOTEMPTY` and fails the whole file with
+  // no assertion in it; retry the passes and report what genuinely survived (#681).
+  await removeTree(root);
 });
 
 test("package.json points Pi at the entry shim", () => {
