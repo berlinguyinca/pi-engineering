@@ -111,6 +111,11 @@ export interface SettleRecoveryDeps {
   isPaced(ctx: SettleRecoveryContext): boolean;
   /** Is a wait already owed (a previous continue whose wait was never taken)? */
   hasPendingWait(ctx: SettleRecoveryContext): boolean;
+  /**
+   * The operator just chose "Cancel (end the turn)" in the advised-model
+   * picker. Consumed once: the turn ends with the advice and is not resumed.
+   */
+  operatorDeclined?(): boolean;
 }
 
 function positive(value: string | undefined): number | undefined {
@@ -316,6 +321,11 @@ export class SettleRecovery {
       return undefined;
     }
     const errorText = failed.message.errorMessage ?? "no error text";
+    // The operator said to end the turn: a recovery wait would overrule them.
+    if (this.deps.operatorDeclined?.() === true) {
+      this.reset();
+      return undefined;
+    }
     // A wait is already owed: an earlier handler continued this turn on its own.
     if (this.deps.hasPendingWait(ctx)) return undefined;
     if (!this.deps.isPaced(ctx)) {

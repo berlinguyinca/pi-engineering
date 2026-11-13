@@ -7,7 +7,9 @@
  * should serve this request. The envelope names no model — the client picks —
  * and before this module the runtime had nothing to pick with mid-turn, so it
  * waited (up to `ALTERNATE_MODEL_MAX_ELAPSED_MS`) and then ended the turn
- * with "switch with /model". The operator did the switch and re-sent.
+ * with "switch with /model". The operator did the switch and re-sent. With a
+ * live UI and no stand-in the pump now abandons at the FIRST refusal and the
+ * settle handler opens the picker at once (`pickerFirst`).
  *
  * Now the pieces fit together across the three places they have to live:
  *
@@ -37,7 +39,7 @@
 import type { Model } from "@earendil-works/pi-ai/compat";
 import type { ModelHealthProvider } from "../models/health.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
-import { PICKER_TIMEOUT_MS, buildPickerEntries, runModelPicker } from "./advisedPicker.ts";
+import { PICKER_TIMEOUT_MS, type PickerOutcome, buildPickerEntries, runModelPicker } from "./advisedPicker.ts";
 import { type ProjectedEntry, hasVisibleOutput, lastFailedAssistant } from "./afterOutputRetry.ts";
 import type { FallbackApplyResult, FallbackContext, PendingFallback } from "./fallbackLifecycle.ts";
 import {
@@ -100,6 +102,12 @@ export interface AdvisedSwitchDeps {
   healthFor?(ctx: FallbackContext): Promise<ModelHealthProvider | undefined> | ModelHealthProvider | undefined;
   /** How long the picker waits for an answer; defaults to {@link PICKER_TIMEOUT_MS}. */
   pickerTimeoutMs?: number;
+  /** The operator chose "Keep waiting" (or the picker timed out): the pump must not abandon for the picker again this episode. */
+  noteKeepWaiting?(): void;
+  /** The operator chose Cancel: later settle handlers must leave the turn ended. */
+  noteOperatorDeclined?(): void;
+  /** The agent run settled (`agent_settled`): the episode is over. */
+  onSettled?(): void;
 }
 
 type BoundaryReplay = { entries: unknown[]; continue: true };
@@ -137,6 +145,7 @@ export class AdvisedModelSwitch {
       this.onBeforeSettle(event, ctx)) as never);
     pi.on("agent_settled", (() => {
       this.stays = 0;
+      this.deps.onSettled?.();
     }) as never);
   }
 
@@ -153,6 +162,11 @@ export class AdvisedModelSwitch {
     // Nothing armed: the hold was waited out or the switch is off. The turn
     // ends with the advice on it, as it always did.
     if (!pending) return undefined;
+
+    // The pump abandoned this hold at the FIRST refusal because no stand-in
+    // fits but an operator can be asked: go straight to the picker, no
+    // automatic attempt and no stay-waits first.
+    if (pending.pickerFirst === true) return this.onPickerFirst(event, ctx, pending, failed);
 
     let result: FallbackApplyResult;
     try {
@@ -208,6 +222,44 @@ export class AdvisedModelSwitch {
     return replay;
   }
 
+  private async onPickerFirst(
+    event: BeforeSettleEvent,
+    ctx: FallbackContext,
+    pending: PendingFallback,
+    failed: { entryId: string },
+  ): Promise<BoundaryResult | undefined> {
+    const replay: BoundaryReplay = {
+      entries: [...(event.entries ?? []), { type: "context_edit", targetId: failed.entryId, replacement: null }],
+      continue: true,
+    };
+    const none: FallbackApplyResult = { switched: false, skipped: "stay", reason: "no stand-in fits this session" };
+    if (this.canOffer(ctx, none)) {
+      const chosen = await this.offerPicker(ctx, pending, none, replay);
+      if (chosen) return chosen;
+      emitTelemetry({
+        level: "warning",
+        key: "advised-model-switch:stay",
+        text: `The gateway advises another model for ${pending.sourceModelId ?? "the current model"} and no stand-in fits this session. Switch with /model.`,
+      });
+      return undefined;
+    }
+    // The UI went away between the hold and the settle (or the replay is
+    // unsafe): the pump skipped the wait, so owe it here, on the same model.
+    if (!this.deps.oweWait || pending.toolExecutionStarted === true) return undefined;
+    this.deps.noteKeepWaiting?.();
+    this.deps.oweWait(ctx, pending.retryAfterMs ?? DEFAULT_STAY_WAIT_MS, 1);
+    return replay;
+  }
+
+  private canOffer(ctx: FallbackContext, result: FallbackApplyResult): boolean {
+    return (
+      this.deps.applyChosen !== undefined &&
+      ctx.ui?.select !== undefined &&
+      ctx.hasUI === true &&
+      result.skipped !== "tool-started-not-replay-safe"
+    );
+  }
+
   /**
    * No stand-in fits and the automatic waits are spent: let an operator at a
    * live UI choose. Anything but an applied choice or an explicit "keep
@@ -222,26 +274,34 @@ export class AdvisedModelSwitch {
     const { applyChosen, oweWait } = this.deps;
     const select = ctx.ui?.select;
     // A refusal for an unsafe replay would refuse the pick too; do not ask.
-    if (!applyChosen || !select || ctx.hasUI !== true || result.skipped === "tool-started-not-replay-safe") {
-      return undefined;
-    }
+    if (!applyChosen || !select || !this.canOffer(ctx, result)) return undefined;
+    const waitMs = result.blocked?.retryAfterMs ?? pending.retryAfterMs ?? DEFAULT_STAY_WAIT_MS;
     const entries = buildPickerEntries({
       source: ctx.model,
       available: ctx.modelRegistry?.getAvailable?.() ?? [],
       excludeIds: pending.excludeIds,
       usedTokens: ctx.getContextUsage?.()?.tokens,
       health: await this.healthOf(ctx),
-      waitMs: result.blocked?.retryAfterMs ?? pending.retryAfterMs ?? DEFAULT_STAY_WAIT_MS,
+      waitMs,
       allowKeepWaiting: oweWait !== undefined,
     });
     const source = pending.sourceModelId ?? ctx.model?.id ?? "the current model";
-    const outcome = await runModelPicker(select, entries, {
+    const answered = await runModelPicker(select, entries, {
       title: `${source} is out of capacity and the gateway advises another model. Choose one:`,
       timeoutMs: this.deps.pickerTimeoutMs ?? PICKER_TIMEOUT_MS,
     });
+    // Nobody answered in time: behave as if the picker did not exist, i.e.
+    // wait on the current model with the normal hold. That is "Keep waiting",
+    // not Cancel; an unattended session must not have its turn ended by a
+    // dialog nobody saw. (Needs the wait seam; without it the turn ends.)
+    const outcome: PickerOutcome =
+      answered.kind === "cancelled" && answered.reason === "timeout" && oweWait
+        ? { kind: "keep-waiting", delayMs: waitMs }
+        : answered;
     // The dialog may have outlived the session (reload, /new): Pi's ctx getters
     // throw once the extension instance is invalidated (runner.js createContext
     // -> assertActive), and a stale `pi`/ctx must not be driven. Probe first.
+    if (outcome.kind === "cancelled" && outcome.reason === "cancel") this.deps.noteOperatorDeclined?.();
     if (outcome.kind !== "keep-waiting" && outcome.kind !== "picked") return undefined;
     if (!isCtxLive(ctx)) {
       emitTelemetry({
@@ -256,6 +316,7 @@ export class AdvisedModelSwitch {
       // The operator chose to wait: grant the automatic waits again before the
       // next prompt; the wait itself is attempt 1, as for any first stay.
       this.stays = 0;
+      this.deps.noteKeepWaiting?.();
       try {
         oweWait(ctx, outcome.delayMs, 1);
       } catch {
