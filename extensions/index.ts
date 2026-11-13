@@ -2063,6 +2063,9 @@ ${RECOVERY_PROMPT}`;
           // with nobody to continue it. Those wait the hold out as before.
           abandonForAlternate: (info, actualModel, context) => {
             if (!(fallbackCoordinator.willAbandonOnAdvice && fallbackCoordinator.hasPending)) return false;
+            // A picker-armed hold with an unfinished side-effecting tool could
+            // not be replayed at the settle boundary: wait it out instead.
+            if (fallbackCoordinator.pickerAbandonBlockedByTool) return false;
             if (isSummarizationRequest(context as ThinkingContext)) return false;
             const callModel = actualModel as Model<any>;
             admission.noteWait({ ...info.signal, provider: callModel.provider, model: callModel.id });

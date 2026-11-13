@@ -333,14 +333,21 @@ test("timeout with no oweWait seam still ends the turn", async () => {
   assert.equal(await h.onBeforeSettle(settleEvent(p.out.ended?.errorMessage ?? ""), ui(hang)), undefined);
 });
 
-test("repeated timeouts are bounded: after MAX_PICKER_TIMEOUTS the episode suppresses the picker and waits", async () => {
+test("repeated timeouts are bounded: the picker is shown at most MAX_PICKER_TIMEOUTS times, then the episode waits", async () => {
+  assert.ok(MAX_PICKER_TIMEOUTS <= 3, "an unattended session must give up quickly");
   const c = advisedCoordinator({ picker: true });
   const t = switcher(c, { timeoutMs: 2 });
-  for (let i = 0; i < MAX_PICKER_TIMEOUTS; i++) {
-    await refuseThenSettle(c, t, hang);
+  let shown = 0;
+  const countingHang = () => {
+    shown++;
+    return hang();
+  };
+  for (let i = 0; i < MAX_PICKER_TIMEOUTS - 1; i++) {
+    await refuseThenSettle(c, t, countingHang);
     assert.equal(c.willAbandonOnAdvice, true, `timeout ${i + 1} still prompts next time`);
   }
-  await refuseThenSettle(c, t, hang);
+  await refuseThenSettle(c, t, countingHang);
+  assert.equal(shown, MAX_PICKER_TIMEOUTS, "shown exactly MAX times");
   assert.equal(c.willAbandonOnAdvice, false, "the bound is spent: wait normally under the pump's budgets");
   // A settled run starts over.
   t.h.register({
@@ -348,6 +355,58 @@ test("repeated timeouts are bounded: after MAX_PICKER_TIMEOUTS the episode suppr
       name === "agent_settled" && fn(undefined as never, undefined as never),
   });
   assert.equal(c.willAbandonOnAdvice, true);
+});
+
+test("an unfinished side-effecting tool: picker-first neither prompts nor replays", async () => {
+  const c = advisedCoordinator({ picker: true });
+  c.noteToolStarted("bash", "c1");
+  const p = pumpOnce(c, [refused()]);
+  await p.outcome;
+  assert.equal(c.pickerAbandonBlockedByTool, true);
+  const t = switcher(c);
+  let asked = 0;
+  const res = await t.h.onBeforeSettle(
+    settleEvent(p.out.ended?.errorMessage ?? ""),
+    ui(async () => {
+      asked++;
+      return undefined;
+    }),
+  );
+  assert.equal(asked, 0);
+  assert.equal(res, undefined);
+  assert.deepEqual(t.owed, []);
+});
+
+test("UI gone by settle with an unsafe unfinished tool: no replay; with a read-only tool: replay", async () => {
+  for (const [tool, replays] of [
+    ["bash", false],
+    ["read", true],
+  ] as const) {
+    const c = advisedCoordinator({ picker: true });
+    const p = pumpOnce(c, [refused()]);
+    await p.outcome;
+    c.noteToolStarted(tool, "c1");
+    const t = switcher(c);
+    const res = await t.h.onBeforeSettle(settleEvent(p.out.ended?.errorMessage ?? ""), ui(undefined, false));
+    assert.equal(res?.continue === true, replays, tool);
+    assert.equal(t.owed.length, replays ? 1 : 0, tool);
+  }
+});
+
+test("an already-pending fallback becomes picker-first when the stand-in is gone and the pump abandons", () => {
+  const c = advisedCoordinator({ picker: true, standIn: true });
+  const hold = { modelId: "qwen3.8-27b", provider: "metabolomics", source: "body" as const, advisesAlternate: true };
+  c.onGatewayHold(hold);
+  assert.equal(c.snapshot().pickerFirst, undefined);
+  c.noteStandIn(false);
+  c.onGatewayHold(hold);
+  assert.equal(c.snapshot().pickerFirst, true);
+});
+
+test("session reset clears the picker boolean", () => {
+  const c = advisedCoordinator({ picker: true });
+  c.onSessionShutdown();
+  assert.equal(c.willAbandonOnAdvice, false);
 });
 
 test("cancel: the turn ends with the advice, and settle recovery does not resume it", async () => {
@@ -394,6 +453,12 @@ test("a model switch or turn start clears keep waiting; a non-advised refusal ne
   assert.equal(c.willAbandonOnAdvice, true);
   c.noteKeepWaiting();
   c.onModelSelect();
+  assert.equal(
+    c.willAbandonOnAdvice,
+    false,
+    "reset drops the stale picker boolean; the lifecycle callback re-notes it",
+  );
+  c.notePickerAvailable(true);
   assert.equal(c.willAbandonOnAdvice, true);
   c.noteKeepWaiting();
   c.onTurnStart();

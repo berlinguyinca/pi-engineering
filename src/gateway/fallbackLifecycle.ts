@@ -93,9 +93,11 @@ export const SWITCHED_FROM_TTL_MS = 10 * 60_000;
  * - the ADVISED path (`advisedSwitch`): the gateway itself says another
  *   deployment should serve this request (`IW-ACT-RETRY-ALTERNATE`). That is
  *   an instruction, not an inference, so it arms on the first such hold —
- *   but only once a lifecycle callback has recorded (`noteStandIn`) that a
- *   usable stand-in exists. With no stand-in on record the hold is waited out
- *   as before: abandoning the wait would turn a slow turn into a failed one.
+ *   but only once a lifecycle callback has recorded that a usable stand-in
+ *   exists (`noteStandIn`) or that an operator can be asked
+ *   (`notePickerAvailable`, not after "Keep waiting"). With neither on record
+ *   the hold is waited out as before: abandoning the wait would turn a slow
+ *   turn into a failed one.
  */
 export class FallbackCoordinator {
   /** Disabled unless the operator explicitly opts into automatic switching. */
@@ -177,7 +179,13 @@ export class FallbackCoordinator {
     // a saturated model the way a waited-out hold is; it must not inflate the
     // opt-in ledger, least of all across Pi's own retries of the same turn.
     if (this.enabled && !advised) this.consecutiveHolds++;
-    if (this.fallbackPending) return;
+    if (this.fallbackPending) {
+      // The pump abandons this hold on the strength of the picker alone: the
+      // settle boundary must go to the picker too, not try a stand-in that is
+      // no longer on record.
+      if (advised && !this.standInAvailable) this.armedForPicker = true;
+      return;
+    }
     if (advised) {
       this.armedForPicker = !this.standInAvailable;
       this.arm("gateway-advised-alternate", info);
@@ -202,11 +210,6 @@ export class FallbackCoordinator {
    */
   noteStandIn(available: boolean): void {
     this.standInAvailable = available;
-  }
-
-  /** Is a gateway "retry on an alternate" hold worth abandoning right now? */
-  get willSwitchOnAdvice(): boolean {
-    return this.advisedSwitch && this.standInAvailable;
   }
 
   /**
@@ -243,6 +246,15 @@ export class FallbackCoordinator {
     const was = this.declined;
     this.declined = false;
     return was;
+  }
+
+  /**
+   * A picker-armed hold must not be abandoned while an unfinished
+   * side-effecting tool exists: the settle boundary would refuse to replay, so
+   * the hold is waited out instead.
+   */
+  get pickerAbandonBlockedByTool(): boolean {
+    return this.armedForPicker && [...this.unfinishedTools.values()].some((name) => !REPLAY_SAFE_TOOLS.has(name));
   }
 
   /**
@@ -312,6 +324,7 @@ export class FallbackCoordinator {
     this.unfinishedTools.clear();
     this.consecutiveHolds = 0;
     this.keepWaiting = false;
+    this.pickerAvailable = false;
     this.armedForPicker = false;
     this.fallbackPending = false;
     this.requestedAt = undefined;

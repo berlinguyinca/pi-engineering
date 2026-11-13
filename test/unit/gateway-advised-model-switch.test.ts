@@ -77,13 +77,13 @@ test("advised: without a stand-in on record an advised hold arms nothing (it is 
   const c = new FallbackCoordinator({ advisedSwitch: true });
   c.onGatewayHold(advisedHold());
   assert.equal(c.hasPending, false);
-  assert.equal(c.willSwitchOnAdvice, false);
+  assert.equal(c.willAbandonOnAdvice, false);
 });
 
 test("advised: with a stand-in on record the FIRST advised hold arms a switch, even with the hold-count path off", () => {
   const c = new FallbackCoordinator({ advisedSwitch: true });
   c.noteStandIn(true);
-  assert.equal(c.willSwitchOnAdvice, true);
+  assert.equal(c.willAbandonOnAdvice, true);
   c.onGatewayHold(advisedHold());
   assert.equal(c.hasPending, true);
   assert.equal(c.snapshot().reason, "gateway-advised-alternate");
@@ -102,7 +102,7 @@ test("advised: switched off, the advice is ignored", () => {
   c.noteStandIn(true);
   c.onGatewayHold(advisedHold());
   assert.equal(c.hasPending, false);
-  assert.equal(c.willSwitchOnAdvice, false);
+  assert.equal(c.willAbandonOnAdvice, false);
 });
 
 test("advised: an account-wide refusal or a transport drop carrying the advice does not arm", () => {
