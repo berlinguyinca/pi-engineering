@@ -210,3 +210,31 @@ test("an identical-turn prevention notice still reads as turns", () => {
   assert.match(line, /4 identical turns/);
   assert.doesNotMatch(line, /non-mutating/);
 });
+
+test("recordDrift counts live drift signals by kind and never touches loop totals", () => {
+  const o = new ApsObservability();
+  o.recordDrift({
+    kind: "undeclared_artifact",
+    subject: "src/panel/Feed.ts",
+    iteration: 0,
+    evidence: "mutating write to src/panel/Feed.ts",
+  });
+  o.recordDrift({
+    kind: "undeclared_artifact",
+    subject: "src/panel/Other.ts",
+    iteration: 1,
+    evidence: "mutating write to src/panel/Other.ts",
+  });
+  o.recordDrift({
+    kind: "out_of_scope_write",
+    subject: "src/ui/theme.ts",
+    iteration: 2,
+    evidence: "mutating write to src/ui/theme.ts",
+  });
+  const s = o.snapshot();
+  assert.equal(s.totals.driftSignals, 3);
+  assert.deepEqual(s.driftByKind, { undeclared_artifact: 2, out_of_scope_write: 1 });
+  assert.equal(s.totals.loopCandidates, 0); // detect-only: loop accounting is untouched
+  assert.equal(emptySnapshot().totals.driftSignals, 0);
+  assert.deepEqual(emptySnapshot().driftByKind, {});
+});

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { promisify } from "node:util";
@@ -111,18 +111,39 @@ async function git(cwd: string, args: string[], env?: Record<string, string>): P
 
 /**
  * Git tree hash of the working directory's content: tracked, modified and
- * untracked-but-not-ignored files. Built in a THROWAWAY index (a copy of the
- * real one) so the repository's own index and status are never touched; it
- * depends on content only, not on mtimes or on whether the change is committed.
+ * untracked-but-not-ignored files. Built in a THROWAWAY index so the
+ * repository's own index and status are never touched.
+ *
+ * The throwaway index is built from NOTHING, not copied from the real one.
+ * A copy carries the real index's stat data, and `git add` trusts that stat
+ * data: while the size, mtime and ctime an entry recorded still describe the
+ * file, git does not read the file, so `write-tree` reports the OLD tree. On a
+ * filesystem whose timestamps are coarse — the shared scratch directories on the
+ * Slurm exec hosts, among others — an edit made in the commit's own tick leaves
+ * all three unchanged, and the fingerprint says "nothing changed" about a source
+ * tree that did change; the cache then hands back a stored pass for code it never
+ * ran. git's racy-timestamp rule is the only thing that re-reads such a file, and
+ * it compares the entry's timestamps against the *index file's own* mtime — a
+ * copy gives the copy a fresh mtime and takes every entry out of that window. A
+ * copy also carries `assume-unchanged` and `skip-worktree` bits, either of which
+ * makes a fingerprint ignore content because somebody once asked git to.
+ *
+ * Evidence: pipeline 48 (Slurm exec host) failed `changing 1 byte in a tracked
+ * file changes the fingerprint` with the edited and unedited trees identical
+ * (c77ffbb4…); the same fixture, which pins length and mtime to the recorded
+ * values, fails on a fine-grained local filesystem about one run in three (ctime
+ * usually still moves) and never fails with this implementation. The
+ * assume-unchanged case fails every run without it.
+ *
+ * Cost of hashing the whole work tree instead of trusting stat data, measured
+ * on a 1250-file checkout: 0.889 s against 0.107 s. A fingerprint is taken once
+ * per stage, and a missed edit serves a wrong pass for every later run of that
+ * fingerprint, so the cheaper answer is not the one to take.
  */
 export async function treeHash(cwd: string): Promise<string> {
   const scratch = await mkdtemp(join(tmpdir(), "pi-treehash-"));
   try {
     const index = join(scratch, "index");
-    const realIndex = (await git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "index"])).trim();
-    await copyFile(realIndex, index).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    });
     const env = { GIT_INDEX_FILE: index };
     await git(cwd, ["add", "-A"], env);
     return (await git(cwd, ["write-tree"], env)).trim();

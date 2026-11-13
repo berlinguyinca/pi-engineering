@@ -1,0 +1,25 @@
+The attribution run: the same command, same machine, a separate worktree checked out at e26541c0 -- the branch
+tip BEFORE this sweep, byte-identical source. Raw log: 07a-.
+
+  $ git worktree add --detach /tmp/pi-x13-pristine e26541c0
+  $ cd /tmp/pi-x13-pristine && npm test
+  tests 7965  pass 7954  fail 6  cancelled 0  duration_ms 796485
+
+  test/integration/disk-pressure-snapshot-e2e.test.ts:161   E2E: recovery never fires while the sentinel fails
+        [Error: ENOTEMPTY: rmdir '...pi-eng-diskpressure-e2e-sentinel-Gh9vMK/.pi-eng']
+  test/integration/no-fixed-deadlines.test.ts:463           resumes from the hung execution's preserved work
+        AssertionError [ERR_ASSERTION]: Expected values to be strictly equal: (expected failed, actual succeeded)
+  test/integration/planner-worker-gateway-timeouts.test.ts:43   Argument dispatcher must implement dispatch
+  test/integration/planner-worker-gateway-timeouts.test.ts:64   Argument dispatcher must implement dispatch
+  test/integration/review-context-and-acceptance.test.ts:399    moving the candidate branch / planting a hook
+  test/integration/runtime-host-entry.test.ts:44 (file level)   ENOTEMPTY rmdir .../go-build/02
+
+So both of the names that looked new on the swept tree are already red at the pristine tip: no-fixed-deadlines:463
+and runtime-host-entry fail without this sweep having touched either file, and the pristine run adds a third
+ENOTEMPTY of the same class (disk-pressure-snapshot-e2e) that the swept runs did not produce. The population is
+{gateway x2, review-context, no-fixed-deadlines, one rotating ENOTEMPTY temp-cleanup failure} -- five to six
+leaves, load-dependent, identical on both sides of the sweep.
+
+Conclusion: the sweep's only true regression was recovery-optin (05-), and it is fixed. The residue is
+pre-existing on the branch at e26541c0 and, for the gateway pair and review-context, on origin/main (X12 ran
+them at origin/main's tip: X12/logs/02-three-leaves-at-origin-main-e7888752.txt).

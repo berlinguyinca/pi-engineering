@@ -1,0 +1,60 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X09",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "a93b53a076ca136d0871250d475577f9d574d86d",
+  "resultSha": "147b827159c426b21b7806ce751e5d9ab771ece9",
+  "taskAuthorityHash": "sha256:d8c914b6b803cd942b38bb9ee40fbdda22fdda25e522cf3648b4044cf3e80017",
+  "changedFiles": [
+    "src/git/GitRepo.ts",
+    "test/integration/worker-stream-truncation.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/integration/worker-stream-truncation.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/01-affected-files.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/git-common-dir-repair.test.ts test/unit/resilience-default-off.test.ts test/integration/resilient-inference-integration.test.ts test/integration/resilient-inference-wiring.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/01-affected-files.txt"
+    },
+    {
+      "command": "npm run typecheck:core",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/02-typecheck-biome.txt"
+    },
+    {
+      "command": "npx biome check src/git/GitRepo.ts test/integration/worker-stream-truncation.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/02-typecheck-biome.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/integration/mission-interrupt-pause.test.ts test/integration/mission-merge-queue-flow.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/03-blocker-and-neighbours.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/01-affected-files.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/02-typecheck-biome.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X09/logs/03-blocker-and-neighbours.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/logs/19-branch-only-failures-alone.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/review-616-opus-20261106.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/review-616-adjudication-20261106.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T17:55:00Z",
+    "notes": "Two changes, both from the model review of #616 (AUDIT/review-616-opus-20261106.txt) and both verified against the tree before and after.\n\n1. test/integration/worker-stream-truncation.test.ts:306 'worker: resume triggers through the armed resilient stream layer (production path)' asserts isResilientRuntime(executor.getModelRuntime()). PiWorkerExecutor arms the layer through wireResilientModelRuntime with no env of its own, so it reads the ambient process.env; 141ca5db (X06) moved PI_INFERENCE_RESILIENCE_ENABLED to default-off, so the scenario asserted an armed runtime while building an unarmed one. Measured before this commit: 20 pass at X06's parent 009837c3, 19 pass / 1 fail at 141ca5db, 45d42acb, 6818842c and a93b53a0 (X08/logs/19 has the per-tree table). withProbe() now takes { resilience: 'on' } and sets the switch for the one scenario that needs the armed path, restoring the previous environment in the same finally block. 20 pass / 0 fail after (X09/logs/01).\n   This is the pattern 259a4233 (#604) already uses for resilient-inference-integration.test.ts:133 and resilient-inference-wiring.test.ts:232. No assertion was changed: the armed-path expectations (streamResumes === 1, resumed history, side effect preserved) are exactly what passed at origin/main while the default was on. The default-off semantics remain asserted in test/unit/resilience-default-off.test.ts (3/3) and the other 19 scenarios in this file keep driving the unarmed default.\n\n2. src/git/GitRepo.ts resolveCommonDir() distinguished ENOENT/ENOTDIR from EACCES/ESTALE/EIO when lstat-ing git's reported path, but called discoverRepo(repoRoot) unguarded: a filesystem error there surfaced bare, losing the fact that git had reported a directory that does not exist. It now throws naming both facts, with `cause`. The 'resolves to nothing usable' branch and its test are untouched (guard unit 5/5, X09/logs/01); the change is error-text only, so no new test was added for it -- the throw it guards requires an injected filesystem failure that this repo's harness has no seam for.\n\nRegression-check set at this commit (X09/logs/01-03): worker-stream-truncation 20/0, git-common-dir-repair 5/5, resilience-default-off 3/3, resilient-inference-integration 10/10, resilient-inference-wiring 7/7, mission-interrupt-pause + mission-merge-queue-flow 18/18 in 49 s, the six git units 5/3/3/11/4/10 pass, typecheck:core exit 0, biome exit 0.\n\nReview findings NOT accepted, with reason (full adjudication in AUDIT/review-616-adjudication-20261106.txt): the pathPolicy case-folding suggestion (case-sensitive git index; folding would cause false rejects on case-sensitive filesystems -- nit, dismissed), and the taskManifest MICROTASK_CEILING note (self-described as theoretical). The review's reference to 'issue #621' is not reproducible from the repository and was not relied upon."
+  },
+  "handoffHash": "sha256:755b98e83a7c87194e90627d44c9f4ac1234ec2fda8df14aedca1767d42c6960"
+}

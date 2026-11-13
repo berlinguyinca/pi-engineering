@@ -209,3 +209,55 @@ test("parseTaskContract omits execution when absent (P3)", () => {
   if (!r.ok) return;
   assert.equal("execution" in r.contract, false);
 });
+
+function auth(allowed: string[], deny: unknown, shape = "scope"): Record<string, unknown> {
+  const base = raw("t1", [], allowed);
+  if (shape === "scope") return { ...base, scope: { allowed, forbidden_authorization: deny } };
+  return { ...base, authorization: { denied: deny } };
+}
+
+function errOf(allowed: string[], deny: unknown, shape = "scope"): string {
+  const r = parseTaskContract(auth(allowed, deny, shape));
+  assert.equal(r.ok, false, JSON.stringify(r));
+  return r.ok ? "" : r.errors.join(" ");
+}
+
+test("authorization denies are never discarded; a contradicting grant rejects the contract (T02)", () => {
+  const r = parseTaskContract(auth(["src/**"], ["src/secret/**", "**/*.pem"]));
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  assert.deepEqual(r.contract.scope.forbidden, ["src/secret/**", "**/*.pem"]);
+  assert.deepEqual(r.contract.scope.forbiddenAuthorization, ["src/secret/**", "**/*.pem"]);
+  assert.equal(r.contract.ignored_forbidden, undefined, "never discarded");
+  for (const p of ["src/secret/x.ts", "src/secret/deep/x.ts", "src/key.pem"])
+    assert.equal(matchesScope(p, r.contract.scope), false, p);
+  for (const grant of ["src/secret/**", "src/secret/x.ts", "src/secret/deep/**", "src/secret"]) {
+    const err = errOf(["src/**", grant], ["src/secret/**"], "authorization");
+    assert.ok(err.includes(`scope.allowed "${grant}"`) && err.includes(`deny "src/secret/**"`), err);
+    assert.match(err, /nothing writable/);
+  }
+});
+
+test("planner-origin keep/discard is unchanged and a note cannot outrank authorization denies (T02)", () => {
+  const scope = { allowed: ["src/calc.js"], forbidden: ["**/*.js", "src/legacy/**"] };
+  const base = parseTaskContract({ ...raw("t1"), scope });
+  assert.ok(base.ok, base.ok ? "" : base.errors.join("; "));
+  assert.deepEqual(base.contract.ignored_forbidden, ["**/*.js"], "base discard behaviour unchanged");
+  assert.deepEqual(base.contract.scope.forbidden, ["src/legacy/**"]);
+  const bothScope = { allowed: ["src/**"], forbidden: ["src/secret/**"], forbidden_authorization: ["src/secret/**"] };
+  const r = parseTaskContract({ ...auth(["src/**"], ["src/secret/**"]), scope: bothScope });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  assert.deepEqual(r.contract.scope.forbidden, ["src/secret/**"], "origins merge de-duplicated");
+  assert.deepEqual(r.contract.scope.forbiddenAuthorization, ["src/secret/**"], "a note cannot remove the deny");
+  for (const bad of [["/etc/**"], ["../out/**"], ["src/[ab].ts"], ["src/ hidden/**"]])
+    assert.match(errOf(["src/**"], bad), /scope glob/);
+});
+
+test("authorization channels refuse coerced values instead of inventing denies (T02)", () => {
+  for (const bad of [[42], [true], ["src/secret/**", 7], "src/secret/**", ["  "], [null], [{}], { a: 1 }]) {
+    assert.match(errOf(["src/**"], bad, "authorization"), /authorization\.denied/);
+    assert.match(errOf(["src/**"], bad), /forbidden_authorization/);
+  }
+  const idx = errOf(["src/**"], ["src/secret/**", 7], "authorization");
+  assert.match(idx, /authorization\.denied\[1\] must be a non-empty string/);
+  assert.ok(parseTaskContract(auth(["src/**"], ["src/secret/**"], "authorization")).ok, "well-formed array accepted");
+});

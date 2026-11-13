@@ -1,0 +1,12 @@
+✔ reproducible context survives: fingerprint, representative summary, affected versions, E07 retry identity, task/handoff ids and the D04 outcome (6.076042ms)
+✔ a bearer URL, an sk- key and a raw prompt are sanitized before byte accounting and appear nowhere in the serialized bundle (1.203375ms)
+✔ maxItems and maxBytes are enforced with the dropped count reported, so truncation is never silent (2.192041ms)
+✔ ordering is total and the same input re-serializes byte-identically in any order, without mutating the caller's data (2.688458ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 167.774292

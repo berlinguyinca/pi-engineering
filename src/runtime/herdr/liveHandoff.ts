@@ -185,6 +185,11 @@ function sendOverSocket(opts: HerdrSocketOptions, line: string): Promise<string>
     const fail = (err: Error): void => {
       if (settled) return;
       settled = true;
+      // Cancel the timeout on every settle path, not just the data path: a
+      // pending timer keeps the event loop alive after the call has already
+      // failed, so a refused connection held the process open for the full
+      // timeout even though nothing was outstanding.
+      clearTimeout(timer);
       socket.destroy();
       reject(err);
     };

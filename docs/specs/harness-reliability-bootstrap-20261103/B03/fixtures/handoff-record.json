@@ -1,0 +1,42 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "B03",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "bcfee3b03791afae66e41050a981d28e2e8a03de",
+ "resultSha": "bfffb539025959a7429cb8703779573c132ead1f",
+ "taskAuthorityHash": "sha256:05c851607b4e9314a4927ccd710c19070b1457ef4a5ef9880c24ddc99c699770",
+ "changedFiles": [
+  "src/bootstrap/diffGuard.ts",
+  "test/unit/bootstrap-diff-guard.test.ts"
+ ],
+ "commands": [
+  {
+   "command": "npm run typecheck",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B03/logs/01-npm-typecheck.txt"
+  },
+  {
+   "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-diff-guard.test.ts",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B03/logs/02-unit-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/B03/logs/01-npm-typecheck.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B03/logs/02-unit-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B03/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B03/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B03/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "B04",
+ "nextBaseSha": "bfffb539025959a7429cb8703779573c132ead1f",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "BACK-FILL 2026-11-05: emitted retrospectively against evidence re-collected at the original commit bfffb539 (feat(bootstrap): diff-scope and size validator), parent bcfee3b03791 exactly matching the base the parent record names. Deliverables unchanged: src/bootstrap/diffGuard.ts plus test/unit/bootstrap-diff-guard.test.ts, no other path in that commit. Declared verify commands re-run at bfffb539 itself in a detached worktree at that commit: npm run typecheck exit 0 (logs/01-npm-typecheck.txt); node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-diff-guard.test.ts -> 2 tests, 2 pass, 0 fail (logs/02-unit-test.txt). Two observations worth carrying, both verified after this unit landed and not deviations here: diffGuard.ts:62 rejects every changed path when mode is read-only, which is the rule that makes B00 unstampable in its declared mode (B00 had to be recorded isolated-change over its one declared doc path), and this module is what the E/D/T/V-series gates used for every later unit. node_modules symlinked from the conductor checkout; nothing installed, nothing edited, porcelain empty before and after. Deviation: temporal only - the record postdates the work by roughly two days and resultSha is the historical commit."
+ }
+}

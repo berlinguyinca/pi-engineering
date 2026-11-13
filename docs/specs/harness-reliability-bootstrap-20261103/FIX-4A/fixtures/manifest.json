@@ -1,0 +1,63 @@
+{
+ "taskId": "FIX-4A",
+ "baseSha": "74b54eb17f51fdd0a1c89f2b6327953ee357e914",
+ "repoId": "pi",
+ "objective": "Derive the task authority from the parsed manifest and require the record to carry it before stamping.",
+ "allowPaths": [
+  "src/bootstrap/resultGate.ts",
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "denyPaths": [
+  "src/bootstrap/handoffWriter.ts",
+  "src/bootstrap/taskManifest.ts",
+  "templates/**",
+  "docs/specs/**",
+  "package.json"
+ ],
+ "commands": [
+  {
+   "id": "01-typecheck",
+   "cwd": "repo-root",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ]
+  },
+  {
+   "id": "02-unit-one",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-one.test.ts"
+   ]
+  },
+  {
+   "id": "03-unit-all",
+   "cwd": "repo-root",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-*.test.ts"
+   ]
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 1,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": null,
+ "expectedOutputs": [
+  "src/bootstrap/resultGate.ts",
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "mode": "isolated-change"
+}

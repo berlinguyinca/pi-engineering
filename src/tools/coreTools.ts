@@ -6,7 +6,9 @@ import type { ContextBroker } from "../context/ContextBroker.ts";
 import { type Actor, type Evidence, isMachineEvidence } from "../core/types.ts";
 import type { Ledger } from "../ledger/Ledger.ts";
 import { countClaims, countGuardMessage, countsAreBacked, metricsFromOutput } from "../ledger/claimDiscipline.ts";
-import type { Orchestrator } from "../orchestration/orchestrator.ts";
+import { MissionRefusedError, missionRefusalText } from "../orchestration/missionRefusal.ts";
+import type { OrchestrateResult, Orchestrator } from "../orchestration/orchestrator.ts";
+import { RepairEntryBlockedError } from "../orchestration/repairEntry.ts";
 import type { Mission } from "../orchestration/types.ts";
 import { lookupMissionDurable } from "../runtime/host/durableMissionLookup.ts";
 import { missionReportLines } from "./missionReport.ts";
@@ -744,30 +746,75 @@ export function buildCoreTools(
           const resumed = await services.resumeMission(missionId, signal);
           return describe(resumed, ["Resume requested."]);
         } catch (error) {
+          // #629: a blocked mission with no repair authority is a result the model
+          // can act on — it names the command — not a bare "Resume failed:" line.
+          if (error instanceof RepairEntryBlockedError) {
+            return text(error.message, {
+              missionId: error.missionId,
+              status: current.status,
+              recoveryBlocked: true,
+              blockedEpisodeId: error.blockedEpisodeId,
+              resumeCommand: error.resumeCommand,
+            });
+          }
           return describe(current, [`Resume failed: ${error instanceof Error ? error.message : String(error)}`]);
         }
       }
 
       const request = String(params.request ?? "").trim();
       if (!request) return text("The run action needs a request.");
-      const result = await services.orchestrator.orchestrate(request, {
-        repository: services.repositoryRoot ?? ctx.cwd,
-        // The orchestrator resolves the request's explicit repository before
-        // choosing a base. Forwarding the caller cwd's SHA can bind an external
-        // target mission to an unrelated launch repository commit.
-        baseRef: "",
-        constraints: (params.constraints as string[] | undefined) ?? [],
-        mutationRequested: params.mutate ?? true,
-        signal,
-        // Interrupting the call (Esc) pauses the mission; it never cancels it.
-        interrupt: "pause",
-        // Stream every live progress line (phase/task transitions + progress
-        // bar) to the operator via the tool update callback instead of blocking
-        // silently for the whole mission.
-        onProgress: (line: string) => {
-          _onUpdate?.({ content: [{ type: "text", text: line }], details: {} });
-        },
-      });
+      let result: OrchestrateResult;
+      try {
+        result = await services.orchestrator.orchestrate(request, {
+          repository: services.repositoryRoot ?? ctx.cwd,
+          // The orchestrator resolves the request's explicit repository before
+          // choosing a base. Forwarding the caller cwd's SHA can bind an external
+          // target mission to an unrelated launch repository commit.
+          baseRef: "",
+          constraints: (params.constraints as string[] | undefined) ?? [],
+          mutationRequested: params.mutate ?? true,
+          signal,
+          // Interrupting the call (Esc) pauses the mission; it never cancels it.
+          interrupt: "pause",
+          // Stream every live progress line (phase/task transitions + progress
+          // bar) to the operator via the tool update callback instead of blocking
+          // silently for the whole mission.
+          onProgress: (line: string) => {
+            _onUpdate?.({ content: [{ type: "text", text: line }], details: {} });
+          },
+        });
+      } catch (error) {
+        // #511: a delegation the runtime refused while maintenance drains is a
+        // result the caller can act on — retry after a wait, resume later — not
+        // an unlabelled tool failure the caller absorbs as "nothing to do".
+        if (error instanceof MissionRefusedError) {
+          return {
+            content: [{ type: "text", text: missionRefusalText(error) }],
+            details: {
+              delegationBlocked: true,
+              reason: error.reason,
+              retryAfterMs: error.retryAfterMs,
+              draining: error.draining,
+              resumeHint: error.resumeHint,
+            },
+          };
+        }
+        // #629: a fresh run that lands on a BLOCKED mission in the same scope used
+        // to escape as the store's raw precondition. That was the agent's last
+        // door, and it said nothing about the one that exists.
+        if (error instanceof RepairEntryBlockedError) {
+          return {
+            content: [{ type: "text", text: error.message }],
+            details: {
+              recoveryBlocked: true,
+              missionId: error.missionId,
+              blockedEpisodeId: error.blockedEpisodeId,
+              resumeCommand: error.resumeCommand,
+            },
+          };
+        }
+        throw error;
+      }
       const m = result.mission;
       const statusLine =
         result.pausedBy === "operator" && m.status !== "PAUSED_INFRASTRUCTURE"

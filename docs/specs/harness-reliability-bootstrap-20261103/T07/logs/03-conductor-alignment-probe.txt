@@ -1,0 +1,14 @@
+drift signals: 5
+   out_of_scope_write|docs/roadmap.md|3|- :: mutating edit to docs/roadmap.md at iteration 3 matches no allowed scope (src/reader/**)
+   out_of_scope_write|src/ui/theme.ts|2|T07 :: mutating write to src/ui/theme.ts at iteration 2 matches no allowed scope (src/reader/**)
+   out_of_scope_write|src/ui/z.ts|7|- :: mutating edit to src/ui/z.ts at iteration 7 matches no allowed scope (src/reader/**)
+   task_expansion|T99|6|T99 :: task T99 observed at iteration 6; declared tasks: T07
+   unrelated_dependency|left-pad|5|- :: new dependency left-pad added at iteration 5; authorized: none
+read-only investigation signals: 0
+stagnation once: false
+in-scope write flagged: false
+sorted: true
+determinism: true
+empty scope flags: true mutating write to a.ts at iteration 1 matches no allowed scope (none declared, so nothing 
+allowed dep (trimmed/case): true
+bad threshold default 10 applied: false undefined

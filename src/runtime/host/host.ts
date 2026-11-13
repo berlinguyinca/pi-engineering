@@ -181,7 +181,6 @@ export interface RuntimeHostOptions {
   /** Bound on each runtime lifecycle call (createRuntime/start/quiesce/snapshot/stop). */
   lifecycleTimeoutMs?: number;
 }
-
 export interface GenerationInfo {
   generation: number;
   source: RuntimeSource;
@@ -225,7 +224,16 @@ export class RuntimeHost implements BridgeTarget {
     this.supported = opts.supportedRuntimeApis ?? HOST_SUPPORTED_RUNTIME_APIS;
     this.handoverWaitMs = opts.handoverWaitMs ?? 120_000;
     this.lifecycleTimeoutMs = opts.lifecycleTimeoutMs ?? 120_000;
-    this.bridge = new PiBridge(opts.pi, this, ["session_start", "session_shutdown"]);
+    this.bridge = new PiBridge(opts.pi, this, ["session_start", "session_shutdown"], {
+      // A tool name that cannot be served is a runtime event, not only a model
+      // turn: #672 was invisible after the fact because nothing recorded it.
+      diagnostics: (event) =>
+        this.telemetry.emit(event.kind === "shadowed" ? "runtime.tool.shadowed" : "runtime.tool.unservable", {
+          tool: event.name,
+          generation: event.generation,
+          tool_reason: event.reason,
+        }),
+    });
     this.installHostHandlers();
   }
 

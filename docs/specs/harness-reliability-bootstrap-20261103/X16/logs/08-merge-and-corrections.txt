@@ -1,0 +1,109 @@
+X16 log 08 -- the merge onto the current integration tip, and two claims this unit wrote and then measured to be wrong
+
+== the merge
+$ git merge --no-ff origin/main          # origin/main = 02e4c1fa ci: provision a pinned, checksummed Node in the pipeline (#502) (#651)
+merge commit 6d71ebb3: Merge origin/main (02e4c1fa, #651 .woodpecker Node pin) into task/x16-scan-hardening
+The trail's rule -- recorded after X08/X09, repeated after X10 -- is that a branch is measured against the
+current integration tip, not the tip it was cut from. origin/main had moved to 02e4c1fa with #651, whose
+whole change is one file: 1 file changed, 61 insertions(+)
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+declared evidence paths=781 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree
+exit=0
+
+$ npm run lint
+
+Checked 1552 files in 1142ms. No fixes applied.
+exit=0
+
+$ npm run typecheck:core
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+exit=0
+
+== CORRECTION 1: this repository does have a CI pipeline. X16/logs/05, commit ef809cd2's message and
+PLAN-COMPLETION.json all say it has none. What is true, measured at 6d71ebb3:
+$ git ls-tree --name-only HEAD .woodpecker .github
+.woodpecker
+(no .github: 85b1b064 removed .github/workflows/ci.yml. The head of the file that replaces it says:
+#
+# Replaces .github/workflows/ci.yml, removed in 85b1b06 when GitHub Actions
+# billing started failing. Same gates, same order the harness documents:
+so the removal was a move to Woodpecker (ci.metabolomics.us), not the end of CI.)
+$ grep -nE '^  - name:|npm run' .woodpecker/ci.yaml
+9:# `release-gate` job (full `npm run roadmap:check`) lives in
+75:  - name: checkout
+102:  - name: node
+131:  - name: toolchain
+146:  - name: install
+177:  - name: lint
+181:      - 'timeout -k 30 10m npm run lint'
+183:  - name: typecheck
+187:      - 'timeout -k 30 10m npm run typecheck'
+199:  - name: test-unit
+207:      - 'timeout -k 30 30m npm run test:unit'
+209:  - name: test-integration
+217:      - 'timeout -k 30 40m npm run test:integration'
+220:  - name: smoke
+226:      - 'timeout -k 30 10m npm run test:e2e'
+230:  - name: roadmap-structural
+236:      - 'timeout -k 30 10m npm run roadmap:structural'
+244:  - name: cleanup-venv
+$ grep -nE '^when:|event:' .woodpecker/ci.yaml | head -4
+23:when:
+24:  - event: [pull_request, manual]
+27:  - event: push
+So CI runs lint, typecheck, test:unit, test:integration, test:e2e and roadmap:structural on every pull
+request and on pushes to main. The part of the claim that holds is narrower than what I wrote:
+$ grep -cE 'integrity-scan|lineage-scan|record-reproducibility' .woodpecker/ci.yaml .woodpecker/release-gate.yaml
+.woodpecker/ci.yaml:0
+.woodpecker/release-gate.yaml:0   (exit 1)
+The three trail scans appear in neither pipeline file, so they are operator-run; the six npm gates above
+are not. 'Nothing runs these scans' should have been 'nothing runs the trail scans, and the scan this
+unit hardens is one of them'. The consequence for this unit is unchanged -- the hardened scanner is not
+enforced by CI either, which is why its own run is a cited artifact here rather than a green check.
+Adding one of the three scans to .woodpecker/ci.yaml is a pipeline change and the operator's call, not an
+audit-tooling unit's; it is named in PLAN-COMPLETION.json's next_action instead.
+
+== CORRECTION 2: the same three artifacts accuse #650 of claiming the trail scans run in CI. #650 makes no
+such claim. The API holds no review object and no inline comment for #650; its one issue comment is
+this unit author's review response, and it does not mention CI.
+$ gh pr view 650 --json body -q .body | wc -c
+    7142   (the body, fetched in full)
+$ gh pr view 650 --json body -q .body | grep -ciE '\bCI\b|workflow|woodpecker'
+0
+$ gh api repos/berlinguyinca/pi-engineering/pulls/650/comments --jq 'length'    # inline review comments
+0
+$ gh api repos/berlinguyinca/pi-engineering/issues/650/comments --jq 'length'    # issue comments
+1
+$ gh api repos/berlinguyinca/pi-engineering/issues/650/comments --jq '.[].body' | grep -ciE '\bCI\b|workflow|woodpecker'
+0
+$ grep -rilE '\bCI\b|workflow|woodpecker' X15/logs | wc -l    # X15's seven logs
+0
+The one issue comment is this unit author's review response to the adversarial review of #650, and it
+says nothing about CI either; the adversarial review itself is quoted in that comment and the API holds
+no review object for #650.
+The defect I attributed to them is real -- the scan read 121 of the 230 records the trail holds, and X16
+fixes that -- but no record in #650 says the scans are enforced, and there is no review of #650 in the
+API at all. Saying a record claims something it does not claim is the same failure this trail keeps
+rediscovering (X09's citation to a log nobody wrote, X11's correction of X10's cause claim): the prose
+reads as evidence and is not. Retracted here. The sentences that carry it are these, and they stand
+corrected by this log rather than edited away -- commits are not rewritten once they carry records:
+  - X16/logs/05: "no .github/workflows since 85b1b064 ... The claim in #650's PR body that CI runs them,
+    repeated in #650's review, is false."
+  - commit ef809cd2's message: "... and this repository has no CI to run them in, so the run recorded
+    here is what a reader has."
+  - PLAN-COMPLETION.json, X16's fifth caveat: "There is no CI: .github/workflows has been absent since
+    85b1b064 ... The CI claim in #650's body and #650's review is false ...".
+The accurate pair of statements is in the two corrections above.

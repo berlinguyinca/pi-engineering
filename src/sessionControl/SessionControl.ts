@@ -6,6 +6,7 @@ import { type Server, type Socket, createConnection, createServer } from "node:n
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { redactSecrets } from "../platform/redact.ts";
+import { usableRuntimeDir } from "../platform/runtimeDir.ts";
 import {
   MaintenanceOperations,
   type MaintenanceOutcome,
@@ -140,10 +141,10 @@ export const SOCKET_PATH_LIMIT = 100;
 export class ControlSocketLimitError extends Error {
   constructor(socketPath: string, rootDir: string) {
     super(
-      `control socket path is ${Buffer.byteLength(socketPath)} bytes, over the ${SOCKET_PATH_LIMIT}-byte Unix socket limit ` +
-        `(the kernel's sun_path is 104 bytes including the terminator): ${socketPath}\n` +
-        `Shorten the control root — currently ${rootDir} — by setting PI_ENGINEERING_CONTROL_DIR ` +
-        `(or PI_ENGINEERING_STATE_DIR, which it is derived from) to a shorter path.`,
+      [
+        `control socket path is ${Buffer.byteLength(socketPath)} bytes, over the ${SOCKET_PATH_LIMIT}-byte Unix socket limit (the kernel's sun_path is 104 bytes including the terminator): ${socketPath}`,
+        `Shorten the control root — currently ${rootDir} — by setting PI_ENGINEERING_CONTROL_DIR (or PI_ENGINEERING_STATE_DIR, which it is derived from) to a shorter path.`,
+      ].join("\n"),
     );
     this.name = "ControlSocketLimitError";
   }
@@ -158,11 +159,14 @@ export class ControlSocketLimitError extends Error {
  * every supported platform. The directory Pi creates inside it is 0700 and the socket
  * 0600, so "short" does not mean "shared".
  */
-function shortSocketRoot(): string {
+export function shortSocketRoot(): string {
   // Capped so that the directory name below still fits: 30 + 23 + 41 is inside the limit,
   // and anything longer is not a runtime dir worth trusting with the socket anyway.
-  const xdg = process.env.XDG_RUNTIME_DIR;
-  return xdg && xdg.startsWith("/") && !xdg.includes("\0") && Buffer.byteLength(xdg) <= 30 ? xdg : "/tmp";
+  // `usableRuntimeDir` is the part that shape-checking alone is not: a scheduler host can
+  // export XDG_RUNTIME_DIR=/run/user/<uid> without the directory existing, and the mkdir of
+  // the hashed directory below then fails ENOENT — the control socket could never start, on
+  // exactly the host class this fallback exists to survive.
+  return usableRuntimeDir(process.env, 30) ?? "/tmp";
 }
 
 /**

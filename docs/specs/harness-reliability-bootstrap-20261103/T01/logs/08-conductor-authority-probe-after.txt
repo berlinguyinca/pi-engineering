@@ -1,0 +1,4 @@
+top diverged: ["goal","scope","nonGoals","tests"] ok= true
+nested diverged: ["goal","scope","nonGoals","tests"] ok= true | same set: true
+identical restatement (order-insensitive?) diverged: ["scope"]
+tampered recorded hash refused: true | authority mismatch: recomputed sha256:24ee19fb1065c3719c7c0beb89509454

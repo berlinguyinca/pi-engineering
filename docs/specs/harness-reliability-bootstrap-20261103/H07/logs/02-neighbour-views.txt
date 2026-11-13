@@ -1,0 +1,25 @@
+✔ events inside one session follow H02 chronologically, and a tie at one instant keeps H02 positional tiebreak (4.890625ms)
+✔ sessions are grouped by reported id, ordered by first instant then id, and two runs render byte-identical HTML (1.452333ms)
+✔ a trace href carrying a quote or markup is escape-safe, and without one the trace says unavailable rather than linking to "#" (0.472459ms)
+✔ an event carrying no step reads "unknown" — a step is never invented from position, id or order (0.243167ms)
+✔ a payload input error is labelled as one, and a section that could not be read is stated instead of an empty timeline (0.280292ms)
+✔ rendering reads the events it is handed and changes neither them nor their own order (0.193791ms)
+✔ escapeHtml covers the five characters, and a payload that looks like markup stays inert (3.213875ms)
+✔ cards sort by severity, then last seen descending, then fingerprint; tied records keep one reproducible order (3.112583ms)
+✔ a record H02 refuses is a visible rejected record — never a half card, never silence (0.223625ms)
+✔ every card figure comes from the record: reported where reported, unknown where not, and never "resolved" (0.289ms)
+✔ an unavailable section says unavailable instead of an empty list that looks like no issues (0.368625ms)
+✔ a relevant and an unrelated action render with different classes, and one fixture re-rendered is byte-identical (4.68775ms)
+✔ relevance comes only from what the report states: an action it never classes renders "relevance unknown", never relevant (0.459583ms)
+✔ the drift verdict and its reason are H02 decideDrift, and the rendered HTML carries no percentage and no score token (1.18725ms)
+✔ the first violation is the record the report carries, and a decided drift with no such record says so rather than pointing at the first action (0.331792ms)
+✔ scope paths are escaped, an unlisted scope reads unknown and a scope listed empty reads none reported (0.27675ms)
+✔ objective, model, quantization and uncertainty absent render the literal unknown, and the sections keep the plan order (0.400375ms)
+ℹ tests 17
+ℹ suites 0
+ℹ pass 17
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 164.999125

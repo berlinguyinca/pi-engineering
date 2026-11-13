@@ -1,0 +1,8 @@
+good pair comparable: {"comparable":true,"reasons":[]}
+rejection missing_quant {"comparable":false,"reasons":["left.quantMethod: must be one of q8|q6|q4|fp16|bf16|unknown"]}
+rejection unknown_weights {"comparable":false,"reasons":["left.weightsHash is unknown: exact weights hash required"]}
+rejection other_family {"comparable":false,"reasons":["model family differs: llama vs qwen"]}
+rejection diff_base {"comparable":false,"reasons":["baseSha differs: deadbeef vs 8c064b37"]}
+rejection diff_ctx {"comparable":false,"reasons":["contextTokens differ: 8192 vs 32768"]}
+rejection bad_hash {"comparable":false,"reasons":["left.promptSha256: expected sha256:<64 hex>"]}
+null left: {"comparable":false,"reasons":["left.modelId: required non-empty string","left.weightsHash

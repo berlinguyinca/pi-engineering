@@ -1,0 +1,44 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "B05",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "7e7157c715f327898e82a350b614774c47c76fd3",
+  "resultSha": "36cab891c696ff709d09fb2c4066186e5201c5d9",
+  "taskAuthorityHash": "sha256:0ae03a8960c56dfd57aa401ea9b4202307cf8507ad508b43c07993c12ea67afe",
+  "changedFiles": [
+    "scripts/bootstrap-one.ts",
+    "src/bootstrap/resultGate.ts",
+    "test/unit/bootstrap-result-gate.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B05/logs/01-npm-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-result-gate.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B05/logs/02-unit-test.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/B05/logs/01-npm-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/B05/logs/02-unit-test.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/B05/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/B05/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/B05/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "E01",
+  "nextBaseSha": "36cab891c696ff709d09fb2c4066186e5201c5d9",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "BACK-FILL 2026-11-05: emitted retrospectively against evidence re-collected at the original commit 36cab891 (feat(bootstrap): result gate and immutable handoff writer), parent 7e7157c715f3 exactly the base the parent record names. Three files, 99 changed lines against the 100 ceiling (scripts/bootstrap-one.ts +15/-13, src/bootstrap/resultGate.ts +40/-0, test/unit/bootstrap-result-gate.test.ts +31/-0), git diff --check 7e7157c7..36cab891 exit 0. Declared verify commands re-run at 36cab891 itself in a detached worktree at that commit: npm run typecheck exit 0 (logs/01-npm-typecheck.txt); node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-result-gate.test.ts -> 3 tests, 3 pass, 0 fail (logs/02-unit-test.txt). This gate is the one every later unit was blocked or released by, including the rejections this session had to work around: it refuses to write a record when a proof is missing or an exit code is non-zero, when the tree is dirty, when a changed path falls outside allowPaths, and when the parent chain does not line up, which is why the B-series could only be recorded by checking each unit's own commit out and re-running its commands there instead of pasting numbers onto today's tip. nextTaskId E01 with nextBaseSha 36cab891 is the truthful pointer: E01's own record carries baseSha 36cab891c696, so the back-filled chain joins the already-landed chain at the real commit rather than at a synthetic one. Deviation: temporal only; mode and scope follow the manifest. node_modules symlinked from the conductor checkout, nothing installed, nothing edited, porcelain empty before and after."
+  },
+  "handoffHash": "sha256:064b4e712f84af0fb7805a03a1b4314cb9f6be5ae598e0bda646fe8115d5515f"
+}

@@ -1,0 +1,5 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/aps-worker-activity.test.ts   # at 8bf854e64d26c10021a20abdd40be194becb8990
+ℹ tests 8
+ℹ pass 8
+ℹ fail 0
+exit=0

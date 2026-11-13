@@ -1,0 +1,5 @@
+herdr-ui 120 ok: true
+herdr-ui 121 errs: ["limits.maxChangedLines: 121 exceeds bootstrap ceiling 120 for mode herdr-ui"]
+isolated 120 errs: ["limits.maxChangedLines: 120 exceeds bootstrap ceiling 100 for mode isolated-change"]
+herdr-ui prod3 errs: ["limits.maxProductionFiles: 3 exceeds bootstrap ceiling 2"]
+bogus mode errs: ["mode: expected one of read-only, isolated-change, herdr-ui"]

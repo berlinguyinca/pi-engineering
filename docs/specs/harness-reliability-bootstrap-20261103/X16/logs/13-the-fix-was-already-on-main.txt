@@ -1,0 +1,66 @@
+X16 log 13 -- the harness PR I was about to open already exists, and it says what log 11 says
+
+Asked to fix the four CI failures, I started by reading the code behind each one. Before writing
+anything I checked where main had gone -- the first useful thing I did in this whole thread -- and
+main had moved twice since the commit this branch last merged:
+$ git log --format='%h %ad %s' --date=format:'%b %d %H:%M' -3 origin/main
+   f6ac8f6d Nov 09 06:09 docs(operations): a CI runbook, written while the cost was known (#655)
+   64cae00b Nov 09 05:40 fix: the four Linux CI test failures were three host assumptions and one copied rule (#652) (#654)
+   02e4c1fa Nov 08 23:12 ci: provision a pinned, checksummed Node in the pipeline (#502) (#651)
+
+64cae00b is #654, 'the four Linux CI test failures were three host assumptions and one copied
+rule (#652)'. Timeline, from the API's epoch stamps and GitHub's own, both converted to local:
+
+   Nov 08 23:53  #652 opened as an issue, naming all four root causes
+   Nov 08 23:12  pipeline 21 (main, 02e4c1fa) -- the commit this branch merged
+   Nov 09 00:34  pipeline 26 (this branch, ad83df4b), finished 00:42
+   Nov 09 00:47  log 11 committed; pipeline 31 (00822b4c) starts, finished 00:52
+   Nov 09 01:12  log 12 committed
+   Nov 09 05:27  #654 opened        Nov 09 05:40  #654 merged into main
+   Nov 09 06:09  #655 merged (docs/operations/ci.md)
+
+So the fix did not exist when log 11 was written -- it appeared four and a half hours after log 12,
+while I was reading pipeline 31's log rather than `git fetch`. Pipelines 26 and 31 reported those
+four failures because both ran at 02e4c1fa-era main, which this branch had merged. There is no
+harness work left to do.
+
+The part worth keeping is the order of operations, not the conclusion. #652 said all four root
+causes fifty-four minutes before log 11 said them, and log 11's last paragraph recommends fixing
+them as if nobody had. The evidence I gathered was fine; the step I skipped was the cheapest one
+on the list -- open issues, then `git fetch` -- and both were sitting in the same tool call.
+
+What #654 changed, against what log 11 read off the pipeline log:
+  log 11: live-handoff-rpc died on mkdtemp ENOENT /run/user/<uid>/lh-…
+  #654:   same file had copied the socket rule verbatim, shape-only validation included, and ran
+          mkdtemp at module scope -- a 119 ms top-level throw with no subtest output.
+  log 11: the #583 control socket died on mkdir ENOENT /run/user/<uid>/pi-sc-hash-…
+  #654:   shortSocketRoot validated XDG_RUNTIME_DIR's shape and trusted it; it now asks the
+          filesystem (usableRuntimeDir: there, a directory, writable -- else /tmp), read-only.
+  log 11: worktree-janitor terminal owner -- path.join received null
+  #654:   rustTargetDir returns null when the Rust cache is off, and the hive agents export
+          CARGO_TARGET_DIR; the test's `!` lied. The env var is dropped in isolatedState.ts and
+          the test asserts on the nullable.
+  log 11: corpus #8 expected a refusal for `Fix ~/pi-eng-repo-that-does-not-exist-7f3a`
+  #654:   the scratch heuristic read a missing ~ path as a scratch output when HOME sits under
+          tmpdir(), which is what a Woodpecker agent looks like (HOME=/tmp/woodpecker-cache).
+          A path inside the home is now never scratch.
+
+Log 11's sentence 'this branch cannot go green until those four pass on a Slurm exec host or the
+pipeline stops running them there' offered two exits and missed the one taken: make the tests
+host-independent. That is now the state of this branch, and the correct claim is narrower than
+log 11's -- the pipeline can go green on the merged head, but nothing here has yet shown it
+happening; log 14 records the run at the merged head.
+
+== the merge, verified rather than assumed
+$ git merge --no-edit origin/main   -> clean, 11 files changed, 377 insertions, 18 deletions
+  (docs/operations/ci.md from #655, src/platform/runtimeDir.ts + test/unit/runtime-dir.test.ts
+   from #654, and the four test-side changes.)
+$ npm run lint -> exit 0
+$ npm run typecheck -> exit 0
+$ npx tsx --test runtime-dir.test.ts live-handoff-rpc.test.ts -> ℹ tests 17 ℹ pass 17 ℹ fail 0 ℹ cancelled 0
+$ integrity-scan.mjs -> RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1 | exit=0
+$ lineage-scan.mjs -> RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation | exit=0
+$ record-reproducibility.mjs -> RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree | exit=0
+
+No new unit record: this merge adds no claim about the trail, and X16 stays terminal with its
+record's baseCommitSha naming 9b3111c8, the scanner commit, which the merge does not move.

@@ -1,0 +1,61 @@
+{
+ "taskId": "V05",
+ "baseSha": "fc4712252558dc438365094929b2071828c94b5c",
+ "repoId": "pi",
+ "objective": "Document shadow-mode enablement, metric baselines, stop criteria, flag rollback and incident data retention; do not invent endpoints. Evidence: Operator can disable each intervention and preserve evidence",
+ "allowPaths": [
+  "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/orchestration/**",
+  "src/aps/**",
+  "src/errors/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "scripts/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "cmd0",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:709c2a8a2219f515fd8ead96c6ae1dc4881e65147f62c14b2623c1dd652e5332",
+ "expectedOutputs": [
+  "docs/specs/harness-reliability-bootstrap/ROLLOUT.md"
+ ],
+ "mode": "isolated-change"
+}

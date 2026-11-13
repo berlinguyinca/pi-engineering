@@ -1,0 +1,39 @@
+✔ each fixture maps to the demanded code and severity with a valid, non-empty summary (3.555916ms)
+✔ unrecognised or unreadable input becomes an explicit unknown event instead of throwing (1.062917ms)
+✔ the original evidence reference is preserved unchanged, ahead of the derived refs (0.135125ms)
+✔ normalization is deterministic, clock-free, redacting and honest about missing attribution (0.459625ms)
+✔ every filter combination leaves the namespace byte- and name-identical, proving no writer was opened (9.457458ms)
+✔ time, host, session and limit filters select exactly what they say (3.745166ms)
+✔ foreign types, corrupt lines and payloads E02 refuses are skipped and counted; order is deterministic (2.1385ms)
+✔ a nonexistent or empty namespace reads as the documented empty result and creates nothing (1.756375ms)
+✔ every secret fixture is absent from the persisted representation and only the env variable's name survives (3.447917ms)
+✔ a raw prompt becomes its length plus a stable digest, never a shorter prefix of itself (1.03225ms)
+✔ list caps drop the tail into a counted marker instead of silently, and re-sanitizing does not stack it (0.876541ms)
+✔ the persisted record respects the byte budget, however oversized the occurrence (1.288ms)
+✔ sanitize is idempotent, keeps the evidence E03 carried, and never throws on malformed input (1.436ms)
+✔ a clean occurrence passes through unchanged apart from the caps (0.229166ms)
+✔ incidents-fingerprint: stable across volatile metadata and configured worktree paths (1.695375ms)
+✔ incidents-fingerprint: different identity fields produce different fingerprints (0.212333ms)
+✔ incidents-fingerprint: does not strip unconfigured paths or lookalike prefixes (0.165083ms)
+✔ incidents-fingerprint: treats the configured prefix literally in quoted paths (0.191625ms)
+✔ incidents-fingerprint: normalizes shell delimiters and local file URLs (0.104167ms)
+✔ incidents-fingerprint: preserves timestamps and meaningful whitespace within causes (0.114417ms)
+✔ incidents-fingerprint: payload is a JSON-safe versioned event with explicit fields (0.911708ms)
+✔ incidents-fingerprint: accepts bounded summaries and rejects blank or oversized summaries (0.329542ms)
+✔ incidents-fingerprint: bounds artifact reference count and length (0.247042ms)
+✔ incidents-fingerprint: nullable exit status survives JSON and invalid numbers are rejected (0.18025ms)
+✔ incidents-fingerprint: rejects non-primitive fields and invalid classification or risk (0.865958ms)
+✔ incidents-fingerprint: rejects blank identity fields and oversized compact fields (0.29675ms)
+✔ two sessions appending concurrently keep their streams isolated while readers see both (5.79975ms)
+✔ an occurrence survives drain + close + reopen with a deep-equal payload (0.754958ms)
+✔ the secret an occurrence carries never reaches the bytes on disk (0.638708ms)
+✔ occurrences stay apart from incident events, carry the fingerprint, and map scope honestly (3.166792ms)
+✔ recording the same occurrence twice writes one line, and a refusal E04 makes writes nothing (1.01325ms)
+ℹ tests 31
+ℹ suites 0
+ℹ pass 31
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 202.245917

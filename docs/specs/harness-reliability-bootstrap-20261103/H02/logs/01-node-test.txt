@@ -1,0 +1,14 @@
+✔ a usable incident normalizes to a copy; a frozen input is never mutated (4.832166ms)
+✔ an unusable incident is rejected with reasons, never repaired into looking valid (0.45925ms)
+✔ an event needs identity, a finite instant, a type, and a plain object payload at most (0.872167ms)
+✔ events sharing an instant keep the order they arrived in (0.46675ms)
+✔ filters narrow the timeline and everything discarded is counted, not hidden (0.6305ms)
+✔ drift comes only from usable numbers; an unusable comparison drifts nowhere and says why (0.59025ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 189.698458

@@ -59,7 +59,7 @@ const PATH_ARGUMENT_KEYS: ReadonlySet<string> = new Set([
 ]);
 
 /** Argument keys, in priority order, from which the canonical target is taken. */
-const TARGET_ARGUMENT_KEYS: readonly string[] = [
+export const TARGET_ARGUMENT_KEYS: readonly string[] = [
   "path",
   "file_path",
   "file",

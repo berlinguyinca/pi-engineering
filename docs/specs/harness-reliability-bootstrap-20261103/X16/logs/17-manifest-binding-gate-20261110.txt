@@ -1,0 +1,176 @@
+X16 log 17 -- the fifth gate, the two hash edges nobody read, and a defect the review did not reach
+
+PLAN-COMPLETION.json's 2026-11-10 segment named this as the next unit of work: "a gate that checks
+parentHandoffHash -- the absence of which is exactly what let F4 and F5 stand invisible in a green CI".
+This log is that gate, what it measured, and what it found that the independent review had not.
+
+== what the four existing gates did not read
+
+  integrity-scan, lineage-scan    the chain by COMMIT pointer (baseSha, resultSha, nextBaseSha)
+  record-reproducibility          the BYTES (does handoffHash recompute; does each vouched file exist)
+  citation-existence-check        the PROSE (does every path and commit id in the state files resolve)
+
+Two hash edges sat outside all four:
+
+  record.taskAuthorityHash      canonicalHash(the PARSED manifest) -- FIX-4A, resultGate.ts:47-51
+  manifest.parentHandoffHash    the handoffHash of the record this task was handed off from
+
+These are the only places the trail says WHICH manifest a record was stamped from and WHICH record a
+manifest descended from. Nothing compared either to what it should equal.
+
+== the gate
+
+  AUDIT/manifest-binding-scan.mjs            plain node, no dependencies, reads the audited REF
+  AUDIT/manifest-binding-declared.json       11 declarations, re-verified every run
+  AUDIT/manifest-binding-controls.sh         16 cases, each declaring the verdict it expects
+  test/unit/manifest-binding-parser-agreement.test.ts   pins the gate to the real parser
+
+  $ node AUDIT/manifest-binding-scan.mjs
+    ref=HEAD records=160 manifests=77 hashes=121 declarations=10
+    authority conforms=151 declared=9 | manifests parse+agree=77 | parent edges resolved=70 declared=1
+    RESULT ok                                                              exit=0
+
+Measured cost on this laptop: integrity-scan 0.22 s, lineage-scan 5.18 s, record-reproducibility 1.26 s,
+citation-existence-check 0.18 s, manifest-binding-scan 1.96 s. All five now run on every pipeline in
+the trail-scans step, before install, so a red install cannot hide a red trail.
+
+== what it found
+
+151 of 160 records reproduce their authority from the parsed manifest. The other nine, and the one
+remaining parent-edge declaration, are declared with the measurement behind each. Two findings are
+worth stating plainly because they correct or extend the record:
+
+1. F4 is wider than the review recorded. It named X15/out-chain; BOTH X15 records carry the
+   raw-manifest value 9766e2fb5a7ad9cc..., and X16/out carries the same value because
+   emit-records.mts:76 copies X15's authority into X16's record. X16 has no manifest at all, so its
+   taskAuthorityHash reproduces from nothing in the repository. Fixing X15 would not fix X16: that
+   copy is frozen into hashed bytes.
+
+   The value is also the one PLAN-COMPLETION.json used to carry as a hand-completed prefix (finding
+   F3). Three findings, one hash.
+
+2. E01 is one defect wearing two symptoms. Its two records stamp an authority that no version of any
+   E01 manifest hashes to -- raw or parsed, at the audited ref or at any commit reachable from it --
+   and E01/fixtures/manifest-e01.json holds the one parentHandoffHash of 71 that names no tracked
+   record (F5). E01's manifest has exactly one version in the whole history, landed by the same commit
+   that landed the record, so this is not a manifest that moved underneath a correct record. The
+   consistent reading is that both were written from run-state that was never committed.
+
+3. A false positive, and the state file caught what the gate and its controls both missed. The first
+   version of this gate reported EDGE-ABSENT on X08: X08's manifest names X07 parent by hash, that hash
+   is X07/out's handoffHash, and X07/out declares nextTaskId null. It wrote "69 of 70 parent edges are
+   symmetric; this is the one declared in only one direction", and that sentence was wrong.
+
+   X07 has an out-chain generation. X07/out-chain carries nextTaskId=X08 and
+   nextBaseSha=45d42acb70fc2fcac76425d18eb1d651b0e0a9ba, which is X08.baseSha, so the chain link exists
+   and integrity-scan sees it. The hash edge names X07/out because that is the record X08 was actually
+   handed off from; the forward edge is carried by the generation written later to continue a unit that
+   had been emitted terminal. PLAN-COMPLETION.json's post_plan_extension.chain_note has said so since
+   the X-series, in as many words: "X08 joins X07 through parentHandoffHash rather than a forward link,
+   because X07's terminal generation was emitted with nextTaskId null and a PASS record is never
+   rewritten". Eight sibling units use that mechanism (X05, X06, X07, X08, X09, X10, X12, X13, X14, X15
+   each have an out-chain carrying the forward link).
+
+   The gate's error was resolving the parent to the single record the hash names and then demanding the
+   forward edge from that same record. The question the chain asks -- and the one integrity-scan asks --
+   is whether the parent unit declares the link at all, in any generation. Fixed: EDGE-ABSENT now fires
+   only when no generation of the parent unit declares the child, and the declaration file's edge_absent
+   entry is gone (11 declarations become 10), with the kind kept and annotated as unused so the shape
+   stays in the vocabulary. Measured after the fix: parent edges resolved=70 declared=1 -- every
+   resolvable parent edge resolves, and E01's unresolvable one is the only declaration.
+
+   Worth stating plainly because of how it was caught: the 13-case controls suite did not catch this.
+   Every case asserted that some break was detected, and a false positive is the opposite failure -- the
+   baseline case M0 passed because the buggy gate's offence list was being compared against nothing, and
+   the X08 entry was in the declaration file from the same wrong reading that produced it. What caught
+   it was reading the state file's own account of the edge while writing this log. Controls prove
+   detection; only the record proves you are not inventing the defect you detect.
+
+Four more records -- H07, R08 twice, V01/out -- are pre-correction originals whose out-corrected
+generation conforms. V01/out deserves the precise wording: its authority IS canonicalHash(parsed V01
+manifest) AT ff2a8a6b, the commit that carries it, so it was right when stamped and the manifest moved
+underneath it afterwards. Recorded as both facts, not smoothed into whichever is tidier.
+
+== the reimplementation is pinned, not trusted
+
+The gate runs before npm install, so it cannot import parseTaskManifest; it reimplements the
+normalization. That is the kind of thing that starts disagreeing with the protocol quietly, so
+test/unit/manifest-binding-parser-agreement.test.ts pins it, under tsx after install:
+
+  77 of 77 tracked manifests   agree on verdict, canonical content, and authority hash
+  26 of 26 hostile mutations   agree on accept/reject
+
+The hostile set is where drift hides: unknown top-level key, missing required field, baseSha too short
+and baseSha non-hex, empty allowPaths, empty commands, command missing cwd, mode not one of three,
+limits over ceiling, 101 changed lines under isolated-change versus 120 under herdr-ui (the mode-aware
+ceiling), limits with an unknown key, malformed parentHandoffHash, denyPaths with a non-string, taskId
+blank, an array instead of an object, __proto__ as an own key -- and one case that must be ACCEPTED
+with the key dropped rather than rejected: a command object carrying an extra key, because the parser
+rebuilds commands as {argv, cwd}.
+
+Two tests guard the pin against going vacuous. One asserts raw and parsed never hash alike for any
+tracked manifest -- which is what makes authority_raw a detectable deviation at all rather than a
+distinction without a difference. One asserts the comparison separates two manifests that differ, so
+the equality check cannot be quietly comparing nothing. A manifest-binding-scan.d.mts declares the
+gate's exported contract so the test imports it typed rather than as any, which would let it pass while
+checking nothing.
+
+== detection, proven
+
+A gate's exit status is evidence only if it would have been nonzero had the tree been wrong, and this
+trail has been burned exactly once on a controls script that exited 0 whatever the scanner found
+(log 16, finding F7). So every case declares its expected exit class AND an output marker, and the
+script exits 1 if any case misbehaves. All 14 behaved:
+
+  M0  clean tree -> RESULT ok
+  M1  record authority corrupted -> AUTHORITY-MISMATCH
+  M2  parent hash names nothing -> PARENT-UNRESOLVED
+  M3  parent hash names a real record that is the WRONG one -> EDGE-WRONG. The record exists, is
+      tracked, and hashes to exactly what the manifest claims; only the commit edge can expose it.
+  M4  manifest describes another task -> UNIT-DISAGREE
+  M5  manifest the real parser would reject -> UNPARSEABLE
+  M6  one declaration deleted -> the offence it excused goes red. This is what makes the declaration
+      file load-bearing rather than decorative.
+  M7  declaration observed value drifted -> STALE
+  M8  annotatedBy unreachable -> BAD-DECLARATION
+  M9  annotatedBy reachable but not carrying the file it annotates -> BAD-DECLARATION
+  M10 declaration for a record with no deviation -> DECL-GONE
+  M11 declaration file unreadable -> exit 2
+  M12 run from a subdirectory -> exit 2, not RESULT ok over zero records
+  M13 every break undone -> RESULT ok, tree clean, HEAD unmoved
+  M14 the forward edge removed from the generation that actually carries it (X07/out-chain) ->
+      EDGE-ABSENT. This is the regression guard for the false positive described above: it asserts the
+      gate is looking at the unit's generations and not at one record, and that a real absence still
+      reads red.
+  M15 back to the untouched tree -> RESULT ok
+
+M0 is the case that would have caught the false positive had it been written against the fixed gate: the
+buggy version reported an X08 offence on a clean tree, which is exactly what M0's expectation forbids.
+It did not catch it as written, because the X08 declaration was added from the same wrong reading that
+produced the offence -- the baseline was compared against a tree that already contained the mistake.
+
+One thing this suite got wrong first, and the reason is worth keeping. The breaks are COMMITTED in the
+probe worktree. The gate audits the REF -- ls-tree plus git show <ref>:./path, exactly as
+record-reproducibility.mjs does -- so that an uncommitted scratch edit cannot be certified as though it
+were merged. The first version of this script edited the working tree and expected detection, and
+reported three correct refusals as three missed detections. The declaration file is the one input read
+from disk, so those cases mutate without committing, which keeps the two read paths visibly distinct.
+
+== fresh clone
+
+git clone of the branch, plain node, all five gates: exit 0 each. The gate's own numbers in the clone
+match the checkout that wrote it: records=160 manifests=77 declarations=10, RESULT ok.
+
+== what this closes and what it does not
+
+Closes: the next unit of work named by the 2026-11-10 segment. The two hash edges are now checked on
+every pipeline, the deviations that were invisible are declared and machine-re-verified, and the class
+of defect is now caught rather than reviewed for.
+
+Does not close, and deliberately so:
+
+* The deviations themselves. Nothing here restamps a hash-bound record. handoffHash binds every field
+  to the logs the record vouches for, so correcting X15's or E01's authority in place would silently
+  unbind their evidence. Superseding them with new generations is a protocol decision, not an
+  audit-tooling one.
+* The release decision, which no gate makes.

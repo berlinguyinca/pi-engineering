@@ -66,6 +66,7 @@ import {
   isPauseAbort,
 } from "./interrupt.ts";
 import { transitionMissionToCanceled } from "./missionCancel.ts";
+import { MISSION_REFUSAL_POLL_MS, MissionRefusedError } from "./missionRefusal.ts";
 import { HandoffRecordError, type MissionStore } from "./missionStore.ts";
 import { MissionActivityTicker } from "./observability/MissionActivityTicker.ts";
 import type { MissionObservability } from "./observability/MissionObservability.ts";
@@ -92,6 +93,8 @@ import {
   replacementTaskFingerprintSpec,
 } from "./recovery.ts";
 import { recordSchedulerStatus } from "./recoveryNotice.ts";
+import type { SweepRecord } from "./referenceSweep.ts";
+import { enterRepairing } from "./repairEntry.ts";
 import type { RepositoryRegistry } from "./repositoryRegistry.ts";
 import { buildReviewContext } from "./reviewContext.ts";
 import { recordGateVerdict, recordRepairRound, recordReviewSettlement } from "./reviewRepairNotice.ts";
@@ -172,6 +175,12 @@ export interface OrchestratorOptions {
    * reasons block completion. Absent = unchanged.
    */
   completionEvidence?: (mission: Mission, candidates: CandidateRevision[]) => string[];
+  /**
+   * Optional drop-decision reference sweep supplied to CompletionGate (issue #510):
+   * a decision that drops an identifier completes only when the `references`
+   * evidence attached to it shows no hit in text a user reads or types.
+   */
+  decisionSweeps?: (mission: Mission, candidates: CandidateRevision[]) => SweepRecord[];
   /** Acceptance criterion deriver. */
   deriveAcceptance?: (mission: Mission) => Promise<string[]>;
   /** Called on each mission phase transition. */
@@ -455,6 +464,8 @@ export class Orchestrator {
   private readonly ownershipByMission = new Map<string, import("./types.ts").MissionLease>();
   /** Run controllers of missions executing in this process, for an explicit cancel. */
   private maintenanceRequested = false;
+  /** When the drain started by `prepareForMaintenance` must have settled (0 outside maintenance). */
+  private maintenanceDeadline = 0;
   private startingRuns = 0;
   private readonly liveRuns = new Map<string, AbortController>();
   private readonly runControllers = new WeakMap<AbortSignal, AbortController>();
@@ -559,7 +570,7 @@ export class Orchestrator {
         this.observeTaskSettled(missionId, taskId, status);
       },
     });
-    this.gate = new CompletionGate(this.store, undefined, opts.completionEvidence);
+    this.gate = new CompletionGate(this.store, undefined, opts.completionEvidence, opts.decisionSweeps);
     this.planner = opts.planner;
     this.deriveAcceptance = opts.deriveAcceptance;
     this.onPhase = opts.onPhase;
@@ -2290,6 +2301,9 @@ export class Orchestrator {
     this.maintenanceRequested = true;
     for (const controller of this.liveRuns.values()) controller.abort(MISSION_MAINTENANCE_REASON);
     const deadline = performance.now() + timeoutMs;
+    // Refusals during the drain quote this window, so a caller is told how long
+    // the wait it is being asked to take was measured to be (#511).
+    this.maintenanceDeadline = deadline;
     while (this.liveRuns.size || this.startingRuns || this.store.listExecutions().some(localExecution)) {
       if (performance.now() >= deadline)
         return { status: "busy", reason: "waiting for resumable worker cancellation to settle" };
@@ -2301,20 +2315,38 @@ export class Orchestrator {
 
   endMaintenance(): void {
     this.maintenanceRequested = false;
+    this.maintenanceDeadline = 0;
+  }
+
+  /**
+   * The refusal every entry point raises while maintenance drains missions (#511).
+   *
+   * `retryAfterMs` is the remaining drain window, floored at a poll interval:
+   * maintenance itself ends when the operator ends it, so the number is when to
+   * ask again, not a promise that the next attempt succeeds.
+   */
+  private maintenanceRefusal(): MissionRefusedError {
+    const remaining = this.maintenanceDeadline > 0 ? this.maintenanceDeadline - performance.now() : 0;
+    return new MissionRefusedError("runtime_maintenance", {
+      retryAfterMs: Math.max(MISSION_REFUSAL_POLL_MS, Math.round(remaining)),
+      resumeHint: "mission action=resume <missionId> (or /mission resume <missionId>) once maintenance ends",
+      draining: this.liveRuns.size,
+    });
   }
 
   async orchestrate(
     request: string,
     options: OrchestrateOptions = { repository: ".", baseRef: "" },
   ): Promise<OrchestrateResult> {
-    if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
+    if (this.maintenanceRequested) throw this.maintenanceRefusal();
     this.startingRuns++;
     const run = interruptibleRun(options.signal, options.interrupt);
     this.runControllers.set(run.signal, run.controller);
     this.pauseHooks.set(run.controller, run.onPause);
     try {
       await this.refreshMissionLimits();
-      if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
+      // Maintenance can begin during the await above; the mission must not start after it.
+      if (this.maintenanceRequested) throw this.maintenanceRefusal();
       return await this.orchestrateLimited(request, { ...options, signal: run.signal });
     } finally {
       this.startingRuns--;
@@ -2399,7 +2431,7 @@ export class Orchestrator {
         selectedBaseRef = targetCommit;
       }
     }
-    if (this.maintenanceRequested) throw new Error("runtime maintenance is draining missions");
+    if (this.maintenanceRequested) throw this.maintenanceRefusal();
     const mission = this.store.createMission({
       title: opts.title ?? request,
       goal: request,
@@ -3498,11 +3530,16 @@ export class Orchestrator {
           handedOver ??
           this.store.getRecoveryDecision(recoveryChoice.recoveryId) ??
           this.store.planRecovery(recoveryChoice);
-        if (probe.status === "planned") this.store.transitionRecovery(probe.recoveryId, "started");
-        await this.store.flush();
-        if (this.store.getMission(missionId)!.status !== "REPAIRING") {
-          this.store.transitionMission(missionId, "REPAIRING");
+        // BLOCKED -> REPAIRING consumes the planned decision (the transition marks
+        // it started); starting it first made the mission's own transition fail the
+        // store's "must be planned" check on top of the missing decision ID.
+        if (probe.status === "planned" && this.store.getMission(missionId)!.status === "BLOCKED") {
+          enterRepairing(this.store, missionId, probe.recoveryId);
+        } else {
+          if (probe.status === "planned") this.store.transitionRecovery(probe.recoveryId, "started");
+          enterRepairing(this.store, missionId);
         }
+        await this.store.flush();
         await this.scheduler.gateBackoff(priorProbes, signal);
         if (signal?.aborted) return this.canceledFinalization(missionId, signal);
         if (blockerTask.kind === "integration") {
@@ -3562,9 +3599,7 @@ export class Orchestrator {
         ) {
           mergeRetries++;
           repairRounds--;
-          if (this.store.getMission(missionId)!.status !== "REPAIRING") {
-            this.store.transitionMission(missionId, "REPAIRING");
-          }
+          enterRepairing(this.store, missionId);
           this.report(
             missionId,
             `[mission ${missionId}] integration failed; retrying the merge onto the current base (${mergeRetries}/${MAX_DETERMINISTIC_MERGE_RETRIES})`,
@@ -3647,9 +3682,7 @@ export class Orchestrator {
         });
       }
 
-      if (this.store.getMission(missionId)!.status !== "REPAIRING") {
-        this.store.transitionMission(missionId, "REPAIRING");
-      }
+      enterRepairing(this.store, missionId);
       this.phase(this.store.getMission(missionId)!, "repairing");
       // Failed re-adoptions are counted per stranded tip, so a different tip
       // gets its own attempts.
@@ -4051,7 +4084,7 @@ export class Orchestrator {
     const reviewGates: RequiredGate[] = ["independent_review", "compatibility_review", "security_review"];
     const missing = () => this.gate.evaluate(this.store.getMission(missionId)!).missing_gates;
     // FINAL_VALIDATION cannot move to VALIDATING; REPAIRING can.
-    if (this.store.getMission(missionId)!.status !== "REPAIRING") this.store.transitionMission(missionId, "REPAIRING");
+    enterRepairing(this.store, missionId);
     let validated = true;
     if (
       required.some((gate) => validationGates.includes(gate)) ||
@@ -4081,7 +4114,7 @@ export class Orchestrator {
     // REPAIRING — the legal, durably-recorded recovery state — before running.
     const cur = this.store.getMission(mission.mission_id)!.status;
     if (cur !== "VALIDATING" && !canTransitionMission(cur, "VALIDATING") && cur !== "REPAIRING") {
-      this.store.transitionMission(mission.mission_id, "REPAIRING");
+      enterRepairing(this.store, mission.mission_id);
     }
     this.store.transitionMission(mission.mission_id, "VALIDATING");
     const task = this.store.createTask({

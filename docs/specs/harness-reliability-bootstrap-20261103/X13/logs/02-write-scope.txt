@@ -1,0 +1,19 @@
+$ npx biome check --write scripts src test        # safe fixes only
+$ npx biome check --write --unsafe <the 5 files of 03->
+$ git diff --numstat  ->  78 files, 7984 insertions, 1553 deletions
+  (the 79th line of the diff is biome.json itself, which is not part of the numstat count above because it was
+   staged separately; the sweep's own footprint is 77 source files + biome.json + this unit's evidence)
+
+By area: src/incidents 11, test/unit 38, src/bootstrap 7, src/inference 5, scripts 5, src/aps 3, src/runtime 2,
+src/plannerWorker 2, src/workbooks -> src/workers 2, src/capability 1, test/fixtures/harness-drift 1, biome.json 1.
+
+Every flagged file is a file this branch introduced or modified. origin/main returns exit 0 for the same
+`biome check .`, and a byte-identical file cannot be flagged in one tree and clean in the other, so the sweep
+touches nothing that main owns and was already happy with.
+
+test/fixtures/harness-drift/tasks.json is in the sweep and is worth naming out loud:
+
+  $ git ls-tree origin/main --name-only test/fixtures/harness-drift/     ->  (empty: main has no such directory)
+
+it is branch-new, its only reader is scripts/bench-task-drift.ts which parses it (so re-flowing JSON is
+behaviour-free), and no record or test asserts a hash over it -- 04- checks every declared evidence hash.

@@ -1,0 +1,44 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X03",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "a4abbb7b0f7e2583a3446b6050f47bbe9a7093a4",
+  "resultSha": "8bf854e64d26c10021a20abdd40be194becb8990",
+  "taskAuthorityHash": "sha256:b904054c0f34a3b75d5c19929c60ecf5ecf2f6b256c6fca2a5d2d9c32bd78f74",
+  "changedFiles": [
+    "src/aps/fingerprint.ts",
+    "src/aps/workerActivity.ts",
+    "test/unit/aps-worker-activity.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X03/logs/01-npm-run-typecheck-.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/aps-worker-activity.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X03/logs/02-node-test-import-test-suppor.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X03/logs/01-npm-run-typecheck-.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X03/logs/02-node-test-import-test-suppor.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X03/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X03/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X03/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "X04",
+  "nextBaseSha": "8bf854e64d26c10021a20abdd40be194becb8990",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Found while landing X01/X02: the detector still only ran when a human ran the bench script - grep showed zero runtime callers, which is exactly the gap V06's integrity audit left open. WorkerActivityAdapter now evaluates every action it records against an operator-declared DriftWatch (permitted scope plus artifact contract) when PI_TASK_DRIFT_SIGNALS is affirmatively set: 1/true/yes/on switch it on, absent, empty, 0, false or a typo such as \"ture\" leave it off, so the default stays off as the resilience spec demands. Signals go to a bounded deduplicated log and to an onDrift sink; a throwing sink or malformed action never breaks the observed session, and no signal changes the run. The target path is read through fingerprint.ts TARGET_ARGUMENT_KEYS (now exported) rather than duplicating a path-key list. Tests drive the real session event bus, so scope drift, contract drift and task expansion are all exercised on the live path."
+  },
+  "handoffHash": "sha256:adc4d38038c6fc3ac41fb224e03decc661f67da9bd61264659ff18e169454b27"
+}

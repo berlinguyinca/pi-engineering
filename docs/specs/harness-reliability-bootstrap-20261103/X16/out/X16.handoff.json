@@ -1,0 +1,60 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X16",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "f145c623f9c93de7a25c7f65af95c48fd4e63c81",
+  "resultSha": "7cc443c71f313e1a920118590259eebe89e992d6",
+  "taskAuthorityHash": "sha256:9766e2fb5a7ad9cc8cc855cfc226f9d997becd1328ffc6b9aef9cc2de6ec84f6",
+  "changedFiles": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/chain-declaration.json"
+  ],
+  "commands": [
+    {
+      "command": "git show 46a7109b:docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs > /tmp/x16-old-scanner.mts && npx tsx /tmp/x16-old-scanner.mts   # the scan as merged, over f145c623f9c93de7a25c7f65af95c48fd4e63c81",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/01-old-scan-on-the-new-tree.txt"
+    },
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs   # at f145c623f9c93de7a25c7f65af95c48fd4e63c81, before this unit's records",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/02-scan-after-x16.txt"
+    },
+    {
+      "command": "bash docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/x16-controls.sh   # C1-C9: tamper, fabricated control, declaration, checkout and cwd cases",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/03-controls.txt"
+    },
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs && npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs && npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs && npm run lint && npm run typecheck:core && npm run test:unit   # at f145c623f9c93de7a25c7f65af95c48fd4e63c81",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/05-gates-at-task-commit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/chain-declaration.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/01-old-scan-on-the-new-tree.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/02-scan-after-x16.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/03-controls.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/04-declaration-truth-table.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/logs/05-gates-at-task-commit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/x16-controls.sh",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/rehash.mts",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/record-census.py",
+    "docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/emit-records.mts",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/out-chain/X15.handoff.json"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review) -- the operator asked for the missing links to be fixed and the things that need closing to be closed",
+    "approvedAt": "2026-11-09T07:44:32Z",
+    "notes": "The scan at 46a7109b built its record list from unit directories x generation directories and opened nothing else: 119 of the 228 tracked records. Flipping status to FAIL in T09/T09.handoff.json -- a tracked record, one whose correction X15's own PR body announces -- left it printing RESULT ok with exit 0 (C1 of X16/logs/03). It accepted a fabricated negative-control record as a canonical child (C2, the probe from review-650 finding P5); it printed canonical records no parent names as a count it then ignored, which is why #650 could merge with four broken links and seven unnamed records; and the 66 payload fixtures under */fixtures/ were invisible to it.\n\nThis unit: every tracked record is read and counted where it lives (in generations=119, in unit directories=41, elsewhere=68); an unnamed canonical record is an ORPHAN-OFFENCE unless AUDIT/chain-declaration.json says why, and a declaration that stops applying is a STALE-DECLARATION, so B00's chain-head exception and the tampered control's hash waiver have to keep earning their place; named controls can no longer satisfy a forward link; and each payload fixture must equal another record of its own unit apart from handoffHash. No runtime code and no test changed -- test:unit is 6784 tests, 6779 pass, 0 fail, 5 skipped, the same as at X15's commit (X16/logs/05).\n\nTwo limits this unit does not remove. RESULT ok still does not certify that the trail is one connected walk; the chain walk plus the declared exceptions do, and the comment above the exit status says so; taskAuthorityHash is carried from X15 and reproduces from nothing stored in the repo; and nothing runs these scans on push: this repo has no .github/workflows since 85b1b064 removed them, so the claim in #650's body and #650's review that CI runs AUDIT/integrity-scan.mjs is false, and main can drift into an offending state with nothing noticing. That is recorded as X17's first task."
+  },
+  "handoffHash": "sha256:8b41189046357c90cd2e3eb645445f14bef7e4a4335afbe247e13a78cd57e0cf"
+}

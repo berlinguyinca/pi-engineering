@@ -1,0 +1,3 @@
+docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md
+75	0	docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md
+      75 docs/specs/harness-reliability-bootstrap/FINAL_AUDIT.md

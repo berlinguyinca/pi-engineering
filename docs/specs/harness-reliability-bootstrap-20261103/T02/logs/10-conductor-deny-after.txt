@@ -1,0 +1,8 @@
+[42] -> REJECTED ["T-1: T-1.authorization.denied[0] must be a non-empty string"]
+[true] -> REJECTED ["T-1: T-1.authorization.denied[0] must be a non-empty string"]
+["src/secret/**",7] -> REJECTED ["T-1: T-1.authorization.denied[1] must be a non-empty string"]
+"src/secret/**" -> REJECTED ["T-1: T-1.authorization.denied must be an array of strings"]
+["src/secret/**"] -> ACCEPTED forbidden=["src/secret/**"]
+named regression still holds: true
+re-grant inside deny rejected: true T-2: scope.allowed "src/secret/app.ts" is inside authorization deny "src/secret/**": nothi
+planner-origin leniency unchanged: true forbidden= ["**/*.md","42"]

@@ -1,0 +1,24 @@
+{
+  "reading": "Waivers for docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs. The scan fails on any finding, so the only way one can be excused is by being declared here, with a reason, and every declaration is printed on every run. A declaration that stops applying is itself an offence (STALE-WAIVER, STALE-DECLARATION), so a fixed problem cannot leave an excuse behind. Added by X16, after a review probe showed the scan printing RESULT ok while a canonical record went unnamed and while a tampered record sat unread outside every generation directory.",
+  "may_be_unnamed": [
+    {
+      "taskId": "B00",
+      "baseSha": "c2b75dc93885d246d712d656f72de1764cf198e0",
+      "generation": "out-backfill",
+      "why": "The chain head. The trail was reconstructed backwards from the runtime defects -- E01 was emitted first, then D01-D08, then B00-B05 and the rest were back-filled into out-backfill -- so no canonical record can precede it without rewriting the units that were already certified. B00 names B01 forward, so the walk continues from here."
+    }
+  ],
+  "payload_fixtures": [
+    {
+      "suffix": "fixtures/handoff-record.json",
+      "field_absent": "handoffHash",
+      "why": "The trail's emitter wrote each unit's record payload here before hashing it, so these files carry every field except the one canonicalHash writes. The scan does not trust this: each such file must equal some other record of its own unit (a generation record, or the unit-directory record for FIX-3C and T09) apart from handoffHash, checked field for field, or it is reported as PAYLOAD-OFFENCE and fails."
+    }
+  ],
+  "hash_mismatch_expected": [
+    {
+      "file": "docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/parent-tampered.json",
+      "why": "A negative control, not a trail record. It is FIX-1/out's record with one field altered -- operatorApproval.notes -- and the stored handoffHash left as FIX-1's, which is exactly why its hash cannot recompute: the bytes it vouches for were changed after the certifying hash. It arrived with the conductor docs land 24f42fba (see FIX-3/logs/01-docs-commit-stat.txt) and is listed nowhere in FIX-2's own record. It carries FIX-1's taskId and baseSha, so the scan reads it but is told never to let it satisfy a forward link."
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+X16 log 07 -- the gates over 19756418, the commit carrying X16/out and X15/out-chain
+run at /Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103 before the commit carrying this log; X16 changes no file under src/ or test/,
+so the unit suite is the one already recorded in X16/logs/05-gates-at-task-commit.txt:
+$ git diff --name-only 7cc443c7 19756418
+docs/specs/harness-reliability-bootstrap-20261103/X15/out-chain/X15.handoff.json
+docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/emit-records.mts
+docs/specs/harness-reliability-bootstrap-20261103/X16/out/X16.handoff.json
+nothing outside docs/specs/harness-reliability-bootstrap-20261103/X1{5,6}/.
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+pointers healthy=305 nullDeclared=22 broken=30 unparseableRecords=0
+healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 3
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+ref=HEAD records=119
+hashes recomputed ok=119 mismatch=0 noHashField=0 unparseable=0
+declared evidence paths=781 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree
+exit=0
+
+$ npm run lint
+> pi-engineering-runtime@0.2.0 lint
+> biome check .
+
+Checked 1552 files in 532ms. No fixes applied.
+exit=0
+
+$ npm run typecheck:core
+
+> pi-engineering-runtime@0.2.0 typecheck:core
+> tsc --noEmit
+
+exit=0
+

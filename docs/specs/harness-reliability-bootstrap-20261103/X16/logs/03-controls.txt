@@ -1,0 +1,254 @@
+X16 log 03 -- the control suite.
+
+$ bash docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/x16-controls.sh
+(the script, re-runnable, is X16/fixtures/x16-controls.sh: it makes a throwaway worktree of HEAD
+under /tmp, extracts the 46a7109b scanner from git so the comparison cannot drift, refuses to run if
+the probe is not a separate tree, and removes the worktree at the end)
+
+X16 CONTROLS. Probe worktree: /private/tmp/x16-controls-EZqMYj at f145c623 fix(audit): the integrity scan read 119 of the 228 records the trail holds
+'old' = AUDIT/integrity-scan.mjs as merged at 46a7109b (X15), taken from git. 'new' = the same file
+as committed at BASE, checked out in the probe worktree. Each case mutates the probe tree and puts
+the bytes back before the next.
+
+==================================================================
+C0  baseline: what each scanner certifies about an untouched tree
+==================================================================
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+units=74 records=228 (in generations=119, in unit directories=41, elsewhere=68) canonical=74 hash_ok=227/227 field_ok=228
+canonical chain links resolved=73 offenders=0
+canonical records no canonical parent names=1 (declared=1 offences=0)
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+RESULT ok: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+$ npx tsx /tmp/x16-old-scanner.mts
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+canonical chain links resolved=73 offenders=0
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 1
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+The old scan reads 119 records: everything in a generation directory. The 41 tracked records in
+unit directories and the 68 record-shaped files elsewhere (66 payload fixtures under */fixtures/,
+X08/fixtures/handoff-record.json, FIX-2/fixtures/parent-tampered.json) are never opened, so its
+hash_ok and field_ok describe a subset. X16/fixtures/record-census.py is that arithmetic on
+git ls-files.
+
+==================================================================
+C1  tamper a tracked record that lives outside every generation directory
+==================================================================
+flips "status": "PASS" -> "FAIL" in T09/T09.handoff.json -- the corrected unit-directory record
+that T09/out-chain copies, one of the records X15's PR body says are fixed.
+$ npx tsx /tmp/x16-old-scanner.mts
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+canonical chain links resolved=73 offenders=0
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 1
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+HASH-OFFENDER docs/specs/harness-reliability-bootstrap-20261103/T09/T09.handoff.json
+  PAYLOAD-OFFENCE docs/specs/harness-reliability-bootstrap-20261103/T09/fixtures/handoff-record.json matches no other record of T09 apart from the absent field
+units=74 records=228 (in generations=119, in unit directories=41, elsewhere=68) canonical=74 hash_ok=226/227 field_ok=228
+canonical chain links resolved=73 offenders=0
+canonical records no canonical parent names=1 (declared=1 offences=0)
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=1, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+RESULT offenders=2: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C2  satisfy a canonical forward link with a fabricated negative-control record
+==================================================================
+adds X08/out-negctl-probe/X08.handoff.json (X08's taskId, a base of 1111..., its own valid hash
+recomputed over those bytes) and re-points X07/out-chain at it, so the real X08/out-chain is named
+by nobody. The three files are then STAGED in this throwaway worktree -- committed bytes are what
+the probe needs, because the old scan's only other sight of a file is its untracked rule, which
+cannot see bytes already in the tree. This is the probe behind review-650 finding P5: run there
+against a commit carrying the fabricated generation, the old scan printed resolved=73 offenders=0
+and RESULT ok. Afterwards the index and the tree are put back.
+docs/specs/harness-reliability-bootstrap-20261103/X08/out-negctl-probe/X08.handoff.json -> sha256:a1271c4b66c65400ded3fff24bc789ac1eba906ef08c62bd04d05c7970b7979f
+docs/specs/harness-reliability-bootstrap-20261103/X07/out-chain/X07.handoff.json -> sha256:7ba1298ffed38e6a4532114125acda41b42b9fd9ded083dcadc5fae87ff8c0fe
+
+staged in the probe worktree:
+docs/specs/harness-reliability-bootstrap-20261103/X07/out-chain/X07.handoff.json
+docs/specs/harness-reliability-bootstrap-20261103/X08/out-negctl-probe/X08.handoff.json
+
+$ npx tsx /tmp/x16-old-scanner.mts
+units=74 records=120 canonical=74 hash_ok=120 field_ok=120
+canonical chain links resolved=73 offenders=0
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 2
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+ORPHAN-OFFENCE docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json is canonical, names no parent, and is not declared
+units=74 records=229 (in generations=120, in unit directories=41, elsewhere=68) canonical=74 hash_ok=228/228 field_ok=229
+canonical chain links resolved=72 offenders=1
+  CHAIN X07/out-chain -> X08@111111111111 (no such record)
+canonical records no canonical parent names=2 (declared=1 offences=1)
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+RESULT offenders=2: 72 canonical forward links resolved, 2 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C3  tamper a payload fixture (the pre-hash copy of a unit's record)
+==================================================================
+flips status in FIX-1/fixtures/handoff-record.json. It carries no hash, so no hash check can see
+it; the X16 rule is that it must still equal another record of its unit apart from handoffHash.
+$ npx tsx /tmp/x16-old-scanner.mts
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+  PAYLOAD-OFFENCE docs/specs/harness-reliability-bootstrap-20261103/FIX-1/fixtures/handoff-record.json matches no other record of FIX-1 apart from the absent field
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=1, stale rules=0)
+RESULT offenders=1: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C3b tamper the one fixture that does carry a hash
+==================================================================
+$ npx tsx /tmp/x16-old-scanner.mts
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+HASH-OFFENDER docs/specs/harness-reliability-bootstrap-20261103/X08/fixtures/handoff-record.json
+units=74 records=228 (in generations=119, in unit directories=41, elsewhere=68) canonical=74 hash_ok=226/227 field_ok=228
+RESULT offenders=1: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C4a the chain head goes undeclared
+==================================================================
+ORPHAN-OFFENCE docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json is canonical, names no parent, and is not declared
+canonical records no canonical parent names=1 (declared=0 offences=1)
+RESULT offenders=1: 73 canonical forward links resolved, 1 unnamed (0 declared), hash waived=1
+exit=1
+
+==================================================================
+C4b a declaration that stops applying
+==================================================================
+STALE-DECLARATION X15@2eee4d1a9592b839f0dd3eb677dd9d7d8ed8d59b is declared unnamed but a canonical parent names it
+canonical records no canonical parent names=1 (declared=1 offences=0)
+RESULT offenders=1: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C4c the tampered control's waiver is removed -- it must offend, not disappear
+==================================================================
+HASH-OFFENDER docs/specs/harness-reliability-bootstrap-20261103/FIX-2/fixtures/parent-tampered.json
+waivers=0 stale (hash=0, unnamed=0)
+RESULT offenders=1: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=0
+exit=1
+
+==================================================================
+C4d a payload-fixture rule that matches nothing
+==================================================================
+STALE-DECLARATION payload fixture rule "fixtures/alleged-payload.json" matches nothing
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=1)
+RESULT offenders=1: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C5 the same committed tree in two checkouts (X14's bug class, unit selection)
+==================================================================
+the worktree this session runs in keeps 12 empty out* directories on disk;
+this fresh worktree keeps 0. git does not track empty directories.
+$ new scanner, this checkout
+units=74 records=228 (in generations=119, in unit directories=41, elsewhere=68) canonical=74 hash_ok=227/227 field_ok=228
+RESULT ok: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+$ old scanner, this checkout -- X15 made generation selection require a .json in the directory,
+so it says 74 here too. Before that fix the same bytes gave units=73 in a worktree holding empty
+out* directories and 72 in a fresh archive of the same commit (X14/logs/01-04); this case is the
+regression check for that class.
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+==================================================================
+C6 run from inside the spec directory
+==================================================================
+$ old scanner from /private/tmp/x16-controls-EZqMYj/docs/specs/harness-reliability-bootstrap-20261103
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+evidence dangling=0 untracked=889
+RESULT offenders=962: 73 canonical forward links resolved
+exit=1
+
+$ new scanner from /private/tmp/x16-controls-EZqMYj/docs/specs/harness-reliability-bootstrap-20261103
+units=74 records=228 (in generations=119, in unit directories=41, elsewhere=68) canonical=74 hash_ok=227/227 field_ok=228
+canonical chain links resolved=73 offenders=0
+RESULT ok: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+==================================================================
+C7 a file named like a handoff that does not parse
+==================================================================
+$ npx tsx /tmp/x16-old-scanner.mts
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+RESULT ok: 73 canonical forward links resolved
+exit=0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+  UNREAD docs/specs/harness-reliability-bootstrap-20261103/T09/T09.handoff.json (named like a handoff record but does not parse)
+RESULT offenders=2: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C7b a record inside a generation directory that does not parse
+==================================================================
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+  UNREAD docs/specs/harness-reliability-bootstrap-20261103/X07/out-chain/X07.handoff.json (a record in a generation directory that does not parse)
+RESULT offenders=2: 72 canonical forward links resolved, 2 unnamed (1 declared), hash waived=1
+exit=1
+
+==================================================================
+C8 a tracked record that belongs to no scanned unit (SILENT-SKIP guard)
+==================================================================
+renames the unit directory R04 to r04. The unit list is structural (any directory holding a
+generation record), so r04 becomes a unit and R04 stops being one, while git still tracks
+docs/.../R04/out/R04.handoff.json. That mismatch -- tracked record paths belonging to no scanned
+unit -- is what SILENT-SKIP reports. Before X15 the unit list was the name pattern
+^[A-Z]{1,4}-?[0-9]{1,2}$, and five units whose ids end in a letter (FIX-3B, FIX-3B2, FIX-3C,
+FIX-4A, FIX-4B) were skipped by it without a message (X15/logs/01-scanner-skipped-five-units.txt).
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+SILENT-SKIP R04: tracked generation records exist but the directory is not a scanned unit
+units=74 records=229 (in generations=119, in unit directories=41, elsewhere=69) canonical=74 hash_ok=228/228 field_ok=229
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/r04/out/R04.handoff.json names a child but is not tracked in git
+RESULT offenders=3: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=1
+
+$ npx tsx /tmp/x16-old-scanner.mts
+units=74 records=119 canonical=74 hash_ok=119 field_ok=119
+  CHAIN docs/specs/harness-reliability-bootstrap-20261103/r04/out/R04.handoff.json names a child but is not tracked in git
+RESULT offenders=3: 73 canonical forward links resolved
+exit=1
+
+==================================================================
+C9 restore: the tree is back to the state that passes
+==================================================================
+units=74 records=228 (in generations=119, in unit directories=41, elsewhere=68) canonical=74 hash_ok=227/227 field_ok=228
+canonical chain links resolved=73 offenders=0
+canonical records no canonical parent names=1 (declared=1 offences=0)
+payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+waivers=1 stale (hash=0, unnamed=0)
+RESULT ok: 73 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1
+exit=0
+
+probe tree after all cases (nothing should be listed):
+
+removing the throwaway worktree /private/tmp/x16-controls-EZqMYj
+
+removing the throwaway worktree /private/tmp/x16-controls-EZqMYj
+fatal: '/private/tmp/x16-controls-EZqMYj' is not a working tree
+(leave it: git worktree remove --force /private/tmp/x16-controls-EZqMYj)

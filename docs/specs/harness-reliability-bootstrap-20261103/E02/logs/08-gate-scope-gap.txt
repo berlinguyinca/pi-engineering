@@ -1,0 +1,9 @@
+REJECT baseline: HEAD cc036f2f8c3b938c80348dff821af77c973fde7b != manifest baseSha 0cc5b21cb68caacd44bb09cb7a9674c616f02d9b
+plan exit=3; no model invoked (B04 stops here)
+handoff=/Users/wohlgemuth/IdeaProjects/worktrees/pi-e02-error-event-20261103/docs/specs/harness-reliability-bootstrap-20261103/E02/out-negctl/E02.handoff.json checksum=sha256:d92a4c99a26dd4fe20291d0678507d1e83821d8acfe81bc156312af6b6410209 gate=accepted (clean tree + proofs + diff scope + HEAD^1 == approved base; the plan baseline line above describes the pre-task state)
+expected: the gate must REJECT, because the task commit cc036f2f contains test/unit/error-event.test.ts, which this manifest neither allows and explicitly denies (denyPaths test/**).
+observed above: gate=accepted. Cause: bootstrap-one.ts feeds evaluateDiffScope() only `git status --porcelain` (empty in the clean stamping worktree) plus `git diff --numstat HEAD^1 HEAD`; evaluateDiffScope() checks allow/deny and the per-file budgets against porcelain paths, never against the numstat paths. So with a clean tree the path grants and the 2-file budget are vacuous, and only added+deleted<=maxChangedLines is actually enforced.
+same run also shows: with HEAD != manifest.baseSha the plan returns exit 3 before parent validation, and exit 3 is not a gate blocker -> the emit path stamps a handoff without ever validating parentHandoffHash (see logs/05 and logs/06).
+--- control 2 (fixtures/manifest-e02-negctl-lines.json: identical scope, maxChangedLines 50):
+REJECT gate: diff scope rejected (changed-line-budget): 98 added + 0 deleted > limit 50  (exit 5)
+=> the line budget from numstat IS enforced; only allow/deny paths and the per-file budgets are vacuous under a clean stamping tree.

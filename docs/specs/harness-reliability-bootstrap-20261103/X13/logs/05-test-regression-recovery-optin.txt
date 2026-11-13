@@ -1,0 +1,30 @@
+One test did break, and it is a real consequence of organizeImports rather than a flake. Whole-suite run 1
+(06a-) reported:
+
+  test at test/unit/recovery-optin.test.ts:233
+  x logging is data, and the module executes nothing
+    AssertionError: types from the owner, decisions from R03/R04/R05
+      [ '../guard/transient.ts', './endpointCircuit.ts', + './recoverySafety.ts', './retryBudget.ts' ]
+
+The assertion read src/inference/resilientStreamOptin.ts and compared the list of import specifiers in SOURCE
+ORDER to a hand-written literal. `biome check .` organizes imports, so the order it now enforces is transient,
+endpointCircuit, recoverySafety, retryBudget -- the same four specifiers, sorted.
+
+Fix: compare the SET. This is the one place in X13 where an assertion's text changed, so it is stated plainly:
+the expectation did not loosen -- the same four specifiers are required, no fifth is allowed, and the sibling
+assertions in the same `it` are untouched (no writeFile/appendFile/console./setTimeout/Math.random/Date.now/
+fetch in the module, exactly one `process.env`). What moved is ownership of the import order, which the
+repository's own gate now holds.
+
+  test/unit/recovery-optin.test.ts:233-239
+    // The set, not the source order: `npm run lint` = `biome check .` owns import order (organizeImports sorts
+    // these four), and what this check proves is that the module imports no I/O, clock, RNG or telemetry.
+    assert.deepEqual(
+      [...source.matchAll(/from\s+"([^"]+)"/gu)].map((m) => m[1]!).sort(),
+      ["../guard/transient.ts", "./endpointCircuit.ts", "./recoverySafety.ts", "./retryBudget.ts"].sort(),
+      "types from the owner, decisions from R03/R04/R05",
+    );
+
+$ npx tsx --import ./test/support/isolatedState.ts --test-force-exit --test --test-concurrency=1 \
+    --test-timeout=180000 test/unit/recovery-optin.test.ts
+  tests 6, pass 6, fail 0

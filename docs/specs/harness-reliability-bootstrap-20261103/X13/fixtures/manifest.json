@@ -1,0 +1,81 @@
+{
+  "taskId": "X13",
+  "baseSha": "e26541c0678045ba2eb3fc791a1bd2abb18f964a",
+  "repoId": "pi",
+  "objective": "X12 left one finding open on purpose and named it as the merge's remaining risk: `npm run lint` is `biome check .`, the repository's own gate, and it returned exit 1 on this branch with 517 errors over 1930 files against exit 0 at origin/main -- so merging #616 would have taken main's gate from green to red. Close it here, and do the two halves differently: the trail's evidence tree is hash-bound (867 declared evidence sha256 values cover it) so it joins biome.json's files.ignore, the mechanism that config already uses for the two byte-compared golden fixtures, and is NOT reformatted; the 127 findings left in the 77 files this branch wrote are fixed for real. Then re-measure: lint, typecheck:core, the unit the formatter's organizeImports broke, and the whole suite against a pristine-tip baseline that settles which failures belong to this unit.",
+  "allowPaths": [
+    "biome.json",
+    "src/**",
+    "scripts/**",
+    "test/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/X13/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/X12/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/PLAN-COMPLETION.json"
+  ],
+  "denyPaths": [
+    "templates/handoff.schema.json",
+    "package.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/**/logs/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/**/out/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/**/out-chain/*.handoff.json"
+  ],
+  "commands": [
+    {
+      "id": "cmd1",
+      "argv": [
+        "npm",
+        "run",
+        "lint"
+      ],
+      "timeoutMs": 600000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd2",
+      "argv": [
+        "npm",
+        "run",
+        "typecheck:core"
+      ],
+      "timeoutMs": 900000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd3",
+      "argv": [
+        "npx",
+        "tsx",
+        "--import",
+        "./test/support/isolatedState.ts",
+        "--test-force-exit",
+        "--test",
+        "--test-concurrency=1",
+        "--test-timeout=180000",
+        "test/unit/recovery-optin.test.ts"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd4",
+      "argv": [
+        "npm",
+        "test"
+      ],
+      "timeoutMs": 2400000,
+      "cwd": "repo"
+    }
+  ],
+  "limits": {
+    "maxProductionFiles": 1,
+    "maxTestFiles": 1,
+    "maxChangedLines": 100
+  },
+  "parentHandoffHash": "sha256:3250c399004f794d5d6f8f661f895f49825652cfabb726780cfb98a4eb87cef1",
+  "expectedOutputs": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X12/out-chain/X12.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/PLAN-COMPLETION.json"
+  ],
+  "mode": "isolated-change"
+}

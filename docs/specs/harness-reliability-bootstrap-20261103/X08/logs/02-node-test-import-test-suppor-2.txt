@@ -1,0 +1,36 @@
+$ node --test --import ./test/support/isolatedState.ts test/unit/git-durable-ownership.test.ts test/unit/git-persist-concurrency.test.ts test/unit/git-lock-publication.test.ts test/unit/git-spawn-economy.test.ts test/unit/git-worktree-safety.test.ts
+✔ records written from the main checkout are not reported as corrupt from a linked worktree (3113.215792ms)
+✔ records from a different root or legacy records validate by content integrity, not path recomputation (2021.208667ms)
+✔ a same-root record with a forged path is quarantined with a reason and does not block (1930.802209ms)
+✔ an unparseable record is quarantined and blocks only when it names this mission (965.69025ms)
+✔ a forged other-root path is quarantined, and a persist from another root does not re-stamp the record (1535.526208ms)
+✔ worktree lock publication cannot make concurrent safe git reject the repository (2517.868666ms)
+✔ git administration lock metadata refuses an existing symlink directory (747.33325ms)
+✔ the new worktree lock namespace still refuses an already-held legacy lock (2360.746125ms)
+✔ concurrent persists of the same candidate record never ENOENT and leave valid JSON (2615.46125ms)
+✔ concurrent integration-run persists of the same record never ENOENT (2781.403542ms)
+✔ concurrent promotion and cleanup persists of the same record never ENOENT (2093.0325ms)
+✔ the LFS attribute scan runs once for repeated calls on an unchanged index (652.096709ms)
+✔ editing an existing .gitattributes changes the generated LFS attributes while the listing memo is live (511.179625ms)
+✔ the LFS listing is refreshed when the index changes (a nested .gitattributes is added) (468.090458ms)
+✔ the LFS listing memo expires after its TTL (870.744917ms)
+✔ PI_ENG_LFS_SCAN_MEMO=0 restores a scan per call (499.727625ms)
+✔ the memo is isolated per repository and per linked worktree (719.993333ms)
+✔ GitRepo.open is uncached by default: a deleted or moved repository is seen at once (453.871208ms)
+✔ an opted-in cached open spawns nothing on a hit, and revalidates a moved repository (519.034917ms)
+✔ idle presence ticks (RepoKeyResolver.lookup, as refreshPresence does) spawn no git (266.849167ms)
+✔ a stale remembered key falls through to a fresh resolve; a non-repository key is never remembered (274.863833ms)
+✔ idle presence ticks in a non-repository cwd spawn nothing after the first; git init is seen by a fresh resolve (381.580167ms)
+✔ worktree cleanup refuses to remove a path outside the worktree namespace (766.258583ms)
+✔ removeWorktree recovers an orphaned worktree whose git metadata is gone (1619.711ms)
+✔ concurrent create/remove keeps the primary checkout intact (3352.38675ms)
+✔ createWorktree crash-recovery never removes the primary checkout (3585.159541ms)
+ℹ tests 26
+ℹ suites 0
+ℹ pass 26
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 10231.40225
+[exit=0]

@@ -1,0 +1,24 @@
+✔ evidence: one failureIdentity across two event ids counts once, keeps both ids, and a shuffled input yields byte-identical output (criterion 1) (4.799042ms)
+✔ first/last seen bound only the deduped occurrences, and every dimension set is sorted and unique (criterion 2) (0.26075ms)
+✔ recovered + unresolved === count, resolution defaults to unresolved, and a duplicate's resolution counts for nothing (criterion 3) (0.214291ms)
+✔ stable ordering: lastSeen desc, then count desc, then fingerprint asc, so the order is total (criterion 1) (0.183792ms)
+✔ maxEventIds caps kept source ids with eventIdsTruncated, limit truncates clusters with truncated, the default cap is documented (criterion 2) (0.356917ms)
+✔ purity and rejection: the caller's array and rows are deep-equal after the call, and a row D02 refuses is rejected and forms no cluster (criterion 4) (0.503834ms)
+✔ every secret fixture is absent from the persisted representation and only the env variable's name survives (3.610208ms)
+✔ a raw prompt becomes its length plus a stable digest, never a shorter prefix of itself (1.196208ms)
+✔ list caps drop the tail into a counted marker instead of silently, and re-sanitizing does not stack it (0.920416ms)
+✔ the persisted record respects the byte budget, however oversized the occurrence (1.386833ms)
+✔ sanitize is idempotent, keeps the evidence E03 carried, and never throws on malformed input (1.394208ms)
+✔ a clean occurrence passes through unchanged apart from the caps (0.265291ms)
+✔ E07 evidence: one upstream failure observed by three layers stays one occurrence with one acting owner (7.002792ms)
+✔ distinct failures and scopes yield distinct ids; the same failure re-derived twice is byte-identical (0.525292ms)
+✔ the emitted payload carries failure_id + error_ref; the secret, absolute path and prompt appear nowhere in it (0.459709ms)
+✔ the old API is intact: actedOn/actingLayers unchanged; old-arity recordRetryTrace pushes and emits as before (0.103667ms)
+ℹ tests 16
+ℹ suites 0
+ℹ pass 16
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 196.194875

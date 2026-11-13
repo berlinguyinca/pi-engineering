@@ -1,0 +1,42 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "V02",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "ff2a8a6bf4eeaff88677ff2ef5f652c43709429f",
+ "resultSha": "9531f8b144d5b0f4c7ac685995f9cb8a2afbb090",
+ "taskAuthorityHash": "sha256:032a06b6ca49c4965788a3bae2fcc5d6937abe69a0e0959903f300e1765229b9",
+ "changedFiles": [
+  "scripts/bench-task-drift.ts",
+  "test/unit/bench-task-drift.test.ts"
+ ],
+ "commands": [
+  {
+   "command": "npm run typecheck",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/V02/logs/01-typecheck.txt"
+  },
+  {
+   "command": "node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/V02/logs/02-unit.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/V02/logs/01-typecheck.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/V02/logs/02-unit.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/V02/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/V02/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/V02/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "V03",
+ "nextBaseSha": "8c064b37dadce3f23876156b91863f510dd7f908",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Worker pane v02 (pane w8:p18, metabolomics/qwen3.8-flash_next) on base ff2a8a6b (the V01 evidence commit in berlinguyinca/pi-engineering), isolated-change mode, first pass, ~7 min. Exactly the two declared files (git show --name-only HEAD: scripts/bench-task-drift.ts, test/unit/bench-task-drift.test.ts), 98 changed lines against the 100 isolated-change ceiling, and the detector under test src/aps/taskAlignment.ts was not touched. Conductor verified independently at 9531f8b1: npm run typecheck (tsc --noEmit -p tsconfig.scripts.json) exit 0; node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts 6 pass / 0 fail; git diff --check ff2a8a6b..HEAD exit 0; and the conductor ran the runner itself (logs/03-runner-output.json): {truePositives:2, falsePositives:0, falseNegatives:1, trueNegatives:2, precision:1, recall:0.6666666666666666, falsePositiveIds:[], missedIds:[drift-03], fixtureTaskCount:5, detectorKinds:[out_of_scope_write]} - machine-readable and deterministic, which is the evidence clause. That recall figure is the finding, not a failure: evaluateTaskAlignment sees only path scope, allowed dependencies, declared tasks and acceptance stagnation, so an action that stays inside permittedScope yet is off-objective (V01 drift-03, seq 3 src/ledger/claimDiscipline.ts) cannot be flagged; the test pins the miss instead of loosening the answer key (test/unit/bench-task-drift.test.ts:22-23 asserts missedIds includes drift-03, commented that only relevance can see it) and pins the whole score object with assert.deepEqual so any future detector change breaks the test loudly. Zero false positives across the two clean controls is the over-triggering half of the evidence clause. Determinism is asserted by scoring twice and comparing the emitted JSON text; the runner makes no network call, no model call, no filesystem write and no clock read, and exits 0 even when recall < 1 because it measures rather than gates. NOTE: this unit had a false start - the conductor's first worktree creation passed an unset variable to git -C, leaving a bare directory in which the first pane started outside the repository; that pane was closed, the worktree was registered properly at ff2a8a6b, and the run recorded here is the second pane on the registered checkout. | CHAIN CORRECTION: this record supersedes V02/out/V02.handoff.json (sha256 kept immutable in out/), whose nextBaseSha pointed at the task commit 9531f8b144d5 while the next unit is cut from the evidence commit 8ad5ce679933 that carries this unit's record; code, proofs and scope are unchanged. | CHAIN: this record supersedes V02/out-corrected (kept immutable), whose nextBaseSha named the pre-amend evidence commit 8ad5ce67; V03 is cut from 8c064b37dadce3f23876156b91863f510dd7f908, the evidence commit as it stands now. Code, proofs and scope are unchanged."
+ }
+}

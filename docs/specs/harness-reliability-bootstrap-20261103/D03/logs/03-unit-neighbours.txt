@@ -1,0 +1,21 @@
+✔ accepts a fully attributed occurrence; absent optionals stay null (2.358041ms)
+✔ an occurrence with no session is refused — unattributable errors are not recordable (0.161209ms)
+✔ rejects unredacted secrets, control characters and unsafe artifact refs (0.706334ms)
+✔ requires correlation and validates layer, severity, version, timestamp (0.156375ms)
+✔ equivalent occurrences from another session, host, run, timestamp, uuid, duration, byte count, worktree path and prompt digest share one key (criterion 1) (3.046166ms)
+✔ distinct causes stay separate — 404 vs 429 above all, plus layer, tool, root-cause noun and exception class (criterion 2) (0.298625ms)
+✔ deterministic and idempotent, with a fixed digest shape that carries none of the volatile text (criterion 3) (0.207583ms)
+✔ malformed input is total: the documented fallback key or a documented coercion, never a throw (criterion 4) (0.155958ms)
+✔ the key is not the payload digest: pointers, severity and model alone cannot move it (criterion 5) (0.122167ms)
+✔ every filter combination leaves the namespace byte- and name-identical, proving no writer was opened (8.928666ms)
+✔ time, host, session and limit filters select exactly what they say (3.926667ms)
+✔ foreign types, corrupt lines and payloads E02 refuses are skipped and counted; order is deterministic (2.209375ms)
+✔ a nonexistent or empty namespace reads as the documented empty result and creates nothing (3.305417ms)
+ℹ tests 13
+ℹ suites 0
+ℹ pass 13
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 176.160791

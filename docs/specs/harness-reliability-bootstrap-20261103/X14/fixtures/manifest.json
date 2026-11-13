@@ -1,0 +1,73 @@
+{
+  "taskId": "X14",
+  "baseSha": "2d9d758c490218e86a7fdbc2d0d7d4472c581cea",
+  "repoId": "pi",
+  "objective": "AUDIT/integrity-scan.mjs chose each unit's canonical generation from a directory listing, ranking any untabled out* directory above the real out and recognising negative controls only by the substring negctl. FIX-2 carries two empty leftovers of control runs (out-noparent, out-tampered), which git cannot store, so in the checkout where those runs happened FIX-2 had no canonical record at all and its unresolved forward link to FIX-3 -- a record that was never emitted -- was filed as history rather than as an offender. The same committed tree (81e229a6, the merge of #616) reported offenders=2 beside the trail and offenders=3 in a fresh checkout of main. Make canonical mean the highest-ranked generation that actually holds a record, make named negative-control generations never canonical even when populated, and correct the series' chain-offender count from two to three.",
+  "allowPaths": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/X13/out-chain/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/PLAN-COMPLETION.json"
+  ],
+  "denyPaths": [
+    "templates/handoff.schema.json",
+    "package.json",
+    "src/**",
+    "test/**",
+    "docs/specs/harness-reliability-bootstrap-20261103/**/logs/**"
+  ],
+  "commands": [
+    {
+      "id": "cmd1",
+      "argv": [
+        "npx",
+        "tsx",
+        "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd2",
+      "argv": [
+        "npx",
+        "tsx",
+        "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd3",
+      "argv": [
+        "npx",
+        "tsx",
+        "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd4",
+      "argv": [
+        "npm",
+        "run",
+        "lint"
+      ],
+      "timeoutMs": 600000,
+      "cwd": "repo"
+    }
+  ],
+  "limits": {
+    "maxProductionFiles": 1,
+    "maxTestFiles": 0,
+    "maxChangedLines": 100
+  },
+  "parentHandoffHash": "sha256:638692077bec897a232271392374486f6517fa176ed8c3f4412ff3cece8f05e0",
+  "expectedOutputs": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/out/X14.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X13/out-chain/X13.handoff.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/fixtures/manifest.json"
+  ],
+  "mode": "isolated-change"
+}

@@ -56,6 +56,25 @@ export interface BridgeTarget {
   trackEvent?(generation: number, event: string, run: () => unknown): unknown;
 }
 
+/**
+ * A tool name the bridge could not serve, or a forwarded call that found nobody
+ * to serve it (#672). Reported to the Host so it reaches telemetry: in the field
+ * the failure was invisible after the fact, which is why it took a live session
+ * to notice.
+ */
+export interface ToolNameEvent {
+  /** `shadowed`: the name was lost at registration. `unservable`: a call found no live owner. */
+  kind: "shadowed" | "unservable";
+  name: string;
+  generation: number | undefined;
+  reason: string;
+}
+
+export interface BridgeOptions {
+  /** Called for every lost or unservable tool name. Best-effort; never throws back into the bridge. */
+  diagnostics?: (event: ToolNameEvent) => void;
+}
+
 /** Methods that register something. Passed through, keyed by Pi, overwrite-on-reregister. */
 const PASSTHROUGH_REGISTRATIONS = new Set([
   "registerShortcut",
@@ -96,12 +115,16 @@ export class PiBridge {
    */
   private readonly pi: ExtensionAPI;
   private readonly target: BridgeTarget;
+  private readonly diagnostics: ((event: ToolNameEvent) => void) | undefined;
+  /** (generation:name) already reported unservable, so a dead name is not logged every turn. */
+  private readonly reportedUnservable = new Set<string>();
 
-  constructor(pi: ExtensionAPI, target: BridgeTarget, hostRouted: Iterable<string> = []) {
+  constructor(pi: ExtensionAPI, target: BridgeTarget, hostRouted: Iterable<string> = [], options: BridgeOptions = {}) {
     this.pi = pi;
     this.target = target;
     this.hasOn = typeof (pi as { on?: unknown }).on === "function";
     this.hostRouted = new Set(hostRouted);
+    this.diagnostics = options.diagnostics;
   }
 
   /** Whether the Pi host delivers events at all (stub hosts do not). */
@@ -170,6 +193,20 @@ export class PiBridge {
     return table ? [...table.shadowedTools].map(([name, reason]) => ({ name, reason })) : [];
   }
 
+  /**
+   * Every tool name any table still held lost at registration, with the
+   * generation that lost it. A name lost by a generation that is still declared
+   * in Pi is exactly the state #672 left behind, so the surface must not be
+   * scoped to the generation currently dispatching.
+   */
+  toolNameLosses(): Array<{ generation: number; name: string; reason: string }> {
+    const out: Array<{ generation: number; name: string; reason: string }> = [];
+    for (const [generation, table] of this.tables) {
+      for (const [name, reason] of table.shadowedTools) out.push({ generation, name, reason });
+    }
+    return out.sort((a, b) => a.generation - b.generation || a.name.localeCompare(b.name));
+  }
+
   /** Forget a retired generation's tables so nothing can route to it again. */
   dropGeneration(generation: number): void {
     this.tables.delete(generation);
@@ -201,6 +238,11 @@ export class PiBridge {
       shadowedTools: new Map(),
     };
     this.tables.set(generation, table);
+    // A fresh generation ends the "no generation active" window. Drop the generation-less
+    // unservable dedup keys so a later incident of the same name (e.g. after this generation
+    // also retires) is reported again; numbered-generation keys are left alone, their numbers
+    // only go up so a stale one is never misleading.
+    for (const key of [...this.reportedUnservable]) if (key.startsWith("none:")) this.reportedUnservable.delete(key);
     const live = () => this.target.isLive(generation) && this.tables.get(generation) === table;
 
     const on = (event: string, handler: Handler): (() => void) => {
@@ -257,12 +299,15 @@ export class PiBridge {
         } as never);
         this.toolForwarders.add(tool.name);
       } catch (error) {
-        // Pi refuses a tool name another extension already registered. Losing
-        // the name must not take the runtime down: the copy that registered
-        // first serves it, and this one keeps every other tool it owns. It is
-        // not added to toolForwarders, because this generation does not own it.
+        // Pi refuses a tool name another extension already registered (or a
+        // schema it will not accept). Losing the name must not take the runtime
+        // down: the copy that registered first serves it, and this one keeps
+        // every other tool it owns. It is not added to toolForwarders, because
+        // this generation does not own it.
+        const reason = error instanceof Error ? error.message : String(error);
         table.tools.delete(tool.name);
-        table.shadowedTools.set(tool.name, error instanceof Error ? error.message : String(error));
+        table.shadowedTools.set(tool.name, reason);
+        this.report({ kind: "shadowed", name: tool.name, generation, reason });
       }
     };
 
@@ -362,11 +407,64 @@ export class PiBridge {
     await this.target.whenOpen();
     const generation = await this.target.dispatchGeneration();
     const tool = generation === undefined ? undefined : this.tables.get(generation)?.tools.get(name);
-    if (generation === undefined || !tool?.execute) {
-      throw new Error(`tool ${name} is not available: no active pi-engineering runtime provides it`);
+    if (generation !== undefined && tool?.execute && this.target.isLive(generation)) {
+      const execute = tool.execute;
+      return this.target.track(generation, "tool", name, async () => execute.apply(tool, args));
     }
-    const execute = tool.execute;
-    return this.target.track(generation, "tool", name, async () => execute.apply(tool, args));
+    // The dispatched generation does not own the name. Another live generation
+    // of this bridge might — a handover that has not finished registering, or a
+    // generation that lost the name at registration while its sibling kept it.
+    // Serving there beats failing a declared tool the model can see.
+    const holder = this.liveHolderOf(name, generation);
+    const sibling = holder === undefined ? undefined : this.tables.get(holder)?.tools.get(name);
+    if (holder !== undefined && sibling?.execute) {
+      const execute = sibling.execute;
+      return this.target.track(holder, "tool", name, async () => execute.apply(sibling, args));
+    }
+    const reason = this.unservableReason(name, generation);
+    const key = `${generation ?? "none"}:${name}`;
+    if (!this.reportedUnservable.has(key)) {
+      this.reportedUnservable.add(key);
+      this.report({ kind: "unservable", name, generation, reason });
+    }
+    throw new Error(`tool ${name} is not available: no active pi-engineering runtime provides it (${reason})`);
+  }
+
+  /** Another live generation of this bridge that owns `name`. */
+  private liveHolderOf(name: string, exclude: number | undefined): number | undefined {
+    for (const [generation, table] of this.tables) {
+      if (generation === exclude || !this.target.isLive(generation)) continue;
+      if (table.tools.get(name)?.execute) return generation;
+    }
+    return undefined;
+  }
+
+  /** Why a declared tool has nobody to serve it, in the caller's terms. */
+  private unservableReason(name: string, generation: number | undefined): string {
+    const parts: string[] = [];
+    if (generation === undefined) {
+      parts.push("no generation is active (a handover is in flight, or the last generation retired)");
+    } else {
+      const table = this.tables.get(generation);
+      parts.push(
+        `generation ${generation} ${this.target.isLive(generation) ? "is live" : "is retired"} and does not own "${name}"`,
+      );
+      const shadow = table?.shadowedTools.get(name);
+      if (shadow !== undefined) parts.push(`it was lost at registration: ${shadow}`);
+      else if (table === undefined) parts.push("its registration table was dropped");
+      else parts.push("no live generation registered it");
+    }
+    parts.push("recover with /engineering reload, or restart the session");
+    return parts.join("; ");
+  }
+
+  /** Tell the Host about a lost or unservable tool name; a broken listener never breaks a call. */
+  private report(event: ToolNameEvent): void {
+    try {
+      this.diagnostics?.(event);
+    } catch {
+      // Diagnostics are never the reason a tool fails.
+    }
   }
 }
 

@@ -1,0 +1,11 @@
+✔ irrelevant refactor flags all four kinds, sorted and deduplicated; read-only investigation stays silent (6.85275ms)
+✔ scope is judged by the caller's mutating flag; in-scope writes and an empty scope behave as specified (0.178542ms)
+✔ dependency compare is trimmed and case-insensitive; stagnation flags once, bad thresholds fall back to 10 (0.203875ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 181.801541

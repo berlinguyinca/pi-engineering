@@ -1,0 +1,37 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "H07",
+ "status": "PASS",
+ "repo": "berlinguyinca/herdr-engineering",
+ "baseSha": "1466be76b49d6c6918ed25a4db5b8fb9ee849c32",
+ "resultSha": "591264f9bd4fc2fc07d88d94febde4cd0e919448",
+ "taskAuthorityHash": "sha256:fbe560e5707c9246a79117420b1d2ab96aee706ffd2455d34e63058d13e8eda2",
+ "changedFiles": [
+  "packages/app.js",
+  "packages/diagnostics-route.test.js",
+  "packages/hosts-view.js"
+ ],
+ "commands": [
+  {
+   "command": "git diff --check",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/H07/logs/01-route-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/H07/logs/01-route-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/H07/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H07/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/H07/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "V01",
+ "nextBaseSha": "9cf164fa5f5f97fa9c3a46ca661d416eb1f70dd9",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "Worker pane h07 (pane w8:p15, metabolomics/qwen3.8-flash_next) on base 1466be76 (H06 result, berlinguyinca/herdr-engineering), herdr-ui mode, first pass, ~8 min. Exactly the three paths named for this unit (git show --name-only HEAD: packages/app.js, packages/diagnostics-route.test.js, packages/hosts-view.js), 106 insertions + 1 deletion = 107 changed lines against the 120 herdr-ui ceiling. PLAN DEVIATION, recorded: the plan named only packages/hosts-view.js as the production file, but navigation and routing live in packages/app.js (packages/app.js:84 NAV, packages/app.js:128 routePath, packages/app.js:144-145 NAV lookup, KNOWN_PAGES derived from NAV at packages/app.js:129) - exactly what the delta meant by 'after confirming exact mount file' - so packages/app.js was added to allowPaths for this unit only and no other file moved. Conductor verified independently at 591264f9: node --test packages/diagnostics-route.test.js 5 pass / 0 fail; node --test packages/hosts-view.test.js packages/diagnostics-view.test.js packages/diagnostics-timeline.test.js packages/task-drift-view.test.js 17 pass / 0 fail, measuring the no-navigation-regression half of the evidence clause instead of asserting it; git diff --check 1466be76..HEAD exit 0. The dashboard shell was not rewritten: app.js gained one NAV entry ({ group: 'Fabric', path: '/diagnostics', label: 'Diagnostics' }), one route-map entry ('/diagnostics': viewDiagnostics), the import-line extension and a comment - NAV groups, SUBNAV, capabilities and SECTION_TABS untouched - and the test re-checks all 17 pre-existing NAV paths from a hard-coded BEFORE list alongside the new one. No backend was invented: the source is built from two transports this repo already has (packages/app.js:1061 uses client.request of the existing /api/v1/events plus client.listHosts, both .catch(() => null)), so a failing feed becomes H03's unavailable section rather than a blank page. Read-only holds structurally: mountDiagnostics reads once with no liveRefresher/pollWhileVisible (matching H03's read-once contract), writes only into its own route node so a read finishing after navigation cannot overwrite the page the operator moved to, and the test asserts the rendered HTML contains no button, form, input, anchor, onclick=, setInterval, setTimeout or addEventListener. NOTE: packages/app.js cannot be imported under node --test (it needs HTMLElement), so route wiring is asserted on source text while the mount is asserted functionally against a fake source - a deliberate posture, not a jsdom dependency. | CHAIN CORRECTION (this record supersedes H07/H07.handoff.json sha256:faabf272, kept immutable): the first stamp passed NEXT_BASE_SHA=1466be76, which is this unit's own base, so the emitted chain pointed V01 at a commit in berlinguyinca/herdr-engineering although V01 executes in berlinguyinca/pi-engineering; nextBaseSha is re-issued as 9cf164fa, the pi evidence commit V01 branches from, applying the same cross-repo rule recorded for R08 -> H01. Code, proofs and scope are unchanged from that record."
+ }
+}

@@ -56,7 +56,11 @@ import {
   type LadderTransport,
   RecoveryLadder,
 } from "./recovery.ts";
-import { type InferenceResilienceConfig, resolveInferenceResilienceConfig } from "./resilienceConfig.ts";
+import {
+  type InferenceResilienceConfig,
+  describeUnparseableSwitches,
+  resolveInferenceResilienceConfig,
+} from "./resilienceConfig.ts";
 import { InferenceTelemetry } from "./telemetry.ts";
 
 /** One raw model invocation at the transport seam (provider-agnostic). */
@@ -195,6 +199,14 @@ export class ResilientInference {
   constructor(opts: ResilientInferenceOptions) {
     this.transport = opts.transport;
     this.env = opts.env ?? (typeof process !== "undefined" && process.env ? process.env : {});
+    // A switch whose value could not be read deserves a line here, because the
+    // run path reads this env ad hoc (`this.cfg.enabled ?? resolve(this.env).enabled`)
+    // and discards the problems: `PI_INFERENCE_RESILIENCE_ENABLED=ture` resolves
+    // to the default (off), so an operator who believes they armed the layer hears
+    // that they did not rather than watching silent single-attempt calls.
+    if (opts.status) {
+      for (const line of describeUnparseableSwitches(resolveInferenceResilienceConfig(this.env))) opts.status(line);
+    }
     this.cfg = opts.config ?? {};
     this.registry = opts.registry;
     this.router = opts.router;

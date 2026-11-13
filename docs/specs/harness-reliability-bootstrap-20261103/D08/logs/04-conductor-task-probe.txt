@@ -1,0 +1,11 @@
+deterministic: true | hint: metabolomics/qwen3.8-flash_next | hints: metabolomics/qwen3.8-flash_next,metabolomics/qwen3.8-27b
+carries ids: true | carries fingerprints: true
+prohibitions present: read-only=true no source modification=true self-repair=true dispatch=true
+bounded: bytes<=cap true | account: {"trunc":true,"dropped":{"items":2,"bytes":1192}}
+complete answer accepted: true | fields: hypothesis,supportingEventIds,disconfirmingEvidence,uncertainty,furtherEvidence
+refusal per missing section: hypothesis=true supportingEventIds=true disconfirmingEvidence=true uncertainty=true furtherEvidence=true
+refusal reasons sample: {"ok":false,"reasons":["missing_section:UNCERTAINTY"]}
+out-of-bundle id refused: {"ok":false,"reasons":["unknown_event_id:evt-999"]}
+restated summary refused: {"ok":false,"reasons":["hypothesis_restates_summary"]}
+garbage refused: {"ok":false,"reasons":["unlabelled_text","missing_section:HYPOTHESIS","missing_section:SUPPORTING_EVENTS","missing_secti
+bundle untouched: true | unknown hint falls back: true false

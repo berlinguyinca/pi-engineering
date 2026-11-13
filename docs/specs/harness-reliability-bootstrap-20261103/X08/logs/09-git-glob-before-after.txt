@@ -1,0 +1,50 @@
+### test/unit/git-*.test.ts before/after the repair, measured in worktree pi-X08-build at base 4ffa82f3 (doubled prefix live there)
+$ node --test --import ./test/support/isolatedState.ts "test/unit/git-*.test.ts"
+--- without the repair: tests 40  pass 24  fail 16
+✖ a forged other-root path is quarantined, and a persist from another root does not re-stamp the record
+✖ a same-root record with a forged path is quarantined with a reason and does not block
+✖ an unparseable record is quarantined and blocks only when it names this mission
+✖ concurrent create/remove keeps the primary checkout intact
+✖ concurrent integration-run persists of the same record never ENOENT
+✖ concurrent persists of the same candidate record never ENOENT and leave valid JSON
+✖ concurrent promotion and cleanup persists of the same record never ENOENT
+✖ createWorktree crash-recovery never removes the primary checkout
+✖ git administration lock metadata refuses an existing symlink directory
+✖ GitRepo remote-ref primitives
+✖ records from a different root or legacy records validate by content integrity, not path recomputation
+✖ records written from the main checkout are not reported as corrupt from a linked worktree
+✖ removeWorktree recovers an orphaned worktree whose git metadata is gone
+✖ the new worktree lock namespace still refuses an already-held legacy lock
+✖ throws with the remote's stderr when a push is refused while the ref is unchanged
+✖ worktree cleanup refuses to remove a path outside the worktree namespace
+✖ worktree lock publication cannot make concurrent safe git reject the repository
+--- with the repair (db3f08b8): tests 45  pass 39  fail 6   (5 tests added by this unit)
+✖ concurrent create/remove keeps the primary checkout intact
+✖ createWorktree crash-recovery never removes the primary checkout
+✖ GitRepo remote-ref primitives
+✖ removeWorktree recovers an orphaned worktree whose git metadata is gone
+✖ the new worktree lock namespace still refuses an already-held legacy lock
+✖ throws with the remote's stderr when a push is refused while the ref is unchanged
+✖ worktree lock publication cannot make concurrent safe git reject the repository
+--- fixed by the repair (failed without, pass with):
+✖ a forged other-root path is quarantined, and a persist from another root does not re-stamp the record
+✖ a same-root record with a forged path is quarantined with a reason and does not block
+✖ an unparseable record is quarantined and blocks only when it names this mission
+✖ concurrent integration-run persists of the same record never ENOENT
+✖ concurrent persists of the same candidate record never ENOENT and leave valid JSON
+✖ concurrent promotion and cleanup persists of the same record never ENOENT
+✖ git administration lock metadata refuses an existing symlink directory
+✖ records from a different root or legacy records validate by content integrity, not path recomputation
+✖ records written from the main checkout are not reported as corrupt from a linked worktree
+✖ worktree cleanup refuses to remove a path outside the worktree namespace
+--- regressions (fail only with the repair):
+(none)
+--- still failing with the repair (pre-existing at that base, unrelated to the common directory):
+✖ concurrent create/remove keeps the primary checkout intact
+✖ createWorktree crash-recovery never removes the primary checkout
+✖ GitRepo remote-ref primitives
+✖ removeWorktree recovers an orphaned worktree whose git metadata is gone
+✖ the new worktree lock namespace still refuses an already-held legacy lock
+✖ throws with the remote's stderr when a push is refused while the ref is unchanged
+✖ worktree lock publication cannot make concurrent safe git reject the repository
+### At the tip 45d42acb the same five repaired-area files pass WITHOUT the repair (upstream #582): see 07-control-tip-without-repair.txt

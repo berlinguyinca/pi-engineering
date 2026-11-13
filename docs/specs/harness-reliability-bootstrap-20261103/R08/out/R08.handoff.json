@@ -1,0 +1,43 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "R08",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "e151794ff1fc21ee9ab77567f330817f802ce0e3",
+  "resultSha": "12d47c2f5658f4e154474f4d235c397b43af65b3",
+  "taskAuthorityHash": "sha256:9b2c4477263be1ee4f8a1d461063709da1b5e3e5fae710839e9cdb8ea10dd5fb",
+  "changedFiles": [
+    "src/incidents/resolutionEvidence.ts",
+    "test/unit/incident-resolution-evidence.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R08/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/incident-resolution-evidence.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/R08/logs/01-unit.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/logs/01-unit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/R08/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "R09",
+  "nextBaseSha": "12d47c2f5658f4e154474f4d235c397b43af65b3",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-06T04:30:00Z",
+    "notes": "Worker pane r08 (pane w8:pV, metabolomics/qwen3.8-flash_next) on base e151794f, isolated-change mode, first pass, ~5 min. Exactly the two declared new files (git show --name-only HEAD), 42 + 56 = 98 changed lines against a 100 cap. Conductor verified independently at 12d47c2f: npm run typecheck exit 0; test/unit/incident-resolution-evidence.test.ts 6 pass / 0 fail; per-suite regressions recovery-outcome 6/6 (the existing durable verdict's own suite), recovery-optin 6/6, and the whole evidence family error-evidence-bundle plus incident-resolution-evidence 42/42 - note the brief named that suite test/unit/evidence-bundle.test.ts, which does not exist; the real file is test/unit/error-evidence-bundle.test.ts. Conductor checks on purity: the only import is a type-only RecoveryOutcome from ./recoveryOutcome.ts (never called, never modified), and no writeFile, appendFile, console, Date.now, Math.random, process.env, setTimeout or fetch appears anywhere. Rules verified in source in the required order: failing reproduction first, so reproduction null, exitCode 0 or a blank command yields unresolved with failing-reproduction missing even when identities, passing check, scope and recovered status are all valid; identity by shape only via RESOLUTION_SHA /^sha256:[0-9a-f]{64}$/ (63 hex and 64 uppercase hex both fail, and the verdict never echoes caller text - the evidenceBundle FAILURE_ID posture); scope by prefix with empty allowedPaths rejecting and the src/a.ts.bak prefix-extension rejected; absent or unknown post-fix status stays unknown; unresolved/suppressed stays unresolved; recovered yields recovered_temporarily with temporaryBecause postFixStatus.recovered:completion-record-not-removed-cause, and retryCount appears only inside reason (retryCount=... ), never raising the status - proven over a 0..500 loop; promotion to root_cause_resolved requires sameCheckSequencePassed true, and resolved === (status === root_cause_resolved) is asserted over the whole status table. Six properties were required as six it() blocks and delivered as six labelled criterion blocks."
+  },
+  "handoffHash": "sha256:c0a7d0683409f56cb796ef9956ba3e4300216f6b09ca24461af400716603dd51"
+}

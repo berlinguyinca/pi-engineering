@@ -1,0 +1,44 @@
+=== X11 log 01 ===
+$ python3 -c "import json;d=json.load(open('docs/specs/harness-reliability-bootstrap-20261103/X08/out/X08.handoff.json'));print({k:d[k] for k in ['baseSha','resultSha','nextBaseSha','nextTaskId']})"
+{'baseSha': '45d42acb70fc2fcac76425d18eb1d651b0e0a9ba', 'resultSha': '9f064450', 'nextBaseSha': None, 'nextTaskId': None}
+
+$ python3 -c "import json;s=json.load(open('docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json'));print({k:s['properties'][k] for k in ('baseSha','resultSha','nextBaseSha')})"
+{'baseSha': {'type': 'string'}, 'resultSha': {'type': 'string'}, 'nextBaseSha': {'type': ['string', 'null']}}
+
+$ git rev-parse --short 9f0644507e51baea9f6d0a75fc838e046c4143b7
+9f064450
+
+THE DEFECT
+  X08/out/X08.handoff.json carries resultSha as eight characters. That is git's own short form for the commit --
+  `git rev-parse --short` prints exactly that string, which is why nobody looking at it saw anything odd. It is a
+  pointer, not an id: a reader has to expand it, the expansion is a guess about how many characters git needed
+  today, and nothing pins it to the commit that was meant.
+
+WHY IT GOT THROUGH
+  The schema permits it. templates/handoff.schema.json types baseSha and resultSha as {"type": "string"} (and
+  nextBaseSha as {"type": ["string","null"]}), with no pattern and no length. writeHandoff validates against that
+  schema, so a pointer of any shape is accepted, hashed into handoffHash, and committed. The canonical chain gate
+  then did the only thing it could: it read the value as malformed, tried to resolve it as an id, failed, and
+  reported UNCOVERED -- which is why X10's lineage scan was red and why X10's record carries this as an unclosed
+  caveat rather than pretending the chain was clean.
+
+MECHANISM -- AND A CLAIM OF MINE THAT WAS WRONG
+  X10's record and logs say the value came from `git rev-parse --path-format=absolute --git-common-dir` under
+  GIT_COMMON_DIR. That is not what produced it, and X10's record is byte-committed and hash-bound so it stays as
+  it is; this log is the correction, and X10/out-chain carries it forward.
+  The generator that wrote X08/out (/tmp/gen-x08.mts, line 41, quoted above) carried the value as a hand-written
+  literal: `resultSha: "9f064450",`. A short id, typed where a full id belonged, through a schema that could not
+  notice. /tmp is ephemeral, so the durable evidence is the three probes at the top of this file: the record's
+  value, the schema's plain string types, and the fact that the value is byte-identical to git's own --short form.
+  The consequence for the harness is the same either way, and it is the reason X11 fixes the gate rather than the
+  generator: an emit path whose schema says "string" will accept whatever shape the writer happens to have
+  produced, so the verification has to live downstream, in a gate that re-reads the record from git every run.
+
+WHAT X11 CHANGED
+  AUDIT/lineage-scan.mjs gained a third declaration kind, `abbreviated` with `rule: uniqueAbbreviation`, whose
+  acceptance conditions are proofs (see the header of that file and log 02 for the mutations that each one refuses).
+  AUDIT/lineage-superseded.json gained entry 30: X08/out resultSha, defect malformed, replacement
+  9f0644507e51baea9f6d0a75fc838e046c4143b7, annotated by 5403bf30 (X10's evidence commit -- a later commit than the
+  defect, which is a requirement now, not a convention).
+  The record itself is untouched. Its handoffHash covers the abbreviation exactly as it always did; the
+  declaration says what the abbreviation denotes, and the gate proves that what it denotes is one commit.

@@ -82,7 +82,14 @@ test("terminal owner: worktree reclaimed, uncommitted work preserved on its bran
     const branch = "pi-eng-candidate-MSN-done01-repo-1-0-EXC-a";
     const wt = await createOwned(repo, head, branch);
     process.env.PI_RUST_CACHE_DIR = join(fixture.root, "rust-cache");
-    const target = (await rustTargetDir(wt.path))!;
+    const target = await rustTargetDir(wt.path);
+    // Not `!`: when the cache is off this returns null by design, and the assertion that
+    // used to sit here was a `join(target, …)` TypeError about a null "path" argument —
+    // which is how a host exporting CARGO_TARGET_DIR showed up as a broken janitor test.
+    assert.ok(
+      target,
+      "the Rust cache is off here (CARGO_TARGET_DIR set, or PI_RUST_CACHE=0), so this fixture cannot place a target dir",
+    );
     await mkdir(join(target, "debug"), { recursive: true });
     await writeFile(join(wt.path, "src", "unsaved.js"), "export const unsaved = 1;\n");
     await writeFile(join(wt.path, "src", "add.js"), "export const add = (a, b) => a + b;\n");
@@ -1259,6 +1266,12 @@ test("an interrupted rebase --autostash keeps the worktree: the autostashed edit
     const wt = await createOwned(repo, await repo.headCommit(), CAND("q7aaaa"));
     await commitFile(wt.path, "c1.txt", "one\n");
     await writeFile(join(wt.path, "src/add.js"), "UNCOMMITTED PRECIOUS EDIT\n");
+    const breakEditor = join(dirname(wt.path), "pi-break-sequence.sh");
+    await writeFile(
+      breakEditor,
+      '#!/bin/sh\n{ printf "break\\n"; cat "$1"; } > "$1.pi-todo" && mv "$1.pi-todo" "$1"\n',
+    );
+    await chmod(breakEditor, 0o755);
     await exec(
       "git",
       [
@@ -1276,7 +1289,11 @@ test("an interrupted rebase --autostash keeps the worktree: the autostashed edit
         "--autostash",
         "HEAD~1",
       ],
-      { env: { ...process.env, GIT_SEQUENCE_EDITOR: "sed -i '1i break'" } },
+      // A sequence editor that prepends `break`. `sed -i '1i break'` is GNU syntax:
+      // BSD sed (macOS) demands an argument to -i, so the editor exits non-zero and
+      // the rebase never starts — the test then fails on the setup, not on the
+      // janitor. A two-line script is portable and says what it does.
+      { env: { ...process.env, GIT_SEQUENCE_EDITOR: breakEditor } },
     );
     const gd = await gitDirOf(wt.path);
     const stash = (await readFile(join(gd, "rebase-merge", "autostash"), "utf8")).trim();

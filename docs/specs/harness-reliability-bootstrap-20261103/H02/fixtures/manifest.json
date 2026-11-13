@@ -1,0 +1,44 @@
+{
+ "taskId": "H02",
+ "baseSha": "debcfeef2ed712bc75e3b702033a005e15646f89",
+ "repoId": "herdr",
+ "objective": "Pure model shape for host/session/incident/event/timeline/drift decisions; no API or rendering changes. Evidence: Input validation and stable filtering tested. Evidence: Input validation and stable filtering tested",
+ "allowPaths": [
+  "packages/diagnostics-model.js",
+  "packages/diagnostics-model.test.js"
+ ],
+ "denyPaths": [
+  "herdr_engineering/**",
+  "tests/**",
+  "deploy/**",
+  "pyproject.toml",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "AGENTS.md",
+  "README.md"
+ ],
+ "commands": [
+  {
+   "id": "diff-check",
+   "argv": [
+    "git",
+    "diff",
+    "--check"
+   ],
+   "timeoutMs": 120000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 120
+ },
+ "parentHandoffHash": "sha256:bc58c0b94e171b90ec0b2ac9597412df35e4a56e46d77fd43ecee42d41d4a889",
+ "expectedOutputs": [
+  "packages/diagnostics-model.js",
+  "packages/diagnostics-model.test.js"
+ ],
+ "mode": "herdr-ui"
+}

@@ -452,6 +452,56 @@ test("a state dir too deep for sun_path still gets a working control socket (#58
   await assert.rejects(stat(dirname(server.socketPath)));
 });
 
+// A Slurm exec host at UC Davis inherits XDG_RUNTIME_DIR=/run/user/<uid> from pam_systemd
+// while the directory itself is never created — there is no user slice. `shortSocketRoot`
+// used to validate that value's *shape* (absolute, no NUL, short enough) and trust it, so
+// the mkdir of the hashed directory failed ENOENT and the control socket could not start:
+// the one host class this fallback exists to survive. Shape is not existence, and these
+// two tests are the difference — without them the suite passes on macOS purely because
+// XDG_RUNTIME_DIR happens to be unset there.
+async function startsOverAnUnusableRuntimeDir(bad: string): Promise<string> {
+  const dir = await root();
+  const control = join(dir, ...Array.from({ length: 3 }, () => "a-deeply-nested-state-directory-segment"));
+  await mkdir(dirname(control), { recursive: true });
+  const saved = process.env.XDG_RUNTIME_DIR;
+  process.env.XDG_RUNTIME_DIR = bad;
+  try {
+    const server = await startSessionControl({ rootDir: control, cwd: dir, sessionId: "runtime-dir" });
+    try {
+      assert.ok(Buffer.byteLength(server.socketPath) <= SOCKET_PATH_LIMIT);
+      assert.ok(
+        !server.socketPath.startsWith(`${bad}/`),
+        `the socket went into the unusable runtime dir: ${server.socketPath}`,
+      );
+      assert.match(server.socketPath, /pi-sc-hash-[0-9a-f]{12}/);
+      const reply = await requestSession(server.descriptor, { version: 1, op: "ping", nonce: "rd-1" });
+      assert.ok(reply.ok);
+      assert.equal(reply.data.nonce, "rd-1");
+      return server.socketPath;
+    } finally {
+      await server.close();
+    }
+  } finally {
+    if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = saved;
+  }
+}
+
+test("an XDG_RUNTIME_DIR that is set but does not exist does not take the socket down (#652)", async () => {
+  // The real shape: an absolute, plausible, short path with nothing behind it.
+  const missing = `/run/user/${process.getuid?.() ?? 1000}-not-created-here`;
+  await assert.rejects(stat(missing));
+  const socket = await startsOverAnUnusableRuntimeDir(missing);
+  assert.ok(socket.startsWith("/tmp/"), `expected the /tmp fallback, got ${socket}`);
+});
+
+test("an XDG_RUNTIME_DIR that is not a directory falls back too (#652)", async () => {
+  const dir = await root();
+  const file = join(dir, "runtime");
+  await writeFile(file, "not a directory");
+  await startsOverAnUnusableRuntimeDir(file);
+});
+
 test("when no socket path can fit, the error names the limit, the length and the setting (#583)", () => {
   const message = new ControlSocketLimitError(join("/run/user/1000", "x".repeat(120)), "/very/deep/state/dir").message;
   assert.match(message, /is \d+ bytes/);

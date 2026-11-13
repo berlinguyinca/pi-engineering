@@ -1,0 +1,52 @@
+Post-commit gates, run at 59b6620c -- the commit that carries X13's record, manifest, logs and X12/out-chain.
+HEAD=59b6620ca12e94d75c7899fcd560ef5f75cd6592
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+exit=0
+records=103 canonical=67 hash_ok=103 field_ok=103
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=61 offenders=2
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+superseded-generation links (informational)=21
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 6
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+evidence dangling=0 untracked=12
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/01-decision-and-scope.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/02-write-scope.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/03-unsafe-fixes.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/04-evidence-hash-independence.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/05-test-regression-recovery-optin.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/06-suite-at-sweep.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/06a-suite-run1-canonical-at-sweep.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/06b-suite-run2-canonical-at-sweep.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/07-pristine-baseline-at-e26541c0.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/07a-suite-pristine-at-e26541c0.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X13/logs/08-typecheck-and-lint-green.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X13/out/X13.handoff.json (record itself)
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+exit=0
+ref=HEAD records=106 fields=3
+pointers healthy=270 nullDeclared=18 broken=30 unparseableRecords=0
+healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 0
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+exit=0
+ref=HEAD records=106
+hashes recomputed ok=106 mismatch=0 noHashField=0 unparseable=0
+declared evidence paths=661 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree
+
+$ npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/citation-anchor-check.mjs
+exit=2
+usage: citation-anchor-check.mjs <git-ref> <file.md> [band] [--json]
+

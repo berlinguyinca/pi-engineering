@@ -1,5 +1,6 @@
 import { realpath } from "node:fs/promises";
 import { connect } from "node:net";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai/compat";
 import {
@@ -71,6 +72,7 @@ import { guardFeedFor } from "../guard/streamText.ts";
 import {
   type BackoffConfig,
   TransientError,
+  type TransientErrorCategory,
   type TransientTelemetry,
   backoffDelayMs,
   classifyError,
@@ -81,6 +83,9 @@ import {
   resolveTransientRetryConfig,
   withTransientRetry,
 } from "../guard/transient.ts";
+import type { ErrorOccurrence } from "../incidents/errorEvent.ts";
+import { normalizeError } from "../incidents/errorNormalize.ts";
+import { sanitizeForPersistence } from "../incidents/errorSanitize.ts";
 import { classifyInferenceFailure } from "../inference/failureClassifier.ts";
 import { currentInferenceInvocation, runWithInferenceInvocation } from "../inference/inferenceContext.ts";
 import { ExecutedActionTracker } from "../inference/recovery.ts";
@@ -144,7 +149,13 @@ import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
 import { ToolLoopDetector, type ToolLoopTrip, toolResultText } from "./toolLoopGuard.ts";
-import { TranscriptWriter, transcriptPath, transcriptsEnabled } from "./transcriptStore.ts";
+import {
+  TranscriptWriter,
+  type TurnExposure,
+  transcriptPath,
+  transcriptsEnabled,
+  turnExposure,
+} from "./transcriptStore.ts";
 import {
   DEFAULT_BUDGET_NOTICE_EVERY,
   NUDGE_MESSAGE,
@@ -302,6 +313,8 @@ export interface PiWorkerExecutorOptions {
    * `DEFAULT_ROLLOUT_PHASE` (full enforcement + observability).
    */
   rolloutPhase?: import("../aps/rollout.ts").ApsRolloutPhase;
+  /** E06 capture: opens the E05 occurrence sink for one worker session (a writer binds ONE stream, hence a factory). Absent (default) = no capture at all. */
+  workerErrorWriter?: (req: WorkerRequest) => ErrorOccurrenceWriter | undefined;
 }
 
 /**
@@ -340,6 +353,8 @@ export class PiWorkerExecutor implements WorkerExecutor {
   private readonly escalation: import("../aps/escalation.ts").EscalationOptions | false | undefined;
   /** APS rollout gate (Phase 6). */
   private readonly rollout: import("../aps/rollout.ts").ApsRollout;
+  /** E06 capture-sink factory (`undefined` = capture not armed). */
+  private readonly workerErrorWriter: ((req: WorkerRequest) => ErrorOccurrenceWriter | undefined) | undefined;
   /** APS observability accumulator (Phase 6). */
   readonly observability: import("../aps/observability.ts").ApsObservability = new ApsObservability();
   private modelRuntime: ModelRuntime | undefined;
@@ -385,6 +400,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
     this.loopPrevention = opts.loopPrevention;
     this.escalation = opts.escalation;
     this.rollout = resolveRollout(opts.rolloutPhase ?? DEFAULT_ROLLOUT_PHASE);
+    this.workerErrorWriter = opts.workerErrorWriter;
     this.requestBodyBudget = opts.requestBodyBudget ?? resolveRequestBodyBudgetConfig();
     this.thinkingPolicy = opts.thinkingPolicy ?? resolveThinkingOffConfig();
     this.capabilityRegistry = opts.capabilityRegistry;
@@ -1031,7 +1047,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
               // The raised allowance of a length-stop retry rides the invocation.
               // While gateway holds are enabled this worker owns the wait on an
               // admission refusal: the in-call resilient ladder settles instead of
-              // replaying it too (RETRY-OWNERS.md), so attempts are not multiplied.
+              // replaying it too (RETRY_OWNERS.md), so attempts are not multiplied.
               const owned = inv && gatewayConfig.enabled;
               // withTransientRetry (this loop) owns 5xx / network / timeout replays, so
               // the ladder defers those too, whether or not gateway holds are enabled.
@@ -1453,9 +1469,15 @@ export class PiWorkerExecutor implements WorkerExecutor {
           !gateway &&
           lastAssistantError !== undefined &&
           classifyError(lastAssistantError).category === "model_unavailable";
+        // A verdict the gateway already gave outranks the wall clock (#457): the run
+        // kept talking to a model that had refused it, and the timer that finally cut
+        // it off is not the failure. Reporting `timeout` here sends the mission down
+        // the resilience path instead of #76's model takeover.
+        const verdict = lastAssistantError === undefined ? undefined : terminalAssistantVerdict(lastAssistantError);
+        const timed = timedOut && verdict === undefined;
         const reason = budgetExhausted
           ? "Worker exceeded the hard context-token budget."
-          : timedOut
+          : timed
             ? "Worker timed out."
             : truncated
               ? `Worker reply truncated at the output limit${lengthRetried ? " (again after a retry with a larger allowance)" : ""}; no worker_result. ${lastAssistantError}`
@@ -1464,7 +1486,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
                 : `Worker returned no worker_result${lengthRetried ? " (the retry after a reply cut at the output limit failed)" : ""}.${lastAssistantError ? ` ${lastAssistantError}` : ""}`;
         const error = budgetExhausted
           ? "budget-exhausted"
-          : timedOut
+          : timed
             ? "timeout"
             : truncated
               ? "truncated"
@@ -1691,6 +1713,8 @@ ${recovery.recoveryPrompt}`;
     let toolCalls = 0;
     let budgetExhausted = false;
     let timedOut = false;
+    // A terminal assistant-message verdict (see terminalAssistantVerdict) ended the turn.
+    let terminalVerdict = false;
     let guardAborted = false;
     let guardReason: GuardAbortReason | undefined;
     let guardDiagnostics: Record<string, unknown> = {};
@@ -1820,6 +1844,9 @@ ${recovery.recoveryPrompt}`;
       }
     }
     let turnToolErrors: string[] = [];
+    // What the model was offered this turn, snapshotted when the turn starts
+    // (the request is built from it) and logged with the turn's record.
+    let turnExposureSnapshot: TurnExposure | undefined;
     const unsubscribe = session.subscribe((event) => {
       armInactivity();
       // Every request is counted as it ends, including a reply Pi later drops.
@@ -1859,6 +1886,8 @@ ${recovery.recoveryPrompt}`;
             isError: Boolean(t.isError),
             errorCategory: category,
           });
+        } else if (t.type === "turn_start") {
+          turnExposureSnapshot = turnExposure(session.systemPrompt, session.getActiveToolNames());
         } else if (t.type === "turn_end") {
           const m = t.message ?? {};
           const toolErrorCategory = turnToolErrors[0] ?? "none";
@@ -1869,7 +1898,9 @@ ${recovery.recoveryPrompt}`;
             stopReason: m.stopReason,
             toolErrorCategory,
             tokens: m.usage?.totalTokens,
+            ...turnExposureSnapshot,
           });
+          turnExposureSnapshot = undefined;
           emitWorkerActivity(req, {
             kind: "state",
             summary: `Turn ended: stop=${m.stopReason ?? "unknown"} tool_error=${toolErrorCategory}`,
@@ -1988,6 +2019,10 @@ ${recovery.recoveryPrompt}`;
         // limit from a degeneration.
         if (msg.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
           assistantError = msg.errorMessage;
+          if (terminalAssistantVerdict(msg.errorMessage) !== undefined) {
+            terminalVerdict = true;
+            void session.abort();
+          }
         }
         // Cut at the output limit, whatever partial text it carries: not a result.
         // Scoped to the final turn: a later turn that ends normally clears it.
@@ -2152,10 +2187,14 @@ ${recovery.recoveryPrompt}`;
         !timedOut &&
         !ownerAborted &&
         !stalled &&
+        !terminalVerdict &&
         !unknownToolLoop &&
         !toolLoop
       ) {
         promptError = err;
+        // E06: the single capture seam — this audited terminal failure path and no
+        // other. Fire-and-forget and unthrowable, so the outcome is untouched.
+        void recordWorkerFailure(this.workerErrorWriter?.(req), workerFailureContext(req, model, attempt), err);
       }
     } finally {
       if (timer) clearTimeout(timer);
@@ -2271,6 +2310,12 @@ ${recovery.recoveryPrompt}`;
       sessionId: req.sessionId,
       runId: req.runId,
       workItemId: req.workItemId,
+      // Live drift watch: only active when the operator set a contract AND turned the
+      // switch on affirmatively; signals are evidence, never an intervention.
+      drift: req.driftWatch,
+      onDrift: (signal) => {
+        if (this.rollout.observability) this.observability.recordDrift(signal);
+      },
       model: { provider: model.provider, id: model.id },
       maxContextTokens: req.maxContextTokens,
       rootPrefix: req.cwd,
@@ -2563,4 +2608,154 @@ function durableRecoveryContext(req: WorkerRequest): string | undefined {
     `artifactHashes=${recovery.artifactHashes.join(",")}`,
   ].join("\n");
   return durable;
+}
+
+// E06 — capture at the ONE terminal worker-failure seam: `runSingleAttempt`'s final catch ("Capture the error"), where a provider/transport or tool
+// failure ends the attempt. Pure builder + swallowing emitter over E03's table, E04's sanitizer and E05's writer; no retry, abort or telemetry change.
+export interface WorkerFailureContext {
+  // what the record must attribute; `timestamp` is injected so the builder stays clock-free (E03 owns stamps)
+  sessionId: string;
+  role: string;
+  model: string | null;
+  quantization: string | null;
+  runId: string | null;
+  taskId: string | null;
+  host?: string;
+  runtime?: string;
+  timestamp?: string;
+  toolName?: string | null;
+  toolError?: unknown;
+  correlationIds?: string[];
+}
+export interface ErrorOccurrenceWriter {
+  record(input: unknown): Promise<unknown>;
+} // E05's writer, seen through the ONE method capture needs
+const WORKER_FAILURE_RUNTIME = "pi-engineering-runtime"; // E02's `runtime`: which runtime failed, not which model answered
+const evidenceOf = (value: unknown): Record<string, any> =>
+  (value !== null && typeof value === "object" ? value : { message: String(value) }) as Record<string, any>;
+const statusOf = (e: Record<string, any>): unknown =>
+  e.httpStatus ??
+  e.status ??
+  e.statusCode ??
+  evidenceOf(e.cause).httpStatus ??
+  evidenceOf(e.cause).status ??
+  evidenceOf(e.cause).statusCode;
+/** Identity of the attempt that just failed; quantization only when the model id itself names it. */
+export function workerFailureContext(req: WorkerRequest, model: Model<any>, attempt: number): WorkerFailureContext {
+  const ids = [
+    ...(req.missionId ? [`mission:${req.missionId}`] : []),
+    ...(req.runId ? [`run:${req.runId}`] : []),
+    ...(req.workItemId ? [`task:${req.workItemId}`] : []),
+  ];
+  return {
+    sessionId: req.sessionId ?? `${req.role}-${attempt}`,
+    role: req.role,
+    model: `${model.provider}/${model.id}`,
+    quantization: /[-_]quant[-_]([a-z0-9._]+)/i.exec(model.id)?.[1] ?? null,
+    runId: req.runId ?? null,
+    taskId: req.workItemId ?? null,
+    host: hostname(),
+    correlationIds: ids,
+  };
+}
+/**
+ * The pure half of E06: identity + the raw failure → what E04 would persist, through E03's table and E04's sanitizer, so the result
+ * satisfies E02 by construction (or `null` when E04 refuses it). E03 names the layer a failure genuinely belongs to (a 503 is `gateway`,
+ * a dropped socket `host`); a tool exception is this seam's own layer, `worker`. The role has no E02 field, so it rides in the summary. */
+export function workerFailureOccurrence(ctx: WorkerFailureContext, error: unknown): ErrorOccurrence | null {
+  const raw = ctx.toolError !== undefined && ctx.toolError !== null ? evidenceOf(ctx.toolError) : evidenceOf(error);
+  const tool =
+    ctx.toolName ?? (typeof raw.toolName === "string" ? raw.toolName : typeof raw.tool === "string" ? raw.tool : null);
+  const status = statusOf(raw);
+  const who = tool === null ? `${ctx.role} worker` : `${ctx.role} tool ${tool}`;
+  const input = {
+    message: `${who} failed: ${String(raw.message ?? raw.error ?? "")}`,
+    code: raw.code,
+    ...(status !== undefined && status !== null ? { httpStatus: status } : {}),
+  };
+  return sanitizeForPersistence(
+    normalizeError(input, {
+      timestamp: ctx.timestamp ?? new Date().toISOString(),
+      host: ctx.host ?? "",
+      sessionId: ctx.sessionId,
+      runtime: ctx.runtime ?? WORKER_FAILURE_RUNTIME,
+      correlationIds: ctx.correlationIds ?? [],
+      runId: ctx.runId,
+      taskId: ctx.taskId,
+      model: ctx.model,
+      quantization: ctx.quantization,
+      layer: tool === null ? undefined : "worker",
+    }),
+  );
+}
+/**
+ * The emitter: build, hand to E05, report whether the writer kept it (E05 answers `null` when E04 refuses). Every failure of the capture
+ * itself is swallowed — a broken writer, a refusal, a throw all end as `false` plus one notice on the EXISTING telemetry sink — because a
+ * capture must never change the outcome of the failure it records. */
+export async function recordWorkerFailure(
+  writer: ErrorOccurrenceWriter | undefined,
+  ctx: WorkerFailureContext,
+  error: unknown,
+): Promise<boolean> {
+  if (writer === undefined) return false; // capture unarmed: the default, and the behaviour of every run that does not ask for it
+  const swallow = (why: string): false => {
+    try {
+      emitTelemetry({
+        level: "warning",
+        key: "worker:failure-capture",
+        text: `worker failure capture ${why} (${ctx.role})`,
+      });
+    } catch {
+      /* reporting is best-effort too */
+    }
+    return false;
+  };
+  try {
+    const occurrence = workerFailureOccurrence(ctx, error);
+    if (occurrence === null) return swallow("found nothing attributable");
+    const kept = await writer.record(occurrence);
+    return kept ? true : swallow("was refused");
+  } catch {
+    return swallow("threw");
+  } // a capture's own failure ends as a value plus one notice, never an exception into the failure path
+}
+/**
+ * A 5xx is infrastructure whatever the keyword table made of the wording, and the retry
+ * ladder owns infrastructure: never let it be reported as a refusal.
+ */
+const SERVER_SHAPED = /\b5\d\d\b|service unavailable|bad gateway|gateway timeout|overloaded/i;
+
+/**
+ * The category of an assistant-message error that ends this run's turn, or undefined.
+ *
+ * A provider or gateway failure can arrive as a terminal assistant message instead of a
+ * throw. Some of those are worth another turn in the same session — a stream cut resumes,
+ * a transport drop retries, a gateway that quotes its own wait is held by the admission
+ * layer, a context overflow compacts once — but a verdict that says the request will not
+ * succeed as sent (a model that is not served, a bad key, a closed billing account) is
+ * not. The model answers the same way to every further turn, and the run sat talking to
+ * it until the inactivity window fired, which reported `timeout` and buried the verdict
+ * (#457). Under a whole-family outage (#433) that was per worker, per attempt, on a model
+ * the gateway had already refused — and `timeout` sends the mission down the resilience
+ * path instead of the model takeover (#76) that the refusal calls for.
+ *
+ * The categories here are exactly the ones the thrown path already treats as final; this
+ * only stops the assistant path from being more patient than the throw.
+ */
+export function terminalAssistantVerdict(text: string): TransientErrorCategory | undefined {
+  if (
+    parseGatewayWait({ text }) !== null ||
+    isTruncatedStream(text) ||
+    isTransportDrop(text) ||
+    isStalledStream(text) ||
+    isTruncatedReply(text) ||
+    isCutStreamError(text)
+  )
+    return undefined;
+  if (SERVER_SHAPED.test(text)) return undefined;
+  const class_ = classifyError(text);
+  if (class_.category === "model_unavailable") return class_.category;
+  // Context overflow has its own ladder (compact once, then fail structured).
+  if (class_.category === "context_overflow") return undefined;
+  return class_.retryable ? undefined : class_.category;
 }

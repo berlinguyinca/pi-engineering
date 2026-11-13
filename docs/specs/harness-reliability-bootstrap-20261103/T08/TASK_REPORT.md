@@ -1,0 +1,26 @@
+# T08 — Carry authority through context handoff — conductor report
+
+Task authority: sha256:750bde9fd7a6f9e9fc86beebe77a4d587934271d6a5da818a5469611a2ed55cb
+Plan delta: Preserve original contract hash and constraints through handoff while keeping transcript bounded; reject altered authority on resumed worker. Verify actual handoff schema first. Evidence: handoff with edited goal rejected; same goal with new summary accepted. (production 1 used of ≤2 / tests 1 / ≤100 lines / verify: typecheck; node --test test/unit/task-handoff-integrity.test.ts)
+Worker pane: t08 (pane w8:pG, metabolomics/qwen3.8-flash_next), base fbb1258e (~40 min).
+Result: 11131ece730d723c1e497d860c6185a717b8691f — parent fbb1258e7e69; 50 added in `src/plannerWorker/handoff.ts` and 49 in the new `test/unit/task-handoff-integrity.test.ts` = **99 changed lines** (99 insertions, 0 deletions).
+
+## Schema verified first, as the delta demanded
+`HandoffArtifact` (`src/plannerWorker/types.ts:153-174`) has no field for a contract hash, and `types.ts` is outside this unit's manifest allowlist — so the unit had to carry authority in a **separate sealed envelope created in `handoff.ts`** rather than by widening the artifact. `buildHandoff()` already clips `mission_summary` (1 500 chars), dependency summaries and `worker_outcome.diff` (24 000 chars) and never carries a reasoning transcript; that behaviour is untouched (the pre-existing `test/unit/planner-handoff-command.test.ts` still passes 3/3).
+
+## What the unit provides
+`sealHandoff(handoff, transcript?) → { handoff, authority }` where `HandoffAuthority` records `authority_hash` plus per-part `objective_sha256` / `constraints_sha256` / `acceptance_sha256` / `scope_sha256`, computed with **T01's `canonicalHash`** so a handoff hash is comparable to a task authority hash; `MAX_TRANSCRIPT_CHARS = 2000` bounds `transcript_excerpt` with `transcript_truncated` / `transcript_chars` recorded and the full transcript retained nowhere. `verifyHandoffAuthority(sealed, expected?)` recomputes and compares; `resumeHandoff(env, expected?)` additionally re-verifies the envelope against the handoff it carries, so rewriting a recorded hash is caught, and it **fails closed** when the expected authority hash is missing. The deliberate authority boundary: `mission_summary`, `decisions`, `architectural_context`, `dependency_results`, `correction` and `worker_outcome` are *not* authority-bearing, which is exactly what lets a resumed worker get a fresh summary without changing authority.
+
+## Conductor verification (logs/T08/, all against the unit commit)
+- `01-typecheck.txt` — `npm run typecheck` exit 0.
+- `02-unit-handoff-integrity.txt` — the task's own verify command: 5/5 pass 0 fail.
+- `03-unit-planner-handoff-command.txt` — **pre-existing** planner handoff test: 3/3 pass 0 fail, so `buildHandoff`/`renderHandoff` behaviour is unchanged.
+- `04-conductor-handoff-authority-probe.txt` — the plan's named pair, independently: **edited goal rejected** (`objective` rewritten → `ok: false`, reason `envelope altered: objective_sha256 …`), **same goal with a new summary accepted** (`mission_summary` replaced wholesale → `ok: true`, same `authority_hash`), plus rejected `constraints` (extra self-granted constraint), `acceptance` (dropped criterion) and `scope.allowed` (`src/plannerWorker/**` → `src/**`) edits each naming the part; envelope tampering (`authority_hash` and `constraints_sha256` rewrites) caught; missing / empty / non-string expected authority hash rejected fail-closed naming the recomputed hash; `null`, `{}`, `{handoff:1}` → `malformed envelope`; a 5 200-char transcript bounded to a 2 000-char excerpt with `transcript_truncated: true`, `transcript_chars: 5200`, and the tail absent from `renderHandoff`; a non-string transcript yielding `""` without throwing; sealing deterministic; and `buildHandoff` still clipping, `token_estimate > 0`, constraints/scope passed through.
+
+## Integration
+`git merge --ff-only feat/t08-handoff-authority` → HEAD `11131ece`; `git show --stat HEAD` lists exactly the two files, 99 insertions / 0 deletions. Handoff `T08/T08.handoff.json` (sha256:f928904f4c544d19dfaeeb8031446cd9465725c162d981772e87302189b77dca) recomputes and validates; next task T09@11131ece.
+
+## Residual risk / observations carried forward
+- **Nothing seals in production yet**: `executor.ts` builds handoffs with `buildHandoff()` and the role sessions read the rendered YAML; no caller invokes `sealHandoff`/`resumeHandoff`, so a resumed worker is still not presented with an authority hash to be rejected against. The predicate is ready and the natural consumer is the executor/session-resume path (outside this unit) — this joins the growing wiring debt (T03, T04/T05 broker inputs, T06 provenance, T07 alignment detector).
+- **Envelope travels outside the artifact**: because `HandoffArtifact` has no authority field (and `types.ts` was off-limits), a producer must carry `SealedHandoff` alongside; a consumer that only reads the YAML sees no authority. Adding an optional field to `HandoffArtifact` is the cleaner follow-up and needs its own unit that owns `src/plannerWorker/types.ts`.
+- **Transcript bounding is excerpt-only**: the excerpt is retained in the envelope (bounded, hashed length recorded), which is fine for provenance but must not be mistaken for a full transcript record.

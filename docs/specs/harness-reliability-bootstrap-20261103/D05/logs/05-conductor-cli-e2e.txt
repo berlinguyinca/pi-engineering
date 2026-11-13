@@ -1,0 +1,17 @@
+A default exit: 0
+A output: namespace=/var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/d05-cli-4I0P5E/events ⏎ read scannedStreams=3 scannedEvents=5 skipped=0/1/0 truncated=false refused=none ⏎ occurrences=0 clusters=0 recovered=0 unresolved=0 duplicateEvents=0 rejected=0
+B json exit: 0 | totals: "totals":{"occurrences":5,"clusters":4,"duplicateEvents":0,"rejected":0,"recovered":0,"unresolved":5}
+C filtered exit: 0
+unknown argument: --bogus
+--last must be a positive integer no greater than 5000
+usage: node --experimental-strip-types scripts/diagnose-errors.ts --namespace <dir> [--last <n>] [--all-sessions|--no-all-sessions] [--session <id>] [--model <id>] [--host <id>] [--json] [--export <path> [--force]] [--help]
+D bad args exit: 2 | unknown argument: --bogus ⏎ --last must be a positive integer no greater than 5000 ⏎ usage: node --experimental-strip-types scripts/diagnose-errors.ts --namespace <dir> [
+namespace refused (missing): /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/d05-cli-4I0P5E/nope
+E missing ns exit: 3 | namespace refused (missing): /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/d05-cli-4I0P
+F export ok exit: 0 | wrote: true
+refusing to overwrite existing file /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/d05-cli-4I0P5E/out.json; pass --force
+G export overwrite refused exit: 2
+refusing --export inside the namespace directory: /var/folders/m_/hg7g2z1s1tg_b_l04fzrrrtm0000gn/T/d05-cli-4I0P5E/events/leak.json
+H export inside namespace exit: 2 | leak created: false
+I namespace untouched: true
+J no raw prompt/key leak in json: true

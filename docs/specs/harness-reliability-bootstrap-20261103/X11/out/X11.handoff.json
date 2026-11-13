@@ -1,0 +1,49 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X11",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "5403bf30a4b9efef9930b36d96996a1398bc4c62",
+  "resultSha": "4797c26b9b5091a763d49aecc0009bb5f58953f6",
+  "taskAuthorityHash": "sha256:db4ee1764ab2238c5b988e0a99a34356edef2f3fbed8152d44630c51f342ed82",
+  "changedFiles": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs",
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-superseded.json"
+  ],
+  "commands": [
+    {
+      "command": "node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X11/logs/03-gate-before-after.txt"
+    },
+    {
+      "command": "bash docs/specs/harness-reliability-bootstrap-20261103/X11/fixtures/lineage-negative-tests.sh",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X11/logs/02-negative-tests.txt"
+    },
+    {
+      "command": "node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X11/logs/03-gate-before-after.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X11/logs/01-defect-found-and-corrected.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X11/logs/02-negative-tests.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X11/logs/03-gate-before-after.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X11/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X11/fixtures/lineage-negative-tests.sh",
+    "docs/specs/harness-reliability-bootstrap-20261103/X10/out-chain/X10.handoff.json"
+  ],
+  "nextTaskId": null,
+  "nextBaseSha": null,
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-07T05:00:23Z",
+    "notes": "The unit the measurement forced, one step downstream of the code. X10's chain links resolved and X10's lineage scan was made to exit 0 -- then the record behind the link was read, and X08/out carries resultSha as \"9f064450\" -- eight characters. A git short id, the exact output of `git rev-parse --short 9f0644507e51…`, sitting where a commit id belongs. The pointer resolves by prefix, so nothing broke; it just cannot be verified by anyone who does not already hold the object and guess the abbreviation correctly.\n\nWhy the harness let it through, which is the part worth fixing. templates/handoff.schema.json types baseSha and resultSha as {\"type\": \"string\"} and nextBaseSha as {\"type\": [\"string\",\"null\"]} -- no pattern, no length -- and writeHandoff validates against that schema, so whatever shape the generator hands it is hashed into handoffHash and committed. X08's generator handed it an abbreviation because a short id was typed where a full id belonged. Nothing in the emit path could tell.\n\nWhat X11 changed: not the record and not the writer, but the gate that reads the record afterwards. AUDIT/lineage-scan.mjs gained a third declaration kind, `abbreviated` with `rule: uniqueAbbreviation`, whose acceptance conditions are proofs: the manifest vocabulary must admit it; brokenSha must be 7-39 hex, match what the record holds at the audited sha, and differ from a full id only by the 32 characters it left off; the prefix must name exactly ONE commit reachable from a fetchable ref (enumerated with `git rev-list --all` and filtered -- `git rev-parse --disambiguate` looks purpose-built and is not: prefix \"9\" returned ONE object here while 161 reachable commits begin with \"9\", and prefix \"9f\" returned 97 objects, 17 of them commits); `replacement` must be spelled in full, be that commit, exist, be an ancestor of the audited ref, and be carried by a fetchable ref -- the same three tests a `superseded` replacement passes; and `annotatedBy` must resolve, must not be the commit whose pointer it declares, and must not be dated before that commit. A record cannot vouch for itself at the moment its pointer is written wrong.\n\nProof that the new kind can still say no -- X11/fixtures/lineage-negative-tests.sh, run in a disposable detached worktree of HEAD that it creates and removes itself, asserting the scanner's own verdict and reason line for each mutation, each committed before it is measured because the scanner reads records with `git show <ref>:<path>`: entry removed -> UNCOVERED; entry disagreeing with the record -> STALE; a live but unrelated commit as the replacement -> \"9f064450 names 9f0644507e51, not this replacement\"; the replacement left abbreviated -> refused; an abbreviation too short to be one -> refused; a 7-hex prefix naming no commit -> \"denotes 0 reachable commits, not one\"; an entry parked on a pointer that is healthy -> DEFECT_GONE; an invented kind -> refused; annotatedBy equal to the defective commit -> refused; annotatedBy dated before the defect -> refused. Baseline plus ten mutations, 11 PASS / 0 FAIL. The `>1 commit` side of the uniqueness predicate cannot be produced in this repository and the reason is measured rather than assumed: `git rev-list --all | cut -c1-$L | sort | uniq -d` is empty for every L from 7 to 12, so no abbreviation of length 7+ is ambiguous here; the reachable side of the predicate is `named.length === 0`, and it fails closed.\n\nManifest churn, because it is a real cost and it is mine to report: the first attempt re-serialised AUDIT/lineage-superseded.json with sorted keys and measured 465 changed lines for a one-entry change -- 406 of the file's 408 lines differ under re-serialisation with no content change at all. The manifest is hand-maintained in X04's field order; canonical sorted-key serialisation is the discipline the handoff RECORDS observe because handoffHash hashes them, not this file. Keeping the layout, the declaration is 20 insertions and 4 deletions, and the whole unit is 67 insertions and 8 deletions across two files -- inside its own ceiling, no production file and no test file touched.\n\nResidual, unclosed: the writer can still produce this defect. `templates/handoff.schema.json` still types the three commit pointers as plain strings, so `writeHandoff` will keep accepting any shape. The gate now catches it on every run, and X11 declares the one instance the series produced, but the schema-level pattern (`^([0-9a-f]{40}|null)$` for baseSha/resultSha and the union for nextBaseSha) is the change that would stop it being written at all -- that is a contract change to the handoff protocol, out of scope for an audit-tooling unit, and it belongs to the operator.\n\nSecond residual, carried unchanged from X10 and unresolved: `test/integration/worker-budget-build-hint.test.ts` hangs under concurrency on this branch (three reproductions, X10/logs/01) and passes in isolation and at origin/main's tip; and `biome check src cmd` is red on the branch with 44 findings / 14 files, all in files this branch wrote, green at origin/main. Neither is in X11's path; neither is closed.\n\nEVIDENCE HASHES (sha256, in the order of `evidence` above):\n  sha256:a0031835aae65c412550429813ce8f5a969c258c947eee7fe40988ee7e5864e8  docs/specs/harness-reliability-bootstrap-20261103/X11/logs/01-defect-found-and-corrected.txt\n  sha256:4b3879c79751bab45bc2c16871ee4c43ed64f23db0740573ff95f79974bcaad5  docs/specs/harness-reliability-bootstrap-20261103/X11/logs/02-negative-tests.txt\n  sha256:4f70fa6aa9b21c8fc50a68c10ed4577f015987acb5aa717f3343b3ca9d140055  docs/specs/harness-reliability-bootstrap-20261103/X11/logs/03-gate-before-after.txt\n  sha256:a3130e5390abb543f639c8ca99425f21b2f2f4b6fb0d9cb07f4bf2af2e4fa2e2  docs/specs/harness-reliability-bootstrap-20261103/X11/fixtures/manifest.json\n  sha256:95a69677e0e8c47e6741725d447ec59abba95cefe69692d69795f2c7cbe7602c  docs/specs/harness-reliability-bootstrap-20261103/X11/fixtures/lineage-negative-tests.sh\n  sha256:1a03bc47a8fc8f69eb40c187d390614bbcf98d05e82a6730f07d8bd9a2fab139  docs/specs/harness-reliability-bootstrap-20261103/X10/out-chain/X10.handoff.json\n\nCEILING: 67 insertions / 8 deletions across two audit-tooling files (AUDIT/lineage-scan.mjs, AUDIT/lineage-superseded.json); 0 production files, 0 test files -- inside the isolated-change ceiling of 100 lines / 2+2 files with no deviation declared. Measured: `git diff --shortstat 5403bf30 4797c26b`."
+  },
+  "handoffHash": "sha256:49d60217910b93d502d8b1f8e1a41c1a2ae4a02a414f1a799d7a83713c4a18e0"
+}

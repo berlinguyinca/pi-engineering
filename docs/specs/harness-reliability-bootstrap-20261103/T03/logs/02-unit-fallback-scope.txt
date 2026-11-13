@@ -1,0 +1,11 @@
+✔ every planner failure falls back to the clamped single task, carrying acceptance and budget (6.06575ms)
+✔ a mutating mission with no safe domain blocks with zero tasks and a visible reason (0.2175ms)
+✔ the non-mutating and planner-off paths are untouched (0.086584ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 247.903791

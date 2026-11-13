@@ -1,0 +1,41 @@
+✔ fetch: sends X-Host-Token, never follows redirects, writes 0600 cache in 0700 dir, posts applied (28.543458ms)
+✔ a failing applied POST does not fail the load (5.335ms)
+✔ cache fallback on 5xx, source is cache (6.177ms)
+✔ cache fallback on network error, source is cache (5.714042ms)
+✔ cache fallback on 3xx (not followed), source is cache (5.223459ms)
+✔ cache fallback on malformed body, source is cache (5.771917ms)
+✔ unreachable with no cache is unavailable (not revoked) and leaks nothing (1.046583ms)
+✔ a cache for another host_id is ignored (0.926334ms)
+✔ 401 deletes the cache and fails revoked=true without leaking the token or values (6.084292ms)
+✔ HTTP 404 with a cache falls back to the cache (source cache) and keeps it (5.831292ms)
+✔ HTTP 403 with a cache falls back to the cache (source cache) and keeps it (5.034416ms)
+✔ HTTP 404 without a cache is a clear, non-revoked failure (0.712375ms)
+✔ empty apiKey values send no X-API-Key header downstream (4.904042ms)
+✔ array / non-object values are rejected (falls back to cache or unavailable) (2.372458ms)
+✔ missing or incomplete host.json is unavailable and names no secret (0.720791ms)
+✔ get() returns fallbacks for missing section, key, null and undotted keys (4.922333ms)
+✔ apiKey: agent.api_key wins, then ingest.api_key, else null (19.863542ms)
+✔ timeout: a hung control plane falls back instead of hanging (33.145416ms)
+✔ links that stay inside the source tree are copied as links (7.39475ms)
+✔ a relative link escaping the source tree is refused (4.283875ms)
+✔ an absolute link to outside the source tree is refused (3.08475ms)
+✔ nested service dependencies are shared and importable (checkout) (5.317041ms)
+✔ nested service dependencies are shared and importable (Git tree) (99.604625ms)
+✔ sharing nested dependencies does not allow escaping service code links (4.758167ms)
+✔ nested dependency directory symlinks reuse their real target (2.723ms)
+✔ resource registry disposes timers, intervals and callbacks exactly once (0.963625ms)
+✔ resource registry disposes filesystem watchers (11.838958ms)
+✔ a failing disposer does not stop the rest and is reported (0.19475ms)
+✔ adding to a disposed registry disposes immediately (no late leak) (0.562667ms)
+✔ operation registry tracks operations per generation (1.70925ms)
+✔ waitForSafePoint resolves when blocking operations finish (22.700792ms)
+✔ waitForSafePoint is cancellable and times out (never wedges) (29.70675ms)
+✔ gate holds new work while closed and releases queued work in order (6.738125ms)
+ℹ tests 33
+ℹ suites 0
+ℹ pass 33
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 291.226708

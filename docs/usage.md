@@ -1316,6 +1316,30 @@ The same history edit backs the interactive `afterOutputRetry` extension
 - A cut before any tool call is unchanged: the attempt is retried in a fresh
   session without consuming an attempt.
 
+## Cache and cadence knobs (env)
+
+A default TTL is a guess about one machine's latency. When it is wrong, retune
+it in the environment instead of editing an installed release: a release under
+`~/.local/share/herdr-engineering/pi/releases/<rev>` is immutable by
+construction, and an in-place edit there makes `stage-release.py --describe`
+refuse the release ("Managed release is dirty"), so fleet status reports the
+host's installed revision as `MISSING` and the next rollout discards the edit.
+
+Set before starting the session; each is read once at startup, and a value that
+is unset, unparseable, or under its floor leaves the default in place — a typo
+never turns a cache into a stampede.
+
+| Variable | Default | Floor | What it gates |
+| --- | --- | --- | --- |
+| `PI_ENG_HEALTH_TTL_MS` | 30000 | 1000 | cached gateway model readiness (`src/models/health.ts`) |
+| `PI_ENG_WORKSPACE_TTL_MS` | 30000 | 1000 | panel workspace/branch cache (`src/panel/feeders/WorkspaceFeeder.ts`) |
+| `PI_ENG_STORAGE_PROBE_MS` | 30000 | 1000 | recovery probe cadence while paused on disk pressure (`src/resilience/storagePressure.ts`) |
+| `PI_ENG_SNAPSHOT_PUBLISH_MS` | 750 | 50 | minimum interval between internal live-view snapshot publications (`src/runtime/EngineeringRuntime.ts`) |
+
+The helper is `envTtlMs` (`src/core/envKnob.ts`); a knob's floor is chosen per
+cadence, because a snapshot interval and a health probe are not nervous at the
+same rate. Fractional input floors down.
+
 ## Verification commands
 
 `/verify` and the mission validators run the repository's own checks. npm

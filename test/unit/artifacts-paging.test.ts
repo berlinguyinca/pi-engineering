@@ -1,15 +1,59 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { link, mkdtemp, open, readFile, rename, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { fstatSync } from "node:fs";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 
+/** Map (dev, inode) -> path for every file under `root`, to name an open fd. */
+async function buildIdentityIndex(root: string): Promise<Map<string, string>> {
+  const index = new Map<string, string>();
+  let entries;
+  try {
+    entries = await readdir(root, { recursive: true, withFileTypes: true });
+  } catch {
+    return index; // the store root may be mid-construction
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const path = join(entry.parentPath ?? entry.path, entry.name);
+    try {
+      const info = await stat(path);
+      index.set(`${info.dev}:${info.ino}`, path);
+    } catch {
+      /* raced away */
+    }
+  }
+  return index;
+}
+
 // Count actual content IO, leaving metadata reads and filesystem validation real.
+//
+// Which open file is a content file is decided by (dev, inode), not by
+// `/proc/self/fd/<fd>`: procfs is Linux-only, and on macOS the helper threw
+// ENOENT inside the patched `FileHandle.readFile` — which the artifact store
+// reported as "artifact lock domain record is corrupt", because its own
+// JSON.parse guard swallowed the test's error. Indexing the store root by
+// identity works on every platform and survives the rename/symlink replacements
+// these tests perform, since an unknown identity re-walks the root.
 async function measureContentReads<T>(
   operation: () => Promise<T>,
+  rootDir: string,
   afterFirstContentRead?: () => Promise<void>,
 ): Promise<{ value: T; bytes: number }> {
   const handle = await open(import.meta.filename, "r");
@@ -19,15 +63,30 @@ async function measureContentReads<T>(
   const originalRead = prototype.read;
   let bytes = 0;
   let injected = false;
-  const isContent = (fd: number) => realpathSync(`/proc/self/fd/${fd}`).endsWith(".txt");
+  let index = await buildIdentityIndex(rootDir);
+  const isContent = async (fd: number): Promise<boolean> => {
+    let identity: string | undefined;
+    try {
+      const info = fstatSync(fd);
+      identity = `${info.dev}:${info.ino}`;
+    } catch {
+      return false; // a closed descriptor is not a content file
+    }
+    let path = index.get(identity);
+    if (path === undefined) {
+      index = await buildIdentityIndex(rootDir);
+      path = index.get(identity);
+    }
+    return path?.endsWith(".txt") ?? false;
+  };
   prototype.readFile = async function (...args: unknown[]) {
-    const content = isContent(this.fd);
+    const content = await isContent(this.fd);
     const result = await originalReadFile.apply(this, args);
     if (content) bytes += Buffer.byteLength(result);
     return result;
   };
   prototype.read = async function (...args: unknown[]) {
-    const content = isContent(this.fd);
+    const content = await isContent(this.fd);
     const result = await originalRead.apply(this, args);
     if (content) {
       bytes += result.bytesRead;
@@ -51,7 +110,7 @@ test("artifact reopen reads metadata without loading historical blobs", async ()
   try {
     const store = await ArtifactStore.create(dir);
     await store.put("logs", "large", "x".repeat(2 * 1024 * 1024), "large log");
-    const measured = await measureContentReads(() => ArtifactStore.create(dir));
+    const measured = await measureContentReads(() => ArtifactStore.create(dir), dir);
     assert.equal(measured.value.getByUri("artifact://logs/large")?.size, 2 * 1024 * 1024);
     assert.equal(measured.bytes, 0, "opening an intact store must not load artifact content");
   } finally {
@@ -66,7 +125,7 @@ test("artifact pages validate once then use bounded ranged IO for distant unicod
     const body = `${"a".repeat(65535)}😀é${"界😀".repeat(400_000)}`;
     await writer.put("logs", "unicode", body, "unicode log");
     const store = await ArtifactStore.create(dir);
-    const initial = await measureContentReads(() => store.readSlice("logs", "unicode", 65535, 1));
+    const initial = await measureContentReads(() => store.readSlice("logs", "unicode", 65535, 1), dir);
     assert.equal(initial.value?.content, body.slice(65535, 65536), "UTF-16 offsets may split surrogate pairs");
     const pages = await measureContentReads(async () => {
       for (const offset of [65536, 65537, 700_000, body.length - 100, body.length + 100]) {
@@ -74,7 +133,7 @@ test("artifact pages validate once then use bounded ranged IO for distant unicod
         assert.equal(page?.content, body.slice(offset, offset + 100));
         assert.equal(page?.nextOffset, offset + body.slice(offset, offset + 100).length);
       }
-    });
+    }, dir);
     assert.ok(pages.bytes < 1024 * 1024, `five cached pages read ${pages.bytes} bytes`);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -146,9 +205,9 @@ test("artifact page indexes evict old entries and revalidate changed metadata di
       await store.put("logs", `item-${index}`, body, "log");
       await store.readSlice("logs", `item-${index}`, 0, 1);
     }
-    const evicted = await measureContentReads(() => store.readSlice("logs", "item-0", 0, 1));
+    const evicted = await measureContentReads(() => store.readSlice("logs", "item-0", 0, 1), dir);
     assert.ok(evicted.bytes >= body.length, "the least recently used index must be revalidated after eviction");
-    const cached = await measureContentReads(() => store.readSlice("logs", "item-0", 0, 1));
+    const cached = await measureContentReads(() => store.readSlice("logs", "item-0", 0, 1), dir);
     assert.ok(cached.bytes < body.length, "the rebuilt index must serve bounded ranged reads");
     const metadataPath = join(dir, "logs", "item-0.json");
     const meta = JSON.parse(await readFile(metadataPath, "utf8"));
@@ -174,6 +233,7 @@ test("artifact ranged reads reject content mutation or path replacement during I
         () =>
           measureContentReads(
             () => store.readSlice("logs", "item", 0, 1),
+            dir,
             async () => {
               injected = true;
               if (change === "rewrite") await writeFile(path, `${body.slice(0, -1)}b`);

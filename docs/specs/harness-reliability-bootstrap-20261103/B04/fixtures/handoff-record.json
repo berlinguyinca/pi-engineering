@@ -1,0 +1,42 @@
+{
+ "specVersion": "1.2.0",
+ "taskId": "B04",
+ "status": "PASS",
+ "repo": "berlinguyinca/pi-engineering",
+ "baseSha": "bfffb539025959a7429cb8703779573c132ead1f",
+ "resultSha": "7e7157c715f327898e82a350b614774c47c76fd3",
+ "taskAuthorityHash": "sha256:9ab6aae88c06f9c5bbf52f6ecca480689eb19b48d54777dc50f55da2608601e6",
+ "changedFiles": [
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "commands": [
+  {
+   "command": "npm run typecheck",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B04/logs/01-npm-typecheck.txt"
+  },
+  {
+   "command": "node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-one.test.ts",
+   "exitCode": 0,
+   "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/B04/logs/02-unit-test.txt"
+  }
+ ],
+ "evidence": [
+  "docs/specs/harness-reliability-bootstrap-20261103/B04/logs/01-npm-typecheck.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B04/logs/02-unit-test.txt",
+  "docs/specs/harness-reliability-bootstrap-20261103/B04/fixtures/manifest.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B04/fixtures/proofs.json",
+  "docs/specs/harness-reliability-bootstrap-20261103/B04/fixtures/handoff-record.json"
+ ],
+ "nextTaskId": "B05",
+ "nextBaseSha": "7e7157c715f327898e82a350b614774c47c76fd3",
+ "blockedReasons": [],
+ "operatorApproval": {
+  "required": true,
+  "approved": true,
+  "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+  "approvedAt": "2026-11-06T04:30:00Z",
+  "notes": "BACK-FILL 2026-11-05: emitted retrospectively against evidence re-collected at the original commit 7e7157c7 (feat(bootstrap): single-task bootstrap CLI wrapper), parent bfffb5390259 exactly the base the parent record names. Deliverables unchanged: scripts/bootstrap-one.ts plus test/unit/bootstrap-one.test.ts, no other path in that commit. Declared verify commands re-run at 7e7157c7 itself in a detached worktree at that commit: npm run typecheck exit 0 (logs/01-npm-typecheck.txt); node --test --import ./test/support/isolatedState.ts test/unit/bootstrap-one.test.ts -> 4 tests, 4 pass, 0 fail (logs/02-unit-test.txt). This is the unit whose CLI stamped every later record in the bootstrap: the same script was invoked with --manifest/--parent-handoff/--proofs/--handoff-record/--emit-handoff for all 45 subsequent units, and its stop-before-model behaviour is visible in this session's own gate output (plan exit=3 followed by no model invocation when a baseline or parent-chain check fails). No scheduler import was added here and none was needed later. Deviation: temporal only; mode and scope follow the manifest (isolated-change over these two paths). node_modules symlinked from the conductor checkout; nothing installed, nothing edited, porcelain empty before and after; resultSha is the historical commit."
+ }
+}

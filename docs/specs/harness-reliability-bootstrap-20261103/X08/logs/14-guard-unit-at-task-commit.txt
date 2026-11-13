@@ -1,0 +1,15 @@
+$ git rev-parse HEAD
+9f0644507e51baea9f6d0a75fc838e046c4143b7
+
+$ node --test --import ./test/support/isolatedState.ts test/unit/git-common-dir-repair.test.ts
+✔ a linked worktree recovers the SHARED common directory, not its own gitdir (125.47525ms)
+✔ an answer that resolves to nothing names the impossible path (1.082583ms)
+✔ GitRepo.commonDir() only ever hands back a directory Pi can write into (219.803792ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 828.793417

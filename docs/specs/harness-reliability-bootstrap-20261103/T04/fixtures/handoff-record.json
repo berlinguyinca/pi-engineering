@@ -1,0 +1,42 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "T04",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "c4acd6455a57a5cbbe19185353b661cbb69f5086",
+  "resultSha": "5b1ab0a465152673ac0bf29ab0956f8750c6fab1",
+  "taskAuthorityHash": "sha256:69761cae6f8167787182f4e96e9ae919610517ce0ba72e7d095a4021914318eb",
+  "changedFiles": [
+    "src/context/ContextBroker.ts",
+    "test/unit/context-keyword-ranking.test.ts"
+  ],
+  "commands": [
+    {
+      "command": "npm run typecheck",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T04/logs/01-typecheck.txt"
+    },
+    {
+      "command": "node --test --import ./test/support/isolatedState.ts test/unit/context-keyword-ranking.test.ts",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/T04/logs/02-unit-keyword-ranking.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/T04/logs/01-typecheck.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T04/logs/02-unit-keyword-ranking.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/T04/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T04/fixtures/proofs.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/T04/fixtures/handoff-record.json"
+  ],
+  "nextTaskId": "T05",
+  "nextBaseSha": "5b1ab0a465152673ac0bf29ab0956f8750c6fab1",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review)",
+    "approvedAt": "2026-11-05T13:10:00Z",
+    "notes": "Worker pane t04 (pane w8:pC, metabolomics/qwen3.8-flash_next) on base c4acd645; the first prompt was misrouted to a closed pane and had to be re-sent to w8:pC. src/context/ContextBroker.ts now exports goalKeywords(), which strips a frozen stopword set, scores path-like (.ext) and identifier-shaped (snake_case, CamelCase, ACRONYM) tokens and later/repeated distinctive tokens above prose, orders by score then first-appearance position, de-dupes, stays bounded at the existing limit=6 default, and retains the first raw token for an all-stopword goal rather than returning an empty array; rankFiles applies a final lexicographic tie-break after score/test-path/length and keeps every pre-existing budget untouched (its limit=10, searchAny's 200, repoMap's 500, no new file reads). Verified independently: the Bluetooth/settings goal yields [Bluetooth, flow, settings, screen, pairing] with no stopwords (the plan's named example); 'add(a,b) to return a + b' yields ['add','Implement'] (return/to filtered); an all-stopword goal keeps its first raw token; identifier/path shapes lead their goal; later distinctive tokens outrank generic earlier ones; output bounded, de-duplicated, deterministic across calls. First pass at 104 lines was reverted by the worker; 100/100 at the commit."
+  }
+}

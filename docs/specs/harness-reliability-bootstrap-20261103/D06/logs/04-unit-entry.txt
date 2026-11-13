@@ -1,0 +1,24 @@
+▶ validateEnvelope
+  ✔ accepts every object in every array of valid.json (1.4105ms)
+  ✔ rejects invalid.json case 'unsupported-version' with PROTOCOL_VERSION_UNSUPPORTED (0.342708ms)
+  ✔ rejects invalid.json case 'sequence-below-one' with INVALID_FIELD (0.109833ms)
+  ✔ rejects invalid.json case 'missing-required-extensions-list' with MISSING_FIELD (0.095958ms)
+  ✔ rejects non-object input with INVALID_FIELD (0.056041ms)
+  ✔ rejects a schema of 'foo' with SCHEMA_VIOLATION (0.045208ms)
+  ✔ rejects protocol_version 2 with PROTOCOL_VERSION_UNSUPPORTED (0.043ms)
+  ✔ rejects an empty mission_id with INVALID_FIELD (0.049625ms)
+  ✔ rejects a non-integer protocol_version with INVALID_FIELD (0.072666ms)
+  ✔ rejects integer protocol_version other than 1 with PROTOCOL_VERSION_UNSUPPORTED (0.074417ms)
+  ✔ rejects a missing protocol_version with MISSING_FIELD (0.045875ms)
+  ✔ rejects schema versions other than v1 with SCHEMA_VIOLATION (0.034417ms)
+  ✔ rejects schema identifiers with uppercase letters or underscores with SCHEMA_VIOLATION (0.029875ms)
+  ✔ accepts a schema identifier with a hyphen in the entity name (0.031167ms)
+✔ validateEnvelope (3.196625ms)
+ℹ tests 14
+ℹ suites 1
+ℹ pass 14
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 146.797875

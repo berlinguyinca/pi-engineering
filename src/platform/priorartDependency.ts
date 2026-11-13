@@ -20,9 +20,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, sep } from "node:path";
 
 export const PRIORART_REMOTE = "https://github.com/berlinguyinca/pi-priorart.git";
 
@@ -115,10 +115,41 @@ function ensureMcp(mcp: string, bin: string, config: string): boolean {
   }
 }
 
+/**
+ * True when `path` is `tmpdir` or lives inside it.
+ *
+ * `os.tmpdir()` re-reads `$TMPDIR` on every call and, on macOS, the base it returns can be
+ * the un-canonicalized `/var/…` spelling of the same directory tests resolve through
+ * `/private/var/…`. Compare against both spellings so a path built from either one is seen
+ * as ephemeral. The candidate is compared lexically, not realpath'd: `source` may not
+ * exist yet (we are deciding whether to create it), so `realpathSync` would throw.
+ */
+export function isUnderTmpdir(path: string): boolean {
+  if (!isAbsolute(path)) return false;
+  const bases = new Set<string>([tmpdir()]);
+  try {
+    bases.add(realpathSync(tmpdir()));
+  } catch {
+    /* tmpdir always exists in practice; the raw form above is still checked */
+  }
+  for (const base of bases) {
+    if (path === base || path.startsWith(base + sep)) return true;
+  }
+  return false;
+}
+
 /** Kick off a DETACHED clone+build (non-blocking) only when the binary is missing. */
 function maybeRebuildBinary(p: PriorartPaths): boolean {
   try {
     if (existsSync(p.bin)) return false;
+    // The build is fire-and-forget: it outlives this process and keeps writing into
+    // `p.source` (and, for a Go build, `$HOME/.cache/go-build`) after we return. A caller
+    // that owns a throwaway `source` — a test that sets HOME under `mkdtemp` and deletes
+    // it in `after()` — would delete that tree out from under the still-running build
+    // (`rmdir .../go-build/… → ENOTEMPTY`). System temp dirs are exactly those throwaway
+    // roots, so never spawn a background build into one. Real homes are not under tmpdir,
+    // so the cold-start self-heal is unchanged there.
+    if (isUnderTmpdir(p.source)) return false;
     mkdirSync(dirname(p.bin), { recursive: true });
     mkdirSync(p.source, { recursive: true });
     const cmd =

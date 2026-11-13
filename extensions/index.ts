@@ -32,8 +32,10 @@ import {
   type FallbackContext,
   FallbackCoordinator,
   type PendingFallback,
+  applyChosenModel,
   applyPendingFallback,
   previewFallback,
+  recordOperatorSwitch,
 } from "../src/gateway/fallbackLifecycle.ts";
 import {
   installGatewayStreamRetry,
@@ -80,6 +82,7 @@ import {
 } from "../src/orchestration/autoInvoke.ts";
 import { MISSION_FLAGS_USAGE, parseMissionFlags } from "../src/orchestration/missionFlags.ts";
 import { assertRootMissionAllowed, chooseMode, readAutospecFlags } from "../src/orchestration/missionMode.ts";
+import { MissionRefusedError, missionRefusalText } from "../src/orchestration/missionRefusal.ts";
 import {
   buildModelErrorRollups,
   explainMission,
@@ -819,7 +822,7 @@ export default function (pi: ExtensionAPI) {
   // (~/.config/herdr-engineering/host.json) sets inspector.enabled. Loaded in the
   // background with a short timeout so session start never waits on the network;
   // a missing config or unreachable control plane simply means no inspector.
-  // Best-effort and bounded; see docs/split-view-and-inspector.md.
+  // Best-effort and bounded; see docs/agent-inspector.md.
   const inspector = createInspectorSlot();
   void attachInspectorWhenReady(pi, {
     modelReason: () => (automaticModelSwitch ? "fallback" : undefined),
@@ -2194,6 +2197,25 @@ ${RECOVERY_PROMPT}`;
       new AdvisedModelSwitch({
         claimPending: () => fallbackCoordinator.claimPending(),
         apply: applyClaimedFallback,
+        healthFor: (c) => healthFor(c as { model?: Model<any>; modelRegistry?: unknown }),
+        // The interactive picker's switch: the operator's own choice, so unlike
+        // the automatic switch it is NOT flagged automatic (a mission may adopt
+        // it as an operator pin). It keeps the replay-safety rule and the
+        // coordinator/stand-in bookkeeping.
+        applyChosen: async (ctx, chosen, pending) => {
+          const result = await applyChosenModel(
+            {
+              setModel: (m) => pi.setModel(m),
+              log: (message) => console.error(message),
+            },
+            ctx,
+            pending,
+            chosen,
+          );
+          recordOperatorSwitch(fallbackCoordinator, result, pending);
+          await refreshStandIn(ctx);
+          return result;
+        },
         // The wait the pump skipped, taken by the gateway wrapper before the
         // continued request (the same seam AfterOutputRetry uses).
         oweWait: (ctx, delayMs, attempt) => {
@@ -2828,22 +2850,33 @@ ${RECOVERY_PROMPT}`;
       // Persistent mission surfaces receive live activity separately. Keep the
       // session guard informed without creating a notice for each timer tick.
       let lastLine = "";
-      const result = await rt.orchestrator.orchestrate(newRequest, {
-        repository: rt.cwd,
-        baseRef,
-        mutationRequested: true,
-        signal: ctx.signal,
-        // Esc pauses the mission (resumable); only /mission cancel ends it.
-        interrupt: "pause",
-        ...(plannerWorker.lastDecision() ? { executionMode: plannerWorker.lastDecision()! } : {}),
-        onProgress: (line) => {
-          // De-duplicate the trailing completion lines (phase transitions and
-          // task settlements can fire within the same tick).
-          if (line === lastLine) return;
-          lastLine = line;
-          activeControl?.missionProgress(line);
-        },
-      });
+      let result: Awaited<ReturnType<NonNullable<typeof rt.orchestrator>["orchestrate"]>>;
+      try {
+        result = await rt.orchestrator.orchestrate(newRequest, {
+          repository: rt.cwd,
+          baseRef,
+          mutationRequested: true,
+          signal: ctx.signal,
+          // Esc pauses the mission (resumable); only /mission cancel ends it.
+          interrupt: "pause",
+          ...(plannerWorker.lastDecision() ? { executionMode: plannerWorker.lastDecision()! } : {}),
+          onProgress: (line) => {
+            // De-duplicate the trailing completion lines (phase transitions and
+            // task settlements can fire within the same tick).
+            if (line === lastLine) return;
+            lastLine = line;
+            activeControl?.missionProgress(line);
+          },
+        });
+      } catch (error) {
+        // #511: a refusal is not a failed mission — no mission exists to report.
+        // Say what was blocked and when to ask again instead of an unlabelled error.
+        if (error instanceof MissionRefusedError) {
+          ctx.ui.notify(missionRefusalText(error), "warning");
+          return;
+        }
+        throw error;
+      }
       const m = result.mission;
       inspector.associate({ mission_id: m.mission_id });
       const completion =

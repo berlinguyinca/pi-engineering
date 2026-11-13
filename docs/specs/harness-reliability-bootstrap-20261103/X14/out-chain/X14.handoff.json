@@ -1,0 +1,62 @@
+{
+  "specVersion": "1.2.0",
+  "taskId": "X14",
+  "status": "PASS",
+  "repo": "berlinguyinca/pi-engineering",
+  "baseSha": "2d9d758c490218e86a7fdbc2d0d7d4472c581cea",
+  "resultSha": "33775a89cd3d17f3b25dcfa320d130af3faeb1fb",
+  "taskAuthorityHash": "sha256:1dd7f532489096d182d86c3e1adca606a7e8179c99753c72a9e2a276c3ded176",
+  "changedFiles": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs"
+  ],
+  "commands": [
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/01-prefix-output-in-the-conductor-worktree.txt"
+    },
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/02-prefix-output-in-the-main-worktree.txt"
+    },
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/03-postfix-output-in-the-conductor-worktree.txt"
+    },
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/04-postfix-output-in-the-main-worktree.txt"
+    },
+    {
+      "command": "npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs && npx tsx docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs && npm run lint",
+      "exitCode": 0,
+      "outputArtifact": "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/07-closure-gates.txt"
+    }
+  ],
+  "evidence": [
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/01-prefix-output-in-the-conductor-worktree.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/02-prefix-output-in-the-main-worktree.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/03-postfix-output-in-the-conductor-worktree.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/04-postfix-output-in-the-main-worktree.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/05-mechanism-and-blame.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/06-negative-controls-still-noncanonical.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/logs/07-closure-gates.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X14/fixtures/manifest.json",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/03-scan-at-task-commit.txt",
+    "docs/specs/harness-reliability-bootstrap-20261103/X15/logs/04-link-truth-table.txt"
+  ],
+  "nextTaskId": "X15",
+  "nextBaseSha": "2eee4d1a9592b839f0dd3eb677dd9d7d8ed8d59b",
+  "blockedReasons": [],
+  "operatorApproval": {
+    "required": true,
+    "approved": true,
+    "approvedBy": "operator (blanket instruction 2026-11-04: continue automatically; no per-task review) -- this unit is post-merge follow-up on a defect the series' own gate under-reported",
+    "approvedAt": "2026-11-09T06:05:50Z",
+    "notes": "Found after #616 merged, by running AUDIT/integrity-scan.mjs in a second checkout of the same tree. The scan read a directory listing to pick each unit's canonical generation, so empty leftover control directories -- which git cannot store -- changed the answer: offenders=2 beside the trail against offenders=3 on main, for byte-identical committed bytes. The truth is three canonical chain offenders (E02->E03, FIX-2->FIX-3, T09->T10), each a child unit that never emitted a record; the series has been reporting two in PLAN-COMPLETION.json. The fix makes canonical mean the highest-ranked generation that actually holds a record and makes named negative-control generations (out-negctl*, out-noparent*, out-tampered*) never canonical even when populated. No runtime code and no test changed; the suite is not re-run for this unit.\n\nX15: X14 was emitted terminal and the trail continued past it; this generation names X15 at the task commit the scanner fix landed (2eee4d1a), so the chain does not stop at a record whose series kept going. Same shape as X13/out-chain. Only nextTaskId/nextBaseSha, the added evidence references and the note change; every other byte is X14/out's."
+  },
+  "handoffHash": "sha256:b204a11f148a80bdbefea26881fc44891347565e390d9cc4697eaba28856da56"
+}

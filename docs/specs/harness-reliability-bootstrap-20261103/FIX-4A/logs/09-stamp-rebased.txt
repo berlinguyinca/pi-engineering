@@ -1,0 +1,3 @@
+REJECT baseline: HEAD 5c5d5a5d6ab8681390c8daf35c1daab542f7051d != manifest baseSha 74b54eb1
+plan exit=3; no model invoked (B04 stops here)
+REJECT gate: commit parent 74b54eb17f51fdd0a1c89f2b6327953ee357e914 != approved base 74b54eb1

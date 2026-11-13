@@ -1,0 +1,26 @@
+[metabolomics] GET https://llm.metabolomics.us/v1/models -> HTTP 200 in 0.04s, served=7
+    laya
+    laya-text
+    qwen3.8-27b-modality-vision-quant-q8_k_xl
+    qwen3.8-flash-modality-vision-quant-iq4_xs
+    qwen3.8-flash_next-modality-text-quant-q4_k_xl
+    qwen3.8-flash_next-modality-text-quant-w3a8
+    qwen3.8-text
+[development] GET http://100.104.39.6:8390/v1/models -> FAILED: URLError: <urlopen error [Errno 61] Connection refused>
+
+=== role pins vs declared/declared-served ids ===
+-- repo .pi/engineering.yaml
+   planner        metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl      declared=False served_probe=True
+   implementer    metabolomics/qwen3.8-flash_next-modality-text-quant-q4_k_xl      declared=False served_probe=True
+   reviewer       metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl           declared=False served_probe=True
+   verifier       metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl           declared=False served_probe=True
+   spec_verifier  metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl           declared=False served_probe=True
+   test_reviewer  metabolomics/qwen3.8-27b-modality-vision-quant-q8_k_xl           declared=False served_probe=True
+-- global ~/.pi/agent/engineering.yaml
+   planner        development/qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m     declared=False served_probe=False
+   implementer    development/qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m     declared=False served_probe=False
+   reviewer       development/qwen3.8-flash_next-modality-vision-quant-mxfp4_fp8_gptq declared=False served_probe=False
+   test_reviewer  development/qwen3.8-flash_next-modality-vision-quant-mxfp4_fp8_gptq declared=False served_probe=False
+   verifier       development/qwen3.8-flash_next-modality-vision-quant-mxfp4_fp8_gptq declared=False served_probe=False
+   orchestrator   development/qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m     declared=False served_probe=False
+   spec_verifier  development/qwen3.8-27b-modality-text-ctx-c128k-quant-q4_k_m     declared=False served_probe=False

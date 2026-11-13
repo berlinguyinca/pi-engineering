@@ -1,0 +1,22 @@
+Six findings survived the safe write. All six are "unsafe fix"-class, which in Biome means the tool will not
+apply them unattended; each was applied to its own file and then read back rather than trusted.
+
+  ./src/bootstrap/diffGuard.ts:98:15                     lint/style/useTemplate
+  ./src/incidents/errorSanitize.ts:25:1                   lint/style/useSingleVarDeclarator
+  ./src/incidents/resolutionEvidence.ts:69:3              lint/style/useSingleVarDeclarator
+  ./src/inference/endpointCircuit.ts:101:3                lint/style/useSingleVarDeclarator
+  ./test/unit/incident-resolution-evidence.test.ts:11:1   lint/style/useSingleVarDeclarator
+  ./test/unit/incident-resolution-evidence.test.ts:14:1   lint/style/useSingleVarDeclarator
+
+useTemplate: `"path policy unavailable: " + built.errors.join("; ")` becomes
+`path policy unavailable: ${built.errors.join("; ")}` -- same operands, same order, no locale or coercion change.
+useSingleVarDeclarator: one const statement carrying two or three declarators split into separate const
+statements. Each initializer keeps its text verbatim; the declarators were adjacent in a single statement with
+no side effects between them, so evaluation order is unchanged.
+
+Resulting lines:
+  src/bootstrap/diffGuard.ts:98          reason: `path policy unavailable: ${built.errors.join("; ")}`,
+  src/incidents/errorSanitize.ts:25-26   const TRANSCRIPT = /.../;  const DROP_MARKER = /.../;
+  src/incidents/resolutionEvidence.ts:69-70   const files = Array.isArray(...) ? ... : [];  const allowed = ...
+  src/inference/endpointCircuit.ts:101-102    const success = input.success === true;  const failed = ...
+  test/unit/incident-resolution-evidence.test.ts:11-13  const SHA = ...; const SHA63 = ...; const SHA_UP = ...

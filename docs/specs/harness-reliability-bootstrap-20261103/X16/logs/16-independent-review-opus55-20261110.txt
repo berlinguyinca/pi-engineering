@@ -1,0 +1,390 @@
+X16 log 16 -- the independent review that ran, what it found, and what the operator verified
+
+The review the entries above (log 10, log 12, log 15) recorded as impossible was run on 2026-11-10,
+one day early and with a different reviewer than the trail had been using:
+
+  reviewer   Claude Opus 5.5 (claude CLI, model claude-opus-5-5), a fresh session with no context
+             from the authoring session. A different model family AND account from the Codex
+             reviewer whose usage cap (until 2026-11-11 07:03) is why log 10 says the review
+             "could not run" -- the cap is on that account, and the operator chose to run the
+             review with the Claude account instead of waiting. It is recorded as a
+             different-model review, because the trail's standing independent reviewer was Codex.
+  where      throwaway worktree at origin/main (8891508b at the time) + a true clone of origin in
+             /tmp (is-shallow-repository=false) -- never the authoring checkout
+  mandate    the trail's own review instructions: P1-P4 (the five tamper scenarios), P5 (hash
+             re-derivation from bytes), fresh-clone gate runs, and an adversarial audit of the
+             trail's self-description against the tree
+
+== P1-P4: the controls, case by case
+
+$ bash docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/x16-controls.sh   (as written at 8891508b)
+
+| Case | Mutation | new scanner | old scanner (46a7109b) |
+|---|---|---|---|
+| C0 | none | RESULT ok, 74 links, 1 unnamed (1 declared), exit 0 | RESULT ok, exit 0 |
+| C1 | T09 unit-dir status flipped | HASH-OFFENDER + PAYLOAD-OFFENCE, exit 1 | RESULT ok (misses it) |
+| C2 | fabricated X08 generation, X07 re-pointed | CHAIN + ORPHAN-OFFENCE, exit 1 | RESULT ok (misses it) |
+| C3 | payload fixture flipped | PAYLOAD-OFFENCE, exit 1 | RESULT ok (misses it) |
+| C3b | hashed fixture flipped | HASH-OFFENDER, exit 1 | RESULT ok (misses it) |
+| C4a | chain head undeclared | ORPHAN-OFFENCE, exit 1 | -- |
+| C4b | stale declaration | STALE-DECLARATION, exit 1 | -- |
+| C4c | waiver removed | HASH-OFFENDER (parent-tampered), exit 1 | -- |
+| C4d | payload rule matching nothing | STALE-DECLARATION, exit 1 | -- |
+| C5 | same tree, fresh worktree | units=75, RESULT ok, exit 0 | units=75, RESULT ok, exit 0 |
+| C6 | run from inside the spec dir | units=75, RESULT ok, exit 0 | untracked=915, offenders=989, exit 1 |
+| C7 | unparseable unit-dir record | UNREAD, exit 1 | RESULT ok (misses it) |
+| C7b | unparseable generation record | UNREAD, exit 1 | -- |
+| C8 | R04 renamed to r04 | SILENT-SKIP, offenders=3, exit 1 | offenders=3 (via CHAIN), exit 1 |
+| C9 | restore | identical to C0, RESULT ok, exit 0 | -- |
+
+After C9 the probe tree was clean (git status --short empty); the probe worktree was removed.
+Every mutation the trail claims the scanner detects was detected, case by case, as claimed.
+
+== P5: the edge, recomputed from the bytes (this is the check log 10 claimed to contain)
+
+The reviewer wrote its own script importing canonicalHash from src/bootstrap/resultGate.ts, hashed
+each record with its own handoffHash removed, and compared:
+
+  X15/out-chain/X15.handoff.json  declared sha256:de1c349459075170e66e990faae726ce83f2cf45a2ff7890772bd3a1d0ed2756  MATCH
+  X16/out/X16.handoff.json        declared sha256:8b41189046357c90cd2e3eb645445f14bef7e4a4335afbe247e13a78cd57e0cf  MATCH
+  X15/out/X15.handoff.json        declared sha256:93382632...  MATCH
+  X14/out-chain/X14.handoff.json  declared sha256:b204a11f...  MATCH
+
+The X15 -> X16 edge itself: X15/out-chain nextTaskId=X16 / nextBaseSha=f145c623f9c93de7a25c7f65af95c48fd4e63c81
+== X16 baseSha; git log -1 --format='%h %p' f145c623 -> "f145c623 46a7109b". The edge is a commit
+pointer the integrity scan resolves structurally (taskId@baseSha key), not a hash binding: no record
+has a lineage field, X16 has no manifest, and the X15/out-chain handoffHash (de1c3494...) is not
+cited by X16. The X14 -> X15 edge, by contrast, IS hash-bound: X15/fixtures/manifest.json's
+parentHandoffHash equals X14/out-chain's handoffHash.
+
+== fresh clone
+
+git clone https://github.com/berlinguyinca/pi-engineering.git (true clone, HEAD 8891508b), each gate:
+
+  integrity-scan.mjs           exit 0  units=75 records=230 (121/41/68) canonical=75 hash_ok=229/229
+                               canonical chain links resolved=74 offenders=0, RESULT ok
+  lineage-scan.mjs             exit 0  records=160 (generation=119, unit-directory=41)
+                               pointers healthy=425 broken=33, manifest entries=33, RESULT ok
+  record-reproducibility.mjs   exit 0  hashes ok=160 mismatch=0, evidence paths=1010 absent=0
+  citation-existence-check.mjs exit 0  full-commit-ids=33 short=120, named-absent=10, declared-gone=2
+
+Re-run with plain node (v26.3.0, as CI invokes them): exit 0 for each.
+
+== CI
+
+Pipeline 131 (push, 52a5ef15) and 135 (push, 8891508b): trail-scans success (6 s), all 12 steps
+success; step log of 135 shows the four RESULT ok lines under NODE_VER=22.23.4. All nine
+merge-order commits (6f380767 093c7bda ec4dcf0c 4a4ad4e4 e19cc560 05781055 4d5ab0db 52a5ef15
+8891508b) verified on main with merge-base --is-ancestor and their claimed subjects.
+
+== Findings, and the operator's verification of each
+
+The reviewer's full write-up follows below as an appendix, verbatim (its own verdict, findings
+F1-F12 with the reviewer's measurements, the checks it performed, and the claims it deliberately
+did not verify). Each finding was re-verified by the operator against the tree before acting; the
+verification is recorded in the per-finding notes above the appendix and is the substance of the
+remediation commit that follows this log.
+
+F1  critical -- log 10's P5 is a crash trace, and its substitute check was worse than mislabelled:
+     it compared 46a7109b against itself (git rev-parse f145c623^ and git log -1 46a7109b, labelled
+     "same commit: yes"), calling 46a7109b "X15/out-chain's declared base" when the record's baseSha
+     is 2eee4d1a9592b839. The check proved nothing. Operator: confirmed the record's bytes
+     (X15/out-chain baseSha=2eee4d1a...) and the log text; the derivation the log claimed to
+     contain is performed in this log's P5 table. Log 10 is historical and is not rewritten; the
+     correction stands in the caveats and here.
+F2  major -- the instruction "re-derive against X16's lineage[0].parentHandoffHash" names a field no
+     record has (git grep '"lineage"' matches only PLAN-COMPLETION.json's prose), X16 has no
+     manifest (X16/fixtures/emit-records.mts says so itself), and "74 hash-bound edges" overstates
+     what the scan checks (per-record self-hashes + commit-id pointers). Operator: confirmed; the
+     PLAN-COMPLETION.json X16 joins-text is corrected to name the real edge, and this log's P5
+     table is the check actually run.
+F3  major -- PLAN-COMPLETION.json carried task_authority_hash = sha256:9766e2fb5a7ad47518f10501003f78ac3378247edbb364e8edae05482a5b6982
+     for X15 and X16. The records carry sha256:9766e2fb5a7ad9cc8cc855cfc226f9d997becd1328ffc6b9aef9cc2de6ec84f6.
+     A 48-bit prefix match between independent SHA-256 values is not chance: the state file's value
+     was a prefix completed by hand or model. No gate catches it (the citation gate skips sha256:
+     tokens by design). Operator: confirmed both values from the files; the state file now carries
+     the real value.
+F4  major -- X15/out-chain's taskAuthorityHash is the canonical hash of the RAW
+     X15/fixtures/manifest.json; the FIX-4A protocol (resultGate.ts:47-54) requires the PARSED
+     manifest (1352fe82... for X15; X14's record follows the protocol). The emit-records.mts
+     comment claiming "no stored object reproduces it" and "neither do X14's or X15's records have
+     manifests" is false on both counts. Operator: confirmed by running canonicalHash over both
+     raw and parsed X14/X15 manifests and reading the protocol; the comment is corrected, the
+     deviation declared in the caveats (the record is hash-bound; no gate reads the field).
+F5  major -- E01's predecessor hash (21bae9f5..., in the record's notes and
+     E01/fixtures/manifest-e01.json's parentHandoffHash) resolves to no tracked record; the only
+     B05 record is 064b4e71... (the backfill). A mechanical sweep: 70 of 71 parentHandoffHash
+     declarations across the trail resolve; E01's is the one that does not. Operator: confirmed the
+     sweep; declared in the caveats. The B05->E01 seam stays structurally connected
+     (B05.nextBaseSha == E01.baseSha).
+F6  major -- RELEASE-REVIEW.md's corrections section is stale on main (#658/#659/#660 merged; the
+     "open" wording was already false at the section's own merge, since #660 landed at 04:25Z
+     before the section went in at 11:24Z; lineage-scan walks 160 since 05781055; the manifest has
+     33 entries), and the same stale sentence survives as a code comment in
+     AUDIT/record-reproducibility.mjs (with "67 payload fixtures" where the scan counts 66).
+     Operator: confirmed line by line; a dated addendum corrects the document without rewriting the
+     dated text, the code comment is fixed in place, and the 67-vs-66 reconciliation is measured:
+     67 tracked fixtures/handoff-record.json files, of which X08's carries its own handoffHash and
+     is hash-checked, so the declared payload rule (which requires the field absent) covers 66.
+F7  major -- x16-controls.sh used set -u without -e and compared no result against an expectation:
+     it exited 0 whether or not the scanner detected anything, while the X16 record cites its
+     exitCode 0 as proof. Operator: confirmed by reading the script; the script now declares an
+     expectation per case (exit class + output marker) and exits 1 on mismatch.
+F8  minor -- the script's prose disagreed with its own output (C0 "reads 119" vs 121; C2 "three
+     files STAGED" vs two; C5 "says 74" vs units=75; restore() was a no-op cp X X, never called;
+     the worktree-removal block was duplicated, so clean runs ended with a misleading
+     "(leave it: ...)" line after the removal had already succeeded). Operator: confirmed each;
+     all fixed in the same edit as F7.
+F9  minor -- integrity-scan counts in generations=121, the other gates 119: the two
+     *.SUPERSEDED-*.json files in FIX-4A/out and FIX-4B/out. They are hash-checked by
+     integrity-scan and by nothing else. Operator: confirmed by git ls-files; declared in the
+     caveats so a reader does not read the difference as a bug.
+F10 minor -- the 2026-11-09 next_action segment said "#662 is another session's ci.yaml credential
+     PR, merged here as e008b3dc by way of #657": #662 was OPEN when that was written (e008b3dc is
+     #657's squash commit). Operator: confirmed against the PR history; #662 was reviewed against
+     this main and merged as b29bf258.
+F11 minor -- the carried-over declared items named T10 (no such unit directory exists) and a
+     lineage[].output field no record has; the out* directory names actually live in the hashed
+     records' prose fields (operatorApproval.notes and the like). Operator: confirmed by ls and by
+     grepping the records; the declaration is corrected to the true state.
+F12 nit  -- X16/fixtures/emit-records.mts:9 cited resultGate.ts:36 for canonicalHash (it is at
+     :30) and the usage line documented a fourth argument the code does not read. Operator:
+     confirmed; both fixed.
+
+== the corrected controls, run as part of the remediation
+
+$ bash X16/fixtures/x16-controls.sh   (the asserting version, in a fresh throwaway worktree at the remediation commit's base)
+   exit 0
+   RESULT ok: every case behaved as declared -- every mutation detected, every restore clean
+   (19 expectation checks: 13 scanner runs with declared exit class + output marker, the C9 clean-tree check,
+   the C2 staged-file check implicit in the case, ... -- every case in the table above is asserted)
+
+Negative control (a deliberate break must be caught by the new assertions):
+$ sed 's/check C1-new-detects fail/check C1-new-detects ok/' x16-controls.sh > /tmp/broken.sh
+$ bash /tmp/broken.sh
+   exit 1
+   EXPECTATION-FAILED: C1-new-detects: expected exit 0, got 1
+   RESULT FAIL: one or more cases did not behave as declared
+
+So the controls' exit status is evidence again: a scanner that stopped detecting C1's tamper would
+fail the script, not pass it.
+
+== What this log closes and what it does not
+
+Closes: the independent review the trail has carried as its standing open item since log 10. The
+central claim -- the trail certifies itself in a fresh clone and in CI -- is verified by a
+different model, in a checkout it was given rather than one it wrote. The P5 derivation that log 10
+claimed to contain is now actually contained, here. The controls' exit status means what the
+record says it means.
+
+Does not close: the release decision (the operator's, not a review's); the two declared
+deviations (F4, F5) that stand because their records are hash-bound; and the missing
+parentHandoffHash gate -- the absence that let F4 and F5 stand invisible in a green pipeline. That
+gate is the next unit of work for this trail, named in PLAN-COMPLETION.json's 2026-11-10 segment.
+
+
+======================================================================
+APPENDIX: the review, verbatim (reviewer: Claude Opus 5.5, fresh session)
+======================================================================
+
+# Independent review — 2026-11-10 — reviewer: Claude Opus 5.5 (fresh session; different model and account from the authoring session)
+
+Target: `berlinguyinca/pi-engineering` `main` = `8891508bdcb820b491f78df7863005e40e6a05eb` (#668). The trail is `docs/specs/harness-reliability-bootstrap-20261103/`.
+
+## Verdict
+
+The central claim holds, and I verified it by measurement. I made a true clone of origin (not shallow, HEAD `8891508b`). In it all four gates print `RESULT ok` and exit 0, under both `npx tsx` and plain `node`. Woodpecker pipelines 131 (`52a5ef15`) and 135 (`8891508b`) ran the `trail-scans` step and it succeeded. The step log of 135 shows the same four `RESULT ok` lines. All nine merge-order commits are on main with the subjects the trail claims. The controls script detects every tamper scenario it sets up, and its restore case (C9) passes. All the hashes named for P5 recompute exactly from their bytes.
+
+Several claims around that core are false or cannot be verified:
+- **P5 never ran.** The trail cites `X16/logs/10` as "hash re-derivation from bytes". In fact the P5 section of that log is a crash trace, followed by a substitute check that mislabels X15's base commit.
+- **The edge P5 was meant to check does not exist as named.** The instruction to check X16's `lineage[0].parentHandoffHash` names a field that no record in the trail has. `PLAN-COMPLETION.json` says X16 joins the trail "through its manifest's parentHandoffHash". X16 has no manifest.
+- **The state file has the wrong authority hash.** It records the `task_authority_hash` of X15/out-chain and X16 as a value that shares only its first 12 hex characters with the value the records actually carry.
+- **No gate checks parent hashes.** None of the four gates verifies `parentHandoffHash` at all. E01 claims to have verified a B05 handoff hash that no tracked file carries.
+- **`RELEASE-REVIEW.md` is stale.** Its correction section describes #658, #659 and #660 as open, and the lineage scan as walking generation records only. Neither is true on main.
+
+None of this breaks the chain the gates certify. But the trail's description of its own verification is stronger than what it recorded.
+
+## Findings
+
+### F1 — critical — the self-verification log cited for "hash re-derivation from bytes" shows the re-derivation crashing
+- **The claim, and where:** `PLAN-COMPLETION.json` `next_action`, first segment: "X16/logs/10 is therefore this unit checking its own work (tamper scenarios, **hash re-derivation from bytes**, …)". The log's own header calls this check "P5's arithmetic".
+- **What I measured:** `X16/logs/10-self-verification-and-the-review-that-could-not-run.txt`, lines 60–68. The P5 command `npx tsx -e "canonicalHash(...)"` produced only a stack trace (`at evalFunction … Node.js v26.3.0`) and no hash. Below the trace, the log substitutes a commit-graph check: `git rev-parse --short f145c623^ -> 46a7109b`, labelled "X15/out-chain's declared base", "same commit: yes". But X15/out-chain's declared `baseSha` is `2eee4d1a9592…`, not `46a7109b`. I read this from the record's bytes. So the substitute check compares a value against a mislabelled quantity.
+- **Why it matters:** the trail describes its self-verification as covering hash re-derivation, and its own log shows that step failed. This review supplies the missing derivation (F2), and the hashes do match. The defect is in the trail's account of what it verified, not in the bytes.
+
+### F2 — major — the X15 → X16 edge the instruction names does not exist; the real edge is a commit pointer, not a hash binding
+- **The claim, and where:**
+  - `next_action`, 2026-11-09 and 2026-11-10 segments: "re-derive canonicalHash of X15/out-chain/X15.handoff.json against X16's lineage[0].parentHandoffHash".
+  - `PLAN-COMPLETION.json:426`: "X16 joins the trail … through its manifest's parentHandoffHash sha256:de1c3494…".
+  - The first `next_action` segment: "the 74 hash-bound edges".
+- **What I measured:**
+  - No tracked file in the trail contains a `"lineage"` key. `git grep '"lineage"'` matches only the prose in `PLAN-COMPLETION.json`. None of the 160 `*.handoff.json` records has a `lineage` field.
+  - X16 has no manifest: there is no `X16/fixtures/manifest.json`, and X16 is not in `manifests/tasks.json`. `X16/fixtures/emit-records.mts:66` says so itself: "X16 has no TaskManifest of its own".
+  - The value `de1c3494…` appears only as X15/out-chain's own `handoffHash` and in `PLAN-COMPLETION.json` prose.
+  - `AUDIT/integrity-scan.mjs:198` links records by `nextTaskId@nextBaseSha`. No gate reads `parentHandoffHash` (grep across `AUDIT/*.mjs`).
+  - The actual edge is X15/out-chain `nextTaskId=X16`, `nextBaseSha=f145c623f9c9…`, which equals X16 `baseSha`. I verified it, and `f145c623`'s parent is `46a7109b` (#650's merge).
+  - Both endpoint records recompute from their bytes (Checks, P5).
+- **Why it matters:** the edge is real, but nothing hash-binds it. Replacing X15/out-chain with any other self-consistent record carrying the same pointer would leave the X16 side unchanged. The instruction cannot be executed as written. "Hash-bound edges" overstates what the gate checks: it checks per-record self-hashes plus commit-id pointers.
+
+### F3 — major — `PLAN-COMPLETION.json` records the wrong `task_authority_hash` for X15/out-chain and X16
+- **The claim, and where:** `PLAN-COMPLETION.json:409` and `:424`: `"task_authority_hash": "sha256:9766e2fb5a7ad47518f10501003f78ac3378247edbb364e8edae05482a5b6982"`.
+- **What I measured:** the records (`X15/out`, `X15/out-chain`, `X16/out`) all carry `sha256:9766e2fb5a7ad9cc8cc855cfc226f9d997becd1328ffc6b9aef9cc2de6ec84f6`. The two values agree on the first 12 hex characters and differ after that. The state file's value appears in no other file. It was introduced in `d00bbb73` (#653).
+- **Why it matters:**
+  - A 48-bit prefix match between independent SHA-256 values is not chance. The state file's value was not copied from the record; it looks like a prefix that was completed by hand or by a model.
+  - No gate catches it: `citation-existence-check` reports `sha256-tokens=23 (skipped)`.
+  - This is exactly the defect class (a fabricated identifier) that the trail's gates exist to stop, and it sits in the trail's own state file.
+
+### F4 — major — X15's and X16's `taskAuthorityHash` contradict both the FIX-4A protocol and the trail's own explanation of them
+- **The claim, and where:**
+  - `X16/fixtures/emit-records.mts:66-70`: "neither do X14's or X15's records [have a TaskManifest] … no stored object reproduces it".
+  - The X16 record's notes: "AuthorityHash is carried from X15 and reproduces from nothing stored in the repo".
+- **What I measured:**
+  - `X14/fixtures/manifest.json` and `X15/fixtures/manifest.json` both exist.
+  - X14's `taskAuthorityHash` (`1dd7f532…`) equals `canonicalHash(parseTaskManifest(X14 manifest).manifest)`. That is the protocol's definition at `src/bootstrap/resultGate.ts:47-54` ("the authority of a task IS the canonical hash of the *parsed* manifest").
+  - X15's value (`9766e2fb…d9cc8c…`) equals `canonicalHash` of the **raw** X15 manifest. The parsed manifest hashes to `1352fe82…`.
+  - So the X15 value can be reproduced from a stored object, but with the wrong canonicalization. X16 copies it while having no authority of its own.
+- **Why it matters:** the explanation is false on two counts, and the value it explains breaks the FIX-4A rule. That rule is the reason defaults and unknown keys cannot change authority. No gate checks authority hashes. Neither the records (hashed) nor the generator can be corrected without changing hashes, and I found no declaration of this anywhere.
+
+### F5 — major — E01 claims to have verified a B05 handoff hash that no tracked file carries
+- **The claim, and where:**
+  - `E01/out/E01.handoff.json` notes: "B05 handoff sha256:21bae9f5a1c1… verified by the CLI before this handoff was emitted".
+  - `E01/fixtures/manifest-e01.json:30` has `parentHandoffHash` set to the same value.
+- **What I measured:**
+  - I checked every manifest that has a `parentHandoffHash` against every tracked record hash: 70 resolve and 1 does not, E01's.
+  - The only tracked B05 record, `B05/out-backfill/B05.handoff.json`, hashes to `064b4e71…`.
+  - `git grep 21bae9f5` finds the value only in E01's own files.
+  - I found no declaration in `PLAN-COMPLETION.json`, `AUDIT/chain-declaration.json` or `FINAL_AUDIT-ADDENDUM-BACKFILL.md`. The back-fill joins B05 to E01 only by `B05.nextBaseSha == E01.baseSha`.
+- **Why it matters:** the one predecessor-hash claim at the seam between the back-filled B-series and the E-series cannot be verified. No gate checks `parentHandoffHash`, and the protocol requires the predecessor hash to be verified (`02-HANDOFF-PROTOCOL.md:9`). So this mismatch is invisible to the certification that passes in CI.
+
+### F6 — major — `RELEASE-REVIEW.md`'s corrections section contradicts main and the trail's own later records
+- **The claim, and where:** `RELEASE-REVIEW.md` §"Corrections, 2026-11-09":
+  - "fixed in an open PR … #658";
+  - "PR #660 widens from 119 (open; on `main` the figure is still 119)";
+  - "`lineage-scan.mjs` walks **generation records only**, so **41 of the 160 records are outside its pointer check** — that gap is open work";
+  - Re-check commands: "after #659 merges";
+  - `lineage-superseded.json` "30 entries".
+- **What I measured:**
+  - #658, #659 and #660 are all MERGED (`gh pr view`). #660 merged at 04:25Z on 11-10, before #663 (which carries this text) merged at 11:24Z, so "open" was already false at merge time.
+  - `lineage-scan` in the fresh clone prints `records=160 (generation=119, unit-directory=41)`.
+  - The manifest has `entries=33`.
+  - The same stale sentence about the lineage scan survives as a code comment in `AUDIT/record-reproducibility.mjs:47-48`. That comment also says "67 payload fixtures", while `integrity-scan` counts 66.
+- **Why it matters:** the release review is the reader-facing document, and it says nothing about the CI `trail-scans` step, which is the trail's central achievement. It understates rather than overstates coverage, but it contradicts `PLAN-COMPLETION.json`'s 11-10 segment. Its verdict, "NOT RELEASABLE", and the open G5/G6 rows remain consistent with the tree, so it does not overclaim release readiness.
+
+### F7 — major — the controls script's exit 0 is not evidence; it exits 0 whatever the scanner detects
+- **The claim, and where:**
+  - The review instruction says the script "must exit 0".
+  - `X16/out/X16.handoff.json` records the command `bash …/x16-controls.sh` with `exitCode: 0` as a proof.
+- **What I measured:** the script uses `set -u` without `-e`, never compares any case's result with an expectation, and ends with `echo`/`git worktree remove … || echo`. Its exit status therefore cannot reflect a missed detection. All detections had to be read case by case, and I did that (see Checks).
+- **Why it matters:** a regression in the scanner would still produce "exit 0" in the record. The controls are an eyeball test that the record presents as a pass/fail gate.
+
+### F8 — minor — the controls script's prose disagrees with its own output
+- C0 says "The old scan reads 119 records". The old scanner prints `records=121`; the extra two are the `*.SUPERSEDED-*.json` files in `FIX-4A/out` and `FIX-4B/out`.
+- C2 says "The three files are then STAGED"; the script stages two.
+- C5 says "so it says 74 here too"; both scanners print `units=75`.
+- `restore()` is defined as `cp X X`, a no-op, and is never called.
+- The worktree-removal block is duplicated, so every clean run ends with a misleading "(leave it: git worktree remove --force …)" message after the removal has already succeeded. I verified that the probe worktree `x16-controls-ugiS7N` is gone from `git worktree list`.
+- The script also runs `git worktree prune` on the shared repository, which goes beyond "touches only the throwaway worktree" (its scope is bookkeeping only).
+
+### F9 — minor — the gates count generation records differently, which the trail mentions but which can mislead a reader
+- `integrity-scan` reports `in generations=121`.
+- `lineage-scan` and `record-reproducibility` report `generation=119`.
+- I reconciled the gap by `git ls-files`: `FIX-4A/out/FIX-4A.handoff.SUPERSEDED-pre-rebase.json` and `FIX-4B/out/FIX-4B.handoff.SUPERSEDED-nextFIX4C.json` live in generation directories but do not match `*.handoff.json`. They are hash-checked by `integrity-scan` only, and no gate walks their commit pointers.
+
+### F10 — minor — the 2026-11-09 segment of `next_action` contains a false statement and a miscount that the 2026-11-10 segment carries forward
+- The 11-09 segment says "#662 is another session's ci.yaml credential PR, merged here as e008b3dc by way of #657". #662 is OPEN (`gh pr list`), and `e008b3dc` is #657's squash. The 11-10 segment correctly says #662 is still open, but leaves the earlier sentence uncorrected.
+- The 11-09 segment lists five open PRs (#658, #659, #660, #661, #663). The 11-10 segment then says "the six PRs the entry above left open".
+
+### F11 — minor — stale lead text in `next_action` and a dangling unit
+- `next_action` still opens with "Merge X16 … the three trail scans are in no workflow file". This follows the append-only convention, but a reader must reach the third segment to learn that both are resolved.
+- The declared item "the canonical-generation rule's abbreviation of R01/FIX-1/FIX-4B/**T10**/X08/X09's out* directories" names T10. No T10 directory exists, and the trail elsewhere says "T10 is not in manifests/tasks.json".
+- The declared item "out* directory names still carried in the records' `lineage[].output` fields" describes a field no record has (see F2). As worded, that declaration matches nothing.
+
+### F12 — nit — citation drift inside the generator
+- `emit-records.mts:9` cites `src/bootstrap/resultGate.ts:36` for `canonicalHash`; it is at `:30`.
+- The usage line documents four arguments (including `<x15-outchain-hash>`); the code reads three.
+
+## Checks performed
+
+**P1–P4: controls.** Ran from the review worktree, `bash docs/specs/harness-reliability-bootstrap-20261103/X16/fixtures/x16-controls.sh`. It created `/private/tmp/x16-controls-ugiS7N` at `8891508b` and exited 0 (but see F7). Results, new scanner vs old scanner (the scanner as merged in `46a7109b`):
+
+| Case | Mutation | New scanner | Old scanner |
+|---|---|---|---|
+| C0 | none (baseline) | `records=230 … hash_ok=229/229 field_ok=230`, `RESULT ok: 74 … 1 unnamed (1 declared), hash waived=1`, exit 0 | `records=121`, `RESULT ok`, exit 0 |
+| C1 | T09 unit-dir status flipped | `HASH-OFFENDER …T09/T09.handoff.json` + `PAYLOAD-OFFENCE T09/fixtures/handoff-record.json`, `offenders=2`, exit 1 | `RESULT ok` |
+| C2 | fabricated X08 generation | `CHAIN X07/out-chain -> X08@111111111111 (no such record)`, `ORPHAN-OFFENCE …X08/out-chain`, exit 1 | `RESULT ok` (resolved=74) |
+| C3 | payload fixture flipped | `PAYLOAD-OFFENCE FIX-1/fixtures/handoff-record.json`, exit 1 | `RESULT ok` |
+| C3b | hashed fixture flipped | `HASH-OFFENDER X08/fixtures/handoff-record.json`, exit 1 | `RESULT ok` |
+| C4a | chain head undeclared | `ORPHAN-OFFENCE B00/out-backfill`, exit 1 | — |
+| C4b | stale declaration | `STALE-DECLARATION X15@2eee4d1a…`, exit 1 | — |
+| C4c | waiver removed | `HASH-OFFENDER FIX-2/fixtures/parent-tampered.json`, exit 1 | — |
+| C4d | payload rule that matches nothing | `STALE-DECLARATION payload fixture rule …`, exit 1 | — |
+| C5 | fresh checkout | `units=75 … RESULT ok`, exit 0 | `units=75 … RESULT ok` |
+| C6 | run from inside the spec dir | `RESULT ok`, exit 0 | `untracked=915 … offenders=989`, exit 1 |
+| C7 | unparseable unit-dir record | `UNREAD …T09/T09.handoff.json`, exit 1 | `RESULT ok` |
+| C7b | unparseable generation record | `UNREAD …X07/out-chain`, exit 1 | — |
+| C8 | R04 renamed to r04 | `SILENT-SKIP R04 …`, offenders=3, exit 1 | offenders=3 |
+| C9 | restore | identical to C0, `RESULT ok`, exit 0 | — |
+
+After C9, `git status --short` was empty. Every mutation was flagged as the logs claim, and the restore passes. Cleanup: the probe worktree was removed. I deleted the `/tmp/x16-*.bak` files and `/tmp/x16-old-scanner.mts` that my run wrote. Pre-existing `/tmp/x16-controls-probe` and `/tmp/x16probe` worktrees from other sessions, dated Nov 8, were left alone. The review worktree's `git status` is clean.
+
+**P5: hashes from bytes.** I wrote my own script, `/tmp/rev/scripts/p5.mts`, which imports `canonicalHash` from `src/bootstrap/resultGate.ts` and hashes each record with its own `handoffHash` removed:
+
+| Record | Declared / recomputed `handoffHash` | Result | Pointers |
+|---|---|---|---|
+| `X15/out-chain/X15.handoff.json` | `sha256:de1c349459075170e66e990faae726ce83f2cf45a2ff7890772bd3a1d0ed2756` | MATCH | base `2eee4d1a…`, next `X16@f145c623f9c93de7a25c7f65af95c48fd4e63c81` |
+| `X16/out/X16.handoff.json` | `sha256:8b41189046357c90cd2e3eb645445f14bef7e4a4335afbe247e13a78cd57e0cf` | MATCH | base `f145c623…`, next null |
+| `X15/out` | `93382632…` | MATCH | — |
+| `X14/out-chain` | `b204a11f…` | MATCH | next `X15@2eee4d1a…` |
+
+Further P5 results:
+- The edge: X15/out-chain.nextBaseSha == X16.baseSha. `git log -1 --format='%h %p' f145c623` gives `f145c623 46a7109b`.
+- No `lineage` field exists in any record (`git grep '"lineage"'` matches only `PLAN-COMPLETION.json`).
+- `X15/fixtures/manifest.json:82` has `parentHandoffHash = b204a11f…`, which equals X14/out-chain's hash, so the X14→X15 edge is hash-bound in a manifest. X16 has no such manifest.
+
+**Authority hashes.** `/tmp/rev/scripts/auth.mts`:
+- X14: parsed manifest → `1dd7f532…`, which equals the record. The raw manifest gives `3b7d2c71…`.
+- X15: raw manifest → `9766e2fb…d9cc8c…`, which equals the record. The parsed manifest gives `1352fe82…`.
+
+**Manifest parent hashes.** A Python sweep of tracked manifests with `parentHandoffHash` against tracked record hashes found 70 resolved and 1 unresolved (`E01/fixtures/manifest-e01.json`, `21bae9f5…`). B05's only record has hash `064b4e71…`.
+
+**Fresh clone.** `git clone https://github.com/berlinguyinca/pi-engineering.git /tmp/rev/clone` gave HEAD `8891508b`, `is-shallow-repository=false`. I symlinked `node_modules` and ran each gate:
+
+| Gate | Exit | Key output |
+|---|---|---|
+| `npx tsx AUDIT/integrity-scan.mjs` | 0 | `units=75 records=230 (in generations=121, in unit directories=41, elsewhere=68) canonical=75 hash_ok=229/229 field_ok=230`; `canonical chain links resolved=74 offenders=0`; `evidence dangling=0 untracked=0`; `RESULT ok: 74 canonical forward links resolved, 1 unnamed (1 declared), hash waived=1` |
+| `npx tsx AUDIT/lineage-scan.mjs` | 0 | `records=160 (generation=119, unit-directory=41)`; `pointers healthy=425 nullDeclared=22 broken=33`; `manifest … entries=33 superseded=8 unresolvable=24 abbreviated=1`; 8 alias applications (`unreachable_from_any_ref -> object_missing`); `RESULT ok` |
+| `npx tsx AUDIT/record-reproducibility.mjs` | 0 | `hashes recomputed ok=160 mismatch=0`; `declared evidence paths=1010 absent from HEAD tree=0`; `RESULT ok: 160 records (119 generation, 41 unit-directory, 0 fixtures …)` |
+| `npx tsx AUDIT/citation-existence-check.mjs` | 0 | `files=2 … full-commit-ids=33 short-commit-ids=120 sha256-tokens=23 (skipped) … named-absent=10 declared-gone=2`; `RESULT ok` |
+
+Re-running all four with plain `node` (v26.3.0, as CI invokes them) also gave exit 0 for each.
+
+**CI.**
+- `.woodpecker/ci.yaml:194-203`: step `trail-scans` runs the four gates under `set -eu`, with no `when` filter. The pipeline-level `when` is pull_request/manual, plus push to main.
+- `gh api …/commits/<sha>/status`: `52a5ef15` reports `ci/woodpecker/push/ci success` (pipeline 131); `8891508b` reports success (pipeline 135).
+- The Woodpecker API (`/api/repos/121/pipelines/{131,135}`) shows `trail-scans success` (6 s) and all 12 steps succeeded.
+- The step log for 135/40428 shows the four `RESULT ok` lines on `NODE_VER=22.23.4`.
+
+**Merge order.** `git merge-base --is-ancestor <c> origin/main` plus subjects, all on main in the claimed order:
+
+| Commit | PR | Merged (local) | Subject (abridged) |
+|---|---|---|---|
+| `6f380767` | #658 | 02:52 | fingerprint from a scratch index |
+| `093c7bda` | #659 | 03:02 | |
+| `ec4dcf0c` | #666 | 03:07 | |
+| `4a4ad4e4` | #663 | 03:24:48 | |
+| `e19cc560` | #665 | 03:24:52 | |
+| `05781055` | #664 | 03:27 | |
+| `4d5ab0db` | #667 | 03:46 | |
+| `52a5ef15` | #661 | 03:56 | "ci: run the three trail gates on every pipeline" (the step runs four) |
+| `8891508b` | #668 | 08:56 | |
+
+Also confirmed: `568234b3` (#660) merged 11-09 20:25 local; `d00bbb73` (#653), `64cae00b` (#654) and `e008b3dc` (#657) are on main. `gh pr view` shows #662 OPEN, and #652 is not a PR (an issue, consistent with the trail's wording).
+
+## Claims not verified
+
+- **Branch protection requiring `ci/woodpecker/pr/ci`.** I did not query the branch protection API.
+- **Timing claims.** "~08:40 local", "opened 05:27", the 1.028 s vs 0.138 s fingerprint timings, and the gate timings in #661 (lineage-scan 8.0 s) were not re-measured. My lineage-scan locally took about 9 s, and CI reports 6 s for the whole step.
+- **That the old scan printed `resolved=73 … RESULT ok` against the review-650 fabricated generation.** My C2 run of the old scanner printed `resolved=74 … RESULT ok` with a different staging; I did not reconstruct the review-650 commit.
+- **The `RELEASE-REVIEW.md` test-suite numbers.** These are 6789 tests / 0 fail, 1185/1182/3 on Node 26, 18 tests on v22.22.3, and pipelines 41/43/44/45 green. I did not re-run the suites; only pipelines 131 and 135 were inspected.
+- **The ci.metabolomics.us host and the earlier Woodpecker DNS outage.** That ci.metabolomics.us "served every run of this round", and the history of the earlier host that stopped resolving, were not verified beyond the pipeline list returned now. That list shows pipelines 112–135, including killed/canceled pushes for `093c7bda`, `4a4ad4e4` and `e19cc560`, which the trail does not mention. The trail's claim is only that #664 and #661 merged green, and pipelines 126 and 131 do show success.
+- **The "two historical gone commits declared and guarded" in citation-existence.** I saw `declared-gone=2` in the output but did not audit the reachability guard's logic.
+- **Whether the 33 lineage declarations are each individually correct.** I checked only that broken (33) equals entries (33) and that the gate passes.

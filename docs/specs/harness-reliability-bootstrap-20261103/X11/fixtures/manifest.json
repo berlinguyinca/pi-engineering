@@ -1,0 +1,55 @@
+{
+  "taskId": "X11",
+  "baseSha": "5403bf30a4b9efef9930b36d96996a1398bc4c62",
+  "repoId": "pi",
+  "objective": "X10's chain links came out clean and the canonical chain gate agreed -- then the record behind one of them was read and its resultSha was 8 characters, an abbreviation git had stamped when the environment variable GIT_COMMON_DIR was set. Declare that defect in AUDIT/lineage-superseded.json as a third kind the gate can verify (a prefix must name exactly one reachable commit, the replacement must be that commit spelled in full, and the annotation must post-date the defect), and prove the new kind can still say no.",
+  "allowPaths": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs",
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-superseded.json"
+  ],
+  "denyPaths": [
+    "src/**",
+    "test/**",
+    "templates/**",
+    "package.json"
+  ],
+  "commands": [
+    {
+      "id": "cmd1",
+      "argv": [
+        "node",
+        "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd2",
+      "argv": [
+        "bash",
+        "docs/specs/harness-reliability-bootstrap-20261103/X11/fixtures/lineage-negative-tests.sh"
+      ],
+      "timeoutMs": 1800000,
+      "cwd": "repo"
+    },
+    {
+      "id": "cmd3",
+      "argv": [
+        "node",
+        "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs"
+      ],
+      "timeoutMs": 300000,
+      "cwd": "repo"
+    }
+  ],
+  "limits": {
+    "maxProductionFiles": 0,
+    "maxTestFiles": 0,
+    "maxChangedLines": 100
+  },
+  "parentHandoffHash": "sha256:be1b374a4675ee714273a7e58c80a1b0ebe1aa393e553b4bbdcb7547344c3db0",
+  "expectedOutputs": [
+    "X11/out/X11.handoff.json"
+  ],
+  "mode": "isolated-change"
+}

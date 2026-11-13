@@ -1,0 +1,14 @@
+▶ scopeIntegrityCheck
+  ✔ out-of-scope paths named in input order; in-scope passes; refs exact (2.205917ms)
+  ✔ protected hits unauthorized even inside scope; override honoured; blocked-reason prefix (0.303084ms)
+  ✔ all six authority families protected; ordinary src/** clean (0.394417ms)
+  ✔ dedup, bound to 20 with note only in refs, inert on odd input, deterministic (1.056417ms)
+✔ scopeIntegrityCheck (4.972959ms)
+ℹ tests 4
+ℹ suites 1
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 332.701833

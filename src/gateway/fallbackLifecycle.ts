@@ -335,7 +335,17 @@ export interface FallbackContext {
   model: Model<any> | undefined;
   modelRegistry: { getAvailable?: () => Model<any>[] } | undefined;
   getContextUsage?: () => { tokens: number } | undefined;
-  ui?: { notify: (message: string, type?: "info" | "warning" | "error") => void };
+  /** True when an interactive UI is attached (Pi's `ctx.hasUI`); absent means headless. */
+  hasUI?: boolean;
+  ui?: {
+    notify: (message: string, type?: "info" | "warning" | "error") => void;
+    /** Pi's `ui.select`; only present on an interactive UI. */
+    select?: (
+      title: string,
+      options: string[],
+      opts?: { signal?: AbortSignal; timeout?: number },
+    ) => Promise<string | undefined>;
+  };
 }
 
 export interface FallbackApplyDeps {
@@ -363,7 +373,7 @@ export interface FallbackApplyResult {
   blocked?: { maxWaitMs: number; retryAfterMs: number; reason: string };
 }
 
-function toCandidate(m: Model<any>, health?: ModelHealthProvider): FallbackCandidate {
+export function toCandidate(m: Model<any>, health?: ModelHealthProvider): FallbackCandidate {
   const reading = health?.get(m.id) ?? {};
   return {
     id: m.id,
@@ -468,6 +478,68 @@ export async function previewFallback(
 }
 
 /**
+ * No blind replay: once a side-effecting tool call has started in the turn,
+ * moving the request to another model could run it a second time.
+ */
+function refuseUnsafeReplay(
+  deps: Pick<FallbackApplyDeps, "log">,
+  ctx: FallbackContext,
+  pending: PendingFallback,
+): FallbackApplyResult | undefined {
+  if (pending.toolExecutionStarted !== true || pending.replaySafe === true) return undefined;
+  ctx.ui?.notify(
+    "Model switch skipped: a tool call already started this turn and is not replay-safe. Waiting on the current model.",
+    "warning",
+  );
+  deps.log?.("[gateway-fallback] stay (tool call started, not replay-safe)");
+  return { switched: false, skipped: "tool-started-not-replay-safe" };
+}
+
+/**
+ * Switch to a model the OPERATOR chose (the advised-switch picker). The
+ * chooser's fit rules do not apply — the operator saw the warnings — but the
+ * replay-safety rule does: it protects against running a side effect twice,
+ * which no amount of informed consent undoes.
+ */
+export async function applyChosenModel(
+  deps: Pick<FallbackApplyDeps, "setModel" | "log">,
+  ctx: FallbackContext,
+  pending: PendingFallback,
+  target: Model<any>,
+): Promise<FallbackApplyResult> {
+  const refused = refuseUnsafeReplay(deps, ctx, pending);
+  if (refused) return refused;
+  const currentId = ctx.model?.id ?? pending.sourceModelId;
+  if (!(await deps.setModel(target))) {
+    deps.log?.(`[gateway-fallback] setModel declined target=${target.id}`);
+    return { switched: false, skipped: "set-model-declined" };
+  }
+  deps.log?.(`[gateway-fallback] operator picked current=${currentId} target=${target.id}`);
+  // No ui.notify here: the caller emits the one operator-visible notice.
+  return {
+    switched: true,
+    ...(currentId ? { currentId } : {}),
+    targetId: target.id,
+    reason: "operator choice",
+  };
+}
+
+/**
+ * Bookkeeping after an operator-picked switch: the model just left stays
+ * excluded (so the next advice cannot bounce the session back to it) and the
+ * hold ledger starts clean. The id comes from the apply result, else from the
+ * pending record, so a missing ctx model cannot drop the exclusion.
+ */
+export function recordOperatorSwitch(
+  coordinator: Pick<FallbackCoordinator, "onSwitched">,
+  result: FallbackApplyResult,
+  pending: Pick<PendingFallback, "sourceModelId">,
+): void {
+  if (!result.switched) return;
+  coordinator.onSwitched(result.currentId ?? pending.sourceModelId);
+}
+
+/**
  * Run a claimed pending fallback against a FRESH, currently-valid context.
  *
  * This is the ONLY place the session is touched, and it must be called from a
@@ -481,16 +553,8 @@ export async function applyPendingFallback(
   ctx: FallbackContext,
   pending: PendingFallback,
 ): Promise<FallbackApplyResult> {
-  // No blind replay: once a side-effecting tool call has started in the turn,
-  // moving the request to another model could run it a second time.
-  if (pending.toolExecutionStarted === true && pending.replaySafe !== true) {
-    ctx.ui?.notify(
-      "Model switch skipped: a tool call already started this turn and is not replay-safe. Waiting on the current model.",
-      "warning",
-    );
-    deps.log?.("[gateway-fallback] stay (tool call started, not replay-safe)");
-    return { switched: false, skipped: "tool-started-not-replay-safe" };
-  }
+  const refused = refuseUnsafeReplay(deps, ctx, pending);
+  if (refused) return refused;
   const choice = await chooseFallback(deps, ctx, pending);
   if (choice.action === "blocked") {
     ctx.ui?.notify(

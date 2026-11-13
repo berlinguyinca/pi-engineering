@@ -1,0 +1,7 @@
+[
+ {
+  "command": "git diff --check",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/V05/logs/02-scope.txt"
+ }
+]

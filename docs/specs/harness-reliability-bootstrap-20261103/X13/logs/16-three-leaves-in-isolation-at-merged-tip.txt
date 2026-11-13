@@ -1,0 +1,86 @@
+[info] thinking: off (mission role) · implementer
+[info] thinking: off (mission role) · implementer
+[info] thinking: off (mission role) · implementer
+▶ mission reliability foundation — synthetic MSN-qSLaeM
+  ✔ runs MSN-qSLaeM through the public runtime, times out after 2/3, and repairs only the remainder (14398.086292ms)
+  ✔ keeps the incumbent unchanged when integration conflicts (7450.600666ms)
+  ✔ records a fresh same-model review with the reduced-independence warning (4708.196041ms)
+  ✔ keeps the incumbent unchanged when current-candidate validation is red (8993.81ms)
+  ✔ replays checkpoint, failure fingerprint, and recovery budget after restart (19.165084ms)
+  ✔ rejects recovery before replacement dispatch when checkpoint artifact content is overwritten (1149.432667ms)
+  ✔ rejects recovery before replacement dispatch when checkpoint artifact content is deleted (1142.131875ms)
+  ✔ re-verifies checkpoint artifacts after execute returns and immediately before replacement dispatch (1178.588291ms)
+  ✔ reads current canonical bytes in the true-final synchronous verify-and-dispatch call (1371.96925ms)
+  ✔ replays checkpoint-owned artifact bytes and verifies them before recovery dispatch (1148.805541ms)
+  ✔ stops with preserved work and an exact resume condition when a fingerprint is exhausted (1147.172166ms)
+  ✔ classifies a nonterminal zero-worker mission as ORPHANED with a scheduled recovery (1.594125ms)
+  ✔ isolates repository authority between two missions without mutating either incumbent (576.228042ms)
+  ✔ refuses a non-local dogfood model before launching Pi or creating a repository (229.584208ms)
+  ✔ still refuses a temporary parent that overlaps the checkout (604.860583ms)
+  ✔ dogfoods the uniquely installed package and validates the versioned snapshot contract (880.028875ms)
+  ✔ rejects wrong-mission dogfood event evidence (871.634291ms)
+  ✔ rejects nested-counterfeit dogfood event evidence (842.06675ms)
+  ✔ rejects out-of-order dogfood event evidence (778.972667ms)
+  ✔ rejects failed-recovery dogfood event evidence (742.279ms)
+  ✔ rejects wrong-recovery dogfood event evidence (749.290792ms)
+  ✔ rejects malformed dogfood event evidence (763.904ms)
+  ✔ labels source-only dogfood and disables extension discovery before loading the source extension (624.398709ms)
+  ✔ refuses a dirty installed package before any extension-loading Pi invocation (435.92675ms)
+  ✔ returns nonzero for a missing runtime v3 snapshot (848.69975ms)
+  ✔ returns nonzero for a malformed runtime v3 snapshot (1023.5365ms)
+  ✔ returns nonzero for a acceptance-not-passed runtime v3 snapshot (1145.006416ms)
+  ✔ returns nonzero for a acceptance-coverage runtime v3 snapshot (988.534958ms)
+  ✔ returns nonzero for a test-accounting runtime v3 snapshot (1062.443375ms)
+  ✔ returns nonzero for a test-failed runtime v3 snapshot (930.334833ms)
+  ✔ returns nonzero for a review-findings runtime v3 snapshot (903.890417ms)
+  ✔ returns nonzero for a review-incomplete runtime v3 snapshot (931.411667ms)
+  ✔ returns nonzero for a review-invalid-severity runtime v3 snapshot (879.34325ms)
+  ✔ returns nonzero for a review-invalid-status runtime v3 snapshot (932.391ms)
+  ✔ returns nonzero for a review-accepted-blocker runtime v3 snapshot (809.053375ms)
+  ✔ returns nonzero for a review-resolved-not-repaired runtime v3 snapshot (798.878959ms)
+  ✔ returns nonzero for a review-open-repaired runtime v3 snapshot (908.704875ms)
+  ✔ returns nonzero for a top-finding-invalid-severity runtime v3 snapshot (817.0735ms)
+  ✔ returns nonzero for a top-finding-invalid-status runtime v3 snapshot (768.542166ms)
+  ✔ returns nonzero for a top-finding-resolved-not-repaired runtime v3 snapshot (731.825875ms)
+  ✔ returns nonzero for a top-finding-accepted-blocker runtime v3 snapshot (733.066667ms)
+  ✔ returns nonzero for a top-finding-projection-mismatch runtime v3 snapshot (754.92175ms)
+  ✔ refuses a temporary parent inside any Git worktree before creating a repository (652.783917ms)
+  ✔ returns nonzero and retains the temporary path for FAILED or CANCELED dogfood missions (697.397083ms)
+✔ mission reliability foundation — synthetic MSN-qSLaeM (68131.160167ms)
+✖ a completion whose headers arrive after the fetch dispatcher's timeouts still completes (34.257459ms)
+✖ the caller's signal still ends a completion (3.071041ms)
+✔ a verification command that opens a listener and never exits is killed after its silence window (725.086792ms)
+✔ a backgrounded child holding stdout open after the shell exits is killed with its process group (467.678625ms)
+✔ a mission abort terminates a running verification command promptly (255.039625ms)
+✔ a command aborted before it starts never runs (0.934708ms)
+✔ a long command that keeps printing is never cut off (1550.181916ms)
+ℹ tests 51
+ℹ suites 1
+ℹ pass 49
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 74485.4245
+
+✖ failing tests:
+
+test at test/integration/planner-worker-gateway-timeouts.test.ts:1:907
+✖ a completion whose headers arrive after the fetch dispatcher's timeouts still completes (34.257459ms)
+  Error [InvalidArgumentError]: Argument dispatcher must implement dispatch
+      at new Dispatcher1Wrapper (node:internal/deps/undici/undici:10092:17)
+      at TestContext.<anonymous> (/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/test/integration/planner-worker-gateway-timeouts.test.ts:35:25)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async TestHook.run (node:internal/test_runner/test:1389:7) {
+    code: 'UND_ERR_INVALID_ARG'
+  }
+
+test at test/integration/planner-worker-gateway-timeouts.test.ts:1:1492
+✖ the caller's signal still ends a completion (3.071041ms)
+  Error [InvalidArgumentError]: Argument dispatcher must implement dispatch
+      at new Dispatcher1Wrapper (node:internal/deps/undici/undici:10092:17)
+      at TestContext.<anonymous> (/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/test/integration/planner-worker-gateway-timeouts.test.ts:35:25)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async TestHook.run (node:internal/test_runner/test:1389:7) {
+    code: 'UND_ERR_INVALID_ARG'
+  }

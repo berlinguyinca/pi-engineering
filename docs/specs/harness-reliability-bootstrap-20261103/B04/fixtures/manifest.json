@@ -1,0 +1,74 @@
+{
+ "taskId": "B04",
+ "baseSha": "bfffb539025959a7429cb8703779573c132ead1f",
+ "repoId": "pi",
+ "objective": "Implement CLI skeleton: load one manifest, verify clean baseline/commit, validate dependencies/handoff, print deterministic execution plan; STOP before invoking a model at this stage. No scheduler imports. Evidence: One manifest accepted; malformed/handoff mismatch rejected; no model calls",
+ "allowPaths": [
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "denyPaths": [
+  "src/plannerWorker/**",
+  "src/runtime/**",
+  "src/orchestration/**",
+  "src/aps/**",
+  "src/errors/**",
+  "src/verify/**",
+  "src/merge/**",
+  "src/gateway/**",
+  "src/guard/**",
+  "src/context/**",
+  "src/routing/**",
+  "src/scheduler/**",
+  "src/workers/**",
+  "src/models/**",
+  "src/lifecycle/**",
+  "src/platform/**",
+  "src/session/**",
+  "src/config/**",
+  "src/tools/**",
+  "src/resilience/**",
+  "templates/**",
+  "manifests/**",
+  "test/support/**",
+  "package.json",
+  "package-lock.json",
+  ".gitignore",
+  "tsconfig.json"
+ ],
+ "commands": [
+  {
+   "id": "typecheck",
+   "argv": [
+    "npm",
+    "run",
+    "typecheck"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  },
+  {
+   "id": "unit",
+   "argv": [
+    "node",
+    "--test",
+    "--import",
+    "./test/support/isolatedState.ts",
+    "test/unit/bootstrap-one.test.ts"
+   ],
+   "timeoutMs": 900000,
+   "cwd": "repo"
+  }
+ ],
+ "limits": {
+  "maxProductionFiles": 2,
+  "maxTestFiles": 2,
+  "maxChangedLines": 100
+ },
+ "parentHandoffHash": "sha256:a1d6030e62a071d8046c0807ed44debac08cef5e739d371f3314e7a46866d113",
+ "expectedOutputs": [
+  "scripts/bootstrap-one.ts",
+  "test/unit/bootstrap-one.test.ts"
+ ],
+ "mode": "isolated-change"
+}

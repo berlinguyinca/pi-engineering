@@ -1,0 +1,13 @@
+✔ no navigation regression: every page listed before H07 is still a NAV entry and /diagnostics is the only addition (2.026458ms)
+✔ the route is wired: app.js imports the mount and routes the /diagnostics path over the feeds that already exist (0.3095ms)
+✔ one read renders the issue list, then the session timeline, then the drift comparison, and an unreadable host feed says so (2.494625ms)
+✔ a missing source, or one whose feeds all fail, still renders the unavailable state and never throws (0.499917ms)
+✔ the rendered page is read-only markup: no control, no handler, no timer, no link the feeds did not provide (0.518083ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 154.729584

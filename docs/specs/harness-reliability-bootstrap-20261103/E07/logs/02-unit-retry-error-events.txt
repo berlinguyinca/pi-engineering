@@ -1,0 +1,12 @@
+✔ E07 evidence: one upstream failure observed by three layers stays one occurrence with one acting owner (4.188625ms)
+✔ distinct failures and scopes yield distinct ids; the same failure re-derived twice is byte-identical (0.389166ms)
+✔ the emitted payload carries failure_id + error_ref; the secret, absolute path and prompt appear nowhere in it (0.365917ms)
+✔ the old API is intact: actedOn/actingLayers unchanged; old-arity recordRetryTrace pushes and emits as before (0.087542ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 140.074

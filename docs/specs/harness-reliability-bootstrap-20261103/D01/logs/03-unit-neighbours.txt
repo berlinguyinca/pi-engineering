@@ -1,0 +1,27 @@
+✔ accepts a fully attributed occurrence; absent optionals stay null (2.272042ms)
+✔ an occurrence with no session is refused — unattributable errors are not recordable (0.172292ms)
+✔ rejects unredacted secrets, control characters and unsafe artifact refs (0.166375ms)
+✔ requires correlation and validates layer, severity, version, timestamp (0.090583ms)
+✔ each fixture maps to the demanded code and severity with a valid, non-empty summary (3.689625ms)
+✔ unrecognised or unreadable input becomes an explicit unknown event instead of throwing (0.989125ms)
+✔ the original evidence reference is preserved unchanged, ahead of the derived refs (0.129125ms)
+✔ normalization is deterministic, clock-free, redacting and honest about missing attribution (0.431041ms)
+✔ every secret fixture is absent from the persisted representation and only the env variable's name survives (3.328291ms)
+✔ a raw prompt becomes its length plus a stable digest, never a shorter prefix of itself (2.49675ms)
+✔ list caps drop the tail into a counted marker instead of silently, and re-sanitizing does not stack it (0.856084ms)
+✔ the persisted record respects the byte budget, however oversized the occurrence (1.262584ms)
+✔ sanitize is idempotent, keeps the evidence E03 carried, and never throws on malformed input (1.363167ms)
+✔ a clean occurrence passes through unchanged apart from the caps (0.243708ms)
+✔ two sessions appending concurrently keep their streams isolated while readers see both (5.769667ms)
+✔ an occurrence survives drain + close + reopen with a deep-equal payload (0.851ms)
+✔ the secret an occurrence carries never reaches the bytes on disk (0.5445ms)
+✔ occurrences stay apart from incident events, carry the fingerprint, and map scope honestly (5.146708ms)
+✔ recording the same occurrence twice writes one line, and a refusal E04 makes writes nothing (1.580458ms)
+ℹ tests 19
+ℹ suites 0
+ℹ pass 19
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 185.0045

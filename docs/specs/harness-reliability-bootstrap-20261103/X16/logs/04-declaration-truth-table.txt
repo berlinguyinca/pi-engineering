@@ -1,0 +1,35 @@
+X16 log 04 -- every exception the scan now accepts, beside the fact that earns it
+AUDIT/chain-declaration.json is the only place a waiver lives; the scan prints each one on
+every run and fails on a waiver that no longer applies (logs/03 C4a-C4d).
+
+1. may_be_unnamed: B00/out-backfill/B00.handoff.json
+   claim: the chain head -- no canonical record names B00@c2b75dc93885.
+   proof: scanning every tracked out* record for one whose nextTaskId is B00:
+     none. No record in the trail names B00 as its child.
+   record: taskId=B00 status=PASS baseSha=c2b75dc93885d246d712d656f72de1764cf198e0
+          nextTaskId=B01 nextBaseSha=c2b75dc93885d246d712d656f72de1764cf198e0
+   introduced by: 900bf8a3 docs(bootstrap): back-fill B00-B05 handoff records with evidence re-run at each unit's own commit
+   why it stays unnamed: the trail was reconstructed backwards from the runtime defects, so
+   the backfill has no parent emission to rewrite. Deleting the declaration turns it into an
+   ORPHAN-OFFENCE and the scan exits 1 (C4a).
+
+2. hash_mismatch_expected: FIX-2/fixtures/parent-tampered.json
+   claim: a negative control, not a trail record -- FIX-1/out's bytes with one field altered.
+   proof: one field differs from FIX-1/out/FIX-1.handoff.json -- operatorApproval.notes, whose first
+   528 characters are identical and whose fixture copy appends a marker:
+     out:     ...read TaskManifest(manifest-fix1.json).manifest).                      (528 chars)
+     fixture: ...read TaskManifest(manifest-fix1.json).manifest). [tampered]           (539 chars)
+   stored handoffHash sha256:942da49b0ab334eac... -- canonicalHash over these bytes disagrees,
+   which is the point: the file is *claimed* to certify FIX-1 and does not. It carries FIX-1's
+   taskId and baseSha, so it is also the record a lax link rule would accept as FIX-1's child;
+   the scan keeps it out of the link targets by name (NEGATIVE_GEN, integrity-scan.mjs).
+   Remove the waiver and it offends rather than disappearing (C4c).
+
+3. payload_fixtures: suffix fixtures/handoff-record.json, field_absent handoffHash
+   claim: the emitter wrote each unit's payload before hashing it -- 67 such files,
+   66 of them without handoffHash (the rule matches those; the one that carries a
+   hash -- X08/fixtures/handoff-record.json -- is read as an ordinary record, hash included).
+   proof: the scan recomputes each payload against every other record of its own unit:
+     payload fixtures under */fixtures/=66, each equal to another record of its unit apart from the absent field (offences=0, stale rules=0)
+   a payload that matches nothing is a PAYLOAD-OFFENCE (C3); a rule that matches no file is a
+   STALE-DECLARATION (C4d).

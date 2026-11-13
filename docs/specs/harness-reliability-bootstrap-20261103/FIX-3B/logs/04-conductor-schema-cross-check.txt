@@ -1,0 +1,19 @@
+E02 real stamped handoff blockers: []
+  mutations -> [["$.status: \"DONE\" is not one of enum [\"PASS\",\"ALREADY_SATISFIED\",\"BLOCKED\"]"],["$.commands[0].exitCode: required property missing","$.commands[0].outputArtifact: required property missing"],["$.sneaky: disallowed additional property"]]
+FIX-1 real stamped handoff blockers: []
+  mutations -> [["$.status: \"DONE\" is not one of enum [\"PASS\",\"ALREADY_SATISFIED\",\"BLOCKED\"]"],["$.commands[0].exitCode: required property missing","$.commands[0].outputArtifact: required property missing"],["$.sneaky: disallowed additional property"]]
+FIX-2 real stamped handoff blockers: []
+  mutations -> [["$.status: \"DONE\" is not one of enum [\"PASS\",\"ALREADY_SATISFIED\",\"BLOCKED\"]"],["$.commands[0].exitCode: required property missing","$.commands[0].outputArtifact: required property missing"],["$.sneaky: disallowed additional property"]]
+file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-fix3-schema-validator-20261104/src/bootstrap/resultGate.ts:37
+  if (existsSync(target)) throw new Error(`refusing to overwrite an existing handoff: ${target}`);
+                                ^
+
+Error: refusing to overwrite an existing handoff: /tmp/fix3b-mkdir-check/a/b/c/MKDIR-CHECK.handoff.json
+    at writeHandoff (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-fix3-schema-validator-20261104/src/bootstrap/resultGate.ts:37:33)
+    at writeHandoff (file:///Users/wohlgemuth/IdeaProjects/worktrees/pi-fix3-schema-validator-20261104/src/bootstrap/handoffWriter.ts:50:47)
+    at file:///private/tmp/schema-cross-check.mjs:14:11
+    at ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:646:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+
+Node.js v26.3.0

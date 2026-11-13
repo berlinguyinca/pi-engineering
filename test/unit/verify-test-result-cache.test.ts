@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -122,6 +122,53 @@ describe("collectFingerprintInput from a real repo", () => {
     assert.notEqual(dirty, before);
     await g("commit", "-aq", "-m", "edit");
     assert.equal(fingerprint(await collect()), dirty, "same content, committed, is the same source tree");
+  });
+
+  it("sees a same-length edit the filesystem stamps in the same tick as the commit", async () => {
+    // The trap, forced as far as a test can force it. A filesystem whose timestamp
+    // granularity is one second -- which is what the exec hosts' scratch directories
+    // are -- reports an edit made inside the commit's own tick as untouched, and git
+    // believes it when the recorded length and ctime match too. Pin the length and
+    // the mtime to what the index recorded; on a fine-grained filesystem ctime
+    // usually still moves, so this case is a coin flip with the copied index (it
+    // failed 1 of 3 local runs and failed on the exec host in pipeline 48), and it
+    // must pass every time with an index that has no stat data to trust.
+    const target = join(repo, "a.txt");
+    const tick = Math.floor((await stat(target)).mtimeMs / 1000) * 1000;
+    await utimes(target, tick / 1000, tick / 1000);
+    await g("update-index", "--really-refresh"); // record the coarsened stat data in the index
+
+    const before = fingerprint(await collect());
+    await writeFile(target, "hellp\n"); // 6 bytes, like "hello\n": size alone proves nothing
+    await utimes(target, tick / 1000, tick / 1000);
+
+    // The trap is armed: the length and the mtime the index recorded are both still true.
+    const st = await stat(target);
+    assert.equal(st.size, 6, "the edit must keep the length the index recorded");
+    assert.equal(Math.round(st.mtimeMs), tick, "the edit must keep the mtime on that tick");
+
+    const dirty = fingerprint(await collect());
+    assert.notEqual(dirty, before, "one edited byte is a different source tree, whatever the stat data says");
+
+    await g("commit", "-aq", "-m", "edit");
+    assert.equal(fingerprint(await collect()), dirty, "same content, committed, is the same source tree");
+  });
+
+  it("sees content that an assume-unchanged bit asks git to overlook", async () => {
+    // The same failure by a different door, and one every filesystem reproduces.
+    // An index built by copying the real one carries `assume-unchanged`, and git
+    // then treats that entry as up to date whatever the file says -- so an edit
+    // the developer marked invisible is also invisible to the fingerprint, which
+    // is the one thing a source-tree fingerprint must never be.
+    const target = join(repo, "a.txt");
+    await g("update-index", "--assume-unchanged", "a.txt");
+    const before = fingerprint(await collect());
+    await writeFile(target, "changed\n");
+    assert.notEqual(
+      fingerprint(await collect()),
+      before,
+      "a fingerprint may not inherit a request to ignore content; the tree changed",
+    );
   });
 
   it("an untracked file counts, an ignored file does not, and the repo is left untouched", async () => {

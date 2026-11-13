@@ -1,0 +1,17 @@
+[
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X02/logs/01-npm-run-typecheck-.txt"
+ },
+ {
+  "command": "node --experimental-strip-types scripts/bench-task-drift.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X02/logs/02-node-experimental-strip-type.txt"
+ },
+ {
+  "command": "node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts test/unit/aps-task-alignment.test.ts",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/X02/logs/03-node-test-import-test-suppor.txt"
+ }
+]

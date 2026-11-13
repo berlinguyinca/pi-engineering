@@ -1,0 +1,12 @@
+{
+  "reason": "Post-plan extension unit: the audit's integrity scans were one-off scripts that could not answer whether a fresh clone can walk the handoff chain, which the X-series broke (chain generations were emitted after the evidence commit that would carry them, so they stayed in the working tree). The grant is one file under docs/specs/**, which no DENY list covers; the file is tooling, so no test file accompanies it and the recorded commands run the scanner, the drift detector suites it exists to protect, and the typecheck. Its evidence commit also carries the six missing chain-parent records (X01-X04 out-final, X05 out-final/out-chain, X06 out-final) and the refreshed fixtures/handoff-record.json copies - evidence bookkeeping, not source, so it lives outside the gated task commit and is named in the commit message.",
+  "production": [
+    "docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs"
+  ],
+  "tests": [],
+  "verify": "node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs; node --test --import ./test/support/isolatedState.ts test/unit/bench-task-drift.test.ts test/unit/aps-task-alignment.test.ts test/unit/aps-drift-watch.test.ts test/unit/aps-observability.test.ts; npm run typecheck",
+  "evidence": "scanner output (records, canonical hash, forward-chain links, tracked/untracked evidence), drift-detector suite counts, typecheck",
+  "maxProductionFiles": 1,
+  "maxTestFiles": 0,
+  "maxChangedLines": 100
+}

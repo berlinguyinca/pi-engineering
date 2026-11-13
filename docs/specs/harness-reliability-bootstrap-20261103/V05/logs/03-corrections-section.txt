@@ -1,0 +1,12 @@
+# ROLLOUT — shadow mode, baselines, stop criteria, rollback, retention (V05)
+
+Written read-only on base `fc471225`. Every flag name below was opened in source at that commit and is cited `file:line`; every number comes from a file I read. Where no flag exists the row says **no flag — revert**. Nothing here turns on new recovery by default.
+
+## 0. Two corrections to the facts handed to this task
+
+| Handed fact | What the source / filesystem actually shows |
+| --- | --- |
+| "the boolean parser is affirmative-only (1/true/yes/on); anything else, including a typo, is OFF" | **There are two parsers with opposite semantics.** `bool()` `src/inference/resilienceConfig.ts:88-93` is **negative-only**: `false` only for `false`/`0`/`off` (trimmed, any case), `true` for every other non-empty value — so a typo leaves the switch **on**. `optIn()` `:100-102` (`/^(1\|true\|yes\|on)$/i`) is **affirmative-only** and guards exactly one switch, `PI_INFERENCE_MODEL_FALLBACK_INTERACTIVE` `:135`. Measured at `fc471225` through `resolveInferenceResilienceConfig`: `PI_INFERENCE_RESILIENCE_ENABLED=ture` → `true`, `=off` → `false`, unset → `true`; `..._INTERACTIVE=ture` → `false`, `=on` → `true`. 11 of 12 switches use `bool()`. |
+| baseline file `docs/specs/harness-reliability-bootstrap-20261103/BASELINE-unit-suite-at-c349613b.txt` | **Absent from this checkout because it was never committed.** It is an untracked file (`git status` → `??`) in the conductor worktree `worktrees/pi-bootstrap-conductor-20261103`, and `git log --all -- '*BASELINE-unit-suite*'` returns no commit — so it belongs to no commit and is not reachable from `fc471225`. Read directly from that worktree it records **210** `✖` lines, **2971** `✔` lines over 3550 lines, and **no `ℹ` summary line** (0 matches), so its totals are line-counted, not runner-reported. |
+| scope gate has no env flag; diagnose path read-only by construction; herdr `591264f9`, 36 tests | **All hold.** Herdr `main` = `591264f9bd4fc2fc07d88d94febde4cd0e919448`; re-running the six files here gives `tests 36 / pass 36 / fail 0`. |
+

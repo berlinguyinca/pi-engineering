@@ -220,11 +220,28 @@ test("outbox perf: per-operation cost does not grow with file history (index, no
     small.push(await perOpMs(SMALL));
     big.push(await perOpMs(BIG));
   }
-  const ratio = Math.min(...big) / Math.max(Math.min(...small), 0.005);
+  const minSmall = Math.min(...small);
+  const minBig = Math.min(...big);
+  const ratio = minBig / Math.max(minSmall, 0.005);
+  const growthMs = minBig - minSmall;
   console.log(
-    `# perf: per-op min ${Math.min(...small).toFixed(4)}ms @${SMALL} vs ${Math.min(...big).toFixed(4)}ms @${BIG}, ratio=${ratio.toFixed(2)}`,
+    `# perf: per-op min ${minSmall.toFixed(4)}ms @${SMALL} vs ${minBig.toFixed(4)}ms @${BIG}, ratio=${ratio.toFixed(2)}, growth=${growthMs.toFixed(4)}ms`,
   );
-  assert.ok(ratio < 5, `per-op cost grew ${ratio.toFixed(2)}x from ${SMALL} to ${BIG} history lines: non-linear`);
+  // Calibrated by measuring the failure mode: constructing a fresh box per operation, so every op
+  // rebuilds the index from the file, costs 16.7 ms per op at BIG on Node 22.22.3 and 22.9 ms on Node
+  // 26.3.0 — growth of 16.7 / 22.6 ms over SMALL. A working index measures 0.03–0.26 ms per op at
+  // either size, so growth is ~0 and the ratio 1.2–1.7.
+  //
+  // The ratio alone is not a safe gate on a busy host: min-of-5 only discards preemption that misses
+  // every round. Run inside `--test-concurrency=4` while the git-layer suite occupied the machine, this
+  // file measured min 0.1209 ms @200 vs 1.1844 ms @6000 — ratio 9.80, a false failure, but a growth of
+  // 1.06 ms. So require non-linearity to be large in absolute terms too: GROWTH_FLOOR_MS is half the
+  // smallest measured regression and seven times the worst noise observed here.
+  const GROWTH_FLOOR_MS = 8;
+  assert.ok(
+    ratio < 5 || growthMs < GROWTH_FLOOR_MS,
+    `per-op cost grew ${ratio.toFixed(2)}x / ${growthMs.toFixed(2)}ms from ${SMALL} to ${BIG} history lines: non-linear`,
+  );
 });
 
 test("outbox: index survives restart and picks up another process's appends without a rescan", async () => {

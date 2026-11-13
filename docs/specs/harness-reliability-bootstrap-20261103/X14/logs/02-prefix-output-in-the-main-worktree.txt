@@ -1,0 +1,21 @@
+# 2. main control worktree /Users/wohlgemuth/IdeaProjects/worktrees/pi-x10-main-ctl
+#   tree 81e229a6, AUDIT/integrity-scan.mjs byte-identical (clean tree)
+#   no empty generation dirs: a checkout cannot carry them
+
+records=103 canonical=67 hash_ok=103 field_ok=103
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=61 offenders=3
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN FIX-2/out -> FIX-3@e77904e73f3c (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+superseded-generation links (informational)=20
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 6
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+evidence dangling=0 untracked=0
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+exit=0

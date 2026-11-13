@@ -1,0 +1,93 @@
+SCOPE HEADER (added before the record was emitted): this snapshot was captured BEFORE the evidence tree was force-added
+and BEFORE the X11/out-chain nextBaseSha fix, so its integrity-scan counters (records=99, links=59, offenders=3 including
+'X11/out-chain -> X12@4be00c17 (no such record)') and its verifier count (58 issues) are the pre-closure state. The closure
+measurement is X12/logs/09-closure-gates.txt (records=101, links=60, offenders=2, 35 issues). Kept as the record of what the
+first run showed, not as the final state.
+
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/integrity-scan.mjs
+records=101 canonical=66 hash_ok=101 field_ok=101
+schema=docs/specs/harness-reliability-bootstrap-20261103/templates/handoff.schema.json required=15
+canonical chain links resolved=59 offenders=3
+  CHAIN E02/out -> E03@cc036f2f8c3b (no such record)
+  CHAIN T09/out -> T10@3bb21ab2e4b4 (no such record)
+  CHAIN X11/out-chain -> X12@4be00c17525c (no such record)
+superseded-generation links (informational)=21
+canonical records not named by a canonical parent (chain head, terminal unit, or parent generation missing): 7
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/B00/out-backfill/B00.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-1/out/FIX-1.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/FIX-5/out/FIX-5.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/R01/out/R01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X01/out-final/X01.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X08/out-chain/X08.handoff.json
+  ORPHAN docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json
+evidence dangling=0 untracked=22
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/01-merge-and-duplicate-function.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/00-pre-resolution-typecheck-core.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/02-whole-suite-canonical-at-4be00c17.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/02-three-leaves-canonical-branch.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/02-three-leaves-alone.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/02-three-leaves-at-origin-main-e7888752.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/03-four-files-gate-invocation.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/03-four-files-no-preload-stall.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/03-budget-hint-canonical.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/03-budget-hint-3copies-canonical.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/03-budget-hint-3copies-no-preload.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/03-budget-hint-alone-no-preload.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/05-method-correction-budget-hint.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/04-lint-npm-branch.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/04-lint-npm-main.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/04-lint-summary-branch.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/06-lint-parity-with-the-repos-own-command.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/07-typecheck-core.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/07-git-common-dir-repair.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/logs/07-biome-gitrepo.txt
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json -> docs/specs/harness-reliability-bootstrap-20261103/X12/fixtures/manifest.json
+  UNTRACKED docs/specs/harness-reliability-bootstrap-20261103/X12/out/X12.handoff.json (record itself)
+working-tree dirty entries under docs/specs/harness-reliability-bootstrap-20261103: 0
+exit=0
+
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/lineage-scan.mjs
+ref=HEAD records=104 fields=3
+pointers healthy=265 nullDeclared=17 broken=30 unparseableRecords=0
+healthy pointers carried only by local heads/tags, not yet on a remote (a clone of origin would not get them): 1
+manifest=harness-reliability-lineage-superseded/v2 entries=30 superseded=8 unresolvable=21 abbreviated=1
+RESULT ok: every commit pointer resolves from a ref, or is declared with a verified annotation
+exit=0
+
+$ node --experimental-strip-types scripts/verify-handoff-trail.ts --trail docs/specs/harness-reliability-bootstrap-20261103
+  evidence-uncommitted X12: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/X12/logs/04-lint-summary-branch.txt
+  evidence-uncommitted X12: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/X12/logs/05-method-correction-budget-hint.txt
+  evidence-uncommitted X12: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/X12/logs/06-lint-parity-with-the-repos-own-command.txt
+  evidence-uncommitted X12: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/X12/logs/07-biome-gitrepo.txt
+  evidence-uncommitted X12: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/X12/logs/07-git-common-dir-repair.txt
+  evidence-uncommitted X12: declared artifact has no blob at the audited revision: docs/specs/harness-reliability-bootstrap-20261103/X12/logs/07-typecheck-core.txt
+  unplanned-record FIX-1: FIX-1 carries a record the plan never ordered
+  unplanned-record FIX-2: FIX-2 carries a record the plan never ordered
+  unplanned-record FIX-3B: FIX-3B carries a record the plan never ordered
+  unplanned-record FIX-3B2: FIX-3B2 carries a record the plan never ordered
+  unplanned-record FIX-3C: FIX-3C carries a record the plan never ordered
+  unplanned-record FIX-4A: FIX-4A carries a record the plan never ordered
+  unplanned-record FIX-4B: FIX-4B carries a record the plan never ordered
+  unplanned-record FIX-5: FIX-5 carries a record the plan never ordered
+  unplanned-record X01: X01 carries a record the plan never ordered
+  unplanned-record X02: X02 carries a record the plan never ordered
+  unplanned-record X03: X03 carries a record the plan never ordered
+  unplanned-record X04: X04 carries a record the plan never ordered
+  unplanned-record X05: X05 carries a record the plan never ordered
+  unplanned-record X06: X06 carries a record the plan never ordered
+  unplanned-record X07: X07 carries a record the plan never ordered
+  unplanned-record X08: X08 carries a record the plan never ordered
+  unplanned-record X09: X09 carries a record the plan never ordered
+  unplanned-record X10: X10 carries a record the plan never ordered
+  unplanned-record X11: X11 carries a record the plan never ordered
+  unplanned-record X12: X12 carries a record the plan never ordered
+  lineage-break E03: E02.nextBaseSha cc036f2f8c3b938c80348dff821af77c973fde7b != E03.baseSha ba22f28a6b540de74eb49a88a3e4fd62a08af1b4
+  next-pointer-mismatch E07: record declares nextTaskId "E08" where the plan orders "D01"
+  next-pointer-mismatch T09: record declares nextTaskId "T10" where the plan orders "R01"
+NOT VERIFIED: 56 issue(s) across 71 record(s)
+
+$ node docs/specs/harness-reliability-bootstrap-20261103/AUDIT/record-reproducibility.mjs
+ref=HEAD records=104
+hashes recomputed ok=104 mismatch=0 noHashField=0 unparseable=0
+declared evidence paths=615 absent from HEAD tree=0
+RESULT ok: every tracked record verifies from its committed bytes, and every file it vouches for is in the same tree

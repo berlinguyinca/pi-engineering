@@ -1,0 +1,14 @@
+out-of-scope: ["src/ui/theme.ts","docs/roadmap.md"] in-scope: true
+protected inside scope: true ["docs/specs/x/manifests/tasks.json"]
+override honoured (not protected now): true
+  family docs/specs/h/manifests/t.json protected: true
+  family docs/specs/h/T.handoff.json protected: true
+  family docs/specs/h/T/fixtures/p.json protected: true
+  family docs/specs/h/templates/s.json protected: true
+  family templates/s.json protected: true
+  family scripts/bootstrap-one.ts protected: true
+src clean: true
+bound: 20 note: true
+odd input: ["x.ts"] empty: true
+determinism: true
+reason: true globs: 6

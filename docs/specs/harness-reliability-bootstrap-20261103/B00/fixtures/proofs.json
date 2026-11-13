@@ -1,0 +1,17 @@
+[
+ {
+  "command": "git status --short",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/B00/logs/01-git-status-short.txt"
+ },
+ {
+  "command": "git rev-parse HEAD",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/B00/logs/02-git-rev-parse.txt"
+ },
+ {
+  "command": "npm run typecheck",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-bootstrap-conductor-20261103/docs/specs/harness-reliability-bootstrap-20261103/B00/logs/03-npm-typecheck.txt"
+ }
+]

@@ -95,6 +95,7 @@ import {
   sweepOnce,
 } from "./safeGitState.ts";
 import { UNBOUNDED_SCAN, scanRepoTreeDetailed } from "./safeGitTree.ts";
+import { mentionsShadow, unshadowText } from "./shadowPaths.ts";
 
 /**
  * Trust model (T16 H5). The repository's LOCAL and WORKTREE config, `info/attributes`, `.gitattributes`, `.lfsconfig`
@@ -1096,6 +1097,15 @@ function emptyTreeFor(format: string, env: NodeJS.ProcessEnv): string | null {
 
 interface Shadow {
   root: string;
+  /**
+   * `root` with symbolic links resolved. git canonicalises the `GIT_COMMON_DIR` it is handed, so everything it
+   * prints - and every path it writes into a work tree's `.git` file - is in THIS form, while `root` is the form Pi
+   * recorded. The two differ whenever Pi's state directory sits behind a symlink (`$TMPDIR` on macOS is `/var`, whose
+   * real path is `/private/var`; a mounted or linked home), and one is then the literal tail of the other.
+   */
+  rootReal: string;
+  /** `common` with symbolic links resolved; see {@link Shadow.rootReal}. */
+  commonReal: string;
   /** Names in the shadow that are private COPIES of a real file (read-only commands only): never written back. */
   copies: ReadonlySet<string>;
   common: string;
@@ -1121,6 +1131,24 @@ interface Prepared {
 }
 
 const SHADOW_SKIP = new Set(["config", "hooks", "info"]);
+/**
+ * Commands that walk the ref directory themselves instead of resolving refs through the ref backend.
+ *
+ * Measured on git 2.55 against a shadow built the normal way (every entry a symlink into the real common
+ * directory): `status`, `log`, `rev-parse`, `for-each-ref`, `branch -a`, `show-ref`, `ls-files`, `diff` and
+ * `count-objects` all succeed, because the ref backend follows the link. `fsck` alone fails — it opens the
+ * ref directory directly and refuses a symlink:
+ *
+ *   error: cannot open directory <common>/refs: Not a directory      (exit 8)
+ *
+ * So `refs` is snapshotted as a real directory for exactly this command. Everywhere else it stays a symlink:
+ * copying thousands of loose refs on every git call would cost real time to fix a command nobody routes
+ * through Pi for performance reasons. A reftable repository needs nothing extra — its `extensions.refstorage`
+ * survives into the generated config, and with that key present fsck passes whether `refs` is empty or copied.
+ */
+const WALKS_REF_DIR = new Set(["fsck"]);
+/** A refusal, not a wrong answer: a repository with more loose ref files than this is not snapshotted. */
+const MAX_SNAPSHOT_REF_ENTRIES = 20_000;
 const DERIVED_KEYS = new Set(["core.repositoryformatversion", "core.bare"]);
 const noticed = new Set<string>();
 
@@ -1215,21 +1243,65 @@ export function readPlainFile(path: string): Buffer | null {
   }
 }
 
+/**
+ * Copy the loose ref tree (refs/heads/main, refs/tags/v1, …) into the shadow. Contents only: a
+ * symlinked ref is git's deprecated symref form, and copying what git would read is the faithful
+ * choice, so anything that reads as a file is copied and anything else is skipped. Depth- and
+ * entry-capped; over the cap it throws, and the caller refuses rather than handing fsck a view of
+ * the repository that silently omits refs — a reachability check that misses its roots is worse
+ * than no check.
+ */
+function snapshotRefTree(source: string, target: string, depth: number, count: { entries: number }): void {
+  if (depth > 32) throw new Error("the ref directory is nested too deeply to snapshot");
+  mkdirSync(target, { mode: 0o700 });
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (++count.entries > MAX_SNAPSHOT_REF_ENTRIES)
+      throw new Error(
+        `the repository has more than ${MAX_SNAPSHOT_REF_ENTRIES} loose ref files; run \`git pack-refs --all\` (Pi is allowed to run it) and retry`,
+      );
+    const from = join(source, entry.name);
+    const to = join(target, entry.name);
+    if (entry.isDirectory()) {
+      snapshotRefTree(from, to, depth + 1, count);
+      continue;
+    }
+    try {
+      writeFileSync(to, readFileSync(from), { mode: 0o400 });
+    } catch {
+      /* a ref git itself cannot read is not ours to invent */
+    }
+  }
+}
+
 function makeShadow(
   layout: RepoLayout,
   configText: string,
   writer: boolean,
   attributesFor: (common: string) => string,
   readOnlyCommand = false,
+  snapshotRefs = false,
 ): Shadow {
   sweepOnce();
   const root = makeShadowRoot();
   const common = join(root, ".git");
+  // The canonical forms are resolved here, once, while the directory exists: git is handed these, and its output is
+  // compared against them. Both forms are kept because a path may be printed in either.
+  const rootReal = realpathOrSelf(root);
+  const commonReal = realpathOrSelf(common);
   const copies = new Set<string>();
+  // Per shadow, not per process: a long-lived session runs many git commands, and a counter that
+  // accumulated across them would start refusing fsck on a repository that was always fine.
+  const refSnapshotCount = { entries: 0 };
   try {
     mkdirSync(common, { mode: 0o700 });
     for (const name of readdirSync(layout.commonDir)) {
       if (SHADOW_SKIP.has(name)) continue;
+      if (snapshotRefs && name === "refs") {
+        // A real directory of copies: git's fsck will not open a symlinked ref directory.
+        snapshotRefTree(join(layout.commonDir, name), join(common, name), 0, refSnapshotCount);
+        copies.add("refs");
+        continue;
+      }
       if (readOnlyCommand && name === "shallow") {
         const body = readPlainFile(join(layout.commonDir, name));
         if (body !== null) {
@@ -1271,11 +1343,19 @@ function makeShadow(
       chmodSync(join(common, "hooks"), 0o500);
       chmodSync(common, 0o500);
     }
-    return { root, copies, common, attributes, attributesText, writer };
+    return { root, rootReal, commonReal, copies, common, attributes, attributesText, writer };
   } catch (e) {
     markShadowDone(root);
     removeShadow(root);
     throw e;
+  }
+}
+
+function realpathOrSelf(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
   }
 }
 
@@ -1693,6 +1773,7 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
         return lfsInfo?.text ?? "";
       },
       READS_ONLY_SHARED_FILES.has(sub ?? ""),
+      WALKS_REF_DIR.has(sub ?? ""),
     );
   } catch (e) {
     return refuse(
@@ -1713,7 +1794,10 @@ function prepare(args: readonly string[], opts: SafeGitOptions): Prepared {
       );
     }
   }
-  const env: NodeJS.ProcessEnv = { ...cleanEnv, GIT_DIR: layout.gitDir, GIT_COMMON_DIR: shadow.common };
+  // GIT_DIR is already canonical (discoverRepo resolves it); handing git the canonical common directory too keeps the
+  // two spellings of one repository consistent, so paths git writes are the ones mapOut and the work-tree pointer
+  // rewrite look for. The recorded spelling stays in Shadow for the filesystem work, which is the same directory.
+  const env: NodeJS.ProcessEnv = { ...cleanEnv, GIT_DIR: layout.gitDir, GIT_COMMON_DIR: shadow.commonReal };
   // the empty tree of THIS repository's hash format (a sha256 repository has a different one)
   const format = generated.kept.find((k) => k.key.toLowerCase() === "extensions.objectformat")?.value ?? "sha1";
   const tree = emptyTreeFor(format.toLowerCase(), env);
@@ -1856,8 +1940,11 @@ function fixWorktreeLinks(p: Prepared): void {
       const pointer = readFileSync(join(dir, name, "gitdir"), "utf8").trim();
       if (!pointer.endsWith("/.git") || !isFile(pointer)) continue;
       const body = readFileSync(pointer, "utf8");
-      if (!body.includes(shadow.root)) continue;
-      writeFileSync(pointer, body.split(shadow.common).join(layout.commonDir));
+      // git wrote this file, so it carries the canonical spelling of the shadow path, not the recorded one
+      if (!mentionsShadow(body, shadow)) continue;
+      const mapped = unshadowText(body, shadow, { commonTo: layout.commonDir, rootTo: null });
+      if (mapped === body) continue;
+      writeFileSync(pointer, mapped);
       // Pi created this work tree: remember which repository it belongs to, so a later rewrite of its `.git` file is noticed
       try {
         pinStore.setRepo(realpathSync(dirname(pointer)), layout.commonDir);
@@ -1896,7 +1983,7 @@ function rollbackWorktrees(p: Prepared): number {
         const pointer = readFileSync(join(dir, name, "gitdir"), "utf8").trim();
         if (!pointer.endsWith("/.git")) continue;
         const st = lstatSync(pointer);
-        if (!st.isFile() || !readFileSync(pointer, "utf8").includes(shadow.root)) continue;
+        if (!st.isFile() || !mentionsShadow(readFileSync(pointer, "utf8"), shadow)) continue;
         const tree = dirname(pointer);
         if (!done.has(tree)) {
           rmSync(tree, { recursive: true, force: true });
@@ -1915,10 +2002,11 @@ function rollbackWorktrees(p: Prepared): number {
 function mapOut(s: string, p: Prepared): string {
   const layout = p.layout as RepoLayout;
   const shadow = p.shadow as Shadow;
-  if (!s.includes(shadow.root)) return s;
-  let out = s.split(shadow.common).join(layout.commonDir);
-  if (basename(layout.commonDir) === ".git") out = out.split(shadow.root).join(dirname(layout.commonDir));
-  return out;
+  return unshadowText(s, shadow, {
+    commonTo: layout.commonDir,
+    // the shadow root stands for the directory that HOLDS `.git`, and only when that is what it is
+    rootTo: basename(layout.commonDir) === ".git" ? dirname(layout.commonDir) : null,
+  });
 }
 
 const gitConfigFile = (file: string, args: readonly string[], env: NodeJS.ProcessEnv): SafeGitResult =>
@@ -2021,6 +2109,10 @@ export function withholdQuotedContent(stderr: string): string {
   return out;
 }
 const clamp = (r: SafeGitResult): SafeGitResult => {
+  // Nothing to withhold and nothing to limit when stderr is empty: `withholdQuotedContent("")` returns "" and
+  // the length/identity test below would return `r` untouched. Same result, five regex passes cheaper, on the
+  // path every git probe takes.
+  if (!r.stderr) return r;
   const text = withholdQuotedContent(r.stderr);
   return text.length > STDERR_LINE || text !== r.stderr ? { ...r, stderr: limitStderr(text) } : r;
 };

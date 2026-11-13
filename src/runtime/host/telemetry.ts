@@ -43,7 +43,11 @@ export type RuntimeEventName =
   | "runtime.reload.completed"
   | "runtime.crash_recovery.started"
   | "runtime.crash_recovery.completed"
-  | "runtime.retention.pruned";
+  | "runtime.retention.pruned"
+  /** A tool name a generation could not register (#672). */
+  | "runtime.tool.shadowed"
+  /** A declared tool a forwarded call found no live generation to serve (#672). */
+  | "runtime.tool.unservable";
 
 /** The field vocabulary of spec §45. All optional; absent means not applicable. */
 export interface RuntimeEventFields {
@@ -61,6 +65,10 @@ export interface RuntimeEventFields {
   duration?: number;
   failure_reason?: string;
   rollback_version?: string;
+  /** Tool surface diagnostics (#672): the name, the generation involved, why it failed. */
+  tool?: string;
+  generation?: number;
+  tool_reason?: string;
   [extra: string]: unknown;
 }
 

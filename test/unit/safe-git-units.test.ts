@@ -211,7 +211,13 @@ test("-C relocates the config that is read: a planted repository named by -C (ab
 test("spawn failures (an argument too large for exec) are results, never rejections, for async and sync", async () => {
   const l = lab();
   try {
-    const big = "z".repeat(140_000); // above the 128 KiB limit of one argument
+    // "an argument too large for exec" is platform-shaped, not a constant: Linux
+    // caps a single argument at 32 pages (128 KiB), while macOS has no per-argument
+    // cap at all and instead caps the whole argv+env block at ARG_MAX (1 MiB).
+    // A fixed 140 000 therefore proves the property on Linux and silently passes
+    // a successful spawn on macOS. Ask the platform for its limit instead.
+    const argMax = Number(execFileSync("getconf", ["ARG_MAX"], { encoding: "utf8" }).trim()) || 1_048_576;
+    const big = "z".repeat(process.platform === "linux" ? 140_000 : argMax + 8_192);
     for (const trust of ["strict", "operator"] as const) {
       const r = await safeGit(["status", big], { cwd: join(l.root, "dirty"), trust, timeoutMs: 30_000 });
       assert.notEqual(r.code, 0);

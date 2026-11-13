@@ -1,3 +1,4 @@
+import type { DriftWatch } from "../aps/workerActivity.ts";
 import type { WorkerResult, WorkerRole, WorkerUsage } from "../core/types.ts";
 import type { CheckpointRecoveryContext } from "../orchestration/broker.ts";
 import type { CheckpointProgressClaim } from "./checkpointProgressTool.ts";
@@ -48,6 +49,12 @@ export interface WorkerRequest {
   tools: string[];
   /** Working directory (candidate worktree or repo root). */
   cwd: string;
+  /**
+   * Operator-declared scope/artifact contract for this request. When present and
+   * `PI_TASK_DRIFT_SIGNALS` is affirmatively set, the activity adapter watches the
+   * session's actions against it and records drift signals (detect-only).
+   */
+  driftWatch?: DriftWatch;
   /**
    * Inactivity guard in ms for standalone runs (no owner `signal`): the session
    * is aborted only after this long with no session event at all. It is not a

@@ -1,0 +1,7 @@
+[
+ {
+  "command": "git diff --check",
+  "exitCode": 0,
+  "outputArtifact": "/Users/wohlgemuth/IdeaProjects/worktrees/pi-e01-error-sources-20261103/docs/specs/harness-reliability-bootstrap-20261103/E01/logs/01-verify-git-diff-check.txt"
+ }
+]

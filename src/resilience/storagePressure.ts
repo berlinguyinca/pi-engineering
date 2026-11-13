@@ -64,6 +64,7 @@
  * filesystem itself — callers supply the mount sample and the sentinel probe.
  */
 
+import { envTtlMs } from "../core/envKnob.ts";
 import type { StoragePressureIncident } from "./classify.ts";
 
 /** The durable blocked-state substatus this controller transitions missions to. */
@@ -71,8 +72,8 @@ export const WAITING_FOR_DISK_SPACE = "WAITING_FOR_DISK_SPACE";
 
 /** Default status (compact warning) cadence: at most once per 10 minutes. */
 export const DEFAULT_STATUS_COOLDOWN_MS = 10 * 60_000;
-/** Default recovery probe cadence while paused: 30 seconds. */
-export const DEFAULT_PROBE_INTERVAL_MS = 30_000;
+/** Default recovery probe cadence while paused: 30 seconds; `PI_ENG_STORAGE_PROBE_MS` retunes it. */
+export const DEFAULT_PROBE_INTERVAL_MS = envTtlMs("PI_ENG_STORAGE_PROBE_MS", 30_000);
 /** Consecutive healthy mount samples required before the sentinel probe. */
 export const DEFAULT_CONSECUTIVE_CHECKS = 2;
 /** Jitter (ms) added to probe intervals to avoid thundering herd. */
