@@ -5,7 +5,8 @@
  */
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -13,6 +14,7 @@ import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import extension from "../../extensions/index.ts";
+import { ArtifactStore } from "../../src/artifacts/ArtifactStore.ts";
 import { RuntimeRegistry } from "../../src/runtime/isolation/RuntimeRegistry.ts";
 import { resolveWorktreeIdentity } from "../../src/runtime/isolation/WorktreeIdentity.ts";
 import { doctorExitCode, runDoctor } from "../../src/runtime/isolation/doctor.ts";
@@ -115,6 +117,62 @@ describe("doctor", () => {
     const fixed = await runDoctor({ cwd: repo, env, repair: true });
     assert.equal(fixed.checks.find((check) => check.name === "Runtime registry")?.status, "ok");
     assert.ok(fixed.repaired.some((entry) => entry.includes("corrupt registry")));
+  });
+
+  it("reports a stale device stamp as repairable and re-stamps it, but never a foreign domain", async () => {
+    const { repo, env } = await fixture();
+    const artifacts = join(repo, ".pi-eng", "artifacts");
+    const store = await ArtifactStore.create(artifacts);
+    await store.put("logs", "probe", "bytes", "probe");
+    const recordPath = join(artifacts, ".artifact-lock-domain.json");
+    const stamped = JSON.parse(readFileSync(recordPath, "utf8")) as {
+      version: number;
+      token: string;
+      device: string;
+      inode: string;
+    };
+    const live = lstatSync(join(artifacts, ".artifact-locks"), { bigint: true });
+    // The stamp a reboot or a `/pie update` volume rollover leaves behind.
+    writeFileSync(recordPath, `${JSON.stringify({ ...stamped, device: (live.dev + 1n).toString() })}\n`);
+
+    const before = await runDoctor({ cwd: repo, env });
+    const stale = before.checks.find((check) => check.name === "Artifact lock domain");
+    assert.equal(stale?.status, "warn", JSON.stringify(before.checks, null, 2));
+    assert.equal(stale?.repairable, 1);
+    assert.match(stale?.detail ?? "", /mount generation/i);
+    assert.equal(doctorExitCode(before), 1, "a repairable stamp does not read as fatal");
+
+    const repaired = await runDoctor({ cwd: repo, env, repair: true });
+    assert.ok(
+      repaired.repaired.some((entry) => entry.includes("re-stamped")),
+      JSON.stringify(repaired.repaired, null, 2),
+    );
+    assert.equal(repaired.checks.find((check) => check.name === "Artifact lock domain")?.status, "ok");
+    assert.equal(repaired.checks.find((check) => check.name === "Artifact lock domain")?.repairable, 0);
+    const healed = JSON.parse(readFileSync(recordPath, "utf8")) as { device: string; token: string; inode: string };
+    assert.equal(healed.device, live.dev.toString());
+    assert.equal(healed.token, stamped.token, "only the device stamp moves");
+    assert.equal(healed.inode, stamped.inode, "only the device stamp moves");
+    assert.equal(await store.readContent("logs", "probe"), "bytes", "the store was never in danger");
+
+    // A different domain token is a different store. Device drift cannot excuse
+    // it, and repair must leave the record alone.
+    const foreign = randomUUID();
+    writeFileSync(
+      recordPath,
+      `${JSON.stringify({ ...stamped, token: foreign, device: (live.dev + 1n).toString() })}\n`,
+    );
+    const unsafe = await runDoctor({ cwd: repo, env, repair: true });
+    const check = unsafe.checks.find((entry) => entry.name === "Artifact lock domain");
+    assert.equal(check?.status, "fail", JSON.stringify(unsafe.checks, null, 2));
+    assert.equal(check?.repairable, 0);
+    assert.match(check?.detail ?? "", /domain token/i);
+    assert.equal(doctorExitCode(unsafe), 2, "an unprovable identity is fatal, not repairable");
+    assert.equal(
+      JSON.parse(readFileSync(recordPath, "utf8")).token,
+      foreign,
+      "repair never rewrites a domain it cannot prove",
+    );
   });
 
   it("CLI: `pi-engineering doctor --json` reports and exits by health", async () => {

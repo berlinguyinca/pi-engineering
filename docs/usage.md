@@ -1682,11 +1682,46 @@ The runtime makes it git-ignored itself: on open it writes `.pi-eng/.gitignore`
 (`*`) when none exists, so the directory stays out of `git status`, `git add -A`,
 `git stash -u` and `git clean -fd` even in a repository whose own `.gitignore`
 does not list it. That matters: a `git stash -u` round-trip deletes and
-recreates an unignored `.pi-eng/` with default permissions and new inodes, and
+recreates an unignored `.pi-eng/` with default permissions and **new inodes**, and
 the artifact store then refuses to open (`ARTIFACT INTEGRITY: artifact root is
-writable by another user` / `artifact lock root identity changed`). If that has
-already happened, move `.pi-eng/artifacts` aside while no session has the store
-open; the runtime recreates it on the next open.
+writable by another user` / `artifact lock root identity changed (inode … is not
+the lock directory …)`). If that has already happened, move `.pi-eng/artifacts`
+aside while no session has the store open; the runtime recreates it on the next
+open.
+
+### Mount generations: why a store no longer refuses after an OS update
+
+The artifact store pins its lock root as `<artifacts>/.artifact-locks` and names
+it in `<artifacts>/.artifact-lock-domain.json` by **inode**, **ownership/mode**
+and — above all — the **domain token** that lives *inside* that directory
+(`.artifact-locks/.domain-token`). Those are identity: a copied, restored,
+renamed or swapped-out tree cannot present them, so it is refused exactly as
+before.
+
+`device` in that record is **not** identity. `st_dev` names the mount a path was
+resolved through, not the storage object, and macOS/APFS regenerates it whenever
+the volume generation changes — a system update, a restore, or `/pie update`
+installing a new extension build. When only `device` moves while the inode,
+ownership, mode and domain token still prove continuity, the store reads that as
+a new mount generation and re-stamps the record by compare-and-swap, so
+concurrent openers converge on one stamp instead of clobbering each other. No
+artifact data is touched, and the runtime logs the one fact that changed:
+
+```
+[pi-engineering] Artifact lock domain moved to a new mount generation (device 16777231 -> 16777233, inode 20563 and domain token unchanged); re-stamped /repo/.pi-eng/artifacts/.artifact-lock-domain.json.
+```
+
+Everything else stays fatal on purpose, with a reason in the message: a different
+inode (`LOCK_ROOT_INODE_CHANGED`), a domain token belonging to another store
+(`LOCK_DOMAIN_TOKEN_MISMATCH`), a lock root another user can write, or a lock
+directory that is simply gone (`LOCK_ROOT_MISSING`). `pi-engineering doctor`
+reports this under the **Artifact lock domain** check: a stale device stamp is
+`WARN` and `--repair` re-stamps it; anything whose continuity cannot be proven is
+`FAIL` (exit 2) and is never rewritten. Before this fix a mount-generation change
+made every existing store unopenable and the whole runtime answered
+`Orchestrator not initialized for this directory: ARTIFACT INTEGRITY: artifact
+lock root identity changed`; a store stamped with an old device now heals itself
+the first time it is opened, so no manual repair is needed.
 
 When the runtime cannot open for a directory, the `mission` tool and `/mission`
 (including `/mission cancel`) report why:
