@@ -1,7 +1,7 @@
 /**
- * Golden fixture for the mission-snapshot contract, version 3 (autospec R-PROTO-0).
+ * Golden fixture for the mission-snapshot contract, version 4 (autospec R-PROTO-0).
  *
- * `test/fixtures/mission-snapshot-v3.golden.json` is rebuilt here from the real
+ * `test/fixtures/mission-snapshot-v4.golden.json` is rebuilt here from the real
  * `buildMissionSnapshotFile` over fixed input and compared byte for byte. The
  * same file is meant to be asserted by berlinguyinca/pi-engineering-web (its
  * issue #2, not started when this landed), so a drift on either side fails a
@@ -29,7 +29,7 @@ import type { MissionProjection } from "../../src/orchestration/observability/ty
 import type { MissionStop } from "../../src/orchestration/types.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 
-const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "mission-snapshot-v3.golden.json");
+const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "mission-snapshot-v4.golden.json");
 const CLOCK = "2026-10-14T12:00:00.000Z";
 
 function projection(over: {
@@ -219,7 +219,19 @@ function goldenInput(): Parameters<typeof buildMissionSnapshotFile>[0] {
       spec: spec(false),
     },
     {
-      mission: store.getMission(full.mission_id) ?? full,
+      mission: { ...(store.getMission(full.mission_id) ?? full), completed_at: "2026-10-14T11:30:00.000Z" },
+      githubLinks: ["issue:github.com/org/repo#5", "pr:github.com/org/repo#9"].map((target) => ({
+        linkId: `ghl_golden_${target}`,
+        missionId: full.mission_id,
+        subject: { kind: "mission" as const, id: full.mission_id },
+        target,
+        targetKind: target.startsWith("pr:") ? ("pr" as const) : ("issue" as const),
+        provenance: "operator" as const,
+        source: "operator",
+        observed: {},
+        status: "active" as const,
+        recordedAt: CLOCK,
+      })),
       tasks: store.listTasks(full.mission_id),
       findings: [{ ...finding, finding_id: "F-golden-1" }],
       stop,
@@ -252,7 +264,7 @@ function rebuild(): string {
   }
 }
 
-/** Every nullable key of the v3 contract, by owner object path. */
+/** Every nullable key of the v4 contract, by owner object path. */
 const NULLABLE: Array<{ path: string[]; keys: string[] }> = [
   {
     path: ["observability"],
@@ -275,7 +287,7 @@ const NULLABLE: Array<{ path: string[]; keys: string[] }> = [
   },
 ];
 
-describe("mission snapshot v3 golden fixture", () => {
+describe("mission snapshot v4 golden fixture", () => {
   if (process.env.UPDATE_GOLDEN === "1") {
     it("rewrites the golden fixture (UPDATE_GOLDEN=1)", () => {
       writeFileSync(FIXTURE, rebuild());
@@ -286,9 +298,9 @@ describe("mission snapshot v3 golden fixture", () => {
     assert.equal(rebuild(), readFileSync(FIXTURE, "utf8"));
   });
 
-  it("is contract version 3", () => {
+  it("is contract version 4", () => {
     const fixture = JSON.parse(readFileSync(FIXTURE, "utf8")) as MissionSnapshotFile;
-    assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 3);
+    assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 4);
     assert.equal(fixture.contractVersion, MISSION_SNAPSHOT_CONTRACT_VERSION);
     assert.equal(fixture.generatedAt, CLOCK);
   });

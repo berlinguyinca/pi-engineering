@@ -159,7 +159,7 @@ test("equal-time checkpoint lineage updates retain durable event order live and 
 });
 
 test("snapshot contract remains additive after the reliability bump", async () => {
-  assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 3);
+  assert.equal(MISSION_SNAPSHOT_CONTRACT_VERSION, 4);
   const backend = JsonlEventStore.inMemory();
   const store = MissionStore.open(backend);
   const m = mission(store, "M");
@@ -181,7 +181,7 @@ test("snapshot contract remains additive after the reliability bump", async () =
   assert.equal(snap.observability, undefined, "null projection yields no observability section");
   assert.equal(snap.id, m.mission_id);
   assert.equal(snap.tasks[0]!.id, t.task_id, "base task shape unchanged");
-  assert.equal(file.contractVersion, 3);
+  assert.equal(file.contractVersion, 4);
 });
 
 test("snapshot includes full observability section when projection present", async () => {
