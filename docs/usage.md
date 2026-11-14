@@ -1982,6 +1982,16 @@ high-water mark (`reason: "sequence_conflict"` and `last_sequence` in the 409 bo
 resumes above it and re-numbers the pending events; nothing is dropped. When that cannot be done, the event is
 dead-lettered with an error notice and `conflictDeadLettered` in the ingest diagnostics.
 
+Sequence lock budget: allocating a `source_sequence` takes a cross-process lock around a read-modify-write of the
+state file. A writer that cannot take the lock waits, and gives up when its budget runs out — 5000 ms by default.
+A lock whose holder is alive is never treated as stale, so on a busy node (several agent sessions, CAV browsers,
+local builds, a shared disk) a legitimate live holder turns into a writer that refuses to write, and that envelope
+stays out of the outbox. `PI_ENGINEERING_SEQUENCE_LOCK_MS=<positive integer>` raises (or lowers) the budget for that
+host or process; a value that is not a positive integer is ignored and the default stays. Measured on this fleet's
+busiest host with 16 concurrent allocators against one source: p50 50 ms, p99 1175 ms, worst 2406 ms — about half
+the default budget, so the default is adequate but no longer comfortable; raise the budget on hosts that report
+`herdr-sequence-failure`, which now names the budget it waited, the source, and this variable.
+
 Steering requests are judged on Herdr's clock (the `Date` header of the poll response plus monotonic time since),
 not on Pi's wall clock. A request that names a digest (`expected_digest`) is applied (redirect, resume, fork, promote)
 only while the target's current plan digest equals it, and is answered `stale` when Pi cannot compute one. Today Herdr

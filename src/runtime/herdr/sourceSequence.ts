@@ -23,7 +23,10 @@ export interface SourceSequenceOptions {
   /** Directory holding this source's state (created on demand, 0700). */
   dir: string;
   source: string;
-  /** Give up acquiring the cross-process lock after this long (default 5000). */
+  /**
+   * Give up acquiring the cross-process lock after this long.
+   * Defaults to `resolveSequenceLockMs()` — `PI_ENGINEERING_SEQUENCE_LOCK_MS`, else 5000.
+   */
   lockTimeoutMs?: number;
   staleLockMs?: number;
   /**
@@ -47,6 +50,31 @@ interface SequenceState {
 }
 
 const chains = new Map<string, Promise<unknown>>();
+
+/** The budget a writer waits for a contended sequence lock when nothing raises it (#683). */
+export const SEQUENCE_LOCK_DEFAULT_MS = 5000;
+
+/**
+ * How long a control-plane writer waits for a sequence lock it cannot take, in ms.
+ *
+ * The critical section is a read-modify-write of one small state file behind an fsync, but it
+ * runs while a fleet node is doing everything else at once — several agent sessions, CAV
+ * browsers, local builds. A holder that is alive is not stale, so a writer whose budget runs
+ * out simply refuses to write and the envelope never reaches the outbox; that is correct
+ * behaviour, and it is also indistinguishable from a storage outage unless somebody reads the
+ * warning (#683).
+ *
+ * `PI_ENGINEERING_SEQUENCE_LOCK_MS=<positive integer>` sets it per host or process. Anything
+ * that is not a positive integer (typo, empty, `0`, negative) falls back to the default, so a
+ * malformed value can never make every writer give up instantly — the failure text names this
+ * variable, so a silently-ignored value is visible the next time allocation fails.
+ */
+export function resolveSequenceLockMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = (env.PI_ENGINEERING_SEQUENCE_LOCK_MS ?? "").trim();
+  if (raw === "") return SEQUENCE_LOCK_DEFAULT_MS;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : SEQUENCE_LOCK_DEFAULT_MS;
+}
 
 function inProcess<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const prev = chains.get(key) ?? Promise.resolve();
@@ -83,7 +111,7 @@ export class SourceSequence {
     this.dir = opts.dir;
     this.file = join(opts.dir, `sequence-${opts.source}.json`);
     this.lockPath = `${this.file}.lock`;
-    this.lockTimeoutMs = opts.lockTimeoutMs ?? 5000;
+    this.lockTimeoutMs = opts.lockTimeoutMs ?? resolveSequenceLockMs();
     this.staleLockMs = opts.staleLockMs;
     this.blockSize = Math.max(1, Math.floor(opts.blockSize ?? 1));
     this.floor = opts.floor;
@@ -123,7 +151,13 @@ export class SourceSequence {
           emitTelemetry({
             level: "warning",
             key: "herdr-sequence-failure",
-            text: `control-plane source_sequence allocation failed: ${(error as Error).message}`,
+            // Names the budget that ran out and the knob that raises it: "a live holder made me
+            // refuse to write" must not read like a storage outage (#683).
+            text: `control-plane source_sequence allocation failed: ${(error as Error).message} (waited ${
+              this.lockTimeoutMs
+            }ms for the "${this.source}" sequence lock; raise it with PI_ENGINEERING_SEQUENCE_LOCK_MS=<ms>, currently ${
+              process.env.PI_ENGINEERING_SEQUENCE_LOCK_MS ?? `unset, default ${SEQUENCE_LOCK_DEFAULT_MS}ms`
+            })`,
           });
         }
         throw error;
