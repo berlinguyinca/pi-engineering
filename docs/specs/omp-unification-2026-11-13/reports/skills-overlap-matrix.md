@@ -1,6 +1,6 @@
 # Skills overlap matrix: OMP skills vs Pi Engineering
 
-PE has no tracked skills, so there are no exact duplicates of OMP skill files. Overlap is functional (prompt-authoring and prompt-compression guidance) and is mapped below. PE sources @ 5ab85965; OMP @ 57263720.
+PE has no tracked skills, so there are no exact duplicates of OMP skill files. Overlap is functional (prompt-authoring and prompt-compression guidance) and is mapped below. PE sources @ 5ab85965fce3f4343eff776ac23d11c1bc197799; OMP @ 57263720c818ab3baaeb74bf415b03592b806ae0.
 
 | OMP skill | PE counterpart | Relation | Notes / evidence |
 |---|---|---|---|

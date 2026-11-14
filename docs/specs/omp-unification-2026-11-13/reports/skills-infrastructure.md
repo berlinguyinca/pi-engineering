@@ -4,7 +4,7 @@ Upstream `oh-my-pi` @ 57263720c818ab3baaeb74bf415b03592b806ae0; PE worktree @ 5a
 
 ## 1. Inventory result
 - Tracked real skills: 3, not 2: `.omp/skills/{semantic-compression,system-prompts,tool-prompt-optimization}/SKILL.md` (system-prompts also ships `small-models.md`; tool-prompt-optimization ships `scripts/probe.ts`, `scripts/probe-builtin.ts`). Spec only knew 2.
-- 17+1 other tracked SKILL.md are test fixtures (`test/fixtures/skills*`, `test/marketplace/fixtures/.../greet`), not skills.
+- 20 other tracked SKILL.md (23 total) are test fixtures (`test/fixtures/skills*`, `test/marketplace/fixtures/.../greet`), not skills.
 - No tracked `skills.json`, `skills.lock.json`, `.claude/`, `.agents/`, `.codex/` skill dirs. Only `.claude-plugin/marketplace.json` under docs examples.
 - UNKNOWN (not ABSENT): contents of registry `https://skills.omp.sh` (wire `DEFAULT_SKILLS_URL`, packages/wire/src/skillshare.ts:18), the maintainer's private/user skills, marketplace plugins, MCP-advertised `skill://` resources (docs/skills.md "MCP-advertised skills").
 - `.omp/skills` in the upstream repo is project-level and is only discovered when cwd is inside oh-my-pi (native provider walks ancestors, src/discovery/builtin.ts:~312-318). It is not shipped with the omp binary.
@@ -49,7 +49,7 @@ Plus `skills.customDirectories` (non-recursive `*/SKILL.md`, outranks same-named
 
 ## 6. Extension-bundled skills as PE packaging (spec item 5)
 - Mechanism works at the discovery level: a package loaded via `extensions:`/`-e`/`~/.omp/plugins` exposes `skills/<name>/SKILL.md` at priority 90, above claude/agents and below native/skillshare (omp-plugins.ts:64-77; docs/skills/authoring-extensions.md:102). PE already has `package.json` `pi.extensions` (package.json:58-60), so a `skills/` dir next to it would be picked up by OMP; versioning is via the npm/package version and lockfile (package-lock.json), i.e. version-pinned without copying upstream files.
-- Blocker found: PE worker sessions are created with empty skills (`getSkills: () => ({ skills: [], diagnostics: [] })`, PE src/workers/PiWorkerExecutor.ts:206-214; src/taskDiscipline/worker.ts:148; src/cav/vision.ts:127). Skills would only reach the operator session, not workers/reviewers, unless that policy is deliberately changed (and tested against the no-user-skills worker isolation invariant).
+- Blocker found: PE worker sessions are created with empty skills (`getSkills: () => ({ skills: [], diagnostics: [] })`, PE src/workers/PiWorkerExecutor.ts:206-214; src/cav/vision.ts:127). Skills would only reach the operator session, not workers/reviewers, unless that policy is deliberately changed (and tested against the no-user-skills worker isolation invariant).
 - Also unverified: PE currently targets Pi (minimumPiVersion 0.87.0), not OMP, so the omp-plugins provider semantics apply only after the OMP unification. Mark: UNKNOWN until tested in an OMP host.
 - A skillshare lock pin is the alternative when third-party content is needed; extension skills/ is preferred for PE-owned content.
 
