@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,24 @@ test("omp adapter: process that never answers yields Unavailable{timeout} and is
   const result = await negotiateOmp({ launch: { command: "/bin/sh", args: ["-c", "sleep 60", "sh"] }, timeoutMs: 400 });
   assert.equal(result.kind === "unavailable" && result.reason, UnavailableReason.Timeout);
   assert.ok(Date.now() - started < 10_000, "must not wait for the hung process");
+});
+
+test("omp adapter: timeout reaps the whole process tree (non-exec'd grandchild)", async () => {
+  // `; true` stops sh from exec'ing sleep, so sleep is a real grandchild holding the stdio pipes.
+  const started = Date.now();
+  const result = await negotiateOmp({
+    launch: { command: "/bin/sh", args: ["-c", "sleep 61.37; true", "sh"] },
+    timeoutMs: 400,
+  });
+  assert.equal(result.kind === "unavailable" && result.reason, UnavailableReason.Timeout);
+  assert.ok(Date.now() - started < 10_000, "must not wait for the grandchild's pipes");
+  let survivors = "";
+  try {
+    survivors = execFileSync("pgrep", ["-f", "sleep 61.37"], { encoding: "utf8" }).trim();
+  } catch {
+    // pgrep exits 1 when nothing matches: that is the success case.
+  }
+  assert.equal(survivors, "", `grandchild sleep survived: ${survivors}`);
 });
 
 test("omp adapter: process that crashes yields Unavailable{crashed} with stderr", async () => {

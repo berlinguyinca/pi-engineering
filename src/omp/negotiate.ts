@@ -13,6 +13,7 @@ import {
 
 const NEGOTIATE_ID = "pe-negotiate-1";
 const KILL_GRACE_MS = 2_000;
+const EXIT_SETTLE_DEFER_MS = 100;
 const STDERR_TAIL_BYTES = 2_048;
 const MAX_VERSION_OUTPUT_BYTES = 4_096;
 /** Matches omp's own MAX_RPC_FRAME_BYTES; a longer line cannot be a valid frame. */
@@ -38,16 +39,45 @@ const unavailable = (reason: UnavailableReason, detail: string): OmpNegotiationR
   detail,
 });
 
-function terminate(child: ChildProcess): Promise<void> {
-  return new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) return resolve();
-    const hard = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
-    child.once("close", () => {
-      clearTimeout(hard);
-      resolve();
-    });
-    child.kill("SIGTERM");
-  });
+/**
+ * Children are spawned as their own process-group leader (POSIX only; Windows
+ * is unsupported by this spike) so a shell-forked grandchild that inherited the
+ * stdio pipes can be signalled too. ESRCH (group already gone) is tolerated.
+ */
+function signalTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  try {
+    if (child.pid !== undefined) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // already gone
+    }
+  }
+}
+
+function hasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+/** Kill the whole process group, wait for the direct child's `exit` (never `close`), then drop the pipes. */
+async function terminate(child: ChildProcess): Promise<void> {
+  if (!hasExited(child)) {
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    signalTree(child, "SIGTERM");
+    const grace = new Promise<void>((resolve) => setTimeout(resolve, KILL_GRACE_MS).unref());
+    await Promise.race([exited, grace]);
+    if (!hasExited(child)) {
+      signalTree(child, "SIGKILL");
+      await exited;
+    }
+  }
+  // Sweep stragglers (grandchildren) that outlived the direct child.
+  signalTree(child, "SIGKILL");
+  child.stdin?.destroy();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
 }
 
 /**
@@ -68,6 +98,7 @@ function runChild<T>(
         stdio: ["pipe", "pipe", "pipe"],
         env: opts.env,
         cwd: opts.cwd,
+        detached: process.platform !== "win32",
       });
     } catch (error) {
       resolve({ kind: "fail", reason: UnavailableReason.Crashed, detail: `spawn threw: ${String(error)}` });
@@ -96,12 +127,16 @@ function runChild<T>(
           : { kind: "fail", reason: UnavailableReason.Crashed, detail: `spawn error: ${error.message}` },
       );
     });
-    child.once("close", (code, signal) => {
-      settle({
-        kind: "fail",
-        reason: UnavailableReason.Crashed,
-        detail: `exited before completing (code=${code}, signal=${signal}) stderr=${stderr.trim() || "<empty>"}`,
-      });
+    // `exit`, not `close`: a grandchild holding the pipes must not delay settlement.
+    // The short defer lets already-buffered stdout (e.g. the version line) settle first.
+    child.once("exit", (code, signal) => {
+      setTimeout(() => {
+        settle({
+          kind: "fail",
+          reason: UnavailableReason.Crashed,
+          detail: `exited before completing (code=${code}, signal=${signal}) stderr=${stderr.trim() || "<empty>"}`,
+        });
+      }, EXIT_SETTLE_DEFER_MS);
     });
     onStart(child, settle, () => stderr);
   });

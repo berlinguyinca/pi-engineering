@@ -60,7 +60,7 @@ UNVERIFIED: other omp versions (range upper bound is a policy, only 18.20.0 was 
 
 ## Known limitations
 - A malformed frame AFTER `ready` (non-JSON or wrong shape) is ignored, so the handshake ends as `timeout`, not `malformed_frame` (oversized lines are the exception).
-- On timeout/settle only the direct child is signalled (SIGTERM then SIGKILL); grandchild processes it spawned are not signalled.
+- Process-tree reaping (fixed after CI failure on Linux, where `sh -c 'sleep 60'` forks `sleep` as a grandchild holding the stdio pipes and `close` never fired until it exited): children are spawned `detached` as process-group leaders and the whole group is signalled (SIGTERM, SIGKILL after 2s, plus a SIGKILL sweep; ESRCH tolerated); settlement uses `exit`, not `close`, and stdio is destroyed afterwards. This is a POSIX-only process-group assumption; Windows is unsupported by this spike. A grandchild that calls `setsid` escapes the group.
 - CI skips the real-omp tests (no `OMP_BIN`); real compatibility is only proven by manual runs.
 - The oversized-line test runs a real shell, not omp; it proves the cap, not omp behavior.
 
