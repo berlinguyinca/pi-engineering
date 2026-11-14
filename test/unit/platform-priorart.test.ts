@@ -8,6 +8,7 @@ import {
   defaultPriorartPaths,
   ensurePriorart,
   isUnderTmpdir,
+  rebuildDisabledByEnv,
 } from "../../src/platform/priorartDependency.ts";
 
 /** The cold-start rebuild is a detached `git clone` that keeps writing into the sandbox while it is deleted. */
@@ -147,5 +148,44 @@ describe("priorartDependency", () => {
     assert.equal(isUnderTmpdir(join(fakeHome, "IdeaProjects", "priorart")), false);
     // And the guard is what makes the ephemeral case false (see the temp-HOME test above),
     // so the two branches are distinguishable purely on the source path.
+  });
+
+  it("PI_ENGINEERING_PRIORART_REBUILD turns the detached clone+build off by name", () => {
+    for (const value of ["0", "false", "no", "off", " OFF ", "False"]) {
+      assert.equal(rebuildDisabledByEnv({ PI_ENGINEERING_PRIORART_REBUILD: value }), true, `${value} disables`);
+    }
+    // Unset and anything else keep the production self-heal exactly as it was.
+    assert.equal(rebuildDisabledByEnv({}), false);
+    assert.equal(rebuildDisabledByEnv({ PI_ENGINEERING_PRIORART_REBUILD: "" }), false);
+    assert.equal(rebuildDisabledByEnv({ PI_ENGINEERING_PRIORART_REBUILD: "1" }), false);
+    assert.equal(rebuildDisabledByEnv({ PI_ENGINEERING_PRIORART_REBUILD: "auto" }), false);
+  });
+
+  it("the env opt-out is what keeps a HOME outside tmpdir from cloning", () => {
+    // Outside tmpdir the guard cannot help, which is why the opt-out has to be explicit:
+    // a test HOME under the checkout, a CI HOME on a data volume, or an operator who wants
+    // no background network build on session start. node_modules is ignored by git and is
+    // never a system temp directory.
+    const outside = join(process.cwd(), "node_modules", ".priorart-env-optout");
+    const paths = {
+      bin: join(outside, "bin", "priorart"),
+      config: join(outside, "config", "priorart.json"),
+      mcp: join(outside, "mcp.json"),
+      source: join(outside, "src", "priorart"),
+      remote: PRIORART_REMOTE,
+    };
+    const saved = process.env.PI_ENGINEERING_PRIORART_REBUILD;
+    process.env.PI_ENGINEERING_PRIORART_REBUILD = "0";
+    try {
+      const res = ensurePriorart(paths); // rebuild at its default: only the env stops it
+      assert.equal(res.rebuildStarted, false, "no detached clone+build with the opt-out set");
+      assert.equal(existsSync(paths.source), false, "the source tree is not even created");
+      assert.equal(res.configPresent, true, "config and mcp registration are unaffected");
+      assert.equal(res.mcpRegistered, true);
+    } finally {
+      if (saved === undefined) delete process.env.PI_ENGINEERING_PRIORART_REBUILD;
+      else process.env.PI_ENGINEERING_PRIORART_REBUILD = saved;
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

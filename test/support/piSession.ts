@@ -5,7 +5,7 @@
  * network. Headless, so Pi uses its own no-op UI context.
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +15,7 @@ import {
   SettingsManager,
   createAgentSession,
 } from "@earendil-works/pi-coding-agent";
+import { removeTree } from "./removeTree.ts";
 
 type Factory = (pi: never) => unknown;
 
@@ -94,7 +95,10 @@ export async function startPiSession(
       closed = true;
       await runner.emit({ type: "session_shutdown", reason: "quit" });
       session.dispose();
-      rmSync(root, { recursive: true, force: true });
+      // `session_shutdown` handlers are fire-and-forget for anything they queued, and a
+      // session can leave work writing under its own root. One synchronous unlink pass turns
+      // that into ENOTEMPTY inside `close()` (#681), so retry and report what survived.
+      await removeTree(root);
     },
   };
 }

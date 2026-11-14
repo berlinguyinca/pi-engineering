@@ -138,12 +138,30 @@ export function isUnderTmpdir(path: string): boolean {
   return false;
 }
 
+/**
+ * `PI_ENGINEERING_PRIORART_REBUILD=0|false|no|off` turns the cold-start self-heal off.
+ *
+ * The self-heal is a detached `git clone` of an external repository followed by `make`, and
+ * it is deliberately fire-and-forget: it outlives the call, the session, and any directory
+ * the caller owns. `isUnderTmpdir` covers the common ephemeral case (a test HOME under
+ * `mkdtemp`), but it cannot see a HOME that lives somewhere else — a checkout-relative test
+ * root, a CI home on a data volume, a container whose HOME is `/root`. This is the explicit
+ * kill switch for those, and it is what the test bootstrap sets, so no test process can
+ * reach the network or write outside its own lifetime no matter where its HOME is.
+ * Unset — the production default — keeps the self-heal exactly as it was.
+ */
+export function rebuildDisabledByEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.PI_ENGINEERING_PRIORART_REBUILD ?? "").trim().toLowerCase();
+  return raw === "0" || raw === "false" || raw === "no" || raw === "off";
+}
+
 /** Kick off a DETACHED clone+build (non-blocking) only when the binary is missing. */
 function maybeRebuildBinary(p: PriorartPaths): boolean {
   try {
     if (existsSync(p.bin)) return false;
+    if (rebuildDisabledByEnv()) return false;
     // The build is fire-and-forget: it outlives this process and keeps writing into
-    // `p.source` (and, for a Go build, `$HOME/.cache/go-build`) after we return. A caller
+    // `p.source` (and, for a build cache, `$HOME/.cache/…`) after we return. A caller
     // that owns a throwaway `source` — a test that sets HOME under `mkdtemp` and deletes
     // it in `after()` — would delete that tree out from under the still-running build
     // (`rmdir .../go-build/… → ENOTEMPTY`). System temp dirs are exactly those throwaway
