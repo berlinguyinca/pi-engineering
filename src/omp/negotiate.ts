@@ -1,5 +1,4 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { createInterface } from "node:readline";
 import { resolveOmpAdapterConfig } from "./config.ts";
 import { decodeNegotiateResponse, decodeReadyFrame, encodeNegotiateRequest, parseFrameLine } from "./frames.ts";
 import { OMP_PIN_MANIFEST, isVersionPinned, parseSemVer, parseVersionOutput } from "./manifest.ts";
@@ -15,6 +14,9 @@ import {
 const NEGOTIATE_ID = "pe-negotiate-1";
 const KILL_GRACE_MS = 2_000;
 const STDERR_TAIL_BYTES = 2_048;
+const MAX_VERSION_OUTPUT_BYTES = 4_096;
+/** Matches omp's own MAX_RPC_FRAME_BYTES; a longer line cannot be a valid frame. */
+const MAX_FRAME_LINE_BYTES = 1024 * 1024;
 
 type Outcome<T> =
   | { readonly kind: "ok"; readonly value: T }
@@ -110,6 +112,13 @@ function probeVersion(opts: NegotiateOptions, deadlineMs: number): Promise<Outco
     let out = "";
     child.stdout?.on("data", (chunk: Buffer) => {
       out += chunk.toString("utf8");
+      if (out.length > MAX_VERSION_OUTPUT_BYTES) {
+        settle({
+          kind: "fail",
+          reason: UnavailableReason.VersionUnreadable,
+          detail: `--version output exceeds ${MAX_VERSION_OUTPUT_BYTES} bytes`,
+        });
+      }
     });
     child.stdout?.once("end", () => {
       // Empty output means the process died or said nothing; the close handler reports that as a crash.
@@ -141,10 +150,9 @@ function handshake(
     opts,
     (child, settle) => {
       if (!child.stdout) return;
-      const lines = createInterface({ input: child.stdout });
       let ready: ReturnType<typeof decodeReadyFrame> = null;
       const finish = (result: OmpNegotiationResult): void => settle({ kind: "ok", value: result });
-      lines.on("line", (line) => {
+      const onLine = (line: string) => {
         const frame = parseFrameLine(line);
         if (frame === null) {
           // stdout is the protocol channel; a non-JSON line before ready means this is not an RPC server.
@@ -181,6 +189,21 @@ function handshake(
         }
         const negotiated: RpcProtocolVersion = response.protocolVersion;
         finish({ kind: "available", report: buildCapabilityReport(ompVersion, ready, negotiated) });
+      };
+      // Manual line splitting (not readline) so an unterminated line cannot grow without bound.
+      let pending = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        pending += chunk.toString("utf8");
+        let newline = pending.indexOf("\n");
+        while (newline !== -1) {
+          onLine(pending.slice(0, newline));
+          pending = pending.slice(newline + 1);
+          newline = pending.indexOf("\n");
+        }
+        if (pending.length > MAX_FRAME_LINE_BYTES) {
+          pending = "";
+          finish(unavailable(UnavailableReason.MalformedFrame, `frame line exceeds ${MAX_FRAME_LINE_BYTES} bytes`));
+        }
       });
     },
   );
@@ -212,7 +235,14 @@ export async function negotiateOmp(opts: NegotiateOptions): Promise<OmpNegotiati
   }
 }
 
-/** Env-driven entry point. Disabled (default) returns immediately without spawning anything. */
+/**
+ * Env-driven entry point.
+ *
+ * KNOWN RISK: the full parent environment is forwarded to the operator-pinned
+ * binary (no allowlist), including any secrets in `process.env`. Only point
+ * PI_ENGINEERING_OMP_BIN at a binary you trust. Behavior intentionally unchanged.
+ * Disabled (default) returns immediately without spawning anything.
+ */
 export async function negotiateOmpFromEnv(env: NodeJS.ProcessEnv = process.env): Promise<OmpNegotiationResult> {
   const config = resolveOmpAdapterConfig(env);
   if (!config.enabled) return unavailable(UnavailableReason.Disabled, "PI_ENGINEERING_OMP_ADAPTER not enabled");

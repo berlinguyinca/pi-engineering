@@ -35,15 +35,16 @@ Failure reasons: disabled, binary_absent, timeout, version_unreadable, version_m
 - Launched only `cli.ts --mode rpc --no-session` and `--version`.
 
 ## Tests
-Unit `test/unit/omp-adapter.test.ts` (8): semver/range boundaries, version output, frame decode (real frame text), negotiate req/resp, protocol selection, report, config default OFF, disabled-without-spawn.
-Integration `test/integration/omp-adapter.test.ts` (8):
+Unit `test/unit/omp-adapter.test.ts` (9, incl. pre-release rejection): semver/range boundaries, version output, frame decode (real frame text), negotiate req/resp, protocol selection, report, config default OFF, disabled-without-spawn.
+Integration `test/integration/omp-adapter.test.ts` (11, incl. oversized output and pre-release cases):
 - always run, real processes: binary absent (nonexistent path), timeout (`sleep 60`, reaped), crash (exit 3 with stderr), unreadable version (`/bin/echo`), enabled flag with absent binary.
 - gated on `OMP_BIN` (+ `OMP_BIN_ARGS`), skip reason "UNVERIFIED: OMP_BIN not set": real omp negotiates v2 and reports capabilities; real omp refused with `version_mismatch` (manifest 99.x); real omp refused with `protocol_mismatch` (empty accepted set).
 
 Results (Node 22):
-- Adapter unit: 8 pass / 0 fail.
-- Adapter integration, `OMP_BIN` set to the sandbox bun + `cli.ts`: 8 pass / 0 fail / 0 skip (real omp 18.20.0).
-- Adapter integration, `OMP_BIN` unset (CI default): 5 pass / 3 skip.
+- Adapter unit: 9 pass / 0 fail.
+- Adapter integration, `OMP_BIN` set to the sandbox bun + `cli.ts`: 11 pass / 0 fail / 0 skip (real omp 18.20.0), re-run after hardening.
+- Adapter integration, `OMP_BIN` unset (CI default): 8 pass / 3 skip.
+- Full-suite numbers below were taken before the hardening commit (adapter files only changed since).
 - typecheck: clean. lint (biome): clean.
 - Full unit suite: 6911 tests, 6906 pass / 0 fail / 5 skip (baseline 6898 pass; +8 new).
 - Full integration suite (OMP_BIN unset): 1206 tests, 1202 pass / 1 fail / 3 skip. The failure was `runtime-host-auto-reload.test.ts` "a commit does not reload while a tracked file is mid-edit" (not the baseline flaky test); it passes 12/12 in isolation both with and without this change, so it is a load-sensitive git-timing flake unrelated to `src/omp/`. The baseline flaky `mission-reliability-foundation.test.ts:865` did not fail this run.
@@ -51,6 +52,17 @@ Results (Node 22):
 ## VERIFIED vs UNVERIFIED
 VERIFIED (executed): ready+negotiate v2 handshake and capability report against real omp 18.20.0 (darwin-arm64, published native addon); version-range refusal and protocol-mismatch refusal against that real process; binary-absent, timeout, crash, unreadable-version fallbacks against real processes; default-OFF behavior.
 UNVERIFIED: other omp versions (range upper bound is a policy, only 18.20.0 was run); Linux/other platforms; v1-only runtimes (the v1 path is unit-covered via selection logic only, no real v1 omp exists in range); behavior with a real configured model/auth; prebuilt-vs-source native addon equivalence; CI never exercises the real-omp tests (skipped without `OMP_BIN`).
+
+## Hardening (post-review)
+- `--version` stdout capped at 4096 bytes -> `version_unreadable`. RPC stdout is split manually (not readline) and an unterminated line over 1 MiB (omp's `MAX_RPC_FRAME_BYTES`) -> `malformed_frame`. Tests use real `/bin/sh` processes emitting oversized output.
+- Pre-release policy: only plain releases are pinned. `parseSemVer` rejects `-pre`/`+build` suffixes (null), so e.g. `omp/18.20.0-rc.1` is refused as `version_mismatch`. Boundary tests: unit + integration.
+- Env policy: `negotiateOmpFromEnv` forwards the full parent environment to the operator-pinned binary (no allowlist). Known risk, intentionally unchanged; documented in a code comment.
+
+## Known limitations
+- A malformed frame AFTER `ready` (non-JSON or wrong shape) is ignored, so the handshake ends as `timeout`, not `malformed_frame` (oversized lines are the exception).
+- On timeout/settle only the direct child is signalled (SIGTERM then SIGKILL); grandchild processes it spawned are not signalled.
+- CI skips the real-omp tests (no `OMP_BIN`); real compatibility is only proven by manual runs.
+- The oversized-line test runs a real shell, not omp; it proves the cap, not omp behavior.
 
 ## Rollback
 Leave `PI_ENGINEERING_OMP_ADAPTER` unset (default): nothing in `src/omp/` is reachable from mission code. Full removal: revert the PR (new files only, no existing file modified).

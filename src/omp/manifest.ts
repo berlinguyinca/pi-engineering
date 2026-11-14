@@ -11,9 +11,9 @@ export const OMP_PIN_MANIFEST: OmpPinManifest = {
   validatedAgainstCommit: "57263720c818ab3baaeb74bf415b03592b806ae0",
 };
 
-/** Parse `X.Y.Z` (optionally `v`-prefixed, pre-release/build suffix ignored). Null when invalid. */
+/** Parse strict `X.Y.Z` (optionally `v`-prefixed). Pre-release/build suffixes are rejected (null): only releases are pinned. */
 export function parseSemVer(input: string): SemVer | null {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.+-]*)?$/.exec(input.trim());
+  const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(input.trim());
   if (!m) return null;
   return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
 }

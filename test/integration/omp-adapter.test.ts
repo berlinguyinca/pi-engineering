@@ -36,6 +36,29 @@ test("omp adapter: non-omp --version output yields Unavailable{version_unreadabl
   assert.equal(result.kind === "unavailable" && result.reason, UnavailableReason.VersionUnreadable);
 });
 
+test("omp adapter: oversized --version output is cut off with version_unreadable", async () => {
+  const result = await negotiateOmp({
+    launch: { command: "/bin/sh", args: ["-c", "yes omp/18.20.0 | head -c 5000000", "sh"] },
+    timeoutMs: 10_000,
+  });
+  assert.equal(result.kind === "unavailable" && result.reason, UnavailableReason.VersionUnreadable);
+  assert.match(result.kind === "unavailable" ? result.detail : "", /exceeds 4096/);
+});
+
+test("omp adapter: pre-release omp version is refused with version_mismatch", async () => {
+  const result = await negotiateOmp({ launch: { command: "/bin/echo", args: ["omp/18.20.0-rc.1"] }, timeoutMs: 5_000 });
+  assert.equal(result.kind === "unavailable" && result.reason, UnavailableReason.VersionMismatch);
+});
+
+test("omp adapter: oversized unterminated frame line yields malformed_frame", async () => {
+  // Real process: answers --version correctly, then streams 3 MiB with no newline on the RPC invocation.
+  const script =
+    'if [ "$1" = "--version" ]; then echo omp/18.20.0; else head -c 3145728 /dev/zero | tr "\\0" "a"; sleep 30; fi';
+  const result = await negotiateOmp({ launch: { command: "/bin/sh", args: ["-c", script, "sh"] }, timeoutMs: 15_000 });
+  assert.equal(result.kind === "unavailable" && result.reason, UnavailableReason.MalformedFrame);
+  assert.match(result.kind === "unavailable" ? result.detail : "", /exceeds 1048576/);
+});
+
 test("omp adapter: enabled flag with absent binary falls back, never throws", async () => {
   const result = await negotiateOmpFromEnv({
     PI_ENGINEERING_OMP_ADAPTER: "1",

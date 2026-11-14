@@ -26,7 +26,6 @@ const REAL_NEGOTIATE_REJECT =
 
 test("omp semver: parse and pin range boundaries", () => {
   assert.deepEqual(parseSemVer("18.20.0"), { major: 18, minor: 20, patch: 0 });
-  assert.deepEqual(parseSemVer("v18.20.1-rc.1"), { major: 18, minor: 20, patch: 1 });
   assert.equal(parseSemVer("18.20"), null);
   assert.equal(parseSemVer("latest"), null);
   const pinned = (v: string) =>
@@ -127,4 +126,11 @@ test("omp adapter: disabled by default returns Unavailable{disabled} without spa
     reason: UnavailableReason.Disabled,
     detail: "PI_ENGINEERING_OMP_ADAPTER not enabled",
   });
+});
+
+test("omp semver: pre-release and build suffixes are rejected (policy: releases only)", () => {
+  assert.equal(parseSemVer("18.20.0-rc.1"), null);
+  assert.equal(parseSemVer("18.20.0+build.5"), null);
+  assert.equal(parseSemVer("v18.20.0-beta"), null);
+  assert.deepEqual(parseSemVer("v18.20.0"), { major: 18, minor: 20, patch: 0 });
 });
