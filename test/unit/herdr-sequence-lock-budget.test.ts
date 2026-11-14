@@ -92,7 +92,9 @@ function runAlloc(script: string, dir: string, env: Record<string, string> = {})
  * that can end the wait is the budget. Returns the lock path and the holder process.
  */
 async function liveHolder(dir: string): Promise<{ lockPath: string; release: () => void }> {
-  const holder = spawn("sleep", ["30"], { stdio: "ignore" });
+  // A Node child, not `sleep`: the test must not depend on a coreutils binary existing in
+  // whatever minimal image the CI agent runs, and the holder only has to be a live pid.
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
   await new Promise((resolve) => setTimeout(resolve, 50));
   const lockPath = join(dir, "sequence-pi.json.lock");
   writeFileSync(
