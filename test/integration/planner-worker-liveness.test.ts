@@ -47,6 +47,15 @@ interface Attempt {
 }
 
 /**
+ * Inactivity window for the real-process cases. The watchdog runs while the child
+ * `node -e` is still booting, which takes 110-170ms idle and up to 305ms with V8
+ * coverage on and every core busy (measured, 5 spawns each); the former 500-700ms
+ * windows failed on loaded CI hosts under `npm run test:coverage`. 2.5s is ~8x the
+ * worst boot measured.
+ */
+const WINDOW_MS = 2_500;
+
+/**
  * Implementer attempts run a real node child: `silent` never prints and never
  * exits; `chatty` prints every 50 ms for 2 s; `capacity-wait` reports a wait
  * for inference capacity, stays silent for 2 s, then resumes and finishes.
@@ -70,8 +79,8 @@ class ChildImplementer implements WorkerExecutor {
     this.attempts.push(attempt);
     const code = {
       silent: "setInterval(()=>{},1e6)",
-      chatty: "const t=setInterval(()=>console.log('tick'),50);setTimeout(()=>{clearInterval(t);process.exit(0)},2000)",
-      "capacity-wait": "setTimeout(()=>{console.log('served');process.exit(0)},2000)",
+      chatty: `const t=setInterval(()=>console.log('tick'),50);setTimeout(()=>{clearInterval(t);process.exit(0)},${2 * WINDOW_MS})`,
+      "capacity-wait": `setTimeout(()=>{console.log('served');process.exit(0)},${WINDOW_MS + 1_000})`,
     }[behaviour];
     if (behaviour === "capacity-wait") {
       req.onActivity?.({ kind: "state", summary: WAITING_FOR_INFERENCE_SUMMARY, meaningfulProgress: false });
@@ -193,7 +202,7 @@ async function mission(
 
 test("without a mission signal, a silent worker is killed only after the configured inactivity window", async () => {
   const prev = process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS;
-  process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS = "700";
+  process.env.PI_ENGINEERING_WORKER_INACTIVITY_MS = String(WINDOW_MS);
   try {
     const { report, worker, events } = await mission(["silent", "chatty"]);
     assert.ok(
@@ -205,7 +214,7 @@ test("without a mission signal, a silent worker is killed only after the configu
     assert.ok(hung && retry);
     assert.equal(hung.aborted, true, "the silent worker was aborted");
     assert.equal(hung.reason, "InactivityError");
-    assert.ok(hung.ms >= 650, `not before the configured window (${hung.ms}ms)`);
+    assert.ok(hung.ms >= WINDOW_MS - 50, `not before the configured window (${hung.ms}ms)`);
     assert.ok(hung.ms < 20_000, `but promptly after it (${hung.ms}ms)`);
     // Every worker carries an owner signal and waits for capacity without a cap.
     assert.ok(hung.request.signal, "a watchdog signal even though Pi gave the mission none");
@@ -220,24 +229,24 @@ test("without a mission signal, a silent worker is killed only after the configu
 test("with a mission signal, a silent worker is still caught by the inactivity watchdog", async () => {
   const mission_ = new AbortController();
   const { report, worker } = await mission(["silent", "chatty"], {
-    workerInactivityMs: 600,
+    workerInactivityMs: WINDOW_MS,
     signal: mission_.signal,
   });
   assert.equal(report.status, "completed", report.failure_reason ?? "");
   assert.equal(worker.attempts[0]?.reason, "InactivityError");
-  assert.ok((worker.attempts[0]?.ms ?? 0) >= 550);
+  assert.ok((worker.attempts[0]?.ms ?? 0) >= WINDOW_MS - 50);
   assert.equal(mission_.signal.aborted, false, "the watchdog never aborts the mission itself");
 });
 
 test("a worker with steady activity outlives the inactivity window", async () => {
-  const { report, worker } = await mission(["chatty"], { workerInactivityMs: 500 });
+  const { report, worker } = await mission(["chatty"], { workerInactivityMs: WINDOW_MS });
   assert.equal(report.status, "completed", report.failure_reason ?? "");
   assert.equal(worker.attempts.length, 1, "first attempt passed");
-  assert.ok((worker.attempts[0]?.ms ?? 0) >= 1_900, "ran four times longer than the window");
+  assert.ok((worker.attempts[0]?.ms ?? 0) >= 2 * WINDOW_MS - 100, "ran twice as long as the window");
 });
 
 test("waiting for inference capacity longer than the window does not fail the task", async () => {
-  const { report, worker } = await mission(["capacity-wait"], { workerInactivityMs: 500 });
+  const { report, worker } = await mission(["capacity-wait"], { workerInactivityMs: WINDOW_MS });
   assert.equal(report.status, "completed", report.failure_reason ?? "");
   assert.equal(worker.attempts.length, 1, "no attempt was spent on the wait");
   assert.equal(worker.attempts[0]?.aborted, false);
