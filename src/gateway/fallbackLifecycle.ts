@@ -55,6 +55,12 @@ export interface PendingFallback {
   toolExecutionStarted?: boolean;
   /** Every unfinished tool call is read-only, so running it again repeats no side effect. */
   replaySafe?: boolean;
+  /**
+   * The advised hold was abandoned with NO stand-in on record, because an
+   * operator can be asked (the picker). The settle boundary goes straight to
+   * the picker instead of trying an automatic switch and its stay-waits.
+   */
+  pickerFirst?: boolean;
 }
 
 /**
@@ -87,9 +93,11 @@ export const SWITCHED_FROM_TTL_MS = 10 * 60_000;
  * - the ADVISED path (`advisedSwitch`): the gateway itself says another
  *   deployment should serve this request (`IW-ACT-RETRY-ALTERNATE`). That is
  *   an instruction, not an inference, so it arms on the first such hold —
- *   but only once a lifecycle callback has recorded (`noteStandIn`) that a
- *   usable stand-in exists. With no stand-in on record the hold is waited out
- *   as before: abandoning the wait would turn a slow turn into a failed one.
+ *   but only once a lifecycle callback has recorded that a usable stand-in
+ *   exists (`noteStandIn`) or that an operator can be asked
+ *   (`notePickerAvailable`, not after "Keep waiting"). With neither on record
+ *   the hold is waited out as before: abandoning the wait would turn a slow
+ *   turn into a failed one.
  */
 export class FallbackCoordinator {
   /** Disabled unless the operator explicitly opts into automatic switching. */
@@ -105,6 +113,13 @@ export class FallbackCoordinator {
   private sourceProvider: string | undefined;
   /** Last lifecycle-time preview: is there a model this session could move to? */
   private standInAvailable = false;
+  /** Last lifecycle-time check: can an interactive picker be shown right now? Plain boolean. */
+  private pickerAvailable = false;
+  /** The operator chose "Keep waiting" this episode: no more picker-driven abandons. */
+  private keepWaiting = false;
+  private declined = false;
+  /** The armed fallback was armed for the picker (no stand-in on record). */
+  private armedForPicker = false;
   /** Models already left during this outage episode: id → excluded until (epoch ms). */
   private readonly switchedFrom = new Map<string, number>();
   private advisedRetryAfterMs: number | undefined;
@@ -159,13 +174,20 @@ export class FallbackCoordinator {
     // Only a model-scoped outage — capacity_unavailable, a reload, a GPU move —
     // makes a switch worth it, and that can last hours.
     if (info.accountWide === true) return;
-    const advised = info.advisesAlternate === true && this.willSwitchOnAdvice;
+    const advised = info.advisesAlternate === true && this.willAbandonOnAdvice;
     // A hold the pump is about to abandon (no wait taken) is not evidence of
     // a saturated model the way a waited-out hold is; it must not inflate the
     // opt-in ledger, least of all across Pi's own retries of the same turn.
     if (this.enabled && !advised) this.consecutiveHolds++;
-    if (this.fallbackPending) return;
+    if (this.fallbackPending) {
+      // The pump abandons this hold on the strength of the picker alone: the
+      // settle boundary must go to the picker too, not try a stand-in that is
+      // no longer on record.
+      if (advised && !this.standInAvailable) this.armedForPicker = true;
+      return;
+    }
     if (advised) {
+      this.armedForPicker = !this.standInAvailable;
       this.arm("gateway-advised-alternate", info);
       return;
     }
@@ -190,9 +212,58 @@ export class FallbackCoordinator {
     this.standInAvailable = available;
   }
 
-  /** Is a gateway "retry on an alternate" hold worth abandoning right now? */
-  get willSwitchOnAdvice(): boolean {
-    return this.advisedSwitch && this.standInAvailable;
+  /**
+   * A lifecycle callback saw whether an interactive picker can be shown
+   * (`ctx.hasUI` and a `ui.select`). Plain boolean, nothing of the ctx kept.
+   */
+  notePickerAvailable(available: boolean): void {
+    this.pickerAvailable = available;
+  }
+
+  /**
+   * The operator explicitly chose to keep waiting on the current model (a picker
+   * timeout does NOT call this, so the next refusal prompts again): the pump waits normally for the rest of the episode
+   * instead of abandoning the hold for the picker again. Cleared by
+   * {@link endEpisode}, a model switch, or a new turn.
+   */
+  noteKeepWaiting(): void {
+    this.keepWaiting = true;
+  }
+
+  /** The agent run settled: the next refusal may prompt again. */
+  endEpisode(): void {
+    this.keepWaiting = false;
+    this.declined = false;
+  }
+
+  /** The operator chose Cancel in the picker: later settle handlers must not resume the turn. */
+  noteOperatorDeclined(): void {
+    this.declined = true;
+  }
+
+  /** Consume the Cancel mark (true once per Cancel). */
+  takeOperatorDeclined(): boolean {
+    const was = this.declined;
+    this.declined = false;
+    return was;
+  }
+
+  /**
+   * A picker-armed hold must not be abandoned while an unfinished
+   * side-effecting tool exists: the settle boundary would refuse to replay, so
+   * the hold is waited out instead.
+   */
+  get pickerAbandonBlockedByTool(): boolean {
+    return this.armedForPicker && [...this.unfinishedTools.values()].some((name) => !REPLAY_SAFE_TOOLS.has(name));
+  }
+
+  /**
+   * Is an advised hold worth abandoning right now? Either an automatic
+   * stand-in is on record, or an operator can be asked and has not already
+   * said to keep waiting this episode.
+   */
+  get willAbandonOnAdvice(): boolean {
+    return this.advisedSwitch && (this.standInAvailable || (this.pickerAvailable && !this.keepWaiting));
   }
 
   /**
@@ -213,6 +284,7 @@ export class FallbackCoordinator {
   /** A new user turn begins: nothing unfinished can be replayed into it. */
   onTurnStart(): void {
     this.unfinishedTools.clear();
+    this.keepWaiting = false;
   }
 
   /** A stream produced output: the consecutive-hold run is over. */
@@ -228,6 +300,7 @@ export class FallbackCoordinator {
    */
   onSwitched(fromId: string | undefined): void {
     this.consecutiveHolds = 0;
+    this.keepWaiting = false;
     if (fromId) this.switchedFrom.set(fromId, this.now() + this.switchedFromTtlMs);
   }
 
@@ -250,6 +323,9 @@ export class FallbackCoordinator {
   private reset(): void {
     this.unfinishedTools.clear();
     this.consecutiveHolds = 0;
+    this.keepWaiting = false;
+    this.pickerAvailable = false;
+    this.armedForPicker = false;
     this.fallbackPending = false;
     this.requestedAt = undefined;
     this.reason = undefined;
@@ -280,6 +356,7 @@ export class FallbackCoordinator {
             sourceProvider: this.sourceProvider,
             ...(excludeIds.length > 0 ? { excludeIds, cooldownUntil: this.liveCooldowns() } : {}),
             ...(this.advisedRetryAfterMs !== undefined ? { retryAfterMs: this.advisedRetryAfterMs } : {}),
+            ...(this.armedForPicker ? { pickerFirst: true } : {}),
             ...(this.unfinishedTools.size > 0
               ? {
                   toolExecutionStarted: true,
@@ -320,6 +397,7 @@ export class FallbackCoordinator {
     this.sourceModelId = undefined;
     this.sourceProvider = undefined;
     this.advisedRetryAfterMs = undefined;
+    this.armedForPicker = false;
     return pending;
   }
 }
@@ -346,6 +424,14 @@ export interface FallbackContext {
       opts?: { signal?: AbortSignal; timeout?: number },
     ) => Promise<string | undefined>;
   };
+}
+
+/**
+ * Can an operator be asked to choose right now? Evaluated against a fresh
+ * lifecycle ctx; only the resulting boolean is kept.
+ */
+export function canOfferPicker(ctx: Pick<FallbackContext, "hasUI" | "ui">): boolean {
+  return ctx.hasUI === true && typeof ctx.ui?.select === "function";
 }
 
 export interface FallbackApplyDeps {

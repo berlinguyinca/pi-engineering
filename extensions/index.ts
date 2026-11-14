@@ -34,6 +34,7 @@ import {
   type PendingFallback,
   applyChosenModel,
   applyPendingFallback,
+  canOfferPicker,
   previewFallback,
   recordOperatorSwitch,
 } from "../src/gateway/fallbackLifecycle.ts";
@@ -2063,7 +2064,10 @@ ${RECOVERY_PROMPT}`;
           // the settle boundary, so abandoning it would fail the compaction
           // with nobody to continue it. Those wait the hold out as before.
           abandonForAlternate: (info, actualModel, context) => {
-            if (!(fallbackCoordinator.willSwitchOnAdvice && fallbackCoordinator.hasPending)) return false;
+            if (!(fallbackCoordinator.willAbandonOnAdvice && fallbackCoordinator.hasPending)) return false;
+            // A picker-armed hold with an unfinished side-effecting tool could
+            // not be replayed at the settle boundary: wait it out instead.
+            if (fallbackCoordinator.pickerAbandonBlockedByTool) return false;
             if (isSummarizationRequest(context as ThinkingContext)) return false;
             const callModel = actualModel as Model<any>;
             admission.noteWait({ ...info.signal, provider: callModel.provider, model: callModel.id });
@@ -2148,6 +2152,10 @@ ${RECOVERY_PROMPT}`;
         // Treated as "no stand-in": the hold is then waited out, never abandoned.
       }
       fallbackCoordinator.noteStandIn(available);
+      // Also whether an operator can be asked at the first refusal (plain
+      // boolean from this fresh ctx): with no stand-in, the pump then hands
+      // the turn to the picker in seconds instead of waiting the hold out.
+      fallbackCoordinator.notePickerAvailable(canOfferPicker(ctx));
     };
 
     const applyClaimedFallback = async (ctx: FallbackContext, pending: PendingFallback) => {
@@ -2200,6 +2208,9 @@ ${RECOVERY_PROMPT}`;
         claimPending: () => fallbackCoordinator.claimPending(),
         apply: applyClaimedFallback,
         healthFor: (c) => healthFor(c as { model?: Model<any>; modelRegistry?: unknown }),
+        noteKeepWaiting: () => fallbackCoordinator.noteKeepWaiting(),
+        noteOperatorDeclined: () => fallbackCoordinator.noteOperatorDeclined(),
+        onSettled: () => fallbackCoordinator.endEpisode(),
         // The interactive picker's switch: the operator's own choice, so unlike
         // the automatic switch it is NOT flagged automatic (a mission may adopt
         // it as an operator pin). It keeps the replay-safety rule and the
@@ -2246,6 +2257,7 @@ ${RECOVERY_PROMPT}`;
           if (!m) return;
           afterOutputRetry.owe({ provider: m.provider, id: m.id }, delayMs, attempt, "gateway failure", label);
         },
+        operatorDeclined: () => fallbackCoordinator.takeOperatorDeclined(),
         isPaced: (ctx) => afterOutputRetry.isPaced({ provider: ctx.model?.provider, id: ctx.model?.id }),
         hasPendingWait: (ctx) => afterOutputRetry.hasPendingWait({ provider: ctx.model?.provider, id: ctx.model?.id }),
       }).register(pi as never);

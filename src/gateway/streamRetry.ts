@@ -178,7 +178,9 @@ export interface GatewayStreamRetryOptions {
   /**
    * A hold the gateway says another model should serve
    * (IW-ACT-RETRY-ALTERNATE): return true to settle the attempt NOW, with the
-   * guidance on the error, instead of waiting it out. Called after `onHold`,
+   * guidance on the error, instead of waiting it out. True when a stand-in is
+   * armed, or when no stand-in fits but an interactive picker can be offered
+   * (and the operator has not chosen to keep waiting). Called after `onHold`,
    * so a coordinator that arms a model switch on the hold is consulted with
    * that switch armed. The owed wait belongs to the model this turn is about
    * to leave; the switch itself happens at the settle boundary, against a
@@ -286,9 +288,13 @@ export function paceInteractiveWait(
 export const SHORT_TRANSIENT_MAX_ELAPSED_MS = 300_000;
 /**
  * Ceiling for a wait the gateway itself says another model should serve
- * (IW-ACT-RETRY-ALTERNATE). Without automatic model switching the operator is
- * the only one who can act on that, so the turn ends with the advice after
- * this long instead of holding silently for the 12-hour long-wait horizon.
+ * (IW-ACT-RETRY-ALTERNATE). This is the budget for a hold that IS waited out:
+ * nobody can be asked (headless, a mission worker, a non-interactive run) or
+ * the operator chose "Keep waiting" in the picker. With an interactive UI and
+ * no stand-in the pump does NOT spend it: it abandons at the first refusal
+ * (`abandonForAlternate`) and the settle boundary offers the picker within
+ * seconds. After this long the turn ends with the advice instead of holding
+ * silently for the 12-hour long-wait horizon.
  *
  * `node_updating` (a node restarting for a deployment) is held on the same
  * model and never abandoned on the gateway's alternate advice, but under this

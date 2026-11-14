@@ -17,8 +17,15 @@ import type { ModelHealthProvider } from "../models/health.ts";
 import { DEFAULT_HEADROOM_TOKENS, isHealthy, requiredWindow } from "./fallback.ts";
 import { toCandidate } from "./fallbackLifecycle.ts";
 
-/** How long the picker waits for an answer before the turn ends as it always did. */
-export const PICKER_TIMEOUT_MS = 120_000;
+/**
+ * How long the picker waits for an answer. We measure this in seconds: the
+ * picker appears at the first refusal, so an unattended session must not sit
+ * in a dialog. A timeout is NOT Cancel and NOT an explicit "Keep waiting": the
+ * owed wait is taken once on the current model and the turn continues, but the
+ * picker stays available, so the next refusal prompts again (bounded by
+ * MAX_PICKER_TIMEOUTS in advisedSwitch.ts).
+ */
+export const PICKER_TIMEOUT_MS = 45_000;
 const DEFAULT_WAIT_MS = 20_000;
 
 export type PickerChoice =
