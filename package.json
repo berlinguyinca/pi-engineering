@@ -16,6 +16,7 @@
     "typecheck:core": "tsc --noEmit",
     "typecheck:scripts": "tsc --noEmit -p tsconfig.scripts.json",
     "test": "node --test --test-concurrency=4 --test-force-exit --test-timeout=600000 --import ./test/support/isolatedState.ts \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\"",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include=\"src/**\" --test-coverage-include=\"extensions/**\" --test-coverage-lines=96 --test-coverage-branches=84 --test-coverage-functions=72 --test-concurrency=4 --test-force-exit --test-timeout=600000 --import ./test/support/isolatedState.ts \"test/unit/**/*.test.ts\" \"test/integration/**/*.test.ts\"",
     "test:unit": "node --test --test-concurrency=4 --test-force-exit --test-timeout=600000 --import ./test/support/isolatedState.ts \"test/unit/**/*.test.ts\"",
     "test:integration": "node --test --test-concurrency=4 --test-force-exit --test-timeout=600000 --import ./test/support/isolatedState.ts \"test/integration/**/*.test.ts\"",
     "test:mission-reliability": "node --test --test-concurrency=4 --test-force-exit --test-timeout=600000 --import ./test/support/isolatedState.ts test/integration/mission-reliability-foundation.test.ts",

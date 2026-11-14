@@ -37,6 +37,17 @@ import { WAITING_FOR_INFERENCE_SUMMARY } from "../../src/workers/activity.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
 /**
+ * Inactivity window used by the real-process tests. A child `node -e` takes
+ * 110-170ms to print its first line on an idle laptop and up to 305ms with
+ * V8 coverage on and every core busy (measured, 5 spawns each); the broker's
+ * window is already running while the child boots, so the old 300-400ms windows
+ * failed whenever the host was loaded (`npm run test:coverage` on the shared CI
+ * hosts). 2.5s is ~8x the worst boot measured and still keeps every case in a few
+ * seconds.
+ */
+const WINDOW_MS = 2_500;
+
+/**
  * A real worker process: prints one line every `everyMs` for `forMs` (or stays
  * silent when `everyMs` is 0), then exits. Every printed line is forwarded as
  * worker activity, exactly like tool output from a live agent.
@@ -134,10 +145,12 @@ describe("no fixed mission deadlines: the broker", () => {
     const { mission, task } = missionWithTask(store);
     const broker = new ExecutionBroker({
       store,
-      inactivityTimeoutMs: 400,
+      inactivityTimeoutMs: WINDOW_MS,
       inferenceWaiting: () => false,
       backends: {
-        agent: { runAgent: ({ signal, onActivity }) => childWorker({ everyMs: 40, forMs: 2_000, signal, onActivity }) },
+        agent: {
+          runAgent: ({ signal, onActivity }) => childWorker({ everyMs: 40, forMs: 3 * WINDOW_MS, signal, onActivity }),
+        },
       },
     });
     const started = Date.now();
@@ -149,7 +162,7 @@ describe("no fixed mission deadlines: the broker", () => {
     });
     const outcome = await handle.result();
     assert.equal(outcome.exitStatus, "succeeded", outcome.summary);
-    assert.ok(Date.now() - started >= 1_900, "ran five times longer than the window");
+    assert.ok(Date.now() - started >= 2 * WINDOW_MS, "ran more than twice as long as the window");
     assert.equal(store.getExecution(handle.executionId)?.status, "SUCCEEDED");
   });
 
@@ -158,7 +171,7 @@ describe("no fixed mission deadlines: the broker", () => {
     const { mission, task } = missionWithTask(store);
     const broker = new ExecutionBroker({
       store,
-      inactivityTimeoutMs: 400,
+      inactivityTimeoutMs: WINDOW_MS,
       cancellationAckTimeoutMs: 200,
       inferenceWaiting: () => false,
       backends: {
@@ -176,7 +189,7 @@ describe("no fixed mission deadlines: the broker", () => {
     assert.equal(outcome.exitStatus, "failed");
     assert.equal(outcome.error, INACTIVITY_MARKER);
     assert.match(outcome.summary ?? "", /no activity/);
-    assert.ok(Date.now() - started < 5_000, "a hung worker is caught promptly, not after a work budget");
+    assert.ok(Date.now() - started < 4 * WINDOW_MS, "a hung worker is caught promptly, not after a work budget");
     assert.equal(store.getExecution(handle.executionId)?.exit_status, INACTIVITY_MARKER);
   });
 
@@ -235,7 +248,7 @@ describe("no fixed mission deadlines: the broker", () => {
       assert.ok(sharedAdmissionController().status().waiting > 0);
       const broker = new ExecutionBroker({
         store,
-        inactivityTimeoutMs: 400,
+        inactivityTimeoutMs: WINDOW_MS,
         cancellationAckTimeoutMs: 200,
         backends: { agent: { runAgent: ({ signal }) => childWorker({ everyMs: 0, forMs: 30_000, signal }) } },
       });
@@ -248,7 +261,7 @@ describe("no fixed mission deadlines: the broker", () => {
       });
       const outcome = await handle.result();
       assert.equal(outcome.error, INACTIVITY_MARKER, "the hung worker is caught although another caller waits");
-      assert.ok(Date.now() - started < 10_000);
+      assert.ok(Date.now() - started < 6 * WINDOW_MS);
     } finally {
       other.abort();
       await parked;
@@ -260,13 +273,13 @@ describe("no fixed mission deadlines: the broker", () => {
     const { mission, task } = missionWithTask(store);
     const broker = new ExecutionBroker({
       store,
-      inactivityTimeoutMs: 300,
+      inactivityTimeoutMs: WINDOW_MS,
       backends: {
         agent: {
           runAgent: async ({ signal, onActivity }) => {
             onActivity?.({ kind: "state", summary: WAITING_FOR_INFERENCE_SUMMARY, meaningfulProgress: false });
             // A gateway hold far longer than the window, with no further signal.
-            await new Promise((r) => setTimeout(r, 1_500));
+            await new Promise((r) => setTimeout(r, WINDOW_MS + 1_000));
             onActivity?.({ kind: "state", summary: "Worker session started", meaningfulProgress: false });
             return childWorker({ everyMs: 40, forMs: 200, signal, ...(onActivity ? { onActivity } : {}) });
           },
@@ -321,14 +334,14 @@ describe("no fixed mission deadlines: the scheduler", () => {
           // Three runs hang; the third resume makes steady progress.
           return calls <= 3
             ? childWorker({ everyMs: 0, forMs: 30_000, signal })
-            : childWorker({ everyMs: 30, forMs: 1_200, signal, onActivity });
+            : childWorker({ everyMs: 30, forMs: 2 * WINDOW_MS, signal, onActivity });
         },
       },
     };
     const broker = new ExecutionBroker({
       store,
       backends,
-      inactivityTimeoutMs: 400,
+      inactivityTimeoutMs: WINDOW_MS,
       cancellationAckTimeoutMs: 200,
       inferenceWaiting: () => false,
     });
@@ -347,14 +360,17 @@ describe("no fixed mission deadlines: the scheduler", () => {
 /** A real-clock mission whose implementer first hits a gateway outage. */
 function outageMission(opts: { outageMs: number; leaseMs: number }) {
   const store = MissionStore.open(JsonlEventStore.inMemory());
-  const startedAt = Date.now();
-  const down = () => Date.now() - startedAt < opts.outageMs;
+  // The outage starts at the first agent call, not at mission creation: planning and
+  // setup time (seconds on a loaded host under coverage) must not eat the outage.
+  let outageStartedAt: number | undefined;
+  const down = () => outageStartedAt !== undefined && Date.now() - outageStartedAt < opts.outageMs;
   let agentCalls = 0;
   const ok = { executionId: "e", exitStatus: "succeeded" as const, summary: "ok", artifactRefs: [], usage: {} };
   const backends: BrokerBackends = {
     agent: {
       runAgent: async () => {
         agentCalls++;
+        outageStartedAt ??= Date.now();
         return down()
           ? {
               ...ok,
@@ -517,12 +533,13 @@ describe("no fixed mission deadlines: resuming a hung worker", () => {
         checkpoints: new CheckpointManager({ store }),
         resolveRepository: async (repoId) => ({ repoId, root: fx.root, git }),
         // 400ms was not a budget, it was a coin flip: this case needs the abort-checkpoint-resume
-        // round trip to complete, and on this machine that reliably takes longer than 400ms (fails
-        // 400 every run, passes 600). 2000ms is ~3x the observed need. The neighbours keep their
-        // 300/400ms windows on purpose — they assert wall-clock relationships (">= 1_900: ran five
-        // times longer than the window", "< 5_000: caught promptly"), so their window IS the
-        // behaviour under test. This one asserts `calls === 2` and resumed content, not timing.
-        inactivityTimeoutMs: 2_000,
+        // round trip (real git worktree + checkpoint commits) to complete inside the window, and
+        // on this machine that reliably takes longer than 400ms (fails 400 every run, passes 600).
+        // 2000ms was ~3x that and still failed on the loaded CI hosts under coverage, so 6s. The neighbours keep their
+        // WINDOW_MS (2.5s) on purpose — they assert wall-clock relationships (ran more than twice as
+        // long as the window, caught within four windows), so their window IS the behaviour under
+        // test. This one asserts `calls === 2` and resumed content, not timing.
+        inactivityTimeoutMs: 6_000,
         cancellationAckTimeoutMs: 5_000,
         inferenceWaiting: () => false,
         backends: {

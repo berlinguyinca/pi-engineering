@@ -81,6 +81,24 @@ npm run typecheck     # tsc --noEmit
 npm run test:unit     # node --test, per-test timeout, isolated state
 ```
 
+## Coverage gate
+
+`npm run test:coverage` runs unit and integration suites once under Node's built-in coverage
+(`src/**`, `extensions/**`; tests and scripts excluded) and fails below the thresholds in
+`package.json`. The Woodpecker step `test-coverage` runs it after `test-integration`.
+
+Policy target: 80% for statements, branches, functions and lines. Node reports lines,
+branches and functions only (no statements metric). Measured when the gate was added:
+
+| metric | measured | enforced | target |
+|---|---|---|---|
+| lines | 96.32 | 96 | 80 |
+| branches | 84.20 | 84 | 80 |
+| functions | 72.23 | 72 | 80 |
+
+Functions is below the 80% target; the enforced value is the measured floor so the gate
+cannot regress, not a claim that the target is met. Raise the flags as coverage improves.
+
 `test:unit` passes `--test-timeout=600000`. That is a hang detector, not a performance
 setting: a suite that blocks forever holds a runner and reports nothing, which is harder to
 diagnose than a slow test.

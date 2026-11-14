@@ -85,6 +85,13 @@ test("benchmark modes A-D run real repositories through a real gateway and repor
         inFlight.now++;
         inFlight.max = Math.max(inFlight.max, inFlight.now);
         await new Promise((r) => setTimeout(r, reply.delayMs));
+        // Rendezvous, not a race: a fixed 600ms hold only overlapped two workers while the host
+        // dispatched them within 600ms of each other, which a loaded host running under coverage
+        // does not. Keep holding until two requests have really been in flight together; a
+        // serial implementation never gets there and fails at the cap below.
+        for (let waited = 0; inFlight.max < 2 && waited < 30_000; waited += 25) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
         inFlight.now--;
         return { content: reply.content };
       }
