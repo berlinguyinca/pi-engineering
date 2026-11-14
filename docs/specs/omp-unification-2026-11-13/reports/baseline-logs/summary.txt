@@ -1,0 +1,8 @@
+ci rc=0 dur=6s
+typecheck rc=0 dur=17s
+lint rc=0 dur=1s
+unit rc=0 dur=311s
+integration rc=1 dur=349s
+e2e rc=0 dur=3s
+platform rc=0 dur=2s
+DONE
