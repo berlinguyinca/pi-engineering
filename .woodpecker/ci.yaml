@@ -346,7 +346,15 @@ steps:
       - *node_env
       - *venv_resolve
       - 'export PATH="$VENV/bin:$PATH"'
-      - 'timeout -k 30 60m npm run test:coverage'
+      # The full TAP log (~54k lines) exceeds what Woodpecker keeps: pipeline 202 lost the tail,
+      # including the threshold verdict. So the run goes to a file and only failures, the
+      # verdicts, the totals and the coverage table are printed.
+      - 'LOG=$(mktemp); trap "rm -f \"$LOG\"" EXIT'
+      - 'rc=0; timeout -k 30 60m npm run test:coverage >"$LOG" 2>&1 || rc=$?'
+      - 'grep -E "^ *not ok" "$LOG" | head -50 || true'
+      - 'grep -E "^# (tests|pass|fail|cancelled|skipped|duration_ms|Error:)" "$LOG" || true'
+      - 'sed -n "/^# start of coverage report/,\$p" "$LOG" | grep -v "^# -" | cut -c1-160 || true'
+      - 'echo "test:coverage exit code $rc"; exit $rc'
 
   # The old verify job's "Package-load + command smoke".
   - name: smoke
