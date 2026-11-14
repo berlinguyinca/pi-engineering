@@ -328,6 +328,26 @@ steps:
       - 'export PATH="$VENV/bin:$PATH"'
       - 'timeout -k 30 40m npm run test:integration'
 
+  # Coverage gate. Node's built-in coverage over src/ and extensions/, unit + integration in ONE
+  # run (`npm run test:coverage`). Kept as its own step AFTER test-unit/test-integration, so
+  # those stay unchanged and a coverage failure is attributable; the cost is a third pass over
+  # the suites (measured 14m08s total on a laptop for the combined run, 8101 tests).
+  # POLICY TARGET is 80% for statements, branches, functions and lines. MEASURED at introduction:
+  # lines 96.32, branches 84.20, functions 72.23 -- functions is BELOW target. The enforced
+  # thresholds in package.json are the measured floors (lines 96, branches 84, functions 72) so
+  # the gate ratchets and cannot regress; they are NOT the 80% target. Raise functions to 80
+  # by adding tests, then raise the flag. Node reports no separate statements metric.
+  # Isolated: to roll back, delete this step.
+  - name: test-coverage
+    image: bash
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: *browsers
+    commands:
+      - *node_env
+      - *venv_resolve
+      - 'export PATH="$VENV/bin:$PATH"'
+      - 'timeout -k 30 60m npm run test:coverage'
+
   # The old verify job's "Package-load + command smoke".
   - name: smoke
     image: bash
