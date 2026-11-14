@@ -32,3 +32,5 @@ code: 128
 Rerun (`npm run test:mission-reliability`, same file): exit 0, 44/44 pass, 68s.
 Classification: flaky, a git index.lock race in a fixture repo under --test-concurrency=4 (not deterministic).
 Logs (scratchpad): /private/tmp/claude-501/-Users-wohlgemuth/7fe1d204-09c3-4474-b541-13bcff0e7036/scratchpad/bl/
+
+Raw logs and SHA-256 manifest: `baseline-logs/`.
