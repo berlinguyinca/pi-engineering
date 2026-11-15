@@ -1102,9 +1102,11 @@ test("runtime exposes bounded redacted mission activity updates for persistent s
 test("snapshot replacement never exposes truncated JSON to concurrent readers", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-eng-atomic-snapshot-"));
   const workDir = join(root, ".pi-eng");
+  let runtime: EngineeringRuntime | undefined;
   try {
-    const runtime = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
-    const mission = runtime.missionStore!.createMission({
+    const opened = await EngineeringRuntime.open({ cwd: root, workDir, worker: new FakeWorkerExecutor({}) });
+    runtime = opened;
+    const mission = opened.missionStore!.createMission({
       title: "atomic",
       goal: "x".repeat(2_000_000),
       user_request: "publish atomically",
@@ -1113,8 +1115,8 @@ test("snapshot replacement never exposes truncated JSON to concurrent readers", 
       risk_profile: "low",
       workflow_class: "engineering",
     });
-    runtime.missionObservability!.missionCreated(mission.mission_id, mission.title);
-    await runtime.publishMissionSnapshot();
+    opened.missionObservability!.missionCreated(mission.mission_id, mission.title);
+    await opened.publishMissionSnapshot();
 
     const path = join(workDir, "orchestration-snapshot.json");
     let reading = true;
@@ -1128,12 +1130,15 @@ test("snapshot replacement never exposes truncated JSON to concurrent readers", 
         }
       }
     })();
-    await Promise.all(Array.from({ length: 20 }, () => runtime.publishMissionSnapshot()));
+    await Promise.all(Array.from({ length: 20 }, () => opened.publishMissionSnapshot()));
     reading = false;
     await reader;
 
     assert.deepEqual(parseFailures, [], "readers must see the old or new snapshot, never a partial write");
   } finally {
+    // Close before removing: an un-closed runtime still has snapshot/store writes in flight, and
+    // rm races them (ENOTEMPTY on .pi-eng on a loaded Linux host).
+    await runtime?.close();
     await rm(root, { recursive: true, force: true });
   }
 });

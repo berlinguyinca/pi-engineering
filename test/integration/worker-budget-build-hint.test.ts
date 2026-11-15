@@ -21,6 +21,14 @@ const LIMIT_REACHED =
 
 const exec = promisify(execFile);
 
+/**
+ * The execution budget starts before the broker allocates the isolated worktree
+ * (real `git worktree add`), so on a loaded host under coverage a 1s budget could be
+ * spent before the worker ran at all, and the worker's build activity was never
+ * recorded (only the bare reason came back). 6s leaves the worker its time with margin.
+ */
+const BUDGET_MS = 6_000;
+
 function ok(req: WorkerRequest) {
   return {
     result: {
@@ -101,7 +109,7 @@ describe("budget-exhausted worker that ran builds", () => {
             execution_requirements: {},
             acceptance_ids: mission.acceptance_criteria.flatMap((c) => (c.acceptance_id ? [c.acceptance_id] : [])),
             deliverables: ["one", "two"],
-            execution_budget_ms: 1_000,
+            execution_budget_ms: BUDGET_MS,
             checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 200 },
             max_attempts: 1,
             failure_policy: "block",
@@ -117,8 +125,8 @@ describe("budget-exhausted worker that ran builds", () => {
   }
 
   it("says probable cold build when builds took most of the execution", async () => {
-    // 900 ms of build in a ~1 s execution, and one build still running.
-    const { result, store } = await run(buildingWorker([{ elapsedMs: 450 }, { elapsedMs: 450 }, {}]));
+    // 5 s of build in a ~6 s execution, and one build still running.
+    const { result, store } = await run(buildingWorker([{ elapsedMs: 2_500 }, { elapsedMs: 2_500 }, {}]));
     assert.equal(result.mission.status, "BLOCKED", result.failureReason ?? "");
     const reason = result.failureReason ?? "";
     assert.ok(reason.startsWith(`${LIMIT_REACHED}: `), reason);

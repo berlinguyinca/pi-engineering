@@ -328,6 +328,34 @@ steps:
       - 'export PATH="$VENV/bin:$PATH"'
       - 'timeout -k 30 40m npm run test:integration'
 
+  # Coverage gate. Node's built-in coverage over src/ and extensions/, UNIT suite only
+  # (`npm run test:coverage`). Own step so test-unit/test-integration stay unchanged. Unit-only
+  # because the combined unit+integration run is not measurable: under load the merged line
+  # data collapsed (96 percent idle, 56-58 percent loaded or on CI), while unit-only gave
+  # identical numbers idle and loaded (lines 85.56, branches 83.29, functions 83.29 on macOS).
+  # Integration-only code paths are therefore NOT counted. POLICY TARGET is 80 for lines,
+  # branches and functions (Node has no statements metric), met on all three. Linux CI measured
+  # lines 85.51, branches 83.23, functions 83.29 (pipeline 218); enforced floors 85/83/83 sit
+  # just below so the gate ratchets and cannot regress. Raise the flags as coverage improves.
+  # Isolated: to roll back, delete this step.
+  - name: test-coverage
+    image: bash
+    environment:
+      PLAYWRIGHT_BROWSERS_PATH: *browsers
+    commands:
+      - *node_env
+      - *venv_resolve
+      - 'export PATH="$VENV/bin:$PATH"'
+      # The full TAP log (~54k lines) exceeds what Woodpecker keeps: pipeline 202 lost the tail,
+      # including the threshold verdict. So the run goes to a file and only failures, the
+      # verdicts, the totals and the coverage table are printed.
+      - 'LOG=$(mktemp); trap "rm -f \"$LOG\"" EXIT'
+      - 'rc=0; timeout -k 30 60m npm run test:coverage >"$LOG" 2>&1 || rc=$?'
+      - 'grep -E "^ *not ok" "$LOG" | head -50 || true'
+      - 'grep -E "^# (tests|pass|fail|cancelled|skipped|duration_ms|Error:)" "$LOG" || true'
+      - 'sed -n "/^# start of coverage report/,\$p" "$LOG" | grep -v "^# -" | cut -c1-160 || true'
+      - 'echo "test:coverage exit code $rc"; exit $rc'
+
   # The old verify job's "Package-load + command smoke".
   - name: smoke
     image: bash
