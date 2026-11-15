@@ -2180,3 +2180,20 @@ cause `vision_delegate`; and back, id `vision-<requestId>-back`, cause `vision_r
 carries the outcome (`vision`, `vision_partial`, `vision_failed`, `vision_timeout`), and both carry the text
 and vision model. No image count is carried. The events reach herdr only when the `herdr:` block of the global
 `engineering.yaml` sets `lineage: true` (see "Herdr connection" above); without it nothing is sent.
+
+## Worker skill packs (opt-in)
+
+By default worker sessions run with no skills (the context firewall). To give one role a version-pinned, digest-verified skill pack, set both:
+
+```yaml
+# .pi/engineering.yaml (or ~/.pi/agent/engineering.yaml)
+workers:
+  skillPacks:
+    scout: [pe-operator]          # pack id (under skill-packs/) or a path such as ./vendor/my-pack
+```
+
+```sh
+export PI_ENGINEERING_WORKER_SKILLS=1
+```
+
+Only the listed role receives the pack, on the legacy worker and on the omp worker. The pack must pass the digest manifest and lockfile check, contain no symlinks and no scripts, and is loaded from a verified private copy; nothing is fetched from the network and no pack script is run. A pack that fails verification is not loaded: the worker runs without it and the work-status activity shows `worker skill pack refused (<role>): <pack>: <reason>`. Foreign (`.claude`, `.agents`, `.codex`, `.github`) and managed skills, auto-learn and memory stay off. Cost: the pe-operator pack adds about 76 tokens (omp) or 226 tokens (legacy) to a worker's first request.

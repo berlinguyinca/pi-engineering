@@ -19,7 +19,7 @@ OMP owns discovery, loading, precedence, registry, lockfile. Auto-learn stays OF
 | 8 | PE `AGENTS.md`, `rolePrompts.ts`, `workers/prompts.ts`, planner/vision/compaction prompts, ~40 slash commands | PE tree | **KEEP CUSTOM** | No tracked PE skills to dedupe; no `/skill:` vs PE command collision. |
 | 9 | Upstream test fixtures (20 SKILL.md), docs examples | `test/fixtures/skills*`, `docs/skills/examples` | **REJECT** | Not skills. |
 | 10 | Private/user/registry/marketplace/MCP-advertised skills | n/a | **DEFER (UNKNOWN)** | Not inspected (no authorization); not ABSENT. |
-| 11 | Worker-session skill access | `PiWorkerExecutor.ts:206-214` | **KEEP (firewall unchanged)** | A unit test now pins the empty `getSkills` and that the pack is not in `pi.extensions`. |
+| 11 | Worker-session skill access | `PiWorkerExecutor.ts:206-214` | **KEEP by default; opt-in added** | Default is unchanged: `getSkills` stays empty (pinned by a unit test). Decided 2026-11-15: version-pinned, digest-verified packs MAY reach workers through an explicit opt-in, see "Worker skill packs (opt-in)" below. |
 
 ## The PE skill pack and its lock
 - Path: `skill-packs/pe-operator/` (own `package.json`, `skills/pe-operator/SKILL.md`). It is an OMP extension package root. It is not under `pi.extensions`, has no `pi`/`omp` key, and nothing in PE loads it. Opt in: `omp -e skill-packs/pe-operator` or the `extensions:` setting. Operator-facing content only (/engineer, /plan, /execute, /verify, /review, /ledger and the evidence/worktree/PR rules). It ships no scripts (a unit test fails if a script-like file appears).
@@ -37,5 +37,15 @@ OMP owns discovery, loading, precedence, registry, lockfile. Auto-learn stays OF
 ## Needs a user decision (not made here)
 - Whether PE's future OMP launch should always pass `--config <overlay with autolearn.enabled: false>` (tested to override user and project config). Today `src/omp/negotiate.ts` passes only `--mode rpc --no-session`, so "off" relies on OMP's default plus the user's own config. Phase 3 area, so not edited.
 - Whether `~/.omp/agent/managed-skills` and project-level foreign skill dirs (`.claude/.agents/.codex/.github` in a cloned repo load by default) should be suppressed for the operator session (e.g. `--no-skills` plus explicit `-e`).
-- Whether any pack should ever reach worker sessions (would change the context firewall).
+- ~~Whether any pack should ever reach worker sessions~~ DECIDED and implemented as an opt-in (below).
 - Registry-signing and whether to re-hash store contents at load: UNKNOWN upstream behavior; consider an upstream issue.
+
+## Worker skill packs (opt-in)
+Default off, byte-identical to before (legacy and `PARITY_PATH=omp` golden gates 27/27). Both switches are required:
+- `PI_ENGINEERING_WORKER_SKILLS=1` (master switch), and
+- `.pi/engineering.yaml` (or the global one) `workers.skillPacks: { <role>: [<pack id or path>] }`. An id resolves to `<repo>/skill-packs/<id>`; anything with a `/` is a path relative to the worker cwd. Only the listed role sees the pack.
+
+Gate (`src/skillpack/workerPacks.ts`, fail closed): the pack must pass `verifyPack` (manifest sha256 + sha512, lockfile agreement, no symlinks) and carry no scripts (no `scripts/`/`bin/`, no script-like extension, no executable bit, no `scripts`/`bin`/`main`/`exports`/`omp`/`pi` in `package.json`, nothing outside `skills/` except `package.json`, README.md, LICENSE). It is verified in place, copied to a content-addressed private directory (`<state dir>/worker-skill-packs/<manifest digest>`), and verified again as copied; the worker loads only the copy. A refused pack means the worker runs without it and a `worker skill pack refused (<role>): <ref>: <problems>` line is emitted as worker activity (state event). No network, no script is ever run.
+- Legacy path: the role resource loader returns the verified skills for that role only (`loadSkillsFromDir` on the copy).
+- omp path: `-e <copied pack dir>` plus the overlay `firewall-skills.yml`: identical to the firewall overlay except `skills.enabled: true`, `customDirectories: []`, and every capability provider except `omp-plugins` is disabled (omp-managed, native, skillshare, claude, claude-plugins, agent-plugins, agents, codex, opencode, github, cursor, gemini, windsurf). `--no-skills` is dropped; `--no-extensions` stays, which makes the `-e` roots the only extension roots (upstream `injectOmpExtensionCliRoots` mode `explicit-only`), so the pack's `skills/` is the only skill source. Auto-learn, memory and skill slash commands stay off. Proven against a real omp with hostile `.claude`, `~/.agents`, managed-skills and auto-learn config: only the pack's skill appears, no `manage_skill`/`learn`.
+- Context cost (pe-operator, role `scout`, first request body): omp +305 bytes (about 76 tokens, catalog entry only), legacy +903 bytes (about 226 tokens, pi's skill preamble). Ratchets: `test/integration/worker-skill-packs.test.ts` (ceilings 400 and 1100 bytes).
