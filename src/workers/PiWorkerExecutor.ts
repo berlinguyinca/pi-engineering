@@ -2376,7 +2376,7 @@ ${recovery.recoveryPrompt}`;
  * report; the generic worker guard's tight budgets are for tool-driven roles
  * whose only job is to call `worker_result` after acting.
  */
-const PROSE_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
+export const PROSE_ROLES: ReadonlySet<WorkerRole> = new Set<WorkerRole>([
   "reviewer",
   "architecture-reviewer",
   "security-review",
@@ -2554,11 +2554,11 @@ export function withIdempotencyEvidence(prompt: string, tracker: ExecutedActionT
  * `checkpoint_progress` is opt-in by name. Mission workers do not get it: the
  * broker derives checkpoints from the worker branch's commits.
  */
-function offersClaimDeliverable(req: WorkerRequest): boolean {
+export function offersClaimDeliverable(req: WorkerRequest): boolean {
   return !!req.deliverables?.length && req.tools.includes(CLAIM_DELIVERABLE_TOOL_NAME);
 }
 
-function offersCheckpointProgress(req: WorkerRequest): boolean {
+export function offersCheckpointProgress(req: WorkerRequest): boolean {
   return !!req.deliverables?.length && req.tools.includes(CHECKPOINT_PROGRESS_TOOL_NAME);
 }
 

@@ -1,3 +1,4 @@
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import { OmpWorkerExecutor, OmpWorkerUnavailable } from "./OmpWorkerExecutor.ts";
 import { OMP_ADAPTER_ENV, resolveOmpAdapterConfig } from "./config.ts";
@@ -10,6 +11,14 @@ export const OMP_HOME_ENV = "PI_ENGINEERING_OMP_HOME";
 
 const isOn = (value: string | undefined): boolean =>
   ["1", "true", "yes", "on"].includes(value?.trim().toLowerCase() ?? "");
+
+/** An executor that runs the runtime's semantic tools (PiWorkerExecutor, OmpWorkerExecutor, FallbackWorkerExecutor). */
+export interface CustomToolSink {
+  setCustomTools(tools: ToolDefinition[]): void;
+}
+
+export const acceptsCustomTools = (worker: unknown): worker is CustomToolSink =>
+  typeof (worker as Partial<CustomToolSink> | null)?.setCustomTools === "function";
 
 export type WorkerSelection = { readonly path: "omp" } | { readonly path: "legacy"; readonly reason: string };
 
@@ -29,6 +38,11 @@ export class FallbackWorkerExecutor implements WorkerExecutor {
   constructor(primary: WorkerExecutor, legacy: WorkerExecutor) {
     this.primary = primary;
     this.legacy = legacy;
+  }
+
+  /** Both sides get the tools: the legacy executor may run any request the OMP worker could not start. */
+  setCustomTools(tools: ToolDefinition[]): void {
+    for (const side of [this.primary, this.legacy]) if (acceptsCustomTools(side)) side.setCustomTools(tools);
   }
 
   async run(req: WorkerRequest): Promise<WorkerRun> {

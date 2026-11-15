@@ -34,7 +34,7 @@ import { Ledger } from "../ledger/Ledger.ts";
 import { claimAuthorityGeneration } from "../ledger/authority.ts";
 import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
 import { DEFAULT_POLICY, loadExecutionConfig, loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
-import { selectOmpWorker } from "../omp/selectWorker.ts";
+import { acceptsCustomTools, selectOmpWorker } from "../omp/selectWorker.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
@@ -2069,9 +2069,9 @@ export class EngineeringRuntime {
         };
       });
       rt.coreTools = tools;
-      if (rt.worker instanceof PiWorkerExecutor) rt.worker.setCustomTools(tools);
+      if (acceptsCustomTools(rt.worker)) rt.worker.setCustomTools(tools);
       // A distinct reviewer worker also needs the shared-ledger tools bound.
-      if (rt.reviewerWorker instanceof PiWorkerExecutor) rt.reviewerWorker.setCustomTools(tools);
+      if (acceptsCustomTools(rt.reviewerWorker)) rt.reviewerWorker.setCustomTools(tools);
       // Supervision is the final initialized service: reconciliation can
       // dispatch repair workers, so every fallible backend and every semantic
       // tool binding must already be ready. The same consumer handles startup,
