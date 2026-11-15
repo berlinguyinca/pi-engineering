@@ -6,6 +6,7 @@ import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { MISSION_DEPTH_ENV, missionDepth } from "../orchestration/missionMode.ts";
 import { PROSE_ROLES, workerContext } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
+import { activityFromSessionEvent, emitWorkerActivity } from "../workers/activity.ts";
 import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt } from "../workers/prompts.ts";
 import { completedReviewResult } from "../workers/reviewVerdict.ts";
 import { createWorkerResultTool } from "../workers/workerResultTool.ts";
@@ -230,6 +231,23 @@ export class OmpWorkerExecutor implements WorkerExecutor {
         }
       };
 
+      // The activity the legacy executor shows for the same session events (same shapes and summaries), so the
+      // existing mission UI needs no change. PE's pe_<name> replacements report as the built-in they replace;
+      // the terminating and checkpoint tools are reported by their own paths, as on the legacy executor.
+      // The legacy session ends at the terminating tool; omp's closing turn after it is not reported.
+      let resultCalled = false;
+      const emitFrameActivity = (frame: Record<string, unknown>): void => {
+        const type = frame.type;
+        if (resultCalled) return;
+        if (type !== "tool_execution_start" && type !== "tool_execution_end" && type !== "message_end") return;
+        const raw = typeof frame.toolName === "string" ? frame.toolName : undefined;
+        if (raw === terminating.name) resultCalled = true;
+        if (raw === terminating.name || (raw !== undefined && isCheckpointTool(raw))) return;
+        const bare = raw?.startsWith("pe_") && replaced.has(raw.slice(3)) ? raw.slice(3) : raw;
+        const activity = activityFromSessionEvent({ ...frame, ...(bare === undefined ? {} : { toolName: bare }) });
+        if (activity) emitWorkerActivity(req, activity);
+      };
+
       const handle = (frame: Record<string, unknown>): void => {
         if (done) return;
         arm();
@@ -245,6 +263,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
           });
           return;
         }
+        emitFrameActivity(frame);
         const event: RpcEvent = translateFrame(frame);
         collector.accept(event);
         if (event.kind === "response" && event.id === "pe-host-tools") {
@@ -254,6 +273,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
           }
           phase = "running";
           arm();
+          emitWorkerActivity(req, { kind: "state", summary: "Worker session started", meaningfulProgress: false });
           send({ id: "pe-prompt", type: "prompt", message: req.kickoff ?? WORKER_KICKOFF });
         } else if (event.kind === "response" && event.id === "pe-prompt" && !event.success) {
           fail(`prompt rejected: ${event.error ?? "unknown"}`);
