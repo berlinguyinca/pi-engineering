@@ -19,33 +19,7 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { MissionObservability } from "../../src/orchestration/observability/MissionObservability.ts";
 import { Orchestrator, intersectWriteDomains } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
-
-/** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
-function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
-  let count = 0;
-  let release: () => void;
-  let settled = false;
-  const gate = new Promise<void>((r) => {
-    release = r;
-  });
-  const timer = setTimeout(() => {
-    if (!settled) {
-      settled = true;
-      release();
-    }
-  }, timeoutMs);
-  return {
-    async arrived() {
-      count++;
-      if (count >= needed && !settled) {
-        settled = true;
-        clearTimeout(timer);
-        release();
-      }
-      await gate;
-    },
-  };
-}
+import { parallelBarrier } from "../support/parallelBarrier.ts";
 
 interface Harness {
   orchestrator: Orchestrator;

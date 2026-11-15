@@ -1,0 +1,7 @@
+{
+  "name": "pe-operator-skill-pack",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi Engineering operator skill pack. An OMP extension package root: OMP's omp-plugins provider discovers skills/<name>/SKILL.md when this directory is loaded with -e or the extensions setting. Opt-in only; nothing in Pi Engineering loads it by default.",
+  "license": "MIT"
+}
