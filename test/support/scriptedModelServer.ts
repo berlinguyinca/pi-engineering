@@ -36,6 +36,8 @@ export interface ScriptedModelServer {
   readonly baseUrl: string;
   /** Every agent turn the server answered, as seen by the script. */
   readonly turns: ScriptTurn[];
+  /** The raw JSON request body of every agent turn, aligned with `turns` (for size measurements). */
+  readonly bodies: string[];
   close(): Promise<void>;
 }
 
@@ -78,6 +80,7 @@ export function toTurn(body: {
 
 export async function startScriptedModel(script: ModelScript): Promise<ScriptedModelServer> {
   const turns: ScriptTurn[] = [];
+  const bodies: string[] = [];
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
@@ -92,7 +95,9 @@ export async function startScriptedModel(script: ModelScript): Promise<ScriptedM
         res.end("{}");
         return;
       }
-      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Parameters<typeof toTurn>[0];
+      const raw = Buffer.concat(chunks).toString("utf8");
+      const body = JSON.parse(raw) as Parameters<typeof toTurn>[0];
+      bodies.push(raw);
       const turn = toTurn(body);
       turns.push(turn);
       const reply = script(turn);
@@ -139,6 +144,7 @@ export async function startScriptedModel(script: ModelScript): Promise<ScriptedM
     port,
     baseUrl: `http://127.0.0.1:${port}/v1`,
     turns,
+    bodies,
     close: () =>
       new Promise<void>((r) => {
         server.closeAllConnections?.();
