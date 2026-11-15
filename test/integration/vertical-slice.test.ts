@@ -12,33 +12,7 @@ import { buildCoreTools } from "../../src/tools/coreTools.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
-
-/** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
-function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
-  let count = 0;
-  let release: () => void;
-  let settled = false;
-  const gate = new Promise<void>((r) => {
-    release = r;
-  });
-  const timer = setTimeout(() => {
-    if (!settled) {
-      settled = true;
-      release();
-    }
-  }, timeoutMs);
-  return {
-    async arrived() {
-      count++;
-      if (count >= needed && !settled) {
-        settled = true;
-        clearTimeout(timer);
-        release();
-      }
-      await gate;
-    },
-  };
-}
+import { parallelBarrier } from "../support/parallelBarrier.ts";
 
 /**
  * End-to-end test of the complete vertical slice, driven by a deterministic
