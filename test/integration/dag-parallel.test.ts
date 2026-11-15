@@ -6,38 +6,7 @@ import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
-
-/**
- * Deterministic overlap barrier: a worker blocks until `needed` workers have
- * entered (or a timeout). Replaces a wall-clock sleep so "independent tasks run
- * concurrently" is asserted deterministically rather than by scheduler timing
- * under full-suite load (which made this test flaky).
- */
-function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
-  let count = 0;
-  let release: () => void;
-  let settled = false;
-  const gate = new Promise<void>((r) => {
-    release = r;
-  });
-  const timer = setTimeout(() => {
-    if (!settled) {
-      settled = true;
-      release();
-    }
-  }, timeoutMs);
-  return {
-    async arrived() {
-      count++;
-      if (count >= needed && !settled) {
-        settled = true;
-        clearTimeout(timer);
-        release();
-      }
-      await gate;
-    },
-  };
-}
+import { parallelBarrier } from "../support/parallelBarrier.ts";
 
 test("executePlan parallel runs independent tasks concurrently and integrates safely", async () => {
   const fixture = await makeFixtureRepo();

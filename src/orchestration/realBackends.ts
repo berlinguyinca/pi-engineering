@@ -12,7 +12,7 @@
  * mission; tests inject deterministic fakes instead.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
 import { modelFamily, sameFamily as sameFamilyId } from "../capability/modelRecord.ts";
 import {
@@ -1620,7 +1620,12 @@ export function realBackends(opts: RealBackendsOptions) {
         const base = await repo.git.headCommit();
         const integrationWt = input.candidate
           ? undefined
-          : await repo.git.createWorktree(base, `pi-eng-integrate-${base.slice(0, 7)}-${Date.now().toString(36)}`);
+          : // Date.now() alone collides for two callers in the same millisecond, and createWorktree then
+            // silently replaces the first caller's clean worktree: the random suffix keeps them apart.
+            await repo.git.createWorktree(
+              base,
+              `pi-eng-integrate-${base.slice(0, 7)}-${Date.now().toString(36)}${randomBytes(3).toString("hex")}`,
+            );
         const target = input.candidate ?? integrationWt;
         if (!target) {
           return {

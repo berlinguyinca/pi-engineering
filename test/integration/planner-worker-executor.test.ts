@@ -562,3 +562,45 @@ test("a hot swap of the implementation route mid-mission is logged and followed 
   assert.equal(swaps.length, 1, JSON.stringify(report.transitions));
   assert.equal(swaps[0]?.reason, "MODEL_ROUTE_CHANGED");
 });
+
+test("the batch-review worktree branch carries a random suffix, so same-millisecond batches never share one", async () => {
+  let reviewBranch = "";
+  const { fixture, executor } = await setup(async (req) => {
+    const role = roleOf(req);
+    if (role === "planner") {
+      return {
+        content: JSON.stringify({
+          decisions: ["d"],
+          contracts: [contract("alpha", { risk: "low" }), contract("beta", { risk: "low" })],
+        }),
+      };
+    }
+    if (role === "implementer") {
+      const id = taskOf(req);
+      return {
+        content: JSON.stringify({
+          status: "completed",
+          summary: `did ${id}`,
+          files: [{ path: `src/${id}/done.txt`, content: id }],
+        }),
+      };
+    }
+    if (req.user.startsWith("BATCH REVIEW")) {
+      const { stdout } = await exec("git", ["-C", fixture.root, "worktree", "list", "--porcelain"]);
+      reviewBranch = /^branch refs\/heads\/(.*batch-review-.*)$/m.exec(stdout)?.[1] ?? "";
+      return {
+        content: JSON.stringify({
+          reviews: [
+            { task_id: "alpha", status: "pass" },
+            { task_id: "beta", status: "pass" },
+          ],
+        }),
+      };
+    }
+    return pass;
+  });
+  const report = await executor.run(brief("M-suffix"));
+  assert.equal(report.status, "completed", report.failure_reason ?? "");
+  // <ids>-<Date.now() base36, 8 chars>-less suffix: 6 random hex characters follow the timestamp.
+  assert.match(reviewBranch, /batch-review-.+-[0-9a-z]{8}[0-9a-f]{6}$/, reviewBranch);
+});

@@ -18,6 +18,7 @@ import {
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import type { GatewayResilienceConfig } from "../../src/resilience/config.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+import { parallelBarrier } from "../support/parallelBarrier.ts";
 
 const cancellationResilience: GatewayResilienceConfig = {
   retry_window_ms: 60_000,
@@ -39,33 +40,6 @@ function transientInfrastructureOutcome() {
     artifactRefs: [],
     usage: {},
     error: "transient:server_unavailable",
-  };
-}
-
-/** Deterministic overlap barrier (see dag-parallel/blackhole tests). */
-function parallelBarrier(needed: number, timeoutMs = 5000): { arrived: () => Promise<void> } {
-  let count = 0;
-  let release: () => void;
-  let settled = false;
-  const gate = new Promise<void>((r) => {
-    release = r;
-  });
-  const timer = setTimeout(() => {
-    if (!settled) {
-      settled = true;
-      release();
-    }
-  }, timeoutMs);
-  return {
-    async arrived() {
-      count++;
-      if (count >= needed && !settled) {
-        settled = true;
-        clearTimeout(timer);
-        release();
-      }
-      await gate;
-    },
   };
 }
 
