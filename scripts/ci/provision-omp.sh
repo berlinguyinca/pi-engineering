@@ -10,7 +10,10 @@
 # To change a pin, change the version and its digest together (see docs/operations/ci.md "Real-omp tests").
 #
 # stdout: exactly two lines, `OMP_BIN=<path>` and `OMP_BIN_ARGS=<path>`; everything else goes to stderr.
-# Cache: $PE_OMP_CACHE (default /tmp/woodpecker-cache), keyed by the three pins, placed by atomic rename.
+# Cache: $PE_OMP_CACHE (default /tmp/woodpecker-cache)/pe-omp-cache, mode 0700, refused if owned by another user or
+# group/world-writable. Entries are keyed by the three pins, placed by atomic rename, and RE-VERIFIED on every reuse
+# against a sha256 manifest (path+hash of every file and symlink target) taken at stage time; a mismatch deletes
+# the entry and provisions again.
 set -euo pipefail
 
 BUN_VER=1.4.4
@@ -24,11 +27,49 @@ NATIVES_SHA256=46a6be7c32082b4ae17f7bac3593a5b153453bf5c7eccec0beaa419e02cf7a7d
 
 log() { echo "provision-omp: $*" >&2; }
 
+if command -v sha256sum >/dev/null; then SHA256_CMD=(sha256sum); else SHA256_CMD=(shasum -a 256); fi
+sha256_of() { "${SHA256_CMD[@]}" "$@"; }
+stat_field() { stat -c "$1" "$3" 2>/dev/null || stat -f "$2" "$3"; } # GNU format, BSD format, path
+
+# Sorted manifest of a provision tree: sha256 of every regular file, target of every symlink. The .git directory is
+# excluded (objects are not executed); everything else, including all of node_modules, is covered.
+manifest() { # dir
+  (
+    cd "$1"
+    export LC_ALL=C
+    find bun omp -name .git -prune -o -type f -print0 | sort -z | xargs -0 -n 512 "${SHA256_CMD[@]}"
+    # shellcheck disable=SC2016 # the sh -c body expands $1 itself
+    find bun omp -name .git -prune -o -type l -print0 | sort -z | xargs -0 -I{} sh -c 'printf "L  %s -> %s\n" "$1" "$(readlink "$1")"' _ {}
+  )
+}
+
+# True when ROOT-like dir $1 carries a manifest and every file still hashes to it.
+manifest_ok() { # dir
+  [ -f "$1/.manifest" ] && manifest "$1" 2>/dev/null | cmp -s - "$1/.manifest"
+}
+
+# The provisioner's cache directory: ours, 0700, not writable by group/world.
+secure_cache_dir() { # dir
+  local d=$1 uid mode
+  mkdir -p "$(dirname "$d")"
+  [ -d "$d" ] || mkdir -m 700 "$d"
+  [ ! -L "$d" ] || { log "refusing: $d is a symlink"; return 1; }
+  uid=$(stat_field %u %u "$d")
+  [ "$uid" = "$(id -u)" ] || { log "refusing: $d is owned by uid $uid, not $(id -u)"; return 1; }
+  mode=$(stat_field %a %Lp "$d")
+  case "$mode" in *[2367][0-7]|*[0-7][2367]) log "refusing: $d is group/world-writable (mode $mode)"; return 1;; esac
+}
+
+main() {
 [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ] || { log "only linux-x86_64 is pinned here (got $(uname -s)-$(uname -m)); set OMP_BIN yourself"; exit 1; }
 
-CACHE=${PE_OMP_CACHE:-/tmp/woodpecker-cache}
-ROOT="$CACHE/pe-omp-$OMP_VER-${OMP_COMMIT:0:8}-bun$BUN_VER"
+CACHE=${PE_OMP_CACHE:-/tmp/woodpecker-cache}/pe-omp-cache
+secure_cache_dir "$CACHE"
+ROOT="$CACHE/$OMP_VER-${OMP_COMMIT:0:8}-bun$BUN_VER"
 NATIVE_DIR=packages/natives/native
+
+# Stale download dirs from killed pipelines (they hold no state worth keeping after an hour).
+find "$CACHE" -maxdepth 1 -name '.pe-omp-dl-*' -mmin +60 -exec rm -rf -- {} + 2>/dev/null || true
 
 emit() {
   echo "OMP_BIN=$ROOT/bun/bin/bun"
@@ -37,23 +78,26 @@ emit() {
 
 ready() {
   [ -f "$ROOT/.provisioned" ] \
-    && [ "$("$ROOT/bun/bin/bun" --version 2>/dev/null)" = "$BUN_VER" ] \
     && [ -f "$ROOT/omp/$NATIVE_DIR/pi_natives.linux-x64-baseline.node" ] \
-    && [ -f "$ROOT/omp/$NATIVE_DIR/pi_natives.linux-x64-modern.node" ]
+    && [ -f "$ROOT/omp/$NATIVE_DIR/pi_natives.linux-x64-modern.node" ] \
+    && manifest_ok "$ROOT" \
+    && [ "$("$ROOT/bun/bin/bun" --version 2>/dev/null)" = "$BUN_VER" ]
 }
 
-if ready; then log "reusing $ROOT"; emit; exit 0; fi
+if [ -e "$ROOT" ]; then
+  if ready; then log "reusing $ROOT (manifest verified)"; emit; return 0; fi
+  log "cached $ROOT failed verification; deleting and provisioning again"
+  rm -rf -- "$ROOT"
+fi
 
-mkdir -p "$CACHE"
 TMP="$CACHE/.pe-omp-dl-$$-$RANDOM"
-mkdir -p "$TMP"
+mkdir -m 700 "$TMP"
 trap 'rm -rf -- "$TMP"' EXIT
 
 fetch() { # url sha256 dest
   timeout -k 30 10m curl -fsSL --retry 2 "$1" -o "$3"
-  echo "$2  $3" | sha256sum -c - >&2
+  echo "$2  $3" | sha256_of -c - >&2
 }
-
 log "bun $BUN_VER"
 fetch "https://registry.npmjs.org/@oven/$BUN_PKG/-/$BUN_PKG-$BUN_VER.tgz" "$BUN_SHA256" "$TMP/bun.tgz"
 mkdir -p "$TMP/stage/bun/bin" "$TMP/bunx"
@@ -81,10 +125,16 @@ mv "$TMP/natx/package/"pi_natives.linux-x64-*.node "$OMP/$NATIVE_DIR/"
 
 echo "bun $BUN_VER omp $OMP_VER $OMP_COMMIT natives sha256 $NATIVES_SHA256" > "$TMP/stage/.provisioned"
 
-# Place atomically. If a concurrent pipeline won the race, theirs is verified by ready() below, not trusted.
-if [ ! -e "$ROOT" ]; then mv "$TMP/stage" "$ROOT" 2>/dev/null || true; fi
+manifest "$TMP/stage" > "$TMP/stage/.manifest"
+
+# Place atomically; -T so an existing $ROOT is never entered (stage cannot land inside it). If a concurrent pipeline
+# won the race, its tree is verified by ready() below, not trusted.
+mv -T "$TMP/stage" "$ROOT" 2>/dev/null || true
 ready || { log "$ROOT is not a working provision; it is owned by this pin alone, remove it: rm -rf $ROOT"; exit 1; }
 "$ROOT/bun/bin/bun" "$ROOT/omp/packages/coding-agent/src/cli.ts" --version | grep -qx "omp/$OMP_VER" \
   || { log "omp --version is not omp/$OMP_VER"; exit 1; }
 log "provisioned $ROOT"
 emit
+}
+
+if [ "${BASH_SOURCE[0]:-}" = "$0" ]; then main; fi

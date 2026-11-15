@@ -372,9 +372,10 @@ steps:
     image: bash
     commands:
       - *node_env
+      - *test_conc
       - *venv_resolve
       - 'export PATH="$VENV/bin:$PATH"'
-      # Concurrency 2 (the script's default): the real-omp tests spawn a Bun process per worker.
+      # The clamped PE_TEST_CONCURRENCY from above, halved by the script (min 1): each worker spawns a Bun process.
       - 'timeout -k 30 50m scripts/ci/omp-real-tests.sh'
 
   # The old verify job's "Package-load + command smoke".
