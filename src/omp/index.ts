@@ -4,3 +4,7 @@ export * from "./manifest.ts";
 export * from "./negotiate.ts";
 export * from "./report.ts";
 export * from "./types.ts";
+export * from "./OmpWorkerExecutor.ts";
+export * from "./rpcTranslate.ts";
+export * from "./selectWorker.ts";
+export * from "./firewall.ts";

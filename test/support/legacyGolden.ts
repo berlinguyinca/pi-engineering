@@ -27,6 +27,7 @@ import { promisify } from "node:util";
 import extension from "../../extensions/index.ts";
 import type { GitRepo } from "../../src/git/GitRepo.ts";
 import type { Ledger } from "../../src/ledger/Ledger.ts";
+import { selectOmpWorker } from "../../src/omp/selectWorker.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator, type OrchestratorOptions } from "../../src/orchestration/orchestrator.ts";
@@ -45,6 +46,7 @@ import {
   parseLedger,
   stableStringify,
 } from "./ledgerNormalizer.ts";
+import { type EngineerScript, engineerModelScript, realOmpEnv, startOfflineOmp } from "./ompOffline.ts";
 
 const exec = promisify(execFile);
 
@@ -57,6 +59,11 @@ export const GOLDEN_BASELINE_SHA = "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736";
 export interface OpenOptions {
   cwd: string;
   worker: WorkerExecutor;
+  /**
+   * Declarative stand-in for `worker`, for paths that drive a real model process
+   * (the omp path). The legacy path ignores it and uses `worker`.
+   */
+  script?: EngineerScript;
 }
 
 /** The ledger operations the scenarios use; the legacy path hands out the runtime's own ledger. */
@@ -105,6 +112,8 @@ export interface ParityPath {
   openMission(opts: MissionOptions): MissionSession;
   /** Register the slash commands on a pi host and return them with a way to shut the host down. */
   loadCommandHost(): CommandHost;
+  /** A reason this path cannot run `s` (the test is then skipped and the reason printed), or false. */
+  skipReason?(s: Pick<Scenario, "command" | "scenario" | "scripted">): string | false;
 }
 
 type CommandHandler = (args: string, ctx: unknown) => Promise<void> | void;
@@ -181,8 +190,54 @@ export const legacyPath: ParityPath = {
   loadCommandHost: legacyCommandHost,
 };
 
+/**
+ * The OMP-backed path (Phase 3 slice). `/engineer` workers run on a REAL omp process
+ * (`PI_ENGINEERING_OMP_WORKER=1`) talking to a local scripted OpenAI-compatible model
+ * with an isolated HOME. Everything else (ledger, verifier, missions, commands) is the
+ * legacy implementation, so only `engineer` scenarios carry a `script` and run here.
+ */
+export const ompPath: ParityPath = {
+  ...legacyPath,
+  name: "omp",
+  openRuntime: async (opts) => {
+    if (!opts.script) throw new Error("the omp path needs a scripted scenario");
+    const offline = await startOfflineOmp(engineerModelScript(opts.script));
+    try {
+      const picked = await selectOmpWorker(
+        () => ({
+          run: async () => {
+            throw new Error("omp parity: the legacy fallback must never run");
+          },
+        }),
+        offline.env,
+      );
+      if (picked?.selection.path !== "omp") {
+        throw new Error(`omp path not selected: ${JSON.stringify(picked?.selection)}`);
+      }
+      const rt = await EngineeringRuntime.open({
+        cwd: opts.cwd,
+        worker: picked.executor,
+        verifier: new CommandVerifier(),
+      });
+      const close = rt.close.bind(rt);
+      rt.close = async () => {
+        await close();
+        await offline.close();
+      };
+      return rt;
+    } catch (error) {
+      await offline.close();
+      throw error;
+    }
+  },
+  skipReason: (s) => {
+    if (!realOmpEnv()) return "UNVERIFIED: OMP_BIN not set";
+    return s.scripted ? false : `omp path covers /engineer only; ${s.command} / ${s.scenario} runs on the legacy path`;
+  },
+};
+
 /** Paths selectable with PARITY_PATH. Another implementation registers itself here. */
-export const PATHS: Readonly<Record<string, ParityPath>> = { legacy: legacyPath };
+export const PATHS: Readonly<Record<string, ParityPath>> = { legacy: legacyPath, omp: ompPath };
 
 /** Resolve the path named by PARITY_PATH (unset or empty means legacy); an unknown name fails loudly. */
 export function resolvePath(name: string | undefined): ParityPath {
@@ -195,6 +250,8 @@ export function resolvePath(name: string | undefined): ParityPath {
 export interface Scenario {
   command: string;
   scenario: string;
+  /** True when the scenario hands paths a declarative model script (so a model-backed path can run it). */
+  scripted?: boolean;
   /** Returns the scenario-specific part of the record. `norm` is shared across the whole record. */
   run(path: ParityPath, norm: Normalizer, roots: string[]): Promise<Record<string, JsonValue>>;
 }
@@ -344,13 +401,19 @@ function engineerScenario(
   workers: (state: { review: ReturnType<typeof reviewWith> }) => ConstructorParameters<typeof FakeWorkerExecutor>[0],
   review: ReturnType<typeof reviewWith>,
   goal: string,
+  script: EngineerScript,
 ): Scenario {
   return {
     command: "engineer",
     scenario,
+    scripted: true,
     async run(path, norm) {
       return withFixture(norm, {}, async (fx) => {
-        const rt = await path.openRuntime({ cwd: fx.root, worker: new FakeWorkerExecutor(workers({ review })) });
+        const rt = await path.openRuntime({
+          cwd: fx.root,
+          worker: new FakeWorkerExecutor(workers({ review })),
+          script,
+        });
         try {
           const report = await rt.engineer(goal);
           return { ...(await engineerBody(path, rt, report, norm)), main_branch: await mainAdd(fx.root) };
@@ -373,18 +436,21 @@ function engineerScenarios(): Scenario[] {
       (s) => ({ scout: scoutOk, implementer: implementer(ADD_OK), reviewer: s.review }),
       reviewWith(() => []),
       GOAL,
+      { implement: ADD_OK, review: () => ({ findings: [] }) },
     ),
     engineerScenario(
       "fix-round",
       (s) => ({ scout: scoutOk, implementer: implementer(ADD_OK), reviewer: s.review }),
       reviewWith((n) => (n === 1 ? HIGH : [])),
       GOAL,
+      { implement: ADD_OK, review: (n) => ({ findings: n === 1 ? HIGH : [] }) },
     ),
     engineerScenario(
       "persistent-findings-failed",
       (s) => ({ scout: scoutOk, implementer: implementer(ADD_OK), reviewer: s.review }),
       reviewWith(() => HIGH),
       GOAL,
+      { implement: ADD_OK, review: () => ({ findings: HIGH }) },
     ),
     engineerScenario(
       "review-not-completed",
@@ -395,6 +461,7 @@ function engineerScenarios(): Scenario[] {
       }),
       reviewWith(() => []),
       GOAL,
+      { implement: ADD_OK, review: () => "fail" },
     ),
   ];
 }
@@ -1033,7 +1100,8 @@ export function runParity(path: ParityPath): void {
   }
   describe(`legacy golden outputs (parity gate, ${path.name} path)`, () => {
     for (const s of scenarios) {
-      it(`${s.command} / ${s.scenario}`, async () => {
+      const skip = path.skipReason?.(s) || false;
+      it(`${s.command} / ${s.scenario}`, { skip }, async () => {
         const actual = await renderScenario(s, path);
         const file = join(GOLDEN_DIR, goldenName(s));
         if (update) {

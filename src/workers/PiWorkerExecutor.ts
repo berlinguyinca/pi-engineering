@@ -146,6 +146,7 @@ import {
 } from "./prompts.ts";
 import { createQuarantinedBashOperations } from "./quarantinedBash.ts";
 import { guardRuntimeRequestBody } from "./requestBodyGuard.ts";
+import { completedReviewResult } from "./reviewVerdict.ts";
 import { StreamStallWatchdog, isStalledStream } from "./streamStall.ts";
 import { createNumberedReadTool, createTolerantEditTool } from "./tolerantFileTools.ts";
 import { ToolLoopDetector, type ToolLoopTrip, toolResultText } from "./toolLoopGuard.ts";
@@ -1175,18 +1176,7 @@ export class PiWorkerExecutor implements WorkerExecutor {
       // worker_result): a delivered verdict is a completed review.
       const reviewDelivered = req.resultTool === "review_result" && structured !== undefined && structured !== null;
       const result: WorkerResult | undefined =
-        captured ??
-        (reviewDelivered
-          ? {
-              status: "completed",
-              summary: String((structured as { summary?: unknown }).summary ?? "").slice(0, 4000) || "Review recorded.",
-              claims: [],
-              evidence_refs: [],
-              new_hypotheses: [],
-              proposed_tasks: [],
-              details: {},
-            }
-          : undefined);
+        captured ?? (reviewDelivered ? completedReviewResult(structured) : undefined);
       if (result) {
         // Success — record recovery outcome if we were in a retry.
         if (attempt > 0) {
