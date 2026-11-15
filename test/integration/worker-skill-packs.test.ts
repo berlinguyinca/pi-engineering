@@ -3,7 +3,7 @@
  * legacy PiWorkerExecutor, and (gated on OMP_BIN) a real omp. No mocks of PE code.
  */
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -13,7 +13,12 @@ import { WORKER_SKILLS_ENV } from "../../src/skillpack/workerPacks.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import { OFFLINE_MODEL, realOmpEnv, startOfflineOmp } from "../support/ompOffline.ts";
 import { type ScriptReply, type ScriptTurn, startScriptedModel } from "../support/scriptedModelServer.ts";
-import { repoGrantingPack } from "../support/workerSkillFixture.ts";
+import {
+  type WorkerSkillFixture,
+  installOperatorPack,
+  operatorGrantingPack,
+  plantHostileRepo,
+} from "../support/workerSkillFixture.ts";
 
 const real = realOmpEnv();
 const ompSkip = real ? false : "UNVERIFIED: OMP_BIN not set; no real omp available";
@@ -98,14 +103,16 @@ interface LegacySeen {
 }
 
 async function legacyFirstTurn(
-  fx: { repo: string; state: string },
+  fx: WorkerSkillFixture,
   role: "scout" | "implementer",
   env: NodeJS.ProcessEnv,
 ): Promise<LegacySeen> {
   const server = await startScriptedModel(finish);
   try {
+    const agentDir = legacyAgentDir(server.baseUrl);
+    cpSync(fx.agentDir, agentDir, { recursive: true });
     const worker = new PiWorkerExecutor({
-      agentDir: legacyAgentDir(server.baseUrl),
+      agentDir,
       aps: false,
       gatewayConfig: resolveGatewayConfig({ enabled: false }),
     });
@@ -129,9 +136,32 @@ async function legacyFirstTurn(
   }
 }
 
+/** Operator grants nothing; the hostile repo ships its own allowlist and a pack with a correct-looking pin. */
+function hostileFixture(): WorkerSkillFixture {
+  const fx = operatorGrantingPack([]);
+  rmSync(join(fx.agentDir, "engineering.yaml"));
+  plantHostileRepo(fx.repo, ["scout"]);
+  return fx;
+}
+
 describe("worker skill packs: legacy path", () => {
+  it("a hostile repo's allowlist and pack are ignored, with a visible warning", async () => {
+    const fx = hostileFixture();
+    const scout = await legacyFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
+    assert.ok(!SKILL_SECTION.test(scout.turn.system));
+    assert.ok(scout.activity.some((s) => /ignored workers\.skillPacks in the repository/.test(s)));
+  });
+
+  it("a wrong pinned digest is refused", async () => {
+    const fx = operatorGrantingPack([]);
+    installOperatorPack(fx.agentDir, ["scout"], { sha: "c".repeat(64) });
+    const scout = await legacyFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
+    assert.ok(!SKILL_SECTION.test(scout.turn.system));
+    assert.ok(scout.activity.some((s) => /does not match the pinned digest/.test(s)));
+  });
+
   it("sees the pack's skill only for the allowlisted role", async () => {
-    const fx = repoGrantingPack(["scout"]);
+    const fx = operatorGrantingPack(["scout"]);
     const scout = await legacyFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
     assert.match(scout.turn.system, /pe-operator/, "allowlisted role gets the skill");
     const impl = await legacyFirstTurn(fx, "implementer", { [WORKER_SKILLS_ENV]: "1" });
@@ -139,7 +169,7 @@ describe("worker skill packs: legacy path", () => {
   });
 
   it("context budget ratchet: the pe-operator pack adds a bounded first-request cost for the granted role", async () => {
-    const fx = repoGrantingPack(["scout"]);
+    const fx = operatorGrantingPack(["scout"]);
     const on = await legacyFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
     const off = await legacyFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: undefined });
     const delta = Buffer.byteLength(on.body) - Buffer.byteLength(off.body);
@@ -150,14 +180,14 @@ describe("worker skill packs: legacy path", () => {
   });
 
   it("switch off: the allowlist alone changes nothing", async () => {
-    const fx = repoGrantingPack(["scout"]);
+    const fx = operatorGrantingPack(["scout"]);
     const scout = await legacyFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: undefined });
     assert.ok(!SKILL_SECTION.test(scout.turn.system));
   });
 
   it("a tampered pack is refused: no skill, and a visible diagnostic", async () => {
-    const fx = repoGrantingPack(["scout"]);
-    appendFileSync(join(fx.repo, "skill-packs", "pe-operator", "skills", "pe-operator", "SKILL.md"), "\nevil\n");
+    const fx = operatorGrantingPack(["scout"]);
+    appendFileSync(join(fx.pack, "skills", "pe-operator", "SKILL.md"), "\nevil\n");
     const scout = await legacyFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
     assert.ok(!SKILL_SECTION.test(scout.turn.system), "fail closed: the worker runs without the pack");
     assert.ok(
@@ -176,7 +206,7 @@ const skillMd = (name: string, marker: string) =>
   `---\nname: ${name}\ndescription: ${marker} use for ${marker}\n---\n\nBody ${marker}.\n`;
 
 async function ompFirstTurn(
-  fx: { repo: string; state: string },
+  fx: WorkerSkillFixture,
   role: string,
   env: NodeJS.ProcessEnv,
 ): Promise<{ turn: ScriptTurn; activity: string[]; body: string }> {
@@ -195,6 +225,8 @@ async function ompFirstTurn(
       skillMd("y", MARKERS.managed),
     );
     writeFileSync(join(offline.home, ".omp", "agent", "config.yml"), "autolearn:\n  enabled: true\n");
+    // The operator's side lives in the agent dir PE reads (PI_CODING_AGENT_DIR points at it in offline.env).
+    cpSync(fx.agentDir, join(offline.home, ".omp", "agent"), { recursive: true });
     const exec = new OmpWorkerExecutor({
       launch: { command: real?.bin ?? "", args: (real?.args ?? "").split(/\s+/).filter(Boolean) },
       model: OFFLINE_MODEL,
@@ -223,7 +255,7 @@ async function ompFirstTurn(
 
 describe("worker skill packs: omp path (real omp, offline)", { skip: ompSkip }, () => {
   it("allowlisted role sees only the pack's skill; no foreign, managed or manage_skill", async () => {
-    const fx = repoGrantingPack(["scout"]);
+    const fx = operatorGrantingPack(["scout"]);
     const { turn } = await ompFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
     assert.match(turn.system, /pe-operator/, "the pack's skill is offered");
     for (const marker of Object.values(MARKERS)) assert.ok(!turn.system.includes(marker), `leaked ${marker}`);
@@ -233,15 +265,22 @@ describe("worker skill packs: omp path (real omp, offline)", { skip: ompSkip }, 
     assert.ok(turn.toolNames.includes("worker_result"));
   });
 
+  it("a hostile repo's allowlist and pack are ignored, with a visible warning", async () => {
+    const fx = hostileFixture();
+    const { turn, activity } = await ompFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
+    assert.ok(!SKILL_SECTION.test(turn.system));
+    assert.ok(activity.some((s) => /ignored workers\.skillPacks in the repository/.test(s)));
+  });
+
   it("a role that is not allowlisted keeps the full firewall", async () => {
-    const fx = repoGrantingPack(["scout"]);
+    const fx = operatorGrantingPack(["scout"]);
     const { turn } = await ompFirstTurn(fx, "implementer", { [WORKER_SKILLS_ENV]: "1" });
     assert.ok(!SKILL_SECTION.test(turn.system));
     for (const marker of Object.values(MARKERS)) assert.ok(!turn.system.includes(marker));
   });
 
   it("context budget ratchet: the pe-operator pack adds a bounded first-request cost for the granted role", async () => {
-    const fx = repoGrantingPack(["scout"]);
+    const fx = operatorGrantingPack(["scout"]);
     const withPack = await ompFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
     const without = await ompFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: undefined });
     const delta = Buffer.byteLength(withPack.body) - Buffer.byteLength(without.body);
@@ -253,8 +292,8 @@ describe("worker skill packs: omp path (real omp, offline)", { skip: ompSkip }, 
   });
 
   it("a tampered pack is refused: no skill, visible diagnostic", async () => {
-    const fx = repoGrantingPack(["scout"]);
-    appendFileSync(join(fx.repo, "skill-packs", "pe-operator", "skills", "pe-operator", "SKILL.md"), "\nevil\n");
+    const fx = operatorGrantingPack(["scout"]);
+    appendFileSync(join(fx.pack, "skills", "pe-operator", "SKILL.md"), "\nevil\n");
     const { turn, activity } = await ompFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" });
     assert.ok(!SKILL_SECTION.test(turn.system));
     assert.ok(activity.some((s) => s.startsWith("worker skill pack refused (scout): pe-operator: digest mismatch")));
