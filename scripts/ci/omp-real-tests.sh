@@ -7,7 +7,10 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 if [ -z "${OMP_BIN:-}" ]; then
-  eval "$(scripts/ci/provision-omp.sh | sed 's/^\([A-Z_]*\)=\(.*\)$/export \1="\2"/')"
+  prov=$(scripts/ci/provision-omp.sh) || { echo "provisioning failed: scripts/ci/provision-omp.sh exited $? (see its log above); refusing to run the real-omp tests" >&2; exit 1; }
+  OMP_BIN=$(printf '%s\n' "$prov" | sed -n 's/^OMP_BIN=//p')
+  OMP_BIN_ARGS=$(printf '%s\n' "$prov" | sed -n 's/^OMP_BIN_ARGS=//p')
+  [ -n "$OMP_BIN" ] || { echo "provisioning failed: provision-omp.sh printed no OMP_BIN" >&2; exit 1; }
 fi
 [ -n "${OMP_BIN:-}" ] && [ -x "$OMP_BIN" ] || { echo "OMP_BIN is not an executable: '${OMP_BIN:-}'" >&2; exit 1; }
 export OMP_BIN OMP_BIN_ARGS="${OMP_BIN_ARGS:-}"
@@ -23,12 +26,16 @@ command -v pgrep >/dev/null || { echo "pgrep (procps) is required by the real-om
 # gated through test/support and runs separately under PARITY_PATH=omp.
 FILES=()
 while IFS= read -r f; do FILES+=("$f"); done < <(grep -lE 'realOmpEnv\(|process\.env\.OMP_BIN' test/unit/*.test.ts test/integration/*.test.ts | sort)
-[ "${#FILES[@]}" -ge 10 ] || { echo "expected at least 10 OMP_BIN-gated test files, found ${#FILES[@]}: ${FILES[*]}" >&2; exit 1; }
+# EXPECTED_GATED_FILES is the count recorded when the gate was written. A renamed or de-gated file drops the count
+# and fails here; adding a gated file means raising this number in the same commit.
+EXPECTED_GATED_FILES=10
+[ "${#FILES[@]}" -ge "$EXPECTED_GATED_FILES" ] || { echo "expected at least $EXPECTED_GATED_FILES OMP_BIN-gated test files, found ${#FILES[@]}: ${FILES[*]}" >&2; exit 1; }
 # shellcheck disable=SC2086
 echo "real omp: $OMP_BIN $OMP_BIN_ARGS -> $("$OMP_BIN" $OMP_BIN_ARGS --version 2>&1 | head -1)"
 echo "gated files (${#FILES[@]}): ${FILES[*]}"
 
-CONC=${PE_TEST_CONCURRENCY:-2}
+CONC=$(( ${PE_TEST_CONCURRENCY:-4} / 2 ))
+[ "$CONC" -ge 1 ] || CONC=1
 run() { # label, then env assignments and files passed via the globals below
   local label=$1; shift
   local log; log=$(mktemp); trap 'rm -f "$log"' RETURN

@@ -133,7 +133,18 @@ no upstream install or postinstall script runs):
 The full digests are in the script. The addon is the published 18.20.0 artifact, **not built
 from the pinned source** (same caveat as the spike). The provision is cached at
 `/tmp/woodpecker-cache/pe-omp-18.20.0-57263720-bun1.4.4` and placed by atomic rename; to
-raise a pin change the version and its digest together. Provisioning needs the network
+raise a pin change the version and its digest together. The cache is not trusted on reuse: it lives in a 0700 directory (`pe-omp-cache`) the script
+refuses to use if another user owns it or it is group/world-writable, and every reuse
+re-hashes the whole tree (bun, the oh-my-pi source and `node_modules`, both `.node` files,
+symlink targets; `.git` excluded) against a manifest taken at stage time. Any mismatch
+deletes the entry and provisions again. Stale `.pe-omp-dl-*` download directories older than
+an hour are swept at start.
+
+Dependency finding: the pinned `bun.lock` has no git or github dependencies (the only
+`git+https` strings are the packages' own `repository` URLs); everything installs from the
+npm registry at lockfile versions, with `--frozen-lockfile --ignore-scripts`.
+
+Provisioning needs the network
 (registry.npmjs.org, github.com); the tests do not: the runner points `HTTP(S)_PROXY` at a
 dead port with loopback exempt.
 
@@ -152,7 +163,7 @@ Changed in this repository:
 
 - **Test concurrency follows the CPUs.** The `test:*` scripts read `PE_TEST_CONCURRENCY`
   (default 4, so laptops are unchanged). The test steps set it to half of `nproc` (which
-  honours the Slurm cgroup), at least 2, at most 4. This lowers oversubscription on small
+  honours the Slurm cgroup), at least 2, at most 4 (`test-omp-real` uses half of that, minimum 1: every worker spawns a Bun process). This lowers oversubscription on small
   allocations; it cannot help when the host itself is oversubscribed by other pipelines.
 - **The unit suite runs once.** The separate `test-unit` step is gone: `test-coverage` runs
   the same files with the same flags plus the coverage gate, and fails on any failing test.
