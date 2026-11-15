@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "@pi_engineering/pe-operator": {
+      "version": "0.1.0",
+      "integrity": "sha512-yYp4e3Mq/x99EYy4RhVqPc5OiIN5QmETyfra9GYFChORLmUnCxbIikHThf6yDnyoPMMg+sjEA+KTwiLHfEqXNg==",
+      "resolved": ""
+    }
+  }
+}
