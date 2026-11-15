@@ -16,13 +16,13 @@ node --test --test-force-exit --import ./test/support/isolatedState.ts test/inte
 | Area | Test | Status | Evidence |
 | --- | --- | --- | --- |
 | /verify after an omp-produced candidate (pass and fail) | `omp-parity-suite.test.ts` "verify after an engineer run" | VERIFIED (real omp) | profile, stages, exit codes, evidence rows, the whole normalized ledger and the event-type sequence (including `evidence.recorded`) equal legacy |
-| Tournament winner selection, 4 leg-outcome mixes (serial) | `omp-parity-suite.test.ts` "tournament winner selection" | VERIFIED (real omp) | winner index, per-entry status/passed/findings, evidence count, normalized ledger equal legacy; legacy winner asserted per seed. Existing goldens (serial-n3-winner, failing-leg) unchanged |
+| Tournament winner selection, 4 leg-outcome mixes (serial) | `omp-parity-suite.test.ts` "tournament winner selection" | VERIFIED (real omp) | winner index, per-entry status/passed/findings, evidence count, normalized ledger equal legacy; the multiset of rejected (entry index, reason) pairs equals legacy and equals the non-winning legs (order-independent identity, since legacy emits the rejections in varying order); legacy winner asserted per seed. Existing goldens (serial-n3-winner, failing-leg) unchanged |
 | Review | golden gate `PARITY_PATH=omp` (review approve/findings, engineer fix-round) | VERIFIED (Phase 4, re-run below) | no new test needed |
 | Recovery after SIGKILL mid worker run | `omp-parity-recovery.test.ts` | VERIFIED (real omp) | see Recovery |
-| Hindsight: one store per fact | `omp-parity-memory-context.test.ts` | VERIFIED (real omp, real stub script) | see Hindsight |
+| Hindsight: PE memory calls equal legacy, no memory-named files in omp HOME | `omp-parity-memory-context.test.ts` | VERIFIED (real omp, real stub script) | see Hindsight |
 | Per-worker context | same file | VERIFIED (measured) | see Context |
 | Firewall leak (skills, context files, rules) | same file | VERIFIED (real omp) | see Context |
-| Offline one-model mode | same file | VERIFIED (real omp) | engineer flow `promoted`, verification passed, with every proxy variable at `http://127.0.0.1:9` and only loopback exempt |
+| Proxy-dead mode (not a connection-attempt proof) | same file | VERIFIED (real omp) | engineer flow `promoted`, verification passed, with every proxy variable at `http://127.0.0.1:9` and only loopback exempt |
 | Full mission DAG on real omp | none | UNVERIFIED | unchanged from Phase 4 |
 
 ### Legacy nondeterminism found (not changed)
@@ -34,7 +34,7 @@ node --test --test-force-exit --import ./test/support/isolatedState.ts test/inte
 
 `test/support/parityRecoveryChild.ts` is a real Node process running a real `EngineeringRuntime` and `/engineer`; the implementer never finishes (legacy: an executor that never settles; omp: a real omp process whose scripted model never answers). The parent waits for the implementer's `agent.started` (and, on omp, a live omp descendant), SIGKILLs the child, reopens the repository, records one more fact, then tears the ledger tail and reopens again.
 
-Asserted equal between legacy and omp: ledger event types at the kill, after reopen (replay plus a new write), and after a torn tail plus reopen; exactly one run left in flight on both. On omp: every omp process that was a descendant of the killed runtime (walked by ppid, since workers run in their own process group) is gone 2.5 s after the kill: no orphan. omp exits when its RPC pipe closes; nothing relies on PE cleanup after SIGKILL. Torn-tail handling is unchanged (no ledger code changed).
+Asserted equal between legacy and omp: ledger event types at the kill, after reopen (replay plus a new write), and after a torn tail plus reopen; exactly one run left in flight on both. On omp: every omp process that was a descendant of the killed runtime (walked by ppid, since workers run in their own process group) is gone within 10 s of the kill (polled, no fixed sleep; each descendant tracked by pid plus start time and command, re-scanned right before the kill, and the implementer's model request is confirmed to have reached the scripted server first): no orphan. omp exits when its RPC pipe closes; nothing relies on PE cleanup after SIGKILL. Torn-tail handling is unchanged (no ledger code changed).
 
 ## Hindsight evidence
 
@@ -58,9 +58,9 @@ Per-worker first request (`assistantTurns == 0`), from the scripted server's raw
 | reviewer | legacy | 2782 | 6951 | 207 | 2485 | |
 | reviewer | omp | 3155 | 7582 | 437 | 2794 | +12% |
 
-Budget (asserted): +15% for read-only roles, +40% for the implementer. The implementer overshoots because omp's built-in tool descriptions (bash, read, grep, find) are longer than legacy's and `pe_write`/`pe_edit` are added; omp also adds about 230 chars of user message. +40% leaves headroom over the +34% measured without allowing a doubling. Trimming omp's tool text would let the budget tighten.
+This is a ratchet against growth, not a parity claim. Asserted per role: a ratio over legacy (+15% read-only roles, +40% implementer) and an absolute omp ceiling (scout 3000, implementer 4200, reviewer 3200 approx tokens). The implementer is +34%, a regression and a known gap: omp's built-in tool descriptions (bash, read, grep, find) are longer than legacy's, `pe_write`/`pe_edit` are added, and omp adds about 230 chars of user message. The bound pins it, it does not endorse it; trimming omp's tool text would let it tighten.
 
-Firewall: a fixture repo and an isolated HOME poisoned with `LEAK-SENTINEL` in AGENTS.md, CLAUDE.md, `.claude/skills`, `.omp/rules`, and skills in every user discovery root: no omp request body contains a sentinel.
+Firewall: a fixture repo and an isolated HOME poisoned with `LEAK-SENTINEL` in AGENTS.md, CLAUDE.md, SYSTEM.md, `.github/copilot-instructions.md`, `.cursor/rules`, `.claude/skills`, `.omp/rules`, `~/.omp/agent/AGENTS.md`, `~/.omp/agent/rules`, and skills in every user discovery root. Every request body of every turn of every role (tool results included) is scanned: no sentinel. Positive control: the same poisoned tree run through real omp without the firewall flags surfaces sentinels (skill, homeskill, ompsystem, homeompagents, copilot), so the scan can fail.
 
 ## OMP's own ratchet, cleanse and reviewer (read from upstream, `packages/coding-agent/src`)
 

@@ -4,9 +4,10 @@
  * own herdr-memory stub script (test/fixtures/herdr-memory-stub.sh) behind a logging shell wrapper. No mocks.
  */
 import assert from "node:assert/strict";
+import { execFile, execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
@@ -16,7 +17,7 @@ import { CommandVerifier } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
-import { engineerModelScript, realOmpEnv, startOfflineOmp } from "../support/ompOffline.ts";
+import { OFFLINE_MODEL, engineerModelScript, realOmpEnv, startOfflineOmp } from "../support/ompOffline.ts";
 import { startScriptedModel } from "../support/scriptedModelServer.ts";
 
 const real = realOmpEnv();
@@ -93,6 +94,22 @@ const callsOf = (log: string): string[] => {
     .sort();
 };
 
+/** Poll until the herdr-memory call count is non-zero and unchanged for 500 ms (10 s deadline), instead of a blind sleep. */
+async function waitForCalls(log: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  let last = -1;
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    const n = callsOf(log).length;
+    if (n !== last) {
+      last = n;
+      stableSince = Date.now();
+    } else if (n > 0 && Date.now() - stableSince >= 500) return;
+    await sleep(100);
+  }
+  throw new Error(`herdr-memory calls never settled (saw ${last})`);
+}
+
 async function hindsightRun(path: "legacy" | "omp"): Promise<HindsightRun> {
   const mem = memoryCli(`hindsight-${path}`);
   const fx = await makeFixtureRepo();
@@ -130,7 +147,7 @@ async function hindsightRun(path: "legacy" | "omp"): Promise<HindsightRun> {
       } finally {
         await rt.close();
       }
-      await sleep(1500); // fire-and-forget memory workers settle
+      await waitForCalls(mem.log); // fire-and-forget memory workers settle
       if (offline) {
         const scout = offline.server.turns.find((t) => /# Role: scout/.test(t.system));
         context = scout?.system ?? "";
@@ -143,30 +160,34 @@ async function hindsightRun(path: "legacy" | "omp"): Promise<HindsightRun> {
   }
 }
 
-describe("Hindsight: one store per fact", { skip, timeout: 300_000 }, () => {
-  it("PE's herdr-memory path behaves identically on both paths, and omp writes no memory of its own", async () => {
-    const legacy = await hindsightRun("legacy");
-    const omp = await hindsightRun("omp");
-    assert.equal(omp.outcome, legacy.outcome);
-    assert.ok(legacy.calls.length > 0, "the herdr-memory stub was called (the fixture exercises Hindsight)");
-    assert.deepEqual(omp.calls, legacy.calls, "same herdr-memory calls, same arguments");
-    assert.match(legacy.context, /\[hindsight durable memory\]/, "legacy worker context carries the recalled fact");
-    assert.match(omp.context, /\[hindsight durable memory\]/, "omp worker prompt carries the same recalled fact");
-    assert.ok(omp.context.includes(FACT), "the recalled fact reaches the omp worker prompt verbatim");
-    // skill-descriptions.db is omp's startup cache of skill descriptions (skills are disabled, it holds no memory);
-    // Library/Caches is bun's package cache and .omp/logs are omp's own logs.
-    const own = omp.files.filter((f) => !f.startsWith("Library/Caches/") && !f.startsWith(".omp/logs/"));
-    const leaked = own.filter((f) =>
-      /memor|mnemo|hindsight|autolearn|rollout|insight|managed-skills|^\.omp\/agent\/skills/i.test(f),
-    );
-    assert.deepEqual(leaked, [], `no omp memory files in the isolated HOME (files: ${own.join(", ")})`);
-  });
+describe(
+  "Hindsight: PE memory calls equal legacy, omp leaves no memory-named files",
+  { skip, timeout: 300_000 },
+  () => {
+    it("PE's herdr-memory calls are identical on both paths and no memory-named file appears in the omp HOME", async () => {
+      const legacy = await hindsightRun("legacy");
+      const omp = await hindsightRun("omp");
+      assert.equal(omp.outcome, legacy.outcome);
+      assert.ok(legacy.calls.length > 0, "the herdr-memory stub was called (the fixture exercises Hindsight)");
+      assert.deepEqual(omp.calls, legacy.calls, "same herdr-memory calls, same arguments");
+      assert.match(legacy.context, /\[hindsight durable memory\]/, "legacy worker context carries the recalled fact");
+      assert.match(omp.context, /\[hindsight durable memory\]/, "omp worker prompt carries the same recalled fact");
+      assert.ok(omp.context.includes(FACT), "the recalled fact reaches the omp worker prompt verbatim");
+      // skill-descriptions.db is omp's startup cache of skill descriptions (skills are disabled, it holds no memory);
+      // Library/Caches is bun's package cache and .omp/logs are omp's own logs.
+      const own = omp.files.filter((f) => !f.startsWith("Library/Caches/") && !f.startsWith(".omp/logs/"));
+      const leaked = own.filter((f) =>
+        /memor|mnemo|hindsight|autolearn|rollout|insight|managed-skills|^\.omp\/agent\/skills/i.test(f),
+      );
+      assert.deepEqual(leaked, [], `no omp memory files in the isolated HOME (files: ${own.join(", ")})`);
+    });
 
-  it("the firewall overlay switches omp memory and autolearn off", () => {
-    assert.match(OMP_FIREWALL_OVERLAY_YML, /memory:\n {2}backend: "off"/);
-    assert.match(OMP_FIREWALL_OVERLAY_YML, /autolearn:\n {2}enabled: false/);
-  });
-});
+    it("the firewall overlay switches omp memory and autolearn off", () => {
+      assert.match(OMP_FIREWALL_OVERLAY_YML, /memory:\n {2}backend: "off"/);
+      assert.match(OMP_FIREWALL_OVERLAY_YML, /autolearn:\n {2}enabled: false/);
+    });
+  },
+);
 
 // -------------------------------------------------------------------- context
 
@@ -204,15 +225,18 @@ function firstRequests(server: { turns: Array<{ system: string; assistantTurns: 
 }
 
 /**
- * The documented budget: how far the omp path's starting context per worker may exceed legacy's (chars / 4).
- * Measured on the scripted flow: scout +13%, reviewer +12%, implementer +34%. The read-only roles get +15%.
- * The implementer gets +40%: it is offered omp's own bash/read/grep/find tool descriptions, which are longer than
- * legacy's, plus the pe_write/pe_edit host tools (tools chars 12539 vs 9106), and omp adds a ~230 char user message.
- * 40% leaves headroom over the measurement without hiding a doubling; tightening it needs omp's tool text trimmed.
+ * A RATCHET AGAINST GROWTH, not a parity claim: omp's starting context is larger than legacy's and the ratio
+ * only bounds how much worse it may get. Measured on the scripted flow: scout +13%, reviewer +12%, implementer
+ * +34% (omp's own bash/read/grep/find tool text plus pe_write/pe_edit, tools chars 12539 vs 9106, and a ~230
+ * char user message). The +34% implementer growth is a REGRESSION and a known gap (report: Known gaps); it is
+ * pinned, not endorsed. Two bounds per role: a ratio over legacy, and an absolute token ceiling so a slow
+ * drift of both paths cannot hide behind the ratio.
  */
 const CONTEXT_BUDGET: Record<string, number> = { implementer: 0.4 };
 const DEFAULT_BUDGET = 0.15;
 const budgetOf = (role: string): number => CONTEXT_BUDGET[role] ?? DEFAULT_BUDGET;
+/** Absolute ceilings on the omp path's starting context in approx tokens (measured: 2311 / 2972 / 2485). */
+const OMP_CEILING_TOKENS: Record<string, number> = { scout: 3000, implementer: 4200, reviewer: 3200 };
 
 async function legacyAgentDir(baseUrl: string): Promise<string> {
   const dir = mkdtempSync(join(scratch, "legacy-agent-"));
@@ -246,39 +270,101 @@ async function legacyAgentDir(baseUrl: string): Promise<string> {
   return dir;
 }
 
-async function measure(path: "legacy" | "omp", poison: boolean): Promise<Record<string, Sizes & { raw: string }>> {
+/** Every instruction source omp discovers in the repository, each carrying its own sentinel. */
+function poisonRepo(root: string): void {
+  const files: Record<string, string> = {
+    "AGENTS.md": "LEAK-SENTINEL-agents\n",
+    "CLAUDE.md": "LEAK-SENTINEL-claude\n",
+    "SYSTEM.md": "LEAK-SENTINEL-system\n",
+    ".github/copilot-instructions.md": "LEAK-SENTINEL-copilot\n",
+    ".cursor/rules/r.mdc": "---\nalwaysApply: true\n---\nLEAK-SENTINEL-cursor\n",
+    ".claude/skills/leak/SKILL.md":
+      "---\nname: leak\ndescription: LEAK-SENTINEL-skill\n---\nLEAK-SENTINEL-skill-body\n",
+    ".omp/rules/r.md": "LEAK-SENTINEL-rule\n",
+    ".omp/SYSTEM.md": "LEAK-SENTINEL-ompsystem\n",
+  };
+  for (const [rel, body] of Object.entries(files)) {
+    mkdirSync(dirname(join(root, rel)), { recursive: true });
+    writeFileSync(join(root, rel), body);
+  }
+  execFileSync("git", ["-C", root, "add", "-A", "-f"]);
+  execFileSync("git", ["-C", root, "commit", "-q", "-m", "poison"]);
+}
+
+/** User-level skills, rules and context files in every discovery root of the isolated HOME. */
+function poisonHome(home: string): void {
+  for (const root of [".omp/agent", ".claude", ".codex", ".agents", ".pi/agent"]) {
+    mkdirSync(join(home, root, "skills", "leak"), { recursive: true });
+    writeFileSync(
+      join(home, root, "skills", "leak", "SKILL.md"),
+      "---\nname: leak\ndescription: LEAK-SENTINEL-homeskill\n---\nLEAK-SENTINEL-homeskill\n",
+    );
+  }
+  mkdirSync(join(home, ".omp", "agent", "rules"), { recursive: true });
+  writeFileSync(join(home, ".omp", "agent", "rules", "r.md"), "LEAK-SENTINEL-homerule\n");
+  writeFileSync(join(home, ".omp", "agent", "AGENTS.md"), "LEAK-SENTINEL-homeompagents\n");
+  writeFileSync(join(home, "AGENTS.md"), "LEAK-SENTINEL-homeagents\n");
+  writeFileSync(join(home, ".claude", "CLAUDE.md"), "LEAK-SENTINEL-homeclaude\n");
+}
+
+const SENTINEL = /LEAK-SENTINEL-[a-z]+/g;
+const sentinelsIn = (bodies: readonly string[]): string[] => [
+  ...new Set(bodies.flatMap((b) => b.match(SENTINEL) ?? [])),
+];
+
+/** The firewalled omp path (PE's real worker selection) on a poisoned repo and HOME: every request body of every turn. */
+async function firewalledBodies(): Promise<string[]> {
+  const fx = await makeFixtureRepo();
+  const offline = await startOfflineOmp(engineerModelScript({ implement: ADD_OK }));
+  try {
+    poisonRepo(fx.root);
+    poisonHome(offline.home);
+    await withEnv(offline.env, async () => {
+      const rt = await EngineeringRuntime.open({ cwd: fx.root, verifier: new CommandVerifier() });
+      try {
+        assert.equal((await rt.engineer(GOAL)).outcome, "promoted");
+      } finally {
+        await rt.close();
+      }
+    });
+    return [...offline.server.bodies];
+  } finally {
+    await offline.close();
+    await fx.cleanup();
+  }
+}
+
+/** Positive control: the same poisoned repo and HOME, a real omp run WITHOUT the firewall flags. */
+async function unfirewalledBodies(): Promise<string[]> {
+  const fx = await makeFixtureRepo();
+  const offline = await startOfflineOmp(() => ({ kind: "text", text: "ok" }));
+  try {
+    poisonRepo(fx.root);
+    poisonHome(offline.home);
+    const launch = real as { bin: string; args: string };
+    await new Promise<void>((resolve) => {
+      const child = execFile(
+        launch.bin,
+        [...launch.args.split(" ").filter(Boolean), "-p", "say ok", "--no-session", "--model", OFFLINE_MODEL],
+        { cwd: fx.root, env: offline.env, timeout: 90_000 },
+        () => resolve(),
+      );
+      child.stdin?.end(); // omp -p reads piped stdin until EOF
+    });
+    return [...offline.server.bodies];
+  } finally {
+    await offline.close();
+    await fx.cleanup();
+  }
+}
+
+async function measure(path: "legacy" | "omp"): Promise<Record<string, Sizes & { raw: string }>> {
   const fx = await makeFixtureRepo();
   try {
-    if (poison) {
-      const { execFileSync } = await import("node:child_process");
-      mkdirSync(join(fx.root, ".claude", "skills", "leak"), { recursive: true });
-      mkdirSync(join(fx.root, ".omp", "rules"), { recursive: true });
-      writeFileSync(join(fx.root, "AGENTS.md"), "LEAK-SENTINEL-agents\n");
-      writeFileSync(join(fx.root, "CLAUDE.md"), "LEAK-SENTINEL-claude\n");
-      writeFileSync(
-        join(fx.root, ".claude", "skills", "leak", "SKILL.md"),
-        "---\nname: leak\ndescription: LEAK-SENTINEL-skill\n---\nLEAK-SENTINEL-skill-body\n",
-      );
-      writeFileSync(join(fx.root, ".omp", "rules", "r.md"), "LEAK-SENTINEL-rule\n");
-      execFileSync("git", ["-C", fx.root, "add", "-A", "-f"]);
-      execFileSync("git", ["-C", fx.root, "commit", "-q", "-m", "poison"]);
-    }
     const script = engineerModelScript({ implement: ADD_OK });
     if (path === "omp") {
       const offline = await startOfflineOmp(script);
       try {
-        if (poison) {
-          // Also poison the isolated HOME: user-level skills, rules and context files in every discovery root.
-          for (const root of [".omp/agent", ".claude", ".codex", ".agents", ".pi/agent"]) {
-            mkdirSync(join(offline.home, root, "skills", "leak"), { recursive: true });
-            writeFileSync(
-              join(offline.home, root, "skills", "leak", "SKILL.md"),
-              "---\nname: leak\ndescription: LEAK-SENTINEL-homeskill\n---\nLEAK-SENTINEL-homeskill\n",
-            );
-          }
-          writeFileSync(join(offline.home, "AGENTS.md"), "LEAK-SENTINEL-homeagents\n");
-          writeFileSync(join(offline.home, ".claude", "CLAUDE.md"), "LEAK-SENTINEL-homeclaude\n");
-        }
         await withEnv(offline.env, async () => {
           const rt = await EngineeringRuntime.open({ cwd: fx.root, verifier: new CommandVerifier() });
           try {
@@ -316,9 +402,9 @@ async function measure(path: "legacy" | "omp", poison: boolean): Promise<Record<
 }
 
 describe("per-worker prompt context", { skip, timeout: 600_000 }, () => {
-  it("omp path starting context stays within the documented per-role budget of legacy", async () => {
-    const legacy = await measure("legacy", false);
-    const omp = await measure("omp", false);
+  it("omp starting context ratchets against growth (not a parity claim): per-role ratio and absolute ceiling", async () => {
+    const legacy = await measure("legacy");
+    const omp = await measure("omp");
     const rows: string[] = ["role | path | system chars | tools chars | messages chars | approx tokens"];
     for (const role of Object.keys(legacy)) {
       for (const [name, m] of [
@@ -337,24 +423,32 @@ describe("per-worker prompt context", { skip, timeout: 600_000 }, () => {
       assert.ok(l && o, `role ${role} measured on both paths`);
       assert.ok(
         tokens(o) <= Math.ceil(tokens(l) * (1 + budgetOf(role))),
-        `${role}: omp ${tokens(o)} tokens vs legacy ${tokens(l)} exceeds the +${budgetOf(role) * 100}% budget`,
+        `${role}: omp ${tokens(o)} tokens vs legacy ${tokens(l)} exceeds the +${budgetOf(role) * 100}% ratchet`,
       );
+      const ceiling = OMP_CEILING_TOKENS[role];
+      assert.ok(ceiling !== undefined, `role ${role} has an absolute ceiling`);
+      assert.ok(tokens(o) <= ceiling, `${role}: omp ${tokens(o)} tokens exceeds the absolute ceiling ${ceiling}`);
     }
   });
 
-  it("no skills, context files or rules leak into an omp worker's requests (firewall)", async () => {
-    const omp = await measure("omp", true);
-    assert.ok(Object.keys(omp).length >= 2);
-    for (const [role, s] of Object.entries(omp)) {
-      assert.doesNotMatch(s.raw, /LEAK-SENTINEL/, `${role}: a discovery root leaked into the request`);
-    }
+  it("no skills, context files or rules leak into ANY request of an omp worker (firewall), and the control proves they are discoverable", async () => {
+    const control = await unfirewalledBodies();
+    const surfaced = sentinelsIn(control);
+    assert.ok(
+      surfaced.length > 0,
+      "positive control: an unfirewalled omp run must surface at least one sentinel, else the leak scan proves nothing",
+    );
+    console.log(`FIREWALL-CONTROL unfirewalled omp surfaced: ${surfaced.join(", ")}`);
+    const bodies = await firewalledBodies();
+    assert.ok(bodies.length >= 3, "every role made at least one request");
+    assert.deepEqual(sentinelsIn(bodies), [], "no discovery root reached any turn of any role, tool results included");
   });
 });
 
 // -------------------------------------------------------------- offline mode
 
-describe("offline one-model mode", { skip, timeout: 300_000 }, () => {
-  it("the whole engineer flow completes on the omp path with every proxy pointing at a dead port", async () => {
+describe("proxy-dead mode (not a connection-attempt proof)", { skip, timeout: 300_000 }, () => {
+  it("the engineer flow completes on the omp path with every proxy variable pointing at a dead port and loopback exempt", async () => {
     const fx = await makeFixtureRepo();
     const offline = await startOfflineOmp(engineerModelScript({ implement: ADD_OK }));
     const dead = "http://127.0.0.1:9";
