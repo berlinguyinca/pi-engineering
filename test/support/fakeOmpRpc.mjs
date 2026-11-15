@@ -42,6 +42,14 @@ else {
     out({ type: "prompt_result", status: "completed" });
   };
   const play = async () => {
+    if (mode === "silent-bash" || mode === "silent-bash-hang") {
+      // FAKE_OMP_SILENCE_MS of silence between a bash tool_execution_start and its end (never ends in -hang).
+      out({ type: "tool_execution_start", toolCallId: "b1", toolName: "bash", args: { command: "sleep" } });
+      if (mode === "silent-bash-hang") return;
+      await new Promise((r) => setTimeout(r, Number(process.env.FAKE_OMP_SILENCE_MS ?? 600)));
+      out({ type: "tool_execution_end", toolCallId: "b1", toolName: "bash", result: { content: [] }, isError: false });
+      return playCalls();
+    }
     if (mode === "calls") return playCalls();
     if (mode === "late-burst") await new Promise((r) => setTimeout(r, 600));
     for (const line of frames) {

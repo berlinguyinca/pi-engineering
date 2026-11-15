@@ -1,6 +1,6 @@
 # Rollback guide (OMP unification, phases 1-7 and skills)
 
-Everything that runs OMP is behind two environment flags and is OFF by default. Legacy is the default path and needs no bun and no omp. The fastest rollback of any OMP behavior is therefore a flag, not a revert.
+Everything that runs OMP is behind two environment flags and is OFF by default. Each flag is on only when its value, trimmed and lowercased, is one of `1`, `true`, `yes`, `on` (`src/omp/config.ts`, `src/omp/selectWorker.ts`); any other value, including `0`, `false`, empty or unset, is off. Legacy is the default path and needs no bun and no omp. The fastest rollback of any OMP behavior is therefore a flag, not a revert.
 
 ## 1. Flag rollback (no code change)
 
@@ -18,9 +18,9 @@ A failure before the prompt is sent (binary absent, crash before `ready`, `set_h
 
 ## 2. Revert order (code rollback)
 
-The stack is linear: 695 (phase 3) -> 696 (phase 4) -> 697 (phase 5) -> 698 (phase 6, PR number as opened) -> this branch (phase 7, `docs/omp-unification-final`). Revert from the top down, newest first, so each revert applies cleanly:
+The stack is linear: 695 (phase 3) -> 696 (phase 4) -> 697 (phase 5) -> phase 6 (PR number not yet assigned) -> this branch (phase 7, `docs/omp-unification-final`). Revert from the top down, newest first, so each revert applies cleanly:
 
-1. phase 7 (this PR): reverts the overlay trimming in `src/omp/firewall.ts` (context +34% again, ratchet back to 0.4 / 4200) and removes these docs.
+1. phase 7 (this PR): reverts the overlay trimming in `src/omp/firewall.ts` (context +34% again, ratchet back to 0.4 / 4200), the bash in-flight inactivity pause and these docs.
 2. phase 6 (Herdr activity bridge): removes the frame-to-activity mapping in `OmpWorkerExecutor`; omp workers then look idle in the UI.
 3. phase 5 (parity suite): tests and the additive `ScriptedModelServer.bodies`; no `src/` change.
 4. phase 4 (worker, session and tool integration): removes `hostTools.ts`, the `acceptsCustomTools` wiring and three `export` keywords; omp workers then serve `/engineer` only again.
@@ -31,7 +31,7 @@ Not in the stack, revertable on their own (each independent of the others, in an
 - #690 phase 1 (docs only), #692 phase 2 (adapter spike: new files only under `src/omp/`; reverting it after phase 3 requires reverting phase 3 first), #691 coverage gate (CI/`package.json` script; reverting it removes the 85/83/83 floors), #693 legacy golden gate (`legacy-golden.test.ts`, `test/fixtures/legacy-golden/`; reverting it removes the byte-parity safety net, so revert phases 3-6 first).
 - #694 skills (independent branch `feat/omp-skills-adoption`): `skill-packs/pe-operator/`, `src/skillpack`, `src/promptcompress`, scripts and tests. No runtime path imports them; reverting cannot change behavior. Use `git revert <merge sha>`.
 
-Use `git revert -m 1 <merge-sha>` per merged PR (merge commits) or `git revert <range>` for a squash-free range; do not force-push `main`.
+#690-#694 were squash-merged: each merge SHA has exactly one parent (checked with `git rev-list --parents -n1 <sha>`; confirm the SHA with `gh pr view <n> --json mergeCommit`). Revert them with a plain `git revert <sha>` (no `-m 1`): 2cb95221 (#690), 783058de (#692), 24a66588 (#691), 1294390c (#693), c8c4c6ba (#694). The merge method of #695-#697 and the phase 6 and 7 PRs is not known yet (UNVERIFIED): run the same `rev-list --parents` check; one parent means `git revert <sha>`, two parents means `git revert -m 1 <sha>`. Do not force-push `main`.
 
 ## 3. State each phase may have created
 
