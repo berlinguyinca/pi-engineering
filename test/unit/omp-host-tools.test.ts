@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -8,6 +8,7 @@ import { type ToolDefinition, defineTool } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 import { OmpWorkerExecutor } from "../../src/omp/OmpWorkerExecutor.ts";
 import { buildHostTools, isCheckpointTool, replacementName, toHostToolSpec } from "../../src/omp/hostTools.ts";
+import { ompToolsFor } from "../../src/omp/rpcTranslate.ts";
 import {
   FallbackWorkerExecutor,
   OMP_WORKER_ENV,
@@ -103,6 +104,16 @@ describe("buildHostTools", () => {
   it("tolerant file tools replace read and edit; without isolation no write twin appears", async () => {
     const plan = await buildHostTools(req({ tools: ["read", "write", "edit"], tolerantFileTools: true }), []);
     assert.deepEqual([...plan.tools.keys()].sort(), ["pe_edit", "pe_read"]);
+  });
+
+  it("a replaced read does not leave `ls` re-enabling omp's built-in read: ls is served host-side", async () => {
+    const plan = await buildHostTools(req({ tools: ["read", "ls"], tolerantFileTools: true }), []);
+    assert.deepEqual([...plan.tools.keys()].sort(), ["pe_ls", "pe_read"]);
+    assert.deepEqual([...plan.replaced].sort(), ["ls", "read"]);
+    const builtin = ompToolsFor(["read", "ls"].filter((n) => !plan.replaced.has(n))).builtin;
+    assert.deepEqual(builtin, [], "omp's own read stays off");
+    const untouched = await buildHostTools(req({ tools: ["read", "ls"] }), []);
+    assert.equal(untouched.tools.size, 0, "without a read replacement ls keeps its omp mapping");
   });
 
   it("toHostToolSpec carries PE's schema and description verbatim", () => {
@@ -213,6 +224,102 @@ describe("OmpWorkerExecutor host tool calls (real child speaking the rpc protoco
     const checkpoint = seen.find((e) => e.kind === "checkpoint");
     assert.equal(checkpoint?.meaningfulProgress, true);
     assert.equal(checkpoint?.claims?.[0]?.deliverable, "Alpha");
+  });
+
+  it("an inactivity timeout does not fire while a host tool call is in flight, and re-arms afterwards", async () => {
+    const slow = defineTool({
+      name: "slow_tool",
+      label: "Slow",
+      description: "slow",
+      parameters: Type.Object({}),
+      async execute() {
+        await new Promise((r) => setTimeout(r, 900));
+        return { content: [{ type: "text", text: "done" }], details: {} };
+      },
+    }) as unknown as ToolDefinition;
+    const { out } = await run([["slow_tool", {}]], req({ tools: ["slow_tool"], timeoutMs: 300 }), [slow]);
+    assert.equal(out.result.status, "completed", out.error);
+  });
+
+  it("an inactivity timeout still fires when omp goes silent with no host call in flight", async () => {
+    const executor = new OmpWorkerExecutor({
+      launch: { command: process.execPath, args: [FAKE] },
+      env: { ...process.env, FAKE_OMP_MODE: "hang-after-prompt", FAKE_OMP_FIXTURE: FIXTURE },
+      startTimeoutMs: 2_000,
+    });
+    const out = await executor.run(req({ tools: ["read"], timeoutMs: 300 }));
+    assert.equal(out.result.status, "failed");
+    assert.match(out.error ?? "", /no omp frame for 300ms/);
+  });
+
+  it("an aborted run does not deliver the result of a host call that was still executing", async () => {
+    let sawAbort: boolean | undefined;
+    const slow = defineTool({
+      name: "slow_tool",
+      label: "Slow",
+      description: "slow",
+      parameters: Type.Object({}),
+      async execute(_id, _p, signal) {
+        await new Promise((r) => setTimeout(r, 400));
+        sawAbort = signal?.aborted;
+        return { content: [{ type: "text", text: "late" }], details: {} };
+      },
+    }) as unknown as ToolDefinition;
+    const ac = new AbortController();
+    const results = join(tmp(), "results.jsonl");
+    const executor = new OmpWorkerExecutor({
+      launch: { command: process.execPath, args: [FAKE] },
+      env: {
+        ...process.env,
+        FAKE_OMP_MODE: "calls",
+        FAKE_OMP_FIXTURE: FIXTURE,
+        FAKE_OMP_CALLS: JSON.stringify([["slow_tool", {}]]),
+        FAKE_OMP_RESULTS: results,
+      },
+      startTimeoutMs: 2_000,
+    });
+    executor.setCustomTools([slow]);
+    const pending = executor.run(req({ tools: ["slow_tool"], signal: ac.signal, timeoutMs: 60_000 }));
+    setTimeout(() => ac.abort(), 150);
+    const out = await pending;
+    assert.match(out.error ?? "", /aborted by owner/);
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(sawAbort, true, "the tool saw the run's abort signal");
+  });
+
+  it("every host tool executes through the omp path with a real worktree-bound context", async () => {
+    const cwd = tmp();
+    mkdirSync(join(cwd, "src"));
+    writeFileSync(join(cwd, "src", "a.txt"), "alpha\n");
+    const r = req({
+      cwd,
+      tools: ["read", "ls", "write", "edit", "claim_deliverable", "checkpoint_progress"],
+      tolerantFileTools: true,
+      isolatedWorktree: true,
+      deliverables: ["Alpha"],
+    });
+    const { out, frames } = await run(
+      [
+        ["pe_read", { path: "src/a.txt" }],
+        ["pe_ls", { path: "src" }],
+        ["pe_write", { path: "src/b.txt", content: "beta\n" }],
+        ["pe_edit", { path: "src/a.txt", edits: [{ oldText: "alpha", newText: "gamma" }] }],
+        ["claim_deliverable", { deliverables: ["Alpha"] }],
+        [
+          "checkpoint_progress",
+          { claims: [{ deliverable: "Alpha", candidate_sha: "abc123", evidence_paths: ["src/a.txt"] }] },
+        ],
+      ],
+      r,
+      [],
+    );
+    assert.equal(out.result.status, "completed", out.error);
+    const results = frames.filter((f) => typeof f.id === "string" && /^h\d$/.test(f.id as string));
+    const errors = results.filter((f) => f.isError === true).map((f) => JSON.stringify(f));
+    assert.equal(results.length, 7, "six tool calls plus the result tool");
+    assert.deepEqual(errors, [], "every host tool succeeds against the worker cwd");
+    assert.equal(readFileSync(join(cwd, "src", "b.txt"), "utf8"), "beta\n");
+    assert.match(readFileSync(join(cwd, "src", "a.txt"), "utf8"), /gamma/);
   });
 
   it("every worker process carries the mission-depth marker one deeper", async () => {

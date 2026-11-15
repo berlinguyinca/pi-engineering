@@ -74,7 +74,11 @@ The cost is process start per worker run (about 1 to 2 s each with bun and the r
 - `bash`: no budget notice or stall quarantine; the process-group kill bounds it.
 - Host tools that replace built-ins are named `pe_*`; prompt wording that says `write` / `edit` is unchanged.
 - Scripted-model parity proves the integration, not model behavior; behavior differences between models are out of scope.
-- Full mission DAGs on real omp are unverified.
+- **Environment.** omp receives the full parent environment plus `HOME`, with `PI_MISSION_DEPTH` incremented. The legacy SDK path strips session variables; the omp path does not.
+- **Budget and stall.** The omp path has no budget notice and no stall quarantine; only the inactivity timeout (paused while a host tool call is in flight) and the owner's abort apply.
+- **Mission DAG.** `realBackends` is verified on real omp for one agent task and one review task; a full mission DAG on real omp is unverified.
+- **CI.** CI does not set `OMP_BIN`, so every real-omp test is skipped there and is local-only evidence; the fake-rpc unit tests run in CI.
+- **`ls`.** When `read` is replaced by `pe_read`, `ls` is served host-side as `pe_ls`; otherwise it keeps the omp `read` mapping.
 
 ## Rollback
 
@@ -82,4 +86,4 @@ Unset `PI_ENGINEERING_OMP_WORKER` (or the adapter flag). Nothing else changes: w
 
 ## Coverage
 
-`npm run test:coverage` exit 0: 6972 tests, 6967 pass, 0 fail, 5 skipped. Lines 85.62, branches 83.28, functions 83.38 (floors 85 / 83 / 83).
+`npm run test:coverage` (no OMP_BIN, as in CI) exit 0: 6977 tests, 6972 pass, 0 fail, 5 skipped. Lines 85.64, branches 83.28, functions 83.45 (floors 85 / 83 / 83).
