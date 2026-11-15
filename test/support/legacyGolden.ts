@@ -9,24 +9,30 @@
  * test/fixtures/legacy-golden/ and are compared byte for byte.
  *
  * Parity gate: the scenario table below takes a {@link ParityPath}. A future
- * OMP-backed path implements the same two factories and runs the SAME table
- * against the SAME golden files; equivalence is decided by byte comparison
- * only. See docs/specs/omp-unification-2026-11-13/reports/phase3-legacy-golden.md.
+ * OMP-backed path implements the same factories and observation hooks and runs
+ * the SAME table against the SAME golden files (select it with PARITY_PATH, see
+ * {@link resolvePath} / {@link runParity}); equivalence is decided by byte
+ * comparison only. Scenarios reach the implementation ONLY through the path. See docs/specs/omp-unification-2026-11-13/reports/phase3-legacy-golden.md.
  */
 
+import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFile, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import extension from "../../extensions/index.ts";
 import type { GitRepo } from "../../src/git/GitRepo.ts";
+import type { Ledger } from "../../src/ledger/Ledger.ts";
 import type { BrokerBackends } from "../../src/orchestration/broker.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { Orchestrator, type OrchestratorOptions } from "../../src/orchestration/orchestrator.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
-import { CommandVerifier } from "../../src/verify/Verifier.ts";
+import { CommandVerifier, type VerifyOutcome } from "../../src/verify/Verifier.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import type { WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
@@ -42,22 +48,61 @@ import {
 
 const exec = promisify(execFile);
 
-/** The commit of the legacy implementation these goldens were captured from. */
-export const LEGACY_SHA = "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736";
+/**
+ * The commit of the legacy implementation the goldens were captured from. It is the
+ * baseline every path is compared against, so the stamped field is path-neutral.
+ */
+export const GOLDEN_BASELINE_SHA = "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736";
 
 export interface OpenOptions {
   cwd: string;
   worker: WorkerExecutor;
 }
 
+/** The ledger operations the scenarios use; the legacy path hands out the runtime's own ledger. */
+export type LedgerAccess = Pick<
+  Ledger,
+  "listCandidates" | "listEntities" | "listTasks" | "getWorkItem" | "count" | "createWorkItem" | "createCandidate"
+>;
+
+/** The mission-store reads the scenarios use. */
+export type MissionView = Pick<
+  MissionStore,
+  "getMission" | "listTasks" | "listFindings" | "listRecoveryDecisions" | "flush"
+>;
+
+export type MissionOptions = Omit<OrchestratorOptions, "store">;
+
+/** One mission store plus the orchestrator driving it and the event log behind it. */
+export interface MissionSession {
+  orchestrator: Orchestrator;
+  store: MissionView;
+  /** Every mission event recorded so far, in order. */
+  events(): RawEvent[];
+  /** A fresh store and orchestrator reopened over the same recorded events (a process restart). */
+  restart(): { orchestrator: Orchestrator; store: MissionView };
+}
+
 /**
- * The implementation under test. The legacy path is the default; the OMP path
- * supplies its own factories and nothing else changes.
+ * The implementation under test. The legacy path is the default; another path
+ * supplies its own factories and observation hooks and nothing else changes: the
+ * scenarios never reach into ledger files or stores themselves.
  */
 export interface ParityPath {
   readonly name: string;
   openRuntime(opts: OpenOptions): Promise<EngineeringRuntime>;
-  makeOrchestrator(opts: OrchestratorOptions): Orchestrator;
+  /** The ledger of an open runtime. */
+  ledgerOf(rt: EngineeringRuntime): LedgerAccess;
+  /** The recorded ledger events of the repository at `root`, in order (empty when nothing was recorded). */
+  readEvents(root: string, opts?: { tornLinesExpected?: boolean }): Promise<RawEvent[]>;
+  /** Simulate a crash mid-append: leave an unterminated, unparseable fragment at the end of the repository's ledger. */
+  tearLedgerTail(root: string): Promise<void>;
+  /** Detect the verification profile for the runtime's repository and run it. */
+  verify(
+    rt: EngineeringRuntime,
+  ): Promise<{ profile: { name: string; stages: Array<{ name: string; required: boolean }> }; outcome: VerifyOutcome }>;
+  /** A mission store (over a fresh in-memory event log) with an orchestrator built on it. */
+  openMission(opts: MissionOptions): MissionSession;
   /** Register the slash commands on a pi host and return them with a way to shut the host down. */
   loadCommandHost(): CommandHost;
 }
@@ -96,12 +141,56 @@ function legacyCommandHost(): CommandHost {
   };
 }
 
+const ledgerFile = (root: string): string => join(root, ".pi-eng", "ledger.jsonl");
+
+function legacyMissionSession(backend: JsonlEventStore, opts: MissionOptions): MissionSession {
+  const store = MissionStore.open(backend);
+  return {
+    orchestrator: new Orchestrator({ ...opts, store }),
+    store,
+    events: () => backend.all() as unknown as RawEvent[],
+    restart: () => {
+      const restored = MissionStore.open(backend);
+      return {
+        store: restored,
+        orchestrator: new Orchestrator({ store: restored, backends: {}, planner: async () => [] }),
+      };
+    },
+  };
+}
+
 export const legacyPath: ParityPath = {
   name: "legacy",
   openRuntime: (opts) => EngineeringRuntime.open({ ...opts, verifier: new CommandVerifier() }),
-  makeOrchestrator: (opts) => new Orchestrator(opts),
+  ledgerOf: (rt) => rt.ledger,
+  readEvents: async (root, opts) => {
+    // A runtime that recorded nothing has no ledger file yet: that is an empty sequence, not an error.
+    const body = await readFile(ledgerFile(root), "utf8").catch((err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return "";
+      throw err;
+    });
+    return parseLedger(body, opts);
+  },
+  tearLedgerTail: (root) => appendFile(ledgerFile(root), '{"event_id":"torn', "utf8"),
+  verify: async (rt) => {
+    const profile = await rt.verifier.detect(rt.cwd);
+    const outcome = await rt.verifier.run(rt.cwd, profile, rt.artifacts);
+    return { profile, outcome };
+  },
+  openMission: (opts) => legacyMissionSession(JsonlEventStore.inMemory(), opts),
   loadCommandHost: legacyCommandHost,
 };
+
+/** Paths selectable with PARITY_PATH. Another implementation registers itself here. */
+export const PATHS: Readonly<Record<string, ParityPath>> = { legacy: legacyPath };
+
+/** Resolve the path named by PARITY_PATH (unset or empty means legacy); an unknown name fails loudly. */
+export function resolvePath(name: string | undefined): ParityPath {
+  const key = name === undefined || name === "" ? "legacy" : name;
+  const path = PATHS[key];
+  if (!path) throw new Error(`unknown PARITY_PATH "${key}"; known paths: ${Object.keys(PATHS).join(", ")}`);
+  return path;
+}
 
 export interface Scenario {
   command: string;
@@ -113,7 +202,7 @@ export interface Scenario {
 export interface GoldenRecord {
   command: string;
   scenario: string;
-  legacySha: string;
+  goldenBaselineSha: string;
   [key: string]: JsonValue;
 }
 
@@ -126,10 +215,10 @@ export async function renderScenario(s: Scenario, path: ParityPath): Promise<str
   const roots = [await realpath(tmpdir())];
   const norm = createNormalizer(roots);
   const body = await s.run(path, norm, roots);
-  // legacySha is stamped after normalization: it is a 40-hex SHA by design and must not become <SHA>.
+  // goldenBaselineSha is stamped after normalization: it is a 40-hex SHA by design and must not become <SHA>.
   const record: GoldenRecord = {
     ...(norm.value({ command: s.command, scenario: s.scenario, ...body }) as Record<string, JsonValue>),
-    legacySha: LEGACY_SHA,
+    goldenBaselineSha: GOLDEN_BASELINE_SHA,
   } as GoldenRecord;
   return stableStringify(Object.fromEntries(Object.entries(record).sort(([a], [b]) => (a < b ? -1 : 1))));
 }
@@ -141,9 +230,15 @@ type Fixture = Awaited<ReturnType<typeof makeFixtureRepo>>;
 const ADD_OK = "export function add(a, b) {\n  return a + b;\n}\n";
 const ADD_BAD = "export function add(a, b) {\n  return a - b;\n}\n";
 
-async function withFixture<T>(opts: { green?: boolean }, fn: (fx: Fixture) => Promise<T>): Promise<T> {
+async function withFixture<T>(
+  norm: Normalizer,
+  opts: { green?: boolean },
+  fn: (fx: Fixture) => Promise<T>,
+): Promise<T> {
   const fx = await makeFixtureRepo();
   try {
+    norm.addRoot(fx.root);
+    norm.addRoot(await realpath(fx.root));
     if (opts.green) {
       await writeFile(join(fx.root, "src", "add.js"), ADD_OK, "utf8");
       await exec("git", ["-C", fx.root, "add", "-A"]);
@@ -178,21 +273,12 @@ const reviewWith = (findingsFor: (n: number) => unknown[]) => {
 };
 const HIGH = [{ severity: "high", claim: "edge case not handled", evidence: "diff://src/add.js" }];
 
-async function ledgerEvents(root: string): Promise<RawEvent[]> {
-  // A runtime that recorded nothing has no ledger file yet: that is an empty sequence, not an error.
-  const body = await readFile(join(root, ".pi-eng", "ledger.jsonl"), "utf8").catch((err: NodeJS.ErrnoException) => {
-    if (err.code === "ENOENT") return "";
-    throw err;
-  });
-  return parseLedger(body);
+async function eventSequence(path: ParityPath, root: string, norm: Normalizer): Promise<JsonValue> {
+  return normalizeEvents(await path.readEvents(root), norm) as unknown as JsonValue;
 }
 
-async function eventSequence(root: string, norm: Normalizer): Promise<JsonValue> {
-  return normalizeEvents(await ledgerEvents(root), norm) as unknown as JsonValue;
-}
-
-function candidateSummary(rt: EngineeringRuntime, norm: Normalizer): JsonValue {
-  const all = rt.ledger.listCandidates();
+function candidateSummary(ledger: LedgerAccess, norm: Normalizer): JsonValue {
+  const all = ledger.listCandidates();
   return all.map((c) => ({
     id: norm.text(c.id),
     status: c.status,
@@ -224,6 +310,7 @@ function verificationSummary(
 type EngineerLike = Awaited<ReturnType<EngineeringRuntime["engineer"]>>;
 
 async function engineerBody(
+  path: ParityPath,
   rt: EngineeringRuntime,
   report: EngineerLike,
   norm: Normalizer,
@@ -241,8 +328,8 @@ async function engineerBody(
     verification: verificationSummary(report.verification),
     evidence_count: report.evidence_ids.length,
     workers: report.telemetry.workers as unknown as JsonValue,
-    candidates: candidateSummary(rt, norm),
-    ledger: await eventSequence(rt.cwd, norm),
+    candidates: candidateSummary(path.ledgerOf(rt), norm),
+    ledger: await eventSequence(path, rt.cwd, norm),
   };
 }
 
@@ -262,11 +349,11 @@ function engineerScenario(
     command: "engineer",
     scenario,
     async run(path, norm) {
-      return withFixture({}, async (fx) => {
+      return withFixture(norm, {}, async (fx) => {
         const rt = await path.openRuntime({ cwd: fx.root, worker: new FakeWorkerExecutor(workers({ review })) });
         try {
           const report = await rt.engineer(goal);
-          return { ...(await engineerBody(rt, report, norm)), main_branch: await mainAdd(fx.root) };
+          return { ...(await engineerBody(path, rt, report, norm)), main_branch: await mainAdd(fx.root) };
         } finally {
           await rt.close();
         }
@@ -317,7 +404,7 @@ function reviewScenario(scenario: string, findings: unknown[]): Scenario {
     command: "review",
     scenario,
     async run(path, norm) {
-      return withFixture({}, async (fx) => {
+      return withFixture(norm, {}, async (fx) => {
         const worker = new FakeWorkerExecutor({
           reviewer: () => ({
             status: "completed",
@@ -327,8 +414,9 @@ function reviewScenario(scenario: string, findings: unknown[]): Scenario {
         });
         const rt = await path.openRuntime({ cwd: fx.root, worker });
         try {
-          const wi = await rt.ledger.createWorkItem("review target", "medium", [fx.root], { type: "system" });
-          const cand = await rt.ledger.createCandidate(wi.id, "base", "branch", null, "implementer", "run", null, {
+          const ledger = path.ledgerOf(rt);
+          const wi = await ledger.createWorkItem("review target", "medium", [fx.root], { type: "system" });
+          const cand = await ledger.createCandidate(wi.id, "base", "branch", null, "implementer", "run", null, {
             type: "system",
           });
           const result = await rt.review(wi, cand, "must be correct");
@@ -336,10 +424,10 @@ function reviewScenario(scenario: string, findings: unknown[]): Scenario {
             completed: result.completed,
             summary: result.summary,
             finding_count: result.findingIds.length,
-            findings: rt.ledger
+            findings: ledger
               .listEntities("finding")
               .map((f) => ({ severity: f.severity ?? null, status: f.status, claim: f.claim })),
-            ledger: await eventSequence(fx.root, norm),
+            ledger: await eventSequence(path, fx.root, norm),
           };
         } finally {
           await rt.close();
@@ -354,16 +442,15 @@ function verifyScenario(scenario: string, green: boolean): Scenario {
     command: "verify",
     scenario,
     async run(path, norm) {
-      return withFixture({ green }, async (fx) => {
+      return withFixture(norm, { green }, async (fx) => {
         const rt = await path.openRuntime({ cwd: fx.root, worker: new FakeWorkerExecutor({}) });
         try {
-          const profile = await rt.verifier.detect(rt.cwd);
-          const outcome = await rt.verifier.run(rt.cwd, profile, rt.artifacts);
+          const { profile, outcome } = await path.verify(rt);
           return {
             profile: profile.name,
             profile_stages: profile.stages.map((s) => ({ name: s.name, required: s.required })),
             ...(verificationSummary(outcome) as Record<string, JsonValue>),
-            ledger: await eventSequence(fx.root, norm),
+            ledger: await eventSequence(path, fx.root, norm),
           };
         } finally {
           await rt.close();
@@ -422,8 +509,8 @@ async function implBoom(req: { cwd: string }) {
 
 type PlanRt = EngineeringRuntime;
 
-function taskSummary(rt: PlanRt, planId: string, norm: Normalizer): JsonValue {
-  const tasks = rt.ledger.listTasks(planId);
+function taskSummary(ledger: LedgerAccess, planId: string, norm: Normalizer): JsonValue {
+  const tasks = ledger.listTasks(planId);
   const index = new Map(tasks.map((t, i) => [t.id, i]));
   return tasks.map((t) => ({
     title: t.title,
@@ -437,17 +524,17 @@ function taskSummary(rt: PlanRt, planId: string, norm: Normalizer): JsonValue {
 function planScenario(
   scenario: string,
   build: () => FakeWorkerExecutor,
-  drive: (rt: PlanRt, norm: Normalizer) => Promise<Record<string, JsonValue>>,
+  drive: (rt: PlanRt, ledger: LedgerAccess, norm: Normalizer) => Promise<Record<string, JsonValue>>,
 ): Scenario {
   return {
     command: "plan",
     scenario,
     async run(path, norm) {
-      return withFixture({}, async (fx) => {
+      return withFixture(norm, {}, async (fx) => {
         const rt = await path.openRuntime({ cwd: fx.root, worker: build() });
         try {
-          const body = await drive(rt, norm);
-          return { ...body, ledger: await eventSequence(fx.root, norm) };
+          const body = await drive(rt, path.ledgerOf(rt), norm);
+          return { ...body, ledger: await eventSequence(path, fx.root, norm) };
         } finally {
           await rt.close();
         }
@@ -465,15 +552,15 @@ function planScenarios(): Scenario[] {
     planScenario(
       "happy",
       () => planWorker(twoTasks, implAddOrSubtract),
-      async (rt, norm) => {
+      async (rt, ledger, norm) => {
         const plan = await rt.plan("Build a small math module with add and subtract");
         const dag = await rt.executePlan(plan.plan_work_item.id);
         return {
           plan_outcome: plan.outcome,
           dag_outcome: dag.outcome,
           order: dag.order.map((t) => t.title),
-          tasks: taskSummary(rt, plan.plan_work_item.id, norm),
-          plan_work_item_status: rt.ledger.getWorkItem(plan.plan_work_item.id)!.status,
+          tasks: taskSummary(ledger, plan.plan_work_item.id, norm),
+          plan_work_item_status: ledger.getWorkItem(plan.plan_work_item.id)!.status,
         };
       },
     ),
@@ -484,13 +571,13 @@ function planScenarios(): Scenario[] {
           [planTask("implement add", "src/add.js"), planTask("implement subtract", "src/subtract.js", [0])],
           implBoom,
         ),
-      async (rt, norm) => {
+      async (rt, ledger, norm) => {
         const plan = await rt.plan("Build add then subtract");
         const dag = await rt.executePlan(plan.plan_work_item.id);
         return {
           plan_outcome: plan.outcome,
           dag_outcome: dag.outcome,
-          tasks: taskSummary(rt, plan.plan_work_item.id, norm),
+          tasks: taskSummary(ledger, plan.plan_work_item.id, norm),
         };
       },
     ),
@@ -499,20 +586,20 @@ function planScenarios(): Scenario[] {
       () => {
         return planWorker([planTask("implement add", "src/add.js")], implAddOrSubtract);
       },
-      async (rt, norm) => {
+      async (rt, ledger, norm) => {
         const plan = await rt.plan("add");
         const first = await rt.executePlan(plan.plan_work_item.id);
-        const linkBefore = rt.ledger.listTasks(plan.plan_work_item.id)[0]!.result_work_item_id;
-        const eventsBetween = rt.ledger.count();
+        const linkBefore = ledger.listTasks(plan.plan_work_item.id)[0]!.result_work_item_id;
+        const eventsBetween = ledger.count();
         const second = await rt.executePlan(plan.plan_work_item.id);
-        const linkAfter = rt.ledger.listTasks(plan.plan_work_item.id)[0]!.result_work_item_id;
+        const linkAfter = ledger.listTasks(plan.plan_work_item.id)[0]!.result_work_item_id;
         return {
           first_outcome: first.outcome,
           second_outcome: second.outcome,
           link_preserved: linkBefore === linkAfter,
-          implementer_reruns: rt.ledger.listCandidates().length,
-          events_added_by_rerun: rt.ledger.count() - eventsBetween,
-          tasks: taskSummary(rt, plan.plan_work_item.id, norm),
+          implementer_reruns: ledger.listCandidates().length,
+          events_added_by_rerun: ledger.count() - eventsBetween,
+          tasks: taskSummary(ledger, plan.plan_work_item.id, norm),
         };
       },
     ),
@@ -523,14 +610,14 @@ function planScenarios(): Scenario[] {
           Array.from({ length: 12 }, (_, i) => planTask(`task ${i}`, `src/t${i}.js`, [999])),
           implAddOrSubtract,
         ),
-      async (rt, norm) => {
+      async (rt, ledger, norm) => {
         const plan = await rt.plan("big goal");
         return {
           plan_outcome: plan.outcome,
           task_count: plan.tasks.length,
-          tasks: taskSummary(rt, plan.plan_work_item.id, norm),
-          decisions: rt.ledger.listEntities("decision").map((d) => d.claim),
-          findings: [...new Set(rt.ledger.listEntities("finding").map((f) => `${f.severity ?? "?"}: ${f.claim}`))],
+          tasks: taskSummary(ledger, plan.plan_work_item.id, norm),
+          decisions: ledger.listEntities("decision").map((d) => d.claim),
+          findings: [...new Set(ledger.listEntities("finding").map((f) => `${f.severity ?? "?"}: ${f.claim}`))],
         };
       },
     ),
@@ -557,7 +644,7 @@ function tournamentScenario(scenario: string, n: number, worker: () => FakeWorke
     command: "tournament",
     scenario,
     async run(path, norm) {
-      return withFixture({}, async (fx) => {
+      return withFixture(norm, {}, async (fx) => {
         const rt = await path.openRuntime({ cwd: fx.root, worker: worker() });
         try {
           const report: TournamentRt = await rt.tournament(GOAL, { n });
@@ -576,9 +663,9 @@ function tournamentScenario(scenario: string, n: number, worker: () => FakeWorke
             })),
             winner_index: report.entries.findIndex((e) => e.winner),
             evidence_count: report.evidence_ids.length,
-            candidates: candidateSummary(rt, norm),
+            candidates: candidateSummary(path.ledgerOf(rt), norm),
             main_branch: await mainAdd(fx.root),
-            ledger: await eventSequence(fx.root, norm),
+            ledger: await eventSequence(path, fx.root, norm),
           };
         } finally {
           await rt.close();
@@ -624,9 +711,9 @@ interface MissionKnobs {
 }
 
 interface MissionHarness {
+  session: MissionSession;
   orchestrator: Orchestrator;
-  store: MissionStore;
-  backend: JsonlEventStore;
+  store: MissionView;
   knobs: MissionKnobs;
   calls: { agent: number; review: number; validation: number };
 }
@@ -699,16 +786,12 @@ function backendsFor(knobs: MissionKnobs, calls: MissionHarness["calls"]): Broke
   };
 }
 
-function missionHarness(
-  path: ParityPath,
-  partial: Partial<MissionKnobs> = {},
-  backend = JsonlEventStore.inMemory(),
-): MissionHarness {
+function missionHarness(path: ParityPath, norm: Normalizer, partial: Partial<MissionKnobs> = {}): MissionHarness {
+  // The stub git provider reports the checkout it runs in as its root.
+  norm.addRoot(process.cwd());
   const knobs: MissionKnobs = { findings: [], validationFailTimes: 0, ...partial };
   const calls = { agent: 0, review: 0, validation: 0 };
-  const store = MissionStore.open(backend);
-  const orchestrator = path.makeOrchestrator({
-    store,
+  const session = path.openMission({
     backends: backendsFor(knobs, calls),
     git: {
       root: process.cwd(),
@@ -738,7 +821,7 @@ function missionHarness(
       },
     ],
   });
-  return { orchestrator, store, backend, knobs, calls };
+  return { session, orchestrator: session.orchestrator, store: session.store, knobs, calls };
 }
 
 const MISSION_REQUEST = "Add a health endpoint";
@@ -760,7 +843,7 @@ function missionSummary(h: MissionHarness, missionId: string, norm: Normalizer):
       .map((f) => ({ severity: f.severity, status: f.status, summary: f.summary })),
     recovery: h.store.listRecoveryDecisions(missionId).map((d) => ({ action: d.action, status: d.status })),
     calls: { ...h.calls },
-    events: normalizeEvents(h.backend.all() as unknown as RawEvent[], norm) as unknown as JsonValue,
+    events: normalizeEvents(h.session.events(), norm) as unknown as JsonValue,
   };
 }
 
@@ -774,22 +857,22 @@ function missionScenario(
 function missionScenarios(): Scenario[] {
   return [
     missionScenario("complete", async (path, norm) => {
-      const h = missionHarness(path);
+      const h = missionHarness(path, norm);
       const r = await h.orchestrator.orchestrate(MISSION_REQUEST, MISSION_CTX);
       return { completed: r.completed, ...missionSummary(h, r.mission.mission_id, norm) };
     }),
     missionScenario("findings-repair-blocked", async (path, norm) => {
-      const h = missionHarness(path, { findings: ["missing null check in auth service"] });
+      const h = missionHarness(path, norm, { findings: ["missing null check in auth service"] });
       const r = await h.orchestrator.orchestrate(MISSION_REQUEST, MISSION_CTX);
       return { completed: r.completed, ...missionSummary(h, r.mission.mission_id, norm) };
     }),
     missionScenario("validation-fail-then-pass", async (path, norm) => {
-      const h = missionHarness(path, { validationFailTimes: 1 });
+      const h = missionHarness(path, norm, { validationFailTimes: 1 });
       const r = await h.orchestrator.orchestrate("Add an endpoint and fix the build", MISSION_CTX);
       return { completed: r.completed, ...missionSummary(h, r.mission.mission_id, norm) };
     }),
     missionScenario("block-then-resume", async (path, norm) => {
-      const h = missionHarness(path, { findings: ["missing null check in auth service"] });
+      const h = missionHarness(path, norm, { findings: ["missing null check in auth service"] });
       const r = await h.orchestrator.orchestrate(MISSION_REQUEST, MISSION_CTX);
       const blocked = h.store.getMission(r.mission.mission_id)!.status;
       h.knobs.findings = [];
@@ -802,19 +885,18 @@ function missionScenarios(): Scenario[] {
       };
     }),
     missionScenario("restart-restores-state", async (path, norm) => {
-      const h = missionHarness(path);
+      const h = missionHarness(path, norm);
       const r = await h.orchestrator.orchestrate(MISSION_REQUEST, MISSION_CTX);
       await h.store.flush();
-      const restored = MissionStore.open(h.backend);
+      const { store: restored, orchestrator: o2 } = h.session.restart();
       const mission = restored.getMission(r.mission.mission_id)!;
-      const o2 = path.makeOrchestrator({ store: restored, backends: {}, planner: async () => [] });
       return {
         status_before: r.mission.status,
         status_after_restart: mission.status,
         task_count_before: h.store.listTasks(r.mission.mission_id).length,
         task_count_after: restored.listTasks(r.mission.mission_id).length,
         gate_can_complete: o2.gate.evaluate(mission).can_complete,
-        events: normalizeEvents(h.backend.all() as unknown as RawEvent[], norm) as unknown as JsonValue,
+        events: normalizeEvents(h.session.events(), norm) as unknown as JsonValue,
       };
     }),
   ];
@@ -828,7 +910,7 @@ function recoveryScenarios(): Scenario[] {
       command: "recovery",
       scenario: "torn-tail-reopen-append",
       async run(path, norm) {
-        return withFixture({}, async (fx) => {
+        return withFixture(norm, {}, async (fx) => {
           const worker = () =>
             new FakeWorkerExecutor({
               scout: scoutOk,
@@ -837,18 +919,19 @@ function recoveryScenarios(): Scenario[] {
             });
           const first = await path.openRuntime({ cwd: fx.root, worker: worker() });
           const report = await first.engineer(GOAL);
-          const eventsBefore = first.ledger.count();
+          const eventsBefore = path.ledgerOf(first).count();
           await first.close();
 
-          const file = join(fx.root, ".pi-eng", "ledger.jsonl");
-          await writeFile(file, `${await readFile(file, "utf8")}{"event_id":"torn`, "utf8");
+          await path.tearLedgerTail(fx.root);
 
           const second = await path.openRuntime({ cwd: fx.root, worker: worker() });
           try {
-            const eventsAfterReopen = second.ledger.count();
-            const wi = second.ledger.getWorkItem(report.work_item.id);
-            const appended = await second.ledger.createWorkItem("after the tear", "low", [fx.root], { type: "system" });
-            const reread = parseLedger(await readFile(file, "utf8"));
+            const ledger = path.ledgerOf(second);
+            const eventsAfterReopen = ledger.count();
+            const wi = ledger.getWorkItem(report.work_item.id);
+            const appended = await ledger.createWorkItem("after the tear", "low", [fx.root], { type: "system" });
+            // The fragment torn above stays mid-file (the store starts the next record on a fresh line).
+            const reread = await path.readEvents(fx.root, { tornLinesExpected: true });
             return {
               events_before: eventsBefore,
               events_after_reopen: eventsAfterReopen,
@@ -876,11 +959,14 @@ function commandScenario(
     command: `cmd-${command}`,
     scenario,
     async run(path, norm) {
-      return withFixture({}, async (fx) => {
+      return withFixture(norm, {}, async (fx) => {
         if (seed) {
           const rt = await path.openRuntime({ cwd: fx.root, worker: new FakeWorkerExecutor({}) });
-          await rt.ledger.createWorkItem("seeded", "low", [fx.root], { type: "system" });
-          await rt.close();
+          try {
+            await path.ledgerOf(rt).createWorkItem("seeded", "low", [fx.root], { type: "system" });
+          } finally {
+            await rt.close();
+          }
         }
         const host = path.loadCommandHost();
         const notices: Array<{ text: string; level: string }> = [];
@@ -925,3 +1011,47 @@ export const scenarios: Scenario[] = [
   ...missionScenarios(),
   ...recoveryScenarios(),
 ];
+
+// -------------------------------------------------------------------- runner
+
+const GOLDEN_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "legacy-golden");
+
+/**
+ * Register one test per scenario that renders it through `path` and compares byte for
+ * byte with its golden file. UPDATE_GOLDEN=1 rewrites the files, but only from the
+ * legacy path (the baseline) and never in CI.
+ */
+export function runParity(path: ParityPath): void {
+  const update = process.env.UPDATE_GOLDEN === "1";
+  if (update && process.env.CI) {
+    throw new Error(
+      "UPDATE_GOLDEN=1 is refused when CI is set: goldens are regenerated deliberately, on a workstation",
+    );
+  }
+  if (update && path.name !== legacyPath.name) {
+    throw new Error(`UPDATE_GOLDEN=1 only regenerates from the legacy path, not "${path.name}"`);
+  }
+  describe(`legacy golden outputs (parity gate, ${path.name} path)`, () => {
+    for (const s of scenarios) {
+      it(`${s.command} / ${s.scenario}`, async () => {
+        const actual = await renderScenario(s, path);
+        const file = join(GOLDEN_DIR, goldenName(s));
+        if (update) {
+          mkdirSync(GOLDEN_DIR, { recursive: true });
+          writeFileSync(file, actual);
+          return;
+        }
+        assert.equal(
+          actual,
+          readFileSync(file, "utf8"),
+          `${goldenName(s)} drifted; rerun with UPDATE_GOLDEN=1 if intended`,
+        );
+      });
+    }
+
+    it("has a unique golden file per scenario", () => {
+      const names = scenarios.map(goldenName);
+      assert.equal(new Set(names).size, names.length);
+    });
+  });
+}

@@ -9,9 +9,15 @@
   "events": [
     {
       "facts": {
+        "mission.acceptance_criteria": 0,
+        "mission.artifact_refs": 0,
+        "mission.constraints": 0,
+        "mission.decision_refs": 0,
         "mission.mission_id": "<MSN#1>",
         "mission.parent_session_id": null,
-        "mission.status": "NEW"
+        "mission.required_gates": 0,
+        "mission.status": "NEW",
+        "mission.task_ids": []
       },
       "type": "mission.created"
     },
@@ -23,18 +29,24 @@
       "type": "mission.updated"
     },
     {
-      "facts": {},
+      "facts": {
+        "manifest.authorizedRoots": 1,
+        "manifest.dependencyEdges": 0,
+        "manifest.repositories": 1
+      },
       "type": "workspace.authorized"
     },
     {
       "facts": {
-        "mission_id": "<MSN#1>"
+        "mission_id": "<MSN#1>",
+        "patch.acceptance_criteria": 1
       },
       "type": "mission.updated"
     },
     {
       "facts": {
-        "mission_id": "<MSN#1>"
+        "mission_id": "<MSN#1>",
+        "patch.required_gates": 2
       },
       "type": "mission.updated"
     },
@@ -47,13 +59,22 @@
     },
     {
       "facts": {
+        "task.acceptance_ids": [
+          "<AC#1>"
+        ],
+        "task.artifacts": 0,
         "task.assigned_execution_id": null,
+        "task.deliverables": 1,
+        "task.depends_on": 0,
         "task.kind": "agent",
         "task.mission_id": "<MSN#1>",
         "task.repo_id": "<REPO>",
+        "task.required_output_artifacts": 0,
         "task.role": "implementer",
         "task.status": "PENDING",
-        "task.task_id": "<TSK#1>"
+        "task.steer_requests": 0,
+        "task.task_id": "<TSK#1>",
+        "task.write_domains": 1
       },
       "type": "task.created"
     },
@@ -80,6 +101,7 @@
     },
     {
       "facts": {
+        "domains": 1,
         "repo_id": "<REPO>",
         "task_id": "<TSK#1>"
       },
@@ -87,8 +109,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#1>",
         "execution.execution_id": "<EXC#1>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": "<WKS#1>",
@@ -106,8 +130,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#1>",
         "execution.execution_id": "<EXC#1>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": "<WKS#1>",
@@ -125,13 +151,31 @@
       "type": "task.started"
     },
     {
-      "facts": {},
+      "facts": {
+        "checkpoint.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "checkpoint.artifactHashes": 0,
+        "checkpoint.artifactRefs": 0,
+        "checkpoint.committedChanges": 0,
+        "checkpoint.completedDeliverables": 1,
+        "checkpoint.handoff.decisions": 0,
+        "checkpoint.handoff.memoryRefs": 0,
+        "checkpoint.handoff.tests": 0,
+        "checkpoint.handoff.unresolvedIssues": 0,
+        "checkpoint.handoff.untracked": 0,
+        "checkpoint.preservedUncommittedChanges": 0,
+        "checkpoint.remainingDeliverables": 0,
+        "checkpoint.validationEvidenceRefs": 0
+      },
       "type": "task.checkpointed"
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#1>",
         "execution.execution_id": "<EXC#1>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": "<WKS#1>",
@@ -174,13 +218,22 @@
     },
     {
       "facts": {
+        "task.acceptance_ids": [
+          "<AC#1>"
+        ],
+        "task.artifacts": 0,
         "task.assigned_execution_id": null,
+        "task.deliverables": 1,
+        "task.depends_on": 0,
         "task.kind": "validation",
         "task.mission_id": "<MSN#1>",
         "task.repo_id": "<REPO>",
+        "task.required_output_artifacts": 0,
         "task.role": "validator",
         "task.status": "PENDING",
-        "task.task_id": "<TSK#2>"
+        "task.steer_requests": 0,
+        "task.task_id": "<TSK#2>",
+        "task.write_domains": 0
       },
       "type": "task.created"
     },
@@ -200,8 +253,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#2>",
         "execution.execution_id": "<EXC#2>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -219,8 +274,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#2>",
         "execution.execution_id": "<EXC#2>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -230,13 +287,31 @@
       "type": "execution.started"
     },
     {
-      "facts": {},
+      "facts": {
+        "checkpoint.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "checkpoint.artifactHashes": 0,
+        "checkpoint.artifactRefs": 0,
+        "checkpoint.committedChanges": 0,
+        "checkpoint.completedDeliverables": 0,
+        "checkpoint.handoff.decisions": 0,
+        "checkpoint.handoff.memoryRefs": 0,
+        "checkpoint.handoff.tests": 0,
+        "checkpoint.handoff.unresolvedIssues": 0,
+        "checkpoint.handoff.untracked": 0,
+        "checkpoint.preservedUncommittedChanges": 0,
+        "checkpoint.remainingDeliverables": 1,
+        "checkpoint.validationEvidenceRefs": 0
+      },
       "type": "task.checkpointed"
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#2>",
         "execution.execution_id": "<EXC#2>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -247,7 +322,8 @@
     },
     {
       "facts": {
-        "classification.category": "VALIDATION_FAILED"
+        "classification.category": "VALIDATION_FAILED",
+        "classification.evidenceRefs": 0
       },
       "type": "failure.classified"
     },
@@ -267,13 +343,22 @@
     },
     {
       "facts": {
+        "task.acceptance_ids": [
+          "<AC#1>"
+        ],
+        "task.artifacts": 0,
         "task.assigned_execution_id": null,
+        "task.deliverables": 1,
+        "task.depends_on": 1,
         "task.kind": "review",
         "task.mission_id": "<MSN#1>",
         "task.repo_id": "<REPO>",
+        "task.required_output_artifacts": 0,
         "task.role": "reviewer",
         "task.status": "PENDING",
-        "task.task_id": "<TSK#3>"
+        "task.steer_requests": 0,
+        "task.task_id": "<TSK#3>",
+        "task.write_domains": 0
       },
       "type": "task.created"
     },
@@ -293,8 +378,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#3>",
         "execution.execution_id": "<EXC#3>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -312,8 +399,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#3>",
         "execution.execution_id": "<EXC#3>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -323,18 +412,46 @@
       "type": "execution.started"
     },
     {
-      "facts": {},
+      "facts": {
+        "checkpoint.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "checkpoint.artifactHashes": 0,
+        "checkpoint.artifactRefs": 0,
+        "checkpoint.committedChanges": 0,
+        "checkpoint.completedDeliverables": 1,
+        "checkpoint.handoff.decisions": 0,
+        "checkpoint.handoff.memoryRefs": 0,
+        "checkpoint.handoff.tests": 0,
+        "checkpoint.handoff.unresolvedIssues": 0,
+        "checkpoint.handoff.untracked": 0,
+        "checkpoint.preservedUncommittedChanges": 0,
+        "checkpoint.remainingDeliverables": 0,
+        "checkpoint.validationEvidenceRefs": 0
+      },
       "type": "task.checkpointed"
     },
     {
       "facts": {
+        "candidate.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "candidate.identity.artifactHashes": 0,
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#3>",
         "execution.execution_id": "<EXC#3>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
         "execution.status": "SUCCEEDED",
         "execution.task_id": "<TSK#3>",
+        "reviewEvidence.acceptanceResults": 1,
+        "reviewEvidence.findings": 0,
+        "reviewEvidence.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "reviewEvidence.identity.artifactHashes": 0,
         "reviewEvidence.verdict": "approve"
       },
       "type": "execution.gate_evidence_published"
@@ -368,7 +485,12 @@
       "type": "recovery.started"
     },
     {
-      "facts": {},
+      "facts": {
+        "invalidation.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "invalidation.identity.artifactHashes": 0
+      },
       "type": "evidence.invalidated"
     },
     {
@@ -380,13 +502,22 @@
     },
     {
       "facts": {
+        "task.acceptance_ids": [
+          "<AC#1>"
+        ],
+        "task.artifacts": 0,
         "task.assigned_execution_id": null,
+        "task.deliverables": 1,
+        "task.depends_on": 0,
         "task.kind": "agent",
         "task.mission_id": "<MSN#1>",
         "task.repo_id": "<REPO>",
+        "task.required_output_artifacts": 0,
         "task.role": "implementer",
         "task.status": "PENDING",
-        "task.task_id": "<TSK#4>"
+        "task.steer_requests": 0,
+        "task.task_id": "<TSK#4>",
+        "task.write_domains": 1
       },
       "type": "task.created"
     },
@@ -406,8 +537,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#4>",
         "execution.execution_id": "<EXC#4>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": "<WKS#2>",
@@ -425,8 +558,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#4>",
         "execution.execution_id": "<EXC#4>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": "<WKS#2>",
@@ -436,17 +571,40 @@
       "type": "execution.started"
     },
     {
-      "facts": {},
+      "facts": {
+        "invalidation.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "invalidation.identity.artifactHashes": 0
+      },
       "type": "evidence.invalidated"
     },
     {
-      "facts": {},
+      "facts": {
+        "checkpoint.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "checkpoint.artifactHashes": 0,
+        "checkpoint.artifactRefs": 0,
+        "checkpoint.committedChanges": 0,
+        "checkpoint.completedDeliverables": 1,
+        "checkpoint.handoff.decisions": 0,
+        "checkpoint.handoff.memoryRefs": 0,
+        "checkpoint.handoff.tests": 0,
+        "checkpoint.handoff.unresolvedIssues": 0,
+        "checkpoint.handoff.untracked": 0,
+        "checkpoint.preservedUncommittedChanges": 0,
+        "checkpoint.remainingDeliverables": 0,
+        "checkpoint.validationEvidenceRefs": 0
+      },
       "type": "task.checkpointed"
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#4>",
         "execution.execution_id": "<EXC#4>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": "<WKS#2>",
@@ -482,13 +640,22 @@
     },
     {
       "facts": {
+        "task.acceptance_ids": [
+          "<AC#1>"
+        ],
+        "task.artifacts": 0,
         "task.assigned_execution_id": null,
+        "task.deliverables": 1,
+        "task.depends_on": 0,
         "task.kind": "validation",
         "task.mission_id": "<MSN#1>",
         "task.repo_id": "<REPO>",
+        "task.required_output_artifacts": 0,
         "task.role": "validator",
         "task.status": "PENDING",
-        "task.task_id": "<TSK#5>"
+        "task.steer_requests": 0,
+        "task.task_id": "<TSK#5>",
+        "task.write_domains": 0
       },
       "type": "task.created"
     },
@@ -508,8 +675,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#5>",
         "execution.execution_id": "<EXC#5>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -527,8 +696,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#5>",
         "execution.execution_id": "<EXC#5>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -538,22 +709,58 @@
       "type": "execution.started"
     },
     {
-      "facts": {},
+      "facts": {
+        "invalidation.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "invalidation.identity.artifactHashes": 0
+      },
       "type": "evidence.invalidated"
     },
     {
-      "facts": {},
+      "facts": {
+        "checkpoint.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "checkpoint.artifactHashes": 0,
+        "checkpoint.artifactRefs": 0,
+        "checkpoint.committedChanges": 0,
+        "checkpoint.completedDeliverables": 1,
+        "checkpoint.handoff.decisions": 0,
+        "checkpoint.handoff.memoryRefs": 0,
+        "checkpoint.handoff.tests": 0,
+        "checkpoint.handoff.unresolvedIssues": 0,
+        "checkpoint.handoff.untracked": 0,
+        "checkpoint.preservedUncommittedChanges": 0,
+        "checkpoint.remainingDeliverables": 0,
+        "checkpoint.validationEvidenceRefs": 0
+      },
       "type": "task.checkpointed"
     },
     {
       "facts": {
+        "candidate.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "candidate.identity.artifactHashes": 0,
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#5>",
         "execution.execution_id": "<EXC#5>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
         "execution.status": "SUCCEEDED",
         "execution.task_id": "<TSK#5>",
+        "invalidation.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "invalidation.identity.artifactHashes": 0,
+        "validationEvidence.acceptanceResults": 0,
+        "validationEvidence.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "validationEvidence.identity.artifactHashes": 0,
         "validationEvidence.testSummary.passed": 1
       },
       "type": "execution.gate_evidence_published"
@@ -574,13 +781,22 @@
     },
     {
       "facts": {
+        "task.acceptance_ids": [
+          "<AC#1>"
+        ],
+        "task.artifacts": 0,
         "task.assigned_execution_id": null,
+        "task.deliverables": 1,
+        "task.depends_on": 2,
         "task.kind": "review",
         "task.mission_id": "<MSN#1>",
         "task.repo_id": "<REPO>",
+        "task.required_output_artifacts": 0,
         "task.role": "reviewer",
         "task.status": "PENDING",
-        "task.task_id": "<TSK#6>"
+        "task.steer_requests": 0,
+        "task.task_id": "<TSK#6>",
+        "task.write_domains": 0
       },
       "type": "task.created"
     },
@@ -600,8 +816,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#6>",
         "execution.execution_id": "<EXC#6>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -619,8 +837,10 @@
     },
     {
       "facts": {
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#6>",
         "execution.execution_id": "<EXC#6>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
@@ -630,22 +850,55 @@
       "type": "execution.started"
     },
     {
-      "facts": {},
+      "facts": {
+        "invalidation.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "invalidation.identity.artifactHashes": 0
+      },
       "type": "evidence.invalidated"
     },
     {
-      "facts": {},
+      "facts": {
+        "checkpoint.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "checkpoint.artifactHashes": 0,
+        "checkpoint.artifactRefs": 0,
+        "checkpoint.committedChanges": 0,
+        "checkpoint.completedDeliverables": 1,
+        "checkpoint.handoff.decisions": 0,
+        "checkpoint.handoff.memoryRefs": 0,
+        "checkpoint.handoff.tests": 0,
+        "checkpoint.handoff.unresolvedIssues": 0,
+        "checkpoint.handoff.untracked": 0,
+        "checkpoint.preservedUncommittedChanges": 0,
+        "checkpoint.remainingDeliverables": 0,
+        "checkpoint.validationEvidenceRefs": 0
+      },
       "type": "task.checkpointed"
     },
     {
       "facts": {
+        "candidate.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "candidate.identity.artifactHashes": 0,
+        "execution.artifact_refs": 0,
         "execution.checkpoint_id": "<TCP#6>",
         "execution.execution_id": "<EXC#6>",
+        "execution.logs": 0,
         "execution.mission_id": "<MSN#1>",
         "execution.repo_id": "<REPO>",
         "execution.session_id": null,
         "execution.status": "SUCCEEDED",
         "execution.task_id": "<TSK#6>",
+        "reviewEvidence.acceptanceResults": 1,
+        "reviewEvidence.findings": 0,
+        "reviewEvidence.identity.acceptanceIds": [
+          "<AC#1>"
+        ],
+        "reviewEvidence.identity.artifactHashes": 0,
         "reviewEvidence.verdict": "approve"
       },
       "type": "execution.gate_evidence_published"
@@ -659,7 +912,8 @@
     },
     {
       "facts": {
-        "mission_id": "<MSN#1>"
+        "mission_id": "<MSN#1>",
+        "patch.acceptance_criteria": 1
       },
       "type": "mission.updated"
     },
@@ -696,7 +950,7 @@
       "summary": "Mutation could not be verified against a base commit (no git provider, nothing to integrate)"
     }
   ],
-  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
+  "goldenBaselineSha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "recovery": [
     {
       "action": "CREATE_REPAIR_TASKS",

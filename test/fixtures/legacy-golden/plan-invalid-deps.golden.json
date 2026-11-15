@@ -18,6 +18,7 @@
     "low: plan task 10 (task 10) had invalid depends_on [999]; those edges dropped.",
     "low: plan task 11 (task 11) had invalid depends_on [999]; those edges dropped."
   ],
+  "goldenBaselineSha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "ledger": [
     {
       "actor": "system",
@@ -25,6 +26,7 @@
         "workItem.current_candidate_id": null,
         "workItem.id": "<WI#1>",
         "workItem.incumbent_candidate_id": null,
+        "workItem.repositories": 1,
         "workItem.status": "DEFINED"
       },
       "type": "work_item.created",
@@ -33,6 +35,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<REQUIREMENT#1>",
         "entity.kind": "requirement",
         "entity.status": "open",
@@ -61,6 +64,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<DECISION#1>",
         "entity.kind": "decision",
         "entity.status": "accepted",
@@ -72,6 +76,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#1>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -84,6 +89,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#2>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -96,6 +102,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#3>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -108,6 +115,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#4>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -120,6 +128,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#5>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -132,6 +141,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#6>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -144,6 +154,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#7>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -156,6 +167,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#8>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -168,6 +180,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#9>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -180,6 +193,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#10>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -192,6 +206,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#11>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -204,6 +219,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<FINDING#12>",
         "entity.kind": "finding",
         "entity.severity": "low",
@@ -216,9 +232,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#1>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -228,9 +246,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#2>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -240,9 +260,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#3>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -252,9 +274,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#4>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -264,9 +288,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#5>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -276,9 +302,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#6>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -288,9 +316,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#7>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -300,9 +330,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#8>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -312,9 +344,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#9>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -324,9 +358,11 @@
     {
       "actor": "system",
       "facts": {
+        "task.depends_on": 0,
         "task.id": "<TASK#10>",
         "task.kind": "implementation",
         "task.result_work_item_id": null,
+        "task.scope_paths": 1,
         "task.status": "ready",
         "task.work_item_id": "<WI#1>"
       },
@@ -336,7 +372,8 @@
     {
       "actor": "system",
       "facts": {
-        "plan_id": "<WI#1>/1"
+        "plan_id": "<WI#1>/1",
+        "steps": 10
       },
       "type": "plan.recorded",
       "work_item": "<WI#1>"
@@ -344,6 +381,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<DECISION#2>",
         "entity.kind": "decision",
         "entity.status": "accepted",
@@ -353,7 +391,6 @@
       "work_item": "<WI#1>"
     }
   ],
-  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "plan_outcome": "planned",
   "scenario": "invalid-deps",
   "task_count": 10,

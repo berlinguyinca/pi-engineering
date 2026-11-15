@@ -4,6 +4,7 @@
   "events_after_append": 19,
   "events_after_reopen": 18,
   "events_before": 18,
+  "goldenBaselineSha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "ledger": [
     {
       "actor": "system",
@@ -11,6 +12,7 @@
         "workItem.current_candidate_id": null,
         "workItem.id": "<WI#1>",
         "workItem.incumbent_candidate_id": null,
+        "workItem.repositories": 1,
         "workItem.status": "DEFINED"
       },
       "type": "work_item.created",
@@ -19,6 +21,7 @@
     {
       "actor": "system",
       "facts": {
+        "entity.evidence": 0,
         "entity.id": "<REQUIREMENT#1>",
         "entity.kind": "requirement",
         "entity.status": "open",
@@ -47,6 +50,8 @@
     {
       "actor": "system",
       "facts": {
+        "candidate.changed_files": 0,
+        "candidate.evidence_ids": [],
         "candidate.id": "<CAND#1>",
         "candidate.parent_id": null,
         "candidate.producer_run_id": "<RUN#1>",
@@ -84,7 +89,8 @@
     {
       "actor": "system",
       "facts": {
-        "candidate_id": "<CAND#1>"
+        "candidate_id": "<CAND#1>",
+        "changes.changed_files": 1
       },
       "type": "candidate.changed",
       "work_item": "<WI#1>"
@@ -100,11 +106,14 @@
     {
       "actor": "system",
       "facts": {
+        "evidence.artifacts": 1,
         "evidence.candidate_id": "<CAND#1>",
         "evidence.exit_code": 0,
         "evidence.id": "<EVID#1>",
         "evidence.status": "passed",
         "evidence.summary.passed": true,
+        "evidence.summary.required_stages": 1,
+        "evidence.summary.tests": 1,
         "evidence.trust": "deterministic"
       },
       "type": "evidence.recorded",
@@ -113,7 +122,10 @@
     {
       "actor": "system",
       "facts": {
-        "candidate_id": "<CAND#1>"
+        "candidate_id": "<CAND#1>",
+        "changes.evidence_ids": [
+          "<EVID#1>"
+        ]
       },
       "type": "candidate.changed",
       "work_item": "<WI#1>"
@@ -174,13 +186,13 @@
         "workItem.current_candidate_id": null,
         "workItem.id": "<WI#2>",
         "workItem.incumbent_candidate_id": null,
+        "workItem.repositories": 1,
         "workItem.status": "DEFINED"
       },
       "type": "work_item.created",
       "work_item": "<WI#2>"
     }
   ],
-  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "prior_work_item_status": "COMPLETED",
   "scenario": "torn-tail-reopen-append"
 }

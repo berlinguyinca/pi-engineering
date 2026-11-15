@@ -46,8 +46,70 @@ const KEY_FIELDS: ReadonlySet<string> = new Set([
   "completed",
 ]);
 
-/** `WI-6GiMT8`, `evt-AbC123`, `REQUIREMENT-o2kjOi`, `MSN-0wDA7O`: a prefix and six base-62 characters. */
-const ID_PATTERN = /\b(evt|[A-Z][A-Z0-9_]*)-([0-9A-Za-z]{6})\b/g;
+/**
+ * Every prefix src/ passes to `id()` (src/core/ids.ts), plus the entity kinds
+ * `newEntityId` upper-cases. Restricting the pattern to this list keeps words
+ * such as `HIGH-abcdef` out of the id table.
+ */
+const ID_PREFIXES: readonly string[] = [
+  "evt",
+  "obsevt",
+  "oevt",
+  "aps",
+  "dur",
+  "mem",
+  "promo",
+  "AC",
+  "ACK",
+  "APSSESS",
+  "ART",
+  "BARAUDIT",
+  "BARREQ",
+  "BARSCOPE",
+  "BLK",
+  "CAND",
+  "CAVEVID",
+  "CTX",
+  "DEFECT",
+  "DSE",
+  "EI",
+  "EVID",
+  "EXC",
+  "F",
+  "FC",
+  "HERD",
+  "MCP",
+  "MEM",
+  "MSN",
+  "PLAN",
+  "PRJ",
+  "RCV",
+  "RE",
+  "REPO",
+  "RT",
+  "RUN",
+  "RVS",
+  "SUP",
+  "TASK",
+  "TCP",
+  "TSK",
+  "VE",
+  "WI",
+  "WKS",
+  "WRK",
+  "WS",
+  // entity kinds (Ledger.createEntity -> newEntityId)
+  "REQUIREMENT",
+  "INVARIANT",
+  "FACT",
+  "HYPOTHESIS",
+  "DECISION",
+  "FINDING",
+  "TESTOB",
+];
+
+/** `WI-6GiMT8`, `evt-AbC123`, `REQUIREMENT-o2kjOi`, `MSN-0wDA7O`: a known prefix and six base-62 characters. */
+const ID_PATTERN = new RegExp(`\\b(${ID_PREFIXES.join("|")})-([0-9A-Za-z]{6})\\b`, "g");
 const SHA_PATTERN = /\b[0-9a-f]{40}\b/g;
 const HASH_PATTERN = /\bsha256:[0-9a-f]{64}\b/g;
 /** Repository ids are a hash of the repository path, so they differ per checkout and temp dir. */
@@ -59,6 +121,8 @@ export interface Normalizer {
   text(input: string): string;
   /** Deep-normalize any JSON-like value; volatile keys are dropped, object keys are sorted. */
   value(input: unknown): unknown;
+  /** Mask one more root (e.g. a fixture directory) in all later output. */
+  addRoot(root: string): void;
 }
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -67,11 +131,15 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [key:
 export function createNormalizer(roots: readonly string[] = []): Normalizer {
   const ordinals = new Map<string, Map<string, number>>();
   // Longest root first so `/tmp/a/b` is replaced before `/tmp/a`.
-  const sortedRoots = [...new Set(roots.filter((r) => r.length > 0))].sort((a, b) => b.length - a.length);
+  const known = new Set(roots.filter((r) => r.length > 0));
+  const sortedRoots = (): string[] => [...known].sort((a, b) => b.length - a.length);
+  const addRoot = (root: string): void => {
+    if (root.length > 0) known.add(root);
+  };
 
   const text = (input: string): string => {
     let out = input;
-    for (const root of sortedRoots) out = out.split(root).join("<ROOT>");
+    for (const root of sortedRoots()) out = out.split(root).join("<ROOT>");
     out = out
       .replace(HASH_PATTERN, "<HASH>")
       .replace(SHA_PATTERN, "<SHA>")
@@ -98,7 +166,7 @@ export function createNormalizer(roots: readonly string[] = []): Normalizer {
     if (input !== null && typeof input === "object") {
       const out: Record<string, unknown> = {};
       for (const key of Object.keys(input).sort()) {
-        if (VOLATILE_KEYS.has(key)) continue;
+        if (VOLATILE_KEYS.has(key) || key.endsWith("_at")) continue;
         out[key] = value((input as Record<string, unknown>)[key]);
       }
       return out;
@@ -106,7 +174,7 @@ export function createNormalizer(roots: readonly string[] = []): Normalizer {
     return input;
   };
 
-  return { text, value };
+  return { text, value, addRoot };
 }
 
 function isScalar(v: unknown): v is string | number | boolean | null {
@@ -115,8 +183,8 @@ function isScalar(v: unknown): v is string | number | boolean | null {
 
 /**
  * Collect the stable facts of a payload as `{ "candidate.status": "ELIGIBLE" }`:
- * enum-like keys (see KEY_FIELDS) and any `*_id` reference, at most four levels
- * deep. Free text, diffs, prompts and summaries are deliberately not recorded.
+ * enum-like keys (see KEY_FIELDS), any `*_id` reference, id lists (`*_ids`,
+ * kept in order) and the length of every other array, at most four levels deep. Free text, diffs, prompts and summaries are deliberately not recorded.
  */
 export function keyFacts(payload: unknown, norm: Normalizer, prefix = "", depth = 0): Record<string, JsonValue> {
   const out: Record<string, JsonValue> = {};
@@ -126,7 +194,11 @@ export function keyFacts(payload: unknown, norm: Normalizer, prefix = "", depth 
     const path = prefix ? `${prefix}.${key}` : key;
     if (isScalar(v) && (KEY_FIELDS.has(key) || key.endsWith("_id") || key === "id")) {
       out[path] = typeof v === "string" ? norm.text(v) : v;
-    } else if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+    } else if (Array.isArray(v)) {
+      // Id lists keep their members in order; every other list is pinned by its length.
+      out[path] =
+        /ids$/i.test(key) && v.every(isScalar) ? v.map((m) => (typeof m === "string" ? norm.text(m) : m)) : v.length;
+    } else if (v !== null && typeof v === "object") {
       Object.assign(out, keyFacts(v, norm, path, depth + 1));
     }
   }
@@ -160,15 +232,23 @@ export function normalizeEvents(events: readonly RawEvent[], norm: Normalizer): 
   });
 }
 
-/** Parse a `.jsonl` ledger body, ignoring a torn (unparseable) final line. */
-export function parseLedger(body: string): RawEvent[] {
+/**
+ * Parse a `.jsonl` ledger body. Only an unparseable FINAL line is tolerated (a torn
+ * tail); a corrupt line anywhere else is real damage and throws. `tornLinesExpected`
+ * is for a ledger that was deliberately torn and then appended to: the store starts
+ * the next record on a fresh line, so the torn fragment stays mid-file and is skipped.
+ */
+export function parseLedger(body: string, opts: { tornLinesExpected?: boolean } = {}): RawEvent[] {
+  const lines = body.split("\n").map((text, i) => ({ text, no: i + 1 }));
+  const used = lines.filter((l) => l.text.trim() !== "");
+  const last = used.at(-1);
   const events: RawEvent[] = [];
-  for (const line of body.split("\n")) {
-    if (line.trim() === "") continue;
+  for (const line of used) {
     try {
-      events.push(JSON.parse(line) as RawEvent);
-    } catch {
-      // torn line: not an event
+      events.push(JSON.parse(line.text) as RawEvent);
+    } catch (err) {
+      if (line === last || opts.tornLinesExpected) continue;
+      throw new Error(`corrupt ledger line ${line.no} (not the final line): ${(err as Error).message}`);
     }
   }
   return events;

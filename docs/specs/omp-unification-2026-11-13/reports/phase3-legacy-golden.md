@@ -1,15 +1,15 @@
 # Phase 3 prerequisite: legacy golden outputs and parity gate
 
-Pinned legacy SHA: `24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736` (constant `LEGACY_SHA` in `test/support/legacyGolden.ts`, stamped into every record).
+Golden baseline SHA (the legacy implementation the goldens were captured from): `24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736` (constant `GOLDEN_BASELINE_SHA` in `test/support/legacyGolden.ts`, stamped into every record as `goldenBaselineSha`; the name is path-neutral so a second path does not claim legacy provenance).
 
 ## What exists
 
 - `test/support/ledgerNormalizer.ts` (unit tests: `test/unit/ledger-normalizer.test.ts`): pure normalization.
-- `test/support/legacyGolden.ts`: the `scenarios` table, `ParityPath`, `legacyPath`, `renderScenario`.
-- `test/integration/legacy-golden.test.ts`: renders each scenario through `legacyPath`, compares byte for byte with `test/fixtures/legacy-golden/<command>-<scenario>.golden.json`.
+- `test/support/legacyGolden.ts`: the `scenarios` table, `ParityPath` (factories plus observation hooks), `legacyPath`, `PATHS`/`resolvePath`, `renderScenario`, and the `runParity(path)` runner.
+- `test/integration/legacy-golden.test.ts`: `runParity(resolvePath(process.env.PARITY_PATH))`; renders each scenario through the selected path (default `legacy`, an unknown name throws) and compares byte for byte with `test/fixtures/legacy-golden/<command>-<scenario>.golden.json`.
 - No production code changed. `biome.json` ignores the golden directory (as it does the other golden fixtures) so byte-exact output is not reformatted.
 
-## Scenarios (25 records)
+## Scenarios (25 records; 26 integration tests = 25 scenarios + 1 unique-filename check; 14 unit tests for the normalizer)
 
 | command | scenarios |
 | --- | --- |
@@ -26,9 +26,9 @@ Drivers: `EngineeringRuntime.open` with `FakeWorkerExecutor`, real `CommandVerif
 
 ## Normalization rules
 
-- Ids `PREFIX-xxxxxx` (`evt`, `WI`, `CAND`, `TASK`, `EVID`, `ART`, `RUN`, `CTX`, `MSN`, entity kinds) become `<PREFIX#n>`, ordinals per prefix in first-seen order, one table per record.
-- Dropped keys: timestamps, `*_at`, `durationMs`. Replaced: temp roots -> `<ROOT>`, 40-hex -> `<SHA>`, `sha256:` -> `<HASH>`, uuid -> `<UUID>`, `repo-<16hex>` -> `<REPO>`.
-- Events keep `type` order, actor type, scope (work item or mission id), and "key facts": enum-like keys (status, outcome, verdict, decision, role, severity, kind, action, category, trust, from, to, exit_code, passed, completed) and `*_id` references up to 4 levels deep. Free text, prompts and diffs are not recorded in events.
+- Ids `PREFIX-xxxxxx` become `<PREFIX#n>`, ordinals per prefix in first-seen order, one table per record. Only the prefixes `src/` passes to `id()` (src/core/ids.ts and its callers, plus `evt` and the upper-cased entity kinds) are recognized, so words like `HIGH-abcdef` survive.
+- Dropped keys: the listed timestamp keys, every key ending `_at`, `durationMs`/`duration_ms`. Replaced: temp roots -> `<ROOT>`, 40-hex -> `<SHA>`, `sha256:` -> `<HASH>`, uuid -> `<UUID>`, `repo-<16hex>` -> `<REPO>`.
+- Events keep `type` order, actor type, scope (work item or mission id), and "key facts": enum-like keys (status, outcome, verdict, decision, role, severity, kind, action, category, trust, from, to, exit_code, passed, completed) `*_id` references, id lists (keys ending `ids`, members kept in order) and the length of every other array, up to 4 levels deep. Free text, prompts and diffs are not recorded in events.
 - Report fields are curated per scenario (outcomes, statuses, counts, stage results, candidate lineage), not dumped.
 
 ## Regenerate
@@ -41,10 +41,15 @@ Commit the diff on purpose. Goldens must only change when the legacy contract is
 
 ## Parity-gate contract for the OMP path
 
-1. Implement `ParityPath` (`openRuntime`, `makeOrchestrator`, `loadCommandHost`) for the OMP-backed implementation.
-2. Run the same `scenarios` through `renderScenario(s, ompPath)` and compare with the same golden files with `assert.equal` on the text. No tolerance, no per-path goldens.
+1. Implement `ParityPath` for the OMP-backed implementation: factories (`openRuntime`, `openMission`, `loadCommandHost`) and observation hooks (`ledgerOf`, `readEvents`, `tearLedgerTail`, `verify`). Scenarios reach the implementation only through these; they never read ledger files or construct stores themselves. Register it in `PATHS`.
+2. Run `PARITY_PATH=<name> node --test ... test/integration/legacy-golden.test.ts`: the same `scenarios` are rendered through that path and compared with the same golden files with `assert.equal` on the text. `UPDATE_GOLDEN=1` is refused in CI and for any path other than `legacy`. No tolerance, no per-path goldens.
 3. A difference is resolved by fixing the OMP path, or by an explicit, reviewed golden change that states why legacy behavior is being changed.
 4. Equivalence is decided only by this deterministic comparison, never by model judgment.
+
+## Known exemptions
+
+- The four mission goldens contain the minor finding "Mutation could not be verified against a base commit (no git provider, nothing to integrate)". It is a product of the in-tree stub `GitRepo` object the mission harness passes, not a defect in the legacy behavior. It is a known exemption: a real-git path must reproduce it through the same harness (the same stub), and it is deliberately not filtered out of the goldens.
+- `recovery / torn-tail-reopen-append` reads its post-append ledger with `tornLinesExpected`: the store starts the next record on a fresh line, so the deliberately torn fragment stays mid-file. Everywhere else `parseLedger` tolerates only an unparseable final line and throws on mid-file corruption.
 
 ## Known gaps / UNVERIFIED
 

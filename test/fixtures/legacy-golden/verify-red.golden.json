@@ -9,8 +9,8 @@
     }
   ],
   "failedStage": "test",
+  "goldenBaselineSha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "ledger": [],
-  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "noTargets": false,
   "passed": false,
   "profile": "detected",

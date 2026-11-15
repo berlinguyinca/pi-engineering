@@ -49,7 +49,7 @@ test("deep value drops volatile keys, sorts keys and normalizes strings", () => 
   assert.deepEqual(Object.keys(out as object), ["id", "nested", "z"]);
 });
 
-test("keyFacts keeps enums and *_id references but not free text or arrays", () => {
+test("keyFacts keeps enums and *_id references, pins arrays by length, drops free text", () => {
   const n = createNormalizer();
   const facts = keyFacts(
     {
@@ -70,6 +70,7 @@ test("keyFacts keeps enums and *_id references but not free text or arrays", () 
     "candidate.id": "<CAND#1>",
     "candidate.parent_id": null,
     "candidate.status": "PROMOTED",
+    "candidate.changed_files": 1,
     "changes.status": "ELIGIBLE",
     role: "scout",
   });
@@ -111,6 +112,66 @@ test("parseLedger skips a torn final line and blank lines", () => {
   const body = `${JSON.stringify({ type: "a" })}\n\n${JSON.stringify({ type: "b" })}\n{"event_id":"torn`;
   assert.deepEqual(
     parseLedger(body).map((e) => e.type),
+    ["a", "b"],
+  );
+});
+
+test("parseLedger throws on a corrupt line in the middle of the file", () => {
+  const body = `${JSON.stringify({ type: "a" })}\n{"event_id":"corrupt\n${JSON.stringify({ type: "b" })}\n`;
+  assert.throws(() => parseLedger(body), /line 2/);
+});
+
+test("parseLedger tolerates an unparseable final line only", () => {
+  const body = `${JSON.stringify({ type: "a" })}\n${JSON.stringify({ type: "b" })}\n{"event_id":"torn\n\n`;
+  assert.deepEqual(
+    parseLedger(body).map((e) => e.type),
+    ["a", "b"],
+  );
+});
+
+test("only known id prefixes are normalized; other PREFIX-xxxxxx words survive", () => {
+  const n = createNormalizer();
+  assert.equal(n.text("HIGH-abcdef and WI-abcdef"), "HIGH-abcdef and <WI#1>");
+  assert.equal(n.text("MSN-0wDA7O TSK-abcdef EXC-abcdef"), "<MSN#1> <TSK#1> <EXC#1>");
+});
+
+test("keys ending in _at are dropped generically", () => {
+  const n = createNormalizer();
+  assert.deepEqual(n.value({ blocked_at: "x", lease_expires_at: "y", keep: 1 }), { keep: 1 });
+});
+
+test("keyFacts keeps id arrays in order and counts other arrays", () => {
+  const n = createNormalizer();
+  const facts = keyFacts(
+    {
+      evidence_ids: ["EVID-aaaaaa", "EVID-bbbbbb", "EVID-aaaaaa"],
+      depends_on: ["a", "b"],
+      changed_files: ["x.js"],
+      inner: { finding_ids: ["F-cccccc"] },
+      note: ["free", "text"],
+    },
+    n,
+  );
+  assert.deepEqual(facts, {
+    changed_files: 1,
+    depends_on: 2,
+    evidence_ids: ["<EVID#1>", "<EVID#2>", "<EVID#1>"],
+    "inner.finding_ids": ["<F#1>"],
+    note: 2,
+  });
+});
+
+test("addRoot makes later text mask the new root, longest first", () => {
+  const n = createNormalizer(["/tmp"]);
+  n.addRoot("/tmp/pi-eng-fixture-x");
+  assert.equal(n.text("/tmp/pi-eng-fixture-x/src and /tmp/other"), "<ROOT>/src and <ROOT>/other");
+});
+
+test("parseLedger skips a mid-file torn fragment only when tornLinesExpected", () => {
+  const body = `${JSON.stringify({ type: "a" })}\n{"event_id":"torn\n${JSON.stringify({ type: "b" })}\n`;
+  assert.throws(() => parseLedger(body));
+  assert.deepEqual(
+    parseLedger(body, { tornLinesExpected: true }).map((e) => e.type),
     ["a", "b"],
   );
 });

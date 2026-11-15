@@ -39,6 +39,7 @@
     }
   ],
   "evidence_count": 2,
+  "goldenBaselineSha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "ledger": [
     {
       "actor": "system",
@@ -46,6 +47,7 @@
         "workItem.current_candidate_id": null,
         "workItem.id": "<WI#1>",
         "workItem.incumbent_candidate_id": null,
+        "workItem.repositories": 1,
         "workItem.status": "DEFINED"
       },
       "type": "work_item.created",
@@ -54,6 +56,8 @@
     {
       "actor": "system",
       "facts": {
+        "candidate.changed_files": 0,
+        "candidate.evidence_ids": [],
         "candidate.id": "<CAND#1>",
         "candidate.parent_id": null,
         "candidate.producer_run_id": "<RUN#1>",
@@ -91,7 +95,8 @@
     {
       "actor": "system",
       "facts": {
-        "candidate_id": "<CAND#1>"
+        "candidate_id": "<CAND#1>",
+        "changes.changed_files": 1
       },
       "type": "candidate.changed",
       "work_item": "<WI#1>"
@@ -107,11 +112,14 @@
     {
       "actor": "system",
       "facts": {
+        "evidence.artifacts": 1,
         "evidence.candidate_id": "<CAND#1>",
         "evidence.exit_code": 1,
         "evidence.id": "<EVID#1>",
         "evidence.status": "failed",
         "evidence.summary.passed": false,
+        "evidence.summary.required_stages": 1,
+        "evidence.summary.tests": 1,
         "evidence.trust": "deterministic"
       },
       "type": "evidence.recorded",
@@ -120,7 +128,10 @@
     {
       "actor": "system",
       "facts": {
-        "candidate_id": "<CAND#1>"
+        "candidate_id": "<CAND#1>",
+        "changes.evidence_ids": [
+          "<EVID#1>"
+        ]
       },
       "type": "candidate.changed",
       "work_item": "<WI#1>"
@@ -145,6 +156,8 @@
     {
       "actor": "system",
       "facts": {
+        "candidate.changed_files": 0,
+        "candidate.evidence_ids": [],
         "candidate.id": "<CAND#2>",
         "candidate.parent_id": null,
         "candidate.producer_run_id": "<RUN#2>",
@@ -182,7 +195,8 @@
     {
       "actor": "system",
       "facts": {
-        "candidate_id": "<CAND#2>"
+        "candidate_id": "<CAND#2>",
+        "changes.changed_files": 1
       },
       "type": "candidate.changed",
       "work_item": "<WI#1>"
@@ -198,11 +212,14 @@
     {
       "actor": "system",
       "facts": {
+        "evidence.artifacts": 1,
         "evidence.candidate_id": "<CAND#2>",
         "evidence.exit_code": 0,
         "evidence.id": "<EVID#2>",
         "evidence.status": "passed",
         "evidence.summary.passed": true,
+        "evidence.summary.required_stages": 1,
+        "evidence.summary.tests": 1,
         "evidence.trust": "deterministic"
       },
       "type": "evidence.recorded",
@@ -211,7 +228,10 @@
     {
       "actor": "system",
       "facts": {
-        "candidate_id": "<CAND#2>"
+        "candidate_id": "<CAND#2>",
+        "changes.evidence_ids": [
+          "<EVID#2>"
+        ]
       },
       "type": "candidate.changed",
       "work_item": "<WI#1>"
@@ -267,7 +287,6 @@
       "work_item": "<WI#1>"
     }
   ],
-  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
   "main_branch": "changed",
   "n_candidates": 2,
   "outcome": "promoted",
