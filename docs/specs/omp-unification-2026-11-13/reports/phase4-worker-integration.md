@@ -79,3 +79,7 @@ The cost is process start per worker run (about 1 to 2 s each with bun and the r
 ## Rollback
 
 Unset `PI_ENGINEERING_OMP_WORKER` (or the adapter flag). Nothing else changes: with the flag off `selectOmpWorker` returns `undefined`, `EngineeringRuntime.open` is untouched, and the legacy gate passes 27/27 with no golden edits.
+
+## Coverage
+
+`npm run test:coverage` exit 0: 6972 tests, 6967 pass, 0 fail, 5 skipped. Lines 85.62, branches 83.28, functions 83.38 (floors 85 / 83 / 83).
