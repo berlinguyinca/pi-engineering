@@ -72,3 +72,51 @@ test("safety blocks survive verbatim in tokens: commit discipline, claim discipl
     assert.ok(impl.toLowerCase().includes(phrase), phrase);
   }
 });
+
+test("lowercase must and not are inventoried and a dropped one is detected", () => {
+  const source = "You must run tests. Do not skip them, and not ever edit.";
+  assert.ok(inventoryInvariants(source).includes("must"));
+  assert.deepEqual(checkInvariantsSurvive(source, "You run tests. Do not skip them, and not ever edit.").lost, [
+    "must",
+  ]);
+  assert.deepEqual(checkInvariantsSurvive(source, "You must run tests. Do not skip them, and ever edit.").lost, [
+    "not",
+  ]);
+});
+
+test("word tokens match on word boundaries: note, nothing, cannot do not satisfy not/no", () => {
+  const source = "Do it. not";
+  assert.deepEqual(checkInvariantsSurvive(source, "Do it. note").lost, ["not"]);
+  assert.deepEqual(checkInvariantsSurvive("it is no use", "it is nothing use").lost, ["no"]);
+  assert.ok(!inventoryInvariants("a note about nothing").includes("not"));
+  assert.ok(!inventoryInvariants("it cannot be").includes("not"));
+});
+
+test("widened vocabulary: avoid, forbidden, refuse, unless, except, without, at most, at least, only, required, should", () => {
+  const inv = inventoryInvariants(
+    "Avoid it. Forbidden. Refuse. Unless X, except Y, without Z. At most 3, at least 1. Only this. Required. You should stop.",
+  );
+  for (const t of [
+    "Avoid",
+    "Forbidden",
+    "Refuse",
+    "Unless",
+    "except",
+    "without",
+    "At most",
+    "at least",
+    "Only",
+    "Required",
+    "should",
+  ]) {
+    assert.ok(inv.includes(t), t);
+  }
+});
+
+test("numbers and identifiers need whole-token survival (9000 does not satisfy 900)", () => {
+  assert.deepEqual(checkInvariantsSurvive("cap 900 words", "cap 9000 words").lost, ["900"]);
+});
+
+test("measure handles empty text", () => {
+  assert.deepEqual(measure(""), { chars: 0, words: 0, approxTokens: 0 });
+});

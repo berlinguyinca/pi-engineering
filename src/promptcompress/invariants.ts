@@ -17,8 +17,9 @@ export interface InvariantCheck {
   readonly lost: readonly string[];
 }
 
-const MODALS = /\b(MUST NOT|MUST|NEVER|ALWAYS|SHALL NOT|SHALL)\b/g;
-const NEGATIONS = /\b(Never|never|Do not|do not|Don't|don't|must not|cannot|not|only|ONLY|nothing|no)\b/g;
+// Case-insensitive, longest phrase first; the matched text keeps its original case.
+const NORMATIVE =
+  /\b(?:must not|must|never|always|shall not|shall|should not|should|do not|don't|cannot|avoid|forbidden|refuse|unless|except|without|at most|at least|only|required|nothing|not|no)\b/gi;
 const BACKTICKED = /`([^`\n]+)`/g;
 const SNAKE_IDENT = /\b[a-z]+(?:_[a-z]+)+\b/g;
 const CITATION = /\b[\w./-]+\.[a-z]{1,4}:\d+\b/g;
@@ -26,14 +27,13 @@ const ISSUE_REF = /#\d+\b/g;
 const NUMBER = /\b\d[\d_,.]*\b/g;
 
 function collect(text: string, re: RegExp, group = 0): string[] {
-  return [...text.matchAll(re)].map((m) => m[group] ?? m[0]);
+  return [...text.matchAll(re)].map((m) => String(m[group]));
 }
 
 /** Every distinct MUST/NEVER-class token, negation, identifier, citation, issue ref and number. */
 export function inventoryInvariants(text: string): string[] {
   const found = new Set<string>([
-    ...collect(text, MODALS),
-    ...collect(text, NEGATIONS),
+    ...collect(text, NORMATIVE),
     ...collect(text, BACKTICKED, 1),
     ...collect(text, SNAKE_IDENT),
     ...collect(text, CITATION),
@@ -43,11 +43,15 @@ export function inventoryInvariants(text: string): string[] {
   return [...found];
 }
 
-/** Occurrence count of a token (case-sensitive), so dropping one of several still counts as loss. */
+const escapeRe = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Whole-token occurrence count (case-sensitive; `not` never matches inside `note`, `nothing`, `cannot`).
+ * Dropping one of several occurrences counts as loss. Count-based: it cannot see a clause that was
+ * moved, or a negation attached to a different clause.
+ */
 function occurrences(text: string, token: string): number {
-  let n = 0;
-  for (let i = text.indexOf(token); i >= 0; i = text.indexOf(token, i + token.length)) n += 1;
-  return n;
+  return [...text.matchAll(new RegExp(`(?<![\\w])${escapeRe(token)}(?![\\w])`, "g"))].length;
 }
 
 /** Tokens from the source inventory that appear fewer times in the candidate than in the source. */
