@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { resolveOmpAdapterConfig } from "./config.ts";
+import { firewallArgs } from "./firewall.ts";
 import { decodeNegotiateResponse, decodeReadyFrame, encodeNegotiateRequest, parseFrameLine } from "./frames.ts";
 import { OMP_PIN_MANIFEST, isVersionPinned, parseSemVer, parseVersionOutput } from "./manifest.ts";
 import { buildCapabilityReport, selectProtocol } from "./report.ts";
@@ -29,6 +30,8 @@ export interface NegotiateOptions {
   readonly timeoutMs: number;
   readonly manifest?: OmpPinManifest;
   readonly env?: NodeJS.ProcessEnv;
+  /** `provider/id` for the handshake child; omp refuses to start without a selectable model. */
+  readonly model?: string;
   /** Working directory for the child; defaults to the current one. */
   readonly cwd?: string;
 }
@@ -62,7 +65,7 @@ function hasExited(child: ChildProcess): boolean {
 }
 
 /** Kill the whole process group, wait for the direct child's `exit` (never `close`), then drop the pipes. */
-async function terminate(child: ChildProcess): Promise<void> {
+export async function terminate(child: ChildProcess): Promise<void> {
   if (!hasExited(child)) {
     const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
     signalTree(child, "SIGTERM");
@@ -180,7 +183,7 @@ function handshake(
 ): Promise<Outcome<OmpNegotiationResult>> {
   return runChild<OmpNegotiationResult>(
     opts.launch,
-    ["--mode", "rpc", "--no-session"],
+    ["--mode", "rpc", "--no-session", ...firewallArgs(), ...(opts.model ? ["--model", opts.model] : [])],
     deadlineMs,
     opts,
     (child, settle) => {

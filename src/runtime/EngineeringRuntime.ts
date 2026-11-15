@@ -34,6 +34,7 @@ import { Ledger } from "../ledger/Ledger.ts";
 import { claimAuthorityGeneration } from "../ledger/authority.ts";
 import { autospecConfigured } from "../lifecycle/autospecProbe.ts";
 import { DEFAULT_POLICY, loadExecutionConfig, loadMissionLimits, loadPolicy } from "../lifecycle/policy.ts";
+import { selectOmpWorker } from "../omp/selectWorker.ts";
 import type { MissionMergeQueueOptions } from "../orchestration/broker.ts";
 import { selectExternalMissionsToStart } from "../orchestration/externalStartSelection.ts";
 import { supervisorAdmitsMission } from "../orchestration/externalSupervision.ts";
@@ -1392,7 +1393,12 @@ export class EngineeringRuntime {
     this.resilience = resolveGatewayResilienceConfig();
   }
 
-  static async open(opts: EngineeringRuntimeOptions): Promise<EngineeringRuntime> {
+  static async open(options: EngineeringRuntimeOptions): Promise<EngineeringRuntime> {
+    // Opt-in OMP worker (PI_ENGINEERING_OMP_WORKER=1 plus the adapter flag). Unset: opts is untouched.
+    const omp = options.worker
+      ? undefined
+      : await selectOmpWorker(() => new PiWorkerExecutor({ model: options.model, agentDir: options.agentDir }));
+    const opts = omp ? { ...options, worker: omp.executor } : options;
     const git = await GitRepo.open(opts.cwd);
     const repoRoot = git ? git.root : opts.cwd;
     const workDir = opts.workDir ?? join(repoRoot, ".pi-eng");
