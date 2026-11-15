@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ArtifactStore } from "../artifacts/ArtifactStore.ts";
@@ -100,7 +101,7 @@ async function computeBaseline(
   // than blocking every later baseline.
   const wt = await input.git.createWorktree(
     baseSha,
-    `pi-eng-baseline-${baseSha.slice(0, 12)}-${Date.now().toString(36)}${process.pid.toString(36)}`,
+    `pi-eng-baseline-${baseSha.slice(0, 12)}-${Date.now().toString(36)}${process.pid.toString(36)}${randomBytes(3).toString("hex")}`,
   );
   try {
     // Detect on the base itself: the profile that describes the base, bound by hash.
