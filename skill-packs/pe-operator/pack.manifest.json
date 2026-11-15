@@ -1,0 +1,15 @@
+{
+  "manifestVersion": 1,
+  "name": "pe-operator-skill-pack",
+  "version": "0.1.0",
+  "files": {
+    "package.json": {
+      "sha256": "55fad8da513d0cc1df92b107f15ba70d3b3ef71ff871f364799ce12f7f4d0166",
+      "sha512": "sha512-z61PhxDQU7nxbafvKv8UEv3063ebI5XUE5ucqsXiGW8U4X7PjVVMlTcOghNFFL2kASDIpbMCRBmA/9eaaUWk6g=="
+    },
+    "skills/pe-operator/SKILL.md": {
+      "sha256": "1be992132d2d92fb6a56eb402443f9911ba59d9a8e80fa07bc11219b81246cde",
+      "sha512": "sha512-tDEZBZhKxI93JWU/8JdI0W77CfwLBCVAbsg8WVbTCIV9MTRgiFetm+y09JSmcQuwRhddLNHPPRf0rJivLcHVNQ=="
+    }
+  }
+}

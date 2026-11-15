@@ -1,0 +1,29 @@
+# Skills experiments A-E (spec 07)
+
+Reproducibility. PE commit base `1294390c2a3eb91df4ec3182e143f60c1cd135e1` (branch `feat/omp-skills-adoption`). OMP `omp/18.20.0` from checkout `57263720c818ab3baaeb74bf415b03592b806ae0`, run as `bun 1.4.4 packages/coding-agent/src/cli.ts` with a fresh temp `HOME` and cwd per probe, dummy API key, proxies pointed at a dead port (soft offline check), `--mode rpc --no-session`, frames `get_available_commands` and `get_state` (`systemPrompt`). Run: `OMP_BIN=<bun 1.4.4> OMP_BIN_ARGS=<cli.ts> node --test --import ./test/support/isolatedState.ts test/integration/omp-skills.test.ts` -> 10 pass, 0 fail. Note: the repo test preload sets `PI_CODING_AGENT_DIR`; OMP honours it over `HOME`, so the helper unsets it. Model used: none (no model call was made in any experiment). Pack digests: see `skill-packs/pe-operator/pack.manifest.json`; skill sha256 `1be992132d2d92fb6a56eb402443f9911ba59d9a8e80fa07bc11219b81246cde`.
+
+Local model probe: `ollama list` -> empty; `curl localhost:11434/api/tags` -> `{"models":[]}`; `~/.lmstudio` absent; no OpenAI-compatible base URL configured. Paid keys were not used.
+
+## A. Semantic compression
+- Deterministic part: VERIFIED. `src/promptcompress/invariants.ts` inventories MUST/NEVER-class modals, negations (never, do not, must not, only, no), backticked and snake_case identifiers, `file:line` citations, issue refs, numbers; `compressPrompt` drops articles/filler outside backticks. Corpus: `buildSystemPrompt` for 12 roles x {worktree, no worktree}, including the commit-discipline, claim-discipline and untrusted-change blocks. `node scripts/prompt-compression-report.ts`: total approximate tokens 6046 -> 5811 (3.9% smaller), 145 invariants, 0 lost. A lossy variant that drops "Never push." is detected (unit test). Counts are chars/4 approximations: no tokenizer library is a dependency.
+- Model-based blind retention / task completion at 60k/100k/120k: UNVERIFIED (no local model; probe output above).
+- Decision: production prompts unchanged, no flag added (3.9% does not justify the surface). The skill's own model-driven compression is untested.
+
+## B. Tool-prompt optimization
+- Inspected: PE has 8 `defineTool` tools in `src/tools/coreTools.ts`; description text totals 2283 chars (ledger_read 140, ledger_claim 535, ledger_evidence 679, artifact_read 168, repo_search 63, symbol 73, tests_for 46, mission 579). OMP built-ins have 91 prompt files, 124167 bytes, under `src/prompts/tools/`; git history shows recent deliberate tightening (e.g. `f2c2894ffa`, `48a9e7dd7a`), so trimming them is upstream's call.
+- Ablation (tool choice, invalid calls, correction loops, cost, latency; small vs large models): UNVERIFIED, no model available and the upstream probe scripts need paid keys. Not run.
+
+## C. Auto-learn (VERIFIED against real OMP)
+- Setting: `autolearn.enabled` (default false); `autolearn.autoContinue` (default false); `autolearn.minToolCalls` (5). Source: `src/autolearn/settings.ts`.
+- Probe: default -> `manage_skill` absent from the system prompt. `~/.omp/agent/config.yml` `autolearn.enabled: true` -> present. A cloned repo's `<cwd>/.omp/config.yml` with the same -> present (a hostile repo can enable it). `--config overlay.yml` with `enabled: false` -> absent, beating both user and project config.
+- Scope and persistence (from source/docs, not re-run): managed skills are global (`~/.omp/agent/managed-skills`), priority 5, discovered unconditionally. Probe: a managed skill loads with auto-learn off and loses to a same-named `.agents` skill. Approval for `manage_skill` is write-level (docs). No human/independent review before a managed skill is discoverable. `learn` tool needs a memory backend: not present in the probe.
+- PE enforcement: PE does not enable it. `src/omp/negotiate.ts` passes `--mode rpc --no-session` only, so OFF is OMP's default, not a PE guarantee. Recommended hardening (user decision): always pass `--config` overlay with `autolearn.enabled: false`.
+
+## D. Registry / lockfile (VERIFIED)
+- Collision: same name in `.omp/skills`, `.claude/skills`, `.agents/skills` -> `dup`=native, `claude/dup`, `agents/dup`. Extension-package skill vs project `.claude`: package keeps bare name. Locked store skill vs native: native keeps bare name, lock copy appears as `pe-operator/pe-operator`.
+- Lockfile: store entry whose marker equals lock integrity loads with no network (proxies dead). Lock integrity differing from the marker: skill not loaded, no hard error. Rollback: re-point the lock at the older version/integrity -> older text loads. Finding: editing the unpacked `SKILL.md` while leaving the marker matched still loads (content not re-hashed at load).
+- Not tested: real registry install/update (network, forbidden here), `--yes` script gate, signing (UNKNOWN).
+
+## E. Cross-agent portability (VERIFIED for layout only)
+- Project `.claude/skills`, `.codex/skills`, `.agents/skills`, `.github/skills` and user `~/.agents/skills` load by default; user `~/.claude/skills` and `~/.codex/skills` do NOT (opt-in settings). The same `<name>/SKILL.md` layout is shared, so the PE pack's skill can be copied/linked into those directories.
+- Runtime semantics (Claude `allowed-tools`, hooks, Codex behaviours) were not exercised: UNKNOWN. Nothing here shows that Claude Code or Codex load `skill-packs/` or honour OMP-specific frontmatter. Not tested against real Claude Code or Codex.
