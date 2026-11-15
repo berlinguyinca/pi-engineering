@@ -79,6 +79,7 @@ The steps are ordinary commands; the pipeline adds only the provisioned Node and
 npm run lint          # biome over the tree
 npm run typecheck     # tsc --noEmit
 npm run test:unit     # node --test, per-test timeout, isolated state
+PE_TEST_CONCURRENCY=2 npm run test:unit   # fewer workers on a busy machine (default 4)
 ```
 
 ## Coverage gate
@@ -107,6 +108,68 @@ Raise the flags as coverage improves. macOS gives the same numbers within 0.1.
 `test:unit` passes `--test-timeout=600000`. That is a hang detector, not a performance
 setting: a suite that blocks forever holds a runner and reports nothing, which is harder to
 diagnose than a slow test.
+
+## Real-omp tests
+
+Step `test-omp-real` runs every `OMP_BIN`-gated test file (derived by grep, so a new gated file
+is picked up) plus `test/integration/legacy-golden.test.ts` with `PARITY_PATH=omp`, against a
+real, pinned omp. Without `OMP_BIN` those tests skip, which is how `test-integration` runs
+them, so this step is the only place they execute in CI. Locally:
+`OMP_BIN=<bun> OMP_BIN_ARGS=<omp>/packages/coding-agent/src/cli.ts scripts/ci/omp-real-tests.sh`
+(unset `OMP_BIN` and it provisions the pinned linux-x64 omp itself).
+
+The step **fails on any skipped test** (`# skipped` must be 0, `# tests` above 0), so a
+provisioning regression cannot pass as green.
+
+Provenance, the same recipe the phase-2 spike used locally (`scripts/ci/provision-omp.sh`;
+no upstream install or postinstall script runs):
+
+| Piece | Source | Pin |
+| --- | --- | --- |
+| Bun | npm tarball `@oven/bun-linux-x64@1.4.4`, only `bin/bun` used | sha256 `93ca5a2a...80dbef18` (npm integrity `sha512-CHbbkmHV...Ao4ujwwYwj1CxFFwEFzLanPfNsId9AhbIP0Q4reWuWBkGimUkoQygrK7Rgjtj3vog==`) |
+| omp 18.20.0 | `git fetch --depth 1` of `can1357/oh-my-pi` at `57263720c818ab3baaeb74bf415b03592b806ae0`, `bun install --frozen-lockfile --ignore-scripts` | commit SHA, verified after checkout; deps pinned by `bun.lock` |
+| Native addon | published npm `@oh-my-pi/pi-natives-linux-x64@18.20.0` (`modern` and `baseline` `.node`), copied into `packages/natives/native/` | sha256 `46a6be7c...f02cf7a7d` (npm integrity `sha512-ro0Aju4IQ/jgYM7dw9ZQHCpnbF8LmV7UGP52pGWNYFhkdJ0C5R35mmC57X/M6iJfIBJeQRojvS3f3sWSTyF4wA==`) |
+
+The full digests are in the script. The addon is the published 18.20.0 artifact, **not built
+from the pinned source** (same caveat as the spike). The provision is cached at
+`/tmp/woodpecker-cache/pe-omp-18.20.0-57263720-bun1.4.4` and placed by atomic rename; to
+raise a pin change the version and its digest together. Provisioning needs the network
+(registry.npmjs.org, github.com); the tests do not: the runner points `HTTP(S)_PROXY` at a
+dead port with loopback exempt.
+
+Linux notes: process working directories come from `/proc` (the tests use `lsof` only when
+`/proc` is absent); `pgrep` (procps) must be on the agent, and the runner checks for it.
+`/private/var` handling is `realpath`-based and a no-op on Linux. Not run on Linux before
+this step existed: see the PR for what was and was not verified.
+
+## Capacity
+
+Pipelines on the shared hive host contend with each other. Observed: with several pipelines
+running at once `test-unit` took 1740 s instead of about 220 s, and the timing-sensitive lock
+and race tests then failed; a webhook storm produced 502s.
+
+Changed in this repository:
+
+- **Test concurrency follows the CPUs.** The `test:*` scripts read `PE_TEST_CONCURRENCY`
+  (default 4, so laptops are unchanged). The test steps set it to half of `nproc` (which
+  honours the Slurm cgroup), at least 2, at most 4. This lowers oversubscription on small
+  allocations; it cannot help when the host itself is oversubscribed by other pipelines.
+- **The unit suite runs once.** The separate `test-unit` step is gone: `test-coverage` runs
+  the same files with the same flags plus the coverage gate, and fails on any failing test.
+- **No double run per PR.** Already the case: `when` limits `push` to `main`, so a PR branch
+  builds on its `pull_request` event only.
+- No retries were added. A retry would hide the failures this is about.
+
+Server-side recommendations, **not applied** (not repository settings):
+
+- The repo already has `cancel_previous_pipeline_events: [push, pull_request]`; confirm it
+  actually fires (a superseded pipeline should end as `killed`), since it is the cheapest
+  contention reducer.
+- Limit concurrent pipelines on the hive pool: fewer agents or lower `WOODPECKER_MAX_WORKFLOWS`
+  per agent, or a Slurm allocation sized for this repo (the suite wants about 4 free CPUs).
+- Size the host for the suite: about 220 s idle versus 1740 s contended is the budget to size to.
+- Webhooks: put a rate limit or queue in front of the Woodpecker webhook endpoint and check the
+  forge's redelivery settings, so a burst of pushes yields queued pipelines, not 502s.
 
 ## Host assumptions that have already broken the build
 
