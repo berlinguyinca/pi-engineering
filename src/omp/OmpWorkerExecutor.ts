@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkerResult } from "../core/types.ts";
 import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
@@ -120,6 +120,8 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       let buffer = "";
       let done = false;
       let timer: NodeJS.Timeout | undefined;
+      // Host tool calls in flight: omp is waiting on PE, so its silence is not inactivity.
+      let inflight = 0;
       const runAbort = new AbortController();
 
       const send = (frame: unknown): void => {
@@ -152,7 +154,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       }
       const arm = (): void => {
         clearTimeout(timer);
-        if (done) return;
+        if (done || inflight > 0) return;
         const ms =
           phase === "starting"
             ? (this.opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS)
@@ -176,7 +178,8 @@ export class OmpWorkerExecutor implements WorkerExecutor {
         });
       };
 
-      const toolCtx = { cwd: req.cwd } as never;
+      // Host tools only read `cwd` from the context; the session-bound members of ExtensionContext have no omp twin.
+      const toolCtx = { cwd: req.cwd } as ExtensionContext;
       const onHostToolCall = async (id: string, toolName: string, toolArgs: unknown): Promise<void> => {
         const isTerminating = toolName === terminating.name;
         const tool = isTerminating ? terminating : hostTools.get(toolName);
@@ -189,8 +192,13 @@ export class OmpWorkerExecutor implements WorkerExecutor {
           });
           return;
         }
+        // A finished or aborted run must not mutate the worktree: the process is already being killed.
+        if (done) return;
+        inflight++;
+        clearTimeout(timer);
         try {
           const out = await tool.execute(id, toolArgs as never, runAbort.signal, undefined, toolCtx);
+          if (done) return;
           const failed = (out as { isError?: boolean }).isError === true;
           if (isTerminating) structured = out.details;
           else if (isCheckpointTool(toolName) && !failed) {
@@ -208,6 +216,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
             result: { content: out.content, details: out.details },
           });
         } catch (error) {
+          if (done) return;
           const message = error instanceof Error ? error.message : String(error);
           send({
             type: "host_tool_result",
@@ -215,6 +224,9 @@ export class OmpWorkerExecutor implements WorkerExecutor {
             isError: true,
             result: { content: [{ type: "text", text: message }] },
           });
+        } finally {
+          inflight--;
+          arm();
         }
       };
 

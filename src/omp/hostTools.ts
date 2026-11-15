@@ -1,4 +1,4 @@
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { type ToolDefinition, createLsToolDefinition } from "@earendil-works/pi-coding-agent";
 import { offersCheckpointProgress, offersClaimDeliverable } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerRequest } from "../workers/WorkerExecutor.ts";
 import { CHECKPOINT_PROGRESS_TOOL_NAME, createCheckpointProgressTool } from "../workers/checkpointProgressTool.ts";
@@ -62,6 +62,15 @@ export async function buildHostTools(req: WorkerRequest, base: readonly ToolDefi
       builtin ? replacementName(tool.name) : tool.name,
       builtin ? { ...tool, name: replacementName(tool.name) } : tool,
     );
+  }
+  // omp has no `ls`; its `read` lists directories. With `read` replaced by pe_read that mapping would re-enable
+  // omp's own read, so `ls` is served host-side instead.
+  if (req.tools.includes("ls") && replaced.has("read")) {
+    tools.set(replacementName("ls"), {
+      ...(createLsToolDefinition(req.cwd) as unknown as ToolDefinition),
+      name: replacementName("ls"),
+    });
+    replaced.add("ls");
   }
   return { tools, replaced };
 }
