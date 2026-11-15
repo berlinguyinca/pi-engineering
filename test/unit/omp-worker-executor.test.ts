@@ -84,6 +84,27 @@ describe("OmpWorkerExecutor against a real rpc child replaying captured frames",
     assert.match(run.error ?? "", /no omp frame for 400ms \(running\)/);
   });
 
+  it("a silent bash call in flight does not trip the inactivity guard; the run still completes", async () => {
+    const run = await exec("silent-bash", {
+      env: {
+        ...process.env,
+        FAKE_OMP_MODE: "silent-bash",
+        FAKE_OMP_FIXTURE: FIXTURE,
+        FAKE_OMP_SILENCE_MS: "700",
+        FAKE_OMP_FINAL: JSON.stringify({ status: "completed", summary: "fin" }),
+      },
+    }).run(req({ timeoutMs: 250 }));
+    assert.equal(run.result.status, "completed", run.error);
+  });
+
+  it("a bash call that never ends is bounded by bashMaxMs, not by the inactivity window", async () => {
+    const started = Date.now();
+    const run = await exec("silent-bash-hang", { bashMaxMs: 700 }).run(req({ timeoutMs: 200 }));
+    assert.equal(run.result.status, "failed");
+    assert.match(run.error ?? "", /no omp frame for 700ms \(running, bash in flight\)/);
+    assert.ok(Date.now() - started >= 650);
+  });
+
   it("the owner's abort signal ends the run", async () => {
     const ac = new AbortController();
     const pending = exec("hang-after-prompt").run(req({ signal: ac.signal, timeoutMs: 30_000 }));
