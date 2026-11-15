@@ -1,0 +1,369 @@
+{
+  "command": "mission",
+  "events": [
+    {
+      "facts": {
+        "mission.mission_id": "<MSN#1>",
+        "mission.parent_session_id": null,
+        "mission.status": "NEW"
+      },
+      "type": "mission.created"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>",
+        "patch.status": "CLASSIFYING"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {},
+      "type": "workspace.authorized"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>",
+        "patch.status": "PLANNING"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "task.assigned_execution_id": null,
+        "task.kind": "agent",
+        "task.mission_id": "<MSN#1>",
+        "task.repo_id": "<REPO>",
+        "task.role": "implementer",
+        "task.status": "PENDING",
+        "task.task_id": "<TSK#1>"
+      },
+      "type": "task.created"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>",
+        "patch.status": "READY"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>",
+        "patch.status": "EXECUTING"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "status": "READY",
+        "task_id": "<TSK#1>"
+      },
+      "type": "task.ready"
+    },
+    {
+      "facts": {
+        "repo_id": "<REPO>",
+        "task_id": "<TSK#1>"
+      },
+      "type": "lane.acquired"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#1>",
+        "execution.execution_id": "<EXC#1>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": "<WKS#1>",
+        "execution.status": "PENDING",
+        "execution.task_id": "<TSK#1>"
+      },
+      "type": "execution.created"
+    },
+    {
+      "facts": {
+        "assigned_execution_id": "<EXC#1>",
+        "task_id": "<TSK#1>"
+      },
+      "type": "task.authority_assigned"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#1>",
+        "execution.execution_id": "<EXC#1>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": "<WKS#1>",
+        "execution.status": "RUNNING",
+        "execution.task_id": "<TSK#1>"
+      },
+      "type": "execution.started"
+    },
+    {
+      "facts": {
+        "assigned_execution_id": "<EXC#1>",
+        "status": "RUNNING",
+        "task_id": "<TSK#1>"
+      },
+      "type": "task.started"
+    },
+    {
+      "facts": {},
+      "type": "task.checkpointed"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#1>",
+        "execution.execution_id": "<EXC#1>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": "<WKS#1>",
+        "execution.status": "SUCCEEDED",
+        "execution.task_id": "<TSK#1>"
+      },
+      "type": "execution.completed"
+    },
+    {
+      "facts": {
+        "status": "SUCCEEDED",
+        "task_id": "<TSK#1>"
+      },
+      "type": "task.completed"
+    },
+    {
+      "facts": {
+        "repo_id": "<REPO>",
+        "task_id": "<TSK#1>"
+      },
+      "type": "lane.released"
+    },
+    {
+      "facts": {
+        "finding.category": "verification",
+        "finding.finding_id": "<F#1>",
+        "finding.mission_id": "<MSN#1>",
+        "finding.severity": "minor",
+        "finding.status": "open",
+        "finding.task_id": null
+      },
+      "type": "finding.created"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>",
+        "patch.status": "VALIDATING"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "task.assigned_execution_id": null,
+        "task.kind": "validation",
+        "task.mission_id": "<MSN#1>",
+        "task.repo_id": "<REPO>",
+        "task.role": "validator",
+        "task.status": "PENDING",
+        "task.task_id": "<TSK#2>"
+      },
+      "type": "task.created"
+    },
+    {
+      "facts": {
+        "status": "READY",
+        "task_id": "<TSK#2>"
+      },
+      "type": "task.ready"
+    },
+    {
+      "facts": {
+        "status": "RUNNING",
+        "task_id": "<TSK#2>"
+      },
+      "type": "task.started"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#2>",
+        "execution.execution_id": "<EXC#2>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": null,
+        "execution.status": "PENDING",
+        "execution.task_id": "<TSK#2>"
+      },
+      "type": "execution.created"
+    },
+    {
+      "facts": {
+        "assigned_execution_id": "<EXC#2>",
+        "task_id": "<TSK#2>"
+      },
+      "type": "task.authority_assigned"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#2>",
+        "execution.execution_id": "<EXC#2>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": null,
+        "execution.status": "RUNNING",
+        "execution.task_id": "<TSK#2>"
+      },
+      "type": "execution.started"
+    },
+    {
+      "facts": {},
+      "type": "task.checkpointed"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#2>",
+        "execution.execution_id": "<EXC#2>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": null,
+        "execution.status": "SUCCEEDED",
+        "execution.task_id": "<TSK#2>",
+        "validationEvidence.testSummary.passed": 1
+      },
+      "type": "execution.gate_evidence_published"
+    },
+    {
+      "facts": {
+        "status": "SUCCEEDED",
+        "task_id": "<TSK#2>"
+      },
+      "type": "task.completed"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>",
+        "patch.status": "REVIEWING"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "task.assigned_execution_id": null,
+        "task.kind": "review",
+        "task.mission_id": "<MSN#1>",
+        "task.repo_id": "<REPO>",
+        "task.role": "reviewer",
+        "task.status": "PENDING",
+        "task.task_id": "<TSK#3>"
+      },
+      "type": "task.created"
+    },
+    {
+      "facts": {
+        "status": "READY",
+        "task_id": "<TSK#3>"
+      },
+      "type": "task.ready"
+    },
+    {
+      "facts": {
+        "status": "RUNNING",
+        "task_id": "<TSK#3>"
+      },
+      "type": "task.started"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#3>",
+        "execution.execution_id": "<EXC#3>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": null,
+        "execution.status": "PENDING",
+        "execution.task_id": "<TSK#3>"
+      },
+      "type": "execution.created"
+    },
+    {
+      "facts": {
+        "assigned_execution_id": "<EXC#3>",
+        "task_id": "<TSK#3>"
+      },
+      "type": "task.authority_assigned"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#3>",
+        "execution.execution_id": "<EXC#3>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": null,
+        "execution.status": "RUNNING",
+        "execution.task_id": "<TSK#3>"
+      },
+      "type": "execution.started"
+    },
+    {
+      "facts": {},
+      "type": "evidence.invalidated"
+    },
+    {
+      "facts": {},
+      "type": "task.checkpointed"
+    },
+    {
+      "facts": {
+        "execution.checkpoint_id": "<TCP#3>",
+        "execution.execution_id": "<EXC#3>",
+        "execution.mission_id": "<MSN#1>",
+        "execution.repo_id": "<REPO>",
+        "execution.session_id": null,
+        "execution.status": "SUCCEEDED",
+        "execution.task_id": "<TSK#3>",
+        "reviewEvidence.verdict": "approve"
+      },
+      "type": "execution.gate_evidence_published"
+    },
+    {
+      "facts": {
+        "status": "SUCCEEDED",
+        "task_id": "<TSK#3>"
+      },
+      "type": "task.completed"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>",
+        "patch.status": "FINAL_VALIDATION"
+      },
+      "type": "mission.updated"
+    },
+    {
+      "facts": {
+        "mission_id": "<MSN#1>"
+      },
+      "type": "mission.completed"
+    }
+  ],
+  "gate_can_complete": true,
+  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
+  "scenario": "restart-restores-state",
+  "status_after_restart": "COMPLETE",
+  "status_before": "COMPLETE",
+  "task_count_after": 3,
+  "task_count_before": 3
+}

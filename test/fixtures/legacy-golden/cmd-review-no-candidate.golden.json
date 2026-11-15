@@ -1,0 +1,12 @@
+{
+  "args": "",
+  "command": "cmd-review",
+  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
+  "notices": [
+    {
+      "level": "error",
+      "text": "No candidate to review."
+    }
+  ],
+  "scenario": "no-candidate"
+}

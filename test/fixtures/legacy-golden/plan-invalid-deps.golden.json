@@ -1,0 +1,432 @@
+{
+  "command": "plan",
+  "decisions": [
+    "plan: planner produced 12 tasks; truncated to 10 (spec §11 recommends 2-6). Extra tasks dropped.",
+    "plan: 10 tasks decomposed for \"big goal\" (planned)"
+  ],
+  "findings": [
+    "low: plan task 0 (task 0) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 1 (task 1) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 2 (task 2) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 3 (task 3) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 4 (task 4) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 5 (task 5) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 6 (task 6) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 7 (task 7) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 8 (task 8) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 9 (task 9) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 10 (task 10) had invalid depends_on [999]; those edges dropped.",
+    "low: plan task 11 (task 11) had invalid depends_on [999]; those edges dropped."
+  ],
+  "ledger": [
+    {
+      "actor": "system",
+      "facts": {
+        "workItem.current_candidate_id": null,
+        "workItem.id": "<WI#1>",
+        "workItem.incumbent_candidate_id": null,
+        "workItem.status": "DEFINED"
+      },
+      "type": "work_item.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<REQUIREMENT#1>",
+        "entity.kind": "requirement",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "requirement.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "role": "planner"
+      },
+      "type": "agent.started",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "role": "planner",
+        "status": "completed"
+      },
+      "type": "agent.completed",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<DECISION#1>",
+        "entity.kind": "decision",
+        "entity.status": "accepted",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "decision.accepted",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#1>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#2>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#3>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#4>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#5>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#6>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#7>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#8>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#9>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#10>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#11>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<FINDING#12>",
+        "entity.kind": "finding",
+        "entity.severity": "low",
+        "entity.status": "open",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "finding.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#1>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#2>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#3>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#4>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#5>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#6>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#7>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#8>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#9>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "task.id": "<TASK#10>",
+        "task.kind": "implementation",
+        "task.result_work_item_id": null,
+        "task.status": "ready",
+        "task.work_item_id": "<WI#1>"
+      },
+      "type": "task.created",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "plan_id": "<WI#1>/1"
+      },
+      "type": "plan.recorded",
+      "work_item": "<WI#1>"
+    },
+    {
+      "actor": "system",
+      "facts": {
+        "entity.id": "<DECISION#2>",
+        "entity.kind": "decision",
+        "entity.status": "accepted",
+        "entity.work_item_id": "<WI#1>"
+      },
+      "type": "decision.accepted",
+      "work_item": "<WI#1>"
+    }
+  ],
+  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
+  "plan_outcome": "planned",
+  "scenario": "invalid-deps",
+  "task_count": 10,
+  "tasks": [
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 0"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 1"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 2"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 3"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 4"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 5"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 6"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 7"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 8"
+    },
+    {
+      "depends_on": [],
+      "linked_result": false,
+      "risk": "medium",
+      "status": "ready",
+      "title": "task 9"
+    }
+  ]
+}

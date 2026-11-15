@@ -1,0 +1,31 @@
+{
+  "command": "verify",
+  "evidence": [
+    {
+      "exit_code": 1,
+      "status": "failed",
+      "trust": "deterministic",
+      "type": "verify.test"
+    }
+  ],
+  "failedStage": "test",
+  "ledger": [],
+  "legacySha": "24a66588e93b3ad9cb3a65f0b71b3fb6d5f61736",
+  "noTargets": false,
+  "passed": false,
+  "profile": "detected",
+  "profile_stages": [
+    {
+      "name": "test",
+      "required": true
+    }
+  ],
+  "scenario": "red",
+  "stages": [
+    {
+      "exitCode": 1,
+      "name": "test",
+      "passed": false
+    }
+  ]
+}
