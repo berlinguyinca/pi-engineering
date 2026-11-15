@@ -227,16 +227,17 @@ function firstRequests(server: { turns: Array<{ system: string; assistantTurns: 
 /**
  * A RATCHET AGAINST GROWTH, not a parity claim: omp's starting context is larger than legacy's and the ratio
  * only bounds how much worse it may get. Measured on the scripted flow: scout +13%, reviewer +12%, implementer
- * +34% (omp's own bash/read/grep/find tool text plus pe_write/pe_edit, tools chars 12539 vs 9106, and a ~230
- * char user message). The +34% implementer growth is a REGRESSION and a known gap (report: Known gaps); it is
- * pinned, not endorsed. Two bounds per role: a ratio over legacy, and an absolute token ceiling so a slow
+ * +24% (omp's own bash/read/edit/grep/glob tool text, tools chars 11312 vs 9106, and a ~230 char user message).
+ * It was +34% before the overlay set edit.mode=replace and turned off bash async/auto-background (src/omp/firewall.ts).
+ * The remainder is omp's built-in tool text, which PE cannot trim without upstream changes (report: Known gaps);
+ * it is pinned, not endorsed. Two bounds per role: a ratio over legacy, and an absolute token ceiling so a slow
  * drift of both paths cannot hide behind the ratio.
  */
-const CONTEXT_BUDGET: Record<string, number> = { implementer: 0.4 };
+const CONTEXT_BUDGET: Record<string, number> = { implementer: 0.28 };
 const DEFAULT_BUDGET = 0.15;
 const budgetOf = (role: string): number => CONTEXT_BUDGET[role] ?? DEFAULT_BUDGET;
-/** Absolute ceilings on the omp path's starting context in approx tokens (measured: 2311 / 2972 / 2485). */
-const OMP_CEILING_TOKENS: Record<string, number> = { scout: 3000, implementer: 4200, reviewer: 3200 };
+/** Absolute ceilings on the omp path's starting context in approx tokens (measured omp: scout 2617, implementer 3671, reviewer 2794; legacy 2311 / 2972 / 2485). */
+const OMP_CEILING_TOKENS: Record<string, number> = { scout: 3000, implementer: 3800, reviewer: 3200 };
 
 async function legacyAgentDir(baseUrl: string): Promise<string> {
   const dir = mkdtempSync(join(scratch, "legacy-agent-"));

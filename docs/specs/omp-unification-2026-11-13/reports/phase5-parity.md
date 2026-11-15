@@ -80,7 +80,7 @@ Findings come from a read-only source review (file and line references as read);
 ## Known gaps
 
 - Legacy tournament tie-break is nondeterministic (above).
-- Implementer context is 34% larger on omp (above).
+- Implementer context is 34% larger on omp (above). Phase 7 trimmed it to +24% through the overlay (edit.mode replace, no bash async/auto-background); see FINAL_REPORT.md.
 - Scripted-model parity proves the integration, not model behavior.
 - Full mission DAGs on real omp, and `agent.db` contents, are UNVERIFIED.
 - Real-omp tests are local-only; CI skips them.

@@ -13,6 +13,11 @@ import { join } from "node:path";
  * project .agents), skills.enableSkillCommands, and disabledProviders for the
  * managed-skills provider (`omp-managed`, ~/.omp/agent/managed-skills), which
  * loads at priority 5 even with auto-learn off.
+ *
+ * Context trimming (same file, no upstream change): edit.mode=replace swaps omp's hashline edit/read text and
+ * schema for the plain old/new form (closest to legacy's tolerant edit); async.enabled and
+ * bash.autoBackground.enabled=false drop the backgrounding text and schema from omp's bash tool and make bash
+ * run in the foreground as legacy's does. Together about 300 approx tokens off the implementer's first request.
  */
 export const OMP_FIREWALL_OVERLAY_YML = `autolearn:
   enabled: false
@@ -30,6 +35,13 @@ skills:
   enableAgentsProject: false
 disabledProviders:
   - omp-managed
+edit:
+  mode: replace
+async:
+  enabled: false
+bash:
+  autoBackground:
+    enabled: false
 `;
 
 /** Flags that accompany the overlay: discovery off on the command line too. */
