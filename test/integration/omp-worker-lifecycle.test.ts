@@ -8,8 +8,9 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { after, describe, it } from "node:test";
+import { shortHash } from "../../src/git/shortHash.ts";
 import { OmpWorkerExecutor } from "../../src/omp/OmpWorkerExecutor.ts";
 import { OMP_HOME_ENV, OMP_MODEL_ENV, selectOmpWorker } from "../../src/omp/selectWorker.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
@@ -36,14 +37,35 @@ const alive = (pid: number): boolean => {
   }
 };
 
-/** Every omp process (by command line) currently running: catches descendants the launcher log cannot see. */
-const ompProcesses = (): string[] => {
+/**
+ * The omp processes (descendants included) that belong to THIS test's repository: matched by command line, then
+ * kept only when their working directory is the repository or one of its candidate worktrees
+ * (`<parent>/pi-eng-<hash of the repo root>-*`). A machine-wide match would also count the omp processes of
+ * other test files running concurrently.
+ */
+const ompProcesses = (root: string): string[] => {
+  const worktree = `pi-eng-${shortHash(root)}-`;
+  const mine = (cwd: string): boolean =>
+    cwd === root || cwd.startsWith(`${root}/`) || basename(cwd).startsWith(worktree);
   try {
-    return execFileSync("pgrep", ["-f", "--", `${real!.args.split(/\s+/)[0] ?? real!.bin}.*--mode rpc`], {
+    const pids = execFileSync("pgrep", ["-f", "--", `${real!.args.split(/\s+/)[0] ?? real!.bin}.*--mode rpc`], {
       encoding: "utf8",
     })
       .split("\n")
       .filter(Boolean);
+    return pids.filter((pid) => {
+      try {
+        const out = execFileSync("lsof", ["-a", "-d", "cwd", "-p", pid, "-Fn"], { encoding: "utf8" });
+        const cwd =
+          out
+            .split("\n")
+            .find((l) => l.startsWith("n"))
+            ?.slice(1) ?? "";
+        return mine(cwd);
+      } catch {
+        return false; // gone between pgrep and lsof
+      }
+    });
   } catch {
     return [];
   }
@@ -110,15 +132,24 @@ const settle = async (pids: number[]): Promise<number[]> => {
 
 describe("omp worker lifecycle (real omp)", { skip }, () => {
   it("negotiates once per runtime open; every tournament leg and the next command get fresh processes; none are left", async () => {
-    const before = ompProcesses();
     const fx = await makeFixtureRepo();
     const leg = (n: number): string => (n === 1 ? ADD_OK : n === 2 ? ADD_BAD : ADD_OK);
     const script: EngineerScript = { implement: (run) => ({ path: "src/add.js", content: leg(run) }) };
     const o = await openRuntime(fx.root, engineerModelScript(script));
+
     try {
       const afterOpen = o.counted.pids().length;
       assert.equal(afterOpen, 2, "negotiation spawns exactly two processes, at open");
-      await o.rt.tournament("Implement add(a, b) to return the sum of a and b", { n: 3 });
+      let seen = 0;
+      const sampler = setInterval(() => {
+        seen = Math.max(seen, ompProcesses(fx.root).length);
+      }, 100);
+      try {
+        await o.rt.tournament("Implement add(a, b) to return the sum of a and b", { n: 3 });
+      } finally {
+        clearInterval(sampler);
+      }
+      assert.ok(seen > 0, "positive control: the scoped matcher sees this runtime's own live omp processes");
       const afterTournament = o.counted.pids();
       const turns = o.offline.server.turns;
       const firstTurns = (role: string): number =>
@@ -142,7 +173,7 @@ describe("omp worker lifecycle (real omp)", { skip }, () => {
       await fx.cleanup();
     }
     assert.deepEqual(
-      ompProcesses().filter((p) => !before.includes(p)),
+      ompProcesses(fx.root),
       [],
       "no omp process (descendants included) is left after the runtime closed",
     );

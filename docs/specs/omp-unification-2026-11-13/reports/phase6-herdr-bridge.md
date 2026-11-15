@@ -18,12 +18,21 @@ Branch `feat/omp-herdr-bridge`, stacked on `test/omp-parity-suite` (PR #697). De
 - typecheck 0, biome lint 0.
 - `omp-parity-ui-activity.test.ts` with real omp: 3/3 pass (1 test each).
 - `legacy-golden.test.ts`: 27 pass / 0 fail on legacy and under `PARITY_PATH=omp`.
-- `npm run test:coverage`: 6972 pass, 0 fail; 85.65 / 83.31 / 83.45 (floors 85/83/83).
-- All `omp-*.test.ts` in one process: 53 pass, 1 fail (`omp-worker-lifecycle` "negotiates once per runtime open ..."). It fails identically at the Phase 5 head (3d1fc2d0: 52 pass, 1 fail) when the files run together and passes alone (4/4, twice): a pre-existing concurrency flake, not from this change.
+- `npm run test:coverage` (follow-up head): 6972 pass, 0 fail; 85.65 / 83.26 / 83.44 (floors 85/83/83). Full `omp-*.test.ts` set together 3x: 54 pass, 0 fail each. Legacy and `PARITY_PATH=omp` golden gates: 27/27 each.
 
-## Contract limits
+## Telemetry parity (follow-up)
 
-Excluded from equality, by name in the test: "Model streaming", "Awaiting model response", "Context usage", "Turn ended: ..." (legacy token-level telemetry; no omp frame carries it). Consequence: Herdr/orchestrator features keyed on `Context usage` (context-threshold triggers) get no signal from omp workers.
+Derived from omp frames, all through the existing `emitWorkerActivity` shapes:
+- "Context usage": assistant `message_end.usage.totalTokens` plus the model's `contextWindow`/`id` from one `get_state` request sent at run start (frames carry usage but not the window). The orchestrator feeds it to `ContextHandoffTrigger` unchanged.
+- "Turn ended: stop=<stopReason> tool_error=<category>": `turn_end.message.stopReason` and `classifyError` over failed `tool_execution_end` results, as the legacy executor does.
+- "Model streaming" / "Tool still producing output": `StreamingActivityThrottle` over `message_update` / `tool_execution_update`. omp also streams updates for `write`/`edit`, which legacy never reports, so only `bash` updates are forwarded.
+- "Awaiting model response" is not emitted by the legacy `PiWorkerExecutor` either (only the gateway planner worker does), so there is nothing to match.
+
+The parity test no longer excludes anything: the full normalized sequence (including context tokens/window/model) and the rendered text are identical, and the same context signals drive a real `ContextHandoffTrigger` to identical handoff records on both paths.
+
+## Lifecycle test isolation
+
+`omp-worker-lifecycle` "negotiates once per runtime open" compared a machine-wide `pgrep` snapshot before/after, so omp processes of other test files running in the same `omp-*.test.ts` invocation counted as leaks. It now counts only omp processes whose cwd is this test's repo or its `pi-eng-<hash>-*` candidate worktrees, with a positive control that the matcher sees live processes during the tournament.
 
 ## UNVERIFIED
 

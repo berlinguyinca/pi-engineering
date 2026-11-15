@@ -14,8 +14,10 @@ import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { selectOmpWorker } from "../../src/omp/selectWorker.ts";
+import { ContextHandoffTrigger } from "../../src/orchestration/contextHandoffTrigger.ts";
 import { realBackends } from "../../src/orchestration/realBackends.ts";
 import type { RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
+import type { HandoffRecord } from "../../src/runtime/host/handoffKinds.ts";
 import { formatMissionActivity } from "../../src/status/missionActivity.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 import type { WorkerActivity, WorkerExecutor } from "../../src/workers/WorkerExecutor.ts";
@@ -35,24 +37,22 @@ const GOLDEN = join(
 const scratch = mkdtempSync(join(tmpdir(), "pe-parity-ui-"));
 after(() => rmSync(scratch, { recursive: true, force: true }));
 
-/**
- * The activity both executors emit for the same session events. The legacy executor also reports streaming,
- * context-size and per-turn state (token-level telemetry no omp frame carries); those are excluded from the
- * contract and named here.
- */
-const LEGACY_ONLY = /^(Model streaming|Awaiting model response|Context usage|Turn ended: .*)$/;
-
 const normalize = (events: WorkerActivity[]): string[] =>
-  events
-    .filter((e) => !LEGACY_ONLY.test(e.summary))
-    .map((e) =>
-      [e.kind, e.phase ?? "-", e.toolName ?? "-", e.toolTarget ?? "-", e.toolCommand ?? "-", e.summary].join(" | "),
-    );
+  events.map((e) =>
+    [
+      e.kind,
+      e.phase ?? "-",
+      e.toolName ?? "-",
+      e.toolTarget ?? "-",
+      e.toolCommand ?? "-",
+      e.summary,
+      e.context ? `${e.context.model}:${e.context.tokens}/${e.context.window}` : "-",
+    ].join(" | "),
+  );
 
 /** One deterministic footer line per activity: the real formatter over a fixed mission frame. */
 function render(events: WorkerActivity[]): string {
   return `${events
-    .filter((e) => !LEGACY_ONLY.test(e.summary))
     .map((e) => {
       const frame: RuntimeMissionActivityEvent = {
         missionId: "m-1",
@@ -115,6 +115,31 @@ function legacyAgentDir(baseUrl: string): string {
     JSON.stringify({ defaultProvider: "pelocal", defaultModel: "scripted", enabledModels: ["pelocal/scripted"] }),
   );
   return dir;
+}
+
+/**
+ * Feed the context signals of a run to the real handoff trigger, exactly as the orchestrator does
+ * (`observeContinuitySignals`), with thresholds set so the scripted usage crosses preferred then emergency.
+ */
+async function triggerRecords(events: WorkerActivity[]): Promise<Array<Record<string, unknown>>> {
+  const records: Array<Record<string, unknown>> = [];
+  const trigger = new ContextHandoffTrigger({
+    thresholdsFor: () => ({ soft: 0.0001, preferred: 0.004, emergency: 0.005 }),
+    requestCheckpoint: async () => true,
+    latestCheckpointSha: () => "d".repeat(40),
+    addHandoff: (record) => {
+      records.push(record as unknown as Record<string, unknown>);
+      return record as unknown as HandoffRecord;
+    },
+    endpoint: () => ({ sessionId: "sess-1", generation: 0 }),
+    report: () => {},
+  });
+  for (const e of events) {
+    if (!e.context) continue;
+    await trigger.observe({ missionId: "m-1", taskId: "t-1", executionId: "e-1", ...e.context });
+    await trigger.safePoint("e-1");
+  }
+  return records.map(({ id: _id, createdAt: _createdAt, ...rest }) => rest);
 }
 
 async function capture(worker: WorkerExecutor, cwd: string): Promise<WorkerActivity[]> {
@@ -188,5 +213,9 @@ describe("UI-facing worker activity: omp path equals legacy (real omp)", { skip,
     assert.equal(render(omp), shown, "the rendered footer text is identical");
     if (process.env.UPDATE_GOLDEN === "1") writeFileSync(GOLDEN, shown);
     assert.equal(shown, readFileSync(GOLDEN, "utf8"), "the legacy render matches the checked-in golden");
+
+    const legacyHandoffs = await triggerRecords(legacy);
+    assert.ok(legacyHandoffs.length >= 1, "the scripted usage fires the context-threshold trigger on legacy");
+    assert.deepEqual(await triggerRecords(omp), legacyHandoffs, "the trigger fires identically on the omp path");
   });
 });

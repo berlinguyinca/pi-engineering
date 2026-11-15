@@ -2,11 +2,17 @@ import { type ChildProcess, spawn } from "node:child_process";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkerResult } from "../core/types.ts";
 import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
+import { classifyError } from "../guard/transient.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { MISSION_DEPTH_ENV, missionDepth } from "../orchestration/missionMode.ts";
 import { PROSE_ROLES, workerContext } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
-import { activityFromSessionEvent, emitWorkerActivity } from "../workers/activity.ts";
+import {
+  CONTEXT_USAGE_SUMMARY,
+  StreamingActivityThrottle,
+  activityFromSessionEvent,
+  emitWorkerActivity,
+} from "../workers/activity.ts";
 import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt } from "../workers/prompts.ts";
 import { completedReviewResult } from "../workers/reviewVerdict.ts";
 import { createWorkerResultTool } from "../workers/workerResultTool.ts";
@@ -236,12 +242,56 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       // the terminating and checkpoint tools are reported by their own paths, as on the legacy executor.
       // The legacy session ends at the terminating tool; omp's closing turn after it is not reported.
       let resultCalled = false;
+      let turnClosed = false;
+      let turnToolErrors: string[] = [];
+      let modelWindow: { id: string; window: number } | undefined;
+      const streaming = new StreamingActivityThrottle();
       const emitFrameActivity = (frame: Record<string, unknown>): void => {
         const type = frame.type;
-        if (resultCalled) return;
-        if (type !== "tool_execution_start" && type !== "tool_execution_end" && type !== "message_end") return;
+        if (turnClosed) return;
         const raw = typeof frame.toolName === "string" ? frame.toolName : undefined;
+        if (type === "turn_end") {
+          const m = (frame.message ?? {}) as { stopReason?: unknown };
+          const stop = typeof m.stopReason === "string" ? m.stopReason : "unknown";
+          emitWorkerActivity(req, {
+            kind: "state",
+            summary: `Turn ended: stop=${stop} tool_error=${turnToolErrors[0] ?? "none"}`,
+            meaningfulProgress: false,
+          });
+          turnToolErrors = [];
+          if (resultCalled) turnClosed = true;
+          return;
+        }
+        // omp streams partial results for tools (write, edit) whose legacy counterparts never do; only bash's count.
+        if (type === "message_update" || (type === "tool_execution_update" && raw === "bash")) {
+          const streamed = streaming.note(frame as { type?: string; message?: unknown; partialResult?: unknown });
+          if (streamed && !resultCalled) emitWorkerActivity(req, streamed);
+          return;
+        }
+        if (type !== "tool_execution_start" && type !== "tool_execution_end" && type !== "message_end") return;
         if (raw === terminating.name) resultCalled = true;
+        if (type === "tool_execution_end" && frame.isError === true && raw !== terminating.name) {
+          const text = (frame.result as { content?: Array<{ text?: unknown }> } | undefined)?.content
+            ?.map((b) => (typeof b?.text === "string" ? b.text : ""))
+            .join("");
+          turnToolErrors.push(classifyError(text ?? "").category);
+        }
+        if (type === "message_end" && !resultCalled) {
+          const message = (frame.message ?? {}) as {
+            role?: unknown;
+            model?: unknown;
+            usage?: { totalTokens?: unknown };
+          };
+          const total = message.usage?.totalTokens;
+          if (message.role === "assistant" && typeof total === "number" && modelWindow && modelWindow.window > 0) {
+            emitWorkerActivity(req, {
+              kind: "state",
+              summary: CONTEXT_USAGE_SUMMARY,
+              meaningfulProgress: false,
+              context: { tokens: total, window: modelWindow.window, model: modelWindow.id },
+            });
+          }
+        }
         if (raw === terminating.name || (raw !== undefined && isCheckpointTool(raw))) return;
         const bare = raw?.startsWith("pe_") && replaced.has(raw.slice(3)) ? raw.slice(3) : raw;
         const activity = activityFromSessionEvent({ ...frame, ...(bare === undefined ? {} : { toolName: bare }) });
@@ -266,6 +316,12 @@ export class OmpWorkerExecutor implements WorkerExecutor {
         emitFrameActivity(frame);
         const event: RpcEvent = translateFrame(frame);
         collector.accept(event);
+        if (event.kind === "response" && event.id === "pe-state") {
+          const model = (event.data as { model?: { id?: unknown; contextWindow?: unknown } } | undefined)?.model;
+          if (event.success && typeof model?.id === "string" && typeof model.contextWindow === "number")
+            modelWindow = { id: model.id, window: model.contextWindow };
+          return;
+        }
         if (event.kind === "response" && event.id === "pe-host-tools") {
           if (!event.success) {
             fail(`set_host_tools rejected: ${event.error ?? "unknown"}`);
@@ -274,6 +330,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
           phase = "running";
           arm();
           emitWorkerActivity(req, { kind: "state", summary: "Worker session started", meaningfulProgress: false });
+          send({ id: "pe-state", type: "get_state" });
           send({ id: "pe-prompt", type: "prompt", message: req.kickoff ?? WORKER_KICKOFF });
         } else if (event.kind === "response" && event.id === "pe-prompt" && !event.success) {
           fail(`prompt rejected: ${event.error ?? "unknown"}`);
