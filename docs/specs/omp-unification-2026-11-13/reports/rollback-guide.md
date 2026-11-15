@@ -9,7 +9,7 @@ Everything that runs OMP is behind two environment flags and is OFF by default. 
 | `PI_ENGINEERING_OMP_WORKER` | `selectOmpWorker` returns `undefined`; `EngineeringRuntime.open` keeps the legacy `PiWorkerExecutor`. No omp process is ever spawned. |
 | `PI_ENGINEERING_OMP_ADAPTER` | Negotiation reports `Unavailable (disabled)`; with the worker flag set the runtime falls back to legacy with a stated reason. |
 | `PI_ENGINEERING_OMP_BIN`, `_BIN_ARGS`, `_MODEL`, `_HOME`, `_TIMEOUT_MS` | Only read when both flags are on. |
-| `PI_ENGINEERING_WORKER_SKILLS` | Workers (legacy and omp) are skill-less: the `workers.skillPacks` allowlist is not even read. Unset it to roll back the worker skill packs opt-in; no code change. |
+| `PI_ENGINEERING_WORKER_SKILLS` | Workers (legacy and omp) are skill-less: the operator's `workers.skillPacks` allowlist is not even read. Unset it to roll back the worker skill packs opt-in; no code change. |
 
 ```sh
 unset PI_ENGINEERING_OMP_WORKER PI_ENGINEERING_OMP_ADAPTER PI_ENGINEERING_OMP_BIN PI_ENGINEERING_OMP_BIN_ARGS PI_ENGINEERING_OMP_MODEL PI_ENGINEERING_OMP_HOME PI_ENGINEERING_OMP_TIMEOUT_MS
@@ -44,7 +44,7 @@ Not in the stack, revertable on their own (each independent of the others, in an
 | 5 | tests only; test runs create temp dirs under the OS temp dir (isolated HOMEs, `pi-eng-*` worktrees) and are removed by test teardown | nothing |
 | 6 | none (activity is in-memory, through the existing `onActivity` seam) | nothing |
 | 7 | none at runtime; same overlay file as phase 3 with three more keys (it is rewritten to match, so rollback self-heals) | nothing |
-| worker skill packs (opt-in) | `<PE state dir>/worker-skill-packs/<digest>/` (verified copies, dir 0700) and `<PE state dir>/omp-firewall/firewall-skills.yml` | unset `PI_ENGINEERING_WORKER_SKILLS`; `rm -rf "${PI_ENGINEERING_STATE_DIR:-$HOME/.local/state/pi-engineering}/worker-skill-packs"` |
+| worker skill packs (opt-in) | `<PE state dir>/worker-skill-packs/<digest>/` (verified copies, dirs 0700, files 0600; the operator's packs and pins live in `<agentDir>/skill-packs` and `<agentDir>/engineering.yaml`, which rollback leaves alone) and `<PE state dir>/omp-firewall/firewall-skills.yml` | unset `PI_ENGINEERING_WORKER_SKILLS`; `rm -rf "${PI_ENGINEERING_STATE_DIR:-$HOME/.local/state/pi-engineering}/worker-skill-packs"` |
 | skills | none at runtime. An operator who opts in with `omp -e skill-packs/pe-operator` gets omp's own skill store entries under their omp agent dir; if auto-learn was ever enabled, `~/.omp/agent/managed-skills/*` | remove the `-e` flag / `extensions:` entry; `rm -rf ~/.omp/agent/managed-skills/*` if auto-learn had been on |
 
 The ledger, custody, lease/fencing code and schema were not changed by any phase, so there is no ledger migration to undo. Ledger events written by an omp-backed run have the same shapes as legacy (asserted by `omp-ledger-parity.test.ts`) and replay under legacy unchanged.

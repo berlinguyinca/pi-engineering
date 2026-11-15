@@ -237,8 +237,8 @@ function roleResourceLoader(
 }
 
 /** Skills of the verified packs the allowlist grants this request's role; refused packs surface as activity. */
-async function workerPackSkills(req: WorkerRequest): Promise<Skill[]> {
-  const resolved = await resolveWorkerSkills({ role: req.role, cwd: req.cwd });
+async function workerPackSkills(req: WorkerRequest, agentDir: string): Promise<Skill[]> {
+  const resolved = await resolveWorkerSkills({ role: req.role, cwd: req.cwd, agentDir });
   for (const line of resolved.diagnostics)
     req.onActivity?.({ kind: "state", summary: line, meaningfulProgress: false });
   return resolved.packs.flatMap(
@@ -1668,7 +1668,7 @@ ${recovery.recoveryPrompt}`;
     /** Terminal provider/gateway error text, when the model call itself failed. */
     assistantError?: string;
   }> {
-    const resourceLoader = roleResourceLoader(systemPrompt, workerGate, await workerPackSkills(req));
+    const resourceLoader = roleResourceLoader(systemPrompt, workerGate, await workerPackSkills(req, this.agentDir));
     const sessionManager = SessionManager.inMemory(req.cwd);
     // Mission workers compact at a share of their context budget (default 60%,
     // PI_WORKER_COMPACT_AT), keeping the autotuned recent window; the summary

@@ -2183,17 +2183,19 @@ and vision model. No image count is carried. The events reach herdr only when th
 
 ## Worker skill packs (opt-in)
 
-By default worker sessions run with no skills (the context firewall). To give one role a version-pinned, digest-verified skill pack, set both:
+By default worker sessions run with no skills (the context firewall). To give one role a version-pinned, digest-verified skill pack, the operator sets both, in the operator's own agent directory (never in the repository; a repository's `.pi/engineering.yaml` entry is ignored with a warning):
 
 ```yaml
-# .pi/engineering.yaml (or ~/.pi/agent/engineering.yaml)
+# ~/.pi/agent/engineering.yaml  (PI_CODING_AGENT_DIR)
 workers:
   skillPacks:
-    scout: [pe-operator]          # pack id (under skill-packs/) or a path such as ./vendor/my-pack
+    scout:
+      - id: pe-operator                      # pack lives at ~/.pi/agent/skill-packs/pe-operator
+        manifestSha256: "<shasum -a 256 ~/.pi/agent/skill-packs/pe-operator/pack.manifest.json>"
 ```
 
 ```sh
 export PI_ENGINEERING_WORKER_SKILLS=1
 ```
 
-Only the listed role receives the pack, on the legacy worker and on the omp worker. The pack must pass the digest manifest and lockfile check, contain no symlinks and no scripts, and is loaded from a verified private copy; nothing is fetched from the network and no pack script is run. A pack that fails verification is not loaded: the worker runs without it and the work-status activity shows `worker skill pack refused (<role>): <pack>: <reason>`. Foreign (`.claude`, `.agents`, `.codex`, `.github`) and managed skills, auto-learn and memory stay off. Cost: the pe-operator pack adds about 76 tokens (omp) or 226 tokens (legacy) to a worker's first request.
+Only the listed role receives the pack, on the legacy worker and on the omp worker. `id` is a plain name (`[a-z0-9-]`), never a path. The manifest digest must equal the pin, and the pack must pass the digest manifest and lockfile check, contain no symlinks and no scripts, and is loaded from a verified private copy; nothing is fetched from the network and no pack script is run. A pack that fails any check is not loaded: the worker runs without it and the work-status activity shows `worker skill pack refused (<role>): <pack>: <reason>`. Foreign (`.claude`, `.agents`, `.codex`, `.github`) and managed skills, auto-learn and memory stay off. Cost: the pe-operator pack adds about 76 tokens (omp) or 226 tokens (legacy) to a worker's first request.

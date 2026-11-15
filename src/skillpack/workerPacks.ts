@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
-import { cpSync, existsSync, lstatSync, readFileSync, renameSync, rmSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { loadPolicy } from "../lifecycle/policy.ts";
+import { chmodSync, cpSync, existsSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { parse as parseYaml } from "yaml";
 import { assertPrivateDir, defaultFirewallDir } from "../omp/firewall.ts";
 import { PACK_MANIFEST_FILE, type PackManifest, verifyPack } from "./verify.ts";
 
@@ -18,35 +18,87 @@ export function workerSkillsEnabled(env: NodeJS.ProcessEnv = process.env): boole
   return flag === "1" || flag === "true" || flag === "yes" || flag === "on";
 }
 
+export interface PackGrant {
+  readonly id: string;
+  /** sha256 (hex) of the pack's `pack.manifest.json` bytes, pinned by the operator. */
+  readonly manifestSha256: string;
+}
+
 export interface WorkerSkillPacksConfig {
-  readonly byRole: Readonly<Record<string, readonly string[]>>;
+  readonly byRole: Readonly<Record<string, readonly PackGrant[]>>;
   readonly issues: readonly string[];
 }
+
+const PACK_ID = /^[a-z0-9][a-z0-9-]*$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 /** Validate a raw `workers.skillPacks` value; malformed entries are reported and dropped. */
 export function parseWorkerSkillPacks(raw: unknown): WorkerSkillPacksConfig {
   const issues: string[] = [];
-  const byRole: Record<string, string[]> = {};
+  const byRole: Record<string, PackGrant[]> = {};
   if (raw === undefined || raw === null) return { byRole, issues };
   if (typeof raw !== "object" || Array.isArray(raw)) {
-    return { byRole, issues: ["workers.skillPacks must be a mapping of role to a list of packs"] };
+    return { byRole, issues: ["workers.skillPacks must be a mapping of role to a list of {id, manifestSha256}"] };
   }
   for (const [role, value] of Object.entries(raw)) {
-    if (!Array.isArray(value) || !value.every((v) => typeof v === "string" && v.trim() !== "")) {
-      issues.push(`workers.skillPacks.${role} must be a list of non-empty strings`);
+    if (!Array.isArray(value)) {
+      issues.push(`workers.skillPacks.${role} must be a list of {id, manifestSha256}`);
       continue;
     }
-    byRole[role] = [...new Set(value.map((v: string) => v.trim()))];
+    const grants = new Map<string, PackGrant>();
+    for (const entry of value) {
+      const e = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : {};
+      const id = typeof e.id === "string" ? e.id.trim() : "";
+      const sha = typeof e.manifestSha256 === "string" ? e.manifestSha256.trim().toLowerCase() : "";
+      if (!PACK_ID.test(id) || !SHA256_HEX.test(sha)) {
+        issues.push(`workers.skillPacks.${role}: entry needs id matching ${PACK_ID} and a 64-hex manifestSha256`);
+        continue;
+      }
+      grants.set(id, { id, manifestSha256: sha });
+    }
+    byRole[role] = [...grants.values()];
   }
   return { byRole, issues };
 }
 
-export async function loadWorkerSkillPacksConfig(cwd: string, env: NodeJS.ProcessEnv): Promise<WorkerSkillPacksConfig> {
-  const { policy } = await loadPolicy({ cwd, env });
-  const workers = (policy as unknown as Record<string, unknown>).workers;
-  const raw =
-    typeof workers === "object" && workers !== null ? (workers as Record<string, unknown>).skillPacks : undefined;
-  return parseWorkerSkillPacks(raw);
+/** The operator's agent directory: the only place the allowlist is read from and packs are resolved in. */
+export function operatorAgentDir(env: NodeJS.ProcessEnv): string {
+  return env.PI_CODING_AGENT_DIR?.trim() || join(env.HOME ?? "~", ".pi", "agent");
+}
+
+function workersSkillPacksOf(file: string): { present: boolean; raw?: unknown; error?: string } {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { present: false }
+      : { present: false, error: String(error) };
+  }
+  try {
+    const doc: unknown = parseYaml(text);
+    const workers = typeof doc === "object" && doc !== null ? (doc as Record<string, unknown>).workers : undefined;
+    const raw =
+      typeof workers === "object" && workers !== null ? (workers as Record<string, unknown>).skillPacks : undefined;
+    return raw === undefined ? { present: false } : { present: true, raw };
+  } catch (error) {
+    return { present: false, error: `unparseable: ${(error as Error).message}` };
+  }
+}
+
+/**
+ * The allowlist comes from the operator's `<agentDir>/engineering.yaml` ONLY. A repository is untrusted input: a
+ * `workers.skillPacks` in `<cwd>/.pi/engineering.yaml` is ignored and reported.
+ */
+export function loadWorkerSkillPacksConfig(
+  cwd: string,
+  agentDir: string,
+): WorkerSkillPacksConfig & { readonly repoAttempt: boolean } {
+  const operator = workersSkillPacksOf(join(agentDir, "engineering.yaml"));
+  const repo = workersSkillPacksOf(join(cwd, ".pi", "engineering.yaml"));
+  const parsed = parseWorkerSkillPacks(operator.raw);
+  const issues = operator.error ? [...parsed.issues, `operator engineering.yaml: ${operator.error}`] : parsed.issues;
+  return { ...parsed, issues, repoAttempt: repo.present };
 }
 
 export interface WorkerSkillPack {
@@ -75,6 +127,8 @@ function contentProblems(dir: string, manifest: PackManifest): string[] {
   for (const path of Object.keys(manifest.files)) {
     const top = path.split("/")[0] ?? "";
     if (SCRIPT_LIKE.test(path)) problems.push(`script-like file: ${path}`);
+    else if (top === "skills" && !/^skills\/[^/]+\/.+/.test(path))
+      problems.push(`file directly under skills/: ${path}`);
     else if (top !== "skills" && !["package.json", "README.md", "LICENSE"].includes(path)) {
       problems.push(`file outside skills/: ${path}`);
     } else if ((lstatSync(join(dir, path)).mode & 0o111) !== 0) problems.push(`executable file: ${path}`);
@@ -85,10 +139,19 @@ function contentProblems(dir: string, manifest: PackManifest): string[] {
   } catch {
     // verifyPack already reports an unreadable package.json
   }
+  problems.push(...emptyDirProblems(dir));
   if (!Object.keys(manifest.files).some((p) => /^skills\/[^/]+\/SKILL\.md$/.test(p))) {
     problems.push("no skills/<name>/SKILL.md");
   }
   return problems;
+}
+
+function emptyDirProblems(root: string, dir = root): string[] {
+  const out: string[] = [];
+  const entries = readdirSync(dir, { withFileTypes: true });
+  if (entries.length === 0 && dir !== root) out.push(`empty directory: ${dir.slice(root.length + 1)}`);
+  for (const e of entries) if (e.isDirectory()) out.push(...emptyDirProblems(root, join(dir, e.name)));
+  return out;
 }
 
 function readManifest(dir: string): PackManifest | undefined {
@@ -107,33 +170,43 @@ export function packProblems(dir: string): string[] {
   return manifest ? contentProblems(dir, manifest) : ["manifest unreadable"];
 }
 
-/** Pack id (a name) resolves under the repository's skill-packs/; anything with a path separator is a path. */
-function locatePack(ref: string, cwd: string): string | undefined {
-  if (isAbsolute(ref) || ref.includes("/") || ref.includes("\\")) return resolve(cwd, ref);
-  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(ref) ? join(cwd, "skill-packs", ref) : undefined;
-}
-
 export function workerSkillCacheDir(env: NodeJS.ProcessEnv = process.env): string {
   return join(dirname(defaultFirewallDir(env)), "worker-skill-packs");
 }
 
+function chmodTree(dir: string): void {
+  chmodSync(dir, 0o700);
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) chmodTree(full);
+    else if (entry.isFile()) chmodSync(full, 0o600);
+  }
+}
+
 /**
- * Content-addressed private copy of a pack that was verified in place, then verified again as copied:
- * the bytes a worker loads are the bytes that passed. No network, no script run, no symlink followed.
+ * Content-addressed private copy (mode 0700/0600) of a pack that was verified in place, then verified again as
+ * copied: the bytes a worker loads are the bytes that passed. An existing copy is trusted only if it verifies now;
+ * a bad one is moved aside, never edited. No network, no script run, no symlink followed.
  */
 function stage(src: string, cacheDir: string): { dir: string } | { problems: string[] } {
+  assertPrivateDir(cacheDir);
   const manifestBytes = readFileSync(join(src, PACK_MANIFEST_FILE));
   const target = join(cacheDir, createHash("sha256").update(manifestBytes).digest("hex").slice(0, 32));
   if (existsSync(target) && packProblems(target).length === 0) return { dir: target };
-  assertPrivateDir(cacheDir);
   const tmp = join(cacheDir, `.stage.${process.pid}.${randomBytes(6).toString("hex")}`);
   try {
     cpSync(src, tmp, { recursive: true, verbatimSymlinks: true, errorOnExist: true });
+    chmodTree(tmp);
     const problems = packProblems(tmp);
     if (problems.length > 0) return { problems: problems.map((p) => `copy: ${p}`) };
-    rmSync(target, { recursive: true, force: true });
-    renameSync(tmp, target);
-    return { dir: target };
+    if (existsSync(target)) renameSync(target, join(cacheDir, `.bad.${randomBytes(6).toString("hex")}`));
+    try {
+      renameSync(tmp, target);
+    } catch {
+      // Another process staged the same content first; use its copy only if it verifies.
+    }
+    const final = packProblems(target);
+    return final.length === 0 ? { dir: target } : { problems: final.map((p) => `staged copy: ${p}`) };
   } catch (error) {
     return { problems: [`stage failed: ${error instanceof Error ? error.message : String(error)}`] };
   } finally {
@@ -145,41 +218,57 @@ const boundedLine = (s: string): string => (s.length > 300 ? `${s.slice(0, 297)}
 
 export interface ResolveWorkerSkillsOptions {
   readonly role: string;
+  /** The worker's working directory. Used only to detect (and warn about) a repo-supplied allowlist. */
   readonly cwd: string;
   readonly env?: NodeJS.ProcessEnv;
+  /** The operator's agent dir; defaults to PI_CODING_AGENT_DIR or ~/.pi/agent. */
+  readonly agentDir?: string;
   /** Test seam only; defaults to the private per-user state directory. */
   readonly cacheDir?: string;
 }
 
 /**
- * The verified packs the allowlist grants `role`. Disabled (default) returns immediately without reading
- * any configuration. A pack that fails verification is dropped with a diagnostic; the worker runs without it.
+ * The verified packs the OPERATOR's allowlist grants `role`. Disabled (default) returns immediately without reading
+ * any configuration. Packs live under `<agentDir>/skill-packs/<id>` and must match the operator-pinned manifest
+ * sha256. A pack that fails any check is dropped with a diagnostic; the worker runs without it.
  */
 export async function resolveWorkerSkills(opts: ResolveWorkerSkillsOptions): Promise<ResolvedWorkerSkills> {
   const env = opts.env ?? process.env;
   if (!workerSkillsEnabled(env)) return NO_WORKER_SKILLS;
-  let config: WorkerSkillPacksConfig;
-  try {
-    config = await loadWorkerSkillPacksConfig(opts.cwd, env);
-  } catch (error) {
-    return {
-      packs: [],
-      diagnostics: [boundedLine(`worker skill packs disabled: config unreadable: ${(error as Error).message}`)],
-    };
-  }
+  const agentDir = opts.agentDir ?? operatorAgentDir(env);
+  const config = loadWorkerSkillPacksConfig(opts.cwd, agentDir);
   const diagnostics = config.issues.map((i) => boundedLine(`worker skill packs config: ${i}`));
+  if (config.repoAttempt) {
+    diagnostics.push(
+      "worker skill packs: ignored workers.skillPacks in the repository's .pi/engineering.yaml (operator config only)",
+    );
+  }
   const packs: WorkerSkillPack[] = [];
   const cacheDir = opts.cacheDir ?? workerSkillCacheDir(env);
-  for (const ref of config.byRole[opts.role] ?? []) {
+  for (const grant of config.byRole[opts.role] ?? []) {
+    const ref = grant.id;
     const refuse = (why: string[]) =>
       diagnostics.push(
         boundedLine(
           `worker skill pack refused (${opts.role}): ${ref}: ${why.slice(0, 3).join("; ")}${why.length > 3 ? `; +${why.length - 3} more` : ""}`,
         ),
       );
-    const src = locatePack(ref, opts.cwd);
-    if (!src || !existsSync(src)) {
+    const src = join(agentDir, "skill-packs", ref);
+    if (!existsSync(src)) {
       refuse(["pack not found"]);
+      continue;
+    }
+    let pinned: string;
+    try {
+      pinned = createHash("sha256")
+        .update(readFileSync(join(src, PACK_MANIFEST_FILE)))
+        .digest("hex");
+    } catch {
+      refuse(["manifest unreadable"]);
+      continue;
+    }
+    if (pinned !== grant.manifestSha256) {
+      refuse(["manifest sha256 does not match the pinned digest"]);
       continue;
     }
     const problems = packProblems(src);

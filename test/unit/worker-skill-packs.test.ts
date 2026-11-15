@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { appendFileSync, chmodSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -10,14 +19,22 @@ import {
   resolveWorkerSkills,
   workerSkillsEnabled,
 } from "../../src/skillpack/workerPacks.ts";
-import { REAL_PE_OPERATOR, repoGrantingPack } from "../support/workerSkillFixture.ts";
+import {
+  REAL_PE_OPERATOR,
+  installOperatorPack,
+  manifestSha,
+  operatorGrantingPack,
+  plantHostileRepo,
+  repinOperator,
+} from "../support/workerSkillFixture.ts";
 
-const on = (state: string, dir: string): NodeJS.ProcessEnv => ({
+const on = (fx: { state: string; agentDir: string }): NodeJS.ProcessEnv => ({
   [WORKER_SKILLS_ENV]: "1",
-  PI_ENGINEERING_STATE_DIR: state,
-  PI_CODING_AGENT_DIR: dir,
-  HOME: dir,
+  PI_ENGINEERING_STATE_DIR: fx.state,
+  PI_CODING_AGENT_DIR: fx.agentDir,
+  HOME: fx.state,
 });
+const SHA = "a".repeat(64);
 
 describe("worker skill packs: config", () => {
   it("the master switch is explicit and off by default", () => {
@@ -27,10 +44,17 @@ describe("worker skill packs: config", () => {
     assert.equal(workerSkillsEnabled({ [WORKER_SKILLS_ENV]: "true" }), true);
   });
 
-  it("parses a per-role allowlist, de-duplicates, and reports malformed entries", () => {
-    const cfg = parseWorkerSkillPacks({ scout: ["a", " a ", "./p/b"], implementer: "x", reviewer: [1] });
-    assert.deepEqual(cfg.byRole, { scout: ["a", "./p/b"] });
-    assert.equal(cfg.issues.length, 2);
+  it("parses pinned {id, manifestSha256} grants, de-duplicates, and reports malformed entries", () => {
+    const cfg = parseWorkerSkillPacks({
+      scout: [
+        { id: "a", manifestSha256: SHA },
+        { id: "a", manifestSha256: SHA },
+      ],
+      implementer: "x",
+      reviewer: ["bare-string", { id: "../evil", manifestSha256: SHA }, { id: "ok", manifestSha256: "short" }],
+    });
+    assert.deepEqual(cfg.byRole, { scout: [{ id: "a", manifestSha256: SHA }], reviewer: [] });
+    assert.equal(cfg.issues.length, 4);
     assert.deepEqual(parseWorkerSkillPacks(undefined), { byRole: {}, issues: [] });
     assert.equal(parseWorkerSkillPacks([]).issues.length, 1);
   });
@@ -38,38 +62,37 @@ describe("worker skill packs: config", () => {
 
 describe("worker skill packs: resolution", () => {
   it("switch off: nothing resolves even with an allowlist (and no config is read)", async () => {
-    const fx = repoGrantingPack(["scout"]);
+    const fx = operatorGrantingPack(["scout"]);
     assert.equal(await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: {} }), NO_WORKER_SKILLS);
   });
 
   it("switch on but role not allowlisted: nothing, no diagnostic", async () => {
-    const fx = repoGrantingPack(["scout"]);
-    const out = await resolveWorkerSkills({ role: "implementer", cwd: fx.repo, env: on(fx.state, fx.state) });
+    const fx = operatorGrantingPack(["scout"]);
+    const out = await resolveWorkerSkills({ role: "implementer", cwd: fx.repo, env: on(fx) });
     assert.deepEqual(out, { packs: [], diagnostics: [] });
   });
 
-  it("allowlisted role by id and by path resolves a verified private copy", async () => {
-    const fx = repoGrantingPack(["scout"]);
-    const env = on(fx.state, fx.state);
+  it("allowlisted role resolves a verified private copy (0700/0600), identical content shares one copy", async () => {
+    const fx = operatorGrantingPack(["scout"]);
+    const env = on(fx);
     const byId = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
     assert.equal(byId.packs.length, 1);
     assert.deepEqual(byId.diagnostics, []);
     const pack = byId.packs[0];
     assert.ok(pack);
-    assert.notEqual(pack.dir, join(fx.repo, "skill-packs", "pe-operator"), "loads the staged copy, not the repo dir");
+    assert.notEqual(pack.dir, fx.pack, "loads the staged copy, not the repo dir");
     assert.deepEqual(packProblems(pack.dir), []);
-    writeFileSync(
-      join(fx.repo, ".pi", "engineering.yaml"),
-      "workers:\n  skillPacks:\n    scout: [./skill-packs/pe-operator]\n",
-    );
-    const byPath = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
-    assert.equal(byPath.packs[0]?.dir, pack.dir, "same content, same content-addressed copy");
+    assert.equal(statSync(pack.dir).mode & 0o777, 0o700);
+    assert.equal(statSync(join(pack.skillsDir, "pe-operator", "SKILL.md")).mode & 0o777, 0o600);
+    const again = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
+    assert.equal(again.packs[0]?.dir, pack.dir, "same content, same content-addressed copy");
   });
 
   it("a missing pack is refused with a diagnostic", async () => {
-    const fx = repoGrantingPack(["scout"], "pe-operator");
-    writeFileSync(join(fx.repo, ".pi", "engineering.yaml"), "workers:\n  skillPacks:\n    scout: [nope]\n");
-    const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx.state, fx.state) });
+    const fx = operatorGrantingPack(["scout"]);
+    installOperatorPack(fx.agentDir, ["scout"], { id: "nope" });
+    rmSync(join(fx.agentDir, "skill-packs", "nope"), { recursive: true });
+    const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx) });
     assert.deepEqual(out.packs, []);
     assert.deepEqual(out.diagnostics, ["worker skill pack refused (scout): nope: pack not found"]);
   });
@@ -95,13 +118,14 @@ describe("worker skill packs: resolution", () => {
       (p) => writeFileSync(join(p, "skills.lock.json"), '{"version":1,"skills":{}}'),
       /lock has no entry for skill/,
     ],
-    ["manifest removed", (p) => writeFileSync(join(p, "pack.manifest.json"), "{"), /manifest unreadable/],
+    ["manifest replaced", (p) => writeFileSync(join(p, "pack.manifest.json"), "{"), /does not match the pinned digest/],
+    ["empty directory", (p) => mkdirSync(join(p, "skills", "pe-operator", "hollow")), /empty directory/],
   ];
   for (const [name, mutate, expected] of tampers) {
     it(`fails closed: ${name}`, async () => {
-      const fx = repoGrantingPack(["scout"]);
-      mutate(join(fx.repo, "skill-packs", "pe-operator"));
-      const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx.state, fx.state) });
+      const fx = operatorGrantingPack(["scout"]);
+      mutate(fx.pack);
+      const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx) });
       assert.deepEqual(out.packs, []);
       assert.equal(out.diagnostics.length, 1);
       assert.match(out.diagnostics[0] ?? "", /^worker skill pack refused \(scout\): pe-operator: /);
@@ -115,15 +139,58 @@ describe("worker skill packs: resolution", () => {
       ["skills/pe-operator/run.sh", 0o644],
       ["skills/pe-operator/notes.md", 0o755],
     ] as const) {
-      const fx = repoGrantingPack(["scout"]);
-      const pack = join(fx.repo, "skill-packs", "pe-operator");
+      const fx = operatorGrantingPack(["scout"]);
+      const pack = fx.pack;
       writeFileSync(join(pack, file), "echo hi\n");
       chmodSync(join(pack, file), mode);
       writeFileSync(join(pack, "pack.manifest.json"), `${JSON.stringify(buildPackManifest(pack), null, 2)}\n`);
-      const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx.state, fx.state) });
+      repinOperator(fx.agentDir, ["scout"]);
+      const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx) });
       assert.deepEqual(out.packs, [], file);
       assert.match(out.diagnostics[0] ?? "", /script-like file|executable file/);
     }
+  });
+
+  it("a hostile repository's allowlist and pack are ignored, with a visible warning", async () => {
+    const fx = operatorGrantingPack([]);
+    rmSync(join(fx.agentDir, "engineering.yaml"));
+    plantHostileRepo(fx.repo, ["scout"]);
+    const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx) });
+    assert.deepEqual(out.packs, []);
+    assert.match(out.diagnostics.join("\n"), /ignored workers\.skillPacks in the repository's \.pi\/engineering\.yaml/);
+  });
+
+  it("a repo allowlist cannot add to the operator's grants for other roles", async () => {
+    const fx = operatorGrantingPack(["scout"]);
+    plantHostileRepo(fx.repo, ["implementer"]);
+    const out = await resolveWorkerSkills({ role: "implementer", cwd: fx.repo, env: on(fx) });
+    assert.deepEqual(out.packs, []);
+  });
+
+  it("ids with separators, dots, traversal or uppercase are rejected, never resolved against cwd", async () => {
+    for (const id of ["../repo-pack", "a/b", "/abs/pack", ".hidden", "Upper", "a..b"]) {
+      const fx = operatorGrantingPack([]);
+      writeFileSync(
+        join(fx.agentDir, "engineering.yaml"),
+        `workers:\n  skillPacks:\n    scout: [{id: "${id}", manifestSha256: "${"a".repeat(64)}"}]\n`,
+      );
+      const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx) });
+      assert.deepEqual(out.packs, [], id);
+      assert.match(out.diagnostics.join("\n"), /entry needs id matching/, id);
+    }
+  });
+
+  it("a wrong pinned manifest digest is refused before anything is staged", async () => {
+    const fx = operatorGrantingPack([]);
+    installOperatorPack(fx.agentDir, ["scout"], { sha: "b".repeat(64) });
+    const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx) });
+    assert.deepEqual(out.packs, []);
+    assert.equal(
+      out.diagnostics[0],
+      "worker skill pack refused (scout): pe-operator: manifest sha256 does not match the pinned digest",
+    );
+    assert.equal(existsSync(join(fx.state, "worker-skill-packs")), false, "nothing staged");
+    assert.equal(manifestSha(fx.pack).length, 64);
   });
 
   it("the committed pe-operator pack is loadable", () => {
@@ -131,8 +198,8 @@ describe("worker skill packs: resolution", () => {
   });
 
   it("a tampered copy in the private cache is rebuilt, never trusted", async () => {
-    const fx = repoGrantingPack(["scout"]);
-    const env = on(fx.state, fx.state);
+    const fx = operatorGrantingPack(["scout"]);
+    const env = on(fx);
     const first = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
     const dir = first.packs[0]?.dir ?? "";
     appendFileSync(join(dir, "skills", "pe-operator", "SKILL.md"), "\nplanted\n");
@@ -146,7 +213,7 @@ describe("worker skill packs: omp firewall overlay", () => {
     const { OMP_FIREWALL_OVERLAY_YML, OMP_FIREWALL_SKILLS_OVERLAY_YML, firewallArgs } = await import(
       "../../src/omp/firewall.ts"
     );
-    const dir = join(repoGrantingPack([]).state, "fw");
+    const dir = join(operatorGrantingPack([]).state, "fw");
     const off = firewallArgs(dir);
     assert.ok(off.includes("--no-skills") && !off.includes("-e"));
     assert.match(off[1] ?? "", /firewall\.yml$/);
