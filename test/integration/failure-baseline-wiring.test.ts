@@ -404,4 +404,37 @@ describe("baseline subtraction hardening (#200 review)", () => {
       await fx.cleanup();
     }
   });
+
+  it("two callers starting in the same millisecond each get their own integration worktree", async () => {
+    // Regression for the intermittent CI red (pipelines 240/243): the integration worktree was
+    // named from Date.now() alone, so two callers (separate GitRepo instances) that read the same
+    // millisecond asked for the same path and branch; the second silently replaced the first's
+    // clean worktree and one verification ran in, then lost, the other's checkout.
+    const fx = await fixture(RED);
+    const realNow = Date.now;
+    try {
+      const good = await fx.branch("good", { "src/x.js": "export const x = 1;\n" });
+      const second = await GitRepo.open(fx.root);
+      assert.ok(second);
+      const artifacts = await ArtifactStore.create(join(fx.root, "..", "artifacts-2"));
+      const other = realBackends({ worker: {} as never, verifier: fx.verifier, artifacts, git: second, cwd: fx.root });
+      const call = (backends: ReturnType<typeof realBackends>) =>
+        backends.integration.runIntegration({
+          objective: "integrate",
+          handoffs: [{ worktree: { path: fx.root, branch: good }, summary: "", artifacts: [] }],
+          signal: new AbortController().signal,
+        });
+      const frozen = realNow();
+      Date.now = () => frozen;
+      const [a, b] = await Promise.all([call(fx.backends), call(other)]).finally(() => {
+        Date.now = realNow;
+      });
+      assert.equal(a.exitStatus, "succeeded", a.summary);
+      assert.equal(b.exitStatus, "succeeded", b.summary);
+      assert.notEqual(a.usage.integrationBranch, b.usage.integrationBranch);
+    } finally {
+      Date.now = realNow;
+      await fx.cleanup();
+    }
+  });
 });
