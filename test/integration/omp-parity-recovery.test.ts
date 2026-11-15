@@ -21,33 +21,37 @@ const skip = real ? false : "UNVERIFIED: OMP_BIN not set; no real omp available"
 const CHILD = join(fileURLToPath(new URL(".", import.meta.url)), "..", "support", "parityRecoveryChild.ts");
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** pid -> ppid for every process, to walk a process tree (omp workers run in their own process group). */
-function descendants(root: number): number[] {
-  const rows = execFileSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf8" })
-    .trim()
+interface Proc {
+  pid: number;
+  /** start time + command line: a reused pid never matches the identity of the process we saw. */
+  identity: string;
+}
+const psRows = (): Array<{ pid: number; ppid: number; identity: string }> =>
+  execFileSync("ps", ["-A", "-o", "pid=,ppid=,lstart=,command="], { encoding: "utf8" })
     .split("\n")
-    .map((l) => l.trim().split(/\s+/).map(Number) as [number, number]);
-  const out: number[] = [];
+    .flatMap((l) => {
+      const m = /^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+[\d:]+\s+\d+)\s+(.*)$/.exec(l);
+      return m ? [{ pid: Number(m[1]), ppid: Number(m[2]), identity: `${m[3]} ${m[4]}` }] : [];
+    });
+
+/** Every descendant of `root` (workers run in their own process group, so walk ppid, not pgid). */
+function descendants(root: number): Proc[] {
+  const rows = psRows();
+  const out: Proc[] = [];
   const queue = [root];
   while (queue.length) {
     const parent = queue.shift() as number;
-    for (const [pid, ppid] of rows) {
-      if (ppid === parent && !out.includes(pid)) {
-        out.push(pid);
-        queue.push(pid);
+    for (const r of rows) {
+      if (r.ppid === parent && !out.some((o) => o.pid === r.pid)) {
+        out.push({ pid: r.pid, identity: r.identity });
+        queue.push(r.pid);
       }
     }
   }
   return out;
 }
-const alive = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-};
+/** True while the very process we saw (same pid, start time and command) is still running. */
+const alive = (p: Proc): boolean => psRows().some((r) => r.pid === p.pid && r.identity === p.identity);
 
 interface Outcome {
   /** Ledger event types after the kill, before the reopen. */
@@ -79,7 +83,7 @@ async function killMidWorkerRun(path: "legacy" | "omp"): Promise<Outcome> {
     child.stdout?.on("data", (b: Buffer) => out.push(String(b)));
     // Wait for the implementer's agent.started (and, on omp, for a real omp process under the child).
     const deadline = Date.now() + 90_000;
-    let omp: number[] = [];
+    let omp: Proc[] = [];
     for (;;) {
       if (child.exitCode !== null) throw new Error(`child exited early (${child.exitCode}); said ${out.join("")}`);
       if (Date.now() > deadline) throw new Error(`no in-flight implementer; child said ${out.join("")}`);
@@ -87,18 +91,24 @@ async function killMidWorkerRun(path: "legacy" | "omp"): Promise<Outcome> {
         (e) => e.type === "agent.started" && (e.payload as { role?: string } | undefined)?.role === "implementer",
       );
       if (child.pid !== undefined) omp = descendants(child.pid);
-      if (types.length > 0 && (path === "legacy" || omp.length > 0)) break;
+      const implementerAsked =
+        path === "legacy" || (offline?.server.turns.some((t) => /# Role: implementer/.test(t.system)) ?? false);
+      if (types.length > 0 && implementerAsked && (path === "legacy" || omp.length > 0)) break;
       await sleep(150);
     }
-    await sleep(300);
-    if (child.pid !== undefined) omp = descendants(child.pid);
+    // Re-scan right before the kill so a worker started since the last poll is tracked too.
+    if (child.pid !== undefined) {
+      for (const p of descendants(child.pid)) if (!omp.some((o) => o.pid === p.pid)) omp.push(p);
+    }
     child.kill("SIGKILL");
     await new Promise((r) => child?.once("exit", r));
-    await sleep(2500); // an omp worker that notices its parent died exits on its own
-    const orphans = omp.filter(alive);
-    for (const pid of orphans) {
+    // An omp worker that notices its parent died exits on its own: poll up to 10 s instead of a fixed sleep.
+    const goneBy = Date.now() + 10_000;
+    while (omp.some(alive) && Date.now() < goneBy) await sleep(100);
+    const orphans = omp.filter(alive).map((p) => p.pid);
+    for (const p of omp.filter(alive)) {
       try {
-        process.kill(pid, "SIGKILL"); // never leave a stray behind, whatever the assertion says
+        process.kill(p.pid, "SIGKILL"); // never leave a stray behind, whatever the assertion says
       } catch {}
     }
 

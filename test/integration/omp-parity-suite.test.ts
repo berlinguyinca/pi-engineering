@@ -54,8 +54,8 @@ function fakeFor(legs: (run: number) => string, findings: (round: number) => unk
 
 /**
  * The normalized ledger. Legacy itself records the losing candidates' `candidate.rejected` events in a run-to-run
- * varying order when several legs pass (observed legacy against legacy), so which candidate each one names is
- * dropped; the number, position and every other fact of those events are still compared.
+ * varying order when several legs pass (observed legacy against legacy), so the position-dependent candidate id
+ * is dropped here; WHICH candidates were rejected, and why, is compared order-independently by `rejectedOf`.
  */
 async function normalized(path: ParityPath, root: string): Promise<unknown> {
   const norm = createNormalizer([await realpath(tmpdir()), root, await realpath(root)]);
@@ -99,7 +99,33 @@ const SEEDS: Seed[] = [
   },
 ];
 
-async function tournament(path: ParityPath, seed: Seed): Promise<{ summary: unknown; ledger: unknown }> {
+/** Rejected candidates as sorted [entry index, reason] pairs: identity survives, event order does not matter. */
+async function rejectedOf(
+  path: ParityPath,
+  root: string,
+  entries: ReadonlyArray<{ candidate: { id: string } }>,
+): Promise<Array<[number, string]>> {
+  const events = await path.readEvents(root);
+  return events
+    .filter((e) => e.type === "candidate.rejected")
+    .map((e): [number, string] => {
+      const p = e.payload as { candidate_id: string; reason?: string };
+      const index = entries.findIndex((en) => en.candidate.id === p.candidate_id);
+      assert.notEqual(index, -1, `rejected candidate ${p.candidate_id} is one of the tournament entries`);
+      // the reason names the winner by candidate id: say which entry instead
+      const reason = (p.reason ?? "").replace(
+        /CAND-\w+/g,
+        (id) => `entry#${entries.findIndex((en) => en.candidate.id === id)}`,
+      );
+      return [index, reason];
+    })
+    .sort((a, b) => a[0] - b[0] || a[1].localeCompare(b[1]));
+}
+
+async function tournament(
+  path: ParityPath,
+  seed: Seed,
+): Promise<{ summary: unknown; ledger: unknown; rejected: Array<[number, string]>; nonWinners: number[] }> {
   const fx = await makeFixtureRepo();
   try {
     const script: EngineerScript = {
@@ -125,6 +151,8 @@ async function tournament(path: ParityPath, seed: Seed): Promise<{ summary: unkn
           evidence_count: report.evidence_ids.length,
         },
         ledger: await normalized(path, fx.root),
+        rejected: await rejectedOf(path, fx.root, report.entries),
+        nonWinners: report.entries.flatMap((e, i) => (e.winner ? [] : [i])),
       };
     } finally {
       await rt.close();
@@ -142,6 +170,12 @@ describe("tournament winner selection: omp path equals legacy", { skip }, () => 
       assert.equal((legacy.summary as { winner_index: number }).winner_index, seed.winner, "fixture sanity");
       assert.deepEqual(omp.summary, legacy.summary);
       assert.deepEqual(omp.ledger, legacy.ledger, "ledger events, facts and actors are identical");
+      assert.deepEqual(omp.rejected, legacy.rejected, "the same candidates are rejected, for the same reasons");
+      assert.deepEqual(
+        omp.rejected.map(([i]) => i),
+        omp.nonWinners,
+        "the rejected candidates are exactly the non-winning legs",
+      );
     });
   }
 });
