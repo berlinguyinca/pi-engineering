@@ -1,0 +1,41 @@
+# Skills adoption decisions (spec 07)
+
+PE @ `1294390c2a3eb91df4ec3182e143f60c1cd135e1` (base of `feat/omp-skills-adoption`). OMP upstream @ `57263720c818ab3baaeb74bf415b03592b806ae0`, real `omp/18.20.0` run under bun 1.4.4. Evidence for every behavioral claim is a passing real-OMP test in `test/integration/omp-skills.test.ts` (gated: skipped with `UNVERIFIED: OMP_BIN not set`) or a unit test; see `skills-benchmarks.md` for the experiments. Verdict vocabulary: ADOPT AS-IS / ADAPT / UPSTREAM / KEEP CUSTOM / REJECT / DEFER. Not measured: UNKNOWN.
+
+## Binding constraints (not reopened here)
+OMP owns discovery, loading, precedence, registry, lockfile. Auto-learn stays OFF. Worker sessions stay skill-less (`src/workers/PiWorkerExecutor.ts:206-214`); packs reach only the operator session. No untrusted script execution, no network auto-install, no blind copying of upstream skill files.
+
+## Decisions
+
+| # | Candidate | Source | Verdict | Behavioral evidence |
+|---|---|---|---|---|
+| 1 | `semantic-compression` skill | `.omp/skills/semantic-compression/SKILL.md` (blob 299a0b137fbf) | **DEFER** (was ADAPT) | Exp A: a deterministic, invariant-preserving telegraphic pass over all 12 worker roles x2 variants saves only 3.9% of approximate tokens (6046 -> 5811) with 0 of 145 invariants lost. A model-driven compression (what the skill does) was NOT evaluated: no local model, UNVERIFIED. Payoff does not justify touching safety prompts. Re-open if a local model appears. |
+| 2 | `system-prompts` skill (+ `small-models.md`) | `.omp/skills/system-prompts/` (blobs 6f50656dcb3c, c055a5b9839f) | **ADAPT** as reading reference only | Style guidance, no code. Not loaded into any PE session. Reject its anti-budget tone pattern (conflicts with `AGENTS.md` Context Discipline). Do not add its tag conventions to PE prompts: would force re-baselining `review-citation-gate` / worker prompt tests for no measured gain. |
+| 3 | `tool-prompt-optimization` skill + `scripts/probe*.ts` | `.omp/skills/tool-prompt-optimization/` (blobs 6b1e25496b91, 34b59466f4ec, 4798be3f7a3c) | **DEFER** | Scripts need OMP monorepo packages and paid provider keys; never executed here. PE has 8 `defineTool` tools (`src/tools/coreTools.ts`) with 2283 chars of description in total (about 570 tokens); trimming cannot pay back. Ablation UNVERIFIED (Exp B). |
+| 4 | OMP skill discovery/precedence/collisions | `src/extensibility/skills.ts`, `src/discovery/*` | **UPSTREAM / ADOPT AS-IS** | Exp D/E tests: native(100) > skillshare(95) > extension package(90) > claude(80) > agents; the loser is namespaced (`claude/dup`, `agents/dup`, `pe-operator/pe-operator`), never dropped. PE reimplements none of it. |
+| 5 | Skillshare registry + `skills.lock.json` | `src/skillshare/*`, `src/discovery/skillshare.ts` | **UPSTREAM / ADOPT AS-IS** for third-party packs; **not used for PE content** | Locked store loads with no network; integrity mismatch is refused (not loaded, no error); rollback = re-pin older locked version. Gap found: load compares only the `.skillshare-integrity` marker with the lock, unpacked files are not re-hashed (test asserts the tampered text still loads). Registry host `skills.omp.sh` content: UNKNOWN. No PE-side network install path exists or was added. |
+| 6 | Auto-learn / `manage_skill` / `learn` | `src/autolearn/*`, `src/tools/manage-skill.ts` | **DEFER; keep OFF** | Exp C: default off; user `config.yml` OR a cloned repo's `.omp/config.yml` flips it on (`manage_skill` appears in the system prompt); a per-run `--config overlay.yml` with `autolearn.enabled: false` beats both. Managed skills are discovered even when off (priority 5, lose to authored). |
+| 7 | PE-authored `pe-operator` skill in an extension package root | `skill-packs/pe-operator/` | **ADOPT (new, PE-owned)** | Real OMP loads it via `-e <pack>`, lists it in the model-visible prompt `<skills>` block, does not load it without `-e`, ranks it above a same-named project `.claude` skill. Spec item 5 answer: yes, `skills/<name>/SKILL.md` in an extension package root suffices; no copy of upstream files, version-pinned. |
+| 8 | PE `AGENTS.md`, `rolePrompts.ts`, `workers/prompts.ts`, planner/vision/compaction prompts, ~40 slash commands | PE tree | **KEEP CUSTOM** | No tracked PE skills to dedupe; no `/skill:` vs PE command collision. |
+| 9 | Upstream test fixtures (20 SKILL.md), docs examples | `test/fixtures/skills*`, `docs/skills/examples` | **REJECT** | Not skills. |
+| 10 | Private/user/registry/marketplace/MCP-advertised skills | n/a | **DEFER (UNKNOWN)** | Not inspected (no authorization); not ABSENT. |
+| 11 | Worker-session skill access | `PiWorkerExecutor.ts:206-214` | **KEEP (firewall unchanged)** | A unit test now pins the empty `getSkills` and that the pack is not in `pi.extensions`. |
+
+## The PE skill pack and its lock
+- Path: `skill-packs/pe-operator/` (own `package.json`, `skills/pe-operator/SKILL.md`). It is an OMP extension package root. It is not under `pi.extensions`, has no `pi`/`omp` key, and nothing in PE loads it. Opt in: `omp -e skill-packs/pe-operator` or the `extensions:` setting. Operator-facing content only (/engineer, /plan, /execute, /verify, /review, /ledger and the evidence/worktree/PR rules). It ships no scripts (a unit test fails if a script-like file appears).
+- `skills.lock.json`: OMP's own lock schema (`version: 1`, `skills[id] = {version, integrity, resolved}`), id `@pi_engineering/pe-operator`, integrity `sha512-yYp4e3Mq/x99EYy4RhVqPc5OiIN5QmETyfra9GYFChORLmUnCxbIikHThf6yDnyoPMMg+sjEA+KTwiLHfEqXNg==` taken from OMP's own `omp skill publish <dir> --dry-run` (deterministic across runs). `resolved` is empty: the pack is not published. The gated test recomputes it with the real OMP.
+- `pack.manifest.json`: PE-side per-file sha256 + sha512 digests, checked by `verifyPack` (`src/skillpack/verify.ts`) in a CI unit test that also checks version agreement across `package.json`, SKILL.md `metadata.version` and the lock. Regenerate after an intentional edit with `node scripts/skillpack-manifest.ts`, then re-run `omp skill publish skills/pe-operator --dry-run` and update the lock integrity.
+- Placing `skills.lock.json` in the pack root is inert for OMP (it reads locks only from `<project>/.omp/` and the agent dir).
+
+## Rollback
+1. Pack content: `git revert` the commit that changed `skill-packs/pe-operator/`; the CI test re-verifies digests.
+2. Stop using the pack: remove `-e skill-packs/pe-operator` / the `extensions:` entry. Nothing else references it.
+3. Registry-installed (third-party) packs: re-pin the previous exact version in `.omp/skills.json`, restore the previous `.omp/skills.lock.json` from git, run `omp skill update` (online) or rely on the still-present store entry (offline; test proves older locked version loads). OMP has no dedicated rollback command (confirmed from source; not found in `omp skill --help` actions).
+4. Experiment code (`src/skillpack`, `src/promptcompress`, scripts, tests) is not imported by any runtime path; deleting it cannot change behavior. Production prompts were not changed.
+5. Auto-learn: if ever enabled by mistake, delete `~/.omp/agent/managed-skills/*` and set `autolearn.enabled: false`.
+
+## Needs a user decision (not made here)
+- Whether PE's future OMP launch should always pass `--config <overlay with autolearn.enabled: false>` (tested to override user and project config). Today `src/omp/negotiate.ts` passes only `--mode rpc --no-session`, so "off" relies on OMP's default plus the user's own config. Phase 3 area, so not edited.
+- Whether `~/.omp/agent/managed-skills` and project-level foreign skill dirs (`.claude/.agents/.codex/.github` in a cloned repo load by default) should be suppressed for the operator session (e.g. `--no-skills` plus explicit `-e`).
+- Whether any pack should ever reach worker sessions (would change the context firewall).
+- Registry-signing and whether to re-hash store contents at load: UNKNOWN upstream behavior; consider an upstream issue.
