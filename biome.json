@@ -11,7 +11,8 @@
       "docs/specs/harness-reliability-bootstrap-20261103/**",
       "test/fixtures/backpressure-conformance-v1.json",
       "test/fixtures/mission-snapshot-v4.golden.json",
-      "test/fixtures/mission-snapshot-v3-legacy.json"
+      "test/fixtures/mission-snapshot-v3-legacy.json",
+      "test/fixtures/legacy-golden"
     ]
   },
   "formatter": {
