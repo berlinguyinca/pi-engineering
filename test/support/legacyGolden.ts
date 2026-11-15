@@ -17,7 +17,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { appendFile, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -46,7 +46,14 @@ import {
   parseLedger,
   stableStringify,
 } from "./ledgerNormalizer.ts";
-import { type EngineerScript, engineerModelScript, realOmpEnv, startOfflineOmp } from "./ompOffline.ts";
+import {
+  type EngineerScript,
+  engineerModelScript,
+  offlineEnv,
+  realOmpEnv,
+  startOfflineOmp,
+  writeOfflineHome,
+} from "./ompOffline.ts";
 
 const exec = promisify(execFile);
 
@@ -113,7 +120,12 @@ export interface ParityPath {
   /** Register the slash commands on a pi host and return them with a way to shut the host down. */
   loadCommandHost(): CommandHost;
   /** A reason this path cannot run `s` (the test is then skipped and the reason printed), or false. */
-  skipReason?(s: Pick<Scenario, "command" | "scenario" | "scripted">): string | false;
+  skipReason?(s: Pick<Scenario, "command" | "scenario">): string | false;
+  /**
+   * Explicit, printed exemptions from "this path runs the scenario end to end": `command / scenario` mapped to the
+   * justification. An exemption never loosens the byte comparison; it states what the run does NOT exercise.
+   */
+  readonly exemptions?: Readonly<Record<string, string>>;
 }
 
 type CommandHandler = (args: string, ctx: unknown) => Promise<void> | void;
@@ -191,17 +203,18 @@ export const legacyPath: ParityPath = {
 };
 
 /**
- * The OMP-backed path (Phase 3 slice). `/engineer` workers run on a REAL omp process
- * (`PI_ENGINEERING_OMP_WORKER=1`) talking to a local scripted OpenAI-compatible model
- * with an isolated HOME. Everything else (ledger, verifier, missions, commands) is the
- * legacy implementation, so only `engineer` scenarios carry a `script` and run here.
+ * The OMP-backed path. Every worker role (scout, planner, implementer, reviewer) runs on a REAL omp
+ * process (`PI_ENGINEERING_OMP_WORKER=1`) talking to a local scripted OpenAI-compatible model with an
+ * isolated HOME; the scenario's `script` is the declarative stand-in for the FakeWorkerExecutor handlers.
+ * The ledger, verifier and orchestrator are the shared implementation, so the same table and the same
+ * goldens decide equivalence. Scenarios that never reach a worker (verify, cmd-*, mission) open the runtime
+ * under the same flags to prove the flag does not disturb them.
  */
 export const ompPath: ParityPath = {
   ...legacyPath,
   name: "omp",
   openRuntime: async (opts) => {
-    if (!opts.script) throw new Error("the omp path needs a scripted scenario");
-    const offline = await startOfflineOmp(engineerModelScript(opts.script));
+    const offline = await startOfflineOmp(engineerModelScript(opts.script ?? {}));
     try {
       const picked = await selectOmpWorker(
         () => ({
@@ -230,10 +243,55 @@ export const ompPath: ParityPath = {
       throw error;
     }
   },
-  skipReason: (s) => {
-    if (!realOmpEnv()) return "UNVERIFIED: OMP_BIN not set";
-    return s.scripted ? false : `omp path covers /engineer only; ${s.command} / ${s.scenario} runs on the legacy path`;
+  loadCommandHost: () => {
+    // The extension opens its runtime itself, so the production selection reads process.env: set the flags for
+    // the host's lifetime (an isolated HOME, no model server: these commands never call a model).
+    const real = realOmpEnv();
+    if (!real) return legacyCommandHost();
+    const home = mkdtempSync(join(tmpdir(), "pe-omp-cmd-home-"));
+    writeOfflineHome(home, "http://127.0.0.1:9");
+    const env = offlineEnv(home, real);
+    const keys = Object.keys(env).filter((k) => env[k] !== process.env[k]);
+    const before = new Map(keys.map((k) => [k, process.env[k]]));
+    for (const k of keys) process.env[k] = env[k];
+    const host = legacyCommandHost();
+    return {
+      commands: host.commands,
+      shutdown: async (ctx) => {
+        try {
+          await host.shutdown(ctx);
+        } finally {
+          for (const [k, v] of before) {
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+          }
+          rmSync(home, { recursive: true, force: true });
+        }
+      },
+    };
   },
+  skipReason: () => (realOmpEnv() ? false : "UNVERIFIED: OMP_BIN not set"),
+  exemptions: Object.fromEntries([
+    ...[
+      "complete",
+      "findings-repair-blocked",
+      "validation-fail-then-pass",
+      "block-then-resume",
+      "restart-restores-state",
+    ].map((name) => [
+      `mission / ${name}`,
+      "pass-through: the mission goldens drive the orchestrator with stub BrokerBackends that never reach a WorkerExecutor, so no omp process runs a worker; the production worker path (realBackends -> rt.worker) is covered by test/integration/omp-mission-backends.test.ts",
+    ]),
+    ...["green", "red"].map((name) => [
+      `verify / ${name}`,
+      "pass-through: the verifier runs real commands; no worker is involved, the runtime is opened under the omp flags to prove they do not disturb it",
+    ]),
+    ["plan / unknown-plan", "pass-through: fails before any worker runs"],
+    ["cmd-review / no-work-item", "pass-through: the command stops before any worker runs"],
+    ["cmd-review / no-candidate", "pass-through: the command stops before any worker runs"],
+    ["cmd-execute / unknown-plan", "pass-through: the command stops before any worker runs"],
+    ["cmd-engineer / missing-goal", "pass-through: the command stops before any worker runs"],
+  ]),
 };
 
 /** Paths selectable with PARITY_PATH. Another implementation registers itself here. */
@@ -250,8 +308,6 @@ export function resolvePath(name: string | undefined): ParityPath {
 export interface Scenario {
   command: string;
   scenario: string;
-  /** True when the scenario hands paths a declarative model script (so a model-backed path can run it). */
-  scripted?: boolean;
   /** Returns the scenario-specific part of the record. `norm` is shared across the whole record. */
   run(path: ParityPath, norm: Normalizer, roots: string[]): Promise<Record<string, JsonValue>>;
 }
@@ -406,7 +462,6 @@ function engineerScenario(
   return {
     command: "engineer",
     scenario,
-    scripted: true,
     async run(path, norm) {
       return withFixture(norm, {}, async (fx) => {
         const rt = await path.openRuntime({
@@ -467,6 +522,7 @@ function engineerScenarios(): Scenario[] {
 }
 
 function reviewScenario(scenario: string, findings: unknown[]): Scenario {
+  const summary = findings.length ? "changes required" : "approved";
   return {
     command: "review",
     scenario,
@@ -475,11 +531,15 @@ function reviewScenario(scenario: string, findings: unknown[]): Scenario {
         const worker = new FakeWorkerExecutor({
           reviewer: () => ({
             status: "completed",
-            summary: findings.length ? "changes required" : "approved",
+            summary,
             details: { findings },
           }),
         });
-        const rt = await path.openRuntime({ cwd: fx.root, worker });
+        const rt = await path.openRuntime({
+          cwd: fx.root,
+          worker,
+          script: { review: () => ({ findings, summary }) },
+        });
         try {
           const ledger = path.ledgerOf(rt);
           const wi = await ledger.createWorkItem("review target", "medium", [fx.root], { type: "system" });
@@ -574,6 +634,17 @@ async function implBoom(req: { cwd: string }) {
   return { status: "completed" as const, summary: "implemented", details: {} };
 }
 
+const SUBTRACT_OK = "export function subtract(a, b) {\n  return a - b;\n}\n";
+const ADD_BOOM = 'export function add(a, b) {\n  throw new Error("boom");\n}\n';
+
+/** Script twin of {@link implAddOrSubtract}. */
+const scriptAddOrSubtract: EngineerScript["implement"] = (_run, task) => {
+  const body = task.toLowerCase();
+  if (body.includes("subtract")) return { path: "src/subtract.js", content: SUBTRACT_OK };
+  if (body.includes("add")) return { path: "src/add.js", content: ADD_OK };
+  return undefined;
+};
+
 type PlanRt = EngineeringRuntime;
 
 function taskSummary(ledger: LedgerAccess, planId: string, norm: Normalizer): JsonValue {
@@ -591,6 +662,7 @@ function taskSummary(ledger: LedgerAccess, planId: string, norm: Normalizer): Js
 function planScenario(
   scenario: string,
   build: () => FakeWorkerExecutor,
+  script: EngineerScript,
   drive: (rt: PlanRt, ledger: LedgerAccess, norm: Normalizer) => Promise<Record<string, JsonValue>>,
 ): Scenario {
   return {
@@ -598,7 +670,7 @@ function planScenario(
     scenario,
     async run(path, norm) {
       return withFixture(norm, {}, async (fx) => {
-        const rt = await path.openRuntime({ cwd: fx.root, worker: build() });
+        const rt = await path.openRuntime({ cwd: fx.root, worker: build(), script });
         try {
           const body = await drive(rt, path.ledgerOf(rt), norm);
           return { ...body, ledger: await eventSequence(path, fx.root, norm) };
@@ -615,10 +687,17 @@ function planScenarios(): Scenario[] {
     planTask("implement add to return the sum", "src/add.js"),
     planTask("implement subtract to return the difference", "src/subtract.js", [0]),
   ];
+  const addThenSubtract = [
+    planTask("implement add", "src/add.js"),
+    planTask("implement subtract", "src/subtract.js", [0]),
+  ];
+  const oneAdd = [planTask("implement add", "src/add.js")];
+  const twelveTasks = Array.from({ length: 12 }, (_, i) => planTask(`task ${i}`, `src/t${i}.js`, [999]));
   return [
     planScenario(
       "happy",
       () => planWorker(twoTasks, implAddOrSubtract),
+      { planner: twoTasks, implement: scriptAddOrSubtract },
       async (rt, ledger, norm) => {
         const plan = await rt.plan("Build a small math module with add and subtract");
         const dag = await rt.executePlan(plan.plan_work_item.id);
@@ -633,11 +712,8 @@ function planScenarios(): Scenario[] {
     ),
     planScenario(
       "blocked-downstream",
-      () =>
-        planWorker(
-          [planTask("implement add", "src/add.js"), planTask("implement subtract", "src/subtract.js", [0])],
-          implBoom,
-        ),
+      () => planWorker(addThenSubtract, implBoom),
+      { planner: addThenSubtract, implement: () => ({ path: "src/add.js", content: ADD_BOOM }) },
       async (rt, ledger, norm) => {
         const plan = await rt.plan("Build add then subtract");
         const dag = await rt.executePlan(plan.plan_work_item.id);
@@ -650,9 +726,8 @@ function planScenarios(): Scenario[] {
     ),
     planScenario(
       "idempotent-rerun",
-      () => {
-        return planWorker([planTask("implement add", "src/add.js")], implAddOrSubtract);
-      },
+      () => planWorker(oneAdd, implAddOrSubtract),
+      { planner: oneAdd, implement: scriptAddOrSubtract },
       async (rt, ledger, norm) => {
         const plan = await rt.plan("add");
         const first = await rt.executePlan(plan.plan_work_item.id);
@@ -672,11 +747,8 @@ function planScenarios(): Scenario[] {
     ),
     planScenario(
       "invalid-deps",
-      () =>
-        planWorker(
-          Array.from({ length: 12 }, (_, i) => planTask(`task ${i}`, `src/t${i}.js`, [999])),
-          implAddOrSubtract,
-        ),
+      () => planWorker(twelveTasks, implAddOrSubtract),
+      { planner: twelveTasks, implement: scriptAddOrSubtract },
       async (rt, ledger, norm) => {
         const plan = await rt.plan("big goal");
         return {
@@ -691,6 +763,7 @@ function planScenarios(): Scenario[] {
     planScenario(
       "unknown-plan",
       () => new FakeWorkerExecutor({}),
+      {},
       async (rt) => {
         let error = "";
         try {
@@ -706,13 +779,18 @@ function planScenarios(): Scenario[] {
 
 type TournamentRt = Awaited<ReturnType<EngineeringRuntime["tournament"]>>;
 
-function tournamentScenario(scenario: string, n: number, worker: () => FakeWorkerExecutor): Scenario {
+function tournamentScenario(
+  scenario: string,
+  n: number,
+  worker: () => FakeWorkerExecutor,
+  script: EngineerScript,
+): Scenario {
   return {
     command: "tournament",
     scenario,
     async run(path, norm) {
       return withFixture(norm, {}, async (fx) => {
-        const rt = await path.openRuntime({ cwd: fx.root, worker: worker() });
+        const rt = await path.openRuntime({ cwd: fx.root, worker: worker(), script });
         try {
           const report: TournamentRt = await rt.tournament(GOAL, { n });
           return {
@@ -743,28 +821,35 @@ function tournamentScenario(scenario: string, n: number, worker: () => FakeWorke
 }
 
 function tournamentScenarios(): Scenario[] {
+  const NOISE = [{ severity: "high", claim: "unnecessary +0 noise", evidence: "diff://src/add.js" }];
+  const ADD_NOISY = "export function add(a, b) {\n  return a + b + 0;\n}\n";
+  const leg3 = (n: number): string => (n === 1 ? ADD_OK : n === 2 ? ADD_BAD : ADD_NOISY);
+  const leg2 = (n: number): string => (n === 1 ? ADD_BAD : ADD_OK);
   return [
-    tournamentScenario("serial-n3-winner", 3, () => {
-      const rev = reviewWith((n) =>
-        n === 2 ? [{ severity: "high", claim: "unnecessary +0 noise", evidence: "diff://src/add.js" }] : [],
-      );
-      return new FakeWorkerExecutor({
-        scout: scoutOk,
-        implementer: implementer((n) =>
-          n === 1 ? ADD_OK : n === 2 ? ADD_BAD : "export function add(a, b) {\n  return a + b + 0;\n}\n",
-        ),
-        reviewer: rev,
-      });
-    }),
+    tournamentScenario(
+      "serial-n3-winner",
+      3,
+      () =>
+        new FakeWorkerExecutor({
+          scout: scoutOk,
+          implementer: implementer(leg3),
+          reviewer: reviewWith((n) => (n === 2 ? NOISE : [])),
+        }),
+      {
+        implement: (run) => ({ path: "src/add.js", content: leg3(run) }),
+        review: (n) => ({ findings: n === 2 ? NOISE : [] }),
+      },
+    ),
     tournamentScenario(
       "failing-leg",
       2,
       () =>
         new FakeWorkerExecutor({
           scout: scoutOk,
-          implementer: implementer((n) => (n === 1 ? ADD_BAD : ADD_OK)),
+          implementer: implementer(leg2),
           reviewer: reviewWith(() => []),
         }),
+      { implement: (run) => ({ path: "src/add.js", content: leg2(run) }) },
     ),
   ];
 }
@@ -984,14 +1069,15 @@ function recoveryScenarios(): Scenario[] {
               implementer: implementer(ADD_OK),
               reviewer: reviewWith(() => []),
             });
-          const first = await path.openRuntime({ cwd: fx.root, worker: worker() });
+          const script: EngineerScript = { implement: ADD_OK };
+          const first = await path.openRuntime({ cwd: fx.root, worker: worker(), script });
           const report = await first.engineer(GOAL);
           const eventsBefore = path.ledgerOf(first).count();
           await first.close();
 
           await path.tearLedgerTail(fx.root);
 
-          const second = await path.openRuntime({ cwd: fx.root, worker: worker() });
+          const second = await path.openRuntime({ cwd: fx.root, worker: worker(), script });
           try {
             const ledger = path.ledgerOf(second);
             const eventsAfterReopen = ledger.count();
@@ -1098,6 +1184,9 @@ export function runParity(path: ParityPath): void {
   if (update && path.name !== legacyPath.name) {
     throw new Error(`UPDATE_GOLDEN=1 only regenerates from the legacy path, not "${path.name}"`);
   }
+  for (const [scenario, why] of Object.entries(path.exemptions ?? {})) {
+    process.stdout.write(`# ${path.name} path exemption: ${scenario}: ${why}\n`);
+  }
   describe(`legacy golden outputs (parity gate, ${path.name} path)`, () => {
     for (const s of scenarios) {
       const skip = path.skipReason?.(s) || false;
@@ -1116,6 +1205,11 @@ export function runParity(path: ParityPath): void {
         );
       });
     }
+
+    it("every printed exemption names a real scenario", () => {
+      const known = new Set(scenarios.map((s) => `${s.command} / ${s.scenario}`));
+      for (const key of Object.keys(path.exemptions ?? {})) assert.ok(known.has(key), `unknown exemption ${key}`);
+    });
 
     it("has a unique golden file per scenario", () => {
       const names = scenarios.map(goldenName);
