@@ -24,6 +24,7 @@ import {
   type VerifyOutcome,
   type VerifyRunOptions,
 } from "../../src/verify/Verifier.ts";
+import { subtractBaselineFailures } from "../../src/verify/baselineSubtraction.ts";
 
 const sh = (cwd: string, ...args: string[]): string =>
   execFileSync("git", ["-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", ...args], {
@@ -39,6 +40,7 @@ const failing = (name: string) =>
 class CountingVerifier implements VerificationProvider {
   readonly inner = new CommandVerifier();
   baseRuns = 0;
+  readonly baseCwds: string[] = [];
   allRuns = 0;
   detect(cwd: string, opts?: { full?: boolean }): Promise<VerificationProfile> {
     return this.inner.detect(cwd, opts);
@@ -50,7 +52,10 @@ class CountingVerifier implements VerificationProvider {
     opts?: VerifyRunOptions,
   ): Promise<VerifyOutcome> {
     this.allRuns++;
-    if (cwd.includes("pi-eng-baseline-")) this.baseRuns++;
+    if (cwd.includes("pi-eng-baseline-")) {
+      this.baseRuns++;
+      if (!this.baseCwds.includes(cwd)) this.baseCwds.push(cwd);
+    }
     return this.inner.run(cwd, profile, store, opts);
   }
 }
@@ -401,6 +406,39 @@ describe("baseline subtraction hardening (#200 review)", () => {
       assert.deepEqual(a.inheritedFailures, b.inheritedFailures);
       assert.equal(fx.verifier.baseRuns, 2, "one baseline (2 confirming runs) for both callers");
     } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("baseline worktrees computed in the same millisecond never share a name", async () => {
+    // A baseline worktree was named from Date.now() + pid; two computations in one process and one
+    // millisecond (separate GitRepo instances) asked createWorktree for the same path.
+    const fx = await fixture(RED);
+    const realNow = Date.now;
+    try {
+      const profile = await fx.verifier.detect(fx.root);
+      const outcome = await fx.verifier.run(fx.root, profile, await ArtifactStore.create(join(fx.root, "..", "a0")));
+      assert.equal(outcome.passed, false);
+      const frozen = realNow();
+      Date.now = () => frozen;
+      const cacheDir = join(await fx.git.commonDir(), "pi-engineering-baselines");
+      for (const git of [fx.git, (await GitRepo.open(fx.root))!]) {
+        await rm(cacheDir, { recursive: true, force: true });
+        const judged = await subtractBaselineFailures({
+          git,
+          verifier: fx.verifier,
+          artifacts: await ArtifactStore.create(join(fx.root, "..", `a-${fx.verifier.baseCwds.length}`)),
+          baseSha: fx.baseSha,
+          cwd: fx.root,
+          profile,
+          outcome,
+        });
+        assert.equal(judged.passed, true, judged.warnings.join("; "));
+      }
+      Date.now = realNow;
+      assert.equal(fx.verifier.baseCwds.length, 2, String(fx.verifier.baseCwds));
+    } finally {
+      Date.now = realNow;
       await fx.cleanup();
     }
   });

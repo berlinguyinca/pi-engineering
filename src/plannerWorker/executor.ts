@@ -19,7 +19,7 @@
  * model disappearing never loses the mission.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { lstat, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { WorkerRole } from "../core/types.ts";
@@ -1315,7 +1315,7 @@ export class PlannerWorkerExecutor {
       const head = (await checkedGit(this.integration.path, ["rev-parse", "HEAD"])).stdout.trim();
       reviewTree = await this.repo.createWorktree(
         head,
-        this.branchFor(`batch-review-${ids.join("-")}-${Date.now().toString(36)}`),
+        this.branchFor(`batch-review-${ids.join("-")}-${Date.now().toString(36)}${randomBytes(3).toString("hex")}`),
       );
       for (const rt of batch) {
         const merged = await git(reviewTree.path, [
