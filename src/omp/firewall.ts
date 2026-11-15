@@ -44,6 +44,40 @@ bash:
     enabled: false
 `;
 
+/**
+ * Capability providers that could contribute skills from outside an explicitly loaded pack. Only `omp-plugins`
+ * (extension-bundled `skills/`, reachable solely through `-e` because `--no-extensions` makes the roots
+ * explicit-only) stays enabled in the worker-skills overlay.
+ */
+const SKILL_PROVIDERS_OFF = [
+  "omp-managed",
+  "native",
+  "skillshare",
+  "claude",
+  "claude-plugins",
+  "agent-plugins",
+  "agents",
+  "codex",
+  "opencode",
+  "github",
+  "cursor",
+  "gemini",
+  "windsurf",
+];
+
+/**
+ * Overlay for a worker granted verified skill packs: identical to {@link OMP_FIREWALL_OVERLAY_YML} except
+ * `skills.enabled` is true, every other skill provider is disabled, and no custom skill directories apply.
+ * Slash commands for skills, auto-learn and memory stay off.
+ */
+export const OMP_FIREWALL_SKILLS_OVERLAY_YML = OMP_FIREWALL_OVERLAY_YML.replace(
+  "skills:\n  enabled: false\n",
+  "skills:\n  enabled: true\n  customDirectories: []\n",
+).replace(
+  "disabledProviders:\n  - omp-managed\n",
+  `disabledProviders:\n${SKILL_PROVIDERS_OFF.map((p) => `  - ${p}`).join("\n")}\n`,
+);
+
 /** Flags that accompany the overlay: discovery off on the command line too. */
 export const OMP_FIREWALL_FLAGS: readonly string[] = [
   "--no-skills",
@@ -61,7 +95,7 @@ export function defaultFirewallDir(env: NodeJS.ProcessEnv = process.env): string
   return join(state, "omp-firewall");
 }
 
-function assertPrivateDir(dir: string): void {
+export function assertPrivateDir(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const st = lstatSync(dir);
   const uid = process.getuid?.();
@@ -76,24 +110,38 @@ function assertPrivateDir(dir: string): void {
  * {@link OMP_FIREWALL_OVERLAY_YML} right now: a missing, planted, stale or truncated
  * file is replaced atomically (temp file + rename) before use.
  */
-export function ensureFirewallOverlay(dir: string = defaultFirewallDir()): string {
+export function ensureFirewallOverlay(
+  dir: string = defaultFirewallDir(),
+  content: string = OMP_FIREWALL_OVERLAY_YML,
+  name = "firewall.yml",
+): string {
   assertPrivateDir(dir);
-  const file = join(dir, "firewall.yml");
+  const file = join(dir, name);
   let current: string | undefined;
   try {
     current = readFileSync(file, "utf8");
   } catch {
     current = undefined;
   }
-  if (current !== OMP_FIREWALL_OVERLAY_YML) {
+  if (current !== content) {
     const tmp = join(dir, `.firewall.${process.pid}.${Date.now()}.tmp`);
-    writeFileSync(tmp, OMP_FIREWALL_OVERLAY_YML, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    writeFileSync(tmp, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
     renameSync(tmp, file);
   }
   return file;
 }
 
-/** `--config <overlay>` plus the firewall flags, for every omp process PE launches. */
-export function firewallArgs(dir?: string): string[] {
-  return ["--config", ensureFirewallOverlay(dir), ...OMP_FIREWALL_FLAGS];
+/**
+ * `--config <overlay>` plus the firewall flags, for every omp process PE launches. With `skillPackDirs` (verified,
+ * staged packs; see src/skillpack/workerPacks.ts) the skills overlay is used, `--no-skills` is dropped and each
+ * pack is loaded with `-e`. `--no-extensions` stays, which makes the `-e` roots the only extension roots.
+ */
+export function firewallArgs(dir?: string, skillPackDirs: readonly string[] = []): string[] {
+  if (skillPackDirs.length === 0) return ["--config", ensureFirewallOverlay(dir), ...OMP_FIREWALL_FLAGS];
+  return [
+    "--config",
+    ensureFirewallOverlay(dir, OMP_FIREWALL_SKILLS_OVERLAY_YML, "firewall-skills.yml"),
+    ...OMP_FIREWALL_FLAGS.filter((flag) => flag !== "--no-skills"),
+    ...skillPackDirs.flatMap((pack) => ["-e", pack]),
+  ];
 }
