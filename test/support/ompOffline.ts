@@ -57,13 +57,9 @@ export function writeOfflineHome(home: string, baseUrl: string): void {
   );
 }
 
-export async function startOfflineOmp(script: ModelScript): Promise<OfflineOmp> {
-  const real = realOmpEnv();
-  if (!real) throw new Error("startOfflineOmp requires OMP_BIN");
-  const server = await startScriptedModel(script);
-  const home = mkdtempSync(join(tmpdir(), "pe-omp-home-"));
-  writeOfflineHome(home, server.baseUrl);
-  const env: NodeJS.ProcessEnv = {
+/** Environment for PE's omp flags: worker + adapter on, the real binary, an isolated HOME, the offline model. */
+export function offlineEnv(home: string, real: { bin: string; args: string }): NodeJS.ProcessEnv {
+  return {
     ...process.env,
     PI_ENGINEERING_OMP_WORKER: "1",
     PI_ENGINEERING_OMP_ADAPTER: "1",
@@ -76,6 +72,15 @@ export async function startOfflineOmp(script: ModelScript): Promise<OfflineOmp> 
     PI_CODING_AGENT_DIR: join(home, ".omp", "agent"),
     PI_AGENT_DIR: join(home, ".omp", "agent"),
   };
+}
+
+export async function startOfflineOmp(script: ModelScript): Promise<OfflineOmp> {
+  const real = realOmpEnv();
+  if (!real) throw new Error("startOfflineOmp requires OMP_BIN");
+  const server = await startScriptedModel(script);
+  const home = mkdtempSync(join(tmpdir(), "pe-omp-home-"));
+  writeOfflineHome(home, server.baseUrl);
+  const env = offlineEnv(home, real);
   return {
     server,
     home,
@@ -87,34 +92,74 @@ export async function startOfflineOmp(script: ModelScript): Promise<OfflineOmp> 
   };
 }
 
-/** What the scripted model does for the engineer scenarios (a declarative stand-in for FakeWorkerExecutor handlers). */
+/** One file an implementer run writes. */
+export interface ImplementWrite {
+  readonly path: string;
+  readonly content: string;
+}
+
+export interface ReviewVerdict {
+  readonly findings: readonly unknown[];
+  /** Reviewer summary; defaults to "material findings" / "clean". */
+  readonly summary?: string;
+}
+
+/**
+ * What the scripted model does, a declarative stand-in for FakeWorkerExecutor handlers.
+ * Every field is optional: a scenario that never runs a worker passes `{}`.
+ */
 export interface EngineerScript {
-  /** File content the implementer writes to src/add.js. */
-  readonly implement: string;
-  /** Reviewer verdict for review round `n` (1-based): findings, or "fail" for a review that does not complete. */
-  readonly review: (n: number) => { findings: unknown[] } | "fail";
+  /**
+   * What each implementer run writes: file content for src/add.js, or a function of the
+   * implementer run number (1-based, across the whole runtime) and the task text. `undefined` writes nothing.
+   */
+  readonly implement?: string | ((run: number, task: string) => ImplementWrite | undefined);
+  /** Reviewer verdict for review round `n` (1-based): findings, or "fail" for a review that does not complete. Default: clean. */
+  readonly review?: (n: number) => ReviewVerdict | "fail";
+  /** The tasks the planner proposes (the `details.tasks` of its result). */
+  readonly planner?: readonly unknown[];
 }
 
 const roleOf = (turn: ScriptTurn): string => /# Role: (\w+)/.exec(turn.system)?.[1] ?? "unknown";
 
-/** Role-aware script: scout/implementer/reviewer each end by calling the terminating host tool. */
+/** The "## Task" section of a worker system prompt (up to the next "## " heading). */
+export const taskOf = (turn: ScriptTurn): string => {
+  const after = turn.system.split("## Task\n")[1] ?? "";
+  return after.split("\n## ")[0] ?? "";
+};
+
+const planOf = (spec: EngineerScript, run: number, task: string): ImplementWrite | undefined =>
+  typeof spec.implement === "function"
+    ? spec.implement(run, task)
+    : spec.implement === undefined
+      ? undefined
+      : { path: "src/add.js", content: spec.implement };
+
+/** Role-aware script: every role ends by calling its terminating host tool. */
 export function engineerModelScript(spec: EngineerScript): ModelScript {
   let reviewRound = 0;
+  let implementRun = 0;
+  const writes = new Map<number, ImplementWrite | undefined>();
   const done = (turn: ScriptTurn): boolean =>
     turn.priorCalls.some((c) => c === "worker_result" || c === "review_result");
   return (turn): ScriptReply => {
     if (done(turn)) return { kind: "text", text: "done" };
     const role = roleOf(turn);
-    if (role === "implementer" && !turn.priorCalls.includes("write")) {
-      return { kind: "tool", name: "write", args: { path: "src/add.js", content: spec.implement } };
-    }
     const terminating = turn.toolNames.includes("review_result") ? "review_result" : "worker_result";
     if (role === "implementer") {
+      if (turn.assistantTurns === 0) {
+        implementRun += 1;
+        writes.set(implementRun, planOf(spec, implementRun, taskOf(turn)));
+      }
+      const write = writes.get(implementRun);
+      if (write && !turn.priorCalls.includes("write")) {
+        return { kind: "tool", name: "write", args: { path: write.path, content: write.content } };
+      }
       return { kind: "tool", name: terminating, args: base("completed", "implemented", {}) };
     }
     if (role === "reviewer") {
       reviewRound += 1;
-      const verdict = spec.review(reviewRound);
+      const verdict = spec.review?.(reviewRound) ?? { findings: [] };
       if (verdict === "fail") {
         return {
           kind: "tool",
@@ -125,10 +170,13 @@ export function engineerModelScript(spec: EngineerScript): ModelScript {
       return {
         kind: "tool",
         name: terminating,
-        args: base("completed", verdict.findings.length ? "material findings" : "clean", {
+        args: base("completed", verdict.summary ?? (verdict.findings.length ? "material findings" : "clean"), {
           findings: verdict.findings,
         }),
       };
+    }
+    if (role === "planner") {
+      return { kind: "tool", name: terminating, args: base("completed", "planned", { tasks: spec.planner ?? [] }) };
     }
     return { kind: "tool", name: terminating, args: base("completed", "scouted", {}) };
   };

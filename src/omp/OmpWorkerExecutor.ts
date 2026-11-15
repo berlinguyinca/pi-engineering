@@ -1,11 +1,16 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkerResult } from "../core/types.ts";
+import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
+import { MISSION_DEPTH_ENV, missionDepth } from "../orchestration/missionMode.ts";
+import { PROSE_ROLES, workerContext } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt } from "../workers/prompts.ts";
 import { completedReviewResult } from "../workers/reviewVerdict.ts";
 import { createWorkerResultTool } from "../workers/workerResultTool.ts";
 import { decodeReadyFrame, parseFrameLine } from "./frames.ts";
+import { buildHostTools, isCheckpointTool, toHostToolSpec } from "./hostTools.ts";
 import { terminate } from "./negotiate.ts";
 import { type RpcEvent, RunCollector, buildOmpArgs, ompToolsFor, translateFrame } from "./rpcTranslate.ts";
 import type { OmpLaunchSpec } from "./types.ts";
@@ -60,24 +65,40 @@ type Outcome = { run: WorkerRun } | { unavailable: string };
  */
 export class OmpWorkerExecutor implements WorkerExecutor {
   private readonly opts: OmpWorkerOptions;
+  private customTools: readonly ToolDefinition[] = [];
 
   constructor(opts: OmpWorkerOptions) {
     this.opts = opts;
   }
 
-  run(req: WorkerRequest): Promise<WorkerRun> {
+  /** Bind the runtime's semantic tools (ledger_read, repo_search, ...); same contract as `PiWorkerExecutor.setCustomTools`. */
+  setCustomTools(tools: readonly ToolDefinition[]): void {
+    this.customTools = tools;
+  }
+
+  async run(req: WorkerRequest): Promise<WorkerRun> {
     const terminating =
       req.resultTool === "review_result"
         ? reviewResultTool
         : createWorkerResultTool(
             req.baseRef && MUTATING_ROLES.has(req.role) ? { cwd: req.cwd, baseRef: req.baseRef } : undefined,
           );
-    const { builtin } = ompToolsFor(req.tools);
+    const { tools: hostTools, replaced } = await buildHostTools(req, this.customTools);
+    // A PE replacement (worktree-confined write/edit) is offered as pe_<name>; the omp built-in it replaces stays off.
+    const builtin = ompToolsFor(req.tools.filter((name) => !replaced.has(name))).builtin;
+    const built = buildSystemPrompt(req.role, req.task, workerContext(req), {
+      isolatedWorktree: req.isolatedWorktree,
+    });
     const systemPrompt =
-      req.systemPromptOverride ??
-      buildSystemPrompt(req.role, req.task, req.context, { isolatedWorktree: req.isolatedWorktree });
+      req.systemPromptOverride ?? (PROSE_ROLES.has(req.role) ? built : `${built}\n\n${TOOL_TRANSITION_RULE}`);
     const args = [...this.opts.launch.args, ...buildOmpArgs({ model: this.opts.model, systemPrompt, builtin })];
-    const env = { ...(this.opts.env ?? process.env), ...(this.opts.home ? { HOME: this.opts.home } : {}) };
+    const base = this.opts.env ?? process.env;
+    // Every worker command runs one mission-depth deeper (recursion guard); omp's children inherit it.
+    const env = {
+      ...base,
+      [MISSION_DEPTH_ENV]: String(missionDepth(base) + 1),
+      ...(this.opts.home ? { HOME: this.opts.home } : {}),
+    };
 
     return new Promise<WorkerRun>((resolve, reject) => {
       let child: ChildProcess;
@@ -99,6 +120,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       let buffer = "";
       let done = false;
       let timer: NodeJS.Timeout | undefined;
+      const runAbort = new AbortController();
 
       const send = (frame: unknown): void => {
         child.stdin?.write(`${JSON.stringify(frame)}\n`);
@@ -112,6 +134,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        runAbort.abort();
         req.signal?.removeEventListener("abort", onAbort);
         void terminate(child).then(() => {
           if ("run" in outcome) resolve(outcome.run);
@@ -153,8 +176,11 @@ export class OmpWorkerExecutor implements WorkerExecutor {
         });
       };
 
+      const toolCtx = { cwd: req.cwd } as never;
       const onHostToolCall = async (id: string, toolName: string, toolArgs: unknown): Promise<void> => {
-        if (toolName !== terminating.name) {
+        const isTerminating = toolName === terminating.name;
+        const tool = isTerminating ? terminating : hostTools.get(toolName);
+        if (!tool) {
           send({
             type: "host_tool_result",
             id,
@@ -164,9 +190,23 @@ export class OmpWorkerExecutor implements WorkerExecutor {
           return;
         }
         try {
-          const out = await terminating.execute(id, toolArgs as never, undefined, undefined, undefined as never);
-          structured = out.details;
-          send({ type: "host_tool_result", id, result: { content: out.content, details: out.details } });
+          const out = await tool.execute(id, toolArgs as never, runAbort.signal, undefined, toolCtx);
+          const failed = (out as { isError?: boolean }).isError === true;
+          if (isTerminating) structured = out.details;
+          else if (isCheckpointTool(toolName) && !failed) {
+            req.onActivity?.({
+              kind: "checkpoint",
+              summary: "Checkpoint progress recorded",
+              meaningfulProgress: true,
+              claims: (out.details as { claims?: never } | undefined)?.claims,
+            });
+          }
+          send({
+            type: "host_tool_result",
+            id,
+            ...(failed ? { isError: true } : {}),
+            result: { content: out.content, details: out.details },
+          });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           send({
@@ -189,14 +229,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
           send({
             id: "pe-host-tools",
             type: "set_host_tools",
-            tools: [
-              {
-                name: terminating.name,
-                description: terminating.description,
-                parameters: JSON.parse(JSON.stringify(terminating.parameters)) as unknown,
-                loadMode: "essential",
-              },
-            ],
+            tools: [terminating, ...hostTools.values()].map(toHostToolSpec),
           });
           return;
         }

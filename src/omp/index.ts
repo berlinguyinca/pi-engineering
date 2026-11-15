@@ -8,3 +8,4 @@ export * from "./OmpWorkerExecutor.ts";
 export * from "./rpcTranslate.ts";
 export * from "./selectWorker.ts";
 export * from "./firewall.ts";
+export * from "./hostTools.ts";
