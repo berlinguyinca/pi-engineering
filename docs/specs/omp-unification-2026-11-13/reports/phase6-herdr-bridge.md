@@ -15,7 +15,11 @@ Branch `feat/omp-herdr-bridge`, stacked on `test/omp-parity-suite` (PR #697). De
 
 ## Evidence
 
-See the run results in the final report (3x runs, legacy and `PARITY_PATH=omp` gates, coverage).
+- typecheck 0, biome lint 0.
+- `omp-parity-ui-activity.test.ts` with real omp: 3/3 pass (1 test each).
+- `legacy-golden.test.ts`: 27 pass / 0 fail on legacy and under `PARITY_PATH=omp`.
+- `npm run test:coverage`: 6972 pass, 0 fail; 85.65 / 83.31 / 83.45 (floors 85/83/83).
+- All `omp-*.test.ts` in one process: 53 pass, 1 fail (`omp-worker-lifecycle` "negotiates once per runtime open ..."). It fails identically at the Phase 5 head (3d1fc2d0: 52 pass, 1 fail) when the files run together and passes alone (4/4, twice): a pre-existing concurrency flake, not from this change.
 
 ## Contract limits
 
