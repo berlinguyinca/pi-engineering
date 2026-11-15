@@ -3,6 +3,7 @@ import type { WorkerResult } from "../core/types.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt } from "../workers/prompts.ts";
+import { completedReviewResult } from "../workers/reviewVerdict.ts";
 import { createWorkerResultTool } from "../workers/workerResultTool.ts";
 import { decodeReadyFrame, parseFrameLine } from "./frames.ts";
 import { terminate } from "./negotiate.ts";
@@ -104,7 +105,8 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       };
       const onAbort = (): void => {
         if (phase === "running") send({ type: "abort", id: "pe-abort" });
-        fail("aborted by owner");
+        // The owner asked to stop: never an Unavailable (that would re-run the work on the legacy executor).
+        finish({ run: failedRun("OMP worker failed: aborted by owner") });
       };
       const finish = (outcome: Outcome): void => {
         if (done) return;
@@ -138,12 +140,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       const complete = (status: "completed" | "aborted" | "error", error?: string): void => {
         if (structured !== undefined && structured !== null) {
           const result: WorkerResult =
-            req.resultTool === "review_result"
-              ? emptyResult(
-                  "completed",
-                  String((structured as { summary?: unknown }).summary ?? "").slice(0, 4000) || "Review recorded.",
-                )
-              : (structured as WorkerResult);
+            req.resultTool === "review_result" ? completedReviewResult(structured) : (structured as WorkerResult);
           finish({ run: { result, usage: collector.usage(), toolCalls: collector.toolCalls, structured } });
           return;
         }
@@ -182,6 +179,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       };
 
       const handle = (frame: Record<string, unknown>): void => {
+        if (done) return;
         arm();
         if (phase === "starting" && frame.type === "ready") {
           if (decodeReadyFrame(frame) === null) {

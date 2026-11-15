@@ -59,14 +59,21 @@ export async function selectOmpWorker(
     return { executor: legacy, selection: { path: "legacy", reason: `disabled: ${OMP_ADAPTER_ENV} not enabled` } };
   }
   const model = env[OMP_MODEL_ENV]?.trim() || undefined;
-  const negotiation = await negotiateOmp({ launch: config.launch, timeoutMs: config.timeoutMs, env, model });
+  const home = env[OMP_HOME_ENV]?.trim() || undefined;
+  // Negotiate under the same HOME as the workers: a handshake under another HOME proves nothing about them.
+  const negotiation = await negotiateOmp({
+    launch: config.launch,
+    timeoutMs: config.timeoutMs,
+    env: home ? { ...env, HOME: home } : env,
+    model,
+  });
   if (negotiation.kind === "unavailable") {
     return { executor: legacy, selection: { path: "legacy", reason: `${negotiation.reason}: ${negotiation.detail}` } };
   }
   const omp = new OmpWorkerExecutor({
     launch: config.launch,
     model,
-    home: env[OMP_HOME_ENV]?.trim() || undefined,
+    home,
     env,
   });
   return { executor: new FallbackWorkerExecutor(omp, legacy), selection: { path: "omp" } };

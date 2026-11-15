@@ -91,13 +91,28 @@ describe("OmpWorkerExecutor against a real rpc child replaying captured frames",
     assert.match(run.error ?? "", /aborted by owner/);
   });
 
-  it("an already-aborted signal never runs", async () => {
+  it("an already-aborted signal is an aborted run, not a fallback", async () => {
     const ac = new AbortController();
     ac.abort();
-    const run = await exec("replay")
-      .run(req({ signal: ac.signal }))
-      .catch((e: unknown) => e);
-    assert.ok(run instanceof OmpWorkerUnavailable);
+    const run = await exec("replay").run(req({ signal: ac.signal }));
+    assert.equal(run.result.status, "failed");
+    assert.match(run.error ?? "", /aborted by owner/);
+  });
+
+  it("abort before ready is an aborted run, never Unavailable (no legacy fallback)", async () => {
+    const ac = new AbortController();
+    const pending = exec("hang-before-ready", { startTimeoutMs: 30_000 }).run(req({ signal: ac.signal }));
+    setTimeout(() => ac.abort(), 300);
+    const run = await pending;
+    assert.equal(run.result.status, "failed");
+    assert.match(run.error ?? "", /aborted by owner/);
+  });
+
+  it("frames buffered after the inactivity timeout are ignored: one failed run, no result", async () => {
+    const run = await exec("late-burst").run(req({ timeoutMs: 200 }));
+    assert.equal(run.result.status, "failed");
+    assert.match(run.error ?? "", /no omp frame for 200ms/);
+    assert.equal(run.structured, undefined);
   });
 });
 
@@ -181,6 +196,23 @@ describe("selectOmpWorker", () => {
     });
     assert.equal(sel?.selection.path, "legacy");
     assert.match((sel?.selection as { reason: string }).reason, /^binary_absent/);
+  });
+
+  it("negotiates under the same HOME override as the workers", async () => {
+    const env = {
+      ...process.env,
+      [OMP_WORKER_ENV]: "1",
+      PI_ENGINEERING_OMP_ADAPTER: "1",
+      PI_ENGINEERING_OMP_BIN: process.execPath,
+      PI_ENGINEERING_OMP_BIN_ARGS: FAKE,
+      FAKE_OMP_FIXTURE: FIXTURE,
+      FAKE_OMP_EXPECT_HOME: "/pe/override-home",
+      HOME: "/somewhere/else",
+    };
+    const without = await selectOmpWorker(() => legacy, env);
+    assert.equal(without?.selection.path, "legacy", "the fake refuses a HOME that is not the override");
+    const withHome = await selectOmpWorker(() => legacy, { ...env, PI_ENGINEERING_OMP_HOME: "/pe/override-home" });
+    assert.deepEqual(withHome?.selection, { path: "omp" });
   });
 
   it("selects the omp path when negotiation succeeds", async () => {

@@ -138,3 +138,49 @@ describe("firewall overlay", () => {
     assert.equal(overlay, args[args.indexOf("--config") + 1]);
   });
 });
+
+describe("firewall overlay file hardening", () => {
+  it("lives in a private 0700 directory and is rewritten when planted, stale or truncated", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const { ensureFirewallOverlay, OMP_FIREWALL_OVERLAY_YML } = await import("../../src/omp/firewall.ts");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "fw-"));
+    try {
+      const dir = path.join(base, "omp-firewall");
+      const file = ensureFirewallOverlay(dir);
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+      assert.equal(fs.readFileSync(file, "utf8"), OMP_FIREWALL_OVERLAY_YML);
+      for (const bad of ["autolearn:\n  enabled: true\n", OMP_FIREWALL_OVERLAY_YML.slice(0, 40), ""]) {
+        fs.writeFileSync(file, bad);
+        assert.equal(ensureFirewallOverlay(dir), file);
+        assert.equal(
+          fs.readFileSync(file, "utf8"),
+          OMP_FIREWALL_OVERLAY_YML,
+          `repaired from ${JSON.stringify(bad.slice(0, 12))}`,
+        );
+        assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+      }
+      assert.deepEqual(fs.readdirSync(dir), ["firewall.yml"], "no temp files left behind");
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a directory owned by someone else or a symlink", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const { ensureFirewallOverlay } = await import("../../src/omp/firewall.ts");
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "fw-"));
+    try {
+      const real = path.join(base, "real");
+      fs.mkdirSync(real);
+      const link = path.join(base, "link");
+      fs.symlinkSync(real, link);
+      assert.throws(() => ensureFirewallOverlay(link), /not a private directory/);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});

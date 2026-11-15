@@ -1,6 +1,6 @@
 // A real child process that speaks omp's `--mode rpc` JSONL protocol, for tests that must not need the omp binary.
 // It replays frames captured from omp 18.20.0 (test/fixtures/omp-frames/). FAKE_OMP_MODE selects the behaviour:
-//   replay | crash-before-ready | hang-before-ready | crash-after-prompt | hang-after-prompt | no-result | prompt-error
+//   replay | crash-before-ready | hang-before-ready | crash-after-prompt | hang-after-prompt | no-result | prompt-error | late-burst
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
@@ -12,6 +12,7 @@ if (argv.includes("--version")) {
   out("omp/18.20.0");
   process.exit(0);
 }
+if (process.env.FAKE_OMP_EXPECT_HOME && process.env.HOME !== process.env.FAKE_OMP_EXPECT_HOME) process.exit(5);
 if (mode === "crash-before-ready") process.exit(3);
 if (mode === "hang-before-ready") setInterval(() => {}, 1000);
 else {
@@ -20,6 +21,7 @@ else {
   out(ready);
   let pending = null;
   const play = async () => {
+    if (mode === "late-burst") await new Promise((r) => setTimeout(r, 600));
     for (const line of frames) {
       const f = JSON.parse(line);
       if (f.type === "ready" || f.type === "response") continue;

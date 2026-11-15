@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 /**
@@ -44,13 +43,40 @@ export const OMP_FIREWALL_FLAGS: readonly string[] = [
   "--no-title",
 ];
 
-/** Write (idempotently, content-addressed) the overlay and return its path. */
-export function ensureFirewallOverlay(dir: string = tmpdir()): string {
-  const hash = createHash("sha256").update(OMP_FIREWALL_OVERLAY_YML).digest("hex").slice(0, 12);
-  const file = join(dir, `pe-omp-firewall-${hash}.yml`);
-  if (!existsSync(file)) {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(file, OMP_FIREWALL_OVERLAY_YML, { encoding: "utf8", mode: 0o600 });
+/** Per-user, private location: the PE state dir, never a shared temp directory. */
+export function defaultFirewallDir(env: NodeJS.ProcessEnv = process.env): string {
+  const state = env.PI_ENGINEERING_STATE_DIR?.trim() || join(homedir(), ".local", "state", "pi-engineering");
+  return join(state, "omp-firewall");
+}
+
+function assertPrivateDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = lstatSync(dir);
+  const uid = process.getuid?.();
+  if (!st.isDirectory() || st.isSymbolicLink() || (uid !== undefined && st.uid !== uid)) {
+    throw new Error(`omp firewall: ${dir} is not a private directory owned by this user`);
+  }
+  if ((st.mode & 0o077) !== 0) chmodSync(dir, 0o700);
+}
+
+/**
+ * Return the path of the overlay, guaranteeing its content is exactly
+ * {@link OMP_FIREWALL_OVERLAY_YML} right now: a missing, planted, stale or truncated
+ * file is replaced atomically (temp file + rename) before use.
+ */
+export function ensureFirewallOverlay(dir: string = defaultFirewallDir()): string {
+  assertPrivateDir(dir);
+  const file = join(dir, "firewall.yml");
+  let current: string | undefined;
+  try {
+    current = readFileSync(file, "utf8");
+  } catch {
+    current = undefined;
+  }
+  if (current !== OMP_FIREWALL_OVERLAY_YML) {
+    const tmp = join(dir, `.firewall.${process.pid}.${Date.now()}.tmp`);
+    writeFileSync(tmp, OMP_FIREWALL_OVERLAY_YML, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(tmp, file);
   }
   return file;
 }

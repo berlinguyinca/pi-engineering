@@ -108,6 +108,17 @@ Each omp run costs about 1.3 s of startup. Tokens: the legacy fake reports a fix
 reports measured usage from the scripted server (synthetic: prompt 400+100n, completion 40 per request, at
 least 2 requests per run: the result tool call and the closing turn). Not a real-model cost comparison.
 
+## Security and semantics notes
+
+- Overlay file: lives in `<PE state dir>/omp-firewall/firewall.yml` (0700 directory owned by the user, symlinks refused),
+  verified byte-for-byte against the expected content before every use and rewritten atomically (temp + rename) on
+  mismatch, so a planted, stale or truncated file cannot weaken the firewall.
+- Negotiation runs under the same `PI_ENGINEERING_OMP_HOME` as workers.
+- Abort is never a fallback: an owner abort (even before `ready`) is an aborted failed run; only genuine unavailability falls back.
+- Environment: the full parent environment is forwarded to omp (no allowlist), the same exposure as the legacy in-process Pi worker, which runs in the parent process.
+- Precedence: a recorded result tool call wins over the `prompt_result` status; a prompt error/abort with no recorded result is a failed run.
+- Timeout: inactivity-based (re-armed on every frame), not wall-clock, matching the legacy executor's semantics.
+
 ## Known gaps
 
 - PE custom tools (`repo_search`, `symbol`, `ledger_read`, `artifact_read`) are NOT exposed to OMP workers; only
