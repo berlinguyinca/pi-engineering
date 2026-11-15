@@ -217,5 +217,9 @@ describe("UI-facing worker activity: omp path equals legacy (real omp)", { skip,
     const legacyHandoffs = await triggerRecords(legacy);
     assert.ok(legacyHandoffs.length >= 1, "the scripted usage fires the context-threshold trigger on legacy");
     assert.deepEqual(await triggerRecords(omp), legacyHandoffs, "the trigger fires identically on the omp path");
+    // Negative control: without the context signals the same runs fire nothing, so the records above come from them.
+    const stripped = (events: WorkerActivity[]): WorkerActivity[] => events.filter((a) => a.context === undefined);
+    assert.deepEqual(await triggerRecords(stripped(legacy)), [], "no context usage, no handoff (legacy)");
+    assert.deepEqual(await triggerRecords(stripped(omp)), [], "no context usage, no handoff (omp)");
   });
 });

@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -43,8 +43,27 @@ const alive = (pid: number): boolean => {
  * (`<parent>/pi-eng-<hash of the repo root>-*`). A machine-wide match would also count the omp processes of
  * other test files running concurrently.
  */
-const ompProcesses = (root: string): string[] => {
-  const worktree = `pi-eng-${shortHash(root)}-`;
+const processCwd = (pid: string): string => {
+  try {
+    return realpathSync(`/proc/${pid}/cwd`); // Linux
+  } catch {
+    // no /proc (macOS): ask lsof
+  }
+  const out = execFileSync("lsof", ["-a", "-d", "cwd", "-p", pid, "-Fn"], { encoding: "utf8" });
+  return (
+    out
+      .split("\n")
+      .find((l) => l.startsWith("n"))
+      ?.slice(1) ?? ""
+  );
+};
+
+// The root is removed with the fixture, so its real path (/var -> /private/var on macOS) is resolved while it exists.
+const realRoots = new Map<string, string>();
+const ompProcesses = (rawRoot: string): string[] => {
+  if (!realRoots.has(rawRoot)) realRoots.set(rawRoot, realpathSync(rawRoot));
+  const root = realRoots.get(rawRoot) as string;
+  const worktree = `pi-eng-${shortHash(rawRoot)}-`;
   const mine = (cwd: string): boolean =>
     cwd === root || cwd.startsWith(`${root}/`) || basename(cwd).startsWith(worktree);
   try {
@@ -55,12 +74,7 @@ const ompProcesses = (root: string): string[] => {
       .filter(Boolean);
     return pids.filter((pid) => {
       try {
-        const out = execFileSync("lsof", ["-a", "-d", "cwd", "-p", pid, "-Fn"], { encoding: "utf8" });
-        const cwd =
-          out
-            .split("\n")
-            .find((l) => l.startsWith("n"))
-            ?.slice(1) ?? "";
+        const cwd = processCwd(pid);
         return mine(cwd);
       } catch {
         return false; // gone between pgrep and lsof

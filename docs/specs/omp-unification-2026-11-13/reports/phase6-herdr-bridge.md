@@ -18,7 +18,7 @@ Branch `feat/omp-herdr-bridge`, stacked on `test/omp-parity-suite` (PR #697). De
 - typecheck 0, biome lint 0.
 - `omp-parity-ui-activity.test.ts` with real omp: 3/3 pass (1 test each).
 - `legacy-golden.test.ts`: 27 pass / 0 fail on legacy and under `PARITY_PATH=omp`.
-- `npm run test:coverage` (follow-up head): 6972 pass, 0 fail; 85.65 / 83.26 / 83.44 (floors 85/83/83). Full `omp-*.test.ts` set together 3x: 54 pass, 0 fail each. Legacy and `PARITY_PATH=omp` golden gates: 27/27 each.
+- `npm run test:coverage` (review-fix head): 6977 pass, 0 fail; 85.65 / 83.31 / 83.45 (floors 85/83/83). All `omp-*.test.ts` (integration + unit, real omp) together 3x: 119 pass, 0 fail each. Legacy and `PARITY_PATH=omp` golden gates: 27/27 each.
 
 ## Telemetry parity (follow-up)
 
@@ -28,7 +28,14 @@ Derived from omp frames, all through the existing `emitWorkerActivity` shapes:
 - "Model streaming" / "Tool still producing output": `StreamingActivityThrottle` over `message_update` / `tool_execution_update`. omp also streams updates for `write`/`edit`, which legacy never reports, so only `bash` updates are forwarded.
 - "Awaiting model response" is not emitted by the legacy `PiWorkerExecutor` either (only the gateway planner worker does), so there is nothing to match.
 
-The parity test no longer excludes anything: the full normalized sequence (including context tokens/window/model) and the rendered text are identical, and the same context signals drive a real `ContextHandoffTrigger` to identical handoff records on both paths.
+The parity test excludes nothing for the scripted write + `worker_result` scenario: the normalized sequence (context tokens/window/model included) and the rendered text are identical, and the same context signals drive a real `ContextHandoffTrigger` to identical handoff records on both paths (negative control: with the context signals stripped, both paths yield 0 records).
+
+Remaining differences, stated honestly:
+- Parity is proved for that one scripted scenario on real omp. Retries, aborts, multi-tool turns and build-command timing are covered only by the unit tests that replay frames (`test/unit/omp-worker-executor.test.ts`, fixture `telemetry-failed-result-retry.jsonl`, synthesized in the shape of captured frames), not against real omp.
+- "Context usage" needs the model window from a `get_state` response; if that fails or lacks `contextWindow`, no "Context usage" is emitted (and the threshold trigger never fires) while everything else still reports. A message ending before the response arrives would also miss it.
+- omp's `write`/`edit` progress updates and its closing turn after a successful `worker_result` are deliberately not reported (legacy never has them).
+- The terminating tool counts as called only when it succeeds; a failed call followed by a retry keeps reporting, as legacy does.
+- `BuildCommandTimer` is applied as on legacy. Legacy-only behavior not bridged: stall watchdog arming and `trackAction` idempotency records (the omp path has its own inactivity guard and host-side tool execution).
 
 ## Lifecycle test isolation
 

@@ -1,0 +1,29 @@
+{"type": "ready", "protocolVersion": 1, "supportedProtocolVersions": [1, 2], "maxFrameBytes": 1048576, "maxReassembledFrameBytes": 67108864, "supportsBashExcludeFromContext": true}
+{"type": "agent_start"}
+{"type": "turn_start"}
+{"type": "message_start", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 500, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 540}, "stopReason": "toolUse"}}
+{"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 500, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 540}, "stopReason": "toolUse"}}
+{"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 500, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 540}, "stopReason": "toolUse"}}
+{"type": "tool_execution_start", "toolCallId": "c1", "toolName": "bash", "args": {"command": "npm test"}}
+{"type": "tool_execution_update", "toolCallId": "c1", "toolName": "bash", "partialResult": {"content": [{"type": "text", "text": "running"}]}}
+{"type": "tool_execution_update", "toolCallId": "c2", "toolName": "write", "partialResult": {"content": [{"type": "text", "text": "partial"}]}}
+{"type": "tool_execution_end", "toolCallId": "c1", "toolName": "bash", "isError": true, "result": {"content": [{"type": "text", "text": "ENOENT: spawn failed 429 rate limit"}]}}
+{"type": "tool_execution_start", "toolCallId": "c3", "toolName": "pe_read", "args": {"path": "a.txt"}}
+{"type": "tool_execution_end", "toolCallId": "c3", "toolName": "pe_read", "isError": false, "result": {"content": [{"type": "text", "text": "ok"}]}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 500, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 540}, "stopReason": "toolUse"}}
+{"type": "turn_start"}
+{"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 860, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 900}, "stopReason": "toolUse"}}
+{"type": "tool_execution_start", "toolCallId": "c4", "toolName": "worker_result", "args": {"status": "completed", "summary": "done", "claims": [], "evidence_refs": [], "new_hypotheses": [], "proposed_tasks": []}}
+{"type": "tool_execution_end", "toolCallId": "c4", "toolName": "worker_result", "isError": true, "result": {"content": [{"type": "text", "text": "invalid arguments"}]}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 860, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 900}, "stopReason": "toolUse"}}
+{"type": "turn_start"}
+{"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 1160, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1200}, "stopReason": "toolUse"}}
+{"type": "host_tool_call", "id": "h1", "toolCallId": "c5", "toolName": "worker_result", "arguments": {"status": "completed", "summary": "done", "claims": [], "evidence_refs": [], "new_hypotheses": [], "proposed_tasks": []}}
+{"type": "tool_execution_start", "toolCallId": "c5", "toolName": "worker_result", "args": {"status": "completed", "summary": "done", "claims": [], "evidence_refs": [], "new_hypotheses": [], "proposed_tasks": []}}
+{"type": "tool_execution_end", "toolCallId": "c5", "toolName": "worker_result", "isError": false, "result": {"content": [{"type": "text", "text": "recorded"}]}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 1160, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1200}, "stopReason": "toolUse"}}
+{"type": "turn_start"}
+{"type": "message_update", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 1260, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1300}, "stopReason": "toolUse"}}
+{"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 1260, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1300}, "stopReason": "stop"}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "x"}], "api": "openai-completions", "provider": "pelocal", "model": "scripted", "usage": {"input": 1260, "output": 40, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1300}, "stopReason": "stop"}}
+{"type": "prompt_result", "id": "p1", "agentInvoked": true, "status": "completed", "sessionSettled": true}

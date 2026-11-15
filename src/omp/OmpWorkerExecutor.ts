@@ -13,6 +13,7 @@ import {
   activityFromSessionEvent,
   emitWorkerActivity,
 } from "../workers/activity.ts";
+import { BuildCommandTimer } from "../workers/buildActivity.ts";
 import { MUTATING_ROLES, WORKER_KICKOFF, buildSystemPrompt } from "../workers/prompts.ts";
 import { completedReviewResult } from "../workers/reviewVerdict.ts";
 import { createWorkerResultTool } from "../workers/workerResultTool.ts";
@@ -246,6 +247,7 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       let turnToolErrors: string[] = [];
       let modelWindow: { id: string; window: number } | undefined;
       const streaming = new StreamingActivityThrottle();
+      const buildTimer = new BuildCommandTimer();
       const emitFrameActivity = (frame: Record<string, unknown>): void => {
         const type = frame.type;
         if (turnClosed) return;
@@ -269,7 +271,8 @@ export class OmpWorkerExecutor implements WorkerExecutor {
           return;
         }
         if (type !== "tool_execution_start" && type !== "tool_execution_end" && type !== "message_end") return;
-        if (raw === terminating.name) resultCalled = true;
+        // The legacy session ends at the terminating tool only when it ran; a failed call is retried.
+        if (type === "tool_execution_end" && raw === terminating.name && frame.isError !== true) resultCalled = true;
         if (type === "tool_execution_end" && frame.isError === true && raw !== terminating.name) {
           const text = (frame.result as { content?: Array<{ text?: unknown }> } | undefined)?.content
             ?.map((b) => (typeof b?.text === "string" ? b.text : ""))
@@ -294,7 +297,10 @@ export class OmpWorkerExecutor implements WorkerExecutor {
         }
         if (raw === terminating.name || (raw !== undefined && isCheckpointTool(raw))) return;
         const bare = raw?.startsWith("pe_") && replaced.has(raw.slice(3)) ? raw.slice(3) : raw;
-        const activity = activityFromSessionEvent({ ...frame, ...(bare === undefined ? {} : { toolName: bare }) });
+        const activity = buildTimer.observe(
+          frame,
+          activityFromSessionEvent({ ...frame, ...(bare === undefined ? {} : { toolName: bare }) }),
+        );
         if (activity) emitWorkerActivity(req, activity);
       };
 
