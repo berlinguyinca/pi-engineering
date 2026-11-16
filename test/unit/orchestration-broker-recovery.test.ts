@@ -23,7 +23,12 @@ import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
 
-type Handoff = { worktree: { path: string; branch: string }; summary: string; ref?: string; recovered?: boolean };
+type Handoff = {
+  worktree: { path: string; branch: string };
+  summary: string;
+  ref?: string;
+  recovered?: boolean;
+};
 
 /** What a scripted worker does inside its worktree before it settles. */
 interface Step {
@@ -35,7 +40,11 @@ interface Step {
   outcome: Pick<ExecutionOutcome, "exitStatus" | "summary" | "error">;
 }
 
-const TIMEOUT = { exitStatus: "failed", summary: "Worker timed out.", error: "timeout" } as const;
+const TIMEOUT = {
+  exitStatus: "failed",
+  summary: "Worker timed out.",
+  error: "timeout",
+} as const;
 const SUCCESS = { exitStatus: "succeeded", summary: "done" } as const;
 
 /**
@@ -87,7 +96,12 @@ async function scenario(steps: Step[], mode: IntegrationMode = {}) {
             workerCommits.set(objective, await git.headCommitIn(worktree!));
           }
           for (const f of step.edit ?? []) await write(f);
-          return { executionId: "e", artifactRefs: [], usage: {}, ...step.outcome };
+          return {
+            executionId: "e",
+            artifactRefs: [],
+            usage: {},
+            ...step.outcome,
+          };
         },
       },
       integration: {
@@ -155,7 +169,16 @@ async function scenario(steps: Step[], mode: IntegrationMode = {}) {
   const branchOf = (task: string) => `pi-eng-orch-${taskIds.get(task)}`;
   const taskOf = (task: string) => taskIds.get(task)!;
   const integration = store.listExecutions(m.mission_id).find((e) => e.backend === "integration")!;
-  return { fx, store, m, handoffs, workerCommits, branchOf, taskOf, integration };
+  return {
+    fx,
+    store,
+    m,
+    handoffs,
+    workerCommits,
+    branchOf,
+    taskOf,
+    integration,
+  };
 }
 
 describe("ExecutionBroker: recovering a timed-out worker's committed work", () => {
@@ -198,7 +221,13 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
           agent: {
             runAgent: async ({ worktree }) => {
               await writeFile(join(worktree!, "src", "late-integration.ts"), "export const late = true;\n");
-              return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+              return {
+                executionId: "worker",
+                exitStatus: "succeeded",
+                summary: "done",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
           integration: {
@@ -292,7 +321,13 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
           agent: {
             runAgent: async ({ worktree }) => {
               await writeFile(join(worktree!, "src", "deferred-cleanup.ts"), "export const deferred = true;\n");
-              return { executionId: "worker", exitStatus: "succeeded", summary: "done", artifactRefs: [], usage: {} };
+              return {
+                executionId: "worker",
+                exitStatus: "succeeded",
+                summary: "done",
+                artifactRefs: [],
+                usage: {},
+              };
             },
           },
           integration: {
@@ -405,7 +440,13 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         manifestId: "WM-timeout-preserve",
         missionId: mission.mission_id,
         generation: 1,
-        authorizedRoots: [{ canonicalPath: fx.root, source: "existing_manifest", access: "write" }],
+        authorizedRoots: [
+          {
+            canonicalPath: fx.root,
+            source: "existing_manifest",
+            access: "write",
+          },
+        ],
         repositories: [
           {
             repoId: "repo-timeout-preserve",
@@ -429,13 +470,10 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         isolation: "worktree",
         write_domains: ["src/**"],
         deliverables: ["implementation"],
-        // Generous budget: the valid checkpoint claim is fired only after the
-        // agent polls for the two earlier reject findings to appear. Under
-        // full-suite load those polls can outrun a 1s budget, so the deadline
-        // checkpoint would be taken before the valid claim is buffered and
-        // completedDeliverables would come back empty. Give the claim time to
-        // land before the timeout.
-        execution_budget_ms: 5_000,
+        // The worker sequences its claims on the store's findings (see
+        // rejectionsRecorded) and must emit the valid one before the budget
+        // expires; the budget leaves room for a slow host.
+        execution_budget_ms: 6_000,
         checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 200 },
       });
       const handoffs: Handoff[] = [];
@@ -449,6 +487,28 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         backends: {
           agent: {
             runAgent: async ({ worktree, onActivity }) => {
+              // Each claim must be evaluated by its own checkpoint before the
+              // next one is emitted: claims are keyed by deliverable, so a
+              // later claim overwrites an unevaluated earlier one. Wait on the
+              // store's own state (time-bounded, not attempt-counted, so a slow
+              // host stretches the wait instead of skipping it) and fail loudly
+              // rather than emit out of sequence. One shared deadline keeps the
+              // whole sequence inside the execution budget.
+              const sequenceDeadline = Date.now() + 5_000;
+              const until = async (what: string, condition: () => boolean): Promise<void> => {
+                while (!condition()) {
+                  if (Date.now() > sequenceDeadline) throw new Error(`${what} was not recorded in time`);
+                  await new Promise((resolve) => setTimeout(resolve, 10));
+                }
+              };
+              const rejectionsRecorded = (count: number): Promise<void> =>
+                until(
+                  `rejection ${count}`,
+                  () =>
+                    store
+                      .listFindings(mission.mission_id)
+                      .filter((finding) => finding.category === "checkpoint_progress").length >= count,
+                );
               await mkdir(join(worktree!, "src"), { recursive: true });
               await writeFile(join(worktree!, "src", "preserved.ts"), "export const preserved = true;\n");
               await git.commitAll(worktree!, "worker checkpoint commit");
@@ -472,13 +532,7 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
                   },
                 ],
               });
-              for (let attempt = 0; attempt < 100; attempt++) {
-                if (
-                  store.listFindings(mission.mission_id).some((finding) => finding.category === "checkpoint_progress")
-                )
-                  break;
-                await new Promise((resolve) => setTimeout(resolve, 10));
-              }
+              await rejectionsRecorded(1);
               onActivity?.({
                 kind: "checkpoint",
                 summary: "spoofed artifact",
@@ -492,14 +546,7 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
                   },
                 ],
               });
-              for (let attempt = 0; attempt < 100; attempt++) {
-                if (
-                  store.listFindings(mission.mission_id).filter((finding) => finding.category === "checkpoint_progress")
-                    .length >= 2
-                )
-                  break;
-                await new Promise((resolve) => setTimeout(resolve, 10));
-              }
+              await rejectionsRecorded(2);
               onActivity?.({
                 kind: "checkpoint",
                 summary: "Checkpoint progress recorded",
@@ -513,6 +560,11 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
                   },
                 ],
               });
+              await until("the valid claim's checkpoint", () =>
+                store
+                  .listTaskCheckpoints(mission.mission_id, task.task_id)
+                  .some((checkpoint) => checkpoint.completedDeliverables.includes("implementation")),
+              );
               await blocked;
               return {
                 executionId: "late-worker",
@@ -641,7 +693,14 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
   });
 
   it("recovers exactly the commits the worker made, not the harvest's auto-commit of its half-done edits", async () => {
-    const s = await scenario([{ task: "committed", commit: ["done.txt"], edit: ["half.txt"], outcome: TIMEOUT }]);
+    const s = await scenario([
+      {
+        task: "committed",
+        commit: ["done.txt"],
+        edit: ["half.txt"],
+        outcome: TIMEOUT,
+      },
+    ]);
     try {
       assert.equal(s.handoffs.length, 1, JSON.stringify(s.handoffs));
       const h = s.handoffs[0]!;
@@ -666,9 +725,19 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
   it("a SUCCEEDED worker that committed some steps and left the last one uncommitted keeps all of it", async () => {
     // Commit discipline makes this the common shape: steps committed as they
     // go, the final step still in the tree when the worker reports success.
-    const s = await scenario([{ task: "disciplined", commit: ["step1.txt"], edit: ["step4.txt"], outcome: SUCCESS }], {
-      merge: true,
-    });
+    const s = await scenario(
+      [
+        {
+          task: "disciplined",
+          commit: ["step1.txt"],
+          edit: ["step4.txt"],
+          outcome: SUCCESS,
+        },
+      ],
+      {
+        merge: true,
+      },
+    );
     try {
       assert.equal(s.handoffs.length, 1);
       assert.ok(existsSync(`${s.fx.root}/src/step1.txt`), "the committed step is integrated");
@@ -693,7 +762,11 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         {
           task: "infra",
           commit: ["partial.txt"],
-          outcome: { exitStatus: "failed", summary: "Worker failed after 5 attempt(s): request timed out", error },
+          outcome: {
+            exitStatus: "failed",
+            summary: "Worker failed after 5 attempt(s): request timed out",
+            error,
+          },
         },
       ]);
       try {
@@ -724,7 +797,15 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
 
   it("a retry of the same task that succeeds is integrated (the last settled outcome wins), once", async () => {
     const s = await scenario([
-      { task: "retried", edit: ["a.txt"], outcome: { exitStatus: "failed", summary: "guard abort", error: "guard" } },
+      {
+        task: "retried",
+        edit: ["a.txt"],
+        outcome: {
+          exitStatus: "failed",
+          summary: "guard abort",
+          error: "guard",
+        },
+      },
       { task: "retried", commit: ["b.txt"], outcome: SUCCESS },
     ]);
     try {
@@ -742,14 +823,23 @@ describe("ExecutionBroker: recording what recovery actually merged (completion-g
   it("records the recovered task, branch and exact ref on the integration execution once merged", async () => {
     const s = await scenario(
       [
-        { task: "recovered", commit: ["r.txt"], edit: ["half.txt"], outcome: TIMEOUT },
+        {
+          task: "recovered",
+          commit: ["r.txt"],
+          edit: ["half.txt"],
+          outcome: TIMEOUT,
+        },
         { task: "clean", commit: ["c.txt"], outcome: SUCCESS },
       ],
       { merge: true },
     );
     try {
       assert.deepEqual(s.integration.recovered_merged, [
-        { task_id: s.taskOf("recovered"), branch: s.branchOf("recovered"), ref: s.workerCommits.get("recovered") },
+        {
+          task_id: s.taskOf("recovered"),
+          branch: s.branchOf("recovered"),
+          ref: s.workerCommits.get("recovered"),
+        },
       ]);
     } finally {
       await s.fx.cleanup();
@@ -816,7 +906,11 @@ describe("ExecutionBroker durable lifecycle inventory", () => {
     });
     const broker = new ExecutionBroker({
       store,
-      resolveRepository: async () => ({ repoId: "repo-inventory", root: "/tmp/not-evidence", git: {} as GitRepo }),
+      resolveRepository: async () => ({
+        repoId: "repo-inventory",
+        root: "/tmp/not-evidence",
+        git: {} as GitRepo,
+      }),
       backends: {},
     });
     await assert.rejects(
