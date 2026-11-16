@@ -25,6 +25,14 @@ Darwin's `getconf DARWIN_USER_TEMP_DIR`. Discovery accepts only real same-user
 0700 directories and 0600 descriptor files. An explicit `PI_ENGINEERING_CONTROL_DIR`
 or client root remains an exact scope; an overlong explicit socket path still fails.
 
+Client timeout and size bounds: each request waits up to 15 s by default (loaded
+hosts answer `status` in 8-14 s); set `PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS`
+to change it. `sessions list` probes descriptors concurrently (8 at a time) and
+reports a descriptor whose process is gone as `session_process_gone` without
+touching its socket, so stale descriptors do not slow the list. Replies up to
+8 MiB are accepted; larger ones fail with `response_too_large`. Servers cap
+`status` at the last 20 missions and 40 tasks per mission.
+
 ## Structured commands
 
 The same-user Unix socket supports the version-1 `maintenance` operation in
