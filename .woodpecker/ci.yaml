@@ -357,7 +357,9 @@ steps:
       # verdicts, the totals and the coverage table are printed.
       - 'LOG=$(mktemp); trap "rm -f \"$LOG\"" EXIT'
       - 'rc=0; timeout -k 30 60m npm run test:coverage >"$LOG" 2>&1 || rc=$?'
-      - 'grep -E "^ *not ok" "$LOG" | head -50 || true'
+      # Each failure with its YAML diagnostic (error, expected/actual, location): pipelines 272 and 273 printed a
+      # bare "not ok" line, which cannot be diagnosed.
+      - 'grep -E -A30 "^ *not ok" "$LOG" | head -400 || true'
       - 'grep -E "^# (tests|pass|fail|cancelled|skipped|duration_ms|Error:)" "$LOG" || true'
       - 'sed -n "/^# start of coverage report/,\$p" "$LOG" | grep -v "^# -" | cut -c1-160 || true'
       - 'echo "test:coverage exit code $rc"; exit $rc'
