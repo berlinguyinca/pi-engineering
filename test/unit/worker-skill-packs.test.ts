@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -17,6 +18,7 @@ import {
   packProblems,
   parseWorkerSkillPacks,
   resolveWorkerSkills,
+  stage,
   workerSkillsEnabled,
 } from "../../src/skillpack/workerPacks.ts";
 import {
@@ -205,6 +207,31 @@ describe("worker skill packs: resolution", () => {
     appendFileSync(join(dir, "skills", "pe-operator", "SKILL.md"), "\nplanted\n");
     const again = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
     assert.deepEqual(packProblems(again.packs[0]?.dir ?? ""), []);
+    const cache = join(fx.state, "worker-skill-packs");
+    assert.equal(readdirSync(cache).filter((n) => n.startsWith(".bad.")).length, 1, "bad copy moved aside, not edited");
+  });
+
+  it("a manifest swapped after the pin check is refused by stage (hash of the bytes actually copied)", async () => {
+    const fx = operatorGrantingPack([]);
+    installOperatorPack(fx.agentDir, ["scout"]);
+    const pin = manifestSha(fx.pack);
+    appendFileSync(join(fx.pack, "pack.manifest.json"), "\n");
+    const cache = join(fx.state, "worker-skill-packs");
+    mkdirSync(cache, { recursive: true, mode: 0o700 });
+    const out = stage(fx.pack, cache, pin);
+    assert.ok("problems" in out);
+    assert.match(out.problems.join(";"), /does not match the pinned digest/);
+    assert.deepEqual(readdirSync(cache), [], "nothing staged");
+  });
+
+  it("a cached copy whose manifest no longer matches the pin is not reused", async () => {
+    const fx = operatorGrantingPack(["scout"]);
+    const env = on(fx);
+    const first = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
+    const dir = first.packs[0]?.dir ?? "";
+    appendFileSync(join(dir, "pack.manifest.json"), "\n");
+    const again = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
+    assert.equal(manifestSha(again.packs[0]?.dir ?? ""), manifestSha(fx.pack));
   });
 });
 

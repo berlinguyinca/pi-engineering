@@ -174,6 +174,17 @@ export function workerSkillCacheDir(env: NodeJS.ProcessEnv = process.env): strin
   return join(dirname(defaultFirewallDir(env)), "worker-skill-packs");
 }
 
+/** sha256 (hex) of the manifest bytes in `dir`, or undefined when unreadable. */
+function manifestSha(dir: string): string | undefined {
+  try {
+    return createHash("sha256")
+      .update(readFileSync(join(dir, PACK_MANIFEST_FILE)))
+      .digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
 function chmodTree(dir: string): void {
   chmodSync(dir, 0o700);
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -188,16 +199,19 @@ function chmodTree(dir: string): void {
  * copied: the bytes a worker loads are the bytes that passed. An existing copy is trusted only if it verifies now;
  * a bad one is moved aside, never edited. No network, no script run, no symlink followed.
  */
-function stage(src: string, cacheDir: string): { dir: string } | { problems: string[] } {
+export function stage(src: string, cacheDir: string, pin: string): { dir: string } | { problems: string[] } {
   assertPrivateDir(cacheDir);
-  const manifestBytes = readFileSync(join(src, PACK_MANIFEST_FILE));
-  const target = join(cacheDir, createHash("sha256").update(manifestBytes).digest("hex").slice(0, 32));
-  if (existsSync(target) && packProblems(target).length === 0) return { dir: target };
+  const copied = manifestSha(src);
+  if (copied !== pin) return { problems: ["manifest sha256 does not match the pinned digest"] };
+  const target = join(cacheDir, pin.slice(0, 32));
+  const stagedProblems = (dir: string): string[] =>
+    manifestSha(dir) === pin ? packProblems(dir) : ["manifest sha256 does not match the pinned digest"];
+  if (existsSync(target) && stagedProblems(target).length === 0) return { dir: target };
   const tmp = join(cacheDir, `.stage.${process.pid}.${randomBytes(6).toString("hex")}`);
   try {
     cpSync(src, tmp, { recursive: true, verbatimSymlinks: true, errorOnExist: true });
     chmodTree(tmp);
-    const problems = packProblems(tmp);
+    const problems = stagedProblems(tmp);
     if (problems.length > 0) return { problems: problems.map((p) => `copy: ${p}`) };
     if (existsSync(target)) renameSync(target, join(cacheDir, `.bad.${randomBytes(6).toString("hex")}`));
     try {
@@ -205,7 +219,7 @@ function stage(src: string, cacheDir: string): { dir: string } | { problems: str
     } catch {
       // Another process staged the same content first; use its copy only if it verifies.
     }
-    const final = packProblems(target);
+    const final = stagedProblems(target);
     return final.length === 0 ? { dir: target } : { problems: final.map((p) => `staged copy: ${p}`) };
   } catch (error) {
     return { problems: [`stage failed: ${error instanceof Error ? error.message : String(error)}`] };
@@ -276,7 +290,7 @@ export async function resolveWorkerSkills(opts: ResolveWorkerSkillsOptions): Pro
       refuse(problems);
       continue;
     }
-    const staged = stage(src, cacheDir);
+    const staged = stage(src, cacheDir, grant.manifestSha256);
     if ("problems" in staged) {
       refuse(staged.problems);
       continue;
