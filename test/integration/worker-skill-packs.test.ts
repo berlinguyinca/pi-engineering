@@ -201,6 +201,7 @@ const MARKERS = {
   project: "ZZ-PROJECT-CLAUDE-SKILL-MARKER",
   agents: "ZZ-AGENTS-USER-SKILL-MARKER",
   managed: "ZZ-MANAGED-SKILL-MARKER",
+  plugin: "ZZ-OMP-PLUGIN-SKILL-MARKER",
 };
 const skillMd = (name: string, marker: string) =>
   `---\nname: ${name}\ndescription: ${marker} use for ${marker}\n---\n\nBody ${marker}.\n`;
@@ -209,9 +210,11 @@ async function ompFirstTurn(
   fx: WorkerSkillFixture,
   role: string,
   env: NodeJS.ProcessEnv,
+  prepare?: (home: string) => void,
 ): Promise<{ turn: ScriptTurn; activity: string[]; body: string }> {
   const offline = await startOfflineOmp(finish);
   try {
+    prepare?.(offline.home);
     // Hostile surroundings: foreign and managed skills plus auto-learn switched on everywhere.
     mkdirSync(join(fx.repo, ".claude", "skills", "x"), { recursive: true });
     writeFileSync(join(fx.repo, ".claude", "skills", "x", "SKILL.md"), skillMd("x", MARKERS.project));
@@ -263,6 +266,21 @@ describe("worker skill packs: omp path (real omp, offline)", { skip: ompSkip }, 
       assert.ok(!turn.toolNames.includes(forbidden), `tool ${forbidden} must not be offered: ${turn.toolNames}`);
     }
     assert.ok(turn.toolNames.includes("worker_result"));
+  });
+
+  it("an operator-installed omp plugin that ships skills/ is not loaded next to the pack", async () => {
+    const fx = operatorGrantingPack(["scout"]);
+    const { turn } = await ompFirstTurn(fx, "scout", { [WORKER_SKILLS_ENV]: "1" }, (home) => {
+      // omp's installed-plugin layout: <home>/.omp/plugins/{package.json,node_modules/<name>/}.
+      const plugins = join(home, ".omp", "plugins");
+      const pkg = join(plugins, "node_modules", "zz-plugin");
+      mkdirSync(join(pkg, "skills", "plug"), { recursive: true });
+      writeFileSync(join(plugins, "package.json"), JSON.stringify({ dependencies: { "zz-plugin": "1.0.0" } }));
+      writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "zz-plugin", version: "1.0.0", omp: {} }));
+      writeFileSync(join(pkg, "skills", "plug", "SKILL.md"), skillMd("plug", MARKERS.plugin));
+    });
+    assert.match(turn.system, /pe-operator/, "the pack's skill is offered");
+    assert.ok(!turn.system.includes(MARKERS.plugin), "the installed plugin's skill leaked into a packed worker");
   });
 
   it("a hostile repo's allowlist and pack are ignored, with a visible warning", async () => {
