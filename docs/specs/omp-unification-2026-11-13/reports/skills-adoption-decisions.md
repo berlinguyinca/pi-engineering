@@ -3,7 +3,7 @@
 PE @ `1294390c2a3eb91df4ec3182e143f60c1cd135e1` (base of `feat/omp-skills-adoption`). OMP upstream @ `57263720c818ab3baaeb74bf415b03592b806ae0`, real `omp/18.20.0` run under bun 1.4.4. Evidence for every behavioral claim is a passing real-OMP test in `test/integration/omp-skills.test.ts` (gated: skipped with `UNVERIFIED: OMP_BIN not set`) or a unit test; see `skills-benchmarks.md` for the experiments. Verdict vocabulary: ADOPT AS-IS / ADAPT / UPSTREAM / KEEP CUSTOM / REJECT / DEFER. Not measured: UNKNOWN.
 
 ## Binding constraints (not reopened here)
-OMP owns discovery, loading, precedence, registry, lockfile. Auto-learn stays OFF. Worker sessions stay skill-less (`src/workers/PiWorkerExecutor.ts:206-214`); packs reach only the operator session. No untrusted script execution, no network auto-install, no blind copying of upstream skill files.
+OMP owns discovery, loading, precedence, registry, lockfile. Auto-learn stays OFF. Worker sessions stay skill-less by default (`src/workers/PiWorkerExecutor.ts`); packs reach them only through the operator-pinned opt-in described under "Worker skill packs (opt-in)". No untrusted script execution, no network auto-install, no blind copying of upstream skill files.
 
 ## Decisions
 
@@ -34,11 +34,10 @@ OMP owns discovery, loading, precedence, registry, lockfile. Auto-learn stays OF
 4. Experiment code (`src/skillpack`, `src/promptcompress`, scripts, tests) is not imported by any runtime path; deleting it cannot change behavior. Production prompts were not changed.
 5. Auto-learn: if ever enabled by mistake, delete `~/.omp/agent/managed-skills/*` and set `autolearn.enabled: false`.
 
-## Needs a user decision (not made here)
-- Whether PE's future OMP launch should always pass `--config <overlay with autolearn.enabled: false>` (tested to override user and project config). Today `src/omp/negotiate.ts` passes only `--mode rpc --no-session`, so "off" relies on OMP's default plus the user's own config. Phase 3 area, so not edited.
-- Whether `~/.omp/agent/managed-skills` and project-level foreign skill dirs (`.claude/.agents/.codex/.github` in a cloned repo load by default) should be suppressed for the operator session (e.g. `--no-skills` plus explicit `-e`).
-- ~~Whether any pack should ever reach worker sessions~~ DECIDED and implemented as an opt-in (below).
-- Registry-signing and whether to re-hash store contents at load: UNKNOWN upstream behavior; consider an upstream issue.
+## Decisions taken since (operator approved)
+- Auto-learn overlay and foreign skill dirs: every omp process PE starts gets the firewall overlay (`autolearn.enabled: false`, memory off) plus `--no-skills --no-extensions --no-rules --no-context-files`. That covers worker runs and the negotiation handshake (`src/omp/negotiate.ts`), so a cloned repo's `.omp/config.yml`, managed skills and `.claude/.agents/.codex/.github` skill dirs do not reach them. Pinned by `test/integration/omp-firewall.test.ts` (workers, against hostile config) and `test/unit/omp-adapter.test.ts` (handshake). The operator's interactive session is PE's legacy pi session, not omp, so it has no OMP auto-learn, and its skills are left alone.
+- Worker sessions may get packs: implemented as an opt-in (below).
+- Store contents are not re-hashed at load: filed upstream as https://github.com/can1357/oh-my-pi/issues/19378. Pack integrity depends on the platform (the gzip OS byte): filed as https://github.com/can1357/oh-my-pi/issues/19402.
 
 ## Worker skill packs (opt-in)
 Default off, byte-identical to before (legacy and `PARITY_PATH=omp` golden gates 27/27). A repository is untrusted input, so the grant is operator-only. Both switches are required:

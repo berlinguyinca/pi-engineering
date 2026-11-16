@@ -11,11 +11,14 @@ Legacy remains the default path. Everything OMP-backed is behind `PI_ENGINEERING
 | coverage gate | `ci/coverage-gate` | #691 | 24a66588 | `test:coverage`, floors 85/83/83 |
 | golden gate | `test/phase3-legacy-golden` | #693 | 1294390c | Legacy goldens, byte-for-byte; `PARITY_PATH=<name>` runs the same scenarios through another path |
 | skills | `feat/omp-skills-adoption` | #694 | c8c4c6ba | PE-owned `pe-operator` skill pack, locked; compression and tool-prompt experiments (DEFER); no runtime path imports it |
-| 3 `/engineer` slice | `feat/omp-engineer-slice` | #695 | pending | `OmpWorkerExecutor`, flag-gated selection, context firewall overlay, fallback to legacy before the prompt |
-| 4 worker/session/tool integration | `feat/omp-worker-integration` | #696 | pending | All worker roles; PE tools as host tools; process-per-run; 27/27 goldens under `PARITY_PATH=omp` |
-| 5 parity suite | `test/omp-parity-suite` | #697 | pending | verify, tournament, recovery (SIGKILL, no orphans), Hindsight, context ratchet, firewall leak scan |
-| 6 Herdr bridge | `feat/omp-herdr-bridge` | PR pending | pending | omp frames mapped to the existing `onActivity` seam; footer text identical to legacy golden |
-| 7 final | `docs/omp-unification-final` | PR pending | pending | Redundancy audit (nothing deleted), context trim, rollback guide, this report |
+| 3 `/engineer` slice | `feat/omp-engineer-slice` | #695 | d0a0d1ce | `OmpWorkerExecutor`, flag-gated selection, context firewall overlay, fallback to legacy before the prompt |
+| 4 worker/session/tool integration | `feat/omp-worker-integration-v2` | #700 (supersedes #696) | 5fb4728c | All worker roles; PE tools as host tools; process-per-run; 27/27 goldens under `PARITY_PATH=omp` |
+| 5 parity suite | `test/omp-parity-suite-v2` | #701 (supersedes #697) | 19627780 | verify, tournament, recovery (SIGKILL, no orphans), Hindsight, context ratchet, firewall leak scan |
+| 6 Herdr bridge | `feat/omp-herdr-bridge-v2` | #702 | 8e16c40d | omp frames mapped to the existing `onActivity` seam; footer text identical to legacy golden |
+| 7 final | `docs/omp-unification-final-v2` | #704 | 3e96703c | Redundancy audit (nothing deleted), context trim, rollback guide, this report |
+| CI: real omp, contention | `ci/omp-real-tests-and-contention-v2` | #705 | fbdaa167 | Woodpecker `test-omp-real`: provisions pinned omp 18.20.0 (sha256-checked), runs every OMP_BIN-gated file plus `PARITY_PATH=omp`, fails on any skip. First Linux run: 58/58 and 27/27 |
+| worker skill packs | `feat/worker-skill-packs-v2` | #706 | b44ff164 | Opt-in, operator-pinned, digest-verified packs for worker sessions; independent security review, no blockers, mediums fixed |
+| test fixes found on the way | `fix/concurrency-test-flakes`, `fix/baseline-concurrent-verify-race`, `fix/fingerprint-same-tick-flake` | #698, #699, #703 | 8baedc85, 15f742f6, f2cc3960 | Parallelism barrier; same-millisecond worktree-name collision (a real production race); same-tick stat flake |
 
 ## Changed files (summary)
 
@@ -52,12 +55,14 @@ Legacy remains the default path. Everything OMP-backed is behind `PI_ENGINEERING
 
 ## Outstanding risks and open user decisions
 
-- CI never runs real-omp tests: `OMP_BIN` is not provisioned in Woodpecker. All real-omp evidence above is local-only.
-- Flaky on the shared CI host: hostile-concurrency and load-sensitive lock and race tests (baseline flake `mission-reliability-foundation` index.lock; `runtime-host-auto-reload` seen failing in Phase 2). Not caused by this program, not fixed.
+- RESOLVED (#705): CI runs the real-omp tests. Woodpecker provisions pinned omp on Linux and fails on any skip. Real-omp evidence is no longer local-only.
+- CI capacity: the repo-side changes are in #705 (concurrency follows `nproc`, the unit suite runs once). The server-side recommendations in `docs/operations/ci.md` "Capacity" are NOT applied; they need the CI host's operator: confirm superseded pipelines are killed, cap concurrent workflows, size the host, rate-limit webhooks.
+- Flaky on the shared CI host: hostile-concurrency and load-sensitive lock and race tests (baseline flake `mission-reliability-foundation` index.lock; `runtime-host-auto-reload` seen failing in Phase 2). Not caused by this program. Fixed when seen during this program: #698, #699, #703, and `session-git-facts` (fixed sleep replaced by a wait, in the closeout PR). Others may remain.
 - Legacy tournament tie-break is nondeterministic (found in Phase 5, unchanged).
 - Full mission DAG on real omp: UNVERIFIED. omp `agent.db` contents: UNVERIFIED. TUI pixel screenshots and a live Herdr room: UNVERIFIED. Model-driven prompt compression and tool-description ablation: UNVERIFIED (no local model).
 - omp bash has no budget notice or stall quarantine; omp receives the full parent environment plus `HOME` (legacy strips session variables).
 - DECIDED and implemented (opt-in, default off): worker sessions may get version-pinned, digest-verified skill packs when `PI_ENGINEERING_WORKER_SKILLS=1` and the operator's own `engineering.yaml` allowlists them per role with a pinned manifest sha256 (repo-supplied allowlists and packs are ignored); fail closed with a visible diagnostic. See skills-adoption-decisions.md, "Worker skill packs (opt-in)".
-- Decision: always pass an `autolearn.enabled: false` overlay to the operator session, and suppress foreign skill dirs there? (Workers already get the overlay.)
-- Upstream issue to file: OMP loads a skillshare store entry by comparing only the `.skillshare-integrity` marker; unpacked files are not re-hashed (a tampered `SKILL.md` still loads).
-- Decision: whether to provision omp in CI so the real-omp tests run.
+- DECIDED (operator approved) and in place: every omp process PE starts gets the firewall overlay (`autolearn.enabled: false`, memory off) plus `--no-skills --no-extensions --no-rules --no-context-files`. That covers worker runs and the negotiation handshake (`src/omp/negotiate.ts`). A regression test now pins the handshake (`test/unit/omp-adapter.test.ts`, "the negotiation handshake process carries the context firewall"). The operator's own interactive session is PE's legacy pi session, not omp, so OMP auto-learn cannot run there, and its skills are left alone.
+- Upstream issues filed:
+  - https://github.com/can1357/oh-my-pi/issues/19378: OMP loads a skillshare store entry by comparing only the `.skillshare-integrity` marker; unpacked files are not re-hashed (a tampered `SKILL.md` still loads).
+  - https://github.com/can1357/oh-my-pi/issues/19402: skill pack integrity is platform-dependent (the gzip header OS byte), so the same files hash differently on macOS and Linux. PE's gated test normalises that byte (#705).

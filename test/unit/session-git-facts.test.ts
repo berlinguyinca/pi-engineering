@@ -204,8 +204,15 @@ test("a runtime worker in a git directory reports its facts, in order, on every 
     await rt.start(rid);
     await rt.sendTask(rid, "x");
     await rt.terminate(rid);
-    await new Promise((r) => setTimeout(r, 1500));
-    const events = calls.filter((c) => c.body.entity_type === "session" && c.body.entity_id === rid);
+    const ofSession = () => calls.filter((c) => c.body.entity_type === "session" && c.body.entity_id === rid);
+    // Ingest is asynchronous: a fixed 1.5 s sleep lost the race on a loaded CI host (pipeline 272). Wait for
+    // the terminated event, then settle briefly so an update arriving after it still fails the order check.
+    for (const deadline = Date.now() + 20_000; Date.now() < deadline; ) {
+      if (ofSession().some((e) => e.body.event_type === "session.terminated")) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    const events = ofSession();
     assert.ok(events.length >= 3, `started, updated, terminated: got ${events.map((e) => e.body.event_type)}`);
     assert.equal(events.at(-1)!.body.event_type, "session.terminated", "terminated is last");
     assert.equal(events[0]!.body.event_type, "session.started", "started is never overtaken by an update");

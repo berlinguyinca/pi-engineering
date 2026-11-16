@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
+  OMP_FIREWALL_FLAGS,
+  OMP_FIREWALL_OVERLAY_YML,
   OMP_PIN_MANIFEST,
   UnavailableReason,
   buildCapabilityReport,
@@ -8,6 +14,7 @@ import {
   decodeReadyFrame,
   encodeNegotiateRequest,
   isVersionPinned,
+  negotiateOmp,
   negotiateOmpFromEnv,
   parseFrameLine,
   parseSemVer,
@@ -133,4 +140,33 @@ test("omp semver: pre-release and build suffixes are rejected (policy: releases 
   assert.equal(parseSemVer("18.20.0+build.5"), null);
   assert.equal(parseSemVer("v18.20.0-beta"), null);
   assert.deepEqual(parseSemVer("v18.20.0"), { major: 18, minor: 20, patch: 0 });
+});
+
+test("omp adapter: the negotiation handshake process carries the context firewall", async () => {
+  const fake = fileURLToPath(new URL("../support/fakeOmpRpc.mjs", import.meta.url));
+  const fixture = fileURLToPath(
+    new URL("../fixtures/omp-frames/agent-turn-write-then-worker-result.jsonl", import.meta.url),
+  );
+  const log = join(mkdtempSync(join(tmpdir(), "omp-neg-fw-")), "log.jsonl");
+  const result = await negotiateOmp({
+    launch: { command: process.execPath, args: [fake] },
+    env: { ...process.env, FAKE_OMP_MODE: "replay", FAKE_OMP_FIXTURE: fixture, FAKE_OMP_LOG: log },
+    timeoutMs: 15_000,
+  });
+  assert.equal(result.kind, "available");
+  // The fixture exits on --version before logging, so every logged process is the rpc handshake.
+  const procs = readFileSync(log, "utf8")
+    .trim()
+    .split("\n")
+    .map((l) => JSON.parse(l) as { argv: string[] });
+  assert.equal(procs.length, 1);
+  const { argv } = procs[0] as { argv: string[] };
+  assert.ok(argv.includes("rpc"));
+  for (const flag of OMP_FIREWALL_FLAGS) assert.ok(argv.includes(flag), `handshake argv lacks ${flag}`);
+  const at = argv.indexOf("--config");
+  assert.ok(at >= 0 && argv[at + 1], "handshake argv lacks --config <overlay>");
+  const overlay = readFileSync(argv[at + 1] as string, "utf8");
+  assert.equal(overlay, OMP_FIREWALL_OVERLAY_YML);
+  assert.match(overlay, /^autolearn:\n {2}enabled: false\n/);
+  assert.match(overlay, /memory:\n {2}backend: "off"/);
 });
