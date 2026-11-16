@@ -1,19 +1,23 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { rm } from "node:fs/promises";
-import { createConnection } from "node:net";
+import { type Server, createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, test } from "node:test";
 import {
   ControlSocketLimitError,
+  MAX_RESPONSE_BYTES,
   SOCKET_PATH_LIMIT,
+  type SessionDescriptor,
   controlSocketPath,
   discoverSessions,
   queryAllSessions,
   requestSession,
   sessionControlRoot,
+  sessionControlTimeoutMs,
   startSessionControl,
 } from "../../src/sessionControl/SessionControl.ts";
 
@@ -609,5 +613,97 @@ test("discovery rejects symlinked, permissive or foreign-owned directories and d
     assert.equal((await discoverSessions(control)).length, 1);
   } finally {
     await server.close();
+  }
+});
+
+// A real socket listener standing in for a live-but-loaded (or fat-status) session.
+async function fakeSession(
+  dir: string,
+  pid: number,
+  reply: (instanceId: string) => string,
+  delayMs: number,
+): Promise<{ descriptor: SessionDescriptor; server: Server }> {
+  const control = join(dir, "control");
+  await mkdir(control, { recursive: true, mode: 0o700 });
+  await chmod(control, 0o700);
+  const instanceId = randomUUID();
+  const descriptor: SessionDescriptor = {
+    version: 1,
+    instanceId,
+    sessionId: "fake",
+    cwd: dir,
+    pid,
+    heartbeatAt: new Date().toISOString(),
+    socketPath: controlSocketPath(control, instanceId),
+  } as SessionDescriptor;
+  await mkdir(dirname(descriptor.socketPath), { recursive: true, mode: 0o700 });
+  const server = createServer((socket) => {
+    socket.on("error", () => {});
+    socket.once("data", () => setTimeout(() => socket.end(`${reply(instanceId)}\n`), delayMs));
+  });
+  await new Promise<void>((ok) => server.listen(descriptor.socketPath, ok));
+  await writeFile(join(control, `${instanceId}.json`), JSON.stringify(descriptor), { mode: 0o600 });
+  return { descriptor, server };
+}
+const statusReply = (pad: number) => (instanceId: string) =>
+  JSON.stringify({
+    version: 1,
+    ok: true,
+    data: { instanceId, pid: process.pid, sessionId: "fake", pad: "x".repeat(pad), missions: [] },
+  });
+
+test("a live session that answers status after 3 s is reachable under the default timeout", async () => {
+  const dir = await root();
+  const { descriptor, server } = await fakeSession(dir, process.pid, statusReply(0), 3000);
+  try {
+    const rows = await queryAllSessions(join(dir, "control"), { fullStatus: true });
+    assert.equal(rows[0]?.reachable, true, rows[0]?.error);
+  } finally {
+    server.close();
+  }
+  assert.ok(descriptor);
+});
+
+test("the session-control timeout is overridable by env and falls back on junk", () => {
+  const prior = process.env.PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS;
+  try {
+    delete process.env.PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS;
+    assert.equal(sessionControlTimeoutMs(), 15000);
+    process.env.PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS = "4321";
+    assert.equal(sessionControlTimeoutMs(), 4321);
+    process.env.PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS = "nope";
+    assert.equal(sessionControlTimeoutMs(), 15000);
+  } finally {
+    if (prior === undefined) delete process.env.PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS;
+    else process.env.PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS = prior;
+  }
+});
+
+test("a descriptor whose process is gone is reported at once without waiting on its socket", async () => {
+  const dir = await root();
+  const child = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]);
+  const deadPid = Number(child.stdout.toString());
+  const { server } = await fakeSession(dir, deadPid, statusReply(0), 60000);
+  try {
+    const started = Date.now();
+    const rows = await queryAllSessions(join(dir, "control"), { fullStatus: true, timeoutMs: 60000 });
+    assert.ok(Date.now() - started < 2000, "dead pid must not be probed");
+    assert.equal(rows[0]?.reachable, false);
+    assert.equal(rows[0]?.error, "session_process_gone");
+  } finally {
+    server.close();
+  }
+});
+
+test("a multi-megabyte status reply is accepted, one above the cap fails cleanly", async () => {
+  const dir = await root();
+  const big = await fakeSession(dir, process.pid, statusReply(2 * 1024 * 1024), 0);
+  const huge = await fakeSession(dir, process.pid, statusReply(MAX_RESPONSE_BYTES + 1024), 0);
+  try {
+    assert.equal((await requestSession(big.descriptor, { version: 1, op: "status" })).ok, true);
+    await assert.rejects(requestSession(huge.descriptor, { version: 1, op: "status" }), /response_too_large/);
+  } finally {
+    big.server.close();
+    huge.server.close();
   }
 });

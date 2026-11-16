@@ -19,7 +19,15 @@ import {
 
 const VERSION = 1;
 const MAX_REQUEST_BYTES = 8192;
-const MAX_RESPONSE_BYTES = 65536;
+/**
+ * Client-side cap on one reply. A `status` reply carries one brief per owned mission, so it grows
+ * with the session; 8 MiB is far above any observed reply (>64 KiB broke live sessions) yet still
+ * bounds a hostile or runaway peer. New servers also truncate (see MAX_STATUS_MISSIONS).
+ */
+export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_STATUS_MISSIONS = 20;
+const MAX_STATUS_TASKS = 40;
+const DEFAULT_CLIENT_TIMEOUT_MS = 15000;
 const NOTE_BYTES = 1024;
 const HEARTBEAT_MS = 10000;
 const SOCKET_TIMEOUT_MS = 2000;
@@ -450,7 +458,7 @@ export class SessionControlServer {
       missionSource,
       missionIds: this.getOwnedMissions ? missions.map((mission) => mission.id) : [...this.recentMissionIds],
       missions: this.getOwnedMissions
-        ? missions
+        ? missions.slice(-MAX_STATUS_MISSIONS).map((m) => ({ ...m, tasks: m.tasks.slice(-MAX_STATUS_TASKS) }))
         : missions.filter((mission) => this.recentMissionIds.includes(mission.id)),
       ...(runtimeDescription ? { runtime: runtimeDescription } : {}),
     };
@@ -610,10 +618,29 @@ async function discoverSessionsInRoot(rootDir: string): Promise<SessionDescripto
   return found.sort((a, b) => a.instanceId.localeCompare(b.instanceId));
 }
 
+/**
+ * Per-request client timeout. Loaded hosts answer `status` in 8-14 s, so the default is generous;
+ * listing stays bounded because descriptors are probed concurrently and dead ones skip the socket.
+ * Override with PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS.
+ */
+export function sessionControlTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const value = Number(env.PI_ENGINEERING_SESSION_CONTROL_TIMEOUT_MS);
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : DEFAULT_CLIENT_TIMEOUT_MS;
+}
+
+function processIsGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+}
+
 export async function requestSession(
   descriptor: SessionDescriptor,
   request: ControlRequest,
-  timeoutMs = 1500,
+  timeoutMs = sessionControlTimeoutMs(),
 ): Promise<ControlReply> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(descriptor.socketPath);
@@ -674,12 +701,16 @@ export async function queryAllSessions(
       while (next < descriptors.length) {
         const index = next++;
         const descriptor = descriptors[index]!;
+        if (processIsGone(descriptor.pid)) {
+          results[index] = { descriptor, reachable: false, error: "session_process_gone" };
+          continue;
+        }
         try {
           const nonce = randomUUID();
           const reply = await requestSession(
             descriptor,
             options.fullStatus ? { version: VERSION, op: "status" } : { version: VERSION, op: "ping", nonce },
-            options.timeoutMs ?? 1500,
+            options.timeoutMs ?? sessionControlTimeoutMs(),
           );
           const reachable =
             reply.ok &&
