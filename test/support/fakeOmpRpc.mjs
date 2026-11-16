@@ -75,7 +75,22 @@ else {
         success: true,
         data: { protocolVersion: cmd.protocolVersion },
       });
-    else if (cmd.type === "set_host_tools") {
+    else if (cmd.type === "get_state") {
+      // FAKE_OMP_STATE: "window:<n>" answers with that model context window; "nowindow" omits it; "error" fails.
+      const st = process.env.FAKE_OMP_STATE ?? "";
+      if (st.startsWith("window:"))
+        out({
+          id: cmd.id,
+          type: "response",
+          command: "get_state",
+          success: true,
+          data: { model: { id: "scripted", contextWindow: Number(st.slice(7)) } },
+        });
+      else if (st === "nowindow")
+        out({ id: cmd.id, type: "response", command: "get_state", success: true, data: { model: { id: "scripted" } } });
+      else if (st === "error")
+        out({ id: cmd.id, type: "response", command: "get_state", success: false, error: "no state" });
+    } else if (cmd.type === "set_host_tools") {
       if (process.env.FAKE_OMP_RESULTS) appendFileSync(process.env.FAKE_OMP_RESULTS, `${line}\n`);
       out({ id: cmd.id, type: "response", command: "set_host_tools", success: true, data: {} });
     } else if (cmd.type === "prompt") {

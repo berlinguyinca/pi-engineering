@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { classifyError } from "../../src/guard/transient.ts";
 import { OmpWorkerExecutor, OmpWorkerUnavailable } from "../../src/omp/OmpWorkerExecutor.ts";
 import {
   FallbackWorkerExecutor,
@@ -226,5 +227,85 @@ describe("selectOmpWorker", () => {
     });
     assert.deepEqual(sel?.selection, { path: "omp" });
     assert.ok(sel?.executor instanceof FallbackWorkerExecutor);
+  });
+
+  describe("OmpWorkerExecutor activity bridge (frames replayed by a real rpc child)", () => {
+    const TELEMETRY = fileURLToPath(
+      new URL("../fixtures/omp-frames/telemetry-failed-result-retry.jsonl", import.meta.url),
+    );
+    const readTool = {
+      name: "read",
+      description: "read",
+      parameters: { type: "object", properties: {} },
+      execute: async () => ({ content: [] }),
+    } as unknown as Parameters<OmpWorkerExecutor["setCustomTools"]>[0][number];
+    const activities = async (state: string): Promise<WorkerActivity[]> => {
+      const e = new OmpWorkerExecutor({
+        launch: { command: process.execPath, args: [FAKE] },
+        env: { ...process.env, FAKE_OMP_MODE: "replay", FAKE_OMP_FIXTURE: TELEMETRY, FAKE_OMP_STATE: state },
+        startTimeoutMs: 1_500,
+      });
+      e.setCustomTools([readTool]);
+      const seen: WorkerActivity[] = [];
+      const run = await e.run(req({ onActivity: (a) => seen.push(a) }));
+      assert.equal(run.result.status, "completed");
+      return seen;
+    };
+    const toolError = classifyError("ENOENT: spawn failed 429 rate limit").category;
+
+    it("reports turns, streaming, bash-only tool progress, tool errors, pe_ renames and context usage", async () => {
+      const seen = await activities("window:10000");
+      assert.deepEqual(
+        seen.map((a) => a.summary),
+        [
+          "Worker session started",
+          "Model streaming",
+          "Context usage",
+          "Model response received",
+          "Running tool: bash · npm test",
+          "Tool still producing output",
+          "Tool failed: bash",
+          "Running tool: read · a.txt",
+          "Finished tool: read",
+          `Turn ended: stop=toolUse tool_error=${toolError}`,
+          "Context usage",
+          "Model response received",
+          "Turn ended: stop=toolUse tool_error=none",
+          "Context usage",
+          "Model response received",
+          "Turn ended: stop=toolUse tool_error=none",
+        ],
+      );
+      assert.deepEqual(
+        seen.filter((a) => a.summary === "Context usage").map((a) => a.context),
+        [
+          { tokens: 540, window: 10000, model: "scripted" },
+          { tokens: 900, window: 10000, model: "scripted" },
+          { tokens: 1200, window: 10000, model: "scripted" },
+        ],
+      );
+    });
+
+    it("a failed worker_result does not end reporting: the retried turns still report (M1)", async () => {
+      const seen = await activities("window:10000");
+      const failedAt = seen.findIndex((a) => a.context?.tokens === 900);
+      assert.ok(failedAt > 0, "context usage after the failed worker_result is reported");
+      assert.ok(
+        seen.some((a) => a.context?.tokens === 1200),
+        "the retry's turn is reported",
+      );
+      // The successful worker_result closes reporting: nothing follows its turn_end.
+      assert.match(seen.at(-1)?.summary ?? "", /^Turn ended/);
+      assert.equal(seen.filter((a) => a.context?.tokens === 1300).length, 0);
+    });
+
+    for (const state of ["error", "nowindow", "silent"]) {
+      it(`get_state ${state}: no Context usage, no crash, everything else still reported`, async () => {
+        const seen = await activities(state);
+        assert.equal(seen.filter((a) => a.summary === "Context usage").length, 0);
+        assert.ok(seen.some((a) => a.summary.startsWith("Turn ended")));
+        assert.ok(seen.some((a) => a.summary === "Model streaming"));
+      });
+    }
   });
 });
