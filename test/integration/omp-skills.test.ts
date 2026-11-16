@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 // Real OMP, isolated HOME and cwd, no mocks. Evidence for spec 07 experiments C, D, E and the pack check.
@@ -110,14 +111,31 @@ test("pack: OMP discovers the PE skill from an extension package root, and only 
   assert.doesNotMatch(without.prompt, /- pe-operator:/);
 });
 
+// OMP's integrity is sha512 over Bun.gzipSync(tar). The tar is deterministic, but the gzip header's OS byte
+// (offset 9) is the host's: 19 on macOS, 3 on Linux. The lockfile was produced on macOS, so the same files
+// hash differently on a Linux CI host (pipeline 267). The comparison normalises that one byte.
+const LOCK_GZIP_OS = 19;
+const sri = (bytes: Buffer) => `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+
 test("pack: lockfile integrity equals OMP's own deterministic pack integrity", { skip }, () => {
-  const out = execFileSync(
-    ompBin as string,
-    [...baseArgs(), "skill", "publish", join(PACK, "skills", "pe-operator"), "--dry-run"],
-    { env: env(dir("omp-home-")), cwd: dir("omp-cwd-"), encoding: "utf8" },
-  );
-  const lock = JSON.parse(execFileSync("cat", [join(PACK, "skills.lock.json")], { encoding: "utf8" }));
-  assert.ok(out.includes(lock.skills["@pi_engineering/pe-operator"].integrity), out);
+  const skillDir = join(PACK, "skills", "pe-operator");
+  const run = { env: env(dir("omp-home-")), cwd: dir("omp-cwd-"), encoding: "utf8" } as const;
+  const out = execFileSync(ompBin as string, [...baseArgs(), "skill", "publish", skillDir, "--dry-run"], run);
+  const lock = JSON.parse(readFileSync(join(PACK, "skills.lock.json"), "utf8"));
+  const pinned: string = lock.skills["@pi_engineering/pe-operator"].integrity;
+  const cli = baseArgs().find((a) => a.endsWith("/cli.ts"));
+  if (!cli) {
+    // A compiled omp exposes no packSkill to read the tarball from; only a same-OS comparison is possible.
+    assert.ok(out.includes(pinned), out);
+    return;
+  }
+  // OMP_BIN is bun here: take the tarball from OMP's own packSkill, not a re-implementation.
+  const packTs = join(dirname(cli), "skillshare", "pack.ts");
+  const script = `const { packSkill } = await import(${JSON.stringify(packTs)}); process.stdout.write(Buffer.from((await packSkill(${JSON.stringify(skillDir)})).tgz).toString("base64"));`;
+  const tgz = Buffer.from(execFileSync(ompBin as string, ["-e", script], run), "base64");
+  assert.ok(out.includes(sri(tgz)), `packSkill bytes are not what publish --dry-run hashes:\n${out}`);
+  tgz[9] = LOCK_GZIP_OS;
+  assert.equal(sri(tgz), pinned);
 });
 
 test(

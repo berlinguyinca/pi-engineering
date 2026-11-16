@@ -42,7 +42,8 @@ run() { # label, then env assignments and files passed via the globals below
   local rc=0
   timeout -k 30 25m node --test --test-concurrency="$CONC" --test-force-exit --test-timeout=600000 \
     --import ./test/support/isolatedState.ts "$@" >"$log" 2>&1 || rc=$?
-  grep -E '^ *not ok' "$log" | head -50 || true
+  # Each failure with its YAML diagnostic (error, expected/actual, location): a bare "not ok" line cannot be diagnosed.
+  grep -E -A30 '^ *not ok' "$log" | head -400 || true
   grep -E '^# (tests|pass|fail|cancelled|skipped|todo|duration_ms)' "$log" || true
   local tests skipped
   tests=$(sed -n 's/^# tests \([0-9]*\).*/\1/p' "$log" | tail -1)
