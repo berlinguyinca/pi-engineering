@@ -63,6 +63,17 @@ variables:
     NODE_HOME=/tmp/woodpecker-cache/pe-node-v$NODE_VER-linux-x64
     export PATH="$NODE_HOME/bin:$PATH"
     hash -r 2>/dev/null || true
+  # Test concurrency, derived from the CPUs THIS step may use (`nproc` honours the Slurm cgroup/affinity)
+  # instead of a fixed 4: half the CPUs, at least 2, at most 4. A fixed 4 oversubscribes a small
+  # allocation, and timing-sensitive lock/race tests then fail under load (see docs/operations/ci.md
+  # "Capacity"). `npm run test:*` reads PE_TEST_CONCURRENCY and defaults to 4 when it is unset, so a
+  # laptop is unchanged. Not a retry, not a loosened timeout: fewer workers, same assertions.
+  - &test_conc |
+    PE_TEST_CONCURRENCY=$(( $(nproc) / 2 ))
+    [ "$PE_TEST_CONCURRENCY" -ge 2 ] || PE_TEST_CONCURRENCY=2
+    [ "$PE_TEST_CONCURRENCY" -le 4 ] || PE_TEST_CONCURRENCY=4
+    export PE_TEST_CONCURRENCY
+    echo "test concurrency: $PE_TEST_CONCURRENCY (nproc $(nproc))"
   - &venv_resolve |
     VENV_PREFIX=/tmp/woodpecker-cache/pe-venv-
     case "$CI_REPO" in ''|*[!A-Za-z0-9._/-]*) echo "refusing: CI_REPO empty or unexpected: '$CI_REPO'" >&2; exit 1;; esac
@@ -252,7 +263,7 @@ steps:
       - 'timeout -k 30 5m node "$AUDIT/citation-existence-check.mjs"'
       # The fifth gate: the two hash edges (record.taskAuthorityHash, manifest.parentHandoffHash) the
       # four above never read. It runs under plain node like the rest, before install; the TypeScript
-      # test that pins its manifest normalization to the real parseTaskManifest runs later, in test-unit.
+      # test that pins its manifest normalization to the real parseTaskManifest runs later, in test-coverage.
       - 'timeout -k 30 5m node "$AUDIT/manifest-binding-scan.mjs"'
 
   - name: install
@@ -301,35 +312,29 @@ steps:
   # Never bare `node --test`: git-touching suites need
   # test/support/isolatedState.ts, which the npm scripts import.
   #
-  # Two different timeouts guard this step, and they are not the same knob. The `timeout 30m` below
+  # There is no separate test-unit step: the coverage step below IS the unit suite (same files, same
+  # flags, plus the coverage gate), so running both ran the unit suite twice per pipeline.
+  #
+  # Two different timeouts guard the test steps, and they are not the same knob. The `timeout` in the step
   # reaps the whole step and names nothing. `--test-timeout` inside the npm scripts is per TEST: a
   # hung test fails naming itself, which is what #581 needed (a `test:unit` sat at zero output for
   # over an hour, and the log said only that the step died). It is 600s because the suite's slowest
   # single test measures 87s (`outbox perf: 2000 events stage + deliver end to end`) — a tidy 60s
   # would fail real tests, on a quiet machine let alone a loaded Slurm exec host. Re-measure before
   # lowering it.
-  - name: test-unit
-    image: bash
-    environment:
-      PLAYWRIGHT_BROWSERS_PATH: *browsers
-    commands:
-      - *node_env
-      - *venv_resolve
-      - 'export PATH="$VENV/bin:$PATH"'
-      - 'timeout -k 30 30m npm run test:unit'
-
   - name: test-integration
     image: bash
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
       - *node_env
+      - *test_conc
       - *venv_resolve
       - 'export PATH="$VENV/bin:$PATH"'
       - 'timeout -k 30 40m npm run test:integration'
 
-  # Coverage gate. Node's built-in coverage over src/ and extensions/, UNIT suite only
-  # (`npm run test:coverage`). Own step so test-unit/test-integration stay unchanged. Unit-only
+  # Unit suite + coverage gate. Node's built-in coverage over src/ and extensions/, UNIT suite only
+  # (`npm run test:coverage`); it replaced the separate test-unit step (the same suite, run twice). Unit-only
   # because the combined unit+integration run is not measurable: under load the merged line
   # data collapsed (96 percent idle, 56-58 percent loaded or on CI), while unit-only gave
   # identical numbers idle and loaded (lines 85.56, branches 83.29, functions 83.29 on macOS).
@@ -337,13 +342,14 @@ steps:
   # branches and functions (Node has no statements metric), met on all three. Linux CI measured
   # lines 85.51, branches 83.23, functions 83.29 (pipeline 218); enforced floors 85/83/83 sit
   # just below so the gate ratchets and cannot regress. Raise the flags as coverage improves.
-  # Isolated: to roll back, delete this step.
+  # To roll back the merge, restore a `test-unit` step running `npm run test:unit`.
   - name: test-coverage
     image: bash
     environment:
       PLAYWRIGHT_BROWSERS_PATH: *browsers
     commands:
       - *node_env
+      - *test_conc
       - *venv_resolve
       - 'export PATH="$VENV/bin:$PATH"'
       # The full TAP log (~54k lines) exceeds what Woodpecker keeps: pipeline 202 lost the tail,
@@ -355,6 +361,22 @@ steps:
       - 'grep -E "^# (tests|pass|fail|cancelled|skipped|duration_ms|Error:)" "$LOG" || true'
       - 'sed -n "/^# start of coverage report/,\$p" "$LOG" | grep -v "^# -" | cut -c1-160 || true'
       - 'echo "test:coverage exit code $rc"; exit $rc'
+
+  # The real-omp tests: every OMP_BIN-gated file plus the legacy golden under PARITY_PATH=omp, against a pinned
+  # omp provisioned by scripts/ci/provision-omp.sh (Bun 1.4.4, oh-my-pi 57263720 = omp 18.20.0, published
+  # linux-x64 native addon; sha256-pinned, no upstream script runs; cached under /tmp/woodpecker-cache).
+  # The tests skip when OMP_BIN is unset, so the runner fails on ANY skipped test: a provisioning
+  # regression cannot pass silently. The run itself uses a dead proxy and loopback only.
+  # Runbook: docs/operations/ci.md "Real-omp tests".
+  - name: test-omp-real
+    image: bash
+    commands:
+      - *node_env
+      - *test_conc
+      - *venv_resolve
+      - 'export PATH="$VENV/bin:$PATH"'
+      # The clamped PE_TEST_CONCURRENCY from above, halved by the script (min 1): each worker spawns a Bun process.
+      - 'timeout -k 30 50m scripts/ci/omp-real-tests.sh'
 
   # The old verify job's "Package-load + command smoke".
   - name: smoke
