@@ -150,7 +150,11 @@ describe("collectFingerprintInput from a real repo", () => {
     const dirty = fingerprint(await collect());
     assert.notEqual(dirty, before, "one edited byte is a different source tree, whatever the stat data says");
 
-    await g("commit", "-aq", "-m", "edit");
+    // `commit -a` would trust the same stat data and report "nothing to commit"
+    // (exit 1) -- the flake seen in pipeline 257. Drop the entry so `add` must read the file.
+    await g("rm", "--cached", "-q", "a.txt");
+    await g("add", "a.txt");
+    await g("commit", "-q", "-m", "edit");
     assert.equal(fingerprint(await collect()), dirty, "same content, committed, is the same source tree");
   });
 
