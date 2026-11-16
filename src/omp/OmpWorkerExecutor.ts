@@ -5,6 +5,7 @@ import { TOOL_TRANSITION_RULE } from "../guard/RecoveryController.ts";
 import { classifyError } from "../guard/transient.ts";
 import { reviewResultTool } from "../lifecycle/reviewResultTool.ts";
 import { MISSION_DEPTH_ENV, missionDepth } from "../orchestration/missionMode.ts";
+import { resolveWorkerSkills } from "../skillpack/workerPacks.ts";
 import { PROSE_ROLES, workerContext } from "../workers/PiWorkerExecutor.ts";
 import type { WorkerExecutor, WorkerRequest, WorkerRun } from "../workers/WorkerExecutor.ts";
 import {
@@ -103,8 +104,21 @@ export class OmpWorkerExecutor implements WorkerExecutor {
     });
     const systemPrompt =
       req.systemPromptOverride ?? (PROSE_ROLES.has(req.role) ? built : `${built}\n\n${TOOL_TRANSITION_RULE}`);
-    const args = [...this.opts.launch.args, ...buildOmpArgs({ model: this.opts.model, systemPrompt, builtin })];
     const base = this.opts.env ?? process.env;
+    // Opt-in (PI_ENGINEERING_WORKER_SKILLS=1 plus workers.skillPacks for this role): verified packs only; a refused
+    // pack is reported as activity and the worker runs without it.
+    const skills = await resolveWorkerSkills({ role: req.role, cwd: req.cwd, env: base });
+    for (const line of skills.diagnostics)
+      req.onActivity?.({ kind: "state", summary: line, meaningfulProgress: false });
+    const args = [
+      ...this.opts.launch.args,
+      ...buildOmpArgs({
+        model: this.opts.model,
+        systemPrompt,
+        builtin,
+        skillPackDirs: skills.packs.map((p) => p.dir),
+      }),
+    ];
     // Every worker command runs one mission-depth deeper (recursion guard); omp's children inherit it.
     const env = {
       ...base,

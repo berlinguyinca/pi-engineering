@@ -9,10 +9,12 @@ import {
   type ResourceLoader,
   SessionManager,
   SettingsManager,
+  type Skill,
   type ToolDefinition,
   createAgentSession,
   createBashToolDefinition,
   createExtensionRuntime,
+  loadSkillsFromDir,
 } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_ESCALATION,
@@ -113,6 +115,7 @@ import {
 } from "../request/thinkingPolicy.ts";
 import { resolveWorktreeIdentity } from "../runtime/isolation/WorktreeIdentity.ts";
 import { resolveStateRoot, worktreeRuntimeDir } from "../runtime/isolation/stateDir.ts";
+import { resolveWorkerSkills } from "../skillpack/workerPacks.ts";
 import { workerSessionGate, workerTaskId } from "../taskDiscipline/worker.ts";
 import { emitTelemetry } from "../telemetry/sink.ts";
 import { MODEL_SUPERSEDED } from "./WorkerExecutor.ts";
@@ -209,8 +212,12 @@ function isToolNotFound(result: unknown): boolean {
  * bound to the worker's OWN narrowed contract (`gateExtensions`; see
  * src/taskDiscipline/worker.ts). With no parent gate the set stays empty.
  */
-function roleResourceLoader(systemPrompt: string, gateExtensions?: LoadExtensionsResult): ResourceLoader {
-  return {
+function roleResourceLoader(
+  systemPrompt: string,
+  gateExtensions?: LoadExtensionsResult,
+  packSkills?: readonly Skill[],
+): ResourceLoader {
+  const base: ResourceLoader = {
     getExtensions: () => gateExtensions ?? { extensions: [], errors: [], runtime: createExtensionRuntime() },
     getSkills: () => ({ skills: [], diagnostics: [] }),
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
@@ -223,6 +230,21 @@ function roleResourceLoader(systemPrompt: string, gateExtensions?: LoadExtension
     extendResources: () => {},
     reload: async () => {},
   };
+  // Opt-in only (PI_ENGINEERING_WORKER_SKILLS=1 and workers.skillPacks): the role's verified pack skills, nothing else.
+  return packSkills && packSkills.length > 0
+    ? { ...base, getSkills: () => ({ skills: [...packSkills], diagnostics: [] }) }
+    : base;
+}
+
+/** Skills of the verified packs the allowlist grants this request's role; refused packs surface as activity. */
+async function workerPackSkills(req: WorkerRequest, agentDir: string): Promise<Skill[]> {
+  const resolved = await resolveWorkerSkills({ role: req.role, cwd: req.cwd, agentDir, env: process.env });
+  for (const line of resolved.diagnostics)
+    req.onActivity?.({ kind: "state", summary: line, meaningfulProgress: false });
+  return resolved.packs.flatMap(
+    (pack) =>
+      loadSkillsFromDir({ dir: pack.skillsDir, source: `pe-worker-skill-pack:${pack.name}@${pack.version}` }).skills,
+  );
 }
 
 export interface PiWorkerExecutorOptions {
@@ -1646,7 +1668,7 @@ ${recovery.recoveryPrompt}`;
     /** Terminal provider/gateway error text, when the model call itself failed. */
     assistantError?: string;
   }> {
-    const resourceLoader = roleResourceLoader(systemPrompt, workerGate);
+    const resourceLoader = roleResourceLoader(systemPrompt, workerGate, await workerPackSkills(req, this.agentDir));
     const sessionManager = SessionManager.inMemory(req.cwd);
     // Mission workers compact at a share of their context budget (default 60%,
     // PI_WORKER_COMPACT_AT), keeping the autotuned recent window; the summary

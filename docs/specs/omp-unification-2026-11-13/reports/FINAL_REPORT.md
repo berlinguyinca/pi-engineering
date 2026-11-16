@@ -57,7 +57,7 @@ Legacy remains the default path. Everything OMP-backed is behind `PI_ENGINEERING
 - Legacy tournament tie-break is nondeterministic (found in Phase 5, unchanged).
 - Full mission DAG on real omp: UNVERIFIED. omp `agent.db` contents: UNVERIFIED. TUI pixel screenshots and a live Herdr room: UNVERIFIED. Model-driven prompt compression and tool-description ablation: UNVERIFIED (no local model).
 - omp bash has no budget notice or stall quarantine; omp receives the full parent environment plus `HOME` (legacy strips session variables).
-- Decision: should worker sessions ever get skill packs (this changes the context firewall; currently no)?
+- DECIDED and implemented (opt-in, default off): worker sessions may get version-pinned, digest-verified skill packs when `PI_ENGINEERING_WORKER_SKILLS=1` and the operator's own `engineering.yaml` allowlists them per role with a pinned manifest sha256 (repo-supplied allowlists and packs are ignored); fail closed with a visible diagnostic. See skills-adoption-decisions.md, "Worker skill packs (opt-in)".
 - Decision: always pass an `autolearn.enabled: false` overlay to the operator session, and suppress foreign skill dirs there? (Workers already get the overlay.)
 - Upstream issue to file: OMP loads a skillshare store entry by comparing only the `.skillshare-integrity` marker; unpacked files are not re-hashed (a tampered `SKILL.md` still loads).
 - Decision: whether to provision omp in CI so the real-omp tests run.

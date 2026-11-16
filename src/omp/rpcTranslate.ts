@@ -167,12 +167,18 @@ export function ompToolsFor(tools: readonly string[]): { builtin: string[]; drop
  * generation or session persistence; only the translated tool allowlist plus
  * the host result tool; a replaced system prompt.
  */
-export function buildOmpArgs(opts: { model?: string; systemPrompt: string; builtin: readonly string[] }): string[] {
+export function buildOmpArgs(opts: {
+  model?: string;
+  systemPrompt: string;
+  builtin: readonly string[];
+  /** Verified, staged skill-pack directories granted to this worker (opt-in; see src/skillpack/workerPacks.ts). */
+  skillPackDirs?: readonly string[];
+}): string[] {
   return [
     "--mode",
     "rpc",
     "--no-session",
-    ...firewallArgs(),
+    ...firewallArgs(undefined, opts.skillPackDirs),
     ...(opts.model ? ["--model", opts.model] : []),
     ...(opts.builtin.length > 0 ? ["--tools", opts.builtin.join(",")] : ["--no-tools"]),
     "--system-prompt",
