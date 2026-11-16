@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -88,6 +89,42 @@ describe("worker skill packs: resolution", () => {
     assert.equal(statSync(join(pack.skillsDir, "pe-operator", "SKILL.md")).mode & 0o777, 0o600);
     const again = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
     assert.equal(again.packs[0]?.dir, pack.dir, "same content, same content-addressed copy");
+  });
+
+  it("a role named like an Object.prototype member is not allowlisted and does not throw", async () => {
+    const fx = operatorGrantingPack(["scout"]);
+    const out = await resolveWorkerSkills({ role: "constructor", cwd: fx.repo, env: on(fx) });
+    assert.deepEqual(out, { packs: [], diagnostics: [] });
+  });
+
+  it("the operator's agent dir honours PI_AGENT_DIR alone, like the legacy executor", async () => {
+    const fx = operatorGrantingPack(["scout"]);
+    const env = { ...on(fx), PI_CODING_AGENT_DIR: undefined, PI_AGENT_DIR: fx.agentDir };
+    const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env });
+    assert.deepEqual(out.diagnostics, []);
+    assert.equal(out.packs.length, 1);
+  });
+
+  it("a cache dir that is a symlink is refused with a diagnostic, never thrown", async () => {
+    const fx = operatorGrantingPack(["scout"]);
+    mkdirSync(join(fx.state, "elsewhere"), { recursive: true });
+    const cacheDir = join(fx.state, "cache-link");
+    symlinkSync(join(fx.state, "elsewhere"), cacheDir);
+    const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx), cacheDir });
+    assert.deepEqual(out.packs, []);
+    assert.equal(out.diagnostics.length, 1);
+    assert.match(out.diagnostics[0] ?? "", /^worker skill pack refused \(scout\): pe-operator: .*private directory/);
+    assert.deepEqual(readdirSync(join(fx.state, "elsewhere")), [], "nothing was staged through the link");
+  });
+
+  it("a pack directory that is itself a symlink is refused", async () => {
+    const fx = operatorGrantingPack(["scout"]);
+    const real = join(fx.agentDir, "real-pack");
+    renameSync(fx.pack, real);
+    symlinkSync(real, fx.pack);
+    const out = await resolveWorkerSkills({ role: "scout", cwd: fx.repo, env: on(fx) });
+    assert.deepEqual(out.packs, []);
+    assert.match(out.diagnostics[0] ?? "", /pe-operator: pack is not a plain directory/);
   });
 
   it("a missing pack is refused with a diagnostic", async () => {

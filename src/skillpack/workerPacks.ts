@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, cpSync, existsSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { normalizeAgentDir } from "../core/piAgentDir.ts";
 import { assertPrivateDir, defaultFirewallDir } from "../omp/firewall.ts";
 import { PACK_MANIFEST_FILE, type PackManifest, verifyPack } from "./verify.ts";
 
@@ -61,9 +63,13 @@ export function parseWorkerSkillPacks(raw: unknown): WorkerSkillPacksConfig {
   return { byRole, issues };
 }
 
-/** The operator's agent directory: the only place the allowlist is read from and packs are resolved in. */
+/**
+ * The operator's agent directory: the only place the allowlist is read from and packs are resolved in. Same
+ * resolution as the legacy executor (PI_CODING_AGENT_DIR, then PI_AGENT_DIR, then ~/.pi/agent).
+ */
 export function operatorAgentDir(env: NodeJS.ProcessEnv): string {
-  return env.PI_CODING_AGENT_DIR?.trim() || join(env.HOME ?? "~", ".pi", "agent");
+  const configured = env.PI_CODING_AGENT_DIR?.trim() || env.PI_AGENT_DIR?.trim();
+  return configured ? normalizeAgentDir(configured) : join(env.HOME?.trim() || homedir(), ".pi", "agent");
 }
 
 function workersSkillPacksOf(file: string): { present: boolean; raw?: unknown; error?: string } {
@@ -200,7 +206,11 @@ function chmodTree(dir: string): void {
  * a bad one is moved aside, never edited. No network, no script run, no symlink followed.
  */
 export function stage(src: string, cacheDir: string, pin: string): { dir: string } | { problems: string[] } {
-  assertPrivateDir(cacheDir);
+  try {
+    assertPrivateDir(cacheDir);
+  } catch (error) {
+    return { problems: [error instanceof Error ? error.message : String(error)] };
+  }
   const copied = manifestSha(src);
   if (copied !== pin) return { problems: ["manifest sha256 does not match the pinned digest"] };
   const target = join(cacheDir, pin.slice(0, 32));
@@ -259,7 +269,7 @@ export async function resolveWorkerSkills(opts: ResolveWorkerSkillsOptions): Pro
   }
   const packs: WorkerSkillPack[] = [];
   const cacheDir = opts.cacheDir ?? workerSkillCacheDir(env);
-  for (const grant of config.byRole[opts.role] ?? []) {
+  for (const grant of Object.hasOwn(config.byRole, opts.role) ? (config.byRole[opts.role] ?? []) : []) {
     const ref = grant.id;
     const refuse = (why: string[]) =>
       diagnostics.push(
@@ -270,6 +280,11 @@ export async function resolveWorkerSkills(opts: ResolveWorkerSkillsOptions): Pro
     const src = join(agentDir, "skill-packs", ref);
     if (!existsSync(src)) {
       refuse(["pack not found"]);
+      continue;
+    }
+    // The pack directory itself must be a plain directory: a symlink would let it point anywhere.
+    if (!lstatSync(src).isDirectory()) {
+      refuse(["pack is not a plain directory"]);
       continue;
     }
     let pinned: string;
@@ -293,6 +308,12 @@ export async function resolveWorkerSkills(opts: ResolveWorkerSkillsOptions): Pro
     const staged = stage(src, cacheDir, grant.manifestSha256);
     if ("problems" in staged) {
       refuse(staged.problems);
+      continue;
+    }
+    // Verify the exact directory about to be loaded once more, right before use.
+    const recheck = manifestSha(staged.dir) === grant.manifestSha256 ? packProblems(staged.dir) : ["digest mismatch"];
+    if (recheck.length > 0) {
+      refuse(recheck.map((p) => `staged copy: ${p}`));
       continue;
     }
     const manifest = readManifest(staged.dir);

@@ -238,7 +238,7 @@ function roleResourceLoader(
 
 /** Skills of the verified packs the allowlist grants this request's role; refused packs surface as activity. */
 async function workerPackSkills(req: WorkerRequest, agentDir: string): Promise<Skill[]> {
-  const resolved = await resolveWorkerSkills({ role: req.role, cwd: req.cwd, agentDir });
+  const resolved = await resolveWorkerSkills({ role: req.role, cwd: req.cwd, agentDir, env: process.env });
   for (const line of resolved.diagnostics)
     req.onActivity?.({ kind: "state", summary: line, meaningfulProgress: false });
   return resolved.packs.flatMap(
