@@ -25,11 +25,15 @@ import type { OmpLaunchSpec } from "./types.ts";
 
 const DEFAULT_START_TIMEOUT_MS = 15_000;
 const DEFAULT_INACTIVITY_MS = 300_000;
+/** Upper bound on how long the inactivity guard is suspended while an omp bash call is in flight (omp's own tool timeout normally ends it first). */
+const DEFAULT_BASH_MAX_MS = 3_600_000;
 const MAX_FRAME_LINE_BYTES = 1024 * 1024;
 const STDERR_TAIL_BYTES = 2_048;
 const EXIT_SETTLE_DEFER_MS = 100;
 
 export interface OmpWorkerOptions {
+  /** Cap on the inactivity pause while a bash call is running; default 1 h. */
+  readonly bashMaxMs?: number;
   readonly launch: OmpLaunchSpec;
   /** `provider/id` passed to `--model`; omp's own default when absent. */
   readonly model?: string;
@@ -160,14 +164,24 @@ export class OmpWorkerExecutor implements WorkerExecutor {
       function fail(error: string): void {
         finish(phase === "starting" ? { unavailable: error } : { run: failedRun(`OMP worker failed: ${error}`) });
       }
+      // omp's own bash runs in the foreground (auto-background is off in the overlay) and is silent until it
+      // ends, so the inactivity guard is suspended while one is in flight, bounded by bashMaxMs. With no tool in
+      // flight, silence still times out as before.
+      const bashInFlight = new Set<string>();
       const arm = (): void => {
         clearTimeout(timer);
         if (done || inflight > 0) return;
+        const bash = bashInFlight.size > 0;
         const ms =
           phase === "starting"
             ? (this.opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS)
-            : (req.timeoutMs ?? DEFAULT_INACTIVITY_MS);
-        timer = setTimeout(() => fail(`no omp frame for ${ms}ms (${phase})`), Math.max(1, ms));
+            : bash
+              ? Math.max(req.timeoutMs ?? DEFAULT_INACTIVITY_MS, this.opts.bashMaxMs ?? DEFAULT_BASH_MAX_MS)
+              : (req.timeoutMs ?? DEFAULT_INACTIVITY_MS);
+        timer = setTimeout(
+          () => fail(`no omp frame for ${ms}ms (${phase}${bash ? ", bash in flight" : ""})`),
+          Math.max(1, ms),
+        );
       };
 
       const complete = (status: "completed" | "aborted" | "error", error?: string): void => {
@@ -306,6 +320,10 @@ export class OmpWorkerExecutor implements WorkerExecutor {
 
       const handle = (frame: Record<string, unknown>): void => {
         if (done) return;
+        if (frame.toolName === "bash" && typeof frame.toolCallId === "string") {
+          if (frame.type === "tool_execution_start") bashInFlight.add(frame.toolCallId);
+          else if (frame.type === "tool_execution_end") bashInFlight.delete(frame.toolCallId);
+        }
         arm();
         if (phase === "starting" && frame.type === "ready") {
           if (decodeReadyFrame(frame) === null) {

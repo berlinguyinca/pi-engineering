@@ -132,6 +132,9 @@ describe("firewall overlay", () => {
       "enableAgentsProject: false",
       "enablePiProject: false",
       "- omp-managed",
+      "edit:\n  mode: replace",
+      "async:\n  enabled: false",
+      "bash:\n  autoBackground:\n    enabled: false",
     ]) {
       assert.ok(yml.includes(key), key);
     }
