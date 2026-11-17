@@ -174,6 +174,28 @@ export interface LockOptions {
   staleMs?: number;
 }
 
+/**
+ * The waiter's budget ran out while the holder stayed alive, so the lock is not stale and giving up is correct.
+ *
+ * It carries what the waiter knows rather than only a sentence, because "a live holder made me refuse to write"
+ * has to be tellable apart from a storage outage without reading prose (#683). `holder` is the owner record as
+ * written by the holder (host / boot / pidns / pid), truncated the same way the message truncates it.
+ */
+export class LockUnavailableError extends Error {
+  readonly lockPath: string;
+  readonly waitedMs: number;
+  readonly timeoutMs: number;
+  readonly holder: string;
+  constructor(lockPath: string, timeoutMs: number, waitedMs: number, holder: string) {
+    super(`timed out after ${timeoutMs}ms waiting for lock ${lockPath} (owner: ${holder})`);
+    this.name = "LockUnavailableError";
+    this.lockPath = lockPath;
+    this.timeoutMs = timeoutMs;
+    this.waitedMs = waitedMs;
+    this.holder = holder;
+  }
+}
+
 /** Run `fn` while holding the cross-process lock at `lockPath`. */
 export async function withFileLock<T>(lockPath: string, fn: () => Promise<T>, opts: LockOptions = {}): Promise<T> {
   const timeoutMs = opts.timeoutMs ?? 5000;
@@ -185,7 +207,7 @@ export async function withFileLock<T>(lockPath: string, fn: () => Promise<T>, op
   for (;;) {
     if (await tryCreate(lockPath, owner)) break;
     if (Date.now() > deadline) {
-      throw new Error(`timed out after ${timeoutMs}ms waiting for lock ${lockPath} (owner: ${describe(lastSeen)})`);
+      throw new LockUnavailableError(lockPath, timeoutMs, Date.now() - (deadline - timeoutMs), describe(lastSeen));
     }
     try {
       const raw = await readFile(lockPath, "utf8");

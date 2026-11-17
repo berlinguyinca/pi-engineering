@@ -30,7 +30,12 @@ export type DeadLetterReason =
   | "client_error"
   | "repeated_5xx"
   | "oversized"
-  | "overflow_dropped";
+  | "overflow_dropped"
+  /**
+   * No sequence could be allocated because a live holder kept the lock past the waiter's budget (#683).
+   * Recorded rather than swallowed: an event that never reached the outbox used to leave no trace at all.
+   */
+  | "sequence_unavailable";
 
 export interface OutboxStats {
   pending: number;
